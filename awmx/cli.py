@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from awmx.config import load_agent_world_config, load_workflow_config
+from awmx.workflow.runner import WorkflowDryRunRunner
 
 
 def _cmd_validate_config(args: argparse.Namespace) -> int:
@@ -28,6 +29,26 @@ def _cmd_validate_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_workflow_dry_run(args: argparse.Namespace) -> int:
+    workflow_path = Path(args.workflow)
+    workflow = load_workflow_config(workflow_path)
+    runner = WorkflowDryRunRunner()
+    result = runner.run(workflow, workflow_path=workflow_path)
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "mode": "dry_run",
+                "workflow_id": workflow.id,
+                "run_id": result.run_id,
+                "events_path": str(result.events_path),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AWMX - Agent World runtime extensions")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -35,6 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
     validate = subparsers.add_parser("validate-config", help="Validate an Agent World config")
     validate.add_argument("config", type=Path)
     validate.set_defaults(func=_cmd_validate_config)
+
+    workflow_dry_run = subparsers.add_parser(
+        "workflow-dry-run",
+        help="Validate and dry-run a workflow DAG without executing nodes",
+    )
+    workflow_dry_run.add_argument("workflow", type=Path)
+    workflow_dry_run.set_defaults(func=_cmd_workflow_dry_run)
 
     return parser
 
