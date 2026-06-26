@@ -39,6 +39,14 @@ def _require_iso_datetime(value: Any, field_name: str) -> None:
         raise ValidationError(f"{field_name} must be an ISO-8601 datetime") from exc
 
 
+def _contains_key(value: Any, key: str) -> bool:
+    if isinstance(value, dict):
+        return any(item_key == key or _contains_key(item_value, key) for item_key, item_value in value.items())
+    if isinstance(value, list):
+        return any(_contains_key(item, key) for item in value)
+    return False
+
+
 @dataclass
 class BaseArtifact:
     id: str
@@ -257,6 +265,12 @@ class TraceRecord(BaseArtifact):
         _require_mapping(self.action, "action")
         _require_mapping(self.observation, "observation")
         _require_mapping(self.evidence, "evidence")
+        if self.event_type == "runner_step":
+            permission = self.evidence.get("permission")
+            _require_mapping(permission, "evidence.permission")
+            if permission.get("allowed") is not True:
+                raise ValidationError("runner_step trace records require an allowed permission decision")
+            _require_non_empty_string(permission.get("kind"), "evidence.permission.kind")
 
 
 @dataclass
@@ -281,26 +295,59 @@ class RewardRecord(BaseArtifact):
         if isinstance(self.score, bool) or not isinstance(self.score, int | float) or not 0.0 <= float(self.score) <= 1.0:
             raise ValidationError("score must be a number between 0.0 and 1.0")
         _require_mapping(self.evidence, "evidence")
-        self._validate_verifier_evidence()
+        if self.source.get("kind") != "verifier":
+            raise ValidationError("reward source.kind must be verifier")
+        _require_non_empty_string(self.source.get("uri"), "source.uri")
+        if _contains_key(self.evidence, "runner_final_answer"):
+            raise ValidationError("reward evidence must not include runner_final_answer")
+        check_results = self._validate_verifier_evidence()
+        if self.passed and not all(check_results):
+            raise ValidationError("passed reward must not include failed checks")
+        if not self.passed and all(check_results):
+            raise ValidationError("failed reward must include at least one failed check")
+        if not self.passed and not self.failure_reason:
+            raise ValidationError("failed rewards must include failure_reason")
         if self.failure_reason is not None and not isinstance(self.failure_reason, str):
             raise ValidationError("failure_reason must be null or a string")
 
-    def _validate_verifier_evidence(self) -> None:
+    def _validate_verifier_evidence(self) -> list[bool]:
+        has_checks = "checks" in self.evidence
+        has_verifier_outputs = "verifier_outputs" in self.evidence
+        if has_checks and has_verifier_outputs:
+            raise ValidationError("mixed verifier evidence is not allowed")
+
         checks = self.evidence.get("checks")
         verifier_outputs = self.evidence.get("verifier_outputs")
         if checks is not None:
-            _require_list(checks, "evidence.checks")
-            if not checks:
-                raise ValidationError("evidence.checks must not be empty")
-            if not all(isinstance(check, dict) for check in checks):
-                raise ValidationError("evidence.checks must contain mappings")
-            return
+            return self._validate_checks(checks)
         if verifier_outputs is not None:
             _require_mapping(verifier_outputs, "evidence.verifier_outputs")
-            if not verifier_outputs:
-                raise ValidationError("evidence.verifier_outputs must not be empty")
-            return
+            if "runner_final_answer" in verifier_outputs:
+                raise ValidationError("verifier_outputs must not include runner_final_answer")
+            checks = verifier_outputs.get("checks")
+            if checks is None:
+                raise ValidationError("evidence.verifier_outputs must contain structured checks")
+            return self._validate_checks(checks)
         raise ValidationError("evidence must contain verifier evidence from checks or verifier_outputs")
+
+    def _validate_checks(self, checks: Any) -> list[bool]:
+        _require_list(checks, "evidence.checks")
+        if not checks:
+            raise ValidationError("evidence.checks must not be empty")
+        results = []
+        for check in checks:
+            _require_mapping(check, "evidence.checks[]")
+            _require_non_empty_string(check.get("name"), "evidence.checks[].name")
+            if not isinstance(check.get("passed"), bool):
+                raise ValidationError("evidence.checks[].passed must be a boolean")
+            results.append(check["passed"])
+            if "runner_final_answer" in check:
+                raise ValidationError("reward checks must not include runner_final_answer")
+            if not any(key in check for key in ("path", "evidence", "detail", "details")):
+                raise ValidationError("evidence.checks[] must include a path, evidence, detail, or details reference")
+            if check["passed"] is False and not (check.get("failure_reason") or self.failure_reason):
+                raise ValidationError("failed checks must include failure_reason")
+        return results
 
 
 SCHEMA_REGISTRY: dict[str, type[BaseArtifact]] = {
