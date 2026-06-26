@@ -1,0 +1,31 @@
+id: config.agent_world.base
+version: 0.1.0
+created_at: "2026-06-27T00:00:00Z"
+source:
+  kind: local_config
+  uri: configs/agent_world/base.yaml
+metadata:
+  stage: contracts
+  description: Minimal Agent World runtime contract config.
+paths:
+  config_root: configs/agent_world
+  output_root: outputs/agent_world
+  registry_root: outputs/agent_world/registry
+  runs_root: outputs/agent_world/runs
+  datasets_root: outputs/agent_world/datasets
+defaults:
+  workflow: configs/agent_world/workflows/vertical_slice.yaml
+policies:
+  first_stage_backends:
+    - scripted
+    - awm
+  allow_real_external_models: false
+  allow_training_integration: false
+  require_independent_review: true
+artifacts:
+  required_metadata:
+    - id
+    - version
+    - created_at
+    - source
+    - metadata

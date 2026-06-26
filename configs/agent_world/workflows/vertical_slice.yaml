@@ -1,0 +1,53 @@
+id: workflow.vertical_slice
+version: 0.1.0
+created_at: "2026-06-27T00:00:00Z"
+source:
+  kind: local_config
+  uri: configs/agent_world/workflows/vertical_slice.yaml
+metadata:
+  stage: contracts
+  description: Contract-only placeholder for the first AWM/scripted vertical slice.
+nodes:
+  - id: load_awm_fixture
+    node_type: awm.import_fixture
+    needs: []
+    config:
+      fixture_root: research/data/awm_1k_samples
+      artifact_types:
+        - scenario
+        - task
+        - environment
+        - tool
+        - verifier
+  - id: check_environment
+    node_type: awm.check_environment
+    needs:
+      - load_awm_fixture
+    config:
+      mode: dry_run
+  - id: scripted_rollout
+    node_type: rollout.scripted
+    needs:
+      - check_environment
+    config:
+      runner_ref: configs/agent_world/runners/scripted.yaml
+  - id: deterministic_verify
+    node_type: verification.deterministic
+    needs:
+      - scripted_rollout
+    config:
+      verifier_ref: configs/agent_world/verifiers/deterministic.yaml
+  - id: record_reward
+    node_type: verification.reward_record
+    needs:
+      - deterministic_verify
+    config:
+      artifact_type: reward
+budgets:
+  max_nodes: 5
+  max_rollout_steps: 8
+gates:
+  require_events_jsonl: true
+  require_trace_jsonl_for_runner: true
+  require_reward_json_for_verifier: true
+  require_independent_review: true

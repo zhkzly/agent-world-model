@@ -38,6 +38,7 @@ dependencies = [
     { name = "numpy" },
     { name = "openai" },
     { name = "orjson" },
+    { name = "pyyaml" },
     { name = "simpleargparser" },
     { name = "sqlalchemy" },
     { name = "tiktoken" },
@@ -47,6 +48,11 @@ dependencies = [
 [package.optional-dependencies]
 bench = [
     { name = "mcp-adapted-bench" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -60,12 +66,16 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.4.2" },
     { name = "openai", specifier = ">=2.17.0" },
     { name = "orjson", specifier = ">=3.11.7" },
+    { name = "pyyaml", specifier = ">=6.0.2" },
     { name = "simpleargparser", specifier = ">=0.2.2" },
     { name = "sqlalchemy", specifier = "==2.0.41" },
     { name = "tiktoken", specifier = ">=0.12.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
 provides-extras = ["bench"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8.3.5" }]
 
 [[package]]
 name = "aiohappyeyeballs"
