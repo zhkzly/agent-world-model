@@ -56,6 +56,19 @@ def resolve_runs_root(config: dict[str, Any], config_path: Path | str) -> Path:
     return _resolve_path(output_root, project_root) / "runs"
 
 
+def resolve_datasets_root(config: dict[str, Any], config_path: Path | str) -> Path:
+    paths = config.get("paths", {})
+    project_root = _project_root_for_config(config, Path(config_path))
+    datasets_root = paths.get("datasets_root")
+    if isinstance(datasets_root, str) and datasets_root:
+        return _resolve_path(datasets_root, project_root)
+
+    output_root = paths.get("output_root")
+    if not isinstance(output_root, str) or not output_root:
+        raise ValidationError("paths.output_root must be a non-empty string")
+    return _resolve_path(output_root, project_root) / "datasets"
+
+
 def _project_root_for_config(config: dict[str, Any], config_path: Path) -> Path:
     config_path = config_path.resolve()
     config_dir = config_path.parent

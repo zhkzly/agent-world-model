@@ -7,6 +7,7 @@ from pathlib import Path
 from awmx.artifacts.schemas import RunSpec
 from awmx.config import load_agent_world_config, load_workflow_config, resolve_config_path, resolve_runs_root
 from awmx.harness.trace import EventLogger, create_run_directory
+from awmx.workflow.executor import ScriptedVerticalSliceExecutor, result_to_json
 from awmx.workflow.runner import WorkflowDryRunRunner
 
 
@@ -90,6 +91,23 @@ def _cmd_create_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run(args: argparse.Namespace) -> int:
+    workflow_path = Path(args.workflow)
+    workflow = load_workflow_config(workflow_path)
+    config_path = Path(args.config) if args.config is not None else _default_config_path(workflow_path)
+    executor = ScriptedVerticalSliceExecutor(config_path=config_path)
+    result = executor.run(workflow, workflow_path=workflow_path)
+    print(result_to_json(result, workflow_id=workflow.id))
+    return 0
+
+
+def _default_config_path(workflow_path: Path) -> Path:
+    workflow_path = Path(workflow_path)
+    if workflow_path.parent.name == "workflows":
+        return workflow_path.parent.parent / "base.yaml"
+    return Path("configs/agent_world/base.yaml")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AWMX - Agent World runtime extensions")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -114,6 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
     create_run.add_argument("--runner-type", default="scripted")
     create_run.add_argument("--created-at", default="2026-06-27T00:00:00Z")
     create_run.set_defaults(func=_cmd_create_run)
+
+    run = subparsers.add_parser("run", help="Execute the first scripted Agent World vertical slice")
+    run.add_argument("workflow", type=Path)
+    run.add_argument("--config", type=Path, default=None)
+    run.set_defaults(func=_cmd_run)
 
     return parser
 
