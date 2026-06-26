@@ -110,6 +110,18 @@ def test_environment_tool_verifier_and_trace_contracts_validate():
     assert verifier.deterministic is True
     assert trace.sequence == 1
 
+    runner_trace = schemas.TraceRecord(
+        **_artifact_payload(id="trace.run_demo.0002"),
+        run_id="run.demo",
+        sequence=2,
+        event_type="runner_step",
+        actor="scripted",
+        action={"kind": "message", "content": "ok"},
+        observation={"status": "ok"},
+        evidence={"permission": {"allowed": True, "kind": "message"}},
+    )
+    assert runner_trace.evidence["permission"]["allowed"] is True
+
 
 @pytest.mark.parametrize(
     ("schema_cls", "payload", "match"),
@@ -160,6 +172,19 @@ def test_environment_tool_verifier_and_trace_contracts_validate():
             },
             "sequence",
         ),
+        (
+            schemas.TraceRecord,
+            {
+                "run_id": "run.demo",
+                "sequence": 1,
+                "event_type": "runner_step",
+                "actor": "scripted",
+                "action": {"kind": "message"},
+                "observation": {},
+                "evidence": {},
+            },
+            "permission",
+        ),
     ],
 )
 def test_artifact_specific_validation_rejects_invalid_payloads(schema_cls, payload, match):
@@ -189,7 +214,7 @@ def test_run_contract_is_runner_neutral():
 def test_reward_must_come_from_verifier():
     with pytest.raises(schemas.ValidationError, match="verifier"):
         schemas.RewardRecord(
-            **_artifact_payload(id="reward.bad"),
+            **_artifact_payload(id="reward.bad", source={"kind": "verifier", "uri": "reward.json"}),
             run_id="run.demo",
             task_id="task.ticketing.close_stale",
             verifier_id="",
@@ -200,27 +225,149 @@ def test_reward_must_come_from_verifier():
         )
 
     reward = schemas.RewardRecord(
-        **_artifact_payload(id="reward.good"),
+        **_artifact_payload(id="reward.good", source={"kind": "verifier", "uri": "reward.json"}),
         run_id="run.demo",
         task_id="task.ticketing.close_stale",
         verifier_id="verifier.ticketing.close_stale",
         passed=True,
         score=1.0,
-        evidence={"checks": [{"name": "db_state", "passed": True}]},
+        evidence={"checks": [{"name": "db_state", "passed": True, "detail": "state matched"}]},
         failure_reason=None,
     )
 
     assert reward.to_dict()["score"] == 1.0
 
-    with pytest.raises(schemas.ValidationError, match="verifier evidence"):
+    with pytest.raises(schemas.ValidationError, match="runner_final_answer"):
         schemas.RewardRecord(
-            **_artifact_payload(id="reward.runner_only"),
+            **_artifact_payload(id="reward.runner_only", source={"kind": "verifier", "uri": "reward.json"}),
             run_id="run.demo",
             task_id="task.ticketing.close_stale",
             verifier_id="verifier.ticketing.close_stale",
             passed=True,
             score=1.0,
             evidence={"runner_final_answer": "done"},
+            failure_reason=None,
+        )
+
+    with pytest.raises(schemas.ValidationError, match="source.kind"):
+        schemas.RewardRecord(
+            **_artifact_payload(id="reward.non_verifier"),
+            run_id="run.demo",
+            task_id="task.ticketing.close_stale",
+            verifier_id="verifier.ticketing.close_stale",
+            passed=True,
+            score=1.0,
+            evidence={"checks": [{"name": "db_state", "passed": True, "detail": "state matched"}]},
+            failure_reason=None,
+        )
+
+    with pytest.raises(schemas.ValidationError, match="runner_final_answer"):
+        schemas.RewardRecord(
+            **_artifact_payload(id="reward.mixed", source={"kind": "verifier", "uri": "reward.json"}),
+            run_id="run.demo",
+            task_id="task.ticketing.close_stale",
+            verifier_id="verifier.ticketing.close_stale",
+            passed=True,
+            score=1.0,
+            evidence={
+                "checks": [{"name": "db_state", "passed": True, "detail": "state matched"}],
+                "runner_final_answer": "done",
+            },
+            failure_reason=None,
+        )
+
+
+def test_reward_requires_replayable_verifier_source():
+    with pytest.raises(schemas.ValidationError, match="source.uri"):
+        schemas.RewardRecord(
+            **_artifact_payload(id="reward.no_source_uri", source={"kind": "verifier"}),
+            run_id="run.demo",
+            task_id="task.ticketing.close_stale",
+            verifier_id="verifier.ticketing.close_stale",
+            passed=True,
+            score=1.0,
+            evidence={"checks": [{"name": "db_state", "passed": True, "detail": "state matched"}]},
+            failure_reason=None,
+        )
+
+
+def test_reward_checks_must_match_reward_status():
+    with pytest.raises(schemas.ValidationError, match="passed reward"):
+        schemas.RewardRecord(
+            **_artifact_payload(id="reward.false_check", source={"kind": "verifier", "uri": "reward.json"}),
+            run_id="run.demo",
+            task_id="task.ticketing.close_stale",
+            verifier_id="verifier.ticketing.close_stale",
+            passed=True,
+            score=1.0,
+            evidence={
+                "checks": [
+                    {
+                        "name": "db_state",
+                        "passed": False,
+                        "detail": "state diverged",
+                        "failure_reason": "state diverged",
+                    }
+                ]
+            },
+            failure_reason=None,
+        )
+
+    with pytest.raises(schemas.ValidationError, match="failed reward"):
+        schemas.RewardRecord(
+            **_artifact_payload(id="reward.true_checks", source={"kind": "verifier", "uri": "reward.json"}),
+            run_id="run.demo",
+            task_id="task.ticketing.close_stale",
+            verifier_id="verifier.ticketing.close_stale",
+            passed=False,
+            score=0.0,
+            evidence={"checks": [{"name": "db_state", "passed": True, "detail": "state matched"}]},
+            failure_reason="verifier failed",
+        )
+
+
+def test_reward_rejects_mixed_or_nested_runner_evidence():
+    with pytest.raises(schemas.ValidationError, match="mixed verifier evidence"):
+        schemas.RewardRecord(
+            **_artifact_payload(id="reward.mixed_evidence", source={"kind": "verifier", "uri": "verifier.py"}),
+            run_id="run.demo",
+            task_id="task.ticketing.close_stale",
+            verifier_id="verifier.ticketing.close_stale",
+            passed=True,
+            score=1.0,
+            evidence={
+                "checks": [{"name": "db_state", "passed": True, "detail": "state matched"}],
+                "verifier_outputs": {
+                    "checks": [
+                        {
+                            "name": "db_state",
+                            "passed": False,
+                            "detail": "state diverged",
+                            "failure_reason": "state diverged",
+                        }
+                    ]
+                },
+            },
+            failure_reason=None,
+        )
+
+    with pytest.raises(schemas.ValidationError, match="runner_final_answer"):
+        schemas.RewardRecord(
+            **_artifact_payload(id="reward.nested_runner_answer", source={"kind": "verifier", "uri": "verifier.py"}),
+            run_id="run.demo",
+            task_id="task.ticketing.close_stale",
+            verifier_id="verifier.ticketing.close_stale",
+            passed=True,
+            score=1.0,
+            evidence={
+                "checks": [
+                    {
+                        "name": "db_state",
+                        "passed": True,
+                        "details": {"runner_final_answer": "claimed success"},
+                    }
+                ]
+            },
             failure_reason=None,
         )
 
