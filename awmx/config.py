@@ -6,6 +6,7 @@ from typing import Any
 import yaml
 
 from awmx.artifacts.schemas import ValidationError, WorkflowSpec
+from awmx.workflow.spec import validate_workflow_spec
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -34,4 +35,5 @@ def load_agent_world_config(path: Path | str) -> dict[str, Any]:
 
 
 def load_workflow_config(path: Path | str) -> WorkflowSpec:
-    return WorkflowSpec.from_dict(_load_yaml(Path(path)))
+    workflow = WorkflowSpec.from_dict(_load_yaml(Path(path)))
+    return validate_workflow_spec(workflow)
