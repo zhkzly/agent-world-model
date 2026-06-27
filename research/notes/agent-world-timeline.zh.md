@@ -1,5 +1,7 @@
 # Agent World 相关论文列表
 
+> 边界说明：本文是研究背景，不是当前仓库的实现计划。当前任务源以 `docs/agent-world-environment-generation.zh.md` 为准；论文时间线只帮助判断设计取舍，不能直接变成实现路线。
+
 排序规则：按 arXiv 首次发布时间排列。核心层指直接讨论 agent world、环境合成、任务合成、可执行环境或环境奖励的论文；扩展层指 harness、loop、自治研究等支撑 agent world 的系统论文。
 
 ## 核心发展顺序

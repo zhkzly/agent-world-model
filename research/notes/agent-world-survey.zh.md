@@ -1,5 +1,7 @@
 # Agent World 方向综述
 
+> 边界说明：本文是研究背景，不是当前仓库的实现计划。当前任务源以 `docs/agent-world-environment-generation.zh.md` 为准；AWM 只提供背景和可参考素材，不能被当成目标架构或默认 schema。
+
 ## 一句话判断
 
 Agent World 不是单纯的环境建模。更准确地说，它是在构建一种用于训练、评测和持续改进智能体的可执行世界系统。

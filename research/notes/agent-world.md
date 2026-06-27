@@ -1,5 +1,7 @@
 # Agent World, Harness Engineering, and Loop Engineering
 
+Boundary: this note is research background, not the repository implementation plan. The current task source is `docs/agent-world-environment-generation.zh.md`. AWM is useful evidence and example material, but it is not the target architecture or default schema.
+
 ## Bottom line
 “Agent world” is not just environment modeling.
 

@@ -1,5 +1,7 @@
 # AWM 1K 数据样本说明
 
+> 边界说明：本文只说明 AWM 样本如何作为背景资料或离线 fixture 使用。当前任务源以 `docs/agent-world-environment-generation.zh.md` 为准；不要把 AWM JSONL 或 MCP 形态当成新系统的核心格式。
+
 ## 来源
 
 数据集：`Snowflake/AgentWorldModel-1K`
@@ -72,7 +74,7 @@ uvx --from huggingface_hub huggingface-cli download Snowflake/AgentWorldModel-1K
 
 - 字段：`scenario`, `db_path`, `full_code`
 - `full_code` 是 FastAPI + MCP 风格的环境代码。
-- 映射：`EnvironmentSpec.runtime` 和 AWM adapter fixture。
+- 映射：可作为后续通用环境 artifact 转换 fixture。
 
 `gen_verifier.jsonl`
 
@@ -86,10 +88,11 @@ uvx --from huggingface_hub huggingface-cli download Snowflake/AgentWorldModel-1K
 - `verification.code` 是 `verify_task_completion(initial_db_path, final_db_path, final_answer=None) -> dict` 风格。
 - 映射：优先用于 deterministic verifier fixture。
 
-## 对 awmx 的约束
+## 作为背景资料的使用边界
 
-- importer 必须支持从这些 JSONL 样本构造 `ScenarioSpec`、`TaskSpec`、`EnvironmentSpec`、`ToolSpec`、`VerifierSpec`。
-- importer 测试必须使用本地小样本，不依赖网络和真实 LLM API。
-- verifier 测试优先使用 `gen_verifier.pure_code.jsonl` 的接口形态。
-- AWM MCP 只能作为 adapter 或 runner 后端，不允许让 AWM 数据格式泄漏到通用 trace/reward schema。
+- AWM 1K 样本可以作为 source discovery 的本地材料或 verifier 设计参考。
+- 不要求新系统复用 AWM JSONL 字段名或 MCP 暴露方式。
+- 如果后续需要 importer，应把 AWM 样本转换成项目自己的通用环境生成 artifact，不能让 AWM 原始格式成为核心 schema。
+- verifier 设计可以参考 `gen_verifier.pure_code.jsonl` 的 pure-code 形态。
+- 本地样本优先用于离线实验；不要默认下载完整数据集到仓库。
 - 所有运行命令使用 `uv run ...`，完整数据下载使用 `uvx ...`。

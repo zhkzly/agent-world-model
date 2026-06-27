@@ -1,271 +1,91 @@
+# Agent World Environment Generation
 
-<h1 align="center"><img src="figures/logo.png" alt="AWM Logo" width="80"> Agent World Model</h1>
+本仓库当前任务是实现一个类似 Agent-World / AW 的环境生成系统。
 
-<h3 align="center">Infinity Synthetic Environments for Agentic Reinforcement Learning</h3>
+用户给出环境需求、模型能力缺口、领域种子、工具生态、PRD、repo、MCP server、CLI、API/SDK 文档或其他资料后，系统应生成可复现、可验证、可发布、可被训练/评估流程消费的可执行环境包。
 
-<p align="center">
-  <a href="https://zhaoyang.win">Zhaoyang Wang<sup>1</sup></a>,
-  <a href="https://www.canwenxu.net/">Canwen Xu<sup>2</sup></a>,
-  <a href="https://www.snowflake.com/en/blog/authors/boyi-liu/">Boyi Liu<sup>2</sup></a>,
-  <a href="https://yitewang.github.io/">Yite Wang<sup>2</sup></a>,
-  <a href="https://lillianwei-h.github.io/">Siwei Han<sup>1</sup></a>,<br/>
-  <a href="https://yaozhewei.github.io/">Zhewei Yao<sup>2</sup></a>,
-  <a href="https://www.huaxiuyao.io/">Huaxiu Yao<sup>1</sup></a>,
-  <a href="https://www.snowflake.com/en/blog/authors/yuxiong-he/">Yuxiong He<sup>2</sup></a>
-</p>
-<p align="center">
-  <sup>1</sup>UNC-Chapel Hill &nbsp; <sup>2</sup>Snowflake AI Research &nbsp;
-</p>
+## 当前任务源
 
+以 [docs/agent-world-environment-generation.zh.md](/home/kelongzx/pycodes/loop_agent/agent-world-model/docs/agent-world-environment-generation.zh.md) 为准。
 
-<p align="center">
-    <a href="https://arxiv.org/pdf/2602.10090"><img src="https://img.shields.io/badge/arXiv-2602.10090-b31b1b.svg" alt="arXiv"></a>
-    <a href="https://huggingface.co/datasets/Snowflake/AgentWorldModel-1K"><img src="https://img.shields.io/badge/🤗-Environments-yellow.svg" alt="HuggingFace"></a>
-    <a href="https://huggingface.co/spaces/ChilleD/agent_world_model_env"><img src="https://img.shields.io/badge/🤗-Live Demo-green.svg" alt="HuggingFace"></a>
-    <a href="https://huggingface.co/Snowflake/Arctic-AWM-4B"><img src="https://img.shields.io/badge/🤗-AWM4B-blue.svg" alt="HuggingFace"></a>
-    <a href="https://huggingface.co/Snowflake/Arctic-AWM-8B"><img src="https://img.shields.io/badge/🤗-AWM8B-blue.svg" alt="HuggingFace"></a>
-    <a href="https://huggingface.co/Snowflake/Arctic-AWM-14B"><img src="https://img.shields.io/badge/🤗-AWM14B-blue.svg" alt="HuggingFace"></a>
-    <a href="https://github.com/meta-pytorch/OpenEnv/tree/main/envs/agent_world_model_env"><img src="https://img.shields.io/badge/⚓️-RL Infra-orange.svg" alt="RL Infra"></a>
-</p>
+辅助背景：
 
-<p align="left">
-  <b>Agent World Model (AWM)</b> is a fully synthetic environment generation pipeline that synthesizes 1,000 executable, SQL database-backed tool-use environments exposed via unified MCP interface for large-scale multi-turn agentic reinforcement learning.
-</p>
+- [docs/loop-engineering.md](/home/kelongzx/pycodes/loop_agent/agent-world-model/docs/loop-engineering.md)
+- [research/notes/](/home/kelongzx/pycodes/loop_agent/agent-world-model/research/notes)
 
----
+这些背景材料用于理解环境生成、任务生成、verifier、harness、workflow 和训练消费关系，不是直接实现计划。
 
-## 📣 News
-- May 1, 2026: AWM got accepted to ICML 2026 🎉, and its infra got merged into [meta-pytorch/OpenEnv](https://github.com/meta-pytorch/OpenEnv) supporting large-scale agentic RL training! Have a live demo try at [huggingface space](https://huggingface.co/spaces/ChilleD/agent_world_model_env) 🤗!
-- Mar 16, 2026: we added the verification demo, please refer to [Verification](#verification) section!
-- Feb 10, 2026: we open-sourced the synthesis pipeline, 1,000 synthesized environments and RL trained agents at [Huggingface](https://huggingface.co/collections/Snowflake/agent-world-model)!
+## 与 AWM 的关系
 
+本仓库来自 Agent World Model 代码，但当前目标不是复现 AWM 论文，也不是把 AWM JSONL、MCP 暴露形式或数据结构当成通用标准。
 
-## 🔮 Resources
-We released the syntheszied 1,000 executable environments and corresponding tasks, databases, and verification in huggingface. Please checkout huggingface repo at [Snowflake/AgentWorldModel-1K](https://huggingface.co/datasets/Snowflake/AgentWorldModel-1K).  You can freely interact with these environments online at [HuggingFace Space](https://huggingface.co/spaces/ChilleD/agent_world_model_env).
+原有 `awm` CLI 仍可作为背景实现和兼容入口保留，后续只在明确需要时复用其中的环境管理、MCP surface、verifier 或样本处理能力。
 
-| Resource | Link |
-|----------|------|
-| 📄 Paper | [📄 arxiv.org/abs/2602.10090](https://arxiv.org/abs/2602.10090) |
-| 💻 Code | [💻 Snowflake-Labs/agent-world-model](https://github.com/Snowflake-Labs/agent-world-model) |
-| ⚓️ RL Infra | [⚓️ meta-pytorch/OpenEnv](https://github.com/meta-pytorch/OpenEnv/tree/main/envs/agent_world_model_env) |
-| 🛜 Live Demo | [🤗 HuggingFace Space](https://huggingface.co/spaces/ChilleD/agent_world_model_env) |
-| 📦 AgentWorldModel-1K | [🤗 Snowflake/AgentWorldModel-1K](https://huggingface.co/datasets/Snowflake/AgentWorldModel-1K) |
-| 🤖 Arctic-AWM-4B | [🤗 Snowflake/Arctic-AWM-4B](https://huggingface.co/Snowflake/Arctic-AWM-4B) |
-| 🤖 Arctic-AWM-8B | [🤗 Snowflake/Arctic-AWM-8B](https://huggingface.co/Snowflake/Arctic-AWM-8B) |
-| 🤖 Arctic-AWM-14B | [🤗 Snowflake/Arctic-AWM-14B](https://huggingface.co/Snowflake/Arctic-AWM-14B) |
+## 当前不做
 
-If you want to directly use our synthesized environments, please download by
+- 不继续 `awmx` demo。
+- 不先实现 scripted rollout / reward / export demo。
+- 不把所有环境固定成 MCP-only 或 CLI-only。
+- 不把 generic shell command executor 当作环境 CLI surface。
+- 不把 Codex SDK、mini-swe-agent、deep-search 或单一训练框架直接绑定进核心；需要时通过可插拔 agent backend adapter 调用。
+- 不把训练框架集成作为第一步。
+- 不下载完整 AWM 1K 数据到仓库。
+
+## 设计方向
+
+当前推荐形态不是固定“两条 loop”，而是一个确定性的环境生成工作流，并允许在明确 gate 后回到上游阶段：
+
+```text
+EnvironmentNeed / CapabilityGap / DomainSeed
+  -> source discovery
+  -> knowledge extraction
+  -> environment specification
+  -> tool dependency graph
+  -> task generation
+  -> surface planning
+  -> verifier planning
+  -> feasibility filtering
+  -> implementation plan or code-agent request
+  -> implementation and checks
+  -> release package
+  -> rollout/export/evaluation consumers
+  -> failure analysis feedback
+```
+
+LLM 或 agent 可以作为 search、extraction、synthesis、judge、implementation 等显式节点，但流程控制、artifact、gate、日志和可重放状态必须由代码、typed config 或显式 DAG 表达。
+
+需要调研 MCP、CLI、API/SDK 文档、repo 或其他资料时，可以在 workflow 中启动 search/code agent backend，例如 Codex SDK/CLI 或 deep-search adapter。此类调用必须写入 `AgentInvocationRecord`，并把结果转换成可审计 artifact，不能隐藏在 prompt 或人工临时步骤里。
+
+Agent backend 的 OpenAI-compatible 配置使用新系统自己的环境变量：
+
+- `AGENT_WORLD_AGENT_BACKEND`
+- `AGENT_WORLD_OPENAI_BASE_URL`
+- `AGENT_WORLD_OPENAI_API_KEY`
+- `AGENT_WORLD_OPENAI_MODEL`
+- `AGENT_WORLD_SMOKE_OPENAI_MODEL`
+- `AGENT_WORLD_OPENAI_API_VERSION`
+- `AGENT_WORLD_CODEX_CMD`
+
+其中 API key 只能作为 env var 或 secret ref 使用，不能写入 artifact。`OPENAI_BASE_URL`、`OPENAI_API_KEY`、`OPENAI_MODEL` 可以作为兼容 fallback；旧 AWM 变量只允许作为 legacy fallback。
+
+Goal/CI/live smoke test 如需真实模型，应优先用便宜模型，例如：
 
 ```bash
-hf download Snowflake/AgentWorldModel-1K --repo-type dataset --local-dir ./outputs/
-```
-Then you can skip to [Environment Management](#environment-management) and [Agent Demo](#agent-demo) to start using the environments locally.
-
-
-## 📦 Setup
-Run `uv sync` to setup the python environment. And set your LLM API credentials:
-
-```bash
-# OpenAI or any other compatible services
-export AWM_SYN_LLM_PROVIDER="openai"
-export OPENAI_API_KEY="your-api-key"
-# optional, if you are using a custom base url
-export OPENAI_BASE_URL="http://xxxxxx"
-
-# Azure OpenAI
-export AWM_SYN_LLM_PROVIDER="azure"
-export AZURE_ENDPOINT_URL="https://your-endpoint.openai.azure.com/"
-export AZURE_OPENAI_API_KEY="your-api-key"
-
-# configure the model/LLM for synthesis
-export AWM_SYN_OVERRIDE_MODEL="your-model-name such as gpt-5"
+export AGENT_WORLD_SMOKE_OPENAI_MODEL=gpt-5.4-mini
+# 或在可用时：
+export AGENT_WORLD_SMOKE_OPENAI_MODEL=gpt-3-codex-spark
 ```
 
-## 🔥 Synthesis
+模型名必须来自配置或环境变量，不能在核心代码里写死。没有凭证、base URL、模型或网络权限时，live smoke test 应跳过，deterministic mock/manual tests 仍应运行。
 
-### AWM CLI
+## 第一实现切片
 
-All synthesis is exposed through the `awm` command-line tool. Run `awm --help` to see available commands:
+第一实现切片的阶段边界、artifact contracts、deterministic/static gates、surface 边界、首个 runnable fixture、release format 和验收标准已在 [docs/agent-world-environment-generation.zh.md](/home/kelongzx/pycodes/loop_agent/agent-world-model/docs/agent-world-environment-generation.zh.md) 中冻结。
 
-```
-awm --help
+当前第一条 vertical slice 已进入 runtime 实现：第一 fixture 是非 AWM 的 `support-desk-lite`；Python callable 是最小 required surface，CLI、HTTP、MCP 只作为 planned-but-deferred surfaces 进入 `SurfacePlan`。第一实现切片包含可运行的 backend-neutral `AgentBackend` / `AgentInvocationRecord` 机制，并至少提供 deterministic mock/manual backend 和一个真实可调用的本地 agent backend，例如受控 `process_agent` 或 Codex CLI adapter。
 
-Available commands:
-  gen        Synthesis pipeline commands
-  ├── scenario   Generate scenario names from seed set
-  ├── task       Generate user tasks per scenario
-  ├── db         Generate database schema and create SQLite databases
-  ├── sample     Generate and insert sample data into databases
-  ├── spec       Generate API specification for each scenario
-  ├── env        Generate MCP environment code
-  ├── verifier   Generate verification code for tasks
-  └── all        Run the full synthesis pipeline
-  env        Environment management commands
-  ├── start      Start MCP server for a scenario
-  ├── check      Check if an MCP server is running and list its tools
-  ├── check_all  Check all generated environments
-  └── reset_db   Reset databases to initial state
-  agent      Run a tool-use agent to solve a task by interacting with the environment
-  verify     Verify agent run outputs using code-augmented LLM-as-a-Judge or purely code-based Judge
-  bench      Run evaluation on mcp-adapted-bench including bfclv3, tau2, and mcp-universe
-```
+## 下一 Goal
 
-Use `awm <command> --help` to see options for any command, e.g. `awm gen task --help`.
+[docs/goal-02-hardcoded-full-chain.zh.md](/home/kelongzx/pycodes/loop_agent/agent-world-model/docs/goal-02-hardcoded-full-chain.zh.md) 定义下一阶段：基于当前硬编码 `support-desk-lite` 案例走通 release package -> rollout/eval -> reward records -> training export -> dataset-only trainer consumer。
 
-### Step 1: Scenario Generation
-We start with a seed set of scenarios and generate 1,000 unique scenario descriptions. Note that only the names are used as seeds; the descriptions are included in the seed file for ease of use.
-
-```bash
-export EMBEDDING_OPENAI_API_KEY="your-api-key for the embedding model"
-
-awm gen scenario \
-    --input_path outputs/seed_scenario.jsonl \
-    --output_path outputs/gen_scenario.jsonl \
-    --target_count 1000
-```
-
-### Step 2: Task Generation
-We generate 10 tasks per scenario, which are also serving as the requirements for building the environment.
-
-```bash
-awm gen task \
-    --input outputs/gen_scenario.jsonl \
-    --output outputs/gen_tasks.jsonl
-```
-
-### Step 3: Database Synthesis
-We define the database schema and complete the initial state to fully support the generated tasks.
-
-```bash
-# database schema
-awm gen db \
-    --input outputs/gen_tasks.jsonl \
-    --output outputs/gen_db.jsonl
-
-# sample data for initial state
-awm gen sample \
-    --input_task outputs/gen_tasks.jsonl \
-    --input_db outputs/gen_db.jsonl \
-    --output outputs/gen_sample.jsonl
-```
-
-### Step 4: Interface Synthesis
-We first generate API spec for better generating the Python code of the environment in MCP interface.
-
-```bash
-# API spec (interface schema)
-awm gen spec \
-    --input_task outputs/gen_tasks.jsonl \
-    --input_db outputs/gen_db.jsonl \
-    --output outputs/gen_spec.jsonl
-
-# Environment code
-awm gen env \
-    --input_spec outputs/gen_spec.jsonl \
-    --input_db outputs/gen_db.jsonl \
-    --output outputs/gen_envs.jsonl
-```
-
-### Step 5: Verification Synthesis
-We provide two options for verification:
-1. code-augmented LLM-as-a-Judge (`sql`)
-2. purely code-based Judge (`code`)
-
-```bash
-awm gen verifier \
-    --mode sql \
-    --input_task outputs/gen_tasks.jsonl \
-    --output outputs/gen_verifier.jsonl
-```
-
-### Environment Management
-
-Run and check each environment. The MCP endpoint will be available at `http://localhost:8001/mcp`.
-
-```bash
-# Reset databases to initial state
-awm env reset_db \
-    --input_db outputs/gen_db.jsonl \
-    --input_sample outputs/gen_sample.jsonl
-
-# Start MCP server for a scenario
-awm env start \
-    --scenario "scenario_name" \
-    --envs_load_path outputs/gen_envs.jsonl \
-    --port 8001
-
-# Check if MCP server is running
-awm env check --url http://localhost:8001/mcp
-
-# Batch test all generated environments
-awm env check_all --output outputs/gen_envs.jsonl
-```
-
-### Agent Demo
-
-AWM includes a simple agent demo that connects to an MCP environment to solve tasks via multi-turn tool calling. Please start the environment and use [vLLM](https://github.com/vllm-project/vllm) to serve the model before running the agent.
-
-```bash
-# serve the model
-vllm serve Snowflake/Arctic-AWM-4B --host 127.0.0.1 --port 8000
-
-# start the environment, this will create an isolated folder outputs/servers/<timestamp> to save the environment related files such as initial.db, final.db, and etc.
-awm env start --scenario e_commerce_33 --envs_load_path outputs/gen_envs.jsonl --port 8001
-
-# run the agent
-awm agent \
-    --task "show me the top 10 most expensive products" \
-    --mcp_url http://localhost:8001/mcp \
-    --api_url http://localhost:8000/v1 \
-    --model Snowflake/Arctic-AWM-4B
-```
-
-### Verification
-AWM supports two types of verification:
-1. `sql`, the recommended code-augmented LLM-as-a-Judge (requires LLM env vars, see Setup section)
-2. `code`, purely code-based Judge
-
-```bash
-# launch an isolated environment and run the agent to finish the task of corresponding scenario
-awm agent \
-    --scenario e_commerce_33 \
-    --task_id 0 \
-    --api_url http://localhost:8000/v1 \
-    --model Snowflake/Arctic-AWM-4B
-
-# after interaction, the trajectory will be saved to outputs/agents/<timestamp>, we can verify it by
-awm verify --input outputs/agents/<timestamp> --mode sql
-```
-
-## Benchmark
-To align the evaluation with the trained tool-use protocol that requires agents to finish the task via unified MCP interface: `list_tools` and `call_tool`, we modified and adapated the evaluation harness of the following benchmarks: BFCLv3, τ²-bench-verified, and MCP-Universe. See more details at [mcp-adapted-bench](https://github.com/Raibows/mcp-adapted-bench). Remember to set the aforementioned env vars for the LLM agent API config before running the evaluation.
-
-```bash
-# install evaluation harness dependencies
-git submodule update --init --recursive mcp-adapted-bench
-uv sync --extra bench
-
-# run evaluation, the tested agent LLM should be set by env vars as described in the Setup section
-awm bench --mode bfcl --output_dir ./outputs/bfcl
-awm bench --mode tau2 --output_dir ./outputs/tau2
-awm bench --mode mcp_universe --output_dir ./outputs/mcp_universe
-```
-
-
-## Citation
-
-If you find this work useful, please kindly cite:
-
-```bibtex
-@article{wang2026agentworldmodelinfinity,
-      title={Agent World Model: Infinity Synthetic Environments for Agentic Reinforcement Learning}, 
-      author={Zhaoyang Wang and Canwen Xu and Boyi Liu and Yite Wang and Siwei Han and Zhewei Yao and Huaxiu Yao and Yuxiong He},
-      year={2026},
-      eprint={2602.10090},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2602.10090}, 
-}
-```
-
-
+这个 Goal 仍然不是通用环境自动生成。它的目的只是先把已发布环境到训练/评估消费的全链路打通，并保持训练框架作为可插拔 consumer。
