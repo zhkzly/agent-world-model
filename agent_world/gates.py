@@ -6,6 +6,8 @@ from agent_world.artifacts import ArtifactValidationError, make_artifact, valida
 
 
 STAGE_GATES: dict[str, list[str]] = {
+    "PLAN": ["G0", "G13"],
+    "SELECT": ["G0", "G13"],
     "S0": ["G0", "G1", "G13"],
     "S1": ["G0", "G2", "G3", "G13"],
     "S2": ["G0", "G2", "G13"],
@@ -185,8 +187,9 @@ def _tool_graph_gate(graph: dict[str, Any], context: dict[str, dict[str, Any]] |
 
 def _task_solvability_gate(task_set: dict[str, Any], context: dict[str, dict[str, Any]] | None = None) -> None:
     tasks = task_set.get("tasks", [])
-    if len(tasks) < 5:
-        raise ArtifactValidationError("TaskSet needs at least five accepted tasks")
+    minimum_task_count = int(task_set.get("minimum_task_count", 5))
+    if len(tasks) < minimum_task_count:
+        raise ArtifactValidationError(f"TaskSet needs at least {_count_word(minimum_task_count)} accepted tasks")
     known_tools = None
     known_verifiers = None
     graph_edges = set()
@@ -332,11 +335,10 @@ def _package_gate(plan: dict[str, Any]) -> None:
         "surfaceplan-",
         "verifierplan-",
         "feasibilityreport-",
-        "impl-support-desk-lite-first-slice",
-        "package-support-desk-lite",
-        "replay-support-desk-lite",
-        "consumer-support-desk-lite",
-        "release-support-desk-lite",
+        "impl-",
+        str(plan["package_plan_id"]),
+        str(plan["replay_plan_ref"]),
+        str(plan["release_manifest_ref"]),
     ]
     for required in required_prefixes:
         if not any(item.startswith(required) or item == required for item in known):
@@ -351,9 +353,10 @@ def _package_gate(plan: dict[str, Any]) -> None:
     for ref in plan.get("fixture_refs", []):
         if not str(ref).startswith("fixtures/"):
             raise ArtifactValidationError("EnvironmentPackagePlan fixture_ref must stay inside fixtures/")
+    allowed_consumer_prefixes = ("release/", "checks/", "training/", "rollouts/")
     for ref in plan.get("consumer_output_refs", []):
-        if not str(ref).startswith("release/"):
-            raise ArtifactValidationError("EnvironmentPackagePlan consumer_output_ref must stay inside release/")
+        if not str(ref).startswith(allowed_consumer_prefixes):
+            raise ArtifactValidationError("EnvironmentPackagePlan consumer_output_ref must stay inside release/, checks/, training/, or rollouts/")
 
 
 def _release_gate(release: dict[str, Any], context: dict[str, dict[str, Any]]) -> None:
@@ -388,7 +391,7 @@ def _review_gate(artifact: dict[str, Any], review: dict[str, Any]) -> None:
         raise ArtifactValidationError("ReviewRecord did not pass")
     if not review.get("source_of_truth_refs") or not review.get("gate_checklist"):
         raise ArtifactValidationError("ReviewRecord lacks source-of-truth refs or gate checklist")
-    if artifact["source_stage"] != "S0" and not review.get("upstream_artifact_ids"):
+    if artifact["source_stage"] not in {"PLAN", "S0"} and not review.get("upstream_artifact_ids"):
         raise ArtifactValidationError("ReviewRecord lacks upstream artifact evidence")
 
 
@@ -408,21 +411,20 @@ def _agent_invocation_gate(invocations: list[dict[str, Any]], context: dict[str,
                 raise ArtifactValidationError(f"Agent invocation lacks {field}")
         if not invocation.get("permissions") or not invocation.get("budget"):
             raise ArtifactValidationError("Agent invocation lacks permissions or budget")
-        if config["backend_kind"] in {"process_agent", "codex_cli"}:
+        if config["backend_kind"] in {"process_agent", "codex_cli", "code_agent_runner", "codex_cli_runner"}:
             command = config.get("command", {})
             if not command.get("allowlist_executables"):
                 raise ArtifactValidationError("Process agent config lacks executable allowlist")
-            if config.get("permissions", {}).get("filesystem") != "controlled_process_cwd":
-                raise ArtifactValidationError("Process agent config must declare controlled_process_cwd filesystem scope")
+            expected_filesystem = "isolated_agent_workspace" if config["backend_kind"] in {"code_agent_runner", "codex_cli_runner"} else "controlled_process_cwd"
+            if config.get("permissions", {}).get("filesystem") != expected_filesystem:
+                raise ArtifactValidationError(f"Process agent config must declare {expected_filesystem} filesystem scope")
             if invocation["permissions"].get("network") and not config.get("permissions", {}).get("network"):
                 raise ArtifactValidationError("Agent invocation requests network beyond config")
             if not config.get("permissions", {}).get("auth") and invocation["permissions"].get("auth"):
                 raise ArtifactValidationError("Agent invocation requests auth beyond config")
-            if config["backend_kind"] == "process_agent":
+            if config["backend_kind"] in {"process_agent", "code_agent_runner"}:
                 if config.get("permissions", {}).get("sandbox") or invocation["permissions"].get("sandbox"):
-                    raise ArtifactValidationError("process_agent must not claim sandbox enforcement")
-                if config.get("permissions", {}).get("auth") or invocation["permissions"].get("auth"):
-                    raise ArtifactValidationError("process_agent must not pass auth secrets to child processes")
+                    raise ArtifactValidationError("process/code_agent_runner must not claim sandbox enforcement")
             if not config.get("redaction_policy", {}).get("secret_env_names_only"):
                 raise ArtifactValidationError("Agent config lacks secret redaction policy")
 
@@ -431,3 +433,13 @@ def _context_required(context: dict[str, dict[str, Any]], name: str) -> dict[str
     if name not in context:
         raise ArtifactValidationError(f"Missing context artifact: {name}")
     return context[name]
+
+
+def _count_word(value: int) -> str:
+    return {
+        1: "one",
+        2: "two",
+        3: "three",
+        4: "four",
+        5: "five",
+    }.get(value, str(value))

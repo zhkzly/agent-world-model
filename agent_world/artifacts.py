@@ -23,6 +23,36 @@ COMMON_FIELDS = [
 ]
 
 ARTIFACT_REQUIRED_FIELDS: dict[str, list[str]] = {
+    "DomainPlan": [
+        "domain_plan_id",
+        "raw_request",
+        "domain_seed",
+        "domain_intent",
+        "recognized_intents",
+        "required_state_objects",
+        "required_operations",
+        "likely_source_needs",
+        "constraints",
+        "license_auth_network_security",
+        "planner_evidence",
+        "planning_status",
+        "blocked_reasons",
+    ],
+    "StrategySelection": [
+        "strategy_selection_id",
+        "domain_plan_ref",
+        "domain_seed",
+        "selection_status",
+        "selected_strategies",
+        "source_strategy",
+        "extraction_strategy",
+        "synthesis_strategy",
+        "implementation_strategy",
+        "independent_verifier_strategy",
+        "package_strategy",
+        "selection_reason",
+        "blocked_reasons",
+    ],
     "NeedSpec": [
         "goal",
         "target_capabilities",
@@ -84,6 +114,35 @@ ARTIFACT_REQUIRED_FIELDS: dict[str, list[str]] = {
         "tdd_requirements",
         "launch_check_replay_commands",
         "review_record_refs",
+    ],
+    "GeneratedEnvironmentBundle": [
+        "bundle_id",
+        "environment_id",
+        "source_artifact_ids",
+        "implementation_request_id",
+        "build_dir",
+        "generated_files",
+        "runtime_entrypoint",
+        "seed_fixture_ref",
+        "verifier_entrypoint",
+        "surface_descriptors",
+        "check_commands",
+        "replay_commands",
+        "build_check_replay_records",
+    ],
+    "IndependentVerificationReport": [
+        "report_id",
+        "environment_id",
+        "generated_bundle_ref",
+        "verifier_strategy",
+        "accepted_task_ids",
+        "verified_task_ids",
+        "task_records",
+        "positive_record_count",
+        "negative_record_count",
+        "success",
+        "failure_class",
+        "recovery_suggestion",
     ],
     "EnvironmentPackagePlan": [
         "package_plan_id",
@@ -221,8 +280,19 @@ VERIFIER_KINDS = {
     "test_assertion",
     "api_assertion",
 }
+GENERATED_FILE_KINDS = {
+    "runtime_code",
+    "seed_fixture",
+    "verifier_code",
+    "surface_descriptor",
+    "test_or_check",
+    "build_manifest",
+}
 AGENT_BACKEND_KINDS = {
     "llm",
+    "openai_codegen",
+    "code_agent_runner",
+    "codex_cli_runner",
     "codex_sdk",
     "codex_cli",
     "process_agent",
@@ -295,7 +365,9 @@ def make_artifact(
         "created_at": created_at or utc_now(),
         "source_stage": source_stage,
         "inputs": inputs or [],
+        "consumed_inputs": inputs or [],
         "producer": producer,
+        "produced_by": producer,
         "hash": "",
         "status": status,
     }
@@ -308,11 +380,14 @@ def make_artifact(
 def _default_id(artifact_type: str, fields: dict[str, Any]) -> str:
     preferred = (
         fields.get("environment_id")
+        or fields.get("domain_plan_id")
+        or fields.get("strategy_selection_id")
         or fields.get("review_id")
         or fields.get("gate_record_id")
         or fields.get("invocation_id")
         or fields.get("backend_id")
         or fields.get("request_id")
+        or fields.get("bundle_id")
         or fields.get("package_plan_id")
         or fields.get("replay_plan_id")
         or fields.get("consumer_index_id")
@@ -339,6 +414,24 @@ def validate_artifact(artifact_type: str, artifact: dict[str, Any]) -> None:
             _assert_in(artifact_type, "source.kind", source.get("kind"), SOURCE_KINDS)
         for obj in artifact["extractable_objects"]:
             _require_fields(artifact_type, obj, ["source_id", "object_kind", "name", "evidence_refs"])
+    elif artifact_type == "DomainPlan":
+        _assert_in(artifact_type, "planning_status", artifact.get("planning_status"), {"planned", "unsupported", "blocked"})
+        if artifact["planning_status"] == "planned" and not artifact.get("domain_seed"):
+            raise ArtifactValidationError("DomainPlan planned status requires domain_seed")
+        if artifact["planning_status"] != "planned" and not artifact.get("blocked_reasons"):
+            raise ArtifactValidationError("DomainPlan non-planned status requires blocked_reasons")
+    elif artifact_type == "StrategySelection":
+        _assert_in(artifact_type, "selection_status", artifact.get("selection_status"), {"selected", "unsupported", "blocked"})
+        for key in [
+            "source_strategy",
+            "extraction_strategy",
+            "synthesis_strategy",
+            "implementation_strategy",
+            "independent_verifier_strategy",
+            "package_strategy",
+        ]:
+            if artifact["selection_status"] == "selected" and not artifact.get(key):
+                raise ArtifactValidationError(f"StrategySelection selected status requires {key}")
     elif artifact_type == "LogicalToolGraph":
         _validate_logical_tool_graph(artifact_type, artifact)
     elif artifact_type == "TaskSet":
@@ -355,6 +448,30 @@ def validate_artifact(artifact_type: str, artifact: dict[str, Any]) -> None:
             raise ArtifactValidationError("FeasibilityReport must declare upstream gate_result_scope")
         if set(artifact.get("self_gate_expectations", [])) != {"G0", "G10", "G13"}:
             raise ArtifactValidationError("FeasibilityReport must declare S8 self gate expectations")
+    elif artifact_type == "GeneratedEnvironmentBundle":
+        _assert_in(artifact_type, "status", artifact.get("status"), {"accepted", "fail", "needs_human"})
+        for generated_file in artifact["generated_files"]:
+            _require_fields(artifact_type, generated_file, ["path", "kind", "sha256", "source_refs"])
+            _assert_in(artifact_type, "generated_file.kind", generated_file.get("kind"), GENERATED_FILE_KINDS)
+            if not re.fullmatch(r"[0-9a-f]{64}", str(generated_file.get("sha256", ""))):
+                raise ArtifactValidationError("GeneratedEnvironmentBundle generated file sha256 must be a hex digest")
+        required_kinds = {"runtime_code", "seed_fixture", "verifier_code", "surface_descriptor", "test_or_check", "build_manifest"}
+        observed_kinds = {item["kind"] for item in artifact["generated_files"]}
+        missing_kinds = sorted(required_kinds - observed_kinds)
+        if missing_kinds:
+            raise ArtifactValidationError(f"GeneratedEnvironmentBundle missing generated file kinds: {missing_kinds}")
+        if not artifact["build_check_replay_records"]:
+            raise ArtifactValidationError("GeneratedEnvironmentBundle must include build/check/replay records")
+        if artifact["status"] == "accepted" and not all(record.get("success") for record in artifact["build_check_replay_records"]):
+            raise ArtifactValidationError("GeneratedEnvironmentBundle accepted status requires passing checks")
+    elif artifact_type == "IndependentVerificationReport":
+        _assert_in(artifact_type, "status", artifact.get("status"), {"accepted", "fail", "needs_human"})
+        if artifact["status"] == "accepted" and artifact.get("success") is not True:
+            raise ArtifactValidationError("IndependentVerificationReport accepted status requires success=true")
+        if artifact.get("success") and set(artifact.get("accepted_task_ids", [])) != set(artifact.get("verified_task_ids", [])):
+            raise ArtifactValidationError("IndependentVerificationReport must verify every accepted task")
+        if artifact.get("success") and (artifact.get("positive_record_count", 0) < len(artifact.get("accepted_task_ids", [])) or artifact.get("negative_record_count", 0) < len(artifact.get("accepted_task_ids", []))):
+            raise ArtifactValidationError("IndependentVerificationReport must include positive and negative records for every task")
     elif artifact_type == "ReviewRecord":
         _assert_in(artifact_type, "alignment_status", artifact.get("alignment_status"), {"pass", "fail", "needs_human"})
         for finding in artifact["drift_findings"]:

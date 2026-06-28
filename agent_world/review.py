@@ -38,7 +38,7 @@ def independent_review(
     if not gate_checklist:
         status = "fail"
         findings.append(_finding("docs/agent-world-environment-generation.zh.md#9.1", "review lacks gate checklist", artifact["id"]))
-    if stage != "S0" and not upstream_artifacts:
+    if stage not in {"PLAN", "S0"} and not upstream_artifacts:
         status = "fail"
         findings.append(_finding("docs/agent-world-environment-generation.zh.md#9.1", "review lacks upstream accepted artifacts", artifact["id"]))
     if need_spec:
@@ -230,5 +230,5 @@ def _check_no_scope_drift(
             findings.append(_finding("docs/agent-world-environment-generation.zh.md#8", f"artifact may drift toward {label}", artifact["id"], "medium"))
     domain_seed = str(need_spec.get("domain_seed", "")).lower()
     upstream_encoded = " ".join(str(item).lower() for item in upstream_artifacts)
-    if stage in {"S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11"} and domain_seed and domain_seed not in encoded and domain_seed not in upstream_encoded:
+    if stage in {"SELECT", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11"} and domain_seed and domain_seed not in encoded and domain_seed not in upstream_encoded:
         findings.append(_finding("docs/agent-world-environment-generation.zh.md#9.1", "artifact does not reference the accepted domain seed", artifact["id"], "medium"))

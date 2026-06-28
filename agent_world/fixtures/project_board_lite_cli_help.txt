@@ -1,0 +1,17 @@
+Usage: project-board-lite <command> [options]
+
+Commands:
+  card-list operation=card_list required= optional=status,assignee,priority reads=card,board writes= idempotency=safe
+    List cards on the local board with optional status, assignee, or priority filters.
+  card-get operation=card_get required=card_id optional= reads=card,board,comment,audit_event writes= idempotency=safe
+    Show one card with board, comments, and audit trail.
+  card-move operation=card_move required=card_id,status,note optional= reads=card writes=card,audit_event idempotency=idempotent_by_target_value
+    Move a card to a workflow status and record an audit note.
+  card-assign operation=card_assign required=card_id,assignee,note optional= reads=card writes=card,audit_event idempotency=idempotent_by_target_value
+    Assign a card and record why the ownership changed.
+  comment-add operation=comment_add required=card_id,body optional= reads=card writes=comment,audit_event idempotency=non_idempotent
+    Add a card comment and audit event.
+
+Options:
+  --json  Emit JSON-compatible output.
+  --workspace <path>  Use an isolated local fixture state file.

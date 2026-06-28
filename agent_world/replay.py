@@ -8,6 +8,7 @@ import yaml
 
 from agent_world.fixtures.support_desk_lite import SupportDeskLite, reset_environment, verify_task_completion
 from agent_world.fixtures.support_desk_lite import snapshot_hash
+from agent_world.fixtures.support_desk_lite_policy import execute_support_desk_lite_policy
 
 
 def replay_package(package_dir: Path, task_id: str) -> dict:
@@ -25,11 +26,7 @@ def replay_package(package_dir: Path, task_id: str) -> dict:
     call_group = _next_call_group(trace_path, task_id)
     initial_hash = snapshot_hash(final)
     surface = SupportDeskLite(final, trace_path=trace_path, task_id=task_id, call_group=call_group)
-    _execute_declared_path(surface, task)
-    if task_id == "task-4":
-        answer = {"customer_id": "cust-vip", "open_ticket_count": 2, "highest_priority": "medium"}
-    else:
-        answer = None
+    answer = execute_support_desk_lite_policy(surface, task)
     verifier_result = verify_task_completion(
         task_id,
         seed,
@@ -43,37 +40,6 @@ def replay_package(package_dir: Path, task_id: str) -> dict:
     return verifier_result
 
 
-def _execute_declared_path(surface: SupportDeskLite, task: dict) -> None:
-    task_id = task["task_id"]
-    path = task["dependency_path"]
-    ticket_id = "T-100"
-    if task_id == "task-2":
-        ticket_id = "T-101"
-    elif task_id == "task-5":
-        ticket_id = "T-102"
-    if "search_tickets" in path:
-        if task_id in {"task-1", "task-3"}:
-            surface.search_tickets(status="open", customer_tier="vip", keyword="refund")
-        elif task_id == "task-2":
-            surface.search_tickets(status="open", customer_tier="standard", keyword="login")
-        elif task_id == "task-4":
-            surface.search_tickets(status="open", customer_tier="vip")
-        elif task_id == "task-5":
-            surface.search_tickets(status="open", customer_tier="vip", keyword="duplicate")
-    if "get_ticket" in path:
-        surface.get_ticket(ticket_id)
-    if task_id == "task-1":
-        surface.add_ticket_note(ticket_id="T-100", visibility="internal", body="Refund follow-up queued with billing.")
-    elif task_id == "task-2":
-        surface.assign_ticket(ticket_id="T-101", queue="enterprise-support", assignee="iris", note="Moved to enterprise support.")
-    elif task_id == "task-3":
-        surface.update_ticket_priority(ticket_id="T-100", priority="high", note="VIP refund issue is under-prioritized.")
-    elif task_id == "task-4":
-        return
-    elif task_id == "task-5":
-        surface.resolve_ticket(ticket_id="T-102", resolution_note="Resolved and closed duplicate refund confirmation.")
-
-
 def _append_summary_trace(trace_path: Path, task_id: str, call_group: str, dependency_path: list[str], initial_hash: str, final_hash: str, verifier_result: dict) -> None:
     record = {
         "task_id": task_id,
@@ -84,8 +50,8 @@ def _append_summary_trace(trace_path: Path, task_id: str, call_group: str, depen
         "verifier_result": verifier_result,
     }
     with trace_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True))
-            handle.write("\n")
+        handle.write(json.dumps(record, sort_keys=True))
+        handle.write("\n")
 
 
 def _next_call_group(trace_path: Path, task_id: str) -> str:

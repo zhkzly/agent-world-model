@@ -12,7 +12,17 @@ from agent_world.agents import (
     invoke_agent,
     load_agent_backend_config_from_env,
 )
-from agent_world.artifacts import make_artifact, stable_json
+from agent_world.artifacts import ARTIFACT_REQUIRED_FIELDS, make_artifact, stable_json
+from agent_world.fixtures.support_desk_lite_nodes import (
+    environment_spec_fields,
+    implementation_request_fields,
+    knowledge_pack_fields,
+    logical_tool_graph_fields,
+    source_evidence_fields,
+    surface_plan_fields,
+    task_set_fields,
+    verifier_plan_fields,
+)
 from agent_world.gates import STAGE_GATES, evaluate_gate, evaluate_stage_gates
 from agent_world.package import PackageAssembler, PackageAssemblyResult
 from agent_world.package import file_sha256
@@ -21,6 +31,26 @@ from agent_world.review import independent_review
 
 
 SOURCE_DOC_REF = "docs/agent-world-environment-generation.zh.md"
+GOAL02_CONSUMER_OUTPUT_REFS = [
+    "release/task-records.jsonl",
+    "release/verifier-records.jsonl",
+    "release/consumer-index.yaml",
+    "release/training-consumer-index.yaml",
+    "release/runtime-index.yaml",
+    "release/surface-runtime-index.yaml",
+    "checks/rollout-records.jsonl",
+    "checks/reward-records.jsonl",
+    "checks/online-step-records.jsonl",
+    "checks/online-final-records.jsonl",
+    "training/dataset-manifest.yaml",
+    "training/rollout-records.jsonl",
+    "training/reward-records.jsonl",
+    "training/sft-records.jsonl",
+    "training/adapter-index.yaml",
+    "training/grpo-prompt-dataset.jsonl",
+    "training/grpo-adapter-index.yaml",
+    "training/verl-adapter-config.yaml",
+]
 REVIEW_OUTPUT_INSTRUCTION = (
     "Return only a JSON object with keys alignment_status, reviewed_artifact_ids, "
     "drift_findings, required_fixes, waived_risks, and reviewer_note. "
@@ -171,7 +201,7 @@ class FirstSliceWorkflow:
                 f"Review {artifact_type} for {stage} against {SOURCE_DOC_REF}. "
                 f"Artifact fields: {sorted(artifact.keys())}. "
                 f"Current artifact id: {artifact['id']}. "
-                f"Artifact JSON: {_artifact_review_json(artifact)}. "
+                f"Artifact JSON: {_artifact_review_json(artifact, artifact_type)}. "
                 f"Upstream artifact IDs: {inputs}. Gate checklist: {STAGE_GATES[stage]}. "
                 f"{REVIEW_OUTPUT_INSTRUCTION}"
             ),
@@ -233,7 +263,7 @@ class FirstSliceWorkflow:
             review_inputs,
             instruction=(
                 f"Review support artifact {artifact_type} for {stage} against {SOURCE_DOC_REF}. "
-                f"Current artifact id: {artifact['id']}. Artifact JSON: {_artifact_review_json(artifact)}. "
+                f"Current artifact id: {artifact['id']}. Artifact JSON: {_artifact_review_json(artifact, artifact_type)}. "
                 f"Upstream artifact IDs: {inputs}. Gate checklist: {gate_ids}. "
                 f"{REVIEW_OUTPUT_INSTRUCTION}"
             ),
@@ -349,250 +379,29 @@ class FirstSliceWorkflow:
         }
 
     def _source_evidence(self) -> dict[str, Any]:
-        return {
-            "sources": [
-                {
-                    "source_id": "source-support-desk-lite-prd",
-                    "kind": "manual_note",
-                    "uri_or_path": "fixture://support-desk-lite/prd",
-                    "version_or_hash": "support-desk-lite-v1",
-                    "retrieved_at": "2026-06-27T00:00:00Z",
-                    "license": "local_fixture",
-                    "auth_requirement": "none",
-                    "network_requirement": "none",
-                    "security_note": "Local synthetic support-desk fixture; no external customer data.",
-                }
-            ],
-            "extractable_objects": [
-                {"source_id": "source-support-desk-lite-prd", "object_kind": "state_entity", "name": "ticket", "evidence_refs": ["fixture://support-desk-lite/prd#ticket"]},
-                {"source_id": "source-support-desk-lite-prd", "object_kind": "operation", "name": "assign ticket", "evidence_refs": ["fixture://support-desk-lite/prd#assignment"]},
-            ],
-            "mock_boundaries": ["no network", "no real customer data", "local SQLite only"],
-            "open_questions": [],
-            "rejected_sources": [
-                {"source_id": "awm-1k", "reason": "background only; not needed for the first non-AWM fixture"}
-            ],
-        }
+        fields = source_evidence_fields(base_dir=Path.cwd())
+        fields["rejected_sources"] = [
+            {"source_id": "awm-1k", "reason": "background only; not needed for the first non-AWM fixture"}
+        ]
+        return fields
 
     def _knowledge_pack(self) -> dict[str, Any]:
-        source = ["source-support-desk-lite-prd"]
-        return {
-            "state_objects": [
-                {"object_id": "customer", "name": "customer", "fields": ["id", "name", "tier", "region", "email"], "relations": [], "source_refs": source},
-                {"object_id": "ticket", "name": "ticket", "fields": ["id", "customer_id", "status", "priority", "subject", "description"], "relations": ["customer"], "source_refs": source},
-                {"object_id": "ticket_note", "name": "ticket note", "fields": ["ticket_id", "visibility", "body"], "relations": ["ticket"], "source_refs": source},
-                {"object_id": "assignment", "name": "assignment", "fields": ["ticket_id", "assignee", "queue"], "relations": ["ticket"], "source_refs": source},
-                {"object_id": "audit_event", "name": "audit event", "fields": ["ticket_id", "event_type", "field", "old_value", "new_value"], "relations": ["ticket"], "source_refs": source},
-            ],
-            "operations": [
-                {"operation_id": tool_id, "name": tool_id.replace("_", " "), "inputs": [], "outputs": [], "side_effects": side_effects, "source_refs": source}
-                for tool_id, side_effects in [
-                    ("search_tickets", []),
-                    ("get_ticket", []),
-                    ("add_ticket_note", ["ticket_note", "audit_event"]),
-                    ("update_ticket_priority", ["ticket", "audit_event"]),
-                    ("assign_ticket", ["assignment", "audit_event"]),
-                    ("resolve_ticket", ["ticket", "ticket_note", "audit_event"]),
-                ]
-            ],
-            "business_rules": [
-                {"rule_id": "audit-on-write", "description": "Every state-changing tool writes an audit_event.", "source_refs": source, "confidence": "high"},
-                {"rule_id": "python-required", "description": "The first runnable surface is Python callable.", "source_refs": source, "confidence": "high"},
-            ],
-            "verifiable_fields": ["ticket.status", "ticket.priority", "assignment.queue", "ticket_note.body", "audit_event.event_type"],
-            "uncertainties": [],
-        }
+        return knowledge_pack_fields(self.artifacts["SourceEvidenceIndex"], base_dir=Path.cwd())
 
     def _environment_spec(self) -> dict[str, Any]:
-        logical_tools = [
-            {"tool_id": tool_id, "name": name}
-            for tool_id, name in [
-                ("search_tickets", "Search tickets"),
-                ("get_ticket", "Get ticket"),
-                ("add_ticket_note", "Add ticket note"),
-                ("update_ticket_priority", "Update ticket priority"),
-                ("assign_ticket", "Assign ticket"),
-                ("resolve_ticket", "Resolve ticket"),
-            ]
-        ]
-        return {
-            "environment_id": "support-desk-lite",
-            "domain": "support desk ticket handling",
-            "state_backend": {
-                "kind": "sqlite",
-                "reset_strategy": "copy versioned seed database into isolated run directory",
-                "isolation_strategy": "one SQLite file per run directory",
-                "seed_fixture_refs": ["fixtures/seed/support-desk-lite.sqlite"],
-            },
-            "state_entities": ["customer", "ticket", "ticket_note", "assignment", "audit_event"],
-            "logical_tools": logical_tools,
-            "permissions": {"network": False, "filesystem": "package_dir_only", "auth": False},
-            "safety_boundaries": ["synthetic fixture only", "no external services", "no generic shell execution surface"],
-            "mock_policy": {"external_services": "not_required", "data": "synthetic"},
-            "release_surfaces_allowed": ["python", "cli", "http", "mcp"],
-            "observability": {"logs": True, "traces": True, "state_snapshots": ["before", "after", "on_failure"]},
-        }
+        return environment_spec_fields(self.artifacts["KnowledgePack"])
 
     def _tool_graph(self) -> dict[str, Any]:
-        tools = [
-            ("search_tickets", [], ["status", "customer_tier", "keyword", "queue"], ["ticket", "customer", "assignment"], [], "safe"),
-            ("get_ticket", ["ticket_id"], [], ["ticket", "customer", "assignment", "ticket_note", "audit_event"], [], "safe"),
-            ("add_ticket_note", ["ticket_id", "visibility", "body"], [], ["ticket"], ["ticket_note", "audit_event"], "non_idempotent"),
-            ("update_ticket_priority", ["ticket_id", "priority", "note"], [], ["ticket"], ["ticket", "audit_event"], "idempotent_by_target_value"),
-            ("assign_ticket", ["ticket_id", "queue", "assignee", "note"], [], ["assignment"], ["assignment", "audit_event"], "idempotent_by_target_value"),
-            ("resolve_ticket", ["ticket_id", "resolution_note"], [], ["ticket"], ["ticket", "ticket_note", "audit_event"], "idempotent_by_status"),
-        ]
-        return {
-            "tools": [
-                {
-                    "tool_id": tool_id,
-                    "name": tool_id.replace("_", " "),
-                    "input_schema": {"required": required_inputs, "optional": optional_inputs},
-                    "output_schema": {"type": "object"},
-                    "reads": reads,
-                    "writes": writes,
-                    "side_effects": writes,
-                    "errors": ["unknown_ticket", "invalid_argument"],
-                    "idempotency": idempotency,
-                }
-                for tool_id, required_inputs, optional_inputs, reads, writes, idempotency in tools
-            ],
-            "edges": [
-                {"from_tool_id": "search_tickets", "to_tool_id": "get_ticket", "dependency_type": "strong", "reason": "search yields ticket id for detail inspection"},
-                {"from_tool_id": "get_ticket", "to_tool_id": "resolve_ticket", "dependency_type": "strong", "reason": "details determine whether resolution is appropriate"},
-                {"from_tool_id": "get_ticket", "to_tool_id": "add_ticket_note", "dependency_type": "strong", "reason": "details confirm the correct ticket before adding notes"},
-                {"from_tool_id": "get_ticket", "to_tool_id": "update_ticket_priority", "dependency_type": "weak", "reason": "details may justify escalation"},
-                {"from_tool_id": "search_tickets", "to_tool_id": "assign_ticket", "dependency_type": "weak", "reason": "search can identify queue candidates"},
-            ],
-            "parameters": [
-                {"name": "ticket_id", "classification": "internal", "source": "search_tickets/get_ticket", "validation": "existing ticket"},
-                {"name": "visibility", "classification": "external", "source": "task requirement or fixed verifier expectation", "validation": "internal or customer"},
-                {"name": "body", "classification": "external", "source": "agent synthesis from user request", "validation": "non-empty string"},
-                {"name": "queue", "classification": "external", "source": "user request", "validation": "non-empty string"},
-                {"name": "assignee", "classification": "external", "source": "user request", "validation": "non-empty string"},
-                {"name": "priority", "classification": "external", "source": "user request", "validation": "low, medium, high, or urgent"},
-                {"name": "note", "classification": "external", "source": "agent synthesis", "validation": "non-empty string"},
-                {"name": "resolution_note", "classification": "external", "source": "agent synthesis from user request", "validation": "non-empty string"},
-                {"name": "keyword", "classification": "optional", "source": "user request", "validation": "string"},
-                {"name": "status", "classification": "optional", "source": "user request or task fixture", "validation": "open, pending, resolved, or closed"},
-                {"name": "customer_tier", "classification": "optional", "source": "user request or fixture metadata", "validation": "known customer tier"},
-            ],
-            "forbidden_direct_access": ["sqlite file path", "table names in user request", "verifier ids"],
-        }
+        return logical_tool_graph_fields(self.artifacts["KnowledgePack"])
 
     def _task_set(self) -> dict[str, Any]:
-        tasks = [
-            {
-                "task_id": "task-1",
-                "natural_request": "Find the VIP customer's open refund case and leave an internal note explaining the refund follow-up.",
-                "target_capability": "stateful note creation",
-                "initial_state_refs": ["fixtures/seed/support-desk-lite.sqlite#T-100"],
-                "expected_state_delta": {"ticket_note": "internal note added to T-100", "audit_event": "note_added"},
-                "expected_answer": "",
-                "allowed_logical_tool_ids": ["search_tickets", "get_ticket", "add_ticket_note"],
-                "forbidden_leakage": ["table names", "backend ids", "verifier ids"],
-                "dependency_path": ["search_tickets", "get_ticket", "add_ticket_note"],
-                "difficulty": {"level": "easy", "requires_state_change": True},
-                "verifier_refs": ["verifier-task-1"],
-            },
-            {
-                "task_id": "task-2",
-                "natural_request": "Move the idle high-priority login outage case to enterprise support and assign it to iris.",
-                "target_capability": "assignment update",
-                "initial_state_refs": ["fixtures/seed/support-desk-lite.sqlite#T-101"],
-                "expected_state_delta": {"assignment": "T-101 queue=enterprise-support assignee=iris", "audit_event": "assignment_updated"},
-                "expected_answer": "",
-                "allowed_logical_tool_ids": ["search_tickets", "assign_ticket"],
-                "forbidden_leakage": ["table names", "backend ids", "verifier ids"],
-                "dependency_path": ["search_tickets", "assign_ticket"],
-                "difficulty": {"level": "medium", "requires_state_change": True},
-                "verifier_refs": ["verifier-task-2"],
-            },
-            {
-                "task_id": "task-3",
-                "natural_request": "The VIP refund issue looks under-prioritized. Raise it to high priority and record why.",
-                "target_capability": "priority escalation",
-                "initial_state_refs": ["fixtures/seed/support-desk-lite.sqlite#T-100"],
-                "expected_state_delta": {"ticket": "T-100 priority=high", "audit_event": "priority_updated"},
-                "expected_answer": "",
-                "allowed_logical_tool_ids": ["search_tickets", "get_ticket", "update_ticket_priority"],
-                "forbidden_leakage": ["table names", "backend ids", "verifier ids"],
-                "dependency_path": ["search_tickets", "get_ticket", "update_ticket_priority"],
-                "difficulty": {"level": "medium", "requires_state_change": True},
-                "verifier_refs": ["verifier-task-3"],
-            },
-            {
-                "task_id": "task-4",
-                "natural_request": "For Acme Corp, report how many open cases they have and the highest current priority.",
-                "target_capability": "read-only aggregation",
-                "initial_state_refs": ["fixtures/seed/support-desk-lite.sqlite#cust-vip"],
-                "expected_state_delta": {},
-                "expected_answer": {"customer_id": "cust-vip", "open_ticket_count": 2, "highest_priority": "medium"},
-                "allowed_logical_tool_ids": ["search_tickets", "get_ticket"],
-                "forbidden_leakage": ["table names", "backend ids", "verifier ids"],
-                "dependency_path": ["search_tickets"],
-                "difficulty": {"level": "easy", "requires_state_change": False},
-                "verifier_refs": ["verifier-task-4"],
-            },
-            {
-                "task_id": "task-5",
-                "natural_request": "Inspect the duplicate refund confirmation case, then close it with a customer-visible resolution note.",
-                "target_capability": "strong dependency state update",
-                "initial_state_refs": ["fixtures/seed/support-desk-lite.sqlite#T-102"],
-                "expected_state_delta": {"ticket": "T-102 status=resolved", "ticket_note": "customer-visible resolution", "audit_event": "ticket_resolved"},
-                "expected_answer": "",
-                "allowed_logical_tool_ids": ["search_tickets", "get_ticket", "resolve_ticket"],
-                "forbidden_leakage": ["table names", "backend ids", "verifier ids"],
-                "dependency_path": ["search_tickets", "get_ticket", "resolve_ticket"],
-                "difficulty": {"level": "hard", "requires_state_change": True, "strong_dependency_path": True},
-                "verifier_refs": ["verifier-task-5"],
-            },
-        ]
-        return {
-            "tasks": tasks,
-            "coverage": {
-                "tool_ids": ["search_tickets", "get_ticket", "add_ticket_note", "update_ticket_priority", "assign_ticket", "resolve_ticket"],
-                "capabilities": ["read", "write", "audit", "strong_dependency"],
-                "state_entities": ["ticket", "ticket_note", "assignment", "audit_event"],
-            },
-            "rejected_candidates": [],
-        }
+        return task_set_fields(self.artifacts["LogicalToolGraph"])
 
     def _surface_plan(self) -> dict[str, Any]:
-        tools = ["search_tickets", "get_ticket", "add_ticket_note", "update_ticket_priority", "assign_ticket", "resolve_ticket"]
-        return {
-            "bindings": [
-                {
-                    "binding_id": f"python-{tool_id}",
-                    "logical_tool_id": tool_id,
-                    "surface": "python",
-                    "exposure_name": f"SupportDeskLite.{tool_id}",
-                    "input_mapping": "same as logical tool schema",
-                    "output_mapping": "dict/list JSON-compatible Python objects",
-                    "error_mapping": "Python exception to logical error",
-                    "auth_context": "none",
-                    "state_scope": "isolated SQLite file per run",
-                }
-                for tool_id in tools
-            ],
-            "surface_status": {"python": "required_for_first_slice", "cli": "deferred", "http": "deferred", "mcp": "deferred"},
-            "compatibility_notes": ["CLI/HTTP/MCP remain planned surfaces; Python is the only required runnable surface."],
-        }
+        return surface_plan_fields(self.artifacts["EnvironmentSpec"])
 
     def _verifier_plan(self) -> dict[str, Any]:
-        return {
-            "verifiers": [
-                self._verifier(task_id, kind)
-                for task_id, kind in [
-                    ("task-1", "state_diff"),
-                    ("task-2", "state_diff"),
-                    ("task-3", "state_diff"),
-                    ("task-4", "state_query"),
-                    ("task-5", "state_diff"),
-                ]
-            ],
-            "llm_judges": [],
-        }
+        return verifier_plan_fields(self.artifacts["TaskSet"])
 
     def _verifier(self, task_id: str, kind: str) -> dict[str, Any]:
         return {
@@ -639,20 +448,7 @@ class FirstSliceWorkflow:
         }
 
     def _implementation_request(self) -> dict[str, Any]:
-        return {
-            "request_id": "impl-support-desk-lite-first-slice",
-            "environment_id": "support-desk-lite",
-            "source_artifact_ids": [self.artifacts["SourceEvidenceIndex"]["id"], self.artifacts["KnowledgePack"]["id"]],
-            "accepted_task_ids": [task["task_id"] for task in self.artifacts["TaskSet"]["tasks"]],
-            "accepted_verifier_ids": [verifier["verifier_id"] for verifier in self.artifacts["VerifierPlan"]["verifiers"]],
-            "required_surface_ids": [binding["binding_id"] for binding in self.artifacts["SurfacePlan"]["bindings"] if binding["surface"] == "python"],
-            "package_layout_ref": "envpkg/",
-            "implementation_scope": ["artifact schema", "static validators", "S0-S11 workflow", "Python callable fixture", "package assembly"],
-            "non_goals": ["training integration", "rollout", "reward export", "AWM reproduction", "MCP-only architecture", "generic shell environment surface"],
-            "tdd_requirements": ["schema validation", "gate records", "independent review records", "support-desk fixture verifier"],
-            "launch_check_replay_commands": ["python -m pytest tests/agent_world"],
-            "review_record_refs": [record["id"] for record in self.review_records],
-        }
+        return implementation_request_fields(self.artifacts, self.review_records)
 
     def _replay_plan(self) -> dict[str, Any]:
         with TemporaryDirectory() as td:
@@ -712,7 +508,7 @@ class FirstSliceWorkflow:
             "review_record_refs": [record["id"] for record in self.review_records],
             "replay_plan_ref": replay_plan["id"],
             "release_manifest_ref": "release-support-desk-lite",
-            "consumer_output_refs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml"],
+            "consumer_output_refs": GOAL02_CONSUMER_OUTPUT_REFS,
             "excluded_items": [
                 {"item": "training integration", "reason": "consumer-only, out of first runtime slice"},
                 {"item": "AWM JSONL schema", "reason": "background only, not target schema"},
@@ -728,8 +524,24 @@ class FirstSliceWorkflow:
             "surface_index_ref": "spec/surfaces.yaml",
             "reset_contract_ref": "checks/replay-plan.yaml#reset_steps",
             "trace_contract_ref": "checks/surface-traces.jsonl",
-            "result_record_schema": {"task_id": "string", "success": "boolean", "checks": "array"},
-            "adapter_notes": "Consumers may convert these records to eval/RL formats outside the core generator.",
+            "rollout_records_ref": "checks/rollout-records.jsonl",
+            "reward_records_ref": "checks/reward-records.jsonl",
+            "online_step_records_ref": "checks/online-step-records.jsonl",
+            "online_final_records_ref": "checks/online-final-records.jsonl",
+            "training_consumer_index_ref": "release/training-consumer-index.yaml",
+            "training_dataset_manifest_ref": "training/dataset-manifest.yaml",
+            "runtime_index_ref": "release/runtime-index.yaml",
+            "surface_runtime_index_ref": "release/surface-runtime-index.yaml",
+            "grpo_adapter_index_ref": "training/grpo-adapter-index.yaml",
+            "verl_adapter_config_ref": "training/verl-adapter-config.yaml",
+            "result_record_schema": {
+                "verifier_result": {"task_id": "string", "success": "boolean", "checks": "array"},
+                "rollout_record": {"task_id": "string", "surface_trace_ref": "string", "success": "boolean"},
+                "reward_record": {"task_id": "string", "reward_source": "deterministic_verifier", "reward": "number"},
+                "online_step_record": {"task_id": "string", "action_kind": "string", "state_snapshot_hash": "string"},
+                "online_final_record": {"task_id": "string", "reward_source": "deterministic_verifier", "reward": "number"},
+            },
+            "adapter_notes": "Consumers may convert release, rollout, reward, online runtime, and training export records outside the core generator.",
         }
 
     def _release_manifest(self, package_plan: dict[str, Any], consumer_index: dict[str, Any]) -> dict[str, Any]:
@@ -744,8 +556,40 @@ class FirstSliceWorkflow:
             "surface_index": self.artifacts["SurfacePlan"]["surface_status"],
             "fixture_index": ["fixtures/seed/support-desk-lite.sqlite"],
             "replay_contract": "checks/replay-plan.yaml",
-            "consumer_outputs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml"],
-            "known_limits": ["CLI, HTTP, and MCP surfaces are planned but deferred.", "No training or rollout integration."],
+            "runtime_refs": {
+                "python_module": "agent_world.fixtures.support_desk_lite",
+                "surface_class": "agent_world.fixtures.support_desk_lite.SupportDeskLite",
+                "seed_function": "agent_world.fixtures.support_desk_lite.create_seed_db",
+                "reset_function": "agent_world.fixtures.support_desk_lite.reset_environment",
+                "verifier_function": "agent_world.fixtures.support_desk_lite.verify_task_completion",
+                "scripted_policy_function": "agent_world.fixtures.support_desk_lite_policy.execute_support_desk_lite_policy",
+                "online_runtime_loader": "agent_world.online_runtime.load_online_runtime",
+                "online_runtime_class": "agent_world.online_runtime.SupportDeskLiteOnlineRuntime",
+                "cli_runtime_module": "agent_world.cli_runtime",
+                "cli_runtime_command": "python -m agent_world.cli_runtime --package <package_dir>",
+                "runtime_control_cli_module": "agent_world.cli_runtime",
+                "environment_cli_module": "agent_world.fixtures.support_desk_lite_cli",
+                "http_runtime_module": "agent_world.http_runtime",
+                "runtime_index_ref": "release/runtime-index.yaml",
+                "surface_runtime_index_ref": "release/surface-runtime-index.yaml",
+                "online_step_records_ref": "checks/online-step-records.jsonl",
+                "online_final_records_ref": "checks/online-final-records.jsonl",
+                "grpo_adapter_index_ref": "training/grpo-adapter-index.yaml",
+                "verl_adapter_config_ref": "training/verl-adapter-config.yaml",
+            },
+            "runtime_surface_status": {
+                "python_callable": "implemented",
+                "runtime_control_cli": "implemented",
+                "environment_cli": "implemented",
+                "http_service": "implemented",
+                "mcp_server": "descriptor_only_deferred",
+            },
+            "consumer_outputs": GOAL02_CONSUMER_OUTPUT_REFS,
+            "known_limits": [
+                "SurfacePlan remains the original first-slice plan; runtime descriptors mark Python, runtime_control_cli, environment_cli, and local HTTP as implemented for support-desk-lite.",
+                "Goal 02 rollout/training outputs are support-desk-lite consumer records only; no generic generator or real training framework integration.",
+                "Goal 03 runtime control surfaces execute Python callable, runtime_control_cli, and local HTTP for support-desk-lite only; Goal 04 environment_cli is a real allowlisted tool surface; MCP and real verl training remain descriptor-only.",
+            ],
         }
 
 
@@ -763,17 +607,99 @@ def _artifact_id_from_fields(fields: dict[str, Any]) -> str | None:
     return None
 
 
-def _artifact_review_json(artifact: dict[str, Any]) -> str:
+def _artifact_review_json(artifact: dict[str, Any], artifact_type: str | None = None) -> str:
     metadata = {
         key: artifact.get(key)
         for key in ["id", "version", "source_stage", "status", "producer", "inputs", "hash"]
     }
-    encoded = stable_json(artifact)
+    required_fields = ARTIFACT_REQUIRED_FIELDS.get(artifact_type or "", [])
+    payload = {
+        "artifact_type": artifact_type or "",
+        "metadata": metadata,
+        "top_level_keys": sorted(artifact.keys()),
+        "required_fields": required_fields,
+        "required_field_presence": {field: field in artifact for field in required_fields},
+        "artifact": _compact_review_value(artifact),
+    }
+    encoded = stable_json(payload)
     if len(encoded) <= 12000:
-        body = encoded
-    else:
-        body = encoded[:12000] + "...[truncated]"
-    return f'{{"metadata":{stable_json(metadata)},"artifact":{body}}}'
+        return encoded
+    payload["artifact"] = _compact_review_value(artifact, max_depth=2, max_items=2, max_string=400)
+    encoded = stable_json(payload)
+    if len(encoded) <= 12000:
+        return encoded
+    payload["artifact_summary"] = {key: _review_value_summary(value) for key, value in artifact.items()}
+    payload.pop("artifact")
+    return stable_json(payload)
+
+
+def _compact_review_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    max_depth: int = 3,
+    max_items: int = 3,
+    max_string: int = 800,
+) -> Any:
+    if isinstance(value, dict):
+        if depth >= max_depth:
+            return _review_value_summary(value)
+        items = sorted(value.items(), key=lambda item: str(item[0]))
+        if depth > 0 and len(items) > max_items:
+            preview_items = items[:max_items]
+            return {
+                "_type": "dict",
+                "length": len(items),
+                "keys": [str(key) for key, _ in items],
+                "items_preview": {
+                    str(key): _compact_review_value(
+                        item,
+                        depth=depth + 1,
+                        max_depth=max_depth,
+                        max_items=max_items,
+                        max_string=max_string,
+                    )
+                    for key, item in preview_items
+                },
+            }
+        return {
+            str(key): _compact_review_value(
+                item,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                max_string=max_string,
+            )
+            for key, item in items
+        }
+    if isinstance(value, list):
+        return {
+            "_type": "list",
+            "length": len(value),
+            "items_preview": [
+                _compact_review_value(
+                    item,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    max_items=max_items,
+                    max_string=max_string,
+                )
+                for item in value[:max_items]
+            ],
+        }
+    if isinstance(value, str) and len(value) > max_string:
+        return {"_type": "str", "length": len(value), "preview": value[:max_string]}
+    return value
+
+
+def _review_value_summary(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return {"_type": "dict", "length": len(value), "keys": sorted(str(key) for key in value.keys())}
+    if isinstance(value, list):
+        return {"_type": "list", "length": len(value)}
+    if isinstance(value, str):
+        return {"_type": "str", "length": len(value), "preview": value[:120]}
+    return {"_type": type(value).__name__, "value": value}
 
 
 def _invocation_id(stage: str, purpose: str, inputs: list[str]) -> str:

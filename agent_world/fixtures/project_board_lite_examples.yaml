@@ -1,0 +1,27 @@
+business_rules:
+  - rule_id: audit-on-write
+    description: Every card mutation writes an audit_event with the changed field.
+  - rule_id: workflow-statuses
+    description: Valid card statuses are todo, in_progress, blocked, in_review, and done.
+  - rule_id: local-only
+    description: The fixture uses synthetic local project data with no network or external credentials.
+
+examples:
+  - example_id: task-move-blocked-card
+    command_path: [card-list, card-get, card-move]
+    natural_request: Move the blocked payment API card into review after checking it.
+    expected_delta:
+      card: C-11 status=in_review
+      audit_event: card_moved
+  - example_id: task-assign-and-comment
+    command_path: [card-list, card-assign, comment-add]
+    natural_request: Assign the checkout bug to sam and add a triage comment.
+    expected_delta:
+      card: C-10 assignee=sam
+      comment: triage comment added
+  - example_id: task-read-only-summary
+    command_path: [card-list]
+    natural_request: Report how many in-progress cards are assigned to eve and their highest priority.
+    expected_answer:
+      card_count: 1
+      highest_priority: medium

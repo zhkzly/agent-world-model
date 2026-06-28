@@ -4,8 +4,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_world.adapters.grpo import export_grpo_adapter_metadata
 from agent_world.artifacts import write_jsonl, write_yaml
 from agent_world.fixtures.support_desk_lite import create_seed_db
+from agent_world.online_runtime import runtime_index_for_release, surface_runtime_index_for_release
+from agent_world.training import (
+    adapter_index_for_release,
+    dataset_manifest_for_release,
+    training_consumer_index_for_release,
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +61,15 @@ class PackageAssembler:
         dump_yaml("checks/replay-plan.yaml", artifacts["ReplayPlan"])
         dump_yaml("release/release-manifest.yaml", artifacts["ReleaseManifest"])
         dump_yaml("release/consumer-index.yaml", artifacts["ConsumerIndex"])
+        dump_yaml("release/training-consumer-index.yaml", training_consumer_index_for_release())
+        dump_yaml("release/runtime-index.yaml", runtime_index_for_release(release=artifacts["ReleaseManifest"]))
+        dump_yaml(
+            "release/surface-runtime-index.yaml",
+            surface_runtime_index_for_release(
+                release=artifacts["ReleaseManifest"],
+                surface_plan=artifacts["SurfacePlan"],
+            ),
+        )
 
         invocations_path = output_dir / "checks/agent-invocations.jsonl"
         write_jsonl(invocations_path, agent_invocations)
@@ -67,6 +83,39 @@ class PackageAssembler:
         verifier_records_path = output_dir / "release/verifier-records.jsonl"
         write_jsonl(verifier_records_path, artifacts["VerifierPlan"]["verifiers"])
         written.append(verifier_records_path)
+        rollout_records_path = output_dir / "checks/rollout-records.jsonl"
+        write_jsonl(rollout_records_path, [])
+        written.append(rollout_records_path)
+        reward_records_path = output_dir / "checks/reward-records.jsonl"
+        write_jsonl(reward_records_path, [])
+        written.append(reward_records_path)
+        online_step_records_path = output_dir / "checks/online-step-records.jsonl"
+        write_jsonl(online_step_records_path, [])
+        written.append(online_step_records_path)
+        online_final_records_path = output_dir / "checks/online-final-records.jsonl"
+        write_jsonl(online_final_records_path, [])
+        written.append(online_final_records_path)
+        training_rollout_records_path = output_dir / "training/rollout-records.jsonl"
+        write_jsonl(training_rollout_records_path, [])
+        written.append(training_rollout_records_path)
+        training_reward_records_path = output_dir / "training/reward-records.jsonl"
+        write_jsonl(training_reward_records_path, [])
+        written.append(training_reward_records_path)
+        training_sft_records_path = output_dir / "training/sft-records.jsonl"
+        write_jsonl(training_sft_records_path, [])
+        written.append(training_sft_records_path)
+        dump_yaml("training/dataset-manifest.yaml", dataset_manifest_for_release())
+        dump_yaml("training/adapter-index.yaml", adapter_index_for_release())
+        grpo_export = export_grpo_adapter_metadata(output_dir)
+        written.extend(
+            [
+                grpo_export.prompt_dataset_path,
+                grpo_export.adapter_index_path,
+                grpo_export.verl_adapter_config_path,
+            ]
+        )
+        (output_dir / "rollouts").mkdir(parents=True, exist_ok=True)
+        (output_dir / "online_rollouts").mkdir(parents=True, exist_ok=True)
 
         seed_path = create_seed_db(output_dir / "fixtures/seed/support-desk-lite.sqlite")
         written.append(seed_path)

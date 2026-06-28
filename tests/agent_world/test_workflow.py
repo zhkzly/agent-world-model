@@ -1,6 +1,7 @@
 from agent_world.agents import AgentBackendRegistry, AgentResult
 from agent_world.artifacts import read_yaml, validate_artifact
-from agent_world.workflow import FirstSliceWorkflow
+from agent_world.workflow import FirstSliceWorkflow, _artifact_review_json
+import json
 import sys
 from pathlib import Path
 
@@ -27,10 +28,25 @@ def test_first_slice_workflow_assembles_surface_neutral_package(tmp_path):
         "checks/agent-invocations.jsonl",
         "checks/surface-traces.jsonl",
         "checks/replay-plan.yaml",
+        "checks/rollout-records.jsonl",
+        "checks/reward-records.jsonl",
+        "checks/online-step-records.jsonl",
+        "checks/online-final-records.jsonl",
         "release/release-manifest.yaml",
         "release/task-records.jsonl",
         "release/verifier-records.jsonl",
         "release/consumer-index.yaml",
+        "release/training-consumer-index.yaml",
+        "release/runtime-index.yaml",
+        "release/surface-runtime-index.yaml",
+        "training/dataset-manifest.yaml",
+        "training/rollout-records.jsonl",
+        "training/reward-records.jsonl",
+        "training/sft-records.jsonl",
+        "training/adapter-index.yaml",
+        "training/grpo-prompt-dataset.jsonl",
+        "training/grpo-adapter-index.yaml",
+        "training/verl-adapter-config.yaml",
         "fixtures/seed/support-desk-lite.sqlite",
     ]
     for relative in expected_files:
@@ -59,6 +75,14 @@ def test_first_slice_workflow_assembles_surface_neutral_package(tmp_path):
     assert result.artifacts["ConsumerIndex"]["id"] == "consumer-support-desk-lite"
     assert result.artifacts["ReleaseManifest"]["id"] == "release-support-desk-lite"
     assert result.artifacts["ReleaseManifest"]["id"] not in result.artifacts["ReleaseManifest"]["inputs"]
+    assert "checks/rollout-records.jsonl" in result.artifacts["ReleaseManifest"]["consumer_outputs"]
+    assert "checks/reward-records.jsonl" in result.artifacts["ReleaseManifest"]["consumer_outputs"]
+    assert "checks/online-step-records.jsonl" in result.artifacts["ReleaseManifest"]["consumer_outputs"]
+    assert "checks/online-final-records.jsonl" in result.artifacts["ReleaseManifest"]["consumer_outputs"]
+    assert "training/sft-records.jsonl" in result.artifacts["ReleaseManifest"]["consumer_outputs"]
+    assert "training/grpo-adapter-index.yaml" in result.artifacts["ReleaseManifest"]["consumer_outputs"]
+    assert result.artifacts["ReleaseManifest"]["runtime_refs"]["surface_class"] == "agent_world.fixtures.support_desk_lite.SupportDeskLite"
+    assert result.artifacts["ReleaseManifest"]["runtime_refs"]["online_runtime_loader"] == "agent_world.online_runtime.load_online_runtime"
 
     validate_artifact("ReleaseManifest", read_yaml(result.package.package_dir / "release/release-manifest.yaml"))
 
@@ -136,3 +160,20 @@ def test_first_slice_workflow_passes_explicit_permissions_to_llm_backend(tmp_pat
     assert all("Return only a JSON object" in request.instruction for request in review_requests)
     assert all("Artifact JSON:" in request.instruction for request in review_requests)
     assert all("evaluated after this review record is produced" in request.instruction for request in review_requests)
+
+
+def test_artifact_review_json_preserves_required_fields_for_large_feasibility_report(tmp_path):
+    result = FirstSliceWorkflow().run(output_dir=tmp_path / "envpkg")
+    feasibility = dict(result.artifacts["FeasibilityReport"])
+    feasibility["gate_results"] = feasibility["gate_results"] * 80
+
+    payload = json.loads(_artifact_review_json(feasibility, "FeasibilityReport"))
+
+    assert payload["artifact_type"] == "FeasibilityReport"
+    assert payload["required_field_presence"]["minimum_viable_surface"] is True
+    assert payload["required_field_presence"]["minimum_viable_task_ids"] is True
+    assert payload["required_field_presence"]["minimum_viable_verifier_ids"] is True
+    assert payload["required_field_presence"]["implementation_blockers"] is True
+    assert "minimum_viable_surface" in payload["top_level_keys"]
+    assert payload["artifact"]["gate_results"]["_type"] == "list"
+    assert payload["artifact"]["gate_results"]["length"] > 80

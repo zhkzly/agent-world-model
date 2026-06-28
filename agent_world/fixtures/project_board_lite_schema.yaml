@@ -1,0 +1,22 @@
+state_objects:
+  - object_id: board
+    name: project board
+    fields: [id, name, workflow_statuses]
+    relations: []
+  - object_id: card
+    name: project card
+    fields: [id, board_id, title, status, priority, assignee]
+    relations: [board]
+  - object_id: comment
+    name: card comment
+    fields: [card_id, body, created_by]
+    relations: [card]
+  - object_id: audit_event
+    name: card audit event
+    fields: [card_id, event_type, field, old_value, new_value, note]
+    relations: [card]
+
+seed_fixture:
+  ref: fixtures/seed/project-board-lite.yaml
+  reset_strategy: copy versioned YAML state into isolated run directory
+  isolation_strategy: one YAML state file per pipeline run
