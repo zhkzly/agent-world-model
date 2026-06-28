@@ -12,18 +12,11 @@ from typing import Any
 
 import yaml
 
-from agent_world.artifacts import make_artifact, stable_json
+from agent_world.artifacts import GENERATED_BUNDLE_FILE_KINDS, make_artifact, stable_json
 from agent_world.independent_verifier import verify_project_board_generated_bundle_independent
 
 
-GENERATED_FILE_KINDS = {
-    "runtime.py": "runtime_code",
-    "seed_state.json": "seed_fixture",
-    "verifier.py": "verifier_code",
-    "surface_descriptor.json": "surface_descriptor",
-    "check_replay.py": "test_or_check",
-    "build_manifest.yaml": "build_manifest",
-}
+GENERATED_FILE_KINDS = dict(GENERATED_BUNDLE_FILE_KINDS)
 DETERMINISTIC_BUNDLE_ID = "bundle-project-board-lite-generated"
 AGENT_GENERATED_BUNDLE_ID = "bundle-project-board-lite-agent-generated"
 DISALLOWED_FIXTURE_IMPORT = "agent_world.fixtures.project_board_lite"
@@ -524,7 +517,7 @@ def _validate_agent_candidate_files(work_dir: Path, manifest: dict[str, Any]) ->
     observed = {
         path.relative_to(candidate_root).as_posix()
         for path in candidate_root.rglob("*")
-        if path.is_file()
+        if path.is_file() and not _is_python_cache_file(path)
     }
     extra = sorted(observed - declared)
     if extra:
@@ -540,6 +533,10 @@ def _validate_agent_candidate_files(work_dir: Path, manifest: dict[str, Any]) ->
                 "recovery_suggestion": "Agent-generated runtime/verifier/check files must not import agent_world.fixtures.project_board_lite.",
             }
     return None
+
+
+def _is_python_cache_file(path: Path) -> bool:
+    return "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}
 
 
 def _agent_candidate_root(work_dir: Path, manifest: dict[str, Any]) -> Path | dict[str, str]:

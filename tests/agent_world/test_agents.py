@@ -197,3 +197,58 @@ def test_codex_cli_backend_rejects_config_override():
 
     assert result.status == "fail"
     assert "overrides" in result.text
+
+
+def test_codex_cli_runner_gets_isolated_codex_home_and_api_key(tmp_path, monkeypatch):
+    codex_probe = tmp_path / "codex-probe"
+    codex_probe.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, pathlib, sys\n"
+        "json.loads(sys.stdin.read() or '{}')\n"
+        "out = pathlib.Path(os.environ['AGENT_WORLD_CODE_AGENT_OUTPUT_DIR'])\n"
+        "codex_home = pathlib.Path(os.environ['CODEX_HOME'])\n"
+        "probe = {\n"
+        "  'has_codex_api_key': bool(os.environ.get('CODEX_API_KEY')),\n"
+        "  'codex_home_inside_workspace': str(codex_home).startswith(os.environ['AGENT_WORLD_CODE_AGENT_WORKSPACE']),\n"
+        "  'config_text': (codex_home / 'config.toml').read_text(encoding='utf-8'),\n"
+        "}\n"
+        "(out / 'probe-env.json').write_text(json.dumps(probe, sort_keys=True), encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    codex_probe.chmod(0o755)
+    monkeypatch.setenv("AGENT_WORLD_OPENAI_API_KEY", "secret-value")
+
+    config = load_agent_backend_config_from_env(
+        {
+            "AGENT_WORLD_AGENT_BACKEND": "codex_cli_runner",
+            "AGENT_WORLD_CODEX_CMD": f"{codex_probe} --ask-for-approval on-request --sandbox workspace-write exec --json --skip-git-repo-check -",
+            "AGENT_WORLD_PROCESS_AGENT_ALLOWLIST": str(codex_probe),
+            "AGENT_WORLD_OPENAI_BASE_URL": "https://router.example.test/v1",
+            "AGENT_WORLD_OPENAI_API_KEY": "secret-value",
+            "AGENT_WORLD_OPENAI_MODEL": "configured-model",
+            "AGENT_WORLD_SMOKE_OPENAI_MODEL": "smoke-model",
+            "AGENT_WORLD_AGENT_NETWORK": "1",
+        }
+    )
+    registry = default_agent_backend_registry()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    request = AgentRequest(
+        stage="IMPLEMENT",
+        node_purpose="implement",
+        instruction="probe codex runner env",
+        input_artifact_ids=["impl"],
+        permissions={"network": True, "filesystem": "isolated_agent_workspace", "filesystem_root": str(workspace), "auth": True, "sandbox": True},
+    )
+
+    _, result = invoke_agent(registry, request, config)
+    probe = json.loads((workspace / "agent-output" / "probe-env.json").read_text(encoding="utf-8"))
+
+    assert result.status == "fail"
+    assert result.failure_class == "missing_runner_manifest"
+    assert probe["has_codex_api_key"] is True
+    assert probe["codex_home_inside_workspace"] is True
+    assert "openai_base_url" in probe["config_text"]
+    assert "router.example.test" in probe["config_text"]
+    assert 'model = "smoke-model"' in probe["config_text"]
+    assert "secret-value" not in probe["config_text"]

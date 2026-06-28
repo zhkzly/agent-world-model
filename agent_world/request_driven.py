@@ -13,7 +13,7 @@ from typing import Any
 import yaml
 
 from agent_world import library_lending
-from agent_world.artifacts import make_artifact, stable_json
+from agent_world.artifacts import GENERATED_BUNDLE_FILE_KINDS, make_artifact, stable_json
 from agent_world.independent_verifier import verify_booking_generated_bundle_independent
 from agent_world.request_matching import match_request_tokens
 from agent_world.sources import LocalSourceConnector
@@ -23,14 +23,7 @@ BOOKING_ENVIRONMENT_ID = "booking-service-lite"
 BOOKING_DETERMINISTIC_BUNDLE_ID = "bundle-booking-service-lite-generated"
 BOOKING_AGENT_BUNDLE_ID = "bundle-booking-service-lite-agent-generated"
 BOOKING_TASK_IDS = ["booking-task-1", "booking-task-2", "booking-task-3"]
-GENERATED_FILE_KINDS = {
-    "runtime.py": "runtime_code",
-    "seed_state.json": "seed_fixture",
-    "verifier.py": "verifier_code",
-    "surface_descriptor.json": "surface_descriptor",
-    "check_replay.py": "test_or_check",
-    "build_manifest.yaml": "build_manifest",
-}
+GENERATED_FILE_KINDS = dict(GENERATED_BUNDLE_FILE_KINDS)
 BOOKING_REQUIRED_STATE_OBJECTS = ["event", "seat_inventory", "seat_hold", "booking", "payment", "audit_event"]
 BOOKING_REQUIRED_OPERATIONS = ["search_events", "check_availability", "hold_seats", "confirm_booking", "cancel_booking"]
 BOOKING_REQUIRED_RULES = ["hold-before-confirm", "capacity-not-negative", "cancel-release-refund"]
@@ -1438,7 +1431,11 @@ def _validate_agent_candidate_files(work_dir: Path, manifest: dict[str, Any]) ->
     missing = sorted(set(GENERATED_FILE_KINDS) - declared)
     if missing:
         return {"failure_class": "missing_generated_file", "recovery_suggestion": f"Agent candidate is missing required files: {missing}"}
-    observed = {path.relative_to(candidate_root).as_posix() for path in candidate_root.rglob("*") if path.is_file()}
+    observed = {
+        path.relative_to(candidate_root).as_posix()
+        for path in candidate_root.rglob("*")
+        if path.is_file() and not _is_python_cache_file(path)
+    }
     extra = sorted(observed - declared)
     if extra:
         return {"failure_class": "undeclared_generated_file", "recovery_suggestion": f"Agent wrote files that were not declared in the candidate manifest: {extra}"}
@@ -1447,6 +1444,10 @@ def _validate_agent_candidate_files(work_dir: Path, manifest: dict[str, Any]) ->
         if "agent_world.fixtures." in text:
             return {"failure_class": "fixture_runtime_import", "recovery_suggestion": "Agent-generated booking files must not import repository fixture runtimes."}
     return None
+
+
+def _is_python_cache_file(path: Path) -> bool:
+    return "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}
 
 
 def _agent_candidate_root(work_dir: Path, manifest: dict[str, Any]) -> Path | dict[str, str]:

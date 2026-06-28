@@ -280,14 +280,15 @@ VERIFIER_KINDS = {
     "test_assertion",
     "api_assertion",
 }
-GENERATED_FILE_KINDS = {
-    "runtime_code",
-    "seed_fixture",
-    "verifier_code",
-    "surface_descriptor",
-    "test_or_check",
-    "build_manifest",
+GENERATED_BUNDLE_FILE_KINDS = {
+    "runtime.py": "runtime_code",
+    "seed_state.json": "seed_fixture",
+    "verifier.py": "verifier_code",
+    "surface_descriptor.json": "surface_descriptor",
+    "check_replay.py": "test_or_check",
+    "build_manifest.yaml": "build_manifest",
 }
+GENERATED_FILE_KINDS = set(GENERATED_BUNDLE_FILE_KINDS.values())
 AGENT_BACKEND_KINDS = {
     "llm",
     "openai_codegen",

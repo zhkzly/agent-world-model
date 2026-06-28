@@ -979,7 +979,35 @@ def _runner_env(config: dict[str, Any], request: AgentRequest, workspace: Path) 
             value = os.environ.get(name)
             if value:
                 child_env[name] = value
+    _configure_codex_runner_env(config, child_env, workspace)
     return child_env
+
+
+def _configure_codex_runner_env(config: dict[str, Any], child_env: dict[str, str], workspace: Path) -> None:
+    if config.get("backend_kind") != "codex_cli_runner":
+        return
+    codex_home = workspace / "agent-output" / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    child_env["CODEX_HOME"] = str(codex_home)
+    child_env["HOME"] = str(codex_home)
+    auth = config.get("auth", {})
+    api_key_env = str(auth.get("api_key_env") or "")
+    api_key = child_env.get(api_key_env) or (os.environ.get(api_key_env) if api_key_env else "")
+    if api_key:
+        child_env["CODEX_API_KEY"] = api_key
+    config_lines = []
+    base_url = str(config.get("base_url") or "")
+    model = str(config.get("smoke_model") or config.get("model") or "")
+    if base_url:
+        config_lines.append(f"openai_base_url = {_toml_string(base_url)}")
+    if model:
+        config_lines.append(f"model = {_toml_string(model)}")
+    if config_lines:
+        (codex_home / "config.toml").write_text("\n".join(config_lines) + "\n", encoding="utf-8")
+
+
+def _toml_string(value: str) -> str:
+    return json.dumps(value)
 
 
 def _append_command_log(

@@ -74,6 +74,66 @@ Use explicit cache locations for CI-like isolated runs when needed:
 PYTHONDONTWRITEBYTECODE=1 UV_CACHE_DIR=/tmp/uv-cache UV_PYTHON_INSTALL_DIR=/tmp/uv-python uv run pytest -p no:cacheprovider
 ```
 
+### Code Agent Runner Workspace Contract
+
+#### 1. Scope / Trigger
+
+Use this contract whenever `code_agent_runner` or `codex_cli_runner` implements a generated environment bundle. This is a cross-layer contract spanning env config, workspace packet files, runner subprocess behavior, candidate manifest validation, framework independent verifier, and bounded repair.
+
+#### 2. Signatures
+
+- Runner command: allowlisted argv executed with `subprocess.run(argv, shell=False)`.
+- Codex CLI runner command: must include safe approval and sandbox flags, for example `codex --ask-for-approval on-request --sandbox workspace-write exec --json --skip-git-repo-check --ephemeral -`.
+- Runtime entrypoint: `runtime.<SurfaceClass>(state, trace_path=None, task_id=None, call_group=None)`.
+- Runtime helpers: `runtime.load_seed_state(seed_path)` and `runtime.reset_environment(seed_state)`.
+- Verifier entrypoint: `verifier.verify_task_completion(task_id, initial_state, final_state, *, surface_trace_path, expected_dependency_path, trace_call_group, final_answer)`.
+
+#### 3. Contracts
+
+- Env keys: prefer `AGENT_WORLD_AGENT_BACKEND=codex_cli_runner`, `AGENT_WORLD_CODEX_CMD`, `AGENT_WORLD_PROCESS_AGENT_ALLOWLIST`, `AGENT_WORLD_OPENAI_BASE_URL`, `AGENT_WORLD_OPENAI_API_KEY`, `AGENT_WORLD_OPENAI_MODEL`, and `AGENT_WORLD_SMOKE_OPENAI_MODEL`.
+- Codex runner auth: pass the API key only as `CODEX_API_KEY` to the child process; write base URL/model to an isolated `CODEX_HOME/config.toml` under the agent workspace, never to artifacts.
+- Workspace packet: `input/implementation-brief.md`, `input/expected-bundle-layout.md`, `input/acceptance-checks.md`, `input/skills/environment-codegen.md`, and `input/artifacts/*.json` must contain the exact runtime entrypoint, constructor, trace JSONL, verifier kwargs, required file kinds, and framework replay expectations.
+- Candidate manifest: `agent-output/candidate_manifest.json` declares `candidate_dir: generated`; every `generated_files[].path` is relative to that directory, for example `runtime.py`, not `generated/runtime.py` or an absolute path.
+- Generated directory: only the six declared bundle files count as candidate source files. Ignore Python bytecode cache files such as `__pycache__/*.pyc`, but reject undeclared source/config/scratch files.
+- Repair packet: include manifest contract, relative candidate paths/hashes, failed task ids, failed task stderr previews, and failed prerequisite checks; avoid feeding absolute local workdir paths back to the runner as candidate paths.
+
+#### 4. Validation & Error Matrix
+
+- Missing `candidate_manifest.json` -> `missing_runner_manifest`.
+- `generated_files` item is not an object -> `malformed_candidate_manifest`.
+- Missing or wrong `kind` -> `candidate_file_kind_mismatch`.
+- Path has `..`, is absolute, or includes `generated/` under `candidate_dir: generated` -> path/manifest failure.
+- Extra non-cache file under `generated/` -> `undeclared_generated_file`.
+- Generated check passes but framework independent verifier fails -> do not release; emit repair packet with task-level stderr.
+- Runner exits non-zero -> `runner_nonzero_exit`; do not infer success from partial files.
+
+#### 5. Good/Base/Bad Cases
+
+- Good: manifest path `runtime.py`, kind `runtime_code`, sha256 lowercase hex, source refs present, runtime exposes the exact surface class and helper functions, tool calls write JSONL trace records.
+- Base: generated `check_replay.py` exits 0 and prints success, then framework independent verifier also verifies positive and negative task records.
+- Bad: local check imports a helper class named differently from the surface descriptor, `search_events` returns `{"events": [...]}` when framework replay expects a list, or repair uses `generated/runtime.py` in manifest paths.
+
+#### 6. Tests Required
+
+- Assert the workspace packet contains exact manifest kind mapping, runtime entrypoint, constructor, trace JSONL, verifier kwargs, and replay expectations.
+- Assert candidate validators ignore `__pycache__/*.pyc` but still reject undeclared real files.
+- Assert bounded repair packets use relative candidate paths and carry manifest contract plus task-level failure details.
+- Keep live Codex/agent smoke tests explicit and non-default; never require network/model credentials for normal test runs.
+
+#### 7. Wrong vs Correct
+
+Wrong:
+
+```json
+{"candidate_dir": "generated", "generated_files": [{"path": "generated/runtime.py", "sha256": "..."}]}
+```
+
+Correct:
+
+```json
+{"candidate_dir": "generated", "generated_files": [{"path": "runtime.py", "kind": "runtime_code", "sha256": "<64 hex>", "source_refs": ["impl-id"]}]}
+```
+
 ---
 
 ## Testing Requirements

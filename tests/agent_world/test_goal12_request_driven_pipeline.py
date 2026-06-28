@@ -263,9 +263,35 @@ def test_goal12_booking_bounded_repair_retries_agent_candidate_and_releases(tmp_
     assert context.build_check_replay_records[0]["status"] == "fail"
     assert context.build_check_replay_records[1]["status"] == "pass"
     assert len(context.repair_failure_packets) == 1
-    assert context.repair_failure_packets[0]["stage"] == "IMPLEMENT"
-    assert "booking-task-1" in context.repair_failure_packets[0]["failed_task_ids"]
+    repair_packet = context.repair_failure_packets[0]
+    assert repair_packet["stage"] == "IMPLEMENT"
+    assert "booking-task-1" in repair_packet["failed_task_ids"]
+    assert repair_packet["manifest_contract"]["candidate_dir"] == "generated"
+    assert repair_packet["manifest_contract"]["generated_file_kinds"]["runtime.py"] == "runtime_code"
+    assert "not generated/runtime.py" in repair_packet["manifest_contract"]["path_rule"]
+    assert "runtime.py" in repair_packet["candidate"]["generated_paths"]
+    assert all(not path.startswith(str(tmp_path)) for path in repair_packet["candidate"]["generated_paths"])
     assert "Previous failure packet JSON" in backend.requests[1].instruction
+    assert "Keep candidate_manifest.json paths relative to candidate_dir" in backend.requests[1].instruction
+    assert context.artifacts["GeneratedEnvironmentBundle"]["id"] == BOOKING_AGENT_BUNDLE_ID
+    assert context.artifacts["ReleaseManifest"]["environment_id"] == BOOKING_ENVIRONMENT_ID
+
+
+def test_goal12_booking_agent_candidate_ignores_python_bytecode_cache(tmp_path):
+    backend = BookingCodegenWithPycacheBackend()
+    registry = AgentBackendRegistry()
+    registry.register(backend)
+
+    record, context = run_request_driven_pipeline(
+        PipelineRunConfig(
+            output_dir=tmp_path,
+            raw_request=BOOKING_REQUEST,
+            implementation_mode="agent",
+        ),
+        agent_registry=registry,
+    )
+
+    assert record.status == "pass"
     assert context.artifacts["GeneratedEnvironmentBundle"]["id"] == BOOKING_AGENT_BUNDLE_ID
     assert context.artifacts["ReleaseManifest"]["environment_id"] == BOOKING_ENVIRONMENT_ID
 
@@ -291,6 +317,25 @@ def test_goal12_booking_bounded_repair_exhaustion_stops_before_release(tmp_path)
     assert len(context.repair_failure_packets) == 2
     assert context.artifacts["GeneratedEnvironmentBundle"]["status"] == "fail"
     assert "ReleaseManifest" not in context.artifacts
+
+
+class BookingCodegenWithPycacheBackend(MockAgentBackend):
+    def invoke(self, request, config):
+        work_dir = Path(request.permissions["filesystem_root"])
+        manifest = write_booking_agent_candidate_files(
+            work_dir,
+            source_refs=request.input_artifact_ids,
+            implementation_request_id=request.input_artifact_ids[0],
+        )
+        pycache = work_dir / "__pycache__"
+        pycache.mkdir(exist_ok=True)
+        (pycache / "runtime.cpython-312.pyc").write_bytes(b"python bytecode cache")
+        return AgentResult(
+            text=json.dumps(manifest, sort_keys=True),
+            evidence_refs=["mock://booking-pycache-candidate"],
+            output_artifact_ids=[manifest["bundle_id"]],
+            trace_ref="mock://trace/booking-pycache-candidate",
+        )
 
 
 class RepairingBookingCodegenBackend(MockAgentBackend):

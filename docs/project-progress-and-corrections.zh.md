@@ -162,13 +162,33 @@ Goal 07-10 的 generated bundle gate 会执行 generated `check_replay.py`，但
 
 训练、部署、verl/GRPO 在线采样、SFT 数据生产，以及根据训练结果反向生成更多环境或修正环境，是后续动态流程。当前已有 Goal 02-04 的 dataset-only/export/online runtime metadata 和 support-desk fixture consumer，但还没有通用 rollout/online adapter，也没有真实训练框架集成。后续可以把训练反馈作为新的显式 loop 或 upstream retry edge 接入，但当前不能把它写成已完成能力。
 
+### 11. 真实 Codex CLI runner 实跑结果
+
+用户进一步澄清：这里需要的不是 unit test，而是由 Codex 代替人实际启动一次真实 code agent 执行，使用当前环境中的 base URL、API key、model 等配置，监控从 request-driven pipeline 到 code agent、repair、independent verifier 的真实结果。
+
+已纠正：
+
+- `codex_cli_runner` 现在会为子进程创建隔离 `CODEX_HOME`，把 base URL/model 写入该 workspace 内的 `config.toml`，并只通过 `CODEX_API_KEY` 给子进程传 API key；secret value 不写入 artifacts。
+- code-agent workspace packet 现在明确写出 manifest kind 表、runtime entrypoint、constructor、trace JSONL、verifier kwargs、framework replay expectations 和 candidate manifest path 规则。
+- failure packet 现在给 runner 提供相对 candidate paths、manifest contract、failed task ids、failed task stderr preview 和 failed prerequisite checks，避免把绝对 `/tmp` workdir 路径误当成 manifest path。
+- candidate validator 忽略 `__pycache__/*.pyc` 这类 Python bytecode cache，但仍拒绝真正的 undeclared generated files。
+
+真实监控结论：
+
+- 多次 live `codex_cli_runner` run 均成功启动真实 Codex CLI，读取 `input/` packet，写 `generated/` 六个文件，并产生 `agent-output/candidate_manifest.json` 与 command log。
+- pipeline 走过 request/domain planner、strategy selector、S0-S9，并进入 implementation/repair gate。
+- 这些 live run 均未进入 S10/S11 release。最终失败仍是 `independent_generated_bundle_verification_failed`；manifest 已合规，剩余问题是 agent 生成的 runtime/verifier 行为没有满足框架侧 replay，例如 framework replay 中出现 `TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'`。
+- 因此当前只能声称“真实 Codex CLI runner path 已接入、可监控、会被 framework gate 拦截错误产物”，不能声称“live Codex 默认能生成并发布 booking-service-lite 环境”。
+
+下一步如果继续推进 live runner 质量，应优先做两件事：把 independent verifier replay contract 抽成更机器可读的 `input/framework-replay-contract.json`，并提供一个 runner 可本地执行的 framework-owned preflight command，而不是让 agent 只靠自然语言 brief 推断 replay shape。
+
 ## 当前真实性等级
 
 截至 Goal 12：
 
 - `support-desk-lite`: runnable fixture，支持 Python callable、deterministic verifier、release package、replay、rollout/export consumer、online runtime、runtime control CLI、environment CLI 和 HTTP wrapper 回归。
 - `project-board-lite`: 第二 source family，使用本地 CLI help、schema、examples 生成 source-grounded artifacts；deterministic generated bundle 和 agent-backed generated bundle 都必须同时通过 generated check 与 framework independent verifier，覆盖 `pb-task-1`、`pb-task-2`、`pb-task-3` 的正反 records；成功 S11 后复制到 `envpkg/runtime/generated/<bundle_id>/` 供后续模块按 package-relative index 调用。
-- agent backend: 已有 backend-neutral contract、invocation record、mock/manual/process/codex-like slot、真实 `openai_codegen` backend，以及 `code_agent_runner` / `codex_cli_runner` runner path；`openai_codegen` 从模型响应写文件，`code_agent_runner` 使用固定 allowlisted argv 和 `subprocess.run(argv, shell=False)` 调用外部 agent 命令，workspace packet、manifest、command log、trace ref 都可审计，secret 只记录 env var/ref；implementation 失败时框架可按 bounded repair loop 生成 failure packet 并重新调用同一 backend。
+- agent backend: 已有 backend-neutral contract、invocation record、mock/manual/process/codex-like slot、真实 `openai_codegen` backend，以及 `code_agent_runner` / `codex_cli_runner` runner path；`openai_codegen` 从模型响应写文件，`code_agent_runner` 使用固定 allowlisted argv 和 `subprocess.run(argv, shell=False)` 调用外部 agent 命令，workspace packet、manifest、command log、trace ref 都可审计，secret 只记录 env var/ref；implementation 失败时框架可按 bounded repair loop 生成 failure packet 并重新调用同一 backend。真实 `codex_cli_runner` 已实跑并可监控，但目前 live booking run 仍被 independent verifier 阻止 release。
 - training: 只有 dataset-only/export/metadata consumer，不是 verl/LLaMA-Factory/OpenRLHF/TRL 真实训练集成。
 - request-driven generation pipeline: 已完成两条验收探针。订票服务 raw request 发布 `booking-service-lite`，图书馆借阅管理 raw request 发布 `library-lending-lite`；二者都通过 request/domain planner、strategy selector、source packet discovery、source-grounded synthesis、generated bundle、framework independent verifier、bounded repair 和 package release；仍只证明已注册 request-driven strategy path，不证明任意领域自动生成。
 - environment package: 当前 generated environment 已能以 package-relative runtime index 被加载检查；这证明后续模块可以调用 packaged generated backend/runtime，但不等于已实现部署、policy rollout、SFT/GRPO 采样或训练反馈闭环。
@@ -181,6 +201,7 @@ Goal 07-10 的 generated bundle gate 会执行 generated `check_replay.py`，但
 - 已经实现通用 code-agent 环境生成质量保证。
 - 已经能从任意 raw_request 动态生成对应新领域。
 - 已经默认跑通 live Codex/Claude/mini-swe-agent。
+- live Codex CLI runner 已能稳定通过 booking-service-lite independent verifier 并发布 release。
 - 已经实现通用 rollout/online runtime adapter 读取任意 generated bundle。
 - 已经实现 MCP/HTTP/CLI/Python 全 surface 通用发布。
 - 已经接入真实 RL trainer。

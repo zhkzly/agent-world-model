@@ -50,7 +50,22 @@ def test_goal09_code_agent_runner_writes_workspace_checks_and_releases_bundle(tm
         "write_candidate_manifest",
     ]
     assert (workspace / "input" / "implementation-brief.md").is_file()
+    brief_text = (workspace / "input" / "implementation-brief.md").read_text(encoding="utf-8")
+    assert "required_runtime_entrypoint: runtime.ProjectBoardLite" in brief_text
+    assert "required_runtime_constructor: __init__(state, trace_path=None, task_id=None, call_group=None)" in brief_text
+    assert "required_runtime_helpers: runtime.load_seed_state(seed_path), runtime.reset_environment(seed_state)" in brief_text
+    assert "required_trace_jsonl" in brief_text
+    assert "surface_trace_path" in brief_text
+    assert "framework_replay_expectation" in brief_text
     assert (workspace / "input" / "expected-bundle-layout.md").is_file()
+    layout_text = (workspace / "input" / "expected-bundle-layout.md").read_text(encoding="utf-8")
+    acceptance_text = (workspace / "input" / "acceptance-checks.md").read_text(encoding="utf-8")
+    assert "`runtime.py` must expose `runtime.ProjectBoardLite`" in layout_text
+    assert "RuntimeClass(state, trace_path=Path(...), task_id=task_id" in layout_text
+    assert "append one JSONL record to `trace_path`" in layout_text
+    assert "`runtime.py` -> `runtime_code`" in layout_text
+    assert '"kind": "runtime_code"' in layout_text
+    assert "generated_files[]` item declares exact `path`, exact `kind`" in acceptance_text
     assert (workspace / "input" / "skills" / "environment-codegen.md").is_file()
     assert (workspace / "input" / "artifacts" / "ImplementationRequest.json").is_file()
     assert (workspace / "agent-output" / "candidate_manifest.json").is_file()
@@ -69,6 +84,14 @@ def test_goal09_code_agent_runner_writes_workspace_checks_and_releases_bundle(tm
         "surface_descriptor.json",
         "check_replay.py",
         "build_manifest.yaml",
+    }
+    assert {item["kind"] for item in manifest["generated_files"]} == {
+        "runtime_code",
+        "seed_fixture",
+        "verifier_code",
+        "surface_descriptor",
+        "test_or_check",
+        "build_manifest",
     }
     command_log = (workspace / "agent-output" / "runner-command-log.jsonl").read_text(encoding="utf-8")
     assert str(helper) in command_log

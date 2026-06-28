@@ -12,7 +12,7 @@ from typing import Any
 
 import yaml
 
-from agent_world.artifacts import make_artifact, stable_json
+from agent_world.artifacts import GENERATED_BUNDLE_FILE_KINDS, make_artifact, stable_json
 from agent_world.independent_verifier import verify_library_generated_bundle_independent
 from agent_world.request_matching import match_request_tokens
 from agent_world.sources import LocalSourceConnector
@@ -21,14 +21,7 @@ from agent_world.sources import LocalSourceConnector
 LIBRARY_ENVIRONMENT_ID = "library-lending-lite"
 LIBRARY_DETERMINISTIC_BUNDLE_ID = "bundle-library-lending-lite-generated"
 LIBRARY_TASK_IDS = ["library-task-1", "library-task-2", "library-task-3"]
-GENERATED_FILE_KINDS = {
-    "runtime.py": "runtime_code",
-    "seed_state.json": "seed_fixture",
-    "verifier.py": "verifier_code",
-    "surface_descriptor.json": "surface_descriptor",
-    "check_replay.py": "test_or_check",
-    "build_manifest.yaml": "build_manifest",
-}
+GENERATED_FILE_KINDS = dict(GENERATED_BUNDLE_FILE_KINDS)
 LIBRARY_REQUIRED_STATE_OBJECTS = ["book", "book_inventory", "patron", "loan", "fine", "audit_event"]
 LIBRARY_REQUIRED_OPERATIONS = ["search_books", "check_availability", "borrow_book", "return_book"]
 LIBRARY_REQUIRED_RULES = ["available-before-borrow", "return-restores-availability", "overdue-fine-assessed"]

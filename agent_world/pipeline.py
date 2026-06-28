@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 import os
 from pathlib import Path
 import shutil
@@ -14,7 +15,7 @@ from agent_world.agents import (
     invoke_agent,
     load_agent_backend_config_from_env,
 )
-from agent_world.artifacts import artifact_hash, make_artifact, stable_json, utc_now, validate_artifact
+from agent_world.artifacts import GENERATED_BUNDLE_FILE_KINDS, artifact_hash, make_artifact, stable_json, utc_now, validate_artifact
 from agent_world.fixtures.project_board_lite_codegen import project_board_agent_generated_implementation_record
 from agent_world.fixtures.project_board_lite_nodes import (
     project_board_deterministic_implementation_record,
@@ -1362,18 +1363,78 @@ def _implementation_failure_packet(
             "stderr_preview": _preview(failed_check.get("stderr", "")),
             "failure_class": failed_check.get("failure_class", ""),
             "recovery_suggestion": failed_check.get("recovery_suggestion", ""),
+            "failed_prerequisite_checks": _failed_prerequisite_checks(failed_check),
+            "failed_task_errors": _failed_task_errors(failed_check),
         },
         "candidate": {
-            "generated_paths": list(attempt_record.get("generated_paths", [])),
-            "generated_file_hashes": dict(attempt_record.get("generated_file_hashes", {})),
-            "agent_candidate_dir": attempt_record.get("agent_candidate_dir", ""),
-            "agent_work_dir": attempt_record.get("agent_work_dir", ""),
+            "generated_paths": _candidate_relative_paths(attempt_record),
+            "generated_file_hashes": _candidate_relative_hashes(attempt_record),
+            "agent_candidate_dir_ref": "generated",
+            "agent_work_dir_ref": ".",
+        },
+        "manifest_contract": {
+            "candidate_dir": "generated",
+            "generated_file_kinds": dict(GENERATED_BUNDLE_FILE_KINDS),
+            "path_rule": "Each generated_files[].path is relative to candidate_dir. Use runtime.py, not generated/runtime.py and not an absolute path.",
+            "required_fields_per_generated_file": ["path", "kind", "sha256", "source_refs"],
         },
         "security_and_manifest_checks": {
             "failure_class": attempt_record.get("failure_class", ""),
             "static_check_command": attempt_record.get("static_check_command", ""),
         },
     }
+
+
+def _failed_prerequisite_checks(check: dict[str, Any]) -> list[dict[str, Any]]:
+    failures = []
+    for item in check.get("prerequisite_checks", []):
+        if item.get("passed") is False:
+            failures.append(
+                {
+                    "name": item.get("name", ""),
+                    "detail": item.get("detail", {}),
+                }
+            )
+    return failures
+
+
+def _failed_task_errors(check: dict[str, Any]) -> list[dict[str, Any]]:
+    errors = []
+    for item in check.get("task_records", []):
+        if item.get("success") is False:
+            errors.append(
+                {
+                    "task_id": item.get("task_id", ""),
+                    "failure_class": item.get("failure_class", ""),
+                    "stderr_preview": _preview(item.get("stderr", ""), limit=500),
+                    "recovery_suggestion": item.get("recovery_suggestion", ""),
+                }
+            )
+    return errors
+
+
+def _candidate_relative_paths(attempt_record: dict[str, Any]) -> list[str]:
+    candidate_dir = str(attempt_record.get("agent_candidate_dir") or "")
+    return [_path_relative_to_candidate(path, candidate_dir) for path in attempt_record.get("generated_paths", [])]
+
+
+def _candidate_relative_hashes(attempt_record: dict[str, Any]) -> dict[str, str]:
+    candidate_dir = str(attempt_record.get("agent_candidate_dir") or "")
+    return {
+        _path_relative_to_candidate(path, candidate_dir): value
+        for path, value in dict(attempt_record.get("generated_file_hashes", {})).items()
+    }
+
+
+def _path_relative_to_candidate(path_value: Any, candidate_dir: str) -> str:
+    text = str(path_value)
+    if not candidate_dir:
+        return text
+    candidate_prefix = str(Path(candidate_dir).resolve())
+    try:
+        return Path(text).resolve().relative_to(candidate_prefix).as_posix()
+    except ValueError:
+        return text
 
 
 def _first_failed_check(record: dict[str, Any]) -> dict[str, Any]:
@@ -1487,7 +1548,8 @@ def _implementation_agent_instruction(
         repair_note = (
             f"\nThis is framework repair attempt {attempt_index} of {total_attempts}. "
             "Use the previous failure packet as the required repair target. "
-            "Do not change pipeline flow or skip required files/checks.\n"
+            "Do not change pipeline flow or skip required files/checks. "
+            "Keep candidate_manifest.json paths relative to candidate_dir unless the failure packet says the path itself is wrong.\n"
             f"Previous failure packet JSON:\n{stable_json(failure_packet)}\n"
         )
     if runner_backend:
@@ -1499,8 +1561,8 @@ def _implementation_agent_instruction(
             "runtime.py, seed_state.json, verifier.py, surface_descriptor.json, check_replay.py, and build_manifest.yaml.\n"
             "Run at least one local check command against generated/check_replay.py. If it fails, repair the generated files and rerun the check.\n"
             "Write agent-output/candidate_manifest.json after the final passing candidate. The manifest must declare "
-            "candidate_dir: generated, relative generated_files paths, sha256 hashes, source_refs, entrypoints, "
-            "check_commands, and replay_commands.\n"
+            "candidate_dir: generated, generated_files objects with exact path/kind/sha256/source_refs values, "
+            "entrypoints, check_commands, and replay_commands. Use the required kind table in input/expected-bundle-layout.md.\n"
             "Do not write outside generated/ and agent-output/. Do not import the repository fixture runtime. "
             "The framework will perform the final build/check/replay gate after you exit.\n"
         )
@@ -1579,7 +1641,7 @@ def _write_code_agent_workspace_packet(
         encoding="utf-8",
     )
     (input_dir / "implementation-brief.md").write_text(_code_agent_implementation_brief(context), encoding="utf-8")
-    (input_dir / "expected-bundle-layout.md").write_text(_code_agent_expected_bundle_layout(), encoding="utf-8")
+    (input_dir / "expected-bundle-layout.md").write_text(_code_agent_expected_bundle_layout(context), encoding="utf-8")
     (input_dir / "acceptance-checks.md").write_text(_code_agent_acceptance_checks(context), encoding="utf-8")
     (skills_dir / "environment-codegen.md").write_text(_code_agent_codegen_skill(), encoding="utf-8")
     if failure_packet:
@@ -1592,18 +1654,82 @@ def _code_agent_implementation_brief(context: PipelineContext) -> str:
     request = context.artifact("ImplementationRequest")
     task_ids = [task["task_id"] for task in context.artifact("TaskSet").get("tasks", [])] if "TaskSet" in context.artifacts else list(request.get("accepted_task_ids", []))
     verifier_ids = [verifier["verifier_id"] for verifier in context.artifact("VerifierPlan").get("verifiers", [])] if "VerifierPlan" in context.artifacts else list(request.get("accepted_verifier_ids", []))
+    runtime_contract = _code_agent_runtime_contract(context)
+    replay_notes = _code_agent_framework_replay_notes(request["environment_id"])
+    replay_note_text = "".join(f"- framework_replay_expectation: {note}\n" for note in replay_notes)
     return (
         f"# Implementation Brief\n\n"
         f"- environment_id: {request['environment_id']}\n"
         f"- implementation_request_id: {request['id']}\n"
         "- candidate_dir: generated\n"
         "- required_files: runtime.py, seed_state.json, verifier.py, surface_descriptor.json, check_replay.py, build_manifest.yaml\n"
+        f"- required_manifest_file_kinds: {stable_json(GENERATED_BUNDLE_FILE_KINDS)}\n"
+        f"- required_runtime_entrypoint: {runtime_contract['runtime_entrypoint']}\n"
+        "- required_runtime_constructor: __init__(state, trace_path=None, task_id=None, call_group=None)\n"
+        "- required_runtime_helpers: runtime.load_seed_state(seed_path), runtime.reset_environment(seed_state)\n"
+        f"- required_python_methods_on_entrypoint: {', '.join(runtime_contract['python_methods'])}\n"
+        "- required_trace_jsonl: each runtime tool call appends a JSON object with `tool`, `task_id`, and `call_group` when trace_path is provided\n"
+        "- required_verifier_entrypoint: verifier.verify_task_completion must accept framework kwargs `surface_trace_path`, `expected_dependency_path`, `trace_call_group`, and `final_answer`\n"
+        f"{replay_note_text}"
         f"- required_tasks: {', '.join(task_ids)}\n"
         f"- required_verifiers: {', '.join(verifier_ids)}\n"
         "- required_negative_check: each task verifier must return success=false when required tool actions, state delta, or answer evidence are absent\n\n"
         "Use input/artifacts/*.json as the source-grounded specification. The generated bundle must be self-contained; "
-        "runtime.py, verifier.py, and check_replay.py must not import repository fixture runtimes.\n"
+        "runtime.py, verifier.py, and check_replay.py must not import repository fixture runtimes. "
+        "If you use internal helper classes, still expose the required runtime entrypoint class and helper functions exactly as listed above.\n"
     )
+
+
+def _code_agent_runtime_contract(context: PipelineContext | None) -> dict[str, Any]:
+    fallback = {
+        "runtime_entrypoint": "runtime.GeneratedEnvironment",
+        "python_methods": [],
+    }
+    if context is None or "SurfacePlan" not in context.artifacts:
+        return fallback
+    bindings = [
+        binding
+        for binding in context.artifact("SurfacePlan").get("bindings", [])
+        if binding.get("surface") == "python" and binding.get("logical_tool_id")
+    ]
+    python_methods = [str(binding.get("method_name") or binding["logical_tool_id"]) for binding in bindings]
+    runtime_class = ""
+    for binding in bindings:
+        exposure = str(binding.get("exposure_name") or "")
+        if "." in exposure:
+            runtime_class = exposure.split(".", 1)[0]
+            break
+    if not runtime_class:
+        runtime_class = fallback["runtime_entrypoint"].split(".", 1)[1]
+    return {
+        "runtime_entrypoint": f"runtime.{runtime_class}",
+        "python_methods": python_methods,
+    }
+
+
+def _code_agent_framework_replay_notes(environment_id: str) -> list[str]:
+    if environment_id == "booking-service-lite":
+        return [
+            "search_events(city='Shanghai', kind='concert') returns a list of event dicts; the framework reads events[0]['event_id']",
+            "check_availability(event_id) returns a dict containing event_id, available_seats, and price",
+            "hold_seats(event_id, quantity=2, customer_id='C-1') returns a dict containing hold_id",
+            "confirm_booking(hold_id, payment_status='authorized') mutates booking/payment state",
+            "cancel_booking(booking_id='B-200', refund=True) cancels the booking, refunds payment, and releases inventory",
+        ]
+    if environment_id == "library-lending-lite":
+        return [
+            "search_books(keyword='distributed') returns a list of book dicts; the framework reads books[0]['book_id']",
+            "check_availability(book_id) returns a dict containing book_id, available_copies, and title",
+            "borrow_book(book_id, patron_id='P-1') mutates loan and inventory state",
+            "return_book(loan_id='L-200', days_late=2) returns the loan, restores inventory, and records a fine",
+        ]
+    if environment_id == "project-board-lite":
+        return [
+            "card_list(...) returns a list of card dicts for framework replay",
+            "card_get(card_id) returns a card dict",
+            "card_move/card_assign/comment_add mutate state and write audit/comment evidence",
+        ]
+    return []
 
 
 def _code_agent_acceptance_checks(context: PipelineContext | None = None) -> str:
@@ -1617,12 +1743,41 @@ def _code_agent_acceptance_checks(context: PipelineContext | None = None) -> str
         "2. The check prints a final JSON object with `success: true`.\n"
         f"3. It covers {task_text}.\n"
         "4. Each task has a positive verifier result with `success: true` and a negative verifier result with `success: false`.\n"
-        "5. `agent-output/candidate_manifest.json` declares `candidate_dir: generated` and exact sha256 hashes.\n"
-        "6. On a repair attempt, read `input/failure-packet.json` and address the listed failure class, failed task/verifier, and command output.\n"
+        "5. `agent-output/candidate_manifest.json` declares `candidate_dir: generated` and a `generated_files` object for each required file.\n"
+        "6. Each `generated_files[]` item declares exact `path`, exact `kind` from the required manifest kind table, lowercase 64-character `sha256`, and `source_refs`.\n"
+        "7. The framework independent verifier can import `runtime.py`, instantiate the required runtime class with `trace_path`, call helper functions, find every required method, read JSONL tool traces, and call `verifier.verify_task_completion` with framework kwargs.\n"
+        "8. On a repair attempt, read `input/failure-packet.json` and address the listed failure class, failed task/verifier, and command output without changing the manifest path shape unless the failure is a manifest/path/hash failure.\n"
     )
 
 
-def _code_agent_expected_bundle_layout() -> str:
+def _code_agent_expected_bundle_layout(context: PipelineContext | None = None) -> str:
+    kind_lines = "".join(
+        f"- `{filename}` -> `{kind}`\n"
+        for filename, kind in GENERATED_BUNDLE_FILE_KINDS.items()
+    )
+    runtime_contract = _code_agent_runtime_contract(context)
+    manifest_example = {
+        "candidate_dir": "generated",
+        "generated_files": [
+            {
+                "path": filename,
+                "kind": kind,
+                "sha256": "<lowercase 64-character sha256>",
+                "source_refs": ["<artifact id or source ref>"],
+            }
+            for filename, kind in GENERATED_BUNDLE_FILE_KINDS.items()
+        ],
+        "entrypoints": {
+            "runtime": "runtime.py",
+            "seed_state": "seed_state.json",
+            "verifier": "verifier.py",
+            "surface_descriptor": "surface_descriptor.json",
+            "check_replay": "check_replay.py",
+            "build_manifest": "build_manifest.yaml",
+        },
+        "check_commands": [["python", "generated/check_replay.py"]],
+        "replay_commands": [["python", "generated/check_replay.py"]],
+    }
     return (
         "# Expected Bundle Layout\n\n"
         "Write exactly these files under `generated/`:\n\n"
@@ -1632,7 +1787,24 @@ def _code_agent_expected_bundle_layout() -> str:
         "- `surface_descriptor.json`: implemented/deferred concrete surfaces.\n"
         "- `check_replay.py`: executable build/check/replay entrypoint.\n"
         "- `build_manifest.yaml`: bundle metadata, entrypoints, and commands.\n\n"
+        "Runtime entrypoint contract:\n\n"
+        f"- `runtime.py` must expose `{runtime_contract['runtime_entrypoint']}`.\n"
+        "- The runtime class constructor must accept `state`, optional `trace_path`, optional `task_id`, and optional `call_group` keyword arguments.\n"
+        "- `runtime.py` must expose `load_seed_state(seed_path)` and `reset_environment(seed_state)` module functions.\n"
+        f"- The runtime entrypoint class must implement these Python methods: {', '.join(runtime_contract['python_methods'])}.\n\n"
+        "Independent verifier replay contract:\n\n"
+        "- The framework will instantiate the runtime as `RuntimeClass(state, trace_path=Path(...), task_id=task_id, call_group=\"positive\")`.\n"
+        "- Every runtime tool method should append one JSONL record to `trace_path` with at least `tool`, `task_id`, and `call_group`.\n"
+        "- `verifier.verify_task_completion` will be called with `surface_trace_path` as a Path to that JSONL file, plus `expected_dependency_path`, `trace_call_group`, and `final_answer` kwargs.\n\n"
+        "Required manifest kind table:\n\n"
+        f"{kind_lines}\n"
+        "Candidate manifest schema example:\n\n"
+        "```json\n"
+        f"{json.dumps(manifest_example, indent=2, sort_keys=True)}\n"
+        "```\n\n"
         "Write runner traces and `candidate_manifest.json` under `agent-output/`; do not place them in `generated/`.\n"
+        "`candidate_dir` is `generated`, so every `generated_files[].path` must be relative to that directory, such as `runtime.py`; do not use `generated/runtime.py` or absolute paths.\n"
+        "Do not leave transient replay traces, logs, scratch files, or cleanup markers under `generated/`; use temporary directories or `agent-output/` for runner-only files.\n"
     )
 
 
@@ -1641,6 +1813,8 @@ def _code_agent_codegen_skill() -> str:
         "# Skill: Environment Code Generation\n\n"
         "Read the artifacts first, then implement the smallest executable environment that satisfies the task and verifier plan. "
         "Prefer deterministic state checks over text judging. Keep surfaces separate from logical tools. "
+        "Expose the exact runtime entrypoint and helper functions named in the implementation brief. "
+        "Keep `generated/` to the six declared bundle files only; do not use shell `rm` cleanup commands inside the Codex sandbox. "
         "After writing files, run the local check, repair failures, and update the candidate manifest only after the final check passes.\n"
     )
 
