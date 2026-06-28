@@ -74,3 +74,37 @@ Audited the dirty implementation state, added Trellis/platform bootstrap, ignore
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: Request form smoke test
+
+**Date**: 2026-06-28
+**Task**: Request form smoke test
+**Package**: mcp-adapted-bench
+**Branch**: `main`
+
+### Summary
+
+Ran the direct raw-request environment generation smoke, found and fixed an English planner mismatch where booking matched library book, verified packaged booking runtime and live LLM backend config without printing secrets, and added regression coverage plus spec guidance.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `cd3588c` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
