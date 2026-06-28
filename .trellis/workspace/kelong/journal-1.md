@@ -39,3 +39,38 @@ Aligned project documentation with loop-engineering intent, generated backend/ru
 ### Next Steps
 
 - None - task complete
+
+
+## Session 2: Audit implementation baseline
+
+**Date**: 2026-06-28
+**Task**: Audit implementation baseline
+**Package**: mcp-adapted-bench
+**Branch**: `main`
+
+### Summary
+
+Audited the dirty implementation state, added Trellis/platform bootstrap, ignored local paper PDFs, verified the Goal 02-12 environment-generation baseline with uv tests, and committed the implementation baseline.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `550b7a4` | (see git log) |
+| `886c21d` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
