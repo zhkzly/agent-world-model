@@ -1,0 +1,3 @@
+{"file":"README.md","reason":"Reader-facing summary that must not overstate implemented generator, training, or live agent capabilities."}
+{"file":"docs/goal-12-request-driven-generation-pipeline.zh.md","reason":"Current request-driven pipeline status and acceptance boundaries for booking/library probes."}
+{"file":"tests/agent_world/test_goal12_request_driven_pipeline.py","reason":"Executable evidence for request-driven booking/library probe paths, packaging, verifier records, forged check rejection, and repair behavior."}

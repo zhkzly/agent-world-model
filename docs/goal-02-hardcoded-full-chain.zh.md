@@ -242,7 +242,7 @@ generate support-desk-lite package
 8. 保持旧 awm CLI 行为不破坏。
 
 验收：
-- pytest 全部通过。
+- `uv run pytest` 全部通过。
 - 一个完整链路运行产出 5 条 rollout records、5 条 reward records、5 条 training export records。
 - 所有任务 replay/verifier 成功。
 - 导出的训练消费数据可被 DatasetOnlyAdapter 成功读取。

@@ -1,0 +1,3 @@
+{"file":"docs/agent-world-environment-generation.zh.md","reason":"Primary task source for project intent, workflow contracts, generated environment bundle requirements, and non-goals."}
+{"file":"docs/loop-engineering.md","reason":"Background reference for the loop-engineering framing: fixed workflow, explicit state, evaluator gates, and agent calls as nodes."}
+{"file":"docs/project-progress-and-corrections.zh.md","reason":"Living progress and drift log to update when current project state or misunderstanding changes."}

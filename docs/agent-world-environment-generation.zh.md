@@ -14,6 +14,8 @@
 
 系统应自动推进环境生成，而不是让人手写一次性 prompt。目标输出不是一篇方案，而是可复现、可验证、可发布、可被训练/评估流程消费的环境包。
 
+这里的环境包本质上是 **可执行后端/runtime 代码包**，而不是只落盘几份规格文件。它至少应逐步包含：状态转移逻辑、seed/state fixture、logical tool 到 concrete surface 的绑定、任务集合、deterministic verifier、check/replay 脚本、release metadata，以及后续 rollout/training/eval consumer 能稳定加载的入口。Codex、mini-swe-agent、OpenAI-compatible codegen 或其他 code agent 可以根据 source evidence 和 generated specs 写这些后端代码，但它们只能作为显式 implementation/repair 节点；是否可发布由框架侧 build/check/replay、independent verifier 和 bounded repair gate 决定。
+
 ## 2. AWM 的位置
 
 AWM 只作为背景知识和可参考素材，不是本项目边界。
@@ -50,7 +52,7 @@ EnvironmentNeed / CapabilityGap / DomainSeed
   -> verifier planning
   -> feasibility filtering
   -> implementation plan or code-agent request
-  -> implementation and checks
+  -> generated backend/runtime implementation and checks
   -> release package
   -> rollout/export/evaluation consumers
   -> failure analysis feedback
@@ -64,6 +66,7 @@ EnvironmentNeed / CapabilityGap / DomainSeed
 - LLM/agent 只出现在显式节点。
 - 失败可以回到上游某个阶段。
 - 训练或评估只是消费发布后的环境，不反向污染环境合约。
+- 后续可以形成部署、采样、SFT/GRPO/verl 消费、训练结果反馈到新环境构造的动态流程，但这些反馈必须作为新的显式 loop 或受控 feedback edge 表达，不能让 trainer 直接改写环境生成合约。
 
 ## 4. 核心模块
 
@@ -108,7 +111,7 @@ Source discovery 可以包含显式 research agent 节点。例如：为了判�
 - version/hash。
 - license/auth/network/security note。
 - 可抽取的状态对象、工具、业务流程、可 mock 边界。
-- 需要人工确认的点。
+- 不确定点、自动解决候选、blocked 条件。
 
 ### 4.3 Knowledge Extraction
 
@@ -212,12 +215,19 @@ LLM judge 只能作为辅助 verifier 或解释节点，必须有 evidence、rub
 
 - environment blueprint。
 - implementation request。
+- runtime/backend code files。
+- seed/state fixture。
+- deterministic verifier。
+- surface descriptor。
+- check/replay script。
 - expected package layout。
 - TDD requirements。
 - launch/check/replay commands。
 - release manifest。
 
 实现可以由 code agent 完成，但 Codex SDK、mini-swe-agent、deep-search 等只能是可替换后端，不能成为核心框架依赖。
+
+只生成 `EnvironmentSpec`、`TaskSet`、`VerifierPlan` 或 `ImplementationRequest` 不等于环境已生成。进入 release 前，必须能从 generated files import 或 launch runtime，执行成功任务和负例 verifier，并把结果写入可审计记录。
 
 ## 5. 训练和评估的位置
 
@@ -229,10 +239,21 @@ LLM judge 只能作为辅助 verifier 或解释节点，必须有 evidence、rub
 - rollout traces。
 - reward/eval records。
 - export manifest。
+- online runtime contract，用于需要在线采样的 RL trainer。
 
 verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer。环境生成框架不能绑定其中任何一个。
 
 当前第二阶段 Goal 可以先基于硬编码 `support-desk-lite` 案例补齐训练/评估消费链路，见 `docs/goal-02-hardcoded-full-chain.zh.md`。这只表示先打通 release package -> rollout/eval -> reward records -> training export -> dataset-only consumer 的链路，不表示已经完成通用环境自动生成，也不表示要把真实训练框架接成核心依赖。
+
+注意：GRPO/PPO 这类在线强化学习不是单纯读取离线 SFT JSONL。它们需要 trainer 在 rollout 阶段反复调用当前 policy，和环境交互，获得 observation、done、verifier reward，再做 advantage 和参数更新。因此环境 release 若要被 verl、verl-agent 或自定义 GRPO trainer 使用，必须额外暴露稳定的 online runtime contract：
+
+```text
+load package -> start runtime -> reset(task) -> step(action/tool_call)* -> finalize(answer) -> verifier reward
+```
+
+Goal 03 可以基于已发布的 `support-desk-lite` package 补齐这个 runtime/adapter contract，见 `docs/goal-03-online-runtime-grpo.zh.md`。这仍然不表示把 verl 作为核心依赖，也不表示实现真实 GPU 训练循环。
+
+SFT 数据生产、verl/GRPO 在线采样、环境部署，以及“根据训练结果继续生成或修正环境”的外层闭环，都是后续动态流程。当前优先级是把 request -> source -> generated backend code -> verifier -> package/release 的前半段稳定跑通，并保留给训练消费的 artifact 和 runtime contract。
 
 ## 6. Loop Engineering 原则
 
@@ -244,7 +265,8 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - 所有 gate 有可审查 evidence。
 - 每次运行可观察、可复盘、可重放。
 - 失败能回到明确阶段，而不是让模型自由决定下一跳。
-- 人可以在需要确认 source、权限、安全、产品语义时介入。
+- 成功路径必须无人参与；人只在运行前提供 raw request、配置、凭证引用、预算和权限策略，或在运行后审计 artifacts。运行中 source、权限、安全、产品语义无法自动解决时，pipeline 写 blocked artifact，而不是等待人工介入。
+- Python 环境和验证命令默认使用 `uv`，例如 `uv run pytest ...`；不要在文档或脚本里默认要求手动 venv、conda 或裸 `python` 执行测试。
 
 ## 7. 当前不做
 
@@ -254,11 +276,183 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - 与环境合约混在一起的 scripted rollout / reward / export demo。若进入 `docs/goal-02-hardcoded-full-chain.zh.md`，可以作为 release package 的下游 consumer 实现最小 rollout/reward/training export 链路。
 - MCP-only 或 CLI-only 环境。
 - generic CLI adapter 当主线。
-- 真实训练框架集成。
+- 真实训练框架集成。若进入 `docs/goal-03-online-runtime-grpo.zh.md`，只能实现 trainer adapter contract、online runtime 和可选配置导出；不能把 verl、verl-agent、LLaMA-Factory、OpenRLHF 或 TRL 写成核心依赖。
 - 把真实 Codex SDK / mini-swe-agent / deep-search 直接绑定进核心或作为唯一 agent backend。
 - AWM 论文复现。
 - 自动下载完整 AWM 1K。
 - 无 verifier evidence 的 LLM judge。
+
+## 7.1 当前阶段判断：打开流水线后的结构收敛
+
+Goal 02-04 已经证明 `support-desk-lite` 这个硬编码 fixture 可以被 package、replay、rollout、online runtime、HTTP wrapper 和 environment CLI surface 消费。这个结果有价值，但它仍然不是通用环境生成。
+
+当前阶段已经从“继续扩展 fixture runtime”切换为“打开真实生成流水线结构”。重点不是一次性实现万能 search 或万能 code generation，而是把下面几层明确拆开，使后续真实节点可以替换硬编码实现：
+
+- pipeline orchestration：已由 `agent_world.pipeline` 负责 S0-S11 节点顺序、失败停止和 run record；后续仍需补更多恢复/反馈边。
+- artifact store：已由 `agent_world.store.ArtifactStore` 负责 artifact、gate record、review record、agent invocation、trace 和 package refs 的本地目录落盘。
+- node registry：已提供 `NodeRegistry` 和 support-desk-lite fixture node set；后续真实 node 可替换 fixture node。
+- source connectors：已提供最小本地 connector，PRD、CLI help、schema-like 本地文件进入 `SourceEvidenceIndex`；真实网络 search 仍不是默认路径。
+- knowledge extractors：已提供 support-desk-lite extractor，把 source evidence 转成带 source refs、hash、section refs 和不确定点的 `KnowledgePack`。
+- synthesis nodes：support-desk-lite 的 `EnvironmentSpec`、`LogicalToolGraph`、`TaskSet`、`SurfacePlan` 和 `VerifierPlan` 已从 `KnowledgePack` 派生；当前不代表通用 synthesis。
+- implementation/code-agent node：已在 S9 与 S10 之间增加 deterministic implementation、generated bundle implementation 和 agent-backed slot；agent path 通过 `AgentBackend` 写 `AgentInvocationRecord`。
+- build/check/replay gate：deterministic implementation 需要通过本地 callable smoke 或 generated bundle check/replay evidence 后才进入 S10/S11；agent output 未通过 gate 不进入 release。
+- release consumers：rollout、online runtime、training/eval export 是 release 的 consumer，不能反向污染生成 pipeline。
+
+因此，下一条结构性 Goal 应该优先建立这些边界。`support-desk-lite` 可以继续作为 fixture node set 和回归测试，但不能继续代表通用 pipeline 本身。
+
+## 7.2 当前阶段判断：第二个本地 Source Family
+
+Goal 05 之后，最重要的风险不是缺少更多 runtime，而是 pipeline 结构仍可能只适配 `support-desk-lite`。Goal 06 已引入第二个本地 source family 来验证复用性。当前第二领域是 `project-board-lite`，输入素材为 CLI help + YAML schema + examples/rules。
+
+推荐形态：
+
+- 输入素材使用 CLI help + JSON/YAML schema + small examples，而不是另一个 PRD-only fixture。
+- source connector 读取真实本地文件，保留 path/hash/line refs，并识别 CLI command、schema state object、business rule 和 example candidates。
+- extractor 从 CLI commands、schema entities、examples/rules 中生成 `KnowledgePack`。
+- node registry 复用 `PipelineRunner`、`ArtifactStore`、gate/review/invocation 机制。
+- S3-S7 是第二领域的 deterministic synthesis，但从 `KnowledgePack` 派生，并且 source 缺失 command/schema/rule 时停止 release。
+- implementation 当前在 `project-board-lite` 上已从 deterministic fixture runtime path 推进到 generated bundle path，并新增 agent-backed codegen path。两条路径都必须写出独立 runtime/verifier/seed/check files，并记录正反 verifier 的 build/check/replay evidence；agent-backed path 只有通过 path/hash/security checks 和同一 build/check/replay gate 后才能 release。
+
+Goal 06 不证明“已经通用”。它只证明：同一 pipeline 结构可以承载第二种 source family，并把剩余领域专用逻辑暴露出来。
+
+### 7.3 当前阶段判断：Generated Environment Bundle 已验证
+
+Goal 07 已把 `project-board-lite` implementation 节点推进到 `GeneratedEnvironmentBundle`：通过 feasibility 后，deterministic implementation path 从 source-grounded artifacts 写出隔离 build directory，并从 generated files 运行 build/check/replay。该结果证明当前 pipeline 能把第二领域从 source evidence 推到 verified generated files，但仍不等于通用 agent code generation。
+
+`GeneratedEnvironmentBundle` 应产出可复现执行产物，例如：
+
+- runtime code files：定义 state backend、reset/isolation、logical tool 行为。
+- verifier code/files：实现 deterministic verifier，含正反例。
+- seed/state fixtures：可版本化，可 reset。
+- surface descriptors：声明 Python callable、environment CLI、HTTP 或 MCP 中哪些 surface 已实现。
+- launch/check/replay commands：说明如何从生成文件构造环境、调用 surface、运行 verifier。
+- build manifest：记录 generated file paths、hashes、source artifact refs、implementation invocation refs、check results。
+
+surface verification 规则：
+
+- Python callable：必须从 generated module import 并执行 reset/tool/verifier。
+- environment CLI：必须能从 generated command 或 module 执行 `--help` 和至少一个成功/失败任务命令，使用 `subprocess.run(argv, shell=False)`。
+- HTTP：若标记 implemented，必须能启动本地服务并调用 health/reset/step/finalize 或 domain endpoints。
+- MCP：若标记 implemented，必须能启动 server，完成 initialize/list_tools/call_tool，并运行 verifier。
+- 未实现 surface 只能标记为 descriptor-only 或 deferred，不能算 verified。
+
+进入 Generated Environment Bundle 阶段后，相关 release 必须引用 verified generated bundle。仅有 source evidence、spec、task、verifier plan 或 implementation request 不足以表示可执行环境已生成。
+
+Goal 07 已基于 `project-board-lite` 完成 deterministic generated bundle 门槛，因为该领域已经有 CLI help、schema、examples、source-grounded `KnowledgePack` 和 pipeline registry。Goal 08 在同一领域补上 agent-backed path 和真实 `openai_codegen` backend：`openai_codegen` 调用 OpenAI-compatible chat-completions endpoint，接收模型返回的 bundle file contents，写入 isolated workdir。Goal 09 进一步补上真正 code agent runner path：pipeline 写入 `input/` workspace packet，外部 runner 在 `generated/` 写环境文件、运行 check，在 `agent-output/` 产出 manifest 和命令日志；框架只对 runner 生成的 `generated/` 执行 path/hash/security checks 和 build/check/replay。框架拒绝绝对路径、`..`、symlink escape、未声明文件、hash mismatch、fixture runtime import、secret leak 和 check failure，只有 verified bundle 才能进入 S10/S11。下一步应减少领域模板比例，让更通用的 planner/codegen strategy 生成 bundle；不应把该结果误判为第三领域、训练/runtime consumer 扩展、通用网络 search 或真实 trainer 集成。
+
+### 7.4 当前阶段判断：Agent-backed Environment Codegen 已验证第一条路径
+
+Goal 08 已证明当前 pipeline 能把 accepted `project-board-lite` artifacts 交给 codegen backend，由 backend 在 isolated workdir 写出可执行 bundle，并由 deterministic build/check/replay gate 放行。该结果分两层：`process_agent` helper 证明 adapter wiring；`openai_codegen` 证明真实 OpenAI-compatible model/file-content backend 通道。二者都仍不等于通用环境自动生成。
+
+当前已验证的形态：
+
+- code agent 是显式 workflow node，`node_purpose=implement`。
+- 调用必须通过 `AgentBackend` / `AgentBackendConfig`，不能把 Codex SDK、mini-swe-agent、Claude Agent SDK、OpenAI-compatible API 或任何单一 runner 绑定进 core。
+- 调用产生 `AgentInvocationRecord`，记录 backend kind、model/runtime、command/config ref、输入输出 artifact、权限、预算、timeout、trace、redaction 和失败原因。
+- code agent 只能写本次 run 的 isolated workdir，不能直接修改 repo、release 目录、`.git`、`.codex`、用户 home 或未声明路径。
+- 进入 bundle 前做 path normalization 和 security check，拒绝绝对路径、`..`、symlink escape、未声明文件、hash mismatch、fixture runtime import 和 secret 泄漏。
+- agent-generated files 和 deterministic generated bundle 一样，通过 build/check/replay：从 generated runtime/verifier/check files import 或启动环境，执行成功任务和负例。
+- agent output 未通过 build/check/replay、schema gate、review gate 和 release gate 前，不得生成 `ReleaseManifest`。
+
+第一条 agent-backed codegen 使用 `project-board-lite`，因为其 source evidence、knowledge pack、tasks、verifier plan 和 deterministic bundle check 已经存在。默认测试使用 mock/process agent 验证 wiring，并使用本地 fake OpenAI-compatible endpoint 验证 `openai_codegen` HTTP/code-file protocol；真实外部模型调用只能作为显式 live smoke。
+
+Goal 08 没有新增第三领域、真实 trainer、GPU/Ray/vLLM/SGLang、MCP 全量 server 或 generic shell executor。它只回答了一个问题：当前环境生成流水线可以把 accepted artifacts 交给 codegen backend，由 backend 写出可执行环境 bundle，并由 deterministic verifier 放行。下一步问题是降低 `project-board-lite` 领域专用模板比例，而不是继续扩 runtime/training consumer。
+
+### 7.5 当前阶段判断：Code Agent Runner 已接入
+
+Goal 09 纠正了一个关键概念：`openai_codegen` 是 LLM/file-content codegen，不是完整 code agent runner。真正的 runner 可以是 Codex CLI/SDK、Claude Code、mini-swe-agent 或自定义 SWE agent；它应接收 workspace packet，自己写文件、自己运行检查、根据失败修复或返回失败，再交给框架做最终 release gate。
+
+当前已接入的 runner contract：
+
+- `code_agent_runner`: 通用本地 runner 命令，通过 `AGENT_WORLD_CODE_AGENT_CMD` 配置，必须在 allowlist 中，使用 `subprocess.run(argv, shell=False)` 调用。
+- `codex_cli_runner`: Codex CLI runner 适配器，要求命令显式声明安全的 approval/sandbox 参数，禁止危险 bypass 参数。
+- workspace packet：`input/artifacts/*.json`、`input/implementation-brief.md`、`input/acceptance-checks.md`、`input/skills/environment-codegen.md`、`generated/`、`agent-output/`。
+- runner 输出：`generated/runtime.py`、`seed_state.json`、`verifier.py`、`surface_descriptor.json`、`check_replay.py`、`build_manifest.yaml`，以及 `agent-output/candidate_manifest.json`。
+- 可观测性：`AgentInvocationRecord` 记录 backend kind、runtime/command、输入 artifact、权限、预算、trace ref、evidence refs；`agent-output/runner-command-log.jsonl` 记录 runner 命令 stdout/stderr/exit code；runner 自己也可以写 `agent-output/*` trace。
+- release 边界：`input/` 和 `agent-output/` 不进入 release；只有 manifest 指向的 `generated/` 被扫描、hash、验证和发布。
+
+当前仍不是“live Codex/Claude 已默认跑通”。默认测试使用本地 runner fixture 验证 contract、workspace、command log 和 release gate；真实 Codex CLI、Claude Code 或 mini-swe-agent smoke 必须由显式 env/command/allowlist/network/auth 配置启用。Goal 11 已补上框架级 bounded repair loop：agent implementation 失败时 pipeline 会写 failure packet，在 `PipelineRunConfig.max_repair_attempts` / `AGENT_WORLD_MAX_REPAIR_ATTEMPTS` 范围内重新调用同一个 backend；达到上限仍失败时 fail，不进入 S10/S11。当前 runner 仍可以内部自修复，但不能控制 pipeline 流程。
+
+### 7.6 当前阶段判断：Packaged Generated Runtime 已接入
+
+Goal 10 解决“生成环境是否可以被之后环节调用”的工程化缺口。此前 verified `GeneratedEnvironmentBundle` 位于 build/workspace 目录，例如 `/tmp/.../agent-runs/.../generated`，release manifest 只能证明它已经生成并验证，但后续 rollout/training/online runtime consumer 缺少稳定 package 内入口。
+
+当前成功 S11 后，如果存在 accepted `GeneratedEnvironmentBundle` 且配置了 `output_dir`，pipeline 会额外写：
+
+```text
+envpkg/
+  release/
+    release-manifest.yaml
+    generated-runtime-index.yaml
+  runtime/
+    generated/<bundle_id>/
+      runtime.py
+      seed_state.json
+      verifier.py
+      surface_descriptor.json
+      check_replay.py
+      build_manifest.yaml
+  checks/
+    generated-bundle-package-check.yaml
+```
+
+后续模块应读取 `envpkg/release/generated-runtime-index.yaml`，其中包含：
+
+- `runtime_dir_ref`
+- `runtime_entrypoint`
+- `verifier_entrypoint`
+- package-relative generated file refs 和 sha256
+- package-relative check/replay command
+- consumer contract
+
+新增 `run_packaged_generated_bundle_check(package_dir)` 作为最小 downstream consumer：它依赖 package 内 runtime index，同时执行 packaged `check_replay.py` 和框架侧 independent verifier；对于 `project-board-lite`，independent verifier 会直接加载 package 内 `runtime.py`、`verifier.py`、`seed_state.json` 并覆盖所有 accepted tasks 的正反记录。这样 generated environment 不再只存在于临时 build workdir，而是有了 package 内稳定调用入口，并且不只信任 generated check 的 stdout 自报。
+
+### 7.7 当前阶段判断：Independent verifier 与 bounded repair loop 已接入
+
+Goal 11 修正了两个 release 真实性问题：
+
+- generated bundle gate 不再把 generated `check_replay.py` stdout success 当作唯一放行证据。
+- agent-backed implementation 失败后不再只能停止；框架会构造 failure packet，并在有界 attempt budget 内重新调用同一个 `AgentBackend`。
+
+当前实现边界：
+
+- `agent_world.independent_verifier` 是框架侧 verifier，不属于 generated bundle。
+- 对 `project-board-lite`，它直接 import generated `runtime.py` / `verifier.py`，加载 `seed_state.json`，检查 runtime/verifier entrypoints、runtime tool methods 和 `check_replay.py` 结构 sanity。
+- 对 release accepted tasks，`pb-task-1`、`pb-task-2`、`pb-task-3` 都会产生独立 positive/negative task records；未覆盖或 unsupported task 会阻止 release。
+- 伪造只打印 success JSON 的 `check_replay.py` 会被拒绝。
+- 每次 agent implementation attempt 都记录 `AgentInvocationRecord`、candidate paths/file hashes、check/replay records；失败 attempt 生成包含 failure class、failed task/verifier、command、exit code、stdout/stderr preview、manifest/path/hash/check failure 的 failure packet。
+- repair loop 由 `PipelineRunner` 控制，agent 只接收 failure packet 并生成下一候选；agent 不能决定跳过 gate 或进入 release。
+
+这仍不等于通用 verifier synthesis，也不等于通用 code-agent 质量保证。当前 independent verifier 仍是 `project-board-lite` generated bundle 的框架侧实现，后续应提炼成可配置的 generated bundle verification strategy。
+
+仍未完成的是通用 rollout/online adapter：当前只是 package-relative check consumer，不是任意 policy rollout，也不是 verl/GRPO trainer 集成。下一步应基于 runtime index 读取 `TaskSet`、加载 runtime/verifier entrypoints、执行外部 policy action，并产出 rollout/reward records。
+
+### 7.8 当前阶段判断：Request-driven generation pipeline 已接入两条探针路径
+
+用户最终要的不是“手动选择一个已注册 fixture registry 后完整跑通”，而是输入一个新环境需求后，系统自动生成对应环境。Goal 12 已接入 request-driven 验收路径，并新增第二个全新场景探针：
+
+```text
+raw_request = 生成一个订票服务环境
+release.environment_id = booking-service-lite
+
+raw_request = 生成一个图书馆借阅管理环境
+release.environment_id = library-lending-lite
+```
+
+当前实现边界：
+
+- `DomainPlan` 从 `PipelineRunConfig.raw_request` 识别 booking/ticket/reservation/seat/payment/cancel 等订票意图，或 library/book/loan/borrow/return/fine 等借阅意图，得到对应 `domain_seed`。
+- `StrategySelection` 自动选择对应 source discovery、extraction/synthesis、implementation、independent verifier 和 package/check strategy。
+- `request_driven_node_registry()` / `run_request_driven_pipeline()` 是 request-driven 入口；未新增手动 `booking_service_lite_node_registry()` 或 `library_lending_lite_node_registry()`。
+- Source planning/discovery 会在 pipeline store 下写本地 PRD/schema/CLI source packet，并通过 `LocalSourceConnector` 进入 `SourceEvidenceIndex`。
+- S2-S7 从 source evidence / `KnowledgePack` 派生 `EnvironmentSpec`、`LogicalToolGraph`、`TaskSet`、`SurfacePlan` 和 `VerifierPlan`。
+- IMPLEMENT 根据 `ImplementationRequest` 写出 generated bundle，并由 generated check 与 framework-owned independent verifier 同时验证。
+- `IndependentVerificationReport` 覆盖对应领域任务的 positive/negative records；伪造只打印 success 的 `check_replay.py` 会被拒绝。
+- 每个阶段 artifact 都记录上游 inputs/consumed_inputs 与 producer/produced_by；`ReleaseManifest.request_lineage` 可追溯 raw request/domain plan -> source evidence -> task/verifier plan -> implementation request -> generated bundle -> independent verifier report。
+- Source failure 会写 failure packet 并停止在 release 前；agent implementation failure 继续进入 bounded repair loop，达到上限仍失败时不生成 S10/S11 release。
+- 手动 `project_board_lite_node_registry()` 加 booking raw request 仍会发布 `project-board-lite`，但测试明确证明这不是 Goal 12 成功路径。
+
+Goal 12 仍不表示一次支持任意所有领域、真实网络 crawler、真实 trainer 或全 surface 发布。下一步应把 booking/library keyword planner、source packet generator、synthesis strategy 和 verifier strategy 继续提炼成更通用的 request-driven strategy 体系。
 
 ## 8. 第一实现切片冻结
 
@@ -279,7 +473,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - gate 默认 deterministic；LLM/agent 只能出现在显式节点，并且必须产生日志、预算、输入、输出和 evidence。
 - 调研、搜索、repo 探索、MCP/CLI/API 文档读取、实现请求起草等需要智能判断的步骤，必须通过 `AgentInvocation` / `AgentBackend` 作为 workflow 节点进入流程。第一实现切片必须实现这个调用机制；Codex SDK、Codex CLI、search agent、mini-swe-agent、deep-search 等真实 backend 可以作为 adapter 使用，但核心只依赖 backend-neutral contract。
 - 训练/评估框架只能消费 release package，不能成为生成系统依赖。
-- 在本文冻结内容稳定前，不继续添加 runtime code。
+- Goal 02-04 已经添加的 rollout、online runtime、HTTP wrapper 和 environment CLI 只能作为 fixture/downstream consumer 回归保留；Goal 05 已完成 pipeline 结构收敛，Goal 06 期间不继续新增 runtime/training surface，除非用户明确要求。
 
 ## 9. 冻结工作流阶段
 
@@ -287,7 +481,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 
 | 阶段 | 名称 | 输入 artifact | 输出 artifact | LLM/agent 边界 | 必过 gate | 允许反馈边 |
 | --- | --- | --- | --- | --- | --- | --- |
-| S0 | Input Normalization | raw request/source seed | `NeedSpec` | 允许 LLM 抽取需求；不能决定流程 | G0, G1, G13 | 回到用户确认 |
+| S0 | Input Normalization | raw request/source seed | `NeedSpec` | 允许 LLM 抽取需求；不能决定流程 | G0, G1, G13 | S0 retry / terminal blocked |
 | S1 | Source Discovery | `NeedSpec` | `SourceEvidenceIndex` | 允许通过 `AgentBackend` 调用 search/code agent 搜索、列候选、读资料、探索 MCP/CLI/API/repo | G0, G2, G3, G13 | S0 |
 | S2 | Knowledge Extraction | `SourceEvidenceIndex` | `KnowledgePack` | 允许 LLM/agent 抽取 schema、流程、状态对象；必须带引用和 invocation evidence | G0, G2, G13 | S1 |
 | S3 | Environment Specification | `NeedSpec`, `KnowledgePack` | `EnvironmentSpec` | 允许 LLM 起草；deterministic validator 定稿 | G0, G4, G13 | S2 |
@@ -363,7 +557,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - `constraints`: `network`, `auth`, `license`, `safety`, `local_execution`, `mocking_allowed`
 - `preferred_surfaces`
 - `out_of_scope`
-- `human_confirmation_required`
+- `blocked_conditions`
 
 ### 10.2 `SourceEvidenceIndex`
 
@@ -464,7 +658,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 
 必填字段：
 
-- `status`: `pass`, `fail`, `needs_human`
+- `status`: `pass`, `fail`, `blocked`
 - `gate_results[]`: `gate_id`, `status`, `evidence`, `failure_class`, `recovery_suggestion`
 - `minimum_viable_surface`
 - `minimum_viable_task_ids`
@@ -490,9 +684,38 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - `launch_check_replay_commands`
 - `review_record_refs`
 
-`ImplementationRequest` 只是给后续 code agent 或人类实现者的输入，不代表本文阶段开始实现 runtime。
+`ImplementationRequest` 是给后续 code agent 或 implementation backend 的输入，不代表本文阶段开始实现 runtime。
 
-### 10.11 `EnvironmentPackagePlan`
+### 10.11 `GeneratedEnvironmentBundle`
+
+必填字段：
+
+- `bundle_id`
+- `environment_id`
+- `source_artifact_ids`
+- `implementation_request_id`
+- `build_dir`
+- `generated_files[]`: `path`, `kind`, `sha256`, `source_refs`
+- `runtime_entrypoint`
+- `seed_fixture_ref`
+- `verifier_entrypoint`
+- `surface_descriptors`
+- `check_commands[]`
+- `replay_commands[]`
+- `build_check_replay_records[]`
+
+`generated_files.kind` 至少支持：
+
+- `runtime_code`
+- `seed_fixture`
+- `verifier_code`
+- `surface_descriptor`
+- `test_or_check`
+- `build_manifest`
+
+`GeneratedEnvironmentBundle` 是 implementation/check 阶段的可执行产物记录，不替代 `ImplementationRequest`。相关 release 必须引用通过 build/check/replay 的 bundle；如果 bundle check fail 或 `blocked`，不得生成 `ReleaseManifest`。
+
+### 10.12 `EnvironmentPackagePlan`
 
 必填字段：
 
@@ -508,7 +731,9 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - `consumer_output_refs`
 - `excluded_items[]`: `item`, `reason`
 
-### 10.12 `ReleaseManifest`
+`EnvironmentPackagePlan` 在存在 generated implementation 时必须引用 verified `GeneratedEnvironmentBundle`，不能只引用 `ImplementationRequest`。
+
+### 10.13 `ReleaseManifest`
 
 必填字段：
 
@@ -527,7 +752,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 
 `consumer_outputs` 面向训练/评估系统，但只描述数据 contract，不引入 verl、LLaMA-Factory、OpenRLHF、TRL 等依赖。
 
-### 10.13 `GateRecord`
+### 10.14 `GateRecord`
 
 必填字段：
 
@@ -535,14 +760,14 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - `gate_id`
 - `stage`
 - `checked_artifact_ids`
-- `status`: `pass`, `fail`, `needs_human`
+- `status`: `pass`, `fail`, `blocked`
 - `evidence_refs`
 - `failure_class`
 - `recovery_suggestion`
 - `review_record_refs`
 - `created_at`
 
-### 10.14 `ReviewRecord`
+### 10.15 `ReviewRecord`
 
 必填字段：
 
@@ -551,7 +776,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - `source_of_truth_refs`
 - `reviewer_ref`
 - `review_type`: `human`, `llm_agent`, `static_check`, `peer_process`
-- `alignment_status`: `pass`, `fail`, `needs_human`
+- `alignment_status`: `pass`, `fail`, `blocked`
 - `drift_findings[]`: `requirement_ref`, `finding`, `severity`, `evidence`
 - `required_fixes[]`
 - `waived_risks[]`: `risk`, `reason`, `approver`
@@ -559,7 +784,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 
 `ReviewRecord` 是 gate evidence，不是可读性建议。没有 review evidence 的关键节点不能标记为通过。
 
-### 10.15 `ReplayPlan`
+### 10.16 `ReplayPlan`
 
 必填字段：
 
@@ -576,7 +801,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - `determinism_notes`
 - `known_nondeterminism[]`: `source`, `mitigation`
 
-### 10.16 `ConsumerIndex`
+### 10.17 `ConsumerIndex`
 
 必填字段：
 
@@ -592,7 +817,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 
 `ConsumerIndex` 只描述训练/评估 consumer 如何读取 release package，不指定或依赖具体训练框架。
 
-### 10.17 `AgentInvocationRecord`
+### 10.18 `AgentInvocationRecord`
 
 当任何阶段调用 LLM、search agent、code agent、Codex SDK/CLI、mini-swe-agent、deep-search 或其他智能 backend 时，必须产生 `AgentInvocationRecord`。
 
@@ -601,7 +826,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - `invocation_id`
 - `stage`
 - `node_purpose`: `search`, `extract`, `synthesize`, `review`, `judge`, `draft_implementation_request`, `implement`, `other`
-- `backend_kind`: `llm`, `codex_sdk`, `codex_cli`, `process_agent`, `search_agent`, `mini_swe_agent`, `deep_search`, `manual`, `mock`, `custom`
+- `backend_kind`: `llm`, `openai_codegen`, `code_agent_runner`, `codex_cli_runner`, `codex_sdk`, `codex_cli`, `process_agent`, `search_agent`, `mini_swe_agent`, `deep_search`, `manual`, `mock`, `custom`
 - `backend_ref`
 - `config_ref`
 - `model_or_runtime`
@@ -613,24 +838,24 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 - `output_artifact_ids`
 - `evidence_refs`
 - `trace_ref`
-- `status`: `pass`, `fail`, `needs_human`
+- `status`: `pass`, `fail`, `blocked`
 - `failure_class`
 - `recovery_suggestion`
 
-### 10.18 `AgentBackendConfig`
+### 10.19 `AgentBackendConfig`
 
-第一实现切片必须定义 agent backend 的配置 contract。它用于让 workflow 节点调用 OpenAI-compatible API、Codex CLI/SDK、search agent、process agent 或 mock/manual backend。
+第一实现切片必须定义 agent backend 的配置 contract。它用于让 workflow 节点调用 OpenAI-compatible API、OpenAI-compatible codegen、Codex CLI/SDK、search agent、process agent 或 mock/manual backend。
 
 必填字段：
 
 - `backend_id`
-- `backend_kind`: `llm`, `codex_sdk`, `codex_cli`, `process_agent`, `search_agent`, `mini_swe_agent`, `deep_search`, `manual`, `mock`, `custom`
+- `backend_kind`: `llm`, `openai_codegen`, `code_agent_runner`, `codex_cli_runner`, `codex_sdk`, `codex_cli`, `process_agent`, `search_agent`, `mini_swe_agent`, `deep_search`, `manual`, `mock`, `custom`
 - `provider`: `openai`, `openai_compatible`, `azure_openai`, `codex`, `local_process`, `manual`, `mock`, `custom`
 - `model`
 - `base_url`
 - `api_version`
 - `auth`: `api_key_env`, `auth_env_refs`, `requires_auth`
-- `command`: 仅 `process_agent` / `codex_cli` 需要，包含命令、固定参数和禁止参数。
+- `command`: 仅 `process_agent` / `codex_cli` / `code_agent_runner` / `codex_cli_runner` 需要，包含命令、固定参数、allowlist 和禁止参数。
 - `timeouts`: `connect_ms`, `run_ms`
 - `budgets`: `max_tokens`, `max_cost`, `max_tool_calls`
 - `permissions`: `network`, `filesystem`, `auth`, `sandbox`
@@ -645,20 +870,21 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 
 第一实现切片至少支持这些环境变量：
 
-- `AGENT_WORLD_AGENT_BACKEND`: 默认 backend，例如 `process_agent`、`codex_cli`、`llm`、`mock`。
+- `AGENT_WORLD_AGENT_BACKEND`: 默认 backend，例如 `openai_codegen`、`code_agent_runner`、`codex_cli_runner`、`process_agent`、`codex_cli`、`llm`、`mock`。
+- `AGENT_WORLD_CODE_AGENT_CMD`: generic process-agent/code-agent runner command；用于 mini-swe-agent、自定义 wrapper、Claude Code wrapper 或其他本地 code agent。
 - `AGENT_WORLD_OPENAI_BASE_URL`: OpenAI-compatible API base URL；未设置时可回退到 `OPENAI_BASE_URL`。
 - `AGENT_WORLD_OPENAI_API_KEY`: API key；未设置时可回退到 `OPENAI_API_KEY`。
 - `AGENT_WORLD_OPENAI_MODEL`: agent backend 使用的模型；未设置时可回退到 `OPENAI_MODEL`。
 - `AGENT_WORLD_SMOKE_OPENAI_MODEL`: Goal/CI/live smoke test 优先使用的低成本模型；未设置时回退到 `AGENT_WORLD_OPENAI_MODEL`。
 - `AGENT_WORLD_OPENAI_API_VERSION`: Azure/OpenAI-compatible provider 需要 API version 时使用；标准 OpenAI API 可以为空。
-- `AGENT_WORLD_CODEX_CMD`: Codex CLI 或 process agent 命令路径。
+- `AGENT_WORLD_CODEX_CMD`: Codex CLI 或 Codex runner 命令路径，例如 `codex exec --json --sandbox workspace-write --ask-for-approval on-request -`。
 
 测试模型策略：
 
 - Goal 模式、CI 或本地 smoke test 若需要真实 OpenAI-compatible 调用，必须优先使用低成本模型。
 - 推荐示例：`gpt-5.4-mini`、`gpt-3-codex-spark`。这些只是配置示例；实现不能把具体模型名写死。
 - live smoke test 必须可通过环境变量关闭或跳过；没有 API key、base URL、模型或网络权限时，不得导致 deterministic test 失败。
-- 默认测试路径应使用 `mock` / `manual` backend；真实模型调用只验证 agent backend wiring、artifact 记录、权限/预算/trace 和 gate 行为。
+- 默认测试路径应使用 `mock` / 预配置 `manual` backend；真实模型调用只验证 agent backend wiring、artifact 记录、权限/预算/trace 和 gate 行为。`manual` backend 只能读取运行前提供的响应，不能在运行中等待人工输入。
 
 安全要求：
 
@@ -670,8 +896,9 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 
 - core workflow 只能依赖 `AgentInvocationRecord` 和 backend-neutral `AgentBackend` 接口，不能直接依赖某个 SDK。
 - 真实 Codex SDK、Codex CLI、mini-swe-agent、deep-search 等只能作为 adapter 实现。
-- 第一实现切片必须实现 agent invocation runtime、backend registry 和至少两个 backend：一个用于 deterministic tests 的 `manual` 或 `mock` backend，以及一个真实可调用的本地 agent backend，例如 `process_agent` 或 `codex_cli` adapter。真实 backend 必须受配置、权限、超时、预算和输出 schema 约束。
+- 第一实现切片必须实现 agent invocation runtime、backend registry 和至少两个 backend：一个用于 deterministic tests 的预配置 `manual` 或 `mock` backend，以及一个真实 codegen/backend runner，例如 `openai_codegen`、`code_agent_runner`、`codex_cli_runner` 或真实可调用的本地 agent backend。真实 backend 必须受配置、权限、超时、预算和输出 schema 约束。
 - `process_agent` 只用于生成流水线内部的 research/code-agent workflow node，不是环境 CLI surface，也不是允许 agent 任意执行 shell 的环境工具。
+- `code_agent_runner` / `codex_cli_runner` 是生成流水线内部的 implementation runner，不是环境 CLI surface。它们的 workspace packet 和 command log 必须可审计，release 只能引用 verified generated bundle。
 - Codex CLI/SDK、search agent、mini-swe-agent、deep-search 等可以作为具体 adapter，但都不能成为 core dependency。
 - agent backend 的输出不能直接放行 gate；必须进入 artifact validator、gate 和 independent review。
 
@@ -684,7 +911,7 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 | G0 Schema Gate | 全阶段 | static | artifact schema、必填字段、枚举、ID、hash、cross-ref 全部合法 |
 | G1 Scope Gate | S0 | static | need 与当前系统目标一致，不要求训练集成、AWM 复现或 runtime 外能力 |
 | G2 Evidence Gate | S1/S2 | deterministic | 每个核心状态对象、工具、规则至少有一个 source ref 或明确 inferred 标记 |
-| G3 Permission Gate | S1 | deterministic | 网络、认证、license、安全要求可接受；不可接受则 `needs_human` |
+| G3 Permission Gate | S1 | deterministic | 网络、认证、license、安全要求可接受；不可接受则 `blocked` |
 | G4 State Reset Gate | S3 | deterministic | state backend 有 reset 和 isolation 策略，seed fixture 可版本化 |
 | G5 Tool Graph Gate | S4 | deterministic | tool 读写对象存在，依赖边无未知节点，strong dependency 可满足 |
 | G6 Task Solvability Gate | S5 | deterministic-first | 每个 accepted task 有 initial state、allowed tools、expected delta/answer 和 verifier ref |
@@ -692,16 +919,16 @@ verl、LLaMA-Factory、OpenRLHF、TRL 或自定义训练框架都只是 consumer
 | G8 Surface Gate | S6 | deterministic | 至少一个 surface 可受控调用；surface binding 不改变 logical tool 语义 |
 | G9 Verifier Gate | S7 | deterministic | 每个任务至少一个 deterministic verifier，有正例和负例说明 |
 | G10 Feasibility Gate | S8 | deterministic | sources、state、tools、tasks、surface、verifier、安全全部满足最小可行要求 |
-| G11 Package Gate | S10 | static | package plan 包含 spec、fixtures、surfaces、tasks、verifiers、checks、release metadata |
-| G12 Release Gate | S11 | static | release manifest 可被训练/评估 consumer 枚举任务、调用 surface、运行 verifier、记录 trace |
-| G13 Independent Review Gate | 关键节点 | review | 关键节点存在独立 `ReviewRecord`，且 `alignment_status=pass` 或明确 `needs_human` 后停止等待 |
+| G11 Package Gate | S10 | static | package plan 包含 spec、fixtures 或 generated bundle、surfaces、tasks、verifiers、checks、release metadata；generated bundle check fail 时不得通过 |
+| G12 Release Gate | S11 | static | release manifest 可被训练/评估 consumer 枚举任务、调用 surface、运行 verifier、记录 trace；存在 generated implementation 时必须引用 verified bundle |
+| G13 Independent Review Gate | 关键节点 | review | 关键节点存在独立 `ReviewRecord`，且 `alignment_status=pass`；若 review blocked 则写 blocked artifact 并停止，不等待人工 |
 | G14 Agent Invocation Gate | 使用 LLM/agent 的阶段 | static/security | 每次 LLM/agent 调用都有 `AgentInvocationRecord` 和 `AgentBackendConfig`，权限/预算/输入输出/trace 完整，secret 不落盘，backend 通过 adapter 接入 |
 
 LLM 可以辅助解释 gate failure，但不能把失败改成通过。
 
 ## 12. Source Discovery 策略
 
-Source discovery 使用 connector registry 的概念，但第一实现切片只冻结策略，不实现 connector runtime。
+Source discovery 使用 connector registry 的概念。第一实现切片最初只冻结策略，不实现 connector runtime；进入结构收敛阶段后，应实现最小 connector runtime，让真实本地 PRD、CLI help、schema 或 docs 文件能进入 `SourceEvidenceIndex`，并能被后续节点引用。
 
 Source discovery 也使用 agent backend registry 的概念。需要调研、搜索、探索 MCP server、读取 CLI/API/SDK 文档或分析 repo 时，可以启动 research/code agent backend；但每次调用必须留下 `AgentInvocationRecord`，并把结果转换成 source evidence 或 knowledge artifact。
 
@@ -762,13 +989,47 @@ Python surface 是第一实现切片的推荐最小 runnable surface，因为它
 
 CLI 是环境发布 surface，不是 generic shell executor。
 
+本文中的 CLI surface 指 **环境工具本身通过命令行暴露**，例如：
+
+```text
+lark doc create ...
+gh issue create ...
+kubectl apply ...
+aws s3 cp ...
+```
+
+它不是 harness/runtime control CLI。`reset`、`observe`、`step`、`finalize` 这类命令可以作为调试或外部 trainer 控制入口，但它们不等于环境工具 CLI surface。
+
 边界：
 
-- CLI 命令必须映射到具体 logical tool 或 lifecycle 命令。
+- CLI 命令必须映射到具体 logical tool。runtime lifecycle 命令必须单独标注为 `runtime_control_cli`，不能冒充 environment CLI surface。
 - 参数来自 logical tool input schema。
 - 输出默认为 JSON 或 JSONL。
 - 不允许暴露任意 shell 执行能力作为环境工具。
 - CLI 名称不能泄漏 backend table/field，除非该名称本来就是用户领域概念。
+- CLI discovery 可以来自 `--help`、man page、CLI docs、examples 或受控探针；正式发布 package 必须固化 command template、input schema、output parser、allowed exit codes、timeout 和 state scope。
+- 运行时必须使用 `subprocess.run(argv, shell=False)` 或等价安全机制，不允许 `bash -c`、管道、重定向、命令拼接或未声明命令。
+
+调用模型：
+
+```text
+RuntimeAction(tool_name, arguments)
+  -> lookup environment_cli descriptor
+  -> render allowlisted argv template
+  -> execute CLI command
+  -> parse stdout/stderr/exit_code
+  -> write observation and step record
+  -> verifier reward
+```
+
+MCP 与 CLI 的发现方式不同：
+
+```text
+MCP: start server -> initialize -> list_tools -> call_tool
+CLI: read docs/help -> package command templates -> subprocess argv
+```
+
+二者进入训练系统前都应归一到 logical tool / RuntimeAction / RuntimeObservation。
 
 ### 14.3 HTTP Surface
 
@@ -831,7 +1092,7 @@ envpkg/
     consumer-index.yaml
 ```
 
-包内可以包含实现代码，但本文阶段只冻结 layout 和 artifact contract，不生成代码。
+包内可以包含实现代码。第一实现切片最初只冻结 layout 和 artifact contract；进入结构收敛阶段后，允许通过 explicit implementation/code-agent node 在隔离目录生成或装配实现代码，但必须记录 `AgentInvocationRecord`、build/check evidence、replay result 和 release refs。
 
 ## 16. 第一 runnable fixture
 
@@ -922,7 +1183,7 @@ Release package 面向 consumer，但 consumer 不属于核心。
 文档验收：
 
 - 阶段边界已定义，并且每个阶段有输入、输出、LLM/agent 边界、gate 和反馈边。
-- artifact contracts 已覆盖 need、source evidence、knowledge、environment、tool graph、task、surface、verifier、feasibility、implementation request、package plan、release、gate record、review record、replay plan、consumer index、agent invocation record 和 agent backend config。
+- artifact contracts 已覆盖 need、source evidence、knowledge、environment、tool graph、task、surface、verifier、feasibility、implementation request、generated environment bundle、package plan、release、gate record、review record、replay plan、consumer index、agent invocation record 和 agent backend config。
 - agent-backed research/code nodes 已有可运行的 `AgentInvocationRecord`、backend registry 和 backend-neutral `AgentBackend` 调用机制，允许通过 Codex SDK/CLI、search agent 等 adapter 调研 MCP、CLI、API、SDK 文档或 repo，但核心不绑定单一 SDK。
 - deterministic/static gates 已定义，并说明 LLM 不能直接放行 gate。
 - 关键节点独立 review 已定义，且 review 输出进入 `ReviewRecord`，用于确认没有偏离任务需求。
@@ -937,7 +1198,11 @@ Release package 面向 consumer，但 consumer 不属于核心。
 后续实现验收：
 
 - 第一条 runtime vertical slice 已按以上文档验收进入实现；后续代码必须继续满足这些验收项。
-- 第一 runtime PR 只能实现 artifact schema、static validators、package assembly skeleton 或 `support-desk-lite` fixture 所需的最小 runtime。
+- Goal 02-04 已经把 `support-desk-lite` 扩展到 rollout/training consumer、online runtime、HTTP wrapper 和 environment CLI fixture。这些能力只能作为 fixture/downstream consumer 回归，不代表通用环境生成已经完成。
+- Goal 05 已打开 pipeline 结构：pipeline runner、node registry、artifact store、source connector、knowledge extractor、synthesis node、implementation/code-agent node、build/check/replay gate 和 release consumer 必须分层明确。
+- 后续实现不得继续把新能力塞进硬编码 `support-desk-lite` workflow，除非同时说明它只是 fixture node set。
+- Goal 06 已通过第二个本地 source family 检验 pipeline 复用性；不得把该结果误判为通用环境生成。
+- Goal 07 已让 `project-board-lite` 从 source-grounded artifacts 生成 verified executable bundle；Goal 08 已让同一领域通过 backend-neutral `AgentBackend` 生成 verified agent-backed bundle。不得把 deterministic template/codegen 或当前 project-board-specific agent mock/process path 误判为通用 agent code generation。
 - 任何实现 PR 都必须保留现有 `awm` CLI 行为，除非用户明确要求改动。
 - 不得恢复 `awmx` demo 作为主线。
-- 不得实现训练、scripted rollout、reward export 或解题/rollout agent runner 绑定作为第一步；环境生成流水线内部的 `AgentBackend` 调用机制属于第一实现切片。
+- 不得继续扩展真实训练、GPU/Ray/vLLM/SGLang、通用 shell executor 或外部认证服务作为下一步；环境生成流水线内部的 `AgentBackend` 调用机制和 code-agent 插槽属于结构收敛范围。
