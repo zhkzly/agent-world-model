@@ -2,3 +2,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 outputs/agent_world/
+
+# Local research paper PDFs are useful evidence but should not be swept into
+# normal source commits.
+research/papers/*.pdf
