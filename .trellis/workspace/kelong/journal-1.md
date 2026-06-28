@@ -108,3 +108,37 @@ Ran the direct raw-request environment generation smoke, found and fixed an Engl
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: Monitor real Codex runner
+
+**Date**: 2026-06-29
+**Task**: Monitor real Codex runner
+**Package**: mcp-adapted-bench
+**Branch**: `main`
+
+### Summary
+
+Wired Codex CLI runner workspace contract, strengthened generated bundle replay packets, and recorded the monitored live run failure at the independent verifier gate.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5d6c29b` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

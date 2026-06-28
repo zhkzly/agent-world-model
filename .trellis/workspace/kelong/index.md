@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 3
-- **Last Active**: 2026-06-28
+- **Total Sessions**: 4
+- **Last Active**: 2026-06-29
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~110 | Active |
+| `journal-1.md` | ~144 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 4 | 2026-06-29 | Monitor real Codex runner | `5d6c29b` | `main` |
 | 3 | 2026-06-28 | Request form smoke test | `cd3588c` | `main` |
 | 2 | 2026-06-28 | Audit implementation baseline | `550b7a4`, `886c21d` | `main` |
 | 1 | 2026-06-28 | Document project alignment | `49ff72e` | `main` |
