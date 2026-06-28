@@ -87,6 +87,23 @@ def test_goal12_booking_raw_request_runs_selector_and_releases_booking_envpkg(tm
     assert summary["environment_id"] == BOOKING_ENVIRONMENT_ID
 
 
+def test_goal12_english_booking_request_does_not_match_library_book_substring(tmp_path):
+    record, context = run_request_driven_pipeline(
+        PipelineRunConfig(
+            run_id="goal12-english-booking",
+            output_dir=tmp_path,
+            raw_request=(
+                "Generate a booking reservation service environment for event search, seat availability, "
+                "temporary holds, booking confirmation, payment status, cancellation, refund, and deterministic state verification."
+            ),
+        )
+    )
+
+    assert record.status == "pass"
+    assert context.artifacts["DomainPlan"]["domain_seed"] == BOOKING_ENVIRONMENT_ID
+    assert context.artifacts["ReleaseManifest"]["environment_id"] == BOOKING_ENVIRONMENT_ID
+
+
 def test_goal12_new_library_lending_request_runs_full_pipeline_and_packaged_check(tmp_path):
     record, context = run_request_driven_pipeline(
         PipelineRunConfig(run_id="goal12-library", output_dir=tmp_path, raw_request=LIBRARY_LENDING_REQUEST)

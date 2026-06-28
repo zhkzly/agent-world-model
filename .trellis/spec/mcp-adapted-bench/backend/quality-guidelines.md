@@ -32,6 +32,24 @@ Questions to answer:
 
 <!-- Patterns that must always be used -->
 
+### Domain Keyword Matching Uses Token Boundaries
+
+Request/domain planners may use simple keyword probes for registered smoke domains, but ASCII domain tokens must not be matched with bare substring checks. Use token-boundary matching for English/alphanumeric terms and reserve substring matching for CJK or other scripts where whitespace token boundaries are not reliable.
+
+Good:
+
+```python
+match_request_tokens(raw_request, lowered, DOMAIN_TOKENS)
+```
+
+Bad:
+
+```python
+token in lowered
+```
+
+The bad form caused `booking` to match the library token `book`, routing an English booking/reservation request to `library-lending-lite`.
+
 ### Python Commands Use `uv`
 
 Run Python tools through `uv` so dependency resolution and interpreter selection stay consistent with `pyproject.toml`.

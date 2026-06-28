@@ -14,6 +14,7 @@ import yaml
 
 from agent_world.artifacts import make_artifact, stable_json
 from agent_world.independent_verifier import verify_library_generated_bundle_independent
+from agent_world.request_matching import match_request_tokens
 from agent_world.sources import LocalSourceConnector
 
 
@@ -36,8 +37,8 @@ LIBRARY_SUPPORTING_TOKENS = {"return", "fine", "available", "inventory", "归还
 
 
 def matches_domain(raw_request: str, lowered: str) -> tuple[list[str], list[str]]:
-    domain = sorted(token for token in LIBRARY_DOMAIN_TOKENS if token in lowered or token in raw_request)
-    supporting = sorted(token for token in LIBRARY_SUPPORTING_TOKENS if token in lowered or token in raw_request)
+    domain = match_request_tokens(raw_request, lowered, LIBRARY_DOMAIN_TOKENS)
+    supporting = match_request_tokens(raw_request, lowered, LIBRARY_SUPPORTING_TOKENS)
     return domain, supporting
 
 

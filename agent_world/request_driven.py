@@ -15,6 +15,7 @@ import yaml
 from agent_world import library_lending
 from agent_world.artifacts import make_artifact, stable_json
 from agent_world.independent_verifier import verify_booking_generated_bundle_independent
+from agent_world.request_matching import match_request_tokens
 from agent_world.sources import LocalSourceConnector
 
 
@@ -144,7 +145,7 @@ def domain_plan_fields(raw_request: str) -> dict[str, Any]:
 
 
 def _matched_tokens(raw_request: str, lowered: str, tokens: set[str]) -> list[str]:
-    return sorted(token for token in tokens if token in lowered or token in raw_request)
+    return match_request_tokens(raw_request, lowered, tokens)
 
 
 def strategy_selection_fields(domain_plan: dict[str, Any]) -> dict[str, Any]:
