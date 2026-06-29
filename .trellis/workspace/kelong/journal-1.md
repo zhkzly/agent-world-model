@@ -176,3 +176,37 @@ Added machine-readable replay contracts, framework-owned generated candidate che
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: Generalize request-driven generation
+
+**Date**: 2026-06-30
+**Task**: Generalize request-driven generation
+**Package**: mcp-adapted-bench
+**Branch**: `main`
+
+### Summary
+
+Replaced hardcoded request-driven domain probes with a generic raw-request artifact pipeline, agent-backed generated bundles, artifact-derived replay contracts, generic independent verification, bounded repair coverage, and corrected docs/specs.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `4421413` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

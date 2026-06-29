@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 5
-- **Last Active**: 2026-06-29
+- **Total Sessions**: 6
+- **Last Active**: 2026-06-30
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~178 | Active |
+| `journal-1.md` | ~212 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 6 | 2026-06-30 | Generalize request-driven generation | `4421413` | `main` |
 | 5 | 2026-06-29 | Executable verifier feedback workflow | `b743401` | `main` |
 | 4 | 2026-06-29 | Monitor real Codex runner | `5d6c29b` | `main` |
 | 3 | 2026-06-28 | Request form smoke test | `cd3588c` | `main` |
