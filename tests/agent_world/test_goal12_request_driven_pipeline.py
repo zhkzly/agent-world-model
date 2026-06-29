@@ -4,6 +4,7 @@ from pathlib import Path
 
 from agent_world import library_lending
 from agent_world.agents import AgentBackendRegistry, AgentResult, MockAgentBackend
+from agent_world.candidate_check import check_generated_candidate
 from agent_world.generated_bundle import run_packaged_generated_bundle_check
 from agent_world.pipeline import (
     PipelineNode,
@@ -64,6 +65,15 @@ def test_goal12_booking_raw_request_runs_selector_and_releases_booking_envpkg(tm
     packaged_check = run_packaged_generated_bundle_check(package_dir)
     assert packaged_check["success"] is True
     assert {item["task_id"] for item in packaged_check["independent_task_records"]} == {"booking-task-1", "booking-task-2", "booking-task-3"}
+    candidate_check = check_generated_candidate(
+        build_dir=runtime_dir,
+        environment_id=BOOKING_ENVIRONMENT_ID,
+        accepted_tasks=context.artifacts["TaskSet"]["tasks"],
+        runtime_entrypoint="runtime.BookingServiceLite",
+    )
+    assert candidate_check["success"] is True
+    assert candidate_check["framework_check_observation"]["schema_version"] == "agent-world.framework-check-observation.v1"
+    assert candidate_check["framework_check_observation"]["environment_id"] == BOOKING_ENVIRONMENT_ID
 
     summary = run_summary(context)
     assert [item["artifact_type"] for item in summary["artifact_flow"]] == [
@@ -268,6 +278,10 @@ def test_goal12_booking_bounded_repair_retries_agent_candidate_and_releases(tmp_
     assert "booking-task-1" in repair_packet["failed_task_ids"]
     assert repair_packet["manifest_contract"]["candidate_dir"] == "generated"
     assert repair_packet["manifest_contract"]["generated_file_kinds"]["runtime.py"] == "runtime_code"
+    assert repair_packet["framework_check_observation"]["schema_version"] == "agent-world.framework-check-observation.v1"
+    assert repair_packet["framework_check_observation"]["environment_id"] == BOOKING_ENVIRONMENT_ID
+    assert "booking-task-1" in repair_packet["framework_check_observation"]["failed_task_ids"]
+    assert repair_packet["failed_check"]["framework_check_observation"]["failed_task_ids"]
     assert "not generated/runtime.py" in repair_packet["manifest_contract"]["path_rule"]
     assert "runtime.py" in repair_packet["candidate"]["generated_paths"]
     assert all(not path.startswith(str(tmp_path)) for path in repair_packet["candidate"]["generated_paths"])
@@ -275,6 +289,28 @@ def test_goal12_booking_bounded_repair_retries_agent_candidate_and_releases(tmp_
     assert "Keep candidate_manifest.json paths relative to candidate_dir" in backend.requests[1].instruction
     assert context.artifacts["GeneratedEnvironmentBundle"]["id"] == BOOKING_AGENT_BUNDLE_ID
     assert context.artifacts["ReleaseManifest"]["environment_id"] == BOOKING_ENVIRONMENT_ID
+
+
+def test_goal12_framework_candidate_check_returns_traceback_observation(tmp_path):
+    build_dir = tmp_path / "broken-booking-candidate"
+    write_booking_agent_candidate_files(build_dir)
+    runtime_path = build_dir / "runtime.py"
+    runtime_path.write_text(
+        runtime_path.read_text(encoding="utf-8").replace("return events", "return []"),
+        encoding="utf-8",
+    )
+
+    check = check_generated_candidate(build_dir=build_dir, environment_id=BOOKING_ENVIRONMENT_ID)
+
+    assert check["success"] is False
+    observation = check["framework_check_observation"]
+    assert observation["schema_version"] == "agent-world.framework-check-observation.v1"
+    assert "booking-task-1" in observation["failed_task_ids"]
+    failed_task = next(item for item in observation["task_observations"] if item["task_id"] == "booking-task-1")
+    assert failed_task["case_id"] == "framework-replay-booking-task-1"
+    assert failed_task["phase"] == "task_replay"
+    assert failed_task["exception"]["type"] == "IndexError"
+    assert "Traceback" in failed_task["exception"]["traceback"]
 
 
 def test_goal12_booking_agent_candidate_ignores_python_bytecode_cache(tmp_path):

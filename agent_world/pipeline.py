@@ -47,6 +47,7 @@ from agent_world.fixtures.support_desk_lite_nodes import (
 from agent_world.gates import STAGE_GATES, evaluate_stage_gates
 from agent_world.generated_bundle import assemble_generated_bundle_package
 import agent_world.request_driven as request_driven
+from agent_world.replay_contract import build_framework_replay_contract
 from agent_world.review import independent_review
 from agent_world.store import ArtifactStore
 
@@ -1344,6 +1345,7 @@ def _implementation_failure_packet(
 ) -> dict[str, Any]:
     failed_check = _first_failed_check(attempt_record)
     failed_tasks = _failed_task_ids(attempt_record)
+    framework_observation = _framework_check_observation(failed_check, attempt_record)
     return {
         "packet_id": f"failure-packet-implement-attempt-{attempt_index}",
         "stage": "IMPLEMENT",
@@ -1363,9 +1365,11 @@ def _implementation_failure_packet(
             "stderr_preview": _preview(failed_check.get("stderr", "")),
             "failure_class": failed_check.get("failure_class", ""),
             "recovery_suggestion": failed_check.get("recovery_suggestion", ""),
+            "framework_check_observation": framework_observation,
             "failed_prerequisite_checks": _failed_prerequisite_checks(failed_check),
             "failed_task_errors": _failed_task_errors(failed_check),
         },
+        "framework_check_observation": framework_observation,
         "candidate": {
             "generated_paths": _candidate_relative_paths(attempt_record),
             "generated_file_hashes": _candidate_relative_hashes(attempt_record),
@@ -1385,6 +1389,22 @@ def _implementation_failure_packet(
     }
 
 
+def _framework_check_observation(failed_check: dict[str, Any], attempt_record: dict[str, Any]) -> dict[str, Any]:
+    observation = failed_check.get("framework_check_observation")
+    if isinstance(observation, dict) and observation:
+        return observation
+    for check in attempt_record.get("build_check_replay_records", []):
+        observation = check.get("framework_check_observation")
+        if isinstance(observation, dict) and observation:
+            return observation
+        independent = check.get("independent_verification_record")
+        if isinstance(independent, dict):
+            observation = independent.get("framework_check_observation")
+            if isinstance(observation, dict) and observation:
+                return observation
+    return {}
+
+
 def _failed_prerequisite_checks(check: dict[str, Any]) -> list[dict[str, Any]]:
     failures = []
     for item in check.get("prerequisite_checks", []):
@@ -1402,11 +1422,16 @@ def _failed_task_errors(check: dict[str, Any]) -> list[dict[str, Any]]:
     errors = []
     for item in check.get("task_records", []):
         if item.get("success") is False:
+            observation = item.get("task_observation")
             errors.append(
                 {
                     "task_id": item.get("task_id", ""),
+                    "case_id": f"framework-replay-{item.get('task_id', '')}",
+                    "phase": item.get("phase", ""),
                     "failure_class": item.get("failure_class", ""),
                     "stderr_preview": _preview(item.get("stderr", ""), limit=500),
+                    "exception": item.get("exception", {}),
+                    "task_observation": observation if isinstance(observation, dict) else {},
                     "recovery_suggestion": item.get("recovery_suggestion", ""),
                 }
             )
@@ -1560,6 +1585,7 @@ def _implementation_agent_instruction(
             "Write the generated environment only under generated/ with exactly these files: "
             "runtime.py, seed_state.json, verifier.py, surface_descriptor.json, check_replay.py, and build_manifest.yaml.\n"
             "Run at least one local check command against generated/check_replay.py. If it fails, repair the generated files and rerun the check.\n"
+            "Treat input/framework-replay-contract.json and input/failure-packet.json as tool-style observations from the framework check workflow.\n"
             "Write agent-output/candidate_manifest.json after the final passing candidate. The manifest must declare "
             "candidate_dir: generated, generated_files objects with exact path/kind/sha256/source_refs values, "
             "entrypoints, check_commands, and replay_commands. Use the required kind table in input/expected-bundle-layout.md.\n"
@@ -1625,6 +1651,8 @@ def _write_code_agent_workspace_packet(
     }
     for name, artifact in selected_artifacts.items():
         (artifacts_dir / f"{name}.json").write_text(stable_json(artifact), encoding="utf-8")
+    framework_replay_contract = build_framework_replay_contract(selected_artifacts)
+    (input_dir / "framework-replay-contract.json").write_text(stable_json(framework_replay_contract), encoding="utf-8")
     (input_dir / "artifact-index.json").write_text(
         stable_json(
             {
@@ -1636,6 +1664,7 @@ def _write_code_agent_workspace_packet(
                     name: artifact["id"]
                     for name, artifact in selected_artifacts.items()
                 },
+                "framework_replay_contract": "framework-replay-contract.json",
             }
         ),
         encoding="utf-8",
@@ -1674,7 +1703,8 @@ def _code_agent_implementation_brief(context: PipelineContext) -> str:
         f"- required_tasks: {', '.join(task_ids)}\n"
         f"- required_verifiers: {', '.join(verifier_ids)}\n"
         "- required_negative_check: each task verifier must return success=false when required tool actions, state delta, or answer evidence are absent\n\n"
-        "Use input/artifacts/*.json as the source-grounded specification. The generated bundle must be self-contained; "
+        "Use input/framework-replay-contract.json as the machine-readable framework execution contract, and use input/artifacts/*.json as the source-grounded specification. "
+        "The generated bundle must be self-contained; "
         "runtime.py, verifier.py, and check_replay.py must not import repository fixture runtimes. "
         "If you use internal helper classes, still expose the required runtime entrypoint class and helper functions exactly as listed above.\n"
     )
@@ -1746,7 +1776,8 @@ def _code_agent_acceptance_checks(context: PipelineContext | None = None) -> str
         "5. `agent-output/candidate_manifest.json` declares `candidate_dir: generated` and a `generated_files` object for each required file.\n"
         "6. Each `generated_files[]` item declares exact `path`, exact `kind` from the required manifest kind table, lowercase 64-character `sha256`, and `source_refs`.\n"
         "7. The framework independent verifier can import `runtime.py`, instantiate the required runtime class with `trace_path`, call helper functions, find every required method, read JSONL tool traces, and call `verifier.verify_task_completion` with framework kwargs.\n"
-        "8. On a repair attempt, read `input/failure-packet.json` and address the listed failure class, failed task/verifier, and command output without changing the manifest path shape unless the failure is a manifest/path/hash failure.\n"
+        "8. `input/framework-replay-contract.json` describes the framework-owned replay cases and check command; generated code must satisfy that contract.\n"
+        "9. On a repair attempt, read `input/failure-packet.json` and address the listed framework_check_observation, failed task/verifier, and command output without changing the manifest path shape unless the failure is a manifest/path/hash failure.\n"
     )
 
 

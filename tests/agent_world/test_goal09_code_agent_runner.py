@@ -50,6 +50,16 @@ def test_goal09_code_agent_runner_writes_workspace_checks_and_releases_bundle(tm
         "write_candidate_manifest",
     ]
     assert (workspace / "input" / "implementation-brief.md").is_file()
+    replay_contract = json.loads((workspace / "input" / "framework-replay-contract.json").read_text(encoding="utf-8"))
+    assert replay_contract["schema_version"] == "agent-world.framework-replay-contract.v1"
+    assert replay_contract["environment_id"] == "project-board-lite"
+    assert replay_contract["candidate_dir"] == "generated"
+    assert replay_contract["runtime_contract"]["entrypoint"] == "runtime.ProjectBoardLite"
+    assert replay_contract["runtime_contract"]["constructor"]["kwargs"] == ["trace_path", "task_id", "call_group"]
+    assert replay_contract["manifest_contract"]["generated_file_kinds"]["runtime.py"] == "runtime_code"
+    assert {case["task_id"] for case in replay_contract["replay_cases"]} == {"pb-task-1", "pb-task-2", "pb-task-3"}
+    assert replay_contract["replay_cases"][0]["expected_dependency_path"]
+    assert replay_contract["framework_check"]["kind"] == "framework_owned_candidate_check"
     brief_text = (workspace / "input" / "implementation-brief.md").read_text(encoding="utf-8")
     assert "required_runtime_entrypoint: runtime.ProjectBoardLite" in brief_text
     assert "required_runtime_constructor: __init__(state, trace_path=None, task_id=None, call_group=None)" in brief_text
@@ -57,6 +67,7 @@ def test_goal09_code_agent_runner_writes_workspace_checks_and_releases_bundle(tm
     assert "required_trace_jsonl" in brief_text
     assert "surface_trace_path" in brief_text
     assert "framework_replay_expectation" in brief_text
+    assert "input/framework-replay-contract.json" in brief_text
     assert (workspace / "input" / "expected-bundle-layout.md").is_file()
     layout_text = (workspace / "input" / "expected-bundle-layout.md").read_text(encoding="utf-8")
     acceptance_text = (workspace / "input" / "acceptance-checks.md").read_text(encoding="utf-8")

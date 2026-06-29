@@ -7,9 +7,12 @@ import inspect
 import json
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
+
+from agent_world.replay_contract import exception_payload, observation_from_independent_report
 
 
 def default_project_board_tasks() -> list[dict[str, Any]]:
@@ -193,41 +196,34 @@ def verify_project_board_generated_bundle_independent(
         if not all(item["passed"] for item in prereq_checks):
             raise RuntimeError("generated bundle prerequisite checks failed")
         for task in tasks:
-            record = _verify_task(
-                task,
-                runtime_class=runtime_class,
-                reset_environment=reset_environment,
-                verifier_fn=verifier_fn,
-                seed=seed,
-            )
+            try:
+                record = _verify_task(
+                    task,
+                    runtime_class=runtime_class,
+                    reset_environment=reset_environment,
+                    verifier_fn=verifier_fn,
+                    seed=seed,
+                )
+            except Exception as exc:
+                record = _task_exception_record(
+                    "project-board-lite",
+                    task["task_id"],
+                    exception_payload(exc, phase="task_replay", traceback_text=traceback.format_exc()),
+                    phase="task_replay",
+                )
             task_records.append(record)
             if record.get("unsupported"):
                 unsupported_task_ids.append(record["task_id"])
     except Exception as exc:
+        exc_info = exception_payload(exc, phase="prerequisite", traceback_text=traceback.format_exc())
         if not prereq_checks:
-            prereq_checks.append(_check("independent_verifier_prerequisites", False, {"error": f"{exc.__class__.__name__}: {exc}"}))
+            failed = _check("independent_verifier_prerequisites", False, {"error": f"{exc.__class__.__name__}: {exc}"})
+            failed["exception"] = exc_info
+            prereq_checks.append(failed)
         for task in tasks:
             if any(record.get("task_id") == task["task_id"] for record in task_records):
                 continue
-            task_records.append(
-                {
-                    "check_id": f"project-board-independent-{task['task_id']}",
-                    "success": False,
-                    "status": "fail",
-                    "verifier_kind": "framework_independent_generated_bundle",
-                    "environment_id": "project-board-lite",
-                    "task_id": task["task_id"],
-                    "command": "framework import runtime.py/verifier.py and execute generated runtime",
-                    "exit_code": None,
-                    "stdout": "",
-                    "stderr": f"{exc.__class__.__name__}: {exc}",
-                    "positive_verifier_result": {},
-                    "negative_verifier_result": {},
-                    "framework_evidence": {"prerequisite_checks": prereq_checks},
-                    "failure_class": "independent_verifier_prerequisite_failed",
-                    "recovery_suggestion": "Fix generated runtime.py, verifier.py, seed_state.json, or check_replay.py before release.",
-                }
-            )
+            task_records.append(_task_exception_record("project-board-lite", task["task_id"], exc_info, phase="prerequisite", prerequisite_checks=prereq_checks))
     finally:
         sys.path[:] = original_path
         for name, previous in original_modules.items():
@@ -248,7 +244,7 @@ def verify_project_board_generated_bundle_independent(
     else:
         failure_class = "independent_generated_bundle_verification_failed"
         recovery = "Regenerate or repair the generated bundle so runtime, verifier, seed, and task evidence pass independently."
-    return {
+    report = {
         "check_id": "project-board-independent-generated-bundle-verifier",
         "success": success,
         "status": "pass" if success else "fail",
@@ -266,6 +262,8 @@ def verify_project_board_generated_bundle_independent(
         "failure_class": failure_class,
         "recovery_suggestion": recovery,
     }
+    report["framework_check_observation"] = observation_from_independent_report(report, candidate_dir=build_dir)
+    return report
 
 
 def verify_booking_generated_bundle_independent(
@@ -317,41 +315,34 @@ def verify_booking_generated_bundle_independent(
         if not all(item["passed"] for item in prereq_checks):
             raise RuntimeError("generated bundle prerequisite checks failed")
         for task in tasks:
-            record = _verify_booking_task(
-                task,
-                runtime_class=runtime_class,
-                reset_environment=reset_environment,
-                verifier_fn=verifier_fn,
-                seed=seed,
-            )
+            try:
+                record = _verify_booking_task(
+                    task,
+                    runtime_class=runtime_class,
+                    reset_environment=reset_environment,
+                    verifier_fn=verifier_fn,
+                    seed=seed,
+                )
+            except Exception as exc:
+                record = _task_exception_record(
+                    "booking-service-lite",
+                    task["task_id"],
+                    exception_payload(exc, phase="task_replay", traceback_text=traceback.format_exc()),
+                    phase="task_replay",
+                )
             task_records.append(record)
             if record.get("unsupported"):
                 unsupported_task_ids.append(record["task_id"])
     except Exception as exc:
+        exc_info = exception_payload(exc, phase="prerequisite", traceback_text=traceback.format_exc())
         if not prereq_checks:
-            prereq_checks.append(_check("independent_verifier_prerequisites", False, {"error": f"{exc.__class__.__name__}: {exc}"}))
+            failed = _check("independent_verifier_prerequisites", False, {"error": f"{exc.__class__.__name__}: {exc}"})
+            failed["exception"] = exc_info
+            prereq_checks.append(failed)
         for task in tasks:
             if any(record.get("task_id") == task["task_id"] for record in task_records):
                 continue
-            task_records.append(
-                {
-                    "check_id": f"booking-independent-{task['task_id']}",
-                    "success": False,
-                    "status": "fail",
-                    "verifier_kind": "framework_independent_generated_bundle",
-                    "environment_id": "booking-service-lite",
-                    "task_id": task["task_id"],
-                    "command": "framework import runtime.py/verifier.py and execute generated runtime",
-                    "exit_code": None,
-                    "stdout": "",
-                    "stderr": f"{exc.__class__.__name__}: {exc}",
-                    "positive_verifier_result": {},
-                    "negative_verifier_result": {},
-                    "framework_evidence": {"prerequisite_checks": prereq_checks},
-                    "failure_class": "independent_verifier_prerequisite_failed",
-                    "recovery_suggestion": "Fix generated runtime.py, verifier.py, seed_state.json, or check_replay.py before release.",
-                }
-            )
+            task_records.append(_task_exception_record("booking-service-lite", task["task_id"], exc_info, phase="prerequisite", prerequisite_checks=prereq_checks))
     finally:
         sys.path[:] = original_path
         for name, previous in original_modules.items():
@@ -372,7 +363,7 @@ def verify_booking_generated_bundle_independent(
     else:
         failure_class = "independent_generated_bundle_verification_failed"
         recovery = "Regenerate or repair the generated booking bundle so runtime, verifier, seed, and task evidence pass independently."
-    return {
+    report = {
         "check_id": "booking-independent-generated-bundle-verifier",
         "success": success,
         "status": "pass" if success else "fail",
@@ -390,6 +381,8 @@ def verify_booking_generated_bundle_independent(
         "failure_class": failure_class,
         "recovery_suggestion": recovery,
     }
+    report["framework_check_observation"] = observation_from_independent_report(report, candidate_dir=build_dir)
+    return report
 
 
 def verify_library_generated_bundle_independent(
@@ -441,41 +434,34 @@ def verify_library_generated_bundle_independent(
         if not all(item["passed"] for item in prereq_checks):
             raise RuntimeError("generated bundle prerequisite checks failed")
         for task in tasks:
-            record = _verify_library_task(
-                task,
-                runtime_class=runtime_class,
-                reset_environment=reset_environment,
-                verifier_fn=verifier_fn,
-                seed=seed,
-            )
+            try:
+                record = _verify_library_task(
+                    task,
+                    runtime_class=runtime_class,
+                    reset_environment=reset_environment,
+                    verifier_fn=verifier_fn,
+                    seed=seed,
+                )
+            except Exception as exc:
+                record = _task_exception_record(
+                    "library-lending-lite",
+                    task["task_id"],
+                    exception_payload(exc, phase="task_replay", traceback_text=traceback.format_exc()),
+                    phase="task_replay",
+                )
             task_records.append(record)
             if record.get("unsupported"):
                 unsupported_task_ids.append(record["task_id"])
     except Exception as exc:
+        exc_info = exception_payload(exc, phase="prerequisite", traceback_text=traceback.format_exc())
         if not prereq_checks:
-            prereq_checks.append(_check("independent_verifier_prerequisites", False, {"error": f"{exc.__class__.__name__}: {exc}"}))
+            failed = _check("independent_verifier_prerequisites", False, {"error": f"{exc.__class__.__name__}: {exc}"})
+            failed["exception"] = exc_info
+            prereq_checks.append(failed)
         for task in tasks:
             if any(record.get("task_id") == task["task_id"] for record in task_records):
                 continue
-            task_records.append(
-                {
-                    "check_id": f"library-independent-{task['task_id']}",
-                    "success": False,
-                    "status": "fail",
-                    "verifier_kind": "framework_independent_generated_bundle",
-                    "environment_id": "library-lending-lite",
-                    "task_id": task["task_id"],
-                    "command": "framework import runtime.py/verifier.py and execute generated runtime",
-                    "exit_code": None,
-                    "stdout": "",
-                    "stderr": f"{exc.__class__.__name__}: {exc}",
-                    "positive_verifier_result": {},
-                    "negative_verifier_result": {},
-                    "framework_evidence": {"prerequisite_checks": prereq_checks},
-                    "failure_class": "independent_verifier_prerequisite_failed",
-                    "recovery_suggestion": "Fix generated runtime.py, verifier.py, seed_state.json, or check_replay.py before release.",
-                }
-            )
+            task_records.append(_task_exception_record("library-lending-lite", task["task_id"], exc_info, phase="prerequisite", prerequisite_checks=prereq_checks))
     finally:
         sys.path[:] = original_path
         for name, previous in original_modules.items():
@@ -496,7 +482,7 @@ def verify_library_generated_bundle_independent(
     else:
         failure_class = "independent_generated_bundle_verification_failed"
         recovery = "Regenerate or repair the generated library bundle so runtime, verifier, seed, and task evidence pass independently."
-    return {
+    report = {
         "check_id": "library-independent-generated-bundle-verifier",
         "success": success,
         "status": "pass" if success else "fail",
@@ -514,6 +500,8 @@ def verify_library_generated_bundle_independent(
         "failure_class": failure_class,
         "recovery_suggestion": recovery,
     }
+    report["framework_check_observation"] = observation_from_independent_report(report, candidate_dir=build_dir)
+    return report
 
 
 def _normalise_tasks(accepted_tasks: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -950,7 +938,13 @@ def _call_verifier(
         }
         result = verifier_fn(task_id, copy.deepcopy(initial), copy.deepcopy(final), **filtered)
     except Exception as exc:
-        return {"task_id": task_id, "success": False, "checks": [{"name": "verifier_exception", "passed": False, "detail": f"{exc.__class__.__name__}: {exc}"}]}
+        exc_info = exception_payload(exc, phase="call_verifier", traceback_text=traceback.format_exc())
+        return {
+            "task_id": task_id,
+            "success": False,
+            "checks": [{"name": "verifier_exception", "passed": False, "detail": f"{exc.__class__.__name__}: {exc}"}],
+            "exception": exc_info,
+        }
     if not isinstance(result, dict):
         return {"task_id": task_id, "success": False, "checks": [{"name": "verifier_result_is_object", "passed": False, "detail": type(result).__name__}]}
     result.setdefault("task_id", task_id)
@@ -1121,6 +1115,59 @@ def _non_target_cards_preserved(initial: dict[str, Any], final: dict[str, Any], 
     initial_cards = {card["id"]: card for card in initial.get("card", []) if card.get("id") not in target_ids}
     final_cards = {card["id"]: card for card in final.get("card", []) if card.get("id") not in target_ids}
     return initial_cards == final_cards
+
+
+def _task_exception_record(
+    environment_id: str,
+    task_id: str,
+    exc_info: dict[str, Any],
+    *,
+    phase: str,
+    prerequisite_checks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    prefix = {
+        "project-board-lite": "project-board",
+        "booking-service-lite": "booking",
+        "library-lending-lite": "library",
+    }.get(environment_id, environment_id)
+    observation = {
+        "task_id": task_id,
+        "case_id": f"framework-replay-{task_id}",
+        "success": False,
+        "phase": phase,
+        "failure_class": "independent_task_replay_exception" if phase != "prerequisite" else "independent_verifier_prerequisite_failed",
+        "expected": {},
+        "actual": {},
+        "positive_verifier_result": {},
+        "negative_verifier_result": {},
+        "trace_evidence": {},
+        "state_or_answer_evidence": {},
+        "exception": exc_info,
+        "recovery_suggestion": "Fix generated runtime.py, verifier.py, seed_state.json, or check_replay.py before release.",
+    }
+    stderr = f"{exc_info.get('type', 'Exception')}: {exc_info.get('message', '')}"
+    if exc_info.get("traceback"):
+        stderr = f"{stderr}\n{exc_info['traceback']}"
+    return {
+        "check_id": f"{prefix}-independent-{task_id}",
+        "success": False,
+        "status": "fail",
+        "verifier_kind": "framework_independent_generated_bundle",
+        "environment_id": environment_id,
+        "task_id": task_id,
+        "phase": phase,
+        "command": "framework import runtime.py/verifier.py and execute generated runtime",
+        "exit_code": None,
+        "stdout": "",
+        "stderr": stderr,
+        "positive_verifier_result": {},
+        "negative_verifier_result": {},
+        "framework_evidence": {"prerequisite_checks": prerequisite_checks or []},
+        "exception": exc_info,
+        "task_observation": observation,
+        "failure_class": observation["failure_class"],
+        "recovery_suggestion": observation["recovery_suggestion"],
+    }
 
 
 def _check(name: str, passed: bool, detail: Any) -> dict[str, Any]:

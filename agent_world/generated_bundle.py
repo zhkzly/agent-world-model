@@ -140,6 +140,7 @@ def run_packaged_generated_bundle_check(package_dir: Path) -> dict[str, Any]:
             "negative_verifier_result": parsed.get("negative_verifier_result", {}),
         },
         "independent_verification_record": independent,
+        "framework_check_observation": independent.get("framework_check_observation", {}),
         "independent_task_records": independent.get("task_records", []),
         "positive_verifier_result": _first_task_result(independent, "positive_verifier_result") or parsed.get("positive_verifier_result", {}),
         "negative_verifier_result": _first_task_result(independent, "negative_verifier_result") or parsed.get("negative_verifier_result", {}),

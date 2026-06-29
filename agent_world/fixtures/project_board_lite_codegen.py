@@ -262,6 +262,7 @@ def check_project_board_generated_bundle(
         "stderr": generated_check.get("stderr", ""),
         "generated_check_record": generated_check,
         "independent_verification_record": independent,
+        "framework_check_observation": independent.get("framework_check_observation", {}),
         "independent_task_records": independent.get("task_records", []),
         "positive_verifier_result": positive,
         "negative_verifier_result": negative,

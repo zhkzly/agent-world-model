@@ -182,6 +182,20 @@ Goal 07-10 的 generated bundle gate 会执行 generated `check_replay.py`，但
 
 下一步如果继续推进 live runner 质量，应优先做两件事：把 independent verifier replay contract 抽成更机器可读的 `input/framework-replay-contract.json`，并提供一个 runner 可本地执行的 framework-owned preflight command，而不是让 agent 只靠自然语言 brief 推断 replay shape。
 
+### 12. 可执行 verifier feedback workflow
+
+用户进一步强调：环境生成不是一次代码生成调用，而是多层 workflow。外层是 S0-S11 的 request/source/spec/task/surface/verifier/package/release workflow；中层是 code-agent implementation 和 bounded repair workflow；内层是 framework-owned executable verifier/check observation workflow。代码必须经过执行，失败必须形成可喂回 agent 的 observation，最终 release 权仍属于框架。
+
+当前已补齐的机制：
+
+- code-agent runner workspace 现在写入 `input/framework-replay-contract.json`。该文件由已接受 artifacts 和 verifier strategy knowledge 生成，包含 runtime entrypoint、constructor、helpers、required methods、verifier kwargs、trace contract、manifest kind mapping 和 replay cases。
+- 新增 framework-owned candidate check API / module：`agent_world.candidate_check.check_generated_candidate()`，可对 generated candidate import/execute independent verifier，并返回 JSON-compatible `framework_check_observation`。
+- independent verifier report 增加 `framework_check_observation`，包含 schema version、environment_id、failed_task_ids、prerequisite/task observations、expected/actual evidence、exception type/message/traceback。
+- bounded repair packet 现在携带 `framework_check_observation`，并继续保留相对 candidate paths/hashes 和 manifest contract，便于下一轮 Codex/code-agent 把它当作 tool-call observation 修复 generated bundle。
+- generated `check_replay.py` 仍只是辅助证据；伪造 success stdout 仍会被 framework independent verifier 拒绝。
+
+这不表示已经完成任意领域 verifier synthesis，也不表示 live Codex 默认能稳定发布 booking-service-lite。它表示 implementation 阶段从“自然语言 brief + 失败摘要”推进为“机器可读 replay contract + 框架执行检查 + 结构化失败 observation + bounded repair”的多层 workflow。
+
 ## 当前真实性等级
 
 截至 Goal 12：
