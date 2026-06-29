@@ -405,7 +405,7 @@ envpkg/
 - package-relative check/replay command
 - consumer contract
 
-新增 `run_packaged_generated_bundle_check(package_dir)` 作为最小 downstream consumer：它依赖 package 内 runtime index，同时执行 packaged `check_replay.py` 和框架侧 independent verifier；对于 `project-board-lite`，independent verifier 会直接加载 package 内 `runtime.py`、`verifier.py`、`seed_state.json` 并覆盖所有 accepted tasks 的正反记录。这样 generated environment 不再只存在于临时 build workdir，而是有了 package 内稳定调用入口，并且不只信任 generated check 的 stdout 自报。
+新增 `run_packaged_generated_bundle_check(package_dir)` 作为最小 downstream consumer：它依赖 package 内 runtime index，同时执行 packaged `check_replay.py` 和框架侧 independent verifier。对 request-generated bundle，independent verifier 会直接加载 package 内 `runtime.py`、`verifier.py`、`seed_state.json`，按 `TaskSet.framework_replay.tool_calls` 覆盖 accepted tasks 的正反记录。这样 generated environment 不再只存在于临时 build workdir，而是有了 package 内稳定调用入口，并且不只信任 generated check 的 stdout 自报。
 
 ### 7.7 当前阶段判断：Independent verifier 与 bounded repair loop 已接入
 
@@ -417,42 +417,40 @@ Goal 11 修正了两个 release 真实性问题：
 当前实现边界：
 
 - `agent_world.independent_verifier` 是框架侧 verifier，不属于 generated bundle。
-- 对 `project-board-lite`，它直接 import generated `runtime.py` / `verifier.py`，加载 `seed_state.json`，检查 runtime/verifier entrypoints、runtime tool methods 和 `check_replay.py` 结构 sanity。
-- 对 release accepted tasks，`pb-task-1`、`pb-task-2`、`pb-task-3` 都会产生独立 positive/negative task records；未覆盖或 unsupported task 会阻止 release。
+- 对 request-generated bundle，它直接 import generated `runtime.py` / `verifier.py`，加载 `seed_state.json`，检查 runtime/verifier entrypoints、runtime tool methods 和 `check_replay.py` 结构 sanity。
+- 对 release accepted tasks，通用 verifier 根据 `TaskSet.framework_replay.tool_calls` 执行工具调用，检查 trace 顺序、state/answer evidence，并产生独立 positive/negative task records；未覆盖或 unsupported task 会阻止 release。
 - 伪造只打印 success JSON 的 `check_replay.py` 会被拒绝。
 - 每次 agent implementation attempt 都记录 `AgentInvocationRecord`、candidate paths/file hashes、check/replay records；失败 attempt 生成包含 failure class、failed task/verifier、command、exit code、stdout/stderr preview、manifest/path/hash/check failure 的 failure packet。
 - repair loop 由 `PipelineRunner` 控制，agent 只接收 failure packet 并生成下一候选；agent 不能决定跳过 gate 或进入 release。
 
-这仍不等于通用 verifier synthesis，也不等于通用 code-agent 质量保证。当前 independent verifier 仍是 `project-board-lite` generated bundle 的框架侧实现，后续应提炼成可配置的 generated bundle verification strategy。
+这仍不等于高质量通用 verifier synthesis，也不等于 live code-agent 质量保证。当前已完成的是 contract-driven generic generated bundle verification：框架能执行上游 artifacts 生成的 replay contract，并把失败 observation 喂给 bounded repair。
 
 仍未完成的是通用 rollout/online adapter：当前只是 package-relative check consumer，不是任意 policy rollout，也不是 verl/GRPO trainer 集成。下一步应基于 runtime index 读取 `TaskSet`、加载 runtime/verifier entrypoints、执行外部 policy action，并产出 rollout/reward records。
 
-### 7.8 当前阶段判断：Request-driven generation pipeline 已接入两条探针路径
+### 7.8 当前阶段判断：Request-driven generation pipeline 已泛化为 agent-backed path
 
-用户最终要的不是“手动选择一个已注册 fixture registry 后完整跑通”，而是输入一个新环境需求后，系统自动生成对应环境。Goal 12 已接入 request-driven 验收路径，并新增第二个全新场景探针：
+用户最终要的不是“手动选择一个已注册 fixture registry 后完整跑通”，而是输入一个新环境需求后，系统自动生成对应环境。当前 request-driven 入口已经从 booking/library 探针改为通用 artifact path：
 
 ```text
-raw_request = 生成一个订票服务环境
-release.environment_id = booking-service-lite
-
-raw_request = 生成一个图书馆借阅管理环境
-release.environment_id = library-lending-lite
+raw_request = 任意非空环境需求
+release.environment_id = env-<request-derived-slug>-<hash>
 ```
 
 当前实现边界：
 
-- `DomainPlan` 从 `PipelineRunConfig.raw_request` 识别 booking/ticket/reservation/seat/payment/cancel 等订票意图，或 library/book/loan/borrow/return/fine 等借阅意图，得到对应 `domain_seed`。
-- `StrategySelection` 自动选择对应 source discovery、extraction/synthesis、implementation、independent verifier 和 package/check strategy。
-- `request_driven_node_registry()` / `run_request_driven_pipeline()` 是 request-driven 入口；未新增手动 `booking_service_lite_node_registry()` 或 `library_lending_lite_node_registry()`。
-- Source planning/discovery 会在 pipeline store 下写本地 PRD/schema/CLI source packet，并通过 `LocalSourceConnector` 进入 `SourceEvidenceIndex`。
-- S2-S7 从 source evidence / `KnowledgePack` 派生 `EnvironmentSpec`、`LogicalToolGraph`、`TaskSet`、`SurfacePlan` 和 `VerifierPlan`。
-- IMPLEMENT 根据 `ImplementationRequest` 写出 generated bundle，并由 generated check 与 framework-owned independent verifier 同时验证。
-- `IndependentVerificationReport` 覆盖对应领域任务的 positive/negative records；伪造只打印 success 的 `check_replay.py` 会被拒绝。
+- `DomainPlan` 从 `PipelineRunConfig.raw_request` 派生 environment id、recognized concepts、state objects 和 operations，不再依赖 booking/library/project-board 等领域词表。
+- `StrategySelection` 自动选择 raw-request source discovery、generic extraction/synthesis、agent-generated bundle、generic independent verifier 和 generated-runtime package strategy。
+- `request_driven_node_registry()` / `run_request_driven_pipeline()` 是 request-driven 入口；success path 不要求调用方手动选择领域 registry。
+- Source planning/discovery 会在 pipeline store 下写 raw request source，并合并显式传入的本地 source paths，形成带 hash/license/auth/network/security note 的 `SourceEvidenceIndex`。
+- S2-S7 从 source evidence / `KnowledgePack` 派生 `EnvironmentSpec`、`LogicalToolGraph`、`TaskSet`、`SurfacePlan`、`VerifierPlan` 和每个 task 的 `framework_replay.tool_calls`。
+- IMPLEMENT 强制使用 `AgentBackend`。如果 request-driven run 仍走 deterministic mode，只会返回 `agent_backend_required`，不会产生 release。
+- Agent 生成的 bundle 必须包含 `runtime.py`、`seed_state.json`、`verifier.py`、`surface_descriptor.json`、`check_replay.py`、`build_manifest.yaml`，并由 generated self-check 与 framework-owned generic independent verifier 同时验证。
+- `IndependentVerificationReport` 覆盖 accepted tasks 的 positive/negative records；伪造只打印 success 的 `check_replay.py` 会被拒绝。
 - 每个阶段 artifact 都记录上游 inputs/consumed_inputs 与 producer/produced_by；`ReleaseManifest.request_lineage` 可追溯 raw request/domain plan -> source evidence -> task/verifier plan -> implementation request -> generated bundle -> independent verifier report。
 - Source failure 会写 failure packet 并停止在 release 前；agent implementation failure 继续进入 bounded repair loop，达到上限仍失败时不生成 S10/S11 release。
-- 手动 `project_board_lite_node_registry()` 加 booking raw request 仍会发布 `project-board-lite`，但测试明确证明这不是 Goal 12 成功路径。
+- 手动 `project_board_lite_node_registry()` 加任意 raw request 仍会发布 `project-board-lite`，但测试明确证明这不是 request-driven success path。
 
-Goal 12 仍不表示一次支持任意所有领域、真实网络 crawler、真实 trainer 或全 surface 发布。下一步应把 booking/library keyword planner、source packet generator、synthesis strategy 和 verifier strategy 继续提炼成更通用的 request-driven strategy 体系。
+当前仍不表示真实网络 crawler、真实 trainer、全 surface 发布，或 live code agent 默认能稳定产出高质量环境。下一步应提升 source-grounded extraction/synthesis 和 implementation brief/replay contract 质量，而不是新增手动领域 registry。
 
 ## 8. 第一实现切片冻结
 

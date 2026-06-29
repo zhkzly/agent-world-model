@@ -1,10 +1,10 @@
 # Goal 12: Request-Driven Environment Generation Pipeline
 
-当前实现状态：已接入两条 request-driven probe path。`run_request_driven_pipeline()` / `request_driven_node_registry()` 会从 booking/ticket/reservation raw_request 生成 `booking-service-lite`，也会从 library/book/loan/borrow/return/fine raw_request 生成 `library-lending-lite`。两条路径都会自动推进 `DomainPlan`、`StrategySelection`、source packet discovery、source-grounded S0-S11、generated backend/runtime bundle、framework-owned independent verifier、bounded repair 和 package release。这不是通用任意领域生成，也不是 live crawler/trainer 集成。
+当前实现状态：本文的 booking/library probe 验收已经被后续 Trellis task 修正。`run_request_driven_pipeline()` / `request_driven_node_registry()` 现在走通用 request-driven artifact path：任意非空 `raw_request` 会派生 environment id、source evidence、knowledge pack、tools、tasks、surface plan、verifier plan、machine-readable replay contract，并强制由 `AgentBackend` 写 generated runtime bundle；framework 再执行 generated self-check、generic independent verifier、bounded repair 和 package release。booking/library 内容只作为历史背景保留，不再是当前完成标准。
 
-阅读方式：本文前半保留 Goal 12 的目标和验收要求，顶部“当前实现状态”和末尾“完成后的真实状态”记录已经完成的事实。Goal 12 的核心不是新增 booking 脚本，而是让用户输入环境需求后，系统自动选择/构造领域流水线并发布可执行环境包。
+阅读方式：本文前半保留 Goal 12 当时的目标和验收要求，其中 booking/library 条目是历史验收探针；当前事实以本文顶部、`docs/project-progress-and-corrections.zh.md` 和 `docs/agent-world-environment-generation.zh.md` 的最新阶段判断为准。Goal 12 的核心不是新增 booking 脚本，而是让用户输入环境需求后，系统自动构造流水线并发布可执行环境包。
 
-订票服务只是第一条验收输入，不是 Goal 12 的架构目标。图书馆借阅管理是第二条 request-driven 探针，用来验证新场景文本不会继续落回旧领域。Goal 12 不能通过新增一个手动调用的领域 registry 然后生成第三个 fixture 来完成。
+订票服务只是当时第一条验收输入，不是架构目标。后续修正已经删除 request-driven success path 里的 booking/library 硬编码，不能再通过新增手动领域 registry 或新增固定探针来宣称完成。
 
 ## 背景
 
@@ -286,17 +286,16 @@ Goal 12 应提炼 verifier strategy 边界：
 
 ## 完成后的真实状态
 
-Goal 12 完成后，可以声称：
+Goal 12 及后续修正完成后，可以声称：
 
-- 项目具备 request-driven environment generation pipeline 的已注册探针路径。
-- 用户只提供 booking raw_request 时，系统能通过 planner/selector/source/codegen/verifier/release 路径发布 `booking-service-lite` envpkg。
-- 用户只提供 library lending raw_request 时，系统能通过同一路径发布 `library-lending-lite` envpkg。
-- 订票服务和图书馆借阅管理是验收探针，用来证明 raw_request 能驱动领域选择和生成，而不是手动 fixture 调用。
+- 项目具备 request-driven environment generation pipeline 的通用 artifact path。
+- 用户只提供非空 raw_request 时，系统能通过 planner/selector/source/synthesis/code-agent/verifier/release 路径发布 request-derived envpkg。
+- 成功路径不依赖 booking/library/project-board/support-desk 领域常量、固定任务 ID 或固定 replay cases。
 - 发布产物包含可被 package-relative runtime index 加载的 generated backend/runtime files，并通过 generated check 与 framework independent verifier。
 
 仍不能声称：
 
-- 任意领域都能自动生成。
+- 任意领域都能高质量自动生成。
 - 通用网络 discovery 已完成。
 - 通用 verifier synthesis 已完成。
 - 真实训练框架已接入。

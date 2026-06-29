@@ -17,7 +17,7 @@
 
 这里的“环境”应理解为后端/runtime 代码包：状态转移逻辑、工具 surface、seed/state fixture、任务、verifier、check/replay、release metadata 和后续 consumer 入口。项目目标不是让 agent 每次临场照 prompt 写一遍流程，而是把 source discovery、任务构造、code-agent implementation、验证、repair、package/release 固化成 loop-engineering workflow。LLM/Codex 等 agent 负责显式节点上的搜索、抽取、代码实现、review 或 repair；框架代码负责状态、gate、记录、retry budget 和 release 决策。
 
-当前最重要的缺口已经从“raw_request 不能驱动生成流水线”转为“request-driven probe 已接入两条领域路径，但本项目还不是任意领域自动生成”。`GeneratedEnvironmentBundle` 既能由 deterministic template/codegen 写出并 verified，也能由 `openai_codegen` 从模型返回的 file contents 写入 isolated workdir 后通过同一 gate，还能由 `code_agent_runner` 接收 workspace packet、写 `generated/`、运行 check、输出 manifest 后通过同一 gate。Goal 10 已把 accepted generated bundle 复制进 `envpkg/runtime/generated/<bundle_id>/` 并写 `envpkg/release/generated-runtime-index.yaml`，使后续模块有 package-relative 调用入口。Goal 11 又补上框架侧 independent verifier 与 bounded repair loop。Goal 12 现在新增 request/domain planner、strategy selector、source packet discovery、source-grounded synthesis、generated bundle、independent verifier strategy、package release 和 bounded repair coverage。订票服务 raw request 会发布 `booking-service-lite`；图书馆借阅管理 raw request 会发布 `library-lending-lite`；两者都通过 `run_request_driven_pipeline()` / `request_driven_node_registry()`，不会落回 `project-board-lite`。
+当前最重要的缺口已经从“request-driven 只是两条领域探针”转为“通用 request-driven 生成路径已经跑通，但仍不是任意领域高质量自动生成”。`run_request_driven_pipeline()` 现在从任意非空 `raw_request` 生成 `DomainPlan`、`StrategySelection`、source evidence、`KnowledgePack`、`EnvironmentSpec`、`LogicalToolGraph`、`TaskSet`、`VerifierPlan` 和 `ImplementationRequest`；环境 ID、工具、任务和 replay cases 从请求/source artifact 派生，不再靠 booking/library/project-board 等领域分支。IMPLEMENT 阶段强制走 `AgentBackend`，由 agent 在 isolated workdir 写 `runtime.py`、`seed_state.json`、`verifier.py`、`surface_descriptor.json`、`check_replay.py`、`build_manifest.yaml`，框架再执行 manifest/path/hash/security check、generated self-check、generic framework independent verifier、bounded repair 和 package/release。Goal 10 的 package-relative runtime index 与 Goal 11 的 failure packet / repair loop 仍保留；当前新增的是通用 replay contract 输入和通用 contract-driven independent verifier。
 
 项目默认使用 `uv` 管理 Python 环境和执行验证命令。后续文档、smoke 和测试说明应优先写成 `uv run ...`，除非是在 generated bundle 内描述由 package check 实际执行的命令。
 
@@ -139,22 +139,19 @@ Goal 07-10 的 generated bundle gate 会执行 generated `check_replay.py`，但
 - bounded repair loop 只负责 implementation node 的受控反馈，不负责 source discovery、task synthesis 或 trainer/rollout 修复。
 - 默认测试仍使用 fake/model fixture 或本地 runner fixture；live Codex/Claude/mini-swe-agent 仍需显式配置和权限。
 
-### 9. raw_request 不能驱动新领域生成
+### 9. raw_request 不能真正驱动通用生成
 
-该偏差已在 Goal 12 中纠正第一条验收路径。原问题是：调用方手动选择 `project_board_lite_node_registry()` 并传入订票服务 raw request 时，pipeline 会发布 `project-board-lite`，说明 raw_request 只进入 `NeedSpec.goal`，不会驱动领域选择、source planning、task/verifier/codegen。
+该偏差已在当前 Trellis task 中进一步纠正。上一版 Goal 12 虽然让 raw request 不再落回 `project-board-lite`，但仍通过 booking/library 领域词表、source packet、task IDs、replay cases 和 independent verifier 分支完成，不能算“全自动生成”。
 
 纠正：
 
-- 新增 `DomainPlan` artifact，由 `PipelineRunConfig.raw_request` 识别 booking/ticket/reservation/seat/payment/cancel 等意图并得到 `domain_seed=booking-service-lite`。
-- 新增 `StrategySelection` artifact，自动选择 booking source discovery、extraction/synthesis、implementation、independent verifier 和 package/check strategy。
-- 新增 `request_driven_node_registry()` 与 `run_request_driven_pipeline()`；成功路径不要求调用方选择 booking registry，也未新增 `booking_service_lite_node_registry()`。
-- S0-S11 artifacts 均记录 `inputs` / `consumed_inputs` 与 `producer` / `produced_by`，ReleaseManifest 增加 request lineage：raw request/domain plan -> source evidence -> task/verifier plan -> implementation request -> generated bundle -> independent verifier report。
-- Booking source strategy 会在 pipeline store 下写 PRD/schema/CLI source packet，再由 `LocalSourceConnector` 生成 `SourceEvidenceIndex`；S2-S7 从该 evidence/KnowledgePack 派生。
-- Booking generated bundle 包含 `runtime.py`、`seed_state.json`、`verifier.py`、`surface_descriptor.json`、`check_replay.py`、`build_manifest.yaml`，并进入 `envpkg/runtime/generated/<bundle_id>/`。
-- `IndependentVerificationReport` 覆盖 `booking-task-1`、`booking-task-2`、`booking-task-3` 的 positive/negative records，package-level check 也通过 strategy dispatcher 调用 booking independent verifier。
-- 伪造只打印 success 的 booking `check_replay.py` 会被 independent verifier 拒绝。
-- Source failure 会写 failure packet 并停止在 release 前；agent implementation failure 继续由 bounded repair loop 重新调用同一 backend，成功/耗尽两条路径均有测试。
-- 手动 `project_board_lite_node_registry()` 加 booking raw request 仍会发布 `project-board-lite`，但新增测试明确证明这不能被误判为 Goal 12 成功。
+- `agent_world.request_driven` 已重写为通用 artifact pipeline：`DomainPlan.domain_seed`、operation IDs、state entities、TaskSet 和 replay cases 从 raw request/source evidence 派生，不包含 booking/library/project-board/support-desk 领域常量。
+- `run_request_driven_pipeline()` 会把 request-driven run 强制切到 `implementation_mode="agent"`；deterministic path 只会返回 `agent_backend_required`，不会偷偷用模板产出 release。
+- `pipeline._run_agent_implementation_attempt()` 只在存在 `DomainPlan` / `StrategySelection` 的 request-driven run 中调用通用 agent candidate handler；旧 support/project fixture 的 agent mode 保持原兼容行为。
+- `input/framework-replay-contract.json` 和 `agent_world.replay_contract` 不再按 environment_id 查硬编码 replay case，而是读取 `TaskSet.framework_replay.tool_calls`，缺省时从 `dependency_path` 派生。
+- `agent_world.independent_verifier` 增加 generic contract verifier：直接加载 generated runtime/verifier/seed，按 accepted tasks 的 replay contract 执行工具调用，检查 trace 顺序、state/answer evidence，并用正反例约束 verifier；旧 fixture 专用 verifier 只作为历史回归路径保留。
+- Goal 12 测试改为任意 incident/runbook raw request，mock code agent 从 artifact JSON 写候选 bundle，框架完成 package/release；伪造 `check_replay.py`、坏 verifier、repair 成功、repair 耗尽和 traceback observation 都被覆盖。
+- 手动 `project_board_lite_node_registry()` 加任意 raw request 仍会发布 `project-board-lite`，测试明确证明这不是 request-driven success。
 
 ### 10. 环境包与训练反馈边界
 
@@ -177,8 +174,8 @@ Goal 07-10 的 generated bundle gate 会执行 generated `check_replay.py`，但
 
 - 多次 live `codex_cli_runner` run 均成功启动真实 Codex CLI，读取 `input/` packet，写 `generated/` 六个文件，并产生 `agent-output/candidate_manifest.json` 与 command log。
 - pipeline 走过 request/domain planner、strategy selector、S0-S9，并进入 implementation/repair gate。
-- 这些 live run 均未进入 S10/S11 release。最终失败仍是 `independent_generated_bundle_verification_failed`；manifest 已合规，剩余问题是 agent 生成的 runtime/verifier 行为没有满足框架侧 replay，例如 framework replay 中出现 `TypeError: unsupported operand type(s) for -: 'NoneType' and 'int'`。
-- 因此当前只能声称“真实 Codex CLI runner path 已接入、可监控、会被 framework gate 拦截错误产物”，不能声称“live Codex 默认能生成并发布 booking-service-lite 环境”。
+- 这些 live run 均未进入 S10/S11 release。最终失败仍是 `independent_generated_bundle_verification_failed`；manifest 已合规，剩余问题是 agent 生成的 runtime/verifier 行为没有满足当时框架侧 replay。
+- 因此当前只能声称“真实 Codex CLI runner path 已接入、可监控、会被 framework gate 拦截错误产物”，不能声称“live Codex 默认能稳定生成并发布任意 request-driven 环境”。
 
 下一步如果继续推进 live runner 质量，应优先做两件事：把 independent verifier replay contract 抽成更机器可读的 `input/framework-replay-contract.json`，并提供一个 runner 可本地执行的 framework-owned preflight command，而不是让 agent 只靠自然语言 brief 推断 replay shape。
 
@@ -194,17 +191,17 @@ Goal 07-10 的 generated bundle gate 会执行 generated `check_replay.py`，但
 - bounded repair packet 现在携带 `framework_check_observation`，并继续保留相对 candidate paths/hashes 和 manifest contract，便于下一轮 Codex/code-agent 把它当作 tool-call observation 修复 generated bundle。
 - generated `check_replay.py` 仍只是辅助证据；伪造 success stdout 仍会被 framework independent verifier 拒绝。
 
-这不表示已经完成任意领域 verifier synthesis，也不表示 live Codex 默认能稳定发布 booking-service-lite。它表示 implementation 阶段从“自然语言 brief + 失败摘要”推进为“机器可读 replay contract + 框架执行检查 + 结构化失败 observation + bounded repair”的多层 workflow。
+这不表示已经完成高质量通用 verifier synthesis，也不表示 live Codex 默认能稳定发布任意 request-driven 环境。它表示 implementation 阶段从“自然语言 brief + 失败摘要”推进为“机器可读 replay contract + 框架执行检查 + 结构化失败 observation + bounded repair”的多层 workflow。
 
 ## 当前真实性等级
 
-截至 Goal 12：
+截至当前 Trellis task：
 
 - `support-desk-lite`: runnable fixture，支持 Python callable、deterministic verifier、release package、replay、rollout/export consumer、online runtime、runtime control CLI、environment CLI 和 HTTP wrapper 回归。
 - `project-board-lite`: 第二 source family，使用本地 CLI help、schema、examples 生成 source-grounded artifacts；deterministic generated bundle 和 agent-backed generated bundle 都必须同时通过 generated check 与 framework independent verifier，覆盖 `pb-task-1`、`pb-task-2`、`pb-task-3` 的正反 records；成功 S11 后复制到 `envpkg/runtime/generated/<bundle_id>/` 供后续模块按 package-relative index 调用。
-- agent backend: 已有 backend-neutral contract、invocation record、mock/manual/process/codex-like slot、真实 `openai_codegen` backend，以及 `code_agent_runner` / `codex_cli_runner` runner path；`openai_codegen` 从模型响应写文件，`code_agent_runner` 使用固定 allowlisted argv 和 `subprocess.run(argv, shell=False)` 调用外部 agent 命令，workspace packet、manifest、command log、trace ref 都可审计，secret 只记录 env var/ref；implementation 失败时框架可按 bounded repair loop 生成 failure packet 并重新调用同一 backend。真实 `codex_cli_runner` 已实跑并可监控，但目前 live booking run 仍被 independent verifier 阻止 release。
+- agent backend: 已有 backend-neutral contract、invocation record、mock/manual/process/codex-like slot、真实 `openai_codegen` backend，以及 `code_agent_runner` / `codex_cli_runner` runner path；`openai_codegen` 从模型响应写文件，`code_agent_runner` 使用固定 allowlisted argv 和 `subprocess.run(argv, shell=False)` 调用外部 agent 命令，workspace packet、manifest、command log、trace ref 都可审计，secret 只记录 env var/ref；implementation 失败时框架可按 bounded repair loop 生成 failure packet 并重新调用同一 backend。真实 `codex_cli_runner` 已实跑并可监控，但 live runner 质量仍取决于模型/提示和 replay contract，不是默认稳定发布能力。
 - training: 只有 dataset-only/export/metadata consumer，不是 verl/LLaMA-Factory/OpenRLHF/TRL 真实训练集成。
-- request-driven generation pipeline: 已完成两条验收探针。订票服务 raw request 发布 `booking-service-lite`，图书馆借阅管理 raw request 发布 `library-lending-lite`；二者都通过 request/domain planner、strategy selector、source packet discovery、source-grounded synthesis、generated bundle、framework independent verifier、bounded repair 和 package release；仍只证明已注册 request-driven strategy path，不证明任意领域自动生成。
+- request-driven generation pipeline: 已从两条领域探针改为通用 artifact path。任意非空 raw request 会产生 request-derived environment id、source evidence、knowledge pack、tools、tasks、surface plan、verifier plan、machine-readable replay contract、agent-generated bundle、generic framework independent verifier records、bounded repair 和 package release。测试使用 incident/runbook 请求证明不再依赖 booking/library/project-board/support-desk 常量。该能力仍只能证明“通用结构和执行闭环跑通”，不等于任意领域语义都高质量，也不等于真实网络 discovery 或 live code agent 默认稳定成功。
 - environment package: 当前 generated environment 已能以 package-relative runtime index 被加载检查；这证明后续模块可以调用 packaged generated backend/runtime，但不等于已实现部署、policy rollout、SFT/GRPO 采样或训练反馈闭环。
 
 当前不能声称：
@@ -215,7 +212,7 @@ Goal 07-10 的 generated bundle gate 会执行 generated `check_replay.py`，但
 - 已经实现通用 code-agent 环境生成质量保证。
 - 已经能从任意 raw_request 动态生成对应新领域。
 - 已经默认跑通 live Codex/Claude/mini-swe-agent。
-- live Codex CLI runner 已能稳定通过 booking-service-lite independent verifier 并发布 release。
+- live Codex CLI runner 已能稳定通过任意 request-driven environment 的 independent verifier 并发布 release。
 - 已经实现通用 rollout/online runtime adapter 读取任意 generated bundle。
 - 已经实现 MCP/HTTP/CLI/Python 全 surface 通用发布。
 - 已经接入真实 RL trainer。
@@ -223,12 +220,12 @@ Goal 07-10 的 generated bundle gate 会执行 generated `check_replay.py`，但
 
 ## 下一优先级
 
-下一 Goal 应优先把 Goal 12 的 request-driven probes 继续泛化，而不是再新增手动领域 registry：
+下一 Goal 应优先提升通用 request-driven path 的语义质量，而不是再新增手动领域 registry：
 
-- 将 request/domain planner 从 booking/library keyword probes 扩展为可配置的 domain/source planning strategy。
-- 把 booking source packet generator 替换或补充为更通用的 local source planner/discovery strategy，仍保持默认不做 live crawler。
-- 将 booking synthesis strategy 中仍然领域专用的 task/verifier/runtime contract 提炼成可配置 schema-driven/codegen inputs。
-- 继续保留 bounded repair loop、AgentBackend、isolated workdir、安全检查、build/check/replay gate 和 independent verifier strategy dispatcher。
+- 把当前 raw-request-only source discovery 扩展为可配置 source planning：本地 PRD/schema/CLI/API docs/repo/MCP/API docs 优先，默认不做 live crawler。
+- 把通用 extraction/synthesis 从简单请求词派生升级为 source-grounded schema/task/verifier synthesis，保持 artifacts 和 replay contract 机器可读。
+- 增强 `ImplementationRequest` 和 `framework-replay-contract.json`，让 live code agent 更容易写出满足 contract 的 runtime/verifier。
+- 继续保留 bounded repair loop、AgentBackend、isolated workdir、安全检查、build/check/replay gate 和 generic independent verifier。
 - 基于 `envpkg/release/generated-runtime-index.yaml` 实现通用 rollout/online adapter：读取 TaskSet，加载 runtime/verifier entrypoints，执行外部 policy action，产出 rollout/reward records。
 - 在通用 rollout/online adapter 稳定后，再设计训练结果反馈到 source/task/verifier/environment generation 的外层 loop。
 - 继续让外部模型/live runner smoke 默认 skip；显式配置时可以用 `AGENT_WORLD_AGENT_BACKEND=openai_codegen` 做最小真实 file-content codegen 检查，或用 `AGENT_WORLD_AGENT_BACKEND=code_agent_runner` / `codex_cli_runner` 做真实 runner 检查。

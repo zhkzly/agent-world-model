@@ -94,6 +94,16 @@ def verify_generated_bundle_independent(
     seed_fixture_ref: str = "seed_state.json",
     check_replay_ref: str = "check_replay.py",
 ) -> dict[str, Any]:
+    if accepted_tasks and _has_framework_replay_tasks(accepted_tasks):
+        return verify_contract_generated_bundle_independent(
+            environment_id,
+            build_dir,
+            accepted_tasks=accepted_tasks,
+            runtime_entrypoint=runtime_entrypoint or "runtime.GeneratedEnvironment",
+            verifier_entrypoint=verifier_entrypoint,
+            seed_fixture_ref=seed_fixture_ref,
+            check_replay_ref=check_replay_ref,
+        )
     if environment_id == "project-board-lite":
         return verify_project_board_generated_bundle_independent(
             build_dir,
@@ -121,25 +131,138 @@ def verify_generated_bundle_independent(
             seed_fixture_ref=seed_fixture_ref,
             check_replay_ref=check_replay_ref,
         )
-    task_ids = [str(task.get("task_id", "")) for task in accepted_tasks or [] if task.get("task_id")]
-    return {
-        "check_id": "unsupported-independent-generated-bundle-verifier",
-        "success": False,
-        "status": "fail",
+    return verify_contract_generated_bundle_independent(
+        environment_id,
+        build_dir,
+        accepted_tasks=accepted_tasks or [],
+        runtime_entrypoint=runtime_entrypoint or "runtime.GeneratedEnvironment",
+        verifier_entrypoint=verifier_entrypoint,
+        seed_fixture_ref=seed_fixture_ref,
+        check_replay_ref=check_replay_ref,
+    )
+
+
+def verify_contract_generated_bundle_independent(
+    environment_id: str,
+    build_dir: Path,
+    *,
+    accepted_tasks: list[dict[str, Any]] | None = None,
+    runtime_entrypoint: str = "runtime.GeneratedEnvironment",
+    verifier_entrypoint: str = "verifier.verify_task_completion",
+    seed_fixture_ref: str = "seed_state.json",
+    check_replay_ref: str = "check_replay.py",
+) -> dict[str, Any]:
+    """Framework-owned generic verifier driven by task replay contracts."""
+    build_dir = Path(build_dir).resolve()
+    tasks = _normalise_contract_tasks(accepted_tasks)
+    prereq_checks: list[dict[str, Any]] = []
+    task_records: list[dict[str, Any]] = []
+    unsupported_task_ids: list[str] = []
+    original_modules = {name: sys.modules.get(name) for name in ["runtime", "verifier"]}
+    original_path = list(sys.path)
+    try:
+        sys.path.insert(0, str(build_dir))
+        runtime_module = _load_named_module("runtime", build_dir / "runtime.py")
+        verifier_module = _load_named_module("verifier", build_dir / "verifier.py")
+        prereq_checks.extend(
+            [
+                _check("runtime_importable", True, {"path": str(build_dir / "runtime.py")}),
+                _check("verifier_importable", True, {"path": str(build_dir / "verifier.py")}),
+            ]
+        )
+        runtime_class = _resolve_entrypoint(runtime_module, runtime_entrypoint, expected_module_name="runtime")
+        verifier_fn = _resolve_entrypoint(verifier_module, verifier_entrypoint, expected_module_name="verifier")
+        load_seed = getattr(runtime_module, "load_seed_state", None)
+        reset_environment = getattr(runtime_module, "reset_environment", None)
+        prereq_checks.extend(
+            [
+                _check("runtime_entrypoint_exists", inspect.isclass(runtime_class), {"entrypoint": runtime_entrypoint}),
+                _check("verifier_entrypoint_exists", callable(verifier_fn), {"entrypoint": verifier_entrypoint}),
+                _check("load_seed_state_exists", callable(load_seed), {"entrypoint": "runtime.load_seed_state"}),
+                _check("reset_environment_exists", callable(reset_environment), {"entrypoint": "runtime.reset_environment"}),
+            ]
+        )
+        seed_path = (build_dir / seed_fixture_ref).resolve()
+        if not _inside(seed_path, build_dir) or not seed_path.is_file():
+            raise FileNotFoundError(seed_path)
+        seed = load_seed(seed_path) if callable(load_seed) else json.loads(seed_path.read_text(encoding="utf-8"))
+        prereq_checks.append(_check("seed_loads", isinstance(seed, dict), {"seed_fixture_ref": seed_fixture_ref}))
+        prereq_checks.extend(_check_replay_static(build_dir / check_replay_ref))
+        prereq_checks.extend(_runtime_tool_checks(runtime_class, tasks, runtime_entrypoint=runtime_entrypoint))
+        if not tasks:
+            prereq_checks.append(_check("accepted_tasks_present", False, {"accepted_task_count": 0}))
+        if not all(item["passed"] for item in prereq_checks):
+            raise RuntimeError("generated bundle prerequisite checks failed")
+        for task in tasks:
+            try:
+                record = _verify_contract_task(
+                    environment_id,
+                    task,
+                    runtime_class=runtime_class,
+                    reset_environment=reset_environment,
+                    verifier_fn=verifier_fn,
+                    seed=seed,
+                )
+            except Exception as exc:
+                record = _task_exception_record(
+                    environment_id,
+                    task["task_id"],
+                    exception_payload(exc, phase="task_replay", traceback_text=traceback.format_exc()),
+                    phase="task_replay",
+                )
+            task_records.append(record)
+            if record.get("unsupported"):
+                unsupported_task_ids.append(record["task_id"])
+    except Exception as exc:
+        exc_info = exception_payload(exc, phase="prerequisite", traceback_text=traceback.format_exc())
+        if not prereq_checks:
+            failed = _check("independent_verifier_prerequisites", False, {"error": f"{exc.__class__.__name__}: {exc}"})
+            failed["exception"] = exc_info
+            prereq_checks.append(failed)
+        for task in tasks:
+            if any(record.get("task_id") == task["task_id"] for record in task_records):
+                continue
+            task_records.append(_task_exception_record(environment_id, task["task_id"], exc_info, phase="prerequisite", prerequisite_checks=prereq_checks))
+    finally:
+        sys.path[:] = original_path
+        for name, previous in original_modules.items():
+            if previous is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = previous
+
+    accepted_task_ids = [task["task_id"] for task in tasks]
+    verified_task_ids = [record["task_id"] for record in task_records if record.get("success") is True]
+    success = all(item["passed"] for item in prereq_checks) and set(verified_task_ids) == set(accepted_task_ids) and bool(accepted_task_ids) and not unsupported_task_ids
+    if success:
+        failure_class = ""
+        recovery = ""
+    elif unsupported_task_ids:
+        failure_class = "unsupported_generated_bundle_task"
+        recovery = "Release is blocked until every accepted task has a framework replay record."
+    else:
+        failure_class = "independent_generated_bundle_verification_failed"
+        recovery = "Regenerate or repair the generated bundle so runtime, verifier, seed, and replay evidence pass independently."
+    report = {
+        "check_id": "contract-independent-generated-bundle-verifier",
+        "success": success,
+        "status": "pass" if success else "fail",
         "verifier_kind": "framework_independent_generated_bundle",
         "environment_id": environment_id,
-        "command": "framework independent verifier strategy selection",
+        "command": "framework import runtime.py/verifier.py/seed_state.json and replay accepted task contracts",
         "exit_code": None,
         "stdout": "",
         "stderr": "",
-        "accepted_task_ids": task_ids,
-        "verified_task_ids": [],
-        "unsupported_task_ids": task_ids,
-        "prerequisite_checks": [],
-        "task_records": [],
-        "failure_class": "unsupported_independent_verifier_strategy",
-        "recovery_suggestion": "Register an independent generated-bundle verifier strategy for this environment.",
+        "accepted_task_ids": accepted_task_ids,
+        "verified_task_ids": verified_task_ids,
+        "unsupported_task_ids": unsupported_task_ids,
+        "prerequisite_checks": prereq_checks,
+        "task_records": task_records,
+        "failure_class": failure_class,
+        "recovery_suggestion": recovery,
     }
+    report["framework_check_observation"] = observation_from_independent_report(report, candidate_dir=build_dir)
+    return report
 
 
 def verify_project_board_generated_bundle_independent(
@@ -546,6 +669,27 @@ def _normalise_library_tasks(accepted_tasks: list[dict[str, Any]] | None) -> lis
     return tasks
 
 
+def _has_framework_replay_tasks(tasks: list[dict[str, Any]]) -> bool:
+    return any(isinstance(task.get("framework_replay"), dict) and task["framework_replay"].get("tool_calls") for task in tasks)
+
+
+def _normalise_contract_tasks(accepted_tasks: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    tasks = []
+    for item in accepted_tasks or []:
+        task = dict(item)
+        if "dependency_path" not in task:
+            task["dependency_path"] = list(task.get("allowed_logical_tool_ids", []))
+        replay = task.get("framework_replay")
+        if not isinstance(replay, dict):
+            replay = {}
+        calls = replay.get("tool_calls")
+        if not isinstance(calls, list) or not calls:
+            calls = [{"tool": tool, "kwargs": {}} for tool in task.get("dependency_path", [])]
+        task["framework_replay"] = {**replay, "tool_calls": calls}
+        tasks.append(task)
+    return tasks
+
+
 def _load_named_module(name: str, path: Path) -> ModuleType:
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -617,6 +761,87 @@ def _runtime_tool_checks(runtime_class: Any, tasks: list[dict[str, Any]], *, run
         )
         for tool in required_tools
     ]
+
+
+def _verify_contract_task(
+    environment_id: str,
+    task: dict[str, Any],
+    *,
+    runtime_class: Any,
+    reset_environment: Callable[[dict[str, Any]], dict[str, Any]],
+    verifier_fn: Callable[..., dict[str, Any]],
+    seed: dict[str, Any],
+) -> dict[str, Any]:
+    task_id = task["task_id"]
+    replay = task.get("framework_replay", {}) if isinstance(task.get("framework_replay"), dict) else {}
+    tool_calls = replay.get("tool_calls", [])
+    if not tool_calls:
+        return {
+            "check_id": f"contract-independent-{task_id}",
+            "success": False,
+            "status": "fail",
+            "verifier_kind": "framework_independent_generated_bundle",
+            "environment_id": environment_id,
+            "task_id": task_id,
+            "unsupported": True,
+            "command": "framework import runtime.py/verifier.py and execute replay contract",
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "",
+            "positive_verifier_result": {},
+            "negative_verifier_result": {},
+            "framework_evidence": {},
+            "failure_class": "missing_framework_replay_contract",
+            "recovery_suggestion": "Task must include framework_replay.tool_calls or dependency_path-derived calls.",
+        }
+    with tempfile.TemporaryDirectory(prefix="agent-world-contract-independent-verifier-") as td:
+        root = Path(td)
+        positive_trace = root / f"{task_id}-positive.jsonl"
+        initial = reset_environment(seed)
+        final = reset_environment(seed)
+        final_answer = _execute_contract_positive_case(task, runtime_class, final, positive_trace)
+        positive = _call_verifier(verifier_fn, task, initial, final, final_answer, positive_trace, "positive")
+
+        negative_initial = reset_environment(seed)
+        negative_final = reset_environment(seed)
+        negative_trace = root / f"{task_id}-negative.jsonl"
+        negative_answer = _contract_negative_answer(task)
+        negative = _call_verifier(verifier_fn, task, negative_initial, negative_final, negative_answer, negative_trace, "negative")
+
+        trace_tools = _trace_tools(positive_trace, task_id=task_id, call_group="positive")
+        expected_path = list(task.get("dependency_path", [])) or [str(call.get("tool", "")) for call in tool_calls]
+        trace_evidence = {
+            "expected": expected_path,
+            "actual": trace_tools,
+            "success": trace_tools == expected_path,
+            "trace_path": str(positive_trace),
+        }
+        state_evidence = _contract_expected_state_or_answer_evidence(task, initial, final, final_answer)
+    positive_success = positive.get("success") is True
+    negative_success = negative.get("success") is False
+    success = positive_success and negative_success and trace_evidence["success"] and state_evidence["success"]
+    return {
+        "check_id": f"contract-independent-{task_id}",
+        "success": success,
+        "status": "pass" if success else "fail",
+        "verifier_kind": "framework_independent_generated_bundle",
+        "environment_id": environment_id,
+        "task_id": task_id,
+        "command": "framework import runtime.py/verifier.py and execute replay contract",
+        "exit_code": None,
+        "stdout": "",
+        "stderr": "",
+        "positive_verifier_result": positive,
+        "negative_verifier_result": negative,
+        "framework_evidence": {
+            "dependency_trace": trace_evidence,
+            "expected_state_or_answer": state_evidence,
+            "positive_case_success": positive_success,
+            "negative_case_failed": negative_success,
+        },
+        "failure_class": "" if success else "independent_task_verification_failed",
+        "recovery_suggestion": "" if success else "Generated runtime/verifier did not satisfy the framework replay contract for this accepted task.",
+    }
 
 
 def _verify_task(
@@ -847,6 +1072,83 @@ def _verify_library_task(
         },
         "failure_class": "" if success else "independent_task_verification_failed",
         "recovery_suggestion": "" if success else "Generated library runtime/verifier did not satisfy the framework replay for this accepted task.",
+    }
+
+
+def _execute_contract_positive_case(task: dict[str, Any], runtime_class: Any, state: dict[str, Any], trace_path: Path) -> Any:
+    task_id = task["task_id"]
+    env = _instantiate_runtime(runtime_class, state, trace_path=trace_path, task_id=task_id, call_group="positive")
+    replay = task.get("framework_replay", {}) if isinstance(task.get("framework_replay"), dict) else {}
+    results: dict[str, Any] = {}
+    last_result: Any = None
+    for call in replay.get("tool_calls", []):
+        tool = str(call.get("tool") or "")
+        if not tool:
+            continue
+        method = getattr(env, tool)
+        args = [_resolve_contract_value(value, results) for value in call.get("args", [])]
+        kwargs = {str(key): _resolve_contract_value(value, results) for key, value in dict(call.get("kwargs", {})).items()}
+        for key, value in dict(call.get("kwargs_from", {})).items():
+            kwargs[str(key)] = _resolve_contract_value(value, results)
+        last_result = method(*args, **kwargs)
+        results[tool] = last_result
+    return last_result
+
+
+def _resolve_contract_value(value: Any, results: dict[str, Any]) -> Any:
+    if not isinstance(value, str):
+        return value
+    if value in results:
+        return results[value]
+    if "." in value:
+        root, _, path = value.partition(".")
+        current = results.get(root)
+        for part in path.split("."):
+            if isinstance(current, list) and part.endswith("]") and "[" in part:
+                name, _, raw_index = part.partition("[")
+                if name:
+                    current = current.get(name) if isinstance(current, dict) else None
+                try:
+                    current = current[int(raw_index.rstrip("]"))]
+                except Exception:
+                    return value
+            elif isinstance(current, dict):
+                current = current.get(part)
+            else:
+                return value
+        return current
+    return value
+
+
+def _contract_negative_answer(task: dict[str, Any]) -> Any:
+    expected = task.get("expected_answer")
+    if expected not in (None, "", {}):
+        return {"accepted": False, "reason": "negative replay"}
+    return None
+
+
+def _contract_expected_state_or_answer_evidence(task: dict[str, Any], initial: dict[str, Any], final: dict[str, Any], final_answer: Any) -> dict[str, Any]:
+    expected_answer = task.get("expected_answer")
+    if expected_answer not in (None, "", {}):
+        return {
+            "kind": "expected_answer",
+            "success": final_answer == expected_answer,
+            "expected": expected_answer,
+            "actual": final_answer,
+        }
+    expected_delta = task.get("expected_state_delta", {})
+    if expected_delta:
+        return {
+            "kind": "expected_state_delta",
+            "success": initial != final,
+            "expected": expected_delta,
+            "actual": {"initial_equals_final": initial == final},
+        }
+    return {
+        "kind": "state_or_answer_presence",
+        "success": final_answer not in (None, "", {}),
+        "expected": "non-empty final answer or explicit state delta",
+        "actual": final_answer,
     }
 
 

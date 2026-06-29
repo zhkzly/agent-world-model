@@ -50,6 +50,25 @@ token in lowered
 
 The bad form caused `booking` to match the library token `book`, routing an English booking/reservation request to `library-lending-lite`.
 
+### Request-Driven Success Paths Must Be Artifact-Driven
+
+The normal `run_request_driven_pipeline()` success path must not depend on registered smoke-domain constants, keyword-selected fixture packs, fixed task ids, or environment-id keyed replay cases. It should derive `DomainPlan`, source evidence, tools, tasks, verifier plan, and replay calls from upstream artifacts, then require an `AgentBackend` candidate bundle and framework-owned verification.
+
+Good:
+
+```python
+tool_calls = task["framework_replay"]["tool_calls"]
+```
+
+Bad:
+
+```python
+if environment_id == "booking-service-lite":
+    return booking_replay_cases[task_id]
+```
+
+Legacy fixture registries may keep domain-specific code for regression coverage, but that code must not be reachable from `request_driven_node_registry()` or from generic framework replay/check paths.
+
 ### Python Commands Use `uv`
 
 Run Python tools through `uv` so dependency resolution and interpreter selection stay consistent with `pyproject.toml`.

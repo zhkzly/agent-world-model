@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import os
 from pathlib import Path
@@ -804,6 +804,8 @@ def run_request_driven_pipeline(
     *,
     agent_registry: AgentBackendRegistry | None = None,
 ) -> tuple[PipelineRunRecord, PipelineContext]:
+    if config.implementation_mode != "agent":
+        config = replace(config, implementation_mode="agent")
     return PipelineRunner(request_driven_node_registry(), agent_registry=agent_registry).run(config)
 
 
@@ -1122,13 +1124,23 @@ def _run_agent_implementation_attempt(
             artifact_id=bundle["id"] if isinstance(bundle, dict) else "",
             agent_invocation_ids=[invocation["id"]],
         )
-    if environment_id == request_driven.BOOKING_ENVIRONMENT_ID:
-        record = request_driven.agent_generated_implementation_record(
-            context,
-            agent_invocation=invocation,
-            agent_result=result,
-            work_dir=work_dir,
-        )
+    if "DomainPlan" not in context.artifacts or "StrategySelection" not in context.artifacts:
+        context.agent_invocations.append(invocation)
+        context.store.put_agent_invocations([invocation])
+        record = {
+            "implementation_id": f"implementation-{environment_id}-agent",
+            "mode": "agent_backed",
+            "environment_id": environment_id,
+            "implementation_request_id": request_artifact["id"],
+            "agent_invocation_id": invocation["id"],
+            "static_check_command": "not run",
+            "test_command": "not run",
+            "replay_command": "not run",
+            "verifier_result": {},
+            "status": "needs_human" if result.status == "pass" else result.status,
+            "failure_class": result.failure_class or "unchecked_agent_output",
+            "recovery_suggestion": result.recovery_suggestion or "Run build/check/replay gate in an isolated workdir before package/release planning.",
+        }
         record = _with_attempt_metadata(
             record,
             attempt_index=attempt_index,
@@ -1137,39 +1149,64 @@ def _run_agent_implementation_attempt(
             input_failure_packet=failure_packet,
         )
         record = _redact_attempt_record(context, record)
-        bundle = record.get("generated_environment_bundle")
-        independent_report = record.get("independent_verification_report")
-        if isinstance(bundle, dict):
-            context.artifacts["GeneratedEnvironmentBundle"] = bundle
-            context.store.put_artifact("GeneratedEnvironmentBundle", bundle)
-            invocation = _with_invocation_outputs(invocation, output_artifact_ids=[bundle["id"]], evidence_refs=[bundle["id"]])
-        if isinstance(independent_report, dict):
-            context.artifacts["IndependentVerificationReport"] = independent_report
-            context.store.put_artifact("IndependentVerificationReport", independent_report)
-            invocation = _with_invocation_outputs(invocation, output_artifact_ids=[independent_report["id"]], evidence_refs=[independent_report["id"]])
-        context.agent_invocations.append(invocation)
-        context.store.put_agent_invocations([invocation])
-        trace_ref = context.store.put_trace(f"implementation-{environment_id}-agent", record)
+        trace_ref = context.store.put_trace("implementation-agent", record)
         context.build_check_replay_records.append(record)
-        if record["status"] != "pass":
-            return PipelineNodeResult(
-                node_id=node.node_id,
-                stage=node.stage,
-                status=record["status"],
-                output_refs=[trace_ref],
-                agent_invocation_ids=[invocation["id"]],
-                failure_class=record["failure_class"],
-                recovery_suggestion=record["recovery_suggestion"],
-            )
         return PipelineNodeResult(
             node_id=node.node_id,
             stage=node.stage,
-            status="pass",
-            output_refs=[trace_ref, bundle["id"] if isinstance(bundle, dict) else "", independent_report["id"] if isinstance(independent_report, dict) else ""],
-            artifact_type="GeneratedEnvironmentBundle",
-            artifact_id=bundle["id"] if isinstance(bundle, dict) else "",
+            status=record["status"],
+            output_refs=[trace_ref],
             agent_invocation_ids=[invocation["id"]],
+            failure_class=record["failure_class"],
+            recovery_suggestion=record["recovery_suggestion"],
         )
+    record = request_driven.agent_generated_implementation_record(
+        context,
+        agent_invocation=invocation,
+        agent_result=result,
+        work_dir=work_dir,
+    )
+    record = _with_attempt_metadata(
+        record,
+        attempt_index=attempt_index,
+        total_attempts=total_attempts,
+        max_repair_attempts=max_repair_attempts,
+        input_failure_packet=failure_packet,
+    )
+    record = _redact_attempt_record(context, record)
+    bundle = record.get("generated_environment_bundle")
+    independent_report = record.get("independent_verification_report")
+    if isinstance(bundle, dict):
+        context.artifacts["GeneratedEnvironmentBundle"] = bundle
+        context.store.put_artifact("GeneratedEnvironmentBundle", bundle)
+        invocation = _with_invocation_outputs(invocation, output_artifact_ids=[bundle["id"]], evidence_refs=[bundle["id"]])
+    if isinstance(independent_report, dict):
+        context.artifacts["IndependentVerificationReport"] = independent_report
+        context.store.put_artifact("IndependentVerificationReport", independent_report)
+        invocation = _with_invocation_outputs(invocation, output_artifact_ids=[independent_report["id"]], evidence_refs=[independent_report["id"]])
+    context.agent_invocations.append(invocation)
+    context.store.put_agent_invocations([invocation])
+    trace_ref = context.store.put_trace(f"implementation-{environment_id}-agent", record)
+    context.build_check_replay_records.append(record)
+    if record["status"] != "pass":
+        return PipelineNodeResult(
+            node_id=node.node_id,
+            stage=node.stage,
+            status=record["status"],
+            output_refs=[trace_ref],
+            agent_invocation_ids=[invocation["id"]],
+            failure_class=record["failure_class"],
+            recovery_suggestion=record["recovery_suggestion"],
+        )
+    return PipelineNodeResult(
+        node_id=node.node_id,
+        stage=node.stage,
+        status="pass",
+        output_refs=[trace_ref, bundle["id"] if isinstance(bundle, dict) else "", independent_report["id"] if isinstance(independent_report, dict) else ""],
+        artifact_type="GeneratedEnvironmentBundle",
+        artifact_id=bundle["id"] if isinstance(bundle, dict) else "",
+        agent_invocation_ids=[invocation["id"]],
+    )
     context.agent_invocations.append(invocation)
     context.store.put_agent_invocations([invocation])
     record = {
@@ -1684,7 +1721,7 @@ def _code_agent_implementation_brief(context: PipelineContext) -> str:
     task_ids = [task["task_id"] for task in context.artifact("TaskSet").get("tasks", [])] if "TaskSet" in context.artifacts else list(request.get("accepted_task_ids", []))
     verifier_ids = [verifier["verifier_id"] for verifier in context.artifact("VerifierPlan").get("verifiers", [])] if "VerifierPlan" in context.artifacts else list(request.get("accepted_verifier_ids", []))
     runtime_contract = _code_agent_runtime_contract(context)
-    replay_notes = _code_agent_framework_replay_notes(request["environment_id"])
+    replay_notes = _code_agent_framework_replay_notes(context)
     replay_note_text = "".join(f"- framework_replay_expectation: {note}\n" for note in replay_notes)
     return (
         f"# Implementation Brief\n\n"
@@ -1737,29 +1774,17 @@ def _code_agent_runtime_contract(context: PipelineContext | None) -> dict[str, A
     }
 
 
-def _code_agent_framework_replay_notes(environment_id: str) -> list[str]:
-    if environment_id == "booking-service-lite":
-        return [
-            "search_events(city='Shanghai', kind='concert') returns a list of event dicts; the framework reads events[0]['event_id']",
-            "check_availability(event_id) returns a dict containing event_id, available_seats, and price",
-            "hold_seats(event_id, quantity=2, customer_id='C-1') returns a dict containing hold_id",
-            "confirm_booking(hold_id, payment_status='authorized') mutates booking/payment state",
-            "cancel_booking(booking_id='B-200', refund=True) cancels the booking, refunds payment, and releases inventory",
-        ]
-    if environment_id == "library-lending-lite":
-        return [
-            "search_books(keyword='distributed') returns a list of book dicts; the framework reads books[0]['book_id']",
-            "check_availability(book_id) returns a dict containing book_id, available_copies, and title",
-            "borrow_book(book_id, patron_id='P-1') mutates loan and inventory state",
-            "return_book(loan_id='L-200', days_late=2) returns the loan, restores inventory, and records a fine",
-        ]
-    if environment_id == "project-board-lite":
-        return [
-            "card_list(...) returns a list of card dicts for framework replay",
-            "card_get(card_id) returns a card dict",
-            "card_move/card_assign/comment_add mutate state and write audit/comment evidence",
-        ]
-    return []
+def _code_agent_framework_replay_notes(context: PipelineContext) -> list[str]:
+    notes: list[str] = []
+    if "TaskSet" not in context.artifacts:
+        return notes
+    for task in context.artifact("TaskSet").get("tasks", []):
+        calls = task.get("framework_replay", {}).get("tool_calls", [])
+        if not calls:
+            calls = [{"tool": tool, "kwargs": {}} for tool in task.get("dependency_path", [])]
+        call_text = ", ".join(f"{call.get('tool')}({stable_json(call.get('kwargs', {}))})" for call in calls)
+        notes.append(f"{task.get('task_id')}: framework will replay {call_text} and then call verifier with the task dependency path")
+    return notes
 
 
 def _code_agent_acceptance_checks(context: PipelineContext | None = None) -> str:

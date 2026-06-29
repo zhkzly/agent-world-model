@@ -50,7 +50,7 @@ def build_framework_replay_contract(artifacts: dict[str, dict[str, Any]]) -> dic
             "negative_call_group": "negative",
             "order_must_match_dependency_path": True,
         },
-        "replay_cases": [_replay_case(environment_id, task) for task in tasks],
+        "replay_cases": [_replay_case(task) for task in tasks],
         "verifier_plan_refs": [verifier.get("verifier_id", "") for verifier in verifier_plan.get("verifiers", [])],
         "framework_check": {
             "kind": "framework_owned_candidate_check",
@@ -147,68 +147,29 @@ def _artifact_ids(artifacts: dict[str, dict[str, Any]]) -> dict[str, str]:
     }
 
 
-def _replay_case(environment_id: str, task: dict[str, Any]) -> dict[str, Any]:
+def _replay_case(task: dict[str, Any]) -> dict[str, Any]:
     task_id = str(task.get("task_id", ""))
+    replay = task.get("framework_replay", {}) if isinstance(task.get("framework_replay"), dict) else {}
+    tool_calls = replay.get("tool_calls")
+    if not isinstance(tool_calls, list) or not tool_calls:
+        tool_calls = [{"tool": tool, "kwargs": {}} for tool in task.get("dependency_path") or task.get("allowed_logical_tool_ids", [])]
     return {
         "case_id": f"framework-replay-{task_id}",
         "task_id": task_id,
         "kind": "tool_call_replay",
         "natural_request": task.get("natural_request", ""),
         "expected_dependency_path": list(task.get("dependency_path") or task.get("allowed_logical_tool_ids", [])),
-        "tool_calls": _tool_calls(environment_id, task_id),
+        "tool_calls": tool_calls,
         "expected_state_or_answer": {
             "expected_state_delta": task.get("expected_state_delta", {}),
             "expected_answer": task.get("expected_answer", ""),
+            "expected_final_answer": replay.get("expected_final_answer", task.get("expected_answer", "")),
         },
         "negative_case": {
             "must_return_success": False,
             "description": "Verifier must reject missing or wrong state/action/answer evidence.",
         },
     }
-
-
-def _tool_calls(environment_id: str, task_id: str) -> list[dict[str, Any]]:
-    cases: dict[tuple[str, str], list[dict[str, Any]]] = {
-        ("booking-service-lite", "booking-task-1"): [
-            {"tool": "search_events", "kwargs": {"city": "Shanghai", "kind": "concert"}, "expects": {"type": "list", "first_item_fields": ["event_id"]}},
-            {"tool": "check_availability", "kwargs_from": {"event_id": "search_events[0].event_id"}, "expects": {"fields": ["event_id", "available_seats", "price"]}},
-            {"tool": "hold_seats", "kwargs_from": {"event_id": "search_events[0].event_id"}, "kwargs": {"quantity": 2, "customer_id": "C-1"}, "expects": {"fields": ["hold_id"]}},
-            {"tool": "confirm_booking", "kwargs_from": {"hold_id": "hold_seats.hold_id"}, "kwargs": {"payment_status": "authorized"}},
-        ],
-        ("booking-service-lite", "booking-task-2"): [
-            {"tool": "cancel_booking", "kwargs": {"booking_id": "B-200", "refund": True}},
-        ],
-        ("booking-service-lite", "booking-task-3"): [
-            {"tool": "search_events", "kwargs": {"city": "Shanghai", "kind": "concert"}, "expects": {"type": "list", "first_item_fields": ["event_id"]}},
-            {"tool": "check_availability", "kwargs_from": {"event_id": "search_events[0].event_id"}, "expects": {"fields": ["event_id", "available_seats", "price"]}},
-        ],
-        ("library-lending-lite", "library-task-1"): [
-            {"tool": "search_books", "kwargs": {"keyword": "distributed"}, "expects": {"type": "list", "first_item_fields": ["book_id"]}},
-            {"tool": "check_availability", "kwargs_from": {"book_id": "search_books[0].book_id"}, "expects": {"fields": ["book_id", "available_copies", "title"]}},
-            {"tool": "borrow_book", "kwargs_from": {"book_id": "search_books[0].book_id"}, "kwargs": {"patron_id": "P-1"}},
-        ],
-        ("library-lending-lite", "library-task-2"): [
-            {"tool": "return_book", "kwargs": {"loan_id": "L-200", "days_late": 2}},
-        ],
-        ("library-lending-lite", "library-task-3"): [
-            {"tool": "search_books", "kwargs": {"keyword": "distributed"}, "expects": {"type": "list", "first_item_fields": ["book_id"]}},
-            {"tool": "check_availability", "kwargs_from": {"book_id": "search_books[0].book_id"}, "expects": {"fields": ["book_id", "available_copies", "title"]}},
-        ],
-        ("project-board-lite", "pb-task-1"): [
-            {"tool": "card_list", "kwargs": {"status": "blocked"}, "expects": {"type": "list"}},
-            {"tool": "card_get", "args": ["C-11"], "expects": {"type": "object"}},
-            {"tool": "card_move", "kwargs": {"card_id": "C-11", "status": "in_review", "note": "Ready for review after checking the blocker."}},
-        ],
-        ("project-board-lite", "pb-task-2"): [
-            {"tool": "card_list", "kwargs": {"priority": "high"}, "expects": {"type": "list"}},
-            {"tool": "card_assign", "kwargs": {"card_id": "C-10", "assignee": "sam", "note": "Sam is taking triage."}},
-            {"tool": "comment_add", "kwargs": {"card_id": "C-10", "body": "Triage comment added for Sam."}},
-        ],
-        ("project-board-lite", "pb-task-3"): [
-            {"tool": "card_list", "kwargs": {"status": "in_progress", "assignee": "eve"}, "expects": {"type": "list"}},
-        ],
-    }
-    return cases.get((environment_id, task_id), [])
 
 
 def _prerequisite_observation(item: dict[str, Any], *, candidate_dir: Path | None) -> dict[str, Any]:
