@@ -142,3 +142,37 @@ Wired Codex CLI runner workspace contract, strengthened generated bundle replay 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: Executable verifier feedback workflow
+
+**Date**: 2026-06-29
+**Task**: Executable verifier feedback workflow
+**Package**: mcp-adapted-bench
+**Branch**: `main`
+
+### Summary
+
+Added machine-readable replay contracts, framework-owned generated candidate checks, traceback-rich independent verifier observations, and repair packet feedback for code-agent environment generation.
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `b743401` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
