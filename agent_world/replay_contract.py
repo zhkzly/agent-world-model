@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from agent_world.artifacts import GENERATED_BUNDLE_FILE_KINDS
+from agent_world.artifacts import GENERATED_PROJECT_FILE_KINDS, RUNTIME_ABI_INTERFACES
 
 
 FRAMEWORK_REPLAY_CONTRACT_SCHEMA_VERSION = "agent-world.framework-replay-contract.v1"
@@ -25,29 +25,22 @@ def build_framework_replay_contract(artifacts: dict[str, dict[str, Any]]) -> dic
         "environment_id": environment_id,
         "candidate_dir": "generated",
         "source_artifact_ids": _artifact_ids(artifacts),
-        "bundle_files": [
-            {"path": path, "kind": kind}
-            for path, kind in GENERATED_BUNDLE_FILE_KINDS.items()
-        ],
+        "project_layout": {
+            "candidate_dir": "generated",
+            "required_refs": ["contract.json", "source/", "state/", "adapters/", "scripts/", "spec/"],
+            "file_kinds": sorted(GENERATED_PROJECT_FILE_KINDS),
+        },
         "manifest_contract": {
             "candidate_dir": "generated",
-            "generated_file_kinds": dict(GENERATED_BUNDLE_FILE_KINDS),
-            "path_rule": "generated_files[].path is relative to candidate_dir; use runtime.py, not generated/runtime.py or an absolute path.",
+            "contract_ref": "contract.json",
+            "generated_file_kinds": sorted(GENERATED_PROJECT_FILE_KINDS),
+            "path_rule": "generated_files[].path is relative to candidate_dir; use source/app.py, not generated/source/app.py and not an absolute path.",
             "required_fields_per_generated_file": ["path", "kind", "sha256", "source_refs"],
         },
         "runtime_contract": runtime_contract,
-        "verifier_contract": {
-            "entrypoint": "verifier.verify_task_completion",
-            "signature": "verify_task_completion(task_id, initial_state, final_state, *, surface_trace_path, expected_dependency_path, trace_call_group, final_answer)",
-            "required_kwargs": ["surface_trace_path", "expected_dependency_path", "trace_call_group", "final_answer"],
-            "positive_result": {"success": True},
-            "negative_result": {"success": False},
-        },
         "trace_contract": {
-            "format": "jsonl",
-            "required_fields": ["tool", "task_id", "call_group"],
-            "positive_call_group": "positive",
-            "negative_call_group": "negative",
+            "format": "json object returned by export_trace",
+            "required_event_fields": ["episode_id", "tool_id", "step_index"],
             "order_must_match_dependency_path": True,
         },
         "replay_cases": [_replay_case(task) for task in tasks],
@@ -56,7 +49,7 @@ def build_framework_replay_contract(artifacts: dict[str, dict[str, Any]]) -> dic
             "kind": "framework_owned_candidate_check",
             "command": ["uv", "run", "--offline", "python", "-m", "agent_world.candidate_check", "--environment-id", environment_id, "--candidate-dir", "<agent-workspace>/generated"],
             "execution_context": "framework-owned gate; run from the project repository after the runner exits, or by a runner only if it can import agent_world safely",
-            "release_authority": "Final release is decided by the framework after the runner exits, not by runner stdout or generated check_replay.py.",
+            "release_authority": "Final release is decided by the framework after the runner exits, not by runner stdout or generated self-check.",
         },
     }
 
@@ -65,28 +58,21 @@ def runtime_contract_from_artifacts(surface_plan: dict[str, Any]) -> dict[str, A
     bindings = [
         binding
         for binding in surface_plan.get("bindings", [])
-        if binding.get("surface") == "python" and binding.get("logical_tool_id")
+        if binding.get("logical_tool_id")
     ]
-    python_methods = [str(binding.get("method_name") or binding["logical_tool_id"]) for binding in bindings]
-    runtime_class = ""
-    for binding in bindings:
-        exposure = str(binding.get("exposure_name") or "")
-        if "." in exposure:
-            runtime_class = exposure.split(".", 1)[0]
-            break
-    if not runtime_class:
-        runtime_class = "GeneratedEnvironment"
     return {
-        "entrypoint": f"runtime.{runtime_class}",
-        "constructor": {
-            "args": ["state"],
-            "kwargs": ["trace_path", "task_id", "call_group"],
+        "runtime_abi_version": "agent-world.runtime-abi.v1",
+        "required_interfaces": sorted(RUNTIME_ABI_INTERFACES),
+        "interface_entrypoint_shape": "contract.json interfaces.<name>.entrypoint, usually module:function relative to generated/",
+        "logical_tool_ids": [str(binding["logical_tool_id"]) for binding in bindings],
+        "invoke_contract": {
+            "input_keys": ["episode_id", "task", "task_id", "tool_id", "arguments", "step_index"],
+            "trace_requirement": "invoke must create export_trace evidence in dependency_path order",
         },
-        "helpers": [
-            {"name": "runtime.load_seed_state", "signature": "load_seed_state(seed_path)"},
-            {"name": "runtime.reset_environment", "signature": "reset_environment(seed_state)"},
-        ],
-        "required_methods": python_methods,
+        "verify_contract": {
+            "positive_result": {"success": True},
+            "negative_result": {"success": False},
+        },
     }
 
 

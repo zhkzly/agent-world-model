@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-world.verification-result.schema.json",
+  "title": "Agent World Verification Result",
+  "type": "object",
+  "required": ["status", "success"],
+  "properties": {
+    "status": {"enum": ["pass", "fail", "needs_human", "ok", "error"]},
+    "success": {"type": "boolean"},
+    "score": {"type": "number"},
+    "reward": {"type": "number"},
+    "checks": {"type": "array", "items": {"type": "object"}},
+    "evidence_refs": {"type": "array", "items": {"type": "string"}},
+    "failure_class": {"type": "string"},
+    "recovery_suggestion": {"type": "string"}
+  }
+}

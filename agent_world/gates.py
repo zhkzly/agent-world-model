@@ -353,7 +353,7 @@ def _package_gate(plan: dict[str, Any]) -> None:
     for ref in plan.get("fixture_refs", []):
         if not str(ref).startswith("fixtures/"):
             raise ArtifactValidationError("EnvironmentPackagePlan fixture_ref must stay inside fixtures/")
-    allowed_consumer_prefixes = ("release/", "checks/", "training/", "rollouts/")
+    allowed_consumer_prefixes = ("runtime/", "release/", "checks/", "training/", "rollouts/")
     for ref in plan.get("consumer_output_refs", []):
         if not str(ref).startswith(allowed_consumer_prefixes):
             raise ArtifactValidationError("EnvironmentPackagePlan consumer_output_ref must stay inside release/, checks/, training/, or rollouts/")
@@ -425,6 +425,17 @@ def _agent_invocation_gate(invocations: list[dict[str, Any]], context: dict[str,
             if config["backend_kind"] in {"process_agent", "code_agent_runner"}:
                 if config.get("permissions", {}).get("sandbox") or invocation["permissions"].get("sandbox"):
                     raise ArtifactValidationError("process/code_agent_runner must not claim sandbox enforcement")
+            if not config.get("redaction_policy", {}).get("secret_env_names_only"):
+                raise ArtifactValidationError("Agent config lacks secret redaction policy")
+        if config["backend_kind"] == "codex_sdk":
+            if config.get("permissions", {}).get("filesystem") != "isolated_agent_workspace":
+                raise ArtifactValidationError("Codex SDK config must declare isolated_agent_workspace filesystem scope")
+            if not config.get("permissions", {}).get("sandbox"):
+                raise ArtifactValidationError("Codex SDK config must declare sandbox enforcement")
+            if invocation["permissions"].get("network") and not config.get("permissions", {}).get("network"):
+                raise ArtifactValidationError("Agent invocation requests network beyond config")
+            if not config.get("permissions", {}).get("auth") and invocation["permissions"].get("auth"):
+                raise ArtifactValidationError("Agent invocation requests auth beyond config")
             if not config.get("redaction_policy", {}).get("secret_env_names_only"):
                 raise ArtifactValidationError("Agent config lacks secret redaction policy")
 

@@ -15,9 +15,9 @@ from agent_world.agents import (
     invoke_agent,
     load_agent_backend_config_from_env,
 )
-from agent_world.artifacts import GENERATED_BUNDLE_FILE_KINDS, artifact_hash, make_artifact, stable_json, utc_now, validate_artifact
+from agent_world.artifacts import GENERATED_PROJECT_FILE_KINDS, RUNTIME_ABI_INTERFACES, artifact_hash, make_artifact, stable_json, utc_now, validate_artifact
 from agent_world.gates import STAGE_GATES, evaluate_stage_gates
-from agent_world.generated_bundle import assemble_generated_bundle_package
+from agent_world.generated_project import assemble_generated_project_package
 import agent_world.request_driven as request_driven
 from agent_world.replay_contract import build_framework_replay_contract
 from agent_world.review import independent_review
@@ -65,7 +65,7 @@ class PipelineRunRecord:
     gate_record_ids: list[str]
     review_record_ids: list[str]
     agent_invocation_ids: list[str]
-    build_check_replay_records: list[dict[str, Any]]
+    implementation_check_records: list[dict[str, Any]]
     repair_failure_packets: list[dict[str, Any]] = field(default_factory=list)
     failure_class: str = ""
     recovery_suggestion: str = ""
@@ -81,7 +81,7 @@ class PipelineRunRecord:
             "gate_record_ids": self.gate_record_ids,
             "review_record_ids": self.review_record_ids,
             "agent_invocation_ids": self.agent_invocation_ids,
-            "build_check_replay_records": self.build_check_replay_records,
+            "implementation_check_records": self.implementation_check_records,
             "repair_failure_packets": self.repair_failure_packets,
             "failure_class": self.failure_class,
             "recovery_suggestion": self.recovery_suggestion,
@@ -97,7 +97,7 @@ class PipelineContext:
     gate_records: list[dict[str, Any]] = field(default_factory=list)
     review_records: list[dict[str, Any]] = field(default_factory=list)
     agent_invocations: list[dict[str, Any]] = field(default_factory=list)
-    build_check_replay_records: list[dict[str, Any]] = field(default_factory=list)
+    implementation_check_records: list[dict[str, Any]] = field(default_factory=list)
     repair_failure_packets: list[dict[str, Any]] = field(default_factory=list)
 
     def artifact(self, artifact_type: str) -> dict[str, Any]:
@@ -176,7 +176,7 @@ class PipelineRunner:
             if config.stop_after and node.stage == config.stop_after:
                 break
         if status == "pass" and not config.stop_after:
-            package_error = _assemble_generated_bundle_package_if_available(context)
+            package_error = _assemble_generated_project_package_if_available(context)
             if package_error:
                 status = "fail"
                 failure_class = package_error["failure_class"]
@@ -191,7 +191,7 @@ class PipelineRunner:
             gate_record_ids=[record["id"] for record in context.gate_records],
             review_record_ids=[record["id"] for record in context.review_records],
             agent_invocation_ids=[record["id"] for record in context.agent_invocations],
-            build_check_replay_records=context.build_check_replay_records,
+            implementation_check_records=context.implementation_check_records,
             repair_failure_packets=context.repair_failure_packets,
             failure_class=failure_class,
             recovery_suggestion=recovery_suggestion,
@@ -218,7 +218,6 @@ class PipelineRunner:
                 gate_checklist=list(STAGE_GATES[node.stage]),
                 source_of_truth_refs=[
                     SOURCE_DOC_REF,
-                    ".trellis/tasks/06-30-06-30-archive-hardcoded-legacy-domains/prd.md",
                 ],
                 reviewer_ref="pipeline-static-reviewer",
             )
@@ -305,7 +304,7 @@ class PipelineRunner:
             stage=node.stage,
             status="fail",
             failure_class="deterministic_implementation_unavailable",
-            recovery_suggestion="Generated environments require an agent backend that writes candidate bundle files.",
+            recovery_suggestion="Generated environments require an agent backend that writes a contract-project candidate.",
         )
 
 
@@ -459,7 +458,7 @@ def request_driven_node_registry() -> NodeRegistry:
             node_id="request-driven-package-plan",
             stage="S10",
             artifact_type="EnvironmentPackagePlan",
-            input_artifact_types=["ImplementationRequest", "GeneratedEnvironmentBundle", "IndependentVerificationReport"],
+            input_artifact_types=["ImplementationRequest", "GeneratedEnvironmentProject", "IndependentVerificationReport"],
             output_artifact_type="EnvironmentPackagePlan",
             allowed_agent_backend=False,
             factory=request_driven.package_plan_fields,
@@ -489,19 +488,19 @@ def run_request_driven_pipeline(
     return PipelineRunner(request_driven_node_registry(), agent_registry=agent_registry).run(config)
 
 
-def _assemble_generated_bundle_package_if_available(context: PipelineContext) -> dict[str, str] | None:
+def _assemble_generated_project_package_if_available(context: PipelineContext) -> dict[str, str] | None:
     if context.config.output_dir is None:
         return None
-    if "GeneratedEnvironmentBundle" not in context.artifacts or "ReleaseManifest" not in context.artifacts:
+    if "GeneratedEnvironmentProject" not in context.artifacts or "ReleaseManifest" not in context.artifacts:
         return None
     try:
-        assemble_generated_bundle_package(
+        assemble_generated_project_package(
             package_dir=context.config.output_dir / "envpkg",
             artifacts=context.artifacts,
             gate_records=context.gate_records,
             review_records=context.review_records,
             agent_invocations=context.agent_invocations,
-            build_check_replay_records=context.build_check_replay_records,
+            implementation_check_records=context.implementation_check_records,
         )
     except Exception as exc:
         return {
@@ -512,16 +511,16 @@ def _assemble_generated_bundle_package_if_available(context: PipelineContext) ->
 
 
 def _record_deterministic_implementation(context: PipelineContext, node: PipelineNode, record: dict[str, Any]) -> PipelineNodeResult:
-    bundle = record.get("generated_environment_bundle")
-    if isinstance(bundle, dict):
-        context.artifacts["GeneratedEnvironmentBundle"] = bundle
-        context.store.put_artifact("GeneratedEnvironmentBundle", bundle)
+    project = record.get("generated_environment_project")
+    if isinstance(project, dict):
+        context.artifacts["GeneratedEnvironmentProject"] = project
+        context.store.put_artifact("GeneratedEnvironmentProject", project)
     independent_report = record.get("independent_verification_report")
     if isinstance(independent_report, dict):
         context.artifacts["IndependentVerificationReport"] = independent_report
         context.store.put_artifact("IndependentVerificationReport", independent_report)
     trace_ref = context.store.put_trace(f"implementation-{record['environment_id']}-deterministic", record)
-    context.build_check_replay_records.append(record)
+    context.implementation_check_records.append(record)
     if record["status"] != "pass":
         return PipelineNodeResult(
             node_id=node.node_id,
@@ -558,7 +557,7 @@ def _run_agent_implementation(context: PipelineContext, node: PipelineNode) -> P
         last_result = result
         all_invocation_ids.extend(result.agent_invocation_ids)
         all_output_refs.extend(ref for ref in result.output_refs if ref)
-        attempt_record = context.build_check_replay_records[-1] if context.build_check_replay_records else {}
+        attempt_record = context.implementation_check_records[-1] if context.implementation_check_records else {}
         if result.status == "pass":
             return _roll_up_attempt_result(result, invocation_ids=all_invocation_ids, output_refs=all_output_refs)
         if result.status != "fail":
@@ -593,18 +592,18 @@ def _run_agent_implementation_attempt(
     _prepare_agent_work_dir(work_dir)
     backend_config = context.artifact("AgentBackendConfig")
     backend_kind = backend_config["backend_kind"]
-    is_runner_backend = backend_kind in {"code_agent_runner", "codex_cli_runner"}
+    is_runner_backend = backend_kind in {"code_agent_runner", "codex_cli_runner", "codex_sdk"}
     if is_runner_backend:
         _write_code_agent_workspace_packet(context, work_dir, failure_packet=failure_packet, previous_attempt=previous_attempt)
     input_artifact_ids = _implementation_agent_input_ids(context)
     if failure_packet:
         input_artifact_ids.append(failure_packet["packet_id"])
     permissions = {
-        "network": backend_kind in {"llm", "openai_codegen", "code_agent_runner", "codex_cli_runner"} and bool(backend_config.get("permissions", {}).get("network")),
+        "network": backend_kind in {"llm", "openai_codegen", "code_agent_runner", "codex_cli_runner", "codex_sdk"} and bool(backend_config.get("permissions", {}).get("network")),
         "filesystem": "isolated_agent_workspace" if is_runner_backend else "isolated_workdir",
         "filesystem_root": str(work_dir),
-        "auth": backend_kind in {"llm", "openai_codegen", "code_agent_runner", "codex_cli_runner"} and bool(backend_config.get("permissions", {}).get("auth")),
-        "sandbox": backend_kind in {"codex_cli", "codex_cli_runner"} and bool(backend_config.get("permissions", {}).get("sandbox")),
+        "auth": backend_kind in {"llm", "openai_codegen", "code_agent_runner", "codex_cli_runner", "codex_sdk"} and bool(backend_config.get("permissions", {}).get("auth")),
+        "sandbox": backend_kind in {"codex_cli", "codex_cli_runner", "codex_sdk"} and bool(backend_config.get("permissions", {}).get("sandbox")),
     }
     instruction = _implementation_agent_instruction(
         context,
@@ -652,7 +651,7 @@ def _run_agent_implementation_attempt(
         )
         record = _redact_attempt_record(context, record)
         trace_ref = context.store.put_trace("implementation-agent", record)
-        context.build_check_replay_records.append(record)
+        context.implementation_check_records.append(record)
         return PipelineNodeResult(
             node_id=node.node_id,
             stage=node.stage,
@@ -676,12 +675,12 @@ def _run_agent_implementation_attempt(
         input_failure_packet=failure_packet,
     )
     record = _redact_attempt_record(context, record)
-    bundle = record.get("generated_environment_bundle")
+    project = record.get("generated_environment_project")
     independent_report = record.get("independent_verification_report")
-    if isinstance(bundle, dict):
-        context.artifacts["GeneratedEnvironmentBundle"] = bundle
-        context.store.put_artifact("GeneratedEnvironmentBundle", bundle)
-        invocation = _with_invocation_outputs(invocation, output_artifact_ids=[bundle["id"]], evidence_refs=[bundle["id"]])
+    if isinstance(project, dict):
+        context.artifacts["GeneratedEnvironmentProject"] = project
+        context.store.put_artifact("GeneratedEnvironmentProject", project)
+        invocation = _with_invocation_outputs(invocation, output_artifact_ids=[project["id"]], evidence_refs=[project["id"]])
     if isinstance(independent_report, dict):
         context.artifacts["IndependentVerificationReport"] = independent_report
         context.store.put_artifact("IndependentVerificationReport", independent_report)
@@ -689,7 +688,7 @@ def _run_agent_implementation_attempt(
     context.agent_invocations.append(invocation)
     context.store.put_agent_invocations([invocation])
     trace_ref = context.store.put_trace(f"implementation-{environment_id}-agent", record)
-    context.build_check_replay_records.append(record)
+    context.implementation_check_records.append(record)
     if record["status"] != "pass":
         return PipelineNodeResult(
             node_id=node.node_id,
@@ -704,9 +703,9 @@ def _run_agent_implementation_attempt(
         node_id=node.node_id,
         stage=node.stage,
         status="pass",
-        output_refs=[trace_ref, bundle["id"] if isinstance(bundle, dict) else "", independent_report["id"] if isinstance(independent_report, dict) else ""],
-        artifact_type="GeneratedEnvironmentBundle",
-        artifact_id=bundle["id"] if isinstance(bundle, dict) else "",
+        output_refs=[trace_ref, project["id"] if isinstance(project, dict) else "", independent_report["id"] if isinstance(independent_report, dict) else ""],
+        artifact_type="GeneratedEnvironmentProject",
+        artifact_id=project["id"] if isinstance(project, dict) else "",
         agent_invocation_ids=[invocation["id"]],
     )
 
@@ -882,8 +881,10 @@ def _implementation_failure_packet(
         },
         "manifest_contract": {
             "candidate_dir": "generated",
-            "generated_file_kinds": dict(GENERATED_BUNDLE_FILE_KINDS),
-            "path_rule": "Each generated_files[].path is relative to candidate_dir. Use runtime.py, not generated/runtime.py and not an absolute path.",
+            "contract_ref": "contract.json",
+            "generated_file_kinds": sorted(GENERATED_PROJECT_FILE_KINDS),
+            "required_interfaces": sorted(RUNTIME_ABI_INTERFACES),
+            "path_rule": "Each generated_files[].path is relative to candidate_dir. Use source/app.py, not generated/source/app.py and not an absolute path.",
             "required_fields_per_generated_file": ["path", "kind", "sha256", "source_refs"],
         },
         "security_and_manifest_checks": {
@@ -897,7 +898,7 @@ def _framework_check_observation(failed_check: dict[str, Any], attempt_record: d
     observation = failed_check.get("framework_check_observation")
     if isinstance(observation, dict) and observation:
         return observation
-    for check in attempt_record.get("build_check_replay_records", []):
+    for check in attempt_record.get("implementation_check_records", []):
         observation = check.get("framework_check_observation")
         if isinstance(observation, dict) and observation:
             return observation
@@ -967,7 +968,7 @@ def _path_relative_to_candidate(path_value: Any, candidate_dir: str) -> str:
 
 
 def _first_failed_check(record: dict[str, Any]) -> dict[str, Any]:
-    for check in record.get("build_check_replay_records", []):
+    for check in record.get("implementation_check_records", []):
         if check.get("success") is False:
             nested = check.get("generated_check_record")
             if isinstance(nested, dict) and nested.get("success") is False:
@@ -992,7 +993,7 @@ def _first_failed_check(record: dict[str, Any]) -> dict[str, Any]:
 
 def _failed_task_ids(record: dict[str, Any]) -> list[str]:
     failed: list[str] = []
-    for check in record.get("build_check_replay_records", []):
+    for check in record.get("implementation_check_records", []):
         task_id = check.get("task_id")
         if task_id and check.get("success") is False:
             failed.append(str(task_id))
@@ -1084,26 +1085,25 @@ def _implementation_agent_instruction(
     if runner_backend:
         return (
             f"You are a code agent runner for {environment_id}. The isolated workspace is {work_dir}.\n"
-            "Read the task packet under input/. Use the artifacts, brief, and acceptance checks as source of truth.\n"
+            "Read the task packet under input/. Use input/skills/agent-world-environment-codegen/SKILL.md, artifacts, schemas, brief, and acceptance checks as source of truth.\n"
             f"{repair_note}"
-            "Write the generated environment only under generated/ with exactly these files: "
-            "runtime.py, seed_state.json, verifier.py, surface_descriptor.json, check_replay.py, and build_manifest.yaml.\n"
-            "Run at least one local check command against generated/check_replay.py. If it fails, repair the generated files and rerun the check.\n"
+            "Write a free-form executable contract project under generated/ with contract.json, source/, state/, adapters/, scripts/, and spec/.\n"
+            "Run the generated self-check declared in agent-output/candidate_manifest.json. If it fails, repair the generated project and rerun the check.\n"
             "Treat input/framework-replay-contract.json and input/failure-packet.json as tool-style observations from the framework check workflow.\n"
             "Write agent-output/candidate_manifest.json after the final passing candidate. The manifest must declare "
-            "candidate_dir: generated, generated_files objects with exact path/kind/sha256/source_refs values, "
-            "entrypoints, check_commands, and replay_commands. Use the required kind table in input/expected-bundle-layout.md.\n"
-            "Do not write outside generated/ and agent-output/. Do not import the repository fixture runtime. "
+            "candidate_dir: generated, contract_ref: contract.json, generated_files objects with exact path/kind/sha256/source_refs values, "
+            "self_check.command, and replay_commands. Use the schema files under input/schemas/.\n"
+            "Do not write outside generated/ and agent-output/. Do not import the agent_world framework package from generated code. "
             "The framework will perform the final build/check/replay gate after you exit.\n"
         )
     return (
         f"Implement the accepted {environment_id} package in this isolated workdir: {work_dir}. "
-        "Generate exactly runtime.py, seed_state.json, verifier.py, surface_descriptor.json, check_replay.py, and build_manifest.yaml. "
-        "Return a JSON candidate manifest with relative paths, sha256 hashes, source refs, and build/check/replay commands. "
+        "Generate a contract project under generated/ with contract.json, source/, state/, adapters/, scripts/, and spec/. "
+        "Return a JSON candidate manifest with relative paths, sha256 hashes, source refs, self_check.command, and replay commands. "
         "Do not modify the repository or any path outside the isolated workdir.\n\n"
         f"{repair_note}"
         "If you are an OpenAI-compatible codegen backend, return only JSON in this schema:\n"
-        "{\"files\":[{\"path\":\"runtime.py\",\"content\":\"...\"}],\"evidence_refs\":[\"...\"]}.\n"
+        "{\"files\":[{\"path\":\"generated/contract.json\",\"content\":\"...\"}],\"evidence_refs\":[\"...\"]}.\n"
         "The backend will write the files and calculate sha256 values.\n\n"
         f"Accepted artifact context JSON:\n{_implementation_agent_context_json(context)}"
     )
@@ -1113,12 +1113,12 @@ def _implementation_agent_allowed_tools(runner_backend: bool) -> list[str]:
     if runner_backend:
         return [
             "read_workspace_packet",
-            "write_generated_bundle_files",
+            "write_generated_project_files",
             "run_local_checks",
-            "repair_generated_bundle",
+            "repair_generated_project",
             "write_candidate_manifest",
         ]
-    return ["write_generated_bundle_files"]
+    return ["write_generated_project_files"]
 
 
 def _write_code_agent_workspace_packet(
@@ -1131,9 +1131,10 @@ def _write_code_agent_workspace_packet(
     input_dir = work_dir / "input"
     artifacts_dir = input_dir / "artifacts"
     skills_dir = input_dir / "skills"
+    schemas_dir = input_dir / "schemas"
     generated_dir = work_dir / "generated"
     output_dir = work_dir / "agent-output"
-    for path in [artifacts_dir, skills_dir, generated_dir, output_dir]:
+    for path in [artifacts_dir, skills_dir, schemas_dir, generated_dir, output_dir]:
         path.mkdir(parents=True, exist_ok=True)
     selected_artifacts = {
         name: context.artifact(name)
@@ -1157,6 +1158,9 @@ def _write_code_agent_workspace_packet(
         (artifacts_dir / f"{name}.json").write_text(stable_json(artifact), encoding="utf-8")
     framework_replay_contract = build_framework_replay_contract(selected_artifacts)
     (input_dir / "framework-replay-contract.json").write_text(stable_json(framework_replay_contract), encoding="utf-8")
+    (input_dir / "implementation_contract.json").write_text(stable_json(_implementation_contract_packet(context)), encoding="utf-8")
+    _write_schema_packet(schemas_dir)
+    _write_skill_packet(skills_dir)
     (input_dir / "artifact-index.json").write_text(
         stable_json(
             {
@@ -1169,18 +1173,70 @@ def _write_code_agent_workspace_packet(
                     for name, artifact in selected_artifacts.items()
                 },
                 "framework_replay_contract": "framework-replay-contract.json",
+                "implementation_contract": "implementation_contract.json",
+                "schemas": {
+                    path.name: f"schemas/{path.name}"
+                    for path in sorted(schemas_dir.glob("*.schema.json"))
+                },
+                "skills": {
+                    "agent-world-environment-codegen": "skills/agent-world-environment-codegen/SKILL.md",
+                },
             }
         ),
         encoding="utf-8",
     )
     (input_dir / "implementation-brief.md").write_text(_code_agent_implementation_brief(context), encoding="utf-8")
-    (input_dir / "expected-bundle-layout.md").write_text(_code_agent_expected_bundle_layout(context), encoding="utf-8")
+    (input_dir / "expected-project-layout.md").write_text(_code_agent_expected_project_layout(context), encoding="utf-8")
     (input_dir / "acceptance-checks.md").write_text(_code_agent_acceptance_checks(context), encoding="utf-8")
-    (skills_dir / "environment-codegen.md").write_text(_code_agent_codegen_skill(), encoding="utf-8")
     if failure_packet:
         (input_dir / "failure-packet.json").write_text(stable_json(failure_packet), encoding="utf-8")
     if previous_attempt:
         (input_dir / "previous-attempt-record.json").write_text(stable_json(previous_attempt), encoding="utf-8")
+
+
+def _implementation_contract_packet(context: PipelineContext) -> dict[str, Any]:
+    request = context.artifact("ImplementationRequest")
+    return {
+        "schema_version": "agent-world.implementation-contract.v1",
+        "environment_id": request["environment_id"],
+        "candidate_dir": "generated",
+        "required_layout": ["contract.json", "source/", "state/", "adapters/", "scripts/", "spec/"],
+        "runtime_abi_version": "agent-world.runtime-abi.v1",
+        "required_interfaces": sorted(RUNTIME_ABI_INTERFACES),
+        "candidate_manifest_ref": "agent-output/candidate_manifest.json",
+        "local_check_report_ref": "agent-output/local_check_report.json",
+        "schema_refs": {
+            "environment_project": "schemas/environment_project.schema.json",
+            "runtime_abi": "schemas/runtime_abi.schema.json",
+            "candidate_manifest": "schemas/candidate_manifest.schema.json",
+            "trace_event": "schemas/trace_event.schema.json",
+            "verification_result": "schemas/verification_result.schema.json",
+        },
+        "source_artifact_ids": list(request.get("source_artifact_ids", [])),
+        "accepted_task_ids": list(request.get("accepted_task_ids", [])),
+        "accepted_verifier_ids": list(request.get("accepted_verifier_ids", [])),
+    }
+
+
+def _write_schema_packet(schemas_dir: Path) -> None:
+    source_dir = Path(__file__).resolve().parent / "contracts"
+    for schema_path in sorted(source_dir.glob("*.schema.json")):
+        shutil.copy2(schema_path, schemas_dir / schema_path.name)
+
+
+def _write_skill_packet(skills_dir: Path) -> None:
+    source_dir = Path.cwd() / ".agents" / "skills" / "agent-world-environment-codegen"
+    target_dir = skills_dir / "agent-world-environment-codegen"
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    if source_dir.is_dir():
+        shutil.copytree(source_dir, target_dir)
+        return
+    target_dir.mkdir(parents=True, exist_ok=True)
+    (target_dir / "SKILL.md").write_text(
+        "# Agent World Environment Codegen\n\nGenerate a contract project under generated/ and satisfy the injected schemas.\n",
+        encoding="utf-8",
+    )
 
 
 def _code_agent_implementation_brief(context: PipelineContext) -> str:
@@ -1195,29 +1251,25 @@ def _code_agent_implementation_brief(context: PipelineContext) -> str:
         f"- environment_id: {request['environment_id']}\n"
         f"- implementation_request_id: {request['id']}\n"
         "- candidate_dir: generated\n"
-        "- required_files: runtime.py, seed_state.json, verifier.py, surface_descriptor.json, check_replay.py, build_manifest.yaml\n"
-        f"- required_manifest_file_kinds: {stable_json(GENERATED_BUNDLE_FILE_KINDS)}\n"
-        f"- required_runtime_entrypoint: {runtime_contract['runtime_entrypoint']}\n"
-        "- required_runtime_constructor: __init__(state, trace_path=None, task_id=None, call_group=None)\n"
-        "- required_runtime_helpers: runtime.load_seed_state(seed_path), runtime.reset_environment(seed_state)\n"
-        f"- required_python_methods_on_entrypoint: {', '.join(runtime_contract['python_methods'])}\n"
-        "- required_trace_jsonl: each runtime tool call appends a JSON object with `tool`, `task_id`, and `call_group` when trace_path is provided\n"
-        "- required_verifier_entrypoint: verifier.verify_task_completion must accept framework kwargs `surface_trace_path`, `expected_dependency_path`, `trace_call_group`, and `final_answer`\n"
+        "- required_layout: contract.json, source/, state/, adapters/, scripts/, spec/\n"
+        f"- required_manifest_file_kinds: {stable_json(sorted(GENERATED_PROJECT_FILE_KINDS))}\n"
+        f"- required_runtime_abi_interfaces: {', '.join(runtime_contract['required_interfaces'])}\n"
+        "- required_trace_export: export_trace must return ordered events with tool_id and step_index\n"
+        "- required_verifier_behavior: verify must return success=true for positive replay and success=false for missing/wrong evidence\n"
         f"{replay_note_text}"
         f"- required_tasks: {', '.join(task_ids)}\n"
         f"- required_verifiers: {', '.join(verifier_ids)}\n"
         "- required_negative_check: each task verifier must return success=false when required tool actions, state delta, or answer evidence are absent\n\n"
-        "Use input/framework-replay-contract.json as the machine-readable framework execution contract, and use input/artifacts/*.json as the source-grounded specification. "
-        "The generated bundle must be self-contained; "
-        "runtime.py, verifier.py, and check_replay.py must not import repository fixture runtimes. "
-        "If you use internal helper classes, still expose the required runtime entrypoint class and helper functions exactly as listed above.\n"
+        "Use input/framework-replay-contract.json and input/implementation_contract.json as machine-readable execution contracts, and use input/artifacts/*.json as the source-grounded specification. "
+        "The generated project must be self-contained and must not import the agent_world framework package. "
+        "If you implement MCP, CLI, HTTP, database, or local services, keep those details behind the eight ABI interfaces declared in generated/contract.json.\n"
     )
 
 
 def _code_agent_runtime_contract(context: PipelineContext | None) -> dict[str, Any]:
     fallback = {
-        "runtime_entrypoint": "runtime.GeneratedEnvironment",
-        "python_methods": [],
+        "required_interfaces": sorted(RUNTIME_ABI_INTERFACES),
+        "logical_tool_ids": [],
     }
     if context is None or "SurfacePlan" not in context.artifacts:
         return fallback
@@ -1226,18 +1278,9 @@ def _code_agent_runtime_contract(context: PipelineContext | None) -> dict[str, A
         for binding in context.artifact("SurfacePlan").get("bindings", [])
         if binding.get("surface") == "python" and binding.get("logical_tool_id")
     ]
-    python_methods = [str(binding.get("method_name") or binding["logical_tool_id"]) for binding in bindings]
-    runtime_class = ""
-    for binding in bindings:
-        exposure = str(binding.get("exposure_name") or "")
-        if "." in exposure:
-            runtime_class = exposure.split(".", 1)[0]
-            break
-    if not runtime_class:
-        runtime_class = fallback["runtime_entrypoint"].split(".", 1)[1]
     return {
-        "runtime_entrypoint": f"runtime.{runtime_class}",
-        "python_methods": python_methods,
+        "required_interfaces": sorted(RUNTIME_ABI_INTERFACES),
+        "logical_tool_ids": [str(binding.get("logical_tool_id")) for binding in bindings],
     }
 
 
@@ -1261,84 +1304,60 @@ def _code_agent_acceptance_checks(context: PipelineContext | None = None) -> str
     task_text = ", ".join(task_ids) if task_ids else "all accepted tasks in input/artifacts/TaskSet.json"
     return (
         "# Acceptance Checks\n\n"
-        "1. `python generated/check_replay.py` exits 0.\n"
-        "2. The check prints a final JSON object with `success: true`.\n"
+        "1. The generated self-check command declared in `agent-output/candidate_manifest.json` exits 0.\n"
+        "2. The check prints a final JSON object with `success: true` or writes `agent-output/local_check_report.json` with success evidence.\n"
         f"3. It covers {task_text}.\n"
         "4. Each task has a positive verifier result with `success: true` and a negative verifier result with `success: false`.\n"
-        "5. `agent-output/candidate_manifest.json` declares `candidate_dir: generated` and a `generated_files` object for each required file.\n"
-        "6. Each `generated_files[]` item declares exact `path`, exact `kind` from the required manifest kind table, lowercase 64-character `sha256`, and `source_refs`.\n"
-        "7. The framework independent verifier can import `runtime.py`, instantiate the required runtime class with `trace_path`, call helper functions, find every required method, read JSONL tool traces, and call `verifier.verify_task_completion` with framework kwargs.\n"
+        "5. `agent-output/candidate_manifest.json` declares `candidate_dir: generated`, `contract_ref: contract.json`, and one `generated_files` object for every file under generated/.\n"
+        "6. Each `generated_files[]` item declares exact package-relative `path`, allowed `kind`, lowercase 64-character `sha256`, and `source_refs`.\n"
+        "7. The framework independent verifier can load `contract.json`, call describe/setup/reset/health/invoke/verify/export_trace/teardown, and observe ordered trace evidence for every required task.\n"
         "8. `input/framework-replay-contract.json` describes the framework-owned replay cases and check command; generated code must satisfy that contract.\n"
         "9. On a repair attempt, read `input/failure-packet.json` and address the listed framework_check_observation, failed task/verifier, and command output without changing the manifest path shape unless the failure is a manifest/path/hash failure.\n"
     )
 
 
-def _code_agent_expected_bundle_layout(context: PipelineContext | None = None) -> str:
-    kind_lines = "".join(
-        f"- `{filename}` -> `{kind}`\n"
-        for filename, kind in GENERATED_BUNDLE_FILE_KINDS.items()
-    )
-    runtime_contract = _code_agent_runtime_contract(context)
+def _code_agent_expected_project_layout(context: PipelineContext | None = None) -> str:
+    kind_lines = "".join(f"- `{kind}`\n" for kind in sorted(GENERATED_PROJECT_FILE_KINDS))
     manifest_example = {
         "candidate_dir": "generated",
+        "environment_id": "<environment id>",
+        "implementation_id": "<stable implementation id>",
+        "contract_ref": "contract.json",
         "generated_files": [
             {
-                "path": filename,
-                "kind": kind,
+                "path": "contract.json",
+                "kind": "contract",
                 "sha256": "<lowercase 64-character sha256>",
                 "source_refs": ["<artifact id or source ref>"],
-            }
-            for filename, kind in GENERATED_BUNDLE_FILE_KINDS.items()
+            },
+            {
+                "path": "adapters/runtime_adapter.py",
+                "kind": "adapter",
+                "sha256": "<lowercase 64-character sha256>",
+                "source_refs": ["<artifact id or source ref>"],
+            },
         ],
-        "entrypoints": {
-            "runtime": "runtime.py",
-            "seed_state": "seed_state.json",
-            "verifier": "verifier.py",
-            "surface_descriptor": "surface_descriptor.json",
-            "check_replay": "check_replay.py",
-            "build_manifest": "build_manifest.yaml",
-        },
-        "check_commands": [["python", "generated/check_replay.py"]],
-        "replay_commands": [["python", "generated/check_replay.py"]],
+        "self_check": {"command": ["python", "scripts/self_check.py"], "report_ref": "../agent-output/local_check_report.json"},
+        "replay_commands": [["framework-abi-replay", "<task_id>"]],
     }
     return (
-        "# Expected Bundle Layout\n\n"
-        "Write exactly these files under `generated/`:\n\n"
-        "- `runtime.py`: self-contained environment runtime and logical tool behavior.\n"
-        "- `seed_state.json`: deterministic seed state fixture.\n"
-        "- `verifier.py`: deterministic verifier with positive and negative behavior.\n"
-        "- `surface_descriptor.json`: implemented/deferred concrete surfaces.\n"
-        "- `check_replay.py`: executable build/check/replay entrypoint.\n"
-        "- `build_manifest.yaml`: bundle metadata, entrypoints, and commands.\n\n"
-        "Runtime entrypoint contract:\n\n"
-        f"- `runtime.py` must expose `{runtime_contract['runtime_entrypoint']}`.\n"
-        "- The runtime class constructor must accept `state`, optional `trace_path`, optional `task_id`, and optional `call_group` keyword arguments.\n"
-        "- `runtime.py` must expose `load_seed_state(seed_path)` and `reset_environment(seed_state)` module functions.\n"
-        f"- The runtime entrypoint class must implement these Python methods: {', '.join(runtime_contract['python_methods'])}.\n\n"
-        "Independent verifier replay contract:\n\n"
-        "- The framework will instantiate the runtime as `RuntimeClass(state, trace_path=Path(...), task_id=task_id, call_group=\"positive\")`.\n"
-        "- Every runtime tool method should append one JSONL record to `trace_path` with at least `tool`, `task_id`, and `call_group`.\n"
-        "- `verifier.verify_task_completion` will be called with `surface_trace_path` as a Path to that JSONL file, plus `expected_dependency_path`, `trace_call_group`, and `final_answer` kwargs.\n\n"
-        "Required manifest kind table:\n\n"
+        "# Expected Project Layout\n\n"
+        "Write a complete executable project under `generated/`:\n\n"
+        "- `contract.json`: static environment contract and ABI entrypoint map.\n"
+        "- `source/`: free-form environment implementation.\n"
+        "- `state/`: seed data, migrations, fixtures, or snapshots.\n"
+        "- `adapters/`: Python ABI adapter functions or thin wrappers around MCP/CLI/HTTP/DB surfaces.\n"
+        "- `scripts/`: generated self-check and optional setup helpers.\n"
+        "- `spec/`: tool, task, verifier, and surface descriptors.\n\n"
+        "Required runtime ABI interfaces in `contract.json`: describe, setup, reset, health, invoke, verify, export_trace, teardown.\n\n"
+        "Allowed manifest file kinds:\n\n"
         f"{kind_lines}\n"
         "Candidate manifest schema example:\n\n"
         "```json\n"
         f"{json.dumps(manifest_example, indent=2, sort_keys=True)}\n"
         "```\n\n"
-        "Write runner traces and `candidate_manifest.json` under `agent-output/`; do not place them in `generated/`.\n"
-        "`candidate_dir` is `generated`, so every `generated_files[].path` must be relative to that directory, such as `runtime.py`; do not use `generated/runtime.py` or absolute paths.\n"
-        "Do not leave transient replay traces, logs, scratch files, or cleanup markers under `generated/`; use temporary directories or `agent-output/` for runner-only files.\n"
-    )
-
-
-def _code_agent_codegen_skill() -> str:
-    return (
-        "# Skill: Environment Code Generation\n\n"
-        "Read the artifacts first, then implement the smallest executable environment that satisfies the task and verifier plan. "
-        "Prefer deterministic state checks over text judging. Keep surfaces separate from logical tools. "
-        "Expose the exact runtime entrypoint and helper functions named in the implementation brief. "
-        "Keep `generated/` to the six declared bundle files only; do not use shell `rm` cleanup commands inside the Codex sandbox. "
-        "After writing files, run the local check, repair failures, and update the candidate manifest only after the final check passes.\n"
+        "Write runner traces, `candidate_manifest.json`, and `local_check_report.json` under `agent-output/`; do not place runner-only files in `generated/`.\n"
+        "`candidate_dir` is `generated`, so every `generated_files[].path` must be relative to that directory, such as `source/app.py`; do not use `generated/source/app.py` or absolute paths.\n"
     )
 
 

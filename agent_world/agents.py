@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import importlib
 import json
 import os
 import shlex
@@ -350,6 +352,99 @@ class CodexCliRunnerBackend(CodeAgentRunnerBackend):
         return super().invoke(request, config)
 
 
+class CodexSdkAgentBackend:
+    backend_kind = "codex_sdk"
+
+    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+        permission_error = _codex_sdk_permission_error(request, config)
+        if permission_error:
+            return permission_error
+        model = config.get("smoke_model") or config.get("model") or ""
+        if not model:
+            return AgentResult(
+                text="Codex SDK model is not configured",
+                status="needs_human",
+                failure_class="missing_codex_model",
+                recovery_suggestion="Set AGENT_WORLD_OPENAI_MODEL or AGENT_WORLD_SMOKE_OPENAI_MODEL for codex_sdk.",
+            )
+        try:
+            sdk_module = importlib.import_module("openai_codex")
+        except ModuleNotFoundError:
+            return AgentResult(
+                text="openai-codex Python SDK is not installed",
+                status="needs_human",
+                failure_class="missing_codex_sdk",
+                recovery_suggestion="Install the official Codex SDK with `pip install openai-codex`, or use another configured AgentBackend.",
+            )
+        Codex = getattr(sdk_module, "Codex", None)
+        Sandbox = getattr(sdk_module, "Sandbox", None)
+        if Codex is None or Sandbox is None:
+            return AgentResult(
+                text="openai_codex module does not expose Codex and Sandbox",
+                status="fail",
+                failure_class="invalid_codex_sdk",
+                recovery_suggestion="Use an official openai-codex build that exposes Codex and Sandbox.",
+            )
+        sandbox, sandbox_error = _codex_sdk_sandbox(Sandbox, config)
+        if sandbox_error:
+            return sandbox_error
+        workspace, workspace_error = _codex_sdk_workspace(request)
+        if workspace_error:
+            return workspace_error
+        output_dir = workspace / "agent-output" if workspace else None
+        if output_dir:
+            output_dir.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        try:
+            with _temporary_cwd(workspace):
+                with Codex() as codex:
+                    thread = codex.thread_start(model=model, sandbox=sandbox)
+                    sdk_result = thread.run(request.instruction)
+        except Exception as exc:
+            duration_ms = int((time.monotonic() - started) * 1000)
+            if output_dir:
+                _write_codex_sdk_result(output_dir / "codex-sdk-result.json", status="fail", duration_ms=duration_ms)
+            return AgentResult(
+                text=str(exc),
+                status="fail",
+                failure_class=exc.__class__.__name__,
+                recovery_suggestion="Check Codex SDK auth, model access, sandbox permissions, and workspace state.",
+                trace_ref=_codex_sdk_trace_ref(workspace),
+                usage={"tokens": None, "cost": None, "duration_ms": duration_ms},
+            )
+        duration_ms = int((time.monotonic() - started) * 1000)
+        response_text = _codex_sdk_result_text(sdk_result)
+        usage = _codex_sdk_usage(sdk_result, duration_ms)
+        if request.node_purpose == "implement":
+            assert output_dir is not None
+            _write_codex_sdk_result(output_dir / "codex-sdk-result.json", status="pass", duration_ms=duration_ms)
+            manifest_path = output_dir / "candidate_manifest.json"
+            command_log_ref = "agent-workspace://agent-output/codex-sdk-result.json"
+            manifest_ref = "agent-workspace://agent-output/candidate_manifest.json"
+            if not manifest_path.is_file():
+                return AgentResult(
+                    text="Codex SDK did not write agent-output/candidate_manifest.json",
+                    status="fail",
+                    failure_class="missing_runner_manifest",
+                    recovery_suggestion="Codex SDK implementation nodes must write agent-output/candidate_manifest.json after generating files.",
+                    evidence_refs=[command_log_ref],
+                    trace_ref=command_log_ref,
+                    usage=usage,
+                )
+            return AgentResult(
+                text=json.dumps({"candidate_manifest_ref": "agent-output/candidate_manifest.json"}, sort_keys=True),
+                evidence_refs=[command_log_ref, manifest_ref],
+                trace_ref=command_log_ref,
+                usage=usage,
+            )
+        return AgentResult(
+            text=response_text,
+            evidence_refs=["codex-sdk://thread"],
+            trace_ref="codex-sdk://thread",
+            usage=usage,
+        )
+
+
 class OpenAICompatibleBackend:
     backend_kind = "llm"
 
@@ -463,7 +558,8 @@ class OpenAICompatibleCodegenBackend:
             config,
             system_message=(
                 "You are an environment code generation backend. Return only a JSON object with a files array. "
-                "Each file item must contain path and content. Generate exactly the files requested by the user. "
+                "Each file item must contain path and content. Generate a contract-project environment under generated/ "
+                "with contract.json, source/, state/, adapters/, scripts/, and spec/. "
                 "Do not include API keys, credentials, or text outside JSON."
             ),
         )
@@ -485,12 +581,19 @@ class OpenAICompatibleCodegenBackend:
 
 
 CODEGEN_FILE_KINDS = {
-    "runtime.py": "runtime_code",
-    "seed_state.json": "seed_fixture",
-    "verifier.py": "verifier_code",
-    "surface_descriptor.json": "surface_descriptor",
-    "check_replay.py": "test_or_check",
-    "build_manifest.yaml": "build_manifest",
+    "contract",
+    "source",
+    "state",
+    "adapter",
+    "script",
+    "spec",
+    "manifest",
+    "check_report",
+    "lockfile",
+    "config",
+    "test",
+    "documentation",
+    "other",
 }
 
 
@@ -610,11 +713,8 @@ def _write_codegen_candidate(
         path_error = _codegen_path_error(rel_text)
         if path_error:
             return {}, path_error
-        if rel_text not in CODEGEN_FILE_KINDS:
-            return {}, _codegen_failure(
-                "unexpected_codegen_file",
-                "OpenAI-compatible codegen may only write the declared generated bundle files.",
-            )
+        if not (rel_text.startswith("generated/") or rel_text.startswith("agent-output/")):
+            return {}, _codegen_failure("unexpected_codegen_file", "OpenAI-compatible codegen files must be under generated/ or agent-output/.")
         if rel_text in declared:
             return {}, _codegen_failure("duplicate_codegen_file", "Model declared the same file twice.")
         content = item.get("content")
@@ -627,29 +727,29 @@ def _write_codegen_candidate(
             return {}, _codegen_failure("path_traversal_rejected", "Generated file path escapes the isolated workdir.")
         target.write_text(content, encoding="utf-8")
         declared.add(rel_text)
-    missing = sorted(set(CODEGEN_FILE_KINDS) - declared)
-    if missing:
-        return {}, _codegen_failure("missing_codegen_files", f"Model response did not include required files: {missing}")
+    generated_root = root / "generated"
+    for dirname in ["source", "state", "adapters", "scripts", "spec"]:
+        (generated_root / dirname).mkdir(parents=True, exist_ok=True)
+    if not (generated_root / "contract.json").is_file():
+        return {}, _codegen_failure("missing_codegen_files", "Model response did not include generated/contract.json.")
     generated_files = [
         {
-            "path": filename,
-            "kind": kind,
-            "sha256": _file_sha256(root / filename),
-            "source_refs": _file_source_refs(candidate, filename, request),
+            "path": path.relative_to(generated_root).as_posix(),
+            "kind": _codegen_kind(path.relative_to(generated_root).as_posix()),
+            "sha256": _file_sha256(path),
+            "source_refs": _file_source_refs(candidate, f"generated/{path.relative_to(generated_root).as_posix()}", request),
         }
-        for filename, kind in CODEGEN_FILE_KINDS.items()
+        for path in sorted(generated_root.rglob("*"))
+        if path.is_file() and not _is_python_cache_file(path)
     ]
     return {
-        "candidate_dir": ".",
-        "bundle_id": str(candidate.get("bundle_id") or "bundle-openai-codegen-candidate"),
+        "candidate_dir": "generated",
+        "implementation_id": str(candidate.get("implementation_id") or "project-openai-codegen-candidate"),
         "environment_id": str(candidate.get("environment_id") or "generated-environment"),
+        "contract_ref": "contract.json",
         "generated_files": generated_files,
-        "runtime_entrypoint": str(candidate.get("runtime_entrypoint") or "runtime.GeneratedEnvironment"),
-        "seed_fixture_ref": str(candidate.get("seed_fixture_ref") or "seed_state.json"),
-        "verifier_entrypoint": str(candidate.get("verifier_entrypoint") or "verifier.verify_task_completion"),
-        "surface_descriptors": list(candidate.get("surface_descriptors") or ["surface_descriptor.json"]),
-        "check_commands": list(candidate.get("check_commands") or [["python", "check_replay.py"]]),
-        "replay_commands": list(candidate.get("replay_commands") or [["python", "check_replay.py"]]),
+        "self_check": dict(candidate.get("self_check") or {"command": ["python", "scripts/self_check.py"]}),
+        "replay_commands": list(candidate.get("replay_commands") or []),
     }, None
 
 
@@ -658,6 +758,23 @@ def _file_source_refs(candidate: dict[str, Any], filename: str, request: AgentRe
         if isinstance(item, dict) and item.get("path") == filename and isinstance(item.get("source_refs"), list) and item["source_refs"]:
             return [str(ref) for ref in item["source_refs"]]
     return request.input_artifact_ids or ["openai-codegen-response"]
+
+
+def _codegen_kind(relative_path: str) -> str:
+    if relative_path == "contract.json":
+        return "contract"
+    first = relative_path.split("/", 1)[0]
+    return {
+        "source": "source",
+        "state": "state",
+        "adapters": "adapter",
+        "scripts": "script",
+        "spec": "spec",
+    }.get(first, "other")
+
+
+def _is_python_cache_file(path: Path) -> bool:
+    return "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}
 
 
 def _codegen_path_error(path_text: str) -> AgentResult | None:
@@ -719,6 +836,7 @@ def default_agent_backend_registry() -> AgentBackendRegistry:
     registry.register(CodexCliAgentBackend())
     registry.register(CodeAgentRunnerBackend())
     registry.register(CodexCliRunnerBackend())
+    registry.register(CodexSdkAgentBackend())
     registry.register(OpenAICompatibleBackend())
     registry.register(OpenAICompatibleCodegenBackend())
     return registry
@@ -740,14 +858,15 @@ def load_agent_backend_config_from_env(env: dict[str, str] | None = None, *, sou
     command_argv = shlex.split(command_value) if command_value else []
     allowlist_value = env.get("AGENT_WORLD_PROCESS_AGENT_ALLOWLIST") or env.get("AGENT_WORLD_CODEX_ALLOWLIST") or ""
     allowlist = shlex.split(allowlist_value) if allowlist_value else []
-    if backend_kind in {"code_agent_runner", "codex_cli_runner"}:
+    if backend_kind in {"code_agent_runner", "codex_cli_runner", "codex_sdk"}:
         command_filesystem = "isolated_agent_workspace"
     elif backend_kind in {"process_agent", "codex_cli"}:
         command_filesystem = "controlled_process_cwd"
     else:
         command_filesystem = "artifact_context"
-    command_sandbox = backend_kind in {"codex_cli", "codex_cli_runner"}
-    auth_permission = bool(api_key_env) and backend_kind in {"llm", "openai_codegen", "code_agent_runner", "codex_cli_runner"}
+    command_sandbox = backend_kind in {"codex_cli", "codex_cli_runner", "codex_sdk"}
+    agent_auth = env.get("AGENT_WORLD_AGENT_AUTH", "0") in {"1", "true", "True"} or env.get("AGENT_WORLD_CODEX_AUTH", "0") in {"1", "true", "True"}
+    auth_permission = (bool(api_key_env) or agent_auth) and backend_kind in {"llm", "openai_codegen", "code_agent_runner", "codex_cli_runner", "codex_sdk"}
     command = (
         {
             "argv": command_argv,
@@ -782,6 +901,7 @@ def load_agent_backend_config_from_env(env: dict[str, str] | None = None, *, sou
             "auth": auth_permission,
             "sandbox": command_sandbox,
         },
+        "codex": {"sandbox": env.get("AGENT_WORLD_CODEX_SANDBOX", "workspace-write")},
         "output_schema_ref": "AgentResult",
         "redaction_policy": {"secret_env_names_only": True, "redact_values": True},
     }
@@ -842,7 +962,7 @@ def invoke_agent(
 def _provider_for_backend(backend_kind: str) -> str:
     if backend_kind in {"process_agent", "code_agent_runner"}:
         return "local_process"
-    if backend_kind in {"codex_cli", "codex_cli_runner"}:
+    if backend_kind in {"codex_cli", "codex_cli_runner", "codex_sdk"}:
         return "codex"
     if backend_kind == "manual":
         return "manual"
@@ -851,6 +971,128 @@ def _provider_for_backend(backend_kind: str) -> str:
     if backend_kind in {"llm", "openai_codegen"}:
         return "openai_compatible"
     return "custom"
+
+
+def _codex_sdk_permission_error(request: AgentRequest, config: dict[str, Any]) -> AgentResult | None:
+    permissions = config.get("permissions", {})
+    if request.permissions.get("network") and not permissions.get("network"):
+        return AgentResult(
+            text="Codex SDK network permission denied",
+            status="fail",
+            failure_class="network_permission_denied",
+            recovery_suggestion="Set AGENT_WORLD_AGENT_NETWORK=1 only for trusted live Codex SDK runs.",
+        )
+    if request.permissions.get("auth") and not permissions.get("auth"):
+        return AgentResult(
+            text="Codex SDK auth permission denied",
+            status="fail",
+            failure_class="auth_permission_denied",
+            recovery_suggestion="Configure explicit auth env refs or AGENT_WORLD_CODEX_AUTH=1 for trusted Codex SDK runs.",
+        )
+    if request.permissions.get("sandbox") and not permissions.get("sandbox"):
+        return AgentResult(
+            text="Codex SDK sandbox permission denied",
+            status="fail",
+            failure_class="sandbox_permission_denied",
+            recovery_suggestion="Use codex_sdk only with an explicit sandbox policy.",
+        )
+    return None
+
+
+def _codex_sdk_sandbox(Sandbox: Any, config: dict[str, Any]) -> tuple[Any, AgentResult | None]:
+    raw = str((config.get("codex") or {}).get("sandbox") or "workspace-write")
+    normalized = raw.strip().lower().replace("_", "-")
+    if normalized in {"workspace-write", "workspace"}:
+        attr = "workspace_write"
+    elif normalized in {"read-only", "readonly", "read"}:
+        attr = "read_only"
+    elif normalized == "full-access":
+        return None, AgentResult(
+            text="Codex SDK full-access sandbox is not allowed by this framework",
+            status="fail",
+            failure_class="invalid_codex_sdk_sandbox",
+            recovery_suggestion="Use AGENT_WORLD_CODEX_SANDBOX=workspace-write or read-only.",
+        )
+    else:
+        return None, AgentResult(
+            text=f"Unsupported Codex SDK sandbox: {raw}",
+            status="fail",
+            failure_class="invalid_codex_sdk_sandbox",
+            recovery_suggestion="Use AGENT_WORLD_CODEX_SANDBOX=workspace-write or read-only.",
+        )
+    if not hasattr(Sandbox, attr):
+        return None, AgentResult(
+            text=f"Codex SDK Sandbox does not expose {attr}",
+            status="fail",
+            failure_class="invalid_codex_sdk",
+            recovery_suggestion="Use an official openai-codex build with Sandbox presets.",
+        )
+    return getattr(Sandbox, attr), None
+
+
+def _codex_sdk_workspace(request: AgentRequest) -> tuple[Path | None, AgentResult | None]:
+    if request.node_purpose != "implement":
+        root = str(request.permissions.get("filesystem_root") or "")
+        if not root:
+            return None, None
+    else:
+        root = str(request.permissions.get("filesystem_root") or "")
+        if not root:
+            return None, AgentResult(
+                text="Codex SDK implementation requires filesystem_root",
+                status="fail",
+                failure_class="missing_runner_workspace",
+                recovery_suggestion="Set request.permissions.filesystem_root to the isolated Codex SDK workspace.",
+            )
+    workspace = Path(root).resolve()
+    if not workspace.is_dir():
+        return None, AgentResult(
+            text="Codex SDK workspace does not exist",
+            status="fail",
+            failure_class="missing_runner_workspace",
+            recovery_suggestion="Create the isolated Codex SDK workspace before invoking the backend.",
+        )
+    return workspace, None
+
+
+@contextlib.contextmanager
+def _temporary_cwd(path: Path | None) -> Any:
+    if path is None:
+        yield
+        return
+    previous = Path.cwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
+
+
+def _codex_sdk_result_text(result: Any) -> str:
+    final_response = getattr(result, "final_response", None)
+    if isinstance(final_response, str):
+        return final_response
+    if final_response is not None:
+        return str(final_response)
+    if isinstance(result, str):
+        return result
+    return str(result)
+
+
+def _codex_sdk_usage(result: Any, duration_ms: int) -> dict[str, Any]:
+    usage = getattr(result, "usage", None)
+    return {"tokens": usage, "cost": None, "duration_ms": duration_ms}
+
+
+def _write_codex_sdk_result(path: Path, *, status: str, duration_ms: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(stable_json({"status": status, "duration_ms": duration_ms}), encoding="utf-8")
+
+
+def _codex_sdk_trace_ref(workspace: Path | None) -> str:
+    if workspace:
+        return "agent-workspace://agent-output/codex-sdk-result.json"
+    return "codex-sdk://thread"
 
 
 def _is_transient_openai_error(exc: Exception) -> bool:

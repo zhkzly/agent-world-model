@@ -12,11 +12,11 @@ from typing import Any
 
 import yaml
 
-from agent_world.artifacts import GENERATED_BUNDLE_FILE_KINDS, make_artifact, stable_json
+from agent_world.artifacts import GENERATED_PROJECT_FILE_KINDS, RUNTIME_ABI_INTERFACES, make_artifact, stable_json
 from agent_world.candidate_check import check_generated_candidate
 
 
-GENERATED_FILE_KINDS = dict(GENERATED_BUNDLE_FILE_KINDS)
+GENERATED_FILE_KINDS = set(GENERATED_PROJECT_FILE_KINDS)
 GENERIC_STRATEGY_FAMILY = "request-driven-generated-environment-v1"
 RAW_REQUEST_SOURCE_ID = "source-raw-request"
 
@@ -35,7 +35,7 @@ def domain_plan_fields(raw_request: str) -> dict[str, Any]:
         "recognized_intents": concepts,
         "required_state_objects": _state_object_ids(concepts),
         "required_operations": operations,
-        "likely_source_needs": ["raw request", "provided local source paths", "generated replay contract", "agent-written runtime bundle"],
+        "likely_source_needs": ["raw request", "provided local source paths", "generated replay contract", "agent-written contract project"],
         "constraints": {
             "network": "not_required",
             "auth": "not_required",
@@ -87,14 +87,14 @@ def strategy_selection_fields(domain_plan: dict[str, Any]) -> dict[str, Any]:
             "raw-request-source-discovery-v1",
             "source-grounded-generic-extraction-v1",
             "artifact-driven-task-synthesis-v1",
-            "agent-generated-bundle-v1",
+            "agent-generated-contract-project-v1",
             "framework-replay-contract-verifier-v1",
             "generated-runtime-package-v1",
         ],
         "source_strategy": "raw-request-source-discovery-v1",
         "extraction_strategy": "source-grounded-generic-extraction-v1",
         "synthesis_strategy": "artifact-driven-task-synthesis-v1",
-        "implementation_strategy": "agent-generated-bundle-v1",
+        "implementation_strategy": "agent-generated-contract-project-v1",
         "independent_verifier_strategy": "framework-replay-contract-verifier-v1",
         "package_strategy": "generated-runtime-package-v1",
         "selection_reason": "The request-driven path selects a generic artifact pipeline and delegates executable code to the configured agent backend.",
@@ -204,9 +204,9 @@ def environment_spec_fields(knowledge: dict[str, Any]) -> dict[str, Any]:
         "environment_id": environment_id,
         "domain": "request-generated local executable environment",
         "state_backend": {
-            "kind": "json",
-            "reset_strategy": "load seed_state.json and deep-copy it for every replay",
-            "isolation_strategy": "one in-memory state snapshot per task replay",
+            "kind": "contract_project_defined",
+            "reset_strategy": "runtime ABI reset returns an isolated episode for every replay",
+            "isolation_strategy": "one generated runtime episode per task replay",
             "seed_fixture_refs": [f"fixtures/seed/{environment_id}.json"],
         },
         "state_entities": [item["object_id"] for item in knowledge.get("state_objects", [])],
@@ -393,15 +393,14 @@ def implementation_request_fields(artifacts: dict[str, dict[str, Any]], review_r
         "required_surface_ids": [binding["binding_id"] for binding in artifacts["SurfacePlan"]["bindings"] if binding["surface"] == "python"],
         "package_layout_ref": "envpkg/",
         "implementation_scope": [
-            "agent-written runtime.py",
-            "agent-written seed_state.json",
-            "agent-written deterministic verifier.py",
-            "agent-written surface descriptor and check script",
+            "agent-written contract.json",
+            "agent-written free-form source project",
+            "agent-written state fixtures, adapters, scripts, specs, and deterministic verifier behavior",
             "framework-owned replay and independent verifier records",
         ],
         "non_goals": ["training integration", "rollout", "reward export", "AWM reproduction", "live external service access", "generic shell environment surface"],
         "tdd_requirements": ["machine-readable framework replay contract", "positive and negative verifier behavior", "forged generated check rejection"],
-        "launch_check_replay_commands": ["python <candidate_dir>/check_replay.py"],
+        "launch_check_commands": ["run candidate_manifest.self_check.command from <candidate_dir>"],
         "review_record_refs": [record["id"] for record in review_records],
         "strategy_selection_ref": artifacts["StrategySelection"]["id"],
     }
@@ -417,11 +416,11 @@ def generated_implementation_record(context: Any, **_: Any) -> dict[str, Any]:
         "static_check_command": "not run",
         "test_command": "not run",
         "replay_command": "not run",
-        "build_check_replay_records": [],
+        "implementation_check_records": [],
         "verifier_result": {},
         "status": "fail",
         "failure_class": "agent_backend_required",
-        "recovery_suggestion": "Request-driven generation requires implementation_mode=agent and a backend that writes a candidate bundle.",
+        "recovery_suggestion": "Request-driven generation requires implementation_mode=agent and a backend that writes a contract-project candidate.",
     }
 
 
@@ -431,16 +430,16 @@ def agent_generated_implementation_record(context: Any, *, agent_invocation: dic
     environment_id = request["environment_id"]
     base = {
         "implementation_id": f"implementation-{environment_id}-agent-generated",
-        "mode": "agent_backed_codegen",
+        "mode": "agent_backed_contract_project",
         "environment_id": environment_id,
         "implementation_request_id": request["id"],
         "agent_invocation_id": agent_invocation["id"],
         "agent_work_dir": str(work_dir),
         "source_artifact_ids": request["source_artifact_ids"],
-        "static_check_command": "validate agent candidate manifest, path boundaries, file hashes, generated self-check, and framework independent verifier",
-        "test_command": f"{sys.executable} <candidate_dir>/check_replay.py",
-        "replay_command": f"{sys.executable} <candidate_dir>/check_replay.py --task <task_id>",
-        "check_commands": [],
+        "static_check_command": "validate agent candidate manifest, contract.json, path boundaries, file hashes, generated self-check, and framework independent verifier",
+        "test_command": "run candidate_manifest.self_check.command",
+        "replay_command": "framework ABI replay through contract.json interfaces",
+        "self_check_commands": [],
         "replay_commands": [],
     }
     if agent_result.status != "pass":
@@ -451,64 +450,64 @@ def agent_generated_implementation_record(context: Any, *, agent_invocation: dic
     validation_error = _validate_agent_candidate_files(work_dir, manifest)
     if validation_error:
         return _agent_failure_record(base, failure_class=validation_error["failure_class"], recovery_suggestion=validation_error["recovery_suggestion"])
-    bundle_dir = _agent_candidate_root(work_dir, manifest)
-    if isinstance(bundle_dir, dict):
-        return _agent_failure_record(base, failure_class=bundle_dir["failure_class"], recovery_suggestion=bundle_dir["recovery_suggestion"])
-    runtime_entrypoint = str(manifest.get("runtime_entrypoint") or "runtime.GeneratedEnvironment")
-    verifier_entrypoint = str(manifest.get("verifier_entrypoint") or "verifier.verify_task_completion")
-    generated_files = _bundle_records_from_agent_manifest(bundle_dir, manifest, fallback_source_refs=_source_refs(context))
-    check_record = check_generated_bundle(
-        bundle_dir,
+    project_dir = _agent_candidate_root(work_dir, manifest)
+    if isinstance(project_dir, dict):
+        return _agent_failure_record(base, failure_class=project_dir["failure_class"], recovery_suggestion=project_dir["recovery_suggestion"])
+    contract = _read_project_contract(project_dir, manifest)
+    if isinstance(contract, dict) and "failure_class" in contract:
+        return _agent_failure_record(base, failure_class=contract["failure_class"], recovery_suggestion=contract["recovery_suggestion"])
+    generated_files = _project_records_from_agent_manifest(project_dir, manifest, fallback_source_refs=_source_refs(context))
+    check_record = check_generated_project(
+        project_dir,
         environment_id=environment_id,
         accepted_tasks=context.artifact("TaskSet")["tasks"],
-        runtime_entrypoint=runtime_entrypoint,
-        verifier_entrypoint=verifier_entrypoint,
+        manifest=manifest,
     )
-    build_check_replay_records = _bundle_check_records(check_record)
+    implementation_check_records = _project_check_records(check_record)
     status = "pass" if check_record["success"] else "fail"
-    check_commands = [[sys.executable, str(bundle_dir / "check_replay.py")]]
-    replay_commands = [[sys.executable, str(bundle_dir / "check_replay.py"), "--task", task_id] for task_id in _accepted_task_ids(context)]
-    bundle_artifact = _bundle_artifact(
+    self_check_commands = [list(manifest.get("self_check", {}).get("command", []))] if isinstance(manifest.get("self_check"), dict) else []
+    replay_commands = [["framework-abi-replay", task_id] for task_id in _accepted_task_ids(context)]
+    project_artifact = _project_artifact(
         context=context,
-        bundle_id=str(manifest.get("bundle_id") or f"bundle-{environment_id}-agent-generated"),
+        project_id=str(manifest.get("implementation_id") or f"project-{environment_id}-agent-generated"),
         producer="request-driven-agent-codegen",
-        build_dir=bundle_dir,
+        build_dir=project_dir,
+        contract=contract,
+        contract_ref=str(manifest.get("contract_ref") or "contract.json"),
         generated_files=generated_files,
-        build_check_replay_records=build_check_replay_records,
+        independent_check_records=implementation_check_records,
         status=status,
-        implementation_mode="agent_backed_codegen",
+        implementation_mode="agent_backed_contract_project",
         extra_inputs=[agent_invocation["id"]],
-        runtime_entrypoint=runtime_entrypoint,
-        verifier_entrypoint=verifier_entrypoint,
-        check_commands=check_commands,
+        self_check_commands=self_check_commands,
         replay_commands=replay_commands,
         agent_invocation_ref=agent_invocation["id"],
     )
-    independent_report = independent_verification_report_from_check(context, bundle_artifact, check_record)
+    independent_report = independent_verification_report_from_check(context, project_artifact, check_record)
     return {
         **base,
-        "generated_bundle_id": bundle_artifact["id"],
-        "generated_environment_bundle": bundle_artifact,
+        "generated_project_id": project_artifact["id"],
+        "generated_environment_project": project_artifact,
         "independent_verification_report": independent_report,
         "generated_paths": [item["path"] for item in generated_files],
         "generated_file_hashes": {item["path"]: item["sha256"] for item in generated_files},
-        "agent_candidate_dir": str(bundle_dir),
-        "test_command": f"{sys.executable} {bundle_dir / 'check_replay.py'}",
+        "agent_candidate_dir": str(project_dir),
+        "test_command": self_check_commands[0] if self_check_commands else "not declared",
         "replay_command": replay_commands[0] if replay_commands else "",
-        "check_commands": check_commands,
+        "self_check_commands": self_check_commands,
         "replay_commands": replay_commands,
-        "build_check_replay_records": build_check_replay_records,
+        "implementation_check_records": implementation_check_records,
         "verifier_result": check_record.get("positive_verifier_result", {}),
         "negative_verifier_result": check_record.get("negative_verifier_result", {}),
         "status": status,
-        "failure_class": "" if status == "pass" else check_record.get("failure_class", "generated_bundle_check_failed"),
-        "recovery_suggestion": "" if status == "pass" else check_record.get("recovery_suggestion", "Repair generated runtime, verifier, seed, or check files before release planning."),
+        "failure_class": "" if status == "pass" else check_record.get("failure_class", "generated_project_check_failed"),
+        "recovery_suggestion": "" if status == "pass" else check_record.get("recovery_suggestion", "Repair generated contract project before release planning."),
     }
 
 
 def package_plan_fields(context: Any) -> dict[str, Any]:
-    bundle = context.artifact("GeneratedEnvironmentBundle")
-    environment_id = bundle["environment_id"]
+    project = context.artifact("GeneratedEnvironmentProject")
+    environment_id = project["environment_id"]
     package_ref = f"package-{environment_id}"
     replay_ref = f"replay-{environment_id}"
     release_ref = f"release-{environment_id}"
@@ -517,7 +516,7 @@ def package_plan_fields(context: Any) -> dict[str, Any]:
         + [package_ref, replay_ref, f"consumer-{environment_id}", release_ref]
         + [record["id"] for record in context.review_records]
         + [record["id"] for record in context.gate_records]
-        + [record["implementation_id"] for record in context.build_check_replay_records]
+        + [record["implementation_id"] for record in context.implementation_check_records]
     )
     return {
         "package_plan_id": package_ref,
@@ -529,9 +528,9 @@ def package_plan_fields(context: Any) -> dict[str, Any]:
         "review_record_refs": [record["id"] for record in context.review_records],
         "replay_plan_ref": replay_ref,
         "release_manifest_ref": release_ref,
-        "generated_bundle_ref": bundle["id"],
+        "generated_project_ref": project["id"],
         "independent_verification_report_ref": context.artifact("IndependentVerificationReport")["id"],
-        "consumer_output_refs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml", "release/generated-runtime-index.yaml"],
+        "consumer_output_refs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml", "runtime/runtime_index.json"],
         "excluded_items": [
             {"item": "live external services", "reason": "request-driven first slice uses synthetic local state"},
             {"item": "generic shell executor", "reason": "environment tools are logical Python callables"},
@@ -541,8 +540,8 @@ def package_plan_fields(context: Any) -> dict[str, Any]:
 
 
 def release_manifest_fields(context: Any) -> dict[str, Any]:
-    bundle = context.artifact("GeneratedEnvironmentBundle")
-    environment_id = bundle["environment_id"]
+    project = context.artifact("GeneratedEnvironmentProject")
+    environment_id = project["environment_id"]
     artifacts = context.artifacts | {"EnvironmentPackagePlan": context.artifact("EnvironmentPackagePlan")}
     return {
         "release_id": f"release-{environment_id}",
@@ -555,7 +554,7 @@ def release_manifest_fields(context: Any) -> dict[str, Any]:
         "surface_index": context.artifact("SurfacePlan")["surface_status"],
         "fixture_index": [f"fixtures/seed/{environment_id}.json"],
         "replay_contract": "checks/framework-replay-contract.json",
-        "generated_bundle_ref": bundle["id"],
+        "generated_project_ref": project["id"],
         "independent_verification_report_ref": context.artifact("IndependentVerificationReport")["id"],
         "request_lineage": {
             "domain_plan_ref": context.artifact("DomainPlan")["id"],
@@ -565,18 +564,18 @@ def release_manifest_fields(context: Any) -> dict[str, Any]:
             "task_set_ref": context.artifact("TaskSet")["id"],
             "verifier_plan_ref": context.artifact("VerifierPlan")["id"],
             "implementation_request_ref": context.artifact("ImplementationRequest")["id"],
-            "generated_bundle_ref": bundle["id"],
+            "generated_project_ref": project["id"],
             "independent_verification_report_ref": context.artifact("IndependentVerificationReport")["id"],
         },
-        "generated_bundle": {
-            "bundle_id": bundle["id"],
-            "build_dir": bundle["build_dir"],
-            "runtime_entrypoint": bundle["runtime_entrypoint"],
-            "verifier_entrypoint": bundle["verifier_entrypoint"],
-            "check_commands": bundle["check_commands"],
-            "replay_commands": bundle["replay_commands"],
+        "generated_project": {
+            "project_id": project["id"],
+            "build_dir": project["build_dir"],
+            "contract_ref": project["contract_ref"],
+            "runtime_abi_version": project["runtime_abi_version"],
+            "self_check_commands": project["self_check_commands"],
+            "replay_commands": project["replay_commands"],
         },
-        "consumer_outputs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml", "release/generated-runtime-index.yaml"],
+        "consumer_outputs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml", "runtime/runtime_index.json"],
         "known_limits": [
             "The request-driven path requires an agent backend to write executable candidate files.",
             "Default source discovery consumes the raw request and optional local source paths; it does not perform live crawling.",
@@ -589,28 +588,28 @@ def blocking_source_uncertainties(knowledge: dict[str, Any]) -> list[dict[str, A
     return [item for item in knowledge.get("uncertainties", []) if item.get("blocking")]
 
 
-def check_generated_bundle(
+def check_generated_project(
     build_dir: Path,
     *,
     environment_id: str,
     accepted_tasks: list[dict[str, Any]] | None = None,
-    runtime_entrypoint: str = "runtime.GeneratedEnvironment",
-    verifier_entrypoint: str = "verifier.verify_task_completion",
+    manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     build_dir = Path(build_dir)
-    generated_check = _run_generated_check([sys.executable, str(build_dir / "check_replay.py")], build_dir)
+    manifest = manifest or {}
+    self_check = manifest.get("self_check") if isinstance(manifest.get("self_check"), dict) else {}
+    command = list(self_check.get("command") or [])
+    generated_check = _run_generated_check(command, build_dir)
     framework_check = check_generated_candidate(
         build_dir=build_dir,
         environment_id=environment_id,
         accepted_tasks=accepted_tasks,
-        runtime_entrypoint=runtime_entrypoint,
-        verifier_entrypoint=verifier_entrypoint,
     )
     independent = framework_check["independent_verification_record"]
     success = generated_check["success"] and framework_check["success"]
     if not generated_check["success"]:
-        failure_class = generated_check.get("failure_class", "generated_bundle_check_failed")
-        recovery = generated_check.get("recovery_suggestion", "Repair generated check_replay.py or runtime files.")
+        failure_class = generated_check.get("failure_class", "generated_project_self_check_failed")
+        recovery = generated_check.get("recovery_suggestion", "Repair generated self-check command or contract project files.")
     elif not framework_check["success"]:
         failure_class = framework_check.get("failure_class", "framework_candidate_check_failed")
         recovery = framework_check.get("recovery_suggestion", "Repair generated runtime, verifier, seed, or trace behavior.")
@@ -618,7 +617,7 @@ def check_generated_bundle(
         failure_class = ""
         recovery = ""
     return {
-        "check_id": "request-driven-generated-check",
+        "check_id": "request-driven-generated-project-check",
         "success": success,
         "command": generated_check["command"],
         "exit_code": generated_check.get("exit_code"),
@@ -636,25 +635,25 @@ def check_generated_bundle(
     }
 
 
-def independent_verification_report_from_check(context: Any, bundle: dict[str, Any], check_record: dict[str, Any]) -> dict[str, Any]:
+def independent_verification_report_from_check(context: Any, project: dict[str, Any], check_record: dict[str, Any]) -> dict[str, Any]:
     independent = check_record.get("independent_verification_record", {})
     task_records = list(independent.get("task_records", []))
     positive_count = sum(1 for record in task_records if isinstance(record.get("positive_verifier_result"), dict) and record["positive_verifier_result"].get("success") is True)
     negative_count = sum(1 for record in task_records if isinstance(record.get("negative_verifier_result"), dict) and record["negative_verifier_result"].get("success") is False)
     success = bool(independent.get("success"))
-    environment_id = bundle["environment_id"]
+    environment_id = project["environment_id"]
     return make_artifact(
         "IndependentVerificationReport",
         source_stage="IMPLEMENT",
         producer="framework-replay-contract-verifier",
         artifact_id=f"independent-verification-{environment_id}",
-        inputs=[bundle["id"], context.artifact("TaskSet")["id"], context.artifact("VerifierPlan")["id"]],
+        inputs=[project["id"], context.artifact("TaskSet")["id"], context.artifact("VerifierPlan")["id"]],
         status="accepted" if success else "fail",
         fields={
             "report_id": f"independent-verification-{environment_id}",
             "environment_id": environment_id,
-            "generated_bundle_ref": bundle["id"],
-            "verifier_strategy": "framework-replay-contract-verifier-v1",
+            "generated_project_ref": project["id"],
+            "verifier_strategy": "framework-contract-project-abi-verifier-v1",
             "accepted_task_ids": list(independent.get("accepted_task_ids", [])),
             "verified_task_ids": list(independent.get("verified_task_ids", [])),
             "task_records": task_records,
@@ -664,7 +663,7 @@ def independent_verification_report_from_check(context: Any, bundle: dict[str, A
             "success": success,
             "failure_class": independent.get("failure_class", ""),
             "recovery_suggestion": independent.get("recovery_suggestion", ""),
-            "source_artifact_refs": [context.artifact("TaskSet")["id"], context.artifact("VerifierPlan")["id"], bundle["id"]],
+            "source_artifact_refs": [context.artifact("TaskSet")["id"], context.artifact("VerifierPlan")["id"], project["id"]],
         },
     )
 
@@ -683,7 +682,7 @@ def run_summary(context: Any) -> dict[str, Any]:
         "VerifierPlan",
         "FeasibilityReport",
         "ImplementationRequest",
-        "GeneratedEnvironmentBundle",
+        "GeneratedEnvironmentProject",
         "IndependentVerificationReport",
         "EnvironmentPackagePlan",
         "ReleaseManifest",
@@ -904,53 +903,53 @@ def _slug(value: str) -> str:
     return f"term_{digest}"
 
 
-def _bundle_artifact(
+def _project_artifact(
     *,
     context: Any,
-    bundle_id: str,
+    project_id: str,
     producer: str,
     build_dir: Path,
+    contract: dict[str, Any],
+    contract_ref: str,
     generated_files: list[dict[str, Any]],
-    build_check_replay_records: list[dict[str, Any]],
+    independent_check_records: list[dict[str, Any]],
     status: str,
     implementation_mode: str,
     extra_inputs: list[str],
-    runtime_entrypoint: str,
-    verifier_entrypoint: str,
-    check_commands: list[list[str]],
+    self_check_commands: list[list[str]],
     replay_commands: list[list[str]],
     agent_invocation_ref: str = "",
 ) -> dict[str, Any]:
     fields = {
-        "bundle_id": bundle_id,
+        "project_id": project_id,
         "environment_id": context.artifact("ImplementationRequest")["environment_id"],
         "source_artifact_ids": context.artifact("ImplementationRequest")["source_artifact_ids"],
         "implementation_request_id": context.artifact("ImplementationRequest")["id"],
         "build_dir": str(build_dir),
+        "contract_ref": contract_ref,
+        "contract": contract,
         "generated_files": generated_files,
-        "runtime_entrypoint": runtime_entrypoint,
-        "seed_fixture_ref": "seed_state.json",
-        "verifier_entrypoint": verifier_entrypoint,
-        "surface_descriptors": ["surface_descriptor.json"],
-        "check_commands": check_commands,
+        "runtime_abi_version": "agent-world.runtime-abi.v1",
+        "required_interfaces": sorted(RUNTIME_ABI_INTERFACES),
+        "self_check_commands": self_check_commands,
         "replay_commands": replay_commands,
-        "build_check_replay_records": build_check_replay_records,
+        "independent_check_records": independent_check_records,
         "implementation_mode": implementation_mode,
     }
     if agent_invocation_ref:
         fields["agent_invocation_ref"] = agent_invocation_ref
     return make_artifact(
-        "GeneratedEnvironmentBundle",
+        "GeneratedEnvironmentProject",
         source_stage="IMPLEMENT",
         producer=producer,
-        artifact_id=bundle_id,
+        artifact_id=project_id,
         inputs=[context.artifact("ImplementationRequest")["id"]] + list(extra_inputs),
         status="accepted" if status == "pass" else "fail",
         fields=fields,
     )
 
 
-def _bundle_check_records(check_record: dict[str, Any]) -> list[dict[str, Any]]:
+def _project_check_records(check_record: dict[str, Any]) -> list[dict[str, Any]]:
     return [check_record] + list(check_record.get("independent_task_records", []))
 
 
@@ -977,13 +976,25 @@ def _source_refs(context: Any) -> list[str]:
 
 
 def _run_generated_check(command: list[str], build_dir: Path) -> dict[str, Any]:
+    if not command:
+        return {
+            "check_id": "generated-self-check",
+            "success": False,
+            "command": [],
+            "exit_code": None,
+            "stdout": "",
+            "stderr": "candidate manifest self_check.command is missing",
+            "failure_class": "missing_generated_self_check",
+            "recovery_suggestion": "Candidate manifest must declare self_check.command.",
+        }
+    argv = [sys.executable if str(part) == "python" else str(part) for part in command]
     try:
-        completed = subprocess.run(command, cwd=build_dir, text=True, capture_output=True, timeout=10, check=False)
+        completed = subprocess.run(argv, cwd=build_dir, text=True, capture_output=True, timeout=10, check=False)
     except Exception as exc:
         return {
             "check_id": "generated-self-check",
             "success": False,
-            "command": command,
+            "command": argv,
             "exit_code": None,
             "stdout": "",
             "stderr": str(exc),
@@ -996,14 +1007,14 @@ def _run_generated_check(command: list[str], build_dir: Path) -> dict[str, Any]:
     return {
         "check_id": "generated-self-check",
         "success": success,
-        "command": command,
+        "command": argv,
         "exit_code": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
         "positive_verifier_result": parsed.get("positive_verifier_result", {}),
         "negative_verifier_result": parsed.get("negative_verifier_result", {}),
-        "failure_class": "" if success else "generated_bundle_check_failed",
-        "recovery_suggestion": "" if success else "Generated check_replay.py did not report success.",
+        "failure_class": "" if success else "generated_project_self_check_failed",
+        "recovery_suggestion": "" if success else "Generated self-check did not report success.",
     }
 
 
@@ -1036,7 +1047,7 @@ def _agent_failure_record(
         **base,
         "generated_paths": [],
         "generated_file_hashes": {},
-        "build_check_replay_records": [
+        "implementation_check_records": [
             {
                 "check_id": base["implementation_id"],
                 "success": False,
@@ -1073,6 +1084,11 @@ def _agent_candidate_manifest(text: str, work_dir: Path) -> tuple[dict[str, Any]
         parsed = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
     if not isinstance(parsed.get("generated_files"), list):
         return {}, {"failure_class": "missing_candidate_files", "recovery_suggestion": "Agent candidate manifest must declare generated_files."}
+    for field in ["candidate_dir", "environment_id", "implementation_id", "contract_ref", "self_check"]:
+        if field not in parsed:
+            return {}, {"failure_class": "missing_candidate_manifest_field", "recovery_suggestion": f"Agent candidate manifest must declare {field}."}
+    if not isinstance(parsed.get("self_check"), dict) or not isinstance(parsed["self_check"].get("command"), list):
+        return {}, {"failure_class": "missing_generated_self_check", "recovery_suggestion": "Agent candidate manifest must declare self_check.command as a list."}
     return parsed, None
 
 
@@ -1081,6 +1097,14 @@ def _validate_agent_candidate_files(work_dir: Path, manifest: dict[str, Any]) ->
     if isinstance(candidate_root, dict):
         return candidate_root
     root = candidate_root.resolve()
+    if str(manifest.get("candidate_dir") or "") != "generated":
+        return {"failure_class": "invalid_candidate_dir", "recovery_suggestion": "Agent candidate manifest must declare candidate_dir: generated."}
+    contract_ref = str(manifest.get("contract_ref") or "contract.json")
+    if contract_ref != "contract.json":
+        return {"failure_class": "invalid_contract_ref", "recovery_suggestion": "Agent candidate manifest must declare contract_ref: contract.json."}
+    for dirname in ["source", "state", "adapters", "scripts", "spec"]:
+        if not (candidate_root / dirname).is_dir():
+            return {"failure_class": "missing_project_directory", "recovery_suggestion": f"Generated project is missing required directory: {dirname}/"}
     declared: set[str] = set()
     for item in manifest.get("generated_files", []):
         if not isinstance(item, dict):
@@ -1089,44 +1113,64 @@ def _validate_agent_candidate_files(work_dir: Path, manifest: dict[str, Any]) ->
         path_error = _candidate_path_error(rel_text)
         if path_error:
             return path_error
-        expected_kind = GENERATED_FILE_KINDS.get(rel_text)
-        if not expected_kind:
-            return {"failure_class": "unexpected_candidate_file", "recovery_suggestion": "Agent candidate may only declare the generated bundle files."}
-        if item.get("kind") != expected_kind:
-            return {"failure_class": "candidate_file_kind_mismatch", "recovery_suggestion": f"Agent candidate file {rel_text} has the wrong kind."}
+        if item.get("kind") not in GENERATED_FILE_KINDS:
+            return {"failure_class": "candidate_file_kind_mismatch", "recovery_suggestion": f"Agent candidate file {rel_text} has an unsupported kind."}
         actual = (candidate_root / rel_text).resolve()
         if not _inside(actual, root):
-            return {"failure_class": "symlink_escape", "recovery_suggestion": "Agent candidate file resolves outside the candidate bundle directory."}
+            return {"failure_class": "symlink_escape", "recovery_suggestion": "Agent candidate file resolves outside the candidate project directory."}
         if not actual.is_file():
             return {"failure_class": "missing_generated_file", "recovery_suggestion": f"Agent candidate file is missing: {rel_text}"}
         expected_hash = str(item.get("sha256") or "")
         if expected_hash != _sha256(actual):
             return {"failure_class": "hash_mismatch", "recovery_suggestion": f"Agent candidate file hash mismatch: {rel_text}"}
         declared.add(rel_text)
-    missing = sorted(set(GENERATED_FILE_KINDS) - declared)
-    if missing:
-        return {"failure_class": "missing_generated_file", "recovery_suggestion": f"Agent candidate is missing required files: {missing}"}
+    if contract_ref not in declared:
+        return {"failure_class": "missing_generated_file", "recovery_suggestion": "Agent candidate must declare contract.json in generated_files."}
     observed = {path.relative_to(candidate_root).as_posix() for path in candidate_root.rglob("*") if path.is_file() and not _is_python_cache_file(path)}
     extra = sorted(observed - declared)
     if extra:
         return {"failure_class": "undeclared_generated_file", "recovery_suggestion": f"Agent wrote files that were not declared in the candidate manifest: {extra}"}
-    for filename in ["runtime.py", "verifier.py", "check_replay.py"]:
+    contract = _read_project_contract(candidate_root, manifest)
+    if isinstance(contract, dict) and "failure_class" in contract:
+        return contract
+    if contract.get("environment_id") != manifest.get("environment_id"):
+        return {"failure_class": "contract_environment_mismatch", "recovery_suggestion": "contract.json environment_id must match candidate manifest environment_id."}
+    if set((contract.get("interfaces") or {}).keys()) != RUNTIME_ABI_INTERFACES:
+        return {"failure_class": "missing_runtime_interface", "recovery_suggestion": "contract.json must declare exactly the eight runtime ABI interfaces."}
+    for filename in sorted(path for path in declared if path.endswith(".py")):
         text = (candidate_root / filename).read_text(encoding="utf-8")
         if "agent_world." in text:
-            return {"failure_class": "framework_runtime_import", "recovery_suggestion": "Generated bundle files must be self-contained and must not import the framework package."}
+            return {"failure_class": "framework_runtime_import", "recovery_suggestion": "Generated project files must be self-contained and must not import the framework package."}
     return None
 
 
-def _bundle_records_from_agent_manifest(bundle_dir: Path, manifest: dict[str, Any], *, fallback_source_refs: list[str]) -> list[dict[str, Any]]:
+def _read_project_contract(project_dir: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    contract_ref = str(manifest.get("contract_ref") or "contract.json")
+    path_error = _candidate_path_error(contract_ref)
+    if path_error:
+        return path_error
+    path = (project_dir / contract_ref).resolve()
+    if not _inside(path, project_dir.resolve()) or not path.is_file():
+        return {"failure_class": "missing_contract", "recovery_suggestion": "Generated project must contain contract.json."}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"failure_class": "malformed_contract", "recovery_suggestion": "Generated contract.json must be valid JSON."}
+    if not isinstance(value, dict):
+        return {"failure_class": "malformed_contract", "recovery_suggestion": "Generated contract.json must contain an object."}
+    return value
+
+
+def _project_records_from_agent_manifest(project_dir: Path, manifest: dict[str, Any], *, fallback_source_refs: list[str]) -> list[dict[str, Any]]:
     by_path = {str(item.get("path")): item for item in manifest.get("generated_files", []) if isinstance(item, dict)}
     records = []
-    for filename, kind in GENERATED_FILE_KINDS.items():
+    for filename in sorted(by_path):
         item = by_path[filename]
         records.append(
             {
-                "path": str((bundle_dir / filename).resolve()),
-                "kind": kind,
-                "sha256": str(item.get("sha256") or _sha256(bundle_dir / filename)),
+                "path": filename,
+                "kind": str(item.get("kind") or "other"),
+                "sha256": str(item.get("sha256") or _sha256(project_dir / filename)),
                 "source_refs": [str(ref) for ref in item.get("source_refs", [])] or fallback_source_refs,
             }
         )

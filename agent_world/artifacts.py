@@ -112,28 +112,28 @@ ARTIFACT_REQUIRED_FIELDS: dict[str, list[str]] = {
         "implementation_scope",
         "non_goals",
         "tdd_requirements",
-        "launch_check_replay_commands",
+        "launch_check_commands",
         "review_record_refs",
     ],
-    "GeneratedEnvironmentBundle": [
-        "bundle_id",
+    "GeneratedEnvironmentProject": [
+        "project_id",
         "environment_id",
         "source_artifact_ids",
         "implementation_request_id",
         "build_dir",
+        "contract_ref",
+        "contract",
         "generated_files",
-        "runtime_entrypoint",
-        "seed_fixture_ref",
-        "verifier_entrypoint",
-        "surface_descriptors",
-        "check_commands",
+        "runtime_abi_version",
+        "required_interfaces",
+        "self_check_commands",
         "replay_commands",
-        "build_check_replay_records",
+        "independent_check_records",
     ],
     "IndependentVerificationReport": [
         "report_id",
         "environment_id",
-        "generated_bundle_ref",
+        "generated_project_ref",
         "verifier_strategy",
         "accepted_task_ids",
         "verified_task_ids",
@@ -280,15 +280,32 @@ VERIFIER_KINDS = {
     "test_assertion",
     "api_assertion",
 }
-GENERATED_BUNDLE_FILE_KINDS = {
-    "runtime.py": "runtime_code",
-    "seed_state.json": "seed_fixture",
-    "verifier.py": "verifier_code",
-    "surface_descriptor.json": "surface_descriptor",
-    "check_replay.py": "test_or_check",
-    "build_manifest.yaml": "build_manifest",
+RUNTIME_ABI_INTERFACES = {
+    "describe",
+    "setup",
+    "reset",
+    "health",
+    "invoke",
+    "verify",
+    "export_trace",
+    "teardown",
 }
-GENERATED_FILE_KINDS = set(GENERATED_BUNDLE_FILE_KINDS.values())
+GENERATED_PROJECT_FILE_KINDS = {
+    "contract",
+    "source",
+    "state",
+    "adapter",
+    "script",
+    "spec",
+    "manifest",
+    "check_report",
+    "lockfile",
+    "config",
+    "test",
+    "documentation",
+    "other",
+}
+GENERATED_FILE_KINDS = set(GENERATED_PROJECT_FILE_KINDS)
 AGENT_BACKEND_KINDS = {
     "llm",
     "openai_codegen",
@@ -388,6 +405,7 @@ def _default_id(artifact_type: str, fields: dict[str, Any]) -> str:
         or fields.get("invocation_id")
         or fields.get("backend_id")
         or fields.get("request_id")
+        or fields.get("project_id")
         or fields.get("bundle_id")
         or fields.get("package_plan_id")
         or fields.get("replay_plan_id")
@@ -449,22 +467,32 @@ def validate_artifact(artifact_type: str, artifact: dict[str, Any]) -> None:
             raise ArtifactValidationError("FeasibilityReport must declare upstream gate_result_scope")
         if set(artifact.get("self_gate_expectations", [])) != {"G0", "G10", "G13"}:
             raise ArtifactValidationError("FeasibilityReport must declare S8 self gate expectations")
-    elif artifact_type == "GeneratedEnvironmentBundle":
+    elif artifact_type == "GeneratedEnvironmentProject":
         _assert_in(artifact_type, "status", artifact.get("status"), {"accepted", "fail", "needs_human"})
+        if artifact.get("runtime_abi_version") != "agent-world.runtime-abi.v1":
+            raise ArtifactValidationError("GeneratedEnvironmentProject requires runtime_abi_version=agent-world.runtime-abi.v1")
+        if set(artifact.get("required_interfaces", [])) != RUNTIME_ABI_INTERFACES:
+            raise ArtifactValidationError("GeneratedEnvironmentProject must declare the eight required runtime ABI interfaces")
+        contract = artifact.get("contract")
+        if not isinstance(contract, dict):
+            raise ArtifactValidationError("GeneratedEnvironmentProject.contract must be an object")
+        if str(contract.get("environment_id", "")) != str(artifact.get("environment_id", "")):
+            raise ArtifactValidationError("GeneratedEnvironmentProject contract environment_id mismatch")
+        if set((contract.get("interfaces") or {}).keys()) != RUNTIME_ABI_INTERFACES:
+            raise ArtifactValidationError("GeneratedEnvironmentProject contract must declare the eight runtime ABI interfaces")
         for generated_file in artifact["generated_files"]:
             _require_fields(artifact_type, generated_file, ["path", "kind", "sha256", "source_refs"])
             _assert_in(artifact_type, "generated_file.kind", generated_file.get("kind"), GENERATED_FILE_KINDS)
             if not re.fullmatch(r"[0-9a-f]{64}", str(generated_file.get("sha256", ""))):
-                raise ArtifactValidationError("GeneratedEnvironmentBundle generated file sha256 must be a hex digest")
-        required_kinds = {"runtime_code", "seed_fixture", "verifier_code", "surface_descriptor", "test_or_check", "build_manifest"}
-        observed_kinds = {item["kind"] for item in artifact["generated_files"]}
-        missing_kinds = sorted(required_kinds - observed_kinds)
-        if missing_kinds:
-            raise ArtifactValidationError(f"GeneratedEnvironmentBundle missing generated file kinds: {missing_kinds}")
-        if not artifact["build_check_replay_records"]:
-            raise ArtifactValidationError("GeneratedEnvironmentBundle must include build/check/replay records")
-        if artifact["status"] == "accepted" and not all(record.get("success") for record in artifact["build_check_replay_records"]):
-            raise ArtifactValidationError("GeneratedEnvironmentBundle accepted status requires passing checks")
+                raise ArtifactValidationError("GeneratedEnvironmentProject generated file sha256 must be a hex digest")
+        by_path = {item["path"]: item for item in artifact["generated_files"]}
+        contract_ref = str(artifact.get("contract_ref") or "")
+        if contract_ref not in by_path or by_path[contract_ref]["kind"] != "contract":
+            raise ArtifactValidationError("GeneratedEnvironmentProject must include contract_ref as a contract generated file")
+        if not artifact["independent_check_records"]:
+            raise ArtifactValidationError("GeneratedEnvironmentProject must include independent check records")
+        if artifact["status"] == "accepted" and not all(record.get("success") for record in artifact["independent_check_records"]):
+            raise ArtifactValidationError("GeneratedEnvironmentProject accepted status requires passing checks")
     elif artifact_type == "IndependentVerificationReport":
         _assert_in(artifact_type, "status", artifact.get("status"), {"accepted", "fail", "needs_human"})
         if artifact["status"] == "accepted" and artifact.get("success") is not True:

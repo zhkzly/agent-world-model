@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-world.trace-event.schema.json",
+  "title": "Agent World Trace Event",
+  "type": "object",
+  "required": ["episode_id", "tool_id", "step_index"],
+  "properties": {
+    "episode_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "tool_id": {"type": "string"},
+    "step_index": {"type": "integer", "minimum": 0},
+    "arguments": {"type": "object"},
+    "result": {},
+    "state_before_hash": {"type": "string"},
+    "state_after_hash": {"type": "string"}
+  }
+}

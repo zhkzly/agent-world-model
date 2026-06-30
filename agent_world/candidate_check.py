@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agent_world.artifacts import stable_json
-from agent_world.independent_verifier import verify_generated_bundle_independent
+from agent_world.independent_verifier import verify_generated_project_independent
 from agent_world.replay_contract import observation_from_independent_report
 
 
@@ -16,17 +16,15 @@ def check_generated_candidate(
     environment_id: str,
     accepted_tasks: list[dict[str, Any]] | None = None,
     runtime_entrypoint: str = "",
-    verifier_entrypoint: str = "verifier.verify_task_completion",
+    verifier_entrypoint: str = "",
     candidate_dir_ref: str = "generated",
 ) -> dict[str, Any]:
     """Run the framework-owned executable check over a generated candidate."""
     build_dir = Path(build_dir)
-    independent = verify_generated_bundle_independent(
+    independent = verify_generated_project_independent(
         environment_id,
         build_dir,
         accepted_tasks=accepted_tasks,
-        runtime_entrypoint=runtime_entrypoint,
-        verifier_entrypoint=verifier_entrypoint,
     )
     observation = independent.get("framework_check_observation")
     if not isinstance(observation, dict):
@@ -44,7 +42,7 @@ def check_generated_candidate(
         "independent_verification_record": independent,
         "framework_check_observation": observation,
         "failure_class": "" if observation.get("success") is True else observation.get("failure_class", "framework_candidate_check_failed"),
-        "recovery_suggestion": "" if observation.get("success") is True else observation.get("recovery_suggestion", "Repair generated runtime, verifier, seed, or check files and rerun framework candidate check."),
+        "recovery_suggestion": "" if observation.get("success") is True else observation.get("recovery_suggestion", "Repair generated contract project and rerun framework candidate check."),
     }
 
 

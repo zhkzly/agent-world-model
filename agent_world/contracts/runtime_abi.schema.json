@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent-world.runtime-abi.schema.json",
+  "title": "Agent World Runtime ABI",
+  "type": "object",
+  "required": ["runtime_abi_version", "required_interfaces"],
+  "properties": {
+    "runtime_abi_version": {"const": "agent-world.runtime-abi.v1"},
+    "required_interfaces": {
+      "type": "array",
+      "items": {
+        "enum": ["describe", "setup", "reset", "health", "invoke", "verify", "export_trace", "teardown"]
+      },
+      "minItems": 8,
+      "maxItems": 8
+    },
+    "return_status_values": {
+      "type": "array",
+      "items": {"enum": ["pass", "fail", "needs_human", "ok", "error"]}
+    }
+  }
+}
