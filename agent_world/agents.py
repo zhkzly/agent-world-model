@@ -644,12 +644,12 @@ def _write_codegen_candidate(
         "bundle_id": str(candidate.get("bundle_id") or "bundle-openai-codegen-candidate"),
         "environment_id": str(candidate.get("environment_id") or "generated-environment"),
         "generated_files": generated_files,
-        "runtime_entrypoint": str(candidate.get("runtime_entrypoint") or "runtime.ProjectBoardLite"),
+        "runtime_entrypoint": str(candidate.get("runtime_entrypoint") or "runtime.GeneratedEnvironment"),
         "seed_fixture_ref": str(candidate.get("seed_fixture_ref") or "seed_state.json"),
         "verifier_entrypoint": str(candidate.get("verifier_entrypoint") or "verifier.verify_task_completion"),
         "surface_descriptors": list(candidate.get("surface_descriptors") or ["surface_descriptor.json"]),
         "check_commands": list(candidate.get("check_commands") or [["python", "check_replay.py"]]),
-        "replay_commands": list(candidate.get("replay_commands") or [["python", "check_replay.py", "--task", "pb-task-1"]]),
+        "replay_commands": list(candidate.get("replay_commands") or [["python", "check_replay.py"]]),
     }, None
 
 

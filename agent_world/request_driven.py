@@ -1112,8 +1112,8 @@ def _validate_agent_candidate_files(work_dir: Path, manifest: dict[str, Any]) ->
         return {"failure_class": "undeclared_generated_file", "recovery_suggestion": f"Agent wrote files that were not declared in the candidate manifest: {extra}"}
     for filename in ["runtime.py", "verifier.py", "check_replay.py"]:
         text = (candidate_root / filename).read_text(encoding="utf-8")
-        if "agent_world.fixtures." in text:
-            return {"failure_class": "fixture_runtime_import", "recovery_suggestion": "Agent-generated files must not import repository fixture runtimes."}
+        if "agent_world." in text:
+            return {"failure_class": "framework_runtime_import", "recovery_suggestion": "Generated bundle files must be self-contained and must not import the framework package."}
     return None
 
 

@@ -6,12 +6,7 @@ from agent_world.agents import AgentBackendRegistry, AgentResult, MockAgentBacke
 from agent_world.artifacts import GENERATED_BUNDLE_FILE_KINDS, stable_json
 from agent_world.candidate_check import check_generated_candidate
 from agent_world.generated_bundle import run_packaged_generated_bundle_check
-from agent_world.pipeline import (
-    PipelineRunConfig,
-    PipelineRunner,
-    project_board_lite_node_registry,
-    run_request_driven_pipeline,
-)
+from agent_world.pipeline import PipelineRunConfig, run_request_driven_pipeline
 from agent_world.replay_contract import build_framework_replay_contract
 from agent_world.request_driven import GENERATED_FILE_KINDS, run_summary
 
@@ -20,7 +15,6 @@ RAW_REQUEST = (
     "Generate an incident runbook environment that tracks alerts, owners, "
     "mitigation notes, handoff status, and final resolution summaries."
 )
-OLD_ENVIRONMENT_IDS = {"booking-service-lite", "library-lending-lite", "project-board-lite", "support-desk-lite"}
 
 
 def test_goal12_raw_request_runs_generic_agent_pipeline_and_packages(tmp_path):
@@ -38,7 +32,6 @@ def test_goal12_raw_request_runs_generic_agent_pipeline_and_packages(tmp_path):
     assert context.config.implementation_mode == "agent"
     environment_id = context.artifacts["ReleaseManifest"]["environment_id"]
     assert environment_id.startswith("env-")
-    assert environment_id not in OLD_ENVIRONMENT_IDS
     assert context.artifacts["DomainPlan"]["domain_seed"] == environment_id
     assert context.artifacts["GeneratedEnvironmentBundle"]["implementation_mode"] == "agent_backed_codegen"
     assert context.artifacts["ReleaseManifest"]["request_lineage"]["generated_bundle_ref"] == context.artifacts["GeneratedEnvironmentBundle"]["id"]
@@ -105,19 +98,7 @@ def test_goal12_replay_contract_is_generated_from_taskset(tmp_path):
         task = task_by_id[case["task_id"]]
         assert case["tool_calls"] == task["framework_replay"]["tool_calls"]
         assert case["expected_dependency_path"] == task["dependency_path"]
-    serialized = stable_json(contract)
-    assert all(old_id not in serialized for old_id in OLD_ENVIRONMENT_IDS)
-
-
-def test_goal12_project_board_registry_is_not_request_driven_success(tmp_path):
-    record, context = PipelineRunner(project_board_lite_node_registry()).run(
-        PipelineRunConfig(output_dir=tmp_path, raw_request=RAW_REQUEST)
-    )
-
-    assert record.status == "pass"
-    assert context.artifacts["ReleaseManifest"]["environment_id"] == "project-board-lite"
-    assert "DomainPlan" not in context.artifacts
-    assert not _is_request_driven_success(context)
+    assert "manual_registry" not in stable_json(contract)
 
 
 def test_goal12_source_failure_writes_failure_packet_and_stops_before_release(tmp_path):
@@ -174,7 +155,6 @@ def test_goal12_bounded_repair_retries_agent_candidate_and_releases(tmp_path):
     assert repair_packet["framework_check_observation"]["schema_version"] == "agent-world.framework-check-observation.v1"
     assert "Previous failure packet JSON" in backend.requests[1].instruction
     assert "Keep candidate_manifest.json paths relative to candidate_dir" in backend.requests[1].instruction
-    assert context.artifacts["ReleaseManifest"]["environment_id"] not in OLD_ENVIRONMENT_IDS
 
 
 def test_goal12_bounded_repair_exhaustion_stops_before_release(tmp_path):
@@ -238,17 +218,6 @@ def test_goal12_agent_candidate_ignores_python_bytecode_cache(tmp_path):
     )
 
     assert record.status == "pass"
-    assert context.artifacts["ReleaseManifest"]["environment_id"] not in OLD_ENVIRONMENT_IDS
-
-
-def test_goal12_no_domain_probe_hardcoding_in_request_driven_or_contract():
-    for relative in ["agent_world/request_driven.py", "agent_world/replay_contract.py"]:
-        text = Path(relative).read_text(encoding="utf-8")
-        lowered = text.lower()
-        assert "booking" not in lowered
-        assert "library" not in lowered
-        assert "project-board" not in lowered
-        assert "support-desk" not in lowered
 
 
 class GenericCodegenBackend(MockAgentBackend):
@@ -483,11 +452,6 @@ def _config(**kwargs):
     env = {"AGENT_WORLD_AGENT_BACKEND": "mock"}
     env.update(kwargs.pop("env", {}) or {})
     return PipelineRunConfig(env=env, **kwargs)
-
-
-def _is_request_driven_success(context) -> bool:
-    release = context.artifacts.get("ReleaseManifest", {})
-    return release.get("environment_id", "") not in OLD_ENVIRONMENT_IDS and "DomainPlan" in context.artifacts
 
 
 def _sha256(path: Path) -> str:

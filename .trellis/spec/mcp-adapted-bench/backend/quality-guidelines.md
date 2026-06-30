@@ -32,24 +32,6 @@ Questions to answer:
 
 <!-- Patterns that must always be used -->
 
-### Domain Keyword Matching Uses Token Boundaries
-
-Request/domain planners may use simple keyword probes for registered smoke domains, but ASCII domain tokens must not be matched with bare substring checks. Use token-boundary matching for English/alphanumeric terms and reserve substring matching for CJK or other scripts where whitespace token boundaries are not reliable.
-
-Good:
-
-```python
-match_request_tokens(raw_request, lowered, DOMAIN_TOKENS)
-```
-
-Bad:
-
-```python
-token in lowered
-```
-
-The bad form caused `booking` to match the library token `book`, routing an English booking/reservation request to `library-lending-lite`.
-
 ### Request-Driven Success Paths Must Be Artifact-Driven
 
 The normal `run_request_driven_pipeline()` success path must not depend on registered smoke-domain constants, keyword-selected fixture packs, fixed task ids, or environment-id keyed replay cases. It should derive `DomainPlan`, source evidence, tools, tasks, verifier plan, and replay calls from upstream artifacts, then require an `AgentBackend` candidate bundle and framework-owned verification.
@@ -63,11 +45,11 @@ tool_calls = task["framework_replay"]["tool_calls"]
 Bad:
 
 ```python
-if environment_id == "booking-service-lite":
-    return booking_replay_cases[task_id]
+if environment_id in REGISTERED_FIXTURE_IDS:
+    return fixture_replay_cases[task_id]
 ```
 
-Legacy fixture registries may keep domain-specific code for regression coverage, but that code must not be reachable from `request_driven_node_registry()` or from generic framework replay/check paths.
+Legacy fixture registries should not remain on the active package import path. If historical material is kept, it must be documentation-only and must not be reachable from `request_driven_node_registry()` or from generic framework replay/check paths.
 
 ### Python Commands Use `uv`
 
@@ -77,14 +59,14 @@ Good:
 
 ```bash
 uv run pytest tests/agent_world
-uv run python -m agent_world.fixtures.support_desk_lite_cli --help
+uv run python -m agent_world.candidate_check --help
 ```
 
 Bad:
 
 ```bash
 pytest tests/agent_world
-python -m agent_world.fixtures.support_desk_lite_cli --help
+python -m agent_world.candidate_check --help
 ```
 
 Use explicit cache locations for CI-like isolated runs when needed:

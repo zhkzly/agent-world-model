@@ -12,27 +12,6 @@ import yaml
 from agent_world.artifacts import utc_now
 
 
-SUPPORT_DESK_REQUIRED_STATE_OBJECTS = [
-    "customer",
-    "ticket",
-    "ticket_note",
-    "assignment",
-    "audit_event",
-]
-SUPPORT_DESK_REQUIRED_OPERATIONS = [
-    "search_tickets",
-    "get_ticket",
-    "add_ticket_note",
-    "update_ticket_priority",
-    "assign_ticket",
-    "resolve_ticket",
-]
-SUPPORT_DESK_REQUIRED_RULES = [
-    "audit-on-write",
-    "python-required",
-]
-
-
 @dataclass(frozen=True)
 class LocalSourceDocument:
     path: Path
@@ -87,8 +66,8 @@ class LocalSourceConnector:
         }
 
 
-class SupportDeskLiteKnowledgeExtractor:
-    """Extracts the first support-desk-lite KnowledgePack from local evidence."""
+class GenericKnowledgeExtractor:
+    """Extracts a source-grounded KnowledgePack from local evidence."""
 
     def __init__(self, *, base_dir: Path | None = None) -> None:
         self.base_dir = Path.cwd() if base_dir is None else Path(base_dir)
@@ -150,7 +129,7 @@ class SupportDeskLiteKnowledgeExtractor:
         state_objects = _dedupe_by_id(state_objects, "object_id")
         operations = _dedupe_by_id(operations, "operation_id")
         business_rules = _dedupe_by_id(business_rules, "rule_id")
-        uncertainties = _support_desk_uncertainties(state_objects, operations, business_rules)
+        uncertainties = _generic_uncertainties(state_objects, operations, business_rules)
         return {
             "state_objects": state_objects,
             "operations": operations,
@@ -341,42 +320,36 @@ def _dedupe_by_id(items: list[dict[str, Any]], id_key: str) -> list[dict[str, An
     return result
 
 
-def _support_desk_uncertainties(
+def _generic_uncertainties(
     state_objects: list[dict[str, Any]],
     operations: list[dict[str, Any]],
     business_rules: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    state_ids = {item["object_id"] for item in state_objects}
-    operation_ids = {item["operation_id"] for item in operations}
-    rule_ids = {item["rule_id"] for item in business_rules}
     uncertainties = []
-    for required in SUPPORT_DESK_REQUIRED_STATE_OBJECTS:
-        if required not in state_ids:
-            uncertainties.append(
-                {
-                    "question": f"Missing required support-desk state object evidence: {required}",
-                    "blocking": True,
-                    "candidate_resolution": "Add source evidence for the state object or stop before synthesis.",
-                }
-            )
-    for required in SUPPORT_DESK_REQUIRED_OPERATIONS:
-        if required not in operation_ids:
-            uncertainties.append(
-                {
-                    "question": f"Missing required support-desk operation evidence: {required}",
-                    "blocking": True,
-                    "candidate_resolution": "Add source evidence for the operation or mark the pipeline needs_human.",
-                }
-            )
-    for required in SUPPORT_DESK_REQUIRED_RULES:
-        if required not in rule_ids:
-            uncertainties.append(
-                {
-                    "question": f"Missing required support-desk business rule evidence: {required}",
-                    "blocking": True,
-                    "candidate_resolution": "Add source evidence for the business rule or stop before implementation.",
-                }
-            )
+    if not state_objects:
+        uncertainties.append(
+            {
+                "question": "No state object evidence was extracted from local sources.",
+                "blocking": True,
+                "candidate_resolution": "Add a source with state objects or use request-driven synthesis from raw request concepts.",
+            }
+        )
+    if not operations:
+        uncertainties.append(
+            {
+                "question": "No operation evidence was extracted from local sources.",
+                "blocking": True,
+                "candidate_resolution": "Add a source with operations or use request-driven synthesis from raw request concepts.",
+            }
+        )
+    if not business_rules:
+        uncertainties.append(
+            {
+                "question": "No business rule evidence was extracted from local sources.",
+                "blocking": False,
+                "candidate_resolution": "Infer generic trace and verifier rules, then keep the inference explicit in KnowledgePack.",
+            }
+        )
     return uncertainties
 
 
@@ -387,9 +360,6 @@ def _verifiable_fields(state_objects: list[dict[str, Any]], operations: list[dic
         for state_id in operation.get("writes", []):
             for field in state_by_id.get(state_id, {}).get("fields", []):
                 fields.add(f"{state_id}.{field}")
-    for state_id in ["ticket", "assignment", "ticket_note", "audit_event"]:
-        for field in state_by_id.get(state_id, {}).get("fields", []):
-            fields.add(f"{state_id}.{field}")
     return sorted(fields)
 
 

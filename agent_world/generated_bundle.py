@@ -4,13 +4,13 @@ import json
 import shutil
 import subprocess
 import sys
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from agent_world.artifacts import read_yaml, write_jsonl, write_yaml
 from agent_world.independent_verifier import verify_generated_bundle_independent
-from agent_world.package import file_sha256
 
 
 GENERATED_RUNTIME_INDEX_REF = "release/generated-runtime-index.yaml"
@@ -177,6 +177,14 @@ def _copy_generated_files(bundle: dict[str, Any], *, runtime_dir: Path, runtime_
     if missing:
         raise ValueError(f"Generated bundle is missing required files before packaging: {missing}")
     return copied
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _runtime_index(*, release: dict[str, Any], bundle: dict[str, Any], runtime_dir_ref: str, copied_files: list[dict[str, Any]]) -> dict[str, Any]:

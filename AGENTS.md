@@ -12,58 +12,27 @@ The current task source is:
 
 - `docs/agent-world-environment-generation.zh.md`
 
-The current staged Goal documents are:
-
-- `docs/goal-02-hardcoded-full-chain.zh.md`
-- `docs/goal-03-online-runtime-grpo.zh.md`
-- `docs/goal-04-environment-cli-surface-correction.zh.md`
-- `docs/goal-05-open-pipeline-structure.zh.md`
-- `docs/goal-06-second-source-family.zh.md`
-- `docs/goal-07-generated-environment-bundle.zh.md`
-- `docs/goal-08-agent-backed-environment-codegen.zh.md`
-- `docs/goal-09-real-code-agent-runner.zh.md`
-- `docs/goal-10-packaged-generated-runtime-consumer.zh.md`
-- `docs/goal-11-independent-verifier-bounded-repair.zh.md`
-- `docs/goal-12-request-driven-generation-pipeline.zh.md`
-
 Keep `docs/loop-engineering.md` and `research/notes/` as background references only.
 Use `docs/project-progress-and-corrections.zh.md` as the living progress and drift log; update it when a Goal changes the project's true state or corrects a misunderstanding.
 
 ## Current Priority
 
-The first vertical slice is implemented under `agent_world/`.
+The active vertical slice is implemented under `agent_world/`.
 
 Maintain and extend that slice without drifting from the task source:
 
 - artifact contracts and validators
-- deterministic S0-S11 workflow
+- request-driven S0-S11 pipeline structure
 - gate and review records
 - backend-neutral agent invocation records and backend config
-- source discovery and knowledge extraction through explicit agent nodes when needed
-- support-desk-lite fixture, Python callable surface, deterministic verifier, replay, and release package
+- source discovery and knowledge extraction through explicit artifact-producing nodes
+- agent-backed generated environment bundle implementation
+- generated self-check plus framework-owned independent verification
+- bounded repair records controlled by framework config
+- package-relative generated runtime consumer check
 - existing `awm` CLI compatibility
 
-Goal 02 extends only the hardcoded `support-desk-lite` chain from release package into rollout/eval records, deterministic reward records, training export records, and a dataset-only trainer consumer. This is still not generic environment generation.
-
-When explicitly working on Goal 03, extend the same hardcoded `support-desk-lite` chain with an online runtime contract, Python callable runtime, online step/final records, and GRPO/verl adapter metadata. This is still not real trainer integration and still not generic environment generation.
-
-When explicitly working on Goal 04, correct the CLI concept drift. `agent_world.cli_runtime` is a runtime control CLI for health/reset/observe/step/finalize. It is not the user's intended environment CLI surface. Implement environment CLI as a real tool surface: logical tool -> allowlisted argv template -> subprocess.run(shell=False) -> stdout/stderr/exit_code observation -> deterministic verifier reward.
-
-When explicitly working on Goal 05, stop expanding fixture runtime surfaces and open the generation pipeline structure. Keep the working support-desk-lite vertical slice, but start separating pipeline orchestration, node registry, artifact store, source connectors, extraction/synthesis nodes, verifier planning, implementation/code-agent nodes, build/check/replay gates, and release consumers. The goal is to make real source discovery, source-grounded synthesis, and agent-backed implementation possible without turning the core into a prompt script or binding it to one backend.
-
-When explicitly working on Goal 06, prove the Goal 05 pipeline structure is reusable by adding a second local source family, preferably CLI help plus schema/examples. Do not add another support-desk special case. The second family must enter through `LocalSourceConnector` or a small connector extension, produce source-grounded `KnowledgePack`, run through the same `PipelineRunner`/`NodeRegistry`/`ArtifactStore` boundaries, and include negative tests showing missing CLI/schema/rule evidence stops release.
-
-When explicitly working on Goal 07, turn implementation from fixture reuse into generated executable environment bundles. The implementation node must write isolated generated files from source-grounded artifacts: runtime code, seed/state fixture, deterministic verifier, surface descriptor, tests/check script, and build manifest. Verification must import or launch those generated files and run success/failure verifier checks before S10/S11 release planning. Do not count existing fixture runtime imports as code generation.
-
-When explicitly working on Goal 08, replace the remaining deterministic-template implementation path with a verified agent-backed environment code generation path. A code agent may be Codex SDK/CLI, mini-swe-agent, Claude Agent SDK, OpenAI-compatible structured generation, or a custom process adapter, but only through the backend-neutral `AgentBackend` contract. The real codegen backend is `openai_codegen`: it calls an OpenAI-compatible chat-completions endpoint, receives file contents, writes candidate bundle files in an isolated workdir, produces `AgentInvocationRecord`, passes path/redaction/security checks, and only enters release after build/check/replay from those generated files. Do not count deterministic template output or the local process test helper as real code generation.
-
-When explicitly working on Goal 09, implement a real code agent runner. This is different from `openai_codegen`: a runner such as Codex CLI/SDK, mini-swe-agent, Claude Code/Agent SDK, or a custom SWE agent must receive a workspace packet, write files in an isolated workdir, run checks, optionally repair failures, and emit a candidate manifest plus command/trace logs. Do not call local deterministic codegen helpers and call that a runner. The framework must still own the final build/check/replay release gate.
-
-When explicitly working on Goal 10, make verified generated environments callable by downstream steps through a stable package path. Copy accepted `GeneratedEnvironmentBundle` files into `envpkg/runtime/generated/<bundle_id>/`, write `envpkg/release/generated-runtime-index.yaml`, and provide a package-relative consumer check. Do not leave downstream consumers dependent on `/tmp` build workdirs.
-
-When explicitly working on Goal 11, stop trusting generated `check_replay.py` stdout as the release authority. Add a framework-owned independent generated bundle verifier that imports generated runtime/verifier/seed files, verifies every accepted release task with positive and negative records, rejects forged success-only checks, and adds a bounded framework repair loop controlled by `PipelineRunConfig.max_repair_attempts` / `AGENT_WORLD_MAX_REPAIR_ATTEMPTS`. Keep repair attempts under the same `AgentBackend` contract and do not let the agent control pipeline flow.
-
-When explicitly working on Goal 12, implement a request-driven environment generation pipeline, not a third hardcoded domain. A raw request for a booking/ticket reservation service is the first acceptance probe and must produce `booking-service-lite`, not fall back to `project-board-lite`. Add an explicit request/domain planner, strategy selector, source planning/discovery node, source-grounded extraction/synthesis strategy, implementation/code-agent strategy, independent verifier strategy, package release, and bounded repair coverage. Every stage must consume upstream artifact refs and write downstream artifacts with lineage; S3-S11 may not fabricate disconnected domain constants. Once the run starts, the loop must be unattended: no human approval, no mid-run prompt, and no manual registry/source/verifier selection may be required for the success path. Failures must become failure packets that feed bounded repair, an explicit upstream retry edge, or a terminal failed/blocked artifact. Do not implement booking as an isolated script or a manually selected `booking_service_lite_node_registry()` outside the request-driven S0-S11 path, and do not mark the Goal complete if `ReleaseManifest.environment_id` is still `project-board-lite` or if the booking release bypasses the planner/selector/gates.
+The current active path must not rely on registered smoke domains, fixed environment ids, fixed task ids, or environment-id keyed verifier/replay cases. Domain examples may appear as raw request text, but core behavior must be artifact-driven.
 
 ## Core Principles
 
@@ -86,17 +55,14 @@ When explicitly working on Goal 12, implement a request-driven environment gener
 - Do not bind the design to AWM JSONL or AWM MCP.
 - Do not make every environment MCP-only.
 - Do not treat a generic CLI command executor as the environment CLI surface.
-- Do not count `agent_world.cli_runtime` health/reset/observe/step/finalize as a completed environment CLI surface. It is runtime control unless a separate environment_cli descriptor and real tool command templates exist.
 - Do not bind Codex SDK, mini-swe-agent, deep-search, or any single agent runner directly into the core. If a workflow node needs one of them, use a pluggable agent backend adapter with explicit invocation records.
 - Do not download the full AWM 1K dataset into the repository.
-- Do not introduce unrelated runtime code outside the explicitly requested Goal scope. Goal 03 may add online runtime contracts and a Python runtime for `support-desk-lite`, but not real MCP/CLI/HTTP implementations unless separately requested.
-- Do not continue adding runtime/training features while Goal 06 is validating pipeline reuse; keep runtime/training as downstream regressions unless explicitly requested.
-- Do not implement Goal 06 by cloning the support-desk workflow with renamed constants; the point is to validate reusable source family and node boundaries.
-- Do not mark a Goal 07 generated environment release as verified unless build/check/replay loaded or launched the generated files themselves.
-- Do not mark Goal 08 as complete unless a code-agent backend path generated the environment bundle in an isolated workdir and that generated bundle passed build/check/replay. A mock/process agent can prove wiring in deterministic tests, but deterministic template output alone is not enough. For real codegen, use `openai_codegen` or another backend that obtains file contents from an external model/agent, not the local template helper.
-- Do not mark Goal 09 as complete unless a code agent runner wrote files in an isolated workspace and ran at least one check command with command logs. A file-content LLM backend, process helper, or deterministic template is not enough for Goal 09.
-- Do not mark Goal 11 as complete unless forged generated check success is rejected, every released `project-board-lite` task has independent verifier records, and bounded repair records both success-after-repair and exhausted-failure cases without entering S10/S11 on failure.
-- Do not mark Goal 12 as complete unless the request-driven planner/selector path is implemented and `raw_request` for a booking service releases `booking-service-lite`, includes package-level generated runtime files, verifies at least three booking tasks with independent positive/negative records, rejects forged generated checks, preserves existing `support-desk-lite`, `project-board-lite`, and `awm` CLI regressions, proves S0-S11 artifact lineage from raw request to release, and proves the result did not come from a manually selected third fixture registry.
+- Do not reintroduce hardcoded fixture registries or domain-specific verifier branches as the normal success path.
+- Do not mark generated environment release as verified unless framework-owned build/check/replay loaded or launched the generated files themselves.
+- Do not mark agent-backed implementation as complete unless the candidate bundle is written in an isolated workdir and passes manifest/path/hash/security checks, generated self-check, and independent verifier.
+- Do not let generated `check_replay.py` stdout decide release by itself.
+- Do not write credentials, base URLs with secrets, API keys, or auth tokens into artifacts or traces.
+- Do not make live model/network credentials mandatory for normal tests.
 
 ## Work Rules
 
@@ -105,7 +71,7 @@ When changing this repo:
 1. Read `docs/agent-world-environment-generation.zh.md` first.
 2. Use AWM material only as background or source evidence.
 3. Remove or rewrite documents that conflict with the current task source.
-4. Keep new implementation scoped to the frozen first-slice contracts unless the user explicitly asks to expand the scope.
+4. Keep new implementation scoped to generic request-driven generated environment contracts unless the user explicitly asks to expand the scope.
 5. Use `uv` for Python commands.
 6. Preserve existing `awm` CLI behavior unless explicitly asked otherwise.
 <!-- TRELLIS:START -->

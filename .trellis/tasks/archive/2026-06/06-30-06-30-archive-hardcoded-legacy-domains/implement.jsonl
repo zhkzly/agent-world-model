@@ -1,0 +1,3 @@
+{"file": "docs/agent-world-environment-generation.zh.md", "reason": "Primary task-source document for the Agent-World-like generated environment pipeline and no-hardcoded-domain direction."}
+{"file": ".trellis/spec/mcp-adapted-bench/backend/quality-guidelines.md", "reason": "Package-level engineering guidelines for preserving generic pipeline boundaries and verification gates."}
+{"file": ".trellis/spec/shared/thinking-about-the-problem.md", "reason": "Shared Trellis guidance used to keep the cleanup aligned with root cause and project intent instead of narrow fixture edits."}

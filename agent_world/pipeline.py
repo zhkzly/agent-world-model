@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
-from tempfile import TemporaryDirectory, mkdtemp
+from tempfile import mkdtemp
 from typing import Any, Callable
 
 from agent_world.agents import (
@@ -16,34 +16,6 @@ from agent_world.agents import (
     load_agent_backend_config_from_env,
 )
 from agent_world.artifacts import GENERATED_BUNDLE_FILE_KINDS, artifact_hash, make_artifact, stable_json, utc_now, validate_artifact
-from agent_world.fixtures.project_board_lite_codegen import project_board_agent_generated_implementation_record
-from agent_world.fixtures.project_board_lite_nodes import (
-    project_board_deterministic_implementation_record,
-    project_board_environment_spec_fields,
-    project_board_feasibility_report_fields,
-    project_board_implementation_request_fields,
-    project_board_knowledge_pack_fields,
-    project_board_logical_tool_graph_fields,
-    project_board_need_spec_fields,
-    project_board_package_plan_fields,
-    project_board_release_manifest_fields,
-    project_board_source_evidence_fields,
-    project_board_surface_plan_fields,
-    project_board_task_set_fields,
-    project_board_verifier_plan_fields,
-)
-from agent_world.fixtures.support_desk_lite import SupportDeskLite, create_seed_db, reset_environment, verify_task_completion
-from agent_world.fixtures.support_desk_lite_nodes import (
-    blocking_source_uncertainties,
-    environment_spec_fields,
-    implementation_request_fields,
-    knowledge_pack_fields,
-    logical_tool_graph_fields,
-    source_evidence_fields,
-    surface_plan_fields,
-    task_set_fields,
-    verifier_plan_fields,
-)
 from agent_world.gates import STAGE_GATES, evaluate_stage_gates
 from agent_world.generated_bundle import assemble_generated_bundle_package
 import agent_world.request_driven as request_driven
@@ -57,8 +29,8 @@ SOURCE_DOC_REF = "docs/agent-world-environment-generation.zh.md"
 
 @dataclass(frozen=True)
 class PipelineRunConfig:
-    run_id: str = "pipeline-run-support-desk-lite"
-    raw_request: str = "Generate the support-desk-lite first slice."
+    run_id: str = "pipeline-run-request-driven"
+    raw_request: str = "Generate a local request-driven executable environment."
     output_dir: Path | None = None
     source_paths: list[Path] = field(default_factory=list)
     env: dict[str, str] | None = None
@@ -176,7 +148,7 @@ class PipelineRunner:
         *,
         agent_registry: AgentBackendRegistry | None = None,
     ) -> None:
-        self.node_registry = node_registry or support_desk_lite_fixture_node_registry()
+        self.node_registry = node_registry or request_driven_node_registry()
         self.agent_registry = agent_registry or default_agent_backend_registry()
 
     def run(self, config: PipelineRunConfig) -> tuple[PipelineRunRecord, PipelineContext]:
@@ -246,9 +218,7 @@ class PipelineRunner:
                 gate_checklist=list(STAGE_GATES[node.stage]),
                 source_of_truth_refs=[
                     SOURCE_DOC_REF,
-                    "docs/goal-05-open-pipeline-structure.zh.md",
-                    "docs/goal-06-second-source-family.zh.md",
-                    "docs/goal-12-request-driven-generation-pipeline.zh.md",
+                    ".trellis/tasks/06-30-06-30-archive-hardcoded-legacy-domains/prd.md",
                 ],
                 reviewer_ref="pipeline-static-reviewer",
             )
@@ -330,303 +300,13 @@ class PipelineRunner:
         record = node.factory(context)
         if record:
             return _record_deterministic_implementation(context, node, record)
-        return _run_deterministic_implementation(context, node)
-
-
-def support_desk_lite_fixture_node_registry() -> NodeRegistry:
-    registry = NodeRegistry()
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-fixture-input-normalization",
-            stage="S0",
-            artifact_type="NeedSpec",
-            input_artifact_types=[],
-            output_artifact_type="NeedSpec",
-            allowed_agent_backend=False,
-            factory=_need_spec_fields,
+        return PipelineNodeResult(
+            node_id=node.node_id,
+            stage=node.stage,
+            status="fail",
+            failure_class="deterministic_implementation_unavailable",
+            recovery_suggestion="Generated environments require an agent backend that writes candidate bundle files.",
         )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="local-source-connector",
-            stage="S1",
-            artifact_type="SourceEvidenceIndex",
-            input_artifact_types=["NeedSpec"],
-            output_artifact_type="SourceEvidenceIndex",
-            allowed_agent_backend=True,
-            factory=lambda context: source_evidence_fields(base_dir=Path.cwd(), source_paths=context.config.source_paths or None),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-source-grounded-extractor",
-            stage="S2",
-            artifact_type="KnowledgePack",
-            input_artifact_types=["SourceEvidenceIndex"],
-            output_artifact_type="KnowledgePack",
-            allowed_agent_backend=True,
-            factory=lambda context: knowledge_pack_fields(context.artifact("SourceEvidenceIndex"), base_dir=Path.cwd()),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-source-grounded-spec-synthesis",
-            stage="S3",
-            artifact_type="EnvironmentSpec",
-            input_artifact_types=["NeedSpec", "KnowledgePack"],
-            output_artifact_type="EnvironmentSpec",
-            allowed_agent_backend=True,
-            factory=lambda context: environment_spec_fields(context.artifact("KnowledgePack")),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-source-grounded-tool-graph",
-            stage="S4",
-            artifact_type="LogicalToolGraph",
-            input_artifact_types=["EnvironmentSpec", "KnowledgePack"],
-            output_artifact_type="LogicalToolGraph",
-            allowed_agent_backend=True,
-            factory=lambda context: logical_tool_graph_fields(context.artifact("KnowledgePack")),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-source-grounded-task-generation",
-            stage="S5",
-            artifact_type="TaskSet",
-            input_artifact_types=["NeedSpec", "LogicalToolGraph", "EnvironmentSpec"],
-            output_artifact_type="TaskSet",
-            allowed_agent_backend=True,
-            factory=lambda context: task_set_fields(context.artifact("LogicalToolGraph")),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-source-grounded-surface-planning",
-            stage="S6",
-            artifact_type="SurfacePlan",
-            input_artifact_types=["LogicalToolGraph", "EnvironmentSpec"],
-            output_artifact_type="SurfacePlan",
-            allowed_agent_backend=True,
-            factory=lambda context: surface_plan_fields(context.artifact("EnvironmentSpec")),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-source-grounded-verifier-planning",
-            stage="S7",
-            artifact_type="VerifierPlan",
-            input_artifact_types=["TaskSet", "EnvironmentSpec", "SurfacePlan"],
-            output_artifact_type="VerifierPlan",
-            allowed_agent_backend=True,
-            factory=lambda context: verifier_plan_fields(context.artifact("TaskSet")),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-deterministic-feasibility",
-            stage="S8",
-            artifact_type="FeasibilityReport",
-            input_artifact_types=["NeedSpec", "SourceEvidenceIndex", "KnowledgePack", "EnvironmentSpec", "LogicalToolGraph", "TaskSet", "SurfacePlan", "VerifierPlan"],
-            output_artifact_type="FeasibilityReport",
-            allowed_agent_backend=False,
-            factory=_feasibility_report_fields,
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-implementation-request",
-            stage="S9",
-            artifact_type="ImplementationRequest",
-            input_artifact_types=["FeasibilityReport", "EnvironmentSpec", "TaskSet", "VerifierPlan"],
-            output_artifact_type="ImplementationRequest",
-            allowed_agent_backend=True,
-            factory=lambda context: implementation_request_fields(context.artifacts, context.review_records),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-implementation-node",
-            stage="IMPLEMENT",
-            artifact_type="CodeImplementation",
-            input_artifact_types=["ImplementationRequest"],
-            output_artifact_type="CodeImplementation",
-            allowed_agent_backend=True,
-            factory=lambda context: {},
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-package-plan",
-            stage="S10",
-            artifact_type="EnvironmentPackagePlan",
-            input_artifact_types=["ImplementationRequest"],
-            output_artifact_type="EnvironmentPackagePlan",
-            allowed_agent_backend=False,
-            factory=_package_plan_fields,
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="support-desk-release-plan",
-            stage="S11",
-            artifact_type="ReleaseManifest",
-            input_artifact_types=["EnvironmentPackagePlan"],
-            output_artifact_type="ReleaseManifest",
-            allowed_agent_backend=False,
-            factory=_release_manifest_fields,
-        )
-    )
-    return registry
-
-
-def project_board_lite_node_registry() -> NodeRegistry:
-    registry = NodeRegistry()
-    registry.register(
-        PipelineNode(
-            node_id="project-board-input-normalization",
-            stage="S0",
-            artifact_type="NeedSpec",
-            input_artifact_types=[],
-            output_artifact_type="NeedSpec",
-            allowed_agent_backend=False,
-            factory=lambda context: project_board_need_spec_fields(context.config.raw_request),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-local-source-connector",
-            stage="S1",
-            artifact_type="SourceEvidenceIndex",
-            input_artifact_types=["NeedSpec"],
-            output_artifact_type="SourceEvidenceIndex",
-            allowed_agent_backend=True,
-            factory=lambda context: project_board_source_evidence_fields(base_dir=Path.cwd(), source_paths=context.config.source_paths or None),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-source-grounded-extractor",
-            stage="S2",
-            artifact_type="KnowledgePack",
-            input_artifact_types=["SourceEvidenceIndex"],
-            output_artifact_type="KnowledgePack",
-            allowed_agent_backend=True,
-            factory=lambda context: project_board_knowledge_pack_fields(context.artifact("SourceEvidenceIndex"), base_dir=Path.cwd()),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-source-grounded-spec-synthesis",
-            stage="S3",
-            artifact_type="EnvironmentSpec",
-            input_artifact_types=["NeedSpec", "KnowledgePack"],
-            output_artifact_type="EnvironmentSpec",
-            allowed_agent_backend=True,
-            factory=lambda context: project_board_environment_spec_fields(context.artifact("KnowledgePack")),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-source-grounded-tool-graph",
-            stage="S4",
-            artifact_type="LogicalToolGraph",
-            input_artifact_types=["EnvironmentSpec", "KnowledgePack"],
-            output_artifact_type="LogicalToolGraph",
-            allowed_agent_backend=True,
-            factory=lambda context: project_board_logical_tool_graph_fields(context.artifact("KnowledgePack")),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-source-grounded-task-generation",
-            stage="S5",
-            artifact_type="TaskSet",
-            input_artifact_types=["NeedSpec", "LogicalToolGraph", "EnvironmentSpec"],
-            output_artifact_type="TaskSet",
-            allowed_agent_backend=True,
-            factory=lambda context: project_board_task_set_fields(context.artifact("LogicalToolGraph"), context.artifact("KnowledgePack")),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-source-grounded-surface-planning",
-            stage="S6",
-            artifact_type="SurfacePlan",
-            input_artifact_types=["LogicalToolGraph", "EnvironmentSpec"],
-            output_artifact_type="SurfacePlan",
-            allowed_agent_backend=True,
-            factory=lambda context: project_board_surface_plan_fields(context.artifact("EnvironmentSpec")),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-source-grounded-verifier-planning",
-            stage="S7",
-            artifact_type="VerifierPlan",
-            input_artifact_types=["TaskSet", "EnvironmentSpec", "SurfacePlan"],
-            output_artifact_type="VerifierPlan",
-            allowed_agent_backend=True,
-            factory=lambda context: project_board_verifier_plan_fields(context.artifact("TaskSet"), context.artifact("KnowledgePack")),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-deterministic-feasibility",
-            stage="S8",
-            artifact_type="FeasibilityReport",
-            input_artifact_types=["NeedSpec", "SourceEvidenceIndex", "KnowledgePack", "EnvironmentSpec", "LogicalToolGraph", "TaskSet", "SurfacePlan", "VerifierPlan"],
-            output_artifact_type="FeasibilityReport",
-            allowed_agent_backend=False,
-            factory=project_board_feasibility_report_fields,
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-implementation-request",
-            stage="S9",
-            artifact_type="ImplementationRequest",
-            input_artifact_types=["FeasibilityReport", "EnvironmentSpec", "TaskSet", "VerifierPlan"],
-            output_artifact_type="ImplementationRequest",
-            allowed_agent_backend=True,
-            factory=lambda context: project_board_implementation_request_fields(context.artifacts, context.review_records),
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-implementation-node",
-            stage="IMPLEMENT",
-            artifact_type="CodeImplementation",
-            input_artifact_types=["ImplementationRequest"],
-            output_artifact_type="CodeImplementation",
-            allowed_agent_backend=True,
-            factory=project_board_deterministic_implementation_record,
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-package-plan",
-            stage="S10",
-            artifact_type="EnvironmentPackagePlan",
-            input_artifact_types=["ImplementationRequest"],
-            output_artifact_type="EnvironmentPackagePlan",
-            allowed_agent_backend=False,
-            factory=project_board_package_plan_fields,
-        )
-    )
-    registry.register(
-        PipelineNode(
-            node_id="project-board-release-plan",
-            stage="S11",
-            artifact_type="ReleaseManifest",
-            input_artifact_types=["EnvironmentPackagePlan"],
-            output_artifact_type="ReleaseManifest",
-            allowed_agent_backend=False,
-            factory=project_board_release_manifest_fields,
-        )
-    )
-    return registry
 
 
 def request_driven_node_registry() -> NodeRegistry:
@@ -809,136 +489,6 @@ def run_request_driven_pipeline(
     return PipelineRunner(request_driven_node_registry(), agent_registry=agent_registry).run(config)
 
 
-def _need_spec_fields(context: PipelineContext) -> dict[str, Any]:
-    return {
-        "goal": context.config.raw_request,
-        "target_capabilities": ["stateful tool use", "source-grounded environment generation", "deterministic verification"],
-        "domain_seed": "support-desk-lite",
-        "expected_agent_behavior": "Use user-facing support requests to inspect and update ticket state through logical tools.",
-        "constraints": {
-            "network": "not_required",
-            "auth": "not_required",
-            "license": "local_fixture",
-            "safety": "local_state_only",
-            "local_execution": True,
-            "mocking_allowed": True,
-        },
-        "preferred_surfaces": ["python", "cli", "http", "mcp"],
-        "out_of_scope": ["training integration", "rollout", "reward export", "AWM reproduction", "MCP-only architecture", "CLI-only architecture"],
-        "human_confirmation_required": [],
-    }
-
-
-def _feasibility_report_fields(context: PipelineContext) -> dict[str, Any]:
-    blockers = blocking_source_uncertainties(context.artifact("KnowledgePack"))
-    status = "needs_human" if blockers else "pass"
-    return {
-        "status": status,
-        "gate_result_scope": "upstream_accepted_gates_before_s8_self_evaluation",
-        "self_gate_expectations": ["G0", "G10", "G13"],
-        "gate_results": [
-            {
-                "gate_id": record["gate_id"],
-                "status": record["status"],
-                "evidence": [record["id"]] + record["evidence_refs"],
-                "failure_class": record["failure_class"],
-                "recovery_suggestion": record["recovery_suggestion"],
-            }
-            for record in context.gate_records
-        ],
-        "minimum_viable_surface": "python",
-        "minimum_viable_task_ids": [task["task_id"] for task in context.artifact("TaskSet")["tasks"]],
-        "minimum_viable_verifier_ids": [verifier["verifier_id"] for verifier in context.artifact("VerifierPlan")["verifiers"]],
-        "implementation_blockers": blockers,
-    }
-
-
-def _package_plan_fields(context: PipelineContext) -> dict[str, Any]:
-    included_ids = (
-        [artifact["id"] for artifact in context.artifacts.values()]
-        + ["package-support-desk-lite", "replay-support-desk-lite", "consumer-support-desk-lite", "release-support-desk-lite"]
-        + [record["id"] for record in context.review_records]
-        + [record["id"] for record in context.gate_records]
-        + [record["implementation_id"] for record in context.build_check_replay_records]
-    )
-    return {
-        "package_plan_id": "package-support-desk-lite",
-        "environment_id": "support-desk-lite",
-        "layout": "envpkg/",
-        "included_artifact_ids": included_ids,
-        "fixture_refs": ["fixtures/seed/support-desk-lite.sqlite"],
-        "static_check_refs": STAGE_GATES,
-        "review_record_refs": [record["id"] for record in context.review_records],
-        "replay_plan_ref": "replay-support-desk-lite",
-        "release_manifest_ref": "release-support-desk-lite",
-        "consumer_output_refs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml"],
-        "excluded_items": [
-            {"item": "trainer loop", "reason": "release consumer only"},
-            {"item": "generic shell executor", "reason": "not an environment CLI surface"},
-        ],
-    }
-
-
-def _release_manifest_fields(context: PipelineContext) -> dict[str, Any]:
-    artifacts = context.artifacts | {"EnvironmentPackagePlan": context.artifact("EnvironmentPackagePlan")}
-    return {
-        "release_id": "release-support-desk-lite",
-        "environment_id": "support-desk-lite",
-        "version": "0.1.0",
-        "artifact_hashes": {name: artifact["hash"] for name, artifact in artifacts.items()},
-        "package_layout": "envpkg/",
-        "task_index": [task["task_id"] for task in context.artifact("TaskSet")["tasks"]],
-        "verifier_index": [verifier["verifier_id"] for verifier in context.artifact("VerifierPlan")["verifiers"]],
-        "surface_index": context.artifact("SurfacePlan")["surface_status"],
-        "fixture_index": ["fixtures/seed/support-desk-lite.sqlite"],
-        "replay_contract": "checks/replay-plan.yaml",
-        "consumer_outputs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml"],
-        "known_limits": [
-            "Pipeline structure is opened, but support-desk-lite remains a fixture node set.",
-            "Code implementation is deterministic fixture assembly unless implementation_mode=agent is explicitly configured.",
-        ],
-    }
-
-
-def _run_deterministic_implementation(context: PipelineContext, node: PipelineNode) -> PipelineNodeResult:
-    with TemporaryDirectory() as td:
-        root = Path(td)
-        seed = create_seed_db(root / "seed.sqlite")
-        final = reset_environment(seed, root / "run")
-        trace = root / "trace.jsonl"
-        surface = SupportDeskLite(final, trace_path=trace, task_id="task-1")
-        surface.search_tickets(status="open", customer_tier="vip", keyword="refund")
-        surface.get_ticket("T-100")
-        surface.add_ticket_note(ticket_id="T-100", visibility="internal", body="Refund follow-up queued with billing.")
-        verifier_result = verify_task_completion("task-1", seed, final, surface_trace_path=trace)
-    record = {
-        "implementation_id": "implementation-support-desk-lite-deterministic",
-        "mode": "deterministic_fixture",
-        "environment_id": "support-desk-lite",
-        "implementation_request_id": context.artifact("ImplementationRequest")["id"],
-        "generated_paths": ["agent_world/fixtures/support_desk_lite.py", "agent_world/fixtures/support_desk_lite_cli.py"],
-        "static_check_command": "validate_artifact(S0-S9 accepted artifacts)",
-        "test_command": "support_desk_lite task-1 callable smoke",
-        "replay_command": "verify_task_completion task-1 over isolated SQLite copy",
-        "verifier_result": verifier_result,
-        "status": "pass" if verifier_result["success"] else "fail",
-        "failure_class": "" if verifier_result["success"] else "deterministic_verifier_failed",
-        "recovery_suggestion": "" if verifier_result["success"] else "Fix fixture implementation before package/release planning.",
-    }
-    trace_ref = context.store.put_trace("implementation-deterministic", record)
-    context.build_check_replay_records.append(record)
-    if record["status"] != "pass":
-        return PipelineNodeResult(
-            node_id=node.node_id,
-            stage=node.stage,
-            status="fail",
-            output_refs=[trace_ref],
-            failure_class=record["failure_class"],
-            recovery_suggestion=record["recovery_suggestion"],
-        )
-    return PipelineNodeResult(node_id=node.node_id, stage=node.stage, status="pass", output_refs=[trace_ref])
-
-
 def _assemble_generated_bundle_package_if_available(context: PipelineContext) -> dict[str, str] | None:
     if context.config.output_dir is None:
         return None
@@ -1076,54 +626,6 @@ def _run_agent_implementation_attempt(
         instruction_ref=f"{SOURCE_DOC_REF}#agent-backed-implementation",
     )
     invocation, result = invoke_agent(context.agent_registry, request, backend_config)
-    if environment_id == "project-board-lite":
-        record = project_board_agent_generated_implementation_record(
-            context,
-            agent_invocation=invocation,
-            agent_result=result,
-            work_dir=work_dir,
-        )
-        record = _with_attempt_metadata(
-            record,
-            attempt_index=attempt_index,
-            total_attempts=total_attempts,
-            max_repair_attempts=max_repair_attempts,
-            input_failure_packet=failure_packet,
-        )
-        record = _redact_attempt_record(context, record)
-        bundle = record.get("generated_environment_bundle")
-        if isinstance(bundle, dict):
-            context.artifacts["GeneratedEnvironmentBundle"] = bundle
-            context.store.put_artifact("GeneratedEnvironmentBundle", bundle)
-            invocation = _with_invocation_outputs(invocation, output_artifact_ids=[bundle["id"]], evidence_refs=[bundle["id"]])
-        independent_report = record.get("independent_verification_report")
-        if isinstance(independent_report, dict):
-            context.artifacts["IndependentVerificationReport"] = independent_report
-            context.store.put_artifact("IndependentVerificationReport", independent_report)
-            invocation = _with_invocation_outputs(invocation, output_artifact_ids=[independent_report["id"]], evidence_refs=[independent_report["id"]])
-        context.agent_invocations.append(invocation)
-        context.store.put_agent_invocations([invocation])
-        trace_ref = context.store.put_trace(f"implementation-{environment_id}-agent", record)
-        context.build_check_replay_records.append(record)
-        if record["status"] != "pass":
-            return PipelineNodeResult(
-                node_id=node.node_id,
-                stage=node.stage,
-                status=record["status"],
-                output_refs=[trace_ref],
-                agent_invocation_ids=[invocation["id"]],
-                failure_class=record["failure_class"],
-                recovery_suggestion=record["recovery_suggestion"],
-            )
-        return PipelineNodeResult(
-            node_id=node.node_id,
-            stage=node.stage,
-            status="pass",
-            output_refs=[trace_ref, bundle["id"] if isinstance(bundle, dict) else ""],
-            artifact_type="GeneratedEnvironmentBundle",
-            artifact_id=bundle["id"] if isinstance(bundle, dict) else "",
-            agent_invocation_ids=[invocation["id"]],
-        )
     if "DomainPlan" not in context.artifacts or "StrategySelection" not in context.artifacts:
         context.agent_invocations.append(invocation)
         context.store.put_agent_invocations([invocation])
@@ -1206,41 +708,6 @@ def _run_agent_implementation_attempt(
         artifact_type="GeneratedEnvironmentBundle",
         artifact_id=bundle["id"] if isinstance(bundle, dict) else "",
         agent_invocation_ids=[invocation["id"]],
-    )
-    context.agent_invocations.append(invocation)
-    context.store.put_agent_invocations([invocation])
-    record = {
-        "implementation_id": f"implementation-{environment_id}-agent",
-        "mode": "agent_backed",
-        "environment_id": environment_id,
-        "implementation_request_id": request_artifact["id"],
-        "agent_invocation_id": invocation["id"],
-        "static_check_command": "not run",
-        "test_command": "not run",
-        "replay_command": "not run",
-        "verifier_result": {},
-        "status": "needs_human" if result.status == "pass" else result.status,
-        "failure_class": result.failure_class or "unchecked_agent_output",
-        "recovery_suggestion": result.recovery_suggestion or "Run build/check/replay gate in an isolated workdir before package/release planning.",
-    }
-    record = _with_attempt_metadata(
-        record,
-        attempt_index=attempt_index,
-        total_attempts=total_attempts,
-        max_repair_attempts=max_repair_attempts,
-        input_failure_packet=failure_packet,
-    )
-    record = _redact_attempt_record(context, record)
-    trace_ref = context.store.put_trace("implementation-agent", record)
-    context.build_check_replay_records.append(record)
-    return PipelineNodeResult(
-        node_id=node.node_id,
-        stage=node.stage,
-        status=record["status"],
-        output_refs=[trace_ref],
-        agent_invocation_ids=[invocation["id"]],
-        failure_class=record["failure_class"],
-        recovery_suggestion=record["recovery_suggestion"],
     )
 
 
