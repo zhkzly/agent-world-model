@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/mcp-adapted-bench/backend/quality-guidelines.md", "reason": "Verified request-driven path no longer uses domain probes and Python checks use uv."}
-{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Checked replay contract and independent verifier data flow from TaskSet through generated runtime, package check, and repair observations."}

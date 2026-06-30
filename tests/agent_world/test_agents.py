@@ -1,4 +1,5 @@
 import json
+import types
 import sys
 from pathlib import Path
 
@@ -252,3 +253,208 @@ def test_codex_cli_runner_gets_isolated_codex_home_and_api_key(tmp_path, monkeyp
     assert "router.example.test" in probe["config_text"]
     assert 'model = "smoke-model"' in probe["config_text"]
     assert "secret-value" not in probe["config_text"]
+
+
+def test_codex_sdk_config_declares_codex_provider_and_workspace_sandbox():
+    config = load_agent_backend_config_from_env(
+        {
+            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
+            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
+            "AGENT_WORLD_AGENT_NETWORK": "1",
+        }
+    )
+
+    assert config["backend_kind"] == "codex_sdk"
+    assert config["provider"] == "codex"
+    assert config["command"]["argv"] == []
+    assert config["permissions"]["filesystem"] == "isolated_agent_workspace"
+    assert config["permissions"]["network"] is True
+    assert config["permissions"]["sandbox"] is True
+    assert config["auth"]["requires_auth"] is True
+
+
+def test_codex_sdk_backend_invokes_official_python_sdk(monkeypatch):
+    calls = {}
+
+    class FakeSandbox:
+        read_only = "read-only"
+        workspace_write = "workspace-write"
+        full_access = "full-access"
+
+    class FakeThread:
+        def run(self, instruction, **kwargs):
+            calls["instruction"] = instruction
+            calls["run_kwargs"] = kwargs
+            return types.SimpleNamespace(final_response="codex final", usage={"total_tokens": 9})
+
+    class FakeCodex:
+        def __enter__(self):
+            calls["entered"] = True
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            calls["exited"] = True
+
+        def thread_start(self, **kwargs):
+            calls["thread_start"] = kwargs
+            return FakeThread()
+
+    monkeypatch.setitem(sys.modules, "openai_codex", types.SimpleNamespace(Codex=FakeCodex, Sandbox=FakeSandbox))
+    config = load_agent_backend_config_from_env(
+        {
+            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
+            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
+            "AGENT_WORLD_AGENT_NETWORK": "1",
+            "AGENT_WORLD_CODEX_SANDBOX": "workspace-write",
+        }
+    )
+    registry = default_agent_backend_registry()
+    request = AgentRequest(
+        stage="S1",
+        node_purpose="search",
+        instruction="discover sources",
+        input_artifact_ids=["need-1"],
+        permissions={"network": True, "filesystem": "artifact_context", "auth": False, "sandbox": True},
+    )
+
+    record, result = invoke_agent(registry, request, config)
+
+    assert result.status == "pass"
+    assert result.text == "codex final"
+    assert result.evidence_refs == ["codex-sdk://thread"]
+    assert result.trace_ref == "codex-sdk://thread"
+    assert result.usage["tokens"] == {"total_tokens": 9}
+    assert result.usage["duration_ms"] is not None
+    assert record["backend_kind"] == "codex_sdk"
+    assert record["model_or_runtime"] == "gpt-test"
+    assert calls["entered"] is True
+    assert calls["exited"] is True
+    assert calls["thread_start"] == {"model": "gpt-test", "sandbox": FakeSandbox.workspace_write}
+    assert calls["instruction"] == "discover sources"
+    assert calls["run_kwargs"] == {}
+
+
+def test_codex_sdk_backend_missing_sdk_needs_human(monkeypatch):
+    import importlib
+
+    real_import_module = importlib.import_module
+
+    def fake_import_module(name, package=None):
+        if name == "openai_codex":
+            raise ModuleNotFoundError("No module named openai_codex")
+        return real_import_module(name, package)
+
+    monkeypatch.delitem(sys.modules, "openai_codex", raising=False)
+    monkeypatch.setattr(importlib, "import_module", fake_import_module)
+    config = load_agent_backend_config_from_env(
+        {
+            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
+            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
+        }
+    )
+    registry = default_agent_backend_registry()
+    request = AgentRequest(stage="S1", node_purpose="search", instruction="discover sources", input_artifact_ids=["need-1"])
+
+    record, result = invoke_agent(registry, request, config)
+
+    assert result.status == "needs_human"
+    assert result.failure_class == "missing_codex_sdk"
+    assert "openai-codex" in result.recovery_suggestion
+    assert record["status"] == "needs_human"
+
+
+def test_codex_sdk_implementation_returns_candidate_manifest_ref(tmp_path, monkeypatch):
+    calls = {}
+
+    class FakeSandbox:
+        read_only = "read-only"
+        workspace_write = "workspace-write"
+        full_access = "full-access"
+
+    class FakeThread:
+        def run(self, instruction, **kwargs):
+            calls["cwd"] = Path.cwd()
+            output_dir = Path("agent-output")
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "candidate_manifest.json").write_text(
+                json.dumps({"generated_files": []}, sort_keys=True),
+                encoding="utf-8",
+            )
+            return types.SimpleNamespace(final_response="done")
+
+    class FakeCodex:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+        def thread_start(self, **kwargs):
+            calls["thread_start"] = kwargs
+            return FakeThread()
+
+    monkeypatch.setitem(sys.modules, "openai_codex", types.SimpleNamespace(Codex=FakeCodex, Sandbox=FakeSandbox))
+    config = load_agent_backend_config_from_env(
+        {
+            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
+            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
+        }
+    )
+    registry = default_agent_backend_registry()
+    request = AgentRequest(
+        stage="IMPLEMENT",
+        node_purpose="implement",
+        instruction="write generated bundle",
+        input_artifact_ids=["impl-1"],
+        permissions={"network": False, "filesystem": "isolated_agent_workspace", "filesystem_root": str(tmp_path), "auth": False, "sandbox": True},
+    )
+
+    _, result = invoke_agent(registry, request, config)
+
+    assert result.status == "pass"
+    assert json.loads(result.text) == {"candidate_manifest_ref": "agent-output/candidate_manifest.json"}
+    assert "agent-workspace://agent-output/candidate_manifest.json" in result.evidence_refs
+    assert calls["cwd"] == tmp_path.resolve()
+
+
+def test_codex_sdk_implementation_requires_candidate_manifest(tmp_path, monkeypatch):
+    class FakeSandbox:
+        read_only = "read-only"
+        workspace_write = "workspace-write"
+        full_access = "full-access"
+
+    class FakeThread:
+        def run(self, instruction, **kwargs):
+            return types.SimpleNamespace(final_response="done without manifest")
+
+    class FakeCodex:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+        def thread_start(self, **kwargs):
+            return FakeThread()
+
+    monkeypatch.setitem(sys.modules, "openai_codex", types.SimpleNamespace(Codex=FakeCodex, Sandbox=FakeSandbox))
+    config = load_agent_backend_config_from_env(
+        {
+            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
+            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
+        }
+    )
+    registry = default_agent_backend_registry()
+    request = AgentRequest(
+        stage="IMPLEMENT",
+        node_purpose="implement",
+        instruction="write generated bundle",
+        input_artifact_ids=["impl-1"],
+        permissions={"network": False, "filesystem": "isolated_agent_workspace", "filesystem_root": str(tmp_path), "auth": False, "sandbox": True},
+    )
+
+    _, result = invoke_agent(registry, request, config)
+
+    assert result.status == "fail"
+    assert result.failure_class == "missing_runner_manifest"
+    assert result.trace_ref == "agent-workspace://agent-output/codex-sdk-result.json"

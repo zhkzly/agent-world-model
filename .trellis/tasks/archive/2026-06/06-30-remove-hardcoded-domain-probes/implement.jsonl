@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/mcp-adapted-bench/backend/quality-guidelines.md", "reason": "Backend quality rules for uv usage, agent runner contracts, framework replay contracts, candidate manifest validation, and request-driven artifact-driven success paths."}
-{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "The change spans artifact contracts, agent workspace inputs, generated bundle verification, package consumers, and tests."}

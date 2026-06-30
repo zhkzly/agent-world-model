@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/mcp-adapted-bench/backend/quality-guidelines.md", "reason": "Verify that Python checks use uv and that commit readiness follows project quality expectations."}
-{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Check that committed groups preserve source-to-runtime-to-release boundaries."}
