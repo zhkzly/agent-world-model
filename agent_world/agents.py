@@ -397,9 +397,10 @@ class CodexSdkAgentBackend:
         started = time.monotonic()
         try:
             with _temporary_cwd(workspace):
-                with Codex() as codex:
-                    thread = codex.thread_start(model=model, sandbox=sandbox)
-                    sdk_result = thread.run(request.instruction)
+                with _codex_sdk_environment(config, workspace):
+                    with Codex() as codex:
+                        thread = codex.thread_start(model=model, sandbox=sandbox)
+                        sdk_result = thread.run(request.instruction)
         except Exception as exc:
             duration_ms = int((time.monotonic() - started) * 1000)
             if output_dir:
@@ -1066,6 +1067,58 @@ def _temporary_cwd(path: Path | None) -> Any:
         yield
     finally:
         os.chdir(previous)
+
+
+@contextlib.contextmanager
+def _codex_sdk_environment(config: dict[str, Any], workspace: Path | None) -> Any:
+    if workspace is None:
+        yield
+        return
+    codex_home = workspace / "agent-output" / "codex-home"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    config_text = _codex_sdk_config_text(config)
+    if config_text:
+        (codex_home / "config.toml").write_text(config_text, encoding="utf-8")
+    updates = {
+        "CODEX_HOME": str(codex_home),
+        "HOME": str(codex_home),
+    }
+    auth = config.get("auth", {})
+    for name in set(auth.get("auth_env_refs", [])) | ({auth.get("api_key_env")} if auth.get("api_key_env") else set()):
+        value = os.environ.get(str(name))
+        if value:
+            updates[str(name)] = value
+    previous = {name: os.environ.get(name) for name in updates}
+    try:
+        os.environ.update(updates)
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _codex_sdk_config_text(config: dict[str, Any]) -> str:
+    lines = []
+    model = str(config.get("smoke_model") or config.get("model") or "")
+    base_url = str(config.get("base_url") or "")
+    auth = config.get("auth", {})
+    api_key_env = str(auth.get("api_key_env") or "")
+    if model:
+        lines.append(f"model = {_toml_string(model)}")
+    if base_url:
+        provider_id = "agent_world_openai"
+        lines.append(f"model_provider = {_toml_string(provider_id)}")
+        lines.append("")
+        lines.append(f"[model_providers.{provider_id}]")
+        lines.append('name = "Agent World OpenAI-compatible provider"')
+        lines.append(f"base_url = {_toml_string(base_url)}")
+        lines.append('wire_api = "responses"')
+        if api_key_env:
+            lines.append(f"env_key = {_toml_string(api_key_env)}")
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def _codex_sdk_result_text(result: Any) -> str:

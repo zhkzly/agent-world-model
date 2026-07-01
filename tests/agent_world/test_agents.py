@@ -1,4 +1,5 @@
 import json
+import os
 import types
 import sys
 from pathlib import Path
@@ -273,7 +274,7 @@ def test_codex_sdk_config_declares_codex_provider_and_workspace_sandbox():
     assert config["auth"]["requires_auth"] is True
 
 
-def test_codex_sdk_backend_invokes_official_python_sdk(monkeypatch):
+def test_codex_sdk_backend_invokes_official_python_sdk(tmp_path, monkeypatch):
     calls = {}
 
     class FakeSandbox:
@@ -285,6 +286,7 @@ def test_codex_sdk_backend_invokes_official_python_sdk(monkeypatch):
         def run(self, instruction, **kwargs):
             calls["instruction"] = instruction
             calls["run_kwargs"] = kwargs
+            calls["codex_home"] = os.environ.get("CODEX_HOME")
             return types.SimpleNamespace(final_response="codex final", usage={"total_tokens": 9})
 
     class FakeCodex:
@@ -314,10 +316,11 @@ def test_codex_sdk_backend_invokes_official_python_sdk(monkeypatch):
         node_purpose="search",
         instruction="discover sources",
         input_artifact_ids=["need-1"],
-        permissions={"network": True, "filesystem": "artifact_context", "auth": False, "sandbox": True},
+        permissions={"network": True, "filesystem": "artifact_context", "filesystem_root": str(tmp_path), "auth": False, "sandbox": True},
     )
 
     record, result = invoke_agent(registry, request, config)
+    config_text = (tmp_path / "agent-output" / "codex-home" / "config.toml").read_text(encoding="utf-8")
 
     assert result.status == "pass"
     assert result.text == "codex final"
@@ -332,6 +335,67 @@ def test_codex_sdk_backend_invokes_official_python_sdk(monkeypatch):
     assert calls["thread_start"] == {"model": "gpt-test", "sandbox": FakeSandbox.workspace_write}
     assert calls["instruction"] == "discover sources"
     assert calls["run_kwargs"] == {}
+    assert calls["codex_home"] == str((tmp_path / "agent-output" / "codex-home").resolve())
+    assert 'model = "gpt-test"' in config_text
+
+
+def test_codex_sdk_backend_writes_isolated_provider_config(tmp_path, monkeypatch):
+    calls = {}
+
+    class FakeSandbox:
+        read_only = "read-only"
+        workspace_write = "workspace-write"
+        full_access = "full-access"
+
+    class FakeThread:
+        def run(self, instruction, **kwargs):
+            calls["codex_home"] = os.environ.get("CODEX_HOME")
+            calls["api_key_visible"] = os.environ.get("AGENT_WORLD_OPENAI_API_KEY")
+            return types.SimpleNamespace(final_response="codex final")
+
+    class FakeCodex:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+        def thread_start(self, **kwargs):
+            return FakeThread()
+
+    monkeypatch.setitem(sys.modules, "openai_codex", types.SimpleNamespace(Codex=FakeCodex, Sandbox=FakeSandbox))
+    monkeypatch.setenv("AGENT_WORLD_OPENAI_API_KEY", "secret-value")
+    config = load_agent_backend_config_from_env(
+        {
+            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
+            "AGENT_WORLD_OPENAI_BASE_URL": "https://router.example.test/v1",
+            "AGENT_WORLD_OPENAI_API_KEY": "secret-value",
+            "AGENT_WORLD_OPENAI_MODEL": "configured-model",
+            "AGENT_WORLD_SMOKE_OPENAI_MODEL": "smoke-model",
+            "AGENT_WORLD_AGENT_NETWORK": "1",
+        }
+    )
+    registry = default_agent_backend_registry()
+    request = AgentRequest(
+        stage="S1",
+        node_purpose="search",
+        instruction="discover sources",
+        input_artifact_ids=["need-1"],
+        permissions={"network": True, "filesystem": "artifact_context", "filesystem_root": str(tmp_path), "auth": True, "sandbox": True},
+    )
+
+    record, result = invoke_agent(registry, request, config)
+    config_text = (tmp_path / "agent-output" / "codex-home" / "config.toml").read_text(encoding="utf-8")
+
+    assert result.status == "pass"
+    assert record["backend_kind"] == "codex_sdk"
+    assert calls["codex_home"] == str((tmp_path / "agent-output" / "codex-home").resolve())
+    assert calls["api_key_visible"] == "secret-value"
+    assert 'model = "smoke-model"' in config_text
+    assert 'model_provider = "agent_world_openai"' in config_text
+    assert 'base_url = "https://router.example.test/v1"' in config_text
+    assert 'env_key = "AGENT_WORLD_OPENAI_API_KEY"' in config_text
+    assert "secret-value" not in config_text
 
 
 def test_codex_sdk_backend_missing_sdk_needs_human(monkeypatch):

@@ -6,7 +6,7 @@ Build an Agent-World-like environment generation system.
 
 The system is a loop-engineering framework: code owns the workflow, artifacts, gates, repair budget, and release decisions; agent SDK backends execute search, extraction, synthesis, code generation, review, and repair nodes; humans are asked only when permission, ambiguity, risk, credentials, or release policy requires confirmation.
 
-Canonical example: the user provides only a text need such as "airline booking environment"; the pipeline should then automatically research requirements, discover MCP/CLI/API/SDK/tool surfaces, generate tasks and verifiers, generate runtime code, validate every key node, repair failures, and package a publishable environment.
+Canonical example: the user provides only a text need for a local business workflow environment; the pipeline should then automatically research requirements, discover MCP/CLI/API/SDK/tool surfaces, generate tasks and verifiers, generate runtime code, validate every key node, repair failures, and package a publishable environment.
 
 Source of truth:
 
