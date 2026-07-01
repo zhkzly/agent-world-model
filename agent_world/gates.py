@@ -143,11 +143,12 @@ def _state_reset_gate(env_spec: dict[str, Any], context: dict[str, dict[str, Any
     if not backend.get("seed_fixture_refs"):
         raise ArtifactValidationError("EnvironmentSpec.state_backend lacks seed fixtures")
     if context and "KnowledgePack" in context:
-        known_entities = {item["object_id"] for item in context["KnowledgePack"]["state_objects"]}
-        if not set(env_spec["state_entities"]).issubset(known_entities):
+        known_entities = _ids_from_items(context["KnowledgePack"].get("state_objects", []), ["object_id", "state_object_id"], "KnowledgePack.state_objects")
+        env_entities = _ids_from_items(env_spec.get("state_entities", []), ["object_id", "state_object_id"], "EnvironmentSpec.state_entities")
+        if not env_entities.issubset(known_entities):
             raise ArtifactValidationError("EnvironmentSpec references state entities absent from KnowledgePack")
-        known_operations = {item["operation_id"] for item in context["KnowledgePack"]["operations"]}
-        tool_ids = {tool["tool_id"] for tool in env_spec["logical_tools"]}
+        known_operations = _ids_from_items(context["KnowledgePack"].get("operations", []), ["operation_id", "tool_id"], "KnowledgePack.operations")
+        tool_ids = _ids_from_items(env_spec.get("logical_tools", []), ["tool_id", "operation_id"], "EnvironmentSpec.logical_tools")
         if not tool_ids.issubset(known_operations):
             raise ArtifactValidationError("EnvironmentSpec references logical tools absent from KnowledgePack")
 
@@ -174,7 +175,7 @@ def _tool_graph_gate(graph: dict[str, Any], context: dict[str, dict[str, Any]] |
         if edge["from_tool_id"] not in tool_ids or edge["to_tool_id"] not in tool_ids:
             raise ArtifactValidationError("LogicalToolGraph edge references unknown tool")
     if context and "EnvironmentSpec" in context:
-        entities = set(context["EnvironmentSpec"]["state_entities"])
+        entities = _aliases_from_items(context["EnvironmentSpec"].get("state_entities", []), ["object_id", "state_object_id", "entity_id"], "EnvironmentSpec.state_entities")
         env_tools = {tool["tool_id"] for tool in context["EnvironmentSpec"]["logical_tools"]}
         for tool in graph.get("tools", []):
             if tool["tool_id"] not in env_tools:
@@ -183,6 +184,39 @@ def _tool_graph_gate(graph: dict[str, Any], context: dict[str, dict[str, Any]] |
                 raise ArtifactValidationError(f"Tool {tool['tool_id']} reads unknown state entities")
             if not set(tool.get("writes", [])).issubset(entities):
                 raise ArtifactValidationError(f"Tool {tool['tool_id']} writes unknown state entities")
+
+
+def _ids_from_items(items: list[Any], keys: list[str], label: str) -> set[str]:
+    ids: set[str] = set()
+    for item in items:
+        value = ""
+        if isinstance(item, str):
+            value = item
+        elif isinstance(item, dict):
+            for key in keys:
+                if item.get(key):
+                    value = str(item[key])
+                    break
+        if not value:
+            raise ArtifactValidationError(f"{label} item lacks identifier field: {keys}")
+        ids.add(value)
+    return ids
+
+
+def _aliases_from_items(items: list[Any], keys: list[str], label: str) -> set[str]:
+    aliases: set[str] = set()
+    for item in items:
+        if isinstance(item, str):
+            aliases.add(item)
+            continue
+        if not isinstance(item, dict):
+            raise ArtifactValidationError(f"{label} item lacks identifier field: {keys}")
+        for key in keys:
+            if item.get(key):
+                aliases.add(str(item[key]))
+        if not any(item.get(key) for key in keys):
+            raise ArtifactValidationError(f"{label} item lacks identifier field: {keys}")
+    return aliases
 
 
 def _task_solvability_gate(task_set: dict[str, Any], context: dict[str, dict[str, Any]] | None = None) -> None:

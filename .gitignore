@@ -1,8 +1,16 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-outputs/agent_world/
+
+# Runtime pipeline outputs can include generated projects, traces, SDK state,
+# local logs, and agent workspaces. Keep the committed seed sample visible.
+outputs/*
+!outputs/seed_scenario.jsonl
 
 # Local research paper PDFs are useful evidence but should not be swept into
 # normal source commits.
 research/papers/*.pdf
+
+# Optional local research-agent clones. Keep adapters in agent_world/research/adapters/.
+external/research/*/
+!external/research/README.md

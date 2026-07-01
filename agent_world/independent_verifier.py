@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from agent_world.artifacts import RUNTIME_ABI_INTERFACES
-from agent_world.replay_contract import exception_payload, observation_from_independent_report
+from agent_world.replay_contract import exception_payload, normalise_framework_replay_calls, observation_from_independent_report
 
 
 def verify_generated_project_independent(
@@ -194,7 +194,7 @@ def _verify_contract_task(
     episode_id = str(reset.get("episode_id") or f"{task_id}-positive")
     expected_path = list(task.get("dependency_path", []))
     invoked_tools = []
-    for step_index, call in enumerate(task.get("framework_replay", {}).get("tool_calls", [])):
+    for step_index, call in enumerate(normalise_framework_replay_calls(task)):
         tool_id = str(call.get("tool") or "")
         kwargs = call.get("kwargs", {})
         if not isinstance(kwargs, dict):
@@ -313,12 +313,8 @@ def _normalise_contract_tasks(accepted_tasks: list[dict[str, Any]] | None) -> li
         if "dependency_path" not in task:
             task["dependency_path"] = list(task.get("allowed_logical_tool_ids", []))
         replay = task.get("framework_replay")
-        if not isinstance(replay, dict):
-            replay = {}
-        calls = replay.get("tool_calls")
-        if not isinstance(calls, list) or not calls:
-            calls = [{"tool": tool, "kwargs": {}} for tool in task.get("dependency_path", [])]
-        task["framework_replay"] = {**replay, "tool_calls": calls}
+        replay_base = replay if isinstance(replay, dict) else {}
+        task["framework_replay"] = {**replay_base, "tool_calls": normalise_framework_replay_calls(task)}
         tasks.append(task)
     return tasks
 

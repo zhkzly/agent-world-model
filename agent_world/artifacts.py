@@ -308,7 +308,7 @@ GENERATED_PROJECT_FILE_KINDS = {
 GENERATED_FILE_KINDS = set(GENERATED_PROJECT_FILE_KINDS)
 AGENT_BACKEND_KINDS = {
     "llm",
-    "openai_codegen",
+    "llm_file_codegen",
     "code_agent_runner",
     "codex_cli_runner",
     "codex_sdk",
@@ -550,16 +550,28 @@ def _validate_environment_spec(artifact: dict[str, Any]) -> None:
 
 
 def _validate_logical_tool_graph(artifact_type: str, artifact: dict[str, Any]) -> None:
+    if not isinstance(artifact.get("tools"), list):
+        raise ArtifactValidationError("LogicalToolGraph.tools must be a list")
+    if not isinstance(artifact.get("edges"), list):
+        raise ArtifactValidationError("LogicalToolGraph.edges must be a list")
+    if not isinstance(artifact.get("parameters"), list):
+        raise ArtifactValidationError("LogicalToolGraph.parameters must be a list of parameter objects")
+    for tool in artifact["tools"]:
+        if not isinstance(tool, dict):
+            raise ArtifactValidationError("LogicalToolGraph.tools items must be objects")
+        _require_fields(artifact_type, tool, ["tool_id", "name", "input_schema", "output_schema", "reads", "writes", "side_effects", "errors", "idempotency"])
     tool_ids = {tool["tool_id"] for tool in artifact["tools"]}
     for edge in artifact["edges"]:
+        if not isinstance(edge, dict):
+            raise ArtifactValidationError("LogicalToolGraph.edges items must be objects")
         _assert_in(artifact_type, "edge.dependency_type", edge.get("dependency_type"), DEPENDENCY_TYPES)
         if edge.get("from_tool_id") not in tool_ids or edge.get("to_tool_id") not in tool_ids:
             raise ArtifactValidationError(f"{artifact_type} edge references an unknown tool")
     for parameter in artifact["parameters"]:
+        if not isinstance(parameter, dict):
+            raise ArtifactValidationError("LogicalToolGraph.parameters items must be objects")
         _assert_in(artifact_type, "parameter.classification", parameter.get("classification"), PARAMETER_CLASSES)
         _require_fields(artifact_type, parameter, ["name", "classification", "source", "validation"])
-    for tool in artifact["tools"]:
-        _require_fields(artifact_type, tool, ["tool_id", "name", "input_schema", "output_schema", "reads", "writes", "side_effects", "errors", "idempotency"])
 
 
 def _validate_task_set(artifact: dict[str, Any]) -> None:
@@ -583,6 +595,10 @@ def _validate_task_set(artifact: dict[str, Any]) -> None:
         )
         if not isinstance(task["allowed_logical_tool_ids"], list) or not isinstance(task["dependency_path"], list):
             raise ArtifactValidationError("TaskSet task tool fields must be lists")
+        if not all(isinstance(item, str) for item in task["allowed_logical_tool_ids"]):
+            raise ArtifactValidationError("TaskSet allowed_logical_tool_ids must contain tool id strings")
+        if not all(isinstance(item, str) for item in task["dependency_path"]):
+            raise ArtifactValidationError("TaskSet dependency_path must contain tool id strings")
     _require_fields("TaskSet", artifact["coverage"], ["tool_ids", "capabilities", "state_entities"])
 
 
@@ -592,6 +608,8 @@ def _validate_surface_plan(artifact_type: str, artifact: dict[str, Any]) -> None
         _assert_in(artifact_type, "binding.surface", binding.get("surface"), SURFACES)
     for surface, status in artifact["surface_status"].items():
         _assert_in(artifact_type, "surface_status key", surface, SURFACES)
+        if not isinstance(status, str):
+            raise ArtifactValidationError("SurfacePlan.surface_status values must be status strings")
         _assert_in(artifact_type, "surface_status value", status, SURFACE_STATUSES)
 
 

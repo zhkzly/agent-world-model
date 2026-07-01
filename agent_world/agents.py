@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +16,19 @@ from pathlib import Path, PurePath
 from typing import Any, Protocol
 
 from agent_world.artifacts import make_artifact, stable_json
+from agent_world.config import (
+    AgentProfileConfig,
+    IMPLEMENTATION_AGENT_PROFILE,
+    SEMANTIC_AGENT_PROFILE,
+    load_agent_world_config,
+)
+
+
+CODEX_SDK_MODEL_PROVIDER_ID = "agent_world_openai"
+
+
+class CodexSdkContinuationUnavailable(RuntimeError):
+    """Raised when an IMPLEMENT repair requested Codex SDK continuation that cannot be resumed."""
 
 
 @dataclass(frozen=True)
@@ -28,6 +42,9 @@ class AgentRequest:
     permissions: dict[str, Any] = field(default_factory=lambda: {"network": False, "filesystem": "artifact_context", "auth": False, "sandbox": False})
     budget: dict[str, Any] = field(default_factory=lambda: {"tokens": 0, "time_ms": 5000, "cost_limit": 0})
     instruction_ref: str = "inline"
+    parent_invocation_id: str = ""
+    conversation_ref: str = ""
+    continuation_mode: str = "stateless"
 
 
 @dataclass(frozen=True)
@@ -40,6 +57,7 @@ class AgentResult:
     failure_class: str = ""
     recovery_suggestion: str = ""
     usage: dict[str, Any] = field(default_factory=dict)
+    conversation_ref: str = ""
 
 
 class AgentBackend(Protocol):
@@ -57,21 +75,14 @@ class MockAgentBackend:
 
     def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
         key = f"{request.stage}:{request.node_purpose}"
-        if request.node_purpose == "review":
-            artifact_id = request.input_artifact_ids[0] if request.input_artifact_ids else ""
-            text = json.dumps(
-                {
-                    "alignment_status": "pass",
-                    "reviewed_artifact_ids": [artifact_id],
-                    "drift_findings": [],
-                    "required_fixes": [],
-                    "waived_risks": [],
-                    "reviewer_note": f"mock independent review for {request.stage}",
-                },
-                sort_keys=True,
+        if key not in self.responses:
+            return AgentResult(
+                text="mock backend is not allowed to produce accepted agent output",
+                status="needs_human",
+                failure_class="mock_backend_not_allowed",
+                recovery_suggestion=f"Configure a real AgentBackend or an explicit test response for {key}.",
             )
-            return AgentResult(text=text, evidence_refs=[f"mock://{key}"], trace_ref=f"mock-trace:{key}")
-        text = self.responses.get(key, f"mock output for {key}")
+        text = self.responses[key]
         return AgentResult(text=text, evidence_refs=[f"mock://{key}"], trace_ref=f"mock-trace:{key}")
 
 
@@ -355,6 +366,9 @@ class CodexCliRunnerBackend(CodeAgentRunnerBackend):
 class CodexSdkAgentBackend:
     backend_kind = "codex_sdk"
 
+    def __init__(self) -> None:
+        self._continued_threads: dict[str, dict[str, Any]] = {}
+
     def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
         permission_error = _codex_sdk_permission_error(request, config)
         if permission_error:
@@ -395,12 +409,19 @@ class CodexSdkAgentBackend:
         if output_dir:
             output_dir.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
+        conversation_ref = request.conversation_ref
         try:
             with _temporary_cwd(workspace):
                 with _codex_sdk_environment(config, workspace):
-                    with Codex() as codex:
-                        thread = codex.thread_start(model=model, sandbox=sandbox)
-                        sdk_result = thread.run(request.instruction)
+                    sdk_result, conversation_ref = self._run_thread(
+                        sdk_module,
+                        Codex,
+                        request,
+                        model=model,
+                        sandbox=sandbox,
+                        workspace=workspace,
+                        config=config,
+                    )
         except Exception as exc:
             duration_ms = int((time.monotonic() - started) * 1000)
             if output_dir:
@@ -412,6 +433,7 @@ class CodexSdkAgentBackend:
                 recovery_suggestion="Check Codex SDK auth, model access, sandbox permissions, and workspace state.",
                 trace_ref=_codex_sdk_trace_ref(workspace),
                 usage={"tokens": None, "cost": None, "duration_ms": duration_ms},
+                conversation_ref=conversation_ref,
             )
         duration_ms = int((time.monotonic() - started) * 1000)
         response_text = _codex_sdk_result_text(sdk_result)
@@ -431,19 +453,84 @@ class CodexSdkAgentBackend:
                     evidence_refs=[command_log_ref],
                     trace_ref=command_log_ref,
                     usage=usage,
+                    conversation_ref=conversation_ref,
                 )
             return AgentResult(
                 text=json.dumps({"candidate_manifest_ref": "agent-output/candidate_manifest.json"}, sort_keys=True),
                 evidence_refs=[command_log_ref, manifest_ref],
                 trace_ref=command_log_ref,
                 usage=usage,
+                conversation_ref=conversation_ref,
             )
         return AgentResult(
             text=response_text,
             evidence_refs=["codex-sdk://thread"],
             trace_ref="codex-sdk://thread",
             usage=usage,
+            conversation_ref=conversation_ref,
         )
+
+    def _run_thread(
+        self,
+        sdk_module: Any,
+        Codex: Any,
+        request: AgentRequest,
+        *,
+        model: str,
+        sandbox: Any,
+        workspace: Path | None,
+        config: dict[str, Any],
+    ) -> tuple[Any, str]:
+        if _codex_sdk_should_continue(request):
+            return self._run_continued_thread(sdk_module, Codex, request, model=model, sandbox=sandbox, workspace=workspace, config=config)
+        with Codex() as codex:
+            thread = codex.thread_start(**_codex_sdk_thread_kwargs(sdk_module, model=model, sandbox=sandbox, workspace=workspace, config=config))
+            result = thread.run(request.instruction, **_codex_sdk_run_kwargs(sdk_module, sandbox=sandbox, workspace=workspace))
+            return result, _codex_sdk_thread_ref(thread, "")
+
+    def _run_continued_thread(
+        self,
+        sdk_module: Any,
+        Codex: Any,
+        request: AgentRequest,
+        *,
+        model: str,
+        sandbox: Any,
+        workspace: Path | None,
+        config: dict[str, Any],
+    ) -> tuple[Any, str]:
+        workspace_ref = str(workspace.resolve()) if workspace else ""
+        if request.conversation_ref:
+            session = self._continued_threads.get(request.conversation_ref)
+            if session:
+                if session.get("workspace_ref") != workspace_ref:
+                    raise CodexSdkContinuationUnavailable("Codex SDK continuation workspace does not match the current isolated workdir")
+                return session["thread"].run(request.instruction, **_codex_sdk_run_kwargs(sdk_module, sandbox=sandbox, workspace=workspace)), request.conversation_ref
+            with Codex() as codex:
+                thread = _codex_sdk_resume_thread(codex, request.conversation_ref)
+                if thread is None:
+                    raise CodexSdkContinuationUnavailable("Codex SDK continuation thread is not available; disable continuation or rerun the initial IMPLEMENT attempt")
+                return thread.run(request.instruction, **_codex_sdk_run_kwargs(sdk_module, sandbox=sandbox, workspace=workspace)), request.conversation_ref
+
+        codex_cm = Codex()
+        codex = codex_cm.__enter__()
+        conversation_ref = ""
+        try:
+            thread = codex.thread_start(**_codex_sdk_thread_kwargs(sdk_module, model=model, sandbox=sandbox, workspace=workspace, config=config))
+            conversation_ref = _codex_sdk_thread_ref(thread, f"codex-sdk-thread:{request.invocation_id or id(thread)}")
+            self._continued_threads[conversation_ref] = {
+                "codex_cm": codex_cm,
+                "thread": thread,
+                "workspace_ref": workspace_ref,
+                "model": model,
+            }
+            return thread.run(request.instruction, **_codex_sdk_run_kwargs(sdk_module, sandbox=sandbox, workspace=workspace)), conversation_ref
+        except Exception:
+            if conversation_ref:
+                self._continued_threads.pop(conversation_ref, None)
+            with contextlib.suppress(Exception):
+                codex_cm.__exit__(*sys.exc_info())
+            raise
 
 
 class OpenAICompatibleBackend:
@@ -466,7 +553,7 @@ class OpenAICompatibleBackend:
                 text="OpenAI-compatible backend is not configured",
                 status="needs_human",
                 failure_class="missing_openai_configuration",
-                recovery_suggestion="Set AGENT_WORLD_OPENAI_API_KEY and AGENT_WORLD_OPENAI_MODEL, or use AGENT_WORLD_AGENT_BACKEND=mock",
+                recovery_suggestion="Set AGENT_WORLD_OPENAI_API_KEY and AGENT_WORLD_OPENAI_MODEL, or choose another real AgentBackend.",
             )
         base_url = (config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
         body = {
@@ -513,21 +600,21 @@ class OpenAICompatibleBackend:
         )
 
 
-class OpenAICompatibleCodegenBackend:
-    backend_kind = "openai_codegen"
+class LLMFileCodegenBackend:
+    backend_kind = "llm_file_codegen"
 
     def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
         if request.node_purpose != "implement":
             return AgentResult(
-                text="openai_codegen only supports implementation nodes",
+                text="llm_file_codegen only supports implementation nodes",
                 status="fail",
                 failure_class="invalid_codegen_request",
-                recovery_suggestion="Use openai_codegen only for node_purpose=implement.",
+                recovery_suggestion="Use llm_file_codegen only for node_purpose=implement.",
             )
         root_text = str(request.permissions.get("filesystem_root") or "")
         if not root_text:
             return AgentResult(
-                text="openai_codegen requires an isolated filesystem_root",
+                text="llm_file_codegen requires an isolated filesystem_root",
                 status="fail",
                 failure_class="missing_codegen_workdir",
                 recovery_suggestion="Set request.permissions.filesystem_root to the isolated workdir.",
@@ -535,24 +622,24 @@ class OpenAICompatibleCodegenBackend:
         work_dir = PurePath(root_text)
         if work_dir.is_absolute() is False:
             return AgentResult(
-                text="openai_codegen filesystem_root must be absolute",
+                text="llm_file_codegen filesystem_root must be absolute",
                 status="fail",
                 failure_class="invalid_codegen_workdir",
                 recovery_suggestion="Use an absolute isolated workdir path.",
             )
         if not request.permissions.get("network") or not config.get("permissions", {}).get("network"):
             return AgentResult(
-                text="OpenAI-compatible codegen backend network permission denied",
+                text="LLM file codegen backend network permission denied",
                 status="fail",
                 failure_class="network_permission_denied",
                 recovery_suggestion="Set AGENT_WORLD_AGENT_NETWORK=1 for live codegen.",
             )
         if not request.permissions.get("auth") or not config.get("permissions", {}).get("auth"):
             return AgentResult(
-                text="OpenAI-compatible codegen backend auth permission denied",
+                text="LLM file codegen backend auth permission denied",
                 status="fail",
                 failure_class="auth_permission_denied",
-                recovery_suggestion="Configure an API key env var and allow auth for openai_codegen.",
+                recovery_suggestion="Configure an API key env var and allow auth for llm_file_codegen.",
             )
         payload, error = _openai_chat_completion(
             request,
@@ -563,6 +650,7 @@ class OpenAICompatibleCodegenBackend:
                 "with contract.json, source/, state/, adapters/, scripts/, and spec/. "
                 "Do not include API keys, credentials, or text outside JSON."
             ),
+            response_format={"type": "json_object"},
         )
         if error:
             return error
@@ -603,6 +691,7 @@ def _openai_chat_completion(
     config: dict[str, Any],
     *,
     system_message: str,
+    response_format: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], AgentResult | None]:
     auth = config.get("auth", {})
     api_key_env = auth.get("api_key_env") or ""
@@ -613,7 +702,7 @@ def _openai_chat_completion(
             text="OpenAI-compatible backend is not configured",
             status="needs_human",
             failure_class="missing_openai_configuration",
-            recovery_suggestion="Set AGENT_WORLD_OPENAI_API_KEY and AGENT_WORLD_OPENAI_MODEL, or use AGENT_WORLD_AGENT_BACKEND=mock",
+            recovery_suggestion="Set AGENT_WORLD_OPENAI_API_KEY and AGENT_WORLD_OPENAI_MODEL, or choose another real AgentBackend.",
         )
     base_url = (config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
     body = {
@@ -624,6 +713,8 @@ def _openai_chat_completion(
         ],
         "max_tokens": int(config.get("budgets", {}).get("max_tokens") or 4096),
     }
+    if response_format:
+        body["response_format"] = response_format
     http_request = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=json.dumps(body).encode("utf-8"),
@@ -715,7 +806,7 @@ def _write_codegen_candidate(
         if path_error:
             return {}, path_error
         if not (rel_text.startswith("generated/") or rel_text.startswith("agent-output/")):
-            return {}, _codegen_failure("unexpected_codegen_file", "OpenAI-compatible codegen files must be under generated/ or agent-output/.")
+            return {}, _codegen_failure("unexpected_codegen_file", "LLM file codegen files must be under generated/ or agent-output/.")
         if rel_text in declared:
             return {}, _codegen_failure("duplicate_codegen_file", "Model declared the same file twice.")
         content = item.get("content")
@@ -726,6 +817,7 @@ def _write_codegen_candidate(
         target = (root / rel_text).resolve()
         if not _path_inside(target, root):
             return {}, _codegen_failure("path_traversal_rejected", "Generated file path escapes the isolated workdir.")
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         declared.add(rel_text)
     generated_root = root / "generated"
@@ -839,26 +931,36 @@ def default_agent_backend_registry() -> AgentBackendRegistry:
     registry.register(CodexCliRunnerBackend())
     registry.register(CodexSdkAgentBackend())
     registry.register(OpenAICompatibleBackend())
-    registry.register(OpenAICompatibleCodegenBackend())
+    registry.register(LLMFileCodegenBackend())
     return registry
 
 
-def load_agent_backend_config_from_env(env: dict[str, str] | None = None, *, source_stage: str = "config") -> dict[str, Any]:
-    env = os.environ if env is None else env
-    backend_kind = env.get("AGENT_WORLD_AGENT_BACKEND", "mock")
-    provider = _provider_for_backend(backend_kind)
-    base_url = env.get("AGENT_WORLD_OPENAI_BASE_URL") or env.get("OPENAI_BASE_URL") or ""
-    api_key_env = "AGENT_WORLD_OPENAI_API_KEY" if env.get("AGENT_WORLD_OPENAI_API_KEY") else ("OPENAI_API_KEY" if env.get("OPENAI_API_KEY") else "")
-    model = env.get("AGENT_WORLD_OPENAI_MODEL") or env.get("OPENAI_MODEL") or ""
-    smoke_model = env.get("AGENT_WORLD_SMOKE_OPENAI_MODEL") or model
-    api_version = env.get("AGENT_WORLD_OPENAI_API_VERSION") or _infer_api_version(base_url, backend_kind)
-    if backend_kind in {"codex_cli", "codex_cli_runner"}:
-        command_value = env.get("AGENT_WORLD_CODEX_CMD") or ""
-    else:
-        command_value = env.get("AGENT_WORLD_CODE_AGENT_CMD") or env.get("AGENT_WORLD_CODEX_CMD") or ""
-    command_argv = shlex.split(command_value) if command_value else []
-    allowlist_value = env.get("AGENT_WORLD_PROCESS_AGENT_ALLOWLIST") or env.get("AGENT_WORLD_CODEX_ALLOWLIST") or ""
-    allowlist = shlex.split(allowlist_value) if allowlist_value else []
+def load_agent_backend_config_from_env(
+    env: dict[str, str] | None = None,
+    *,
+    source_stage: str = "config",
+    profile_id: str = SEMANTIC_AGENT_PROFILE,
+) -> dict[str, Any]:
+    """Compatibility wrapper for the default semantic backend profile."""
+
+    world_config = load_agent_world_config(env)
+    profile = world_config.agent_profiles[profile_id]
+    return agent_backend_config_from_profile(profile, source_stage=source_stage)
+
+
+def load_stage_agent_backend_config_from_env(stage: str, env: dict[str, str] | None = None, *, source_stage: str = "config") -> dict[str, Any]:
+    world_config = load_agent_world_config(env)
+    return agent_backend_config_from_profile(world_config.profile_for_stage(stage), source_stage=source_stage)
+
+
+def load_implementation_agent_backend_config_from_env(env: dict[str, str] | None = None, *, source_stage: str = "config") -> dict[str, Any]:
+    return load_agent_backend_config_from_env(env, source_stage=source_stage, profile_id=IMPLEMENTATION_AGENT_PROFILE)
+
+
+def agent_backend_config_from_profile(profile: AgentProfileConfig, *, source_stage: str = "config") -> dict[str, Any]:
+    backend_kind = profile.backend_kind
+    command_argv = shlex.split(profile.command_value) if profile.command_value else []
+    allowlist = shlex.split(profile.allowlist_value) if profile.allowlist_value else []
     if backend_kind in {"code_agent_runner", "codex_cli_runner", "codex_sdk"}:
         command_filesystem = "isolated_agent_workspace"
     elif backend_kind in {"process_agent", "codex_cli"}:
@@ -866,52 +968,55 @@ def load_agent_backend_config_from_env(env: dict[str, str] | None = None, *, sou
     else:
         command_filesystem = "artifact_context"
     command_sandbox = backend_kind in {"codex_cli", "codex_cli_runner", "codex_sdk"}
-    agent_auth = env.get("AGENT_WORLD_AGENT_AUTH", "0") in {"1", "true", "True"} or env.get("AGENT_WORLD_CODEX_AUTH", "0") in {"1", "true", "True"}
-    auth_permission = (bool(api_key_env) or agent_auth) and backend_kind in {"llm", "openai_codegen", "code_agent_runner", "codex_cli_runner", "codex_sdk"}
+    auth_permission = (bool(profile.api_key_env) or profile.agent_auth) and backend_kind in {"llm", "llm_file_codegen", "code_agent_runner", "codex_cli_runner", "codex_sdk"}
     command = (
         {
             "argv": command_argv,
             "fixed_args": [],
             "forbidden_args": ["--dangerously-bypass-approvals-and-sandbox", "--force", "--unsafe"],
             "allowlist_executables": allowlist,
-            "cwd": env.get("AGENT_WORLD_PROCESS_AGENT_CWD", "."),
+            "cwd": profile.command_cwd,
         }
-        if command_value
+        if profile.command_value
         else {"argv": [], "fixed_args": [], "forbidden_args": [], "allowlist_executables": [], "cwd": "."}
     )
+    profile_ref = _safe_profile_ref(profile.profile_id)
     fields = {
-        "backend_id": "default-agent-backend",
+        "backend_id": f"{profile_ref}-agent-backend",
+        "profile_id": profile.profile_id,
         "backend_kind": backend_kind,
-        "provider": provider,
-        "model": model,
-        "smoke_model": smoke_model,
-        "base_url": base_url,
-        "api_version": api_version,
+        "provider": profile.provider,
+        "model": profile.model,
+        "smoke_model": profile.smoke_model,
+        "model_candidates": profile.model_candidates,
+        "base_url": profile.base_url,
+        "api_version": profile.api_version,
         "auth": {
-            "api_key_env": api_key_env,
-            "auth_env_refs": [name for name in ["AGENT_WORLD_OPENAI_API_KEY", "OPENAI_API_KEY"] if env.get(name)],
-            "requires_auth": backend_kind in {"llm", "openai_codegen", "code_agent_runner", "codex_cli_runner", "codex_sdk"},
+            "api_key_env": profile.api_key_env,
+            "auth_env_refs": profile.auth_env_refs,
+            "requires_auth": backend_kind in {"llm", "llm_file_codegen", "code_agent_runner", "codex_cli_runner", "codex_sdk"},
         },
         "command": command,
-        "timeouts": {"connect_ms": 1000, "run_ms": int(env.get("AGENT_WORLD_AGENT_TIMEOUT_MS", "5000"))},
-        "retries": {"max_attempts": int(env.get("AGENT_WORLD_AGENT_MAX_ATTEMPTS", "3"))},
-        "budgets": {"max_tokens": int(env.get("AGENT_WORLD_AGENT_MAX_TOKENS", "0")), "max_cost": 0, "max_tool_calls": 0},
+        "timeouts": {"connect_ms": 1000, "run_ms": int(profile.timeout_ms)},
+        "retries": {"max_attempts": int(profile.max_attempts)},
+        "budgets": {"max_tokens": int(profile.max_tokens), "max_cost": 0, "max_tool_calls": 0},
         "permissions": {
-            "network": env.get("AGENT_WORLD_AGENT_NETWORK", "0") in {"1", "true", "True"},
+            "network": bool(profile.network),
             "filesystem": command_filesystem,
             "auth": auth_permission,
             "sandbox": command_sandbox,
         },
-        "codex": {"sandbox": env.get("AGENT_WORLD_CODEX_SANDBOX", "workspace-write")},
+        "codex": {"sandbox": profile.codex_sandbox},
+        "code_repair": {"thread_mode": profile.code_repair_thread_mode},
         "output_schema_ref": "AgentResult",
         "redaction_policy": {"secret_env_names_only": True, "redact_values": True},
     }
     return make_artifact(
         "AgentBackendConfig",
         source_stage=source_stage,
-        producer="agent-backend-config-loader",
+        producer="agent-world-config-loader",
         fields=fields,
-        artifact_id="agent-backend-config-default",
+        artifact_id=f"agent-backend-config-{profile_ref}",
         status="accepted",
     )
 
@@ -939,11 +1044,14 @@ def invoke_agent(
         "allowed_tool_access": request.allowed_tool_access,
         "permissions": request.permissions,
         "budget": request.budget,
+        "parent_invocation_id": request.parent_invocation_id,
+        "conversation_ref": result.conversation_ref or request.conversation_ref,
+        "continuation_mode": request.continuation_mode,
         "output_artifact_ids": result.output_artifact_ids,
         "evidence_refs": result.evidence_refs,
         "trace_ref": result.trace_ref,
         "result_preview": result.text[:500],
-        "usage": result.usage or {"tokens": None, "cost": None, "duration_ms": None},
+        "usage": _json_safe(result.usage or {"tokens": None, "cost": None, "duration_ms": None}),
         "failure_class": result.failure_class,
         "recovery_suggestion": result.recovery_suggestion,
     }
@@ -960,18 +1068,14 @@ def invoke_agent(
     return record, result
 
 
-def _provider_for_backend(backend_kind: str) -> str:
-    if backend_kind in {"process_agent", "code_agent_runner"}:
-        return "local_process"
-    if backend_kind in {"codex_cli", "codex_cli_runner", "codex_sdk"}:
-        return "codex"
-    if backend_kind == "manual":
-        return "manual"
-    if backend_kind == "mock":
-        return "mock"
-    if backend_kind in {"llm", "openai_codegen"}:
-        return "openai_compatible"
-    return "custom"
+def _code_repair_thread_mode(raw: str) -> str:
+    mode = str(raw or "stateless").strip().lower()
+    return mode if mode in {"stateless", "continue"} else "stateless"
+
+
+def _safe_profile_ref(profile_id: str) -> str:
+    cleaned = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in profile_id.strip().lower())
+    return cleaned or "default"
 
 
 def _codex_sdk_permission_error(request: AgentRequest, config: dict[str, Any]) -> AgentResult | None:
@@ -997,6 +1101,26 @@ def _codex_sdk_permission_error(request: AgentRequest, config: dict[str, Any]) -
             failure_class="sandbox_permission_denied",
             recovery_suggestion="Use codex_sdk only with an explicit sandbox policy.",
         )
+    return None
+
+
+def _codex_sdk_should_continue(request: AgentRequest) -> bool:
+    return request.stage == "IMPLEMENT" and request.node_purpose == "implement" and request.continuation_mode == "continue"
+
+
+def _codex_sdk_thread_ref(thread: Any, fallback: str) -> str:
+    for attr in ["id", "thread_id", "threadId"]:
+        value = getattr(thread, attr, "")
+        if value:
+            return str(value)
+    return fallback
+
+
+def _codex_sdk_resume_thread(codex: Any, conversation_ref: str) -> Any | None:
+    for method_name in ["thread_resume", "resume_thread", "resumeThread"]:
+        method = getattr(codex, method_name, None)
+        if callable(method):
+            return method(conversation_ref)
     return None
 
 
@@ -1029,6 +1153,40 @@ def _codex_sdk_sandbox(Sandbox: Any, config: dict[str, Any]) -> tuple[Any, Agent
             recovery_suggestion="Use an official openai-codex build with Sandbox presets.",
         )
     return getattr(Sandbox, attr), None
+
+
+def _codex_sdk_thread_kwargs(
+    sdk_module: Any,
+    *,
+    model: str,
+    sandbox: Any,
+    workspace: Path | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"model": model, "sandbox": sandbox}
+    if workspace:
+        kwargs["cwd"] = str(workspace)
+    if config.get("base_url"):
+        kwargs["model_provider"] = CODEX_SDK_MODEL_PROVIDER_ID
+    approval_mode = _codex_sdk_auto_review_approval_mode(sdk_module)
+    if approval_mode is not None:
+        kwargs["approval_mode"] = approval_mode
+    return kwargs
+
+
+def _codex_sdk_run_kwargs(sdk_module: Any, *, sandbox: Any, workspace: Path | None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"sandbox": sandbox}
+    if workspace:
+        kwargs["cwd"] = str(workspace)
+    approval_mode = _codex_sdk_auto_review_approval_mode(sdk_module)
+    if approval_mode is not None:
+        kwargs["approval_mode"] = approval_mode
+    return kwargs
+
+
+def _codex_sdk_auto_review_approval_mode(sdk_module: Any) -> Any | None:
+    approval_mode = getattr(sdk_module, "ApprovalMode", None)
+    return getattr(approval_mode, "auto_review", None) if approval_mode is not None else None
 
 
 def _codex_sdk_workspace(request: AgentRequest) -> tuple[Path | None, AgentResult | None]:
@@ -1109,7 +1267,7 @@ def _codex_sdk_config_text(config: dict[str, Any]) -> str:
     if model:
         lines.append(f"model = {_toml_string(model)}")
     if base_url:
-        provider_id = "agent_world_openai"
+        provider_id = CODEX_SDK_MODEL_PROVIDER_ID
         lines.append(f"model_provider = {_toml_string(provider_id)}")
         lines.append("")
         lines.append(f"[model_providers.{provider_id}]")
@@ -1134,7 +1292,25 @@ def _codex_sdk_result_text(result: Any) -> str:
 
 def _codex_sdk_usage(result: Any, duration_ms: int) -> dict[str, Any]:
     usage = getattr(result, "usage", None)
-    return {"tokens": usage, "cost": None, "duration_ms": duration_ms}
+    return {"tokens": _json_safe(usage), "cost": None, "duration_ms": duration_ms}
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return _json_safe(model_dump(mode="json"))
+        except TypeError:
+            return _json_safe(model_dump())
+    if hasattr(value, "__dict__"):
+        return _json_safe(vars(value))
+    return str(value)
 
 
 def _write_codex_sdk_result(path: Path, *, status: str, duration_ms: int) -> None:
@@ -1157,7 +1333,7 @@ def _is_transient_openai_error(exc: Exception) -> bool:
 
 
 def _infer_api_version(base_url: str, backend_kind: str) -> str:
-    if backend_kind in {"llm", "openai_codegen"} and base_url.rstrip("/").endswith("/v1"):
+    if backend_kind in {"llm", "llm_file_codegen"} and base_url.rstrip("/").endswith("/v1"):
         return "v1"
     return ""
 

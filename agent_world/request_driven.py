@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 import subprocess
 import sys
-import tempfile
 import traceback
 from pathlib import Path, PurePath
 from typing import Any
@@ -17,48 +15,6 @@ from agent_world.candidate_check import check_generated_candidate
 
 
 GENERATED_FILE_KINDS = set(GENERATED_PROJECT_FILE_KINDS)
-GENERIC_STRATEGY_FAMILY = "request-driven-generated-environment-v1"
-RAW_REQUEST_SOURCE_ID = "source-raw-request"
-
-
-def domain_plan_fields(raw_request: str) -> dict[str, Any]:
-    """Plan a generated environment from the request itself, without domain registries."""
-    normalized = _normalize_text(raw_request)
-    environment_id = _environment_id(raw_request)
-    concepts = _concepts(raw_request)
-    operations = _operation_ids(concepts)
-    return {
-        "domain_plan_id": f"domain-plan-{environment_id}",
-        "raw_request": raw_request,
-        "domain_seed": environment_id,
-        "domain_intent": _sentence(raw_request),
-        "recognized_intents": concepts,
-        "required_state_objects": _state_object_ids(concepts),
-        "required_operations": operations,
-        "likely_source_needs": ["raw request", "provided local source paths", "generated replay contract", "agent-written contract project"],
-        "constraints": {
-            "network": "not_required",
-            "auth": "not_required",
-            "license": "user_supplied_or_generated_local_sources",
-            "safety": "synthetic_local_state_only",
-            "local_execution": True,
-            "mocking_allowed": True,
-        },
-        "license_auth_network_security": {
-            "license": "user_supplied_request",
-            "auth_requirement": "none",
-            "network_requirement": "none",
-            "security_note": "The default request-driven path uses local synthetic state and never contacts external services during planning.",
-        },
-        "planner_evidence": {
-            "raw_request_ref": "PipelineRunConfig.raw_request",
-            "request_hash": hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
-            "strategy_family": GENERIC_STRATEGY_FAMILY,
-            "generated_environment_id": environment_id,
-        },
-        "planning_status": "planned" if normalized else "blocked",
-        "blocked_reasons": [] if normalized else ["raw_request is empty"],
-    }
 
 
 def strategy_selection_fields(domain_plan: dict[str, Any]) -> dict[str, Any]:
@@ -79,7 +35,7 @@ def strategy_selection_fields(domain_plan: dict[str, Any]) -> dict[str, Any]:
             "blocked_reasons": list(domain_plan.get("blocked_reasons", [])),
         }
     return {
-        "strategy_selection_id": f"strategy-selection-{domain_plan['domain_seed']}",
+        "strategy_selection_id": f"strategy-selection-{_stable_id_fragment(domain_plan['domain_seed'])}",
         "domain_plan_ref": domain_plan["id"],
         "domain_seed": domain_plan["domain_seed"],
         "selection_status": "selected",
@@ -102,254 +58,24 @@ def strategy_selection_fields(domain_plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def need_spec_fields(domain_plan: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "goal": domain_plan["raw_request"],
-        "target_capabilities": [
-            "request-driven environment generation",
-            "source-grounded task construction",
-            "agent-backed executable runtime generation",
-            "framework-owned replay and verifier feedback",
-        ],
-        "domain_seed": domain_plan["domain_seed"],
-        "expected_agent_behavior": "Use the generated logical tools to mutate or inspect an isolated local state according to the accepted tasks.",
-        "constraints": dict(domain_plan["constraints"]),
-        "preferred_surfaces": ["python", "cli", "http", "mcp"],
-        "out_of_scope": [
-            "training integration",
-            "rollout",
-            "reward export",
-            "AWM reproduction",
-            "MCP-only architecture",
-            "CLI-only architecture",
-            "live external service access",
-            "generic shell execution surface",
-        ],
-        "human_confirmation_required": [],
-        "domain_plan_ref": domain_plan["id"],
-    }
-
-
-def source_evidence_fields(context: Any) -> dict[str, Any]:
-    selection = context.artifact("StrategySelection")
-    if selection.get("selection_status") != "selected":
-        return _empty_source_index(["StrategySelection did not select a source strategy."])
-    env = context.config.env or {}
-    if env.get("AGENT_WORLD_REQUEST_SOURCE_STRATEGY") == "none":
-        return _empty_source_index(["Source strategy disabled by AGENT_WORLD_REQUEST_SOURCE_STRATEGY=none."])
-    root = _source_root(context)
-    root.mkdir(parents=True, exist_ok=True)
-    request_path = root / "raw-request.md"
-    request_path.write_text(_raw_request_document(context), encoding="utf-8")
-    source_paths = [request_path] + [Path(path) for path in context.config.source_paths]
-    sources = []
-    extractable = []
-    rejected = []
-    for index, path in enumerate(source_paths, start=1):
-        resolved = path.resolve()
-        if not resolved.is_file():
-            rejected.append({"source": str(path), "reason": "source path is not a file"})
-            continue
-        source_id = RAW_REQUEST_SOURCE_ID if resolved == request_path.resolve() else f"source-local-{index}"
-        sources.append(
-            {
-                "source_id": source_id,
-                "kind": "manual_note" if source_id == RAW_REQUEST_SOURCE_ID else "local_files",
-                "uri_or_path": str(resolved),
-                "version_or_hash": _sha256(resolved),
-                "license": "user_supplied",
-                "auth_requirement": "none",
-                "network_requirement": "none",
-                "security_note": "Local request-driven source; no credentials or live service access required.",
-            }
-        )
-        extractable.append(
-            {
-                "source_id": source_id,
-                "object_kind": "request_source",
-                "name": resolved.name,
-                "evidence_refs": [f"{source_id}#sha256:{_sha256(resolved)}"],
-            }
-        )
-    return {
-        "planned_environment_id": context.artifact("DomainPlan")["domain_seed"],
-        "sources": sources,
-        "extractable_objects": extractable,
-        "mock_boundaries": ["synthetic local state", "no external credentials", "no live service mutation"],
-        "open_questions": [],
-        "rejected_sources": rejected,
-    }
-
-
-def knowledge_pack_fields(source_index: dict[str, Any], *, base_dir: Path | None = None) -> dict[str, Any]:
-    text = _source_text(source_index, base_dir=base_dir)
-    concepts = _concepts(text)
-    state_objects = _state_objects(concepts)
-    operations = _operations(concepts)
-    rules = _business_rules(source_index)
-    return {
-        "environment_id": source_index.get("planned_environment_id") or _environment_id(text),
-        "state_objects": state_objects,
-        "operations": operations,
-        "business_rules": rules,
-        "verifiable_fields": _verifiable_fields(state_objects),
-        "uncertainties": [],
-        "request_concepts": concepts,
-    }
-
-
-def environment_spec_fields(knowledge: dict[str, Any]) -> dict[str, Any]:
-    environment_id = str(knowledge.get("environment_id") or _environment_id(" ".join(knowledge.get("request_concepts", []))))
-    return {
-        "environment_id": environment_id,
-        "domain": "request-generated local executable environment",
-        "state_backend": {
-            "kind": "contract_project_defined",
-            "reset_strategy": "runtime ABI reset returns an isolated episode for every replay",
-            "isolation_strategy": "one generated runtime episode per task replay",
-            "seed_fixture_refs": [f"fixtures/seed/{environment_id}.json"],
-        },
-        "state_entities": [item["object_id"] for item in knowledge.get("state_objects", [])],
-        "logical_tools": [{"tool_id": operation["operation_id"], "name": operation["name"]} for operation in knowledge.get("operations", [])],
-        "permissions": {"network": False, "filesystem": "package_dir_only", "auth": False},
-        "safety_boundaries": ["synthetic state only", "no live external service calls", "no generic shell execution surface"],
-        "mock_policy": {"external_services": "represented by generated local state only"},
-        "release_surfaces_allowed": ["python", "cli", "http", "mcp"],
-        "observability": {"logs": True, "traces": True, "state_snapshots": ["before", "after", "on_failure"]},
-    }
-
-
-def logical_tool_graph_fields(knowledge: dict[str, Any]) -> dict[str, Any]:
-    operations = list(knowledge.get("operations", []))
-    parameters = {"payload": _parameter("payload", optional=False), "note": _parameter("note", optional=True)}
-    return {
-        "tools": [
-            {
-                "tool_id": operation["operation_id"],
-                "name": operation["name"],
-                "input_schema": {"required": ["payload"], "optional": ["note"]},
-                "output_schema": {"type": "object"},
-                "reads": list(operation.get("reads", [])),
-                "writes": list(operation.get("writes", [])),
-                "side_effects": list(operation.get("side_effects", [])),
-                "errors": ["invalid_payload", "state_update_failed"],
-                "idempotency": operation.get("idempotency", "non_idempotent"),
-                "source_refs": list(operation.get("source_refs", [])),
-            }
-            for operation in operations
-        ],
-        "edges": [
-            {
-                "from_tool_id": operations[index]["operation_id"],
-                "to_tool_id": operations[index + 1]["operation_id"],
-                "dependency_type": "weak",
-                "reason": "Generated tasks may compose tools in source order, but each accepted replay case remains explicit.",
-            }
-            for index in range(len(operations) - 1)
-        ],
-        "parameters": list(parameters.values()),
-        "forbidden_direct_access": ["state file path", "verifier implementation", "internal artifact ids"],
-    }
-
-
-def task_set_fields(graph: dict[str, Any], knowledge: dict[str, Any]) -> dict[str, Any]:
-    tools = [tool["tool_id"] for tool in graph.get("tools", [])]
-    concepts = list(knowledge.get("request_concepts", [])) or ["request", "state", "result"]
-    environment_id = str(knowledge.get("environment_id") or _environment_id(" ".join(concepts)))
-    tasks = []
-    for index, tool_id in enumerate(tools[:3], start=1):
-        task_id = f"{environment_id}-task-{index}"
-        payload = f"{concepts[(index - 1) % len(concepts)]} acceptance payload {index}"
-        expected_answer = {"task_id": task_id, "tool": tool_id, "accepted": True} if index == 3 else ""
-        expected_delta = {} if index == 3 else {"state_changed": True, "tool": tool_id}
-        tasks.append(
-            {
-                "task_id": task_id,
-                "natural_request": _natural_task_request(index, concepts),
-                "target_capability": f"request-derived capability {index}",
-                "initial_state_refs": [f"fixtures/seed/{environment_id}.json#initial"],
-                "expected_state_delta": expected_delta,
-                "expected_answer": expected_answer,
-                "allowed_logical_tool_ids": [tool_id],
-                "forbidden_leakage": ["state file path", "verifier id", "logical tool id"],
-                "dependency_path": [tool_id],
-                "difficulty": {"level": "easy" if index == 3 else "medium", "requires_state_change": index != 3},
-                "verifier_refs": [f"verifier-{task_id}"],
-                "source_refs": _knowledge_source_refs(knowledge),
-                "framework_replay": {
-                    "tool_calls": [
-                        {
-                            "tool": tool_id,
-                            "kwargs": {"payload": payload, "note": f"task-{index}"},
-                            "expects": {"type": "object"},
-                        }
-                    ],
-                    "expected_final_answer": expected_answer,
-                },
-            }
-        )
-    return {
-        "tasks": tasks,
-        "minimum_task_count": 3,
-        "coverage": {
-            "tool_ids": sorted({tool_id for task in tasks for tool_id in task["allowed_logical_tool_ids"]}),
-            "capabilities": [task["target_capability"] for task in tasks],
-            "state_entities": [item["object_id"] for item in knowledge.get("state_objects", [])],
-        },
-        "rejected_candidates": [],
-    }
-
-
-def surface_plan_fields(env_spec: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "bindings": [
-            {
-                "binding_id": f"python-{tool['tool_id']}",
-                "logical_tool_id": tool["tool_id"],
-                "surface": "python",
-                "exposure_name": f"GeneratedEnvironment.{tool['tool_id']}",
-                "input_mapping": "same as logical tool schema",
-                "output_mapping": "JSON-compatible object",
-                "error_mapping": "Python exception to logical error",
-                "auth_context": "none",
-                "state_scope": "isolated generated state snapshot",
-            }
-            for tool in env_spec.get("logical_tools", [])
-        ],
-        "surface_status": {"python": "required_for_first_slice", "cli": "planned", "http": "deferred", "mcp": "deferred"},
-        "compatibility_notes": ["The first generated slice verifies the Python callable surface; other surfaces remain descriptors until implemented by later nodes."],
-    }
-
-
-def verifier_plan_fields(task_set: dict[str, Any], knowledge: dict[str, Any]) -> dict[str, Any]:
-    evidence_refs = _knowledge_source_refs(knowledge)
-    verifiers = []
-    for task in task_set.get("tasks", []):
-        kind = "state_query" if task.get("expected_answer") else "state_diff"
-        verifiers.append(
-            {
-                "verifier_id": f"verifier-{task['task_id']}",
-                "task_id": task["task_id"],
-                "kind": kind,
-                "inputs": ["initial_state", "final_state", "final_answer", "surface_trace_path", "expected_dependency_path", "trace_call_group"],
-                "checks": ["dependency path trace assertion", "state snapshot or answer assertion", "negative replay rejection"],
-                "success_criteria": "success=true only when the replay trace and expected state or answer evidence match the task contract",
-                "failure_criteria": "missing trace entries, unchanged state for mutating tasks, wrong answer, or negative replay success",
-                "positive_examples": [f"{task['task_id']}: replay contract succeeds"],
-                "negative_examples": [f"{task['task_id']}: empty trace and unchanged state are rejected"],
-                "evidence_refs": evidence_refs,
-                "replay_inputs": ["seed fixture", "initial snapshot", "final snapshot", "surface trace", "trace call group", "declared dependency path", "final answer"],
-                "assertions": [
-                    {"assertion_id": f"assert-{task['task_id']}-success", "target": "verify_task_completion.success", "operator": "equals", "expected": True, "tolerance": 0, "source_ref": "framework-replay-contract-verifier-v1"},
-                    {"assertion_id": f"assert-{task['task_id']}-path", "target": "dependency_path_trace_matches", "operator": "equals", "expected": True, "tolerance": 0, "source_ref": "framework-replay-contract-verifier-v1"},
-                ],
-                "allowed_side_effects": [],
-                "timeout_ms": 1000,
-                "isolation_requirement": "read-only verifier over copied generated state",
-                "failure_diagnostics": ["return structured failed checks and observed trace evidence"],
-            }
-        )
-    return {"verifiers": verifiers, "llm_judges": []}
+def _stable_id_fragment(value: Any, *, max_length: int = 64) -> str:
+    raw = str(value or "request").strip().lower()
+    chars = []
+    previous_dash = False
+    for char in raw:
+        keep = ("a" <= char <= "z") or ("0" <= char <= "9") or char in {"_", "-", ".", ":", "/", "#"}
+        if keep:
+            chars.append(char)
+            previous_dash = False
+        elif not previous_dash:
+            chars.append("-")
+            previous_dash = True
+    slug = "".join(chars).strip("-._:/#") or "request"
+    if len(slug) <= max_length:
+        return slug
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    prefix = slug[: max_length - len(digest) - 1].strip("-._:/#") or "request"
+    return f"{prefix}-{digest}"
 
 
 def feasibility_report_fields(context: Any) -> dict[str, Any]:
@@ -532,7 +258,7 @@ def package_plan_fields(context: Any) -> dict[str, Any]:
         "independent_verification_report_ref": context.artifact("IndependentVerificationReport")["id"],
         "consumer_output_refs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml", "runtime/runtime_index.json"],
         "excluded_items": [
-            {"item": "live external services", "reason": "request-driven first slice uses synthetic local state"},
+            {"item": "live external services", "reason": "release package must not mutate undeclared external services"},
             {"item": "generic shell executor", "reason": "environment tools are logical Python callables"},
             {"item": "trainer runtime", "reason": "training is a downstream consumer"},
         ],
@@ -578,7 +304,7 @@ def release_manifest_fields(context: Any) -> dict[str, Any]:
         "consumer_outputs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml", "runtime/runtime_index.json"],
         "known_limits": [
             "The request-driven path requires an agent backend to write executable candidate files.",
-            "Default source discovery consumes the raw request and optional local source paths; it does not perform live crawling.",
+            "Source discovery is performed by the configured research provider and accepted agent output.",
             "Training, deployment, and online rollout remain downstream consumers.",
         ],
     }
@@ -701,206 +427,6 @@ def run_summary(context: Any) -> dict[str, Any]:
         ],
         "environment_id": context.artifacts.get("ReleaseManifest", {}).get("environment_id", ""),
     }
-
-
-def _raw_request_document(context: Any) -> str:
-    domain_plan = context.artifact("DomainPlan")
-    return (
-        "# Raw Request Source\n\n"
-        f"run_id: {context.config.run_id}\n"
-        f"environment_id: {domain_plan['domain_seed']}\n\n"
-        "## Request\n\n"
-        f"{domain_plan['raw_request']}\n\n"
-        "## Generated Planning Notes\n\n"
-        "- Build a deterministic local environment from this request.\n"
-        "- Generate executable files through the configured agent backend.\n"
-        "- Verify with framework-owned positive and negative replay cases.\n"
-    )
-
-
-def _source_root(context: Any) -> Path:
-    if context.store.root:
-        return context.store.root / "sources" / "request-driven" / context.artifact("DomainPlan")["domain_seed"]
-    return Path(tempfile.mkdtemp(prefix="agent-world-request-source-"))
-
-
-def _empty_source_index(reasons: list[str]) -> dict[str, Any]:
-    return {
-        "sources": [],
-        "extractable_objects": [],
-        "mock_boundaries": ["local files only", "no external credentials"],
-        "open_questions": [{"question": reason, "blocking": True, "candidate_resolution": "Retry source planning or stop without release."} for reason in reasons],
-        "rejected_sources": [{"source": "request-driven-source-strategy", "reason": reason} for reason in reasons],
-    }
-
-
-def _source_text(source_index: dict[str, Any], *, base_dir: Path | None) -> str:
-    root = Path.cwd() if base_dir is None else Path(base_dir)
-    chunks = []
-    for source in source_index.get("sources", []):
-        path = Path(str(source.get("uri_or_path", "")))
-        if not path.is_absolute():
-            path = root / path
-        if path.is_file():
-            chunks.append(path.read_text(encoding="utf-8", errors="replace"))
-    return "\n".join(chunks)
-
-
-def _state_objects(concepts: list[str]) -> list[dict[str, Any]]:
-    object_ids = _state_object_ids(concepts)
-    names = ["primary request record", "operation evidence log", "result summary"]
-    fields = [
-        ["id", "payload", "status", "notes"],
-        ["id", "tool", "payload", "result"],
-        ["id", "accepted", "summary", "last_tool"],
-    ]
-    return [
-        {
-            "object_id": object_id,
-            "name": names[index],
-            "fields": fields[index],
-            "relations": object_ids[:index],
-            "source_refs": [f"{RAW_REQUEST_SOURCE_ID}#concept-{index + 1}"],
-        }
-        for index, object_id in enumerate(object_ids)
-    ]
-
-
-def _operations(concepts: list[str]) -> list[dict[str, Any]]:
-    object_ids = _state_object_ids(concepts)
-    operation_ids = _operation_ids(concepts)
-    return [
-        {
-            "operation_id": operation_id,
-            "name": operation_id.replace("_", " "),
-            "inputs": ["payload", "note"],
-            "outputs": ["object"],
-            "side_effects": [object_ids[min(index, len(object_ids) - 1)]],
-            "source_refs": [f"{RAW_REQUEST_SOURCE_ID}#operation-{index + 1}"],
-            "required_inputs": ["payload"],
-            "optional_inputs": ["note"],
-            "reads": object_ids[: max(1, index)],
-            "writes": [object_ids[min(index, len(object_ids) - 1)]],
-            "idempotency": "non_idempotent" if index < 2 else "read_only",
-        }
-        for index, operation_id in enumerate(operation_ids)
-    ]
-
-
-def _business_rules(source_index: dict[str, Any]) -> list[dict[str, Any]]:
-    refs = [f"{source.get('source_id', RAW_REQUEST_SOURCE_ID)}#sha256:{source.get('version_or_hash', '')}" for source in source_index.get("sources", [])]
-    refs = refs or [f"{RAW_REQUEST_SOURCE_ID}#request"]
-    return [
-        {"rule_id": "rule-trace-every-call", "description": "Every replayed tool call must append a structured trace record.", "source_refs": refs, "confidence": "inferred"},
-        {"rule_id": "rule-mutation-needs-state-evidence", "description": "Tasks with expected state deltas must change the generated state snapshot.", "source_refs": refs, "confidence": "inferred"},
-        {"rule_id": "rule-query-needs-answer-evidence", "description": "Tasks with expected answers must return the declared final answer.", "source_refs": refs, "confidence": "inferred"},
-    ]
-
-
-def _verifiable_fields(state_objects: list[dict[str, Any]]) -> list[str]:
-    fields = []
-    for item in state_objects:
-        for field in item.get("fields", []):
-            fields.append(f"{item['object_id']}.{field}")
-    return fields
-
-
-def _knowledge_source_refs(knowledge: dict[str, Any]) -> list[str]:
-    refs = []
-    for key in ["state_objects", "operations", "business_rules"]:
-        for item in knowledge.get(key, []):
-            refs.extend(str(ref) for ref in item.get("source_refs", []))
-    return sorted(set(refs)) or [f"{RAW_REQUEST_SOURCE_ID}#request"]
-
-
-def _parameter(name: str, *, optional: bool) -> dict[str, str]:
-    return {
-        "name": name,
-        "classification": "optional" if optional else "external",
-        "source": "user request or generated replay contract",
-        "validation": "non-empty JSON-compatible value",
-    }
-
-
-def _natural_task_request(index: int, concepts: list[str]) -> str:
-    concept = concepts[(index - 1) % len(concepts)] if concepts else "request"
-    if index == 1:
-        return f"Create the first accepted state change for the {concept} need."
-    if index == 2:
-        return f"Apply a second accepted update and keep evidence for the {concept} need."
-    return f"Return the accepted summary for the {concept} need without requiring external services."
-
-
-def _environment_id(text: str) -> str:
-    concepts = _concepts(text)
-    seed = "-".join(item.replace("_", "-") for item in concepts[:3]) or "request"
-    digest = hashlib.sha1(_normalize_text(text).encode("utf-8")).hexdigest()[:8]
-    return f"env-{seed}-{digest}"
-
-
-def _state_object_ids(concepts: list[str]) -> list[str]:
-    base = concepts[:3] or ["request", "state", "result"]
-    while len(base) < 3:
-        base.append(["request", "state", "result"][len(base)])
-    return [f"{item}_record" for item in base[:1]] + [f"{base[1]}_evidence", f"{base[2]}_summary"]
-
-
-def _operation_ids(concepts: list[str]) -> list[str]:
-    base = concepts[:3] or ["request", "state", "result"]
-    while len(base) < 3:
-        base.append(["request", "state", "result"][len(base)])
-    return [f"capture_{base[0]}", f"apply_{base[1]}", f"summarize_{base[2]}"]
-
-
-def _concepts(text: str) -> list[str]:
-    words = re.findall(r"[A-Za-z][A-Za-z0-9]{2,}|[\u4e00-\u9fff]{2,}", text.lower())
-    stop = {
-        "generate",
-        "create",
-        "build",
-        "environment",
-        "service",
-        "system",
-        "with",
-        "and",
-        "the",
-        "for",
-        "that",
-        "this",
-        "支持",
-        "生成",
-        "环境",
-        "系统",
-        "服务",
-        "以及",
-        "一个",
-    }
-    result = []
-    for word in words:
-        slug = _slug(word)
-        if len(slug) < 3 or slug in stop or slug in result:
-            continue
-        result.append(slug)
-        if len(result) == 6:
-            break
-    return result or ["request", "state", "result"]
-
-
-def _sentence(text: str) -> str:
-    compact = " ".join(text.split())
-    return compact[:240] if compact else "Generated local environment request"
-
-
-def _normalize_text(text: str) -> str:
-    return " ".join(text.split()).strip().lower()
-
-
-def _slug(value: str) -> str:
-    ascii_text = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
-    if ascii_text:
-        return ascii_text[:32]
-    digest = hashlib.sha1(value.encode("utf-8")).hexdigest()[:8]
-    return f"term_{digest}"
 
 
 def _project_artifact(

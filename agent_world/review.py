@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from agent_world.artifacts import make_artifact
@@ -217,7 +218,6 @@ def _check_no_scope_drift(
     upstream_artifacts: list[dict[str, Any]],
     findings: list[dict[str, Any]],
 ) -> None:
-    encoded = str(artifact).lower()
     forbidden = {
         "training integration": "training",
         "reward export": "reward",
@@ -225,10 +225,64 @@ def _check_no_scope_drift(
         "mcp-only": "mcp-only",
         "cli-only": "cli-only",
     }
+    scope_texts = list(_scope_scan_texts(artifact))
     for label, needle in forbidden.items():
-        if needle in encoded and stage not in {"S0", "S9", "S10", "S11"}:
+        if stage not in {"S0", "S9", "S10", "S11"} and any(_has_positive_scope_reference(text, needle) for text in scope_texts):
             findings.append(_finding("docs/agent-world-environment-generation.zh.md#8", f"artifact may drift toward {label}", artifact["id"], "medium"))
     domain_seed = str(need_spec.get("domain_seed", "")).lower()
+    encoded = str(artifact).lower()
     upstream_encoded = " ".join(str(item).lower() for item in upstream_artifacts)
     if stage in {"SELECT", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9", "S10", "S11"} and domain_seed and domain_seed not in encoded and domain_seed not in upstream_encoded:
         findings.append(_finding("docs/agent-world-environment-generation.zh.md#9.1", "artifact does not reference the accepted domain seed", artifact["id"], "medium"))
+
+
+def _scope_scan_texts(value: Any, path: tuple[str, ...] = ()) -> list[str]:
+    if isinstance(value, dict):
+        texts = []
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text in {"id", "hash", "version", "created_at", "source_refs", "inputs", "consumed_inputs", "producer", "produced_by"}:
+                continue
+            texts.extend(_scope_scan_texts(item, path + (key_text,)))
+        return texts
+    if isinstance(value, list):
+        return [text for item in value for text in _scope_scan_texts(item, path)]
+    if isinstance(value, str):
+        return [value.lower()]
+    return []
+
+
+def _has_positive_scope_reference(text: str, needle: str) -> bool:
+    for segment in re.split(r"[\n.;]+", text):
+        if needle not in segment:
+            continue
+        if _is_scope_exclusion_context(segment):
+            continue
+        return True
+    return False
+
+
+def _is_scope_exclusion_context(segment: str) -> bool:
+    negative_markers = [
+        "must not",
+        "mustn't",
+        "do not",
+        "does not",
+        "not include",
+        "exclude",
+        "excluded",
+        "excludes",
+        "excluding",
+        "out_of_scope",
+        "out of scope",
+        "non_goals",
+        "non-goals",
+        "non goal",
+        "no ",
+        "without",
+        "forbid",
+        "forbidden",
+        "prohibit",
+        "rejected",
+    ]
+    return any(marker in segment for marker in negative_markers)

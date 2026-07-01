@@ -10,6 +10,10 @@
 
 - [docs/loop-engineering.md](docs/loop-engineering.md)
 
+配置说明：
+
+- [docs/configuration.zh.md](docs/configuration.zh.md)
+
 验证入口：
 
 ```bash

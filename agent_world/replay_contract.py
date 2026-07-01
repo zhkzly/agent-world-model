@@ -10,6 +10,37 @@ FRAMEWORK_REPLAY_CONTRACT_SCHEMA_VERSION = "agent-world.framework-replay-contrac
 FRAMEWORK_CHECK_OBSERVATION_SCHEMA_VERSION = "agent-world.framework-check-observation.v1"
 
 
+def normalise_framework_replay_calls(task: dict[str, Any]) -> list[dict[str, Any]]:
+    replay = task.get("framework_replay")
+    if isinstance(replay, dict):
+        raw_calls = replay.get("tool_calls")
+    elif isinstance(replay, list):
+        raw_calls = replay
+    else:
+        raw_calls = []
+    calls: list[dict[str, Any]] = []
+    if isinstance(raw_calls, list):
+        for item in raw_calls:
+            if isinstance(item, dict):
+                tool_id = str(item.get("tool") or item.get("tool_id") or item.get("logical_tool_id") or "")
+                kwargs = item.get("kwargs")
+                if kwargs is None:
+                    kwargs = item.get("arguments")
+                if kwargs is None:
+                    kwargs = item.get("input")
+                calls.append({"tool": tool_id, "kwargs": kwargs if isinstance(kwargs, dict) else {}})
+            elif isinstance(item, str):
+                calls.append({"tool": item, "kwargs": {}})
+    calls = [call for call in calls if call["tool"]]
+    if calls:
+        return calls
+    return [
+        {"tool": str(tool), "kwargs": {}}
+        for tool in task.get("dependency_path") or task.get("allowed_logical_tool_ids", [])
+        if str(tool)
+    ]
+
+
 def build_framework_replay_contract(artifacts: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Build the machine-readable replay contract given to code-agent runners."""
     implementation = artifacts.get("ImplementationRequest", {})
@@ -136,9 +167,7 @@ def _artifact_ids(artifacts: dict[str, dict[str, Any]]) -> dict[str, str]:
 def _replay_case(task: dict[str, Any]) -> dict[str, Any]:
     task_id = str(task.get("task_id", ""))
     replay = task.get("framework_replay", {}) if isinstance(task.get("framework_replay"), dict) else {}
-    tool_calls = replay.get("tool_calls")
-    if not isinstance(tool_calls, list) or not tool_calls:
-        tool_calls = [{"tool": tool, "kwargs": {}} for tool in task.get("dependency_path") or task.get("allowed_logical_tool_ids", [])]
+    tool_calls = normalise_framework_replay_calls(task)
     return {
         "case_id": f"framework-replay-{task_id}",
         "task_id": task_id,
