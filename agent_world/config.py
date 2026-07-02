@@ -8,8 +8,8 @@ from typing import Any, Mapping
 import yaml
 
 
-DEFAULT_AGENT_BACKEND = "llm"
-DEFAULT_IMPLEMENTATION_AGENT_BACKEND = "codex_sdk"
+DEFAULT_INVOCATION_BACKEND = "llm"
+DEFAULT_IMPLEMENTATION_INVOCATION_BACKEND = "codex_sdk"
 DEFAULT_OPENAI_BASE_URL = "https://blog.r78xoaxrk.nyat.app:50903/v1"
 DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
 DEFAULT_OPENAI_MODEL_CANDIDATES = [
@@ -17,16 +17,28 @@ DEFAULT_OPENAI_MODEL_CANDIDATES = [
     "gpt-5.4",
     "gpt-5.5",
 ]
-DEFAULT_AGENT_NETWORK = True
-DEFAULT_AGENT_TIMEOUT_MS = 60000
-DEFAULT_AGENT_MAX_TOKENS = 4096
-DEFAULT_AGENT_MAX_ATTEMPTS = 3
+DEFAULT_INVOCATION_NETWORK = True
+DEFAULT_INVOCATION_TIMEOUT_MS = 60000
+DEFAULT_INVOCATION_MAX_TOKENS = 4096
+DEFAULT_INVOCATION_MAX_ATTEMPTS = 3
 DEFAULT_CODE_REPAIR_THREAD_MODE = "stateless"
 DEFAULT_CODEX_SANDBOX = "workspace-write"
 DEFAULT_CONFIG_RELATIVE_PATH = Path("config") / "agent-world.default.yaml"
-SEMANTIC_AGENT_PROFILE = "semantic"
-IMPLEMENTATION_AGENT_PROFILE = "implementation"
-KNOWN_PIPELINE_STAGES = [
+SEMANTIC_INVOCATION_PROFILE = "semantic"
+IMPLEMENTATION_INVOCATION_PROFILE = "implementation"
+INVOCATION_PROFILE_STAGES = [
+    "PLAN",
+    "S0",
+    "S1",
+    "S2",
+    "S3",
+    "S4",
+    "S5",
+    "S6",
+    "S7",
+    "IMPLEMENT",
+]
+PIPELINE_STAGES = [
     "PLAN",
     "SELECT",
     "S0",
@@ -43,8 +55,8 @@ KNOWN_PIPELINE_STAGES = [
     "S10",
     "S11",
 ]
-DEFAULT_STAGE_AGENT_PROFILES = {stage: SEMANTIC_AGENT_PROFILE for stage in KNOWN_PIPELINE_STAGES}
-DEFAULT_STAGE_AGENT_PROFILES["IMPLEMENT"] = IMPLEMENTATION_AGENT_PROFILE
+DEFAULT_STAGE_INVOCATION_PROFILES = {stage: SEMANTIC_INVOCATION_PROFILE for stage in INVOCATION_PROFILE_STAGES}
+DEFAULT_STAGE_INVOCATION_PROFILES["IMPLEMENT"] = IMPLEMENTATION_INVOCATION_PROFILE
 
 
 @dataclass(frozen=True)
@@ -60,13 +72,7 @@ class ResearchConfig:
 
 
 @dataclass(frozen=True)
-class NodeExecutionConfig:
-    mode: str
-    research: ResearchConfig
-
-
-@dataclass(frozen=True)
-class AgentProfileConfig:
+class InvocationProfileConfig:
     profile_id: str
     backend_kind: str
     provider: str
@@ -77,7 +83,7 @@ class AgentProfileConfig:
     api_version: str
     api_key_env: str
     auth_env_refs: list[str]
-    agent_auth: bool
+    backend_auth: bool
     command_value: str
     allowlist_value: str
     command_cwd: str
@@ -91,63 +97,55 @@ class AgentProfileConfig:
 
 @dataclass(frozen=True)
 class AgentWorldConfig:
-    node_execution_mode: str
     research: ResearchConfig
-    agent_profiles: dict[str, AgentProfileConfig]
-    stage_agent_profiles: dict[str, str]
+    invocation_profiles: dict[str, InvocationProfileConfig]
+    stage_invocation_profiles: dict[str, str]
     config_path: str = ""
 
-    def profile_for_stage(self, stage: str) -> AgentProfileConfig:
-        profile_id = self.stage_agent_profiles.get(stage, SEMANTIC_AGENT_PROFILE)
-        if profile_id not in self.agent_profiles:
-            raise KeyError(f"Stage {stage} references unknown agent profile: {profile_id}")
-        return self.agent_profiles[profile_id]
+    def profile_for_stage(self, stage: str) -> InvocationProfileConfig:
+        if stage not in self.stage_invocation_profiles:
+            raise KeyError(f"Stage {stage} has no invocation profile because it is deterministic or unknown.")
+        profile_id = self.stage_invocation_profiles[stage]
+        if profile_id not in self.invocation_profiles:
+            raise KeyError(f"Stage {stage} references unknown invocation profile: {profile_id}")
+        return self.invocation_profiles[profile_id]
 
     def to_redacted_dict(self) -> dict[str, Any]:
         return {
-            "node_execution_mode": self.node_execution_mode,
             "research": asdict(self.research),
-            "agent_profiles": {
+            "invocation_profiles": {
                 profile_id: asdict(profile)
-                for profile_id, profile in self.agent_profiles.items()
+                for profile_id, profile in self.invocation_profiles.items()
             },
-            "stage_agent_profiles": dict(self.stage_agent_profiles),
+            "stage_invocation_profiles": dict(self.stage_invocation_profiles),
             "config_path": self.config_path,
         }
-
-
-def load_node_execution_config(env: Mapping[str, str] | None = None) -> NodeExecutionConfig:
-    config = load_agent_world_config(env)
-    return NodeExecutionConfig(
-        mode=config.node_execution_mode,
-        research=config.research,
-    )
 
 
 def load_agent_world_config(env: Mapping[str, str] | None = None) -> AgentWorldConfig:
     values = os.environ if env is None else env
     file_config, config_path = _load_config_file(values)
-    semantic = _resolve_agent_profile(
+    semantic = _resolve_invocation_profile(
         values,
         file_config,
-        profile_id=SEMANTIC_AGENT_PROFILE,
+        profile_id=SEMANTIC_INVOCATION_PROFILE,
         base=None,
-        default_backend_kind=DEFAULT_AGENT_BACKEND,
+        default_backend_kind=DEFAULT_INVOCATION_BACKEND,
     )
-    implementation = _resolve_agent_profile(
+    implementation = _resolve_invocation_profile(
         values,
         file_config,
-        profile_id=IMPLEMENTATION_AGENT_PROFILE,
+        profile_id=IMPLEMENTATION_INVOCATION_PROFILE,
         base=semantic,
         default_backend_kind=_implementation_default_backend_kind(file_config),
     )
     profiles = {
-        SEMANTIC_AGENT_PROFILE: semantic,
-        IMPLEMENTATION_AGENT_PROFILE: implementation,
+        SEMANTIC_INVOCATION_PROFILE: semantic,
+        IMPLEMENTATION_INVOCATION_PROFILE: implementation,
     }
     for profile_id in sorted(_configured_profile_ids(file_config) - set(profiles)):
         base_profile = profiles.get(_profile_parent(file_config, profile_id), semantic)
-        profiles[profile_id] = _resolve_agent_profile(
+        profiles[profile_id] = _resolve_invocation_profile(
             values,
             file_config,
             profile_id=profile_id,
@@ -155,10 +153,9 @@ def load_agent_world_config(env: Mapping[str, str] | None = None) -> AgentWorldC
             default_backend_kind=base_profile.backend_kind,
         )
     return AgentWorldConfig(
-        node_execution_mode=str(_config_value(file_config, ["node_execution", "mode"], "agent")),
         research=_load_research_config(file_config=file_config),
-        agent_profiles=profiles,
-        stage_agent_profiles=_stage_agent_profiles(file_config),
+        invocation_profiles=profiles,
+        stage_invocation_profiles=_stage_invocation_profiles(file_config),
         config_path=config_path,
     )
 
@@ -190,14 +187,14 @@ def _jina_api_key_env(research: Mapping[str, Any] | None = None) -> str:
     return "JINA_API_KEY"
 
 
-def _resolve_agent_profile(
+def _resolve_invocation_profile(
     values: Mapping[str, str],
     file_config: Mapping[str, Any],
     *,
     profile_id: str,
-    base: AgentProfileConfig | None,
+    base: InvocationProfileConfig | None,
     default_backend_kind: str,
-) -> AgentProfileConfig:
+) -> InvocationProfileConfig:
     profile = _profile_mapping(file_config, profile_id)
     backend_kind = str(profile.get("backend_kind", default_backend_kind))
     base_url = _base_url_value(values, profile.get("base_url", base.base_url if base else DEFAULT_OPENAI_BASE_URL))
@@ -211,7 +208,7 @@ def _resolve_agent_profile(
     command_value = _command_value(profile, backend_kind, base)
     allowlist_value = str(profile.get("allowlist_value", base.allowlist_value if base else ""))
     command_cwd = str(profile.get("command_cwd", base.command_cwd if base else "."))
-    return AgentProfileConfig(
+    return InvocationProfileConfig(
         profile_id=profile_id,
         backend_kind=backend_kind,
         provider=str(profile.get("provider") or _provider_for_backend(backend_kind)),
@@ -222,30 +219,30 @@ def _resolve_agent_profile(
         api_version=api_version,
         api_key_env=api_key_env,
         auth_env_refs=auth_env_refs,
-        agent_auth=bool(profile.get("agent_auth", base.agent_auth if base else False)),
+        backend_auth=bool(profile.get("backend_auth", base.backend_auth if base else False)),
         command_value=command_value,
         allowlist_value=allowlist_value,
         command_cwd=command_cwd,
-        timeout_ms=int(profile.get("timeout_ms", base.timeout_ms if base else DEFAULT_AGENT_TIMEOUT_MS)),
-        max_attempts=int(profile.get("max_attempts", base.max_attempts if base else DEFAULT_AGENT_MAX_ATTEMPTS)),
-        max_tokens=int(profile.get("max_tokens", base.max_tokens if base else DEFAULT_AGENT_MAX_TOKENS)),
-        network=bool(profile.get("network", base.network if base else DEFAULT_AGENT_NETWORK)),
+        timeout_ms=int(profile.get("timeout_ms", base.timeout_ms if base else DEFAULT_INVOCATION_TIMEOUT_MS)),
+        max_attempts=int(profile.get("max_attempts", base.max_attempts if base else DEFAULT_INVOCATION_MAX_ATTEMPTS)),
+        max_tokens=int(profile.get("max_tokens", base.max_tokens if base else DEFAULT_INVOCATION_MAX_TOKENS)),
+        network=bool(profile.get("network", base.network if base else DEFAULT_INVOCATION_NETWORK)),
         codex_sandbox=str(profile.get("codex_sandbox", base.codex_sandbox if base else DEFAULT_CODEX_SANDBOX)),
         code_repair_thread_mode=_code_repair_thread_mode(str(profile.get("code_repair_thread_mode", base.code_repair_thread_mode if base else DEFAULT_CODE_REPAIR_THREAD_MODE))),
     )
 
 
 def _implementation_default_backend_kind(file_config: Mapping[str, Any]) -> str:
-    profile = _profile_mapping(file_config, IMPLEMENTATION_AGENT_PROFILE)
+    profile = _profile_mapping(file_config, IMPLEMENTATION_INVOCATION_PROFILE)
     if profile.get("backend_kind"):
         return str(profile["backend_kind"])
-    return DEFAULT_IMPLEMENTATION_AGENT_BACKEND
+    return DEFAULT_IMPLEMENTATION_INVOCATION_BACKEND
 
 
 def _command_value(
     profile: Mapping[str, Any],
     backend_kind: str,
-    base: AgentProfileConfig | None,
+    base: InvocationProfileConfig | None,
 ) -> str:
     default = str(profile.get("command_value", base.command_value if base else ""))
     if backend_kind in {"codex_cli", "codex_cli_runner"}:
@@ -253,19 +250,26 @@ def _command_value(
     return str(default or profile.get("code_agent_cmd", ""))
 
 
-def _stage_agent_profiles(file_config: Mapping[str, Any]) -> dict[str, str]:
+def _stage_invocation_profiles(file_config: Mapping[str, Any]) -> dict[str, str]:
     stage_config = _mapping_at(file_config, ["stages"])
     if stage_config:
-        default_profile = str(stage_config.get("default_agent_profile", SEMANTIC_AGENT_PROFILE))
-        bindings = {stage: default_profile for stage in KNOWN_PIPELINE_STAGES}
+        default_profile = str(stage_config.get("default_invocation_profile", SEMANTIC_INVOCATION_PROFILE))
+        bindings = {stage: default_profile for stage in INVOCATION_PROFILE_STAGES}
     else:
-        bindings = dict(DEFAULT_STAGE_AGENT_PROFILES)
-    configured = stage_config.get("agent_profiles", {})
+        bindings = dict(DEFAULT_STAGE_INVOCATION_PROFILES)
+    configured = stage_config.get("invocation_profiles", {})
     if isinstance(configured, Mapping):
-        bindings.update({str(stage): str(profile_id) for stage, profile_id in configured.items()})
+        for stage, profile_id in configured.items():
+            stage_name = str(stage).upper()
+            if stage_name not in INVOCATION_PROFILE_STAGES:
+                raise ValueError(f"Stage {stage_name} cannot declare an invocation profile; deterministic stages do not invoke backends.")
+            bindings[stage_name] = str(profile_id)
     for key, value in stage_config.items():
-        if str(key).upper() in KNOWN_PIPELINE_STAGES and isinstance(value, str):
-            bindings[str(key).upper()] = value
+        stage_name = str(key).upper()
+        if stage_name in INVOCATION_PROFILE_STAGES and isinstance(value, str):
+            bindings[stage_name] = value
+        elif stage_name in PIPELINE_STAGES:
+            raise ValueError(f"Stage {stage_name} cannot declare an invocation profile; deterministic stages do not invoke backends.")
     return bindings
 
 
@@ -297,19 +301,19 @@ def _reject_secret_material(value: Any) -> None:
 
 
 def _configured_profile_ids(file_config: Mapping[str, Any]) -> set[str]:
-    profiles = _mapping_at(file_config, ["agent_profiles"])
+    profiles = _mapping_at(file_config, ["invocation_profiles"])
     return {str(profile_id) for profile_id in profiles}
 
 
 def _profile_mapping(file_config: Mapping[str, Any], profile_id: str) -> dict[str, Any]:
-    profiles = _mapping_at(file_config, ["agent_profiles"])
+    profiles = _mapping_at(file_config, ["invocation_profiles"])
     value = profiles.get(profile_id, {})
     return dict(value) if isinstance(value, Mapping) else {}
 
 
 def _profile_parent(file_config: Mapping[str, Any], profile_id: str) -> str:
-    parent = _profile_mapping(file_config, profile_id).get("inherits", SEMANTIC_AGENT_PROFILE)
-    return str(parent or SEMANTIC_AGENT_PROFILE)
+    parent = _profile_mapping(file_config, profile_id).get("inherits", SEMANTIC_INVOCATION_PROFILE)
+    return str(parent or SEMANTIC_INVOCATION_PROFILE)
 
 
 def _mapping_at(value: Mapping[str, Any], path: list[str]) -> dict[str, Any]:

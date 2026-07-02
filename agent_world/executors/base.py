@@ -5,7 +5,7 @@ from typing import Any, Protocol
 
 
 @dataclass(frozen=True)
-class NodeExecutionResult:
+class NodeAttemptResult:
     status: str
     fields: dict[str, Any] = field(default_factory=dict)
     invocation_records: list[dict[str, Any]] = field(default_factory=list)
@@ -15,9 +15,8 @@ class NodeExecutionResult:
     recovery_suggestion: str = ""
 
 
-class NodeExecutor(Protocol):
+class NodeAttemptExecutor(Protocol):
     executor_id: str
 
-    def execute(self, context: Any, node: Any, profile: Any) -> NodeExecutionResult:
+    def execute(self, context: Any, node: Any, profile: Any, *, attempt_index: int = 1) -> NodeAttemptResult:
         ...
-

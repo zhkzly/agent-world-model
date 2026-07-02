@@ -1,36 +1,16 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from agent_world.executors.structured_agent import _fields_for_stage
-from agent_world.pipeline import _agent_work_dir
+from agent_world.pipeline import _agent_work_dir, request_driven_node_registry
+from agent_world.strategies import attempt_profile_for_stage
 
 
-def test_s8_llm_feasibility_review_is_advisory_only():
-    context = _context(
-        KnowledgePack={"uncertainties": []},
-        TaskSet={"tasks": [{"task_id": "task_001_create_alert"}]},
-        VerifierPlan={"verifiers": [{"verifier_id": "verifier_task_001_create_alert"}]},
-    )
+def test_s8_feasibility_is_framework_deterministic():
+    node = request_driven_node_registry().get("S8")
 
-    fields = _fields_for_stage(
-        context,
-        "S8",
-        {
-            "status": "needs_human",
-            "summary": "Semantic risks remain, but upstream gates passed.",
-        },
-    )
-
-    assert fields["status"] == "pass"
-    assert fields["implementation_blockers"] == []
-    assert fields["llm_feasibility_review"]["status"] == "needs_human"
-    assert fields["advisory_implementation_risks"] == [
-        {
-            "source": "llm_feasibility_review",
-            "reason": "Semantic risks remain, but upstream gates passed.",
-            "blocking": False,
-        }
-    ]
+    assert node.execution_mode == "deterministic"
+    assert node.factory is not None
+    assert attempt_profile_for_stage("S8") is None
 
 
 def test_agent_work_dir_is_absolute_for_relative_output_dir():
@@ -43,12 +23,3 @@ def test_agent_work_dir_is_absolute_for_relative_output_dir():
 
     assert work_dir.is_absolute()
     assert work_dir.as_posix().endswith("/outputs/relative-pipeline-store/build/agent-runs/pipeline-run-request-driven/env-task-handoff")
-
-
-class _Context(SimpleNamespace):
-    def artifact(self, name):
-        return self.artifacts[name]
-
-
-def _context(**artifacts):
-    return _Context(artifacts=artifacts, gate_records=[])

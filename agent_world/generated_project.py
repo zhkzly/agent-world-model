@@ -27,7 +27,7 @@ def assemble_generated_project_package(
     artifacts: dict[str, dict[str, Any]],
     gate_records: list[dict[str, Any]],
     review_records: list[dict[str, Any]],
-    agent_invocations: list[dict[str, Any]],
+    invocation_records: list[dict[str, Any]],
     implementation_check_records: list[dict[str, Any]],
 ) -> GeneratedProjectPackageResult:
     if "GeneratedEnvironmentProject" not in artifacts:
@@ -59,7 +59,7 @@ def assemble_generated_project_package(
     _write_json(package_dir / "checks" / "independent_verification_report.json", artifacts["IndependentVerificationReport"])
     _write_jsonl(package_dir / "checks" / "gate_records.jsonl", gate_records)
     _write_jsonl(package_dir / "checks" / "review_records.jsonl", review_records)
-    _write_jsonl(package_dir / "checks" / "agent_invocations.jsonl", agent_invocations)
+    _write_jsonl(package_dir / "checks" / "invocation_records.jsonl", invocation_records)
     _write_jsonl(package_dir / "checks" / "implementation_check_records.jsonl", implementation_check_records)
 
     check_record = run_packaged_generated_project_check(package_dir)

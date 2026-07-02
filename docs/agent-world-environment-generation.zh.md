@@ -25,7 +25,7 @@
 
 ## 流水线
 
-本质上这是 loop engineering：把环境构造拆成可审计节点，由代码维护流程、状态、artifact、gate 和 retry/repair；需要智能判断或生成的节点调用 agent backend，例如 Codex SDK、Claude Code SDK 或同级 code/search agent。人类只在必要时介入，例如需求歧义、权限授权、外部凭证、风险确认、发布决策或 repair 预算升级。
+本质上这是 loop engineering：把环境构造拆成可审计节点，由代码维护流程、状态、artifact、gate 和 retry/repair；需要智能判断或生成的节点声明 deterministic、llm 或 agent execution mode，并在需要模型/工具调用时通过 invocation backend 执行一次 attempt。人类只在必要时介入，例如需求歧义、权限授权、外部凭证、风险确认、发布决策或 repair 预算升级。
 
 典型输入可以只是一个文本需求，例如“生成一个飞机订票场景环境”。Pipeline 后续应自动完成需求调研、MCP/CLI/API/SDK/tool surface 发现、knowledge extraction、task generation、verifier planning、code generation、运行检查、独立验证、repair 和发布打包。
 
@@ -50,7 +50,7 @@ request / source material
 
 框架负责流程控制、artifact、gate、trace、预算、repair 和 release 决策。Agent 只在显式节点中负责搜索、抽取、生成、判断、代码实现或修复。
 
-每个关键节点都必须有可检查输出：输入 artifact、输出 artifact、agent invocation record、gate/review result、失败原因和必要的 repair packet。不能让某一步只存在于 prompt、stdout 或人类记忆里。
+每个关键节点都必须有可检查输出：输入 artifact、输出 artifact、invocation record、gate/review result、失败原因和必要的 repair packet。不能让某一步只存在于 prompt、stdout 或人类记忆里。
 
 与论文思想的对应关系：
 
@@ -61,10 +61,10 @@ request / source material
 
 ## Codex SDK
 
-Codex SDK 是优先支持的真实 code agent backend；Claude Code SDK 或其他同级 runner 也应通过相同 backend contract 接入。
+Codex SDK 是优先支持的真实 code-agent invocation backend；Claude Code SDK 或其他同级 runner 也应通过相同 invocation backend contract 接入。
 
 - 真实调用官方 Codex SDK，不用 mock、demo 或通用 shell runner 伪装。
-- SDK 调用集中在 `AgentBackend` adapter，例如 `codex_sdk`。
+- SDK 调用集中在 `InvocationBackend` adapter，例如 `codex_sdk`。
 - Pipeline core 只依赖 backend contract，不散落 SDK 调用。
 - 每次调用记录 backend-neutral invocation record。
 - token、API key、secret-bearing URL、本地 Codex auth 状态不得写入 artifact、trace 或 release package。
@@ -102,7 +102,7 @@ envpkg/
     verifiers.jsonl
   checks/
     independent_verification_report.json
-    agent_invocations.jsonl
+    invocation_records.jsonl
   release/
     release_manifest.json
     runtime_index.json

@@ -80,7 +80,7 @@ def evaluate_gate(
         elif gate_id == "G13":
             _review_gate(artifact, review)
         elif gate_id == "G14":
-            _agent_invocation_gate(invocations, context)
+            _invocation_gate(invocations, context)
     except Exception as exc:
         status = "fail"
         failure_class = exc.__class__.__name__
@@ -429,22 +429,22 @@ def _review_gate(artifact: dict[str, Any], review: dict[str, Any]) -> None:
         raise ArtifactValidationError("ReviewRecord lacks upstream artifact evidence")
 
 
-def _agent_invocation_gate(invocations: list[dict[str, Any]], context: dict[str, dict[str, Any]]) -> None:
+def _invocation_gate(invocations: list[dict[str, Any]], context: dict[str, dict[str, Any]]) -> None:
     if not invocations:
-        raise ArtifactValidationError("AgentInvocationRecord required")
-    config = context.get("AgentBackendConfig")
+        raise ArtifactValidationError("InvocationRecord required")
+    config = context.get("InvocationBackendConfig")
     if not config:
-        raise ArtifactValidationError("AgentBackendConfig required")
+        raise ArtifactValidationError("InvocationBackendConfig required")
     for invocation in invocations:
         if invocation.get("status") != "pass":
-            raise ArtifactValidationError(f"Agent invocation did not pass: {invocation['id']}")
+            raise ArtifactValidationError(f"Invocation did not pass: {invocation['id']}")
         if invocation.get("config_ref") != config["id"]:
-            raise ArtifactValidationError("Agent invocation does not reference current config")
+            raise ArtifactValidationError("Invocation does not reference current config")
         for field in ["instruction_text", "model_or_runtime", "trace_ref", "result_preview", "usage"]:
             if field not in invocation:
-                raise ArtifactValidationError(f"Agent invocation lacks {field}")
+                raise ArtifactValidationError(f"Invocation lacks {field}")
         if not invocation.get("permissions") or not invocation.get("budget"):
-            raise ArtifactValidationError("Agent invocation lacks permissions or budget")
+            raise ArtifactValidationError("Invocation lacks permissions or budget")
         if config["backend_kind"] in {"process_agent", "codex_cli", "code_agent_runner", "codex_cli_runner"}:
             command = config.get("command", {})
             if not command.get("allowlist_executables"):
@@ -453,9 +453,9 @@ def _agent_invocation_gate(invocations: list[dict[str, Any]], context: dict[str,
             if config.get("permissions", {}).get("filesystem") != expected_filesystem:
                 raise ArtifactValidationError(f"Process agent config must declare {expected_filesystem} filesystem scope")
             if invocation["permissions"].get("network") and not config.get("permissions", {}).get("network"):
-                raise ArtifactValidationError("Agent invocation requests network beyond config")
+                raise ArtifactValidationError("Invocation requests network beyond config")
             if not config.get("permissions", {}).get("auth") and invocation["permissions"].get("auth"):
-                raise ArtifactValidationError("Agent invocation requests auth beyond config")
+                raise ArtifactValidationError("Invocation requests auth beyond config")
             if config["backend_kind"] in {"process_agent", "code_agent_runner"}:
                 if config.get("permissions", {}).get("sandbox") or invocation["permissions"].get("sandbox"):
                     raise ArtifactValidationError("process/code_agent_runner must not claim sandbox enforcement")
@@ -467,9 +467,9 @@ def _agent_invocation_gate(invocations: list[dict[str, Any]], context: dict[str,
             if not config.get("permissions", {}).get("sandbox"):
                 raise ArtifactValidationError("Codex SDK config must declare sandbox enforcement")
             if invocation["permissions"].get("network") and not config.get("permissions", {}).get("network"):
-                raise ArtifactValidationError("Agent invocation requests network beyond config")
+                raise ArtifactValidationError("Invocation requests network beyond config")
             if not config.get("permissions", {}).get("auth") and invocation["permissions"].get("auth"):
-                raise ArtifactValidationError("Agent invocation requests auth beyond config")
+                raise ArtifactValidationError("Invocation requests auth beyond config")
             if not config.get("redaction_policy", {}).get("secret_env_names_only"):
                 raise ArtifactValidationError("Agent config lacks secret redaction policy")
 

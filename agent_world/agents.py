@@ -18,9 +18,9 @@ from typing import Any, Protocol
 
 from agent_world.artifacts import make_artifact, stable_json
 from agent_world.config import (
-    AgentProfileConfig,
-    IMPLEMENTATION_AGENT_PROFILE,
-    SEMANTIC_AGENT_PROFILE,
+    InvocationProfileConfig,
+    IMPLEMENTATION_INVOCATION_PROFILE,
+    SEMANTIC_INVOCATION_PROFILE,
     load_agent_world_config,
 )
 
@@ -33,7 +33,7 @@ class CodexSdkContinuationUnavailable(RuntimeError):
 
 
 @dataclass(frozen=True)
-class AgentRequest:
+class InvocationRequest:
     stage: str
     node_purpose: str
     instruction: str
@@ -49,7 +49,7 @@ class AgentRequest:
 
 
 @dataclass(frozen=True)
-class AgentResult:
+class InvocationResult:
     text: str
     evidence_refs: list[str] = field(default_factory=list)
     output_artifact_ids: list[str] = field(default_factory=list)
@@ -61,79 +61,79 @@ class AgentResult:
     conversation_ref: str = ""
 
 
-class AgentBackend(Protocol):
+class InvocationBackend(Protocol):
     backend_kind: str
 
-    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+    def invoke(self, request: InvocationRequest, config: dict[str, Any]) -> InvocationResult:
         ...
 
 
-class MockAgentBackend:
+class MockInvocationBackend:
     backend_kind = "mock"
 
     def __init__(self, responses: dict[str, str] | None = None) -> None:
         self.responses = responses or {}
 
-    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+    def invoke(self, request: InvocationRequest, config: dict[str, Any]) -> InvocationResult:
         key = f"{request.stage}:{request.node_purpose}"
         if key not in self.responses:
-            return AgentResult(
-                text="mock backend is not allowed to produce accepted agent output",
+            return InvocationResult(
+                text="mock backend is not allowed to produce accepted invocation output",
                 status="needs_human",
                 failure_class="mock_backend_not_allowed",
-                recovery_suggestion=f"Configure a real AgentBackend or an explicit test response for {key}.",
+                recovery_suggestion=f"Configure a real InvocationBackend or an explicit test response for {key}.",
             )
         text = self.responses[key]
-        return AgentResult(text=text, evidence_refs=[f"mock://{key}"], trace_ref=f"mock-trace:{key}")
+        return InvocationResult(text=text, evidence_refs=[f"mock://{key}"], trace_ref=f"mock-trace:{key}")
 
 
-class ManualAgentBackend:
+class ManualInvocationBackend:
     backend_kind = "manual"
 
-    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+    def invoke(self, request: InvocationRequest, config: dict[str, Any]) -> InvocationResult:
         responses = config.get("manual_responses", {})
         key = f"{request.stage}:{request.node_purpose}"
         if key not in responses:
-            return AgentResult(
+            return InvocationResult(
                 text="manual input required",
                 status="needs_human",
                 failure_class="manual_input_required",
                 recovery_suggestion=f"Provide manual response for {key}",
             )
-        return AgentResult(text=responses[key], evidence_refs=[f"manual://{key}"], trace_ref=f"manual-trace:{key}")
+        return InvocationResult(text=responses[key], evidence_refs=[f"manual://{key}"], trace_ref=f"manual-trace:{key}")
 
 
-class ProcessAgentBackend:
+class ProcessInvocationBackend:
     backend_kind = "process_agent"
 
-    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+    def invoke(self, request: InvocationRequest, config: dict[str, Any]) -> InvocationResult:
         try:
             command = _command_argv(config)
             cwd = _safe_cwd(config)
         except ValueError as exc:
-            return AgentResult(
+            return InvocationResult(
                 text=str(exc),
                 status="fail",
                 failure_class="invalid_process_agent_config",
                 recovery_suggestion="Use an allowlisted command without shell control operators or unsafe args",
             )
         if not command:
-            return AgentResult(
+            return InvocationResult(
                 text="process agent command is not configured",
                 status="fail",
                 failure_class="missing_process_command",
-                recovery_suggestion="Configure command_value and allowlist_value in the selected YAML agent profile.",
+                recovery_suggestion="Configure command_value and allowlist_value in the selected YAML invocation profile.",
             )
         timeout_ms = int(config.get("timeouts", {}).get("run_ms") or request.budget.get("time_ms") or 5000)
         if request.permissions.get("network") and not config.get("permissions", {}).get("network"):
-            return AgentResult(
+            return InvocationResult(
                 text="process agent network permission denied",
                 status="fail",
                 failure_class="permission_denied",
                 recovery_suggestion="Use a backend config that explicitly allows network access",
             )
         if request.permissions.get("auth"):
-            return AgentResult(
+            return InvocationResult(
                 text="process agent auth passthrough is disabled for the first slice",
                 status="fail",
                 failure_class="permission_denied",
@@ -141,7 +141,7 @@ class ProcessAgentBackend:
             )
         if self.backend_kind == "process_agent":
             if request.permissions.get("sandbox") or config.get("permissions", {}).get("sandbox"):
-                return AgentResult(
+                return InvocationResult(
                     text="process_agent does not claim OS sandbox enforcement",
                     status="fail",
                     failure_class="invalid_process_agent_config",
@@ -169,14 +169,14 @@ class ProcessAgentBackend:
                 env=_scrubbed_env(config, request),
             )
         except subprocess.TimeoutExpired:
-            return AgentResult(
+            return InvocationResult(
                 text="process agent timed out",
                 status="fail",
                 failure_class="process_timeout",
                 recovery_suggestion="Increase timeout or use a cheaper deterministic backend",
             )
         if completed.returncode != 0:
-            return AgentResult(
+            return InvocationResult(
                 text=completed.stderr.strip() or completed.stdout.strip(),
                 status="fail",
                 failure_class="process_nonzero_exit",
@@ -188,14 +188,14 @@ class ProcessAgentBackend:
         except json.JSONDecodeError:
             decoded = {"text": stdout}
         if not isinstance(decoded, dict):
-            return AgentResult(
-                text="process agent output is not an object",
+            return InvocationResult(
+                text="process invocation output is not an object",
                 status="fail",
                 failure_class="invalid_process_output",
-                recovery_suggestion="Return a JSON object matching AgentResult",
+                recovery_suggestion="Return a JSON object matching InvocationResult",
             )
         elapsed_ms = int((time.monotonic() - started) * 1000)
-        return AgentResult(
+        return InvocationResult(
             text=str(decoded.get("text", stdout)),
             evidence_refs=list(decoded.get("evidence_refs", ["process://stdout"])),
             output_artifact_ids=list(decoded.get("output_artifact_ids", [])),
@@ -207,14 +207,14 @@ class ProcessAgentBackend:
         )
 
 
-class CodexCliAgentBackend(ProcessAgentBackend):
+class CodexCliInvocationBackend(ProcessInvocationBackend):
     backend_kind = "codex_cli"
 
-    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+    def invoke(self, request: InvocationRequest, config: dict[str, Any]) -> InvocationResult:
         try:
             _validate_codex_cli_command(config)
         except ValueError as exc:
-            return AgentResult(
+            return InvocationResult(
                 text=str(exc),
                 status="fail",
                 failure_class="invalid_codex_cli_config",
@@ -223,29 +223,29 @@ class CodexCliAgentBackend(ProcessAgentBackend):
         return super().invoke(request, config)
 
 
-class CodeAgentRunnerBackend:
+class CodeAgentRunnerInvocationBackend:
     backend_kind = "code_agent_runner"
 
-    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+    def invoke(self, request: InvocationRequest, config: dict[str, Any]) -> InvocationResult:
         try:
             command = _command_argv(config)
         except ValueError as exc:
-            return AgentResult(
+            return InvocationResult(
                 text=str(exc),
                 status="fail",
                 failure_class="invalid_code_agent_runner_config",
                 recovery_suggestion="Use an allowlisted runner command without shell control operators or unsafe args.",
             )
         if not command:
-            return AgentResult(
+            return InvocationResult(
                 text="code agent runner command is not configured",
                 status="fail",
                 failure_class="missing_runner_command",
-                recovery_suggestion="Configure command_value and allowlist_value in the selected YAML agent profile.",
+                recovery_suggestion="Configure command_value and allowlist_value in the selected YAML invocation profile.",
             )
         workspace_text = str(request.permissions.get("filesystem_root") or "")
         if not workspace_text:
-            return AgentResult(
+            return InvocationResult(
                 text="code agent runner requires filesystem_root",
                 status="fail",
                 failure_class="missing_runner_workspace",
@@ -253,21 +253,21 @@ class CodeAgentRunnerBackend:
             )
         workspace = Path(workspace_text).resolve()
         if not workspace.is_dir():
-            return AgentResult(
+            return InvocationResult(
                 text="code agent runner workspace does not exist",
                 status="fail",
                 failure_class="missing_runner_workspace",
                 recovery_suggestion="Create the code-agent workspace packet before invoking the runner.",
             )
         if request.permissions.get("network") and not config.get("permissions", {}).get("network"):
-            return AgentResult(
+            return InvocationResult(
                 text="code agent runner network permission denied",
                 status="fail",
                 failure_class="permission_denied",
-                recovery_suggestion="Set network: true only for trusted live runners in the selected YAML agent profile.",
+                recovery_suggestion="Set network: true only for trusted live runners in the selected YAML invocation profile.",
             )
         if request.permissions.get("auth") and not config.get("permissions", {}).get("auth"):
-            return AgentResult(
+            return InvocationResult(
                 text="code agent runner auth permission denied",
                 status="fail",
                 failure_class="permission_denied",
@@ -305,7 +305,7 @@ class CodeAgentRunnerBackend:
             )
         except subprocess.TimeoutExpired:
             _append_command_log(command_log, command=command, exit_code=None, stdout="", stderr="timeout", duration_ms=timeout_ms)
-            return AgentResult(
+            return InvocationResult(
                 text="code agent runner timed out",
                 status="fail",
                 failure_class="runner_timeout",
@@ -322,7 +322,7 @@ class CodeAgentRunnerBackend:
             duration_ms=duration_ms,
         )
         if completed.returncode != 0:
-            return AgentResult(
+            return InvocationResult(
                 text=completed.stderr.strip() or completed.stdout.strip(),
                 status="fail",
                 failure_class="runner_nonzero_exit",
@@ -332,7 +332,7 @@ class CodeAgentRunnerBackend:
             )
         manifest_path = output_dir / "candidate_manifest.json"
         if not manifest_path.is_file():
-            return AgentResult(
+            return InvocationResult(
                 text="runner did not write agent-output/candidate_manifest.json",
                 status="fail",
                 failure_class="missing_runner_manifest",
@@ -340,7 +340,7 @@ class CodeAgentRunnerBackend:
                 evidence_refs=[command_log_ref],
                 trace_ref=command_log_ref,
             )
-        return AgentResult(
+        return InvocationResult(
             text=json.dumps({"candidate_manifest_ref": "agent-output/candidate_manifest.json"}, sort_keys=True),
             evidence_refs=[command_log_ref, manifest_ref],
             trace_ref=command_log_ref,
@@ -348,14 +348,14 @@ class CodeAgentRunnerBackend:
         )
 
 
-class CodexCliRunnerBackend(CodeAgentRunnerBackend):
+class CodexCliRunnerInvocationBackend(CodeAgentRunnerInvocationBackend):
     backend_kind = "codex_cli_runner"
 
-    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+    def invoke(self, request: InvocationRequest, config: dict[str, Any]) -> InvocationResult:
         try:
             _validate_codex_cli_command(config)
         except ValueError as exc:
-            return AgentResult(
+            return InvocationResult(
                 text=str(exc),
                 status="fail",
                 failure_class="invalid_codex_cli_runner_config",
@@ -364,19 +364,19 @@ class CodexCliRunnerBackend(CodeAgentRunnerBackend):
         return super().invoke(request, config)
 
 
-class CodexSdkAgentBackend:
+class CodexSdkInvocationBackend:
     backend_kind = "codex_sdk"
 
     def __init__(self) -> None:
         self._continued_threads: dict[str, dict[str, Any]] = {}
 
-    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+    def invoke(self, request: InvocationRequest, config: dict[str, Any]) -> InvocationResult:
         permission_error = _codex_sdk_permission_error(request, config)
         if permission_error:
             return permission_error
         model = config.get("smoke_model") or config.get("model") or ""
         if not model:
-            return AgentResult(
+            return InvocationResult(
                 text="Codex SDK model is not configured",
                 status="needs_human",
                 failure_class="missing_codex_model",
@@ -385,16 +385,16 @@ class CodexSdkAgentBackend:
         try:
             sdk_module = importlib.import_module("openai_codex")
         except ModuleNotFoundError:
-            return AgentResult(
+            return InvocationResult(
                 text="openai-codex Python SDK is not installed",
                 status="needs_human",
                 failure_class="missing_codex_sdk",
-                recovery_suggestion="Install the official Codex SDK with `pip install openai-codex`, or use another configured AgentBackend.",
+                recovery_suggestion="Install the official Codex SDK with `pip install openai-codex`, or use another configured InvocationBackend.",
             )
         Codex = getattr(sdk_module, "Codex", None)
         Sandbox = getattr(sdk_module, "Sandbox", None)
         if Codex is None or Sandbox is None:
-            return AgentResult(
+            return InvocationResult(
                 text="openai_codex module does not expose Codex and Sandbox",
                 status="fail",
                 failure_class="invalid_codex_sdk",
@@ -427,7 +427,7 @@ class CodexSdkAgentBackend:
             duration_ms = int((time.monotonic() - started) * 1000)
             if output_dir:
                 _write_codex_sdk_result(output_dir / "codex-sdk-result.json", status="fail", duration_ms=duration_ms)
-            return AgentResult(
+            return InvocationResult(
                 text=str(exc),
                 status="fail",
                 failure_class=exc.__class__.__name__,
@@ -446,7 +446,7 @@ class CodexSdkAgentBackend:
             command_log_ref = "agent-workspace://agent-output/codex-sdk-result.json"
             manifest_ref = "agent-workspace://agent-output/candidate_manifest.json"
             if not manifest_path.is_file():
-                return AgentResult(
+                return InvocationResult(
                     text="Codex SDK did not write agent-output/candidate_manifest.json",
                     status="fail",
                     failure_class="missing_runner_manifest",
@@ -456,14 +456,14 @@ class CodexSdkAgentBackend:
                     usage=usage,
                     conversation_ref=conversation_ref,
                 )
-            return AgentResult(
+            return InvocationResult(
                 text=json.dumps({"candidate_manifest_ref": "agent-output/candidate_manifest.json"}, sort_keys=True),
                 evidence_refs=[command_log_ref, manifest_ref],
                 trace_ref=command_log_ref,
                 usage=usage,
                 conversation_ref=conversation_ref,
             )
-        return AgentResult(
+        return InvocationResult(
             text=response_text,
             evidence_refs=["codex-sdk://thread"],
             trace_ref="codex-sdk://thread",
@@ -475,7 +475,7 @@ class CodexSdkAgentBackend:
         self,
         sdk_module: Any,
         Codex: Any,
-        request: AgentRequest,
+        request: InvocationRequest,
         *,
         model: str,
         sandbox: Any,
@@ -493,7 +493,7 @@ class CodexSdkAgentBackend:
         self,
         sdk_module: Any,
         Codex: Any,
-        request: AgentRequest,
+        request: InvocationRequest,
         *,
         model: str,
         sandbox: Any,
@@ -537,9 +537,9 @@ class CodexSdkAgentBackend:
 class OpenAICompatibleBackend:
     backend_kind = "llm"
 
-    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+    def invoke(self, request: InvocationRequest, config: dict[str, Any]) -> InvocationResult:
         if not request.permissions.get("network") or not config.get("permissions", {}).get("network"):
-            return AgentResult(
+            return InvocationResult(
                 text="OpenAI-compatible backend network permission denied",
                 status="fail",
                 failure_class="network_permission_denied",
@@ -550,11 +550,11 @@ class OpenAICompatibleBackend:
         api_key = os.environ.get(api_key_env) if api_key_env else ""
         model = config.get("smoke_model") or config.get("model") or ""
         if not api_key or not model:
-            return AgentResult(
+            return InvocationResult(
                 text="OpenAI-compatible backend is not configured",
                 status="needs_human",
                 failure_class="missing_openai_configuration",
-                recovery_suggestion="Set OPENAI_API_KEY and configure model/api_key_env in the selected YAML agent profile.",
+                recovery_suggestion="Set OPENAI_API_KEY and configure model/api_key_env in the selected YAML invocation profile.",
             )
         base_url = (config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
         body = {
@@ -586,14 +586,14 @@ class OpenAICompatibleBackend:
                 time.sleep(0.25 * (attempt + 1))
         if payload is None:
             exc = last_exc or RuntimeError("OpenAI-compatible backend request failed")
-            return AgentResult(
+            return InvocationResult(
                 text=str(exc),
                 status="fail",
                 failure_class=exc.__class__.__name__,
                 recovery_suggestion="Skip live smoke test or check API credentials/network/model access",
             )
         text = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return AgentResult(
+        return InvocationResult(
             text=text,
             evidence_refs=["openai-compatible://chat-completions"],
             trace_ref="openai-compatible://response",
@@ -604,9 +604,9 @@ class OpenAICompatibleBackend:
 class LLMFileCodegenBackend:
     backend_kind = "llm_file_codegen"
 
-    def invoke(self, request: AgentRequest, config: dict[str, Any]) -> AgentResult:
+    def invoke(self, request: InvocationRequest, config: dict[str, Any]) -> InvocationResult:
         if request.node_purpose != "implement":
-            return AgentResult(
+            return InvocationResult(
                 text="llm_file_codegen only supports implementation nodes",
                 status="fail",
                 failure_class="invalid_codegen_request",
@@ -614,7 +614,7 @@ class LLMFileCodegenBackend:
             )
         root_text = str(request.permissions.get("filesystem_root") or "")
         if not root_text:
-            return AgentResult(
+            return InvocationResult(
                 text="llm_file_codegen requires an isolated filesystem_root",
                 status="fail",
                 failure_class="missing_codegen_workdir",
@@ -622,21 +622,21 @@ class LLMFileCodegenBackend:
             )
         work_dir = PurePath(root_text)
         if work_dir.is_absolute() is False:
-            return AgentResult(
+            return InvocationResult(
                 text="llm_file_codegen filesystem_root must be absolute",
                 status="fail",
                 failure_class="invalid_codegen_workdir",
                 recovery_suggestion="Use an absolute isolated workdir path.",
             )
         if not request.permissions.get("network") or not config.get("permissions", {}).get("network"):
-            return AgentResult(
+            return InvocationResult(
                 text="LLM file codegen backend network permission denied",
                 status="fail",
                 failure_class="network_permission_denied",
-                recovery_suggestion="Set network: true for live codegen in the selected YAML agent profile.",
+                recovery_suggestion="Set network: true for live codegen in the selected YAML invocation profile.",
             )
         if not request.permissions.get("auth") or not config.get("permissions", {}).get("auth"):
-            return AgentResult(
+            return InvocationResult(
                 text="LLM file codegen backend auth permission denied",
                 status="fail",
                 failure_class="auth_permission_denied",
@@ -662,7 +662,7 @@ class LLMFileCodegenBackend:
         write_result, write_error = _write_codegen_candidate(candidate, root_text, request, config)
         if write_error:
             return write_error
-        return AgentResult(
+        return InvocationResult(
             text=stable_json(write_result),
             evidence_refs=list(candidate.get("evidence_refs", [])) + ["openai-compatible-codegen://chat-completions"],
             trace_ref="openai-compatible-codegen://response",
@@ -688,22 +688,22 @@ CODEGEN_FILE_KINDS = {
 
 
 def _openai_chat_completion(
-    request: AgentRequest,
+    request: InvocationRequest,
     config: dict[str, Any],
     *,
     system_message: str,
     response_format: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], AgentResult | None]:
+) -> tuple[dict[str, Any], InvocationResult | None]:
     auth = config.get("auth", {})
     api_key_env = auth.get("api_key_env") or ""
     api_key = os.environ.get(api_key_env) if api_key_env else ""
     model = config.get("smoke_model") or config.get("model") or ""
     if not api_key or not model:
-        return {}, AgentResult(
+        return {}, InvocationResult(
             text="OpenAI-compatible backend is not configured",
             status="needs_human",
             failure_class="missing_openai_configuration",
-            recovery_suggestion="Set OPENAI_API_KEY and configure model/api_key_env in the selected YAML agent profile.",
+            recovery_suggestion="Set OPENAI_API_KEY and configure model/api_key_env in the selected YAML invocation profile.",
         )
     base_url = (config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
     body = {
@@ -737,7 +737,7 @@ def _openai_chat_completion(
                 break
             time.sleep(0.25 * (attempt + 1))
     exc = last_exc or RuntimeError("OpenAI-compatible backend request failed")
-    return {}, AgentResult(
+    return {}, InvocationResult(
         text=str(exc),
         status="fail",
         failure_class=exc.__class__.__name__,
@@ -754,7 +754,7 @@ def _message_content(payload: dict[str, Any]) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _parse_codegen_response(text: str) -> tuple[dict[str, Any], AgentResult | None]:
+def _parse_codegen_response(text: str) -> tuple[dict[str, Any], InvocationResult | None]:
     raw = text.strip()
     if raw.startswith("```"):
         lines = raw.splitlines()
@@ -791,9 +791,9 @@ def _parse_codegen_response(text: str) -> tuple[dict[str, Any], AgentResult | No
 def _write_codegen_candidate(
     candidate: dict[str, Any],
     root_text: str,
-    request: AgentRequest,
+    request: InvocationRequest,
     config: dict[str, Any],
-) -> tuple[dict[str, Any], AgentResult | None]:
+) -> tuple[dict[str, Any], InvocationResult | None]:
     root = Path(root_text).resolve()
     root.mkdir(parents=True, exist_ok=True)
     declared: set[str] = set()
@@ -847,7 +847,7 @@ def _write_codegen_candidate(
     }, None
 
 
-def _file_source_refs(candidate: dict[str, Any], filename: str, request: AgentRequest) -> list[str]:
+def _file_source_refs(candidate: dict[str, Any], filename: str, request: InvocationRequest) -> list[str]:
     for item in candidate.get("files", []):
         if isinstance(item, dict) and item.get("path") == filename and isinstance(item.get("source_refs"), list) and item["source_refs"]:
             return [str(ref) for ref in item["source_refs"]]
@@ -871,7 +871,7 @@ def _is_python_cache_file(path: Path) -> bool:
     return "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}
 
 
-def _codegen_path_error(path_text: str) -> AgentResult | None:
+def _codegen_path_error(path_text: str) -> InvocationResult | None:
     if not path_text:
         return _codegen_failure("invalid_codegen_path", "Generated file paths must be non-empty relative paths.")
     if "\\" in path_text:
@@ -900,8 +900,8 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _codegen_failure(failure_class: str, recovery_suggestion: str) -> AgentResult:
-    return AgentResult(
+def _codegen_failure(failure_class: str, recovery_suggestion: str) -> InvocationResult:
+    return InvocationResult(
         text=recovery_suggestion,
         status="fail",
         failure_class=failure_class,
@@ -909,56 +909,54 @@ def _codegen_failure(failure_class: str, recovery_suggestion: str) -> AgentResul
     )
 
 
-class AgentBackendRegistry:
+class InvocationBackendRegistry:
     def __init__(self) -> None:
-        self._backends: dict[str, AgentBackend] = {}
+        self._backends: dict[str, InvocationBackend] = {}
 
-    def register(self, backend: AgentBackend) -> None:
+    def register(self, backend: InvocationBackend) -> None:
         self._backends[backend.backend_kind] = backend
 
-    def get(self, backend_kind: str) -> AgentBackend:
+    def get(self, backend_kind: str) -> InvocationBackend:
         if backend_kind not in self._backends:
-            raise KeyError(f"Agent backend is not registered: {backend_kind}")
+            raise KeyError(f"Invocation backend is not registered: {backend_kind}")
         return self._backends[backend_kind]
 
 
-def default_agent_backend_registry() -> AgentBackendRegistry:
-    registry = AgentBackendRegistry()
-    registry.register(MockAgentBackend())
-    registry.register(ManualAgentBackend())
-    registry.register(ProcessAgentBackend())
-    registry.register(CodexCliAgentBackend())
-    registry.register(CodeAgentRunnerBackend())
-    registry.register(CodexCliRunnerBackend())
-    registry.register(CodexSdkAgentBackend())
+def default_invocation_backend_registry() -> InvocationBackendRegistry:
+    registry = InvocationBackendRegistry()
+    registry.register(MockInvocationBackend())
+    registry.register(ManualInvocationBackend())
+    registry.register(ProcessInvocationBackend())
+    registry.register(CodexCliInvocationBackend())
+    registry.register(CodeAgentRunnerInvocationBackend())
+    registry.register(CodexCliRunnerInvocationBackend())
+    registry.register(CodexSdkInvocationBackend())
     registry.register(OpenAICompatibleBackend())
     registry.register(LLMFileCodegenBackend())
     return registry
 
 
-def load_agent_backend_config_from_env(
+def load_invocation_backend_config_from_env(
     env: dict[str, str] | None = None,
     *,
     source_stage: str = "config",
-    profile_id: str = SEMANTIC_AGENT_PROFILE,
+    profile_id: str = SEMANTIC_INVOCATION_PROFILE,
 ) -> dict[str, Any]:
-    """Compatibility wrapper for the default semantic backend profile."""
-
     world_config = load_agent_world_config(env)
-    profile = world_config.agent_profiles[profile_id]
-    return agent_backend_config_from_profile(profile, source_stage=source_stage)
+    profile = world_config.invocation_profiles[profile_id]
+    return invocation_backend_config_from_profile(profile, source_stage=source_stage)
 
 
-def load_stage_agent_backend_config_from_env(stage: str, env: dict[str, str] | None = None, *, source_stage: str = "config") -> dict[str, Any]:
+def load_stage_invocation_backend_config_from_env(stage: str, env: dict[str, str] | None = None, *, source_stage: str = "config") -> dict[str, Any]:
     world_config = load_agent_world_config(env)
-    return agent_backend_config_from_profile(world_config.profile_for_stage(stage), source_stage=source_stage)
+    return invocation_backend_config_from_profile(world_config.profile_for_stage(stage), source_stage=source_stage)
 
 
-def load_implementation_agent_backend_config_from_env(env: dict[str, str] | None = None, *, source_stage: str = "config") -> dict[str, Any]:
-    return load_agent_backend_config_from_env(env, source_stage=source_stage, profile_id=IMPLEMENTATION_AGENT_PROFILE)
+def load_implementation_invocation_backend_config_from_env(env: dict[str, str] | None = None, *, source_stage: str = "config") -> dict[str, Any]:
+    return load_invocation_backend_config_from_env(env, source_stage=source_stage, profile_id=IMPLEMENTATION_INVOCATION_PROFILE)
 
 
-def agent_backend_config_from_profile(profile: AgentProfileConfig, *, source_stage: str = "config") -> dict[str, Any]:
+def invocation_backend_config_from_profile(profile: InvocationProfileConfig, *, source_stage: str = "config") -> dict[str, Any]:
     backend_kind = profile.backend_kind
     command_argv = shlex.split(profile.command_value) if profile.command_value else []
     allowlist = shlex.split(profile.allowlist_value) if profile.allowlist_value else []
@@ -969,7 +967,7 @@ def agent_backend_config_from_profile(profile: AgentProfileConfig, *, source_sta
     else:
         command_filesystem = "artifact_context"
     command_sandbox = backend_kind in {"codex_cli", "codex_cli_runner", "codex_sdk"}
-    auth_permission = (bool(profile.api_key_env) or profile.agent_auth) and backend_kind in {"llm", "llm_file_codegen", "code_agent_runner", "codex_cli_runner", "codex_sdk"}
+    auth_permission = (bool(profile.api_key_env) or profile.backend_auth) and backend_kind in {"llm", "llm_file_codegen", "code_agent_runner", "codex_cli_runner", "codex_sdk"}
     command = (
         {
             "argv": command_argv,
@@ -983,7 +981,7 @@ def agent_backend_config_from_profile(profile: AgentProfileConfig, *, source_sta
     )
     profile_ref = _safe_profile_ref(profile.profile_id)
     fields = {
-        "backend_id": f"{profile_ref}-agent-backend",
+        "backend_id": f"{profile_ref}-invocation-backend",
         "profile_id": profile.profile_id,
         "backend_kind": backend_kind,
         "provider": profile.provider,
@@ -1009,26 +1007,26 @@ def agent_backend_config_from_profile(profile: AgentProfileConfig, *, source_sta
         },
         "codex": {"sandbox": profile.codex_sandbox},
         "code_repair": {"thread_mode": profile.code_repair_thread_mode},
-        "output_schema_ref": "AgentResult",
+        "output_schema_ref": "InvocationResult",
         "redaction_policy": {"secret_env_names_only": True, "redact_values": True},
     }
     return make_artifact(
-        "AgentBackendConfig",
+        "InvocationBackendConfig",
         source_stage=source_stage,
-        producer="agent-world-config-loader",
+        producer="invocation-backend-config-loader",
         fields=fields,
-        artifact_id=f"agent-backend-config-{profile_ref}",
+        artifact_id=f"invocation-backend-config-{profile_ref}",
         status="accepted",
     )
 
 
-def invoke_agent(
-    registry: AgentBackendRegistry,
-    request: AgentRequest,
+def invoke_backend(
+    registry: InvocationBackendRegistry,
+    request: InvocationRequest,
     config: dict[str, Any],
     *,
-    producer: str = "agent-invocation-runtime",
-) -> tuple[dict[str, Any], AgentResult]:
+    producer: str = "invocation-runtime",
+) -> tuple[dict[str, Any], InvocationResult]:
     backend = registry.get(config["backend_kind"])
     result = backend.invoke(request, config)
     fields = {
@@ -1058,7 +1056,7 @@ def invoke_agent(
     }
     fields = _redact_record_fields(fields, config)
     record = make_artifact(
-        "AgentInvocationRecord",
+        "InvocationRecord",
         source_stage=request.stage,
         producer=producer,
         fields=fields,
@@ -1079,24 +1077,24 @@ def _safe_profile_ref(profile_id: str) -> str:
     return cleaned or "default"
 
 
-def _codex_sdk_permission_error(request: AgentRequest, config: dict[str, Any]) -> AgentResult | None:
+def _codex_sdk_permission_error(request: InvocationRequest, config: dict[str, Any]) -> InvocationResult | None:
     permissions = config.get("permissions", {})
     if request.permissions.get("network") and not permissions.get("network"):
-        return AgentResult(
+        return InvocationResult(
             text="Codex SDK network permission denied",
             status="fail",
             failure_class="network_permission_denied",
-            recovery_suggestion="Set network: true only for trusted live Codex SDK runs in the selected YAML agent profile.",
+            recovery_suggestion="Set network: true only for trusted live Codex SDK runs in the selected YAML invocation profile.",
         )
     if request.permissions.get("auth") and not permissions.get("auth"):
-        return AgentResult(
+        return InvocationResult(
             text="Codex SDK auth permission denied",
             status="fail",
             failure_class="auth_permission_denied",
             recovery_suggestion="Configure api_key_env/auth_env_refs in YAML for trusted Codex SDK runs.",
         )
     if request.permissions.get("sandbox") and not permissions.get("sandbox"):
-        return AgentResult(
+        return InvocationResult(
             text="Codex SDK sandbox permission denied",
             status="fail",
             failure_class="sandbox_permission_denied",
@@ -1105,7 +1103,7 @@ def _codex_sdk_permission_error(request: AgentRequest, config: dict[str, Any]) -
     return None
 
 
-def _codex_sdk_should_continue(request: AgentRequest) -> bool:
+def _codex_sdk_should_continue(request: InvocationRequest) -> bool:
     return request.stage == "IMPLEMENT" and request.node_purpose == "implement" and request.continuation_mode == "continue"
 
 
@@ -1125,7 +1123,7 @@ def _codex_sdk_resume_thread(codex: Any, conversation_ref: str) -> Any | None:
     return None
 
 
-def _codex_sdk_sandbox(Sandbox: Any, config: dict[str, Any]) -> tuple[Any, AgentResult | None]:
+def _codex_sdk_sandbox(Sandbox: Any, config: dict[str, Any]) -> tuple[Any, InvocationResult | None]:
     raw = str((config.get("codex") or {}).get("sandbox") or "workspace-write")
     normalized = raw.strip().lower().replace("_", "-")
     if normalized in {"workspace-write", "workspace"}:
@@ -1133,21 +1131,21 @@ def _codex_sdk_sandbox(Sandbox: Any, config: dict[str, Any]) -> tuple[Any, Agent
     elif normalized in {"read-only", "readonly", "read"}:
         attr = "read_only"
     elif normalized == "full-access":
-        return None, AgentResult(
+        return None, InvocationResult(
             text="Codex SDK full-access sandbox is not allowed by this framework",
             status="fail",
             failure_class="invalid_codex_sdk_sandbox",
             recovery_suggestion="Use codex_sandbox: workspace-write or read-only in YAML.",
         )
     else:
-        return None, AgentResult(
+        return None, InvocationResult(
             text=f"Unsupported Codex SDK sandbox: {raw}",
             status="fail",
             failure_class="invalid_codex_sdk_sandbox",
             recovery_suggestion="Use codex_sandbox: workspace-write or read-only in YAML.",
         )
     if not hasattr(Sandbox, attr):
-        return None, AgentResult(
+        return None, InvocationResult(
             text=f"Codex SDK Sandbox does not expose {attr}",
             status="fail",
             failure_class="invalid_codex_sdk",
@@ -1190,7 +1188,7 @@ def _codex_sdk_auto_review_approval_mode(sdk_module: Any) -> Any | None:
     return getattr(approval_mode, "auto_review", None) if approval_mode is not None else None
 
 
-def _codex_sdk_workspace(request: AgentRequest) -> tuple[Path | None, AgentResult | None]:
+def _codex_sdk_workspace(request: InvocationRequest) -> tuple[Path | None, InvocationResult | None]:
     if request.node_purpose != "implement":
         root = str(request.permissions.get("filesystem_root") or "")
         if not root:
@@ -1198,7 +1196,7 @@ def _codex_sdk_workspace(request: AgentRequest) -> tuple[Path | None, AgentResul
     else:
         root = str(request.permissions.get("filesystem_root") or "")
         if not root:
-            return None, AgentResult(
+            return None, InvocationResult(
                 text="Codex SDK implementation requires filesystem_root",
                 status="fail",
                 failure_class="missing_runner_workspace",
@@ -1206,7 +1204,7 @@ def _codex_sdk_workspace(request: AgentRequest) -> tuple[Path | None, AgentResul
             )
     workspace = Path(root).resolve()
     if not workspace.is_dir():
-        return None, AgentResult(
+        return None, InvocationResult(
             text="Codex SDK workspace does not exist",
             status="fail",
             failure_class="missing_runner_workspace",
@@ -1439,7 +1437,7 @@ def _safe_cwd(config: dict[str, Any]) -> str | None:
     return cwd
 
 
-def _scrubbed_env(config: dict[str, Any], request: AgentRequest) -> dict[str, str]:
+def _scrubbed_env(config: dict[str, Any], request: InvocationRequest) -> dict[str, str]:
     allowed_names = {"PATH", "TMPDIR", "TEMP", "TMP"}
     child_env = {name: value for name, value in os.environ.items() if name in allowed_names}
     child_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1448,7 +1446,7 @@ def _scrubbed_env(config: dict[str, Any], request: AgentRequest) -> dict[str, st
     return child_env
 
 
-def _runner_env(config: dict[str, Any], request: AgentRequest, workspace: Path) -> dict[str, str]:
+def _runner_env(config: dict[str, Any], request: InvocationRequest, workspace: Path) -> dict[str, str]:
     child_env = _scrubbed_env(config, request)
     child_env["AGENT_WORLD_CODE_AGENT_WORKSPACE"] = str(workspace)
     child_env["AGENT_WORLD_CODE_AGENT_GENERATED_DIR"] = str(workspace / "generated")

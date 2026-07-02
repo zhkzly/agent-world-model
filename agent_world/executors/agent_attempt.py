@@ -4,110 +4,105 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent_world.agents import AgentRequest, invoke_agent
+from agent_world.agents import InvocationRequest, invoke_backend
 from agent_world.artifacts import ARTIFACT_REQUIRED_FIELDS, make_artifact, stable_json
-from agent_world.config import load_node_execution_config
-from agent_world.executors.base import NodeExecutionResult
+from agent_world.config import load_research_config
+from agent_world.executors.base import NodeAttemptResult
 from agent_world.research.lightweight import collect_research_candidates
 
 
-class ResearchAgentExecutor:
-    executor_id = "research_agent"
+class AgentAttemptExecutor:
+    executor_id = "agent_attempt"
 
-    def execute(self, context: Any, node: Any, profile: Any) -> NodeExecutionResult:
-        config = load_node_execution_config(context.config.env)
-        backend_config = context.artifact("AgentBackendConfig")
+    def execute(self, context: Any, node: Any, profile: Any, *, attempt_index: int = 1) -> NodeAttemptResult:
+        research_config = load_research_config(context.config.env)
+        backend_config = context.artifact("InvocationBackendConfig")
         if backend_config.get("backend_kind") == "mock":
-            return NodeExecutionResult(
+            return NodeAttemptResult(
                 status="needs_human",
                 failure_class="mock_backend_not_allowed",
-                recovery_suggestion="Configure a real AgentBackend for research execution; mock backends cannot produce accepted SourceEvidenceIndex fields.",
+                recovery_suggestion="Configure a real InvocationBackend for research execution; mock backends cannot produce accepted SourceEvidenceIndex fields.",
             )
         try:
-            packet = collect_research_candidates(context, config.research)
+            packet = collect_research_candidates(context, research_config)
         except Exception as exc:
-            return NodeExecutionResult(
+            return NodeAttemptResult(
                 status="fail",
                 failure_class="research_provider_failed",
                 recovery_suggestion=str(exc),
             )
         if not packet.get("candidates"):
-            return NodeExecutionResult(
+            return NodeAttemptResult(
                 status="fail",
                 failure_class="research_result_empty",
                 recovery_suggestion="Research source discovery produced no accepted sources.",
             )
-        attempts = max(1, int(backend_config.get("retries", {}).get("max_attempts") or 1))
         invocations = []
         evidence_refs = []
         trace_refs = []
-        feedback = []
-        last_failure_class = "research_agent_failed"
-        last_recovery = "Fix the configured research AgentBackend."
-        for attempt_index in range(1, attempts + 1):
-            stage_feedback = list(getattr(context, "node_feedback", {}).get(node.stage, []))
-            request = AgentRequest(
-                stage=node.stage,
-                node_purpose=profile.node_purpose,
-                instruction=_instruction(context, node, profile, packet, feedback=stage_feedback + feedback),
-                input_artifact_ids=[context.artifacts[name]["id"] for name in node.input_artifact_types if name in context.artifacts],
-                invocation_id=f"invoke-{node.stage.lower()}-{profile.executor_id}-{profile.node_purpose}-attempt-{attempt_index}",
-                allowed_tool_access=["local_sources", "searxng", "jina_reader_search", "process_research"],
-                permissions={
-                    "network": bool(backend_config.get("permissions", {}).get("network")),
-                    "filesystem": "artifact_context",
-                    "auth": bool(backend_config.get("permissions", {}).get("auth")),
-                    "sandbox": False,
-                },
-                budget={
-                    "tokens": int(backend_config.get("budgets", {}).get("max_tokens", 0)),
-                    "time_ms": int(backend_config.get("timeouts", {}).get("run_ms", 5000)),
-                    "cost_limit": int(backend_config.get("budgets", {}).get("max_cost", 0)),
-                },
-                instruction_ref=profile.prompt_ref or f"stage:{node.stage}",
-            )
-            invocation, result = invoke_agent(context.agent_registry, request, backend_config)
-            invocation = _annotate_invocation(invocation, profile)
-            invocations.append(invocation)
-            evidence_refs.extend(result.evidence_refs)
-            if result.trace_ref:
-                trace_refs.append(result.trace_ref)
-            if result.status != "pass":
-                return NodeExecutionResult(
-                    status=result.status,
-                    invocation_records=invocations,
-                    evidence_refs=evidence_refs,
-                    trace_refs=trace_refs,
-                    failure_class=result.failure_class or "research_agent_failed",
-                    recovery_suggestion=result.recovery_suggestion or "Fix the configured research AgentBackend.",
-                )
-            parsed, parse_error = _parse_json_object(result.text)
-            if parse_error:
-                last_failure_class = "invalid_agent_json"
-                last_recovery = parse_error
-                feedback.append(_feedback("invalid_agent_json", parse_error, result.text))
-                continue
-            fields = _normalize_source_evidence_fields(dict(parsed.get("fields") if isinstance(parsed.get("fields"), dict) else parsed))
-            validation_error = _validate_fields(context, node, fields)
-            if validation_error:
-                last_failure_class = "invalid_agent_artifact_fields"
-                last_recovery = validation_error
-                feedback.append(_feedback("invalid_agent_artifact_fields", validation_error, stable_json(fields)))
-                continue
-            return NodeExecutionResult(
-                status="pass",
-                fields=fields,
+        stage_feedback = list(getattr(context, "node_feedback", {}).get(node.stage, []))
+        request = InvocationRequest(
+            stage=node.stage,
+            node_purpose=profile.node_purpose,
+            instruction=_instruction(context, node, profile, packet, feedback=stage_feedback),
+            input_artifact_ids=[context.artifacts[name]["id"] for name in node.input_artifact_types if name in context.artifacts],
+            invocation_id=f"invoke-{node.stage.lower()}-{profile.executor_id}-{profile.node_purpose}-attempt-{attempt_index}",
+            allowed_tool_access=["local_sources", "searxng", "jina_reader_search", "process_research"],
+            permissions={
+                "network": bool(backend_config.get("permissions", {}).get("network")),
+                "filesystem": "artifact_context",
+                "auth": bool(backend_config.get("permissions", {}).get("auth")),
+                "sandbox": False,
+            },
+            budget={
+                "tokens": int(backend_config.get("budgets", {}).get("max_tokens", 0)),
+                "time_ms": int(backend_config.get("timeouts", {}).get("run_ms", 5000)),
+                "cost_limit": int(backend_config.get("budgets", {}).get("max_cost", 0)),
+            },
+            instruction_ref=profile.prompt_ref or f"stage:{node.stage}",
+        )
+        invocation, result = invoke_backend(context.invocation_registry, request, backend_config)
+        invocation = _annotate_invocation(invocation, profile)
+        invocations.append(invocation)
+        evidence_refs.extend(result.evidence_refs)
+        if result.trace_ref:
+            trace_refs.append(result.trace_ref)
+        if result.status != "pass":
+            return NodeAttemptResult(
+                status=result.status,
                 invocation_records=invocations,
-                evidence_refs=[ref for item in fields.get("extractable_objects", []) for ref in item.get("evidence_refs", [])] + evidence_refs,
+                evidence_refs=evidence_refs,
                 trace_refs=trace_refs,
+                failure_class=result.failure_class or "agent_attempt_failed",
+                recovery_suggestion=result.recovery_suggestion or "Fix the configured research InvocationBackend.",
             )
-        return NodeExecutionResult(
-            status="fail",
+        parsed, parse_error = _parse_json_object(result.text)
+        if parse_error:
+            return NodeAttemptResult(
+                status="fail",
+                invocation_records=invocations,
+                evidence_refs=evidence_refs,
+                trace_refs=trace_refs,
+                failure_class="invalid_invocation_json",
+                recovery_suggestion=parse_error,
+            )
+        fields = _normalize_source_evidence_fields(dict(parsed.get("fields") if isinstance(parsed.get("fields"), dict) else parsed))
+        validation_error = _validate_fields(context, node, fields)
+        if validation_error:
+            return NodeAttemptResult(
+                status="fail",
+                invocation_records=invocations,
+                evidence_refs=evidence_refs,
+                trace_refs=trace_refs,
+                failure_class="invalid_attempt_artifact_fields",
+                recovery_suggestion=validation_error,
+            )
+        return NodeAttemptResult(
+            status="pass",
+            fields=fields,
             invocation_records=invocations,
-            evidence_refs=evidence_refs,
+            evidence_refs=[ref for item in fields.get("extractable_objects", []) for ref in item.get("evidence_refs", [])] + evidence_refs,
             trace_refs=trace_refs,
-            failure_class=last_failure_class,
-            recovery_suggestion=last_recovery,
         )
 
 
@@ -165,13 +160,13 @@ def _parse_json_object(text: str) -> tuple[dict[str, Any], str]:
         start = text.find("{")
         end = text.rfind("}")
         if start < 0 or end <= start:
-            return {}, "Agent output is not a JSON object."
+            return {}, "Invocation output is not a JSON object."
         try:
             parsed = json.loads(text[start : end + 1])
         except json.JSONDecodeError as exc:
-            return {}, f"Agent output JSON parse failed: {exc}"
+            return {}, f"Invocation output JSON parse failed: {exc}"
     if not isinstance(parsed, dict):
-        return {}, "Agent output must be a JSON object."
+        return {}, "Invocation output must be a JSON object."
     return parsed, ""
 
 
@@ -202,7 +197,7 @@ def _normalize_source_evidence_fields(fields: dict[str, Any]) -> dict[str, Any]:
 def _annotate_invocation(invocation: dict[str, Any], profile: Any) -> dict[str, Any]:
     updated = dict(invocation)
     updated["executor_id"] = profile.executor_id
-    updated["execution_profile"] = {
+    updated["attempt_profile"] = {
         "stage": profile.stage,
         "executor_id": profile.executor_id,
         "node_purpose": profile.node_purpose,
@@ -225,11 +220,3 @@ def _validate_fields(context: Any, node: Any, fields: dict[str, Any]) -> str:
     except Exception as exc:
         return str(exc)
     return ""
-
-
-def _feedback(failure_class: str, recovery_suggestion: str, output_preview: str) -> dict[str, str]:
-    return {
-        "failure_class": failure_class,
-        "recovery_suggestion": recovery_suggestion,
-        "invalid_output_preview": output_preview[:2000],
-    }

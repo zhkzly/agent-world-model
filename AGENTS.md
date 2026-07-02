@@ -21,7 +21,7 @@ Background only:
 
 - Read the source-of-truth document before changing code.
 - Keep implementation under the current `agent_world/` slice unless the user explicitly expands scope.
-- Use real agent backends through `AgentBackend`; do not fake codegen with templates or generic shell runners.
+- Use real llm/agent invocation through `InvocationBackend`; do not fake codegen with templates or generic shell runners.
 - Codex SDK integration should be a real backend adapter, not scattered SDK calls in pipeline core.
 - Do not reintroduce fixed environments, fixed task ids, fixed replay cases, fixture registries, or environment-id verifier branches as normal success paths.
 - Do not write secrets into artifacts, traces, manifests, or release packages.

@@ -219,7 +219,7 @@ ARTIFACT_REQUIRED_FIELDS: dict[str, list[str]] = {
         "result_record_schema",
         "adapter_notes",
     ],
-    "AgentInvocationRecord": [
+    "InvocationRecord": [
         "invocation_id",
         "stage",
         "node_purpose",
@@ -238,7 +238,7 @@ ARTIFACT_REQUIRED_FIELDS: dict[str, list[str]] = {
         "failure_class",
         "recovery_suggestion",
     ],
-    "AgentBackendConfig": [
+    "InvocationBackendConfig": [
         "backend_id",
         "backend_kind",
         "provider",
@@ -306,7 +306,7 @@ GENERATED_PROJECT_FILE_KINDS = {
     "other",
 }
 GENERATED_FILE_KINDS = set(GENERATED_PROJECT_FILE_KINDS)
-AGENT_BACKEND_KINDS = {
+INVOCATION_BACKEND_KINDS = {
     "llm",
     "llm_file_codegen",
     "code_agent_runner",
@@ -321,7 +321,7 @@ AGENT_BACKEND_KINDS = {
     "mock",
     "custom",
 }
-AGENT_PROVIDERS = {
+INVOCATION_PROVIDERS = {
     "openai",
     "openai_compatible",
     "azure_openai",
@@ -331,7 +331,7 @@ AGENT_PROVIDERS = {
     "mock",
     "custom",
 }
-AGENT_NODE_PURPOSES = {
+INVOCATION_NODE_PURPOSES = {
     "search",
     "extract",
     "synthesize",
@@ -517,15 +517,15 @@ def validate_artifact(artifact_type: str, artifact: dict[str, Any]) -> None:
         missing = [task_id for task_id in artifact.get("task_ids", []) if not any(f"--task {task_id}" in command for command in commands)]
         if missing:
             raise ArtifactValidationError(f"ReplayPlan replay_commands missing tasks: {missing}")
-    elif artifact_type == "AgentInvocationRecord":
-        _assert_in(artifact_type, "backend_kind", artifact.get("backend_kind"), AGENT_BACKEND_KINDS)
-        _assert_in(artifact_type, "node_purpose", artifact.get("node_purpose"), AGENT_NODE_PURPOSES)
+    elif artifact_type == "InvocationRecord":
+        _assert_in(artifact_type, "backend_kind", artifact.get("backend_kind"), INVOCATION_BACKEND_KINDS)
+        _assert_in(artifact_type, "node_purpose", artifact.get("node_purpose"), INVOCATION_NODE_PURPOSES)
         _assert_in(artifact_type, "status", artifact.get("status"), {"pass", "fail", "needs_human"})
         _require_fields(artifact_type, artifact["permissions"], ["network", "filesystem", "auth", "sandbox"])
         _require_fields(artifact_type, artifact["budget"], ["tokens", "time_ms", "cost_limit"])
-    elif artifact_type == "AgentBackendConfig":
-        _assert_in(artifact_type, "backend_kind", artifact.get("backend_kind"), AGENT_BACKEND_KINDS)
-        _assert_in(artifact_type, "provider", artifact.get("provider"), AGENT_PROVIDERS)
+    elif artifact_type == "InvocationBackendConfig":
+        _assert_in(artifact_type, "backend_kind", artifact.get("backend_kind"), INVOCATION_BACKEND_KINDS)
+        _assert_in(artifact_type, "provider", artifact.get("provider"), INVOCATION_PROVIDERS)
         _require_fields(artifact_type, artifact["auth"], ["api_key_env", "auth_env_refs", "requires_auth"])
         _require_fields(artifact_type, artifact["command"], ["argv", "fixed_args", "forbidden_args", "allowlist_executables", "cwd"])
         _require_fields(artifact_type, artifact["timeouts"], ["connect_ms", "run_ms"])
@@ -656,10 +656,10 @@ def _assert_in(artifact_type: str, field: str, value: Any, allowed: set[str]) ->
 def _validate_no_secret_material(artifact: dict[str, Any]) -> None:
     auth = artifact.get("auth", {})
     if "api_key" in auth:
-        raise ArtifactValidationError("AgentBackendConfig.auth must not contain api_key values")
+        raise ArtifactValidationError("InvocationBackendConfig.auth must not contain api_key values")
     api_key_env = auth.get("api_key_env", "")
     if api_key_env and not str(api_key_env).endswith("API_KEY"):
-        raise ArtifactValidationError("AgentBackendConfig.auth.api_key_env must name an env var, not a secret")
+        raise ArtifactValidationError("InvocationBackendConfig.auth.api_key_env must name an env var, not a secret")
 
 
 def write_yaml(path: Path, value: Any) -> None:
