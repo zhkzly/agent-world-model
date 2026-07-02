@@ -3,6 +3,7 @@ import os
 import types
 import sys
 from pathlib import Path
+import textwrap
 
 import agent_world.agents as agents_module
 from agent_world.agents import (
@@ -17,75 +18,110 @@ from agent_world.agents import (
 from agent_world.config import load_agent_world_config
 
 
-def test_agent_backend_config_uses_env_refs_without_secret_values(monkeypatch):
-    monkeypatch.setenv("AGENT_WORLD_AGENT_BACKEND", "llm")
-    monkeypatch.setenv("AGENT_WORLD_OPENAI_BASE_URL", "https://api.example.test/v1")
-    monkeypatch.setenv("AGENT_WORLD_OPENAI_API_KEY", "secret-value-must-not-be-written")
-    monkeypatch.setenv("AGENT_WORLD_OPENAI_MODEL", "configured-model")
-    monkeypatch.setenv("AGENT_WORLD_SMOKE_OPENAI_MODEL", "cheap-smoke-model")
+def _config_env(tmp_path, *, semantic: str, implementation: str = "", stages: str = "", research: str = "") -> dict[str, str]:
+    text = "agent_profiles:\n  semantic:\n"
+    text += textwrap.indent(textwrap.dedent(semantic).strip() + "\n", "    ")
+    text += "  implementation:\n"
+    implementation_text = "inherits: semantic\n" + textwrap.dedent(implementation).strip()
+    text += textwrap.indent(implementation_text.strip() + "\n", "    ")
+    if stages:
+        text += "stages:\n" + textwrap.indent(textwrap.dedent(stages).strip() + "\n", "  ")
+    if research:
+        text += "research:\n" + textwrap.indent(textwrap.dedent(research).strip() + "\n", "  ")
+    config_path = tmp_path / "agent-world.yaml"
+    config_path.write_text(text, encoding="utf-8")
+    return {"AGENT_WORLD_CONFIG": str(config_path)}
 
-    config = load_agent_backend_config_from_env()
+
+def test_agent_backend_config_uses_env_refs_without_secret_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-value-must-not-be-written")
+
+    config = load_agent_backend_config_from_env(
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: llm
+            base_url: https://api.example.test/v1
+            api_key_env: OPENAI_API_KEY
+            model: configured-model
+            smoke_model: cheap-smoke-model
+            """,
+        )
+    )
     encoded = json.dumps(config)
 
     assert config["backend_kind"] == "llm"
-    assert config["auth"]["api_key_env"] == "AGENT_WORLD_OPENAI_API_KEY"
+    assert config["auth"]["api_key_env"] == "OPENAI_API_KEY"
     assert "secret-value-must-not-be-written" not in encoded
     assert config["model"] == "configured-model"
     assert config["smoke_model"] == "cheap-smoke-model"
 
 
 def test_empty_env_mapping_uses_project_agent_defaults_without_secret_values(monkeypatch):
-    monkeypatch.setenv("AGENT_WORLD_AGENT_BACKEND", "llm")
-    monkeypatch.setenv("AGENT_WORLD_OPENAI_API_KEY", "ambient-secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-secret")
+    world_config = load_agent_world_config({})
     config = load_agent_backend_config_from_env({})
 
     assert config["backend_kind"] == "llm"
+    assert world_config.config_path.endswith("config/agent-world.default.yaml")
     assert config["base_url"] == "https://blog.r78xoaxrk.nyat.app:50903/v1"
-    assert config["model"] == "gpt-5.3-codex-spark"
-    assert config["smoke_model"] == "gpt-5.3-codex-spark"
-    assert config["model_candidates"] == ["gpt-5.3-codex-spark", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+    assert config["model"] == "gpt-5.4-mini"
+    assert config["smoke_model"] == "gpt-5.4-mini"
+    assert config["model_candidates"] == ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5"]
     assert config["permissions"]["network"] is True
     assert config["budgets"]["max_tokens"] == 4096
     assert config["timeouts"]["run_ms"] == 60000
-    assert config["auth"]["api_key_env"] == ""
+    assert config["auth"]["api_key_env"] == "OPENAI_API_KEY"
+    assert world_config.research.backend == "jina"
+    assert world_config.research.jina_api_key_env == "JINA_API_KEY"
 
 
-def test_agent_world_config_resolves_semantic_and_implementation_profiles_without_secret_values():
+def test_agent_world_config_resolves_semantic_and_implementation_profiles_without_secret_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "semantic-secret")
     config = load_agent_world_config(
-        {
-            "AGENT_WORLD_OPENAI_API_KEY": "semantic-secret",
-            "AGENT_WORLD_IMPLEMENT_AGENT_BACKEND": "codex_sdk",
-            "AGENT_WORLD_IMPLEMENT_OPENAI_MODEL": "implementation-model",
-            "AGENT_WORLD_IMPLEMENT_OPENAI_API_KEY": "implementation-secret",
-            "AGENT_WORLD_IMPLEMENT_CODE_REPAIR_THREAD_MODE": "continue",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: llm
+            api_key_env: OPENAI_API_KEY
+            """,
+            implementation="""
+            backend_kind: codex_sdk
+            model: implementation-model
+            code_repair_thread_mode: continue
+            """,
+        )
     )
     encoded = json.dumps(config.to_redacted_dict(), sort_keys=True)
 
     assert config.stage_agent_profiles["PLAN"] == "semantic"
     assert config.stage_agent_profiles["IMPLEMENT"] == "implementation"
     assert config.agent_profiles["semantic"].backend_kind == "llm"
-    assert config.agent_profiles["semantic"].api_key_env == "AGENT_WORLD_OPENAI_API_KEY"
+    assert config.agent_profiles["semantic"].api_key_env == "OPENAI_API_KEY"
     assert config.agent_profiles["implementation"].backend_kind == "codex_sdk"
     assert config.agent_profiles["implementation"].model == "implementation-model"
-    assert config.agent_profiles["implementation"].api_key_env == "AGENT_WORLD_IMPLEMENT_OPENAI_API_KEY"
+    assert config.agent_profiles["implementation"].api_key_env == "OPENAI_API_KEY"
     assert config.agent_profiles["implementation"].code_repair_thread_mode == "continue"
     assert "semantic-secret" not in encoded
-    assert "implementation-secret" not in encoded
 
 
-def test_implementation_backend_config_uses_scoped_profile_overrides_without_secret_values():
+def test_implementation_backend_config_uses_yaml_profile_without_secret_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "implementation-secret")
     config = load_implementation_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "llm",
-            "AGENT_WORLD_OPENAI_MODEL": "semantic-model",
-            "AGENT_WORLD_OPENAI_API_KEY": "semantic-secret",
-            "AGENT_WORLD_IMPLEMENT_AGENT_BACKEND": "codex_sdk",
-            "AGENT_WORLD_IMPLEMENT_OPENAI_BASE_URL": "https://impl.example/v1",
-            "AGENT_WORLD_IMPLEMENT_OPENAI_MODEL": "implementation-model",
-            "AGENT_WORLD_IMPLEMENT_OPENAI_API_KEY": "implementation-secret",
-            "AGENT_WORLD_IMPLEMENT_CODE_REPAIR_THREAD_MODE": "continue",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: llm
+            api_key_env: OPENAI_API_KEY
+            model: semantic-model
+            """,
+            implementation="""
+            backend_kind: codex_sdk
+            base_url: https://impl.example/v1
+            model: implementation-model
+            code_repair_thread_mode: continue
+            """,
+        )
     )
     encoded = json.dumps(config, sort_keys=True)
 
@@ -95,21 +131,22 @@ def test_implementation_backend_config_uses_scoped_profile_overrides_without_sec
     assert config["backend_kind"] == "codex_sdk"
     assert config["model"] == "implementation-model"
     assert config["base_url"] == "https://impl.example/v1"
-    assert config["auth"]["api_key_env"] == "AGENT_WORLD_IMPLEMENT_OPENAI_API_KEY"
+    assert config["auth"]["api_key_env"] == "OPENAI_API_KEY"
     assert config["code_repair"]["thread_mode"] == "continue"
-    assert "semantic-secret" not in encoded
     assert "implementation-secret" not in encoded
 
 
-def test_implementation_scoped_command_fallback_overrides_global_command():
+def test_implementation_command_comes_from_yaml_profile(tmp_path):
     config = load_implementation_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_CODE_AGENT_CMD": "global-runner",
-            "AGENT_WORLD_PROCESS_AGENT_ALLOWLIST": "global-runner",
-            "AGENT_WORLD_IMPLEMENT_AGENT_BACKEND": "code_agent_runner",
-            "AGENT_WORLD_IMPLEMENT_CODEX_CMD": "implementation-runner",
-            "AGENT_WORLD_IMPLEMENT_CODEX_ALLOWLIST": "implementation-runner",
-        }
+        _config_env(
+            tmp_path,
+            semantic="backend_kind: llm",
+            implementation="""
+            backend_kind: code_agent_runner
+            command_value: implementation-runner
+            allowlist_value: implementation-runner
+            """,
+        )
     )
 
     assert config["command"]["argv"] == ["implementation-runner"]
@@ -178,26 +215,32 @@ stages:
     assert config.stage_agent_profiles["IMPLEMENT"] == "implementation"
 
 
-def test_llm_config_infers_v1_api_version_from_base_url():
+def test_llm_config_infers_v1_api_version_from_base_url(tmp_path):
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "llm",
-            "AGENT_WORLD_OPENAI_BASE_URL": "https://api.example.test/v1",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: llm
+            base_url: https://api.example.test/v1
+            """,
+        )
     )
 
     assert config["api_version"] == "v1"
 
 
-def test_llm_backend_requires_network_permission(monkeypatch):
-    monkeypatch.setenv("AGENT_WORLD_OPENAI_API_KEY", "secret")
+def test_llm_backend_requires_network_permission(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "llm",
-            "AGENT_WORLD_OPENAI_API_KEY": "secret",
-            "AGENT_WORLD_OPENAI_MODEL": "model",
-            "AGENT_WORLD_AGENT_NETWORK": "0",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: llm
+            api_key_env: OPENAI_API_KEY
+            model: model
+            network: false
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(stage="S1", node_purpose="search", instruction="live", input_artifact_ids=["need"])
@@ -238,15 +281,21 @@ def test_llm_file_codegen_requests_json_object_response_format(tmp_path, monkeyp
         captured["timeout"] = timeout
         return FakeResponse()
 
-    monkeypatch.setenv("AGENT_WORLD_OPENAI_API_KEY", "secret")
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
     monkeypatch.setattr(agents_module.urllib.request, "urlopen", fake_urlopen)
     config = load_implementation_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_OPENAI_API_KEY": "secret",
-            "AGENT_WORLD_IMPLEMENT_AGENT_BACKEND": "llm_file_codegen",
-            "AGENT_WORLD_IMPLEMENT_OPENAI_MODEL": "codegen-model",
-            "AGENT_WORLD_IMPLEMENT_AGENT_NETWORK": "1",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: llm
+            api_key_env: OPENAI_API_KEY
+            """,
+            implementation="""
+            backend_kind: llm_file_codegen
+            model: codegen-model
+            network: true
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(
@@ -269,11 +318,14 @@ def test_llm_file_codegen_requests_json_object_response_format(tmp_path, monkeyp
 def test_process_agent_backend_records_invocation(tmp_path):
     helper = Path(__file__).resolve().parents[1] / "fixtures" / "echo_agent.py"
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "process_agent",
-            "AGENT_WORLD_CODEX_CMD": f"{sys.executable} {helper}",
-            "AGENT_WORLD_PROCESS_AGENT_ALLOWLIST": sys.executable,
-        }
+        _config_env(
+            tmp_path,
+            semantic=f"""
+            backend_kind: process_agent
+            command_value: {sys.executable} {helper}
+            allowlist_value: {sys.executable}
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(
@@ -296,13 +348,16 @@ def test_process_agent_backend_records_invocation(tmp_path):
     assert config["permissions"]["auth"] is False
 
 
-def test_process_agent_rejects_shell_control_arguments():
+def test_process_agent_rejects_shell_control_arguments(tmp_path):
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "process_agent",
-            "AGENT_WORLD_CODEX_CMD": f"{sys.executable} -c 'print(1); print(2)'",
-            "AGENT_WORLD_PROCESS_AGENT_ALLOWLIST": sys.executable,
-        }
+        _config_env(
+            tmp_path,
+            semantic=f"""
+            backend_kind: process_agent
+            command_value: {sys.executable} -c 'print(1); print(2)'
+            allowlist_value: {sys.executable}
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(stage="S1", node_purpose="search", instruction="discover sources", input_artifact_ids=["need-1"])
@@ -314,16 +369,19 @@ def test_process_agent_rejects_shell_control_arguments():
     assert record["status"] == "fail"
 
 
-def test_process_agent_scrubs_secret_env(monkeypatch):
-    monkeypatch.setenv("AGENT_WORLD_OPENAI_API_KEY", "secret-value")
+def test_process_agent_scrubs_secret_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-value")
     helper = Path(__file__).resolve().parents[1] / "fixtures" / "env_probe_agent.py"
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "process_agent",
-            "AGENT_WORLD_CODEX_CMD": f"{sys.executable} {helper}",
-            "AGENT_WORLD_PROCESS_AGENT_ALLOWLIST": sys.executable,
-            "AGENT_WORLD_OPENAI_API_KEY": "secret-value",
-        }
+        _config_env(
+            tmp_path,
+            semantic=f"""
+            backend_kind: process_agent
+            api_key_env: OPENAI_API_KEY
+            command_value: {sys.executable} {helper}
+            allowlist_value: {sys.executable}
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(stage="S1", node_purpose="search", instruction="probe env", input_artifact_ids=["need-1"])
@@ -333,13 +391,16 @@ def test_process_agent_scrubs_secret_env(monkeypatch):
     assert json.loads(result.text)["has_secret"] is False
 
 
-def test_invocation_record_redacts_secret_values(monkeypatch):
-    monkeypatch.setenv("AGENT_WORLD_OPENAI_API_KEY", "secret-value")
+def test_invocation_record_redacts_secret_values(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-value")
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "mock",
-            "AGENT_WORLD_OPENAI_API_KEY": "secret-value",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: mock
+            api_key_env: OPENAI_API_KEY
+            """,
+        )
     )
     registry = AgentBackendRegistry()
     registry.register(MockAgentBackend({"S1:search": "result contains secret-value"}))
@@ -352,13 +413,16 @@ def test_invocation_record_redacts_secret_values(monkeypatch):
     assert "[REDACTED_SECRET]" in record["result_preview"]
 
 
-def test_codex_cli_backend_rejects_unsafe_approval_flags():
+def test_codex_cli_backend_rejects_unsafe_approval_flags(tmp_path):
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_cli",
-            "AGENT_WORLD_CODEX_CMD": "codex --approval-mode=never",
-            "AGENT_WORLD_PROCESS_AGENT_ALLOWLIST": "codex",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_cli
+            command_value: codex --approval-mode=never
+            allowlist_value: codex
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(stage="S1", node_purpose="search", instruction="probe", input_artifact_ids=["need-1"])
@@ -370,13 +434,16 @@ def test_codex_cli_backend_rejects_unsafe_approval_flags():
     assert record["status"] == "fail"
 
 
-def test_codex_cli_backend_requires_safe_approval_and_sandbox():
+def test_codex_cli_backend_requires_safe_approval_and_sandbox(tmp_path):
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_cli",
-            "AGENT_WORLD_CODEX_CMD": "codex exec",
-            "AGENT_WORLD_PROCESS_AGENT_ALLOWLIST": "codex",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_cli
+            command_value: codex exec
+            allowlist_value: codex
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(stage="S1", node_purpose="search", instruction="probe", input_artifact_ids=["need-1"])
@@ -387,13 +454,16 @@ def test_codex_cli_backend_requires_safe_approval_and_sandbox():
     assert "safe approval" in result.text
 
 
-def test_codex_cli_backend_rejects_config_override():
+def test_codex_cli_backend_rejects_config_override(tmp_path):
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_cli",
-            "AGENT_WORLD_CODEX_CMD": "codex exec --approval-mode=on-request --sandbox=workspace-write -c approval_policy=never",
-            "AGENT_WORLD_PROCESS_AGENT_ALLOWLIST": "codex",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_cli
+            command_value: codex exec --approval-mode=on-request --sandbox=workspace-write -c approval_policy=never
+            allowlist_value: codex
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(stage="S1", node_purpose="search", instruction="probe", input_artifact_ids=["need-1"])
@@ -421,19 +491,22 @@ def test_codex_cli_runner_gets_isolated_codex_home_and_api_key(tmp_path, monkeyp
         encoding="utf-8",
     )
     codex_probe.chmod(0o755)
-    monkeypatch.setenv("AGENT_WORLD_OPENAI_API_KEY", "secret-value")
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-value")
 
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_cli_runner",
-            "AGENT_WORLD_CODEX_CMD": f"{codex_probe} --ask-for-approval on-request --sandbox workspace-write exec --json --skip-git-repo-check -",
-            "AGENT_WORLD_PROCESS_AGENT_ALLOWLIST": str(codex_probe),
-            "AGENT_WORLD_OPENAI_BASE_URL": "https://router.example.test/v1",
-            "AGENT_WORLD_OPENAI_API_KEY": "secret-value",
-            "AGENT_WORLD_OPENAI_MODEL": "configured-model",
-            "AGENT_WORLD_SMOKE_OPENAI_MODEL": "smoke-model",
-            "AGENT_WORLD_AGENT_NETWORK": "1",
-        }
+        _config_env(
+            tmp_path,
+            semantic=f"""
+            backend_kind: codex_cli_runner
+            base_url: https://router.example.test/v1
+            api_key_env: OPENAI_API_KEY
+            model: configured-model
+            smoke_model: smoke-model
+            network: true
+            command_value: {codex_probe} --ask-for-approval on-request --sandbox workspace-write exec --json --skip-git-repo-check -
+            allowlist_value: {codex_probe}
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     workspace = tmp_path / "workspace"
@@ -459,13 +532,16 @@ def test_codex_cli_runner_gets_isolated_codex_home_and_api_key(tmp_path, monkeyp
     assert "secret-value" not in probe["config_text"]
 
 
-def test_codex_sdk_config_declares_codex_provider_and_workspace_sandbox():
+def test_codex_sdk_config_declares_codex_provider_and_workspace_sandbox(tmp_path):
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
-            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
-            "AGENT_WORLD_AGENT_NETWORK": "1",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_sdk
+            model: gpt-test
+            network: true
+            """,
+        )
     )
 
     assert config["backend_kind"] == "codex_sdk"
@@ -478,13 +554,16 @@ def test_codex_sdk_config_declares_codex_provider_and_workspace_sandbox():
     assert config["code_repair"]["thread_mode"] == "stateless"
 
 
-def test_codex_sdk_config_accepts_implementation_repair_continuation():
+def test_codex_sdk_config_accepts_implementation_repair_continuation(tmp_path):
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
-            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
-            "AGENT_WORLD_CODE_REPAIR_THREAD_MODE": "continue",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_sdk
+            model: gpt-test
+            code_repair_thread_mode: continue
+            """,
+        )
     )
 
     assert config["code_repair"]["thread_mode"] == "continue"
@@ -519,12 +598,15 @@ def test_codex_sdk_backend_invokes_official_python_sdk(tmp_path, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "openai_codex", types.SimpleNamespace(Codex=FakeCodex, Sandbox=FakeSandbox))
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
-            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
-            "AGENT_WORLD_AGENT_NETWORK": "1",
-            "AGENT_WORLD_CODEX_SANDBOX": "workspace-write",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_sdk
+            model: gpt-test
+            network: true
+            codex_sandbox: workspace-write
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(
@@ -594,11 +676,14 @@ def test_codex_sdk_implementation_can_continue_same_thread(tmp_path, monkeypatch
 
     monkeypatch.setitem(sys.modules, "openai_codex", types.SimpleNamespace(Codex=FakeCodex, Sandbox=FakeSandbox))
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
-            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
-            "AGENT_WORLD_CODE_REPAIR_THREAD_MODE": "continue",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_sdk
+            model: gpt-test
+            code_repair_thread_mode: continue
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     first = AgentRequest(
@@ -646,7 +731,7 @@ def test_codex_sdk_backend_writes_isolated_provider_config(tmp_path, monkeypatch
     class FakeThread:
         def run(self, instruction, **kwargs):
             calls["codex_home"] = os.environ.get("CODEX_HOME")
-            calls["api_key_visible"] = os.environ.get("AGENT_WORLD_OPENAI_API_KEY")
+            calls["api_key_visible"] = os.environ.get("OPENAI_API_KEY")
             return types.SimpleNamespace(final_response="codex final")
 
     class FakeCodex:
@@ -660,16 +745,19 @@ def test_codex_sdk_backend_writes_isolated_provider_config(tmp_path, monkeypatch
             return FakeThread()
 
     monkeypatch.setitem(sys.modules, "openai_codex", types.SimpleNamespace(Codex=FakeCodex, Sandbox=FakeSandbox))
-    monkeypatch.setenv("AGENT_WORLD_OPENAI_API_KEY", "secret-value")
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-value")
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
-            "AGENT_WORLD_OPENAI_BASE_URL": "https://router.example.test/v1",
-            "AGENT_WORLD_OPENAI_API_KEY": "secret-value",
-            "AGENT_WORLD_OPENAI_MODEL": "configured-model",
-            "AGENT_WORLD_SMOKE_OPENAI_MODEL": "smoke-model",
-            "AGENT_WORLD_AGENT_NETWORK": "1",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_sdk
+            base_url: https://router.example.test/v1
+            api_key_env: OPENAI_API_KEY
+            model: configured-model
+            smoke_model: smoke-model
+            network: true
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(
@@ -690,11 +778,79 @@ def test_codex_sdk_backend_writes_isolated_provider_config(tmp_path, monkeypatch
     assert 'model = "smoke-model"' in config_text
     assert 'model_provider = "agent_world_openai"' in config_text
     assert 'base_url = "https://router.example.test/v1"' in config_text
-    assert 'env_key = "AGENT_WORLD_OPENAI_API_KEY"' in config_text
+    assert 'env_key = "OPENAI_API_KEY"' in config_text
     assert "secret-value" not in config_text
 
 
-def test_codex_sdk_backend_missing_sdk_needs_human(monkeypatch):
+def test_codex_sdk_backend_configures_temp_home_without_workspace(tmp_path, monkeypatch):
+    calls = {}
+
+    class FakeSandbox:
+        read_only = "read-only"
+        workspace_write = "workspace-write"
+        full_access = "full-access"
+
+    class FakeThread:
+        def run(self, instruction, **kwargs):
+            codex_home = Path(os.environ["CODEX_HOME"])
+            calls["codex_home"] = codex_home
+            calls["api_key_visible"] = os.environ.get("OPENAI_API_KEY")
+            calls["config_text"] = (codex_home / "config.toml").read_text(encoding="utf-8")
+            calls["run_kwargs"] = kwargs
+            return types.SimpleNamespace(final_response="codex final")
+
+    class FakeCodex:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            pass
+
+        def thread_start(self, **kwargs):
+            calls["thread_start"] = kwargs
+            return FakeThread()
+
+    monkeypatch.setitem(sys.modules, "openai_codex", types.SimpleNamespace(Codex=FakeCodex, Sandbox=FakeSandbox))
+    monkeypatch.setenv("OPENAI_API_KEY", "secret-value")
+    config = load_agent_backend_config_from_env(
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_sdk
+            base_url: https://router.example.test/v1
+            api_key_env: OPENAI_API_KEY
+            model: configured-model
+            network: true
+            """,
+        )
+    )
+    registry = default_agent_backend_registry()
+    request = AgentRequest(
+        stage="S1",
+        node_purpose="search",
+        instruction="discover sources",
+        input_artifact_ids=["need-1"],
+        permissions={"network": True, "filesystem": "artifact_context", "auth": True, "sandbox": True},
+    )
+
+    record, result = invoke_agent(registry, request, config)
+
+    assert result.status == "pass"
+    assert record["backend_kind"] == "codex_sdk"
+    assert calls["api_key_visible"] == "secret-value"
+    assert calls["thread_start"] == {
+        "model": "configured-model",
+        "sandbox": FakeSandbox.workspace_write,
+        "model_provider": "agent_world_openai",
+    }
+    assert calls["run_kwargs"] == {"sandbox": FakeSandbox.workspace_write}
+    assert 'base_url = "https://router.example.test/v1"' in calls["config_text"]
+    assert 'env_key = "OPENAI_API_KEY"' in calls["config_text"]
+    assert "secret-value" not in calls["config_text"]
+    assert not calls["codex_home"].exists()
+
+
+def test_codex_sdk_backend_missing_sdk_needs_human(tmp_path, monkeypatch):
     import importlib
 
     real_import_module = importlib.import_module
@@ -707,10 +863,13 @@ def test_codex_sdk_backend_missing_sdk_needs_human(monkeypatch):
     monkeypatch.delitem(sys.modules, "openai_codex", raising=False)
     monkeypatch.setattr(importlib, "import_module", stub_import_module)
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
-            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_sdk
+            model: gpt-test
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(stage="S1", node_purpose="search", instruction="discover sources", input_artifact_ids=["need-1"])
@@ -755,10 +914,13 @@ def test_codex_sdk_implementation_returns_candidate_manifest_ref(tmp_path, monke
 
     monkeypatch.setitem(sys.modules, "openai_codex", types.SimpleNamespace(Codex=FakeCodex, Sandbox=FakeSandbox))
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
-            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_sdk
+            model: gpt-test
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(
@@ -799,10 +961,13 @@ def test_codex_sdk_implementation_requires_candidate_manifest(tmp_path, monkeypa
 
     monkeypatch.setitem(sys.modules, "openai_codex", types.SimpleNamespace(Codex=FakeCodex, Sandbox=FakeSandbox))
     config = load_agent_backend_config_from_env(
-        {
-            "AGENT_WORLD_AGENT_BACKEND": "codex_sdk",
-            "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
-        }
+        _config_env(
+            tmp_path,
+            semantic="""
+            backend_kind: codex_sdk
+            model: gpt-test
+            """,
+        )
     )
     registry = default_agent_backend_registry()
     request = AgentRequest(

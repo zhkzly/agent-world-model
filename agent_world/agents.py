@@ -7,6 +7,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -121,7 +122,7 @@ class ProcessAgentBackend:
                 text="process agent command is not configured",
                 status="fail",
                 failure_class="missing_process_command",
-                recovery_suggestion="Set AGENT_WORLD_CODE_AGENT_CMD or configure AgentBackendConfig.command.argv",
+                recovery_suggestion="Configure command_value and allowlist_value in the selected YAML agent profile.",
             )
         timeout_ms = int(config.get("timeouts", {}).get("run_ms") or request.budget.get("time_ms") or 5000)
         if request.permissions.get("network") and not config.get("permissions", {}).get("network"):
@@ -240,7 +241,7 @@ class CodeAgentRunnerBackend:
                 text="code agent runner command is not configured",
                 status="fail",
                 failure_class="missing_runner_command",
-                recovery_suggestion="Set AGENT_WORLD_CODE_AGENT_CMD or configure AgentBackendConfig.command.argv.",
+                recovery_suggestion="Configure command_value and allowlist_value in the selected YAML agent profile.",
             )
         workspace_text = str(request.permissions.get("filesystem_root") or "")
         if not workspace_text:
@@ -263,7 +264,7 @@ class CodeAgentRunnerBackend:
                 text="code agent runner network permission denied",
                 status="fail",
                 failure_class="permission_denied",
-                recovery_suggestion="Set AGENT_WORLD_AGENT_NETWORK=1 only for trusted live runners.",
+                recovery_suggestion="Set network: true only for trusted live runners in the selected YAML agent profile.",
             )
         if request.permissions.get("auth") and not config.get("permissions", {}).get("auth"):
             return AgentResult(
@@ -379,7 +380,7 @@ class CodexSdkAgentBackend:
                 text="Codex SDK model is not configured",
                 status="needs_human",
                 failure_class="missing_codex_model",
-                recovery_suggestion="Set AGENT_WORLD_OPENAI_MODEL or AGENT_WORLD_SMOKE_OPENAI_MODEL for codex_sdk.",
+                recovery_suggestion="Configure model or smoke_model in the selected YAML codex_sdk profile.",
             )
         try:
             sdk_module = importlib.import_module("openai_codex")
@@ -553,7 +554,7 @@ class OpenAICompatibleBackend:
                 text="OpenAI-compatible backend is not configured",
                 status="needs_human",
                 failure_class="missing_openai_configuration",
-                recovery_suggestion="Set AGENT_WORLD_OPENAI_API_KEY and AGENT_WORLD_OPENAI_MODEL, or choose another real AgentBackend.",
+                recovery_suggestion="Set OPENAI_API_KEY and configure model/api_key_env in the selected YAML agent profile.",
             )
         base_url = (config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
         body = {
@@ -632,7 +633,7 @@ class LLMFileCodegenBackend:
                 text="LLM file codegen backend network permission denied",
                 status="fail",
                 failure_class="network_permission_denied",
-                recovery_suggestion="Set AGENT_WORLD_AGENT_NETWORK=1 for live codegen.",
+                recovery_suggestion="Set network: true for live codegen in the selected YAML agent profile.",
             )
         if not request.permissions.get("auth") or not config.get("permissions", {}).get("auth"):
             return AgentResult(
@@ -702,7 +703,7 @@ def _openai_chat_completion(
             text="OpenAI-compatible backend is not configured",
             status="needs_human",
             failure_class="missing_openai_configuration",
-            recovery_suggestion="Set AGENT_WORLD_OPENAI_API_KEY and AGENT_WORLD_OPENAI_MODEL, or choose another real AgentBackend.",
+            recovery_suggestion="Set OPENAI_API_KEY and configure model/api_key_env in the selected YAML agent profile.",
         )
     base_url = (config.get("base_url") or "https://api.openai.com/v1").rstrip("/")
     body = {
@@ -1085,14 +1086,14 @@ def _codex_sdk_permission_error(request: AgentRequest, config: dict[str, Any]) -
             text="Codex SDK network permission denied",
             status="fail",
             failure_class="network_permission_denied",
-            recovery_suggestion="Set AGENT_WORLD_AGENT_NETWORK=1 only for trusted live Codex SDK runs.",
+            recovery_suggestion="Set network: true only for trusted live Codex SDK runs in the selected YAML agent profile.",
         )
     if request.permissions.get("auth") and not permissions.get("auth"):
         return AgentResult(
             text="Codex SDK auth permission denied",
             status="fail",
             failure_class="auth_permission_denied",
-            recovery_suggestion="Configure explicit auth env refs or AGENT_WORLD_CODEX_AUTH=1 for trusted Codex SDK runs.",
+            recovery_suggestion="Configure api_key_env/auth_env_refs in YAML for trusted Codex SDK runs.",
         )
     if request.permissions.get("sandbox") and not permissions.get("sandbox"):
         return AgentResult(
@@ -1136,14 +1137,14 @@ def _codex_sdk_sandbox(Sandbox: Any, config: dict[str, Any]) -> tuple[Any, Agent
             text="Codex SDK full-access sandbox is not allowed by this framework",
             status="fail",
             failure_class="invalid_codex_sdk_sandbox",
-            recovery_suggestion="Use AGENT_WORLD_CODEX_SANDBOX=workspace-write or read-only.",
+            recovery_suggestion="Use codex_sandbox: workspace-write or read-only in YAML.",
         )
     else:
         return None, AgentResult(
             text=f"Unsupported Codex SDK sandbox: {raw}",
             status="fail",
             failure_class="invalid_codex_sdk_sandbox",
-            recovery_suggestion="Use AGENT_WORLD_CODEX_SANDBOX=workspace-write or read-only.",
+            recovery_suggestion="Use codex_sandbox: workspace-write or read-only in YAML.",
         )
     if not hasattr(Sandbox, attr):
         return None, AgentResult(
@@ -1229,11 +1230,19 @@ def _temporary_cwd(path: Path | None) -> Any:
 
 @contextlib.contextmanager
 def _codex_sdk_environment(config: dict[str, Any], workspace: Path | None) -> Any:
-    if workspace is None:
-        yield
+    if workspace is not None:
+        codex_home = workspace / "agent-output" / "codex-home"
+        codex_home.mkdir(parents=True, exist_ok=True)
+        with _codex_sdk_home_environment(config, codex_home):
+            yield
         return
-    codex_home = workspace / "agent-output" / "codex-home"
-    codex_home.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="agent-world-codex-home-") as temp_dir:
+        with _codex_sdk_home_environment(config, Path(temp_dir)):
+            yield
+
+
+@contextlib.contextmanager
+def _codex_sdk_home_environment(config: dict[str, Any], codex_home: Path) -> Any:
     config_text = _codex_sdk_config_text(config)
     if config_text:
         (codex_home / "config.toml").write_text(config_text, encoding="utf-8")

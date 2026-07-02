@@ -40,7 +40,7 @@ def local_source_results(paths: list[Path]) -> list[dict[str, Any]]:
 
 def searxng_results(base_url: str, queries: list[str], *, max_results: int) -> list[dict[str, Any]]:
     if not base_url:
-        raise ValueError("AGENT_WORLD_SEARXNG_URL is required for searxng research backend")
+        raise ValueError("research.searxng_url is required for searxng research backend")
     output: list[dict[str, Any]] = []
     root = base_url.rstrip("/")
     for query in queries:
@@ -70,7 +70,7 @@ def jina_results(
     max_results: int,
 ) -> list[dict[str, Any]]:
     if not search_url:
-        raise ValueError("AGENT_WORLD_JINA_SEARCH_URL is required for jina research backend")
+        raise ValueError("research.jina_search_url is required for jina research backend")
     output: list[dict[str, Any]] = []
     for query in queries:
         search_text = _jina_http_text(_jina_search_endpoint(search_url, query), api_key=api_key)
@@ -98,7 +98,7 @@ def jina_results(
 
 def process_results(command: str, packet: dict[str, Any], *, max_results: int) -> list[dict[str, Any]]:
     if not command:
-        raise ValueError("AGENT_WORLD_RESEARCH_CMD is required for process research backend")
+        raise ValueError("research.process_command is required for process research backend")
     completed = subprocess.run(
         shlex.split(command),
         input=json.dumps(packet, sort_keys=True),
@@ -142,7 +142,7 @@ def _jina_reader_endpoint(reader_url: str, target_url: str) -> str:
 
 
 def _jina_http_text(url: str, *, api_key: str) -> str:
-    headers = {"Accept": "text/plain"}
+    headers = {"Accept": "text/plain", "User-Agent": "agent-world-model/0.1 (+https://jina.ai/reader)"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(url, headers=headers, method="GET")

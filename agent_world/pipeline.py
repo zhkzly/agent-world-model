@@ -704,7 +704,7 @@ def _run_agent_implementation_attempt(
             "verifier_result": {},
             "status": "fail",
             "failure_class": "missing_code_repair_conversation_ref",
-            "recovery_suggestion": "Disable AGENT_WORLD_CODE_REPAIR_THREAD_MODE=continue or rerun the initial IMPLEMENT attempt with Codex SDK continuation enabled.",
+            "recovery_suggestion": "Disable code_repair_thread_mode: continue in YAML or rerun the initial IMPLEMENT attempt with Codex SDK continuation enabled.",
         }
         record = _with_attempt_metadata(
             record,
@@ -846,11 +846,7 @@ def _run_agent_implementation_attempt(
 
 
 def _configured_max_repair_attempts(config: PipelineRunConfig) -> int:
-    env = os.environ if config.env is None else config.env
-    raw = env.get("AGENT_WORLD_MAX_REPAIR_ATTEMPTS")
-    if raw is None or raw == "":
-        return max(0, int(config.max_repair_attempts))
-    return max(0, int(raw))
+    return max(0, int(config.max_repair_attempts))
 
 
 def _stage_attempt_budget(node: PipelineNode, context: PipelineContext) -> int:

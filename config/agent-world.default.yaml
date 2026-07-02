@@ -1,0 +1,39 @@
+node_execution:
+  mode: agent
+
+agent_profiles:
+  semantic:
+    backend_kind: llm
+    provider: openai_compatible
+    base_url: https://blog.r78xoaxrk.nyat.app:50903/v1
+    model: gpt-5.4-mini
+    api_key_env: OPENAI_API_KEY
+    model_candidates:
+      - gpt-5.4-mini
+      - gpt-5.4
+      - gpt-5.5
+    network: true
+    timeout_ms: 60000
+    max_attempts: 3
+    max_tokens: 4096
+    codex_sandbox: workspace-write
+    code_repair_thread_mode: stateless
+
+  implementation:
+    inherits: semantic
+    backend_kind: codex_sdk
+    provider: codex
+    model: gpt-5.4
+
+stages:
+  default_agent_profile: semantic
+  agent_profiles:
+    IMPLEMENT: implementation
+
+research:
+  backend: jina
+  jina_search_url: https://s.jina.ai
+  jina_reader_url: https://r.jina.ai
+  jina_api_key_env: JINA_API_KEY
+  max_queries: 5
+  max_results: 10

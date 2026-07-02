@@ -1,8 +1,18 @@
 import json
+import textwrap
 
 from agent_world.config import load_research_config
 from agent_world.research import lightweight
 from agent_world.research import providers
+
+
+def _research_env(tmp_path, research: str, **values: str) -> dict[str, str]:
+    config_path = tmp_path / "agent-world.yaml"
+    config_path.write_text(
+        "research:\n" + textwrap.indent(textwrap.dedent(research).strip() + "\n", "  "),
+        encoding="utf-8",
+    )
+    return {"AGENT_WORLD_CONFIG": str(config_path), **values}
 
 
 def test_jina_provider_searches_and_fetches_markdown(monkeypatch):
@@ -41,9 +51,10 @@ URL Source: https://docs.example/two
     assert "Fetched markdown one" in results[0]["snippet"]
     assert all(len(item["version_or_hash"]) == 64 for item in results)
     assert any(call["headers"].get("Authorization") == "Bearer jina-test-key" for call in calls)
+    assert all(call["headers"].get("User-agent") or call["headers"].get("User-Agent") for call in calls)
 
 
-def test_jina_research_backend_collects_candidates_without_recording_secret(monkeypatch):
+def test_jina_research_backend_collects_candidates_without_recording_secret(tmp_path, monkeypatch):
     captured = {}
 
     def stub_jina_results(search_url, reader_url, api_key, queries, *, max_results):
@@ -68,13 +79,17 @@ def test_jina_research_backend_collects_candidates_without_recording_secret(monk
 
     monkeypatch.setattr(lightweight, "jina_results", stub_jina_results)
     context = _ResearchContext(
-        {
-            "AGENT_WORLD_RESEARCH_BACKEND": "jina",
-            "AGENT_WORLD_JINA_SEARCH_URL": "https://s.jina.ai",
-            "AGENT_WORLD_JINA_READER_URL": "https://r.jina.ai",
-            "AGENT_WORLD_JINA_API_KEY": "secret-value",
-            "AGENT_WORLD_RESEARCH_MAX_RESULTS": "3",
-        }
+        _research_env(
+            tmp_path,
+            """
+            backend: jina
+            jina_search_url: https://s.jina.ai
+            jina_reader_url: https://r.jina.ai
+            jina_api_key_env: JINA_API_KEY
+            max_results: 3
+            """,
+            JINA_API_KEY="secret-value",
+        )
     )
 
     packet = lightweight.collect_research_candidates(context, load_research_config(context.config.env))
@@ -86,16 +101,48 @@ def test_jina_research_backend_collects_candidates_without_recording_secret(monk
     assert "secret-value" not in serialized
 
 
-def test_research_backend_provider_failure_keeps_local_raw_request(monkeypatch):
+def test_default_research_backend_uses_jina_configured_key_env_without_secret(monkeypatch):
+    captured = {}
+
+    def stub_jina_results(search_url, reader_url, api_key, queries, *, max_results):
+        captured.update(
+            {
+                "search_url": search_url,
+                "reader_url": reader_url,
+                "api_key": api_key,
+                "queries": queries,
+                "max_results": max_results,
+            }
+        )
+        return []
+
+    monkeypatch.setattr(lightweight, "jina_results", stub_jina_results)
+    context = _ResearchContext({})
+    config = load_research_config(context.config.env)
+
+    packet = lightweight.collect_research_candidates(context, config)
+
+    assert config.backend == "jina"
+    assert config.jina_api_key_env == "JINA_API_KEY"
+    assert captured["search_url"] == "https://s.jina.ai"
+    assert captured["reader_url"] == "https://r.jina.ai"
+    assert captured["api_key"] == ""
+    assert any(source["source_id"] == "source-raw-request" for source in packet["candidates"])
+
+
+def test_research_backend_provider_failure_keeps_local_raw_request(tmp_path, monkeypatch):
     def failing_jina_results(*args, **kwargs):
         raise TimeoutError("jina timed out")
 
     monkeypatch.setattr(lightweight, "jina_results", failing_jina_results)
     context = _ResearchContext(
-        {
-            "AGENT_WORLD_RESEARCH_BACKEND": "jina",
-            "AGENT_WORLD_RESEARCH_MAX_RESULTS": "3",
-        }
+        _research_env(
+            tmp_path,
+            """
+            backend: jina
+            max_results: 3
+            """,
+        )
     )
 
     packet = lightweight.collect_research_candidates(context, load_research_config(context.config.env))

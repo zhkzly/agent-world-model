@@ -1,3 +1,5 @@
+import textwrap
+
 from agent_world.agents import AgentBackendRegistry, AgentResult, load_agent_backend_config_from_env, load_implementation_agent_backend_config_from_env
 from agent_world.artifacts import make_artifact
 from agent_world.pipeline import (
@@ -16,13 +18,24 @@ from agent_world.store import ArtifactStore
 RAW_REQUEST = "Generate an incident runbook environment that tracks alerts and owners."
 
 
+def _config_env(tmp_path, *, semantic: str = "backend_kind: llm", implementation: str = "") -> dict[str, str]:
+    text = "agent_profiles:\n  semantic:\n"
+    text += textwrap.indent(textwrap.dedent(semantic).strip() + "\n", "    ")
+    text += "  implementation:\n"
+    implementation_text = "inherits: semantic\n" + textwrap.dedent(implementation).strip()
+    text += textwrap.indent(implementation_text.strip() + "\n", "    ")
+    config_path = tmp_path / "agent-world.yaml"
+    config_path.write_text(text, encoding="utf-8")
+    return {"AGENT_WORLD_CONFIG": str(config_path)}
+
+
 def test_request_driven_pipeline_rejects_mock_semantic_backend(tmp_path):
     record, context = run_request_driven_pipeline(
         PipelineRunConfig(
             run_id="reject-mock-semantic-backend",
             raw_request=RAW_REQUEST,
             output_dir=tmp_path,
-            env={"AGENT_WORLD_AGENT_BACKEND": "mock"},
+            env=_config_env(tmp_path, semantic="backend_kind: mock"),
         )
     )
 
@@ -39,7 +52,7 @@ def test_invalid_agent_json_fails_with_invocation_record(tmp_path):
             run_id="invalid-json",
             raw_request=RAW_REQUEST,
             output_dir=tmp_path,
-            env={"AGENT_WORLD_AGENT_BACKEND": "llm"},
+            env=_config_env(tmp_path),
         ),
         agent_registry=_registry(backend),
     )
@@ -60,7 +73,7 @@ def test_invalid_agent_fields_fail_with_invocation_record(tmp_path):
             run_id="invalid-fields",
             raw_request=RAW_REQUEST,
             output_dir=tmp_path,
-            env={"AGENT_WORLD_AGENT_BACKEND": "llm"},
+            env=_config_env(tmp_path),
         ),
         agent_registry=_registry(backend),
     )
@@ -187,7 +200,7 @@ def _context_at_s1(tmp_path, backend):
             run_id="s1-agent-call-setup",
             raw_request=RAW_REQUEST,
             output_dir=tmp_path,
-            env={"AGENT_WORLD_AGENT_BACKEND": "llm"},
+            env=_config_env(tmp_path),
             stop_after="SELECT",
         ),
         agent_registry=_registry(SetupBackend()),
@@ -245,11 +258,15 @@ class FailingCodexBackend:
 
 
 def _implementation_context(tmp_path, backend):
-    env = {
-        "AGENT_WORLD_IMPLEMENT_AGENT_BACKEND": "codex_sdk",
-        "AGENT_WORLD_OPENAI_MODEL": "gpt-test",
-        "AGENT_WORLD_IMPLEMENT_CODE_REPAIR_THREAD_MODE": "continue",
-    }
+    env = _config_env(
+        tmp_path,
+        semantic="backend_kind: llm",
+        implementation="""
+        backend_kind: codex_sdk
+        model: gpt-test
+        code_repair_thread_mode: continue
+        """,
+    )
     config = PipelineRunConfig(
         run_id="implementation-repair-continuation",
         raw_request=RAW_REQUEST,

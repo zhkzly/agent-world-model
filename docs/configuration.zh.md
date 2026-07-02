@@ -2,49 +2,62 @@
 
 项目配置入口是 `agent_world.config.load_agent_world_config()`。
 
-配置模型只有一个：`AgentWorldConfig`。它包含：
+默认非 secret 配置放在：
 
-- `agent_profiles`：可复用的 agent/backend profile，例如 `semantic`、`implementation`。
-- `stage_agent_profiles`：每个 pipeline stage 使用哪个 profile。
-- `research`：source discovery provider 配置，例如 `local`、`jina`、`searxng`、`process`。
-- `node_execution_mode`：节点执行模式，默认 `agent`。
+```text
+config/agent-world.default.yaml
+```
+
+用户平时只需要在 shell 里配置 secret 和机器相关值：
+
+```bash
+export OPENAI_API_KEY=...
+export JINA_API_KEY=...
+# 可选：覆盖 YAML 里的 OpenAI-compatible base URL
+export OPENAI_BASE_URL=https://...
+```
+
+不要把真实 key 写入 YAML、artifact、trace、manifest 或 release 包。
+
+## 配置模型
+
+配置只有一套：`AgentWorldConfig`。
+
+- `agent_profiles`：可复用的 backend profile，例如 `semantic`、`implementation`。
+- `stages`：每个 pipeline stage 使用哪个 profile。
+- `research`：source discovery provider 配置，例如 `jina`、`searxng`、`process`。
+- `node_execution`：节点执行模式，默认 `agent`。
+
+`semantic` 不是语义搜索，也不是一次固定调用。它是 PLAN、S0-S8、S10、S11 等非实现阶段的默认 profile：这些阶段主要产出结构化 JSON artifact。默认让它走 OpenAI-compatible `llm`，用 `gpt-5.4-mini`。
+
+`implementation` 是 IMPLEMENT 阶段的 profile。默认走真实 `codex_sdk`，用 `gpt-5.4`，让 Codex SDK 在隔离 workspace 中生成 `generated/` 和 `agent-output/candidate_manifest.json`。
 
 ## 默认行为
 
-默认无需配置文件：
-
-```bash
-export AGENT_WORLD_OPENAI_API_KEY=...
-```
-
-默认语义节点使用：
-
-- profile: `semantic`
-- backend: `llm`
-- base url: `https://blog.r78xoaxrk.nyat.app:50903/v1`
-- model: `gpt-5.3-codex-spark`
-
-默认 `IMPLEMENT` 使用 profile `implementation`。如果没有显式覆盖实现 profile，并且没有设置全局 `AGENT_WORLD_AGENT_BACKEND`，实现 backend 默认是 `codex_sdk`；如果设置了全局 backend，则 implementation 会继承该 backend。
-
-`codex_sdk` 是 IMPLEMENT 的真实 code agent 路径：SDK 在隔离 workspace 中直接生成 `generated/` 和 `agent-output/candidate_manifest.json`。`llm_file_codegen` 只是低能力兼容适配器：它调用 OpenAI-compatible LLM 产出 `files[]` JSON，再由框架代写文件；它不是 Codex SDK，也不应作为默认实现路径。
-
-## YAML 配置
-
-可以通过 `AGENT_WORLD_CONFIG` 指向 YAML：
+默认使用 `config/agent-world.default.yaml`：
 
 ```yaml
+node_execution:
+  mode: agent
+
 agent_profiles:
   semantic:
     backend_kind: llm
+    provider: openai_compatible
     base_url: https://blog.r78xoaxrk.nyat.app:50903/v1
-    model: gpt-5.3-codex-spark
-    api_key_env: AGENT_WORLD_OPENAI_API_KEY
+    model: gpt-5.4-mini
+    api_key_env: OPENAI_API_KEY
+    model_candidates:
+      - gpt-5.4-mini
+      - gpt-5.4
+      - gpt-5.5
+    network: true
 
   implementation:
     inherits: semantic
     backend_kind: codex_sdk
-    model: gpt-5.3-codex-spark
-    code_repair_thread_mode: continue
+    provider: codex
+    model: gpt-5.4
 
 stages:
   default_agent_profile: semantic
@@ -53,47 +66,35 @@ stages:
 
 research:
   backend: jina
-  max_results: 5
+  jina_search_url: https://s.jina.ai
+  jina_reader_url: https://r.jina.ai
+  jina_api_key_env: JINA_API_KEY
 ```
 
-配置文件只能写 secret 的环境变量名，例如 `api_key_env`，不能写真实 key、token 或 secret 值。
-
-## Env 覆盖规则
-
-Env 优先级高于 YAML。
-
-全局语义 profile：
+如果要使用另一套非 secret 配置，只设置：
 
 ```bash
-AGENT_WORLD_AGENT_BACKEND=llm
-AGENT_WORLD_OPENAI_BASE_URL=https://...
-AGENT_WORLD_OPENAI_MODEL=gpt-5.3-codex-spark
-AGENT_WORLD_OPENAI_API_KEY=...
+export AGENT_WORLD_CONFIG=/path/to/agent-world.yaml
 ```
 
-实现 profile 覆盖：
+## Jina
 
-```bash
-AGENT_WORLD_IMPLEMENT_AGENT_BACKEND=codex_sdk
-AGENT_WORLD_IMPLEMENT_OPENAI_MODEL=gpt-5.4
-AGENT_WORLD_IMPLEMENT_CODE_REPAIR_THREAD_MODE=continue
-```
+默认 source discovery 使用 Jina Search/Reader：
 
-Research provider：
+- `research.backend: jina`
+- `research.jina_search_url: https://s.jina.ai`
+- `research.jina_reader_url: https://r.jina.ai`
+- `research.jina_api_key_env: JINA_API_KEY`
 
-```bash
-AGENT_WORLD_RESEARCH_BACKEND=jina
-AGENT_WORLD_JINA_SEARCH_URL=https://s.jina.ai
-AGENT_WORLD_JINA_READER_URL=https://r.jina.ai
-```
+Jina Search 需要 API key。Reader 读取已知 URL 可能允许匿名，但 pipeline 的 search 阶段应配置 `JINA_API_KEY`。
 
-Stage 绑定覆盖：
+## Env 边界
 
-```bash
-AGENT_WORLD_STAGE_IMPLEMENT_AGENT_PROFILE=implementation
-AGENT_WORLD_STAGE_S1_AGENT_PROFILE=semantic
-```
+配置行为由 YAML 决定。环境变量只用于：
 
-## Runtime Artifact
+- `OPENAI_API_KEY`：OpenAI-compatible/Codex SDK 鉴权。
+- `OPENAI_BASE_URL`：本机临时覆盖 OpenAI-compatible base URL。
+- `JINA_API_KEY`：Jina Search/Reader 鉴权。
+- `AGENT_WORLD_CONFIG`：选择另一份 YAML。
 
-Pipeline 会把解析后的 profile 写成 `AgentBackendConfig` artifact，供 agent invocation record 和 gates 引用。IMPLEMENT 的 profile 也会被记录为 backend-config artifact，但它来自同一个 `AgentWorldConfig`，不是另一套独立配置系统。
+历史 backend/model/stage/research 环境变量覆盖入口不再作为配置来源。内部执行时注入的运行时变量只给子进程使用，不属于用户配置面。
