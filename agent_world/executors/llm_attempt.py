@@ -4,115 +4,96 @@ import json
 from pathlib import Path
 from typing import Any
 
-from agent_world.agents import AgentRequest, invoke_agent
+from agent_world.agents import InvocationRequest, invoke_backend
 from agent_world.artifacts import ARTIFACT_REQUIRED_FIELDS, make_artifact, stable_json
 from agent_world.canonical_ids import canonicalize_stage_fields
-from agent_world.executors.base import NodeExecutionResult
-import agent_world.request_driven as request_driven
+from agent_world.executors.base import NodeAttemptResult
 
 
-class StructuredAgentExecutor:
-    executor_id = "structured_agent"
+class LlmAttemptExecutor:
+    executor_id = "llm_attempt"
 
-    def execute(self, context: Any, node: Any, profile: Any) -> NodeExecutionResult:
+    def execute(self, context: Any, node: Any, profile: Any, *, attempt_index: int = 1) -> NodeAttemptResult:
         prompt_text = _read_project_text(profile.prompt_ref)
         skill_texts = [(ref, _read_project_text(ref)) for ref in profile.skill_refs]
-        backend_config = context.artifact("AgentBackendConfig")
+        backend_config = context.artifact("InvocationBackendConfig")
         if backend_config.get("backend_kind") == "mock":
-            return NodeExecutionResult(
+            return NodeAttemptResult(
                 status="needs_human",
                 failure_class="mock_backend_not_allowed",
-                recovery_suggestion=f"Configure a real AgentBackend for {node.stage}; mock backends cannot produce accepted semantic artifact fields.",
+                recovery_suggestion=f"Configure a real InvocationBackend for {node.stage}; mock backends cannot produce accepted semantic artifact fields.",
             )
-        attempts = max(1, int(backend_config.get("retries", {}).get("max_attempts") or 1))
         invocations = []
         evidence_refs = []
         trace_refs = []
-        feedback = []
-        last_failure_class = "agent_node_failed"
-        last_recovery = "Fix the configured agent backend or stage prompt."
-        for attempt_index in range(1, attempts + 1):
-            stage_feedback = list(getattr(context, "node_feedback", {}).get(node.stage, []))
-            instruction = _instruction(context, node, profile, prompt_text, skill_texts, feedback=stage_feedback + feedback)
-            request = AgentRequest(
-                stage=node.stage,
-                node_purpose=profile.node_purpose,
-                instruction=instruction,
-                input_artifact_ids=[context.artifacts[name]["id"] for name in node.input_artifact_types if name in context.artifacts],
-                invocation_id=f"invoke-{node.stage.lower()}-{profile.executor_id}-{profile.node_purpose}-attempt-{attempt_index}",
-                permissions={
-                    "network": bool(backend_config.get("permissions", {}).get("network")),
-                    "filesystem": "artifact_context",
-                    "auth": bool(backend_config.get("permissions", {}).get("auth")),
-                    "sandbox": False,
-                },
-                budget={
-                    "tokens": int(backend_config.get("budgets", {}).get("max_tokens", 0)),
-                    "time_ms": int(backend_config.get("timeouts", {}).get("run_ms", 5000)),
-                    "cost_limit": int(backend_config.get("budgets", {}).get("max_cost", 0)),
-                },
-                instruction_ref=profile.prompt_ref or f"stage:{node.stage}",
-            )
-            invocation, result = invoke_agent(context.agent_registry, request, backend_config)
-            invocation = _annotate_invocation(invocation, profile)
-            invocations.append(invocation)
-            evidence_refs.extend(result.evidence_refs)
-            if result.trace_ref:
-                trace_refs.append(result.trace_ref)
-            if result.status != "pass":
-                return NodeExecutionResult(
-                    status=result.status,
-                    invocation_records=invocations,
-                    evidence_refs=evidence_refs,
-                    trace_refs=trace_refs,
-                    failure_class=result.failure_class or "agent_node_failed",
-                    recovery_suggestion=result.recovery_suggestion or "Fix the configured agent backend or stage prompt.",
-                )
-            parsed, parse_error = _parse_json_object(result.text)
-            if parse_error:
-                last_failure_class = "invalid_agent_json"
-                last_recovery = parse_error
-                feedback.append(_feedback("invalid_agent_json", parse_error, result.text))
-                continue
-            fields = _fields_for_stage(context, node.stage, parsed)
-            validation_error = _validate_fields(context, node, fields)
-            if validation_error:
-                last_failure_class = "invalid_agent_artifact_fields"
-                last_recovery = validation_error
-                feedback.append(_feedback("invalid_agent_artifact_fields", validation_error, stable_json(fields)))
-                continue
-            return NodeExecutionResult(
-                status="pass",
-                fields=fields,
+        stage_feedback = list(getattr(context, "node_feedback", {}).get(node.stage, []))
+        instruction = _instruction(context, node, profile, prompt_text, skill_texts, feedback=stage_feedback)
+        request = InvocationRequest(
+            stage=node.stage,
+            node_purpose=profile.node_purpose,
+            instruction=instruction,
+            input_artifact_ids=[context.artifacts[name]["id"] for name in node.input_artifact_types if name in context.artifacts],
+            invocation_id=f"invoke-{node.stage.lower()}-{profile.executor_id}-{profile.node_purpose}-attempt-{attempt_index}",
+            permissions={
+                "network": bool(backend_config.get("permissions", {}).get("network")),
+                "filesystem": "artifact_context",
+                "auth": bool(backend_config.get("permissions", {}).get("auth")),
+                "sandbox": False,
+            },
+            budget={
+                "tokens": int(backend_config.get("budgets", {}).get("max_tokens", 0)),
+                "time_ms": int(backend_config.get("timeouts", {}).get("run_ms", 5000)),
+                "cost_limit": int(backend_config.get("budgets", {}).get("max_cost", 0)),
+            },
+            instruction_ref=profile.prompt_ref or f"stage:{node.stage}",
+        )
+        invocation, result = invoke_backend(context.invocation_registry, request, backend_config)
+        invocation = _annotate_invocation(invocation, profile)
+        invocations.append(invocation)
+        evidence_refs.extend(result.evidence_refs)
+        if result.trace_ref:
+            trace_refs.append(result.trace_ref)
+        if result.status != "pass":
+            return NodeAttemptResult(
+                status=result.status,
                 invocation_records=invocations,
                 evidence_refs=evidence_refs,
                 trace_refs=trace_refs,
+                failure_class=result.failure_class or "llm_attempt_failed",
+                recovery_suggestion=result.recovery_suggestion or "Fix the configured invocation backend or stage prompt.",
             )
-        return NodeExecutionResult(
-            status="fail",
+        parsed, parse_error = _parse_json_object(result.text)
+        if parse_error:
+            return NodeAttemptResult(
+                status="fail",
+                invocation_records=invocations,
+                evidence_refs=evidence_refs,
+                trace_refs=trace_refs,
+                failure_class="invalid_invocation_json",
+                recovery_suggestion=parse_error,
+            )
+        fields = _fields_for_stage(context, node.stage, parsed)
+        validation_error = _validate_fields(context, node, fields)
+        if validation_error:
+            return NodeAttemptResult(
+                status="fail",
+                invocation_records=invocations,
+                evidence_refs=evidence_refs,
+                trace_refs=trace_refs,
+                failure_class="invalid_attempt_artifact_fields",
+                recovery_suggestion=validation_error,
+            )
+        return NodeAttemptResult(
+            status="pass",
+            fields=fields,
             invocation_records=invocations,
             evidence_refs=evidence_refs,
             trace_refs=trace_refs,
-            failure_class=last_failure_class,
-            recovery_suggestion=last_recovery,
         )
 
 
 def _fields_for_stage(context: Any, stage: str, parsed: dict[str, Any]) -> dict[str, Any]:
-    fields = canonicalize_stage_fields(context, stage, dict(parsed.get("fields") if isinstance(parsed.get("fields"), dict) else parsed))
-    if stage == "S8":
-        base = request_driven.feasibility_report_fields(context)
-        base["llm_feasibility_review"] = fields
-        if fields.get("status") in {"fail", "needs_human"}:
-            base["advisory_implementation_risks"] = [
-                {
-                    "source": "llm_feasibility_review",
-                    "reason": str(fields.get("summary") or fields.get("reason") or "LLM feasibility review did not pass."),
-                    "blocking": False,
-                }
-            ]
-        return base
-    return fields
+    return canonicalize_stage_fields(context, stage, dict(parsed.get("fields") if isinstance(parsed.get("fields"), dict) else parsed))
 
 
 def _instruction(context: Any, node: Any, profile: Any, prompt_text: str, skill_texts: list[tuple[str, str]], *, feedback: list[dict[str, str]]) -> str:
@@ -168,20 +149,20 @@ def _parse_json_object(text: str) -> tuple[dict[str, Any], str]:
         start = text.find("{")
         end = text.rfind("}")
         if start < 0 or end <= start:
-            return {}, "Agent output is not a JSON object."
+            return {}, "Invocation output is not a JSON object."
         try:
             parsed = json.loads(text[start : end + 1])
         except json.JSONDecodeError as exc:
-            return {}, f"Agent output JSON parse failed: {exc}"
+            return {}, f"Invocation output JSON parse failed: {exc}"
     if not isinstance(parsed, dict):
-        return {}, "Agent output must be a JSON object."
+        return {}, "Invocation output must be a JSON object."
     return parsed, ""
 
 
 def _annotate_invocation(invocation: dict[str, Any], profile: Any) -> dict[str, Any]:
     updated = dict(invocation)
     updated["executor_id"] = profile.executor_id
-    updated["execution_profile"] = {
+    updated["attempt_profile"] = {
         "stage": profile.stage,
         "executor_id": profile.executor_id,
         "node_purpose": profile.node_purpose,
@@ -212,14 +193,6 @@ def _artifact_id_from_fields(fields: dict[str, Any]) -> str | None:
         if fields.get(key):
             return str(fields[key])
     return None
-
-
-def _feedback(failure_class: str, recovery_suggestion: str, output_preview: str) -> dict[str, str]:
-    return {
-        "failure_class": failure_class,
-        "recovery_suggestion": recovery_suggestion,
-        "invalid_output_preview": output_preview[:2000],
-    }
 
 
 def _contract_hints(target_type: str) -> dict[str, Any]:

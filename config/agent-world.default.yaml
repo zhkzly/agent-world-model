@@ -1,7 +1,4 @@
-node_execution:
-  mode: agent
-
-agent_profiles:
+invocation_profiles:
   semantic:
     backend_kind: llm
     provider: openai_compatible
@@ -26,8 +23,8 @@ agent_profiles:
     model: gpt-5.4
 
 stages:
-  default_agent_profile: semantic
-  agent_profiles:
+  default_invocation_profile: semantic
+  invocation_profiles:
     IMPLEMENT: implementation
 
 research:

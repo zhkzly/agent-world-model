@@ -9,24 +9,24 @@ from tempfile import mkdtemp
 from typing import Any, Callable
 
 from agent_world.agents import (
-    AgentRequest,
-    AgentBackendRegistry,
-    default_agent_backend_registry,
-    invoke_agent,
-    load_agent_backend_config_from_env,
-    load_implementation_agent_backend_config_from_env,
+    InvocationRequest,
+    InvocationBackendRegistry,
+    default_invocation_backend_registry,
+    invoke_backend,
+    load_invocation_backend_config_from_env,
+    load_implementation_invocation_backend_config_from_env,
 )
 from agent_world.artifacts import GENERATED_PROJECT_FILE_KINDS, RUNTIME_ABI_INTERFACES, artifact_hash, make_artifact, stable_json, utc_now, validate_artifact
-from agent_world.executors.base import NodeExecutionResult
-from agent_world.executors.research_agent import ResearchAgentExecutor
-from agent_world.executors.structured_agent import StructuredAgentExecutor
+from agent_world.executors.base import NodeAttemptResult
+from agent_world.executors.agent_attempt import AgentAttemptExecutor
+from agent_world.executors.llm_attempt import LlmAttemptExecutor
 from agent_world.gates import STAGE_GATES, evaluate_stage_gates
 from agent_world.generated_project import assemble_generated_project_package
 import agent_world.request_driven as request_driven
 from agent_world.replay_contract import build_framework_replay_contract, normalise_framework_replay_calls
 from agent_world.review import independent_review
 from agent_world.store import ArtifactStore
-from agent_world.strategies import execution_profile_for_stage
+from agent_world.strategies import attempt_profile_for_stage
 
 
 SOURCE_DOC_REF = "docs/agent-world-environment-generation.zh.md"
@@ -54,7 +54,7 @@ class PipelineNodeResult:
     output_refs: list[str] = field(default_factory=list)
     gate_record_ids: list[str] = field(default_factory=list)
     review_record_ids: list[str] = field(default_factory=list)
-    agent_invocation_ids: list[str] = field(default_factory=list)
+    invocation_record_ids: list[str] = field(default_factory=list)
     failure_class: str = ""
     recovery_suggestion: str = ""
 
@@ -69,7 +69,7 @@ class PipelineRunRecord:
     artifact_ids: dict[str, str]
     gate_record_ids: list[str]
     review_record_ids: list[str]
-    agent_invocation_ids: list[str]
+    invocation_record_ids: list[str]
     implementation_check_records: list[dict[str, Any]]
     repair_failure_packets: list[dict[str, Any]] = field(default_factory=list)
     failure_class: str = ""
@@ -85,7 +85,7 @@ class PipelineRunRecord:
             "artifact_ids": self.artifact_ids,
             "gate_record_ids": self.gate_record_ids,
             "review_record_ids": self.review_record_ids,
-            "agent_invocation_ids": self.agent_invocation_ids,
+            "invocation_record_ids": self.invocation_record_ids,
             "implementation_check_records": self.implementation_check_records,
             "repair_failure_packets": self.repair_failure_packets,
             "failure_class": self.failure_class,
@@ -97,11 +97,11 @@ class PipelineRunRecord:
 class PipelineContext:
     config: PipelineRunConfig
     store: ArtifactStore
-    agent_registry: AgentBackendRegistry
+    invocation_registry: InvocationBackendRegistry
     artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
     gate_records: list[dict[str, Any]] = field(default_factory=list)
     review_records: list[dict[str, Any]] = field(default_factory=list)
-    agent_invocations: list[dict[str, Any]] = field(default_factory=list)
+    invocation_records: list[dict[str, Any]] = field(default_factory=list)
     implementation_check_records: list[dict[str, Any]] = field(default_factory=list)
     repair_failure_packets: list[dict[str, Any]] = field(default_factory=list)
     node_feedback: dict[str, list[dict[str, str]]] = field(default_factory=dict)
@@ -110,7 +110,7 @@ class PipelineContext:
         return self.artifacts[artifact_type]
 
     def upstream_artifacts(self) -> list[dict[str, Any]]:
-        return [artifact for name, artifact in self.artifacts.items() if name not in {"AgentBackendConfig", "ImplementationAgentBackendConfig"}]
+        return [artifact for name, artifact in self.artifacts.items() if name not in {"InvocationBackendConfig", "ImplementationInvocationBackendConfig"}]
 
 
 @dataclass(frozen=True)
@@ -120,7 +120,7 @@ class PipelineNode:
     artifact_type: str
     input_artifact_types: list[str]
     output_artifact_type: str
-    allowed_agent_backend: bool
+    execution_mode: str
     factory: Callable[[PipelineContext], dict[str, Any]] | None = None
     failure_policy: str = "stop"
 
@@ -152,25 +152,25 @@ class PipelineRunner:
         self,
         node_registry: NodeRegistry | None = None,
         *,
-        agent_registry: AgentBackendRegistry | None = None,
+        invocation_registry: InvocationBackendRegistry | None = None,
     ) -> None:
         self.node_registry = node_registry or request_driven_node_registry()
-        self.agent_registry = agent_registry or default_agent_backend_registry()
+        self.invocation_registry = invocation_registry or default_invocation_backend_registry()
         self.node_executors = {
-            StructuredAgentExecutor.executor_id: StructuredAgentExecutor(),
-            ResearchAgentExecutor.executor_id: ResearchAgentExecutor(),
+            LlmAttemptExecutor.executor_id: LlmAttemptExecutor(),
+            AgentAttemptExecutor.executor_id: AgentAttemptExecutor(),
         }
 
     def run(self, config: PipelineRunConfig) -> tuple[PipelineRunRecord, PipelineContext]:
         started_at = utc_now()
         store = ArtifactStore(config.output_dir / "pipeline-store" if config.output_dir else None)
-        context = PipelineContext(config=config, store=store, agent_registry=self.agent_registry)
-        backend_config = load_agent_backend_config_from_env(config.env)
-        implementation_backend_config = load_implementation_agent_backend_config_from_env(config.env)
-        context.artifacts["AgentBackendConfig"] = backend_config
-        context.artifacts["ImplementationAgentBackendConfig"] = implementation_backend_config
-        store.put_artifact("AgentBackendConfig", backend_config)
-        store.put_artifact("ImplementationAgentBackendConfig", implementation_backend_config)
+        context = PipelineContext(config=config, store=store, invocation_registry=self.invocation_registry)
+        backend_config = load_invocation_backend_config_from_env(config.env)
+        implementation_backend_config = load_implementation_invocation_backend_config_from_env(config.env)
+        context.artifacts["InvocationBackendConfig"] = backend_config
+        context.artifacts["ImplementationInvocationBackendConfig"] = implementation_backend_config
+        store.put_artifact("InvocationBackendConfig", backend_config)
+        store.put_artifact("ImplementationInvocationBackendConfig", implementation_backend_config)
         node_results: list[PipelineNodeResult] = []
         status = "pass"
         failure_class = ""
@@ -203,7 +203,7 @@ class PipelineRunner:
             artifact_ids={name: artifact["id"] for name, artifact in context.artifacts.items()},
             gate_record_ids=[record["id"] for record in context.gate_records],
             review_record_ids=[record["id"] for record in context.review_records],
-            agent_invocation_ids=[record["id"] for record in context.agent_invocations],
+            invocation_record_ids=[record["id"] for record in context.invocation_records],
             implementation_check_records=context.implementation_check_records,
             repair_failure_packets=context.repair_failure_packets,
             failure_class=failure_class,
@@ -217,27 +217,30 @@ class PipelineRunner:
         last_result: PipelineNodeResult | None = None
         for attempt_index in range(1, attempts + 1):
             snapshot = _context_stage_snapshot(context)
-            result = self._run_artifact_node_once(node, context)
+            result = self._run_artifact_node_once(node, context, attempt_index=attempt_index)
             last_result = result
             if result.status == "pass":
                 return result
-            if attempt_index >= attempts or not _stage_can_retry(node, result):
+            can_retry = attempt_index < attempts and _stage_can_retry(node, result)
+            _mark_latest_stage_failure_packet_terminal(context, node, attempt_index=attempt_index, terminal=not can_retry)
+            if not can_retry:
                 return result
             _append_node_feedback(context, node, result)
             _restore_context_stage_snapshot(context, snapshot)
         return last_result or PipelineNodeResult(node_id=node.node_id, stage=node.stage, status="fail", artifact_type=node.output_artifact_type)
 
-    def _run_artifact_node_once(self, node: PipelineNode, context: PipelineContext) -> PipelineNodeResult:
+    def _run_artifact_node_once(self, node: PipelineNode, context: PipelineContext, *, attempt_index: int) -> PipelineNodeResult:
         try:
-            execution = self._execute_artifact_node(node, context)
+            execution = self._execute_artifact_node(node, context, attempt_index=attempt_index)
             if execution.status != "pass":
                 invocation_records = _store_node_invocations(context, execution, output_artifact_ids=[], evidence_refs=execution.evidence_refs)
                 failure_packet = _record_stage_failure_packet(
                     context,
                     node=node,
                     artifact=None,
-                    failure_class=execution.failure_class or "node_execution_failed",
-                    recovery_suggestion=execution.recovery_suggestion or "Fix the configured node executor or agent backend.",
+                    attempt_index=attempt_index,
+                    failure_class=execution.failure_class or "node_attempt_failed",
+                    recovery_suggestion=execution.recovery_suggestion or "Fix the configured node attempt executor or invocation backend.",
                     gate_record_ids=[],
                 )
                 return PipelineNodeResult(
@@ -246,9 +249,9 @@ class PipelineRunner:
                     status=execution.status,
                     artifact_type=node.output_artifact_type,
                     output_refs=[failure_packet["trace_ref"]] + execution.trace_refs,
-                    agent_invocation_ids=[record["id"] for record in invocation_records],
-                    failure_class=execution.failure_class or "node_execution_failed",
-                    recovery_suggestion=execution.recovery_suggestion or "Fix the configured node executor or agent backend.",
+                    invocation_record_ids=[record["id"] for record in invocation_records],
+                    failure_class=execution.failure_class or "node_attempt_failed",
+                    recovery_suggestion=execution.recovery_suggestion or "Fix the configured node attempt executor or invocation backend.",
                 )
             fields = execution.fields
             base_invocation_records = _prepare_node_invocations(execution, output_artifact_ids=[], evidence_refs=execution.evidence_refs)
@@ -267,7 +270,8 @@ class PipelineRunner:
                     context,
                     node=node,
                     artifact=None,
-                    failure_class="invalid_agent_artifact_fields",
+                    attempt_index=attempt_index,
+                    failure_class="invalid_attempt_artifact_fields",
                     recovery_suggestion=str(exc),
                     gate_record_ids=[],
                 )
@@ -277,8 +281,8 @@ class PipelineRunner:
                     status="fail",
                     artifact_type=node.output_artifact_type,
                     output_refs=[failure_packet["trace_ref"]] + execution.trace_refs,
-                    agent_invocation_ids=[record["id"] for record in base_invocation_records],
-                    failure_class="invalid_agent_artifact_fields",
+                    invocation_record_ids=[record["id"] for record in base_invocation_records],
+                    failure_class="invalid_attempt_artifact_fields",
                     recovery_suggestion=str(exc),
                 )
             invocation_records = _store_node_invocations(
@@ -318,6 +322,7 @@ class PipelineRunner:
                     context,
                     node=node,
                     artifact=artifact,
+                    attempt_index=attempt_index,
                     failure_class=failures[0]["failure_class"],
                     recovery_suggestion=failures[0]["recovery_suggestion"],
                     gate_record_ids=[record["id"] for record in gate_records],
@@ -331,7 +336,7 @@ class PipelineRunner:
                     output_refs=[failure_packet["trace_ref"]],
                     gate_record_ids=[record["id"] for record in gate_records],
                     review_record_ids=[review["id"]],
-                    agent_invocation_ids=[record["id"] for record in invocation_records],
+                    invocation_record_ids=[record["id"] for record in invocation_records],
                     failure_class=failures[0]["failure_class"],
                     recovery_suggestion=failures[0]["recovery_suggestion"],
                 )
@@ -343,13 +348,14 @@ class PipelineRunner:
                 artifact_id=artifact["id"],
                 gate_record_ids=[record["id"] for record in gate_records],
                 review_record_ids=[review["id"]],
-                agent_invocation_ids=[record["id"] for record in invocation_records],
+                invocation_record_ids=[record["id"] for record in invocation_records],
             )
         except Exception as exc:
             failure_packet = _record_stage_failure_packet(
                 context,
                 node=node,
                 artifact=None,
+                attempt_index=attempt_index,
                 failure_class=exc.__class__.__name__,
                 recovery_suggestion=str(exc),
                 gate_record_ids=[],
@@ -364,30 +370,43 @@ class PipelineRunner:
                 recovery_suggestion=str(exc),
             )
 
-    def _execute_artifact_node(self, node: PipelineNode, context: PipelineContext) -> NodeExecutionResult:
-        profile = execution_profile_for_stage(node.stage)
-        if profile:
-            if not node.allowed_agent_backend:
-                return NodeExecutionResult(
+    def _execute_artifact_node(self, node: PipelineNode, context: PipelineContext, *, attempt_index: int) -> NodeAttemptResult:
+        if node.execution_mode == "deterministic":
+            if node.factory is None:
+                return NodeAttemptResult(
                     status="fail",
-                    failure_class="agent_backend_not_allowed",
-                    recovery_suggestion=f"Stage {node.stage} has an agent execution profile but the node disallows agent backends.",
+                    failure_class="deterministic_factory_missing",
+                    recovery_suggestion=f"Stage {node.stage} is deterministic but has no factory.",
                 )
-            executor = self.node_executors.get(profile.executor_id)
-            if executor is None:
-                return NodeExecutionResult(
-                    status="fail",
-                    failure_class="node_executor_not_registered",
-                    recovery_suggestion=f"No executor registered for {profile.executor_id}.",
-                )
-            return executor.execute(context, node, profile)
-        if node.factory is None:
-            return NodeExecutionResult(
+            return NodeAttemptResult(status="pass", fields=node.factory(context))
+        if node.execution_mode not in {"llm", "agent"}:
+            return NodeAttemptResult(
                 status="fail",
-                failure_class="node_executor_missing",
-                recovery_suggestion=f"Stage {node.stage} has neither an execution profile nor a deterministic framework factory.",
+                failure_class="invalid_node_execution_mode",
+                recovery_suggestion=f"Stage {node.stage} declares unsupported execution_mode={node.execution_mode!r}.",
             )
-        return NodeExecutionResult(status="pass", fields=node.factory(context))
+        profile = attempt_profile_for_stage(node.stage)
+        if profile is None:
+            return NodeAttemptResult(
+                status="fail",
+                failure_class="node_attempt_profile_missing",
+                recovery_suggestion=f"Stage {node.stage} is {node.execution_mode} but has no attempt profile.",
+            )
+        expected_executor_id = {"llm": LlmAttemptExecutor.executor_id, "agent": AgentAttemptExecutor.executor_id}[node.execution_mode]
+        if profile.executor_id != expected_executor_id:
+            return NodeAttemptResult(
+                status="fail",
+                failure_class="node_attempt_profile_mismatch",
+                recovery_suggestion=f"Stage {node.stage} declares execution_mode={node.execution_mode} but profile uses {profile.executor_id}.",
+            )
+        executor = self.node_executors.get(profile.executor_id)
+        if executor is None:
+            return NodeAttemptResult(
+                status="fail",
+                failure_class="node_attempt_executor_not_registered",
+                recovery_suggestion=f"No attempt executor registered for {profile.executor_id}.",
+            )
+        return executor.execute(context, node, profile, attempt_index=attempt_index)
 
     def _run_implementation_node(self, node: PipelineNode, context: PipelineContext) -> PipelineNodeResult:
         if context.artifact("FeasibilityReport")["status"] != "pass":
@@ -408,7 +427,7 @@ class PipelineRunner:
             stage=node.stage,
             status="fail",
             failure_class="deterministic_implementation_unavailable",
-            recovery_suggestion="Generated environments require an agent backend that writes a contract-project candidate.",
+            recovery_suggestion="Generated environments require an agent execution backend that writes a contract-project candidate.",
         )
 
 
@@ -421,7 +440,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="DomainPlan",
             input_artifact_types=[],
             output_artifact_type="DomainPlan",
-            allowed_agent_backend=True,
+            execution_mode="llm",
         )
     )
     registry.register(
@@ -431,7 +450,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="StrategySelection",
             input_artifact_types=["DomainPlan"],
             output_artifact_type="StrategySelection",
-            allowed_agent_backend=False,
+            execution_mode="deterministic",
             factory=lambda context: request_driven.strategy_selection_fields(context.artifact("DomainPlan")),
         )
     )
@@ -442,7 +461,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="NeedSpec",
             input_artifact_types=["DomainPlan"],
             output_artifact_type="NeedSpec",
-            allowed_agent_backend=True,
+            execution_mode="llm",
         )
     )
     registry.register(
@@ -452,7 +471,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="SourceEvidenceIndex",
             input_artifact_types=["NeedSpec", "DomainPlan", "StrategySelection"],
             output_artifact_type="SourceEvidenceIndex",
-            allowed_agent_backend=True,
+            execution_mode="agent",
         )
     )
     registry.register(
@@ -462,7 +481,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="KnowledgePack",
             input_artifact_types=["SourceEvidenceIndex", "StrategySelection"],
             output_artifact_type="KnowledgePack",
-            allowed_agent_backend=True,
+            execution_mode="llm",
         )
     )
     registry.register(
@@ -472,7 +491,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="EnvironmentSpec",
             input_artifact_types=["NeedSpec", "KnowledgePack", "DomainPlan", "StrategySelection"],
             output_artifact_type="EnvironmentSpec",
-            allowed_agent_backend=True,
+            execution_mode="llm",
         )
     )
     registry.register(
@@ -482,7 +501,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="LogicalToolGraph",
             input_artifact_types=["EnvironmentSpec", "KnowledgePack", "StrategySelection"],
             output_artifact_type="LogicalToolGraph",
-            allowed_agent_backend=True,
+            execution_mode="llm",
         )
     )
     registry.register(
@@ -492,7 +511,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="TaskSet",
             input_artifact_types=["NeedSpec", "LogicalToolGraph", "EnvironmentSpec", "KnowledgePack"],
             output_artifact_type="TaskSet",
-            allowed_agent_backend=True,
+            execution_mode="llm",
         )
     )
     registry.register(
@@ -502,7 +521,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="SurfacePlan",
             input_artifact_types=["LogicalToolGraph", "EnvironmentSpec", "StrategySelection"],
             output_artifact_type="SurfacePlan",
-            allowed_agent_backend=True,
+            execution_mode="llm",
         )
     )
     registry.register(
@@ -512,7 +531,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="VerifierPlan",
             input_artifact_types=["TaskSet", "EnvironmentSpec", "SurfacePlan", "KnowledgePack"],
             output_artifact_type="VerifierPlan",
-            allowed_agent_backend=True,
+            execution_mode="llm",
         )
     )
     registry.register(
@@ -522,7 +541,8 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="FeasibilityReport",
             input_artifact_types=["NeedSpec", "DomainPlan", "StrategySelection", "SourceEvidenceIndex", "KnowledgePack", "EnvironmentSpec", "LogicalToolGraph", "TaskSet", "SurfacePlan", "VerifierPlan"],
             output_artifact_type="FeasibilityReport",
-            allowed_agent_backend=True,
+            execution_mode="deterministic",
+            factory=request_driven.feasibility_report_fields,
         )
     )
     registry.register(
@@ -532,7 +552,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="ImplementationRequest",
             input_artifact_types=["FeasibilityReport", "EnvironmentSpec", "TaskSet", "VerifierPlan", "StrategySelection"],
             output_artifact_type="ImplementationRequest",
-            allowed_agent_backend=False,
+            execution_mode="deterministic",
             factory=lambda context: request_driven.implementation_request_fields(context.artifacts, context.review_records),
         )
     )
@@ -543,7 +563,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="CodeImplementation",
             input_artifact_types=["ImplementationRequest"],
             output_artifact_type="CodeImplementation",
-            allowed_agent_backend=True,
+            execution_mode="agent",
             factory=request_driven.generated_implementation_record,
         )
     )
@@ -554,7 +574,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="EnvironmentPackagePlan",
             input_artifact_types=["ImplementationRequest", "GeneratedEnvironmentProject", "IndependentVerificationReport"],
             output_artifact_type="EnvironmentPackagePlan",
-            allowed_agent_backend=False,
+            execution_mode="deterministic",
             factory=request_driven.package_plan_fields,
         )
     )
@@ -565,7 +585,7 @@ def request_driven_node_registry() -> NodeRegistry:
             artifact_type="ReleaseManifest",
             input_artifact_types=["EnvironmentPackagePlan", "IndependentVerificationReport"],
             output_artifact_type="ReleaseManifest",
-            allowed_agent_backend=False,
+            execution_mode="deterministic",
             factory=request_driven.release_manifest_fields,
         )
     )
@@ -575,11 +595,11 @@ def request_driven_node_registry() -> NodeRegistry:
 def run_request_driven_pipeline(
     config: PipelineRunConfig,
     *,
-    agent_registry: AgentBackendRegistry | None = None,
+    invocation_registry: InvocationBackendRegistry | None = None,
 ) -> tuple[PipelineRunRecord, PipelineContext]:
     if config.implementation_mode != "agent":
         config = replace(config, implementation_mode="agent")
-    return PipelineRunner(request_driven_node_registry(), agent_registry=agent_registry).run(config)
+    return PipelineRunner(request_driven_node_registry(), invocation_registry=invocation_registry).run(config)
 
 
 def _assemble_generated_project_package_if_available(context: PipelineContext) -> dict[str, str] | None:
@@ -593,7 +613,7 @@ def _assemble_generated_project_package_if_available(context: PipelineContext) -
             artifacts=context.artifacts,
             gate_records=context.gate_records,
             review_records=context.review_records,
-            agent_invocations=context.agent_invocations,
+            invocation_records=context.invocation_records,
             implementation_check_records=context.implementation_check_records,
         )
     except Exception as exc:
@@ -649,7 +669,7 @@ def _run_agent_implementation(context: PipelineContext, node: PipelineNode) -> P
             failure_packet=failure_packet,
         )
         last_result = result
-        all_invocation_ids.extend(result.agent_invocation_ids)
+        all_invocation_ids.extend(result.invocation_record_ids)
         all_output_refs.extend(ref for ref in result.output_refs if ref)
         attempt_record = context.implementation_check_records[-1] if context.implementation_check_records else {}
         if result.status == "pass":
@@ -684,11 +704,11 @@ def _run_agent_implementation_attempt(
     request_artifact = context.artifact("ImplementationRequest")
     work_dir = _agent_attempt_work_dir(context, environment_id, attempt_index=attempt_index, total_attempts=total_attempts)
     _prepare_agent_work_dir(work_dir)
-    backend_config = context.artifact("ImplementationAgentBackendConfig")
+    backend_config = context.artifact("ImplementationInvocationBackendConfig")
     backend_kind = backend_config["backend_kind"]
     is_runner_backend = backend_kind in {"code_agent_runner", "codex_cli_runner", "codex_sdk"}
     repair_thread_mode = _implementation_repair_thread_mode(backend_config)
-    parent_invocation_id = str(failure_packet.get("previous_agent_invocation_id", "")) if failure_packet else ""
+    parent_invocation_id = str(failure_packet.get("previous_invocation_record_id", "")) if failure_packet else ""
     conversation_ref = _implementation_repair_conversation_ref(context, parent_invocation_id) if parent_invocation_id else ""
     if backend_kind == "codex_sdk" and repair_thread_mode == "continue" and failure_packet and not conversation_ref:
         record = {
@@ -696,7 +716,7 @@ def _run_agent_implementation_attempt(
             "mode": "agent_backed",
             "environment_id": environment_id,
             "implementation_request_id": request_artifact["id"],
-            "agent_invocation_id": parent_invocation_id,
+            "invocation_record_id": parent_invocation_id,
             "static_check_command": "not run",
             "test_command": "not run",
             "replay_command": "not run",
@@ -743,7 +763,7 @@ def _run_agent_implementation_attempt(
         total_attempts=total_attempts,
         failure_packet=failure_packet,
     )
-    request = AgentRequest(
+    request = InvocationRequest(
         stage="IMPLEMENT",
         node_purpose="implement",
         instruction=instruction,
@@ -757,16 +777,16 @@ def _run_agent_implementation_attempt(
         conversation_ref=conversation_ref,
         continuation_mode=repair_thread_mode if backend_kind == "codex_sdk" else "stateless",
     )
-    invocation, result = invoke_agent(context.agent_registry, request, backend_config)
+    invocation, result = invoke_backend(context.invocation_registry, request, backend_config)
     if "DomainPlan" not in context.artifacts or "StrategySelection" not in context.artifacts:
-        context.agent_invocations.append(invocation)
-        context.store.put_agent_invocations([invocation])
+        context.invocation_records.append(invocation)
+        context.store.put_invocation_records([invocation])
         record = {
             "implementation_id": f"implementation-{environment_id}-agent",
             "mode": "agent_backed",
             "environment_id": environment_id,
             "implementation_request_id": request_artifact["id"],
-            "agent_invocation_id": invocation["id"],
+            "invocation_record_id": invocation["id"],
             "static_check_command": "not run",
             "test_command": "not run",
             "replay_command": "not run",
@@ -791,14 +811,14 @@ def _run_agent_implementation_attempt(
             stage=node.stage,
             status=record["status"],
             output_refs=[trace_ref],
-            agent_invocation_ids=[invocation["id"]],
+            invocation_record_ids=[invocation["id"]],
             failure_class=record["failure_class"],
             recovery_suggestion=record["recovery_suggestion"],
         )
     record = request_driven.agent_generated_implementation_record(
         context,
-        agent_invocation=invocation,
-        agent_result=result,
+        invocation_record=invocation,
+        invocation_result=result,
         work_dir=work_dir,
     )
     record = _with_attempt_metadata(
@@ -820,8 +840,8 @@ def _run_agent_implementation_attempt(
         context.artifacts["IndependentVerificationReport"] = independent_report
         context.store.put_artifact("IndependentVerificationReport", independent_report)
         invocation = _with_invocation_outputs(invocation, output_artifact_ids=[independent_report["id"]], evidence_refs=[independent_report["id"]])
-    context.agent_invocations.append(invocation)
-    context.store.put_agent_invocations([invocation])
+    context.invocation_records.append(invocation)
+    context.store.put_invocation_records([invocation])
     trace_ref = context.store.put_trace(f"implementation-{environment_id}-agent", record)
     context.implementation_check_records.append(record)
     if record["status"] != "pass":
@@ -830,7 +850,7 @@ def _run_agent_implementation_attempt(
             stage=node.stage,
             status=record["status"],
             output_refs=[trace_ref],
-            agent_invocation_ids=[invocation["id"]],
+            invocation_record_ids=[invocation["id"]],
             failure_class=record["failure_class"],
             recovery_suggestion=record["recovery_suggestion"],
         )
@@ -841,7 +861,7 @@ def _run_agent_implementation_attempt(
         output_refs=[trace_ref, project["id"] if isinstance(project, dict) else "", independent_report["id"] if isinstance(independent_report, dict) else ""],
         artifact_type="GeneratedEnvironmentProject",
         artifact_id=project["id"] if isinstance(project, dict) else "",
-        agent_invocation_ids=[invocation["id"]],
+        invocation_record_ids=[invocation["id"]],
     )
 
 
@@ -850,20 +870,28 @@ def _configured_max_repair_attempts(config: PipelineRunConfig) -> int:
 
 
 def _stage_attempt_budget(node: PipelineNode, context: PipelineContext) -> int:
-    if not execution_profile_for_stage(node.stage):
+    if node.execution_mode == "deterministic":
         return 1
-    config = context.artifacts.get("AgentBackendConfig", {})
+    config = context.artifacts.get("InvocationBackendConfig", {})
     return max(1, int((config.get("retries") or {}).get("max_attempts") or 1))
 
 
 def _stage_can_retry(node: PipelineNode, result: PipelineNodeResult) -> bool:
-    if not execution_profile_for_stage(node.stage):
+    if node.execution_mode == "deterministic":
         return False
     if result.status not in {"fail", "needs_human"}:
         return False
-    if not result.gate_record_ids:
-        return False
-    return result.failure_class not in {"mock_backend_not_allowed", "manual_input_required", "permission_denied", "network_permission_denied", "auth_permission_denied"}
+    return result.failure_class not in {
+        "mock_backend_not_allowed",
+        "manual_input_required",
+        "permission_denied",
+        "network_permission_denied",
+        "auth_permission_denied",
+        "node_attempt_profile_missing",
+        "node_attempt_profile_mismatch",
+        "node_attempt_executor_not_registered",
+        "invalid_node_execution_mode",
+    }
 
 
 def _append_node_feedback(context: PipelineContext, node: PipelineNode, result: PipelineNodeResult) -> None:
@@ -906,14 +934,14 @@ def _implementation_repair_thread_mode(backend_config: dict[str, Any]) -> str:
 def _implementation_repair_conversation_ref(context: PipelineContext, parent_invocation_id: str) -> str:
     if not parent_invocation_id:
         return ""
-    for invocation in reversed(context.agent_invocations):
+    for invocation in reversed(context.invocation_records):
         if invocation.get("id") == parent_invocation_id:
             return str(invocation.get("conversation_ref") or "")
     return ""
 
 
 def _roll_up_attempt_result(result: PipelineNodeResult, *, invocation_ids: list[str], output_refs: list[str]) -> PipelineNodeResult:
-    result.agent_invocation_ids = list(dict.fromkeys(invocation_ids))
+    result.invocation_record_ids = list(dict.fromkeys(invocation_ids))
     result.output_refs = list(dict.fromkeys(output_refs))
     return result
 
@@ -936,11 +964,11 @@ def _with_attempt_metadata(
     return updated
 
 
-def _with_agent_continuation_metadata(record: dict[str, Any], *, request: AgentRequest, invocation: dict[str, Any]) -> dict[str, Any]:
+def _with_agent_continuation_metadata(record: dict[str, Any], *, request: InvocationRequest, invocation: dict[str, Any]) -> dict[str, Any]:
     updated = dict(record)
     updated["code_repair_thread_mode"] = request.continuation_mode
     if request.parent_invocation_id:
-        updated["parent_agent_invocation_id"] = request.parent_invocation_id
+        updated["parent_invocation_record_id"] = request.parent_invocation_id
     conversation_ref = str(invocation.get("conversation_ref") or request.conversation_ref or "")
     if conversation_ref:
         updated["agent_conversation_ref"] = conversation_ref
@@ -956,7 +984,7 @@ def _redact_attempt_record(context: PipelineContext, record: dict[str, Any]) -> 
 
 def _secret_values_for_context(context: PipelineContext) -> list[str]:
     names: set[str] = set()
-    for config_name in ["AgentBackendConfig", "ImplementationAgentBackendConfig"]:
+    for config_name in ["InvocationBackendConfig", "ImplementationInvocationBackendConfig"]:
         config = context.artifacts.get(config_name, {})
         auth = config.get("auth", {}) if isinstance(config, dict) else {}
         names.update(str(name) for name in auth.get("auth_env_refs", []))
@@ -1011,15 +1039,17 @@ def _record_stage_failure_packet(
     *,
     node: PipelineNode,
     artifact: dict[str, Any] | None,
+    attempt_index: int,
     failure_class: str,
     recovery_suggestion: str,
     gate_record_ids: list[str],
 ) -> dict[str, Any]:
-    packet_id = f"failure-packet-{node.stage.lower()}-{node.output_artifact_type.lower()}"
+    packet_id = f"failure-packet-{node.stage.lower()}-{node.output_artifact_type.lower()}-attempt-{attempt_index}"
     packet = {
         "packet_id": packet_id,
         "stage": node.stage,
         "node_id": node.node_id,
+        "attempt_index": attempt_index,
         "artifact_type": node.output_artifact_type,
         "artifact_id": artifact.get("id", "") if isinstance(artifact, dict) else "",
         "input_artifact_ids": [context.artifacts[name]["id"] for name in node.input_artifact_types if name in context.artifacts],
@@ -1034,6 +1064,22 @@ def _record_stage_failure_packet(
     packet["trace_ref"] = trace_ref
     context.repair_failure_packets.append(packet)
     return packet
+
+
+def _mark_latest_stage_failure_packet_terminal(
+    context: PipelineContext,
+    node: PipelineNode,
+    *,
+    attempt_index: int,
+    terminal: bool,
+) -> None:
+    if not context.repair_failure_packets:
+        return
+    packet = context.repair_failure_packets[-1]
+    if packet.get("stage") != node.stage or packet.get("attempt_index") != attempt_index:
+        return
+    packet["terminal"] = terminal
+    context.store.put_trace(packet["packet_id"], packet)
 
 
 def _stage_recovery_edge(stage: str) -> str:
@@ -1062,7 +1108,7 @@ def _implementation_failure_packet(
         "attempt_index": attempt_index,
         "remaining_repair_attempts": max(0, max_repair_attempts - attempt_index),
         "previous_implementation_id": attempt_record.get("implementation_id", ""),
-        "previous_agent_invocation_id": attempt_record.get("agent_invocation_id", ""),
+        "previous_invocation_record_id": attempt_record.get("invocation_record_id", ""),
         "previous_agent_conversation_ref": attempt_record.get("agent_conversation_ref", ""),
         "failure_class": attempt_result.failure_class or attempt_record.get("failure_class", "implementation_failed"),
         "recovery_suggestion": attempt_result.recovery_suggestion or attempt_record.get("recovery_suggestion", "Repair the generated candidate and rerun checks."),
@@ -1580,7 +1626,7 @@ def _prepare_agent_work_dir(work_dir: Path) -> None:
 
 def _store_node_invocations(
     context: PipelineContext,
-    execution: NodeExecutionResult,
+    execution: NodeAttemptResult,
     *,
     output_artifact_ids: list[str],
     evidence_refs: list[str],
@@ -1591,7 +1637,7 @@ def _store_node_invocations(
 
 
 def _prepare_node_invocations(
-    execution: NodeExecutionResult,
+    execution: NodeAttemptResult,
     *,
     output_artifact_ids: list[str],
     evidence_refs: list[str],
@@ -1604,8 +1650,8 @@ def _prepare_node_invocations(
 
 def _store_prepared_node_invocations(context: PipelineContext, records: list[dict[str, Any]]) -> None:
     if records:
-        context.agent_invocations.extend(records)
-        context.store.put_agent_invocations(records)
+        context.invocation_records.extend(records)
+        context.store.put_invocation_records(records)
 
 
 def _with_invocation_outputs(invocation: dict[str, Any], *, output_artifact_ids: list[str], evidence_refs: list[str]) -> dict[str, Any]:
@@ -1614,7 +1660,7 @@ def _with_invocation_outputs(invocation: dict[str, Any], *, output_artifact_ids:
     updated["evidence_refs"] = sorted(set(updated.get("evidence_refs", [])) | set(evidence_refs))
     updated["hash"] = ""
     updated["hash"] = artifact_hash(updated)
-    validate_artifact("AgentInvocationRecord", updated)
+    validate_artifact("InvocationRecord", updated)
     return updated
 
 

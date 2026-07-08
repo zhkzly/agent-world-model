@@ -53,7 +53,7 @@ def strategy_selection_fields(domain_plan: dict[str, Any]) -> dict[str, Any]:
         "implementation_strategy": "agent-generated-contract-project-v1",
         "independent_verifier_strategy": "framework-replay-contract-verifier-v1",
         "package_strategy": "generated-runtime-package-v1",
-        "selection_reason": "The request-driven path selects a generic artifact pipeline and delegates executable code to the configured agent backend.",
+        "selection_reason": "The request-driven path selects a generic artifact pipeline and delegates executable code to the configured agent execution backend.",
         "blocked_reasons": [],
     }
 
@@ -145,12 +145,12 @@ def generated_implementation_record(context: Any, **_: Any) -> dict[str, Any]:
         "implementation_check_records": [],
         "verifier_result": {},
         "status": "fail",
-        "failure_class": "agent_backend_required",
+        "failure_class": "agent_execution_required",
         "recovery_suggestion": "Request-driven generation requires implementation_mode=agent and a backend that writes a contract-project candidate.",
     }
 
 
-def agent_generated_implementation_record(context: Any, *, agent_invocation: dict[str, Any], agent_result: Any, work_dir: Path) -> dict[str, Any]:
+def agent_generated_implementation_record(context: Any, *, invocation_record: dict[str, Any], invocation_result: Any, work_dir: Path) -> dict[str, Any]:
     work_dir = Path(work_dir)
     request = context.artifact("ImplementationRequest")
     environment_id = request["environment_id"]
@@ -159,7 +159,7 @@ def agent_generated_implementation_record(context: Any, *, agent_invocation: dic
         "mode": "agent_backed_contract_project",
         "environment_id": environment_id,
         "implementation_request_id": request["id"],
-        "agent_invocation_id": agent_invocation["id"],
+        "invocation_record_id": invocation_record["id"],
         "agent_work_dir": str(work_dir),
         "source_artifact_ids": request["source_artifact_ids"],
         "static_check_command": "validate agent candidate manifest, contract.json, path boundaries, file hashes, generated self-check, and framework independent verifier",
@@ -168,9 +168,9 @@ def agent_generated_implementation_record(context: Any, *, agent_invocation: dic
         "self_check_commands": [],
         "replay_commands": [],
     }
-    if agent_result.status != "pass":
-        return _agent_failure_record(base, status=agent_result.status, failure_class=agent_result.failure_class or "agent_backend_failed", recovery_suggestion=agent_result.recovery_suggestion or "Fix or configure the agent backend.")
-    manifest, manifest_error = _agent_candidate_manifest(agent_result.text, work_dir)
+    if invocation_result.status != "pass":
+        return _agent_failure_record(base, status=invocation_result.status, failure_class=invocation_result.failure_class or "agent_attempt_failed", recovery_suggestion=invocation_result.recovery_suggestion or "Fix or configure the agent execution backend.")
+    manifest, manifest_error = _agent_candidate_manifest(invocation_result.text, work_dir)
     if manifest_error:
         return _agent_failure_record(base, failure_class=manifest_error["failure_class"], recovery_suggestion=manifest_error["recovery_suggestion"])
     validation_error = _validate_agent_candidate_files(work_dir, manifest)
@@ -204,10 +204,10 @@ def agent_generated_implementation_record(context: Any, *, agent_invocation: dic
         independent_check_records=implementation_check_records,
         status=status,
         implementation_mode="agent_backed_contract_project",
-        extra_inputs=[agent_invocation["id"]],
+        extra_inputs=[invocation_record["id"]],
         self_check_commands=self_check_commands,
         replay_commands=replay_commands,
-        agent_invocation_ref=agent_invocation["id"],
+        invocation_record_ref=invocation_record["id"],
     )
     independent_report = independent_verification_report_from_check(context, project_artifact, check_record)
     return {
@@ -303,8 +303,8 @@ def release_manifest_fields(context: Any) -> dict[str, Any]:
         },
         "consumer_outputs": ["release/task-records.jsonl", "release/verifier-records.jsonl", "release/consumer-index.yaml", "runtime/runtime_index.json"],
         "known_limits": [
-            "The request-driven path requires an agent backend to write executable candidate files.",
-            "Source discovery is performed by the configured research provider and accepted agent output.",
+            "The request-driven path requires an agent execution backend to write executable candidate files.",
+            "Source discovery is performed by the configured research provider and accepted invocation output.",
             "Training, deployment, and online rollout remain downstream consumers.",
         ],
     }
@@ -444,7 +444,7 @@ def _project_artifact(
     extra_inputs: list[str],
     self_check_commands: list[list[str]],
     replay_commands: list[list[str]],
-    agent_invocation_ref: str = "",
+    invocation_record_ref: str = "",
 ) -> dict[str, Any]:
     fields = {
         "project_id": project_id,
@@ -462,8 +462,8 @@ def _project_artifact(
         "independent_check_records": independent_check_records,
         "implementation_mode": implementation_mode,
     }
-    if agent_invocation_ref:
-        fields["agent_invocation_ref"] = agent_invocation_ref
+    if invocation_record_ref:
+        fields["invocation_record_ref"] = invocation_record_ref
     return make_artifact(
         "GeneratedEnvironmentProject",
         source_stage="IMPLEMENT",
@@ -593,9 +593,9 @@ def _agent_candidate_manifest(text: str, work_dir: Path) -> tuple[dict[str, Any]
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        return {}, {"failure_class": "malformed_agent_output", "recovery_suggestion": "Agent output must be a JSON candidate manifest."}
+        return {}, {"failure_class": "malformed_agent_output", "recovery_suggestion": "Invocation output must be a JSON candidate manifest."}
     if not isinstance(parsed, dict):
-        return {}, {"failure_class": "malformed_agent_output", "recovery_suggestion": "Agent output must be a JSON object."}
+        return {}, {"failure_class": "malformed_agent_output", "recovery_suggestion": "Invocation output must be a JSON object."}
     if "candidate_manifest_ref" in parsed and "generated_files" not in parsed:
         ref = str(parsed.get("candidate_manifest_ref") or "")
         path_error = _candidate_path_error(ref)

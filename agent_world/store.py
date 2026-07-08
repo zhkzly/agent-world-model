@@ -15,7 +15,7 @@ class ArtifactStore:
     artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
     gate_records: list[dict[str, Any]] = field(default_factory=list)
     review_records: list[dict[str, Any]] = field(default_factory=list)
-    agent_invocations: list[dict[str, Any]] = field(default_factory=list)
+    invocation_records: list[dict[str, Any]] = field(default_factory=list)
     traces: dict[str, Any] = field(default_factory=dict)
     package_refs: list[str] = field(default_factory=list)
 
@@ -34,10 +34,10 @@ class ArtifactStore:
         if self.root:
             write_yaml(self.root / "checks" / "review-records.yaml", {"review_records": self.review_records})
 
-    def put_agent_invocations(self, records: list[dict[str, Any]]) -> None:
-        self.agent_invocations.extend(records)
+    def put_invocation_records(self, records: list[dict[str, Any]]) -> None:
+        self.invocation_records.extend(records)
         if self.root:
-            write_jsonl(self.root / "checks" / "agent-invocations.jsonl", self.agent_invocations)
+            write_jsonl(self.root / "checks" / "invocation-records.jsonl", self.invocation_records)
 
     def put_trace(self, name: str, value: Any) -> str:
         self.traces[name] = value

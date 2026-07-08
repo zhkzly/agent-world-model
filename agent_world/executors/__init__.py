@@ -1,2 +1,1 @@
-"""Node executors for agent-backed environment generation."""
-
+"""Node attempt executors for request-driven environment generation."""

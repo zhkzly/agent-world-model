@@ -23,12 +23,11 @@ export OPENAI_BASE_URL=https://...
 
 配置只有一套：`AgentWorldConfig`。
 
-- `agent_profiles`：可复用的 backend profile，例如 `semantic`、`implementation`。
-- `stages`：每个 pipeline stage 使用哪个 profile。
+- `invocation_profiles`：可复用的 backend profile，例如 `semantic`、`implementation`。
+- `stages`：需要调用外部 backend 的 pipeline stage 使用哪个 profile；deterministic stage 不配置 profile。
 - `research`：source discovery provider 配置，例如 `jina`、`searxng`、`process`。
-- `node_execution`：节点执行模式，默认 `agent`。
 
-`semantic` 不是语义搜索，也不是一次固定调用。它是 PLAN、S0-S8、S10、S11 等非实现阶段的默认 profile：这些阶段主要产出结构化 JSON artifact。默认让它走 OpenAI-compatible `llm`，用 `gpt-5.4-mini`。
+`semantic` 不是语义搜索，也不是一次固定调用。它是 PLAN、S0-S7 等非实现且需要模型/agent 调用阶段的默认 profile：这些阶段主要产出结构化 JSON artifact 或 source evidence。默认让它走 OpenAI-compatible `llm`，用 `gpt-5.4-mini`。
 
 `implementation` 是 IMPLEMENT 阶段的 profile。默认走真实 `codex_sdk`，用 `gpt-5.4`，让 Codex SDK 在隔离 workspace 中生成 `generated/` 和 `agent-output/candidate_manifest.json`。
 
@@ -37,10 +36,7 @@ export OPENAI_BASE_URL=https://...
 默认使用 `config/agent-world.default.yaml`：
 
 ```yaml
-node_execution:
-  mode: agent
-
-agent_profiles:
+invocation_profiles:
   semantic:
     backend_kind: llm
     provider: openai_compatible
@@ -60,8 +56,8 @@ agent_profiles:
     model: gpt-5.4
 
 stages:
-  default_agent_profile: semantic
-  agent_profiles:
+  default_invocation_profile: semantic
+  invocation_profiles:
     IMPLEMENT: implementation
 
 research:
