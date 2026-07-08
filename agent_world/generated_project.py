@@ -248,6 +248,7 @@ def _write_portable_specs(package_dir: Path, artifacts: dict[str, dict[str, Any]
 def _run_runtime_command(cwd: Path, command: list[Any]) -> dict[str, Any]:
     if not command:
         return {"success": False, "command": [], "exit_code": None, "stdout": "", "stderr": "missing command", "failure_class": "missing_runtime_command"}
+    _prepare_runtime_command_workspace(cwd)
     argv = [sys.executable if str(part) == "python" else str(part) for part in command]
     try:
         completed = subprocess.run(argv, cwd=cwd, text=True, capture_output=True, timeout=15, check=False)
@@ -256,6 +257,12 @@ def _run_runtime_command(cwd: Path, command: list[Any]) -> dict[str, Any]:
     parsed = _parse_json_stdout(completed.stdout)
     success = completed.returncode == 0 and parsed.get("success") is True
     return {"success": success, "command": argv, "exit_code": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "parsed": parsed, "failure_class": "" if success else "portable_runtime_command_failed"}
+
+
+def _prepare_runtime_command_workspace(cwd: Path) -> None:
+    # Agent implementations receive this directory during codegen; packaged checks
+    # need the same package-local sink before running portable self-check commands.
+    (Path(cwd).parent / "agent-output").mkdir(parents=True, exist_ok=True)
 
 
 def file_sha256(path: Path) -> str:

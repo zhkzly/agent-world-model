@@ -8,6 +8,7 @@ Rules:
 - Every task must still include both `expected_state_delta` and `expected_answer` fields; one may be empty only when the other carries the check.
 - Every task must include `target_capability`, `forbidden_leakage`, and `difficulty`.
 - `dependency_path` is an ordered list of logical tool id strings, not a list of edge objects.
+- Every adjacent pair in `dependency_path` must be either identical or present as a directed `from_tool_id -> to_tool_id` edge in `LogicalToolGraph.edges`; do not assume sibling tools can be sequenced unless that edge exists.
 - Tasks must be solvable using the declared logical tool graph.
 - Avoid leaking verifier ids, state file paths, internal implementation details, or logical tool ids in user-facing natural requests.
 - Include coverage over tools, capabilities, and state entities.

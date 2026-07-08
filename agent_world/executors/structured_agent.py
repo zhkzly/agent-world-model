@@ -270,6 +270,7 @@ def _contract_hints(target_type: str) -> dict[str, Any]:
         ]
         hints["coverage_required_fields"] = ["tool_ids", "capabilities", "state_entities"]
         hints["dependency_path_shape"] = "List of logical tool id strings in execution order, not edge objects."
+        hints["dependency_path_edge_rule"] = "Every adjacent pair in dependency_path must be identical or match a declared directed LogicalToolGraph.edges from_tool_id -> to_tool_id edge; never invent implicit sibling edges."
         hints["natural_request_rule"] = "Do not mention database, backend, verifier, logical_tool, tool_id, or actual tool ids in user-facing natural_request."
     if target_type == "SurfacePlan":
         hints["python_surface_required"] = "surface_status.python must be required_for_first_slice and at least one binding must use surface=python."

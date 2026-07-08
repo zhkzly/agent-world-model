@@ -1301,6 +1301,7 @@ def _implementation_agent_instruction(
             "Write agent-output/candidate_manifest.json after the final passing candidate. The manifest must declare "
             "candidate_dir: generated, contract_ref: contract.json, generated_files objects with exact path/kind/sha256/source_refs values, "
             "self_check.command, and replay_commands. Use the schema files under input/schemas/.\n"
+            "Generated self-check scripts must create their report directory before writing agent-output/local_check_report.json so the packaged runtime remains portable.\n"
             "Do not write outside generated/ and agent-output/. Do not import the agent_world framework package from generated code. "
             "The framework will perform the final build/check/replay gate after you exit.\n"
         )
@@ -1512,13 +1513,14 @@ def _code_agent_acceptance_checks(context: PipelineContext | None = None) -> str
         "# Acceptance Checks\n\n"
         "1. The generated self-check command declared in `agent-output/candidate_manifest.json` exits 0.\n"
         "2. The check prints a final JSON object with `success: true` or writes `agent-output/local_check_report.json` with success evidence.\n"
-        f"3. It covers {task_text}.\n"
-        "4. Each task has a positive verifier result with `success: true` and a negative verifier result with `success: false`.\n"
-        "5. `agent-output/candidate_manifest.json` declares `candidate_dir: generated`, `contract_ref: contract.json`, and one `generated_files` object for every file under generated/.\n"
-        "6. Each `generated_files[]` item declares exact package-relative `path`, allowed `kind`, lowercase 64-character `sha256`, and `source_refs`.\n"
-        "7. The framework independent verifier can load `contract.json`, call describe/setup/reset/health/invoke/verify/export_trace/teardown, and observe ordered trace evidence for every required task.\n"
-        "8. `input/framework-replay-contract.json` describes the framework-owned replay cases and check command; generated code must satisfy that contract.\n"
-        "9. On a repair attempt, read `input/failure-packet.json` and address the listed framework_check_observation, failed task/verifier, and command output without changing the manifest path shape unless the failure is a manifest/path/hash failure.\n"
+        "3. The self-check creates the report directory itself before writing the local check report, so it works after packaging.\n"
+        f"4. It covers {task_text}.\n"
+        "5. Each task has a positive verifier result with `success: true` and a negative verifier result with `success: false`.\n"
+        "6. `agent-output/candidate_manifest.json` declares `candidate_dir: generated`, `contract_ref: contract.json`, and one `generated_files` object for every file under generated/.\n"
+        "7. Each `generated_files[]` item declares exact package-relative `path`, allowed `kind`, lowercase 64-character `sha256`, and `source_refs`.\n"
+        "8. The framework independent verifier can load `contract.json`, call describe/setup/reset/health/invoke/verify/export_trace/teardown, and observe ordered trace evidence for every required task.\n"
+        "9. `input/framework-replay-contract.json` describes the framework-owned replay cases and check command; generated code must satisfy that contract.\n"
+        "10. On a repair attempt, read `input/failure-packet.json` and address the listed framework_check_observation, failed task/verifier, and command output without changing the manifest path shape unless the failure is a manifest/path/hash failure.\n"
     )
 
 

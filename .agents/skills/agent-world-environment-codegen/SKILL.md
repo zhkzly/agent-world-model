@@ -62,7 +62,7 @@ MCP, CLI, HTTP, database, local service, or Python callable details belong behin
 3. Implement the free-form project under `generated/source/`, plus state fixtures under `generated/state/`.
 4. Implement adapter entrypoints under `generated/adapters/` or `generated/scripts/` that expose the eight ABI interfaces declared in `contract.json`.
 5. Write task, tool, verifier, and surface descriptors under `generated/spec/`.
-6. Run a local generated self-check and write `agent-output/local_check_report.json`.
+6. Run a local generated self-check and write `agent-output/local_check_report.json`; self-check code must create the report directory before writing so it still works after packaging.
 7. Write `agent-output/candidate_manifest.json` only after the candidate has the final file hashes.
 
 ## Candidate Manifest Rules
