@@ -1,0 +1,35 @@
+{
+  "id": "trustworthy-programmatic-runtime-refactor",
+  "name": "trustworthy-programmatic-runtime-refactor",
+  "title": "Programmatic Environment Foundry v2 Clean-Break Refactor",
+  "description": "Design a clean-break five-component programmatic environment foundry: Controller coordinates Designer, Builder, Judge, and Registry to compile one request into a real package; ExpandJob reuses the same flow for revisions/new packages without training dependency; rollout/veRL stays external and optional.",
+  "status": "in_progress",
+  "dev_type": "architecture-refactor",
+  "scope": "agent_world",
+  "package": "agent_world",
+  "priority": "P0",
+  "creator": "kelong.zx",
+  "assignee": "kelong.zx",
+  "createdAt": "2026-07-13",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "AGENTS.md",
+    "docs/agent-world-environment-generation.zh.md",
+    ".trellis/tasks/07-13-trustworthy-programmatic-runtime-refactor/prd.md",
+    ".trellis/tasks/07-13-trustworthy-programmatic-runtime-refactor/design.md",
+    ".trellis/tasks/07-13-trustworthy-programmatic-runtime-refactor/implement.md"
+  ],
+  "notes": "User approved the five-component clean-break implementation. Direct Generation always produces the requested first package; a non-blocking Discovery lane feeds a later budgeted ExpansionCampaign. Specialized agents require hermetic Skills/Hooks/Tools/workspaces, and evolution prioritizes tool surfaces, transition constraints, and task scope over source-code mutation. No compatibility or mock/fake/stub path is allowed.",
+  "meta": {
+    "source_of_truth": "docs/agent-world-environment-generation.zh.md",
+    "compatibility_required": false
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Challenge Agent World"
+  short_description: "Design independent behavioral verification"
+  default_prompt: "Challenge the candidate against the WorldSpec and produce verifier IR without modifying it."

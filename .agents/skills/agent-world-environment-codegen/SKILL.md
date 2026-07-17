@@ -1,94 +1,70 @@
 ---
 name: agent-world-environment-codegen
-description: Generate Agent World contract-project executable environments from pipeline artifacts. Use when Codex or another code agent is asked to implement an environment project under an isolated workspace from input/artifacts, input/schemas, input/implementation_contract.json, or repair packets.
+description: Generate or repair a real Agent World Environment Candidate from frozen EnvironmentDesign, WorldSpec, ImplementationContract, Task Materializer v3 schema, or disclosed Builder findings. Use for isolated environment implementation under candidate/, Runtime ABI v2, Task Materializer v3, public self-checks, and public tests.
 ---
 
 # Agent World Environment Codegen
 
 ## Objective
 
-Implement a complete executable environment project from the provided artifacts. Let the environment need determine the code structure, data model, tools, services, database, MCP server, CLI, HTTP API, or Python package. Do not force a fixed runtime file template.
+Compile the frozen design into a self-contained executable environment whose state transitions
+are owned by program code. The framework—not this Agent—owns validation, repair routing, release,
+packaging, Registry publication, and training-suite selection.
 
-The framework only requires a stable contract-project boundary so downstream systems can set up, reset, invoke, verify, export traces, package, and release the generated environment.
+## Inputs and trust boundary
 
-## Required Inputs
+Read all immutable files that exist under `inputs/`, especially:
 
-Read these files before implementation when present:
+- `environment-design.json`
+- `world-spec.json`
+- `implementation-contract.json`
+- `task-materializer-output.schema.json`
+- the current `repair-disclosure-*.json` on repair turns
 
-- `input/implementation_contract.json`
-- `input/framework-replay-contract.json`
-- `input/artifacts/*.json`
-- `input/schemas/*.schema.json`
-- `input/failure-packet.json` on repair attempts
+Treat `inputs/` as build-time information only. A restored `candidate/` tree must install, import,
+start, reset, invoke, test, and self-check with no sibling `inputs/` directory. Compile required
+public schemas and constants into candidate source or declared package data. Never open
+`../inputs`, workspace paths, Codex state, prior Judge artifacts, or undisclosed evidence at
+runtime or from public tests.
 
-Treat schema files under `input/schemas/` as the machine contract. This skill is guidance, not the schema source of truth.
+## Required project
 
-## Required Outputs
+Create or repair only `candidate/` as a Python 3.12 uv virtual project:
 
-Write the candidate under the isolated workspace:
+- `pyproject.toml` with `[tool.uv] package = false`
+- closed, wheel-installable `uv.lock`
+- non-empty declared `LICENSE`
+- Runtime implementation and entry module
+- Task Materializer v3 callable and entry module
+- runnable public self-check
+- real standalone public tests
 
-```text
-generated/
-  contract.json
-  source/
-  state/
-  adapters/
-  scripts/
-  spec/
-agent-output/
-  candidate_manifest.json
-  local_check_report.json
-```
+Do not include `.venv`, caches, bytecode, build output, symlinks, undeclared files, credentials,
+host paths, or generated release/Judge claims.
 
-`generated/source/` is free-form project code. Use whatever structure the environment requires.
+## Runtime and task contracts
 
-`generated/contract.json` must declare the eight runtime ABI interfaces:
+Implement `agent-world.runtime.v2` exactly from `implementation-contract.json`. Implement every
+WorldSpec tool and code-owned transition for unseen uint64 seeds. Bind the reset actor for the
+episode; project reset/invoke observations to the declared actor visibility; keep snapshot as the
+full Judge-only state. Do not accept task ids, expected answers, evaluator goals, verifier IR,
+oracle data, sealed data, or release metadata.
 
-- `describe`
-- `setup`
-- `reset`
-- `health`
-- `invoke`
-- `verify`
-- `export_trace`
-- `teardown`
+Expose exactly:
 
-MCP, CLI, HTTP, database, local service, or Python callable details belong behind these interfaces as adapters. Do not add top-level required interfaces for specific surfaces.
+`materialize(seed, task_type, actor, difficulty) -> task-materialization-v3`
 
-## Implementation Procedure
+Echo the four inputs and return only the schema-authorized public goal and initial config fields.
+Make identical calls deterministic and make declared difficulty dimensions materially affect the
+goal or initial state. Never create authoritative reward, answer, witness, or release logic.
 
-1. Read the requirement, task set, surface plan, verifier plan, replay contract, and schemas.
-2. Design the environment state, logical tools, concrete surfaces, reset model, trace model, and deterministic verifier.
-3. Implement the free-form project under `generated/source/`, plus state fixtures under `generated/state/`.
-4. Implement adapter entrypoints under `generated/adapters/` or `generated/scripts/` that expose the eight ABI interfaces declared in `contract.json`.
-5. Write task, tool, verifier, and surface descriptors under `generated/spec/`.
-6. Run a local generated self-check and write `agent-output/local_check_report.json`; self-check code must create the report directory before writing so it still works after packaging.
-7. Write `agent-output/candidate_manifest.json` only after the candidate has the final file hashes.
+Read [references/generation-guidelines.md](references/generation-guidelines.md) when implementing
+or repairing Runtime protocol details, component isolation, or portability.
 
-## Candidate Manifest Rules
+## Validation and completion
 
-`candidate_manifest.json` must use package-relative paths:
-
-- `candidate_dir` must be `generated`.
-- `contract_ref` must point to `contract.json`.
-- Every file under `generated/` must appear in `generated_files[]`, except Python bytecode cache files.
-- Every `generated_files[]` item must include `path`, `kind`, `sha256`, and `source_refs`.
-- Do not use absolute paths, home-relative paths, `..`, symlink escapes, credentials, or secret-bearing URLs.
-
-Use the file kinds allowed by `input/schemas/candidate_manifest.schema.json`.
-
-## Verification Rules
-
-Generated self-checks are only supporting evidence. The framework will independently:
-
-- validate schemas, paths, hashes, and package-relative references;
-- call the eight ABI interfaces;
-- reset episodes for accepted tasks;
-- replay positive tool calls through `invoke`;
-- call `verify` for positive and negative cases;
-- call `export_trace` and check event evidence;
-- call `teardown`.
-
-Do not make release decisions from stdout or from the generated self-check.
-
-For more guidance, read `references/generation-guidelines.md`.
+Run real uv/public checks. Test from the project root and ensure imports still work when the
+candidate tree is copied alone. Return the complete structured `CandidateCompletion`, not a patch.
+All declared paths are relative to the physical `candidate/` project root; do not repeat the outer
+directory. Report a real blocker instead of using templates, mocks, fixed replay cases, or fake
+success evidence.

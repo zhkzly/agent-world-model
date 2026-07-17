@@ -1,0 +1,1422 @@
+"""Structured outputs requested from the two Designer-facing Agent profiles."""
+
+from __future__ import annotations
+
+from typing import Annotated, Any, Literal, Self
+
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic.config import ExtraValues
+from pydantic_core import PydanticCustomError
+
+from agent_world.agent_output_authority import (
+    AgentOutputAuthority,
+    SemanticAdvisoryOutput,
+    register_agent_output_contract,
+)
+from agent_world.contracts import (
+    Claim,
+    ConcurrencySemantics,
+    ContentHash,
+    CoverageDimension,
+    CurriculumRequirements,
+    DifficultyDimension,
+    EvidenceConflict,
+    FidelityStatement,
+    IdempotencySemantics,
+    Identifier,
+    ObservationSemantics,
+    PermissionRule,
+    RetrySemantics,
+    RewardSpec,
+    RollbackSemantics,
+    Rule,
+    RuleFamily,
+    RuleValueSource,
+    RuleValueType,
+    StateEntitySchema,
+    StateSchema,
+    TimeoutSemantics,
+    ToolContract,
+    ToolError,
+    ToolSemantics,
+    ToolSurface,
+    TransactionSemantics,
+    VerificationRequirements,
+    WorldBoundary,
+)
+
+
+class AgentOutput(SemanticAdvisoryOutput, BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+
+    @classmethod
+    def model_validate(
+        cls,
+        obj: Any,
+        *,
+        strict: bool | None = None,
+        extra: ExtraValues | None = None,
+        from_attributes: bool | None = None,
+        context: Any | None = None,
+        by_alias: bool | None = None,
+        by_name: bool | None = None,
+    ) -> Self:
+        """Validate a JSON response without rejecting JSON arrays for tuple fields.
+
+        Codex structured output is JSON, so arrays necessarily arrive as ``list``
+        values.  The durable contracts remain strict after construction; this
+        boundary only enables Pydantic's JSON-compatible list-to-tuple parsing.
+        The provider output schema still rejects scalar type mismatches before
+        this method and the framework performs semantic validation afterwards.
+        """
+
+        return super().model_validate(
+            obj,
+            strict=False if strict is None else strict,
+            extra=extra,
+            from_attributes=from_attributes,
+            context=context,
+            by_alias=by_alias,
+            by_name=by_name,
+        )
+
+
+class PlannedSearchQuery(AgentOutput):
+    text: Annotated[str, Field(min_length=1)]
+    rationale: Annotated[str, Field(min_length=1)]
+    language: str = "all"
+    topics: tuple[str, ...] = ()
+
+
+class ResearchPlan(AgentOutput):
+    queries: Annotated[tuple[PlannedSearchQuery, ...], Field(min_length=1, max_length=12)]
+    target_coverage_dimensions: Annotated[tuple[str, ...], Field(min_length=1)]
+    known_source_urls: tuple[str, ...] = ()
+    stop_conditions: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
+class EvidenceSynthesis(AgentOutput):
+    claims: tuple[Claim, ...]
+    conflicts: tuple[EvidenceConflict, ...] = ()
+    unresolved_questions: tuple[str, ...] = ()
+
+
+class AssumptionIssueOrigin(AgentOutput):
+    """One exact artifact field that exposes a release-blocking uncertainty."""
+
+    source: Literal[
+        "evidence_graph",
+        "environment_design",
+        "world_spec",
+        "coverage_dimension",
+    ]
+    coverage_dimension: Identifier | None = None
+
+    @model_validator(mode="after")
+    def validate_coverage_dimension(self) -> AssumptionIssueOrigin:
+        if (self.source == "coverage_dimension") != (self.coverage_dimension is not None):
+            raise ValueError("coverage_dimension is required only for coverage_dimension origins")
+        return self
+
+
+class AssumptionIssue(AgentOutput):
+    """A deduplicated uncertainty with every artifact origin retained."""
+
+    issue_id: Identifier
+    statement: Annotated[str, Field(min_length=1)]
+    origins: Annotated[tuple[AssumptionIssueOrigin, ...], Field(min_length=1)]
+
+
+class AssumptionResolutionDraft(AgentOutput):
+    """One explicit disposition for a previously recorded evidence question."""
+
+    issue_id: Identifier
+    question: Annotated[str, Field(min_length=1)]
+    disposition: Literal["product_decision", "bounded_out_of_scope", "needs_human"]
+    rationale: Annotated[str, Field(min_length=1)]
+    claim: Claim | None = None
+    fidelity: FidelityStatement | None = None
+
+    @model_validator(mode="after")
+    def validate_disposition(self) -> AssumptionResolutionDraft:
+        if self.disposition == "needs_human":
+            if self.claim is not None or self.fidelity is not None:
+                raise PydanticCustomError(
+                    "assumption_needs_human_payload_forbidden",
+                    "needs_human requires null claim and fidelity",
+                )
+            return self
+        if self.claim is None or self.fidelity is None:
+            raise PydanticCustomError(
+                "assumption_closure_payload_required",
+                "closed resolution requires both claim and fidelity",
+            )
+        expected_kind = (
+            "product_decision" if self.disposition == "product_decision" else "bounded_assumption"
+        )
+        expected_level = (
+            "synthetic_policy"
+            if self.disposition == "product_decision"
+            else "bounded_approximation"
+        )
+        if self.claim.kind != expected_kind or self.claim.status != "supported":
+            raise PydanticCustomError(
+                "assumption_claim_disposition_mismatch",
+                "claim kind/status must match disposition and be supported",
+            )
+        if self.fidelity.level != expected_level:
+            raise PydanticCustomError(
+                "assumption_fidelity_level_mismatch",
+                "fidelity level must match the selected disposition",
+            )
+        if self.claim.claim_id not in self.fidelity.evidence_claim_ids:
+            raise PydanticCustomError(
+                "assumption_fidelity_claim_missing",
+                "fidelity evidence_claim_ids must include the closure claim id",
+            )
+        if self.disposition == "bounded_out_of_scope" and not self.fidelity.known_divergence:
+            raise PydanticCustomError(
+                "assumption_known_divergence_required",
+                "bounded_out_of_scope requires a non-empty known_divergence",
+            )
+        return self
+
+
+class EvidenceAssumptionClosureDraft(AgentOutput):
+    """Bounded closure decisions for every frozen EvidenceGraph question."""
+
+    resolutions: Annotated[
+        tuple[AssumptionResolutionDraft, ...], Field(min_length=1, max_length=32)
+    ]
+
+
+class ToolSurfaceDraft(AgentOutput):
+    """One evidence-bound public tool shape before behavior is authored."""
+
+    surface: ToolSurface
+    evidence_claim_ids: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
+class WorldBoundaryDraft(AgentOutput):
+    """World identity, authority, dimensions, and fidelity before state design."""
+
+    boundary: WorldBoundary
+    task_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    fidelity: Annotated[tuple[FidelityStatement, ...], Field(min_length=1)]
+
+
+class TaskDimensionsDraft(AgentOutput):
+    """Stable compiler identifiers for one frozen human-readable dimension taxonomy."""
+
+    task_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+
+
+class WorldStateDraft(AgentOutput):
+    """State model compiled against one frozen WorldBoundary."""
+
+    state: StateSchema
+
+
+class WorldStateShapeDraft(AgentOutput):
+    """Entity and root schemas without executable initial-state rules."""
+
+    entities: Annotated[tuple[StateEntitySchema, ...], Field(min_length=1, max_length=32)]
+    root_state_schema: dict[str, JsonValue]
+
+
+class StateEntityPlan(AgentOutput):
+    """One bounded semantic unit selected before its JSON Schema is authored."""
+
+    entity: Identifier
+    purpose: Annotated[str, Field(min_length=1)]
+    root_field: Identifier
+    storage: Literal["collection", "singleton"]
+    system_of_record: Identifier
+    boundary_resource_ids: tuple[Identifier, ...] = ()
+    primary_key_fields: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    mutable_fields: tuple[Identifier, ...] = ()
+    lifecycle_field: Identifier | None = None
+    lifecycle_states: tuple[Identifier, ...] = ()
+    evidence_claim_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+
+
+class StateEntityInventoryDraft(AgentOutput):
+    """Normalized entity ownership and identity, without recursive schemas."""
+
+    entities: Annotated[tuple[StateEntityPlan, ...], Field(min_length=1, max_length=12)]
+
+
+class StateEntitySchemaDraft(AgentOutput):
+    """Framework-compiled JSON Schema for exactly one frozen entity plan."""
+
+    entity: Identifier
+    json_schema: dict[str, JsonValue]
+
+
+class InitialStateRulesDraft(AgentOutput):
+    """Executable reset invariants compiled against one frozen state shape."""
+
+    initial_state_constraints: tuple[Rule, ...] = ()
+
+
+class WorldToolInventoryDraft(AgentOutput):
+    """Frozen public ToolSurfaces compiled against boundary and state."""
+
+    tool_surfaces: Annotated[tuple[ToolSurfaceDraft, ...], Field(min_length=1, max_length=8)]
+
+
+class ToolSurfacePlan(AgentOutput):
+    """One frozen public tool identity before its schemas are authored."""
+
+    tool_id: Identifier
+    namespace: Identifier
+    name: Identifier
+    description: Annotated[str, Field(min_length=1)]
+    transport: Literal["runtime", "mcp", "http", "cli", "python", "database"]
+    evidence_claim_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+
+
+class WorldToolPlanInventoryDraft(AgentOutput):
+    """Bounded tool identities and evidence bindings, without recursive schemas."""
+
+    tools: Annotated[tuple[ToolSurfacePlan, ...], Field(min_length=1, max_length=8)]
+
+
+class ToolSurfaceSchemasDraft(AgentOutput):
+    """Three locally closed schemas for exactly one frozen tool plan."""
+
+    tool_id: Identifier
+    input_schema: dict[str, JsonValue]
+    output_schema: dict[str, JsonValue]
+    observation_schema: dict[str, JsonValue]
+
+
+class ToolSchemaDraft(AgentOutput):
+    """One locally closed schema for one frozen tool and schema role."""
+
+    tool_id: Identifier
+    schema_kind: Literal["input", "output", "observation"]
+    json_schema: dict[str, JsonValue]
+
+
+class SchemaPropertyDraft(AgentOutput):
+    name: Identifier
+    node_id: Identifier
+    required: bool
+
+
+class SchemaObjectNodeDraft(AgentOutput):
+    node_id: Identifier
+    kind: Literal["object"]
+    description: str | None = None
+    properties: Annotated[tuple[SchemaPropertyDraft, ...], Field(max_length=64)] = ()
+
+
+class SchemaArrayNodeDraft(AgentOutput):
+    node_id: Identifier
+    kind: Literal["array"]
+    description: str | None = None
+    items_node_id: Identifier
+    min_items: Annotated[int | None, Field(ge=0)] = None
+    max_items: Annotated[int | None, Field(ge=0)] = None
+
+
+class SchemaStringNodeDraft(AgentOutput):
+    node_id: Identifier
+    kind: Literal["string"]
+    description: str | None = None
+    format: Literal["none", "date", "date-time", "email", "uri", "uuid"] = "none"
+    enum_values: Annotated[tuple[str, ...], Field(max_length=64)] = ()
+    const_value: str | None = None
+    min_length: Annotated[int | None, Field(ge=0)] = None
+    max_length: Annotated[int | None, Field(ge=0)] = None
+
+
+class SchemaIntegerNodeDraft(AgentOutput):
+    node_id: Identifier
+    kind: Literal["integer"]
+    description: str | None = None
+    enum_values: Annotated[tuple[int, ...], Field(max_length=64)] = ()
+    const_value: int | None = None
+    minimum: int | None = None
+    maximum: int | None = None
+
+
+class SchemaNumberNodeDraft(AgentOutput):
+    node_id: Identifier
+    kind: Literal["number"]
+    description: str | None = None
+    const_value: float | None = None
+    minimum: float | None = None
+    maximum: float | None = None
+
+
+class SchemaBooleanNodeDraft(AgentOutput):
+    node_id: Identifier
+    kind: Literal["boolean"]
+    description: str | None = None
+    const_value: bool | None = None
+
+
+class SchemaNullNodeDraft(AgentOutput):
+    node_id: Identifier
+    kind: Literal["null"]
+    description: str | None = None
+
+
+class SchemaUnionNodeDraft(AgentOutput):
+    node_id: Identifier
+    kind: Literal["union"]
+    description: str | None = None
+    variant_node_ids: Annotated[tuple[Identifier, ...], Field(min_length=2, max_length=16)]
+
+
+SchemaNodeDraft = Annotated[
+    SchemaObjectNodeDraft
+    | SchemaArrayNodeDraft
+    | SchemaStringNodeDraft
+    | SchemaIntegerNodeDraft
+    | SchemaNumberNodeDraft
+    | SchemaBooleanNodeDraft
+    | SchemaNullNodeDraft
+    | SchemaUnionNodeDraft,
+    Field(discriminator="kind"),
+]
+
+
+class StateEntitySchemaIRDraft(AgentOutput):
+    """Shape-only semantic entity graph; Designer preflight owns graph invariants."""
+
+    entity: Identifier
+    root_node_id: Identifier
+    nodes: Annotated[tuple[SchemaNodeDraft, ...], Field(min_length=1, max_length=128)]
+
+
+class RuleConstantDraft(AgentOutput):
+    """One unvalidated JSON constant authored at the Agent boundary."""
+
+    kind: Literal["constant"]
+    value_type: Literal["null", "boolean", "number", "string", "array", "object"]
+    value: JsonValue
+
+
+class RuleReferenceDraft(AgentOutput):
+    """One reference whose pointer/type closure is checked by the framework compiler."""
+
+    kind: Literal["reference"]
+    source: RuleValueSource
+    pointer: str = ""
+    value_type: RuleValueType
+
+
+RuleAtomDraft = Annotated[
+    RuleConstantDraft | RuleReferenceDraft,
+    Field(discriminator="kind"),
+]
+
+
+class RuleArithmeticDraft(AgentOutput):
+    """Bounded non-recursive arithmetic authored without hidden validators."""
+
+    kind: Literal["arithmetic"]
+    operator: Literal["add", "subtract", "multiply", "divide", "modulo"]
+    left: RuleAtomDraft
+    right: RuleAtomDraft
+
+
+RuleTermDraft = Annotated[
+    RuleConstantDraft | RuleReferenceDraft | RuleArithmeticDraft,
+    Field(discriminator="kind"),
+]
+
+
+class RuleExistsClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["exists"]
+    left: RuleReferenceDraft
+    negate: bool = False
+
+
+class RuleNotExistsClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["not_exists"]
+    left: RuleReferenceDraft
+    negate: bool = False
+
+
+class RuleSchemaClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["schema_valid"]
+    left: RuleTermDraft
+    json_schema: dict[str, JsonValue]
+    negate: bool = False
+
+
+class RuleEqualClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["equal"]
+    left: RuleTermDraft
+    right: RuleTermDraft
+    negate: bool = False
+
+
+class RuleNotEqualClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["not_equal"]
+    left: RuleTermDraft
+    right: RuleTermDraft
+    negate: bool = False
+
+
+class RuleGreaterThanClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["greater_than"]
+    ordering: Literal["number", "date", "date-time"]
+    left: RuleTermDraft
+    right: RuleTermDraft
+    negate: bool = False
+
+
+class RuleGreaterOrEqualClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["greater_or_equal"]
+    ordering: Literal["number", "date", "date-time"]
+    left: RuleTermDraft
+    right: RuleTermDraft
+    negate: bool = False
+
+
+class RuleLessThanClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["less_than"]
+    ordering: Literal["number", "date", "date-time"]
+    left: RuleTermDraft
+    right: RuleTermDraft
+    negate: bool = False
+
+
+class RuleLessOrEqualClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["less_or_equal"]
+    ordering: Literal["number", "date", "date-time"]
+    left: RuleTermDraft
+    right: RuleTermDraft
+    negate: bool = False
+
+
+class RuleContainsClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["contains"]
+    left: RuleTermDraft
+    right: RuleTermDraft
+    negate: bool = False
+
+
+class RuleNotContainsClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["not_contains"]
+    left: RuleTermDraft
+    right: RuleTermDraft
+    negate: bool = False
+
+
+RuleClauseDraft = Annotated[
+    RuleExistsClauseDraft
+    | RuleNotExistsClauseDraft
+    | RuleSchemaClauseDraft
+    | RuleEqualClauseDraft
+    | RuleNotEqualClauseDraft
+    | RuleGreaterThanClauseDraft
+    | RuleGreaterOrEqualClauseDraft
+    | RuleLessThanClauseDraft
+    | RuleLessOrEqualClauseDraft
+    | RuleContainsClauseDraft
+    | RuleNotContainsClauseDraft,
+    Field(discriminator="operator"),
+]
+
+
+class RuleDraft(AgentOutput):
+    """Agent-facing Rule ADT deterministically compiled into the core Rule IR."""
+
+    rule_id: Identifier
+    family: RuleFamily
+    description: Annotated[str, Field(min_length=1)]
+    boolean_operator: Literal["all", "any"]
+    clauses: Annotated[tuple[RuleClauseDraft, ...], Field(min_length=1, max_length=64)]
+    case_sensitivity: Literal["positive_only", "positive_and_negative"]
+    evidence_claim_ids: tuple[Identifier, ...] = ()
+
+
+class ToolErrorSourceDraft(AgentOutput):
+    error_code: Identifier
+    when: RuleDraft
+    observation: Annotated[str, Field(min_length=1)]
+    state_effect: Literal["none", "partial", "rolled_back", "unknown"]
+    retryable: bool
+    evidence_claim_ids: tuple[Identifier, ...] = ()
+
+
+class PermissionRuleSourceDraft(AgentOutput):
+    permission_id: Identifier
+    allowed_actors: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    required_scopes_by_actor: dict[Identifier, tuple[Identifier, ...]]
+    condition: RuleDraft | None = None
+    denied_observation: Annotated[str, Field(min_length=1)]
+
+
+class ObservationSemanticsSourceDraft(AgentOutput):
+    visible_fields_by_actor: dict[Identifier, tuple[Identifier, ...]]
+    redacted_fields_by_actor: dict[Identifier, tuple[Identifier, ...]]
+    consistency: Literal["strong", "read_after_write", "eventual", "snapshot"]
+    staleness_bound_seconds: Annotated[float | None, Field(ge=0)] = None
+
+
+class IdempotencyUnsupportedDraft(AgentOutput):
+    mode: Literal["not_supported"]
+    duplicate_observation: Annotated[str, Field(min_length=1)]
+
+
+class IdempotencyNaturalDraft(AgentOutput):
+    mode: Literal["natural"]
+    duplicate_observation: Annotated[str, Field(min_length=1)]
+
+
+class IdempotencyKeyDraft(AgentOutput):
+    mode: Literal["idempotency_key"]
+    key_field: Identifier
+    retention_seconds: Annotated[float | None, Field(gt=0)] = None
+    duplicate_observation: Annotated[str, Field(min_length=1)]
+
+
+IdempotencySourceDraft = Annotated[
+    IdempotencyUnsupportedDraft | IdempotencyNaturalDraft | IdempotencyKeyDraft,
+    Field(discriminator="mode"),
+]
+
+
+class ToolSchemaIRDraft(AgentOutput):
+    """Shape-only tool schema graph; Designer preflight owns graph invariants."""
+
+    tool_id: Identifier
+    schema_kind: Literal["input", "output", "observation"]
+    root_node_id: Identifier
+    nodes: Annotated[tuple[SchemaNodeDraft, ...], Field(min_length=1, max_length=128)]
+
+
+class WorldSkeletonDraft(AgentOutput):
+    """Compact world identity/state/tool inventory shared by semantic nodes."""
+
+    boundary: WorldBoundary
+    state: StateSchema
+    tool_surfaces: Annotated[tuple[ToolSurfaceDraft, ...], Field(min_length=1, max_length=8)]
+    task_dimensions: Annotated[tuple[str, ...], Field(min_length=1)]
+    fidelity: Annotated[tuple[FidelityStatement, ...], Field(min_length=1)]
+
+
+class ToolBehaviorDraft(AgentOutput):
+    """Framework-composed state-transition and error behavior for one tool."""
+
+    tool_id: Annotated[str, Field(min_length=1)]
+    preconditions: tuple[Rule, ...] = ()
+    transition: Annotated[tuple[Rule, ...], Field(min_length=1)]
+    postconditions: tuple[Rule, ...] = ()
+    errors: tuple[ToolError, ...] = ()
+
+
+class ToolConditionsDraft(AgentOutput):
+    """Preconditions and postconditions for one frozen tool."""
+
+    tool_id: Annotated[str, Field(min_length=1)]
+    preconditions: tuple[Rule, ...] = ()
+    postconditions: tuple[Rule, ...] = ()
+
+
+class ToolStateTransitionDraft(AgentOutput):
+    """Executable pre-state/argument to post-state/output constraints for one tool."""
+
+    tool_id: Annotated[str, Field(min_length=1)]
+    transition: Annotated[tuple[Rule, ...], Field(min_length=1)]
+
+
+class ToolErrorsDraft(AgentOutput):
+    """Declared error conditions for one frozen tool."""
+
+    tool_id: Annotated[str, Field(min_length=1)]
+    errors: Annotated[tuple[ToolError, ...], Field(min_length=1)]
+
+
+class InitialStateRulesSourceDraft(AgentOutput):
+    """Agent-authored reset rules before deterministic Rule compilation."""
+
+    initial_state_constraints: tuple[RuleDraft, ...] = ()
+
+
+class ToolConditionsSourceDraft(AgentOutput):
+    tool_id: Identifier
+    preconditions: tuple[RuleDraft, ...] = ()
+    postconditions: tuple[RuleDraft, ...] = ()
+
+
+class ToolStateTransitionSourceDraft(AgentOutput):
+    tool_id: Identifier
+    transition: Annotated[tuple[RuleDraft, ...], Field(min_length=1)]
+
+
+class ToolErrorsSourceDraft(AgentOutput):
+    tool_id: Identifier
+    errors: Annotated[tuple[ToolErrorSourceDraft, ...], Field(min_length=1)]
+
+
+class ToolAccessObservationDraft(AgentOutput):
+    """Actor authority and Agent-visible observation behavior for one tool."""
+
+    tool_id: Annotated[str, Field(min_length=1)]
+    permission: PermissionRule
+    observation: ObservationSemantics
+
+
+class ToolAccessObservationSourceDraft(AgentOutput):
+    tool_id: Identifier
+    permission: PermissionRuleSourceDraft
+    observation: ObservationSemanticsSourceDraft
+
+
+class ToolReliabilityDraft(AgentOutput):
+    """Retry, timeout, transaction, rollback, and concurrency behavior for one tool."""
+
+    tool_id: Annotated[str, Field(min_length=1)]
+    idempotency: IdempotencySemantics
+    retry: RetrySemantics
+    timeout: TimeoutSemantics
+    transaction: TransactionSemantics
+    rollback: RollbackSemantics
+    concurrency: ConcurrencySemantics
+
+
+class ToolReliabilitySourceDraft(AgentOutput):
+    tool_id: Identifier
+    idempotency: IdempotencySourceDraft
+    retry: RetrySemantics
+    timeout: TimeoutSemantics
+    transaction: TransactionSemantics
+    rollback: RollbackSemantics
+    concurrency: ConcurrencySemantics
+
+
+class ToolSemanticsDraft(AgentOutput):
+    """Framework-composed complete executable behavior for one frozen ToolSurface."""
+
+    tool_id: Annotated[str, Field(min_length=1)]
+    semantics: ToolSemantics
+
+
+class WorldClosureDraft(AgentOutput):
+    """Global invariants authored after all tool contracts are visible."""
+
+    invariants: Annotated[tuple[Rule, ...], Field(min_length=1)]
+
+
+class WorldClosureSourceDraft(AgentOutput):
+    invariants: Annotated[tuple[RuleDraft, ...], Field(min_length=1)]
+
+
+class WorldClosureReferenceTerm(AgentOutput):
+    kind: Literal["reference"]
+    source: RuleValueSource
+    pointer: str
+    value_type: RuleValueType
+
+
+class WorldClosureConstantTerm(AgentOutput):
+    kind: Literal["constant"]
+    value_type: Literal["null", "boolean", "number", "string", "array", "object"]
+    value: JsonValue
+
+
+class WorldClosureArithmeticTerm(AgentOutput):
+    kind: Literal["arithmetic"]
+    operator: Literal["add", "subtract", "multiply", "divide", "modulo"]
+    left: WorldClosureReferenceTerm | WorldClosureConstantTerm
+    right: WorldClosureReferenceTerm | WorldClosureConstantTerm
+
+
+WorldClosureTerm = Annotated[
+    WorldClosureReferenceTerm | WorldClosureConstantTerm | WorldClosureArithmeticTerm,
+    Field(discriminator="kind"),
+]
+
+
+class WorldClosureConstraint(AgentOutput):
+    """One deduplicated executable relation; clause identity metadata is intentionally absent."""
+
+    constraint_id: Identifier
+    left: WorldClosureTerm
+    operator: Literal[
+        "exists",
+        "not_exists",
+        "equal",
+        "not_equal",
+        "greater_than",
+        "greater_or_equal",
+        "less_than",
+        "less_or_equal",
+        "contains",
+        "not_contains",
+        "schema_valid",
+    ]
+    right: WorldClosureTerm | None = None
+    negate: bool = False
+    schema_elided: bool = False
+
+
+class WorldClosureRulePath(AgentOutput):
+    """Rule intent plus references into the deduplicated constraint catalog."""
+
+    rule_id: Identifier
+    description: Annotated[str, Field(min_length=1)]
+    boolean_operator: Literal["all", "any"]
+    constraint_ids: tuple[Identifier, ...] = ()
+    evidence_claim_ids: tuple[Identifier, ...] = ()
+
+
+class WorldClosureErrorPath(AgentOutput):
+    """Only the error information that can affect cross-tool world invariants."""
+
+    error_code: Identifier
+    when: WorldClosureRulePath
+    state_effect: Literal["none", "partial", "rolled_back", "unknown"]
+
+
+class WorldClosureToolPath(AgentOutput):
+    """Compact successful and failed state paths for one frozen tool."""
+
+    tool_id: Identifier
+    preconditions: tuple[WorldClosureRulePath, ...] = ()
+    transition: tuple[WorldClosureRulePath, ...] = ()
+    postconditions: tuple[WorldClosureRulePath, ...] = ()
+    errors: tuple[WorldClosureErrorPath, ...] = ()
+
+
+class WorldClosureContext(AgentOutput):
+    """Framework-derived bounded input for authoring global invariant Rules."""
+
+    core_invariants: Annotated[tuple[str, ...], Field(min_length=1)]
+    root_state_schema: dict[str, JsonValue]
+    constraints: tuple[WorldClosureConstraint, ...] = ()
+    initial_state_rules: tuple[WorldClosureRulePath, ...] = ()
+    tool_paths: Annotated[tuple[WorldClosureToolPath, ...], Field(min_length=1)]
+    task_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    evidence_claims: tuple[Claim, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_constraint_catalog(self) -> WorldClosureContext:
+        constraint_ids = [item.constraint_id for item in self.constraints]
+        if len(set(constraint_ids)) != len(constraint_ids):
+            raise ValueError("world closure constraint ids must be unique")
+        known = set(constraint_ids)
+        rules = list(self.initial_state_rules)
+        for tool in self.tool_paths:
+            rules.extend(tool.preconditions)
+            rules.extend(tool.transition)
+            rules.extend(tool.postconditions)
+            rules.extend(error.when for error in tool.errors)
+        referenced = {item for rule in rules for item in rule.constraint_ids}
+        if unknown := referenced - known:
+            raise ValueError(
+                f"world closure rules reference unknown constraints: {sorted(unknown)}"
+            )
+        if unreachable := known - referenced:
+            raise ValueError(
+                "world closure constraint catalog contains unreachable entries: "
+                f"{sorted(unreachable)}"
+            )
+        return self
+
+
+class TrainingRuleCatalogEntry(AgentOutput):
+    """Stable identity and intent of one already-validated world Rule."""
+
+    rule_id: Identifier
+    family: Literal[
+        "initial_state",
+        "invariant",
+        "precondition",
+        "transition",
+        "postcondition",
+        "error_condition",
+        "permission",
+        "task_success",
+        "task_failure",
+        "task_terminal",
+        "sampling",
+    ]
+    description: Annotated[str, Field(min_length=1)]
+    evidence_claim_ids: tuple[Identifier, ...] = ()
+
+
+class TrainingToolContext(AgentOutput):
+    """Task-authoring view of one executable tool without operational payload."""
+
+    tool_id: Identifier
+    description: Annotated[str, Field(min_length=1)]
+    input_schema: dict[str, JsonValue]
+    allowed_actor_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    rules: Annotated[tuple[TrainingRuleCatalogEntry, ...], Field(min_length=1)]
+    error_codes: tuple[Identifier, ...] = ()
+    evidence_claim_ids: tuple[Identifier, ...] = ()
+
+
+class TrainingContractContext(AgentOutput):
+    """Framework-derived bounded input for task, reward, and verifier policy."""
+
+    boundary: WorldBoundary
+    root_state_schema: dict[str, JsonValue]
+    initial_state_constraints: tuple[Rule, ...] = ()
+    tools: Annotated[tuple[TrainingToolContext, ...], Field(min_length=1)]
+    world_invariants: Annotated[tuple[TrainingRuleCatalogEntry, ...], Field(min_length=1)]
+    task_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    fidelity: Annotated[tuple[FidelityStatement, ...], Field(min_length=1)]
+    evidence_claims: tuple[Claim, ...] = ()
+
+
+class CurriculumContractDraft(AgentOutput):
+    """Agent-authored task distribution; framework compiles reward and verification."""
+
+    coverage_dimensions: Annotated[tuple[CoverageDimension, ...], Field(min_length=1)]
+    curriculum: CurriculumRequirements
+    unresolved_questions: tuple[str, ...] = ()
+
+
+class CurriculumTaskPlan(AgentOutput):
+    """Frozen lightweight identity and reachability boundary for one task shard."""
+
+    task_type: Identifier
+    objective: Annotated[str, Field(min_length=1)]
+    allowed_actor_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    required_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    difficulty_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    minimum_tool_calls: Annotated[int, Field(ge=1, le=32)] = 1
+
+    @model_validator(mode="after")
+    def validate_unique_sets(self) -> CurriculumTaskPlan:
+        for label, values in (
+            ("allowed_actor_ids", self.allowed_actor_ids),
+            ("required_tool_ids", self.required_tool_ids),
+            ("difficulty_dimensions", self.difficulty_dimensions),
+        ):
+            if len(set(values)) != len(values):
+                raise ValueError(f"task plan {self.task_type} {label} must be unique")
+        return self
+
+
+class CurriculumPlanDraft(AgentOutput):
+    """Bounded curriculum topology before independently authored task contracts."""
+
+    coverage_dimensions: Annotated[
+        tuple[CoverageDimension, ...], Field(min_length=1, max_length=32)
+    ]
+    task_plans: Annotated[tuple[CurriculumTaskPlan, ...], Field(min_length=1, max_length=8)]
+    difficulty_dimensions: Annotated[
+        tuple[DifficultyDimension, ...], Field(min_length=1, max_length=32)
+    ]
+    generation_seed_space: Annotated[str, Field(min_length=1)]
+    minimum_distinct_initial_states: Annotated[int, Field(ge=2)] = 2
+    minimum_distinct_tasks_per_type: Annotated[int, Field(ge=2)] = 2
+    sampling_constraints: Annotated[tuple[Rule, ...], Field(max_length=128)] = ()
+    unresolved_questions: tuple[str, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_plan_topology(self) -> CurriculumPlanDraft:
+        task_ids = [item.task_type for item in self.task_plans]
+        if len(set(task_ids)) != len(task_ids):
+            raise ValueError("curriculum task plan ids must be unique")
+        dimensions = [item.dimension for item in self.difficulty_dimensions]
+        if len(set(dimensions)) != len(dimensions):
+            raise ValueError("curriculum difficulty dimensions must be unique")
+        dimension_set = set(dimensions)
+        for task in self.task_plans:
+            if not set(task.difficulty_dimensions) <= dimension_set:
+                raise ValueError(
+                    f"task plan {task.task_type} references unknown difficulty dimensions"
+                )
+        coverage = [item.dimension for item in self.coverage_dimensions]
+        if len(set(coverage)) != len(coverage):
+            raise ValueError("curriculum coverage dimensions must be unique")
+        return self
+
+
+class CurriculumTaskPlanSourceDraft(AgentOutput):
+    task_type: Identifier
+    objective: Annotated[str, Field(min_length=1)]
+    allowed_actor_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    required_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    difficulty_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    minimum_tool_calls: Annotated[int, Field(ge=1, le=32)] = 1
+
+
+class CurriculumPlanSourceDraft(AgentOutput):
+    """Agent-facing curriculum topology and sampling Rule source."""
+
+    coverage_dimensions: Annotated[
+        tuple[CoverageDimension, ...], Field(min_length=1, max_length=32)
+    ]
+    task_plans: Annotated[
+        tuple[CurriculumTaskPlanSourceDraft, ...], Field(min_length=1, max_length=8)
+    ]
+    difficulty_dimensions: Annotated[
+        tuple[DifficultyDimension, ...], Field(min_length=1, max_length=32)
+    ]
+    generation_seed_space: Annotated[str, Field(min_length=1)]
+    minimum_distinct_initial_states: Annotated[int, Field(ge=2)] = 2
+    minimum_distinct_tasks_per_type: Annotated[int, Field(ge=2)] = 2
+    sampling_constraints: Annotated[tuple[RuleDraft, ...], Field(max_length=128)] = ()
+    unresolved_questions: tuple[str, ...] = ()
+
+
+class TaskRequirementDraft(AgentOutput):
+    """Open task semantics before framework-owned schema compilation.
+
+    The Agent authors objectives and executable Rule IR.  It deliberately does
+    not author JSON Schema envelopes, evaluator bindings, or reachability
+    budgets: those are protocol and release-policy concerns compiled by the
+    framework from the frozen world and the task-goal references below.
+    """
+
+    task_type: Identifier
+    objective: Annotated[str, Field(min_length=1)]
+    allowed_actor_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    required_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    initial_state_constraints: tuple[Rule, ...] = ()
+    success_conditions: Annotated[tuple[Rule, ...], Field(min_length=1, max_length=64)]
+    failure_conditions: Annotated[tuple[Rule, ...], Field(max_length=64)] = ()
+    terminal_conditions: Annotated[tuple[Rule, ...], Field(min_length=1, max_length=64)]
+    difficulty_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    minimum_tool_calls: Annotated[int, Field(ge=1, le=32)] = 1
+
+
+class TaskRequirementSourceDraft(AgentOutput):
+    """Agent-facing task semantics compiled into framework-owned task protocols."""
+
+    task_type: Identifier
+    objective: Annotated[str, Field(min_length=1)]
+    allowed_actor_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    required_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    initial_state_constraints: tuple[RuleDraft, ...] = ()
+    success_conditions: Annotated[tuple[RuleDraft, ...], Field(min_length=1, max_length=64)]
+    failure_conditions: Annotated[tuple[RuleDraft, ...], Field(max_length=64)] = ()
+    terminal_conditions: Annotated[tuple[RuleDraft, ...], Field(min_length=1, max_length=64)]
+    difficulty_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    minimum_tool_calls: Annotated[int, Field(ge=1, le=32)] = 1
+
+
+class WorldModelDraft(AgentOutput):
+    """Executable-world semantics, intentionally independent of training policy."""
+
+    boundary: WorldBoundary
+    state: StateSchema
+    tools: Annotated[tuple[ToolContract, ...], Field(min_length=1)]
+    invariants: Annotated[tuple[Rule, ...], Field(min_length=1)]
+    task_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    fidelity: Annotated[tuple[FidelityStatement, ...], Field(min_length=1)]
+
+
+class TrainingContractDraft(AgentOutput):
+    """Task/reward/evaluation semantics compiled against one frozen world model."""
+
+    coverage_dimensions: Annotated[tuple[CoverageDimension, ...], Field(min_length=1)]
+    curriculum: CurriculumRequirements
+    reward: RewardSpec
+    verification: VerificationRequirements
+    unresolved_questions: tuple[str, ...] = ()
+
+
+class EnvironmentDesignDraft(WorldModelDraft, TrainingContractDraft):
+    """Framework-composed complete design validated across both semantic halves."""
+
+
+class WorldSemanticSourceIRDraft(AgentOutput):
+    """Typed source compiled into a complete executable WorldModelDraft.
+
+    State and Tool JSON Schemas are absent by construction.  The Agent owns
+    bounded semantic node graphs; framework code owns every schema envelope,
+    root reference, closure check, and ToolSurface assembly.
+    """
+
+    boundary: WorldBoundaryDraft
+    state_inventory: StateEntityInventoryDraft
+    state_entity_schemas: Annotated[
+        tuple[StateEntitySchemaIRDraft, ...], Field(min_length=1, max_length=12)
+    ]
+    initial_state_rules: InitialStateRulesDraft
+    tool_inventory: WorldToolPlanInventoryDraft
+    tool_schemas: Annotated[tuple[ToolSchemaIRDraft, ...], Field(min_length=3, max_length=24)]
+    tool_semantics: Annotated[tuple[ToolSemanticsDraft, ...], Field(min_length=1, max_length=8)]
+    closure: WorldClosureDraft
+
+    @model_validator(mode="after")
+    def validate_topology(self) -> WorldSemanticSourceIRDraft:
+        planned_entities = tuple(item.entity for item in self.state_inventory.entities)
+        authored_entities = tuple(item.entity for item in self.state_entity_schemas)
+        if authored_entities != planned_entities:
+            raise ValueError(
+                "state schema IR shards must preserve state inventory order and identity"
+            )
+        planned_tools = tuple(item.tool_id for item in self.tool_inventory.tools)
+        authored_semantics = tuple(item.tool_id for item in self.tool_semantics)
+        if authored_semantics != planned_tools:
+            raise ValueError("tool semantics must preserve tool inventory order and identity")
+        expected_schema_shards = tuple(
+            (tool_id, schema_kind)
+            for tool_id in planned_tools
+            for schema_kind in ("input", "output", "observation")
+        )
+        actual_schema_shards = tuple((item.tool_id, item.schema_kind) for item in self.tool_schemas)
+        if actual_schema_shards != expected_schema_shards:
+            raise ValueError(
+                "tool schema IR shards must be ordered input/output/observation for every tool"
+            )
+        return self
+
+
+class EnvironmentSemanticSourceDraft(AgentOutput):
+    """Agent-owned semantic source for canonical framework compilation.
+
+    A repair or expansion Agent may change the executable world, curriculum
+    topology, and task Rule IR.  It cannot author task protocol schemas,
+    evaluator bindings, reward values, or verification closure; those fields
+    exist only on the compiled :class:`EnvironmentDesignDraft`.
+    """
+
+    world: WorldSemanticSourceIRDraft
+    curriculum_plan: CurriculumPlanDraft
+    task_requirements: Annotated[
+        tuple[TaskRequirementDraft, ...], Field(min_length=1, max_length=8)
+    ]
+
+    @model_validator(mode="after")
+    def validate_task_topology(self) -> EnvironmentSemanticSourceDraft:
+        planned = tuple(item.task_type for item in self.curriculum_plan.task_plans)
+        authored = tuple(item.task_type for item in self.task_requirements)
+        if authored != planned:
+            raise ValueError(
+                "semantic source task requirements must preserve curriculum plan order and identity"
+            )
+        return self
+
+
+class ToolSurfaceDeltaClaimDraft(AgentOutput):
+    operation: Literal["add", "remove", "modify"]
+    tool_id: Identifier
+    before_hash: ContentHash | None = None
+    changed_aspects: Annotated[
+        tuple[Literal["surface", "schema", "observation_schema"], ...],
+        Field(min_length=1),
+    ]
+
+    @model_validator(mode="after")
+    def validate_operation(self) -> ToolSurfaceDeltaClaimDraft:
+        if (self.operation == "add") != (self.before_hash is None):
+            raise ValueError("add forbids before_hash; remove/modify require it")
+        return self
+
+
+class ToolSemanticsDeltaClaimDraft(AgentOutput):
+    operation: Literal["add", "remove", "modify"]
+    tool_id: Identifier
+    before_hash: ContentHash | None = None
+    changed_aspects: Annotated[
+        tuple[
+            Literal[
+                "precondition",
+                "transition",
+                "postcondition",
+                "error",
+                "permission",
+                "observation",
+                "idempotency",
+                "retry",
+                "timeout",
+                "transaction",
+                "rollback",
+                "concurrency",
+            ],
+            ...,
+        ],
+        Field(min_length=1),
+    ]
+
+    @model_validator(mode="after")
+    def validate_operation(self) -> ToolSemanticsDeltaClaimDraft:
+        if (self.operation == "add") != (self.before_hash is None):
+            raise ValueError("add forbids before_hash; remove/modify require it")
+        return self
+
+
+class StateSchemaDeltaClaimDraft(AgentOutput):
+    before_hash: ContentHash
+    changed_entities: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    rationale: Annotated[str, Field(min_length=1)]
+
+
+class TransitionConstraintDeltaClaimDraft(AgentOutput):
+    operation: Literal["add", "remove", "modify"]
+    rule_id: Identifier
+    before_hash: ContentHash | None = None
+    affected_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    rationale: Annotated[str, Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def validate_operation(self) -> TransitionConstraintDeltaClaimDraft:
+        if (self.operation == "add") != (self.before_hash is None):
+            raise ValueError("add forbids before_hash; remove/modify require it")
+        return self
+
+
+class TaskScopeDeltaClaimDraft(AgentOutput):
+    operation: Literal["add", "remove", "modify"]
+    task_type: Identifier
+    before_hash: ContentHash | None = None
+    rationale: Annotated[str, Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def validate_operation(self) -> TaskScopeDeltaClaimDraft:
+        if (self.operation == "add") != (self.before_hash is None):
+            raise ValueError("add forbids before_hash; remove/modify require it")
+        return self
+
+
+class TaskDistributionDeltaClaimDraft(AgentOutput):
+    """Agent claim for sampling semantics; framework supplies the after snapshot."""
+
+    before_hash: ContentHash
+    changed_aspects: Annotated[
+        tuple[
+            Literal[
+                "task_type_order",
+                "task_dimensions",
+                "difficulty_dimensions",
+                "generation_seed_space",
+                "minimum_distinct_initial_states",
+                "minimum_distinct_tasks_per_type",
+                "sampling_constraints",
+            ],
+            ...,
+        ],
+        Field(min_length=1),
+    ]
+    rationale: Annotated[str, Field(min_length=1)]
+
+
+class WorldBoundaryDeltaClaimDraft(AgentOutput):
+    before_hash: ContentHash
+    changed_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    rationale: Annotated[str, Field(min_length=1)]
+
+
+class ExpansionSemanticDeltaDraft(AgentOutput):
+    """Agent-declared change claim; framework owns every authoritative after value."""
+
+    tool_surface_deltas: tuple[ToolSurfaceDeltaClaimDraft, ...] = ()
+    tool_semantics_deltas: tuple[ToolSemanticsDeltaClaimDraft, ...] = ()
+    state_schema_deltas: tuple[StateSchemaDeltaClaimDraft, ...] = ()
+    transition_constraint_deltas: tuple[TransitionConstraintDeltaClaimDraft, ...] = ()
+    task_scope_deltas: tuple[TaskScopeDeltaClaimDraft, ...] = ()
+    task_distribution_deltas: Annotated[
+        tuple[TaskDistributionDeltaClaimDraft, ...], Field(max_length=1)
+    ] = ()
+    world_boundary_delta: WorldBoundaryDeltaClaimDraft | None = None
+    unresolved_questions: tuple[str, ...] = ()
+
+
+class ExpansionDesignDraft(AgentOutput):
+    """Agent-owned expansion semantics plus a framework-checkable delta claim."""
+
+    semantic_source: EnvironmentSemanticSourceDraft
+    semantic_delta: ExpansionSemanticDeltaDraft
+
+
+class DiscoveryClueDraft(AgentOutput):
+    hypothesis: Annotated[str, Field(min_length=1)]
+    evidence_ids: Annotated[tuple[str, ...], Field(min_length=1)]
+    tool_or_workflow_surface: tuple[str, ...] = ()
+    coverage_dimensions: Annotated[tuple[str, ...], Field(min_length=1)]
+    scope_relation: Literal["in_scope", "adjacent", "new_domain", "uncertain"]
+    feasibility: Literal["supported", "plausible", "uncertain", "blocked"]
+    risk: Literal["low", "medium", "high", "critical"]
+    unresolved_questions: tuple[str, ...] = ()
+
+
+class DiscoverySynthesis(AgentOutput):
+    clues: tuple[DiscoveryClueDraft, ...] = ()
+
+
+class ExpansionSourceHypothesisDraft(AgentOutput):
+    statement: Annotated[str, Field(min_length=1)]
+    tool_or_workflow_surface: tuple[str, ...] = ()
+    coverage_dimensions: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
+class ExpansionSourcePlan(AgentOutput):
+    hypotheses: Annotated[
+        tuple[ExpansionSourceHypothesisDraft, ...],
+        Field(min_length=1, max_length=32),
+    ]
+    queries: Annotated[tuple[PlannedSearchQuery, ...], Field(min_length=1, max_length=32)]
+
+
+class ExpansionSourceClueDraft(DiscoveryClueDraft):
+    hypothesis_index: Annotated[int, Field(ge=0)]
+
+
+class ExpansionSourceSynthesis(AgentOutput):
+    clues: tuple[ExpansionSourceClueDraft, ...] = ()
+
+
+class AdmissionAssessment(AgentOutput):
+    relation: Literal["in_scope", "adjacent", "new_domain", "unrelated", "uncertain"]
+    challenged_claim_ids: tuple[str, ...] = ()
+    confidence: Annotated[float, Field(ge=0, le=1)]
+    rationale: Annotated[str, Field(min_length=1)]
+
+
+for _agent_output_root in (
+    AdmissionAssessment,
+    CurriculumPlanDraft,
+    CurriculumPlanSourceDraft,
+    DiscoverySynthesis,
+    EnvironmentSemanticSourceDraft,
+    EvidenceAssumptionClosureDraft,
+    EvidenceSynthesis,
+    ExpansionDesignDraft,
+    ExpansionSourcePlan,
+    ExpansionSourceSynthesis,
+    InitialStateRulesDraft,
+    InitialStateRulesSourceDraft,
+    ResearchPlan,
+    StateEntityInventoryDraft,
+    StateEntitySchemaIRDraft,
+    TaskDimensionsDraft,
+    TaskRequirementSourceDraft,
+    ToolAccessObservationDraft,
+    ToolAccessObservationSourceDraft,
+    ToolConditionsDraft,
+    ToolConditionsSourceDraft,
+    ToolErrorsDraft,
+    ToolErrorsSourceDraft,
+    ToolReliabilityDraft,
+    ToolReliabilitySourceDraft,
+    ToolSchemaDraft,
+    ToolSchemaIRDraft,
+    ToolStateTransitionDraft,
+    ToolStateTransitionSourceDraft,
+    WorldBoundaryDraft,
+    WorldClosureDraft,
+    WorldClosureSourceDraft,
+    WorldToolPlanInventoryDraft,
+):
+    register_agent_output_contract(
+        _agent_output_root,
+        authority=AgentOutputAuthority.SEMANTIC_ADVISORY,
+    )
+
+
+__all__ = [
+    "AdmissionAssessment",
+    "AssumptionResolutionDraft",
+    "CurriculumContractDraft",
+    "CurriculumPlanDraft",
+    "CurriculumPlanSourceDraft",
+    "CurriculumTaskPlan",
+    "CurriculumTaskPlanSourceDraft",
+    "DiscoveryClueDraft",
+    "DiscoverySynthesis",
+    "EnvironmentDesignDraft",
+    "EnvironmentSemanticSourceDraft",
+    "EvidenceAssumptionClosureDraft",
+    "EvidenceSynthesis",
+    "ExpansionDesignDraft",
+    "ExpansionSourceClueDraft",
+    "ExpansionSourceHypothesisDraft",
+    "ExpansionSourcePlan",
+    "ExpansionSourceSynthesis",
+    "ExpansionSemanticDeltaDraft",
+    "InitialStateRulesDraft",
+    "InitialStateRulesSourceDraft",
+    "IdempotencySourceDraft",
+    "PermissionRuleSourceDraft",
+    "ObservationSemanticsSourceDraft",
+    "PlannedSearchQuery",
+    "ResearchPlan",
+    "RuleArithmeticDraft",
+    "RuleAtomDraft",
+    "RuleClauseDraft",
+    "RuleConstantDraft",
+    "RuleDraft",
+    "RuleReferenceDraft",
+    "RuleTermDraft",
+    "SchemaArrayNodeDraft",
+    "SchemaBooleanNodeDraft",
+    "SchemaIntegerNodeDraft",
+    "SchemaNodeDraft",
+    "SchemaNullNodeDraft",
+    "SchemaNumberNodeDraft",
+    "SchemaObjectNodeDraft",
+    "SchemaPropertyDraft",
+    "SchemaStringNodeDraft",
+    "SchemaUnionNodeDraft",
+    "StateEntityInventoryDraft",
+    "StateEntityPlan",
+    "StateEntitySchemaDraft",
+    "StateEntitySchemaIRDraft",
+    "StateSchemaDeltaClaimDraft",
+    "TrainingContractContext",
+    "TrainingContractDraft",
+    "TrainingRuleCatalogEntry",
+    "TrainingToolContext",
+    "TaskDimensionsDraft",
+    "TaskRequirementDraft",
+    "TaskRequirementSourceDraft",
+    "TaskDistributionDeltaClaimDraft",
+    "TaskScopeDeltaClaimDraft",
+    "ToolAccessObservationDraft",
+    "ToolAccessObservationSourceDraft",
+    "ToolBehaviorDraft",
+    "ToolConditionsDraft",
+    "ToolConditionsSourceDraft",
+    "ToolErrorsDraft",
+    "ToolErrorsSourceDraft",
+    "ToolReliabilityDraft",
+    "ToolReliabilitySourceDraft",
+    "ToolSemanticsDeltaClaimDraft",
+    "ToolSemanticsDraft",
+    "ToolSchemaDraft",
+    "ToolSchemaIRDraft",
+    "ToolSurfacePlan",
+    "ToolSurfaceSchemasDraft",
+    "ToolSurfaceDraft",
+    "ToolSurfaceDeltaClaimDraft",
+    "ToolStateTransitionDraft",
+    "ToolStateTransitionSourceDraft",
+    "WorldBoundaryDraft",
+    "WorldBoundaryDeltaClaimDraft",
+    "WorldClosureArithmeticTerm",
+    "WorldClosureConstantTerm",
+    "WorldClosureConstraint",
+    "WorldClosureDraft",
+    "WorldClosureSourceDraft",
+    "WorldClosureContext",
+    "WorldClosureErrorPath",
+    "WorldClosureReferenceTerm",
+    "WorldClosureRulePath",
+    "WorldClosureTerm",
+    "WorldClosureToolPath",
+    "WorldModelDraft",
+    "WorldSkeletonDraft",
+    "WorldStateDraft",
+    "WorldStateShapeDraft",
+    "WorldSemanticSourceIRDraft",
+    "WorldToolInventoryDraft",
+    "WorldToolPlanInventoryDraft",
+    "TransitionConstraintDeltaClaimDraft",
+]

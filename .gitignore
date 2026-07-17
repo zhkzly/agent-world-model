@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Real local Foundry runs contain generated workspaces, immutable artifacts,
+# package registries, and SDK session state. They are audit data, not source.
+.agent-world-live/
+
 # Runtime pipeline outputs can include generated projects, traces, SDK state,
 # local logs, and agent workspaces. Keep the committed seed sample visible.
 outputs/*

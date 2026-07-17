@@ -1,0 +1,1616 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+from pydantic import HttpUrl
+from v3_fixture import ReleaseGraph, build_release_graph
+
+from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.artifact_store import ArtifactStore, ArtifactWriter
+from agent_world.builder import EnvironmentBuilder
+from agent_world.config import AgentBackendConfig, FoundryConfig, ResearchConfig
+from agent_world.contracts import (
+    ArtifactRef,
+    Budget,
+    BudgetUsage,
+    CurriculumSamplingPolicy,
+    EnvironmentJob,
+    EnvironmentPackageManifest,
+    EnvironmentRequest,
+    ExpansionSourceCatalog,
+    ExpansionSourceDescriptor,
+    FrameworkPackagePayload,
+    IntegrationReport,
+    JudgeReport,
+    MutationIntent,
+    PermissionScope,
+    ReleaseProfile,
+    SuiteSelectionRequest,
+    sha256_digest,
+)
+from agent_world.control import (
+    ClaimVector,
+    DirectJobResumeRequiredError,
+    DirectRequestConflictError,
+    JobRunSnapshot,
+    MetricPoint,
+    TelemetryReleaseSummary,
+    TelemetryStore,
+    new_direct_job_head,
+)
+from agent_world.controller import FoundryController, GenerateResult
+from agent_world.designer import (
+    DiscoveryService,
+    EnvironmentDesigner,
+    EvidenceBackedExpansionSource,
+    ExpansionDesigner,
+    ExpansionSourceRouter,
+)
+from agent_world.invocation import CodexSdkBackend
+from agent_world.judge import EnvironmentJudge, VerifierCompiler
+from agent_world.registry import (
+    EnvironmentRegistry,
+    PackageVersionReservation,
+    ParentNotEligibleError,
+    RegistryIntegrityError,
+    ReleaseRejectedError,
+    ReservationConflictError,
+    ReservationExpiredError,
+    UnsafePackageError,
+)
+from agent_world.research import build_research_toolchain
+
+_release_graph = build_release_graph
+
+
+def _framework_writer(store: ArtifactStore) -> ArtifactWriter:
+    return store.issue_writer(
+        producer="framework",
+        allowed_artifact_types=(
+            "curriculum",
+            "environment_candidate",
+            "environment_design",
+            "environment_package_manifest",
+            "evaluation_evidence",
+            "evidence_summary",
+            "implementation_contract",
+            "public_verifier",
+            "task_materializer_protocol",
+            "test.semantic_source",
+        ),
+        allowed_artifact_type_prefixes=("control.", "discovery.", "expansion.", "release."),
+        allowed_event_type_prefixes=(
+            "design_",
+            "discovery_",
+            "expansion_",
+            "generation_",
+            "judge_",
+        ),
+    )
+
+
+def _judge_writer(store: ArtifactStore) -> ArtifactWriter:
+    return store.issue_writer(
+        producer="environment-judge",
+        allowed_artifact_types=("judge_report",),
+        allowed_artifact_type_prefixes=("judge.",),
+    )
+
+
+def _commit(
+    store: ArtifactStore,
+    artifact_id: str,
+    artifact_type: str,
+    value: dict[str, object],
+    *,
+    dependencies: tuple[ArtifactRef, ...] = (),
+) -> ArtifactRef:
+    return _framework_writer(store).put_json(
+        artifact_id=artifact_id,
+        artifact_type=artifact_type,
+        value=value,
+        dependencies=dependencies,
+    )
+
+
+def _reserve(
+    registry: EnvironmentRegistry,
+    graph: ReleaseGraph,
+    *,
+    package_id: str | None = None,
+    version: str | None = None,
+) -> PackageVersionReservation:
+    return registry.reserve_package_version(
+        package_id or graph.package_id,
+        version or graph.version,
+        graph.owner_ref,
+    )
+
+
+def _direct_controller(
+    root: Path,
+    store: ArtifactStore,
+    registry: EnvironmentRegistry,
+    release_profile: ReleaseProfile,
+) -> FoundryController:
+    agent = AgentBackendConfig(
+        model="gpt-5",
+        api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+    )
+    research_config = ResearchConfig(
+        provider="searxng",
+        searxng_base_url=HttpUrl("http://127.0.0.1:9"),
+        searxng_allow_private_endpoint=True,
+        use_jina_reader_fallback=False,
+    )
+    config = FoundryConfig(
+        state_root=root,
+        agent=agent,
+        research=research_config,
+        release_profile=release_profile,
+    )
+    profiles = IsolatedAgentProfileProvider(agent, source_environment={})
+    backend = CodexSdkBackend()
+    research = build_research_toolchain(research_config, source_environment={})
+    controller_artifacts = _framework_writer(store)
+    designer_artifacts = store.issue_writer(
+        producer="environment-designer",
+        allowed_artifact_type_prefixes=("design.", "discovery."),
+    )
+    research_artifacts = store.issue_writer(
+        producer="research-toolchain",
+        allowed_artifact_type_prefixes=("evidence.",),
+    )
+    builder_artifacts = store.issue_writer(
+        producer="environment-builder",
+        allowed_artifact_type_prefixes=("build.",),
+    )
+    judge_artifacts = _judge_writer(store)
+    expansion_runner_artifacts = store.issue_writer(
+        producer="expansion-runner",
+        allowed_artifact_type_prefixes=("control.", "expansion."),
+    )
+    expansion_designer_artifacts = store.issue_writer(
+        producer="expansion-designer",
+        allowed_artifact_type_prefixes=("expansion.",),
+    )
+    expansion_source_artifacts = store.issue_writer(
+        producer="expansion-source",
+        allowed_artifact_types=(
+            "expansion.source_hypothesis",
+            "expansion.source_clue",
+            "expansion.source_result",
+        ),
+    )
+    designer = EnvironmentDesigner(
+        artifact_store=designer_artifacts,
+        research_artifact_store=research_artifacts,
+        invocation_backend=backend,
+        profile_provider=profiles,
+        research_toolchain=research,
+    )
+    return FoundryController(
+        config=config,
+        artifact_store=controller_artifacts,
+        expansion_artifact_store=expansion_runner_artifacts,
+        profile_provider=profiles,
+        designer=designer,
+        discovery=DiscoveryService(
+            designer=designer,
+            artifact_store=designer_artifacts,
+            research_toolchain=research,
+        ),
+        expansion_designer=ExpansionDesigner(
+            designer=designer,
+            artifact_store=expansion_designer_artifacts,
+            research_toolchain=research,
+        ),
+        expansion_source=ExpansionSourceRouter(
+            (
+                EvidenceBackedExpansionSource(
+                    designer=designer,
+                    artifact_store=expansion_source_artifacts,
+                    research_toolchain=research,
+                ),
+            )
+        ),
+        builder=EnvironmentBuilder(
+            artifact_store=builder_artifacts,
+            invocation_backend=backend,
+            profile_provider=profiles,
+        ),
+        verifier_compiler=VerifierCompiler(
+            artifact_store=judge_artifacts,
+            invocation_backend=backend,
+            profile_provider=profiles,
+        ),
+        judge=EnvironmentJudge(artifact_store=judge_artifacts),
+        registry=registry,
+    )
+
+
+def test_controller_reconciles_registry_event_failure_after_atomic_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "foundry"
+    store = ArtifactStore(state_root / "artifacts")
+    registry = EnvironmentRegistry(state_root / "registry", store)
+    release_profile = ReleaseProfile(
+        profile_id="registry-post-commit-fault",
+        required_hard_gates=("runtime_protocol", "clean_deployment"),
+    )
+    controller = _direct_controller(state_root, store, registry, release_profile)
+    graph = _release_graph(tmp_path, store)
+    reservation = _reserve(registry, graph)
+    prepared = registry.prepare(
+        candidate_workspace=graph.workspace,
+        manifest_ref=graph.manifest_ref,
+        judge_report_ref=graph.report_ref,
+        release_profile=release_profile,
+        reservation=reservation,
+        framework_payloads=graph.framework_payloads,
+    )
+
+    def fail_after_index_commit(**_kwargs: object) -> None:
+        raise OSError("injected Registry event fsync failure")
+
+    monkeypatch.setattr(registry, "_append_event", fail_after_index_commit)
+
+    published = controller._publish_registry_release(  # noqa: SLF001
+        prepared=prepared,
+        job_ref=graph.owner_ref,
+        manifest_ref=graph.manifest_ref,
+    )
+
+    inspected = registry.inspect(
+        graph.package_id,
+        graph.version,
+        package_digest=published.coordinate.package_digest,
+    )
+    assert published == inspected
+    assert published.reservation_owner_ref == graph.owner_ref
+    assert registry.inspect_reservation(reservation.reservation_id).status == "consumed"
+
+
+@pytest.mark.parametrize("completed_failure_head", (False, True))
+def test_direct_generate_recovers_published_job_and_retries_without_agent_replay(
+    tmp_path: Path,
+    completed_failure_head: bool,
+) -> None:
+    state_root = tmp_path / "foundry"
+    store = ArtifactStore(state_root / "artifacts")
+    registry = EnvironmentRegistry(state_root / "registry", store)
+    release_profile = ReleaseProfile(
+        profile_id="registry-integration",
+        required_hard_gates=("runtime_protocol", "clean_deployment"),
+    )
+    controller = _direct_controller(
+        state_root,
+        store,
+        registry,
+        release_profile,
+    )
+    request_id = "request:published-crash-window"
+    need = "Build a real inventory environment with executable state transitions."
+    request = EnvironmentRequest(
+        request_id=request_id,
+        need=need,
+        budget=controller.config.generation_budget,
+        release_profile=release_profile,
+    )
+    request_ref = _framework_writer(store).put_json(
+        artifact_id=controller._stable_id("request-artifact", request_id),  # noqa: SLF001
+        artifact_type="control.environment_request",
+        value=request,
+    )
+    job_id = controller._stable_id(  # noqa: SLF001
+        "generate-job",
+        request_id,
+        request_ref.revision_id,
+    )
+    job = EnvironmentJob(
+        job_id=job_id,
+        kind="generate",
+        request_ref=request_ref,
+        budget=request.budget,
+        release_profile=release_profile,
+    )
+    job_ref = _framework_writer(store).put_json(
+        artifact_id=f"{job_id}:job",
+        artifact_type="control.environment_job",
+        value=job,
+        dependencies=(request_ref,),
+    )
+
+    graph = _release_graph(tmp_path, store, owner_ref=job_ref)
+    reservation = _reserve(registry, graph)
+    prepared = registry.prepare(
+        candidate_workspace=graph.workspace,
+        manifest_ref=graph.manifest_ref,
+        judge_report_ref=graph.report_ref,
+        release_profile=release_profile,
+        reservation=reservation,
+        framework_payloads=graph.framework_payloads,
+    )
+    published = registry.publish(prepared)
+
+    run_id = "run:published-crash-window"
+    telemetry = TelemetryStore(state_root / "telemetry")
+    controller.telemetry = telemetry
+    root_span = telemetry.start_span(
+        trace_id=run_id,
+        component="controller",
+        operation="direct.generate",
+        run_id=run_id,
+    )
+    for node in ("request", "design", "verifier", "build", "integration", "judge", "release"):
+        span = telemetry.start_span(
+            trace_id=run_id,
+            component="controller",
+            operation=f"node.{node}",
+            parent_span_id=root_span.span_id,
+            run_id=run_id,
+            node=node,
+        )
+        span.finish(status="passed")
+    invocation_span = telemetry.start_span(
+        trace_id=run_id,
+        component="invocation",
+        operation="agent.invoke",
+        parent_span_id=root_span.span_id,
+        run_id=run_id,
+    )
+    invocation_span.finish(status="passed")
+    for operation in ("research.search", "research.fetch", "research.extract"):
+        span = telemetry.start_span(
+            trace_id=run_id,
+            component="research",
+            operation=operation,
+            parent_span_id=root_span.span_id,
+            run_id=run_id,
+        )
+        span.finish(status="passed")
+    telemetry.record_metrics(
+        run_id,
+        root_span.span_id,
+        (
+            MetricPoint("invocation.tokens.total", 1, "tokens", "provider"),
+            MetricPoint("research.search.calls", 1, "calls", "framework"),
+            MetricPoint("research.fetch.calls", 1, "calls", "framework"),
+            MetricPoint("research.documents.extracted", 1, "documents", "framework"),
+        ),
+    )
+    telemetry.flush()
+    running_snapshot = JobRunSnapshot(
+        run_id=run_id,
+        job_ref=job_ref,
+        revision=1,
+        status="running",
+        reserved_budget=request.budget,
+        observed_actual_budget=BudgetUsage(),
+        unknown_upper_bound_budget=BudgetUsage(),
+        conservative_committed_budget=BudgetUsage(),
+        latest_artifact_refs=(job_ref, request_ref),
+    )
+    running_snapshot_ref = _framework_writer(store).put_json(
+        artifact_id=f"{run_id}:state",
+        artifact_type="control.job_run_snapshot",
+        value=running_snapshot,
+        dependencies=(job_ref, request_ref),
+    )
+    fingerprint = controller._direct_request_fingerprint(  # noqa: SLF001
+        request,
+        enable_discovery=False,
+        discovery_budget=controller.config.discovery_budget,
+    )
+    with controller.direct_jobs.exclusive(request_id) as lock:
+        initial_head = new_direct_job_head(
+            request_id=request_id,
+            request_fingerprint=fingerprint,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            run_id=run_id,
+            snapshot_ref=running_snapshot_ref,
+            snapshot_revision=1,
+            status="running",
+        )
+        controller.direct_jobs.compare_and_swap(
+            lock,
+            expected_head=None,
+            next_head=initial_head,
+        )
+        if completed_failure_head:
+            failed_snapshot = running_snapshot.model_copy(
+                update={
+                    "revision": 2,
+                    "status": "failed",
+                    "failure_code": "post_publish_bookkeeping_failed",
+                    "failure_summary": "Controller bookkeeping failed after Registry publish.",
+                }
+            )
+            failed_snapshot_ref = _framework_writer(store).put_json(
+                artifact_id=f"{run_id}:state",
+                artifact_type="control.job_run_snapshot",
+                value=failed_snapshot,
+                dependencies=(running_snapshot_ref, job_ref, request_ref),
+            )
+            failed_head = new_direct_job_head(
+                request_id=request_id,
+                request_fingerprint=fingerprint,
+                request_ref=request_ref,
+                job_ref=job_ref,
+                run_id=run_id,
+                snapshot_ref=failed_snapshot_ref,
+                snapshot_revision=2,
+                status="failed",
+            )
+            controller.direct_jobs.compare_and_swap(
+                lock,
+                expected_head=initial_head,
+                next_head=failed_head,
+            )
+            failed_result = GenerateResult(
+                run_id=run_id,
+                status="failed",
+                request_ref=request_ref,
+                job_ref=job_ref,
+                final_snapshot_ref=failed_snapshot_ref,
+                failure_code="post_publish_bookkeeping_failed",
+                failure_summary="Controller bookkeeping failed after Registry publish.",
+            )
+            failed_result_ref = _framework_writer(store).put_json(
+                artifact_id=f"{run_id}:generate-result",
+                artifact_type="control.generate_result",
+                value=failed_result,
+                dependencies=(request_ref, job_ref, failed_snapshot_ref),
+            )
+            completed_head = new_direct_job_head(
+                request_id=request_id,
+                request_fingerprint=fingerprint,
+                request_ref=request_ref,
+                job_ref=job_ref,
+                run_id=run_id,
+                snapshot_ref=failed_snapshot_ref,
+                snapshot_revision=2,
+                status="failed",
+                result_ref=failed_result_ref,
+            )
+            controller.direct_jobs.compare_and_swap(
+                lock,
+                expected_head=failed_head,
+                next_head=completed_head,
+            )
+
+    recovered = asyncio.run(
+        controller.generate(
+            need,
+            request_id=request_id,
+            enable_discovery=False,
+        )
+    )
+    retried = asyncio.run(
+        controller.generate(
+            need,
+            request_id=request_id,
+            enable_discovery=False,
+        )
+    )
+
+    assert recovered.status == "released"
+    assert recovered.release is not None
+    assert recovered.release.release_id == published.release_id
+    assert retried == recovered
+    assert retried.release_ref == recovered.release_ref
+    recovered_snapshot = store.get_json(recovered.final_snapshot_ref, JobRunSnapshot)
+    final_telemetry_refs = tuple(
+        ref
+        for ref in recovered_snapshot.latest_artifact_refs
+        if ref.artifact_type == "release.final_telemetry_summary"
+    )
+    assert len(final_telemetry_refs) == 1
+    final_telemetry = store.get_json(final_telemetry_refs[0], TelemetryReleaseSummary)
+    assert final_telemetry.cut_stage == "post_publish"
+    assert final_telemetry.open_span_count == 0
+
+    with pytest.raises(DirectRequestConflictError, match="different canonical"):
+        asyncio.run(
+            controller.generate(
+                "A different environment need must not reuse this request id.",
+                request_id=request_id,
+                enable_discovery=False,
+            )
+        )
+
+    unfinished_id = "request:unfinished-agent-work"
+    unfinished_request = EnvironmentRequest(
+        request_id=unfinished_id,
+        need="An interrupted environment whose unknown Agent work cannot be replayed.",
+        budget=controller.config.generation_budget,
+        release_profile=release_profile,
+    )
+    unfinished_request_ref = _framework_writer(store).put_json(
+        artifact_id=controller._stable_id(  # noqa: SLF001
+            "request-artifact",
+            unfinished_id,
+        ),
+        artifact_type="control.environment_request",
+        value=unfinished_request,
+    )
+    unfinished_job_id = controller._stable_id(  # noqa: SLF001
+        "generate-job",
+        unfinished_id,
+        unfinished_request_ref.revision_id,
+    )
+    unfinished_job = EnvironmentJob(
+        job_id=unfinished_job_id,
+        kind="generate",
+        request_ref=unfinished_request_ref,
+        budget=unfinished_request.budget,
+        release_profile=release_profile,
+    )
+    unfinished_job_ref = _framework_writer(store).put_json(
+        artifact_id=f"{unfinished_job_id}:job",
+        artifact_type="control.environment_job",
+        value=unfinished_job,
+        dependencies=(unfinished_request_ref,),
+    )
+    unfinished_run_id = "run:unfinished-agent-work"
+    unfinished_snapshot = JobRunSnapshot(
+        run_id=unfinished_run_id,
+        job_ref=unfinished_job_ref,
+        revision=1,
+        status="running",
+        reserved_budget=unfinished_request.budget,
+        observed_actual_budget=BudgetUsage(agent_turns=1),
+        unknown_upper_bound_budget=BudgetUsage(),
+        conservative_committed_budget=BudgetUsage(agent_turns=1),
+        latest_artifact_refs=(unfinished_job_ref, unfinished_request_ref),
+    )
+    unfinished_snapshot_ref = _framework_writer(store).put_json(
+        artifact_id=f"{unfinished_run_id}:state",
+        artifact_type="control.job_run_snapshot",
+        value=unfinished_snapshot,
+        dependencies=(unfinished_job_ref, unfinished_request_ref),
+    )
+    unfinished_fingerprint = controller._direct_request_fingerprint(  # noqa: SLF001
+        unfinished_request,
+        enable_discovery=False,
+        discovery_budget=controller.config.discovery_budget,
+    )
+    with controller.direct_jobs.exclusive(unfinished_id) as lock:
+        controller.direct_jobs.compare_and_swap(
+            lock,
+            expected_head=None,
+            next_head=new_direct_job_head(
+                request_id=unfinished_id,
+                request_fingerprint=unfinished_fingerprint,
+                request_ref=unfinished_request_ref,
+                job_ref=unfinished_job_ref,
+                run_id=unfinished_run_id,
+                snapshot_ref=unfinished_snapshot_ref,
+                snapshot_revision=1,
+                status="running",
+            ),
+        )
+    with pytest.raises(DirectJobResumeRequiredError, match="will not replay"):
+        asyncio.run(
+            controller.generate(
+                unfinished_request.need,
+                request_id=unfinished_id,
+                enable_discovery=False,
+            )
+        )
+
+    terminal_id = "request:terminal-budget-result"
+    zero_wall_budget = controller.config.generation_budget.model_copy(update={"wall_seconds": 0.0})
+    terminal = asyncio.run(
+        controller.generate(
+            "A zero-wall budget must produce one durable honest terminal result.",
+            request_id=terminal_id,
+            budget=zero_wall_budget,
+            enable_discovery=False,
+        )
+    )
+    terminal_retry = asyncio.run(
+        controller.generate(
+            "A zero-wall budget must produce one durable honest terminal result.",
+            request_id=terminal_id,
+            budget=zero_wall_budget,
+            enable_discovery=False,
+        )
+    )
+    assert terminal.status == "budget_exhausted"
+    assert terminal.failure_code == "wall_budget_missing"
+    assert terminal_retry == terminal
+
+
+def test_registry_prepares_and_atomically_publishes_immutable_package(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(tmp_path, store)
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = _reserve(registry, graph)
+
+    prepared = registry.prepare(
+        candidate_workspace=graph.workspace,
+        manifest_ref=graph.manifest_ref,
+        judge_report_ref=graph.report_ref,
+        release_profile=graph.release_profile,
+        reservation=reservation,
+        framework_payloads=graph.framework_payloads,
+    )
+    staging = registry.root / prepared.staging_relpath
+    assert staging.is_dir()
+    assert (staging / "runtime.py").read_bytes() == (graph.workspace / "runtime.py").read_bytes()
+
+    record = registry.publish(prepared)
+    package_path = registry.root / record.package_relpath
+    assert record.status == "released"
+    assert record.reservation_id == reservation.reservation_id
+    consumed = registry.inspect_reservation(reservation.reservation_id)
+    assert consumed.status == "consumed"
+    assert _reserve(registry, graph) == consumed
+    competing_owner = _commit(
+        store,
+        "job:competing-publisher",
+        "control.environment_job",
+        {"job_id": "job:competing-publisher", "kind": "expand"},
+    )
+    with pytest.raises(ReservationConflictError, match="already published"):
+        registry.reserve_package_version(
+            graph.package_id,
+            graph.version,
+            competing_owner,
+        )
+    with pytest.raises(ReservationConflictError, match="cannot be released"):
+        registry.release_reservation(reservation.reservation_id, graph.owner_ref)
+    assert record.candidate_ref == graph.candidate_ref
+    assert package_path.is_dir()
+    assert not staging.exists()
+    assert not (registry.root / "prepared" / f"{prepared.staging_token}.json").exists()
+    assert (package_path / "manifest.json").is_file()
+    assert (package_path / "release-dossier.json").is_file()
+    manifest = store.get_json(graph.manifest_ref, EnvironmentPackageManifest)
+    declared_roles = {item.path: item.role for item in manifest.files}
+    assert manifest.format == "envpkg-v3"
+    assert manifest.task_materializer.protocol == "python-callable-v3"
+    assert manifest.task_materializer.output_schema_path == "tasks/materializer_protocol.json"
+    assert manifest.trusted_evaluator.rule_ir_path == "world/rule_ir.json"
+    assert declared_roles["tasks/materializer_protocol.json"] == "materializer_protocol"
+    assert declared_roles["tasks/curriculum.json"] == "curriculum"
+    assert declared_roles["world/rule_ir.json"] == "rule_ir"
+    assert declared_roles["world/world_spec.json"] == "world_spec"
+    assert declared_roles["envpkg.toml"] == "package_metadata"
+    assert declared_roles["evidence/provenance.json"] == "provenance"
+    assert declared_roles["evidence/assurance.json"] == "assurance"
+    assert declared_roles["evidence/fidelity.json"] == "fidelity"
+    assert declared_roles["sbom/sbom.json"] == "sbom"
+    for payload in graph.framework_payloads:
+        assert (package_path / payload.path).read_bytes() == payload.content
+    assert registry.inspect(graph.package_id, graph.version) == record
+    assert registry.list() == (record,)
+
+    assert registry.publish(prepared) == record
+    assert registry.list() == (record,)
+
+    snapshot = registry.pool_snapshot()
+    assert snapshot.releases == (record,)
+    assert registry.load_pool_snapshot(snapshot.snapshot_id) == snapshot
+    suite = registry.create_suite_snapshot(
+        (
+            SuiteSelectionRequest(
+                package_id=record.coordinate.package_id,
+                version=record.coordinate.version,
+                weight=Decimal("2.5"),
+                curriculum_policy=CurriculumSamplingPolicy(maximum_steps=37),
+            ),
+        )
+    )
+    suite_member = suite.packages[0]
+    assert suite.consumer_protocol == "agent-world.local-consumer.v3"
+    assert suite_member.package_digest == record.coordinate.package_digest
+    assert suite_member.manifest_hash == manifest.content_digest()
+    assert suite_member.weight == Decimal("2.5")
+    assert suite_member.curriculum_policy.maximum_steps == 37
+    assert registry.load_suite_snapshot(suite.snapshot_id) == suite
+    resolved = registry.resolve_suite_package(
+        suite.snapshot_id,
+        record.coordinate.package_id,
+        record.coordinate.version,
+    )
+    assert resolved.record == record
+    assert resolved.package_root == package_path
+    assert registry.require_released_manifest(graph.manifest_ref) == record
+    assert registry.require_snapshot_parent(snapshot.snapshot_id, graph.manifest_ref) == record
+    with pytest.raises(ParentNotEligibleError, match="artifact_type"):
+        registry.require_released_manifest(graph.candidate_ref)
+    with pytest.raises(ParentNotEligibleError, match="not a member"):
+        registry.require_snapshot_parent(snapshot.snapshot_id, graph.candidate_ref)
+
+    released_runtime = package_path / "runtime.py"
+    released_bytes = released_runtime.read_bytes()
+    released_mode = released_runtime.stat().st_mode & 0o777
+    released_runtime.chmod(0o600)
+    released_runtime.write_bytes(b"tampered released runtime\n")
+    with pytest.raises(RegistryIntegrityError, match="changed|digest|hash|size"):
+        registry.load_suite_snapshot(suite.snapshot_id)
+    released_runtime.write_bytes(released_bytes)
+    released_runtime.chmod(released_mode)
+    assert registry.load_suite_snapshot(suite.snapshot_id) == suite
+
+    for protected_path in (payload.path for payload in graph.framework_payloads):
+        released_contract = package_path / protected_path
+        original_bytes = released_contract.read_bytes()
+        original_mode = released_contract.stat().st_mode & 0o777
+        released_contract.chmod(0o600)
+        released_contract.write_bytes(b'{"tampered":true}')
+        with pytest.raises(RegistryIntegrityError, match="changed|digest|hash|size"):
+            registry.load_suite_snapshot(suite.snapshot_id)
+        released_contract.write_bytes(original_bytes)
+        released_contract.chmod(original_mode)
+        assert registry.load_suite_snapshot(suite.snapshot_id) == suite
+
+    report = store.get_json(graph.report_ref, JudgeReport)
+    reachability_ref = next(
+        ref
+        for ref in report.evaluation_evidence_refs
+        if ref.artifact_type == "judge.reachability_public_evidence"
+    )
+    evidence_digest = reachability_ref.content_hash.removeprefix("sha256:")
+    evidence_blob = (
+        store.root / "blobs" / "sha256" / evidence_digest[:2] / evidence_digest
+    )
+    evidence_bytes = evidence_blob.read_bytes()
+    evidence_mode = evidence_blob.stat().st_mode & 0o777
+    evidence_blob.chmod(0o600)
+    evidence_blob.write_bytes(b'{"tampered":true}')
+    with pytest.raises(
+        RegistryIntegrityError,
+        match="Judge evidence closure is invalid",
+    ):
+        registry.load_suite_snapshot(suite.snapshot_id)
+    evidence_blob.write_bytes(evidence_bytes)
+    evidence_blob.chmod(evidence_mode)
+    assert registry.load_suite_snapshot(suite.snapshot_id) == suite
+
+    (graph.workspace / "runtime.py").write_bytes(b"changed candidate bytes\n")
+    assert (package_path / "runtime.py").read_bytes() == released_bytes
+
+    quarantined = registry.quarantine(
+        graph.package_id,
+        graph.version,
+        reason_code="new_hard_evidence",
+    )
+    assert quarantined.status == "quarantined"
+    assert (package_path / "runtime.py").read_bytes() == released_bytes
+    assert registry.list(statuses=("released",)) == ()
+    assert registry.list(statuses=("quarantined",)) == (quarantined,)
+    with pytest.raises(ParentNotEligibleError, match="not currently released"):
+        registry.require_released_manifest(graph.manifest_ref)
+    with pytest.raises(ParentNotEligibleError, match="not currently released"):
+        registry.require_snapshot_parent(snapshot.snapshot_id, graph.manifest_ref)
+    assert registry.load_suite_snapshot(suite.snapshot_id) == suite
+    with pytest.raises(ParentNotEligibleError, match="only currently released"):
+        registry.create_suite_snapshot(
+            (
+                SuiteSelectionRequest(
+                    package_id=record.coordinate.package_id,
+                    version=record.coordinate.version,
+                ),
+            )
+        )
+    with pytest.raises(ParentNotEligibleError, match="not currently released"):
+        registry.resolve_suite_package(
+            suite.snapshot_id,
+            record.coordinate.package_id,
+            record.coordinate.version,
+        )
+
+
+def test_prepare_rejects_tampering_of_every_framework_metadata_payload(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(tmp_path, store)
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = _reserve(registry, graph)
+
+    for target in graph.framework_payloads:
+        tampered = tuple(
+            FrameworkPackagePayload(
+                path=payload.path,
+                role=payload.role,
+                content=payload.content + b"\n",
+            )
+            if payload.path == target.path
+            else payload
+            for payload in graph.framework_payloads
+        )
+        with pytest.raises(
+            UnsafePackageError,
+            match="framework package payload differs",
+        ):
+            registry.prepare(
+                candidate_workspace=graph.workspace,
+                manifest_ref=graph.manifest_ref,
+                judge_report_ref=graph.report_ref,
+                release_profile=graph.release_profile,
+                reservation=reservation,
+                framework_payloads=tampered,
+            )
+
+    assert registry.inspect_reservation(reservation.reservation_id).status == "active"
+
+
+def test_expansion_uses_all_frozen_pool_parents_and_revokes_quarantine(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    anchor_root = tmp_path / "anchor-package"
+    pool_root = tmp_path / "pool-package"
+    anchor_root.mkdir()
+    pool_root.mkdir()
+    anchor_graph = _release_graph(anchor_root, store, variant="anchor")
+    pool_graph = _release_graph(pool_root, store, variant="pool")
+
+    for graph in (anchor_graph, pool_graph):
+        prepared = registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=graph.manifest_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=_reserve(registry, graph),
+            framework_payloads=graph.framework_payloads,
+        )
+        assert registry.publish(prepared).status == "released"
+
+    controller = _direct_controller(
+        tmp_path / "foundry",
+        store,
+        registry,
+        anchor_graph.release_profile,
+    )
+    runner = controller.expansion_runner
+    campaign_id = "campaign:complete-frozen-parent-universe"
+    source_budget = Budget(
+        llm_tokens=2,
+        agent_turns=2,
+        search_calls=1,
+        tool_calls=2,
+        wall_seconds=10,
+    )
+    source_catalog = ExpansionSourceCatalog(
+        catalog_id="source-catalog:pool-parent-test",
+        sources=(
+            ExpansionSourceDescriptor(
+                source_id="source:unavailable-fault-injection",
+                kind="pool_neighborhood",
+                budget=source_budget,
+            ),
+        ),
+    )
+    campaign_budget = Budget(
+        llm_tokens=2,
+        agent_turns=8,
+        search_calls=1,
+        tool_calls=2,
+        wall_seconds=300,
+    )
+    candidate_budget = Budget(agent_turns=2, wall_seconds=60)
+
+    class UnavailableSourceFault:
+        async def discover(self, **_kwargs: object) -> object:
+            raise ConnectionError("intentional Source outage for recovery coverage")
+
+    runner.source = UnavailableSourceFault()  # type: ignore[assignment]
+    with controller.campaign_store.exclusive(campaign_id) as lock:
+        state = runner._create_state(  # noqa: SLF001
+            lock=lock,
+            campaign_id=campaign_id,
+            anchor_package_refs=(anchor_graph.manifest_ref,),
+            target_coverage_dimensions=("tool_semantics",),
+            inbox_snapshot_ref=None,
+            source_catalog=source_catalog,
+            feedback_refs=(),
+            policy_id="wide-search",
+            policy_parameters=(),
+            permissions=PermissionScope(),
+            campaign_budget=campaign_budget,
+            candidate_budget=candidate_budget,
+            release_profile=anchor_graph.release_profile,
+            campaign_seed=73,
+            maximum_intents_per_iteration=5,
+            maximum_in_flight=1,
+            maximum_iterations=2,
+            maximum_no_release_iterations=2,
+            maximum_infrastructure_error_iterations=2,
+            version_reservation_ttl_seconds=3600,
+            allowed_source_kinds=("web",),
+            risk_level="medium",
+            fidelity_requirements=(),
+        )
+        assert state.context is None
+        state = asyncio.run(runner._execute_source_intake(lock, state))  # noqa: SLF001
+
+    frozen_refs = tuple(item.manifest_ref for item in state.snapshot.releases)
+    assert state.context is not None
+    assert {item.package_ref for item in state.context.parents} == set(frozen_refs)
+    assert state.context.anchor_parent_refs == (anchor_graph.manifest_ref,)
+    assert pool_graph.manifest_ref in frozen_refs
+
+    pool_intent = MutationIntent(
+        intent_id="intent:frozen-non-anchor-parent",
+        parent_refs=(pool_graph.manifest_ref,),
+        primary_parent_ref=pool_graph.manifest_ref,
+        operator="tool_semantics",
+        operator_version="1",
+        seed=11,
+        target_coverage_dimensions=("tool_semantics",),
+    )
+    assert runner._admission_error(state, pool_intent) is None  # noqa: SLF001
+
+    recombination = MutationIntent(
+        intent_id="intent:pool-recombination",
+        parent_refs=(anchor_graph.manifest_ref, pool_graph.manifest_ref),
+        primary_parent_ref=anchor_graph.manifest_ref,
+        operator="composite",
+        operator_version="1",
+        seed=12,
+        target_coverage_dimensions=("tool_semantics",),
+    )
+    assert runner._admission_error(state, recombination) is None  # noqa: SLF001
+
+    single_parent_composite = MutationIntent(
+        intent_id="intent:invalid-single-parent-composite",
+        parent_refs=(anchor_graph.manifest_ref,),
+        primary_parent_ref=anchor_graph.manifest_ref,
+        operator="composite",
+        operator_version="1",
+        seed=13,
+        target_coverage_dimensions=("tool_semantics",),
+    )
+    assert (  # noqa: SLF001
+        runner._admission_error(state, single_parent_composite)
+        == "composite_single_parent_requires_clue"
+    )
+
+    registry.quarantine(
+        pool_graph.package_id,
+        pool_graph.version,
+        reason_code="parent_semantics_invalidated",
+    )
+    assert (  # noqa: SLF001
+        runner._admission_error(state, pool_intent) == "parent_no_longer_eligible"
+    )
+
+
+def test_version_reservation_is_exclusive_idempotent_and_restart_safe(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    first_owner = _commit(
+        store,
+        "job:first-owner",
+        "control.environment_job",
+        {"job_id": "job:first-owner", "kind": "expand"},
+    )
+    second_owner = _commit(
+        store,
+        "job:second-owner",
+        "control.environment_job",
+        {"job_id": "job:second-owner", "kind": "expand"},
+    )
+    registry_root = tmp_path / "registry"
+    registry = EnvironmentRegistry(registry_root, store)
+
+    def attempt(owner_ref: ArtifactRef) -> PackageVersionReservation | str:
+        try:
+            return registry.reserve_package_version("shared-environment", "1.1.0", owner_ref)
+        except ReservationConflictError:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(attempt, (first_owner, second_owner)))
+
+    winners = tuple(item for item in results if isinstance(item, PackageVersionReservation))
+    assert len(winners) == 1
+    assert results.count("conflict") == 1
+    winner = winners[0]
+    assert winner.status == "active"
+    assert (
+        registry.reserve_package_version(
+            winner.package_id,
+            winner.version,
+            winner.owner_ref,
+        )
+        == winner
+    )
+
+    restarted = EnvironmentRegistry(registry_root, store)
+    assert restarted.inspect_reservation(winner.reservation_id) == winner
+    assert (
+        restarted.reserve_package_version(
+            winner.package_id,
+            winner.version,
+            winner.owner_ref,
+        )
+        == winner
+    )
+
+
+def test_expired_and_cancelled_reservations_release_the_coordinate(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    first_owner = _commit(
+        store,
+        "job:expiring-owner",
+        "control.environment_job",
+        {"job_id": "job:expiring-owner", "kind": "expand"},
+    )
+    second_owner = _commit(
+        store,
+        "job:replacement-owner",
+        "control.environment_job",
+        {"job_id": "job:replacement-owner", "kind": "expand"},
+    )
+    registry = EnvironmentRegistry(
+        tmp_path / "registry",
+        store,
+        reservation_ttl_seconds=0.03,
+    )
+    expiring = registry.reserve_package_version("expiry-environment", "1.0.0", first_owner)
+    time.sleep(0.05)
+    assert registry.inspect_reservation(expiring.reservation_id).status == "expired"
+
+    replacement = registry.reserve_package_version(
+        "expiry-environment",
+        "1.0.0",
+        second_owner,
+        ttl_seconds=60,
+    )
+    cancelled = registry.release_reservation(replacement.reservation_id, second_owner)
+    assert cancelled.status == "cancelled"
+    assert registry.release_reservation(replacement.reservation_id, second_owner) == cancelled
+
+    reacquired = registry.reserve_package_version(
+        "expiry-environment",
+        "1.0.0",
+        first_owner,
+        ttl_seconds=60,
+    )
+    assert reacquired.status == "active"
+    assert reacquired.reservation_id not in {
+        expiring.reservation_id,
+        replacement.reservation_id,
+    }
+
+
+def test_prepare_rejects_manifest_outside_reserved_coordinate(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(tmp_path, store)
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    wrong_coordinate = _reserve(
+        registry,
+        graph,
+        package_id="different-environment",
+        version="9.0.0",
+    )
+
+    with pytest.raises(ReservationConflictError, match="manifest coordinate"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=graph.manifest_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=wrong_coordinate,
+            framework_payloads=graph.framework_payloads,
+        )
+    assert registry.list() == ()
+    assert registry.inspect_reservation(wrong_coordinate.reservation_id).status == "active"
+
+
+def test_prepare_rejects_unparsable_physical_world_spec(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(
+        tmp_path,
+        store,
+        world_spec_bytes_override=b'{"world":"inventory"}',
+    )
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = _reserve(registry, graph)
+
+    with pytest.raises(
+        ReleaseRejectedError,
+        match="physical WorldSpec is not a valid closed contract",
+    ):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=graph.manifest_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=reservation,
+            framework_payloads=graph.framework_payloads,
+        )
+
+    assert registry.list() == ()
+    assert registry.inspect_reservation(reservation.reservation_id).status == "active"
+
+
+def test_expired_prepared_release_cannot_publish_or_claim_success(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(tmp_path, store)
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = registry.reserve_package_version(
+        graph.package_id,
+        graph.version,
+        graph.owner_ref,
+        ttl_seconds=5.0,
+    )
+    prepared = registry.prepare(
+        candidate_workspace=graph.workspace,
+        manifest_ref=graph.manifest_ref,
+        judge_report_ref=graph.report_ref,
+        release_profile=graph.release_profile,
+        reservation=reservation,
+        framework_payloads=graph.framework_payloads,
+    )
+    remaining = (reservation.expires_at - datetime.now(UTC)).total_seconds()
+    time.sleep(max(remaining + 0.05, 0.05))
+
+    with pytest.raises(ReservationExpiredError, match="reservation expired"):
+        registry.publish(prepared)
+    assert registry.list() == ()
+    assert registry.inspect_reservation(reservation.reservation_id).status == "expired"
+
+
+def test_registry_rejects_nonpassing_judge_evidence(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(tmp_path, store, judge_passes=False)
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = _reserve(registry, graph)
+
+    with pytest.raises(ReleaseRejectedError, match="Judge verdict is not pass"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=graph.manifest_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=reservation,
+            framework_payloads=graph.framework_payloads,
+        )
+
+
+def test_registry_rejects_source_tree_not_verified_by_judge(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    graph = _release_graph(tmp_path, store)
+    report = store.get_json(graph.report_ref, JudgeReport)
+    wrong_report = report.model_copy(
+        update={"candidate_source_tree_digest": sha256_digest(b"different-source-tree")}
+    )
+    wrong_report_ref = _judge_writer(store).put_json(
+        artifact_id="judge-report:wrong-source-tree",
+        artifact_type="judge_report",
+        value=wrong_report,
+        dependencies=(graph.candidate_ref, *wrong_report.evaluation_evidence_refs),
+    )
+    manifest = store.get_json(graph.manifest_ref, EnvironmentPackageManifest)
+    wrong_manifest = manifest.model_copy(update={"judge_report_ref": wrong_report_ref})
+    original_dependencies = store.dependencies(graph.manifest_ref)
+    wrong_manifest_ref = _framework_writer(store).put_json(
+        artifact_id="manifest:wrong-source-tree",
+        artifact_type="environment_package_manifest",
+        value=wrong_manifest,
+        dependencies=(
+            *(item for item in original_dependencies if item != graph.report_ref),
+            wrong_report_ref,
+        ),
+    )
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = _reserve(registry, graph)
+
+    with pytest.raises(ReleaseRejectedError, match="different candidate source trees"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=wrong_manifest_ref,
+            judge_report_ref=wrong_report_ref,
+            release_profile=graph.release_profile,
+            reservation=reservation,
+            framework_payloads=graph.framework_payloads,
+        )
+    assert registry.list() == ()
+
+
+def test_registry_rejects_generic_reachability_evidence(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    graph = _release_graph(tmp_path, store)
+    generic_ref = _judge_writer(store).put_json(
+        artifact_id="reachability:generic-summary",
+        artifact_type="judge.evaluation_evidence",
+        value={"status": "pass", "claim": "all generated tasks are reachable"},
+        dependencies=(graph.candidate_ref,),
+    )
+    manifest = store.get_json(graph.manifest_ref, EnvironmentPackageManifest)
+    report = store.get_json(graph.report_ref, JudgeReport)
+    claim_vector = store.get_json(manifest.claim_vector_ref, ClaimVector)
+    assert claim_vector.verifier_ref is not None
+    gate_results = tuple(
+        gate.model_copy(update={"evidence_refs": (generic_ref,)})
+        if gate.gate_id == "task_reachability"
+        else gate
+        for gate in report.gate_results
+    )
+    evidence_refs = tuple(
+        ref
+        for ref in report.evaluation_evidence_refs
+        if ref.artifact_type != "judge.reachability_public_evidence"
+    ) + (generic_ref,)
+    generic_report = report.model_copy(
+        update={
+            "gate_results": gate_results,
+            "evaluation_evidence_refs": evidence_refs,
+        }
+    )
+    generic_report_ref = _judge_writer(store).put_json(
+        artifact_id="judge-report:generic-reachability",
+        artifact_type="judge_report",
+        value=generic_report,
+        dependencies=(graph.candidate_ref, claim_vector.verifier_ref, *evidence_refs),
+    )
+    telemetry = store.get_json(manifest.telemetry_summary_ref, TelemetryReleaseSummary)
+    generic_telemetry_ref = _framework_writer(store).put_json(
+        artifact_id="telemetry-summary:generic-reachability",
+        artifact_type="release.telemetry_summary",
+        value=telemetry,
+        dependencies=(graph.owner_ref, graph.candidate_ref, generic_report_ref),
+    )
+    generic_claims = tuple(
+        item.model_copy(update={"evidence_refs": (generic_report_ref,)})
+        if item.claim_id == "release_judge.valid"
+        else item.model_copy(update={"evidence_refs": (generic_telemetry_ref,)})
+        if item.claim_id == "observability.release_ready"
+        else item
+        for item in claim_vector.claims
+    )
+    generic_claim_vector = claim_vector.model_copy(
+        update={
+            "release_judge_ref": generic_report_ref,
+            "telemetry_ref": generic_telemetry_ref,
+            "claims": generic_claims,
+        }
+    )
+    generic_claim_vector_ref = _framework_writer(store).put_json(
+        artifact_id="claim-vector:generic-reachability",
+        artifact_type="release.claim_vector",
+        value=generic_claim_vector,
+        dependencies=(
+            *(
+                ref
+                for ref in store.dependencies(manifest.claim_vector_ref)
+                if ref not in {graph.report_ref, manifest.telemetry_summary_ref}
+            ),
+            generic_report_ref,
+            generic_telemetry_ref,
+        ),
+    )
+    generic_manifest = manifest.model_copy(
+        update={
+            "judge_report_ref": generic_report_ref,
+            "claim_vector_ref": generic_claim_vector_ref,
+            "telemetry_summary_ref": generic_telemetry_ref,
+        }
+    )
+    generic_manifest_ref = _framework_writer(store).put_json(
+        artifact_id="manifest:generic-reachability",
+        artifact_type="environment_package_manifest",
+        value=generic_manifest,
+        dependencies=(
+            *(
+                ref
+                for ref in store.dependencies(graph.manifest_ref)
+                if ref
+                not in {
+                    graph.report_ref,
+                    manifest.claim_vector_ref,
+                    manifest.telemetry_summary_ref,
+                }
+            ),
+            generic_report_ref,
+            generic_claim_vector_ref,
+            generic_telemetry_ref,
+        ),
+    )
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = _reserve(registry, graph)
+
+    with pytest.raises(
+        ReleaseRejectedError,
+        match="typed public reachability evidence",
+    ):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=generic_manifest_ref,
+            judge_report_ref=generic_report_ref,
+            release_profile=graph.release_profile,
+            reservation=reservation,
+            framework_payloads=graph.framework_payloads,
+        )
+    assert registry.list() == ()
+
+
+def test_registry_rejects_incomplete_integration_gate_closure(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    graph = _release_graph(tmp_path, store)
+    manifest = store.get_json(graph.manifest_ref, EnvironmentPackageManifest)
+    integration = store.get_json(manifest.integration_report_ref, IntegrationReport)
+    incomplete = integration.model_copy(update={"gate_results": integration.gate_results[:-1]})
+    incomplete_ref = _judge_writer(store).put_json(
+        artifact_id="integration-report:missing-gate",
+        artifact_type="judge.integration_report",
+        value=incomplete,
+        dependencies=store.dependencies(manifest.integration_report_ref),
+    )
+    revised_manifest = manifest.model_copy(
+        update={"integration_report_ref": incomplete_ref}
+    )
+    revised_manifest_ref = _framework_writer(store).put_json(
+        artifact_id="manifest:missing-integration-gate",
+        artifact_type="environment_package_manifest",
+        value=revised_manifest,
+        dependencies=tuple(
+            incomplete_ref if ref == manifest.integration_report_ref else ref
+            for ref in store.dependencies(graph.manifest_ref)
+        ),
+    )
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    with pytest.raises(ReleaseRejectedError, match="gate closure is not canonical"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=revised_manifest_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=_reserve(registry, graph),
+            framework_payloads=graph.framework_payloads,
+        )
+
+
+def test_registry_rejects_claim_with_wrong_evidence_semantics(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    graph = _release_graph(tmp_path, store)
+    manifest = store.get_json(graph.manifest_ref, EnvironmentPackageManifest)
+    vector = store.get_json(manifest.claim_vector_ref, ClaimVector)
+    wrong_claims = tuple(
+        item.model_copy(update={"evidence_refs": (manifest.telemetry_summary_ref,)})
+        if item.claim_id == "verifier.valid"
+        else item
+        for item in vector.claims
+    )
+    wrong_vector = vector.model_copy(update={"claims": wrong_claims})
+    wrong_vector_ref = _framework_writer(store).put_json(
+        artifact_id="claim-vector:wrong-verifier-evidence",
+        artifact_type="release.claim_vector",
+        value=wrong_vector,
+        dependencies=store.dependencies(manifest.claim_vector_ref),
+    )
+    revised_manifest = manifest.model_copy(update={"claim_vector_ref": wrong_vector_ref})
+    revised_manifest_ref = _framework_writer(store).put_json(
+        artifact_id="manifest:wrong-claim-evidence",
+        artifact_type="environment_package_manifest",
+        value=revised_manifest,
+        dependencies=tuple(
+            wrong_vector_ref if ref == manifest.claim_vector_ref else ref
+            for ref in store.dependencies(graph.manifest_ref)
+        ),
+    )
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    with pytest.raises(ReleaseRejectedError, match="evidence semantics are invalid"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=revised_manifest_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=_reserve(registry, graph),
+            framework_payloads=graph.framework_payloads,
+        )
+
+
+def test_registry_rejects_incomplete_release_telemetry(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    graph = _release_graph(tmp_path, store)
+    manifest = store.get_json(graph.manifest_ref, EnvironmentPackageManifest)
+    telemetry = store.get_json(manifest.telemetry_summary_ref, TelemetryReleaseSummary)
+    incomplete_telemetry = telemetry.model_copy(
+        update={
+            "required_node_attempts": {
+                key: value
+                for key, value in telemetry.required_node_attempts.items()
+                if key != "judge"
+            }
+        }
+    )
+    incomplete_telemetry_ref = _framework_writer(store).put_json(
+        artifact_id="telemetry-summary:missing-judge",
+        artifact_type="release.telemetry_summary",
+        value=incomplete_telemetry,
+        dependencies=store.dependencies(manifest.telemetry_summary_ref),
+    )
+    vector = store.get_json(manifest.claim_vector_ref, ClaimVector)
+    revised_claims = tuple(
+        item.model_copy(update={"evidence_refs": (incomplete_telemetry_ref,)})
+        if item.claim_id == "observability.release_ready"
+        else item
+        for item in vector.claims
+    )
+    revised_vector = vector.model_copy(
+        update={
+            "telemetry_ref": incomplete_telemetry_ref,
+            "claims": revised_claims,
+        }
+    )
+    revised_vector_ref = _framework_writer(store).put_json(
+        artifact_id="claim-vector:missing-telemetry-node",
+        artifact_type="release.claim_vector",
+        value=revised_vector,
+        dependencies=tuple(
+            incomplete_telemetry_ref if ref == manifest.telemetry_summary_ref else ref
+            for ref in store.dependencies(manifest.claim_vector_ref)
+        ),
+    )
+    revised_manifest = manifest.model_copy(
+        update={
+            "telemetry_summary_ref": incomplete_telemetry_ref,
+            "claim_vector_ref": revised_vector_ref,
+        }
+    )
+    revised_manifest_ref = _framework_writer(store).put_json(
+        artifact_id="manifest:missing-telemetry-node",
+        artifact_type="environment_package_manifest",
+        value=revised_manifest,
+        dependencies=tuple(
+            incomplete_telemetry_ref
+            if ref == manifest.telemetry_summary_ref
+            else revised_vector_ref
+            if ref == manifest.claim_vector_ref
+            else ref
+            for ref in store.dependencies(graph.manifest_ref)
+        ),
+    )
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    with pytest.raises(ReleaseRejectedError, match="complete release trace"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=revised_manifest_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=_reserve(registry, graph),
+            framework_payloads=graph.framework_payloads,
+        )
+
+
+def test_registry_rejects_manifest_from_non_framework_signed_producer(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(tmp_path, store)
+    manifest = store.get_json(graph.manifest_ref, EnvironmentPackageManifest)
+    untrusted_writer = store.issue_writer(
+        producer="environment-builder",
+        allowed_artifact_types=("environment_package_manifest",),
+    )
+    forged_ref = untrusted_writer.put_json(
+        artifact_id="manifest:forged-producer",
+        artifact_type="environment_package_manifest",
+        value=manifest,
+        dependencies=store.dependencies(graph.manifest_ref),
+    )
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = _reserve(registry, graph)
+
+    with pytest.raises(ReleaseRejectedError, match="signed framework producer"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=forged_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=reservation,
+            framework_payloads=graph.framework_payloads,
+        )
+
+
+def test_registry_rejects_judge_report_from_non_judge_signed_producer(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(tmp_path, store)
+    report = store.get_json(graph.report_ref, JudgeReport)
+    untrusted_writer = store.issue_writer(
+        producer="environment-builder",
+        allowed_artifact_types=("judge_report",),
+    )
+    forged_report_ref = untrusted_writer.put_json(
+        artifact_id="judge-report:forged-producer",
+        artifact_type="judge_report",
+        value=report,
+        dependencies=store.dependencies(graph.report_ref),
+    )
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = _reserve(registry, graph)
+
+    with pytest.raises(ReleaseRejectedError, match="signed Judge producer"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=graph.manifest_ref,
+            judge_report_ref=forged_report_ref,
+            release_profile=graph.release_profile,
+            reservation=reservation,
+            framework_payloads=graph.framework_payloads,
+        )
+
+
+def test_registry_rejects_undeclared_files(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(tmp_path, store)
+    (graph.workspace / "undeclared.txt").write_text("not declared by the package manifest")
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = _reserve(registry, graph)
+
+    with pytest.raises(UnsafePackageError, match="declaration mismatch"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=graph.manifest_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=reservation,
+            framework_payloads=graph.framework_payloads,
+        )
+
+
+def test_registry_rejects_known_credential_canary(tmp_path: Path) -> None:
+    canary = b"release-boundary-canary-2c75e19e"
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(tmp_path, store, runtime_bytes=b"payload=" + canary + b"\n")
+    registry = EnvironmentRegistry(
+        tmp_path / "registry",
+        store,
+        known_secret_canaries=(canary,),
+    )
+    reservation = _reserve(registry, graph)
+
+    with pytest.raises(UnsafePackageError, match="known secret canary"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=graph.manifest_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=reservation,
+            framework_payloads=graph.framework_payloads,
+        )
+
+
+def test_registry_rejects_symlinked_payload(tmp_path: Path) -> None:
+    if os.name == "nt":
+        pytest.skip("symlink creation may require elevated Windows privileges")
+    store = ArtifactStore(tmp_path / "artifact-store")
+    graph = _release_graph(tmp_path, store)
+    outside = tmp_path / "outside-runtime.py"
+    outside.write_bytes((graph.workspace / "runtime.py").read_bytes())
+    (graph.workspace / "runtime.py").unlink()
+    (graph.workspace / "runtime.py").symlink_to(outside)
+    registry = EnvironmentRegistry(tmp_path / "registry", store)
+    reservation = _reserve(registry, graph)
+
+    with pytest.raises(UnsafePackageError, match="symlink is prohibited"):
+        registry.prepare(
+            candidate_workspace=graph.workspace,
+            manifest_ref=graph.manifest_ref,
+            judge_report_ref=graph.report_ref,
+            release_profile=graph.release_profile,
+            reservation=reservation,
+            framework_payloads=graph.framework_payloads,
+        )

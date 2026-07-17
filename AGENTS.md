@@ -26,7 +26,7 @@ Background only:
 - Do not reintroduce fixed environments, fixed task ids, fixed replay cases, fixture registries, or environment-id verifier branches as normal success paths.
 - Do not write secrets into artifacts, traces, manifests, or release packages.
 - Use `uv` for Python commands.
-- Preserve existing `awm` CLI compatibility unless explicitly asked otherwise.
+- Do not preserve the old `awm` CLI, runtime ABI v1, or replay compatibility path; the user explicitly approved a clean-break redesign.
 
 ## Trellis
 

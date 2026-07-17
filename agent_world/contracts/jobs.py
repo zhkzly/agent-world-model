@@ -1,0 +1,120 @@
+"""Request, budget, release policy, and job contracts."""
+
+from __future__ import annotations
+
+from typing import Annotated, Literal
+
+from pydantic import Field, model_validator
+
+from .base import ArtifactRef, Identifier, NonEmptyStr, V2Contract
+
+
+class Budget(V2Contract):
+    """A vector budget; no dimension may be silently traded for another."""
+
+    llm_tokens: Annotated[int, Field(ge=0)] = 0
+    agent_turns: Annotated[int, Field(ge=0)] = 0
+    search_calls: Annotated[int, Field(ge=0)] = 0
+    tool_calls: Annotated[int, Field(ge=0)] = 0
+    build_seconds: Annotated[float, Field(ge=0)] = 0
+    evaluation_episodes: Annotated[int, Field(ge=0)] = 0
+    container_seconds: Annotated[float, Field(ge=0)] = 0
+    live_probe_cost: Annotated[float, Field(ge=0)] = 0
+    repair_attempts: Annotated[int, Field(ge=0)] = 0
+    wall_seconds: Annotated[float, Field(ge=0)] = 0
+    monetary_cost: Annotated[float, Field(ge=0)] = 0
+
+
+class BudgetUsage(Budget):
+    """Observed consumption using the same dimensions as a reservation."""
+
+
+class PermissionScope(V2Contract):
+    filesystem_read_roots: tuple[NonEmptyStr, ...] = ()
+    filesystem_write_roots: tuple[NonEmptyStr, ...] = ()
+    network_domains: tuple[NonEmptyStr, ...] = ()
+    executable_allowlist: tuple[NonEmptyStr, ...] = ()
+    tool_allowlist: tuple[Identifier, ...] = ()
+    credential_handles: tuple[Identifier, ...] = ()
+    allow_external_side_effects: bool = False
+
+
+class ReleaseProfile(V2Contract):
+    profile_id: Identifier
+    required_hard_gates: tuple[Identifier, ...] = (
+        "schema",
+        "supply_chain",
+        "static_assurance",
+        "public_self_check",
+        "runtime_protocol",
+        "task_materialization",
+        "task_reachability",
+        "behavior",
+        "sealed_release",
+        "clean_deployment",
+    )
+    minimum_coverage_dimensions: tuple[Identifier, ...] = ()
+    maximum_risk: Literal["low", "medium", "high", "critical"] = "medium"
+    require_reproducible_reset: bool = True
+    require_unknown_seed_testing: bool = True
+    require_clean_install: bool = True
+    require_package_relative_paths: bool = True
+    allow_unresolved_assumptions: bool = False
+
+
+class EnvironmentRequest(V2Contract):
+    request_id: Identifier
+    need: NonEmptyStr
+    supplied_asset_refs: tuple[ArtifactRef, ...] = ()
+    allowed_source_kinds: tuple[Identifier, ...] = ("web",)
+    fidelity_requirements: tuple[NonEmptyStr, ...] = ()
+    permissions: PermissionScope = Field(default_factory=PermissionScope)
+    risk_level: Literal["low", "medium", "high", "critical"] = "medium"
+    unknowns_requiring_human: tuple[NonEmptyStr, ...] = ()
+    budget: Budget = Field(default_factory=Budget)
+    release_profile: ReleaseProfile
+
+    @model_validator(mode="after")
+    def implemented_research_sources_only(self) -> EnvironmentRequest:
+        if self.allowed_source_kinds != ("web",):
+            raise ValueError(
+                "the production research adapter currently implements exactly the web source "
+                "kind; tool surfaces such as MCP/CLI/API/SDK are discovered from fetched Web "
+                "evidence, not advertised as unimplemented source transports"
+            )
+        return self
+
+
+class EnvironmentJob(V2Contract):
+    job_id: Identifier
+    kind: Literal["generate", "expand"]
+    request_ref: ArtifactRef | None = None
+    anchor_package_refs: tuple[ArtifactRef, ...] = ()
+    expansion_campaign_ref: ArtifactRef | None = None
+    permissions: PermissionScope = Field(default_factory=PermissionScope)
+    budget: Budget = Field(default_factory=Budget)
+    release_profile: ReleaseProfile
+
+    @model_validator(mode="after")
+    def validate_job_inputs(self) -> EnvironmentJob:
+        if self.kind == "generate":
+            if self.request_ref is None:
+                raise ValueError("generate jobs require request_ref")
+            if self.anchor_package_refs or self.expansion_campaign_ref is not None:
+                raise ValueError("generate jobs cannot carry expansion anchors or campaign")
+        else:
+            if self.expansion_campaign_ref is None:
+                raise ValueError("expand jobs require expansion_campaign_ref")
+            if not self.anchor_package_refs:
+                raise ValueError("expand jobs require at least one anchor package")
+        return self
+
+
+__all__ = [
+    "Budget",
+    "BudgetUsage",
+    "EnvironmentJob",
+    "EnvironmentRequest",
+    "PermissionScope",
+    "ReleaseProfile",
+]

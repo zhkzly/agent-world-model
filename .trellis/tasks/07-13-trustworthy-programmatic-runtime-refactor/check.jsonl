@@ -1,0 +1,5 @@
+{"file":"AGENTS.md","reason":"Repository-level project intent, trust boundaries, real InvocationBackend requirement, and working rules."}
+{"file":"docs/agent-world-environment-generation.zh.md","reason":"Canonical source of truth for the Foundry purpose, product unit, discovery/evolution separation, trust invariants, and breaking redesign."}
+{"file":".trellis/tasks/07-13-trustworthy-programmatic-runtime-refactor/prd.md","reason":"Acceptance requirements and live-lane success criteria for review."}
+{"file":".trellis/tasks/07-13-trustworthy-programmatic-runtime-refactor/design.md","reason":"Architecture contracts and trust boundaries to verify against the implementation."}
+{"file":".trellis/tasks/07-13-trustworthy-programmatic-runtime-refactor/implement.md","reason":"Milestone gates, deletion sequence, and real-versus-fake test matrix."}

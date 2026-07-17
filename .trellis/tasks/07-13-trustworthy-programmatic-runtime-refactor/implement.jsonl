@@ -1,0 +1,5 @@
+{"file":"AGENTS.md","reason":"Mandatory repository instructions before implementation."}
+{"file":"docs/agent-world-environment-generation.zh.md","reason":"Canonical purpose and invariants that all implementation choices must serve."}
+{"file":".trellis/tasks/07-13-trustworthy-programmatic-runtime-refactor/prd.md","reason":"Product contracts and acceptance criteria for each subsystem."}
+{"file":".trellis/tasks/07-13-trustworthy-programmatic-runtime-refactor/design.md","reason":"Target module boundaries, protocols, data models, and migration decisions."}
+{"file":".trellis/tasks/07-13-trustworthy-programmatic-runtime-refactor/implement.md","reason":"Ordered implementation batches, gates, and deletion plan."}

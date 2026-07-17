@@ -1,375 +1,516 @@
+"""Non-secret configuration for the Agent World Foundry."""
+
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
 import os
+import re
+import tomllib
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Literal
+from urllib.parse import urlsplit
 
-import yaml
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
-
-DEFAULT_INVOCATION_BACKEND = "llm"
-DEFAULT_IMPLEMENTATION_INVOCATION_BACKEND = "codex_sdk"
-DEFAULT_OPENAI_BASE_URL = "https://blog.r78xoaxrk.nyat.app:50903/v1"
-DEFAULT_OPENAI_MODEL = "gpt-5.4-mini"
-DEFAULT_OPENAI_MODEL_CANDIDATES = [
-    "gpt-5.4-mini",
-    "gpt-5.4",
-    "gpt-5.5",
-]
-DEFAULT_INVOCATION_NETWORK = True
-DEFAULT_INVOCATION_TIMEOUT_MS = 60000
-DEFAULT_INVOCATION_MAX_TOKENS = 4096
-DEFAULT_INVOCATION_MAX_ATTEMPTS = 3
-DEFAULT_CODE_REPAIR_THREAD_MODE = "stateless"
-DEFAULT_CODEX_SANDBOX = "workspace-write"
-DEFAULT_CONFIG_RELATIVE_PATH = Path("config") / "agent-world.default.yaml"
-SEMANTIC_INVOCATION_PROFILE = "semantic"
-IMPLEMENTATION_INVOCATION_PROFILE = "implementation"
-INVOCATION_PROFILE_STAGES = [
-    "PLAN",
-    "S0",
-    "S1",
-    "S2",
-    "S3",
-    "S4",
-    "S5",
-    "S6",
-    "S7",
-    "IMPLEMENT",
-]
-PIPELINE_STAGES = [
-    "PLAN",
-    "SELECT",
-    "S0",
-    "S1",
-    "S2",
-    "S3",
-    "S4",
-    "S5",
-    "S6",
-    "S7",
-    "S8",
-    "S9",
-    "IMPLEMENT",
-    "S10",
-    "S11",
-]
-DEFAULT_STAGE_INVOCATION_PROFILES = {stage: SEMANTIC_INVOCATION_PROFILE for stage in INVOCATION_PROFILE_STAGES}
-DEFAULT_STAGE_INVOCATION_PROFILES["IMPLEMENT"] = IMPLEMENTATION_INVOCATION_PROFILE
+from agent_world.contracts import (
+    Budget,
+    ExpansionSourceDescriptor,
+    ExpansionSourceKind,
+    KeyValue,
+    ReleaseProfile,
+)
 
 
-@dataclass(frozen=True)
-class ResearchConfig:
-    backend: str
-    searxng_url: str
-    jina_search_url: str
-    jina_reader_url: str
-    jina_api_key_env: str
-    process_command: str
-    max_queries: int
-    max_results: int
+class ConfigError(RuntimeError):
+    pass
 
 
-@dataclass(frozen=True)
-class InvocationProfileConfig:
-    profile_id: str
-    backend_kind: str
-    provider: str
-    model: str
-    smoke_model: str
-    model_candidates: list[str]
-    base_url: str
-    api_version: str
-    api_key_env: str
-    auth_env_refs: list[str]
-    backend_auth: bool
-    command_value: str
-    allowlist_value: str
-    command_cwd: str
-    timeout_ms: int
-    max_attempts: int
-    max_tokens: int
-    network: bool
-    codex_sandbox: str
-    code_repair_thread_mode: str
+class ConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
 
-@dataclass(frozen=True)
-class AgentWorldConfig:
-    research: ResearchConfig
-    invocation_profiles: dict[str, InvocationProfileConfig]
-    stage_invocation_profiles: dict[str, str]
-    config_path: str = ""
-
-    def profile_for_stage(self, stage: str) -> InvocationProfileConfig:
-        if stage not in self.stage_invocation_profiles:
-            raise KeyError(f"Stage {stage} has no invocation profile because it is deterministic or unknown.")
-        profile_id = self.stage_invocation_profiles[stage]
-        if profile_id not in self.invocation_profiles:
-            raise KeyError(f"Stage {stage} references unknown invocation profile: {profile_id}")
-        return self.invocation_profiles[profile_id]
-
-    def to_redacted_dict(self) -> dict[str, Any]:
-        return {
-            "research": asdict(self.research),
-            "invocation_profiles": {
-                profile_id: asdict(profile)
-                for profile_id, profile in self.invocation_profiles.items()
-            },
-            "stage_invocation_profiles": dict(self.stage_invocation_profiles),
-            "config_path": self.config_path,
-        }
-
-
-def load_agent_world_config(env: Mapping[str, str] | None = None) -> AgentWorldConfig:
-    values = os.environ if env is None else env
-    file_config, config_path = _load_config_file(values)
-    semantic = _resolve_invocation_profile(
-        values,
-        file_config,
-        profile_id=SEMANTIC_INVOCATION_PROFILE,
-        base=None,
-        default_backend_kind=DEFAULT_INVOCATION_BACKEND,
+class AgentBackendConfig(ConfigModel):
+    model: str = Field(min_length=1)
+    model_provider: str | None = None
+    openai_base_url: HttpUrl | None = None
+    codex_bin: Path | None = None
+    reasoning_researcher: Literal["low", "medium", "high", "xhigh"] = "high"
+    reasoning_engineer: Literal["low", "medium", "high", "xhigh"] = "xhigh"
+    reasoning_challenger: Literal["low", "medium", "high", "xhigh"] = "xhigh"
+    chatgpt_auth_file: Path | None = None
+    api_key_environment: str | None = None
+    engineer_network_domain_ceiling: tuple[str, ...] = (
+        "pypi.org",
+        "files.pythonhosted.org",
     )
-    implementation = _resolve_invocation_profile(
-        values,
-        file_config,
-        profile_id=IMPLEMENTATION_INVOCATION_PROFILE,
-        base=semantic,
-        default_backend_kind=_implementation_default_backend_kind(file_config),
+    engineer_dependency_network_domains: tuple[str, ...] = ()
+    invocation_timeout_seconds: float = Field(default=2_700, gt=0)
+    structured_invocation_timeout_seconds: float = Field(default=2_700, gt=0)
+    environment_codegen_invocation_timeout_seconds: float = Field(default=2_700, gt=0)
+    max_concurrent_invocations: int = Field(default=1, ge=1, le=32)
+    tool_output_token_limit: int = Field(default=2_048, ge=512, le=32_768)
+    structured_turn_token_limit: int = Field(default=65_536, ge=16_384, le=1_048_576)
+    environment_codegen_turn_token_limit: int = Field(
+        default=262_144,
+        ge=32_768,
+        le=2_097_152,
     )
-    profiles = {
-        SEMANTIC_INVOCATION_PROFILE: semantic,
-        IMPLEMENTATION_INVOCATION_PROFILE: implementation,
-    }
-    for profile_id in sorted(_configured_profile_ids(file_config) - set(profiles)):
-        base_profile = profiles.get(_profile_parent(file_config, profile_id), semantic)
-        profiles[profile_id] = _resolve_invocation_profile(
-            values,
-            file_config,
-            profile_id=profile_id,
-            base=base_profile,
-            default_backend_kind=base_profile.backend_kind,
+
+    @model_validator(mode="after")
+    def exactly_one_authentication_mode(self) -> AgentBackendConfig:
+        configured = sum(
+            value is not None for value in (self.chatgpt_auth_file, self.api_key_environment)
         )
-    return AgentWorldConfig(
-        research=_load_research_config(file_config=file_config),
-        invocation_profiles=profiles,
-        stage_invocation_profiles=_stage_invocation_profiles(file_config),
-        config_path=config_path,
+        if configured != 1:
+            raise ValueError("configure exactly one of chatgpt_auth_file or api_key_environment")
+        if (
+            self.api_key_environment is not None
+            and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*",
+                self.api_key_environment,
+            )
+            is None
+        ):
+            raise ValueError("api_key_environment must be an environment-variable name")
+        if self.openai_base_url is not None:
+            if self.chatgpt_auth_file is not None:
+                raise ValueError("openai_base_url requires API-key authentication")
+            if self.model_provider not in {None, "openai"}:
+                raise ValueError(
+                    "openai_base_url only overrides the built-in openai model provider"
+                )
+            parsed = urlsplit(str(self.openai_base_url))
+            if (
+                parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "openai_base_url must not contain credentials, query parameters, or fragments"
+                )
+        if len(self.engineer_network_domain_ceiling) != len(
+            set(self.engineer_network_domain_ceiling)
+        ):
+            raise ValueError("engineer_network_domain_ceiling must not contain duplicates")
+        if len(self.engineer_dependency_network_domains) != len(
+            set(self.engineer_dependency_network_domains)
+        ):
+            raise ValueError("engineer_dependency_network_domains must not contain duplicates")
+        if not set(self.engineer_dependency_network_domains) <= set(
+            self.engineer_network_domain_ceiling
+        ):
+            raise ValueError(
+                "engineer_dependency_network_domains must be contained by the role ceiling"
+            )
+        return self
+
+
+class ResearchConfig(ConfigModel):
+    provider: Literal["searxng", "jina"]
+    searxng_base_url: HttpUrl | None = None
+    searxng_allow_private_endpoint: bool = False
+    allow_rfc2544_synthetic_egress: bool = False
+    jina_search_url: HttpUrl = HttpUrl("https://s.jina.ai")
+    jina_reader_url: HttpUrl = HttpUrl("https://r.jina.ai")
+    jina_api_key_environment: str | None = None
+    jina_credential_handle: str = Field(
+        default="jina-api-key",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$",
+    )
+    use_jina_reader_fallback: bool = True
+    request_timeout_seconds: float = Field(default=30, gt=0)
+    max_response_bytes: int = Field(default=8 * 1024 * 1024, gt=0, le=8 * 1024 * 1024)
+    max_parallel_searches: int = Field(default=4, ge=1, le=32)
+    max_parallel_fetches: int = Field(default=4, ge=1, le=32)
+
+    @model_validator(mode="after")
+    def provider_requirements(self) -> ResearchConfig:
+        if self.provider == "searxng" and self.searxng_base_url is None:
+            raise ValueError("searxng provider requires searxng_base_url")
+        if self.provider == "jina" and self.jina_api_key_environment is None:
+            raise ValueError("jina search requires jina_api_key_environment")
+        if (
+            self.jina_api_key_environment is not None
+            and re.fullmatch(
+                r"[A-Za-z_][A-Za-z0-9_]*",
+                self.jina_api_key_environment,
+            )
+            is None
+        ):
+            raise ValueError("jina_api_key_environment must be an environment-variable name")
+        _require_exact_jina_origin(self.jina_search_url, official_host="s.jina.ai")
+        _require_exact_jina_origin(self.jina_reader_url, official_host="r.jina.ai")
+        return self
+
+
+def _require_exact_jina_origin(value: HttpUrl, *, official_host: str) -> None:
+    parsed = urlsplit(str(value))
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Jina endpoint has an invalid port") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != official_host
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError(f"Jina endpoint must be exactly https://{official_host} on port 443")
+
+
+class JudgeConfig(ConfigModel):
+    clean_build_timeout_seconds: float = Field(default=600, gt=0)
+    uv_cache_dir: Path | None = None
+    maximum_tasks_per_verifier_batch: int = Field(default=2, ge=1, le=8)
+
+
+class ObservabilityConfig(ConfigModel):
+    """Production telemetry policy; secrets and sealed content are never captured."""
+
+    commit_batch_size: int = Field(default=32, ge=1, le=4096)
+
+
+def _expansion_campaign_budget() -> Budget:
+    return Budget(
+        llm_tokens=6_000_000,
+        agent_turns=640,
+        search_calls=30,
+        tool_calls=2_560,
+        build_seconds=4_500,
+        evaluation_episodes=640,
+        container_seconds=18_000,
+        repair_attempts=15,
+        wall_seconds=36_000,
     )
 
 
-def load_research_config(env: Mapping[str, str] | None = None) -> ResearchConfig:
-    values = os.environ if env is None else env
-    file_config, _ = _load_config_file(values)
-    return _load_research_config(file_config=file_config)
-
-
-def _load_research_config(*, file_config: Mapping[str, Any] | None = None) -> ResearchConfig:
-    research = _mapping_at(file_config or {}, ["research"])
-    return ResearchConfig(
-        backend=str(research.get("backend", "jina")),
-        searxng_url=str(research.get("searxng_url", "")),
-        jina_search_url=str(research.get("jina_search_url", "https://s.jina.ai")),
-        jina_reader_url=str(research.get("jina_reader_url", "https://r.jina.ai")),
-        jina_api_key_env=_jina_api_key_env(research),
-        process_command=str(research.get("process_command", "")),
-        max_queries=max(1, int(research.get("max_queries", "5"))),
-        max_results=max(1, int(research.get("max_results", "10"))),
+def _expansion_candidate_budget() -> Budget:
+    return Budget(
+        llm_tokens=1_200_000,
+        agent_turns=128,
+        search_calls=6,
+        tool_calls=512,
+        build_seconds=900,
+        evaluation_episodes=128,
+        container_seconds=3_600,
+        repair_attempts=3,
+        wall_seconds=7_200,
     )
 
 
-def _jina_api_key_env(research: Mapping[str, Any] | None = None) -> str:
-    configured = (research or {}).get("jina_api_key_env") or (research or {}).get("api_key_env")
-    if configured:
-        return str(configured)
-    return "JINA_API_KEY"
-
-
-def _resolve_invocation_profile(
-    values: Mapping[str, str],
-    file_config: Mapping[str, Any],
-    *,
-    profile_id: str,
-    base: InvocationProfileConfig | None,
-    default_backend_kind: str,
-) -> InvocationProfileConfig:
-    profile = _profile_mapping(file_config, profile_id)
-    backend_kind = str(profile.get("backend_kind", default_backend_kind))
-    base_url = _base_url_value(values, profile.get("base_url", base.base_url if base else DEFAULT_OPENAI_BASE_URL))
-    model = str(profile.get("model", base.model if base else DEFAULT_OPENAI_MODEL))
-    smoke_model = str(profile.get("smoke_model", model))
-    candidates_raw = profile.get("model_candidates", base.model_candidates if base else DEFAULT_OPENAI_MODEL_CANDIDATES)
-    model_candidates = _model_candidates(candidates_raw)
-    api_version = str(profile.get("api_version", _infer_api_version(base_url, backend_kind)))
-    api_key_env = str(profile.get("api_key_env", base.api_key_env if base else "OPENAI_API_KEY"))
-    auth_env_refs = _auth_env_refs(api_key_env)
-    command_value = _command_value(profile, backend_kind, base)
-    allowlist_value = str(profile.get("allowlist_value", base.allowlist_value if base else ""))
-    command_cwd = str(profile.get("command_cwd", base.command_cwd if base else "."))
-    return InvocationProfileConfig(
-        profile_id=profile_id,
-        backend_kind=backend_kind,
-        provider=str(profile.get("provider") or _provider_for_backend(backend_kind)),
-        model=model,
-        smoke_model=smoke_model,
-        model_candidates=model_candidates,
-        base_url=base_url,
-        api_version=api_version,
-        api_key_env=api_key_env,
-        auth_env_refs=auth_env_refs,
-        backend_auth=bool(profile.get("backend_auth", base.backend_auth if base else False)),
-        command_value=command_value,
-        allowlist_value=allowlist_value,
-        command_cwd=command_cwd,
-        timeout_ms=int(profile.get("timeout_ms", base.timeout_ms if base else DEFAULT_INVOCATION_TIMEOUT_MS)),
-        max_attempts=int(profile.get("max_attempts", base.max_attempts if base else DEFAULT_INVOCATION_MAX_ATTEMPTS)),
-        max_tokens=int(profile.get("max_tokens", base.max_tokens if base else DEFAULT_INVOCATION_MAX_TOKENS)),
-        network=bool(profile.get("network", base.network if base else DEFAULT_INVOCATION_NETWORK)),
-        codex_sandbox=str(profile.get("codex_sandbox", base.codex_sandbox if base else DEFAULT_CODEX_SANDBOX)),
-        code_repair_thread_mode=_code_repair_thread_mode(str(profile.get("code_repair_thread_mode", base.code_repair_thread_mode if base else DEFAULT_CODE_REPAIR_THREAD_MODE))),
+def _expansion_source_budget() -> Budget:
+    return Budget(
+        llm_tokens=80_000,
+        agent_turns=4,
+        search_calls=3,
+        tool_calls=12,
+        wall_seconds=900,
     )
 
 
-def _implementation_default_backend_kind(file_config: Mapping[str, Any]) -> str:
-    profile = _profile_mapping(file_config, IMPLEMENTATION_INVOCATION_PROFILE)
-    if profile.get("backend_kind"):
-        return str(profile["backend_kind"])
-    return DEFAULT_IMPLEMENTATION_INVOCATION_BACKEND
+class ExpansionSourceConfig(ConfigModel):
+    """One replaceable evidence source frozen into each Campaign catalog."""
+
+    source_id: str = Field(
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    engine: str = Field(
+        default="evidence-backed-web",
+        min_length=1,
+        max_length=160,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+    )
+    version: str = Field(min_length=1, max_length=80, default="1")
+    kind: ExpansionSourceKind
+    parameters: tuple[KeyValue, ...] = ()
+    budget: Budget = Field(default_factory=_expansion_source_budget)
+    maximum_hypotheses: int = Field(default=4, ge=1, le=32)
+    maximum_clues: int = Field(default=4, ge=1, le=32)
+    maximum_parents: int = Field(default=8, ge=1, le=64)
+    maximum_context_bytes: int = Field(
+        default=524_288,
+        ge=16_384,
+        le=4 * 1024 * 1024,
+    )
+
+    def descriptor(self) -> ExpansionSourceDescriptor:
+        return ExpansionSourceDescriptor(
+            source_id=self.source_id,
+            engine=self.engine,
+            kind=self.kind,
+            version=self.version,
+            parameters=self.parameters,
+            budget=self.budget,
+            maximum_hypotheses=self.maximum_hypotheses,
+            maximum_clues=self.maximum_clues,
+            maximum_parents=self.maximum_parents,
+            maximum_context_bytes=self.maximum_context_bytes,
+        )
 
 
-def _command_value(
-    profile: Mapping[str, Any],
-    backend_kind: str,
-    base: InvocationProfileConfig | None,
-) -> str:
-    default = str(profile.get("command_value", base.command_value if base else ""))
-    if backend_kind in {"codex_cli", "codex_cli_runner"}:
-        return str(profile.get("codex_cmd", default))
-    return str(default or profile.get("code_agent_cmd", ""))
+def _default_expansion_sources() -> tuple[ExpansionSourceConfig, ...]:
+    return (
+        ExpansionSourceConfig(
+            source_id="source:tool-ecosystem",
+            kind="tool_ecosystem",
+        ),
+        ExpansionSourceConfig(
+            source_id="source:pool-neighborhood",
+            kind="pool_neighborhood",
+        ),
+        ExpansionSourceConfig(
+            source_id="source:random-theme",
+            kind="random_theme",
+        ),
+    )
 
 
-def _stage_invocation_profiles(file_config: Mapping[str, Any]) -> dict[str, str]:
-    stage_config = _mapping_at(file_config, ["stages"])
-    if stage_config:
-        default_profile = str(stage_config.get("default_invocation_profile", SEMANTIC_INVOCATION_PROFILE))
-        bindings = {stage: default_profile for stage in INVOCATION_PROFILE_STAGES}
+def _default_expansion_source_ids() -> tuple[str, ...]:
+    return (
+        "source:tool-ecosystem",
+        "source:pool-neighborhood",
+        "source:random-theme",
+    )
+
+
+class ExpansionConfig(ConfigModel):
+    """Default resource/search policy for an explicitly started campaign."""
+
+    policy: Literal["random-search", "wide-search", "evolutionary-archive"] = "evolutionary-archive"
+    sources: tuple[ExpansionSourceConfig, ...] = Field(default_factory=_default_expansion_sources)
+    default_source_ids: tuple[str, ...] = Field(
+        default_factory=_default_expansion_source_ids,
+        min_length=1,
+    )
+    campaign_budget: Budget = Field(default_factory=_expansion_campaign_budget)
+    candidate_budget: Budget = Field(default_factory=_expansion_candidate_budget)
+    maximum_intents_per_iteration: int = Field(default=2, ge=1, le=128)
+    maximum_iterations: int = Field(default=5, ge=1, le=1_000)
+    maximum_no_release_iterations: int = Field(default=3, ge=1, le=1_000)
+    maximum_infrastructure_error_iterations: int = Field(default=3, ge=1, le=100)
+    max_in_flight: int = Field(default=2, ge=1, le=32)
+    external_injection_rate: float = Field(default=0.25, ge=0, le=1)
+    version_reservation_ttl_seconds: float = Field(default=86_400, ge=60, le=604_800)
+
+    @model_validator(mode="after")
+    def budgets_can_start_one_real_candidate(self) -> ExpansionConfig:
+        if not self.sources:
+            raise ValueError("Expansion requires at least one configured evidence Source")
+        source_ids = [item.source_id for item in self.sources]
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("Expansion Source ids must be unique")
+        if len(set(self.default_source_ids)) != len(self.default_source_ids):
+            raise ValueError("default_source_ids must be unique")
+        unknown_defaults = sorted(set(self.default_source_ids) - set(source_ids))
+        if unknown_defaults:
+            raise ValueError(
+                f"default_source_ids are not in the Source catalog: {unknown_defaults}"
+            )
+        # Constructing the public descriptor here applies the same closed budget
+        # and parameter rules used by the durable Campaign artifact.
+        for source in self.sources:
+            source.descriptor()
+        if self.max_in_flight > self.maximum_intents_per_iteration:
+            raise ValueError("max_in_flight cannot exceed maximum_intents_per_iteration")
+        if self.candidate_budget.agent_turns < 1 or self.candidate_budget.wall_seconds <= 0:
+            raise ValueError("candidate_budget requires positive Agent-turn and wall reservations")
+        for field_name in Budget.model_fields:
+            if field_name == "schema_version" or field_name == "wall_seconds":
+                continue
+            if getattr(self.candidate_budget, field_name) > getattr(
+                self.campaign_budget, field_name
+            ):
+                raise ValueError(
+                    f"candidate_budget.{field_name} exceeds the whole campaign reservation"
+                )
+        if self.candidate_budget.wall_seconds > self.campaign_budget.wall_seconds:
+            raise ValueError("candidate wall timeout exceeds the campaign deadline")
+        default_sources = tuple(
+            source for source in self.sources if source.source_id in self.default_source_ids
+        )
+        for source in default_sources:
+            if source.budget.wall_seconds > self.campaign_budget.wall_seconds:
+                raise ValueError(f"Source {source.source_id} timeout exceeds the campaign deadline")
+        for field_name in Budget.model_fields:
+            if field_name in {"schema_version", "wall_seconds"}:
+                continue
+            required = getattr(self.candidate_budget, field_name) + sum(
+                getattr(source.budget, field_name) for source in default_sources
+            )
+            if required > getattr(self.campaign_budget, field_name):
+                raise ValueError(
+                    "default Source intake plus one real candidate exceeds "
+                    f"campaign_budget.{field_name}"
+                )
+        return self
+
+
+def _generation_budget() -> Budget:
+    return Budget(
+        llm_tokens=10_000_000,
+        agent_turns=128,
+        search_calls=6,
+        tool_calls=512,
+        build_seconds=900,
+        evaluation_episodes=128,
+        container_seconds=3_600,
+        repair_attempts=15,
+        wall_seconds=28_800,
+    )
+
+
+def _discovery_budget() -> Budget:
+    return Budget(
+        # Four independent structured turns at the default hard per-turn cap.
+        # This lane never borrows capacity from Direct Generation.
+        llm_tokens=262_144,
+        agent_turns=4,
+        search_calls=3,
+        tool_calls=12,
+        wall_seconds=900,
+    )
+
+
+class FoundryConfig(ConfigModel):
+    state_root: Path
+    agent: AgentBackendConfig
+    research: ResearchConfig
+    judge: JudgeConfig = Field(default_factory=JudgeConfig)
+    observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+    expansion: ExpansionConfig = Field(default_factory=ExpansionConfig)
+    generation_budget: Budget = Field(default_factory=_generation_budget)
+    discovery_budget: Budget = Field(default_factory=_discovery_budget)
+    release_profile: ReleaseProfile = Field(
+        default_factory=lambda: ReleaseProfile(profile_id="default-release")
+    )
+
+    @model_validator(mode="after")
+    def discovery_budget_can_admit_its_base_work(self) -> FoundryConfig:
+        budget = self.discovery_budget
+        configured = any(
+            getattr(budget, field_name) > 0
+            for field_name in Budget.model_fields
+            if field_name != "schema_version"
+        )
+        if not configured:
+            return self
+        minimum_turns = 2
+        if budget.agent_turns < minimum_turns:
+            raise ValueError("discovery_budget requires at least two base Agent turns")
+        minimum_tokens = minimum_turns * self.agent.structured_turn_token_limit
+        if budget.llm_tokens < minimum_tokens:
+            raise ValueError(
+                "discovery_budget.llm_tokens cannot reserve two structured turns at "
+                "agent.structured_turn_token_limit"
+            )
+        if budget.wall_seconds <= 0:
+            raise ValueError("discovery_budget requires positive wall_seconds")
+        return self
+
+
+_SENSITIVE_CONFIG_KEYS = re.compile(
+    r"(?:^|[_-])(?:password|secret|access_token|refresh_token|private_key)(?:$|[_-])",
+    re.IGNORECASE,
+)
+
+
+def load_foundry_config(path: str | os.PathLike[str] | None = None) -> FoundryConfig:
+    """Load one explicit TOML config without accepting embedded credential values."""
+
+    selected = path or os.environ.get("AGENT_WORLD_CONFIG")
+    if selected is None:
+        selected_path = Path.home() / ".config" / "agent-world" / "config.toml"
     else:
-        bindings = dict(DEFAULT_STAGE_INVOCATION_PROFILES)
-    configured = stage_config.get("invocation_profiles", {})
-    if isinstance(configured, Mapping):
-        for stage, profile_id in configured.items():
-            stage_name = str(stage).upper()
-            if stage_name not in INVOCATION_PROFILE_STAGES:
-                raise ValueError(f"Stage {stage_name} cannot declare an invocation profile; deterministic stages do not invoke backends.")
-            bindings[stage_name] = str(profile_id)
-    for key, value in stage_config.items():
-        stage_name = str(key).upper()
-        if stage_name in INVOCATION_PROFILE_STAGES and isinstance(value, str):
-            bindings[stage_name] = value
-        elif stage_name in PIPELINE_STAGES:
-            raise ValueError(f"Stage {stage_name} cannot declare an invocation profile; deterministic stages do not invoke backends.")
-    return bindings
+        selected_path = Path(selected).expanduser()
+    try:
+        raw = selected_path.read_bytes()
+    except OSError as exc:
+        raise ConfigError(f"cannot read Foundry config {selected_path}: {exc}") from exc
+    try:
+        value = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"invalid Foundry TOML {selected_path}: {exc}") from exc
+    _reject_embedded_secrets(value)
+    value = _normalise_toml_contract_fields(value)
+    try:
+        config = FoundryConfig.model_validate(value)
+    except Exception as exc:
+        raise ConfigError(f"invalid Foundry config {selected_path}: {exc}") from exc
+
+    base = selected_path.resolve().parent
+    state_root = _resolve_config_path(config.state_root, base)
+    agent = config.agent
+    auth_file = (
+        _resolve_config_path(agent.chatgpt_auth_file, base)
+        if agent.chatgpt_auth_file is not None
+        else None
+    )
+    codex_bin = _resolve_config_path(agent.codex_bin, base) if agent.codex_bin is not None else None
+    judge_cache = (
+        _resolve_config_path(config.judge.uv_cache_dir, base)
+        if config.judge.uv_cache_dir is not None
+        else None
+    )
+    return config.model_copy(
+        update={
+            "state_root": state_root,
+            "agent": agent.model_copy(
+                update={"chatgpt_auth_file": auth_file, "codex_bin": codex_bin}
+            ),
+            "judge": config.judge.model_copy(update={"uv_cache_dir": judge_cache}),
+        }
+    )
 
 
-def _load_config_file(values: Mapping[str, str]) -> tuple[dict[str, Any], str]:
-    path_text = str(values.get("AGENT_WORLD_CONFIG", "")).strip()
-    if not path_text:
-        path = Path(__file__).resolve().parents[1] / DEFAULT_CONFIG_RELATIVE_PATH
-        if not path.is_file():
-            return {}, ""
-        path_text = str(path)
-    else:
-        path = Path(path_text).expanduser()
-    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    if not isinstance(payload, dict):
-        raise ValueError("AGENT_WORLD_CONFIG must point to a YAML object")
-    _reject_secret_material(payload)
-    return payload, str(path)
+def _resolve_config_path(path: Path, base: Path) -> Path:
+    expanded = path.expanduser()
+    combined = base / expanded if not expanded.is_absolute() else expanded
+    return Path(os.path.abspath(combined))
 
 
-def _reject_secret_material(value: Any) -> None:
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if str(key).lower() in {"api_key", "secret", "token"}:
-                raise ValueError("Agent World config must reference secret env names, not secret values")
-            _reject_secret_material(item)
+def _normalise_toml_contract_fields(value: dict[str, object]) -> dict[str, object]:
+    """Adapt TOML arrays at the config boundary without weakening strict contracts."""
+
+    release_profile = value.get("release_profile")
+    if not isinstance(release_profile, dict):
+        return value
+    normalised_profile = dict(release_profile)
+    for field_name in ("required_hard_gates", "minimum_coverage_dimensions"):
+        field_value = normalised_profile.get(field_name)
+        if isinstance(field_value, list):
+            normalised_profile[field_name] = tuple(field_value)
+    return {**value, "release_profile": normalised_profile}
+
+
+def _reject_embedded_secrets(value: object, *, path: str = "config") -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key)
+            if _SENSITIVE_CONFIG_KEYS.search(key_text):
+                raise ConfigError(f"secret-valued config key is prohibited: {path}.{key_text}")
+            _reject_embedded_secrets(child, path=f"{path}.{key_text}")
     elif isinstance(value, list):
-        for item in value:
-            _reject_secret_material(item)
+        for index, child in enumerate(value):
+            _reject_embedded_secrets(child, path=f"{path}[{index}]")
+    elif isinstance(value, str):
+        lowered = value.lower()
+        if lowered.startswith("sk-") or "-----begin private key-----" in lowered:
+            raise ConfigError(f"credential-like value is prohibited in {path}")
 
 
-def _configured_profile_ids(file_config: Mapping[str, Any]) -> set[str]:
-    profiles = _mapping_at(file_config, ["invocation_profiles"])
-    return {str(profile_id) for profile_id in profiles}
-
-
-def _profile_mapping(file_config: Mapping[str, Any], profile_id: str) -> dict[str, Any]:
-    profiles = _mapping_at(file_config, ["invocation_profiles"])
-    value = profiles.get(profile_id, {})
-    return dict(value) if isinstance(value, Mapping) else {}
-
-
-def _profile_parent(file_config: Mapping[str, Any], profile_id: str) -> str:
-    parent = _profile_mapping(file_config, profile_id).get("inherits", SEMANTIC_INVOCATION_PROFILE)
-    return str(parent or SEMANTIC_INVOCATION_PROFILE)
-
-
-def _mapping_at(value: Mapping[str, Any], path: list[str]) -> dict[str, Any]:
-    current: Any = value
-    for key in path:
-        if not isinstance(current, Mapping):
-            return {}
-        current = current.get(key, {})
-    return dict(current) if isinstance(current, Mapping) else {}
-
-
-def _config_value(file_config: Mapping[str, Any], path: list[str], default: Any) -> Any:
-    current: Any = file_config
-    for key in path:
-        if not isinstance(current, Mapping) or key not in current:
-            return default
-        current = current[key]
-    return current
-
-
-def _base_url_value(values: Mapping[str, str], configured: Any) -> str:
-    return str(values.get("OPENAI_BASE_URL") or configured or DEFAULT_OPENAI_BASE_URL)
-
-
-def _auth_env_refs(api_key_env: str) -> list[str]:
-    return [api_key_env] if api_key_env else []
-
-
-def _model_candidates(raw: Any) -> list[str]:
-    if isinstance(raw, list):
-        values = [str(item).strip().lstrip("-") for item in raw if str(item).strip()]
-    else:
-        values = [item.strip().lstrip("-") for item in str(raw or "").split(",") if item.strip()]
-    return values or list(DEFAULT_OPENAI_MODEL_CANDIDATES)
-
-
-def _code_repair_thread_mode(raw: str) -> str:
-    mode = str(raw or DEFAULT_CODE_REPAIR_THREAD_MODE).strip().lower()
-    return mode if mode in {"stateless", "continue"} else DEFAULT_CODE_REPAIR_THREAD_MODE
-
-
-def _infer_api_version(base_url: str, backend_kind: str) -> str:
-    if backend_kind in {"llm", "llm_file_codegen"} and str(base_url).rstrip("/").endswith("/v1"):
-        return "v1"
-    return ""
-
-
-def _provider_for_backend(backend_kind: str) -> str:
-    if backend_kind in {"process_agent", "code_agent_runner"}:
-        return "local_process"
-    if backend_kind in {"codex_cli", "codex_cli_runner", "codex_sdk"}:
-        return "codex"
-    if backend_kind == "manual":
-        return "manual"
-    if backend_kind == "mock":
-        return "mock"
-    if backend_kind in {"llm", "llm_file_codegen"}:
-        return "openai_compatible"
-    return "custom"
+__all__ = [
+    "AgentBackendConfig",
+    "ConfigError",
+    "ExpansionConfig",
+    "ExpansionSourceConfig",
+    "FoundryConfig",
+    "JudgeConfig",
+    "ResearchConfig",
+    "load_foundry_config",
+]
