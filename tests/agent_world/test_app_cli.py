@@ -86,6 +86,10 @@ def test_production_app_assembles_real_components_and_secret_canaries(tmp_path: 
     assert isinstance(app.expansion_designer, ExpansionDesigner)
     assert isinstance(app.builder, EnvironmentBuilder)
     assert isinstance(app.verifier_compiler, VerifierCompiler)
+    assert (
+        app.verifier_compiler.maximum_structured_reworks
+        == app.config.judge.maximum_structured_reworks
+    )
     assert isinstance(app.judge, EnvironmentJudge)
     assert isinstance(app.judge.interactive_challenger, InteractiveChallengerStrategy)
     assert app.judge.interactive_challenger.backend is app.backend

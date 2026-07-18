@@ -484,6 +484,7 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         artifact_store=judge_artifacts,
         invocation_backend=backend,
         profile_provider=profiles,
+        maximum_structured_reworks=config.judge.maximum_structured_reworks,
         maximum_tasks_per_batch=config.judge.maximum_tasks_per_verifier_batch,
     )
     clean_builder = CleanCandidateBuilder(

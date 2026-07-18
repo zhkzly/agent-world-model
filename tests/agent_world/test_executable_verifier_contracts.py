@@ -24,6 +24,7 @@ from agent_world.contracts import (
     ParameterizedSolveRecipe,
     ParameterizedSolveStep,
     PermissionRule,
+    PermissionScope,
     RecipePointer,
     RetrySemantics,
     RewardSpec,
@@ -53,7 +54,7 @@ from agent_world.contracts import (
     sha256_digest,
 )
 from agent_world.control import StructuredValidationError
-from agent_world.invocation import InvocationResult, InvocationStatus
+from agent_world.invocation import InvocationError, InvocationResult, InvocationStatus
 from agent_world.judge import compiler as verifier_compiler_module
 from agent_world.judge.compiler import VerifierCompilationError, VerifierCompiler
 from agent_world.judge.models import (
@@ -516,7 +517,7 @@ def test_challenger_context_is_deduplicated_and_omits_rule_expressions() -> None
     context = VerifierCompiler._challenger_context(design)
     serialized = json.dumps(context, sort_keys=True)
 
-    assert context["schema_version"] == "agent-world.challenger-context.v2"
+    assert context["schema_version"] == "agent-world.challenger-context.v3"
     reset_config_schemas = context["reset_config_schemas"]
     assert isinstance(reset_config_schemas, list)
     assert len(reset_config_schemas) == 1
@@ -525,6 +526,14 @@ def test_challenger_context_is_deduplicated_and_omits_rule_expressions() -> None
     assert '"rule:transition"' not in serialized
     assert '"property_kind": "transition"' in serialized
     assert '"rule_count"' in serialized
+    coverage_requirements = context["coverage_requirements"]
+    assert isinstance(coverage_requirements, list)
+    shared_requirements = [
+        item for item in coverage_requirements if item["scope"] == "world_shared"
+    ]
+    assert shared_requirements
+    assert all(item["task_type"] is None for item in shared_requirements)
+    assert '"task_type": "shared"' not in serialized
     assert "You have no tools" in VerifierCompiler._prompt(context)
 
 
@@ -691,6 +700,93 @@ def test_verifier_diagnostic_is_typed_and_does_not_persist_private_case_id() -> 
     assert "sealed-private-42" not in diagnostic.feedback
 
 
+def test_verifier_intent_schema_feedback_reports_exact_safe_field_paths() -> None:
+    design = _design()
+    source = _draft(design).cases[0]
+    intent = VerifierIntent(
+        cases=(
+            VerifierCaseIntent(
+                task_type=source.task_type,
+                evaluator_goal={"target": 5},
+                actor=source.actor,
+                reset_config={"initial": []},
+                actions=(
+                    RuntimeAction(
+                        tool_id="counter.increment",
+                        arguments={"amount": "private-sentinel"},
+                    ),
+                ),
+                expectations=(
+                    PropertyExpectationIntent(
+                        kind="transition",
+                        after_action_ordinal=1,
+                        expected=True,
+                    ),
+                ),
+            ),
+            VerifierCaseIntent(
+                task_type=source.task_type,
+                evaluator_goal={"target": []},
+                actor=source.actor,
+                reset_config={},
+                actions=(source.actions[0],),
+                expectations=(
+                    PropertyExpectationIntent(
+                        kind="transition",
+                        after_action_ordinal=1,
+                        expected=True,
+                    ),
+                ),
+            ),
+            VerifierCaseIntent(
+                task_type=source.task_type,
+                evaluator_goal={"target": 5},
+                actor=source.actor,
+                reset_config={"initial": 2},
+                actions=(
+                    RuntimeAction(
+                        tool_id="counter.increment",
+                        arguments={"amount": -11},
+                    ),
+                ),
+                expectations=(
+                    PropertyExpectationIntent(
+                        kind="transition",
+                        after_action_ordinal=1,
+                        expected=True,
+                    ),
+                ),
+            ),
+        )
+    )
+
+    with pytest.raises(StructuredValidationError) as captured:
+        VerifierCompiler._validate_intent(  # noqa: SLF001
+            intent,
+            design,
+            allowed_task_types=("increase",),
+            required_rule_ids=design.verification.required_rule_ids,
+            required_property_families=design.verification.required_property_families,
+            require_metamorphic=False,
+        )
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic.validation_phase == "intent_value_schemas"
+    assert {
+        issue.issue_code for issue in diagnostic.issues
+    } == {
+        "intent_reset_config_schema_mismatch@cases.0.reset_config.initial",
+        "intent_action_input_schema_mismatch@cases.0.actions.0.arguments.amount",
+        "intent_evaluator_goal_schema_mismatch@cases.1.evaluator_goal.target",
+        "intent_reset_config_schema_mismatch@cases.1.reset_config",
+        "intent_action_input_schema_mismatch@cases.2.actions.0.arguments.amount",
+    }
+    assert "private-sentinel" not in diagnostic.feedback
+    assert "schema type integer" in diagnostic.feedback
+    assert "initial" in diagnostic.feedback
+    assert "minimum=-10" in diagnostic.feedback
+
+
 def test_verifier_intent_uses_one_based_ordinals_and_reports_all_bad_references() -> None:
     design = _design()
     draft = _draft(design)
@@ -731,6 +827,7 @@ def test_verifier_intent_uses_one_based_ordinals_and_reports_all_bad_references(
     assert all("after_action_ordinal" in issue.issue_code for issue in diagnostic.issues)
     assert "one-based" in diagnostic.feedback
     assert "one-based" in VerifierCompiler._prompt({})
+    assert "fewest distinct trajectories" in VerifierCompiler._prompt({})
 
 
 def test_verifier_intent_compiles_one_based_ordinal_to_zero_based_index() -> None:
@@ -747,6 +844,98 @@ def test_verifier_intent_compiles_one_based_ordinal_to_zero_based_index() -> Non
         "after_action_ordinal": 1,
         "expected": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_verifier_code_router_retries_retryable_backend_failure_fresh(
+    tmp_path: Path,
+) -> None:
+    source = _draft(_design()).cases[0]
+    case = VerifierCaseIntent(
+        task_type=source.task_type,
+        evaluator_goal=source.evaluator_goal,
+        actor=source.actor,
+        reset_config=source.reset_config,
+        actions=source.actions,
+        expectations=(
+            PropertyExpectationIntent(
+                kind="transition",
+                after_action_ordinal=1,
+                expected=True,
+            ),
+        ),
+    )
+    intent = VerifierIntent(cases=(case, case))
+
+    class Profile:
+        rollout_token_limit = 100
+
+    class Profiles:
+        def resolve(self, **_kwargs: object) -> Profile:
+            return Profile()
+
+    class RetryBackend:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def invoke(self, request: object) -> InvocationResult:
+            self.requests.append(request)
+            invocation_id = request.invocation_id  # type: ignore[attr-defined]
+            if len(self.requests) == 1:
+                return InvocationResult(
+                    invocation_id=invocation_id,
+                    status=InvocationStatus.FAILED,
+                    session=None,
+                    turn_id=None,
+                    final_text=None,
+                    structured_output=None,
+                    usage=None,
+                    events=(),
+                    error=InvocationError(
+                        code="worker_protocol_error",
+                        message="provider output transport failed",
+                        retryable=True,
+                    ),
+                    duration_ms=1,
+                )
+            return InvocationResult(
+                invocation_id=invocation_id,
+                status=InvocationStatus.COMPLETED,
+                session=None,
+                turn_id="turn:completed",
+                final_text="completed",
+                structured_output=intent.model_dump(mode="json"),
+                usage=None,
+                events=(),
+                error=None,
+                duration_ms=1,
+            )
+
+    backend = RetryBackend()
+    compiler = VerifierCompiler(
+        artifact_store=object(),  # type: ignore[arg-type]
+        invocation_backend=backend,  # type: ignore[arg-type]
+        profile_provider=Profiles(),  # type: ignore[arg-type]
+        maximum_structured_reworks=1,
+    )
+
+    output, results = await compiler._run_structured(  # noqa: SLF001
+        lineage_id="verifier-backend-retry",
+        workspace=tmp_path / "verifier-backend-retry",
+        model=VerifierIntent,
+        prompt="immutable verifier batch prompt",
+        semantic_validator=lambda _output: None,
+        budget=Budget(llm_tokens=200, agent_turns=2, wall_seconds=30),
+        permissions=PermissionScope(),
+    )
+
+    assert output == intent
+    assert len(results) == 2
+    assert results[0].error is not None and results[0].error.retryable
+    assert all(request.session is None for request in backend.requests)  # type: ignore[attr-defined]
+    assert all(  # type: ignore[attr-defined]
+        request.prompt == "immutable verifier batch prompt" for request in backend.requests
+    )
 
 
 @pytest.mark.asyncio

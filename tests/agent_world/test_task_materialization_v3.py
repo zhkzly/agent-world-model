@@ -204,6 +204,29 @@ def test_compiled_output_schema_is_a_defensive_copy() -> None:
     assert "evaluator_goal" not in second_properties
 
 
+def test_task_specific_schema_diagnostic_reports_paths_without_instance_values() -> None:
+    compiler = TaskMaterializerV3Compiler(_curriculum())
+    sensitive_value = "do-not-copy-this-instance-value"
+
+    with pytest.raises(TaskMaterializationError) as rejected:
+        compiler.materialize(
+            _call(),
+            _output(
+                initial_config={
+                    "initial": 2,
+                    "context": {"unexpected_field": sensitive_value},
+                }
+            ),
+        )
+
+    assert rejected.value.code == "candidate_schema_violation"
+    message = str(rejected.value)
+    assert "path=/initial_config/context keyword=required missing=['region']" in message
+    assert "path=/initial_config/context keyword=additionalProperties" in message
+    assert "unexpected=['unexpected_field']" in message
+    assert sensitive_value not in message
+
+
 def test_materialize_requires_exact_framework_call_echo() -> None:
     compiler = TaskMaterializerV3Compiler(_curriculum())
     with pytest.raises(TaskMaterializationError) as rejected:

@@ -49,9 +49,11 @@ from agent_world.judge import (
     validate_tool_execution,
 )
 from agent_world.judge.rules import (
+    RuleEvaluationError,
     RuleExecutionContext,
     contract_rule_index,
     evaluate_rule,
+    initially_evaluable_invariants,
 )
 from agent_world.registry import EnvironmentRegistry, ResolvedEnvironmentPackage
 from agent_world.task_materialization import (
@@ -506,17 +508,23 @@ class LocalEpisode:
             for item in self._contracts.curriculum.task_types
             if item.task_type == self._task.task_type
         )
-        for rule in (
-            *self._contracts.world_spec.invariants,
-            *self._contracts.world_spec.state.initial_state_constraints,
-            *requirement.initial_state_constraints,
-            *self._contracts.curriculum.sampling_constraints,
-        ):
-            if not evaluate_rule(rule, initial_context).result:
-                raise LocalConsumerError(
-                    "generated_task_rule",
-                    f"generated task violated packaged Rule {rule.rule_id}",
-                )
+        try:
+            for rule in (
+                *initially_evaluable_invariants(self._contracts.world_spec.invariants),
+                *self._contracts.world_spec.state.initial_state_constraints,
+                *requirement.initial_state_constraints,
+                *self._contracts.curriculum.sampling_constraints,
+            ):
+                if not evaluate_rule(rule, initial_context).result:
+                    raise LocalConsumerError(
+                        "generated_task_rule",
+                        f"generated task violated packaged Rule {rule.rule_id}",
+                    )
+        except RuleEvaluationError as exc:
+            raise LocalConsumerError(
+                "generated_task_rule",
+                f"generated task Rule could not be evaluated: {exc}",
+            ) from exc
         reset_view: dict[str, JsonValue] = {
             "observation": reset_response.result["observation"],
         }

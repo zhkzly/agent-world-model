@@ -66,6 +66,7 @@ def test_resolved_profile_clamps_timeout_to_node_budget(tmp_path: Path) -> None:
     )
 
     assert profile.limits.timeout_seconds == 900
+    assert profile.limits.max_events == 65_536
     assert profile.allowed_builtin_tools == ()
 
 

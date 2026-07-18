@@ -790,6 +790,7 @@ class VerifierCompiler:
                 permission_denied=True,
             ) from exc
         session = None
+        immutable_prompt = prompt
         current_prompt = prompt
         results: list[InvocationResult] = []
         batch_accounting = accounting or _VerifierBatchAccounting()
@@ -820,6 +821,8 @@ class VerifierCompiler:
         async def authorize_repair(
             issue_codes: tuple[str, ...],
             diagnostic: ValidationDiagnostic | None = None,
+            *,
+            repair_mode: StructuredRepairMode = StructuredRepairMode.CONTRACT_CORRECTION,
         ) -> None:
             nonlocal active_repair_entry
             if repair_authority is None:
@@ -829,7 +832,7 @@ class VerifierCompiler:
                     owner_node="verifier",
                     lineage_id=lineage_id,
                     role="challenger",
-                    repair_mode=StructuredRepairMode.CONTRACT_CORRECTION,
+                    repair_mode=repair_mode,
                     issue_codes=issue_codes,
                     continued_session=True,
                     diagnostic=diagnostic,
@@ -903,7 +906,24 @@ class VerifierCompiler:
                 backend_code = (
                     result.error.code if result.error is not None else result.status.value
                 )
-                await complete_repair((f"verifier_backend:{backend_code}",))
+                backend_issue = f"verifier_backend:{backend_code}"
+                await complete_repair((backend_issue,))
+                if (
+                    result.error is not None
+                    and result.error.retryable
+                    and attempt < self.maximum_structured_reworks
+                    and attempt + 1 < budget.agent_turns
+                ):
+                    # Provider/transport failures are code-routed local retries, not
+                    # semantic corrections. Restart from the immutable batch prompt in
+                    # a fresh session so partial provider state cannot affect VerifierIR.
+                    await authorize_repair(
+                        (backend_issue,),
+                        repair_mode=StructuredRepairMode.BACKEND_RETRY,
+                    )
+                    session = None
+                    current_prompt = immutable_prompt
+                    continue
                 message = result.error.message if result.error else result.status.value
                 raise VerifierCompilationError(
                     message,
@@ -1162,6 +1182,7 @@ class VerifierCompiler:
             )
 
         observed_kinds: set[str] = set()
+        value_schema_issues: list[SafeValidationIssue] = []
         for case_index, case in enumerate(intent.cases):
             requirement = tasks.get(case.task_type)
             if requirement is None:
@@ -1176,31 +1197,31 @@ class VerifierCompiler:
                 ("evaluator_goal", requirement.evaluator_goal_schema, case.evaluator_goal),
                 ("reset_config", requirement.initial_config_schema, case.reset_config),
             ):
-                errors = tuple(Draft202012Validator(schema).iter_errors(value))
-                if errors:
-                    path = "/".join(str(item) for item in errors[0].absolute_path) or "<root>"
-                    raise ValueError(
-                        f"VerifierIntent case at index {case_index} {label} "
-                        f"violates schema at {path}"
+                value_schema_issues.extend(
+                    VerifierCompiler._json_schema_issues(
+                        schema=schema,
+                        value=value,
+                        location=("cases", case_index, label),
+                        code=f"intent_{label}_schema_mismatch",
+                        value_label=label,
                     )
+                )
             unknown_tools = {item.tool_id for item in case.actions} - set(tools)
             if unknown_tools:
                 raise ValueError(
                     f"VerifierIntent case at index {case_index} uses unknown tools: "
                     f"{sorted(unknown_tools)}"
                 )
-            for action in case.actions:
-                errors = tuple(
-                    Draft202012Validator(tools[action.tool_id].surface.input_schema).iter_errors(
-                        action.arguments
+            for action_index, action in enumerate(case.actions):
+                value_schema_issues.extend(
+                    VerifierCompiler._json_schema_issues(
+                        schema=tools[action.tool_id].surface.input_schema,
+                        value=action.arguments,
+                        location=("cases", case_index, "actions", action_index, "arguments"),
+                        code="intent_action_input_schema_mismatch",
+                        value_label="action input",
                     )
                 )
-                if errors:
-                    path = "/".join(str(item) for item in errors[0].absolute_path) or "<root>"
-                    raise ValueError(
-                        f"VerifierIntent case at index {case_index} action {action.tool_id} "
-                        f"violates input schema at {path}"
-                    )
             canonical = {
                 item.kind
                 for item in case.expectations
@@ -1212,6 +1233,16 @@ class VerifierCompiler:
                     "requires a canonical expectation"
                 )
             observed_kinds.update(str(item.kind) for item in case.expectations)
+
+        if value_schema_issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="verifier",
+                    validation_phase="intent_value_schemas",
+                    frontier_ordinal=20,
+                    issues=tuple(value_schema_issues),
+                )
+            )
 
         for task_type, requirement in tasks.items():
             cases = [item for item in intent.cases if item.task_type == task_type]
@@ -1253,6 +1284,83 @@ class VerifierCompiler:
             required_property_families=required_property_families,
             require_metamorphic=require_metamorphic,
         )
+
+    @staticmethod
+    def _json_schema_issues(
+        *,
+        schema: dict[str, JsonValue],
+        value: JsonValue,
+        location: tuple[str | int, ...],
+        code: str,
+        value_label: str,
+    ) -> tuple[SafeValidationIssue, ...]:
+        """Return field-addressable schema errors without echoing rejected values."""
+
+        issues: list[SafeValidationIssue] = []
+        errors = sorted(
+            Draft202012Validator(schema).iter_errors(value),
+            key=lambda error: (
+                tuple(str(part) for part in error.absolute_path),
+                str(error.validator),
+            ),
+        )
+        for error in errors[:64]:
+            keyword = str(error.validator or "invalid")
+            issue_location = (*location, *tuple(error.absolute_path))
+            if keyword == "type":
+                expected = error.validator_value
+                expected_label = (
+                    ", ".join(str(item) for item in expected)
+                    if isinstance(expected, list)
+                    else str(expected)
+                )
+                message = f"Use frozen schema type {expected_label} for this {value_label} field."
+            elif keyword == "required":
+                required = error.validator_value
+                missing = (
+                    [str(field) for field in required if field not in value]
+                    if isinstance(required, list) and isinstance(value, dict)
+                    else []
+                )
+                missing_text = ", ".join(missing)[:320]
+                message = (
+                    f"Add these fields required by the frozen {value_label} schema: "
+                    f"{missing_text}."
+                    if missing_text
+                    else f"Add every field required by the frozen {value_label} schema here."
+                )
+            elif keyword == "additionalProperties":
+                message = (
+                    f"Remove fields not declared by the frozen closed {value_label} schema here."
+                )
+            elif keyword == "enum":
+                message = f"Use a value allowed by the frozen {value_label} schema here."
+            elif keyword == "format":
+                message = f"Use the format declared by the frozen {value_label} schema here."
+            elif keyword in {
+                "minimum",
+                "maximum",
+                "minItems",
+                "maxItems",
+                "minLength",
+                "maxLength",
+            }:
+                message = (
+                    f"Satisfy the frozen {value_label} schema constraint "
+                    f"{keyword}={error.validator_value} at this field."
+                )
+            else:
+                message = (
+                    f"Satisfy the frozen {value_label} schema keyword {keyword} at this field."
+                )
+            issues.append(
+                SafeValidationIssue(
+                    code=code,
+                    location=issue_location,
+                    message=message,
+                )
+            )
+        return tuple(issues)
 
     @staticmethod
     def _compile_intent(
@@ -1823,6 +1931,8 @@ For every coverage requirement provide a positive semantic expectation; when
 positive_and_negative is true, also provide a negative expectation. Framework code pairs every
 semantic trajectory into public and sealed cases and assigns both case ids and independent uint64
 seeds. You must not propose or infer disclosure partitions, ids, or seeds.
+Coverage requirements with `scope="world_shared"` and `task_type=null` apply across the assigned
+real tasks; `world_shared` is never a case task_type. Choose case task_type only from `tasks`.
 Use meaningful multi-action trajectories, error paths, idempotency, permissions, rollback, and
 ordering/concurrency where applicable. Obligations stay Judge-side, while actions/reset_config
 contain only legitimate domain input. Never put expected values, verifier metadata, release
@@ -1830,7 +1940,9 @@ labels, Python code, expressions, reward targets, or shell commands into Runtime
 cannot see Runtime source and do not decide release.
 The context field `semantic_case_limit` is a hard framework capacity. Return no more cases than
 that value; public/sealed pairing happens after your output and consumes two execution cases per
-semantic trajectory.
+semantic trajectory. It is not a target count: return the fewest distinct trajectories needed for
+complete semantic coverage, and attach multiple compatible expectations to one trajectory instead
+of repeating the same full reset state.
 
 Each case must declare a real task_type and evaluator_goal satisfying that task's
 evaluator_goal_schema, plus one actor from that task's allowed_actor_ids. Actor is bound once by
@@ -1932,11 +2044,13 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
         relevant_tool_ids.update(
             tool_id for rule_id in selected_rule_ids for tool_id in rule_tools[rule_id]
         )
-        coverage_groups: dict[tuple[str, str, tuple[str, ...], bool], int] = {}
+        coverage_groups: dict[tuple[str, str, str, tuple[str, ...], bool], int] = {}
         for rule_id in sorted(selected_rule_ids):
             rule = rules[rule_id]
+            task_owner = task_rule_owners.get(rule_id)
             key = (
-                task_rule_owners.get(rule_id, "shared"),
+                "task" if task_owner is not None else "world_shared",
+                task_owner or "",
                 str(_CANONICAL_PROPERTY_KIND[rule.family]),
                 tuple(sorted(rule_tools[rule_id])),
                 rule.case_sensitivity == "positive_and_negative",
@@ -1944,7 +2058,7 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
             coverage_groups[key] = coverage_groups.get(key, 0) + 1
 
         return {
-            "schema_version": "agent-world.challenger-context.v2",
+            "schema_version": "agent-world.challenger-context.v3",
             "reset_config_schemas": [
                 {"schema_id": schema_id, "schema": schema}
                 for schema_id, schema in sorted(reset_schemas.items())
@@ -1978,13 +2092,15 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
             ],
             "coverage_requirements": [
                 {
-                    "task_type": task_type,
+                    "scope": scope,
+                    "task_type": task_type or None,
                     "property_kind": property_kind,
                     "tool_ids": list(tool_ids),
                     "positive_and_negative": positive_and_negative,
                     "rule_count": count,
                 }
                 for (
+                    scope,
                     task_type,
                     property_kind,
                     tool_ids,

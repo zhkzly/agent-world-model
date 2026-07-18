@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from typing import Any, cast
 
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from jsonschema.exceptions import ValidationError as JsonSchemaValidationError
 from pydantic import JsonValue, ValidationError
 
 from agent_world.contracts.base import canonical_json_bytes
@@ -44,7 +45,13 @@ class TaskMaterializationError(ValueError):
 class TaskMaterializerV3Compiler:
     """Immutable framework compiler for one committed curriculum revision."""
 
-    __slots__ = ("_curriculum", "_output_schema", "_requirements", "_validator")
+    __slots__ = (
+        "_base_validator",
+        "_branch_validators",
+        "_curriculum",
+        "_output_schema",
+        "_requirements",
+    )
 
     def __init__(self, curriculum: CurriculumRequirements) -> None:
         self._curriculum = CurriculumRequirements.model_validate_json(
@@ -54,7 +61,20 @@ class TaskMaterializerV3Compiler:
             requirement.task_type: requirement for requirement in self._curriculum.task_types
         }
         self._output_schema = _compile_output_schema(self._curriculum)
-        self._validator = Draft202012Validator(self._output_schema)
+        base_schema = copy.deepcopy(self._output_schema)
+        branches = base_schema.pop("oneOf")
+        assert isinstance(branches, list)
+        self._base_validator = Draft202012Validator(base_schema)
+        self._branch_validators: dict[str, Draft202012Validator] = {}
+        for branch in branches:
+            assert isinstance(branch, dict)
+            properties = branch["properties"]
+            assert isinstance(properties, dict)
+            task_schema = properties["task_type"]
+            assert isinstance(task_schema, dict)
+            task_type = task_schema["const"]
+            assert isinstance(task_type, str)
+            self._branch_validators[task_type] = Draft202012Validator(branch)
 
     @property
     def output_schema(self) -> dict[str, JsonValue]:
@@ -110,15 +130,27 @@ class TaskMaterializerV3Compiler:
         frozen_call = self.validate_call(call)
         normalized = _copy_json_object(candidate_output, error_code="candidate_json_invalid")
         schema_errors = sorted(
-            self._validator.iter_errors(normalized),
+            (
+                *self._base_validator.iter_errors(normalized),
+                *self._branch_validators[frozen_call.task_type].iter_errors(normalized),
+            ),
             key=lambda error: (tuple(str(item) for item in error.path), error.message),
         )
         if schema_errors:
-            first = schema_errors[0]
-            path = "/".join(str(item) for item in first.path) or "<root>"
+            all_diagnostics = tuple(
+                dict.fromkeys(_schema_error_diagnostic(error) for error in schema_errors)
+            )
+            diagnostics = all_diagnostics[:16]
+            suffix = (
+                f"; ... {len(all_diagnostics) - 16} more"
+                if len(all_diagnostics) > 16
+                else ""
+            )
             raise TaskMaterializationError(
                 "candidate_schema_violation",
-                f"task materialization violates v3 output schema at {path}: {first.message}",
+                "task materialization violates its task-specific v3 output schema: "
+                + "; ".join(diagnostics)
+                + suffix,
             )
         try:
             materialization = TaskMaterializationV3.model_validate(normalized)
@@ -300,6 +332,31 @@ def _validate_instance_schema(
         first = errors[0]
         path = "/".join(str(item) for item in first.path) or "<root>"
         raise TaskMaterializationError(code, f"{label} violates its schema at {path}")
+
+
+def _schema_error_diagnostic(error: JsonSchemaValidationError) -> str:
+    path = "/" + "/".join(str(item) for item in error.absolute_path)
+    if path == "/":
+        path = "<root>"
+    keyword = str(error.validator)
+    detail = ""
+    if keyword == "required" and isinstance(error.instance, Mapping):
+        required = error.validator_value
+        if isinstance(required, list):
+            missing = sorted(
+                item for item in required if isinstance(item, str) and item not in error.instance
+            )
+            detail = f" missing={missing}"
+    elif keyword == "additionalProperties" and isinstance(error.instance, Mapping):
+        properties = error.schema.get("properties", {})
+        if isinstance(properties, dict):
+            unexpected = sorted(str(item) for item in set(error.instance) - set(properties))
+            detail = f" unexpected={unexpected}"
+    elif keyword == "type":
+        detail = f" expected={error.validator_value}"
+    elif keyword == "format":
+        detail = f" expected={error.validator_value}"
+    return f"path={path} keyword={keyword}{detail}"
 
 
 def _resolve_pointer(value: Mapping[str, JsonValue], pointer: str) -> JsonValue:

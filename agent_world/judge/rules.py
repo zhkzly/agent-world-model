@@ -27,6 +27,7 @@ _MISSING = object()
 _MAX_RUNTIME_CONTAINER_ITEMS = 10_000
 _MAX_INTEGER_BITS = 4096
 _FORMAT_CHECKER = FormatChecker()
+_ACTION_ONLY_RULE_SOURCES = frozenset({"args", "tool_result", "error", "events"})
 
 
 class RuleEvaluationError(ValueError):
@@ -118,6 +119,39 @@ def evaluate_rule(rule: Rule, context: RuleExecutionContext) -> RuleEvaluation:
     clause_results = tuple(_evaluate_clause(clause, context) for clause in rule.clauses)
     result = all(clause_results) if rule.boolean_operator == "all" else any(clause_results)
     return RuleEvaluation(rule.rule_id, result, clause_results)
+
+
+def rule_value_sources(rule: Rule) -> frozenset[str]:
+    """Return the execution-context roots read by one closed Rule."""
+
+    sources: set[str] = set()
+
+    def visit(term: RuleTerm) -> None:
+        if isinstance(term, RuleValueRef):
+            sources.add(term.source)
+        elif isinstance(term, RuleArithmetic):
+            visit(term.left)
+            visit(term.right)
+
+    for clause in rule.clauses:
+        visit(clause.left)
+        if clause.right is not None:
+            visit(clause.right)
+    return frozenset(sources)
+
+
+def initially_evaluable_invariants(invariants: tuple[Rule, ...]) -> tuple[Rule, ...]:
+    """Route only invariants whose inputs exist before the first Runtime action.
+
+    Action-scoped roots intentionally contain no meaningful value during reset.  Those
+    invariants remain mandatory in ``validate_tool_execution`` after every real action.
+    """
+
+    return tuple(
+        rule
+        for rule in invariants
+        if not (rule_value_sources(rule) & _ACTION_ONLY_RULE_SOURCES)
+    )
 
 
 def evaluate_task_reward(
@@ -404,4 +438,6 @@ __all__ = [
     "evaluate_task_reward",
     "evaluate_task_reward_contract",
     "evaluate_rule",
+    "initially_evaluable_invariants",
+    "rule_value_sources",
 ]

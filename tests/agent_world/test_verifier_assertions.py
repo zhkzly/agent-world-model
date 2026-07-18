@@ -12,7 +12,13 @@ from agent_world.contracts import (
     VerifierAssertion,
 )
 from agent_world.judge.assertions import evaluate_assertion
-from agent_world.judge.rules import RuleEvaluationError, RuleExecutionContext, evaluate_rule
+from agent_world.judge.rules import (
+    RuleEvaluationError,
+    RuleExecutionContext,
+    evaluate_rule,
+    initially_evaluable_invariants,
+    rule_value_sources,
+)
 
 
 def _context(*, before: int = 2, after: int = 5) -> RuleExecutionContext:
@@ -164,6 +170,44 @@ def test_verifier_assertion_can_only_obligate_the_real_rule() -> None:
     assert check.passed
     assert check.rule_id == rule.rule_id
     assert check.observed is True
+
+
+def test_initial_rule_router_defers_action_invariants_but_keeps_state_invariants() -> None:
+    state_invariant = Rule(
+        rule_id="rule:state-visible",
+        family="invariant",
+        description="The counter remains visible in state.",
+        boolean_operator="all",
+        case_sensitivity="positive_only",
+        clauses=(
+            RuleClause(
+                clause_id="clause:state-visible",
+                left=_reference("post_state", "/counter/value", "number"),
+                operator="exists",
+            ),
+        ),
+    )
+    action_invariant = Rule(
+        rule_id="rule:result-matches-state",
+        family="invariant",
+        description="A successful tool result matches the post-state value.",
+        boolean_operator="all",
+        case_sensitivity="positive_and_negative",
+        clauses=(
+            RuleClause(
+                clause_id="clause:result-matches-state",
+                left=_reference("tool_result", "/value", "number"),
+                operator="equal",
+                right=_reference("post_state", "/counter/value", "number"),
+            ),
+        ),
+    )
+
+    assert rule_value_sources(state_invariant) == frozenset({"post_state"})
+    assert rule_value_sources(action_invariant) == frozenset({"post_state", "tool_result"})
+    assert initially_evaluable_invariants((state_invariant, action_invariant)) == (
+        state_invariant,
+    )
 
 
 def test_weak_exists_assertion_shape_is_not_expressible() -> None:

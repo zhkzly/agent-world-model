@@ -40,6 +40,7 @@ from agent_world.contracts import (
     PublicTask,
     ReleaseProfile,
     Rule,
+    RuleValueRef,
     RuntimeAction,
     TaskMaterializerCall,
     TaskRequirement,
@@ -80,7 +81,14 @@ from .reachability import (
     ParameterizedRecipeStrategy,
     ReachabilityOutcome,
 )
-from .rules import RuleExecutionContext, design_rule_index, evaluate_rule, evaluate_task_reward
+from .rules import (
+    RuleEvaluationError,
+    RuleExecutionContext,
+    design_rule_index,
+    evaluate_rule,
+    evaluate_task_reward,
+    initially_evaluable_invariants,
+)
 from .semantics import ToolExecutionEvidence, validate_tool_execution
 from .supervisor import (
     CandidateBuildError,
@@ -156,6 +164,10 @@ _FORBIDDEN_SOURCE_PARTS = frozenset(
 
 class _CandidateTaskFailure(ValueError):
     """Candidate-owned materializer or Runtime defect safe to route to Builder."""
+
+    def __init__(self, message: str, *, details: Mapping[str, JsonValue] | None = None) -> None:
+        self.details = dict(details or {})
+        super().__init__(message)
 
 
 class _RuntimeContractFailure(_CandidateTaskFailure):
@@ -1947,6 +1959,7 @@ class EnvironmentJudge:
             )
             requirements = {item.task_type: item for item in curriculum.task_types}
             runtime_initial_views: dict[int, tuple[str, JsonValue]] = {}
+            rule_violations: list[dict[str, JsonValue]] = []
             for index, envelope in enumerate(envelopes):
                 async with self._episode_driver(
                     clean,
@@ -1978,15 +1991,97 @@ class EnvironmentJudge:
                     )
                     requirement = requirements[envelope.call.task_type]
                     for rule in (
-                        *design.world_spec.invariants,
+                        *initially_evaluable_invariants(design.world_spec.invariants),
                         *design.world_spec.state.initial_state_constraints,
                         *requirement.initial_state_constraints,
                         *design.curriculum.sampling_constraints,
                     ):
-                        if not evaluate_rule(rule, context).result:
-                            raise _CandidateTaskFailure(
-                                f"materialized task violates framework Rule {rule.rule_id}"
+                        evaluation = evaluate_rule(rule, context)
+                        if not evaluation.result:
+                            failed_clauses = tuple(
+                                clause.clause_id
+                                for clause, passed in zip(
+                                    rule.clauses,
+                                    evaluation.clause_results,
+                                    strict=True,
+                                )
+                                if not passed
                             )
+                            rule_violations.append(
+                                {
+                                    "task_type": envelope.call.task_type,
+                                    "seed": envelope.call.seed,
+                                    "rule_id": rule.rule_id,
+                                    "failed_clause_ids": list(failed_clauses),
+                                }
+                            )
+            if rule_violations:
+                grouped: dict[
+                    tuple[str, str, tuple[str, ...]],
+                    dict[str, Any],
+                ] = {}
+                rule_lookup = {
+                    rule.rule_id: rule
+                    for requirement in curriculum.task_types
+                    for rule in requirement.initial_state_constraints
+                }
+                for item in rule_violations:
+                    task_type = cast(str, item["task_type"])
+                    rule_id = cast(str, item["rule_id"])
+                    clause_ids = tuple(cast(list[str], item["failed_clause_ids"]))
+                    key = (task_type, rule_id, clause_ids)
+                    group = grouped.setdefault(
+                        key,
+                        {
+                            "task_type": task_type,
+                            "rule_id": rule_id,
+                            "failed_clause_ids": list(clause_ids),
+                            "count": 0,
+                            "example_seeds": [],
+                        },
+                    )
+                    group["count"] += 1
+                    example_seeds = cast(list[int], group["example_seeds"])
+                    if len(example_seeds) < 3:
+                        example_seeds.append(cast(int, item["seed"]))
+                violation_groups: list[dict[str, JsonValue]] = []
+                previews: list[str] = []
+                for (task_type, rule_id, clause_ids), group in grouped.items():
+                    rule = rule_lookup[rule_id]
+                    failed_contracts = [
+                        clause.model_dump(mode="json", exclude={"schema_version"})
+                        for clause in rule.clauses
+                        if clause.clause_id in clause_ids
+                    ]
+                    group["failed_clause_contracts"] = failed_contracts
+                    violation_groups.append(cast(dict[str, JsonValue], group))
+                    coordinates = []
+                    for clause in rule.clauses:
+                        if clause.clause_id not in clause_ids:
+                            continue
+                        left = _rule_term_coordinate(clause.left)
+                        right = (
+                            _rule_term_coordinate(clause.right)
+                            if clause.right is not None
+                            else "none"
+                        )
+                        coordinates.append(f"{left} {clause.operator} {right}")
+                    previews.append(
+                        f"{group['count']}x task_type={task_type} rule={rule_id} "
+                        f"clauses={list(clause_ids)} comparisons={coordinates} "
+                        f"example_seeds={group['example_seeds']}"
+                    )
+                preview = " | ".join(previews[:16])
+                if len(previews) > 16:
+                    preview += f" | ... {len(previews) - 16} more groups"
+                raise _CandidateTaskFailure(
+                    f"{len(rule_violations)} materialized task Rule violations: {preview}",
+                    details={
+                        "violation_count": len(rule_violations),
+                        "violation_group_count": len(violation_groups),
+                        "violation_groups": violation_groups,
+                    },
+                )
             difficulty_evidence = self._validate_runtime_difficulty_contrasts(
                 contrasts,
                 runtime_initial_views,
@@ -2039,6 +2134,7 @@ class EnvironmentJudge:
             ProtocolViolation,
             RuntimeProcessCrashed,
             RuntimeRequestTimeout,
+            RuleEvaluationError,
             ValidationError,
         ) as exc:
             record = {
@@ -2048,6 +2144,8 @@ class EnvironmentJudge:
                 "runtime_reset_count": episodes,
                 "candidate_output_authority": "public_goal_and_initial_config_only",
             }
+            if isinstance(exc, _CandidateTaskFailure) and exc.details:
+                record["failure_details"] = exc.details
             status = "fail"
             summary = str(exc)
             owner = "build"
@@ -3816,6 +3914,13 @@ def _worse_reachability_route(
 
     rank = {"pass": 0, "inconclusive": 1, "fail": 2, "error": 3}
     return left if rank[left[0]] >= rank[right[0]] else right
+
+
+def _rule_term_coordinate(term: Any) -> str:
+    if isinstance(term, RuleValueRef):
+        return f"{term.source}:{term.pointer or '/'}"
+    kind = getattr(term, "kind", "unknown")
+    return str(kind)
 
 
 _SENSITIVE_EVIDENCE_KEYS = frozenset(

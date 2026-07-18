@@ -68,6 +68,15 @@ def test_completed_candidate_requires_materializer_v3_and_supply_chain_echo() ->
     assert completion.dependency_install_mode == "offline-wheel-only"
 
 
+def test_builder_repair_prompt_preserves_unrelated_regression_obligations() -> None:
+    prompt = EnvironmentBuilder._repair_prompt(4, "repair-disclosure-4.json")  # noqa: SLF001
+    normalized = " ".join(prompt.split())
+
+    assert "unrelated to the disclosed Finding as regression obligations" in normalized
+    assert "do not delete, relax, invert, or replace" in normalized
+    assert "Add or strengthen a focused regression test" in normalized
+
+
 def test_completed_candidate_requires_a_real_license_role_file() -> None:
     values = _completed_values()
     files = values["files"]

@@ -2100,10 +2100,14 @@ against the frozen design; it must not weaken WorldSpec, infer hidden cases, or 
 Read `inputs/{disclosure_filename}`. It is the complete authorized disclosure for repair attempt
 {attempt}. Do not search for evidence refs, expected outputs, evaluator goals, sealed cases, or
 Judge internals. Framework inputs are build-time only: the candidate must run when restored alone,
-and no candidate component or test may read `../inputs` or another workspace file. Fix the root
-cause, rerun real uv/public checks from an isolated candidate-only copy, clean build debris, and
-return only the requested CandidateCompletion relative-path/launch declaration. If blocked,
-report it honestly.
+and no candidate component or test may read `../inputs` or another workspace file. Treat existing
+candidate behavior and public-test assertions unrelated to the disclosed Finding as regression
+obligations: do not delete, relax, invert, or replace them merely to make the current repair pass.
+Add or strengthen a focused regression test for the root cause, inspect the final diff for
+unrelated changes, rerun real uv/public checks from an isolated candidate-only copy, clean build
+debris, and return only the requested CandidateCompletion relative-path/launch declaration. If a
+pre-existing assertion truly conflicts with the frozen design, report the blocker instead of
+silently weakening it. If blocked, report it honestly.
 """
 
     @staticmethod

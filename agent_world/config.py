@@ -166,6 +166,7 @@ class JudgeConfig(ConfigModel):
     clean_build_timeout_seconds: float = Field(default=600, gt=0)
     uv_cache_dir: Path | None = None
     maximum_tasks_per_verifier_batch: int = Field(default=2, ge=1, le=8)
+    maximum_structured_reworks: int = Field(default=3, ge=0, le=8)
 
 
 class ObservabilityConfig(ConfigModel):

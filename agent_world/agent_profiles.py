@@ -304,6 +304,14 @@ class IsolatedAgentProfileProvider:
             if role == "environment-engineer"
             else self.config.structured_invocation_timeout_seconds
         )
+        default_limits = InvocationLimits()
+        structured_event_limit = (
+            max(default_limits.max_events, rollout_token_limit)
+            if role == "challenger"
+            and output_schema is not None
+            and rollout_token_limit is not None
+            else default_limits.max_events
+        )
         return AgentProfileSpec(
             profile_id=role,
             profile_version="3",
@@ -356,7 +364,8 @@ class IsolatedAgentProfileProvider:
                     invocation_timeout_seconds
                     if invocation_timeout_seconds is not None
                     else self.config.invocation_timeout_seconds,
-                )
+                ),
+                max_events=structured_event_limit,
             ),
         )
 
