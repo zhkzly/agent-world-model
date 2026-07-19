@@ -1,10 +1,9 @@
-"""Closed contracts for the shared generation WorkGraph control plane.
+"""Closed contracts for the generation WorkGraph control plane.
 
 These records separate expensive proposal execution, deterministic validation,
-real-execution assurance, boundary evaluation, and repair authority.  They are
-deliberately not wired into the legacy orchestration yet: Phase 1 establishes
-one strict vocabulary before the Controller, Designer, Builder, and Judge are
-migrated to it.
+real-execution assurance, boundary evaluation, repair authority, and resumable
+commit state.  They are the clean-break target for every generation component;
+the old FeedbackContract and component-local retry limits are not inputs.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ from pydantic import AwareDatetime, Field, model_validator
 
 from agent_world.contracts import (
     ArtifactRef,
+    BudgetUsage,
     ContentHash,
     Identifier,
     NonEmptyStr,
@@ -70,6 +70,21 @@ type RepairDecision = Literal[
     "request_human",
     "reject",
 ]
+type ProposalExecutionStatus = Literal[
+    "completed",
+    "failed",
+    "interrupted",
+    "cancelled",
+    "budget_exhausted",
+]
+type RepairOutcome = Literal[
+    "authorized",
+    "resolved",
+    "progressed",
+    "no_progress",
+    "rejected",
+    "exhausted",
+]
 
 _GENERIC_ISSUE_CODES = {
     "invalid",
@@ -96,6 +111,7 @@ class OperationBudget(V2Contract):
     tool_calls: Annotated[int, Field(ge=0)] = 0
     process_calls: Annotated[int, Field(ge=0)] = 0
     evaluation_episodes: Annotated[int, Field(ge=0)] = 0
+    monetary_cost: Annotated[float, Field(ge=0)] = 0
 
     @model_validator(mode="after")
     def validate_deadlines(self) -> OperationBudget:
@@ -276,12 +292,15 @@ class WorkDefinition(V2Contract):
 
     work_id: Identifier
     coordinate: WorkCoordinate
+    claim: Annotated[NonEmptyStr, Field(max_length=512)]
+    timing_reason: Annotated[NonEmptyStr, Field(max_length=512)]
     dependency_coordinates: tuple[WorkCoordinate, ...] = ()
     proposal_policy: ProposalPolicy
     validation_policy: ValidationPolicy
     assurance_policy: AssurancePolicy | None = None
     repair_policy: RepairPolicy
     required_claim_id: Identifier
+    allowed_mutation_roots: tuple[NonEmptyStr, ...] = ()
     invalidation_rule: Literal["descendants"] = "descendants"
     success_maturity: Identifier
 
@@ -292,6 +311,17 @@ class WorkDefinition(V2Contract):
             raise ValueError("work dependencies must be unique")
         if self.coordinate.coordinate_key in dependency_keys:
             raise ValueError("work cannot depend on its own output coordinate")
+        if _duplicates(self.allowed_mutation_roots):
+            raise ValueError("work mutation roots must be unique")
+        semantic_repair = (
+            self.repair_policy.maximum_local_corrections
+            or self.repair_policy.strict_progress_bonus_corrections
+            or self.repair_policy.maximum_automatic_backjump
+        )
+        if semantic_repair != bool(self.allowed_mutation_roots):
+            raise ValueError(
+                "semantic repair policy and allowed mutation roots must be declared together"
+            )
         if self.validation_policy.claim_id != self.required_claim_id:
             raise ValueError("validation policy must evaluate the WorkDefinition claim")
         if (
@@ -306,13 +336,67 @@ class WorkDefinition(V2Contract):
         return self.content_digest()
 
 
+class ProposalExecution(V2Contract):
+    """Public commitment to one real proposal execution, never its raw transcript."""
+
+    execution_id: Identifier
+    attempt_id: Identifier
+    executor: ProposalExecutor
+    operation: Identifier
+    status: ProposalExecutionStatus
+    invocation_id: Identifier | None = None
+    provider: Identifier | None = None
+    model: NonEmptyStr | None = None
+    profile_digest: ContentHash | None = None
+    output_schema_digest: ContentHash | None = None
+    output_commitment: ContentHash | None = None
+    continuation_commitment: ContentHash | None = None
+    error_code: Identifier | None = None
+    observed_actual: BudgetUsage = Field(default_factory=BudgetUsage)
+    unknown_upper_bound: BudgetUsage = Field(default_factory=BudgetUsage)
+    conservative_committed: BudgetUsage = Field(default_factory=BudgetUsage)
+    started_at: AwareDatetime
+    finished_at: AwareDatetime
+    duration_ms: Annotated[int, Field(ge=0)]
+
+    @model_validator(mode="after")
+    def validate_execution_evidence(self) -> ProposalExecution:
+        if self.finished_at < self.started_at:
+            raise ValueError("proposal execution cannot finish before it starts")
+        if self.status == "completed":
+            if self.output_commitment is None or self.error_code is not None:
+                raise ValueError("completed proposal requires output commitment and no error")
+        elif self.error_code is None:
+            raise ValueError("non-completed proposal requires a stable error code")
+        agent_fields = (
+            self.invocation_id,
+            self.provider,
+            self.model,
+            self.profile_digest,
+            self.output_schema_digest,
+        )
+        if self.executor == "agent" and any(value is None for value in agent_fields):
+            raise ValueError("Agent execution requires invocation/profile/model/schema evidence")
+        if self.executor != "agent" and any(value is not None for value in agent_fields):
+            raise ValueError("non-Agent execution cannot claim Agent invocation evidence")
+        expected = {
+            field_name: getattr(self.observed_actual, field_name)
+            + getattr(self.unknown_upper_bound, field_name)
+            for field_name in BudgetUsage.model_fields
+            if field_name != "schema_version"
+        }
+        if self.conservative_committed != BudgetUsage.model_validate(expected):
+            raise ValueError("proposal conservative usage must equal actual plus unknown")
+        return self
+
+
 class ValidationIssue(V2Contract):
     """Safe field-addressable deterministic diagnostic with no rejected value."""
 
     code: Identifier
     path: Annotated[tuple[str | int, ...], Field(min_length=1)]
     violated_condition: Annotated[NonEmptyStr, Field(max_length=512)]
-    expected_category: Identifier
+    expected_category: Annotated[NonEmptyStr, Field(max_length=512)]
     severity: Literal["warning", "blocker"] = "blocker"
     retryable: bool = True
 
@@ -507,10 +591,17 @@ class WorkAttempt(V2Contract):
     validation_policy_digest: ContentHash
     assurance_policy_digest: ContentHash | None = None
     repair_policy_digest: ContentHash
+    budget_lease_ref: ArtifactRef
     input_refs: tuple[ArtifactRef, ...] = ()
     output_refs: tuple[ArtifactRef, ...] = ()
+    proposal_execution_refs: tuple[ArtifactRef, ...] = ()
     validation_report_ref: ArtifactRef | None = None
     feedback_evaluation_ref: ArtifactRef | None = None
+    repair_action_ref: ArtifactRef | None = None
+    continuation_commitment: ContentHash | None = None
+    observed_actual: BudgetUsage = Field(default_factory=BudgetUsage)
+    unknown_upper_bound: BudgetUsage = Field(default_factory=BudgetUsage)
+    conservative_committed: BudgetUsage = Field(default_factory=BudgetUsage)
     scheduled_at: AwareDatetime
     started_at: AwareDatetime | None = None
     first_progress_at: AwareDatetime | None = None
@@ -522,7 +613,11 @@ class WorkAttempt(V2Contract):
 
     @model_validator(mode="after")
     def validate_lifecycle(self) -> WorkAttempt:
-        if _duplicates(self.input_refs) or _duplicates(self.output_refs):
+        if (
+            _duplicates(self.input_refs)
+            or _duplicates(self.output_refs)
+            or _duplicates(self.proposal_execution_refs)
+        ):
             raise ValueError("work attempt input/output refs must be unique")
         if set(self.input_refs) & set(self.output_refs):
             raise ValueError("work attempt output cannot also be an immutable input")
@@ -536,6 +631,26 @@ class WorkAttempt(V2Contract):
             and self.feedback_evaluation_ref.artifact_type != "control.feedback_evaluation"
         ):
             raise ValueError("work attempt evaluation ref has the wrong Artifact type")
+        if self.budget_lease_ref.artifact_type != "control.budget_lease":
+            raise ValueError("work attempt budget lease ref has the wrong Artifact type")
+        if any(
+            item.artifact_type != "control.proposal_execution"
+            for item in self.proposal_execution_refs
+        ):
+            raise ValueError("work attempt proposal refs have the wrong Artifact type")
+        if (
+            self.repair_action_ref is not None
+            and self.repair_action_ref.artifact_type != "control.repair_action"
+        ):
+            raise ValueError("work attempt repair action ref has the wrong Artifact type")
+        expected_usage = {
+            field_name: getattr(self.observed_actual, field_name)
+            + getattr(self.unknown_upper_bound, field_name)
+            for field_name in BudgetUsage.model_fields
+            if field_name != "schema_version"
+        }
+        if self.conservative_committed != BudgetUsage.model_validate(expected_usage):
+            raise ValueError("work attempt conservative usage must equal actual plus unknown")
         if self.diagnostic_only and self.releasable:
             raise ValueError("diagnostic work attempts are never releasable")
         terminal = self.status not in {"scheduled", "running"}
@@ -574,10 +689,20 @@ class WorkAttempt(V2Contract):
         ):
             raise ValueError("work cannot finish before it starts")
         if self.status == "succeeded":
-            if not self.output_refs or self.feedback_evaluation_ref is None:
-                raise ValueError("successful work requires output and boundary evaluation refs")
+            if (
+                not self.output_refs
+                or not self.proposal_execution_refs
+                or self.feedback_evaluation_ref is None
+            ):
+                raise ValueError(
+                    "successful work requires output, proposal, and boundary evaluation refs"
+                )
             if self.failure_code is not None:
                 raise ValueError("successful work cannot carry failure_code")
+        elif self.status in {"failed", "budget_exhausted", "needs_human"} and (
+            self.feedback_evaluation_ref is None
+        ):
+            raise ValueError("evaluated terminal failure requires a boundary evaluation")
         elif terminal and self.failure_code is None:
             raise ValueError("non-success terminal work requires a stable failure_code")
         return self
@@ -591,6 +716,7 @@ class WorkCommit(V2Contract):
     coordinate: WorkCoordinate
     attempt_id: Identifier
     definition_digest: ContentHash
+    validation_policy_digest: ContentHash
     input_refs: tuple[ArtifactRef, ...] = ()
     output_refs: Annotated[tuple[ArtifactRef, ...], Field(min_length=1)]
     feedback_evaluation_ref: ArtifactRef
@@ -617,6 +743,75 @@ class WorkCommit(V2Contract):
             raise ValueError("aggregate commits must bind child commits and leaves must not")
         if self.diagnostic_only and self.releasable:
             raise ValueError("diagnostic work commits are never releasable")
+        return self
+
+
+class WorkRepairLedgerEntry(V2Contract):
+    """Repair history owned only by RepairAction and exact ValidationReports."""
+
+    entry_id: Identifier
+    work_id: Identifier
+    coordinate: WorkCoordinate
+    repair_policy_digest: ContentHash
+    repair_action_ref: ArtifactRef
+    decision: Literal["local_correction", "parent_correction", "infrastructure_retry"]
+    source_evaluation_ref: ArtifactRef
+    report_before_ref: ArtifactRef
+    report_after_ref: ArtifactRef | None = None
+    progress: ProgressClassification | None = None
+    outcome: RepairOutcome = "authorized"
+    repair_attempt_ordinal: Annotated[int, Field(ge=1)]
+    budget_lease_ref: ArtifactRef
+    observed_actual: BudgetUsage = Field(default_factory=BudgetUsage)
+    unknown_upper_bound: BudgetUsage = Field(default_factory=BudgetUsage)
+    conservative_committed: BudgetUsage = Field(default_factory=BudgetUsage)
+    authorized_at: AwareDatetime
+    finished_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def validate_ledger_entry(self) -> WorkRepairLedgerEntry:
+        expected_types = {
+            "repair_action_ref": (self.repair_action_ref, "control.repair_action"),
+            "source_evaluation_ref": (
+                self.source_evaluation_ref,
+                "control.feedback_evaluation",
+            ),
+            "report_before_ref": (self.report_before_ref, "control.validation_report"),
+            "budget_lease_ref": (self.budget_lease_ref, "control.budget_lease"),
+        }
+        if self.report_after_ref is not None:
+            expected_types["report_after_ref"] = (
+                self.report_after_ref,
+                "control.validation_report",
+            )
+        for field_name, (ref, artifact_type) in expected_types.items():
+            if ref.artifact_type != artifact_type:
+                raise ValueError(f"{field_name} has the wrong Artifact type")
+        terminal = self.outcome != "authorized"
+        executed_terminal = self.outcome in {"resolved", "progressed", "no_progress"}
+        if terminal != (self.finished_at is not None):
+            raise ValueError("terminal repair ledger entry requires finished_at")
+        if executed_terminal != (self.progress is not None):
+            raise ValueError("executed terminal repair requires progress classification")
+        if executed_terminal != (self.report_after_ref is not None):
+            raise ValueError("executed terminal repair requires the after report")
+        expected_outcome: RepairOutcome | None = None
+        if self.progress == "resolved":
+            expected_outcome = "resolved"
+        elif self.progress == "strict_progress":
+            expected_outcome = "progressed"
+        elif self.progress is not None:
+            expected_outcome = "no_progress"
+        if expected_outcome is not None and self.outcome != expected_outcome:
+            raise ValueError("repair outcome is not derived from progress classification")
+        expected_usage = {
+            field_name: getattr(self.observed_actual, field_name)
+            + getattr(self.unknown_upper_bound, field_name)
+            for field_name in BudgetUsage.model_fields
+            if field_name != "schema_version"
+        }
+        if self.conservative_committed != BudgetUsage.model_validate(expected_usage):
+            raise ValueError("repair conservative usage must equal actual plus unknown")
         return self
 
 
@@ -704,8 +899,10 @@ def classify_progress(
 
     current_blockers = set(current.blocking_issue_ids)
     previous_blockers = set(previous.blocking_issue_ids)
-    if not current_blockers:
+    if current.status == "passed":
         return "resolved"
+    if not current_blockers:
+        return "unknown"
     if (
         previous.diagnostic_quality != "actionable"
         or current.diagnostic_quality != "actionable"
@@ -738,9 +935,11 @@ def classify_progress(
     reintroduced = current_blockers & (historical_blockers - previous_blockers)
     if reintroduced:
         return "regressed"
+    if current_blockers < previous_blockers:
+        return "strict_progress"
     if (
-        current_blockers < previous_blockers
-        or current.frontier_ordinal > previous.frontier_ordinal
+        current.frontier_ordinal > previous.frontier_ordinal
+        and not (current_blockers & previous_blockers)
     ):
         return "strict_progress"
     return "unknown"
@@ -754,12 +953,15 @@ __all__ = [
     "FeedbackEvaluation",
     "OperationBudget",
     "ProgressClassification",
+    "ProposalExecution",
+    "ProposalExecutionStatus",
     "ProposalExecutor",
     "ProposalPolicy",
     "ReadinessEffect",
     "RepairAction",
     "RepairDecision",
     "RepairPolicy",
+    "RepairOutcome",
     "ValidationEffect",
     "ValidationIssue",
     "ValidationPolicy",
@@ -770,5 +972,6 @@ __all__ = [
     "WorkComponent",
     "WorkCoordinate",
     "WorkDefinition",
+    "WorkRepairLedgerEntry",
     "classify_progress",
 ]

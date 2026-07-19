@@ -27,6 +27,11 @@ from .campaign_store import (
     CampaignStore,
     CampaignStoreError,
 )
+from .continuation_store import (
+    ContinuationStoreError,
+    NodeContinuationRecord,
+    NodeContinuationStore,
+)
 from .decision import (
     AdvisoryWorkOrder,
     CodeRouter,
@@ -94,11 +99,14 @@ from .work import (
     FeedbackEvaluation,
     OperationBudget,
     ProgressClassification,
+    ProposalExecution,
+    ProposalExecutionStatus,
     ProposalExecutor,
     ProposalPolicy,
     ReadinessEffect,
     RepairAction,
     RepairDecision,
+    RepairOutcome,
     RepairPolicy,
     ValidationEffect,
     ValidationIssue,
@@ -110,7 +118,26 @@ from .work import (
     WorkComponent,
     WorkCoordinate,
     WorkDefinition,
+    WorkRepairLedgerEntry,
     classify_progress,
+)
+from .work_graph import (
+    GenerationWorkGraph,
+    WorkGraphError,
+    tool_semantics_batch_definition,
+)
+from .work_readiness import WorkReadinessProjection, WorkReadinessSnapshot
+from .work_repair import WorkRepairDenied, WorkRepairLedger
+from .work_runtime import WorkControlRuntime, WorkRuntimeError, restore_work_budget_ledger
+from .work_store import (
+    WorkAlreadyRunningError,
+    WorkControlHead,
+    WorkControlLock,
+    WorkControlStore,
+    WorkControlStoreError,
+    WorkHeadConflictError,
+    WorkHeadStatus,
+    WorkResumeError,
 )
 
 __all__ = [
@@ -129,6 +156,7 @@ __all__ = [
     "ClaimVector",
     "CampaignStore",
     "CampaignStoreError",
+    "ContinuationStoreError",
     "AdvisoryWorkOrder",
     "CodeRouter",
     "ControlEvent",
@@ -161,6 +189,8 @@ __all__ = [
     "MetricPoint",
     "JobRunSnapshot",
     "NodeAttempt",
+    "NodeContinuationRecord",
+    "NodeContinuationStore",
     "NodeKind",
     "NodeCommit",
     "RepairDirective",
@@ -196,12 +226,15 @@ __all__ = [
     "FeedbackEvaluation",
     "OperationBudget",
     "ProgressClassification",
+    "ProposalExecution",
+    "ProposalExecutionStatus",
     "ProposalExecutor",
     "ProposalPolicy",
     "ReadinessEffect",
     "RepairAction",
     "RepairDecision",
     "RepairPolicy",
+    "RepairOutcome",
     "ValidationEffect",
     "ValidationIssue",
     "ValidationPolicy",
@@ -212,6 +245,25 @@ __all__ = [
     "WorkComponent",
     "WorkCoordinate",
     "WorkDefinition",
+    "WorkRepairLedgerEntry",
+    "WorkAlreadyRunningError",
+    "WorkControlHead",
+    "WorkControlLock",
+    "WorkControlStore",
+    "WorkControlStoreError",
+    "WorkHeadConflictError",
+    "WorkHeadStatus",
+    "WorkResumeError",
+    "WorkControlRuntime",
+    "WorkRuntimeError",
+    "restore_work_budget_ledger",
+    "GenerationWorkGraph",
+    "WorkGraphError",
+    "WorkRepairDenied",
+    "WorkRepairLedger",
+    "WorkReadinessProjection",
+    "WorkReadinessSnapshot",
+    "tool_semantics_batch_definition",
     "classify_progress",
     "reduce_maturity",
 ]

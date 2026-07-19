@@ -38,17 +38,18 @@ repair and the contracts are ready for clean replacement in Phase 2.
 
 ## Phase 2: replace Designer control plane and remove microsharding
 
-1. Migrate `ToolSemanticsBatch` first as the live proof boundary: one WorkDefinition owns
-   proposal budget, deterministic compiler, ValidationReport, FeedbackEvaluation,
-   RepairPolicy, RepairAction, private continuation and WorkCommit.  Remove its old
-   FeedbackResult/Event/Disposition/Finding retry chain rather than double-writing.
+1. Prove `ToolSemanticsBatch` first in an isolated, non-release acceptance runtime: one
+   WorkDefinition owns proposal budget, deterministic compiler, ValidationReport,
+   FeedbackEvaluation, RepairPolicy, RepairAction, private continuation and WorkCommit.  This
+   harness must not enter the ordinary Generate success path while other nodes remain old.
 2. Define the shared logical Generation WorkGraph and GenerateSeed/ExpansionSeed adapters.
 3. Move Direct ResearchEvidence, Architecture, Behavior, Rules, Curriculum and Modeling into
    WorkDefinitions.
 4. Split shared behavior contract from tool-batch policy and fix the reproduced slot mismatch.
 5. Commit physical shards hierarchically; retain successful siblings by exact dependency.
-6. Route every correction through RepairAction/RepairLedger; delete local semantic retry
-   counters as authorities.
+6. Route every correction through RepairAction/RepairLedger; switch the entire Direct Designer
+   WorkGraph in one production cut, then immediately delete local semantic retry counters and
+   the old FeedbackResult/Event/Disposition/Finding/SemanticNodeCommit authorities.
 7. Persist and restore a private semantic continuation checkpoint only after a new repair and
    budget authorization validates all lineage/input/profile/schema/config digests.
 8. Extend RuleContextCatalog to WorldRules and task/Verifier Rule contexts.
@@ -57,6 +58,25 @@ repair and the contracts are ready for clean replacement in Phase 2.
 Bad-case regressions first: BC-02 through BC-05 and BC-13 through BC-18.  Exit: the
 existing hotel EvidenceGraph checkpoint can execute Design in bounded no-rework and bounded
 repair modes with exact diagnostics and complete usage.
+
+### 2026-07-19 implementation checkpoint
+
+- Added closed WorkDefinition/Attempt/ProposalExecution/ValidationReport/FeedbackEvaluation/
+  RepairAction/WorkRepairLedgerEntry/WorkCommit contracts with actual/unknown/conservative
+  usage and monetary limits.
+- Added real file-lock CAS WorkControlStore, explicit invalidation `supersede`, framework
+  GenerationWorkGraph, private NodeContinuationStore, WorkRepairLedger, WorkReadinessProjection
+  and executable WorkControlRuntime.
+- Isolated ToolSemantics acceptance writes real Artifacts and BudgetLeases. Preserved bad cases
+  prove strict progress grants one bonus, unchanged/regression terminates, restart restores the
+  durable action/ledger/leases, and only an exact WorkCommit resumes. It produces none of the old
+  local Feedback/Finding/SemanticNodeCommit Artifacts.
+- Independent review found and the implementation closed three initial P0 defects: fake
+  WorkAttempt commits are rejected by full Attempt/Proposal/Report/Evaluation/Lease/DAG checks;
+  CAS tokens must correspond to a live flock; frontier advancement cannot retain old blockers.
+- Current regression: `525 passed, 2 skipped`; Ruff and mypy pass for `agent_world/control`.
+- This is not yet a production cutover. Designer/Builder/Verifier/Controller still execute the
+  old authority path and must be replaced and deleted, not adapted or double-written.
 
 ## Phase 3: make Evolve an input policy to the same WorkGraph
 

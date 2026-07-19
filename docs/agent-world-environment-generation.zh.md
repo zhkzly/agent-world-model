@@ -896,12 +896,12 @@ CLI 必须支持对 run/campaign 的实时/事后 metrics inspect、JSON/Parquet
 
 ## 14. 目标合同与当前实现状态
 
-本节是 2026-07-14 的迁移快照，不是 release 宣言。每次声称完成前仍应以当前代码、真实配置、完整测试与 end-to-end evidence 为准。
+本节更新至 2026-07-19，仍是迁移快照，不是 release 宣言。每次声称完成前仍应以当前代码、真实配置、完整测试与 end-to-end evidence 为准。
 
 | 区域 | 当前状态 | 仍需达到的验收 |
 |---|---|---|
 | 真实调用与研究 | 已有真实 Codex InvocationBackend、Search/Fetch/Extract 适配和无伪成功 fallback 的基础 | 在提供真实凭证/endpoint 的环境运行 live Generate，并保存完整 evidence provenance |
-| 控制面 | 已有 Direct 持久幂等、EvidenceGraph 单一稳定 typed checkpoint、Artifact provenance、Campaign CAS/ask-tell、Pool parent lease 与 durable Source intake | 只有经过故障注入证明可原子提交、可精确复验且不会重放外部副作用的 Designer 子节点，才允许新增恢复 ABI；所有 Agent/Judge/Source 中断必须保守结算未知 usage |
+| 控制面 | 新 clean-break 合同、真实 Artifact/lease WorkControlRuntime、不可伪造 flock CAS、显式 DAG supersede、durable repair/budget 恢复、私有 continuation 与 exact WorkCommit 已在隔离 ToolSemantics harness 通过 bad-case；全仓 `525 passed, 2 skipped` | 这套新控制面尚未接管完整生产流水线；必须整体切换 Direct Designer 后立即删除旧 FeedbackContract/RepairTarget/FeedbackResult/SemanticNodeCommit/component retry authority，再迁移 Builder/Verifier/Judge/Release，禁止长期双轨 |
 | 能力隔离 | 已有 EffectiveCapabilityPlan、角色 profile 和 workspace/network/credential 边界 | 持续用隔离验收证明 Skills/Hooks/Tools 不发生 ambient 继承 |
 | Evolve Source/Policy | 已有配置化 Source catalog/default selection、真实 two-turn Researcher/Search、冻结 clue context、可替换 ask/tell Policy 与 tool-first Operator | 用 live providers 对多种 Source/policy 做恢复、空 clue、needs-human、纵向与横向 Campaign 验收 |
 | Runtime/Judge | 已有 out-of-process Runtime、Unix RPC、bubblewrap/uv offline supply-chain、Task v3、recipe/interactive reachability 和独立 hard Gates | 用真实 Agent 生成的未知环境持续扩大 property、并发、资源限制与 adversarial sealed 验收 |

@@ -5,11 +5,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from agent_world.contracts import ArtifactRef, sha256_digest
+from agent_world.contracts import ArtifactRef, BudgetUsage, sha256_digest
 from agent_world.control.work import (
     AssurancePolicy,
     FeedbackEvaluation,
     OperationBudget,
+    ProposalExecution,
     ProposalPolicy,
     RepairAction,
     RepairPolicy,
@@ -20,6 +21,7 @@ from agent_world.control.work import (
     WorkCommit,
     WorkCoordinate,
     WorkDefinition,
+    WorkRepairLedgerEntry,
     classify_progress,
 )
 
@@ -142,12 +144,15 @@ def test_work_policies_separate_agent_validation_and_real_execution() -> None:
     definition = WorkDefinition(
         work_id="work:world-behavior",
         coordinate=_coordinate(),
+        claim="The exact tool behavior compiles against the frozen world schema.",
+        timing_reason="World rules require committed executable tool semantics.",
         dependency_coordinates=(_coordinate("architecture", stage="world_architecture"),),
         proposal_policy=proposal,
         validation_policy=validation,
         assurance_policy=assurance,
         repair_policy=RepairPolicy(policy_id="repair:world-behavior"),
         required_claim_id="design.behavior.valid",
+        allowed_mutation_roots=("/tools",),
         success_maturity="design_behavior_valid",
     )
 
@@ -217,11 +222,14 @@ def test_work_contracts_are_closed_and_definition_rejects_self_dependency() -> N
         WorkDefinition(
             work_id="work:self-cycle",
             coordinate=_coordinate(),
+            claim="The exact compiled value is valid.",
+            timing_reason="Its consumers require a valid revision.",
             dependency_coordinates=(_coordinate(),),
             proposal_policy=proposal,
             validation_policy=validation,
             repair_policy=RepairPolicy(policy_id="repair:none"),
             required_claim_id="design.compiles",
+            allowed_mutation_roots=("/value",),
             success_maturity="design_valid",
         )
 
@@ -281,6 +289,8 @@ def test_one_repair_policy_is_the_total_semantic_and_infrastructure_ceiling() ->
             maximum_infrastructure_retries=1,
             maximum_total_repair_attempts=2,
         )
+
+
 def test_progress_classifier_covers_real_no_progress_and_frontier_bad_cases() -> None:
     issue_a = _issue("reference_missing", ("tools", 0, "state_path"))
     issue_b = _issue("lifecycle_field_missing", ("entities", 0, "lifecycle_field"))
@@ -385,7 +395,11 @@ def test_work_attempt_commit_and_diagnostic_lifecycle_are_fail_closed() -> None:
         proposal_policy_digest=_hash("proposal"),
         validation_policy_digest=_hash("validation"),
         repair_policy_digest=_hash("repair"),
+        budget_lease_ref=_ref("budget", "control.budget_lease"),
         output_refs=(output,),
+        proposal_execution_refs=(
+            _ref("proposal-execution", "control.proposal_execution"),
+        ),
         feedback_evaluation_ref=evaluation,
         scheduled_at=now,
         started_at=now + timedelta(seconds=1),
@@ -398,6 +412,7 @@ def test_work_attempt_commit_and_diagnostic_lifecycle_are_fail_closed() -> None:
         coordinate=attempt.coordinate,
         attempt_id=attempt.attempt_id,
         definition_digest=attempt.definition_digest,
+        validation_policy_digest=attempt.validation_policy_digest,
         output_refs=attempt.output_refs,
         feedback_evaluation_ref=evaluation,
         committed_at=now + timedelta(seconds=4),
@@ -415,6 +430,60 @@ def test_work_attempt_commit_and_diagnostic_lifecycle_are_fail_closed() -> None:
     with pytest.raises(ValidationError, match="aggregate commits"):
         WorkCommit.model_validate(
             {**commit.model_dump(mode="python"), "aggregate": True}
+        )
+
+
+def test_proposal_execution_and_repair_ledger_bind_real_usage_and_reports() -> None:
+    now = datetime.now(UTC)
+    actual = BudgetUsage(llm_tokens=100, agent_turns=1)
+    unknown = BudgetUsage(monetary_cost=0.5)
+    committed = BudgetUsage(llm_tokens=100, agent_turns=1, monetary_cost=0.5)
+    execution = ProposalExecution(
+        execution_id="execution:behavior:1",
+        attempt_id="attempt:behavior:1",
+        executor="agent",
+        operation="design.world_behavior",
+        status="completed",
+        invocation_id="invocation:1",
+        provider="openai",
+        model="gpt-5.4-mini",
+        profile_digest=_hash("profile"),
+        output_schema_digest=_hash("schema"),
+        output_commitment=_hash("output"),
+        continuation_commitment=_hash("continuation"),
+        observed_actual=actual,
+        unknown_upper_bound=unknown,
+        conservative_committed=committed,
+        started_at=now,
+        finished_at=now + timedelta(seconds=1),
+        duration_ms=1000,
+    )
+    assert execution.model == "gpt-5.4-mini"
+
+    entry = WorkRepairLedgerEntry(
+        entry_id="work-repair-ledger:1",
+        work_id="work:behavior",
+        coordinate=_coordinate(),
+        repair_policy_digest=_hash("repair"),
+        repair_action_ref=_ref("repair-action", "control.repair_action"),
+        decision="local_correction",
+        source_evaluation_ref=_ref("evaluation", "control.feedback_evaluation"),
+        report_before_ref=_ref("report-before", "control.validation_report"),
+        report_after_ref=_ref("report-after", "control.validation_report"),
+        progress="strict_progress",
+        outcome="progressed",
+        repair_attempt_ordinal=1,
+        budget_lease_ref=_ref("repair-budget", "control.budget_lease"),
+        observed_actual=actual,
+        unknown_upper_bound=unknown,
+        conservative_committed=committed,
+        authorized_at=now,
+        finished_at=now + timedelta(seconds=1),
+    )
+    assert entry.outcome == "progressed"
+    with pytest.raises(ValidationError, match="derived from progress"):
+        WorkRepairLedgerEntry.model_validate(
+            {**entry.model_dump(mode="python"), "outcome": "no_progress"}
         )
 
 
