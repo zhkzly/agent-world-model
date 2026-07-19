@@ -37,6 +37,7 @@ from agent_world.contracts import (
     sha256_digest,
 )
 from agent_world.control.decision import StructuredRepairMode
+from agent_world.control.feedback import RepairTargetRef
 from agent_world.control.repair import StructuredRepairAuthority, StructuredRepairDenied
 from agent_world.control.validation import (
     SafeValidationIssue,
@@ -712,6 +713,22 @@ class EnvironmentBuilder:
                     issue_codes=diagnostic.issue_codes,
                     continued_session=True,
                     diagnostic=diagnostic,
+                    feedback_contract_id="feedback.build.candidate",
+                    repair_target=RepairTargetRef(
+                        target_id=sha256_digest(
+                            canonical_json_bytes(
+                                {
+                                    "lineage_id": lineage_id,
+                                    "slot": "candidate_workspace",
+                                }
+                            )
+                        ),
+                        component="build",
+                        artifact_slot="candidate_workspace",
+                        lineage_id=lineage_id,
+                        immutable_input_refs=(design_ref, contract_ref),
+                        allowed_mutation_paths=("/candidate",),
+                    ),
                 )
             except StructuredRepairDenied as exc:
                 raise BuilderError(

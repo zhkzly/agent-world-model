@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 from agent_world.config import ResearchConfig
 
 from .providers import (
+    BingRssSearchProvider,
     HttpFetcher,
     JinaReaderFetcher,
     JinaSearchProvider,
@@ -38,7 +39,7 @@ def build_research_toolchain(
             timeout_seconds=config.request_timeout_seconds,
             allow_private_endpoint=config.searxng_allow_private_endpoint,
         )
-    else:
+    elif config.provider == "jina":
         assert config.jina_api_key_environment is not None
         search = JinaSearchProvider(
             endpoint=str(config.jina_search_url),
@@ -46,6 +47,12 @@ def build_research_toolchain(
             credential_handle=config.jina_credential_handle,
             timeout_seconds=config.request_timeout_seconds,
             source_environment=source_environment,
+            allow_rfc2544_synthetic_egress=config.allow_rfc2544_synthetic_egress,
+        )
+    else:
+        search = BingRssSearchProvider(
+            endpoint=str(config.bing_search_url),
+            timeout_seconds=config.request_timeout_seconds,
             allow_rfc2544_synthetic_egress=config.allow_rfc2544_synthetic_egress,
         )
     primary = HttpFetcher(

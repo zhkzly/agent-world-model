@@ -4,6 +4,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from pydantic import HttpUrl, ValidationError
 from agent_world.config import ResearchConfig
 from agent_world.contracts import PermissionScope
 from agent_world.research import (
+    BingRssSearchProvider,
     FetchedDocument,
     HttpFetcher,
     JinaReaderFetcher,
@@ -67,6 +69,31 @@ def test_jina_reader_provider_and_config_repeat_exact_origin_validation() -> Non
     )
     assert str(config.jina_search_url) == "https://s.jina.ai/"
     assert str(config.jina_reader_url) == "https://r.jina.ai/"
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    (
+        "http://www.bing.com/search",
+        "https://bing.com/search",
+        "https://www.bing.com:444/search",
+        "https://user@www.bing.com/search",
+        "https://www.bing.com/search?q=secret",
+    ),
+)
+def test_bing_rss_provider_rejects_noncanonical_search_origins(endpoint: str) -> None:
+    with pytest.raises(ResearchProviderError):
+        BingRssSearchProvider(endpoint)
+
+    with pytest.raises(ValidationError):
+        ResearchConfig(provider="bing_rss", bing_search_url=HttpUrl(endpoint))
+
+
+def test_bing_rss_provider_requires_no_credential_handle() -> None:
+    config = ResearchConfig(provider="bing_rss", use_jina_reader_fallback=False)
+    provider = BingRssSearchProvider(str(config.bing_search_url))
+
+    assert provider.name == "bing-rss"
 
 
 @pytest.mark.asyncio
@@ -211,14 +238,35 @@ async def test_rfc2544_synthetic_egress_is_explicit_and_never_implied(
         ]
 
     monkeypatch.setattr("socket.getaddrinfo", synthetic_getaddrinfo)
-    default_policy = UrlPolicy()
+    default_policy = UrlPolicy(dns_timeout_seconds=0.5)
     with pytest.raises(ResearchProviderError, match="reserved source address denied"):
         await default_policy.resolve("https://public.example/reference")
 
-    explicit_policy = UrlPolicy(allow_rfc2544_synthetic_egress=True)
+    explicit_policy = UrlPolicy(
+        allow_rfc2544_synthetic_egress=True,
+        dns_timeout_seconds=0.5,
+    )
     resolution = await explicit_policy.resolve("https://public.example/reference")
     assert resolution.uses_synthetic_egress
     assert tuple(str(item) for item in resolution.addresses) == ("198.18.0.160",)
+
+
+@pytest.mark.asyncio
+async def test_dns_resolution_has_a_framework_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def blocked_getaddrinfo(*_args: object, **_kwargs: object) -> list[object]:
+        time.sleep(0.2)
+        return []
+
+    monkeypatch.setattr("socket.getaddrinfo", blocked_getaddrinfo)
+    policy = UrlPolicy(dns_timeout_seconds=0.02)
+
+    with pytest.raises(ResearchProviderError, match="timed out"):
+        await asyncio.wait_for(
+            policy.resolve("https://public.example/reference"),
+            timeout=0.1,
+        )
 
 
 def test_research_content_is_normalized_and_secret_scanned_without_truncation() -> None:

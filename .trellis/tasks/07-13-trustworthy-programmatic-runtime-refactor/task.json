@@ -18,7 +18,9 @@
   "commit": null,
   "pr_url": null,
   "subtasks": [],
-  "children": [],
+  "children": [
+    "07-19-feedback-control-plane-topology-refactor"
+  ],
   "parent": null,
   "relatedFiles": [
     "AGENTS.md",

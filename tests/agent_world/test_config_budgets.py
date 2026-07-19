@@ -14,7 +14,11 @@ from agent_world.config import (
     load_foundry_config,
 )
 from agent_world.contracts import Budget
-from agent_world.designer import DIRECT_DESIGN_BASE_TURNS
+from agent_world.designer import (
+    DIRECT_DESIGN_BASE_TURNS,
+    DIRECT_DESIGN_MAX_CORRECTIONS,
+    DIRECT_DESIGN_MAX_TURNS,
+)
 from agent_world.designer.budget import derive_designer_invocation_budget
 
 
@@ -54,11 +58,11 @@ def test_production_defaults_reserve_full_v3_judge_capacity(tmp_path: Path) -> N
     direct_designer = derive_designer_invocation_budget(
         direct,
         base_turns=DIRECT_DESIGN_BASE_TURNS,
-        maximum_corrections=direct.repair_attempts,
+        maximum_corrections=min(DIRECT_DESIGN_MAX_CORRECTIONS, direct.repair_attempts),
         rollout_token_limit=config.agent.structured_turn_token_limit,
     )
     assert direct_designer.agent_turns == (
-        DIRECT_DESIGN_BASE_TURNS + direct.repair_attempts
+        DIRECT_DESIGN_MAX_TURNS
     )
     assert direct_designer.llm_tokens <= direct.llm_tokens
 

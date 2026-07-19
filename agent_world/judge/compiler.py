@@ -40,6 +40,7 @@ from agent_world.contracts.reachability import (
     RecipePointer,
 )
 from agent_world.control.decision import StructuredRepairMode
+from agent_world.control.feedback import RepairTargetRef
 from agent_world.control.repair import StructuredRepairAuthority, StructuredRepairDenied
 from agent_world.control.validation import (
     SafeValidationIssue,
@@ -423,6 +424,23 @@ class VerifierCompiler:
                 budget=batch_budget,
                 permissions=permissions,
                 repair_authority=repair_authority,
+                repair_target=RepairTargetRef(
+                    target_id=sha256_digest(
+                        canonical_json_bytes(
+                            {
+                                "lineage_id": lineage_id,
+                                "batch_index": batch_index,
+                                "slot": "verifier_intent_batch",
+                            }
+                        )
+                    ),
+                    component="verifier",
+                    artifact_slot="verifier_intent_batch",
+                    lineage_id=f"{lineage_id}.batch.{batch_index}",
+                    batch_id=f"batch-{batch_index}",
+                    immutable_input_refs=(design_ref, world_spec_ref),
+                    allowed_mutation_paths=("/",),
+                ),
                 active_invocation_ids=active_invocations[batch_index],
                 accounting=accounting,
             )
@@ -763,6 +781,7 @@ class VerifierCompiler:
         budget: Budget,
         permissions: PermissionScope,
         repair_authority: StructuredRepairAuthority | None = None,
+        repair_target: RepairTargetRef | None = None,
         active_invocation_ids: set[str] | None = None,
         accounting: _VerifierBatchAccounting | None = None,
     ) -> tuple[TOutput, tuple[InvocationResult, ...]]:
@@ -828,15 +847,28 @@ class VerifierCompiler:
             if repair_authority is None:
                 return
             try:
-                active_repair_entry = await repair_authority.authorize(
-                    owner_node="verifier",
-                    lineage_id=lineage_id,
-                    role="challenger",
-                    repair_mode=repair_mode,
-                    issue_codes=issue_codes,
-                    continued_session=True,
-                    diagnostic=diagnostic,
-                )
+                if repair_target is None:
+                    active_repair_entry = await repair_authority.authorize(
+                        owner_node="verifier",
+                        lineage_id=lineage_id,
+                        role="challenger",
+                        repair_mode=repair_mode,
+                        issue_codes=issue_codes,
+                        continued_session=True,
+                        diagnostic=diagnostic,
+                    )
+                else:
+                    active_repair_entry = await repair_authority.authorize(
+                        owner_node="verifier",
+                        lineage_id=lineage_id,
+                        role="challenger",
+                        repair_mode=repair_mode,
+                        issue_codes=issue_codes,
+                        continued_session=True,
+                        diagnostic=diagnostic,
+                        feedback_contract_id="feedback.verifier.intent",
+                        repair_target=repair_target,
+                    )
             except StructuredRepairDenied as exc:
                 raise VerifierCompilationError(
                     "global RepairLedger rejected another Verifier correction",

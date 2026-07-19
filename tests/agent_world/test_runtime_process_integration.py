@@ -447,13 +447,13 @@ async def test_candidate_materializer_is_public_only_and_framework_compiles_goal
             candidate.root,
             entrypoint="task_materializer:materialize",
             calls=tuple(call.call_arguments() for call in calls),
-            visible_workspace_paths=("task_materializer.py",),
+            visible_workspace_paths=("runtime.py", "task_materializer.py"),
         )
         second = await runner.run_task_materializer(
             candidate.root,
             entrypoint="task_materializer:materialize",
             calls=tuple(call.call_arguments() for call in calls),
-            visible_workspace_paths=("task_materializer.py",),
+            visible_workspace_paths=("runtime.py", "task_materializer.py"),
         )
         assert first.succeeded, (first.failure_class, first.stderr)
         assert second.succeeded, (second.failure_class, second.stderr)
@@ -481,7 +481,11 @@ async def test_candidate_materializer_is_public_only_and_framework_compiles_goal
         public_check = await runner.run(
             candidate.root,
             argv=(".venv/bin/python", "-m", "public_check"),
-            visible_workspace_paths=("public_check.py",),
+            visible_workspace_paths=(
+                "runtime.py",
+                "task_materializer.py",
+                "public_check.py",
+            ),
             timeout_seconds=10,
             max_output_bytes=128 * 1024,
             failure_prefix="public_self_check",
@@ -842,7 +846,7 @@ async def test_real_public_test_failure_blocks_release_with_typed_static_evidenc
     assert report.verdict == "fail"
     assert gates["supply_chain"].status == "pass"
     assert gates["static_assurance"].status == "fail"
-    assert "public_tests/test_public.py" in gates["static_assurance"].summary
+    assert "public_test.py" in gates["static_assurance"].summary
     evidence_ref = next(
         ref
         for ref in gates["static_assurance"].evidence_refs

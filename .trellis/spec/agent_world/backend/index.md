@@ -116,19 +116,18 @@ Rules:
 
 ### 1. Scope / Trigger
 
-- Applies whenever Direct Generation fails after research has produced a typed `EvidenceGraph`, or
-  after the evidence-backed `WorldSkeleton` has been committed.
+- Applies whenever Direct Generation fails after research has produced a typed `EvidenceGraph`.
 
 ### 2. Signatures
 
-- `DesignPhaseCheckpoint.phase: Literal["evidence_graph", "world_skeleton"]`
+- `DesignPhaseCheckpoint.phase: Literal["evidence_graph"]` on the production path.
 - `EnvironmentDesigner.adopt_latest_phase_checkpoint(...) -> ArtifactRef`
 - `EnvironmentDesigner.resume_from_phase_checkpoint(...) -> DesignBundle`
 
 ### 3. Contracts
 
-- A checkpoint binds exact job, request, input artifact revisions and `designer-v4` ABI by hash.
-- Resume selects the most advanced unique valid phase for the same immutable job/request.
+- The only stable checkpoint binds exact job, request and EvidenceGraph revisions by hash.
+- Resume adopts the unique valid EvidenceGraph for the same immutable job/request.
 - Evidence resume performs no Researcher, search, fetch or extract call and reports zero new
   research usage; it recompiles World Boundary and downstream world nodes.
 - Cross-request evidence reuse requires a separate explicit freshness/adoption policy and is not
@@ -136,22 +135,23 @@ Rules:
 
 ### 4. Validation & Error Matrix
 
-- Exact unique WorldSkeleton checkpoint -> resume Designer tail.
-- No WorldSkeleton but exact unique EvidenceGraph -> adopt typed evidence checkpoint and resume
-  before World Boundary.
+- Exact unique EvidenceGraph -> adopt the typed evidence checkpoint and resume before
+  WorldArchitecture.
+- Any `world_skeleton` phase -> reject as retired microsharded ABI.
 - Multiple candidate revisions -> `checkpoint.ambiguous`.
 - Missing, dependency-unbound, ABI-mismatched or semantically invalid artifact -> fail closed.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: one state-schema failure resumes from EvidenceGraph without a new research directory.
+- Good: one world-modeling failure resumes from EvidenceGraph without a new research directory.
 - Base: initial generation researches once and commits the EvidenceGraph checkpoint immediately.
 - Bad: create a new request id after every downstream failure, silently choose one of several
-  revisions, or replay search merely because WorldSkeleton was not reached.
+  revisions, or claim that an uncommitted model transaction is a safe recovery point.
 
 ### 6. Tests Required
 
 - Assert adopted evidence binds exact request/job/graph revisions.
+- Assert public Designer and Controller APIs cannot adopt or resume a `world_skeleton` checkpoint.
 - Assert evidence resume has empty invocation prefix, zero research usage and a
   `design_phase_resumed` event.
 - Live acceptance must show `design-resume/resumed-evidence-checkpoint.json` and no new research
@@ -164,171 +164,114 @@ Rules:
 - Correct: retain immutable evidence lineage, revalidate its checkpoint, and rerun only the
   dependent world-compilation suffix.
 
-## Tool schema semantic IR compilation
+## Compact architecture and deterministic schema compilation
 
 ### 1. Scope / Trigger
 
-- Applies whenever Environment Designer authors input, output, or observation schemas for a
-  frozen `ToolSurfacePlan`.
+- Applies whenever Designer turns one `WorldArchitectureSourceDraft` into state and tool schemas.
 
 ### 2. Signatures
 
-- Model output: `ToolSchemaIRDraft`.
-- Framework output: `ToolSchemaDraft` containing closed Draft 2020-12 JSON Schema.
+- Model output: compact entity field and tool interface semantics; no schema graph or JSON Schema.
+- Framework output: closed Entity/Tool Schema IR and Draft 2020-12 JSON Schema.
 
 ### 3. Contracts
 
-- The Agent authors a flat, closed, acyclic, fully reachable typed node graph; it does not author
-  raw JSON Schema syntax.
-- Framework code deterministically compiles object requiredness, array items, unions, scalar
-  constraints, and `additionalProperties=false`.
-- The compiled artifact depends on the exact IR artifact; resume revalidates the IR, recompiles it,
-  and requires byte-equivalent typed content.
+- The Agent owns names, business meanings, scalar categories, nullability, cardinality and bounded
+  scalar constraints. It owns neither a schema node graph nor raw JSON Schema syntax.
+- Framework code deterministically owns root objects, ids, references, requiredness, array items,
+  nullable unions, scalar constraints, lifecycle closure and `additionalProperties=false`.
+- `WorldArchitectureSourceDraft.model_json_schema()` must stay compact enough for one transaction;
+  adding schema-compiler mechanics to it is an ownership regression.
 
 ### 4. Validation & Error Matrix
 
-- Unknown, cyclic, duplicate or unreachable node -> semantic rework at the schema IR node.
-- Tool id or schema kind drift -> semantic rework.
-- Compiled Draft invalid or compiled artifact differs from its IR -> fail closed.
-- Same-job pre-IR compiled artifact -> reusable only after current full Draft validation.
+- Duplicate/invalid business field or frozen identity drift -> one architecture correction.
+- Broken framework reference, invalid compiled Draft or open object -> framework defect; do not ask
+  the Agent to repair compiler syntax.
+- More than the bounded tool count/context size -> reject scope before invocation or partition only
+  the ToolSemantics transaction, never split schema mechanics into per-field turns.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: an observation has a required id and an array of union results; IR compiles required at the
-  object level, one schema under items, and alternatives under `anyOf`.
-- Base: a closed empty input object compiles without model-authored JSON Schema keywords.
-- Bad: ask the model to place `required`, `items`, or `properties` directly in arbitrary JSON.
+- Good: an optional repeated guest-name field compiles into a required root property whose value is
+  a nullable array with framework-owned `items`.
+- Base: an empty tool input compiles into a closed object without model-authored schema keywords.
+- Bad: ask the model to author node ids, `required`, `items`, `properties` or references.
 
 ### 6. Tests Required
 
-- Assert required fields, nested arrays and unions compile to a valid closed Draft.
-- Assert cycles and unknown/unreachable references fail before compilation.
-- Assert provider structured-output normalization accepts `ToolSchemaIRDraft`.
+- Assert compact entity/tool fields compile to valid closed Drafts with stable ids/references.
+- Assert Architecture structured-output schema excludes state/tool Schema IR fields and stays under
+  the fixed size budget.
+- Assert compiler failures are framework failures and cannot consume semantic repair attempts.
 
 ### 7. Wrong vs Correct
 
-- Wrong: retry malformed model-authored JSON Schema with increasingly detailed examples.
-- Correct: keep business shape decisions in typed Agent output and syntax ownership in a small,
+- Wrong: retry malformed model-authored Schema IR with increasingly detailed examples.
+- Correct: keep only business meaning in typed Agent output and all schema mechanics in a small,
   deterministic, fully tested framework compiler.
 
-## State entity schema semantic IR compilation
+## Prohibited per-entity schema sharding
+
+The retired microsharded Designer asked the Agent to author a Schema IR once per entity/tool and
+then tried to recover individual shards. Do not restore it. Entity cardinality may increase compact
+architecture output and deterministic compiler work, but must not increase Agent transaction count.
+Validation diagnostics still use stable field paths and monotonic frontiers; A-to-B progress is
+real progress, while A-to-B-to-A within one RepairTarget family is oscillation and stops locally.
+
+## Batched tool semantics and WorldRules
 
 ### 1. Scope / Trigger
 
-- Applies whenever Designer compiles one frozen `StateEntityPlan` into an entity schema.
+- Applies after compact architecture schemas compile and before TaskCurriculum.
 
 ### 2. Signatures
 
-- Model output: `StateEntitySchemaIRDraft(entity, root_node_id, nodes)`.
-- Framework output: `StateEntitySchemaDraft(entity, json_schema)` and immutable
-  `StateEntitySchema`.
+- Agent transactions: up to two `ToolSemanticsBatchSourceDraft` values (at most four coupled tools
+  each), then one `WorldRuleSemanticsSourceDraft` for initial-state and global invariants.
+- Framework output: closed ToolContracts and WorldModel Rule IR.
 
 ### 3. Contracts
 
-- The Agent owns field type, requiredness, enum and nesting semantics, but never raw JSON Schema
-  object syntax.
-- Pydantic models own only closed output shape and scalar types. Framework preflight owns every
-  node-local, graph-closure, frozen-plan and lifecycle invariant and reports all independently
-  checkable failures in one `ValidationDiagnostic`.
-- The root graph is an object, closed, acyclic and fully reachable; its root fields equal the
-  frozen union of primary-key and mutable fields.
-- Framework deterministically owns `properties`, `required`, `additionalProperties`, `items`,
-  `anyOf` and final Draft 2020-12 validation.
-- Treat scalar constraints as intersections. If `const` belongs to `enum`, compile the equivalent
-  canonical `const` form without Agent rework; reject only a disjoint `const`/`enum` pair as an
-  unsatisfiable semantic constraint.
-- Diagnostics use stable field/index paths and framework-authored messages; never route on or
-  persist Pydantic `msg`, `input`, `ctx`, or rejected Agent identifiers.
-- Validation frontiers are monotonic: transport precedes shape, graph closure precedes frozen-plan
-  checks, and compilation runs only after preflight is empty. Moving from an earlier failure to a
-  newly reachable later failure is progress even when issue codes are disjoint.
-- Concurrent Designer shards are all-settled. Each successful independent shard commits before the
-  first original leaf error is propagated; never cancel already-paid sibling work that resume can
-  safely reuse.
-- Commit the IR before the compiled artifact. A compiled artifact may depend on exactly one IR;
-  resume recompiles and revalidates it without another model turn.
+- Partition tools by shared state and transaction coupling, not by environment id.
+- Tool batches have exact RepairTarget identity and stable order. Current scheduler is sequential;
+  concurrency is allowed only after backend capacity, lease accounting and deterministic commit
+  behavior are proven.
+- WorldRules owns business initial-state/invariant meaning only. Framework validates every path and
+  compiles Rule IR; it never asks the model to repair framework-generated ids or schema syntax.
+- The full pre-Build Direct proposal graph has at most eight base turns: two research,
+  architecture, an optional multi-batch shared contract, one or two tool batches, world rules and
+  curriculum. A global WorkGraph budget currently reserves at most two semantic corrections, so
+  the hard envelope is ten turns. No component-local counter may grant work beyond that envelope;
+  a second correction for one logical Artifact requires code-proven strict progress.
 
 ### 4. Validation & Error Matrix
 
-- Unknown, cyclic, duplicate or unreachable node -> local structured correction.
-- Entity identity or root-field drift -> reject the IR revision.
-- Lifecycle node missing or enum differs from the frozen plan -> reject the IR revision.
-- Compiled schema open/invalid -> framework error; never ask the model to hand-author syntax.
+- Unknown business path in Agent RuleDraft -> local WorldRules correction.
+- Invalid framework-compiled path/id/schema -> framework failure, no semantic correction.
+- Transaction projection above 192 KiB or total turn bound -> reject before invocation.
+- Provider retryable failure below the bound -> bounded fresh-session retry under the same target.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: payment fields and lifecycle enum compile to a closed object and commit IR before schema.
-- Base: one id-only entity compiles in one model turn.
-- Bad: expose arbitrary `dict[str, JsonValue]` JSON Schema syntax to the Agent, then repeatedly
-  prompt it to add `type` or `additionalProperties`.
+- Good: reserve/cancel tools that share booking state are one batch; global inventory non-negativity
+  is expressed once in WorldRules and compiled by code.
+- Base: one small tool produces one tool batch and one WorldRules transaction.
+- Bad: invoke one Agent per precondition/postcondition field or merge rules into a giant architecture
+  prompt that spends ten minutes before producing its first artifact.
 
 ### 6. Tests Required
 
-- Assert closed compilation, exact planned fields and lifecycle enum.
-- Assert cycles, unplanned fields and identity drift fail before a compiled Artifact is committed.
-- Assert node-local constraints are aggregated, an unknown/non-object root advances to frozen-plan
-  diagnostics after correction, and transport -> shape -> semantic failures never become false
-  no-progress.
-- Assert equivalent `enum` + `const` intersections canonicalize without a model turn while a
-  disjoint pair fails with a typed unsatisfiable-constraint issue.
-- Assert a committed IR resumes without an InvocationBackend call.
-- Live acceptance must prove a previously failing entity advances without replaying earlier
-  Research/Entity nodes.
+- Assert eight tools form at most two stable batches and nested tool identity drift fails locally.
+- Assert WorldRules compile only after all tool batches and preserve source evidence bindings.
+- Measure every real semantic transaction's wall time, tokens, repair mode and projection size.
 
 ### 7. Wrong vs Correct
 
-- Wrong: classify every distinct raw-schema failure as one `semantic_contract_violation`, causing
-  real progress to be treated as no-progress, or make the Agent discover independent invariants
-  one expensive turn at a time.
-- Correct: make raw syntax structurally unrepresentable, aggregate safe typed issues at the deepest
-  reachable frontier, and treat any later-frontier correction as progress.
-
-## World closure semantic projection
-
-### 1. Scope / Trigger
-
-- Applies after all ToolContracts are assembled and before authoring global invariant Rules.
-
-### 2. Signatures
-
-- Framework input: full validated `WorldSkeleton` plus ToolContracts.
-- Agent input: `WorldClosureContext` with a deduplicated `WorldClosureConstraint` catalog and
-  RulePaths that reference catalog ids.
-
-### 3. Contracts
-
-- Preserve executable references, constants, bounded arithmetic, operators, boolean composition,
-  error state effects, descriptions, rule ids and evidence bindings.
-- Remove repeated contract schema versions and clause ids; deduplicate clauses by exact semantic
-  content. Elide only `schema_valid` bodies already retained and validated by framework code.
-- Compact canonical context must remain at or below 192 KiB.
-
-### 4. Validation & Error Matrix
-
-- Unknown or unreachable constraint id -> local typed validation failure.
-- Hash collision with different semantic content -> fail closed.
-- Projection above 192 KiB -> fail before model invocation and shard the owning node.
-- Provider retryable failure below the bound -> bounded fresh-session retry remains allowed.
-
-### 5. Good/Base/Bad Cases
-
-- Good: several transition variants share assignment clauses; one catalog entry is referenced by
-  each RulePath while their distinct descriptions and boolean composition remain visible.
-- Base: one small tool produces one closed catalog and one global closure turn.
-- Bad: inline every complete ToolContract and repeat schema/version/clause metadata for every rule.
-
-### 6. Tests Required
-
-- Assert projected operator and state pointers match source clauses.
-- Assert semantically identical clauses deduplicate and every catalog entry is reachable.
-- Measure a real multi-tool acceptance context below the fixed bound before live invocation.
-
-### 7. Wrong vs Correct
-
-- Wrong: spend the entire retry lease on multiple provider turns with a redundant 250+ KiB
-  ToolContract projection.
-- Correct: framework retains full contracts, sends only a closed typed semantic projection, and
-  independently validates the resulting invariants against the original complete world.
+- Wrong: spend the retry lease on one redundant 250+ KiB transaction or on per-field turns.
+- Correct: send compact business semantics in bounded transactions and compile all executable
+  contracts in framework code.
 
 ## Modeling uncertainty closure and no-progress protection
 
@@ -483,65 +426,80 @@ source = await fetcher.fetch(url)
 span.finish(status="passed")
 ```
 
-## Owner-scoped semantic revision and canonical design compilation
+## Shared Generate/Expand WorkGraph and canonical design compilation
 
 ### 1. Scope / Trigger
 
-- Applies to Direct design revision and both initial/rework Expansion design turns.
-- Triggered whenever an Agent must replace complete design semantics after a Finding or mutation.
+- Applies to every Direct Generate and Evolve-selected Expansion candidate.
+- Triggered after a GenerateSeed or ExpansionSeed is frozen and whenever one exact logical Design
+  Artifact is repaired.
 
 ### 2. Signatures
 
-- Agent output: `EnvironmentSemanticSourceDraft(world, curriculum_plan, task_requirements)` where
-  `world` is `WorldSemanticSourceIRDraft`, not `WorldModelDraft`.
-- Framework compiler: `EnvironmentDesigner._compile_semantic_source(...) -> EnvironmentDesignDraft`.
-- Expansion output: `ExpansionDesignDraft(semantic_source, semantic_delta)` where delta entries are
-  claim drafts without `after`.
+- Seed adapters: `GenerateSeed | ExpansionSeed -> GenerationContext`.
+- Shared logical work: `ResearchEvidence -> WorldArchitecture -> WorldBehavior -> WorldRules ->
+  TaskCurriculum -> ModelingBoundary`.
+- Stage outputs are compact typed semantic sources; framework compilation produces the complete
+  `EnvironmentDesignDraft` and, for Expansion, the authoritative SemanticDelta against parents.
+- `ExpansionDesignDraft` is not a production success boundary.
 
 ### 3. Contracts
 
-- Agent owns bounded state/tool schema node graphs, executable world Rule semantics, curriculum
-  topology and ordered TaskRequirement Rule IR.
+- Generate and Expand instantiate the same WorkDefinitions, ValidationPolicies, RepairPolicies and
+  WorkCommit hierarchy. They differ only in frozen GenerationContext: Expansion adds exact parent
+  refs, MutationIntent, coverage target and admitted clues.
+- Agent owns compact business field/tool meaning, executable world Rule semantics, curriculum
+  topology and ordered task semantics. It does not own schema graphs or protocol syntax.
 - Framework exclusively compiles StateSchema/ToolSurface/WorldModel, task reset/public/evaluator
   schemas, goal bindings, reachability, RewardSpec and VerificationRequirements.
 - Reward is task-outcome aggregation fixed at 0/+1/-1 with failure-over-success precedence; Rule
   count cannot amplify it.
-- Expansion claims include operation, subject identity, exact parent `before_hash`, changed aspects
-  and rationale. The authoritative SemanticDelta, including every `after`, is framework-computed.
+- Expansion MutationIntent includes operation, subject identity, exact parent refs, changed aspects
+  and rationale. The authoritative SemanticDelta, including every `after`, is framework-computed
+  only after the common complete Design commits.
+- Every semantic correction is authorized by the same global RepairLedger. Expansion may not use
+  `EnvironmentDesigner.maximum_structured_reworks` as an independent retry authority.
 - Provider-normalized output schemas must retain the same forbidden-field boundary; checking only
   Pydantic `model_fields` is insufficient.
 
 ### 4. Validation & Error Matrix
 
 - Task draft order/identity differs from CurriculumPlan -> reject the structured Agent turn.
-- Typed StateEntitySchemaIR contains an unsupported union -> reject that owning structured turn.
+- Compact architecture contains an unsupported field semantic -> reject Architecture locally.
 - A root task-reset projection failure after typed IR validation -> framework invariant failure;
   persist the state-shape subject and do not trigger semantic rework.
 - Task reset schema changes only because framework recompiled a changed state -> no TaskScopeDelta.
 - Curriculum distribution changes -> one TaskDistributionDelta with exact framework before hash.
-- Declared delta metadata differs from framework diff -> reject the Expansion design turn.
+- Mutation scope differs from framework-computed parent diff -> reject the owning shared stage or
+  final identity boundary; do not regenerate one giant design.
 - Agent output includes raw state/tool schema, task schema/binding/reward/verification, unresolved
   release blockers, or delta `after` -> closed output-schema validation error before adoption.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: Agent changes a task success Rule; framework recompiles goal schema, reward and full rule
-  closure, then computes a TaskScopeDelta containing the compiled task.
-- Base: Agent preserves semantics; canonical compilation produces the same owned protocol fields.
-- Bad: ask for a complete `EnvironmentDesignDraft`, accept `reward=99`, or let TaskScopeDelta carry
-  an Agent-authored complete TaskRequirement.
+- Good: ExpansionSeed requests a task success-Rule mutation; shared Research/Architecture/Behavior
+  commits are reused only when their exact inputs remain valid, Curriculum is revised locally,
+  framework recompiles reward/goal closure and computes TaskScopeDelta.
+- Base: Direct GenerateSeed traverses the same WorkDefinitions without parent-delta constraints.
+- Bad: ask Expansion for one complete design transaction, retry it outside RepairLedger, accept
+  `reward=99`, or let a delta carry an Agent-authored complete TaskRequirement.
 
 ### 6. Tests Required
 
-- Assert semantic source has no reward/verification fields and TaskRequirementDraft has no protocol
-  schemas or bindings.
-- Assert semantic source exposes StateEntitySchemaIR/ToolSchemaIR rather than raw state/tool schema.
+- Assert Generate and Expand instantiate the same ordered logical WorkDefinitions and repair
+  authority; only their seed/context types differ.
+- Assert no Expansion `run_structured_agent` call can retry without a RepairAction authorization.
+- Assert stage semantic sources have no reward/verification fields and TaskRequirement source has
+  no protocol schemas or bindings.
+- Assert compact architecture exposes business field/tool meaning rather than raw schema or Schema
+  IR mechanics.
 - Differentially assert compiled reset schema comes from the frozen world and reward values are
   canonical.
 - Assert duplicate success Rules remain +1 and simultaneous success/failure returns -1 with
   succeeded=false.
 - Assert provider output-schema normalization still excludes forbidden fields.
-- Assert delta claims reject `after` and must exactly match framework-computed metadata.
+- Assert MutationIntent cannot carry `after` and framework-computed delta exactly matches parent and
+  committed full Design.
 - Assert state plus derived task-schema recompilation has state delta but no task delta, and seed
   space alone produces TaskDistributionDelta.
 - Assert structural state unions fail at state-schema IR before curriculum/task invocations.
@@ -549,12 +507,13 @@ span.finish(status="passed")
 ### 7. Wrong vs Correct
 
 ```python
-# Wrong: repair Agent owns framework protocol and release policy.
-draft = await invoke(model=EnvironmentDesignDraft)
+# Wrong: Expansion bypasses shared stages and global repair authority.
+draft = await invoke(model=ExpansionDesignDraft)
 
-# Correct: Agent owns semantics; framework recompiles protocol and policy.
-source = await invoke(model=EnvironmentSemanticSourceDraft)
-draft = designer._compile_semantic_source(source, evidence_graph=graph, evidence_graph_ref=ref)
+# Correct: adapt a frozen seed, run the shared graph, then compute delta in code.
+context = adapt_seed(expansion_seed)
+design = await generation_work_graph.run(context)
+delta = compile_semantic_delta(parent, design)
 ```
 
 ## Agent-facing contracts must expose every structural choice

@@ -2079,7 +2079,7 @@ class EnvironmentJudge:
                     details={
                         "violation_count": len(rule_violations),
                         "violation_group_count": len(violation_groups),
-                        "violation_groups": violation_groups,
+                        "violation_groups": cast(JsonValue, violation_groups),
                     },
                 )
             difficulty_evidence = self._validate_runtime_difficulty_contrasts(

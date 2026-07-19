@@ -17,6 +17,7 @@ from agent_world.contracts import (
     Rule,
     RuleArithmetic,
     RuleConstant,
+    RuleLookupByKey,
     RuleTerm,
     RuleValueRef,
     WorldSpec,
@@ -129,6 +130,9 @@ def rule_value_sources(rule: Rule) -> frozenset[str]:
     def visit(term: RuleTerm) -> None:
         if isinstance(term, RuleValueRef):
             sources.add(term.source)
+        elif isinstance(term, RuleLookupByKey):
+            sources.add(term.source)
+            visit(term.key)
         elif isinstance(term, RuleArithmetic):
             visit(term.left)
             visit(term.right)
@@ -241,6 +245,33 @@ def _resolve_term(term: RuleTerm, context: RuleExecutionContext) -> Any:
     if isinstance(term, RuleValueRef):
         root = getattr(context, term.source)
         value = _resolve_pointer(root, term.pointer)
+        if value is not _MISSING:
+            _require_declared_type(value, term.value_type)
+        return value
+    if isinstance(term, RuleLookupByKey):
+        root = getattr(context, term.source)
+        collection = _resolve_pointer(root, term.collection_pointer)
+        if collection is _MISSING:
+            return _MISSING
+        if not isinstance(collection, list):
+            raise RuleEvaluationError("lookup_by_key collection is not an array")
+        if len(collection) > _MAX_RUNTIME_CONTAINER_ITEMS:
+            raise RuleEvaluationError("lookup_by_key collection exceeds framework limits")
+        key = _resolve_term(term.key, context)
+        if key is _MISSING:
+            raise RuleEvaluationError("lookup_by_key key is absent")
+        matches = [
+            item
+            for item in collection
+            if isinstance(item, Mapping)
+            and term.key_field in item
+            and _canonical_equal(item[term.key_field], key)
+        ]
+        if not matches:
+            return _MISSING
+        if len(matches) != 1:
+            raise RuleEvaluationError("lookup_by_key matched more than one state record")
+        value = _resolve_pointer(matches[0], term.value_pointer)
         if value is not _MISSING:
             _require_declared_type(value, term.value_type)
         return value

@@ -565,14 +565,15 @@ def _validate_handshake_result(result: Mapping[str, JsonValue], *, request_id: s
                 request_id=request_id,
             )
         for schema_name in ("input_schema", "output_schema", "observation_schema"):
-            if not isinstance(tool[schema_name], dict):
+            schema = tool[schema_name]
+            if not isinstance(schema, dict):
                 raise ProtocolViolation(
                     "invalid_handshake",
                     f"handshake tool {tool_id} {schema_name} must be an object",
                     request_id=request_id,
                 )
             try:
-                Draft202012Validator.check_schema(tool[schema_name])
+                Draft202012Validator.check_schema(schema)
             except SchemaError as exc:
                 raise ProtocolViolation(
                     "invalid_handshake",

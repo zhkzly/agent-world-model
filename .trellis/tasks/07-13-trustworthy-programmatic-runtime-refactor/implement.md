@@ -367,12 +367,14 @@ agent_world/
 
 本轮不是单点 Verifier 补丁，按以下顺序破坏性实施：
 
-1. 生产遥测底座：WorkSpan、usage provenance、SQLite WAL、Audit bridge、CLI inspect/export/ExperimentSnapshot；先让后续真实运行全部可测。
-2. ClaimVector、GateEffect、ArtifactMaturity、NodeCommit 与 IntegrationReport；成熟度完全由 framework reducer 推导。
-3. RepairRouter v2 与唯一 RepairLedger：owner-by-DAG、跳距/因果、fingerprint/no-progress、精确 invalidation/retention。
-4. 拆分 EnvironmentJudge：不依赖 Verifier 的真实 Integration lane，与严格 Release Judge 分离；Verifier 失败只 block release。
-5. `VerifierIntent -> deterministic VerifierIR`，每个 batch 独立 Artifact/NodeCommit，恢复只重跑缺失 batch。
-6. Release Kernel 将 exact IntegrationReport、ClaimVector、VerifierIR、Release Judge 和 required claims join 后才允许 envpkg v3/Registry promotion。
-7. 使用真实 `用户预订宾馆` request、真实 Search/Codex `gpt-5.4-mini`、clean install、未知 seed rollout、sealed Judge、envpkg v3、Registry、Suite/RPC 完成 live acceptance；再演练 Verifier 中断恢复，证明 Research/Design/Build 没有重放。
+1. 冻结宾馆预订失败 run，记录 pre-build Agent turn/token/wall-time、issue 和 Artifact retention 基线。
+2. 引入 FeedbackContract catalog，所有 validator/Gate/review 声明 Claim、timing、executor、cost、owner、repair target、retry、backjump、invalidation 与 effect；机械错误不得进入 LLM Router。
+3. 将 Direct Designer 从逐实体/逐 schema/逐语义 shard 调用重构为 compact WorldArchitecture + bounded ToolSemanticsBatch + WorldRules + deterministic compiler；首次 Build 前 Agent turn 硬上限 9、典型 7。
+4. RepairRouter/RepairLedger 使用精确 RepairTargetRef 和 immutable input refs；每批 issue 聚合为一个 RepairAction，相同 frontier/issue set 一次后停止，失效按 Artifact dependency closure 推导。
+5. 保留单一最终 Builder：完整 Task/Curriculum 先进入 EnvironmentDesign；Builder 与 VerifierIntent 并行，Builder commit 后立即复用现有 Integration lane 对相同最终 digest 做 clean install/ABI/reset-step，不新增 tainted DiagnosticCandidate 或第二成功路径。
+6. 保留并复验现有 WorkSpan、ClaimVector、GateEffect、ArtifactMaturity、NodeCommit、IntegrationReport、VerifierIntent compiler 和 Release Kernel；删除重复、无 Claim 或错误时机的反馈点。
+7. 先跑确定性 schema/ref/router/repair/invalidation 单测，再跑 Designer/Builder/Integration 分阶段真实测试，避免每次从 Research 重放。
+8. 使用真实 `用户预订宾馆` request、真实 Search/Codex `gpt-5.4-mini`、clean install、未知 seed rollout、sealed Judge、envpkg v3、Registry、Suite/RPC 完成 live acceptance；目标 pre-build token/wall-time 比冻结基线下降至少 60%。
+9. 独立 Agent 按项目目的复审最终 node/feedback catalog、调用次数、回跳和 release closure；将经验同步到 source of truth 与 Trellis backend spec。
 
 每个阶段必须同时交付确定性合同测试、故障注入测试和真实执行证据。fixture 只能证明 framework 协议，不能算 live Foundry 成功；外部能力缺失时只能诚实失败/skip/needs_human。

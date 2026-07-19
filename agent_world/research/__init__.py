@@ -20,6 +20,7 @@ from .models import (
 )
 from .passages import build_evidence_passage_pack
 from .providers import (
+    BingRssSearchProvider,
     HttpFetcher,
     JinaReaderFetcher,
     JinaSearchProvider,
@@ -34,6 +35,7 @@ from .security import ResearchSafetyError
 from .service import ResearchAccessPolicy, ResearchToolchain
 
 __all__ = [
+    "BingRssSearchProvider",
     "ExtractedDocument",
     "FetchFailure",
     "FetchedDocument",

@@ -332,6 +332,52 @@ Controller 内部持有一个横切 telemetry service，但五组件只发送 ba
 
 数据合同覆盖 hierarchical span、token provenance、search/fetch/extract、tool、build/runtime、Gate/Claim/maturity、repair/backjump/retention、Registry、Consumer 和 Evolve。Unknown 不等于 0；raw prompt、secret、sealed/EvaluatorGoal 不得进入 telemetry。CLI 提供 `inspect --metrics`、JSON/Parquet export 与 experiment snapshot/compare/summarize。
 
+### 6.8 Feedback contracts and execution placement
+
+Node、Artifact、validation claim、observability span 和 Agent transaction 是五种不同对象。
+Artifact/claim/span 可以细；昂贵 Agent transaction 必须少且有界。每个反馈点注册
+`FeedbackContract(claim, timing_reason, executor, cost_class, owner,
+maximum_attempts, maximum_backjump, invalidation_boundary, effect)`；没有合同的
+validator/Gate 不得进入生产 catalog。Contract 是静态策略；动态 `FeedbackResult` 才绑定
+精确 subject、RepairTarget、diagnostic、evidence 与 usage。
+
+执行权固定如下：
+
+- code：shape/schema/ref/type/rule compile/permission/projection、budget、retry、router、
+  no-progress、invalidation、maturity、release；
+- real execution：build/install/protocol/reset-step/reachability/property/sealed/deploy；
+- LLM advisory：evidence synthesis、business/world/tool/task semantics、adversarial intent；
+- hybrid：LLM 产出 typed semantic source，framework 编译并拥有所有控制效果。
+
+RepairLedger 保持 run-global，但授权 key 从粗粒度 NodeKind 扩展为
+`RepairTargetRef(component, artifact_slot, batch_id, immutable_input_refs)`。例如
+`design.world_architecture`、`design.tool_semantics:booking-1`、
+`judge.verifier_intent:batch-2`。顶层 owner 仍用于组件路由；实际 invalidation 从 target
+Artifact dependency closure 推导，不能因为 target 属于 design 就清空全部后代。
+
+### 6.9 Bounded semantic transaction topology
+
+Direct Designer 改为：
+
+```text
+ResearchPlan -> real search/fetch/extract -> EvidenceSynthesis
+-> WorldArchitecture transaction
+-> deterministic schema/reference compiler
+-> ToolSemanticsBatch × bounded partitions (up to 4 coupled tools)
+-> one WorldRules transaction
+-> deterministic WorldSpec closure
+-> one TaskCurriculumSemantics transaction
+-> deterministic Task/Reward/VerificationRequirements compiler
+-> optional bounded SemanticRepair (whole run maximum 2)
+-> ModelingGate
+```
+
+首次真实 Build 前硬上限 9 个 Agent turn，典型 7。实体数量只扩大 typed IR 和
+deterministic compile，不扩大 Agent turn；工具数量只按 context-bound semantic batch 扩大。
+完整 Task/Curriculum 必须在 Builder 前编译进 EnvironmentDesign，因为 Builder 要一次生成
+最终 Task Materializer。只有 Challenger VerifierIntent 可与 Builder 并行；Builder commit 后
+现有 Integration 对同一最终 digest 立即启动。现阶段不引入第二 Diagnostic Builder。
+
 ## 7. Direct Generation Flow
 
 ### 7.1 Intake

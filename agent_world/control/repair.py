@@ -11,6 +11,7 @@ from agent_world.artifact_store import ArtifactWriter
 from agent_world.contracts import ArtifactRef, BudgetUsage, Finding
 
 from .decision import StructuredRepairMode
+from .feedback import RepairTargetRef
 from .models import NodeKind, RepairDirective, RepairLedgerEntry
 from .validation import ValidationDiagnostic
 
@@ -52,6 +53,8 @@ class StructuredRepairAuthority(Protocol):
         issue_codes: tuple[str, ...],
         continued_session: bool,
         diagnostic: ValidationDiagnostic | None = None,
+        feedback_contract_id: str | None = None,
+        repair_target: RepairTargetRef | None = None,
     ) -> str: ...
 
     async def complete(
@@ -185,8 +188,23 @@ class RepairLedger:
             raise ValueError("RepairLedger entry is already terminal")
         before = set(current.blocking_claim_ids_before)
         after = set(blocking_claim_ids_after)
+        seen_blocker_sets = {
+            frozenset(blockers)
+            for item in self._entries
+            if item.entry_id != current.entry_id
+            and item.finding_fingerprint == current.finding_fingerprint
+            and item.target_node == current.target_node
+            for blockers in (
+                item.blocking_claim_ids_before,
+                item.blocking_claim_ids_after,
+            )
+            if blockers
+        }
+        oscillated = bool(after) and frozenset(after) in seen_blocker_sets
         if not after:
             outcome = "resolved"
+        elif oscillated:
+            outcome = "no_progress"
         elif after < before:
             outcome = "progressed"
         elif progress_evidence in {"issue_set_changed", "validation_stage_advanced"}:
@@ -348,7 +366,7 @@ class RepairRouter:
             + hashlib.sha256(
                 (
                     f"{current_node}\0{owner}\0{action}\0"
-                    f"{owner_ref.revision_id if owner_ref is not None else 'unresolved'}"
+                    f"{owner_ref.artifact_type if owner_ref is not None else 'unresolved'}"
                 ).encode()
             ).hexdigest()
         )

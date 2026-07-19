@@ -171,6 +171,60 @@ def test_live_trace_reports_running_time_as_provisional(tmp_path: Path) -> None:
         assert complete["terminal_span_count"] == 2
 
 
+def test_semantic_transaction_costs_are_aggregated_without_prompt_content(
+    tmp_path: Path,
+) -> None:
+    with TelemetryStore(tmp_path / "telemetry") as store:
+        span = store.start_span(
+            trace_id="run:transactions",
+            component="invocation",
+            operation="agent.invoke",
+            run_id="run:transactions",
+            attributes={
+                "semantic_transaction": "design.world-architecture",
+                "repair_mode": "contract-correction",
+            },
+        )
+        span.finish(
+            status="passed",
+            metrics=(
+                MetricPoint(
+                    "invocation.tokens.total",
+                    1200,
+                    "tokens",
+                    "provider",
+                    {
+                        "transaction": "design.world-architecture",
+                        "repair_mode": "contract-correction",
+                    },
+                ),
+                MetricPoint(
+                    "invocation.tokens.input",
+                    900,
+                    "tokens",
+                    "provider",
+                    {
+                        "transaction": "design.world-architecture",
+                        "repair_mode": "contract-correction",
+                    },
+                ),
+            ),
+        )
+
+        transaction = store.inspect_trace("run:transactions")["summary"][
+            "semantic_transactions"
+        ]["design.world-architecture"]
+        assert transaction["turns"] == 1
+        assert transaction["tokens_total"] == 1200
+        assert transaction["tokens_input"] == 900
+        assert transaction["duration_ms"] >= 0
+        repair = store.inspect_trace("run:transactions")["summary"]["repair_modes"][
+            "contract-correction"
+        ]
+        assert repair["turns"] == 1
+        assert repair["tokens_total"] == 1200
+
+
 def test_invocation_admission_is_visible_to_an_independent_reader(tmp_path: Path) -> None:
     root = tmp_path / "telemetry"
     with (
@@ -193,7 +247,11 @@ def test_invocation_admission_is_visible_to_an_independent_reader(tmp_path: Path
                 prompt="content-must-not-be-persisted",
                 profile=profile,
                 session=None,
-                metadata={"trace_id": "run:invocation-live", "role": "designer"},
+                metadata={
+                    "trace_id": "run:invocation-live",
+                    "role": "designer",
+                    "repair_mode": "contract_correction",
+                },
             ),
         )
 
@@ -204,6 +262,8 @@ def test_invocation_admission_is_visible_to_an_independent_reader(tmp_path: Path
         assert observed["spans"][0]["status"] == "running"
         attributes = json.loads(observed["spans"][0]["attributes_json"])
         assert attributes["input_bytes"] == len(request.prompt.encode("utf-8"))
+        assert attributes["repair_mode"] == "contract_correction"
+        assert observed["summary"]["repair_modes"]["contract_correction"]["turns"] == 1
         assert "prompt_bytes" not in attributes
         assert request.prompt not in observed["spans"][0]["attributes_json"]
         span.finish(status="passed")

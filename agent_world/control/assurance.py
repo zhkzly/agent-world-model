@@ -274,6 +274,34 @@ class NodeCommit(V2Contract):
         return self
 
 
+class SemanticNodeCommit(V2Contract):
+    """Final commit for one internal semantic transaction.
+
+    Source Artifacts may be written before a process crashes.  Only this
+    framework-authored record makes one exact source revision resumable.
+    """
+
+    commit_id: Identifier
+    job_ref: ArtifactRef
+    node: Identifier
+    detail: Identifier | None = None
+    subject_ref: ArtifactRef
+    immutable_input_refs: tuple[ArtifactRef, ...]
+    derived_refs: tuple[ArtifactRef, ...] = ()
+    validator_contract_digest: str
+    committed_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_commit_graph(self) -> SemanticNodeCommit:
+        if len(set(self.immutable_input_refs)) != len(self.immutable_input_refs):
+            raise ValueError("semantic commit immutable inputs must be unique")
+        if len(set(self.derived_refs)) != len(self.derived_refs):
+            raise ValueError("semantic commit derived refs must be unique")
+        if self.subject_ref in {*self.immutable_input_refs, *self.derived_refs}:
+            raise ValueError("semantic commit subject must not repeat an input or derived ref")
+        return self
+
+
 def reduce_maturity(
     claims: tuple[AssuranceClaim, ...] | list[AssuranceClaim],
 ) -> tuple[ArtifactMaturity, tuple[Identifier, ...]]:
@@ -335,6 +363,7 @@ __all__ = [
     "NodeCommit",
     "TelemetryReleaseSummary",
     "ResearchCheckpointReuseEvidence",
+    "SemanticNodeCommit",
     "claim",
     "reduce_maturity",
 ]

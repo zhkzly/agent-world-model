@@ -306,6 +306,17 @@ Generated code 默认不可信；network/filesystem/process/secret/cost least pr
 
 每个 run/campaign 可查看 artifact DAG、active findings、agent sessions、Gate evidence、budget、repair history、lineage、terminal reason 和 next ready work。
 
+### SYS-07 Feedback and bounded Agent transactions
+
+- 每个 validator、Gate、LLM review 和 repair trigger 必须有完整 FeedbackContract；
+- JSON/schema/ref/type/protocol/budget/retry/router/invalidation/release 由代码拥有；
+- LLM 只拥有 evidence/world/tool/task/adversarial 语义 proposal，输出仍由 framework 编译；
+- 首次真实 Build 前 Agent turn 硬上限 9、典型 7，调用数不得按实体数量线性增长；
+- Tool Semantics 按 2–3 个共享状态/namespace 的工具有界分批；
+- 每个语义批次最多一次普通 correction；generic root error 不得重复调用模型；
+- 自动 backjump 最大 1，且必须有 causal evidence；Research 只接受 hard external correction；
+- 当前不引入第二 DiagnosticCandidate；Builder commit 后立即运行的 Integration 必须绑定最终 candidate digest。未来 staged Builder 只有在 live metrics 达到预先声明阈值后才能立项，且所有最终 Gate 必须对 final digest 重跑。
+
 ## 8. Optional Consumption Requirements
 
 - Framework-neutral local consumer 先提供 reset/step/reward/termination/trace contract。

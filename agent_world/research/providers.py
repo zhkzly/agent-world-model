@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, urljoin, urlsplit
 
 import httpx
+from defusedxml import ElementTree as ET  # type: ignore[import-untyped]
 
 from .models import (
     ExtractedDocument,
@@ -90,7 +91,10 @@ class UrlPolicy:
         additional_allowed_domain_sets: Iterable[Iterable[str]] = (),
         private_host_exceptions: Iterable[str] = (),
         allow_rfc2544_synthetic_egress: bool = False,
+        dns_timeout_seconds: float = 10.0,
     ) -> None:
+        if dns_timeout_seconds <= 0:
+            raise ValueError("DNS timeout must be positive")
         domain_sets = (
             tuple(allowed_domains),
             *tuple(tuple(items) for items in additional_allowed_domain_sets),
@@ -102,6 +106,7 @@ class UrlPolicy:
             self._normalize_host(item) for item in private_host_exceptions
         )
         self._allow_rfc2544_synthetic_egress = allow_rfc2544_synthetic_egress
+        self._dns_timeout_seconds = dns_timeout_seconds
 
     @staticmethod
     def _normalize_host(value: str) -> str:
@@ -161,10 +166,17 @@ class UrlPolicy:
             addresses = (literal,)
         except ValueError:
             try:
-                resolved = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda: socket.getaddrinfo(host, port, type=socket.SOCK_STREAM),
+                resolved = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        socket.getaddrinfo,
+                        host,
+                        port,
+                        type=socket.SOCK_STREAM,
+                    ),
+                    timeout=self._dns_timeout_seconds,
                 )
+            except TimeoutError as exc:
+                raise ResearchProviderError(f"DNS resolution timed out for {host}") from exc
             except OSError as exc:
                 raise ResearchProviderError(f"DNS resolution failed for {host}: {exc}") from exc
             addresses = tuple(
@@ -396,6 +408,140 @@ class SearxngSearchProvider:
             raw_response_sha256=hashlib.sha256(response_content).hexdigest(),
             hits=tuple(hits),
             upstream_failures=upstream_failures,
+        )
+
+
+class BingRssSearchProvider:
+    """Use Bing's public RSS search surface with bounded strict XML parsing.
+
+    RSS entries are discovery hints only.  ResearchToolchain still has to
+    fetch and extract the selected source body before any claim can cite it.
+    """
+
+    name = "bing-rss"
+
+    def __init__(
+        self,
+        endpoint: str = "https://www.bing.com/search",
+        *,
+        timeout_seconds: float = 20,
+        allow_rfc2544_synthetic_egress: bool = False,
+    ) -> None:
+        parsed = urlsplit(endpoint)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != "www.bing.com"
+            or parsed.port is not None
+            or parsed.path != "/search"
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ResearchProviderError(
+                "Bing RSS endpoint must be the exact credential-free HTTPS search origin"
+            )
+        self.endpoint = endpoint.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self._policy = UrlPolicy(
+            allowed_domains=("www.bing.com",),
+            allow_rfc2544_synthetic_egress=allow_rfc2544_synthetic_egress,
+            dns_timeout_seconds=min(10.0, timeout_seconds),
+        )
+
+    async def search(
+        self,
+        query: SearchQuery,
+        *,
+        limit: int = 10,
+        credential_handles: frozenset[str] = frozenset(),
+    ) -> SearchRecord:
+        del credential_handles
+        requested_at = datetime.now(UTC)
+        params: dict[str, str | int] = {
+            "q": query.text,
+            "format": "rss",
+            "count": min(50, max(1, limit)),
+        }
+        language = query.language.strip().lower()
+        if language not in {"", "all", "auto"}:
+            if language.startswith("zh"):
+                params.update({"setlang": "zh-Hans", "mkt": "zh-CN"})
+            elif language.startswith("en"):
+                params.update({"setlang": "en", "mkt": "en-US"})
+            else:
+                params["setlang"] = language
+        try:
+            async with asyncio.timeout(self.timeout_seconds):
+                resolution = await self._policy.resolve(self.endpoint)
+                async with httpx.AsyncClient(
+                    timeout=self.timeout_seconds,
+                    follow_redirects=False,
+                    trust_env=False,
+                ) as client:
+                    async with client.stream("GET", self.endpoint, params=params) as response:
+                        await _verify_response_route(
+                            response,
+                            policy=self._policy,
+                            before=resolution,
+                        )
+                        if response.is_redirect:
+                            raise ResearchProviderError(
+                                "Bing RSS endpoint redirects are forbidden"
+                            )
+                        response.raise_for_status()
+                        response_content = await _read_response_bytes(
+                            response,
+                            maximum=_MAX_SEARCH_RESPONSE_BYTES,
+                        )
+        except TimeoutError as exc:
+            raise SearchUpstreamUnavailable("Bing RSS request timed out") from exc
+        except httpx.HTTPError as exc:
+            raise SearchUpstreamUnavailable("Bing RSS transport is unavailable") from exc
+        lowered = response_content[:4096].lower()
+        if b"<!doctype" in lowered or b"<!entity" in lowered:
+            raise ResearchProviderError("Bing RSS response contains forbidden XML declarations")
+        try:
+            root = ET.fromstring(response_content)
+        except (ET.ParseError, UnicodeError) as exc:
+            raise ResearchProviderError("Bing RSS did not return valid bounded XML") from exc
+        if root.tag != "rss":
+            raise ResearchProviderError("Bing RSS response root is not rss")
+        hits: list[SearchHit] = []
+        seen: set[str] = set()
+        for item in root.findall("./channel/item"):
+            url = (item.findtext("link") or "").strip()
+            title = (item.findtext("title") or url).strip()
+            snippet = (item.findtext("description") or "").strip()
+            published = (item.findtext("pubDate") or "").strip() or None
+            parsed = urlsplit(url)
+            if (
+                not url
+                or url in seen
+                or parsed.scheme not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                continue
+            seen.add(url)
+            hits.append(
+                SearchHit(
+                    url=url,
+                    title=normalize_research_text(title),
+                    snippet=normalize_research_text(snippet),
+                    engine=self.name,
+                    published_at=published,
+                )
+            )
+            if len(hits) >= limit:
+                break
+        return SearchRecord(
+            query=query,
+            provider=self.name,
+            requested_at=requested_at,
+            raw_response_sha256=hashlib.sha256(response_content).hexdigest(),
+            hits=tuple(hits),
         )
 
 
@@ -856,6 +1002,7 @@ class TrafilaturaExtractor:
 
 
 __all__ = [
+    "BingRssSearchProvider",
     "HttpFetcher",
     "JinaReaderFetcher",
     "JinaSearchProvider",

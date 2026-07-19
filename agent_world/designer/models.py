@@ -14,6 +14,7 @@ from agent_world.agent_output_authority import (
     register_agent_output_contract,
 )
 from agent_world.contracts import (
+    ArtifactRef,
     Claim,
     ConcurrencySemantics,
     ContentHash,
@@ -41,6 +42,7 @@ from agent_world.contracts import (
     ToolSemantics,
     ToolSurface,
     TransactionSemantics,
+    V2Contract,
     VerificationRequirements,
     WorldBoundary,
 )
@@ -273,13 +275,117 @@ class ToolSurfacePlan(AgentOutput):
     name: Identifier
     description: Annotated[str, Field(min_length=1)]
     transport: Literal["runtime", "mcp", "http", "cli", "python", "database"]
+    reads_state_entities: tuple[Identifier, ...] = ()
+    writes_state_entities: tuple[Identifier, ...] = ()
     evidence_claim_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def validate_state_footprint(self) -> ToolSurfacePlan:
+        if len(set(self.reads_state_entities)) != len(self.reads_state_entities):
+            raise ValueError("tool plan read-state entities must be unique")
+        if len(set(self.writes_state_entities)) != len(self.writes_state_entities):
+            raise ValueError("tool plan write-state entities must be unique")
+        if not (self.reads_state_entities or self.writes_state_entities):
+            raise ValueError("tool plan must declare a non-empty read/write state footprint")
+        return self
 
 
 class WorldToolPlanInventoryDraft(AgentOutput):
     """Bounded tool identities and evidence bindings, without recursive schemas."""
 
     tools: Annotated[tuple[ToolSurfacePlan, ...], Field(min_length=1, max_length=8)]
+
+
+class CompactFieldSemanticDraft(AgentOutput):
+    """Business meaning for one flat field; framework owns schema graph syntax."""
+
+    name: Identifier
+    value_type: Literal["string", "integer", "number", "boolean"]
+    description: Annotated[str, Field(min_length=1)]
+    required: bool = True
+    nullable: bool = False
+    repeated: bool = False
+    string_format: Literal["none", "date", "date-time", "email", "uri", "uuid"] = "none"
+    enum_values: Annotated[tuple[str, ...], Field(max_length=32)] = ()
+    minimum: float | None = None
+    maximum: float | None = None
+
+    @model_validator(mode="after")
+    def validate_type_constraints(self) -> CompactFieldSemanticDraft:
+        if self.value_type != "string" and (
+            self.string_format != "none" or self.enum_values
+        ):
+            raise ValueError("format and enum values are valid only for string fields")
+        if self.value_type not in {"integer", "number"} and (
+            self.minimum is not None or self.maximum is not None
+        ):
+            raise ValueError("numeric bounds are valid only for integer/number fields")
+        if (
+            self.minimum is not None
+            and self.maximum is not None
+            and self.minimum > self.maximum
+        ):
+            raise ValueError("field minimum cannot exceed maximum")
+        if len(set(self.enum_values)) != len(self.enum_values):
+            raise ValueError("field enum values must be unique")
+        return self
+
+
+class ToolInterfaceSourceDraft(AgentOutput):
+    """Schema meaning owned by exactly one enclosing tool source."""
+
+    input_fields: Annotated[tuple[CompactFieldSemanticDraft, ...], Field(max_length=32)] = ()
+    output_fields: Annotated[
+        tuple[CompactFieldSemanticDraft, ...], Field(max_length=32)
+    ] = ()
+    observation_fields: Annotated[
+        tuple[CompactFieldSemanticDraft, ...], Field(max_length=32)
+    ] = ()
+
+    @model_validator(mode="after")
+    def validate_field_sets(self) -> ToolInterfaceSourceDraft:
+        for role, fields in (
+            ("input", self.input_fields),
+            ("output", self.output_fields),
+            ("observation", self.observation_fields),
+        ):
+            names = tuple(item.name for item in fields)
+            if len(set(names)) != len(names):
+                raise ValueError(f"tool {role} field names must be unique")
+        if not (self.output_fields or self.observation_fields):
+            raise ValueError("tool interface requires output or observation fields")
+        return self
+
+
+class ToolSurfaceSourceDraft(AgentOutput):
+    """Agent-owned tool meaning; framework derives the canonical tool id."""
+
+    namespace: Identifier
+    name: Identifier
+    description: Annotated[str, Field(min_length=1)]
+    transport: Literal["runtime", "mcp", "http", "cli", "python", "database"]
+    reads_state_entities: tuple[Identifier, ...] = ()
+    writes_state_entities: tuple[Identifier, ...] = ()
+    evidence_claim_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    interface: ToolInterfaceSourceDraft
+
+    @property
+    def tool_id(self) -> str:
+        return f"{self.namespace}.{self.name}"
+
+    @model_validator(mode="after")
+    def validate_state_footprint(self) -> ToolSurfaceSourceDraft:
+        if len(set(self.reads_state_entities)) != len(self.reads_state_entities):
+            raise ValueError("tool source read-state entities must be unique")
+        if len(set(self.writes_state_entities)) != len(self.writes_state_entities):
+            raise ValueError("tool source write-state entities must be unique")
+        if not (self.reads_state_entities or self.writes_state_entities):
+            raise ValueError("tool source must declare a non-empty read/write state footprint")
+        return self
+
+
+class WorldToolSourceInventoryDraft(AgentOutput):
+    tools: Annotated[tuple[ToolSurfaceSourceDraft, ...], Field(min_length=1, max_length=8)]
 
 
 class ToolSurfaceSchemasDraft(AgentOutput):
@@ -409,8 +515,26 @@ class RuleReferenceDraft(AgentOutput):
     value_type: RuleValueType
 
 
-RuleAtomDraft = Annotated[
+RuleLookupKeyDraft = Annotated[
     RuleConstantDraft | RuleReferenceDraft,
+    Field(discriminator="kind"),
+]
+
+
+class RuleLookupByKeyDraft(AgentOutput):
+    """Bounded state-collection selector compiled into executable Rule IR."""
+
+    kind: Literal["lookup_by_key"]
+    source: Literal["pre_state", "post_state"]
+    collection_pointer: str
+    key_field: Identifier
+    key: RuleLookupKeyDraft
+    value_pointer: str = ""
+    value_type: RuleValueType
+
+
+RuleAtomDraft = Annotated[
+    RuleConstantDraft | RuleReferenceDraft | RuleLookupByKeyDraft,
     Field(discriminator="kind"),
 ]
 
@@ -425,7 +549,7 @@ class RuleArithmeticDraft(AgentOutput):
 
 
 RuleTermDraft = Annotated[
-    RuleConstantDraft | RuleReferenceDraft | RuleArithmeticDraft,
+    RuleConstantDraft | RuleReferenceDraft | RuleLookupByKeyDraft | RuleArithmeticDraft,
     Field(discriminator="kind"),
 ]
 
@@ -566,8 +690,9 @@ class PermissionRuleSourceDraft(AgentOutput):
 
 
 class ObservationSemanticsSourceDraft(AgentOutput):
+    """Agent chooses visibility; framework derives the exact redacted complement."""
+
     visible_fields_by_actor: dict[Identifier, tuple[Identifier, ...]]
-    redacted_fields_by_actor: dict[Identifier, tuple[Identifier, ...]]
     consistency: Literal["strong", "read_after_write", "eventual", "snapshot"]
     staleness_bound_seconds: Annotated[float | None, Field(ge=0)] = None
 
@@ -734,15 +859,28 @@ class WorldClosureConstantTerm(AgentOutput):
     value: JsonValue
 
 
+class WorldClosureLookupTerm(AgentOutput):
+    kind: Literal["lookup_by_key"]
+    source: Literal["pre_state", "post_state"]
+    collection_pointer: str
+    key_field: Identifier
+    key: WorldClosureReferenceTerm | WorldClosureConstantTerm
+    value_pointer: str
+    value_type: RuleValueType
+
+
 class WorldClosureArithmeticTerm(AgentOutput):
     kind: Literal["arithmetic"]
     operator: Literal["add", "subtract", "multiply", "divide", "modulo"]
-    left: WorldClosureReferenceTerm | WorldClosureConstantTerm
-    right: WorldClosureReferenceTerm | WorldClosureConstantTerm
+    left: WorldClosureReferenceTerm | WorldClosureConstantTerm | WorldClosureLookupTerm
+    right: WorldClosureReferenceTerm | WorldClosureConstantTerm | WorldClosureLookupTerm
 
 
 WorldClosureTerm = Annotated[
-    WorldClosureReferenceTerm | WorldClosureConstantTerm | WorldClosureArithmeticTerm,
+    WorldClosureReferenceTerm
+    | WorldClosureConstantTerm
+    | WorldClosureLookupTerm
+    | WorldClosureArithmeticTerm,
     Field(discriminator="kind"),
 ]
 
@@ -1079,6 +1217,311 @@ class WorldSemanticSourceIRDraft(AgentOutput):
         return self
 
 
+class StateFieldSourceDraft(CompactFieldSemanticDraft):
+    """One state field declared once; framework derives plan and schema identity."""
+
+    role: Literal["primary_key", "mutable"]
+    lifecycle: bool = False
+
+    @model_validator(mode="after")
+    def validate_lifecycle_semantics(self) -> StateFieldSourceDraft:
+        if self.lifecycle and (
+            self.role != "mutable" or self.value_type != "string" or not self.enum_values
+        ):
+            raise ValueError(
+                "a lifecycle field must be mutable, string-valued and declare enum values"
+            )
+        return self
+
+
+class StateEntitySourceDraft(AgentOutput):
+    """Single Agent-owned source for state, resource ownership and visibility.
+
+    Boundary resources and actor-visible root fields are compiled from these
+    declarations.  They are deliberately not repeated in the boundary source.
+    """
+
+    entity: Identifier
+    purpose: Annotated[str, Field(min_length=1)]
+    root_field: Identifier
+    storage: Literal["collection", "singleton"]
+    system_of_record: Identifier
+    owned_resource_ids: tuple[Identifier, ...] = ()
+    visible_to_actor_ids: tuple[Identifier, ...] = ()
+    fields: Annotated[tuple[StateFieldSourceDraft, ...], Field(min_length=1, max_length=32)]
+    evidence_claim_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def validate_owned_sets(self) -> StateEntitySourceDraft:
+        if len(set(self.owned_resource_ids)) != len(self.owned_resource_ids):
+            raise ValueError("state entity owned resources must be unique")
+        if len(set(self.visible_to_actor_ids)) != len(self.visible_to_actor_ids):
+            raise ValueError("state entity visible actor ids must be unique")
+        return self
+
+
+class ActorAuthoritySourceDraft(AgentOutput):
+    """Actor identity and authority; state visibility is entity-owned."""
+
+    actor: Identifier
+    authorities: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def validate_authorities(self) -> ActorAuthoritySourceDraft:
+        if len(set(self.authorities)) != len(self.authorities):
+            raise ValueError("actor authorities must be unique")
+        return self
+
+
+class WorldBoundarySourceDraft(AgentOutput):
+    """Boundary meaning without duplicated resource or visibility indexes."""
+
+    primary_domain: Identifier
+    actors_and_authority: Annotated[
+        tuple[ActorAuthoritySourceDraft, ...], Field(min_length=1)
+    ]
+    systems_of_record: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    transition_authorities: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    tool_namespaces: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    core_invariants: Annotated[tuple[str, ...], Field(min_length=1)]
+    task_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    fidelity: Annotated[tuple[FidelityStatement, ...], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def validate_unique_boundary_sets(self) -> WorldBoundarySourceDraft:
+        actors = tuple(item.actor for item in self.actors_and_authority)
+        if len(set(actors)) != len(actors):
+            raise ValueError("boundary actor ids must be unique")
+        for label, values in (
+            ("systems_of_record", self.systems_of_record),
+            ("transition_authorities", self.transition_authorities),
+            ("tool_namespaces", self.tool_namespaces),
+            ("core_invariants", self.core_invariants),
+            ("task_dimensions", self.task_dimensions),
+        ):
+            if len(set(values)) != len(values):
+                raise ValueError(f"boundary source {label} values must be unique")
+        return self
+
+
+class StateEntityFieldsSourceDraft(AgentOutput):
+    entity: Identifier
+    fields: Annotated[tuple[CompactFieldSemanticDraft, ...], Field(min_length=1, max_length=32)]
+
+    @model_validator(mode="after")
+    def validate_unique_fields(self) -> StateEntityFieldsSourceDraft:
+        names = tuple(item.name for item in self.fields)
+        if len(set(names)) != len(names):
+            raise ValueError("state entity field names must be unique")
+        return self
+
+
+class WorldArchitectureSourceDraft(AgentOutput):
+    """One coherent architecture transaction before tool behavior is authored.
+
+    The Agent owns field and resource meaning, but not schema node ids, graph
+    edges, nullable wrappers or JSON Schema syntax.  The framework compiles all
+    of those mechanically, so cardinality increases output data rather than
+    Agent turns or reasoning surface.
+    """
+
+    boundary: WorldBoundarySourceDraft
+    state_entities: Annotated[
+        tuple[StateEntitySourceDraft, ...], Field(min_length=1, max_length=12)
+    ]
+    tool_inventory: WorldToolSourceInventoryDraft
+
+
+class ToolCouplingGroupPlan(V2Contract):
+    group_id: Identifier
+    ordered_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=8)]
+    shared_state_entity_ids: tuple[Identifier, ...] = ()
+    namespaces: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    coupling_reasons: Annotated[
+        tuple[Literal["namespace", "state_overlap"], ...], Field(min_length=1)
+    ]
+    mode: Literal["single_batch", "multi_batch"]
+    batches: Annotated[
+        tuple[Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=4)], ...],
+        Field(min_length=1, max_length=2),
+    ]
+
+    @model_validator(mode="after")
+    def validate_batches(self) -> ToolCouplingGroupPlan:
+        flattened = tuple(tool_id for batch in self.batches for tool_id in batch)
+        if flattened != self.ordered_tool_ids:
+            raise ValueError("coupling batches must preserve exact group tool order and identity")
+        if self.mode == "single_batch" and len(self.batches) != 1:
+            raise ValueError("single_batch coupling group requires exactly one batch")
+        if self.mode == "multi_batch" and len(self.batches) < 2:
+            raise ValueError("multi_batch coupling group requires at least two batches")
+        return self
+
+
+class ToolCouplingPlan(V2Contract):
+    plan_id: Identifier
+    architecture_ref: ArtifactRef
+    groups: Annotated[tuple[ToolCouplingGroupPlan, ...], Field(min_length=1, max_length=8)]
+    execution_batches: Annotated[
+        tuple[Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=4)], ...],
+        Field(min_length=1, max_length=2),
+    ]
+
+    @model_validator(mode="after")
+    def validate_unique_membership(self) -> ToolCouplingPlan:
+        group_ids = tuple(group.group_id for group in self.groups)
+        tool_ids = tuple(tool_id for group in self.groups for tool_id in group.ordered_tool_ids)
+        if len(set(group_ids)) != len(group_ids):
+            raise ValueError("tool coupling group ids must be unique")
+        if len(set(tool_ids)) != len(tool_ids):
+            raise ValueError("each tool must belong to exactly one coupling group")
+        scheduled = tuple(tool_id for batch in self.execution_batches for tool_id in batch)
+        if set(scheduled) != set(tool_ids) or len(scheduled) != len(tool_ids):
+            raise ValueError(
+                "execution batches must schedule every coupling-plan tool exactly once"
+            )
+        return self
+
+
+class SharedAtomicityDomainSourceDraft(AgentOutput):
+    domain_id: Identifier
+    member_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=8)]
+    atomicity: Literal["atomic", "best_effort", "saga", "none"]
+    rationale: Annotated[str, Field(min_length=1)]
+
+
+class SharedConcurrencyDomainSourceDraft(AgentOutput):
+    domain_id: Identifier
+    member_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=8)]
+    isolation: Literal[
+        "serial",
+        "serializable",
+        "snapshot",
+        "read_committed",
+        "optimistic",
+        "last_write_wins",
+    ]
+    rationale: Annotated[str, Field(min_length=1)]
+
+
+class SharedIdempotencyDomainSourceDraft(AgentOutput):
+    domain_id: Identifier
+    member_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=8)]
+    mode: Literal["none", "natural", "idempotency_key"]
+    rationale: Annotated[str, Field(min_length=1)]
+
+
+class SharedOrderingConstraintSourceDraft(AgentOutput):
+    before_tool_id: Identifier
+    after_tool_id: Identifier
+    rationale: Annotated[str, Field(min_length=1)]
+    evidence_claim_ids: tuple[Identifier, ...] = ()
+
+
+class SharedCompensationEdgeSourceDraft(AgentOutput):
+    failure_tool_id: Identifier
+    compensation_tool_id: Identifier
+    rationale: Annotated[str, Field(min_length=1)]
+
+
+class SharedErrorPolicySourceDraft(AgentOutput):
+    policy_id: Identifier
+    member_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=8)]
+    required_error_suffix: Identifier
+    retryable: bool
+    rationale: Annotated[str, Field(min_length=1)]
+
+
+class SharedToolSemanticsSourceDraft(AgentOutput):
+    atomicity_domains: Annotated[
+        tuple[SharedAtomicityDomainSourceDraft, ...], Field(min_length=1, max_length=8)
+    ]
+    concurrency_domains: Annotated[
+        tuple[SharedConcurrencyDomainSourceDraft, ...], Field(min_length=1, max_length=8)
+    ]
+    idempotency_domains: Annotated[
+        tuple[SharedIdempotencyDomainSourceDraft, ...], Field(min_length=1, max_length=8)
+    ]
+    ordering_constraints: Annotated[
+        tuple[SharedOrderingConstraintSourceDraft, ...], Field(max_length=16)
+    ] = ()
+    compensation_edges: Annotated[
+        tuple[SharedCompensationEdgeSourceDraft, ...], Field(max_length=16)
+    ] = ()
+    error_policies: Annotated[
+        tuple[SharedErrorPolicySourceDraft, ...], Field(min_length=1, max_length=16)
+    ]
+
+
+class SharedToolSemanticsContract(V2Contract):
+    contract_id: Identifier
+    group_id: Identifier
+    member_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=2, max_length=8)]
+    source: SharedToolSemanticsSourceDraft
+
+
+class ToolSemanticGroupClosure(V2Contract):
+    closure_id: Identifier
+    group_id: Identifier
+    member_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=8)]
+    semantic_refs: Annotated[tuple[ArtifactRef, ...], Field(min_length=1, max_length=8)]
+    shared_contract_ref: ArtifactRef | None = None
+
+    @model_validator(mode="after")
+    def validate_member_refs(self) -> ToolSemanticGroupClosure:
+        if len(self.semantic_refs) != len(self.member_tool_ids):
+            raise ValueError("group closure requires one semantic ref per member tool")
+        return self
+
+
+class WorldRuleSemanticsSourceDraft(AgentOutput):
+    """Executable reset/global rules authored only after schema closure exists."""
+
+    initial_state_rules: InitialStateRulesSourceDraft
+    invariants: Annotated[tuple[RuleDraft, ...], Field(min_length=1, max_length=64)]
+
+
+class ToolSemanticSourceDraft(AgentOutput):
+    """All business semantics for one frozen tool in one transaction batch."""
+
+    tool_id: Identifier
+    conditions: ToolConditionsSourceDraft
+    state_transition: ToolStateTransitionSourceDraft
+    errors: ToolErrorsSourceDraft
+    access_observation: ToolAccessObservationSourceDraft
+    reliability: ToolReliabilitySourceDraft
+
+
+class ToolSemanticsBatchSourceDraft(AgentOutput):
+    """A bounded group of state-coupled tools repaired as one semantic unit."""
+
+    tools: Annotated[tuple[ToolSemanticSourceDraft, ...], Field(min_length=1, max_length=4)]
+
+    @model_validator(mode="after")
+    def validate_unique_tools(self) -> ToolSemanticsBatchSourceDraft:
+        tool_ids = tuple(item.tool_id for item in self.tools)
+        if len(set(tool_ids)) != len(tool_ids):
+            raise ValueError("tool semantics batch tool ids must be unique")
+        return self
+
+
+class TrainingSemanticSourceDraft(AgentOutput):
+    """Curriculum and task meaning after the executable world has been frozen."""
+
+    curriculum_plan: CurriculumPlanSourceDraft
+    task_requirements: Annotated[
+        tuple[TaskRequirementSourceDraft, ...], Field(min_length=1, max_length=8)
+    ]
+
+    @model_validator(mode="after")
+    def validate_task_topology(self) -> TrainingSemanticSourceDraft:
+        planned = tuple(item.task_type for item in self.curriculum_plan.task_plans)
+        authored = tuple(item.task_type for item in self.task_requirements)
+        if authored != planned:
+            raise ValueError("task requirements must preserve curriculum plan order and identity")
+        return self
+
+
 class EnvironmentSemanticSourceDraft(AgentOutput):
     """Agent-owned semantic source for canonical framework compilation.
 
@@ -1281,6 +1724,7 @@ class AdmissionAssessment(AgentOutput):
 
 
 for _agent_output_root in (
+    ActorAuthoritySourceDraft,
     AdmissionAssessment,
     CurriculumPlanDraft,
     CurriculumPlanSourceDraft,
@@ -1293,9 +1737,14 @@ for _agent_output_root in (
     ExpansionSourceSynthesis,
     InitialStateRulesDraft,
     InitialStateRulesSourceDraft,
+    CompactFieldSemanticDraft,
+    StateEntitySourceDraft,
+    StateFieldSourceDraft,
     ResearchPlan,
+    StateEntityFieldsSourceDraft,
     StateEntityInventoryDraft,
     StateEntitySchemaIRDraft,
+    SharedToolSemanticsSourceDraft,
     TaskDimensionsDraft,
     TaskRequirementSourceDraft,
     ToolAccessObservationDraft,
@@ -1310,10 +1759,18 @@ for _agent_output_root in (
     ToolSchemaIRDraft,
     ToolStateTransitionDraft,
     ToolStateTransitionSourceDraft,
+    ToolSemanticsBatchSourceDraft,
+    ToolInterfaceSourceDraft,
+    ToolSurfaceSourceDraft,
     WorldBoundaryDraft,
+    WorldBoundarySourceDraft,
+    WorldArchitectureSourceDraft,
+    WorldRuleSemanticsSourceDraft,
     WorldClosureDraft,
     WorldClosureSourceDraft,
     WorldToolPlanInventoryDraft,
+    WorldToolSourceInventoryDraft,
+    TrainingSemanticSourceDraft,
 ):
     register_agent_output_contract(
         _agent_output_root,
@@ -1322,6 +1779,7 @@ for _agent_output_root in (
 
 
 __all__ = [
+    "ActorAuthoritySourceDraft",
     "AdmissionAssessment",
     "AssumptionResolutionDraft",
     "CurriculumContractDraft",
@@ -1343,6 +1801,8 @@ __all__ = [
     "ExpansionSemanticDeltaDraft",
     "InitialStateRulesDraft",
     "InitialStateRulesSourceDraft",
+    "CompactFieldSemanticDraft",
+    "StateEntitySourceDraft",
     "IdempotencySourceDraft",
     "PermissionRuleSourceDraft",
     "ObservationSemanticsSourceDraft",
@@ -1352,6 +1812,7 @@ __all__ = [
     "RuleAtomDraft",
     "RuleClauseDraft",
     "RuleConstantDraft",
+    "RuleLookupByKeyDraft",
     "RuleDraft",
     "RuleReferenceDraft",
     "RuleTermDraft",
@@ -1365,7 +1826,17 @@ __all__ = [
     "SchemaPropertyDraft",
     "SchemaStringNodeDraft",
     "SchemaUnionNodeDraft",
+    "SharedAtomicityDomainSourceDraft",
+    "SharedCompensationEdgeSourceDraft",
+    "SharedConcurrencyDomainSourceDraft",
+    "SharedErrorPolicySourceDraft",
+    "SharedIdempotencyDomainSourceDraft",
+    "SharedOrderingConstraintSourceDraft",
+    "SharedToolSemanticsContract",
+    "SharedToolSemanticsSourceDraft",
     "StateEntityInventoryDraft",
+    "StateEntityFieldsSourceDraft",
+    "StateFieldSourceDraft",
     "StateEntityPlan",
     "StateEntitySchemaDraft",
     "StateEntitySchemaIRDraft",
@@ -1384,11 +1855,18 @@ __all__ = [
     "ToolBehaviorDraft",
     "ToolConditionsDraft",
     "ToolConditionsSourceDraft",
+    "ToolCouplingGroupPlan",
+    "ToolCouplingPlan",
     "ToolErrorsDraft",
     "ToolErrorsSourceDraft",
     "ToolReliabilityDraft",
     "ToolReliabilitySourceDraft",
     "ToolSemanticsDeltaClaimDraft",
+    "ToolSemanticSourceDraft",
+    "ToolSemanticGroupClosure",
+    "ToolSemanticsBatchSourceDraft",
+    "ToolInterfaceSourceDraft",
+    "ToolSurfaceSourceDraft",
     "ToolSemanticsDraft",
     "ToolSchemaDraft",
     "ToolSchemaIRDraft",
@@ -1399,9 +1877,11 @@ __all__ = [
     "ToolStateTransitionDraft",
     "ToolStateTransitionSourceDraft",
     "WorldBoundaryDraft",
+    "WorldBoundarySourceDraft",
     "WorldBoundaryDeltaClaimDraft",
     "WorldClosureArithmeticTerm",
     "WorldClosureConstantTerm",
+    "WorldClosureLookupTerm",
     "WorldClosureConstraint",
     "WorldClosureDraft",
     "WorldClosureSourceDraft",
@@ -1416,7 +1896,11 @@ __all__ = [
     "WorldStateDraft",
     "WorldStateShapeDraft",
     "WorldSemanticSourceIRDraft",
+    "WorldArchitectureSourceDraft",
+    "WorldRuleSemanticsSourceDraft",
+    "TrainingSemanticSourceDraft",
     "WorldToolInventoryDraft",
     "WorldToolPlanInventoryDraft",
+    "WorldToolSourceInventoryDraft",
     "TransitionConstraintDeltaClaimDraft",
 ]

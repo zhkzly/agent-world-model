@@ -348,7 +348,8 @@ def _schema_error_diagnostic(error: JsonSchemaValidationError) -> str:
             )
             detail = f" missing={missing}"
     elif keyword == "additionalProperties" and isinstance(error.instance, Mapping):
-        properties = error.schema.get("properties", {})
+        schema = error.schema
+        properties = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
         if isinstance(properties, dict):
             unexpected = sorted(str(item) for item in set(error.instance) - set(properties))
             detail = f" unexpected={unexpected}"

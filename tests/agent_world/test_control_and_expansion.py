@@ -68,12 +68,14 @@ from agent_world.control import (
     CampaignIterationRecord,
     CampaignRunCheckpoint,
     CampaignStore,
+    ControlEventKind,
     ErrorAuditPolicy,
     JobRunSnapshot,
     LeaseBudgetLedger,
     NodeAttempt,
     RepairLedger,
     RepairRouter,
+    StructuredRepairMode,
     TelemetryStore,
     invalidated_nodes,
     new_direct_job_head,
@@ -1740,7 +1742,7 @@ def test_modeling_failure_binds_design_subject_and_gate_as_causal_evidence(
     finding_ref = scenario.controller._control_failure_finding(  # noqa: SLF001
         scenario.run,
         node="design",
-        owner="design",
+        event_kind=ControlEventKind.CONTRACT_FAILURE,
         code="modeling_gate_failed",
         error_type="ModelingGateRejected",
         subject_ref=scenario.design.design_ref,
@@ -2015,6 +2017,61 @@ def test_repair_ledger_rejects_unproven_disjoint_blocker_churn() -> None:
         entries=(type(completed).model_validate(completed.model_dump(mode="python")),)
     )
     assert restored.entries == (completed,)
+
+
+def test_repair_ledger_detects_a_b_a_oscillation_within_one_repair_family() -> None:
+    subject = _ref("design:oscillation", "design.environment_design")
+    evidence = _ref("validation:oscillation", "control.structured_repair_evidence")
+    finding_ref = _ref("finding:oscillation", "control.finding")
+    finding = Finding(
+        finding_id="finding:oscillation",
+        category="structured_semantic_correction",
+        severity="high",
+        owner="design",
+        subject_ref=subject,
+        summary="The same transaction alternated between two blocker sets.",
+        evidence_refs=(evidence,),
+        fingerprint=sha256_digest(b"oscillation"),
+        disclosure="repair",
+    )
+    ledger = RepairLedger()
+    first = ledger.authorize(
+        finding=finding,
+        finding_ref=finding_ref,
+        repair_fingerprint="repair-family:stable",
+        current_node="design",
+        target_node="design",
+        owner_ref=subject,
+        action="continue_session",
+        jump_distance=0,
+        causal_evidence_refs=(evidence,),
+        blocking_claim_ids_before=("blocker:a",),
+    )
+    first_done = ledger.complete(
+        first.entry_id,
+        blocking_claim_ids_after=("blocker:b",),
+        progress_evidence="issue_set_changed",
+    )
+    second = ledger.authorize(
+        finding=finding,
+        finding_ref=finding_ref,
+        repair_fingerprint="repair-family:stable",
+        current_node="design",
+        target_node="design",
+        owner_ref=subject,
+        action="continue_session",
+        jump_distance=0,
+        causal_evidence_refs=(evidence,),
+        blocking_claim_ids_before=("blocker:b",),
+    )
+    second_done = ledger.complete(
+        second.entry_id,
+        blocking_claim_ids_after=("blocker:a",),
+        progress_evidence="issue_set_changed",
+    )
+
+    assert first_done.outcome == "progressed"
+    assert second_done.outcome == "no_progress"
 
 
 def test_repair_router_zero_attempt_policy_never_authorizes_work(tmp_path: Path) -> None:
@@ -3150,7 +3207,7 @@ def test_structured_repair_keeps_stable_family_while_issue_set_shrinks(
             owner_node="design",
             lineage_id="job:hotel.evidence-synthesis",
             role="researcher",
-            repair_mode="semantic_correction",
+            repair_mode=StructuredRepairMode.CONTRACT_CORRECTION,
             issue_codes=initial_issues,
             continued_session=True,
         )
@@ -3165,7 +3222,7 @@ def test_structured_repair_keeps_stable_family_while_issue_set_shrinks(
             owner_node="design",
             lineage_id="job:hotel.evidence-synthesis",
             role="researcher",
-            repair_mode="semantic_correction",
+            repair_mode=StructuredRepairMode.CONTRACT_CORRECTION,
             issue_codes=remaining_issues,
             continued_session=True,
         )
@@ -3191,7 +3248,7 @@ def test_controller_treats_exact_issue_change_as_bounded_progress(tmp_path: Path
             owner_node="design",
             lineage_id="job:hotel.assumption-closure",
             role="researcher",
-            repair_mode="semantic_correction",
+            repair_mode=StructuredRepairMode.CONTRACT_CORRECTION,
             issue_codes=("schema_assumption_fidelity_claim_missing@resolutions.0",),
             continued_session=True,
         )
@@ -3213,7 +3270,7 @@ def test_controller_treats_exact_issue_change_as_bounded_progress(tmp_path: Path
             owner_node="design",
             lineage_id="job:hotel.assumption-closure",
             role="researcher",
-            repair_mode="semantic_correction",
+            repair_mode=StructuredRepairMode.CONTRACT_CORRECTION,
             issue_codes=(
                 "assumption_fidelity_unknown_claim@resolutions.0.fidelity.evidence_claim_ids",
             ),

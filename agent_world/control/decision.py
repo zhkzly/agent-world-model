@@ -131,7 +131,10 @@ class CodeRouter:
         "request": "permissions",
         "discovery": "design",
     }
-    _SEMANTIC_ROLE = {
+    _SEMANTIC_ROLE: dict[
+        SemanticQuestionKind,
+        Literal["researcher", "environment-engineer", "challenger"],
+    ] = {
         SemanticQuestionKind.BUSINESS_MEANING: "environment-engineer",
         SemanticQuestionKind.REASONABLENESS: "environment-engineer",
         SemanticQuestionKind.EVIDENCE_CONFLICT: "researcher",

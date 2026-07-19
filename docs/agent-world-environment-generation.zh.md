@@ -108,7 +108,7 @@ flowchart TB
 
 输入一个 `EnvironmentRequest`，输出一个 released `EnvironmentPackage`，或结构化的 `rejected`、`needs_human`、`budget_exhausted`。成功不依赖 EnvironmentPool、Evolve、Suite、rollout 或训练反馈。
 
-Designer v4 在两个经过 framework typed validation 的边界提交 `DesignPhaseCheckpoint`：`evidence_graph` 绑定同一 `EnvironmentJob`、`EnvironmentRequest` 与完整证据 DAG，`world_skeleton` 再绑定已验证的状态/工具骨架。失败恢复必须选择同一 job 下最靠后的唯一有效检查点：Skeleton 之后从 tail 继续；Skeleton 之前复用 EvidenceGraph，且本次恢复的 search/fetch/Researcher 调用为零。World Boundary、State Entity Inventory、各 Entity Schema、Initial State Rules、Tool Plan 和各 Tool Schema 同时是节点级不可变 Artifact；恢复时只复用依赖集合完全匹配、通过当前 typed/semantic validator 且具有唯一完成决策的 revision，从第一个缺失或失效节点继续，而不是无条件重编整个前缀。需求语义变化、跨 request 复用、证据过期或来源失效不得隐式采用旧证据，必须进入显式 freshness/adoption policy；当前 ABI 只允许同一 immutable request/job 的恢复。
+Designer 对外只暴露经过 framework typed validation 的 `evidence_graph` `DesignPhaseCheckpoint`，它绑定同一 `EnvironmentJob`、`EnvironmentRequest` 与完整证据 DAG。恢复时复用该 EvidenceGraph，且本次恢复的 search/fetch/Researcher 调用为零。其后的 WorldArchitecture、SharedToolSemantics、ToolSemanticsBatch、WorldRules 和 TaskCurriculum 不暴露为可任意采用的 phase checkpoint；每个事务只能在 Source/derived Artifacts、当前 compiler 的 `ValidationReport`、唯一 terminal `FeedbackEvaluation` 全部完成后写一个 framework-owned `WorkCommit`。跨进程恢复只可采用同 WorkDefinition、同 coordinate、精确 immutable dependencies、当前 policy/schema digests 和未失效 WorkCommit 全部匹配的 revision；单独 Source、审计事件、未完成模型输出或旧控制对象均无恢复资格。需求语义变化、跨 request 复用、证据过期或来源失效不得隐式采用旧证据，必须进入显式 freshness/adoption policy。
 
 首次通过 Modeling Gate 时，Controller 仍固化 `DesignBaselineCheckpoint`。Controller 不会为了制造“基线前接入”而等待 Discovery，也不会伪称 late evidence 已进入当前 Design：完成的 clue 先确定性写入 provisional Expansion Inbox，再由独立 admission 细化；未完成 work 写成 deferred state，可由 `agent-world discovery resume DISCOVERY_RUN_ID` 在新独立预算下恢复。任何时刻证明 hard claim、工具语义、安全规则或 fidelity 声明错误的新证据仍必须形成 Finding 与 `quarantine_recommended` 信号；真正 quarantine 由框架独立证据政策决定，不能由 LLM admission 单独执行。
 
@@ -212,7 +212,7 @@ EnvironmentRequest
 
 这是 readiness DAG，不是固定直线阶段。多个 EvidenceGraph、WorldSpec、Task、Verifier 或 Candidate revision 可以并存；current 只是 projection。任一 Gate 可以推翻上游 Artifact，rework 创建新 revision，不覆盖旧内容。
 
-恢复同样按 readiness DAG，而不是按“整条流水线重跑”。任一节点通过后，Controller 必须在启动下一个长耗时 consumer 前立即结算 lease、关闭 NodeAttempt、写 `NodeCommit` 和不可变快照；Builder 与 Verifier 并发时，Builder 一完成就必须提交 ImplementationContract、source tar、lineage、CandidateManifest、BuildRecord 与 Candidate，并立即进入 Integration，慢 Verifier 不得推迟或抹掉已经成功的 Build。恢复只采用同一 request/job、同一最终 Design revision、当前 Modeling Gate 仍通过且 Artifact dependency closure 完整的节点。Build 恢复还必须逐文件复验 link-free source tar 的 path、mode、size、content hash 和完整 manifest closure，再物化到新的隔离 workspace，并从精确 Design/ImplementationContract 重新生成候选只读的 `inputs/`（不能把它遗漏或塞入 source tar）；SDK session/profile/workspace handle 属于易失状态，不得伪造为可恢复。若 Judge 后续要求实现返工但原 session 已丢失，则显式失效该 Build checkpoint 并启动新的真实 Builder，而不是把旧候选假装修好。
+恢复同样按 readiness DAG，而不是按“整条流水线重跑”。任一节点通过后，Controller 必须在启动下一个长耗时 consumer 前立即结算 lease、关闭 `WorkAttempt`、写唯一 `WorkCommit` 和不可变快照；Builder 与 Verifier 并发时，Builder 一完成就必须提交 ImplementationContract、source tar、lineage、CandidateManifest、BuildRecord 与 Candidate，并立即进入 Integration，慢 Verifier 不得推迟或抹掉已经成功的 Build。恢复只采用同一 request/job、同一最终 Design revision、当前 Modeling Gate 仍通过且 Artifact dependency closure 完整的 WorkCommit。Build 恢复还必须逐文件复验 link-free source tar 的 path、mode、size、content hash 和完整 manifest closure，再物化到新的隔离 workspace，并从精确 Design/ImplementationContract 重新生成候选只读的 `inputs/`（不能把它遗漏或塞入 source tar）。Agent continuation 只能从 framework 私有 checkpoint 恢复，并重新验证 workspace、lineage、profile/config/schema、immutable inputs、RepairAction 和 budget lease；不存在这些绑定时显式启动新的真实 Builder，不能伪造 session 或把旧候选假装修好。
 
 ### 3.6 决策权限：Code Router 执行，LLM 只作语义裁判
 
@@ -283,6 +283,59 @@ flowchart LR
 - schema 校验必须返回 field path 和封闭 reason code。相同 validator frontier、相同 issue set 才算无进展；错误 A 变成错误 B 不能按粗粒度 `value_error` 判成无进展。
 
 因此，“LLM 作为 Router”在本项目中只是一种口语误称。真正实现是：LLM 对程序不可判定的业务语义给出受限 advisory，Code Router 对一切执行效果作最终、可复现、可审计的决定。
+
+### 3.7 Feedback control plane：检查可以多，决策边界必须少而精确
+
+并非每个 Validator assertion 都注册独立反馈权威。格式、schema、引用、类型、协议、预算等
+叶子检查可以细且多，但同一 `WorkAttempt` 内必须聚合成一个 `ValidationReport`；只有当结果
+会改变 Claim、Artifact readiness、repair route、quarantine 或 release state 时，才由
+framework-owned `WorkDefinition/ValidationPolicy` 声明一个决策边界并产生唯一终态
+`FeedbackEvaluation`。没有决策价值的检查不得制造独立 retry、Finding、ControlEvent 或 Gate。
+
+`WorkDefinition` 分开声明 `ProposalPolicy`、`ValidationPolicy` 和可选 `AssurancePolicy`：LLM、
+真实检索或 Builder 属于 proposal/execution 成本，code compiler 属于确定性判断，真实 Runtime /
+sealed probe 属于 assurance。旧的 `hybrid` 单字段不能继续同时表达“谁提出内容”和“谁有验证
+权威”。每个决策边界至少回答：
+
+Agent/real-execution 的 usage 必须聚合该事务全部真实尝试的 turn、wall-time、search/tool/process
+和 provider token；未报告的维度保持 unknown，不得补零。每个 exact subject + policy digest
+只有一个 active terminal FeedbackEvaluation；内部 correction 只由 RepairAction/RepairLedger 和
+invocation span 表达，不为每次失败重复生成一套 feedback/event/disposition/finding 权威。
+
+```text
+验证哪个 Claim？
+为什么必须在当前成熟度验证？
+proposal 由 LLM、真实 tool 还是 subprocess 执行；validation/assurance 又由谁执行？
+成本等级和硬预算是什么？
+失败 owner 如何从 boundary policy、Claim producer 和 Artifact DAG 推导？
+最小可修复 Artifact 是什么？
+允许多少次 correction / retry？
+最多自动回跳多远？
+失败后允许失效到哪类依赖边界？实际失效哪些 refs 必须怎样从 Artifact DAG 推导？
+效果是 evidence_only、reject_revision、block_compile、block_integration、block_release 还是 quarantine？
+```
+
+成本等级固定为：`L0` 进程内确定性检查、`L1` 编译/子进程/真实 smoke、`L2`
+单次语义 Agent transaction、`L3` 独立 Challenger/sealed/deploy assurance。L0 可以细且多；
+L2/L3 必须批量化、显式预算并产生可复用 Artifact。反馈粒度取“最小因果可修复
+Artifact”，不取最小字段；多个字段问题属于同一语义批次时必须聚合成一个 RepairAction。
+
+执行权边界固定如下：
+
+- `code` 负责 JSON/schema 语法、ID、引用、类型、required、closed shape、Rule IR 编译、
+  permission/visibility closure、预算、重试、no-progress、路由、失效和发布；
+- `real_execution` 负责 build、install、Runtime protocol、reset/invoke、task reachability、
+  property、sealed 和 deploy 事实；
+- `llm_advisory` 只负责证据综合、业务语义、工具行为、任务合理性和 adversarial intent；
+- LLM proposal 与 code validation 即使属于同一 WorkAttempt，也必须分别计费和观察，不能合并
+  成一个含糊 executor。
+
+Generic root schema error、没有 exact path 的机械错误、相同 validator frontier + issue set 的
+重复错误不得继续消耗 LLM correction。它们必须被判为 output-contract/framework defect。
+错误 A 变成字段可定位的错误 B 是进展而不是解决；只有 Contract 仍有同一 RepairTarget 的
+第二次额度时才可继续；默认每个 logical Artifact 一次 local correction，只有 code 证明
+strict progress 才允许第二次，同时仍受全 run 的硬 Budget ceiling 约束。LLM 永远不能决定
+WorkDefinition、cost、owner、重试、回跳、失效、maturity 或 Gate effect。
 
 ## 4. 五个组件的具体职责
 
@@ -395,21 +448,25 @@ Hook 使用 framework 定义的 backend-neutral lifecycle contract，并映射�
 1. **Intake**：Controller 将 canonical Request、permission、release profile 和预算绑定到 durable job fingerprint；同 id 不同 fingerprint 冲突。
 2. **Budget reservation**：为 Direct 前台工作预留容量；Discovery 使用独立低优先级 lease，不能借走首包预算。
 3. **Research**：Researcher 反复执行 plan、真实 search/fetch/extract、冲突核对和 gap 更新；停止由 coverage/risk/budget Gate 决定，不由 Agent 自称完成。
-4. **World modeling**：同一个隔离 Engineer profile 按依赖生成 `WorldBoundary -> StateEntityInventory -> 每实体 EntitySchemaIR -> InitialStateRules -> ToolPlanInventory -> 每工具分别生成 Input/Output/Observation Schema IR -> 每工具分别生成 Conditions、StateTransition、Errors、AccessObservation、Reliability`。实体清单冻结 identity、root storage、system-of-record、resource ownership、主键/可变字段和 lifecycle；模型逐实体只生成闭合、无环、全可达的 typed Schema IR，framework 确定性编译并验证局部闭合 schema，再组装 root `$defs`。工具清单先冻结 `namespace.name`、transport 与 evidence；工具 schema 同样由模型生成 typed Schema IR，framework 确定性编译成局部闭合的 Draft 2020-12 JSON Schema，并将编译产物绑定到 IR dependency，恢复时重新编译比对。模型不得直接拥有 `properties/required/additionalProperties/items/anyOf` 等易错语法；这不是固定业务模板，而是把业务语义生成与格式编译分层。所有由 Agent 编写的 Rule 同样只能采用可判别 `RuleDraft` ADT：存在性、schema、相等、顺序和包含关系在 provider JSON Schema 中是不同分支，顺序关系显式声明 `number/date/date-time`；framework 将其编译为核心 Rule IR，代码执行数值或 ISO 时间比较，核心 validator 只作纵深防御。三个 schema 再组装为 ToolSurface；framework 组装冻结 `WorldSkeleton` 后，为目标工具只投影 boundary/state、绑定 claim catalog 和必要 tool catalog，分别验证前后条件、真正的 pre-state/args 到 post-state/tool-result 约束、显式错误路径、权限与可见观测、幂等/重试/超时/事务/回滚/并发，再确定性组装完整 `ToolSemantics`，最后生成全局 invariant closure。相互独立的工具节点由 framework 在硬 turn lease 下做至多 3 路有界 fan-out；采用 all-settled 语义让成功 sibling 立即提交，全部 sibling 结算后再重新抛出原始失败，不能因一个失败取消并丢弃其他已付费结果；产物仍按冻结 plan 顺序组装，不把并发完成顺序变成语义。framework 按 skeleton identity 组装唯一 `WorldSpec/ToolContractSet`，逐节点检查 schema、引用、规则、权限、错误、回滚、幂等和 evidence，并在 closure 节点执行完整跨工具/状态/不变量验证。这里增加的是 Artifact/返工边界，不是增加产品级 Agent 角色，也不允许各节点发明不同世界。
+4. **World modeling**：同一个隔离 Engineer profile 执行少量、有界的语义事务，而不是把每个实体、schema role 和工具语义字段变成独立模型调用。`WorldArchitecture` 一次冻结 identity、authority、实体及紧凑字段语义、生命周期、关系、工具边界与嵌入所属工具的紧凑接口语义；framework 从它确定性编译 Entity/Tool Schema、ID、引用、required、closed shape 和 root assembly。framework 随后从 namespace 与共享状态生成不可由模型修改的 `ToolCouplingPlan`。含五至八个耦合工具的 group 先由一次短 `SharedToolSemantics` 事务冻结 atomicity、concurrency、idempotency、ordering、compensation 与共享 error policy；每个最多四工具的 `ToolSemanticsBatch` 必须实现这份共享合同。所有 batch 完成后，代码生成 `ToolSemanticGroupClosure` 并在 WorldRules 前拒绝跨批冲突。随后单独的 `WorldRules` 事务只表达初态规则和跨实体/工具 invariant；framework 将其编译并与 Schema/Tool contracts 做闭包校验。`TaskCurriculumSemantics` 在完整 WorldModel 编译成功后一次产生 task family、objective、actor/tool scope、difficulty 与 success/failure/terminal RuleDraft；framework 再编译 TaskRequirement、task protocol、Reward 和 VerificationRequirements。
+
+   模型只拥有业务字段意义和 `RuleDraft`/typed source IR，不拥有 `properties/required/additionalProperties/items/anyOf`、case id、seed、public/sealed partition、reward、Gate 或发布字段。framework 确定性编译 Draft 2020-12 schema、核心 Rule IR、projection、task binding 和全局闭包。一个批次中的所有安全问题在同一 validation frontier 聚合；机械问题由代码直接拒绝或规范化，只有仍需业务判断的缺口才允许对整个最小语义批次做一次 correction。工具批次具有独立 commit/repair identity；当前调度器按稳定顺序执行，后续只有在 backend 容量、预算 lease 与提交确定性均得到证明后才可并发，失败批次不得失效已提交 sibling。
+
+   首次真实 Build 前，Direct Designer 的最坏基础 Agent turn 为 8：Research plan、检索后 synthesis、World Architecture、最多一次 multi-batch Shared Tool Contract、1–2 个 Tool Semantics batch、一次 WorldRules 和一次 Task/Curriculum；加上全 run 最多两次按需 Semantic Repair，硬预留为 10。没有 multi-batch group 时共享事务为零，典型调用仍更少。调用数不得随实体数量线性增长。若 192 KiB 输入投影或单 turn output cap 要求更小批次，Controller 必须在调用前拒绝超过总 turn 上限的 scope，而不是提交巨型 prompt 后靠 retry 消耗预算。
 
    WorldClosure 不复制完整 ToolContract JSON。framework 把已验证 Rule 确定性投影为去除重复 metadata 的 typed RulePath，并按执行语义对 clause 去重为 ConstraintCatalog；RulePath 只引用 constraint id，`schema_valid` 的 schema 正文由 framework 留存并标记为 elided。投影必须保留 reference source/pointer/type、constant、bounded arithmetic、operator、boolean composition、error state effect 与 evidence 绑定，并受固定 192 KiB 输入上限约束。超过上限必须在调用模型前明确失败并要求进一步分片，不能把超大上下文交给 provider 后以空响应或重试耗尽收场。
 5. **Baseline**：首次 Modeling PASS 固化 DesignBaselineCheckpoint；当前原子 Designer 下，全部并发 Discovery clue 先进入 provisional Inbox，hard correction 形成 Finding 与隔离建议；deferred lane 由独立 resume job 继续，不阻塞或重开 Direct。
-6. **Parallel compilation**：从同一 WorldSpec revision 编译 TaskRequirement/Curriculum、VerifierBundle 和 ImplementationContract。
-7. **Real build**：Engineer 通过 Codex backend 在隔离 workspace 生成候选；framework 重新检查源码闭包、协议、锁文件和完成条件。
+6. **Modeling Gate 与并行编译**：完整 EnvironmentDesign 必须已经包含 framework 编译的 TaskRequirement、Reward 和 VerificationRequirements，随后通过 Modeling Gate。Builder 需要这份完整合同来一次生成最终 Runtime 与 Task Materializer；因此 Task/Curriculum 不能后移到 Builder 之后。通过后 Builder 与 Challenger VerifierIntent 分支并行。
+7. **Real build 与早期 Integration**：Engineer 通过 Codex backend 在隔离 workspace 一次生成最终候选；framework 重新检查源码闭包、协议、锁文件和完成条件。Builder 一提交，现有 Integration lane 立即对同一最终 source digest 执行 clean install、handshake、未知 seed reset/invoke、task materialization、restart/concurrency smoke，无需等待 Verifier。Verifier 缺失或失败只 `block_release`，不能取消或抹掉已完成的 Build/Integration。现阶段不引入第二个 Diagnostic Builder 或 tainted candidate；只有至少十个收敛后的 live run 证明 Runtime-core failure 比例和 staged-build 成本满足明确阈值，才考虑同一 Builder lineage 的两阶段 source checkpoint。
 8. **Independent Judge**：候选作为不可信子进程运行；Judge 执行 Task Materialization、reachability、conformance、property、sealed 和 clean deployment Gate。
 9. **Directed rework**：失败回到 owning Artifact，创建新 revision并传递失效；没有进展或预算耗尽时拒绝或请求人，而不是无限重试。
 10. **Atomic release**：Release Kernel 只读取有效 evidence；Registry 复验签名、owner、digest、reservation 和 package 物理内容后发布 envpkg v3。
 
-Direct revision 与 Evolve 不能绕开第 4 步的 schema 权限边界。它们输出完整
-`WorldSemanticSourceIRDraft`（boundary、实体计划、实体 Schema IR、初态规则、工具计划、按
-input/output/observation 排序的 Tool Schema IR、ToolSemantics、WorldClosure），framework
-复用同一编译器组装 `StateSchema/ToolSurface/WorldModel`，再编译 Curriculum、Task protocol、
-Reward 和 Verification。任何路径都不允许模型直接提交 state/tool JSON Schema。typed IR 已经
+Direct revision 与 Evolve 不能绕开第 4 步的 schema 权限边界。它们只输出紧凑的
+`WorldArchitectureSourceDraft`（boundary、实体/字段语义、工具/接口语义）、批量
+`ToolSemanticsSourceDraft`、`WorldRuleSemanticsSourceDraft` 和 Curriculum source；framework
+复用同一编译器生成 `StateSchema/ToolSurface/WorldModel`，再编译 Task protocol、Reward 和
+Verification。任何路径都不允许模型直接提交 state/tool JSON Schema。typed source 已经
 排除的 task-reset 投影若仍在根级失败，属于 framework invariant/infrastructure failure，不能
 伪装成 Designer Finding 触发语义返工。
 
@@ -419,7 +476,7 @@ rule id 或等价 Rule 重复均不得放大奖励；Judge 从 envpkg 中的 Rul
 
 Direct job 的持久幂等是成功合同的一部分。publish 后 Controller 若在终态 bookkeeping 前崩溃，可以依据同 owner 的 Registry 事实补齐终态；带未知 Agent/tool 消耗的中断不得静默从头重放。
 
-每个设计子节点跨越真实 Agent 边界前记录 `design_node_started`；完成时必须先提交 typed intermediate Artifact，再记录 `design_node_completed`。Controller 的 NodeAttempt、预算 lease、Finding 和终态事件继续形成外层执行轨迹。`agent-world run inspect <request-id>` 只读这些持久事实，不解析 Agent 私有 transcript，也不需要模型或研究凭证。WorldSkeleton、逐工具 ToolContract、WorldClosure 和 TrainingContract 可被观察和定向失效，但不进入发布包。
+每个设计子节点跨越真实 Agent 边界前创建 `WorkAttempt` 并记录 scheduled/started；完成时先提交 typed Source/derived Artifact 和一个聚合 `ValidationReport`，再由唯一 terminal `FeedbackEvaluation` 决定是否写 `WorkCommit`。预算 lease、ProposalExecution、RepairAction/RepairLedgerEntry 和终态事件形成同一执行轨迹；普通本地 schema 修复不再制造 Finding/Event/Disposition 权威链。`agent-world run inspect <request-id>` 只读这些持久事实，不解析 Agent 私有 transcript，也不需要模型或研究凭证。EvidenceGraph 是对外稳定 phase checkpoint；WorldArchitecture、SharedToolSemantics、逐批 ToolSemantics、WorldRules 和 TrainingContract 只能通过精确 WorkCommit 自动恢复，不能由 CLI 或 Agent 任意采用。它们可观察、可定向失效且不进入发布包。
 
 真实 backend 若报告明确 `retryable` 的 provider/transport 失败，Designer 只可在当前节点的硬 turn/repair lease 内，用完全相同的 immutable prompt 与新隔离 session 重试；失败的 `InvocationResult` 必须保留在 lineage 中。它不构成语义修正，不能沿用可能残缺的会话状态，也不能绕过 Pydantic/semantic Gate。重试耗尽后，Controller 将 backend code、retryable 标志、尝试次数和安全诊断写入 FailureEvidence/Finding，并继续阻断发布。
 
@@ -602,7 +659,7 @@ flowchart TD
     RERUN -->|"相同 fingerprint / 无进展"| ESC["扩大 owner scope、换 session/backend、reject 或 needs_human"]
 ```
 
-后置步骤不完全信任前一步。每个 Finding 都绑定 subject revision 和 evidence；Repair Router 找到拥有错误语义的 Artifact，而不是盲目从头再跑。同一 JudgeReport 中 owner/action 相同的多个 Finding 仍分别持久化，但必须合并成一个 `RepairAction`、一个 RepairLedger authorization 和一次实际返工；只有 owner/action 不同才拆成多个动作，避免 finding 数量把成本几何放大。上游 revision 变化时只 invalidates 受影响的后代，不相关 sibling 可以复用。Judge infrastructure error 既不是 candidate FAIL，也不能成为 PASS。
+后置步骤不完全信任前一步。叶子错误先聚合成绑定 exact subject/policy 的 ValidationReport；Code Router 从 Claim、Artifact coordinate 和 dependency edge 推导最小 repair owner，而不是盲目从头再跑或信任 Finding.owner。同一边界中 owner/action 相同的问题必须形成一个 `RepairAction`、一个 RepairLedger authorization 和一次实际返工；只有 owner/action 不同才拆成多个动作。Finding 只保留给跨边界执行失败、硬语义冲突、权限/风险或发布政策证据。上游 revision 变化时只 invalidates 受影响的后代，不相关 sibling 可以复用。Judge infrastructure error 既不是 candidate FAIL，也不能成为 PASS。
 
 `modeling_gate_failed` 与其 revision 后续失败必须保留同一种定向路由语义：若唯一问题是可闭合假设，只运行轻量 Assumption Closure，不得重写完整 EnvironmentDesign。Controller 比较返工前后的 release-blocking issue 集合；集合未缩小时立即以 `design_rework_no_progress` fail-closed，禁止把同一 Finding 改名后继续消耗全量设计 turn。
 
@@ -626,10 +683,10 @@ Direct Generation 有前台保留容量。Discovery 和 Evolve 使用独立 part
 2. Framework 从精确 Artifact 与 Claim dependency closure 推导 `DESIGN_VALID -> BUILD_VALID -> EXECUTABLE -> INTEGRATION_READY -> RELEASE_CANDIDATE -> RELEASED` 成熟度。Agent、候选和 LLM Judge 无权自报成熟度。
 3. Finding 可由任何 Gate、Agent 或工具发现，但 owner 必须由 framework Repair Router 根据失败分类、subject revision、claim producer 和 Artifact DAG 判定；生产者提供的 owner 只能作为不可信 hint。
 4. Challenger 只产生紧凑、typed 的 `VerifierIntent`：选择要攻击的语义、轨迹骨架、变形关系和任务覆盖。Framework 确定性扩展 id、public/sealed 配对、Rule/schema 闭包和 Property family，编译为 Verifier IR；机械闭包不得反复消耗模型 turn。
-5. 每个节点成功后必须先提交输出 Artifact、结算 lease、写 `NodeCommit` 和更新 snapshot，再启动长耗时 consumer。Verifier 的每个 batch 必须先提交可审计的 projection/commitment Artifact，不能等全部 batch 成功后才首次持久化；由于 sealed 输入不得进入普通 ArtifactStore，该 projection 只支持 provenance 与完整性检查，不虚构跨进程 sealed 恢复能力。
+5. 每个节点成功后必须先提交输出 Artifact、结算 lease、写唯一 `WorkCommit` 和更新 snapshot，再启动长耗时 consumer。Verifier 的每个 batch 必须先提交可审计的 projection/commitment Artifact，不能等全部 batch 成功后才首次持久化；由于 sealed 输入不得进入普通 ArtifactStore，该 projection 只支持 provenance 与完整性检查，不虚构跨进程 sealed 恢复能力。
 6. `Integration` 是独立真实执行 lane：只依赖精确 Design 与 Build，执行 clean install、启动、handshake、未知 seed reset/invoke、task materialization、public smoke rollout、restart/concurrency/teardown。Verifier 缺失或失败只 `block_release`，不得阻止 Build 达到 `INTEGRATION_READY`；IntegrationReport 也绝不能自行发布。
 7. 自动返工有跳转距离和因果证据：同 owner 的 distance 0 默认最多两次；直接语义父节点的 distance 1 必须绑定因果 evidence 且默认最多一次；distance >= 2 默认禁止；回到 Research/Evidence 只允许 hard external correction。相同 fingerprint 且 blocking claim 集合未缩小立即 no-progress。
-8. 一个 run/campaign 只有一份 durable `RepairLedger` 和一份权威 `BudgetLedger`。Designer structured correction、Verifier correction、Builder repair、Judge infrastructure retry 都必须从同一账本申请授权并真正扣减同一 `repair_attempts` 维度；预算按实际 `RepairAction` 而非 Finding 条数消费，禁止节点内 retry × Controller retry 形成乘法放大。
+8. 一个 run/campaign 只有一份 durable `RepairLedger` 和一份权威 `BudgetLedger`。Designer structured correction、Verifier correction、Builder repair、Judge infrastructure retry 都必须由其 WorkDefinition 的 RepairPolicy 产生 RepairAction，再从同一账本申请授权并真正扣减同一 `repair_attempts` 维度；组件不得保留独立 retry ceiling，预算按实际 RepairAction 消费，禁止节点内 retry × Controller retry 形成乘法放大。
 
 Readiness 关系固定为：
 
@@ -844,7 +901,7 @@ CLI 必须支持对 run/campaign 的实时/事后 metrics inspect、JSON/Parquet
 | 区域 | 当前状态 | 仍需达到的验收 |
 |---|---|---|
 | 真实调用与研究 | 已有真实 Codex InvocationBackend、Search/Fetch/Extract 适配和无伪成功 fallback 的基础 | 在提供真实凭证/endpoint 的环境运行 live Generate，并保存完整 evidence provenance |
-| 控制面 | 已有 Direct 持久幂等、EvidenceGraph/WorldSkeleton 两级 typed checkpoint、Artifact provenance、Campaign CAS/ask-tell、Pool parent lease 与 durable Source intake | 把最小恢复边界继续下沉到 Designer 子节点，并对所有 Agent/Judge/Source 中断点做 fault injection，证明未知 usage 保守结算且不重放外部副作用 |
+| 控制面 | 已有 Direct 持久幂等、EvidenceGraph 单一稳定 typed checkpoint、Artifact provenance、Campaign CAS/ask-tell、Pool parent lease 与 durable Source intake | 只有经过故障注入证明可原子提交、可精确复验且不会重放外部副作用的 Designer 子节点，才允许新增恢复 ABI；所有 Agent/Judge/Source 中断必须保守结算未知 usage |
 | 能力隔离 | 已有 EffectiveCapabilityPlan、角色 profile 和 workspace/network/credential 边界 | 持续用隔离验收证明 Skills/Hooks/Tools 不发生 ambient 继承 |
 | Evolve Source/Policy | 已有配置化 Source catalog/default selection、真实 two-turn Researcher/Search、冻结 clue context、可替换 ask/tell Policy 与 tool-first Operator | 用 live providers 对多种 Source/policy 做恢复、空 clue、needs-human、纵向与横向 Campaign 验收 |
 | Runtime/Judge | 已有 out-of-process Runtime、Unix RPC、bubblewrap/uv offline supply-chain、Task v3、recipe/interactive reachability 和独立 hard Gates | 用真实 Agent 生成的未知环境持续扩大 property、并发、资源限制与 adversarial sealed 验收 |
@@ -864,7 +921,7 @@ CLI 必须支持对 run/campaign 的实时/事后 metrics inspect、JSON/Parquet
 - Researcher 使用真实 search/fetch/extract 建立 evidence；
 - Engineer 生成 evidence-backed WorldSpec、Task Materializer 与 Runtime；
 - Runtime 在不可信独立进程执行程序化状态转移；
-- Judge 对实际生成任务通过 `task_materialization` 与 `task_reachability`，并至少触发一次真实 Finding/rework；
+- Judge 对实际生成任务通过 `task_materialization` 与 `task_reachability`；正常成功 run 不要求故意制造 Finding。另一个独立 live negative/rework acceptance 必须证明真实 ValidationReport/FeedbackEvaluation 能生成精确 RepairAction、完成受限返工并保留无关 Artifact；
 - clean offline build、sealed evaluation、restart/concurrency/teardown 和 package-relative execution通过；
 - Registry 原子发布 envpkg v3；
 - 关闭任何必需真实 backend 后诚实失败，不转入模板、固定样例或人工中间修改。

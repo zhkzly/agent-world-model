@@ -289,7 +289,7 @@ TASK_MATERIALIZER_SOURCE = r"""from __future__ import annotations
 import os
 
 assert os.path.isfile("/workspace/task_materializer.py")
-assert not os.path.exists("/workspace/runtime.py")
+assert os.path.isfile("/workspace/runtime.py")
 assert not os.path.exists("/workspace/world/rule_ir.json")
 
 
@@ -316,8 +316,8 @@ import os
 
 assert os.path.isdir(os.environ["AGENT_WORLD_STATE_DIR"])
 assert os.path.isfile("/workspace/public_check.py")
-assert not os.path.exists("/workspace/runtime.py")
-assert not os.path.exists("/workspace/task_materializer.py")
+assert os.path.isfile("/workspace/runtime.py")
+assert os.path.isfile("/workspace/task_materializer.py")
 print(json.dumps({"status": "pass", "network_required": False}, sort_keys=True))
 """
 

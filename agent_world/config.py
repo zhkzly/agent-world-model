@@ -33,9 +33,9 @@ class AgentBackendConfig(ConfigModel):
     model_provider: str | None = None
     openai_base_url: HttpUrl | None = None
     codex_bin: Path | None = None
-    reasoning_researcher: Literal["low", "medium", "high", "xhigh"] = "high"
-    reasoning_engineer: Literal["low", "medium", "high", "xhigh"] = "xhigh"
-    reasoning_challenger: Literal["low", "medium", "high", "xhigh"] = "xhigh"
+    reasoning_researcher: Literal["low", "medium", "high", "xhigh"] = "medium"
+    reasoning_engineer: Literal["low", "medium", "high", "xhigh"] = "medium"
+    reasoning_challenger: Literal["low", "medium", "high", "xhigh"] = "medium"
     chatgpt_auth_file: Path | None = None
     api_key_environment: str | None = None
     engineer_network_domain_ceiling: tuple[str, ...] = (
@@ -106,7 +106,8 @@ class AgentBackendConfig(ConfigModel):
 
 
 class ResearchConfig(ConfigModel):
-    provider: Literal["searxng", "jina"]
+    provider: Literal["searxng", "jina", "bing_rss"]
+    bing_search_url: HttpUrl = HttpUrl("https://www.bing.com/search")
     searxng_base_url: HttpUrl | None = None
     searxng_allow_private_endpoint: bool = False
     allow_rfc2544_synthetic_egress: bool = False
@@ -129,6 +130,18 @@ class ResearchConfig(ConfigModel):
             raise ValueError("searxng provider requires searxng_base_url")
         if self.provider == "jina" and self.jina_api_key_environment is None:
             raise ValueError("jina search requires jina_api_key_environment")
+        parsed_bing = urlsplit(str(self.bing_search_url))
+        if (
+            parsed_bing.scheme != "https"
+            or parsed_bing.hostname != "www.bing.com"
+            or parsed_bing.port is not None
+            or parsed_bing.path != "/search"
+            or parsed_bing.username is not None
+            or parsed_bing.password is not None
+            or parsed_bing.query
+            or parsed_bing.fragment
+        ):
+            raise ValueError("bing_search_url must be the exact credential-free Bing HTTPS origin")
         if (
             self.jina_api_key_environment is not None
             and re.fullmatch(

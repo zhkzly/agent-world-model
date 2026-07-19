@@ -10,7 +10,7 @@ from pydantic import Field, JsonValue, model_validator
 
 from .base import ArtifactRef, ContentHash, Identifier, NonEmptyStr, V2Contract
 from .reachability import ReachabilityPolicy
-from .world import Rule, RuleArithmetic, RuleTerm, RuleValueRef, WorldSpec
+from .world import Rule, RuleArithmetic, RuleLookupByKey, RuleTerm, RuleValueRef, WorldSpec
 
 _RULE_PROPERTY_FAMILY = {
     "initial_state": "initial_state",
@@ -51,6 +51,8 @@ _UNSAFE_TASK_SCHEMA_KEYS = frozenset(
 def _term_sources(term: RuleTerm) -> frozenset[str]:
     if isinstance(term, RuleValueRef):
         return frozenset((term.source,))
+    if isinstance(term, RuleLookupByKey):
+        return frozenset((term.source,)) | _term_sources(term.key)
     if isinstance(term, RuleArithmetic):
         return _term_sources(term.left) | _term_sources(term.right)
     return frozenset()
@@ -68,6 +70,8 @@ def _rule_sources(rule: Rule) -> frozenset[str]:
 def _term_goal_pointers(term: RuleTerm | None) -> frozenset[str]:
     if isinstance(term, RuleValueRef):
         return frozenset((term.pointer,)) if term.source == "task_goal" else frozenset()
+    if isinstance(term, RuleLookupByKey):
+        return _term_goal_pointers(term.key)
     if isinstance(term, RuleArithmetic):
         return _term_goal_pointers(term.left) | _term_goal_pointers(term.right)
     return frozenset()

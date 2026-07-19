@@ -71,6 +71,7 @@ from agent_world.contracts import (
     sha256_digest,
 )
 from agent_world.control import (
+    PRODUCTION_FEEDBACK,
     BudgetExceeded,
     BudgetLease,
     BudgetLedger,
@@ -90,6 +91,7 @@ from agent_world.control import (
     DirectRequestConflictError,
     ErrorAuditPolicy,
     ExpansionCandidateAttempt,
+    FeedbackResult,
     JobRunSnapshot,
     LeaseBudgetLedger,
     MetricPoint,
@@ -102,6 +104,7 @@ from agent_world.control import (
     RepairLedger,
     RepairLedgerEntry,
     RepairRouter,
+    RepairTargetRef,
     ResearchCheckpointReuseEvidence,
     StructuredRepairAuthority,
     StructuredRepairDenied,
@@ -117,7 +120,7 @@ from agent_world.control import (
 from agent_world.designer import (
     DIRECT_DESIGN_BASE_TURNS,
     DIRECT_DESIGN_EVIDENCE_BASE_TURNS,
-    DIRECT_DESIGN_TAIL_BASE_TURNS,
+    DIRECT_DESIGN_MAX_CORRECTIONS,
     AdmissionBundle,
     DesignBundle,
     DesignerBudgetPlanError,
@@ -405,6 +408,8 @@ class _ControllerStructuredRepairAuthority(StructuredRepairAuthority):
         issue_codes: tuple[str, ...],
         continued_session: bool,
         diagnostic: ValidationDiagnostic | None = None,
+        feedback_contract_id: str | None = None,
+        repair_target: RepairTargetRef | None = None,
     ) -> str:
         async with self.run.repair_snapshot_lock:
             return await self.controller._authorize_structured_repair(
@@ -416,6 +421,8 @@ class _ControllerStructuredRepairAuthority(StructuredRepairAuthority):
                 issue_codes=issue_codes,
                 continued_session=continued_session,
                 diagnostic=diagnostic,
+                feedback_contract_id=feedback_contract_id,
+                repair_target=repair_target,
             )
 
     async def complete(
@@ -519,6 +526,7 @@ class _PendingRepairActions:
     directives: tuple[RepairDirective, ...]
     session_strategy: Literal["continued", "fresh", "none"]
     action_usage: BudgetUsage
+    invalidated_refs: tuple[ArtifactRef, ...] = ()
 
 
 class _GenerationHalt(RuntimeError):
@@ -2326,8 +2334,6 @@ class FoundryController:
             )
         run.remember(*directive_refs)
         run.remember_findings(*correction.finding_refs)
-        self._invalidate_design_downstream(run, directive_refs)
-
         routes_completed = False
 
         def complete_design_routes(
@@ -2335,6 +2341,7 @@ class FoundryController:
             *,
             retained_refs: tuple[ArtifactRef, ...],
             usage: BudgetUsage,
+            invalidated_refs: tuple[ArtifactRef, ...] = (),
         ) -> None:
             nonlocal routes_completed
             if routes_completed:
@@ -2345,6 +2352,7 @@ class FoundryController:
                 run.repair_ledger.complete(
                     route.ledger_entry_id,
                     blocking_claim_ids_after=blocking_claim_ids_after,
+                    invalidated_refs=invalidated_refs,
                     retained_refs=retained_refs,
                     session_strategy="continued",
                     usage=usage,
@@ -2540,10 +2548,16 @@ class FoundryController:
                 modeling_gate_ref,
             )
             run.remember(*outputs)
+            invalidated_refs = self._invalidate_artifact_descendants(
+                run,
+                superseded_refs=(previous.design_ref,),
+                invalidating_refs=(*directive_refs, bundle.design_ref),
+            )
             complete_design_routes(
                 (),
                 retained_refs=(bundle.design_ref,),
                 usage=total_usage,
+                invalidated_refs=invalidated_refs,
             )
             self._finish_attempt(
                 run,
@@ -4430,8 +4444,10 @@ class FoundryController:
             )
             checkpoint_phase = checkpoint.phase
         if checkpoint_phase == "world_skeleton":
-            base_turns = DIRECT_DESIGN_TAIL_BASE_TURNS
-        elif checkpoint_phase == "evidence_graph":
+            raise DirectJobStoreError(
+                "world_skeleton belongs to the retired microsharded Designer ABI"
+            )
+        if checkpoint_phase == "evidence_graph":
             base_turns = DIRECT_DESIGN_EVIDENCE_BASE_TURNS
         else:
             base_turns = DIRECT_DESIGN_BASE_TURNS
@@ -4439,7 +4455,10 @@ class FoundryController:
             run,
             purpose="direct-design-resume" if resumed else "direct-design",
             base_turns=base_turns,
-            maximum_corrections=(base_turns * self.designer.maximum_structured_reworks),
+            maximum_corrections=min(
+                DIRECT_DESIGN_MAX_CORRECTIONS,
+                self.designer.maximum_structured_reworks,
+            ),
             controller_owns_structured_repairs=True,
         )
         attempt_id = self._start_attempt(
@@ -4725,8 +4744,6 @@ class FoundryController:
             raise ValueError("design revision received a non-design RepairDirective")
         run.remember(*directive_refs)
         run.remember_findings(*correction.finding_refs)
-        self._invalidate_design_downstream(run, directive_refs)
-
         routes_completed = False
 
         def complete_design_routes(
@@ -4734,6 +4751,7 @@ class FoundryController:
             *,
             retained_refs: tuple[ArtifactRef, ...],
             usage: BudgetUsage,
+            invalidated_refs: tuple[ArtifactRef, ...] = (),
         ) -> None:
             nonlocal routes_completed
             if routes_completed:
@@ -4744,6 +4762,7 @@ class FoundryController:
                 run.repair_ledger.complete(
                     route.ledger_entry_id,
                     blocking_claim_ids_after=blocking_claim_ids_after,
+                    invalidated_refs=invalidated_refs,
                     retained_refs=retained_refs,
                     session_strategy="continued",
                     usage=usage,
@@ -4931,10 +4950,16 @@ class FoundryController:
                 modeling_gate_ref,
             )
             run.remember(*outputs)
+            invalidated_refs = self._invalidate_artifact_descendants(
+                run,
+                superseded_refs=(previous.design_ref,),
+                invalidating_refs=(*directive_refs, bundle.design_ref),
+            )
             complete_design_routes(
                 (),
                 retained_refs=(bundle.design_ref,),
                 usage=total_usage,
+                invalidated_refs=invalidated_refs,
             )
             self._finish_attempt(
                 run,
@@ -5115,7 +5140,83 @@ class FoundryController:
                 design.world_spec_ref,
             ),
         )
+        feedback_target = RepairTargetRef(
+            target_id=self._stable_id(
+                "feedback-target",
+                "feedback.design.modeling_gate",
+                design.design_ref.revision_id,
+            ),
+            component="design",
+            artifact_slot="environment_design",
+            lineage_id=f"{job.job_id}.modeling-gate",
+            immutable_input_refs=(
+                design.evidence_graph_ref,
+                design.coverage_map_ref,
+                design.world_spec_ref,
+            ),
+            committed_subject_ref=design.design_ref,
+            allowed_mutation_paths=("/",),
+        )
+        self._record_feedback_result(
+            contract_id="feedback.design.modeling_gate",
+            status="passed" if status == "pass" else "failed",
+            subject_ref=design.design_ref,
+            evidence_refs=(gate_ref,),
+            diagnostic_ref=gate_ref if failures else None,
+            target=feedback_target,
+            summary=gate.summary,
+        )
         return gate_ref, tuple(failures)
+
+    def _record_feedback_result(
+        self,
+        *,
+        contract_id: str,
+        status: Literal["passed", "failed", "inconclusive", "error", "not_run"],
+        subject_ref: ArtifactRef | None,
+        evidence_refs: tuple[ArtifactRef, ...],
+        summary: str,
+        target: RepairTargetRef | None = None,
+        diagnostic_ref: ArtifactRef | None = None,
+        usage: BudgetUsage | None = None,
+    ) -> ArtifactRef:
+        """Persist a dynamic feedback fact after catalog and target validation."""
+
+        contract = PRODUCTION_FEEDBACK.require(contract_id)
+        identity_ref = subject_ref or diagnostic_ref or evidence_refs[0]
+        result = FeedbackResult(
+            result_id=self._stable_id(
+                "feedback-result",
+                contract_id,
+                identity_ref.revision_id,
+                status,
+            ),
+            contract_id=contract.contract_id,
+            claim_id=contract.claim_id,
+            target=target,
+            status=status,
+            subject_ref=subject_ref,
+            evidence_refs=self._unique_refs(evidence_refs),
+            diagnostic_ref=diagnostic_ref,
+            usage=usage or BudgetUsage(),
+            evaluated_at=datetime.now(UTC),
+            summary=summary,
+        )
+        PRODUCTION_FEEDBACK.validate_result(result)
+        result_ref = self.artifacts.put_json(
+            artifact_id=result.result_id,
+            artifact_type="control.feedback_result",
+            value=result,
+            dependencies=self._unique_refs(
+                (
+                    *((subject_ref,) if subject_ref is not None else ()),
+                    *evidence_refs,
+                    *((diagnostic_ref,) if diagnostic_ref is not None else ()),
+                    *(target.immutable_input_refs if target is not None else ()),
+                )
+            ),
+        )
+        return result_ref
 
     @staticmethod
     def _modeling_unresolved(
@@ -5393,6 +5494,28 @@ class FoundryController:
             else:
                 compiled = result
                 run.remember(result.verifier_ref, *result.checkpoint_refs)
+                feedback_ref = self._record_feedback_result(
+                    contract_id="feedback.verifier.intent",
+                    status="passed",
+                    subject_ref=result.verifier_ref,
+                    evidence_refs=tuple(result.checkpoint_refs) or (result.verifier_ref,),
+                    target=RepairTargetRef(
+                        target_id=self._stable_id(
+                            "feedback-target",
+                            "feedback.verifier.intent",
+                            result.verifier_ref.revision_id,
+                        ),
+                        component="verifier",
+                        artifact_slot="verifier_intent_batch",
+                        lineage_id=f"{run.run_id}.verifier",
+                        immutable_input_refs=(design.design_ref, design.world_spec_ref),
+                        committed_subject_ref=result.verifier_ref,
+                        allowed_mutation_paths=("/",),
+                    ),
+                    summary="Independent verifier intent compiled to closed framework IR.",
+                    usage=usage,
+                )
+                run.remember(feedback_ref)
                 self._finish_attempt(
                     run,
                     verifier_attempt,
@@ -5466,6 +5589,30 @@ class FoundryController:
                     result.candidate_ref,
                 )
                 run.remember(*outputs)
+                feedback_ref = self._record_feedback_result(
+                    contract_id="feedback.build.candidate",
+                    status="passed",
+                    subject_ref=result.candidate_ref,
+                    evidence_refs=outputs[:-1],
+                    target=RepairTargetRef(
+                        target_id=self._stable_id(
+                            "feedback-target",
+                            "feedback.build.candidate",
+                            result.candidate_ref.revision_id,
+                        ),
+                        component="build",
+                        artifact_slot="candidate_workspace",
+                        lineage_id=f"{run.run_id}.builder",
+                        immutable_input_refs=(design.design_ref,),
+                        committed_subject_ref=result.candidate_ref,
+                        allowed_mutation_paths=("/candidate",),
+                    ),
+                    summary=(
+                        "Builder committed one closed candidate and reproducible source snapshot."
+                    ),
+                    usage=usage,
+                )
+                run.remember(feedback_ref)
                 self._finish_attempt(
                     run,
                     build_attempt,
@@ -6008,6 +6155,20 @@ class FoundryController:
             status: Literal["passed", "failed"] = (
                 "passed" if integrated.report.status == "ready" else "failed"
             )
+            feedback_ref = self._record_feedback_result(
+                contract_id="feedback.integration.runtime",
+                status=status,
+                subject_ref=integrated.report_ref,
+                evidence_refs=tuple(integrated.evidence_refs) or (integrated.report_ref,),
+                diagnostic_ref=(integrated.report_ref if status == "failed" else None),
+                summary=(
+                    "The candidate passed real install, reset and invocation execution."
+                    if status == "passed"
+                    else "Real integration execution produced release-blocking findings."
+                ),
+                usage=integrated.report.budget_usage,
+            )
+            run.remember(feedback_ref)
             self._finish_attempt(
                 run,
                 attempt_id,
@@ -6032,11 +6193,26 @@ class FoundryController:
                 for directive in pending.directives:
                     if directive.ledger_entry_id is None:
                         raise ValueError("pending repair directive lacks ledger entry")
+                    ledger_entry = next(
+                        item
+                        for item in run.repair_ledger.entries
+                        if item.entry_id == directive.ledger_entry_id
+                    )
+                    progress_evidence: Literal["none", "issue_set_changed"] = "none"
+                    if (
+                        ledger_entry.blocking_claim_ids_before
+                        and blockers_after
+                        and frozenset(ledger_entry.blocking_claim_ids_before)
+                        != frozenset(blockers_after)
+                    ):
+                        progress_evidence = "issue_set_changed"
                     run.repair_ledger.complete(
                         directive.ledger_entry_id,
                         blocking_claim_ids_after=blockers_after,
+                        invalidated_refs=pending.invalidated_refs,
                         retained_refs=(design.design_ref,),
                         session_strategy=pending.session_strategy,
+                        progress_evidence=progress_evidence,
                         usage=pending.action_usage,
                     )
                 self._persist_repair_ledger_entries(run, pending.directives)
@@ -6375,6 +6551,11 @@ class FoundryController:
                 repaired.candidate_ref,
             )
             run.remember(*repair_outputs)
+            invalidated_refs = self._invalidate_artifact_descendants(
+                run,
+                superseded_refs=(build.candidate_ref,),
+                invalidating_refs=(repaired.candidate_ref,),
+            )
             self._finish_attempt(
                 run,
                 repair_attempt_id,
@@ -6399,6 +6580,7 @@ class FoundryController:
                     BudgetUsage(repair_attempts=1),
                     repair_usage,
                 ),
+                invalidated_refs=invalidated_refs,
             )
             await self._persist_snapshot(run, status="running")
             build = repaired
@@ -6614,11 +6796,26 @@ class FoundryController:
                 for directive in pending.directives:
                     if directive.ledger_entry_id is None:
                         raise ValueError("pending Judge repair directive lacks ledger entry")
+                    ledger_entry = next(
+                        item
+                        for item in run.repair_ledger.entries
+                        if item.entry_id == directive.ledger_entry_id
+                    )
+                    progress_evidence: Literal["none", "issue_set_changed"] = "none"
+                    if (
+                        ledger_entry.blocking_claim_ids_before
+                        and blockers_after
+                        and frozenset(ledger_entry.blocking_claim_ids_before)
+                        != frozenset(blockers_after)
+                    ):
+                        progress_evidence = "issue_set_changed"
                     run.repair_ledger.complete(
                         directive.ledger_entry_id,
                         blocking_claim_ids_after=blockers_after,
+                        invalidated_refs=pending.invalidated_refs,
                         retained_refs=(design.design_ref, compiled.verifier_ref),
                         session_strategy=pending.session_strategy,
+                        progress_evidence=progress_evidence,
                         usage=pending.action_usage,
                     )
                 self._persist_repair_ledger_entries(run, pending.directives)
@@ -6626,6 +6823,20 @@ class FoundryController:
             judge_status: Literal["passed", "failed"] = (
                 "passed" if judge_bundle.report.verdict == "pass" else "failed"
             )
+            feedback_ref = self._record_feedback_result(
+                contract_id="feedback.judge.release",
+                status=judge_status,
+                subject_ref=judge_bundle.report_ref,
+                evidence_refs=tuple(judge_bundle.evidence_refs) or (judge_bundle.report_ref,),
+                diagnostic_ref=(judge_bundle.report_ref if judge_status == "failed" else None),
+                summary=(
+                    "Independent executable release gates passed for the exact candidate bytes."
+                    if judge_status == "passed"
+                    else "Independent executable release gates produced blocking findings."
+                ),
+                usage=judge_bundle.report.budget_usage,
+            )
+            run.remember(feedback_ref)
             self._finish_attempt(
                 run,
                 attempt_id,
@@ -7149,6 +7360,11 @@ class FoundryController:
                 repaired.candidate_ref,
             )
             run.remember(*repair_outputs)
+            invalidated_refs = self._invalidate_artifact_descendants(
+                run,
+                superseded_refs=(build.candidate_ref,),
+                invalidating_refs=(repaired.candidate_ref,),
+            )
             self._finish_attempt(
                 run,
                 repair_attempt_id,
@@ -7177,6 +7393,7 @@ class FoundryController:
                     BudgetUsage(repair_attempts=1),
                     repair_usage,
                 ),
+                invalidated_refs=invalidated_refs,
             )
             try:
                 _, build = await self._integrate_and_repair(
@@ -7701,25 +7918,51 @@ class FoundryController:
                 *research_provenance_refs,
             ),
         )
+        observability_feedback_ref = self._record_feedback_result(
+            contract_id="feedback.controller.observability",
+            status="passed",
+            subject_ref=telemetry_ref,
+            evidence_refs=(telemetry_ref, *research_provenance_refs),
+            summary="Sanitized telemetry covers every required pre-release operation.",
+        )
+        run.remember(observability_feedback_ref)
         evaluated_at = datetime.now(UTC)
+        design_claim_id, design_effect = self._release_feedback_claim_policy(
+            "feedback.design.modeling_gate"
+        )
+        build_claim_id, build_effect = self._release_feedback_claim_policy(
+            "feedback.build.candidate"
+        )
+        verifier_claim_id, verifier_effect = self._release_feedback_claim_policy(
+            "feedback.verifier.intent"
+        )
+        integration_claim_id, integration_effect = self._release_feedback_claim_policy(
+            "feedback.integration.runtime"
+        )
+        judge_claim_id, judge_effect = self._release_feedback_claim_policy(
+            "feedback.judge.release"
+        )
+        observability_claim_id, observability_effect = self._release_feedback_claim_policy(
+            "feedback.controller.observability"
+        )
         claims = (
             claim(
-                claim_id="design.valid",
+                claim_id=design_claim_id,
                 subject_ref=design.design_ref,
                 producer=_FRAMEWORK_ACTOR,
                 status="passed",
-                effect="block_integration",
+                effect=design_effect,
                 summary="The exact EnvironmentDesign passed framework modeling gates.",
                 evidence_refs=(modeling_gate_ref,),
                 dependency_refs=(design.design_ref, design.world_spec_ref),
                 evaluated_at=evaluated_at,
             ),
             claim(
-                claim_id="build.valid",
+                claim_id=build_claim_id,
                 subject_ref=build.candidate_ref,
                 producer=_FRAMEWORK_ACTOR,
                 status="passed",
-                effect="block_integration",
+                effect=build_effect,
                 summary="Builder committed a closed candidate source tree.",
                 evidence_refs=(build.build_artifact_ref, build.candidate_manifest_ref),
                 dependency_refs=(design.design_ref,),
@@ -7737,44 +7980,44 @@ class FoundryController:
                 evaluated_at=evaluated_at,
             ),
             claim(
-                claim_id="integration.ready",
+                claim_id=integration_claim_id,
                 subject_ref=build.candidate_ref,
                 producer=_FRAMEWORK_ACTOR,
                 status="passed",
-                effect="block_release",
+                effect=integration_effect,
                 summary="All Integration gates passed for the exact final source tree.",
                 evidence_refs=(integration_ref,),
                 dependency_refs=(build.candidate_ref,),
                 evaluated_at=evaluated_at,
             ),
             claim(
-                claim_id="verifier.valid",
+                claim_id=verifier_claim_id,
                 subject_ref=build.candidate_ref,
                 producer=_FRAMEWORK_ACTOR,
                 status="passed",
-                effect="block_release",
+                effect=verifier_effect,
                 summary="Framework-expanded Verifier IR is bound to the release Judge.",
                 evidence_refs=(verifier_ref,),
                 dependency_refs=(design.design_ref, design.world_spec_ref),
                 evaluated_at=evaluated_at,
             ),
             claim(
-                claim_id="release_judge.valid",
+                claim_id=judge_claim_id,
                 subject_ref=build.candidate_ref,
                 producer=_FRAMEWORK_ACTOR,
                 status="passed",
-                effect="block_release",
+                effect=judge_effect,
                 summary="Independent release Judge passed every required hard gate.",
                 evidence_refs=(judge_bundle.report_ref,),
                 dependency_refs=(integration_ref, verifier_ref),
                 evaluated_at=evaluated_at,
             ),
             claim(
-                claim_id="observability.release_ready",
+                claim_id=observability_claim_id,
                 subject_ref=build.candidate_ref,
                 producer=_FRAMEWORK_ACTOR,
                 status="passed",
-                effect="block_release",
+                effect=observability_effect,
                 summary="Durable sanitized execution telemetry exists for the release path.",
                 evidence_refs=(telemetry_ref,),
                 dependency_refs=(run.job_ref,),
@@ -7827,6 +8070,44 @@ class FoundryController:
         )
         run.remember(integration_ref, verifier_ref, telemetry_ref, claim_vector_ref)
         return integration, integration_ref, verifier_ref, telemetry_ref, claim_vector_ref
+
+    @staticmethod
+    def _release_feedback_claim_policy(
+        contract_id: str,
+    ) -> tuple[
+        str,
+        Literal[
+            "observe",
+            "reject_revision",
+            "block_integration",
+            "block_release",
+            "quarantine",
+        ],
+    ]:
+        """Compile release Claim policy from the executable feedback catalog."""
+
+        contract = PRODUCTION_FEEDBACK.require(contract_id)
+        effect = "observe" if contract.effect == "evidence_only" else contract.effect
+        if effect not in {
+            "observe",
+            "reject_revision",
+            "block_integration",
+            "block_release",
+            "quarantine",
+        }:
+            raise ValueError(
+                f"feedback contract {contract_id} cannot produce a release Claim effect"
+            )
+        return contract.claim_id, cast(
+            Literal[
+                "observe",
+                "reject_revision",
+                "block_integration",
+                "block_release",
+                "quarantine",
+            ],
+            effect,
+        )
 
     def _persist_research_checkpoint_reuse_evidence(
         self,
@@ -8282,12 +8563,20 @@ class FoundryController:
             value=release,
             dependencies=(manifest_ref, judge_bundle.report_ref, build.candidate_ref),
         )
+        registry_feedback_ref = self._record_feedback_result(
+            contract_id="feedback.registry.publish",
+            status="passed",
+            subject_ref=release_ref,
+            evidence_refs=(manifest_ref, release_ref),
+            summary="Registry committed and re-read the exact verified environment package.",
+        )
         run.remember(
             plan.identity_ref,
             plan.semantic_lineage_ref,
             plan.evidence_summary_ref,
             manifest_ref,
             release_ref,
+            registry_feedback_ref,
         )
         self._finish_attempt(
             run,
@@ -8515,7 +8804,22 @@ class FoundryController:
         issue_codes: tuple[str, ...],
         continued_session: bool,
         diagnostic: ValidationDiagnostic | None = None,
+        feedback_contract_id: str | None = None,
+        repair_target: RepairTargetRef | None = None,
     ) -> str:
+        if (feedback_contract_id is None) != (repair_target is None):
+            raise StructuredRepairDenied("feedback_contract_target_binding_incomplete")
+        feedback_contract = None
+        if feedback_contract_id is not None and repair_target is not None:
+            try:
+                feedback_contract = PRODUCTION_FEEDBACK.require_for_target(
+                    feedback_contract_id,
+                    repair_target,
+                )
+            except ValueError as exc:
+                raise StructuredRepairDenied("feedback_contract_target_mismatch") from exc
+            if feedback_contract.repair_owner_component != owner_node:
+                raise StructuredRepairDenied("feedback_contract_node_mismatch")
         active_structured_authorizations = sum(
             entry.outcome == "authorized" and entry.current_node == entry.target_node
             for entry in run.repair_ledger.entries
@@ -8536,17 +8840,28 @@ class FoundryController:
             if diagnostic_issues != safe_issues:
                 raise StructuredRepairDenied("diagnostic_issue_set_mismatch")
         issue_set_digest = sha256_digest(canonical_json_bytes(safe_issues))
+        ordinal = len(run.repair_ledger.entries) + 1
+        repair_target_ref: ArtifactRef | None = None
+        if repair_target is not None:
+            repair_target_ref = self.artifacts.put_json(
+                artifact_id=f"{run.run_id}:repair-target:{ordinal}",
+                artifact_type="control.repair_target",
+                value=repair_target,
+                dependencies=repair_target.immutable_input_refs or (run.job_ref,),
+            )
         fingerprint = sha256_digest(
             canonical_json_bytes(
                 {
                     "run_id": run.run_id,
+                    "repair_target_key": (
+                        repair_target.target_key if repair_target is not None else None
+                    ),
                     "lineage_id": self._safe_identifier(lineage_id),
                     "role": safe_role,
                     "repair_mode": safe_mode,
                 }
             )
         )
-        ordinal = len(run.repair_ledger.entries) + 1
         evidence_ref = self.artifacts.put_json(
             artifact_id=f"{run.run_id}:structured-repair-evidence:{ordinal}",
             artifact_type="control.structured_repair_evidence",
@@ -8558,12 +8873,51 @@ class FoundryController:
                 "issue_codes": safe_issues,
                 "issue_set_digest": issue_set_digest,
                 "continued_session": continued_session,
+                "feedback_contract_id": feedback_contract_id,
+                "repair_target_ref": (
+                    repair_target_ref.model_dump(mode="json")
+                    if repair_target_ref is not None
+                    else None
+                ),
                 "diagnostic": (
                     diagnostic.persistence_projection() if diagnostic is not None else None
                 ),
             },
-            dependencies=(run.job_ref,),
+            dependencies=self._unique_refs(
+                (run.job_ref, *((repair_target_ref,) if repair_target_ref is not None else ()))
+            ),
         )
+        feedback_result_ref: ArtifactRef | None = None
+        if feedback_contract is not None and repair_target is not None:
+            feedback_result = FeedbackResult(
+                result_id=self._stable_id(
+                    "feedback-result",
+                    run.run_id,
+                    feedback_contract.contract_id,
+                    str(ordinal),
+                ),
+                contract_id=feedback_contract.contract_id,
+                claim_id=feedback_contract.claim_id,
+                target=repair_target,
+                status="failed",
+                subject_ref=repair_target.committed_subject_ref,
+                evidence_refs=(evidence_ref,),
+                diagnostic_ref=evidence_ref,
+                evaluated_at=datetime.now(UTC),
+                summary="The exact semantic transaction failed its framework contract.",
+            )
+            PRODUCTION_FEEDBACK.validate_result(feedback_result)
+            feedback_result_ref = self.artifacts.put_json(
+                artifact_id=feedback_result.result_id,
+                artifact_type="control.feedback_result",
+                value=feedback_result,
+                dependencies=self._unique_refs(
+                    (
+                        evidence_ref,
+                        *((repair_target_ref,) if repair_target_ref is not None else ()),
+                    )
+                ),
+            )
         event = ControlEvent(
             event_id=f"{run.run_id}:structured-repair-event:{ordinal}",
             kind=(
@@ -8573,8 +8927,13 @@ class FoundryController:
             ),
             node=owner_node,
             reason_code=f"structured_{safe_mode}",
-            subject_ref=evidence_ref,
-            evidence_refs=(evidence_ref,),
+            subject_ref=repair_target_ref or evidence_ref,
+            evidence_refs=self._unique_refs(
+                (
+                    evidence_ref,
+                    *((feedback_result_ref,) if feedback_result_ref is not None else ()),
+                )
+            ),
             issue_codes=safe_issues,
         )
         disposition = self.code_router.classify_local_repair(event, mode=repair_mode)
@@ -8595,9 +8954,16 @@ class FoundryController:
             category=f"{owner_node}_structured_{safe_mode}",
             severity="high",
             owner=disposition.owner,
-            subject_ref=evidence_ref,
+            subject_ref=repair_target_ref or evidence_ref,
             summary=(f"{safe_role} output requires a framework-authorized {safe_mode} correction."),
-            evidence_refs=(event_ref, disposition_ref, evidence_ref),
+            evidence_refs=self._unique_refs(
+                (
+                    event_ref,
+                    disposition_ref,
+                    evidence_ref,
+                    *((feedback_result_ref,) if feedback_result_ref is not None else ()),
+                )
+            ),
             fingerprint=fingerprint,
             disclosure="repair",
             suggested_repair="Correct only the rejected typed artifact at the current node.",
@@ -8608,27 +8974,39 @@ class FoundryController:
             value=finding,
             dependencies=(event_ref, disposition_ref, evidence_ref),
         )
-        run.remember(evidence_ref, event_ref, disposition_ref)
+        if repair_target_ref is not None:
+            run.remember(repair_target_ref)
+        run.remember(
+            evidence_ref,
+            event_ref,
+            disposition_ref,
+            *((feedback_result_ref,) if feedback_result_ref is not None else ()),
+        )
         run.remember_findings(finding_ref)
         entry = run.repair_ledger.authorize(
             finding=finding,
             finding_ref=finding_ref,
             current_node=owner_node,
             target_node=owner_node,
-            owner_ref=evidence_ref,
+            owner_ref=repair_target_ref or evidence_ref,
             action=(
                 "retry_infrastructure"
                 if repair_mode is StructuredRepairMode.BACKEND_RETRY
                 else "continue_session"
             ),
             jump_distance=0,
-            causal_evidence_refs=(evidence_ref,),
+            causal_evidence_refs=self._unique_refs(
+                (evidence_ref, *((repair_target_ref,) if repair_target_ref is not None else ()))
+            ),
             blocking_claim_ids_before=safe_issues,
             validation_phase_before=(
                 diagnostic.validation_phase if diagnostic is not None else None
             ),
             validation_frontier_before=(
                 diagnostic.frontier_ordinal if diagnostic is not None else None
+            ),
+            maximum_attempts=(
+                feedback_contract.maximum_attempts if feedback_contract is not None else None
             ),
         )
         self._persist_repair_ledger_entry(run, entry)
@@ -8789,7 +9167,7 @@ class FoundryController:
             node=node,
             reason_code=safe_code,
             subject_ref=subject,
-            evidence_refs=self._unique_refs(causal_refs),
+            evidence_refs=self._unique_refs(tuple(causal_refs)),
             issue_codes=safe_context,
         )
         disposition = self.code_router.classify(event)
@@ -9734,34 +10112,55 @@ class FoundryController:
                 span.finish(status="error", error_code=error_code)
         run.telemetry_node_spans.clear()
 
-    @staticmethod
-    def _invalidate_design_downstream(
+    def _invalidate_artifact_descendants(
+        self,
         run: _RunState,
+        *,
+        superseded_refs: tuple[ArtifactRef, ...],
         invalidating_refs: tuple[ArtifactRef, ...],
-    ) -> None:
-        """Mark prior dependent attempts obsolete before recomputing the branch."""
+    ) -> tuple[ArtifactRef, ...]:
+        """Invalidate only attempts that consumed the superseded Artifact DAG.
 
-        if not invalidating_refs:
-            raise ValueError("downstream invalidation requires RepairDirective refs")
+        Rejected pre-commit output has no ArtifactRef and therefore invalidates
+        nothing.  A successful new revision invalidates the transitive
+        descendants of the precise superseded revisions; unrelated research,
+        sibling batches and cached artifacts remain valid.
+        """
+
+        if not superseded_refs or not invalidating_refs:
+            raise ValueError("artifact invalidation requires superseded and invalidating refs")
+        descendants: dict[str, ArtifactRef] = {}
+        frontier = list(self._unique_refs(superseded_refs))
+        visited = {item.revision_id for item in frontier}
+        while frontier:
+            current = frontier.pop()
+            for dependent in self.artifacts.dependents(current):
+                if dependent.revision_id in visited:
+                    continue
+                visited.add(dependent.revision_id)
+                descendants[dependent.revision_id] = dependent
+                frontier.append(dependent)
+
+        invalidated_output_refs: list[ArtifactRef] = []
+        causal_revision_ids = set(descendants) | {
+            item.revision_id for item in superseded_refs
+        }
         for index, attempt in enumerate(run.attempts):
-            if attempt.node not in {
-                "verifier",
-                "build",
-                "integration",
-                "judge",
-                "release",
-            }:
-                continue
             if attempt.status in {"pending", "running", "invalidated"}:
                 continue
+            bound_refs = (*attempt.input_refs, *attempt.output_refs)
+            if not any(ref.revision_id in causal_revision_ids for ref in bound_refs):
+                continue
+            invalidated_output_refs.extend(attempt.output_refs)
             run.attempts[index] = attempt.model_copy(
                 update={
                     "status": "invalidated",
-                    "invalidated_by_refs": FoundryController._unique_refs(invalidating_refs),
+                    "invalidated_by_refs": self._unique_refs(invalidating_refs),
                     "failure_code": None,
                     "failure_summary": None,
                 }
             )
+        return self._unique_refs(tuple(invalidated_output_refs))
 
     def _finish_discovery_attempt(
         self,

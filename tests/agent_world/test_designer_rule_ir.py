@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from pydantic import BaseModel
@@ -147,6 +149,85 @@ def test_temporal_rule_draft_compiles_and_executes_without_llm_repair() -> None:
             rule,
             _context(check_in="not-a-date", check_out="2026-07-21"),
         )
+
+
+def test_lookup_by_key_rule_compiles_and_executes_against_collection_state() -> None:
+    source = ToolConditionsSourceDraft.model_validate(
+        {
+            "tool_id": "hotel.booking.get",
+            "postconditions": [
+                {
+                    "rule_id": "rule:hotel.booking.get:confirmed",
+                    "family": "postcondition",
+                    "description": "The selected booking is confirmed.",
+                    "boolean_operator": "all",
+                    "clauses": [
+                        {
+                            "clause_id": "selected_booking_confirmed",
+                            "operator": "equal",
+                            "left": {
+                                "kind": "lookup_by_key",
+                                "source": "post_state",
+                                "collection_pointer": "/bookings",
+                                "key_field": "booking_id",
+                                "key": {
+                                    "kind": "reference",
+                                    "source": "args",
+                                    "pointer": "/booking_id",
+                                    "value_type": "string",
+                                },
+                                "value_pointer": "/status",
+                                "value_type": "string",
+                            },
+                            "right": {
+                                "kind": "constant",
+                                "value_type": "string",
+                                "value": "confirmed",
+                            },
+                            "negate": False,
+                        }
+                    ],
+                    "case_sensitivity": "positive_only",
+                    "evidence_claim_ids": [],
+                }
+            ],
+        }
+    )
+    rule = EnvironmentDesigner._compile_tool_conditions_source(source).postconditions[0]
+    context = RuleExecutionContext(
+        actor="guest",
+        pre_state={"bookings": []},
+        post_state={
+            "bookings": [
+                {"booking_id": "booking:other", "status": "cancelled"},
+                {"booking_id": "booking:target", "status": "confirmed"},
+            ]
+        },
+        args={"booking_id": "booking:target"},
+        tool_result={},
+        error=None,
+        observation={},
+        events=[],
+        reset_config={},
+        task_goal={},
+        seed=1,
+        terminated=False,
+        truncated=False,
+    )
+
+    assert evaluate_rule(rule, context).result
+
+    duplicate_context = replace(
+        context,
+        post_state={
+            "bookings": [
+                {"booking_id": "booking:target", "status": "confirmed"},
+                {"booking_id": "booking:target", "status": "confirmed"},
+            ]
+        },
+    )
+    with pytest.raises(RuleEvaluationError, match="more than one state record"):
+        evaluate_rule(rule, duplicate_context)
 
 
 def test_direct_agent_source_contracts_have_no_hidden_model_validators() -> None:

@@ -17,8 +17,11 @@ _COMPONENT_DEPENDENCY_ROLES: dict[CandidateComponentRole, frozenset[str]] = {
 
 
 class _RoleFile(Protocol):
-    path: str
-    role: str
+    @property
+    def path(self) -> str: ...
+
+    @property
+    def role(self) -> str: ...
 
 
 def component_visible_paths(

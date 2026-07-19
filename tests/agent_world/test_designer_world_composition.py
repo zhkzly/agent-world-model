@@ -29,7 +29,9 @@ from agent_world.control.validation import (
 )
 from agent_world.designer.expansion_service import ExpansionDesigner
 from agent_world.designer.models import (
+    ActorAuthoritySourceDraft,
     AssumptionResolutionDraft,
+    CompactFieldSemanticDraft,
     CurriculumPlanDraft,
     CurriculumTaskPlan,
     EnvironmentDesignDraft,
@@ -48,6 +50,8 @@ from agent_world.designer.models import (
     StateEntityPlan,
     StateEntitySchemaDraft,
     StateEntitySchemaIRDraft,
+    StateEntitySourceDraft,
+    StateFieldSourceDraft,
     TaskDistributionDeltaClaimDraft,
     TaskRequirementDraft,
     TaskScopeDeltaClaimDraft,
@@ -55,6 +59,7 @@ from agent_world.designer.models import (
     ToolBehaviorDraft,
     ToolConditionsDraft,
     ToolErrorsDraft,
+    ToolInterfaceSourceDraft,
     ToolReliabilityDraft,
     ToolSchemaDraft,
     ToolSchemaIRDraft,
@@ -63,7 +68,10 @@ from agent_world.designer.models import (
     ToolSurfaceDraft,
     ToolSurfacePlan,
     ToolSurfaceSchemasDraft,
+    ToolSurfaceSourceDraft,
+    WorldArchitectureSourceDraft,
     WorldBoundaryDraft,
+    WorldBoundarySourceDraft,
     WorldClosureDraft,
     WorldClosureReferenceTerm,
     WorldModelDraft,
@@ -73,9 +81,11 @@ from agent_world.designer.models import (
     WorldStateShapeDraft,
     WorldToolInventoryDraft,
     WorldToolPlanInventoryDraft,
+    WorldToolSourceInventoryDraft,
 )
 from agent_world.designer.service import (
     DIRECT_DESIGN_BASE_TURNS,
+    DIRECT_DESIGN_MAX_TURNS,
     MAX_STATE_ENTITIES,
     MAX_WORLD_CLOSURE_CONTEXT_BYTES,
     MAX_WORLD_TOOL_SURFACES,
@@ -174,17 +184,40 @@ def test_tool_access_observation_reports_all_missing_fields_by_actor(
         dict[str, JsonValue],
         skeleton.tool_surfaces[0].surface.observation_schema["properties"],
     )
-    expected_fields = set(properties)
+    assert properties
     missing_locations = {
         issue.location
         for issue in raised.value.issues
         if issue.code == "observation_field_missing"
     }
     assert missing_locations == {
-        ("observation", "classification", actor, field)
-        for actor in actors
-        for field in expected_fields
+        ("observation", "classification", actor) for actor in actors
     }
+
+
+def test_public_tool_may_allow_every_frozen_actor_without_invented_condition(
+    tmp_path: Path,
+) -> None:
+    _, skeleton, _, tool_draft, _ = _inputs(tmp_path)
+    actors = tuple(item.actor for item in skeleton.boundary.actors_and_authority)
+    permission = tool_draft.semantics.permission.model_copy(
+        update={
+            "allowed_actors": actors,
+            "required_scopes_by_actor": {actor: () for actor in actors},
+            "condition": None,
+        }
+    )
+    access = ToolAccessObservationDraft(
+        tool_id=tool_draft.tool_id,
+        permission=permission,
+        observation=tool_draft.semantics.observation,
+    )
+
+    EnvironmentDesigner._validate_tool_access_observation_draft(
+        access,
+        expected_tool_id=tool_draft.tool_id,
+        skeleton=skeleton,
+    )
 
 
 def test_tool_access_observation_routes_permission_rule_id_collision(
@@ -336,6 +369,7 @@ def test_world_model_is_framework_composed_from_bounded_real_semantic_nodes(
         name=surface.name,
         description=surface.description,
         transport=surface.transport,
+        reads_state_entities=("counter",),
         evidence_claim_ids=("claim:counter",),
     )
     tool_plan_inventory = WorldToolPlanInventoryDraft(tools=(tool_plan,))
@@ -474,7 +508,105 @@ def test_world_model_is_framework_composed_from_bounded_real_semantic_nodes(
     assert assembled.invariants == closure.invariants
     assert MAX_WORLD_TOOL_SURFACES == 8
     assert MAX_STATE_ENTITIES == 12
-    assert DIRECT_DESIGN_BASE_TURNS == (8 + MAX_STATE_ENTITIES + (8 * MAX_WORLD_TOOL_SURFACES))
+    # Cardinality changes payload size, never the number of semantic transactions.
+    # Eight turns reserve two research calls, architecture, up to two tool
+    # batches, task/curriculum, and at most two local corrections.
+    assert DIRECT_DESIGN_BASE_TURNS == 8
+    assert DIRECT_DESIGN_MAX_TURNS == 10
+
+
+def test_compact_architecture_compiles_full_typed_skeleton_with_framework_tool_id(
+    tmp_path: Path,
+) -> None:
+    _world, existing, graph, _tool_draft, _closure = _inputs(tmp_path)
+    surface = existing.tool_surfaces[0]
+    source = WorldArchitectureSourceDraft(
+        boundary=WorldBoundarySourceDraft(
+            primary_domain=existing.boundary.primary_domain,
+            actors_and_authority=tuple(
+                ActorAuthoritySourceDraft(
+                    actor=actor.actor,
+                    authorities=actor.authorities,
+                )
+                for actor in existing.boundary.actors_and_authority
+            ),
+            systems_of_record=existing.boundary.systems_of_record,
+            transition_authorities=existing.boundary.transition_authorities,
+            tool_namespaces=existing.boundary.tool_namespaces,
+            core_invariants=existing.boundary.core_invariants,
+            task_dimensions=existing.task_dimensions,
+            fidelity=existing.fidelity,
+        ),
+        state_entities=(
+            StateEntitySourceDraft(
+                entity="counter",
+                purpose="Own deterministic counter state.",
+                root_field="counter",
+                storage="singleton",
+                system_of_record=existing.boundary.systems_of_record[0],
+                owned_resource_ids=("counter",),
+                visible_to_actor_ids=tuple(
+                    actor.actor
+                    for actor in existing.boundary.actors_and_authority
+                    if "counter" in actor.visibility
+                ),
+                fields=(
+                    StateFieldSourceDraft(
+                        name="value",
+                        value_type="integer",
+                        description="Current counter value.",
+                        minimum=0,
+                        role="primary_key",
+                    ),
+                ),
+                evidence_claim_ids=("claim:counter",),
+            ),
+        ),
+        tool_inventory=WorldToolSourceInventoryDraft(
+            tools=(
+                ToolSurfaceSourceDraft(
+                    namespace=surface.surface.namespace,
+                    name=surface.surface.name,
+                    description=surface.surface.description,
+                    transport=surface.surface.transport,
+                    writes_state_entities=("counter",),
+                    evidence_claim_ids=surface.evidence_claim_ids,
+                    interface=ToolInterfaceSourceDraft(
+                        input_fields=(
+                            CompactFieldSemanticDraft(
+                                name="amount",
+                                value_type="integer",
+                                description="Increment amount.",
+                                minimum=0,
+                            ),
+                        ),
+                        output_fields=(
+                            CompactFieldSemanticDraft(
+                                name="value",
+                                value_type="integer",
+                                description="Updated counter value.",
+                            ),
+                        ),
+                        observation_fields=(
+                            CompactFieldSemanticDraft(
+                                name="value",
+                                value_type="integer",
+                                description="Visible counter value.",
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+
+    compiled = EnvironmentDesigner.__new__(EnvironmentDesigner)._compile_architecture_skeleton(
+        source,
+        evidence_graph=graph,
+    )
+
+    assert compiled.tool_surfaces[0].surface.tool_id == surface.surface.tool_id
+    assert compiled.state.root_state_schema["additionalProperties"] is False
 
 
 def test_state_entity_inventory_reports_independent_semantic_errors_together(
@@ -1210,6 +1342,7 @@ def test_semantic_source_canonically_compiles_task_reward_and_verification(
                     name=tool.surface.name,
                     description=tool.surface.description,
                     transport=tool.surface.transport,
+                    writes_state_entities=("counter",),
                     evidence_claim_ids=tool.evidence_claim_ids,
                 ),
             )
@@ -1564,6 +1697,7 @@ def test_tool_surface_schema_cannot_drift_or_remain_open() -> None:
         name="reserve",
         description="Reserve selected inventory.",
         transport="runtime",
+        reads_state_entities=("booking",),
         evidence_claim_ids=("claim:booking",),
     )
     closed: dict[str, JsonValue] = {
@@ -1628,6 +1762,7 @@ def test_tool_schema_ir_compiles_required_arrays_and_unions_to_valid_draft() -> 
         name="reserve",
         description="Reserve selected inventory.",
         transport="runtime",
+        reads_state_entities=("booking",),
         evidence_claim_ids=("claim:booking",),
     )
     schema_ir = ToolSchemaIRDraft(
@@ -1705,6 +1840,7 @@ def test_tool_schema_ir_rejects_cycles_before_compilation() -> None:
         name="reserve",
         description="Reserve selected inventory.",
         transport="runtime",
+        reads_state_entities=("booking",),
         evidence_claim_ids=("claim:booking",),
     )
     draft = ToolSchemaIRDraft.model_validate(

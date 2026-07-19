@@ -1,0 +1,125 @@
+{
+  "schema_version": "agent-world.feedback-topology-bad-cases.v1",
+  "cases": [
+    {
+      "id": "BC-01",
+      "proof": "live",
+      "source": ".agent-world-live/batched-hotel",
+      "summary": "Seven hotel Direct runs ended before Build.",
+      "required_regression": "A fresh real hotel run reaches Registry; staged downstream execution is also proven independently."
+    },
+    {
+      "id": "BC-02",
+      "proof": "live",
+      "run_id": "run:d8dd78a081ce4942b56e67e8466ede8c",
+      "summary": "One unchanged reliability repair spent 50,645 provider tokens.",
+      "required_regression": "Same issue/frontier terminates after one local correction and generic diagnostics spend no Agent turn."
+    },
+    {
+      "id": "BC-03",
+      "proof": "live",
+      "run_ids": [
+        "run:128002f281ad4d5a8f064374a0db7eae",
+        "run:91ae8d6acadd4bfe89dc9380bea8c565"
+      ],
+      "summary": "Root schema errors erased causal repair information.",
+      "required_regression": "Mechanical diagnostics include stable code, safe path, violated condition and expected category."
+    },
+    {
+      "id": "BC-04",
+      "proof": "live",
+      "run_id": "run:6e37cb825ca944129b361504550c4a7a",
+      "summary": "Validation moved A to B to A across frontier 15 to 20 to 15.",
+      "required_regression": "Code distinguishes strict progress, unchanged, regression and oscillation."
+    },
+    {
+      "id": "BC-05",
+      "proof": "live",
+      "run_id": "run:c96ab6b04eb54f0c8718c3a83864b1bf",
+      "summary": "Retired microsharding used over 900k accounted tokens without Design.",
+      "required_regression": "Compact logical transactions have bounded physical shards and retain explicit accounting discrepancies."
+    },
+    {
+      "id": "BC-06",
+      "proof": "live",
+      "run_id": "run:d8dd78a081ce4942b56e67e8466ede8c",
+      "summary": "One local correction produced overlapping feedback, target, event, disposition, finding and ledger authority objects.",
+      "required_regression": "ValidationReport, one terminal FeedbackEvaluation and one RepairLedger authority are sufficient for recovery and routing."
+    },
+    {
+      "id": "BC-07",
+      "proof": "live-observation",
+      "source": "trellis-session:019f75c5-89ae-70f1-bd82-be3be1feaa62",
+      "summary": "Builder ran about 896 seconds without first write.",
+      "required_regression": "Real Builder exposes first-progress/write and reaches a bounded terminal; prompt cause remains a hypothesis."
+    },
+    {
+      "id": "BC-08",
+      "proof": "source",
+      "source": "agent_world/judge/service.py",
+      "summary": "Integration and final Judge repeat deterministic/public checks on the same Candidate.",
+      "required_regression": "Digest-bound Integration evidence is reused and additive final checks remain independent."
+    },
+    {
+      "id": "BC-09",
+      "proof": "source-and-live-effect",
+      "summary": "FeedbackContract, components, RepairLedger, Controller and Budget each own retry limits.",
+      "required_regression": "Every semantic retry has exactly one RepairPolicy authorization and one global budget charge."
+    },
+    {
+      "id": "BC-10",
+      "proof": "source",
+      "summary": "Direct uses staged Design while Evolve uses one ExpansionDesignDraft transaction.",
+      "required_regression": "Generate and Expand instantiate the same logical WorkGraph with only seed context differing."
+    },
+    {
+      "id": "BC-11",
+      "proof": "source",
+      "summary": "Evolve semantic retries bypass StructuredRepairAuthority and SemanticNodeCommit.",
+      "required_regression": "No Generate or Expand semantic retry occurs outside the global RepairLedger."
+    },
+    {
+      "id": "BC-12",
+      "proof": "reproduced-infrastructure",
+      "summary": "Managed sandbox did not deliver asyncio child exit; the exact test passed outside it in 0.60 seconds.",
+      "required_regression": "Classify isolation limitations as infrastructure; keep production cancellation semantics and explicit deadlines."
+    },
+    {
+      "id": "BC-13",
+      "proof": "reproduced",
+      "summary": "SharedToolSemantics uses a repair slot incompatible with feedback.design.tool_semantics.",
+      "required_regression": "A distinct shared behavior contract validates the production RepairTarget without ValueError."
+    },
+    {
+      "id": "BC-14",
+      "proof": "live-and-reproduced",
+      "summary": "Hotel tool-semantics continuation produced 62 relative Rule pointers; 11 core RuleValueRef errors collapsed to framework_diagnostic_incomplete root issues after one progressing repair.",
+      "required_regression": "Canonical Rule validators emit stable codes, whole-Rule compilation retains tool/rule/clause/term paths, and diagnostic prefixing preserves retryability, violated condition, and expected category."
+    },
+    {
+      "id": "BC-15",
+      "proof": "live-source-and-static-replay",
+      "summary": "Hotel Rules attempted paths such as bookings/booking_status through array-backed state collections, which RFC 6901 cannot use to select the action-targeted record.",
+      "required_regression": "RuleContextCatalog rejects unreachable direct pointers and the bounded lookup_by_key Rule term compiles, schema-checks, and executes with fail-closed uniqueness semantics."
+    },
+    {
+      "id": "BC-16",
+      "proof": "source-and-live-restart",
+      "summary": "InvocationBackend can continue a Codex thread, but semantic transaction state is process-local; a restart preserves only a hashed session id and phase resume reruns the whole node.",
+      "required_regression": "A private framework-owned continuation checkpoint can resume only the authorized semantic transaction after policy, lineage, input, profile, schema and budget digests are revalidated."
+    },
+    {
+      "id": "BC-17",
+      "proof": "live",
+      "run_id": "run:a11204339b724e768a93889339194764",
+      "summary": "A hotel tool batch used 97,995 tokens across one proposal and two progressing corrections, moving shape frontier 10 to semantic frontier 30 and then from 15 to 10 Rule issues, but still terminated before a valid batch.",
+      "required_regression": "The bounded progress bonus remains terminal after two corrections, while physical batch sizing and frozen context make a fresh real batch converge without increasing the retry ceiling."
+    },
+    {
+      "id": "BC-18",
+      "proof": "source",
+      "summary": "The new WorkDefinition/ValidationReport/FeedbackEvaluation/RepairAction control vocabulary is tested but explicitly not wired into orchestration; production still uses FeedbackContract plus component-local loops and the legacy RepairLedger.",
+      "required_regression": "Every production boundary is instantiated from one executable WorkDefinition and no component loop can retry, jump, invalidate or establish readiness outside its RepairPolicy and FeedbackEvaluation."
+    }
+  ]
+}

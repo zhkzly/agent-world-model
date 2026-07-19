@@ -447,9 +447,9 @@ def normalize_candidate_completion_output(value: JsonValue) -> JsonValue:
 
     files = proposal.get("files")
     if isinstance(files, list) and all(isinstance(item, dict) for item in files):
-        declarations = cast(list[dict[str, JsonValue]], files)
+        file_declarations = cast(list[dict[str, JsonValue]], files)
         by_path: dict[str, dict[str, JsonValue]] = {}
-        for declaration in declarations:
+        for declaration in file_declarations:
             path = declaration.get("path")
             if not isinstance(path, str) or path in by_path:
                 break

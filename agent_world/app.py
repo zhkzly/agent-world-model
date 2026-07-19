@@ -365,6 +365,10 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
     )
     designer_artifacts = artifacts.issue_writer(
         producer="environment-designer",
+        allowed_artifact_types=(
+            "control.feedback_diagnostic",
+            "control.feedback_result",
+        ),
         allowed_artifact_type_prefixes=("design.", "discovery."),
         allowed_event_type_prefixes=("design_",),
     )

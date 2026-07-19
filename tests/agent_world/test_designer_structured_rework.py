@@ -19,10 +19,13 @@ from agent_world.contracts import (
     EnvironmentRequest,
     Evidence,
     EvidenceGraph,
+    KeyValue,
     PermissionScope,
     ReleaseProfile,
     sha256_digest,
 )
+from agent_world.control import StructuredRepairMode
+from agent_world.control.feedback import RepairTargetRef
 from agent_world.control.validation import (
     SafeValidationIssue,
     StructuredValidationError,
@@ -31,6 +34,12 @@ from agent_world.control.validation import (
 from agent_world.designer.budget import DesignerInvocationBudget
 from agent_world.designer.models import (
     EvidenceSynthesis,
+    ObservationSemanticsSourceDraft,
+    PermissionRuleSourceDraft,
+    RuleArithmeticDraft,
+    RuleConstantDraft,
+    RuleDraft,
+    RuleReferenceDraft,
     SchemaArrayNodeDraft,
     SchemaIntegerNodeDraft,
     SchemaNullNodeDraft,
@@ -41,15 +50,17 @@ from agent_world.designer.models import (
     SchemaUnionNodeDraft,
     StateEntityPlan,
     StateEntitySchemaIRDraft,
+    ToolAccessObservationSourceDraft,
+    ToolConditionsSourceDraft,
 )
 from agent_world.designer.service import (
-    _DESIGN_COMPLETION_INDEX_SCOPE,
     _DESIGN_REPAIR_AUTHORITY,
     _DESIGN_RESEARCH_USAGE,
     AgentProfileProvider,
     DesignerError,
     EnvironmentDesigner,
-    _DesignCompletionIndexScope,
+    RootSectionRepairProjection,
+    ToolSemanticsRepairProjection,
     _gather_independent,
 )
 from agent_world.designer.validation import (
@@ -78,8 +89,163 @@ class _Output(SemanticAdvisoryOutput, BaseModel):
     value: str
 
 
+class _SectionOutput(SemanticAdvisoryOutput, BaseModel):
+    state: str
+    tools: str
+
+
+class _ToolParts(BaseModel):
+    conditions: str
+    access_observation: str
+
+
+class _ToolBatchOutput(SemanticAdvisoryOutput, BaseModel):
+    tools: tuple[_ToolParts, ...]
+
+
 register_agent_output_contract(
     _Output,
+    authority=AgentOutputAuthority.SEMANTIC_ADVISORY,
+)
+register_agent_output_contract(
+    _ToolBatchOutput,
+    authority=AgentOutputAuthority.SEMANTIC_ADVISORY,
+)
+
+
+def test_rule_source_rejects_ordering_type_mismatch_at_clause_path() -> None:
+    rule = RuleDraft.model_validate(
+        {
+                "rule_id": "rule:hotel.search:result_count",
+                "family": "transition",
+                "description": "Result count is non-negative.",
+                "boolean_operator": "all",
+                "clauses": [
+                    {
+                        "clause_id": "result_count_nonnegative",
+                        "operator": "greater_or_equal",
+                        "ordering": "number",
+                        "left": {
+                            "kind": "reference",
+                            "source": "post_state",
+                            "pointer": "/offers",
+                            "value_type": "array",
+                        },
+                        "right": {
+                            "kind": "constant",
+                            "value_type": "number",
+                            "value": 0,
+                        },
+                    }
+                ],
+                "case_sensitivity": "positive_only",
+                "evidence_claim_ids": [],
+        }
+    )
+
+    with pytest.raises(StructuredSemanticError) as captured:
+        EnvironmentDesigner._validate_rule_source_draft(rule)
+
+    assert captured.value.issues[0].code == "rule_ordering_type_mismatch"
+    assert captured.value.issues[0].location == ("clauses", 0)
+
+
+def test_rule_source_rejects_non_numeric_arithmetic_and_zero_divisor() -> None:
+    def rule_with(term: RuleArithmeticDraft) -> RuleDraft:
+        return RuleDraft.model_validate(
+            {
+                "rule_id": "rule:arithmetic",
+                "family": "transition",
+                "description": "Validate an arithmetic term.",
+                "boolean_operator": "all",
+                "clauses": [
+                    {
+                        "clause_id": "arithmetic_equal",
+                        "operator": "equal",
+                        "left": term.model_dump(mode="json"),
+                        "right": {
+                            "kind": "constant",
+                            "value_type": "number",
+                            "value": 1,
+                        },
+                    }
+                ],
+                "case_sensitivity": "positive_only",
+                "evidence_claim_ids": [],
+            }
+        )
+
+    non_numeric = RuleArithmeticDraft(
+        kind="arithmetic",
+        operator="add",
+        left=RuleReferenceDraft(
+            kind="reference",
+            source="args",
+            pointer="/name",
+            value_type="string",
+        ),
+        right=RuleConstantDraft(kind="constant", value_type="number", value=1),
+    )
+    zero_divisor = RuleArithmeticDraft(
+        kind="arithmetic",
+        operator="divide",
+        left=RuleConstantDraft(kind="constant", value_type="number", value=1),
+        right=RuleConstantDraft(kind="constant", value_type="number", value=0),
+    )
+
+    with pytest.raises(StructuredSemanticError) as captured:
+        EnvironmentDesigner._validate_rule_source_draft(rule_with(non_numeric))
+    assert "rule_arithmetic_operand_type" in {issue.code for issue in captured.value.issues}
+    with pytest.raises(StructuredSemanticError) as captured:
+        EnvironmentDesigner._validate_rule_source_draft(rule_with(zero_divisor))
+    assert "rule_arithmetic_zero_divisor" in {issue.code for issue in captured.value.issues}
+
+
+def test_rule_compiler_preserves_live_relative_pointer_paths_and_expectations() -> None:
+    source = ToolConditionsSourceDraft.model_validate(
+        {
+            "tool_id": "hotel.booking.get",
+            "preconditions": [
+                {
+                    "rule_id": "rule:hotel.booking.get:exists",
+                    "family": "precondition",
+                    "description": "The booking exists.",
+                    "boolean_operator": "all",
+                    "clauses": [
+                        {
+                            "clause_id": "booking_exists",
+                            "operator": "exists",
+                            "left": {
+                                "kind": "reference",
+                                "source": "pre_state",
+                                "pointer": "bookings/booking_id",
+                                "value_type": "string",
+                            },
+                            "negate": False,
+                        }
+                    ],
+                    "case_sensitivity": "positive_only",
+                    "evidence_claim_ids": [],
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(StructuredValidationError) as captured:
+        EnvironmentDesigner._compile_tool_conditions_source(source)
+
+    issue = captured.value.diagnostic.issues[0]
+    assert issue.code == "rule_pointer_not_absolute"
+    assert issue.location[:2] == ("preconditions", 0)
+    assert "clauses" in issue.location
+    assert "left" in issue.location
+    assert issue.retryable
+    assert issue.violated_condition == "closed schema constraint rule_pointer_not_absolute"
+    assert issue.expected_category == "an empty or absolute RFC 6901 pointer"
+
+
+register_agent_output_contract(
+    _SectionOutput,
     authority=AgentOutputAuthority.SEMANTIC_ADVISORY,
 )
 
@@ -279,7 +445,7 @@ class _RetryableBackend:
 
 
 @pytest.mark.asyncio
-async def test_invalid_output_without_session_starts_fresh_bounded_rework(
+async def test_untyped_semantic_error_never_spends_a_repair_turn(
     tmp_path: Path,
 ) -> None:
     backend = _RecordingBackend()
@@ -296,29 +462,205 @@ async def test_invalid_output_without_session_starts_fresh_bounded_rework(
         if output.value != "valid":
             raise ValueError("value must equal valid")
 
+    with pytest.raises(DesignerError) as captured:
+        await designer.run_structured_agent(
+            role="environment-engineer",
+            lineage_id="lineage:test",
+            workspace=tmp_path,
+            model=_Output,
+            prompt="Create the complete artifact from immutable input.",
+            permissions=PermissionScope(),
+            budget=DesignerInvocationBudget(
+                Budget(llm_tokens=1_000, agent_turns=2, repair_attempts=1, wall_seconds=30)
+            ),
+            semantic_validator=require_valid,
+        )
+
+    assert captured.value.stage == "agent.environment-engineer.framework_diagnostic"
+    assert captured.value.validation_issues == (
+        "framework_diagnostic_incomplete@semantic_output",
+    )
+    assert len(captured.value.results) == 1
+    assert len(backend.requests) == 1
+    assert backend.requests[0].metadata["repair_mode"] == "initial"
+
+
+@pytest.mark.asyncio
+async def test_section_scoped_correction_freezes_unrelated_valid_roots(
+    tmp_path: Path,
+) -> None:
+    backend = _SequenceBackend(
+        (
+            {"state": "valid", "tools": "invalid"},
+            # A full rewrite fixes tools but regresses state.  Code must accept
+            # only the diagnostic-authorized tools root.
+            {"state": "regressed", "tools": "valid"},
+        )
+    )
+    designer = EnvironmentDesigner(
+        artifact_store=cast(ArtifactWriter, object()),
+        research_artifact_store=cast(ArtifactWriter, object()),
+        invocation_backend=cast(InvocationBackend, backend),
+        profile_provider=cast(AgentProfileProvider, _ProfileProvider()),
+        research_toolchain=cast(ResearchToolchain, object()),
+        maximum_structured_reworks=1,
+    )
+    diagnostic = ValidationDiagnostic(
+        owner_component="design",
+        validation_phase="section_test",
+        frontier_ordinal=10,
+        issues=(
+            SafeValidationIssue(
+                "tools_invalid",
+                ("tools",),
+                "The tools section must be valid.",
+            ),
+        ),
+    )
+
+    def validate(output: _SectionOutput) -> None:
+        if output.tools != "valid":
+            raise StructuredValidationError(diagnostic)
+        if output.state != "valid":
+            raise AssertionError("an unrelated root regression reached semantic validation")
+
     output, results = await designer.run_structured_agent(
         role="environment-engineer",
-        lineage_id="lineage:test",
+        lineage_id="lineage:section-projection",
         workspace=tmp_path,
-        model=_Output,
-        prompt="Create the complete artifact from immutable input.",
+        model=_SectionOutput,
+        prompt="Create a two-section artifact.",
         permissions=PermissionScope(),
         budget=DesignerInvocationBudget(
             Budget(llm_tokens=1_000, agent_turns=2, repair_attempts=1, wall_seconds=30)
         ),
-        semantic_validator=require_valid,
+        semantic_validator=validate,
+        repair_projection=RootSectionRepairProjection(
+            allowed_roots=frozenset({"state", "tools"}),
+            resolve_roots=lambda _diagnostic: ("tools",),
+        ),
+        feedback_contract_id="feedback.test.section_projection",
+        repair_target=RepairTargetRef(
+            target_id="repair:section-projection",
+            component="design",
+            artifact_slot="section_output",
+            lineage_id="lineage:section-projection",
+            allowed_mutation_paths=("/state", "/tools"),
+        ),
     )
 
-    assert output.value == "valid"
+    assert output == _SectionOutput(state="valid", tools="valid")
     assert len(results) == 2
-    assert len(backend.requests) == 2
-    assert backend.requests[0].metadata["repair_mode"] == "initial"
-    assert backend.requests[1].session is None
-    assert backend.requests[1].metadata["repair_mode"] == "fresh_session"
-    assert "Create the complete artifact from immutable input." in backend.requests[1].prompt
-    assert "semantic_contract_violation" in backend.requests[1].prompt
-    assert "value must equal valid" not in backend.requests[1].prompt
-    assert "invalid" not in backend.requests[1].prompt
+    assert "('tools',)" in backend.requests[1].prompt
+
+
+@pytest.mark.asyncio
+async def test_tool_subcomponent_correction_freezes_other_tools_and_sections(
+    tmp_path: Path,
+) -> None:
+    backend = _SequenceBackend(
+        (
+            {
+                "tools": [
+                    {"conditions": "stable-0", "access_observation": "invalid"},
+                    {"conditions": "stable-1", "access_observation": "stable-1"},
+                ]
+            },
+            {
+                "tools": [
+                    {"conditions": "regressed-0", "access_observation": "valid"},
+                    {"conditions": "regressed-1", "access_observation": "regressed-1"},
+                ]
+            },
+        )
+    )
+    designer = EnvironmentDesigner(
+        artifact_store=cast(ArtifactWriter, object()),
+        research_artifact_store=cast(ArtifactWriter, object()),
+        invocation_backend=cast(InvocationBackend, backend),
+        profile_provider=cast(AgentProfileProvider, _ProfileProvider()),
+        research_toolchain=cast(ResearchToolchain, object()),
+        maximum_structured_reworks=1,
+    )
+    diagnostic = ValidationDiagnostic(
+        owner_component="design",
+        validation_phase="tool_semantics_batch_preflight",
+        frontier_ordinal=30,
+        issues=(
+            SafeValidationIssue(
+                "observation_field_unknown",
+                ("tools", 0, "access_observation", "observation"),
+                "Use only frozen observation fields.",
+            ),
+        ),
+    )
+
+    def validate(output: _ToolBatchOutput) -> None:
+        if output.tools[0].access_observation != "valid":
+            raise StructuredValidationError(diagnostic)
+        assert output.tools[0].conditions == "stable-0"
+        assert output.tools[1] == _ToolParts(
+            conditions="stable-1",
+            access_observation="stable-1",
+        )
+
+    output, _results = await designer.run_structured_agent(
+        role="environment-engineer",
+        lineage_id="lineage:tool-section-projection",
+        workspace=tmp_path,
+        model=_ToolBatchOutput,
+        prompt="Create a tool batch.",
+        permissions=PermissionScope(),
+        budget=DesignerInvocationBudget(
+            Budget(llm_tokens=1_000, agent_turns=2, repair_attempts=1, wall_seconds=30)
+        ),
+        semantic_validator=validate,
+        repair_projection=ToolSemanticsRepairProjection(),
+        feedback_contract_id="feedback.test.tool_section_projection",
+        repair_target=RepairTargetRef(
+            target_id="repair:tool-section-projection",
+            component="design",
+            artifact_slot="tool_batch_output",
+            lineage_id="lineage:tool-section-projection",
+            allowed_mutation_paths=("/tools",),
+        ),
+    )
+
+    assert output.tools[0] == _ToolParts(
+        conditions="stable-0",
+        access_observation="valid",
+    )
+    assert "tools/0/access_observation" in backend.requests[1].prompt
+
+
+def test_observation_source_derives_redacted_complement() -> None:
+    source = ToolAccessObservationSourceDraft(
+        tool_id="hotel.search",
+        permission=PermissionRuleSourceDraft(
+            permission_id="permission:hotel.search",
+            allowed_actors=("traveler", "auditor"),
+            required_scopes_by_actor={"traveler": (), "auditor": ()},
+            denied_observation="Caller is not permitted.",
+        ),
+        observation=ObservationSemanticsSourceDraft(
+            visible_fields_by_actor={
+                "traveler": ("public_result",),
+                "auditor": ("public_result", "audit_trace"),
+            },
+            consistency="strong",
+            staleness_bound_seconds=0,
+        ),
+    )
+
+    compiled = EnvironmentDesigner._compile_tool_access_observation_source(
+        source,
+        observation_fields=("public_result", "audit_trace"),
+    )
+
+    assert compiled.observation.redacted_fields_by_actor == {
+        "traveler": ("audit_trace",),
+        "auditor": (),
+    }
 
 
 @pytest.mark.asyncio
@@ -335,10 +677,24 @@ async def test_structured_correction_uses_one_shared_repair_authority(
         research_toolchain=cast(ResearchToolchain, object()),
         maximum_structured_reworks=1,
     )
+    diagnostic = ValidationDiagnostic(
+        owner_component="design",
+        validation_phase="typed_value_semantics",
+        frontier_ordinal=20,
+        issues=(
+            SafeValidationIssue(
+                "output_value_invalid",
+                ("value",),
+                "The value must satisfy the frozen semantic category.",
+                violated_condition="value is outside the frozen semantic category",
+                expected_category="the literal valid",
+            ),
+        ),
+    )
 
     def require_valid(output: _Output) -> None:
         if output.value != "valid":
-            raise ValueError("value must equal valid")
+            raise StructuredValidationError(diagnostic)
 
     token = _DESIGN_REPAIR_AUTHORITY.set(authority)
     try:
@@ -363,17 +719,38 @@ async def test_structured_correction_uses_one_shared_repair_authority(
         _DESIGN_REPAIR_AUTHORITY.reset(token)
 
     assert output.value == "valid"
-    assert authority.authorizations == [
-        {
-            "owner_node": "design",
-            "lineage_id": "lineage:authorized-repair",
-            "role": "environment-engineer",
-            "repair_mode": "semantic_correction",
-            "issue_codes": ("semantic_contract_violation",),
-            "continued_session": False,
-        }
-    ]
+    assert len(authority.authorizations) == 1
+    authorization = authority.authorizations[0]
+    assert authorization == {
+        "owner_node": "design",
+        "lineage_id": "lineage:authorized-repair",
+        "role": "environment-engineer",
+        "repair_mode": StructuredRepairMode.CONTRACT_CORRECTION,
+        "issue_codes": ("output_value_invalid@value",),
+        "continued_session": False,
+        "diagnostic": diagnostic,
+    }
     assert authority.completions == [("repair-entry:1", (), False)]
+
+
+def test_known_tool_identity_drift_is_typed_and_unknown_value_error_is_not_retryable() -> None:
+    known = EnvironmentDesigner._typed_value_error_issues(
+        ValueError("tool reliability must target hotel.search, got hotel.reserve"),
+        prefix=("tools", 0, "reliability"),
+    )
+    unknown = EnvironmentDesigner._typed_value_error_issues(
+        ValueError("new validator condition without typed mapping"),
+        prefix=("tools", 0, "reliability"),
+    )
+
+    assert known[0].issue_code == (
+        "reliability_tool_identity_drift@tools.0.reliability.tool_id"
+    )
+    assert known[0].actionable_for_agent
+    assert known[0].expected_category == "tool_id equal to the assigned batch tool_id"
+    assert unknown[0].code == "framework_diagnostic_incomplete"
+    assert not unknown[0].retryable
+    assert not unknown[0].actionable_for_agent
 
 
 @pytest.mark.asyncio
@@ -1044,14 +1421,48 @@ def test_resumable_node_uses_latest_committed_valid_revision(tmp_path: Path) -> 
         value={"value": "first"},
         dependencies=(dependency_ref,),
     )
-    writer.record_event(event_type="design_node_completed", subject_ref=first_ref)
+    writer.record_event(
+        event_type="design_node_completed",
+        subject_ref=first_ref,
+        related_refs=(job_ref,),
+        details=(
+            KeyValue(key="node", value="test_node"),
+            KeyValue(key="detail", value="test_detail"),
+        ),
+    )
+    designer._commit_semantic_node(
+        job_ref=job_ref,
+        node="test_node",
+        detail="test_detail",
+        subject_ref=first_ref,
+        immutable_input_refs=(dependency_ref,),
+        derived_refs=(),
+        model=_Output,
+    )
     second_ref = writer.put_json(
         artifact_id="node:resume-test",
         artifact_type="design.test_output",
         value={"value": "second"},
         dependencies=(dependency_ref,),
     )
-    writer.record_event(event_type="design_node_completed", subject_ref=second_ref)
+    writer.record_event(
+        event_type="design_node_completed",
+        subject_ref=second_ref,
+        related_refs=(job_ref,),
+        details=(
+            KeyValue(key="node", value="test_node"),
+            KeyValue(key="detail", value="test_detail"),
+        ),
+    )
+    designer._commit_semantic_node(
+        job_ref=job_ref,
+        node="test_node",
+        detail="test_detail",
+        subject_ref=second_ref,
+        immutable_input_refs=(dependency_ref,),
+        derived_refs=(),
+        model=_Output,
+    )
 
     reused = designer._load_validated_design_node(
         artifact_id="node:resume-test",
@@ -1071,9 +1482,8 @@ def test_resumable_node_uses_latest_committed_valid_revision(tmp_path: Path) -> 
     assert {item.key: item.value for item in reuse_event.details}["valid_candidate_count"] == 2
 
 
-def test_resumable_single_candidate_does_not_scan_event_history(
+def test_resumable_single_candidate_requires_authenticated_completion(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = ArtifactStore(tmp_path / "artifacts")
     writer = store.issue_writer(
@@ -1105,10 +1515,74 @@ def test_resumable_single_candidate_does_not_scan_event_history(
         dependencies=(dependency_ref,),
     )
 
-    def forbidden_scan(_writer: object) -> tuple[object, ...]:
-        raise AssertionError("one valid candidate must not scan historical events")
+    reused = designer._load_validated_design_node(
+        artifact_id="node:single-resume-test",
+        artifact_type="design.test_output",
+        model=_Output,
+        required_dependencies=(dependency_ref,),
+        semantic_validator=lambda output: None,
+        job_ref=job_ref,
+        node="single_node",
+        detail="single_detail",
+    )
 
-    monkeypatch.setattr(type(writer), "list_events", forbidden_scan)
+    assert reused is None
+
+    wrong_completion = writer.record_event(
+        event_type="design_node_completed",
+        subject_ref=node_ref,
+        related_refs=(job_ref,),
+        details=(KeyValue(key="node", value="different_node"),),
+    )
+    assert wrong_completion.event_type == "design_node_completed"
+    assert (
+        designer._load_validated_design_node(
+            artifact_id="node:single-resume-test",
+            artifact_type="design.test_output",
+            model=_Output,
+            required_dependencies=(dependency_ref,),
+            semantic_validator=lambda output: None,
+            job_ref=job_ref,
+            node="single_node",
+            detail="single_detail",
+        )
+        is None
+    )
+
+    completion = writer.record_event(
+        event_type="design_node_completed",
+        subject_ref=node_ref,
+        related_refs=(job_ref,),
+        details=(
+            KeyValue(key="node", value="single_node"),
+            KeyValue(key="detail", value="single_detail"),
+        ),
+    )
+    assert completion.event_type == "design_node_completed"
+
+    # Completion events are audit records, not resumability authority.
+    assert (
+        designer._load_validated_design_node(
+            artifact_id="node:single-resume-test",
+            artifact_type="design.test_output",
+            model=_Output,
+            required_dependencies=(dependency_ref,),
+            semantic_validator=lambda output: None,
+            job_ref=job_ref,
+            node="single_node",
+            detail="single_detail",
+        )
+        is None
+    )
+    designer._commit_semantic_node(
+        job_ref=job_ref,
+        node="single_node",
+        detail="single_detail",
+        subject_ref=node_ref,
+        immutable_input_refs=(dependency_ref,),
+        derived_refs=(),
+        model=_Output,
+    )
 
     reused = designer._load_validated_design_node(
         artifact_id="node:single-resume-test",
@@ -1124,10 +1598,7 @@ def test_resumable_single_candidate_does_not_scan_event_history(
     assert reused == (_Output(value="only"), node_ref)
 
 
-def test_resumable_multi_candidate_nodes_share_one_scoped_event_index(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_resumable_multi_candidate_nodes_use_latest_semantic_commit(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path / "artifacts")
     writer = store.issue_writer(
         producer="designer-indexed-resume-test",
@@ -1160,35 +1631,28 @@ def test_resumable_multi_candidate_nodes_share_one_scoped_event_index(
                 value={"value": value},
                 dependencies=(dependency_ref,),
             )
-            writer.record_event(event_type="design_node_completed", subject_ref=ref)
-            expected[node_name] = ref
-
-    scans = 0
-
-    def counted_scan(_writer: object):  # type: ignore[no-untyped-def]
-        nonlocal scans
-        scans += 1
-        return store.list_events()
-
-    monkeypatch.setattr(type(writer), "list_events", counted_scan)
-    token = _DESIGN_COMPLETION_INDEX_SCOPE.set(_DesignCompletionIndexScope())
-    try:
-        for node_name in ("alpha", "beta"):
-            reused = designer._load_validated_design_node(
-                artifact_id=f"node:indexed-resume-test:{node_name}",
-                artifact_type="design.test_output",
-                model=_Output,
-                required_dependencies=(dependency_ref,),
-                semantic_validator=lambda output: None,
+            designer._commit_semantic_node(
                 job_ref=job_ref,
                 node=node_name,
                 detail=node_name,
+                subject_ref=ref,
+                immutable_input_refs=(dependency_ref,),
+                derived_refs=(),
+                model=_Output,
             )
-            assert reused == (_Output(value="second"), expected[node_name])
-    finally:
-        _DESIGN_COMPLETION_INDEX_SCOPE.reset(token)
-
-    assert scans == 1
+            expected[node_name] = ref
+    for node_name in ("alpha", "beta"):
+        reused = designer._load_validated_design_node(
+            artifact_id=f"node:indexed-resume-test:{node_name}",
+            artifact_type="design.test_output",
+            model=_Output,
+            required_dependencies=(dependency_ref,),
+            semantic_validator=lambda output: None,
+            job_ref=job_ref,
+            node=node_name,
+            detail=node_name,
+        )
+        assert reused == (_Output(value="second"), expected[node_name])
 
 
 @pytest.mark.asyncio

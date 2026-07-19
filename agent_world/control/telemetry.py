@@ -484,6 +484,16 @@ class TelemetryStore:
                 "model_provider": request.profile.model_provider or "unknown",
                 "reasoning_effort": request.profile.reasoning_effort.value,
                 "continued_session": request.session is not None,
+                "semantic_transaction": _optional_metadata_string(
+                    request.metadata,
+                    "semantic_transaction",
+                )
+                or "unknown",
+                "repair_mode": _optional_metadata_string(
+                    request.metadata,
+                    "repair_mode",
+                )
+                or "initial",
                 # Record only a scalar size.  The key deliberately avoids the
                 # secret scanner's prompt marker so this safe aggregate cannot
                 # disable the entire invocation span.
@@ -591,6 +601,16 @@ class TelemetryStore:
                 "model_provider": request.profile.model_provider or "unknown",
                 "reasoning_effort": request.profile.reasoning_effort.value,
                 "continued_session": request.session is not None,
+                "semantic_transaction": _optional_metadata_string(
+                    request.metadata,
+                    "semantic_transaction",
+                )
+                or "unknown",
+                "repair_mode": _optional_metadata_string(
+                    request.metadata,
+                    "repair_mode",
+                )
+                or "initial",
                 "input_bytes": len(request.prompt.encode("utf-8")),
                 "output_schema": request.profile.output_schema is not None,
             },
@@ -1142,6 +1162,13 @@ def _invocation_metrics(
         "provider": request.profile.model_provider or "unknown",
         "reasoning_effort": request.profile.reasoning_effort.value,
         "role": request.profile.profile_id,
+        "transaction": _optional_metadata_string(
+            request.metadata,
+            "semantic_transaction",
+        )
+        or "unknown",
+        "repair_mode": _optional_metadata_string(request.metadata, "repair_mode")
+        or "initial",
     }
     metrics: list[MetricPoint] = [
         MetricPoint("invocation.duration_ms", result.duration_ms, "ms", "framework", labels),
@@ -1231,6 +1258,70 @@ def _summarize_trace(
     invocation_ns = sum(
         effective_duration(row) for row in spans if row["operation"] == "agent.invoke"
     )
+    semantic_transactions: dict[str, dict[str, float | int]] = {}
+    repair_modes: dict[str, dict[str, float | int]] = {}
+    for row in spans:
+        if row["operation"] != "agent.invoke":
+            continue
+        try:
+            attributes = json.loads(str(row.get("attributes_json") or "{}"))
+        except json.JSONDecodeError:
+            attributes = {}
+        transaction = str(attributes.get("semantic_transaction") or "unknown")
+        aggregate = semantic_transactions.setdefault(
+            transaction,
+            {"turns": 0, "duration_ms": 0.0, "unknown_token_measurements": 0},
+        )
+        aggregate["turns"] = int(aggregate["turns"]) + 1
+        aggregate["duration_ms"] = float(aggregate["duration_ms"]) + (
+            effective_duration(row) / 1_000_000
+        )
+        repair_mode = str(attributes.get("repair_mode") or "initial")
+        repair_aggregate = repair_modes.setdefault(
+            repair_mode,
+            {"turns": 0, "duration_ms": 0.0, "unknown_token_measurements": 0},
+        )
+        repair_aggregate["turns"] = int(repair_aggregate["turns"]) + 1
+        repair_aggregate["duration_ms"] = float(repair_aggregate["duration_ms"]) + (
+            effective_duration(row) / 1_000_000
+        )
+    transaction_token_names = {
+        "invocation.tokens.input": "tokens_input",
+        "invocation.tokens.output": "tokens_output",
+        "invocation.tokens.reasoning_output": "tokens_reasoning_output",
+        "invocation.tokens.total": "tokens_total",
+    }
+    for row in metrics:
+        output_name = transaction_token_names.get(str(row["name"]))
+        if output_name is None:
+            continue
+        try:
+            labels = json.loads(str(row.get("labels_json") or "{}"))
+        except json.JSONDecodeError:
+            labels = {}
+        transaction = str(labels.get("transaction") or "unknown")
+        aggregate = semantic_transactions.setdefault(
+            transaction,
+            {"turns": 0, "duration_ms": 0.0, "unknown_token_measurements": 0},
+        )
+        repair_mode = str(labels.get("repair_mode") or "initial")
+        repair_aggregate = repair_modes.setdefault(
+            repair_mode,
+            {"turns": 0, "duration_ms": 0.0, "unknown_token_measurements": 0},
+        )
+        if int(row["value_unknown"]):
+            aggregate["unknown_token_measurements"] = (
+                int(aggregate["unknown_token_measurements"]) + 1
+            )
+            repair_aggregate["unknown_token_measurements"] = (
+                int(repair_aggregate["unknown_token_measurements"]) + 1
+            )
+            continue
+        value = row["value_integer"] if row["value_integer"] is not None else row["value_real"]
+        aggregate[output_name] = float(aggregate.get(output_name, 0.0)) + float(value)
+        repair_aggregate[output_name] = float(
+            repair_aggregate.get(output_name, 0.0)
+        ) + float(value)
     open_work_ns = sum(effective_duration(row) for row in open_spans)
     numeric: dict[str, float] = {}
     unknown: dict[str, int] = {}
@@ -1258,6 +1349,8 @@ def _summarize_trace(
         "framework_overhead_ms": max(0, critical_path_ns - covered_ns) / 1_000_000,
         "node_duration_ms": dict(sorted(node_duration_ms.items())),
         "invocation_duration_ms": invocation_ns / 1_000_000,
+        "semantic_transactions": dict(sorted(semantic_transactions.items())),
+        "repair_modes": dict(sorted(repair_modes.items())),
         "metrics_sum": numeric,
         "unknown_measurements": unknown,
     }
@@ -1298,6 +1391,20 @@ def _trace_measurements(inspected: Mapping[str, Any]) -> dict[str, Any]:
     measurements.update(
         {f"node.{node}.duration_ms": float(value) for node, value in node_durations.items()}
     )
+    transaction_metrics = cast(
+        Mapping[str, Mapping[str, float | int]],
+        summary.get("semantic_transactions", {}),
+    )
+    for transaction, values in transaction_metrics.items():
+        for name, value in values.items():
+            measurements[f"transaction.{transaction}.{name}"] = float(value)
+    repair_metrics = cast(
+        Mapping[str, Mapping[str, float | int]],
+        summary.get("repair_modes", {}),
+    )
+    for repair_mode, values in repair_metrics.items():
+        for name, value in values.items():
+            measurements[f"repair_mode.{repair_mode}.{name}"] = float(value)
     return {
         "trace_id": inspected["trace_id"],
         "provisional": bool(summary["provisional"]),

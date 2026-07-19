@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
@@ -24,6 +25,7 @@ from pydantic import BaseModel, JsonValue, ValidationError
 
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.contracts import (
+    ActorBoundary,
     ArtifactRef,
     Budget,
     BudgetUsage,
@@ -49,6 +51,7 @@ from agent_world.contracts import (
     RuleArithmetic,
     RuleClause,
     RuleConstant,
+    RuleLookupByKey,
     RuleValueRef,
     StateEntitySchema,
     StateSchema,
@@ -58,12 +61,19 @@ from agent_world.contracts import (
     ToolSemantics,
     ToolSurface,
     VerificationRequirements,
+    WorldBoundary,
     WorldSpec,
     canonical_json_bytes,
     sha256_digest,
 )
 from agent_world.contracts.design import _validate_closed_object_schema
+from agent_world.control.assurance import SemanticNodeCommit
 from agent_world.control.decision import DesignRevisionMode, StructuredRepairMode
+from agent_world.control.feedback import (
+    PRODUCTION_FEEDBACK,
+    FeedbackResult,
+    RepairTargetRef,
+)
 from agent_world.control.repair import StructuredRepairAuthority, StructuredRepairDenied
 from agent_world.control.validation import (
     SafeValidationIssue,
@@ -102,6 +112,7 @@ from .models import (
     AssumptionIssue,
     AssumptionIssueOrigin,
     AssumptionResolutionDraft,
+    CompactFieldSemanticDraft,
     CurriculumContractDraft,
     CurriculumPlanDraft,
     CurriculumPlanSourceDraft,
@@ -118,6 +129,7 @@ from .models import (
     RuleArithmeticDraft,
     RuleConstantDraft,
     RuleDraft,
+    RuleLookupByKeyDraft,
     RuleReferenceDraft,
     SchemaArrayNodeDraft,
     SchemaBooleanNodeDraft,
@@ -125,8 +137,11 @@ from .models import (
     SchemaNullNodeDraft,
     SchemaNumberNodeDraft,
     SchemaObjectNodeDraft,
+    SchemaPropertyDraft,
     SchemaStringNodeDraft,
     SchemaUnionNodeDraft,
+    SharedToolSemanticsContract,
+    SharedToolSemanticsSourceDraft,
     StateEntityInventoryDraft,
     StateEntityPlan,
     StateEntitySchemaDraft,
@@ -139,12 +154,16 @@ from .models import (
     ToolBehaviorDraft,
     ToolConditionsDraft,
     ToolConditionsSourceDraft,
+    ToolCouplingGroupPlan,
+    ToolCouplingPlan,
     ToolErrorsDraft,
     ToolErrorsSourceDraft,
     ToolReliabilityDraft,
     ToolReliabilitySourceDraft,
     ToolSchemaDraft,
     ToolSchemaIRDraft,
+    ToolSemanticGroupClosure,
+    ToolSemanticsBatchSourceDraft,
     ToolSemanticsDraft,
     ToolStateTransitionDraft,
     ToolStateTransitionSourceDraft,
@@ -154,7 +173,9 @@ from .models import (
     TrainingContractContext,
     TrainingContractDraft,
     TrainingRuleCatalogEntry,
+    TrainingSemanticSourceDraft,
     TrainingToolContext,
+    WorldArchitectureSourceDraft,
     WorldBoundaryDraft,
     WorldClosureArithmeticTerm,
     WorldClosureConstantTerm,
@@ -162,12 +183,14 @@ from .models import (
     WorldClosureContext,
     WorldClosureDraft,
     WorldClosureErrorPath,
+    WorldClosureLookupTerm,
     WorldClosureReferenceTerm,
     WorldClosureRulePath,
     WorldClosureSourceDraft,
     WorldClosureTerm,
     WorldClosureToolPath,
     WorldModelDraft,
+    WorldRuleSemanticsSourceDraft,
     WorldSemanticSourceIRDraft,
     WorldSkeletonDraft,
     WorldStateDraft,
@@ -175,6 +198,7 @@ from .models import (
     WorldToolInventoryDraft,
     WorldToolPlanInventoryDraft,
 )
+from .rule_context import RuleContextCatalog, validate_rule_context
 from .validation import StructuredSemanticError, StructuredSemanticIssue
 
 _CANONICAL_RULE_PROPERTY = {
@@ -195,9 +219,10 @@ MAX_WORLD_TOOL_SURFACES = 8
 MAX_STATE_ENTITIES = 12
 MAX_DESIGN_FANOUT_CONCURRENCY = 3
 MAX_WORLD_CLOSURE_CONTEXT_BYTES = 192 * 1024
-DIRECT_DESIGN_BASE_TURNS = 8 + MAX_STATE_ENTITIES + (8 * MAX_WORLD_TOOL_SURFACES)
-DIRECT_DESIGN_EVIDENCE_BASE_TURNS = DIRECT_DESIGN_BASE_TURNS - 2
-DIRECT_DESIGN_TAIL_BASE_TURNS = 2 + (5 * MAX_WORLD_TOOL_SURFACES)
+DIRECT_DESIGN_BASE_TURNS = 8
+DIRECT_DESIGN_EVIDENCE_BASE_TURNS = 5
+DIRECT_DESIGN_MAX_CORRECTIONS = 2
+DIRECT_DESIGN_MAX_TURNS = DIRECT_DESIGN_BASE_TURNS + DIRECT_DESIGN_MAX_CORRECTIONS
 MAX_INLINE_FROZEN_INPUT_BYTES = 1024 * 1024
 _TRANSPORT_ARTIFACT_FIELD = "artifact_json"
 
@@ -284,7 +309,17 @@ class _EvidencePhaseBundle:
     invocation_results: tuple[InvocationResult, ...]
 
 
-type _DesignCompletionOrder = dict[str, tuple[ArtifactRef, datetime, int]]
+@dataclass(frozen=True, slots=True)
+class _DesignCompletionDecision:
+    ref: ArtifactRef
+    occurred_at: datetime
+    ordinal: int
+    node: str | None
+    detail: str | None
+    related_refs: tuple[ArtifactRef, ...]
+
+
+type _DesignCompletionOrder = dict[str, _DesignCompletionDecision]
 
 
 @dataclass(slots=True)
@@ -309,6 +344,136 @@ _DESIGN_REPAIR_AUTHORITY: ContextVar[StructuredRepairAuthority | None] = Context
 
 
 TOutput = TypeVar("TOutput", bound=BaseModel)
+
+
+@dataclass(frozen=True, slots=True)
+class RootSectionRepairProjection:
+    """Code-owned merge policy for bounded semantic corrections.
+
+    An Agent may return a complete structured value because providers support
+    one fixed output schema per session.  The framework accepts only the root
+    sections authorized by the previous diagnostic and restores every other
+    section from the last shape-valid candidate before re-running the complete
+    semantic compiler.
+    """
+
+    allowed_roots: frozenset[str]
+    resolve_roots: Callable[[ValidationDiagnostic], tuple[str, ...]]
+
+    def roots(self, diagnostic: ValidationDiagnostic) -> tuple[str, ...]:
+        roots = tuple(dict.fromkeys(self.resolve_roots(diagnostic)))
+        if not roots or not set(roots) <= self.allowed_roots:
+            raise ValueError("repair projection resolved an empty or unauthorized root scope")
+        return roots
+
+    def merge[TModel: BaseModel](
+        self,
+        baseline: TModel,
+        correction: TModel,
+        *,
+        roots: tuple[str, ...],
+    ) -> TModel:
+        if type(baseline) is not type(correction):
+            raise TypeError("repair projection candidates must share one exact model type")
+        baseline_value = baseline.model_dump(mode="python")
+        correction_value = correction.model_dump(mode="python")
+        for root in roots:
+            baseline_value[root] = correction_value[root]
+        return cast(TModel, type(baseline).model_validate(baseline_value))
+
+
+@dataclass(frozen=True, slots=True)
+class ToolSemanticsRepairProjection:
+    """Freeze every unaffected tool/subcomponent during batch correction."""
+
+    _sections = frozenset(
+        {"conditions", "state_transition", "errors", "access_observation", "reliability"}
+    )
+    _error_reliability_issue_codes = frozenset(
+        {
+            "reliability_retry_error_unknown",
+            "reliability_retryability_mismatch",
+            "reliability_timeout_error_unknown",
+            "reliability_rollback_error_unknown",
+            "reliability_conflict_error_unknown",
+        }
+    )
+
+    def roots(self, diagnostic: ValidationDiagnostic) -> tuple[str, ...]:
+        scopes: list[str] = []
+        for issue in diagnostic.issues:
+            location = issue.location
+            if len(location) < 2 or location[0] != "tools" or not isinstance(location[1], int):
+                return ("tools",)
+            tool_index = location[1]
+            section = location[2] if len(location) > 2 else None
+            if section == "reliability" and issue.code in self._error_reliability_issue_codes:
+                # Error declarations and operational reliability form one closed
+                # reference graph.  Freezing either side would make a valid repair
+                # impossible or encourage relabelling a business error as a timeout.
+                scopes.extend(
+                    (f"tools/{tool_index}/errors", f"tools/{tool_index}/reliability")
+                )
+            elif section in self._sections:
+                scopes.append(f"tools/{tool_index}/{section}")
+            elif section in {"behavior", "complete_semantics"}:
+                scopes.append(f"tools/{tool_index}")
+            else:
+                scopes.append(f"tools/{tool_index}")
+        return tuple(dict.fromkeys(scopes)) or ("tools",)
+
+    def merge[TModel: BaseModel](
+        self,
+        baseline: TModel,
+        correction: TModel,
+        *,
+        roots: tuple[str, ...],
+    ) -> TModel:
+        if type(baseline) is not type(correction):
+            raise TypeError("repair projection candidates must share one exact model type")
+        baseline_value = baseline.model_dump(mode="json")
+        correction_value = correction.model_dump(mode="json")
+        baseline_tools = baseline_value.get("tools")
+        correction_tools = correction_value.get("tools")
+        baseline_ids = (
+            tuple(item.get("tool_id") for item in baseline_tools)
+            if isinstance(baseline_tools, list)
+            else ()
+        )
+        correction_ids = (
+            tuple(item.get("tool_id") for item in correction_tools)
+            if isinstance(correction_tools, list)
+            else ()
+        )
+        if not baseline_ids or correction_ids != baseline_ids:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_semantics_repair_projection",
+                    frontier_ordinal=20,
+                    issues=(
+                        SafeValidationIssue(
+                            "tool_batch_identity_drift",
+                            ("tools",),
+                            (
+                                "A correction must preserve the exact baseline tool count, "
+                                "order, and identities."
+                            ),
+                        ),
+                    ),
+                )
+            )
+        for scope in roots:
+            parts: tuple[str | int, ...] = tuple(
+                int(part) if part.isdigit() else part for part in scope.split("/")
+            )
+            baseline_parent: Any = baseline_value
+            correction_parent: Any = correction_value
+            for part in parts[:-1]:
+                baseline_parent = baseline_parent[part]
+                correction_parent = correction_parent[part]
+            baseline_parent[parts[-1]] = correction_parent[parts[-1]]
+        return cast(TModel, type(baseline).model_validate(baseline_value))
 
 
 @overload
@@ -419,6 +584,2163 @@ class EnvironmentDesigner:
         invocation_budget: Budget,
         phase_checkpoint_ref: ArtifactRef | None = None,
     ) -> DesignBundle:
+        """Run the bounded semantic-transaction generation path.
+
+        Entity and tool cardinality may increase output size, but they must not
+        multiply Agent turns.  Framework code compiles and validates all
+        schemas, references, protocol fields, reward closure, and artifact
+        bindings between a small number of coherent semantic transactions.
+        """
+
+        self._validate_generate_inputs(
+            job=job,
+            job_ref=job_ref,
+            request=request,
+            request_ref=request_ref,
+            phase_checkpoint_ref=phase_checkpoint_ref,
+        )
+        workspace = workspace.expanduser().resolve()  # noqa: ASYNC240
+        workspace.mkdir(parents=True, exist_ok=True)
+        self._write_json(workspace / "inputs" / "request.json", request.model_dump(mode="json"))
+        meter = DesignerInvocationBudget(invocation_budget)
+        evidence_phase = await self._prepare_evidence_phase(
+            job=job,
+            job_ref=job_ref,
+            request=request,
+            request_ref=request_ref,
+            workspace=workspace,
+            meter=meter,
+            fetch_budget=job.budget.tool_calls - job.budget.search_calls,
+            phase_checkpoint_ref=phase_checkpoint_ref,
+        )
+        _DESIGN_RESEARCH_USAGE.set(evidence_phase.research_usage)
+        evidence_graph = evidence_phase.evidence_graph
+        evidence_graph_ref = evidence_phase.evidence_graph_ref
+
+        def validate_architecture(value: WorldArchitectureSourceDraft) -> None:
+            self._compile_architecture_skeleton(value, evidence_graph=evidence_graph)
+
+        cached_architecture = self._load_validated_design_node(
+            artifact_id=f"{job.job_id}:world-architecture-source",
+            artifact_type="design.world_architecture_source",
+            model=WorldArchitectureSourceDraft,
+            required_dependencies=(evidence_graph_ref,),
+            semantic_validator=validate_architecture,
+            job_ref=job_ref,
+            node="world_architecture",
+            detail=None,
+        )
+        if cached_architecture is None:
+            self._record_design_node_started(
+                node="world_architecture",
+                subject_ref=evidence_graph_ref,
+                job_ref=job_ref,
+            )
+            architecture, architecture_results = await self.run_structured_agent(
+                role="environment-engineer",
+                lineage_id=f"{job.job_id}.world-architecture",
+                workspace=workspace / "world-architecture",
+                model=WorldArchitectureSourceDraft,
+                prompt=self._with_frozen_inputs(
+                    self._world_architecture_prompt(request),
+                    request=request,
+                    evidence_claim_catalog=evidence_graph.claims,
+                    evidence_conflicts=evidence_graph.conflicts,
+                    evidence_unresolved_questions=evidence_graph.unresolved_questions,
+                ),
+                semantic_validator=validate_architecture,
+                permissions=job.permissions,
+                budget=meter,
+                capability_requirement=NodeCapabilityRequirement.structured_output(
+                    node_id="environment-engineer.world-architecture",
+                    role="environment-engineer",
+                ),
+                feedback_contract_id="feedback.design.world_architecture",
+                semantic_transaction="design.world-architecture",
+                repair_projection=RootSectionRepairProjection(
+                    allowed_roots=frozenset(
+                        {"boundary", "state_entities", "tool_inventory"}
+                    ),
+                    resolve_roots=self._architecture_repair_roots,
+                ),
+                repair_target=RepairTargetRef(
+                    target_id=self._stable_id(
+                        "repair-target", job.job_id, "world-architecture"
+                    ),
+                    component="design",
+                    artifact_slot="world_architecture",
+                    lineage_id=f"{job.job_id}.world-architecture",
+                    immutable_input_refs=(request_ref, evidence_graph_ref),
+                    allowed_mutation_paths=(
+                        "/boundary",
+                        "/state_entities",
+                        "/tool_inventory",
+                    ),
+                ),
+            )
+            architecture_ref = self.artifacts.put_json(
+                artifact_id=f"{job.job_id}:world-architecture-source",
+                artifact_type="design.world_architecture_source",
+                value=architecture,
+                dependencies=(evidence_graph_ref,),
+            )
+        else:
+            architecture, architecture_ref = cached_architecture
+            architecture_results = ()
+        skeleton = self._compile_architecture_skeleton(
+            architecture,
+            evidence_graph=evidence_graph,
+        )
+        boundary = self._compile_architecture_boundary(architecture)
+        state_inventory = self._compile_architecture_state_inventory(architecture)
+        tool_plan_inventory = self._compile_architecture_tool_inventory(architecture)
+        skeleton_ref = self.artifacts.put_json(
+            artifact_id=f"{job.job_id}:world-skeleton",
+            artifact_type="design.world_skeleton",
+            value=skeleton,
+            dependencies=(architecture_ref, evidence_graph_ref),
+        )
+        if cached_architecture is None:
+            self._record_design_node(
+                node="world_architecture",
+                subject_ref=architecture_ref,
+                job_ref=job_ref,
+                related_refs=(evidence_graph_ref, skeleton_ref),
+            )
+            self._record_feedback_pass(
+                contract_id="feedback.design.world_architecture",
+                subject_ref=architecture_ref,
+                component="design",
+                artifact_slot="world_architecture",
+                lineage_id=f"{job.job_id}.world-architecture",
+                immutable_input_refs=(request_ref, evidence_graph_ref),
+                evidence_refs=(skeleton_ref, evidence_graph_ref),
+                summary="The committed world architecture compiled to one closed skeleton.",
+                invocation_results=architecture_results,
+                allowed_mutation_paths=(
+                    "/boundary",
+                    "/state_entities",
+                    "/tool_inventory",
+                ),
+            )
+            self._commit_semantic_node(
+                job_ref=job_ref,
+                node="world_architecture",
+                detail=None,
+                subject_ref=architecture_ref,
+                immutable_input_refs=(evidence_graph_ref,),
+                derived_refs=(skeleton_ref,),
+                model=WorldArchitectureSourceDraft,
+            )
+
+        coupling_plan = self._compile_tool_coupling_plan(
+            architecture,
+            architecture_ref=architecture_ref,
+        )
+        coupling_plan_ref = self.artifacts.put_json(
+            artifact_id=f"{job.job_id}:tool-coupling-plan",
+            artifact_type="design.tool_coupling_plan",
+            value=coupling_plan,
+            dependencies=(architecture_ref, skeleton_ref),
+        )
+        shared_contracts: dict[str, SharedToolSemanticsContract] = {}
+        shared_contract_refs: dict[str, ArtifactRef] = {}
+        shared_results: list[InvocationResult] = []
+        for group in coupling_plan.groups:
+            if group.mode != "multi_batch":
+                continue
+
+            def validate_shared_source(
+                value: SharedToolSemanticsSourceDraft,
+                *,
+                target_group: ToolCouplingGroupPlan = group,
+            ) -> None:
+                self._validate_shared_tool_semantics_source(
+                    value,
+                    group=target_group,
+                    evidence_graph=evidence_graph,
+                )
+
+            shared_dependencies = (coupling_plan_ref, skeleton_ref, evidence_graph_ref)
+            cached_shared = self._load_validated_design_node(
+                artifact_id=f"{job.job_id}:shared-tool-semantics-source:{group.group_id}",
+                artifact_type="design.shared_tool_semantics_source",
+                model=SharedToolSemanticsSourceDraft,
+                required_dependencies=shared_dependencies,
+                semantic_validator=validate_shared_source,
+                job_ref=job_ref,
+                node="shared_tool_semantics",
+                detail=group.group_id,
+            )
+            if cached_shared is None:
+                self._record_design_node_started(
+                    node="shared_tool_semantics",
+                    subject_ref=coupling_plan_ref,
+                    job_ref=job_ref,
+                    detail=group.group_id,
+                )
+                shared_source, current_results = await self.run_structured_agent(
+                    role="environment-engineer",
+                    lineage_id=f"{job.job_id}.shared-tool-semantics.{group.group_id}",
+                    workspace=workspace / "shared-tool-semantics" / group.group_id,
+                    model=SharedToolSemanticsSourceDraft,
+                    prompt=self._with_frozen_inputs(
+                        self._shared_tool_semantics_prompt(request),
+                        request=request,
+                        evidence_claim_catalog=evidence_graph.claims,
+                        world_skeleton=skeleton,
+                        coupling_group=group,
+                    ),
+                    semantic_validator=validate_shared_source,
+                    permissions=job.permissions,
+                    budget=meter,
+                    capability_requirement=NodeCapabilityRequirement.structured_output(
+                        node_id="environment-engineer.shared-tool-semantics",
+                        role="environment-engineer",
+                    ),
+                    feedback_contract_id="feedback.design.shared_tool_semantics",
+                    semantic_transaction="design.shared-tool-semantics",
+                    repair_target=self._shared_tool_semantics_repair_target(
+                        job_id=job.job_id,
+                        group_id=group.group_id,
+                        immutable_input_refs=shared_dependencies,
+                    ),
+                )
+                shared_source_ref = self.artifacts.put_json(
+                    artifact_id=(
+                        f"{job.job_id}:shared-tool-semantics-source:{group.group_id}"
+                    ),
+                    artifact_type="design.shared_tool_semantics_source",
+                    value=shared_source,
+                    dependencies=shared_dependencies,
+                )
+                shared_results.extend(current_results)
+            else:
+                shared_source, shared_source_ref = cached_shared
+                current_results = ()
+            contract = self._compile_shared_tool_semantics_contract(
+                shared_source,
+                group=group,
+                evidence_graph=evidence_graph,
+            )
+            contract_ref = self.artifacts.put_json(
+                artifact_id=f"{job.job_id}:shared-tool-semantics:{group.group_id}",
+                artifact_type="design.shared_tool_semantics_contract",
+                value=contract,
+                dependencies=(shared_source_ref, coupling_plan_ref, skeleton_ref),
+            )
+            shared_contracts[group.group_id] = contract
+            shared_contract_refs[group.group_id] = contract_ref
+            if cached_shared is None:
+                self._record_design_node(
+                    node="shared_tool_semantics",
+                    subject_ref=shared_source_ref,
+                    job_ref=job_ref,
+                    related_refs=(coupling_plan_ref, contract_ref),
+                    detail=group.group_id,
+                )
+                self._record_feedback_pass(
+                    contract_id="feedback.design.shared_tool_semantics",
+                    subject_ref=shared_source_ref,
+                    component="design",
+                    artifact_slot="shared_tool_semantics",
+                    lineage_id=f"{job.job_id}.shared-tool-semantics.{group.group_id}",
+                    batch_id=group.group_id,
+                    immutable_input_refs=shared_dependencies,
+                    evidence_refs=(contract_ref,),
+                    summary="The shared multi-batch tool policy compiled and closed.",
+                    invocation_results=current_results,
+                    allowed_mutation_paths=(
+                        "/atomicity_domains",
+                        "/concurrency_domains",
+                        "/idempotency_domains",
+                        "/ordering_constraints",
+                        "/compensation_edges",
+                        "/error_policies",
+                    ),
+                )
+                self._commit_semantic_node(
+                    job_ref=job_ref,
+                    node="shared_tool_semantics",
+                    detail=group.group_id,
+                    subject_ref=shared_source_ref,
+                    immutable_input_refs=shared_dependencies,
+                    derived_refs=(contract_ref,),
+                    model=SharedToolSemanticsSourceDraft,
+                )
+
+        semantic_drafts: dict[str, ToolSemanticsDraft] = {}
+        semantic_refs: list[ArtifactRef] = []
+        semantic_ref_by_id: dict[str, ArtifactRef] = {}
+        semantic_results: list[InvocationResult] = []
+        surface_by_id = {item.surface.tool_id: item for item in skeleton.tool_surfaces}
+        plan_by_id = {item.tool_id: item for item in tool_plan_inventory.tools}
+        for batch_index, tool_ids in enumerate(coupling_plan.execution_batches):
+            batch_workspace = workspace / "tool-semantics" / f"batch-{batch_index + 1}"
+            batch_id = f"tool-batch-{batch_index + 1}"
+            target_groups = tuple(
+                group
+                for group in coupling_plan.groups
+                if set(group.ordered_tool_ids) & set(tool_ids)
+            )
+            target_shared_contracts = tuple(
+                shared_contracts[group.group_id]
+                for group in target_groups
+                if group.group_id in shared_contracts
+            )
+            target_shared_refs = tuple(
+                shared_contract_refs[group.group_id]
+                for group in target_groups
+                if group.group_id in shared_contract_refs
+            )
+
+            def validate_batch(
+                value: ToolSemanticsBatchSourceDraft,
+                *,
+                expected: tuple[str, ...] = tool_ids,
+                expected_contracts: tuple[
+                    SharedToolSemanticsContract, ...
+                ] = target_shared_contracts,
+            ) -> None:
+                compiled = self._compile_tool_semantics_batch(
+                    value,
+                    expected_tool_ids=expected,
+                    skeleton=skeleton,
+                    evidence_graph=evidence_graph,
+                )
+                if tuple(item.tool_id for item in compiled) != expected:
+                    raise ValueError("compiled tool batch changed frozen tool order")
+                self._validate_tool_batch_against_shared_contracts(
+                    compiled,
+                    contracts=expected_contracts,
+                )
+
+            dependencies = (
+                architecture_ref,
+                skeleton_ref,
+                evidence_graph_ref,
+                coupling_plan_ref,
+                *target_shared_refs,
+            )
+            cached_batch = self._load_validated_design_node(
+                artifact_id=f"{job.job_id}:tool-semantics-source:{batch_id}",
+                artifact_type="design.tool_semantics_batch_source",
+                model=ToolSemanticsBatchSourceDraft,
+                required_dependencies=dependencies,
+                semantic_validator=validate_batch,
+                job_ref=job_ref,
+                node="tool_semantics_batch",
+                detail=batch_id,
+            )
+            if cached_batch is None:
+                self._record_design_node_started(
+                    node="tool_semantics_batch",
+                    subject_ref=skeleton_ref,
+                    job_ref=job_ref,
+                    detail=batch_id,
+                )
+                batch_source, batch_results = await self.run_structured_agent(
+                    role="environment-engineer",
+                    lineage_id=f"{job.job_id}.tool-semantics.{batch_id}",
+                    workspace=batch_workspace,
+                    model=ToolSemanticsBatchSourceDraft,
+                    prompt=self._with_frozen_inputs(
+                        self._tool_semantics_batch_prompt(request, tool_ids=tool_ids),
+                        request=request,
+                        evidence_claim_catalog=evidence_graph.claims,
+                        world_skeleton=skeleton,
+                        coupling_groups=target_groups,
+                        shared_tool_contracts=target_shared_contracts,
+                        target_tool_plans=tuple(plan_by_id[tool_id] for tool_id in tool_ids),
+                        target_tool_surfaces=tuple(
+                            surface_by_id[tool_id] for tool_id in tool_ids
+                        ),
+                        rule_context_catalogs={
+                            tool_id: RuleContextCatalog.for_tool(
+                                state=skeleton.state,
+                                surface=surface_by_id[tool_id].surface,
+                            ).prompt_projection()
+                            for tool_id in tool_ids
+                        },
+                    ),
+                    semantic_validator=validate_batch,
+                    permissions=job.permissions,
+                    budget=meter,
+                    capability_requirement=NodeCapabilityRequirement.structured_output(
+                        node_id="environment-engineer.tool-semantics-batch",
+                        role="environment-engineer",
+                    ),
+                    feedback_contract_id="feedback.design.tool_semantics",
+                    semantic_transaction="design.tool-semantics-batch",
+                    repair_projection=ToolSemanticsRepairProjection(),
+                    repair_target=RepairTargetRef(
+                        target_id=self._stable_id("repair-target", job.job_id, batch_id),
+                        component="design",
+                        artifact_slot="tool_semantics_batch",
+                        lineage_id=f"{job.job_id}.tool-semantics.{batch_id}",
+                        batch_id=batch_id,
+                        immutable_input_refs=dependencies,
+                        allowed_mutation_paths=("/tools",),
+                    ),
+                )
+                batch_ref = self.artifacts.put_json(
+                    artifact_id=f"{job.job_id}:tool-semantics-source:{batch_id}",
+                    artifact_type="design.tool_semantics_batch_source",
+                    value=batch_source,
+                    dependencies=dependencies,
+                )
+            else:
+                batch_source, batch_ref = cached_batch
+                batch_results = ()
+            compiled_batch = self._compile_tool_semantics_batch(
+                batch_source,
+                expected_tool_ids=tool_ids,
+                skeleton=skeleton,
+                evidence_graph=evidence_graph,
+            )
+            for semantics in compiled_batch:
+                semantic_drafts[semantics.tool_id] = semantics
+                semantic_ref = self.artifacts.put_json(
+                    artifact_id=f"{job.job_id}:tool-semantics:{semantics.tool_id}",
+                    artifact_type="design.tool_semantics",
+                    value=semantics,
+                    dependencies=(
+                        batch_ref,
+                        skeleton_ref,
+                        evidence_graph_ref,
+                        coupling_plan_ref,
+                        *target_shared_refs,
+                    ),
+                )
+                semantic_refs.append(semantic_ref)
+                semantic_ref_by_id[semantics.tool_id] = semantic_ref
+            semantic_results.extend(batch_results)
+            if cached_batch is None:
+                self._record_design_node(
+                    node="tool_semantics_batch",
+                    subject_ref=batch_ref,
+                    job_ref=job_ref,
+                    related_refs=(skeleton_ref, *semantic_refs[-len(compiled_batch) :]),
+                    detail=batch_id,
+                )
+                self._record_feedback_pass(
+                    contract_id="feedback.design.tool_semantics",
+                    subject_ref=batch_ref,
+                    component="design",
+                    artifact_slot="tool_semantics_batch",
+                    lineage_id=f"{job.job_id}.tool-semantics.{batch_id}",
+                    batch_id=batch_id,
+                    immutable_input_refs=dependencies,
+                    evidence_refs=tuple(semantic_refs[-len(compiled_batch) :]),
+                    summary="The committed tool batch compiled against the frozen world skeleton.",
+                    invocation_results=batch_results,
+                    allowed_mutation_paths=("/tools",),
+                )
+                self._commit_semantic_node(
+                    job_ref=job_ref,
+                    node="tool_semantics_batch",
+                    detail=batch_id,
+                    subject_ref=batch_ref,
+                    immutable_input_refs=dependencies,
+                    derived_refs=tuple(semantic_refs[-len(compiled_batch) :]),
+                    model=ToolSemanticsBatchSourceDraft,
+                )
+
+        group_closure_refs: list[ArtifactRef] = []
+        for group in coupling_plan.groups:
+            group_semantic_refs = tuple(
+                semantic_ref_by_id[tool_id] for tool_id in group.ordered_tool_ids
+            )
+            shared_contract_ref = shared_contract_refs.get(group.group_id)
+            closure = ToolSemanticGroupClosure(
+                closure_id=self._stable_id(
+                    "tool-semantic-group-closure",
+                    group.group_id,
+                    *(ref.revision_id for ref in group_semantic_refs),
+                    shared_contract_ref.revision_id if shared_contract_ref is not None else "",
+                ),
+                group_id=group.group_id,
+                member_tool_ids=group.ordered_tool_ids,
+                semantic_refs=group_semantic_refs,
+                shared_contract_ref=shared_contract_ref,
+            )
+            closure_dependencies = (
+                coupling_plan_ref,
+                *group_semantic_refs,
+                *((shared_contract_ref,) if shared_contract_ref is not None else ()),
+            )
+            closure_ref = self.artifacts.put_json(
+                artifact_id=f"{job.job_id}:tool-semantic-group-closure:{group.group_id}",
+                artifact_type="design.tool_semantic_group_closure",
+                value=closure,
+                dependencies=closure_dependencies,
+            )
+            group_closure_refs.append(closure_ref)
+            self._record_design_node(
+                node="tool_semantic_group_closure",
+                subject_ref=closure_ref,
+                job_ref=job_ref,
+                related_refs=closure_dependencies,
+                detail=group.group_id,
+            )
+
+        state_schema_irs, tool_schema_irs = self._compile_architecture_schema_irs(architecture)
+
+        def compose_world_source(
+            rules: WorldRuleSemanticsSourceDraft,
+        ) -> WorldSemanticSourceIRDraft:
+            return WorldSemanticSourceIRDraft(
+                boundary=boundary,
+                state_inventory=state_inventory,
+                state_entity_schemas=state_schema_irs,
+                initial_state_rules=self._compile_initial_state_rules_source(
+                    rules.initial_state_rules
+                ),
+                tool_inventory=tool_plan_inventory,
+                tool_schemas=tool_schema_irs,
+                tool_semantics=tuple(
+                    semantic_drafts[item.tool_id] for item in tool_plan_inventory.tools
+                ),
+                closure=self._compile_world_closure_source(
+                    WorldClosureSourceDraft(invariants=rules.invariants)
+                ),
+            )
+
+        def validate_world_rules(value: WorldRuleSemanticsSourceDraft) -> None:
+            self._compile_world_semantic_source(
+                compose_world_source(value),
+                evidence_graph=evidence_graph,
+                evidence_graph_ref=evidence_graph_ref,
+            )
+
+        world_rule_dependencies = (
+            architecture_ref,
+            skeleton_ref,
+            coupling_plan_ref,
+            *group_closure_refs,
+        )
+        cached_world_rules = self._load_validated_design_node(
+            artifact_id=f"{job.job_id}:world-rules-source",
+            artifact_type="design.world_rules_source",
+            model=WorldRuleSemanticsSourceDraft,
+            required_dependencies=world_rule_dependencies,
+            semantic_validator=validate_world_rules,
+            job_ref=job_ref,
+            node="world_rules",
+            detail=None,
+        )
+        if cached_world_rules is None:
+            self._record_design_node_started(
+                node="world_rules",
+                subject_ref=skeleton_ref,
+                job_ref=job_ref,
+            )
+            world_rules_source, world_rule_results = await self.run_structured_agent(
+                role="environment-engineer",
+                lineage_id=f"{job.job_id}.world-rules",
+                workspace=workspace / "world-rules",
+                model=WorldRuleSemanticsSourceDraft,
+                prompt=self._with_frozen_inputs(
+                    self._world_rules_prompt(request),
+                    request=request,
+                    evidence_claim_catalog=evidence_graph.claims,
+                    world_skeleton=skeleton,
+                    tool_semantics=tuple(
+                        semantic_drafts[item.tool_id] for item in tool_plan_inventory.tools
+                    ),
+                ),
+                semantic_validator=validate_world_rules,
+                permissions=job.permissions,
+                budget=meter,
+                capability_requirement=NodeCapabilityRequirement.structured_output(
+                    node_id="environment-engineer.world-rules",
+                    role="environment-engineer",
+                ),
+                feedback_contract_id="feedback.design.world_rules",
+                semantic_transaction="design.world-rules",
+                repair_target=RepairTargetRef(
+                    target_id=self._stable_id("repair-target", job.job_id, "world-rules"),
+                    component="design",
+                    artifact_slot="world_rules",
+                    lineage_id=f"{job.job_id}.world-rules",
+                    immutable_input_refs=world_rule_dependencies,
+                    allowed_mutation_paths=("/initial_state_rules", "/invariants"),
+                ),
+            )
+            world_rules_ref = self.artifacts.put_json(
+                artifact_id=f"{job.job_id}:world-rules-source",
+                artifact_type="design.world_rules_source",
+                value=world_rules_source,
+                dependencies=world_rule_dependencies,
+            )
+            self._record_design_node(
+                node="world_rules",
+                subject_ref=world_rules_ref,
+                job_ref=job_ref,
+                related_refs=(skeleton_ref, coupling_plan_ref, *group_closure_refs),
+            )
+            self._record_feedback_pass(
+                contract_id="feedback.design.world_rules",
+                subject_ref=world_rules_ref,
+                component="design",
+                artifact_slot="world_rules",
+                lineage_id=f"{job.job_id}.world-rules",
+                immutable_input_refs=world_rule_dependencies,
+                evidence_refs=(skeleton_ref, coupling_plan_ref, *group_closure_refs),
+                summary=(
+                    "Reset and invariant rules compiled over the exact world and tool semantics."
+                ),
+                invocation_results=world_rule_results,
+                allowed_mutation_paths=("/initial_state_rules", "/invariants"),
+            )
+            self._commit_semantic_node(
+                job_ref=job_ref,
+                node="world_rules",
+                detail=None,
+                subject_ref=world_rules_ref,
+                immutable_input_refs=world_rule_dependencies,
+                derived_refs=(),
+                model=WorldRuleSemanticsSourceDraft,
+            )
+        else:
+            world_rules_source, world_rules_ref = cached_world_rules
+            world_rule_results = ()
+
+        world_source = compose_world_source(world_rules_source)
+        world_model = self._compile_world_semantic_source(
+            world_source,
+            evidence_graph=evidence_graph,
+            evidence_graph_ref=evidence_graph_ref,
+        )
+        world_source_ref = self.artifacts.put_json(
+            artifact_id=f"{job.job_id}:world-semantic-source",
+            artifact_type="design.world_semantic_source",
+            value=world_source,
+            dependencies=(
+                architecture_ref,
+                world_rules_ref,
+                coupling_plan_ref,
+                *group_closure_refs,
+            ),
+        )
+
+        training_context = self._training_contract_context(
+            world=world_model,
+            evidence_graph=evidence_graph,
+        )
+
+        def validate_training(value: TrainingSemanticSourceDraft) -> None:
+            complete_source = self._compose_environment_semantic_source(world_source, value)
+            compiled = self._compile_semantic_source(
+                complete_source,
+                evidence_graph=evidence_graph,
+                evidence_graph_ref=evidence_graph_ref,
+            )
+            self._validate_required_coverage(
+                compiled,
+                job.release_profile.minimum_coverage_dimensions,
+            )
+
+        training_dependencies = (world_source_ref, evidence_graph_ref)
+        cached_training = self._load_validated_design_node(
+            artifact_id=f"{job.job_id}:task-curriculum-source",
+            artifact_type="design.task_curriculum_source",
+            model=TrainingSemanticSourceDraft,
+            required_dependencies=training_dependencies,
+            semantic_validator=validate_training,
+            job_ref=job_ref,
+            node="task_curriculum",
+            detail=None,
+        )
+        if cached_training is None:
+            self._record_design_node_started(
+                node="task_curriculum",
+                subject_ref=world_source_ref,
+                job_ref=job_ref,
+            )
+            training_source, training_results = await self.run_structured_agent(
+                role="environment-engineer",
+                lineage_id=f"{job.job_id}.task-curriculum",
+                workspace=workspace / "task-curriculum",
+                model=TrainingSemanticSourceDraft,
+                prompt=self._with_frozen_inputs(
+                    self._training_semantics_prompt(request),
+                    request=request,
+                    training_contract_context=training_context,
+                ),
+                semantic_validator=validate_training,
+                permissions=job.permissions,
+                budget=meter,
+                capability_requirement=NodeCapabilityRequirement.structured_output(
+                    node_id="environment-engineer.task-curriculum",
+                    role="environment-engineer",
+                ),
+                feedback_contract_id="feedback.design.task_curriculum",
+                semantic_transaction="design.task-curriculum",
+                repair_target=RepairTargetRef(
+                    target_id=self._stable_id(
+                        "repair-target", job.job_id, "task-curriculum"
+                    ),
+                    component="design",
+                    artifact_slot="task_curriculum",
+                    lineage_id=f"{job.job_id}.task-curriculum",
+                    immutable_input_refs=training_dependencies,
+                    allowed_mutation_paths=("/curriculum_plan", "/task_requirements"),
+                ),
+            )
+            training_source_ref = self.artifacts.put_json(
+                artifact_id=f"{job.job_id}:task-curriculum-source",
+                artifact_type="design.task_curriculum_source",
+                value=training_source,
+                dependencies=training_dependencies,
+            )
+        else:
+            training_source, training_source_ref = cached_training
+            training_results = ()
+        semantic_source = self._compose_environment_semantic_source(
+            world_source,
+            training_source,
+        )
+        design_draft = self._compile_semantic_source(
+            semantic_source,
+            evidence_graph=evidence_graph,
+            evidence_graph_ref=evidence_graph_ref,
+        )
+        self._validate_required_coverage(
+            design_draft,
+            job.release_profile.minimum_coverage_dimensions,
+        )
+        if cached_training is None:
+            self._record_design_node(
+                node="task_curriculum",
+                subject_ref=training_source_ref,
+                job_ref=job_ref,
+                related_refs=training_dependencies,
+            )
+            self._record_feedback_pass(
+                contract_id="feedback.design.task_curriculum",
+                subject_ref=training_source_ref,
+                component="design",
+                artifact_slot="task_curriculum",
+                lineage_id=f"{job.job_id}.task-curriculum",
+                immutable_input_refs=training_dependencies,
+                evidence_refs=training_dependencies,
+                summary=(
+                    "The committed task curriculum compiled against the frozen executable world."
+                ),
+                invocation_results=training_results,
+                allowed_mutation_paths=("/curriculum_plan", "/task_requirements"),
+            )
+            self._commit_semantic_node(
+                job_ref=job_ref,
+                node="task_curriculum",
+                detail=None,
+                subject_ref=training_source_ref,
+                immutable_input_refs=training_dependencies,
+                derived_refs=(),
+                model=TrainingSemanticSourceDraft,
+            )
+        return self._persist_initial_design(
+            job=job,
+            job_ref=job_ref,
+            request=request,
+            request_ref=request_ref,
+            evidence_graph=evidence_graph,
+            evidence_graph_ref=evidence_graph_ref,
+            design_draft=design_draft,
+            design_dependencies=(architecture_ref, world_source_ref, training_source_ref),
+            research_usage=evidence_phase.research_usage,
+            meter=meter,
+            invocation_results=(
+                *evidence_phase.invocation_results,
+                *architecture_results,
+                *shared_results,
+                *semantic_results,
+                *world_rule_results,
+                *training_results,
+            ),
+        )
+
+    def _validate_generate_inputs(
+        self,
+        *,
+        job: EnvironmentJob,
+        job_ref: ArtifactRef,
+        request: EnvironmentRequest,
+        request_ref: ArtifactRef,
+        phase_checkpoint_ref: ArtifactRef | None,
+    ) -> None:
+        if job.kind != "generate":
+            raise ValueError("generate() only accepts a GenerateJob")
+        self.artifacts.require_exact_json(job_ref, job, artifact_types=("control.environment_job",))
+        self.artifacts.require_exact_json(
+            request_ref,
+            request,
+            artifact_types=("control.environment_request",),
+        )
+        if job.request_ref != request_ref:
+            raise ValueError("GenerateJob request_ref does not bind the supplied request")
+        if request.supplied_asset_refs:
+            raise DesignerError(
+                "request.assets",
+                "supplied_asset_refs require an authorized asset materializer",
+            )
+        if job.budget.agent_turns < DIRECT_DESIGN_MAX_TURNS:
+            raise DesignerError(
+                "budget",
+                "direct generation requires seven semantic transactions plus two repair turns",
+            )
+        if phase_checkpoint_ref is None:
+            if job.budget.search_calls < 1:
+                raise DesignerError("budget", "direct generation requires real search")
+            if job.budget.tool_calls - job.budget.search_calls < 1:
+                raise DesignerError("budget", "tool_calls must reserve a real fetch")
+
+    @staticmethod
+    def _validate_architecture_source(source: WorldArchitectureSourceDraft) -> None:
+        """Validate cross-field source topology without leaking rejected identifiers."""
+
+        issues: list[SafeValidationIssue] = []
+
+        def add(code: str, location: tuple[str | int, ...], message: str) -> None:
+            issues.append(SafeValidationIssue(code, location, message))
+
+        actor_ids = [item.actor for item in source.boundary.actors_and_authority]
+        known_actors = set(actor_ids)
+        entity_ids = [item.entity for item in source.state_entities]
+        root_fields = [item.root_field for item in source.state_entities]
+        owned_resources: set[str] = set()
+        for index, item in enumerate(source.state_entities):
+            if entity_ids.count(item.entity) > 1:
+                add(
+                    "architecture_entity_duplicate",
+                    ("state_entities", index, "entity"),
+                    "Each state entity identifier must be unique.",
+                )
+            if root_fields.count(item.root_field) > 1:
+                add(
+                    "architecture_root_field_duplicate",
+                    ("state_entities", index, "root_field"),
+                    "Each state entity root field must be unique.",
+                )
+            names = [field.name for field in item.fields]
+            for field_index, field in enumerate(item.fields):
+                if names.count(field.name) > 1:
+                    add(
+                        "architecture_state_field_duplicate",
+                        ("state_entities", index, "fields", field_index, "name"),
+                        "Each state field name must be declared exactly once.",
+                    )
+            if not any(field.role == "primary_key" for field in item.fields):
+                add(
+                    "architecture_primary_key_missing",
+                    ("state_entities", index, "fields"),
+                    "Each state entity requires at least one primary-key field.",
+                )
+            lifecycle_indexes = [
+                field_index
+                for field_index, field in enumerate(item.fields)
+                if field.lifecycle
+            ]
+            if len(lifecycle_indexes) > 1:
+                add(
+                    "architecture_lifecycle_ambiguous",
+                    ("state_entities", index, "fields"),
+                    "Each state entity may declare at most one lifecycle field.",
+                )
+            if item.system_of_record not in source.boundary.systems_of_record:
+                add(
+                    "architecture_system_of_record_unknown",
+                    ("state_entities", index, "system_of_record"),
+                    "Each entity system_of_record must name one boundary system.",
+                )
+            for resource_index, resource_id in enumerate(item.owned_resource_ids):
+                if resource_id in owned_resources:
+                    add(
+                        "architecture_resource_owner_duplicate",
+                        ("state_entities", index, "owned_resource_ids", resource_index),
+                        "Each resource id must be declared by exactly one owning entity.",
+                    )
+                owned_resources.add(resource_id)
+            for actor_index, actor_id in enumerate(item.visible_to_actor_ids):
+                if actor_id not in known_actors:
+                    add(
+                        "architecture_visibility_actor_unknown",
+                        ("state_entities", index, "visible_to_actor_ids", actor_index),
+                        "Entity visibility must reference one declared actor id.",
+                    )
+
+        if not owned_resources:
+            add(
+                "architecture_resource_missing",
+                ("state_entities",),
+                "At least one state entity must own a core world resource.",
+            )
+
+        known_entities = set(entity_ids)
+        canonical_tool_ids = [item.tool_id for item in source.tool_inventory.tools]
+        for index, tool in enumerate(source.tool_inventory.tools):
+            if canonical_tool_ids.count(tool.tool_id) > 1:
+                add(
+                    "architecture_tool_identity_duplicate",
+                    ("tool_inventory", "tools", index),
+                    "Derived namespace/name tool identity must be unique.",
+                )
+            footprint = set(tool.reads_state_entities) | set(tool.writes_state_entities)
+            if footprint - known_entities:
+                add(
+                    "architecture_tool_state_unknown",
+                    ("tool_inventory", "tools", index),
+                    "Tool state footprints must reference declared entity identifiers.",
+                )
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="world_architecture_topology",
+                    frontier_ordinal=15,
+                    issues=tuple(issues),
+                )
+            )
+
+    @staticmethod
+    def _architecture_repair_roots(
+        diagnostic: ValidationDiagnostic,
+    ) -> tuple[str, ...]:
+        """Route an Architecture finding to the smallest safe root-section closure."""
+
+        issue_codes = {issue.code for issue in diagnostic.issues}
+        if diagnostic.validation_phase == "world_architecture_topology":
+            roots: list[str] = []
+            for issue in diagnostic.issues:
+                root = issue.location[0] if issue.location else None
+                if root in {"boundary", "state_entities", "tool_inventory"}:
+                    roots.append(cast(str, root))
+            # Changing entity identity can invalidate tool state footprints;
+            # accept that dependency closure in the same bounded correction.
+            if issue_codes & {
+                "architecture_entity_duplicate",
+                "architecture_root_field_duplicate",
+            }:
+                roots.append("tool_inventory")
+            return tuple(dict.fromkeys(roots))
+        if diagnostic.validation_phase == "state_inventory_semantics":
+            # Resource ownership and actor visibility are one state-owned source
+            # projection; the compiled boundary is regenerated mechanically.
+            return ("state_entities",)
+        if diagnostic.validation_phase.startswith("worldboundarydraft_"):
+            return ("boundary",)
+        if diagnostic.validation_phase.startswith("state"):
+            return ("state_entities",)
+        if diagnostic.validation_phase.startswith("world_tool"):
+            return ("tool_inventory",)
+        # A later closure failure can involve any Architecture root. Full scope
+        # remains explicit and code-authorized rather than an Agent decision.
+        return ("boundary", "state_entities", "tool_inventory")
+
+    @staticmethod
+    def _compile_architecture_state_inventory(
+        source: WorldArchitectureSourceDraft,
+    ) -> StateEntityInventoryDraft:
+        entities: list[StateEntityPlan] = []
+        for item in source.state_entities:
+            lifecycle = next((field for field in item.fields if field.lifecycle), None)
+            entities.append(
+                StateEntityPlan(
+                    entity=item.entity,
+                    purpose=item.purpose,
+                    root_field=item.root_field,
+                    storage=item.storage,
+                    system_of_record=item.system_of_record,
+                    boundary_resource_ids=item.owned_resource_ids,
+                    primary_key_fields=tuple(
+                        field.name for field in item.fields if field.role == "primary_key"
+                    ),
+                    mutable_fields=tuple(
+                        field.name for field in item.fields if field.role == "mutable"
+                    ),
+                    lifecycle_field=lifecycle.name if lifecycle is not None else None,
+                    lifecycle_states=lifecycle.enum_values if lifecycle is not None else (),
+                    evidence_claim_ids=item.evidence_claim_ids,
+                )
+            )
+        return StateEntityInventoryDraft(entities=tuple(entities))
+
+    @staticmethod
+    def _compile_architecture_boundary(
+        source: WorldArchitectureSourceDraft,
+    ) -> WorldBoundaryDraft:
+        """Compile resource ownership and actor visibility from state declarations.
+
+        The Agent declares each relationship once on the owning entity.  This
+        projection prevents drift between a boundary index and the state model.
+        """
+
+        boundary_source = source.boundary
+        return WorldBoundaryDraft(
+            boundary=WorldBoundary(
+                primary_domain=boundary_source.primary_domain,
+                actors_and_authority=tuple(
+                    ActorBoundary(
+                        actor=actor.actor,
+                        authorities=actor.authorities,
+                        visibility=tuple(
+                            entity.root_field
+                            for entity in source.state_entities
+                            if actor.actor in entity.visible_to_actor_ids
+                        ),
+                    )
+                    for actor in boundary_source.actors_and_authority
+                ),
+                systems_of_record=boundary_source.systems_of_record,
+                core_resources=tuple(
+                    resource_id
+                    for entity in source.state_entities
+                    for resource_id in entity.owned_resource_ids
+                ),
+                transition_authorities=boundary_source.transition_authorities,
+                tool_namespaces=boundary_source.tool_namespaces,
+                core_invariants=boundary_source.core_invariants,
+            ),
+            task_dimensions=boundary_source.task_dimensions,
+            fidelity=boundary_source.fidelity,
+        )
+
+    @staticmethod
+    def _compile_architecture_tool_inventory(
+        source: WorldArchitectureSourceDraft,
+    ) -> WorldToolPlanInventoryDraft:
+        """Derive canonical tool ids; Agents never repeat namespace/name as identity."""
+
+        return WorldToolPlanInventoryDraft(
+            tools=tuple(
+                ToolSurfacePlan(
+                    tool_id=item.tool_id,
+                    namespace=item.namespace,
+                    name=item.name,
+                    description=item.description,
+                    transport=item.transport,
+                    reads_state_entities=item.reads_state_entities,
+                    writes_state_entities=item.writes_state_entities,
+                    evidence_claim_ids=item.evidence_claim_ids,
+                )
+                for item in source.tool_inventory.tools
+            )
+        )
+
+    def _compile_architecture_skeleton(
+        self,
+        source: WorldArchitectureSourceDraft,
+        *,
+        evidence_graph: EvidenceGraph,
+    ) -> WorldSkeletonDraft:
+        self._validate_architecture_source(source)
+        boundary = self._compile_architecture_boundary(source)
+        state_inventory = self._compile_architecture_state_inventory(source)
+        self._validate_world_boundary_draft(boundary, evidence_graph=evidence_graph)
+        self._validate_state_entity_inventory_draft(
+            state_inventory,
+            boundary=boundary,
+            evidence_graph=evidence_graph,
+        )
+        state_schema_irs, tool_schema_irs = self._compile_architecture_schema_irs(source)
+        entities: list[StateEntitySchema] = []
+        for state_plan, entity_schema_ir in zip(
+            state_inventory.entities,
+            state_schema_irs,
+            strict=True,
+        ):
+            self._validate_state_entity_schema_ir_draft(
+                entity_schema_ir,
+                plan=state_plan,
+            )
+            entities.append(
+                self._compose_state_entity_schema(
+                    state_plan,
+                    self._compile_state_entity_schema_ir(entity_schema_ir),
+                )
+            )
+        state_shape = self._compose_world_state_shape(state_inventory, tuple(entities))
+        self._validate_world_state_shape_draft(
+            state_shape,
+            boundary=boundary,
+            evidence_graph=evidence_graph,
+        )
+        # Architecture freezes schema closure only. Executable reset rules are
+        # authored in the later WorldRules transaction against this exact shape.
+        initial_rules = InitialStateRulesDraft()
+        self._validate_initial_state_rules_draft(
+            initial_rules,
+            state_shape=state_shape,
+            evidence_graph=evidence_graph,
+        )
+        state = self._compose_world_state(state_shape, initial_rules)
+        tool_plan_inventory = self._compile_architecture_tool_inventory(source)
+        self._validate_world_tool_plan_inventory_draft(
+            tool_plan_inventory,
+            boundary=boundary,
+            evidence_graph=evidence_graph,
+        )
+        schema_index = 0
+        surfaces: list[ToolSurfaceDraft] = []
+        for tool_plan in tool_plan_inventory.tools:
+            compiled: dict[str, ToolSchemaDraft] = {}
+            for schema_kind in ("input", "output", "observation"):
+                tool_schema_ir = tool_schema_irs[schema_index]
+                schema_index += 1
+                self._validate_tool_schema_ir_draft(
+                    tool_schema_ir,
+                    plan=tool_plan,
+                    schema_kind=schema_kind,
+                )
+                schema = self._compile_tool_schema_ir(tool_schema_ir)
+                self._validate_tool_schema_draft(
+                    schema,
+                    plan=tool_plan,
+                    schema_kind=schema_kind,
+                )
+                compiled[schema_kind] = schema
+            schemas = ToolSurfaceSchemasDraft(
+                tool_id=tool_plan.tool_id,
+                input_schema=compiled["input"].json_schema,
+                output_schema=compiled["output"].json_schema,
+                observation_schema=compiled["observation"].json_schema,
+            )
+            self._validate_tool_surface_schemas_draft(schemas, plan=tool_plan)
+            surfaces.append(self._compose_tool_surface(tool_plan, schemas))
+        inventory = WorldToolInventoryDraft(tool_surfaces=tuple(surfaces))
+        self._validate_world_tool_inventory_draft(
+            inventory,
+            boundary=boundary,
+            evidence_graph=evidence_graph,
+        )
+        skeleton = self._compose_world_skeleton(boundary, state, inventory)
+        self._validate_world_skeleton(skeleton, evidence_graph=evidence_graph)
+        return skeleton
+
+    @staticmethod
+    def _compact_fields_to_schema_nodes(
+        fields: Sequence[CompactFieldSemanticDraft],
+    ) -> tuple[
+        SchemaObjectNodeDraft
+        | SchemaArrayNodeDraft
+        | SchemaStringNodeDraft
+        | SchemaIntegerNodeDraft
+        | SchemaNumberNodeDraft
+        | SchemaBooleanNodeDraft
+        | SchemaNullNodeDraft
+        | SchemaUnionNodeDraft,
+        ...,
+    ]:
+        """Compile compact domain fields into a closed, deterministic Schema IR graph."""
+
+        properties: list[SchemaPropertyDraft] = []
+        nodes: list[
+            SchemaObjectNodeDraft
+            | SchemaArrayNodeDraft
+            | SchemaStringNodeDraft
+            | SchemaIntegerNodeDraft
+            | SchemaNumberNodeDraft
+            | SchemaBooleanNodeDraft
+            | SchemaNullNodeDraft
+            | SchemaUnionNodeDraft
+        ] = []
+        for index, field in enumerate(fields):
+            scalar_id = f"field:{index}:value"
+            scalar: (
+                SchemaStringNodeDraft
+                | SchemaIntegerNodeDraft
+                | SchemaNumberNodeDraft
+                | SchemaBooleanNodeDraft
+            )
+            if field.value_type == "string":
+                scalar = SchemaStringNodeDraft(
+                    node_id=scalar_id,
+                    kind="string",
+                    description=field.description,
+                    format=field.string_format,
+                    enum_values=field.enum_values,
+                )
+            elif field.value_type == "integer":
+                if any(
+                    value is not None and not float(value).is_integer()
+                    for value in (field.minimum, field.maximum)
+                ):
+                    raise ValueError(f"integer field {field.name} requires integral bounds")
+                scalar = SchemaIntegerNodeDraft(
+                    node_id=scalar_id,
+                    kind="integer",
+                    description=field.description,
+                    minimum=int(field.minimum) if field.minimum is not None else None,
+                    maximum=int(field.maximum) if field.maximum is not None else None,
+                )
+            elif field.value_type == "number":
+                scalar = SchemaNumberNodeDraft(
+                    node_id=scalar_id,
+                    kind="number",
+                    description=field.description,
+                    minimum=field.minimum,
+                    maximum=field.maximum,
+                )
+            else:
+                scalar = SchemaBooleanNodeDraft(
+                    node_id=scalar_id,
+                    kind="boolean",
+                    description=field.description,
+                )
+            nodes.append(scalar)
+            property_node_id = scalar_id
+            if field.repeated:
+                property_node_id = f"field:{index}:array"
+                nodes.append(
+                    SchemaArrayNodeDraft(
+                        node_id=property_node_id,
+                        kind="array",
+                        items_node_id=scalar_id,
+                    )
+                )
+            if field.nullable:
+                null_id = f"field:{index}:null"
+                nullable_id = f"field:{index}:nullable"
+                nodes.append(SchemaNullNodeDraft(node_id=null_id, kind="null"))
+                nodes.append(
+                    SchemaUnionNodeDraft(
+                        node_id=nullable_id,
+                        kind="union",
+                        variant_node_ids=(property_node_id, null_id),
+                    )
+                )
+                property_node_id = nullable_id
+            properties.append(
+                SchemaPropertyDraft(
+                    name=field.name,
+                    node_id=property_node_id,
+                    required=field.required,
+                )
+            )
+        return (
+            SchemaObjectNodeDraft(
+                node_id="root",
+                kind="object",
+                properties=tuple(properties),
+            ),
+            *nodes,
+        )
+
+    @classmethod
+    def _compile_architecture_schema_irs(
+        cls,
+        source: WorldArchitectureSourceDraft,
+    ) -> tuple[tuple[StateEntitySchemaIRDraft, ...], tuple[ToolSchemaIRDraft, ...]]:
+        state_irs = tuple(
+            StateEntitySchemaIRDraft(
+                entity=item.entity,
+                root_node_id="root",
+                nodes=cls._compact_fields_to_schema_nodes(item.fields),
+            )
+            for item in source.state_entities
+        )
+        tool_irs: list[ToolSchemaIRDraft] = []
+        for tool_source in source.tool_inventory.tools:
+            item = tool_source.interface
+            for schema_kind, fields in (
+                ("input", item.input_fields),
+                ("output", item.output_fields),
+                ("observation", item.observation_fields),
+            ):
+                tool_irs.append(
+                    ToolSchemaIRDraft(
+                        tool_id=tool_source.tool_id,
+                        schema_kind=cast(Literal["input", "output", "observation"], schema_kind),
+                        root_node_id="root",
+                        nodes=cls._compact_fields_to_schema_nodes(fields),
+                    )
+                )
+        return state_irs, tuple(tool_irs)
+
+    @classmethod
+    def _compile_tool_coupling_plan(
+        cls,
+        architecture: WorldArchitectureSourceDraft,
+        *,
+        architecture_ref: ArtifactRef,
+    ) -> ToolCouplingPlan:
+        """Own coupling, group membership, ordering and bounded batch topology in code."""
+
+        tools = architecture.tool_inventory.tools
+        footprints = {
+            item.tool_id: set(item.reads_state_entities) | set(item.writes_state_entities)
+            for item in tools
+        }
+        ordered_footprints = {
+            item.tool_id: tuple(
+                dict.fromkeys((*item.reads_state_entities, *item.writes_state_entities))
+            )
+            for item in tools
+        }
+        remaining = [item.tool_id for item in tools]
+        by_id = {item.tool_id: item for item in tools}
+        components: list[list[str]] = []
+        while remaining:
+            component = [remaining.pop(0)]
+            changed = True
+            while changed:
+                changed = False
+                for tool_id in tuple(remaining):
+                    if any(
+                        by_id[tool_id].namespace == by_id[member].namespace
+                        or bool(footprints[tool_id] & footprints[member])
+                        for member in component
+                    ):
+                        remaining.remove(tool_id)
+                        component.append(tool_id)
+                        changed = True
+            components.append(component)
+        groups: list[ToolCouplingGroupPlan] = []
+        for component in components:
+            ordered = tuple(component)
+            namespaces = tuple(dict.fromkeys(by_id[tool_id].namespace for tool_id in ordered))
+            shared_state = tuple(
+                entity
+                for entity in dict.fromkeys(
+                    entity for tool_id in ordered for entity in ordered_footprints[tool_id]
+                )
+                if sum(entity in footprints[tool_id] for tool_id in ordered) > 1
+            )
+            reasons: list[Literal["namespace", "state_overlap"]] = []
+            if len(namespaces) < len(ordered):
+                reasons.append("namespace")
+            if shared_state:
+                reasons.append("state_overlap")
+            if not reasons:
+                # A singleton is a valid independent coupling group.
+                reasons.append("namespace")
+            batches = tuple(ordered[index : index + 4] for index in range(0, len(ordered), 4))
+            groups.append(
+                ToolCouplingGroupPlan(
+                    group_id=cls._stable_id("tool-coupling-group", *ordered),
+                    ordered_tool_ids=ordered,
+                    shared_state_entity_ids=shared_state,
+                    namespaces=namespaces,
+                    coupling_reasons=tuple(reasons),
+                    mode="multi_batch" if len(batches) > 1 else "single_batch",
+                    batches=batches,
+                )
+            )
+        return ToolCouplingPlan(
+            plan_id=cls._stable_id(
+                "tool-coupling-plan",
+                architecture_ref.revision_id,
+                *(item.tool_id for item in tools),
+            ),
+            architecture_ref=architecture_ref,
+            groups=tuple(groups),
+            execution_batches=tuple(
+                tuple(item.tool_id for item in tools[index : index + 4])
+                for index in range(0, len(tools), 4)
+            ),
+        )
+
+    @classmethod
+    def _tool_semantic_batches(
+        cls,
+        architecture: WorldArchitectureSourceDraft,
+    ) -> tuple[tuple[str, ...], ...]:
+        """Compatibility-free view used only by tests and bounded generation."""
+
+        placeholder_ref = ArtifactRef(
+            artifact_id="architecture:batch-plan",
+            artifact_type="design.world_architecture_source",
+            revision_id="sha256:" + "0" * 64,
+            content_hash="sha256:" + "0" * 64,
+            size_bytes=1,
+            media_type="application/json",
+        )
+        plan = cls._compile_tool_coupling_plan(
+            architecture,
+            architecture_ref=placeholder_ref,
+        )
+        return plan.execution_batches
+
+    @staticmethod
+    def _validate_shared_tool_semantics_source(
+        source: SharedToolSemanticsSourceDraft,
+        *,
+        group: ToolCouplingGroupPlan,
+        evidence_graph: EvidenceGraph,
+    ) -> None:
+        members = set(group.ordered_tool_ids)
+        issues: list[StructuredSemanticIssue] = []
+
+        def validate_partition(label: str, domains: Sequence[Any]) -> None:
+            seen: list[str] = []
+            for index, domain in enumerate(domains):
+                unknown = set(domain.member_tool_ids) - members
+                if unknown:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="shared_contract_tool_unknown",
+                            location=(label, index, "member_tool_ids"),
+                            message="A shared domain may reference only frozen group tools.",
+                        )
+                    )
+                seen.extend(domain.member_tool_ids)
+            if set(seen) != members or len(seen) != len(set(seen)):
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="shared_contract_partition",
+                        location=(label,),
+                        message=(
+                            "Shared domains must partition every frozen group tool exactly once."
+                        ),
+                    )
+                )
+
+        validate_partition("atomicity_domains", source.atomicity_domains)
+        validate_partition("concurrency_domains", source.concurrency_domains)
+        validate_partition("idempotency_domains", source.idempotency_domains)
+        known_claims = {claim.claim_id for claim in evidence_graph.claims}
+        for index, constraint in enumerate(source.ordering_constraints):
+            if (
+                constraint.before_tool_id not in members
+                or constraint.after_tool_id not in members
+                or constraint.before_tool_id == constraint.after_tool_id
+            ):
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="shared_ordering_tool_invalid",
+                        location=("ordering_constraints", index),
+                        message="Ordering must connect two distinct frozen group tools.",
+                    )
+                )
+            if not set(constraint.evidence_claim_ids) <= known_claims:
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="shared_ordering_evidence_unknown",
+                        location=("ordering_constraints", index, "evidence_claim_ids"),
+                        message="Ordering evidence must use only supplied claim ids.",
+                    )
+                )
+        for index, edge in enumerate(source.compensation_edges):
+            if (
+                edge.failure_tool_id not in members
+                or edge.compensation_tool_id not in members
+                or edge.failure_tool_id == edge.compensation_tool_id
+            ):
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="shared_compensation_tool_invalid",
+                        location=("compensation_edges", index),
+                        message="Compensation must connect two distinct frozen group tools.",
+                    )
+                )
+        error_members: list[str] = []
+        for index, policy in enumerate(source.error_policies):
+            if set(policy.member_tool_ids) - members:
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="shared_error_tool_unknown",
+                        location=("error_policies", index, "member_tool_ids"),
+                        message="Shared error policies may reference only frozen group tools.",
+                    )
+                )
+            error_members.extend(policy.member_tool_ids)
+        if set(error_members) != members:
+            issues.append(
+                StructuredSemanticIssue(
+                    code="shared_error_coverage",
+                    location=("error_policies",),
+                    message="Every frozen group tool requires at least one shared error policy.",
+                )
+            )
+        if issues:
+            raise StructuredSemanticError(tuple(issues))
+
+    @classmethod
+    def _compile_shared_tool_semantics_contract(
+        cls,
+        source: SharedToolSemanticsSourceDraft,
+        *,
+        group: ToolCouplingGroupPlan,
+        evidence_graph: EvidenceGraph,
+    ) -> SharedToolSemanticsContract:
+        cls._validate_shared_tool_semantics_source(
+            source,
+            group=group,
+            evidence_graph=evidence_graph,
+        )
+        return SharedToolSemanticsContract(
+            contract_id=cls._stable_id(
+                "shared-tool-semantics",
+                group.group_id,
+                sha256_digest(canonical_json_bytes(source.model_dump(mode="json"))),
+            ),
+            group_id=group.group_id,
+            member_tool_ids=group.ordered_tool_ids,
+            source=source,
+        )
+
+    @staticmethod
+    def _validate_tool_batch_against_shared_contracts(
+        compiled: tuple[ToolSemanticsDraft, ...],
+        *,
+        contracts: Sequence[SharedToolSemanticsContract],
+    ) -> None:
+        issues: list[StructuredSemanticIssue] = []
+        for tool_index, item in enumerate(compiled):
+            contract = next(
+                (
+                    candidate
+                    for candidate in contracts
+                    if item.tool_id in candidate.member_tool_ids
+                ),
+                None,
+            )
+            if contract is None:
+                continue
+            source = contract.source
+            atomicity = next(
+                domain.atomicity
+                for domain in source.atomicity_domains
+                if item.tool_id in domain.member_tool_ids
+            )
+            isolation = next(
+                domain.isolation
+                for domain in source.concurrency_domains
+                if item.tool_id in domain.member_tool_ids
+            )
+            idempotency_mode = next(
+                domain.mode
+                for domain in source.idempotency_domains
+                if item.tool_id in domain.member_tool_ids
+            )
+            semantics = item.semantics
+            for code, location, matches, message in (
+                (
+                    "shared_atomicity_mismatch",
+                    ("reliability", "transaction", "atomicity"),
+                    semantics.transaction.atomicity == atomicity,
+                    "Tool atomicity must match its frozen shared domain.",
+                ),
+                (
+                    "shared_isolation_mismatch",
+                    ("reliability", "concurrency", "isolation"),
+                    semantics.concurrency.isolation == isolation,
+                    "Tool isolation must match its frozen shared domain.",
+                ),
+                (
+                    "shared_idempotency_mismatch",
+                    ("reliability", "idempotency", "mode"),
+                    semantics.idempotency.mode == idempotency_mode,
+                    "Tool idempotency mode must match its frozen shared domain.",
+                ),
+            ):
+                if not matches:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code=code,
+                            location=("tools", tool_index, *location),
+                            message=message,
+                        )
+                    )
+            error_by_suffix = {
+                error.error_code.rsplit(":", maxsplit=1)[-1]: error
+                for error in semantics.errors
+            }
+            for policy in source.error_policies:
+                if item.tool_id not in policy.member_tool_ids:
+                    continue
+                error = error_by_suffix.get(policy.required_error_suffix)
+                if error is None or error.retryable != policy.retryable:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="shared_error_policy_mismatch",
+                            location=("tools", tool_index, "errors"),
+                            message=(
+                                "Tool errors must implement every frozen shared suffix and "
+                                "retryability policy."
+                            ),
+                        )
+                    )
+            for edge in source.compensation_edges:
+                if edge.failure_tool_id == item.tool_id and (
+                    edge.compensation_tool_id not in semantics.rollback.compensation_tools
+                ):
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="shared_compensation_mismatch",
+                            location=("tools", tool_index, "reliability", "rollback"),
+                            message="Tool rollback must implement the frozen compensation edge.",
+                        )
+                    )
+        if issues:
+            raise StructuredSemanticError(tuple(issues))
+
+    def _compile_tool_semantics_batch(
+        self,
+        source: ToolSemanticsBatchSourceDraft,
+        *,
+        expected_tool_ids: tuple[str, ...],
+        skeleton: WorldSkeletonDraft,
+        evidence_graph: EvidenceGraph,
+    ) -> tuple[ToolSemanticsDraft, ...]:
+        if tuple(item.tool_id for item in source.tools) != expected_tool_ids:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_semantics_batch_identity",
+                    frontier_ordinal=10,
+                    issues=(
+                        SafeValidationIssue(
+                            "tool_batch_identity_drift",
+                            ("tools",),
+                            "Batch length, order and tool ids must equal the frozen target batch.",
+                        ),
+                    ),
+                )
+            )
+        identity_issues = tuple(
+            SafeValidationIssue(
+                "tool_semantics_nested_identity",
+                ("tools", index),
+                "nested identity must preserve the parent frozen tool id in every section.",
+            )
+            for index, item in enumerate(source.tools)
+            if {
+                item.conditions.tool_id,
+                item.state_transition.tool_id,
+                item.errors.tool_id,
+                item.access_observation.tool_id,
+                item.reliability.tool_id,
+            }
+            != {item.tool_id}
+        )
+        if identity_issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_semantics_batch_identity",
+                    frontier_ordinal=10,
+                    issues=identity_issues,
+                )
+            )
+        issues: list[SafeValidationIssue] = []
+        compiled: list[ToolSemanticsDraft] = []
+        for tool_index, item in enumerate(source.tools):
+            tool_issue_start = len(issues)
+            conditions: ToolConditionsDraft | None = None
+            transition: ToolStateTransitionDraft | None = None
+            errors: ToolErrorsDraft | None = None
+            try:
+                conditions = self._compile_tool_conditions_source(item.conditions)
+            except (
+                StructuredSemanticError,
+                StructuredValidationError,
+                ValidationError,
+                ValueError,
+            ) as exc:
+                issues.extend(
+                    self._prefixed_validation_issues(
+                        exc,
+                        prefix=("tools", tool_index, "conditions"),
+                    )
+                )
+            try:
+                transition = self._compile_tool_state_transition_source(item.state_transition)
+            except (
+                StructuredSemanticError,
+                StructuredValidationError,
+                ValidationError,
+                ValueError,
+            ) as exc:
+                issues.extend(
+                    self._prefixed_validation_issues(
+                        exc,
+                        prefix=("tools", tool_index, "state_transition"),
+                    )
+                )
+            try:
+                errors = self._compile_tool_errors_source(item.errors)
+            except (
+                StructuredSemanticError,
+                StructuredValidationError,
+                ValidationError,
+                ValueError,
+            ) as exc:
+                issues.extend(
+                    self._prefixed_validation_issues(
+                        exc,
+                        prefix=("tools", tool_index, "errors"),
+                    )
+                )
+            behavior: ToolBehaviorDraft | None = None
+            if conditions is not None and transition is not None and errors is not None:
+                behavior = self._compose_tool_behavior(conditions, transition, errors)
+                try:
+                    self._validate_tool_conditions_draft(
+                        conditions,
+                        expected_tool_id=item.tool_id,
+                        skeleton=skeleton,
+                        evidence_graph=evidence_graph,
+                    )
+                except (
+                    StructuredSemanticError,
+                    StructuredValidationError,
+                    ValidationError,
+                    ValueError,
+                ) as exc:
+                    issues.extend(
+                        self._prefixed_validation_issues(
+                            exc,
+                            prefix=("tools", tool_index, "conditions"),
+                        )
+                    )
+                try:
+                    self._validate_tool_state_transition_draft(
+                        transition,
+                        expected_tool_id=item.tool_id,
+                        skeleton=skeleton,
+                        evidence_graph=evidence_graph,
+                    )
+                except (
+                    StructuredSemanticError,
+                    StructuredValidationError,
+                    ValidationError,
+                    ValueError,
+                ) as exc:
+                    issues.extend(
+                        self._prefixed_validation_issues(
+                            exc,
+                            prefix=("tools", tool_index, "state_transition"),
+                        )
+                    )
+                try:
+                    self._validate_tool_errors_draft(
+                        errors,
+                        expected_tool_id=item.tool_id,
+                        skeleton=skeleton,
+                        evidence_graph=evidence_graph,
+                    )
+                except (
+                    StructuredSemanticError,
+                    StructuredValidationError,
+                    ValidationError,
+                    ValueError,
+                ) as exc:
+                    issues.extend(
+                        self._prefixed_validation_issues(
+                            exc,
+                            prefix=("tools", tool_index, "errors"),
+                        )
+                    )
+                try:
+                    self._validate_tool_behavior_draft(
+                        behavior,
+                        expected_tool_id=item.tool_id,
+                        skeleton=skeleton,
+                        evidence_graph=evidence_graph,
+                    )
+                except (
+                    StructuredSemanticError,
+                    StructuredValidationError,
+                    ValidationError,
+                    ValueError,
+                ) as exc:
+                    issues.extend(
+                        self._prefixed_validation_issues(
+                            exc,
+                            prefix=("tools", tool_index, "behavior"),
+                        )
+                    )
+            surface = next(
+                candidate.surface
+                for candidate in skeleton.tool_surfaces
+                if candidate.surface.tool_id == item.tool_id
+            )
+            access: ToolAccessObservationDraft | None = None
+            try:
+                access = self._compile_tool_access_observation_source(
+                    item.access_observation,
+                    observation_fields=self._observation_schema_fields(surface),
+                )
+                self._validate_tool_access_observation_draft(
+                    access,
+                    expected_tool_id=item.tool_id,
+                    skeleton=skeleton,
+                    behavior=behavior,
+                )
+            except (
+                StructuredSemanticError,
+                StructuredValidationError,
+                ValidationError,
+                ValueError,
+            ) as exc:
+                issues.extend(
+                    self._prefixed_validation_issues(
+                        exc,
+                        prefix=("tools", tool_index, "access_observation"),
+                    )
+                )
+            reliability: ToolReliabilityDraft | None = None
+            try:
+                reliability = self._compile_tool_reliability_source(item.reliability)
+                if behavior is not None:
+                    self._validate_tool_reliability_draft(
+                        reliability,
+                        expected_tool_id=item.tool_id,
+                        skeleton=skeleton,
+                        behavior=behavior,
+                    )
+            except (
+                StructuredSemanticError,
+                StructuredValidationError,
+                ValidationError,
+                ValueError,
+            ) as exc:
+                issues.extend(
+                    self._prefixed_validation_issues(
+                        exc,
+                        prefix=("tools", tool_index, "reliability"),
+                    )
+                )
+            if (
+                access is None
+                or behavior is None
+                or reliability is None
+                or len(issues) != tool_issue_start
+            ):
+                continue
+            semantics = ToolSemanticsDraft(
+                tool_id=item.tool_id,
+                semantics=self._compose_tool_semantics(behavior, access, reliability),
+            )
+            context_catalog = RuleContextCatalog.for_tool(
+                state=skeleton.state,
+                surface=surface,
+            )
+            context_rules: tuple[tuple[tuple[str | int, ...], Rule], ...] = tuple(
+                (role_path, rule)
+                for role, rules in (
+                    ("preconditions", behavior.preconditions),
+                    ("transition", behavior.transition),
+                    ("postconditions", behavior.postconditions),
+                )
+                for rule_index, rule in enumerate(rules)
+                for role_path in (("behavior", role, rule_index),)
+            ) + tuple(
+                (("behavior", "errors", error_index, "when"), error.when)
+                for error_index, error in enumerate(behavior.errors)
+            )
+            if access.permission.condition is not None:
+                context_rules = (
+                    *context_rules,
+                    (
+                        ("access_observation", "permission", "condition"),
+                        access.permission.condition,
+                    ),
+                )
+            for rule_path, rule in context_rules:
+                for issue in validate_rule_context(rule, catalog=context_catalog):
+                    issues.append(
+                        SafeValidationIssue(
+                            code=issue.code,
+                            location=("tools", tool_index, *rule_path, *issue.location),
+                            message=issue.message,
+                            retryable=issue.retryable,
+                            violated_condition=issue.violated_condition,
+                            expected_category=issue.expected_category,
+                        )
+                    )
+            try:
+                self._validate_tool_semantics_draft(
+                    semantics,
+                    expected_tool_id=item.tool_id,
+                    skeleton=skeleton,
+                    evidence_graph=evidence_graph,
+                )
+            except (
+                StructuredSemanticError,
+                StructuredValidationError,
+                ValidationError,
+                ValueError,
+            ) as exc:
+                issues.extend(
+                    self._prefixed_validation_issues(
+                        exc,
+                        prefix=("tools", tool_index, "complete_semantics"),
+                    )
+                )
+            else:
+                if len(issues) != tool_issue_start:
+                    continue
+                compiled.append(semantics)
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_semantics_batch_preflight",
+                    frontier_ordinal=30,
+                    issues=tuple(issues),
+                )
+            )
+        return tuple(compiled)
+
+    @staticmethod
+    def _prefixed_validation_issues(
+        exc: StructuredSemanticError | StructuredValidationError | ValidationError | ValueError,
+        *,
+        prefix: tuple[str | int, ...],
+    ) -> tuple[SafeValidationIssue, ...]:
+        if isinstance(exc, StructuredSemanticError):
+            return tuple(
+                SafeValidationIssue(
+                    issue.code,
+                    (*prefix, *issue.location),
+                    issue.message,
+                    violated_condition=f"semantic contract {issue.code}",
+                    expected_category="a value satisfying the named semantic contract",
+                )
+                for issue in exc.issues
+            )
+        if isinstance(exc, StructuredValidationError):
+            return tuple(
+                SafeValidationIssue(
+                    issue.code,
+                    (*prefix, *issue.location),
+                    issue.message,
+                    retryable=issue.retryable,
+                    violated_condition=issue.violated_condition,
+                    expected_category=issue.expected_category,
+                )
+                for issue in exc.diagnostic.issues
+            )
+        if isinstance(exc, ValidationError):
+            diagnostic = pydantic_validation_diagnostic(
+                exc,
+                owner_component="design",
+                validation_phase="tool_semantics_component_shape",
+                frontier_ordinal=20,
+            )
+            return tuple(
+                SafeValidationIssue(
+                    issue.code,
+                    (*prefix, *issue.location),
+                    issue.message,
+                    retryable=issue.retryable,
+                    violated_condition=issue.violated_condition,
+                    expected_category=issue.expected_category,
+                )
+                for issue in diagnostic.issues
+            )
+        return EnvironmentDesigner._typed_value_error_issues(exc, prefix=prefix)
+
+    @staticmethod
+    def _typed_value_error_issues(
+        exc: ValueError,
+        *,
+        prefix: tuple[str | int, ...],
+    ) -> tuple[SafeValidationIssue, ...]:
+        """Map known framework-authored semantic errors without echoing values.
+
+        Unknown ValueError text is a framework diagnostic defect, not a reason to
+        spend an Agent repair turn.  The mapping deliberately matches only stable
+        framework prefixes and never includes the rejected suffix.
+        """
+
+        message = str(exc)
+        mappings: tuple[tuple[str, str, tuple[str, ...], str, str], ...] = (
+            (
+                "tool reliability must target",
+                "reliability_tool_identity_drift",
+                ("tool_id",),
+                "Reliability semantics changed the frozen tool identity.",
+                "tool_id equal to the assigned batch tool_id",
+            ),
+            (
+                "tool behavior must target",
+                "behavior_tool_identity_drift",
+                ("tool_id",),
+                "Behavior semantics changed the frozen tool identity.",
+                "tool_id equal to the assigned batch tool_id",
+            ),
+            (
+                "tool semantics must target",
+                "tool_semantics_identity_drift",
+                ("tool_id",),
+                "Composed tool semantics changed the frozen tool identity.",
+                "tool_id equal to the assigned batch tool_id",
+            ),
+            (
+                "tool access/observation must target",
+                "access_tool_identity_drift",
+                ("tool_id",),
+                "Access/observation semantics changed the frozen tool identity.",
+                "tool_id equal to the assigned batch tool_id",
+            ),
+        )
+        for starts_with, code, relative_path, safe_message, expected in mappings:
+            if message.startswith(starts_with):
+                return (
+                    SafeValidationIssue(
+                        code=code,
+                        location=(*prefix, *relative_path),
+                        message=safe_message,
+                        violated_condition="the proposal drifted from immutable tool identity",
+                        expected_category=expected,
+                    ),
+                )
+        return (
+            SafeValidationIssue(
+                code="framework_diagnostic_incomplete",
+                location=prefix,
+                message=(
+                    "A framework semantic validator lacks a typed safe diagnostic. "
+                    "Do not retry the Agent until the validator is corrected."
+                ),
+                retryable=False,
+                violated_condition="an untyped ValueError reached the control boundary",
+                expected_category="a stable field-addressable StructuredValidationError",
+            ),
+        )
+
+    @staticmethod
+    def _compose_environment_semantic_source(
+        world: WorldSemanticSourceIRDraft,
+        training: TrainingSemanticSourceDraft,
+    ) -> EnvironmentSemanticSourceDraft:
+        return EnvironmentSemanticSourceDraft(
+            world=world,
+            curriculum_plan=EnvironmentDesigner._compile_curriculum_plan_source(
+                training.curriculum_plan
+            ),
+            task_requirements=tuple(
+                EnvironmentDesigner._compile_task_requirement_source(item)
+                for item in training.task_requirements
+            ),
+        )
+
+    def _persist_initial_design(
+        self,
+        *,
+        job: EnvironmentJob,
+        job_ref: ArtifactRef,
+        request: EnvironmentRequest,
+        request_ref: ArtifactRef,
+        evidence_graph: EvidenceGraph,
+        evidence_graph_ref: ArtifactRef,
+        design_draft: EnvironmentDesignDraft,
+        design_dependencies: tuple[ArtifactRef, ...],
+        research_usage: BudgetUsage,
+        meter: DesignerInvocationBudget,
+        invocation_results: tuple[InvocationResult, ...],
+    ) -> DesignBundle:
+        coverage_map = CoverageMap(
+            coverage_id=self._stable_id("coverage", request.request_id),
+            revision=1,
+            dimensions=design_draft.coverage_dimensions,
+            evidence_graph_ref=evidence_graph_ref,
+        )
+        coverage_map_ref = self.artifacts.put_json(
+            artifact_id=f"{job.job_id}:coverage-map",
+            artifact_type="design.coverage_map",
+            value=coverage_map,
+            dependencies=(evidence_graph_ref, *design_dependencies),
+        )
+        world_spec = WorldSpec(
+            world_spec_id=self._stable_id("world", request.request_id),
+            revision=1,
+            boundary=design_draft.boundary,
+            state=design_draft.state,
+            tools=design_draft.tools,
+            invariants=design_draft.invariants,
+            task_dimensions=design_draft.task_dimensions,
+            fidelity=design_draft.fidelity,
+            unknowns=design_draft.unresolved_questions,
+            evidence_graph_ref=evidence_graph_ref,
+            coverage_map_ref=coverage_map_ref,
+        )
+        world_spec_ref = self.artifacts.put_json(
+            artifact_id=f"{job.job_id}:world-spec",
+            artifact_type="design.world_spec",
+            value=world_spec,
+            dependencies=(evidence_graph_ref, coverage_map_ref, *design_dependencies),
+        )
+        design = EnvironmentDesign(
+            design_id=self._stable_id("design", request.request_id),
+            revision=1,
+            job_ref=job_ref,
+            request_ref=request_ref,
+            evidence_graph_ref=evidence_graph_ref,
+            coverage_map_ref=coverage_map_ref,
+            world_spec=world_spec,
+            curriculum=design_draft.curriculum,
+            reward=design_draft.reward,
+            verification=design_draft.verification,
+            target_kind="initial_package",
+            unresolved_questions=design_draft.unresolved_questions,
+        )
+        design_ref = self.artifacts.put_json(
+            artifact_id=f"{job.job_id}:environment-design",
+            artifact_type="design.environment_design",
+            value=design,
+            dependencies=(
+                job_ref,
+                request_ref,
+                evidence_graph_ref,
+                coverage_map_ref,
+                world_spec_ref,
+                *design_dependencies,
+            ),
+        )
+        baseline = DesignBaselineCheckpoint(
+            checkpoint_id=self._stable_id("baseline", design_ref.revision_id),
+            origin_job_ref=job_ref,
+            created_at=datetime.now(UTC),
+            request_ref=request_ref,
+            evidence_graph_ref=evidence_graph_ref,
+            coverage_map_ref=coverage_map_ref,
+            world_spec_ref=world_spec_ref,
+            scope_fingerprint=world_spec.boundary.content_digest(),
+        )
+        baseline_ref = self.artifacts.put_json(
+            artifact_id=f"{job.job_id}:design-baseline",
+            artifact_type="design.baseline_checkpoint",
+            value=baseline,
+            dependencies=(design_ref,),
+        )
+        return DesignBundle(
+            evidence_graph=evidence_graph,
+            evidence_graph_ref=evidence_graph_ref,
+            coverage_map=coverage_map,
+            coverage_map_ref=coverage_map_ref,
+            world_spec=world_spec,
+            world_spec_ref=world_spec_ref,
+            design=design,
+            design_ref=design_ref,
+            baseline=baseline,
+            baseline_ref=baseline_ref,
+            research_usage=research_usage,
+            invocation_usage=meter.usage,
+            invocation_results=invocation_results,
+            invocation_observed_actual=meter.observed_actual,
+            invocation_unknown_upper_bound=meter.unknown_upper_bound,
+        )
+
+    async def _generate_microsharded_reference(
+        self,
+        *,
+        job: EnvironmentJob,
+        job_ref: ArtifactRef,
+        request: EnvironmentRequest,
+        request_ref: ArtifactRef,
+        workspace: Path,
+        invocation_budget: Budget,
+        phase_checkpoint_ref: ArtifactRef | None = None,
+    ) -> DesignBundle:
+        raise DesignerError(
+            "checkpoint.abi",
+            "the microsharded Designer path is retired and cannot produce a design",
+        )
         if job.kind != "generate":
             raise ValueError("generate() only accepts a GenerateJob")
         self.artifacts.require_exact_json(
@@ -439,13 +2761,12 @@ class EnvironmentDesigner:
                 "supplied_asset_refs require an authorized asset materializer, which is not "
                 "implemented; refusing to pretend these assets were consumed",
             )
-        if job.budget.agent_turns < 16:
+        if job.budget.agent_turns < DIRECT_DESIGN_MAX_TURNS:
             raise DesignerError(
                 "budget",
-                "direct generation requires at least sixteen Agent turns (research plan, evidence "
-                "synthesis, world boundary, state entity inventory, at least one entity schema, "
-                "initial-state rules, tool plan inventory, three schemas and five semantic shards "
-                "for at least one tool, world closure, and training contract)",
+                "direct generation requires eight Agent turns for two research transactions, "
+                "world architecture, bounded tool semantics, task/curriculum and at most two "
+                "semantic corrections",
             )
         fetch_budget = job.budget.tool_calls - job.budget.search_calls
         if phase_checkpoint_ref is None:
@@ -1309,6 +3630,16 @@ class EnvironmentDesigner:
             prompt=self._research_plan_prompt(request),
             permissions=job.permissions,
             budget=meter,
+            semantic_transaction="research.plan",
+            feedback_contract_id="feedback.research.plan",
+            repair_target=RepairTargetRef(
+                target_id=self._stable_id("repair-target", job.job_id, "research-plan"),
+                component="design",
+                artifact_slot="research_plan",
+                lineage_id=f"{job.job_id}.research-plan",
+                immutable_input_refs=(job_ref, request_ref),
+                allowed_mutation_paths=("/",),
+            ),
         )
         plan_ref = self.artifacts.put_json(
             artifact_id=f"{job.job_id}:research-plan",
@@ -1320,6 +3651,18 @@ class EnvironmentDesigner:
             node="research_plan",
             subject_ref=plan_ref,
             job_ref=job_ref,
+        )
+        self._record_feedback_pass(
+            contract_id="feedback.research.plan",
+            subject_ref=plan_ref,
+            component="design",
+            artifact_slot="research_plan",
+            lineage_id=f"{job.job_id}.research-plan",
+            immutable_input_refs=(job_ref, request_ref),
+            evidence_refs=(request_ref,),
+            summary="The bounded query plan passed the structured research contract.",
+            invocation_results=plan_results,
+            allowed_mutation_paths=("/",),
         )
         queries = tuple(
             SearchQuery(
@@ -1454,6 +3797,18 @@ class EnvironmentDesigner:
             semantic_validator=validate_synthesis,
             permissions=job.permissions,
             budget=meter,
+            semantic_transaction="research.evidence-synthesis",
+            feedback_contract_id="feedback.research.evidence",
+            repair_target=RepairTargetRef(
+                target_id=self._stable_id(
+                    "repair-target", job.job_id, "evidence-synthesis"
+                ),
+                component="design",
+                artifact_slot="evidence_synthesis",
+                lineage_id=f"{job.job_id}.evidence-synthesis",
+                immutable_input_refs=(plan_ref, passage_pack_ref, request_ref, *source_refs),
+                allowed_mutation_paths=("/",),
+            ),
             capability_requirement=NodeCapabilityRequirement.structured_output(
                 node_id="researcher.evidence-synthesis",
                 role="researcher",
@@ -1470,6 +3825,18 @@ class EnvironmentDesigner:
             subject_ref=synthesis_ref,
             job_ref=job_ref,
             related_refs=(plan_ref,),
+        )
+        self._record_feedback_pass(
+            contract_id="feedback.research.evidence",
+            subject_ref=synthesis_ref,
+            component="design",
+            artifact_slot="evidence_synthesis",
+            lineage_id=f"{job.job_id}.evidence-synthesis",
+            immutable_input_refs=(plan_ref, passage_pack_ref, request_ref, *source_refs),
+            evidence_refs=(passage_pack_ref, *source_refs),
+            summary="Observed claims bind fetched source passages with conflicts preserved.",
+            invocation_results=synthesis_results,
+            allowed_mutation_paths=("/",),
         )
         evidence_graph = EvidenceGraph(
             graph_id=self._stable_id("evidence-graph", request.request_id),
@@ -1520,7 +3887,7 @@ class EnvironmentDesigner:
             invocation_results=(*plan_results, *synthesis_results),
         )
 
-    async def resume_from_world_skeleton(
+    async def _retired_resume_from_world_skeleton(
         self,
         *,
         job: EnvironmentJob,
@@ -1531,7 +3898,12 @@ class EnvironmentDesigner:
         workspace: Path,
         invocation_budget: Budget,
     ) -> DesignBundle:
-        """Continue only after revalidating one exact committed skeleton checkpoint."""
+        """Retained temporarily for source archaeology; never a runnable success path."""
+
+        raise DesignerError(
+            "checkpoint.abi",
+            "world_skeleton resume belongs to the retired microsharded Designer ABI",
+        )
 
         if job.kind != "generate" or job.request_ref != request_ref:
             raise ValueError("skeleton resume requires its exact Direct Generate job")
@@ -1654,7 +4026,7 @@ class EnvironmentDesigner:
         invocation_budget: Budget,
         repair_authority: StructuredRepairAuthority | None = None,
     ) -> DesignBundle:
-        """Dispatch resume by the typed phase without weakening phase validation."""
+        """Resume the batched path only from its evidence transaction boundary."""
 
         token = _DESIGN_COMPLETION_INDEX_SCOPE.set(_DesignCompletionIndexScope())
         authority_token = _DESIGN_REPAIR_AUTHORITY.set(repair_authority)
@@ -1663,15 +4035,10 @@ class EnvironmentDesigner:
                 phase_checkpoint_ref,
                 DesignPhaseCheckpoint,
             )
-            if checkpoint.phase == "world_skeleton":
-                return await self.resume_from_world_skeleton(
-                    job=job,
-                    job_ref=job_ref,
-                    request=request,
-                    request_ref=request_ref,
-                    phase_checkpoint_ref=phase_checkpoint_ref,
-                    workspace=workspace,
-                    invocation_budget=invocation_budget,
+            if checkpoint.phase != "evidence_graph":
+                raise DesignerError(
+                    "checkpoint.abi",
+                    "only batched evidence checkpoints can enter the production generation path",
                 )
             return await self.generate(
                 job=job,
@@ -1695,18 +4062,8 @@ class EnvironmentDesigner:
         request: EnvironmentRequest,
         request_ref: ArtifactRef,
     ) -> ArtifactRef:
-        """Adopt the most advanced unambiguous verified phase for this exact job."""
+        """Adopt the only production checkpoint in the batched Designer ABI."""
 
-        try:
-            return self.adopt_world_skeleton_checkpoint(
-                job=job,
-                job_ref=job_ref,
-                request=request,
-                request_ref=request_ref,
-            )
-        except DesignerError as exc:
-            if exc.stage != "checkpoint.unavailable":
-                raise
         return self.adopt_evidence_graph_checkpoint(
             job=job,
             job_ref=job_ref,
@@ -1792,7 +4149,7 @@ class EnvironmentDesigner:
         )
         return checkpoint_ref
 
-    def adopt_world_skeleton_checkpoint(
+    def _retired_adopt_world_skeleton_checkpoint(
         self,
         *,
         job: EnvironmentJob,
@@ -1800,7 +4157,12 @@ class EnvironmentDesigner:
         request: EnvironmentRequest,
         request_ref: ArtifactRef,
     ) -> ArtifactRef:
-        """Adopt one unambiguous pre-checkpoint DAG after full typed revalidation."""
+        """Retained temporarily for source archaeology; never a runnable success path."""
+
+        raise DesignerError(
+            "checkpoint.abi",
+            "world_skeleton adoption belongs to the retired microsharded Designer ABI",
+        )
 
         if job.kind != "generate" or job.request_ref != request_ref:
             raise ValueError("checkpoint adoption requires its exact Direct Generate job")
@@ -1953,7 +4315,7 @@ class EnvironmentDesigner:
         dependency_validator: (Callable[[TOutput, tuple[ArtifactRef, ...]], None] | None) = None,
         job_ref: ArtifactRef,
         node: str,
-        detail: str,
+        detail: str | None,
     ) -> tuple[TOutput, ArtifactRef] | None:
         """Reuse one exact node revision only after current-contract revalidation."""
 
@@ -1987,45 +4349,159 @@ class EnvironmentDesigner:
         if not valid:
             return None
 
-        if len(valid) == 1:
-            # A sole fully revalidated candidate is unambiguous.  Reading the
-            # append-only event history cannot change that decision and turns
-            # resume into O(nodes * historical_events) on mature stores.
-            value, ref = valid[0]
-        else:
-            completion_order = self._design_completion_order()
-            completed = [
-                candidate
-                for candidate in valid
+        current_contract_digest = self._semantic_node_contract_digest(model, node=node)
+        committed: list[tuple[TOutput, ArtifactRef, SemanticNodeCommit, ArtifactRef]] = []
+        commit_artifact_id = self._semantic_node_commit_artifact_id(
+            job_ref=job_ref,
+            node=node,
+            detail=detail,
+        )
+        valid_by_revision = {ref.revision_id: (value, ref) for value, ref in valid}
+        for commit_ref in self.artifacts.list_revisions(commit_artifact_id):
+            if commit_ref.artifact_type != "design.semantic_node_commit":
+                continue
+            try:
+                commit = self.artifacts.get_json(commit_ref, SemanticNodeCommit)
+                candidate = valid_by_revision.get(commit.subject_ref.revision_id)
+                if candidate is None or candidate[1] != commit.subject_ref:
+                    continue
                 if (
-                    (decision := completion_order.get(candidate[1].revision_id)) is not None
-                    and decision[0] == candidate[1]
+                    commit.job_ref != job_ref
+                    or commit.node != node
+                    or commit.detail != detail
+                    or frozenset(commit.immutable_input_refs) != expected_dependencies
+                    or commit.validator_contract_digest != current_contract_digest
+                ):
+                    continue
+                expected_commit_dependencies = frozenset(
+                    (
+                        job_ref,
+                        commit.subject_ref,
+                        *commit.immutable_input_refs,
+                        *commit.derived_refs,
+                    )
                 )
-            ]
-            if not completed:
-                raise DesignerError(
-                    "checkpoint.ambiguous",
-                    "multiple valid revisions for resumable node "
-                    f"{node} lack a committed completion decision",
-                )
-            # Completion events are authenticated append-only decisions.  Prefer the
-            # latest accepted revision instead of guessing from a content hash or
-            # filesystem timestamp when several historical attempts remain valid.
-            value, ref = max(
-                completed,
-                key=lambda candidate: completion_order[candidate[1].revision_id][1:],
-            )
+                if (
+                    frozenset(self.artifacts.dependencies(commit_ref))
+                    != expected_commit_dependencies
+                ):
+                    continue
+            except (ValidationError, ValueError):
+                continue
+            committed.append((*candidate, commit, commit_ref))
+        if not committed:
+            # A shape-valid Source Artifact or even a completion event is not a
+            # resumable semantic node until its final commit Artifact exists.
+            return None
+        value, ref, commit, commit_ref = max(
+            committed,
+            key=lambda candidate: (candidate[2].committed_at, candidate[3].revision_id),
+        )
+        dependency_fingerprint = sha256_digest(
+            "\0".join(sorted(item.revision_id for item in required_dependencies)).encode("utf-8")
+        )
+        reuse_details = [
+            KeyValue(key="node", value=node),
+            KeyValue(key="valid_candidate_count", value=len(valid)),
+            KeyValue(key="dependency_fingerprint", value=dependency_fingerprint),
+            KeyValue(key="current_contract_revalidated", value=True),
+            KeyValue(key="saved_agent_transactions", value=1),
+            KeyValue(key="commit_revision", value=commit_ref.revision_id),
+            KeyValue(key="validator_contract_digest", value=current_contract_digest),
+        ]
+        if detail is not None:
+            reuse_details.append(KeyValue(key="detail", value=detail))
         self.artifacts.record_event(
             event_type="design_node_reused",
             subject_ref=ref,
-            related_refs=(job_ref, *required_dependencies),
-            details=(
-                KeyValue(key="node", value=node),
-                KeyValue(key="detail", value=detail),
-                KeyValue(key="valid_candidate_count", value=len(valid)),
-            ),
+            related_refs=(job_ref, commit_ref, *required_dependencies),
+            details=tuple(reuse_details),
         )
         return value, ref
+
+    @classmethod
+    def _semantic_node_commit_artifact_id(
+        cls,
+        *,
+        job_ref: ArtifactRef,
+        node: str,
+        detail: str | None,
+    ) -> str:
+        return cls._stable_id(
+            "semantic-node-commit-slot",
+            job_ref.revision_id,
+            node,
+            detail or "",
+        )
+
+    @staticmethod
+    def _semantic_node_contract_digest(model: type[BaseModel], *, node: str) -> str:
+        return sha256_digest(
+            canonical_json_bytes(
+                {
+                    "abi": "agent-world.design-semantic-node.v1",
+                    "node": node,
+                    "source_schema": model.model_json_schema(mode="validation"),
+                }
+            )
+        )
+
+    def _commit_semantic_node(
+        self,
+        *,
+        job_ref: ArtifactRef,
+        node: str,
+        detail: str | None,
+        subject_ref: ArtifactRef,
+        immutable_input_refs: tuple[ArtifactRef, ...],
+        derived_refs: tuple[ArtifactRef, ...],
+        model: type[BaseModel],
+    ) -> ArtifactRef:
+        contract_digest = self._semantic_node_contract_digest(model, node=node)
+        commit = SemanticNodeCommit(
+            commit_id=self._stable_id(
+                "semantic-node-commit",
+                job_ref.revision_id,
+                node,
+                detail or "",
+                subject_ref.revision_id,
+                contract_digest,
+            ),
+            job_ref=job_ref,
+            node=node,
+            detail=detail,
+            subject_ref=subject_ref,
+            immutable_input_refs=immutable_input_refs,
+            derived_refs=derived_refs,
+            validator_contract_digest=contract_digest,
+            committed_at=datetime.now(UTC),
+        )
+        dependencies = self._unique_refs(
+            (job_ref, subject_ref, *immutable_input_refs, *derived_refs)
+        )
+        commit_ref = self.artifacts.put_json(
+            artifact_id=self._semantic_node_commit_artifact_id(
+                job_ref=job_ref,
+                node=node,
+                detail=detail,
+            ),
+            artifact_type="design.semantic_node_commit",
+            value=commit,
+            dependencies=dependencies,
+        )
+        details = [
+            KeyValue(key="node", value=node),
+            KeyValue(key="validator_contract_digest", value=contract_digest),
+        ]
+        if detail is not None:
+            details.append(KeyValue(key="detail", value=detail))
+        self.artifacts.record_event(
+            event_type="design_semantic_node_committed",
+            subject_ref=commit_ref,
+            related_refs=(subject_ref, job_ref, *immutable_input_refs, *derived_refs),
+            details=tuple(details),
+        )
+        return commit_ref
 
     def _design_completion_order(self) -> _DesignCompletionOrder:
         """Build one authenticated completion index per public resume call."""
@@ -2036,10 +4512,14 @@ class EnvironmentDesigner:
         order: _DesignCompletionOrder = {}
         for ordinal, event in enumerate(self.artifacts.list_events()):
             if event.event_type == "design_node_completed":
-                order[event.subject_ref.revision_id] = (
-                    event.subject_ref,
-                    event.occurred_at,
-                    ordinal,
+                details = {item.key: item.value for item in event.details}
+                order[event.subject_ref.revision_id] = _DesignCompletionDecision(
+                    ref=event.subject_ref,
+                    occurred_at=event.occurred_at,
+                    ordinal=ordinal,
+                    node=cast(str | None, details.get("node")),
+                    detail=cast(str | None, details.get("detail")),
+                    related_refs=event.related_refs,
                 )
         if scope is not None:
             scope.order = order
@@ -2061,6 +4541,10 @@ class EnvironmentDesigner:
         research_usage: BudgetUsage,
         prefix_invocation_results: tuple[InvocationResult, ...],
     ) -> DesignBundle:
+        raise DesignerError(
+            "checkpoint.abi",
+            "the microsharded skeleton tail is retired and cannot produce a design",
+        )
         dimension_results: tuple[InvocationResult, ...] = ()
         dimension_ref: ArtifactRef | None = None
 
@@ -2464,7 +4948,12 @@ class EnvironmentDesigner:
                     value: ToolAccessObservationSourceDraft,
                 ) -> None:
                     validate_tool_access_observation(
-                        self._compile_tool_access_observation_source(value)
+                        self._compile_tool_access_observation_source(
+                            value,
+                            observation_fields=self._observation_schema_fields(
+                                planned_tool.surface
+                            ),
+                        )
                     )
 
                 cached = self._load_validated_design_node(
@@ -2511,7 +5000,10 @@ class EnvironmentDesigner:
                             role="environment-engineer",
                         ),
                     )
-                    tool_access = self._compile_tool_access_observation_source(tool_access_source)
+                    tool_access = self._compile_tool_access_observation_source(
+                        tool_access_source,
+                        observation_fields=self._observation_schema_fields(planned_tool.surface),
+                    )
                 access_ref = self.artifacts.put_json(
                     artifact_id=f"{job.job_id}:tool-access-observation:{tool_id}",
                     artifact_type="design.tool_access_observation",
@@ -3925,7 +6417,15 @@ class EnvironmentDesigner:
         budget: DesignerInvocationBudget,
         semantic_validator: Callable[[TOutput], None] | None = None,
         capability_requirement: NodeCapabilityRequirement | None = None,
+        feedback_contract_id: str | None = None,
+        repair_target: RepairTargetRef | None = None,
+        semantic_transaction: str | None = None,
+        repair_projection: (
+            RootSectionRepairProjection | ToolSemanticsRepairProjection | None
+        ) = None,
     ) -> tuple[TOutput, tuple[InvocationResult, ...]]:
+        if (feedback_contract_id is None) != (repair_target is None):
+            raise ValueError("feedback contract and repair target must be supplied together")
         workspace.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 - bounded setup I/O
         invocation_results: list[InvocationResult] = []
         assert_agent_output_advisory(
@@ -3948,6 +6448,14 @@ class EnvironmentDesigner:
                 rollout_token_limit=budget.rollout_token_limit,
             )
         except CapabilityResolutionError as exc:
+            self._record_feedback_terminal(
+                contract_id=feedback_contract_id,
+                target=repair_target,
+                status="error",
+                issue_codes=("capability_resolution_error",),
+                summary="The semantic transaction could not resolve its isolated Agent profile.",
+                results=(),
+            )
             raise DesignerError(
                 "agent.permissions",
                 str(exc),
@@ -3966,6 +6474,8 @@ class EnvironmentDesigner:
         repair_authority = _DESIGN_REPAIR_AUTHORITY.get()
         active_repair_entry: str | None = None
         active_repair_continued = False
+        previous_candidate: TOutput | None = None
+        pending_repair_roots: tuple[str, ...] = ()
 
         async def complete_active_repair(
             remaining_issue_codes: tuple[str, ...],
@@ -3990,6 +6500,14 @@ class EnvironmentDesigner:
                         remaining_diagnostic=remaining_diagnostic,
                     )
             except Exception as exc:
+                self._record_feedback_terminal(
+                    contract_id=feedback_contract_id,
+                    target=repair_target,
+                    status="error",
+                    issue_codes=("repair_authority_completion_error",),
+                    summary="The framework could not complete the active repair authorization.",
+                    results=tuple(invocation_results),
+                )
                 raise DesignerError(
                     f"agent.{role}.repair_authority",
                     f"global RepairLedger completion raised {type(exc).__name__}",
@@ -4013,7 +6531,7 @@ class EnvironmentDesigner:
             if repair_authority is None:
                 return
             try:
-                if diagnostic is None:
+                if diagnostic is None and repair_target is None:
                     active_repair_entry = await repair_authority.authorize(
                         owner_node="design",
                         lineage_id=lineage_id,
@@ -4022,7 +6540,20 @@ class EnvironmentDesigner:
                         issue_codes=issue_codes,
                         continued_session=continued_session,
                     )
-                else:
+                elif diagnostic is None:
+                    assert feedback_contract_id is not None
+                    assert repair_target is not None
+                    active_repair_entry = await repair_authority.authorize(
+                        owner_node="design",
+                        lineage_id=lineage_id,
+                        role=role,
+                        repair_mode=mode,
+                        issue_codes=issue_codes,
+                        continued_session=continued_session,
+                        feedback_contract_id=feedback_contract_id,
+                        repair_target=repair_target,
+                    )
+                elif repair_target is None:
                     active_repair_entry = await repair_authority.authorize(
                         owner_node="design",
                         lineage_id=lineage_id,
@@ -4032,7 +6563,28 @@ class EnvironmentDesigner:
                         continued_session=continued_session,
                         diagnostic=diagnostic,
                     )
+                else:
+                    assert feedback_contract_id is not None
+                    active_repair_entry = await repair_authority.authorize(
+                        owner_node="design",
+                        lineage_id=lineage_id,
+                        role=role,
+                        repair_mode=mode,
+                        issue_codes=issue_codes,
+                        continued_session=continued_session,
+                        diagnostic=diagnostic,
+                        feedback_contract_id=feedback_contract_id,
+                        repair_target=repair_target,
+                    )
             except StructuredRepairDenied as exc:
+                self._record_feedback_terminal(
+                    contract_id=feedback_contract_id,
+                    target=repair_target,
+                    status="failed",
+                    issue_codes=issue_codes,
+                    summary="The semantic transaction exhausted or violated its repair policy.",
+                    results=tuple(invocation_results),
+                )
                 raise DesignerError(
                     f"agent.{role}.repair_denied",
                     "global RepairLedger rejected another local correction",
@@ -4045,6 +6597,14 @@ class EnvironmentDesigner:
                     lineage_id=lineage_id,
                 ) from exc
             except Exception as exc:
+                self._record_feedback_terminal(
+                    contract_id=feedback_contract_id,
+                    target=repair_target,
+                    status="error",
+                    issue_codes=issue_codes,
+                    summary="The framework could not authorize a semantic correction.",
+                    results=tuple(invocation_results),
+                )
                 raise DesignerError(
                     f"agent.{role}.repair_authority",
                     f"global RepairLedger authorization raised {type(exc).__name__}",
@@ -4071,6 +6631,9 @@ class EnvironmentDesigner:
                             metadata={
                                 "role": role,
                                 "lineage_id": lineage_id,
+                                "semantic_transaction": (
+                                    semantic_transaction or f"{role}.structured-output"
+                                ),
                                 "attempt": attempt,
                                 "repair_mode": repair_mode,
                             },
@@ -4080,6 +6643,14 @@ class EnvironmentDesigner:
                 invocation_results.append(result)
             except (DesignerBudgetExhausted, TimeoutError) as exc:
                 await complete_active_repair(("invocation_budget_or_timeout",))
+                self._record_feedback_terminal(
+                    contract_id=feedback_contract_id,
+                    target=repair_target,
+                    status="error",
+                    issue_codes=("invocation_budget_or_timeout",),
+                    summary="The semantic transaction exhausted its wall-time or turn budget.",
+                    results=tuple(invocation_results),
+                )
                 raise DesignerError(
                     f"agent.{role}.budget",
                     str(exc) or "Designer invocation exceeded its wall-time reservation",
@@ -4093,6 +6664,14 @@ class EnvironmentDesigner:
                 ) from exc
             except Exception as exc:
                 await complete_active_repair(("invocation_execution_error",))
+                self._record_feedback_terminal(
+                    contract_id=feedback_contract_id,
+                    target=repair_target,
+                    status="error",
+                    issue_codes=("invocation_execution_error",),
+                    summary="The InvocationBackend failed before producing a valid transaction.",
+                    results=tuple(invocation_results),
+                )
                 raise DesignerError(
                     f"agent.{role}.execution",
                     f"InvocationBackend raised {type(exc).__name__}",
@@ -4130,6 +6709,14 @@ class EnvironmentDesigner:
                     )
                     continue
                 message = result.error.message if result.error else result.status.value
+                self._record_feedback_terminal(
+                    contract_id=feedback_contract_id,
+                    target=repair_target,
+                    status="error",
+                    issue_codes=(backend_issue,),
+                    summary="The Agent backend terminated without a successful semantic result.",
+                    results=tuple(invocation_results),
+                )
                 raise DesignerError(
                     f"agent.{role}",
                     message,
@@ -4152,8 +6739,22 @@ class EnvironmentDesigner:
                     raise transport_error
                 validation_stage = "shape"
                 output = model.model_validate_json(canonical_json_bytes(result.structured_output))
+                if (
+                    repair_projection is not None
+                    and previous_candidate is not None
+                    and pending_repair_roots
+                ):
+                    output = repair_projection.merge(
+                        previous_candidate,
+                        output,
+                        roots=pending_repair_roots,
+                    )
                 if semantic_validator is not None:
                     validation_stage = "semantic"
+                    # Retain only shape-valid in-memory candidates.  They are
+                    # never artifacts or checkpoints until the full compiler
+                    # passes, but they make a local correction monotonic.
+                    previous_candidate = output
                     semantic_validator(output)
                 await complete_active_repair(())
                 return output, tuple(invocation_results)
@@ -4163,13 +6764,65 @@ class EnvironmentDesigner:
                     model=model,
                     validation_stage=validation_stage,
                 )
-                issue_codes = (
-                    diagnostic.issue_codes
-                    if diagnostic is not None
-                    else self._validation_issue_codes(exc)
-                )
+                if diagnostic is None:
+                    diagnostic = ValidationDiagnostic(
+                        owner_component="design",
+                        validation_phase="framework_diagnostic",
+                        frontier_ordinal=0,
+                        issues=(
+                            SafeValidationIssue(
+                                "framework_diagnostic_incomplete",
+                                ("semantic_output",),
+                                (
+                                    "A framework semantic validator lacks a typed safe "
+                                    "diagnostic. Do not retry the Agent until it is corrected."
+                                ),
+                                retryable=False,
+                                violated_condition=(
+                                    "an untyped semantic ValueError reached the control boundary"
+                                ),
+                                expected_category=(
+                                    "a stable field-addressable StructuredValidationError"
+                                ),
+                            ),
+                        ),
+                    )
+                issue_codes = diagnostic.issue_codes
                 await complete_active_repair(issue_codes, diagnostic)
+                if not diagnostic.actionable_for_agent:
+                    self._record_feedback_terminal(
+                        contract_id=feedback_contract_id,
+                        target=repair_target,
+                        status="error",
+                        issue_codes=diagnostic.issue_codes,
+                        summary=(
+                            "The framework diagnostic is not actionable and cannot spend an "
+                            "Agent correction."
+                        ),
+                        results=tuple(invocation_results),
+                    )
+                    raise DesignerError(
+                        f"agent.{role}.framework_diagnostic",
+                        diagnostic.feedback,
+                        result,
+                        results=tuple(invocation_results),
+                        budget_usage=budget.usage,
+                        budget_observed_actual=budget.observed_actual,
+                        budget_unknown_upper_bound=budget.unknown_upper_bound,
+                        validation_issues=diagnostic.issue_codes,
+                        lineage_id=lineage_id,
+                    ) from exc
                 if attempt >= self.maximum_structured_reworks:
+                    self._record_feedback_terminal(
+                        contract_id=feedback_contract_id,
+                        target=repair_target,
+                        status="failed",
+                        issue_codes=issue_codes,
+                        summary=(
+                            "The semantic transaction remained invalid after bounded correction."
+                        ),
+                        results=tuple(invocation_results),
+                    )
                     raise DesignerError(
                         f"agent.{role}.output",
                         f"structured output remained invalid: {exc}",
@@ -4187,6 +6840,15 @@ class EnvironmentDesigner:
                     else self._structured_repair_feedback(exc)
                 )
                 session = result.session
+                pending_repair_roots = (
+                    repair_projection.roots(diagnostic)
+                    if repair_projection is not None and diagnostic is not None
+                    else ()
+                )
+                self._assert_repair_projection_authorized(
+                    pending_repair_roots,
+                    repair_target=repair_target,
+                )
                 await authorize_repair(
                     StructuredRepairMode.CONTRACT_CORRECTION,
                     issue_codes,
@@ -4196,7 +6858,13 @@ class EnvironmentDesigner:
                 correction_prompt = (
                     "The previous structured output failed the framework contract. "
                     "Correct the same artifact without changing scope or inventing evidence. "
-                    "Return the entire corrected artifact, not a patch. "
+                    + (
+                        "Framework code will accept only these typed paths and restore every "
+                        f"other path from the prior candidate: {pending_repair_roots}. "
+                        if pending_repair_roots
+                        else ""
+                    )
+                    + "Return the entire corrected artifact, not a patch. "
                     f"Validation errors:\n{repair_feedback}"
                 )
                 current_prompt = (
@@ -4215,6 +6883,32 @@ class EnvironmentDesigner:
             budget_unknown_upper_bound=budget.unknown_upper_bound,
             lineage_id=lineage_id,
         )
+
+    @staticmethod
+    def _assert_repair_projection_authorized(
+        roots: tuple[str, ...],
+        *,
+        repair_target: RepairTargetRef | None,
+    ) -> None:
+        """Keep code-derived projection paths inside the durable repair authority."""
+
+        if not roots:
+            return
+        if repair_target is None:
+            raise DesignerError(
+                "repair.projection_authority",
+                "A scoped repair projection requires an explicit RepairTargetRef.",
+            )
+        allowed = tuple(path.rstrip("/") or "/" for path in repair_target.allowed_mutation_paths)
+        for root in roots:
+            projected = "/" + root.strip("/")
+            if not any(
+                projected == path or projected.startswith(path + "/") for path in allowed
+            ):
+                raise DesignerError(
+                    "repair.projection_authority",
+                    f"Repair projection path {projected} exceeds the target mutation authority.",
+                )
 
     @staticmethod
     def _transport_validation_error(code: str, message: str) -> StructuredValidationError:
@@ -4301,7 +6995,9 @@ class EnvironmentDesigner:
         )
 
     @staticmethod
-    def _validation_issue_codes(exc: ValidationError | ValueError) -> tuple[str, ...]:
+    def _validation_issue_codes(
+        exc: ValidationError | SchemaError | ValueError,
+    ) -> tuple[str, ...]:
         """Return bounded field/code diagnostics without rejected input or messages."""
 
         if isinstance(exc, StructuredSemanticError):
@@ -4806,15 +7502,18 @@ class EnvironmentDesigner:
         if scope is not None and scope.order is not None:
             next_ordinal = (
                 max(
-                    (entry[2] for entry in scope.order.values()),
+                    (entry.ordinal for entry in scope.order.values()),
                     default=-1,
                 )
                 + 1
             )
-            scope.order[event.subject_ref.revision_id] = (
-                event.subject_ref,
-                event.occurred_at,
-                next_ordinal,
+            scope.order[event.subject_ref.revision_id] = _DesignCompletionDecision(
+                ref=event.subject_ref,
+                occurred_at=event.occurred_at,
+                ordinal=next_ordinal,
+                node=node,
+                detail=detail,
+                related_refs=event.related_refs,
             )
 
     def _record_design_node_started(
@@ -4833,6 +7532,204 @@ class EnvironmentDesigner:
             subject_ref=subject_ref,
             related_refs=self._unique_refs((job_ref,)),
             details=tuple(details),
+        )
+
+    def _record_feedback_pass(
+        self,
+        *,
+        contract_id: str,
+        subject_ref: ArtifactRef,
+        component: Literal["research", "design"],
+        artifact_slot: str,
+        lineage_id: str,
+        immutable_input_refs: tuple[ArtifactRef, ...],
+        evidence_refs: tuple[ArtifactRef, ...],
+        summary: str,
+        invocation_results: tuple[InvocationResult, ...] = (),
+        batch_id: str | None = None,
+        allowed_mutation_paths: tuple[str, ...] = (),
+    ) -> ArtifactRef:
+        """Persist one exact successful feedback fact after validated commit."""
+
+        contract = PRODUCTION_FEEDBACK.require(contract_id)
+        target = RepairTargetRef(
+            target_id=self._stable_id(
+                "feedback-target",
+                contract_id,
+                subject_ref.revision_id,
+            ),
+            component=component,
+            artifact_slot=artifact_slot,
+            lineage_id=lineage_id,
+            batch_id=batch_id,
+            immutable_input_refs=self._unique_refs(immutable_input_refs),
+            committed_subject_ref=subject_ref,
+            allowed_mutation_paths=allowed_mutation_paths,
+        )
+        usage, usage_unknown_dimensions = self._feedback_invocation_usage(invocation_results)
+        result = FeedbackResult(
+            result_id=self._stable_id(
+                "feedback-result",
+                contract_id,
+                subject_ref.revision_id,
+            ),
+            contract_id=contract.contract_id,
+            claim_id=contract.claim_id,
+            target=target,
+            status="passed",
+            subject_ref=subject_ref,
+            evidence_refs=self._unique_refs(evidence_refs or (subject_ref,)),
+            usage=usage,
+            usage_unknown_dimensions=usage_unknown_dimensions,
+            evaluated_at=datetime.now(UTC),
+            summary=summary,
+        )
+        PRODUCTION_FEEDBACK.validate_result(result)
+        result_ref = self.artifacts.put_json(
+            artifact_id=result.result_id,
+            artifact_type="control.feedback_result",
+            value=result,
+            dependencies=self._unique_refs(
+                (subject_ref, *target.immutable_input_refs, *result.evidence_refs)
+            ),
+        )
+        return result_ref
+
+    @classmethod
+    def _shared_tool_semantics_repair_target(
+        cls,
+        *,
+        job_id: str,
+        group_id: str,
+        immutable_input_refs: tuple[ArtifactRef, ...],
+    ) -> RepairTargetRef:
+        """Build the exact repair coordinate for one shared tool-policy group."""
+
+        return RepairTargetRef(
+            target_id=cls._stable_id("repair-target", job_id, group_id, "shared"),
+            component="design",
+            artifact_slot="shared_tool_semantics",
+            lineage_id=f"{job_id}.shared-tool-semantics.{group_id}",
+            batch_id=group_id,
+            immutable_input_refs=immutable_input_refs,
+            allowed_mutation_paths=(
+                "/atomicity_domains",
+                "/concurrency_domains",
+                "/idempotency_domains",
+                "/ordering_constraints",
+                "/compensation_edges",
+                "/error_policies",
+            ),
+        )
+
+    def _record_feedback_terminal(
+        self,
+        *,
+        contract_id: str | None,
+        target: RepairTargetRef | None,
+        status: Literal["failed", "error"],
+        issue_codes: tuple[str, ...],
+        summary: str,
+        results: tuple[InvocationResult, ...],
+    ) -> ArtifactRef | None:
+        """Record one terminal transaction result without persisting model content."""
+
+        if contract_id is None or target is None:
+            return None
+        contract = PRODUCTION_FEEDBACK.require_for_target(contract_id, target)
+        last_result = results[-1] if results else None
+        attempt_commitment = sha256_digest(
+            canonical_json_bytes(
+                {
+                    "invocation_status": (
+                        last_result.status.value if last_result is not None else None
+                    ),
+                    "structured_output": (
+                        last_result.structured_output if last_result is not None else None
+                    ),
+                    "error_code": (
+                        last_result.error.code
+                        if last_result is not None and last_result.error is not None
+                        else None
+                    ),
+                    "issue_codes": issue_codes,
+                }
+            )
+        )
+        failed_target = target.model_copy(
+            update={
+                "committed_subject_ref": None,
+                "attempt_commitment": attempt_commitment,
+            }
+        )
+        diagnostic_ref = self.artifacts.put_json(
+            artifact_id=self._stable_id(
+                "feedback-diagnostic",
+                contract.contract_id,
+                failed_target.target_key,
+                attempt_commitment,
+            ),
+            artifact_type="control.feedback_diagnostic",
+            value={
+                "contract_id": contract.contract_id,
+                "target_key": failed_target.target_key,
+                "attempt_commitment": attempt_commitment,
+                "status": status,
+                "issue_codes": tuple(self._safe_event_value(item) for item in issue_codes),
+            },
+            dependencies=failed_target.immutable_input_refs,
+        )
+        usage, usage_unknown_dimensions = self._feedback_invocation_usage(results)
+        feedback_result = FeedbackResult(
+            result_id=self._stable_id(
+                "feedback-result",
+                contract.contract_id,
+                failed_target.target_key,
+                attempt_commitment,
+                status,
+            ),
+            contract_id=contract.contract_id,
+            claim_id=contract.claim_id,
+            target=failed_target,
+            status=status,
+            subject_ref=target.committed_subject_ref,
+            evidence_refs=(diagnostic_ref,),
+            diagnostic_ref=diagnostic_ref,
+            usage=usage,
+            usage_unknown_dimensions=usage_unknown_dimensions,
+            evaluated_at=datetime.now(UTC),
+            summary=summary,
+        )
+        PRODUCTION_FEEDBACK.validate_result(feedback_result)
+        return self.artifacts.put_json(
+            artifact_id=feedback_result.result_id,
+            artifact_type="control.feedback_result",
+            value=feedback_result,
+            dependencies=self._unique_refs(
+                (diagnostic_ref, *failed_target.immutable_input_refs)
+            ),
+        )
+
+    @staticmethod
+    def _feedback_invocation_usage(
+        results: tuple[InvocationResult, ...],
+    ) -> tuple[BudgetUsage, tuple[str, ...]]:
+        """Aggregate observable transaction cost while preserving provider unknowns."""
+
+        tokens = 0
+        tokens_unknown = False
+        for item in results:
+            if item.usage is None or item.usage.turn is None:
+                tokens_unknown = True
+            else:
+                tokens += item.usage.turn.total_tokens
+        return (
+            BudgetUsage(
+                llm_tokens=tokens,
+                agent_turns=len(results),
+                wall_seconds=sum(item.duration_ms for item in results) / 1000,
+            ),
+            (("llm_tokens",) if tokens_unknown else ()),
         )
 
     def _record_design_node_interrupted(
@@ -5966,8 +8863,8 @@ class EnvironmentDesigner:
 
     @staticmethod
     def _compile_rule_term_draft(
-        draft: RuleConstantDraft | RuleReferenceDraft | RuleArithmeticDraft,
-    ) -> RuleConstant | RuleValueRef | RuleArithmetic:
+        draft: RuleConstantDraft | RuleReferenceDraft | RuleLookupByKeyDraft | RuleArithmeticDraft,
+    ) -> RuleConstant | RuleValueRef | RuleLookupByKey | RuleArithmetic:
         """Compile one Agent-facing term into the closed core Rule IR."""
 
         if isinstance(draft, RuleConstantDraft):
@@ -5976,6 +8873,18 @@ class EnvironmentDesigner:
             return RuleValueRef(
                 source=draft.source,
                 pointer=draft.pointer,
+                value_type=draft.value_type,
+            )
+        if isinstance(draft, RuleLookupByKeyDraft):
+            key = EnvironmentDesigner._compile_rule_term_draft(draft.key)
+            if not isinstance(key, RuleConstant | RuleValueRef):
+                raise TypeError("lookup_by_key key compiler produced an unsupported term")
+            return RuleLookupByKey(
+                source=draft.source,
+                collection_pointer=draft.collection_pointer,
+                key_field=draft.key_field,
+                key=key,
+                value_pointer=draft.value_pointer,
                 value_type=draft.value_type,
             )
         return RuleArithmetic(
@@ -5991,45 +8900,164 @@ class EnvironmentDesigner:
         )
 
     @staticmethod
-    def _compile_rule_draft(draft: RuleDraft) -> Rule:
-        """Compile a discriminated Agent Rule ADT into the executable core contract."""
+    def _validate_rule_source_draft(draft: RuleDraft) -> None:
+        """Run cross-field Rule checks explicitly so feedback owns their paths."""
 
-        clauses: list[RuleClause] = []
-        for clause in draft.clauses:
-            right_draft = getattr(clause, "right", None)
-            clauses.append(
-                RuleClause(
-                    clause_id=clause.clause_id,
-                    left=EnvironmentDesigner._compile_rule_term_draft(clause.left),
-                    operator=clause.operator,
-                    right=(
-                        EnvironmentDesigner._compile_rule_term_draft(right_draft)
-                        if right_draft is not None
-                        else None
-                    ),
-                    json_schema=getattr(clause, "json_schema", None),
-                    ordering=getattr(clause, "ordering", None),
-                    negate=clause.negate,
+        issues: list[StructuredSemanticIssue] = []
+
+        def validate_term(
+            term: RuleConstantDraft
+            | RuleReferenceDraft
+            | RuleLookupByKeyDraft
+            | RuleArithmeticDraft,
+            location: tuple[str | int, ...],
+        ) -> str:
+            if isinstance(term, RuleConstantDraft):
+                if term.value is None:
+                    actual = "null"
+                elif isinstance(term.value, bool):
+                    actual = "boolean"
+                elif isinstance(term.value, int | float):
+                    actual = "number"
+                elif isinstance(term.value, str):
+                    actual = "string"
+                elif isinstance(term.value, list):
+                    actual = "array"
+                else:
+                    actual = "object"
+                if actual != term.value_type:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="rule_constant_type_mismatch",
+                            location=location,
+                            message="A rule constant value must match its declared value_type.",
+                        )
+                    )
+                if isinstance(term.value, float) and not math.isfinite(term.value):
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="rule_constant_non_finite",
+                            location=location,
+                            message="Rule constant numbers must be finite.",
+                        )
+                    )
+                return term.value_type
+            if isinstance(term, RuleReferenceDraft):
+                return term.value_type
+            if isinstance(term, RuleLookupByKeyDraft):
+                validate_term(term.key, (*location, "key"))
+                return term.value_type
+            left_type = validate_term(term.left, (*location, "left"))
+            right_type = validate_term(term.right, (*location, "right"))
+            if left_type != "number" or right_type != "number":
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="rule_arithmetic_operand_type",
+                        location=location,
+                        message="Rule arithmetic operands must declare number value_type.",
+                    )
+                )
+            if (
+                term.operator in {"divide", "modulo"}
+                and isinstance(term.right, RuleConstantDraft)
+                and term.right.value == 0
+            ):
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="rule_arithmetic_zero_divisor",
+                        location=(*location, "right"),
+                        message="A rule arithmetic divisor cannot be constant zero.",
+                    )
+                )
+            return "number"
+
+        for index, clause in enumerate(draft.clauses):
+            left_type = validate_term(clause.left, ("clauses", index, "left"))
+            right = getattr(clause, "right", None)
+            right_type = (
+                validate_term(right, ("clauses", index, "right"))
+                if right is not None
+                else None
+            )
+            ordering = getattr(clause, "ordering", None)
+            if ordering is not None and right_type is not None:
+                allowed = {"number", "any"} if ordering == "number" else {"string", "any"}
+                if left_type not in allowed or right_type not in allowed:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="rule_ordering_type_mismatch",
+                            location=("clauses", index),
+                            message=(
+                                "Ordered rule terms must match the declared number/date/"
+                                "date-time domain."
+                            ),
+                        )
+                    )
+        if issues:
+            raise StructuredSemanticError(tuple(issues))
+
+    @staticmethod
+    def _compile_rule_draft(draft: RuleDraft) -> Rule:
+        """Compile one Agent Rule through the canonical executable IR validator."""
+
+        EnvironmentDesigner._validate_rule_source_draft(draft)
+        try:
+            return Rule.model_validate_json(draft.model_dump_json())
+        except ValidationError as exc:
+            raise StructuredValidationError(
+                pydantic_validation_diagnostic(
+                    exc,
+                    owner_component="design",
+                    validation_phase="rule_ir_compile",
+                    frontier_ordinal=40,
+                )
+            ) from exc
+
+    @staticmethod
+    def _compile_rule_sequence(
+        drafts: Sequence[RuleDraft],
+        *,
+        path: tuple[str | int, ...],
+        path_suffix: tuple[str | int, ...] = (),
+    ) -> tuple[Rule, ...]:
+        """Compile sibling Rules while retaining every exact failing Rule path."""
+
+        compiled: list[Rule] = []
+        issues: list[SafeValidationIssue] = []
+        for index, draft in enumerate(drafts):
+            try:
+                compiled.append(EnvironmentDesigner._compile_rule_draft(draft))
+            except (
+                StructuredSemanticError,
+                StructuredValidationError,
+                ValidationError,
+                ValueError,
+            ) as exc:
+                issues.extend(
+                    EnvironmentDesigner._prefixed_validation_issues(
+                        exc,
+                        prefix=(*path, index, *path_suffix),
+                    )
+                )
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="rule_ir_sequence_compile",
+                    frontier_ordinal=40,
+                    issues=tuple(issues),
                 )
             )
-        return Rule(
-            rule_id=draft.rule_id,
-            family=draft.family,
-            description=draft.description,
-            boolean_operator=draft.boolean_operator,
-            clauses=tuple(clauses),
-            case_sensitivity=draft.case_sensitivity,
-            evidence_claim_ids=draft.evidence_claim_ids,
-        )
+        return tuple(compiled)
 
     @staticmethod
     def _compile_initial_state_rules_source(
         source: InitialStateRulesSourceDraft,
     ) -> InitialStateRulesDraft:
         return InitialStateRulesDraft(
-            initial_state_constraints=tuple(
-                EnvironmentDesigner._compile_rule_draft(rule)
-                for rule in source.initial_state_constraints
+            initial_state_constraints=EnvironmentDesigner._compile_rule_sequence(
+                source.initial_state_constraints,
+                path=("initial_state_constraints",),
             )
         )
 
@@ -6037,13 +9065,34 @@ class EnvironmentDesigner:
     def _compile_tool_conditions_source(
         source: ToolConditionsSourceDraft,
     ) -> ToolConditionsDraft:
+        issues = tuple(
+            StructuredSemanticIssue(
+                code=(
+                    "tool_precondition_family"
+                    if role == "preconditions"
+                    else "tool_postcondition_family"
+                ),
+                location=(role, index, "family"),
+                message=f"Tool {role} must use the matching Rule family.",
+            )
+            for role, rules, family in (
+                ("preconditions", source.preconditions, "precondition"),
+                ("postconditions", source.postconditions, "postcondition"),
+            )
+            for index, rule in enumerate(rules)
+            if rule.family != family
+        )
+        if issues:
+            raise StructuredSemanticError(issues)
         return ToolConditionsDraft(
             tool_id=source.tool_id,
-            preconditions=tuple(
-                EnvironmentDesigner._compile_rule_draft(rule) for rule in source.preconditions
+            preconditions=EnvironmentDesigner._compile_rule_sequence(
+                source.preconditions,
+                path=("preconditions",),
             ),
-            postconditions=tuple(
-                EnvironmentDesigner._compile_rule_draft(rule) for rule in source.postconditions
+            postconditions=EnvironmentDesigner._compile_rule_sequence(
+                source.postconditions,
+                path=("postconditions",),
             ),
         )
 
@@ -6051,33 +9100,69 @@ class EnvironmentDesigner:
     def _compile_tool_state_transition_source(
         source: ToolStateTransitionSourceDraft,
     ) -> ToolStateTransitionDraft:
+        issues = tuple(
+            StructuredSemanticIssue(
+                code="tool_transition_family",
+                location=("transition", index, "family"),
+                message="Tool state-transition rules must use the transition family.",
+            )
+            for index, rule in enumerate(source.transition)
+            if rule.family != "transition"
+        )
+        if issues:
+            raise StructuredSemanticError(issues)
         return ToolStateTransitionDraft(
             tool_id=source.tool_id,
-            transition=tuple(
-                EnvironmentDesigner._compile_rule_draft(rule) for rule in source.transition
+            transition=EnvironmentDesigner._compile_rule_sequence(
+                source.transition,
+                path=("transition",),
             ),
         )
 
     @staticmethod
     def _compile_tool_errors_source(source: ToolErrorsSourceDraft) -> ToolErrorsDraft:
+        issues = tuple(
+            StructuredSemanticIssue(
+                code="tool_error_condition_family",
+                location=("errors", index, "when", "family"),
+                message="Tool error conditions must use the error_condition Rule family.",
+            )
+            for index, error in enumerate(source.errors)
+            if error.when.family != "error_condition"
+        )
+        if issues:
+            raise StructuredSemanticError(issues)
+        compiled_when = EnvironmentDesigner._compile_rule_sequence(
+            tuple(error.when for error in source.errors),
+            path=("errors",),
+            path_suffix=("when",),
+        )
         return ToolErrorsDraft(
             tool_id=source.tool_id,
             errors=tuple(
                 ToolError(
                     error_code=error.error_code,
-                    when=EnvironmentDesigner._compile_rule_draft(error.when),
+                    when=compiled_when[index],
                     observation=error.observation,
                     state_effect=error.state_effect,
                     retryable=error.retryable,
                     evidence_claim_ids=error.evidence_claim_ids,
                 )
-                for error in source.errors
+                for index, error in enumerate(source.errors)
             ),
         )
 
     @staticmethod
     def _compile_permission_source(source: PermissionRuleSourceDraft) -> PermissionRule:
         issues: list[SafeValidationIssue] = []
+        if source.condition is not None and source.condition.family != "permission":
+            issues.append(
+                SafeValidationIssue(
+                    "tool_permission_family",
+                    ("permission", "condition", "family"),
+                    "Tool permission conditions must use the permission Rule family.",
+                )
+            )
         allowed = set(source.allowed_actors)
         scoped = set(source.required_scopes_by_actor)
         if allowed != scoped:
@@ -6121,58 +9206,28 @@ class EnvironmentDesigner:
     @staticmethod
     def _compile_tool_access_observation_source(
         source: ToolAccessObservationSourceDraft,
+        *,
+        observation_fields: tuple[str, ...],
     ) -> ToolAccessObservationDraft:
         observation_source = source.observation
-        issues: list[SafeValidationIssue] = []
-        visible_actors = set(observation_source.visible_fields_by_actor)
-        redacted_actors = set(observation_source.redacted_fields_by_actor)
-        if visible_actors != redacted_actors:
-            issues.append(
-                SafeValidationIssue(
-                    "observation_actor_projection_coverage",
-                    ("observation", "redacted_fields_by_actor"),
-                    "Visible and redacted projections must cover the same actors.",
-                )
+        duplicate_issues = tuple(
+            StructuredSemanticIssue(
+                code="observation_visible_field_duplicate",
+                location=("observation", "visible_fields_by_actor", actor),
+                message="Visible observation field lists must contain unique identifiers.",
             )
-        for actor in sorted(visible_actors & redacted_actors):
-            visible = observation_source.visible_fields_by_actor[actor]
-            redacted = observation_source.redacted_fields_by_actor[actor]
-            if len(set(visible)) != len(visible):
-                issues.append(
-                    SafeValidationIssue(
-                        "observation_visible_field_duplicate",
-                        ("observation", "visible_fields_by_actor", actor),
-                        "Visible field lists must contain unique identifiers.",
-                    )
-                )
-            if len(set(redacted)) != len(redacted):
-                issues.append(
-                    SafeValidationIssue(
-                        "observation_redacted_field_duplicate",
-                        ("observation", "redacted_fields_by_actor", actor),
-                        "Redacted field lists must contain unique identifiers.",
-                    )
-                )
-            if set(visible) & set(redacted):
-                issues.append(
-                    SafeValidationIssue(
-                        "observation_projection_overlap",
-                        ("observation", "visible_fields_by_actor", actor),
-                        "One field cannot be both visible and redacted for the same actor.",
-                    )
-                )
-        if issues:
-            raise StructuredValidationError(
-                ValidationDiagnostic(
-                    owner_component="design",
-                    validation_phase="observation_source_compile",
-                    frontier_ordinal=20,
-                    issues=tuple(issues),
-                )
-            )
+            for actor, fields in observation_source.visible_fields_by_actor.items()
+            if len(set(fields)) != len(fields)
+        )
+        if duplicate_issues:
+            raise StructuredSemanticError(duplicate_issues)
+        redacted_fields_by_actor = {
+            actor: tuple(field for field in observation_fields if field not in set(visible))
+            for actor, visible in observation_source.visible_fields_by_actor.items()
+        }
         observation = ObservationSemantics(
             visible_fields_by_actor=observation_source.visible_fields_by_actor,
-            redacted_fields_by_actor=observation_source.redacted_fields_by_actor,
+            redacted_fields_by_actor=redacted_fields_by_actor,
             consistency=observation_source.consistency,
             staleness_bound_seconds=observation_source.staleness_bound_seconds,
         )
@@ -6181,6 +9236,16 @@ class EnvironmentDesigner:
             permission=EnvironmentDesigner._compile_permission_source(source.permission),
             observation=observation,
         )
+
+    @staticmethod
+    def _observation_schema_fields(surface: ToolSurface) -> tuple[str, ...]:
+        properties = surface.observation_schema.get("properties")
+        if surface.observation_schema.get("type") != "object" or not isinstance(
+            properties,
+            dict,
+        ):
+            raise AssertionError("compiled tool observation schema must be a closed object")
+        return tuple(properties)
 
     @staticmethod
     def _compile_tool_reliability_source(
@@ -6666,18 +9731,10 @@ class EnvironmentDesigner:
                         )
                     )
         if set(permission.allowed_actors) == actors:
-            if permission.condition is None:
-                issues.append(
-                    StructuredSemanticIssue(
-                        code="access_denial_missing",
-                        location=("permission", "condition"),
-                        message=(
-                            "a tool allowed to every frozen actor requires an executable "
-                            "denial condition"
-                        ),
-                    )
-                )
-            elif permission.condition.case_sensitivity != "positive_and_negative":
+            if (
+                permission.condition is not None
+                and permission.condition.case_sensitivity != "positive_and_negative"
+            ):
                 issues.append(
                     StructuredSemanticIssue(
                         code="access_case_coverage",
@@ -6794,14 +9851,13 @@ class EnvironmentDesigner:
             visible_fields = visible_by_actor[actor]
             redacted_fields = redacted_by_actor[actor]
             classified_fields = set(visible_fields) | set(redacted_fields)
-            for field in observation_fields - classified_fields:
+            if observation_fields - classified_fields:
                 issues.append(
                     StructuredSemanticIssue(
                         code="observation_field_missing",
-                        location=("observation", "classification", actor, field),
+                        location=("observation", "classification", actor),
                         message=(
-                            "frozen observation field must appear exactly once in this actor's "
-                            "visible or redacted list"
+                            "this actor projection must classify every frozen observation field"
                         ),
                     )
                 )
@@ -6809,15 +9865,16 @@ class EnvironmentDesigner:
                 ("visible_fields_by_actor", visible_fields),
                 ("redacted_fields_by_actor", redacted_fields),
             ):
-                for index, field in enumerate(values):
-                    if field not in observation_fields:
-                        issues.append(
-                            StructuredSemanticIssue(
-                                code="observation_field_unknown",
-                                location=("observation", collection_name, actor, index),
-                                message="entry must name one frozen observation-schema field",
-                            )
+                if set(values) - observation_fields:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="observation_field_unknown",
+                            location=("observation", collection_name, actor),
+                            message=(
+                                "this actor list may contain only frozen observation-schema fields"
+                            ),
                         )
+                    )
         if issues:
             raise StructuredSemanticError(tuple(issues))
 
@@ -6835,16 +9892,81 @@ class EnvironmentDesigner:
             raise ValueError(
                 f"tool reliability must target {expected_tool_id}, got {draft.tool_id}"
             )
-        known_errors = {item.error_code for item in behavior.errors}
+        issues: list[StructuredSemanticIssue] = []
+        errors_by_code = {item.error_code: item for item in behavior.errors}
+        known_errors = set(errors_by_code)
         unknown_retry = set(draft.retry.retryable_error_codes) - known_errors
         if unknown_retry:
-            raise ValueError(f"retry semantics references unknown errors: {sorted(unknown_retry)}")
+            issues.append(
+                StructuredSemanticIssue(
+                    code="reliability_retry_error_unknown",
+                    location=("retry", "retryable_error_codes"),
+                    message=(
+                        "Every retryable_error_code must be declared by this tool's errors section."
+                    ),
+                )
+            )
+        retryability_mismatch = {
+            code
+            for code in draft.retry.retryable_error_codes
+            if code in errors_by_code and not errors_by_code[code].retryable
+        }
+        if retryability_mismatch:
+            issues.append(
+                StructuredSemanticIssue(
+                    code="reliability_retryability_mismatch",
+                    location=("retry", "retryable_error_codes"),
+                    message=(
+                        "Every retryable_error_code must reference an error declared retryable."
+                    ),
+                )
+            )
         if draft.timeout.timeout_error_code not in known_errors:
-            raise ValueError("timeout_error_code must be declared in tool behavior errors")
+            issues.append(
+                StructuredSemanticIssue(
+                    code="reliability_timeout_error_unknown",
+                    location=("timeout", "timeout_error_code"),
+                    message="timeout_error_code must be declared by this tool's errors section.",
+                )
+            )
+        unknown_rollback = set(draft.rollback.rollback_trigger_codes) - known_errors
+        if unknown_rollback:
+            issues.append(
+                StructuredSemanticIssue(
+                    code="reliability_rollback_error_unknown",
+                    location=("rollback", "rollback_trigger_codes"),
+                    message=(
+                        "Every rollback_trigger_code must be declared by this tool's "
+                        "errors section."
+                    ),
+                )
+            )
+        if (
+            draft.concurrency.conflict_error_code is not None
+            and draft.concurrency.conflict_error_code not in known_errors
+        ):
+            issues.append(
+                StructuredSemanticIssue(
+                    code="reliability_conflict_error_unknown",
+                    location=("concurrency", "conflict_error_code"),
+                    message=(
+                        "conflict_error_code must be null or declared by this tool's "
+                        "errors section."
+                    ),
+                )
+            )
         known_tools = {item.surface.tool_id for item in skeleton.tool_surfaces}
         unknown_compensation = set(draft.rollback.compensation_tools) - known_tools
         if unknown_compensation:
-            raise ValueError(f"rollback references unknown tools: {sorted(unknown_compensation)}")
+            issues.append(
+                StructuredSemanticIssue(
+                    code="reliability_compensation_tool_unknown",
+                    location=("rollback", "compensation_tools"),
+                    message="Every compensation tool must exist in the frozen tool inventory.",
+                )
+            )
+        if issues:
+            raise StructuredSemanticError(tuple(issues))
 
     @staticmethod
     def _compose_tool_semantics(
@@ -6900,11 +10022,10 @@ class EnvironmentDesigner:
         }
         if missing_scopes:
             raise ValueError(f"allowed actors lack required scopes: {missing_scopes}")
-        if set(semantics.permission.allowed_actors) == actors:
-            if semantics.permission.condition is None:
-                raise ValueError(
-                    "a universally allowed tool requires an executable denial condition"
-                )
+        if (
+            set(semantics.permission.allowed_actors) == actors
+            and semantics.permission.condition is not None
+        ):
             if semantics.permission.condition.case_sensitivity != "positive_and_negative":
                 raise ValueError(
                     "a universal permission condition requires positive-and-negative cases"
@@ -7037,16 +10158,33 @@ class EnvironmentDesigner:
                         "value": value.value,
                     }
                 )
+            if isinstance(value, RuleLookupByKey):
+                key = project_term(value.key)
+                if not isinstance(key, WorldClosureReferenceTerm | WorldClosureConstantTerm):
+                    raise TypeError("lookup_by_key projection produced an unsupported key")
+                return WorldClosureLookupTerm(
+                    kind="lookup_by_key",
+                    source=value.source,
+                    collection_pointer=value.collection_pointer,
+                    key_field=value.key_field,
+                    key=key,
+                    value_pointer=value.value_pointer,
+                    value_type=value.value_type,
+                )
             if isinstance(value, RuleArithmetic):
                 return WorldClosureArithmeticTerm(
                     kind="arithmetic",
                     operator=value.operator,
                     left=cast(
-                        WorldClosureReferenceTerm | WorldClosureConstantTerm,
+                        WorldClosureReferenceTerm
+                        | WorldClosureConstantTerm
+                        | WorldClosureLookupTerm,
                         project_term(value.left),
                     ),
                     right=cast(
-                        WorldClosureReferenceTerm | WorldClosureConstantTerm,
+                        WorldClosureReferenceTerm
+                        | WorldClosureConstantTerm
+                        | WorldClosureLookupTerm,
                         project_term(value.right),
                     ),
                 )
@@ -7479,6 +10617,8 @@ class EnvironmentDesigner:
                     raise ValueError(
                         f"task_goal pointer {term.pointer} has conflicting value types"
                     )
+            elif isinstance(term, RuleLookupByKey):
+                visit(term.key)
             elif isinstance(term, RuleArithmetic):
                 visit(term.left)
                 visit(term.right)
@@ -8266,6 +11406,167 @@ Return exactly the requested EvidenceSynthesis JSON. Never claim a failed or abs
 """
 
     @staticmethod
+    def _world_architecture_prompt(request: EnvironmentRequest) -> str:
+        return f"""You are the Environment Architect for a production Agent training world.
+Project purpose: turn one human need into a real programmatic environment whose state transitions
+are executed by code, not narrated by an LLM. This transaction owns the coherent world boundary,
+state meaning, public tool surfaces, and global invariants. Framework code owns JSON Schema
+envelopes, references, closure checks, runtime protocol, reward, verifier policy, and release.
+
+Use only the frozen request, evidence claim catalog, conflicts and unresolved questions. Produce
+exactly WorldArchitectureSourceDraft.
+Choose a compact but complete set of state entities and at most eight tools. Declare each state
+field exactly once inside its entity with role `primary_key` or `mutable`; mark at most one mutable
+string field as lifecycle and place its states in that field's enum_values. Framework code derives
+the StateEntityPlan field/lifecycle lists. Declare every core resource exactly once in the owning
+entity's `owned_resource_ids`, and declare the actors that can observe that entity root in
+`visible_to_actor_ids`. Do not repeat core resources or actor visibility in `boundary`; framework
+code compiles both boundary indexes from the entity declarations. Every tool declares exact state
+entities it reads/writes;
+read-only tools are valid but an empty read/write footprint is not. For each entity and tool
+interface emit only compact business fields: stable name, scalar type, meaning, required/null/list,
+format/enum/bounds. Do not repeat state field names in a separate inventory. For each tool emit
+namespace, name, and that same tool's nested interface; do not repeat a tool_id, because framework
+code deterministically derives `<namespace>.<name>`. The nested ownership prevents positional
+schema binding between different tools. The framework generates all schema node ids,
+object/property graphs, nullable
+unions, array wrappers, references, required lists and closed JSON Schema. Bind factual choices
+only to exact supplied claim ids and keep
+unsupported behavior explicitly bounded in fidelity or unresolved questions.
+
+Do not emit Schema IR or raw JSON Schema, reset/global rules, tool transition/error/permission/
+retry semantics, tasks, reward, verifier, runtime code, fixed cases, replay trajectories, expected
+answers, or release decisions. Do not use tools.
+
+Original need:
+{request.need}
+"""
+
+    @staticmethod
+    def _world_rules_prompt(request: EnvironmentRequest) -> str:
+        return f"""You are the World Rule Engineer for a frozen programmatic Agent world.
+Project purpose: make reset validity and cross-tool business invariants executable in framework
+Rule IR rather than leaving them as prose or trusting an LLM during rollout.
+
+Use only the frozen request, evidence claim catalog, WorldSkeleton and compiled ToolSemantics.
+Produce exactly WorldRuleSemanticsSourceDraft. Author the smallest complete initial-state and global
+invariant RuleDraft set. Initial rules use family `initial_state` and ids beginning `rule:state:`;
+global rules use family `invariant` and ids beginning `rule:world:`. Every pointer and value type
+must exist in the frozen schemas, cite only supplied claim ids, and never read task_goal. Rules must
+be general properties, not fixed booking cases, expected answers or trajectories.
+
+Do not change state, schemas, tools or tool semantics; do not emit tasks, reward, verifier, runtime
+code or release decisions. Do not use tools.
+
+Original need:
+{request.need}
+"""
+
+    @staticmethod
+    def _shared_tool_semantics_prompt(request: EnvironmentRequest) -> str:
+        return f"""You are the Shared Tool Policy Engineer for one frozen multi-batch tool group.
+Project purpose: keep five to eight coupled Agent tools in one coherent executable business world
+without asking a later Judge or an LLM rollout to reconcile contradictory state transitions.
+
+Use only the frozen request, evidence claim catalog, WorldSkeleton and code-owned coupling group.
+Produce exactly SharedToolSemanticsSourceDraft. Partition every group tool exactly once into
+atomicity, concurrency and idempotency domains. Add only genuine cross-tool ordering and
+compensation edges. Error policies use the final identifier suffix that every named member tool
+must declare (for example `timeout`), with one shared retryability decision. Every group tool must
+appear in at least one error policy. Use only exact frozen tool ids and supplied evidence claim ids.
+
+This is a short shared contract, not per-tool behavior: do not emit schemas, preconditions,
+transitions, observations, complete errors, tasks, verifier code, runtime code, fixed cases, Gate
+decisions or release decisions. Do not use tools.
+
+Original need:
+{request.need}
+"""
+
+    @staticmethod
+    def _tool_semantics_batch_prompt(
+        request: EnvironmentRequest,
+        *,
+        tool_ids: tuple[str, ...],
+    ) -> str:
+        ids = json.dumps(tool_ids, ensure_ascii=False)
+        return (
+            f"""You are the Tool Semantics Engineer for one frozen programmatic Agent world.
+Project purpose: replace hallucinated state changes with executable business rules that a Runtime
+and an independent Judge can both evaluate. This transaction owns the coupled behavior of exactly
+the ordered tool ids {ids}; the framework owns their identities, schemas, state, protocols, and
+release decisions.
+
+Produce exactly ToolSemanticsBatchSourceDraft and preserve the exact tool order and every nested
+tool_id. For each tool provide conditions, the smallest complete pre-state/args to post-state/output
+transition RuleDraft set, explicit error paths including timeout behavior, actor permission and
+complete per-actor observation visibility, plus idempotency/retry/transaction/rollback/
+concurrency policy. All rule ids for a tool must start with `rule:<tool_id>:`. Use only frozen state
+and schema paths, only supplied evidence claim ids, and never read evaluator-only task_goal. Keep
+state effects consistent across the tools in this batch; do not silently invent another resource.
+For every `lookup_by_key`, copy collection_pointer, primary key and item field names exactly from
+that tool's frozen `rule_context_catalogs` input; never infer a collection path from prose.
+The frozen coupling groups and shared_tool_contracts are mandatory. For every tool covered by a
+shared contract, implement its exact atomicity, concurrency isolation, idempotency mode, error
+suffix/retryability, and compensation edges. Ordering constraints must be reflected in executable
+preconditions/transitions rather than prose.
+
+Closed contract checklist: preconditions/postconditions/transitions/error conditions/permission
+conditions must use exactly their matching Rule family. Ordered clauses must declare an ordering
+whose operands have compatible types; arrays are never numeric counts. Every non-empty direct
+reference pointer must be an absolute RFC 6901 pointer. A direct pointer cannot resolve a dynamic
+record inside a state collection: use `lookup_by_key` with pre_state/post_state,
+collection_pointer, the collection primary-key field, an args/reference key, and a value_pointer
+inside the action-targeted record. Do not write fake paths such as `/bookings/status` through an
+array;
+do not use a fixed numeric array index for an action-selected business record. The compiler checks
+all paths and declared value types against the frozen schemas. `required_scopes_by_actor`
+must cover exactly allowed actors and every scope must be copied from that actor's frozen boundary
+authorities; an empty scope list is valid. A tool may be unconditionally available to every frozen
+actor with condition=null. `visible_fields_by_actor` must cover every frozen actor and may contain
+only exact top-level fields from that tool's frozen observation_schema -- never output-schema
+fields, state paths, dotted paths, wildcards, or resource names. Framework code derives each
+actor's redacted-field complement, so do not emit redacted_fields_by_actor. Every
+`timeout_error_code`, `retryable_error_code`, `rollback_trigger_code`, and non-null
+`conflict_error_code` must also be explicitly declared in that same tool's errors section; an error
+named by retry semantics must have retryable=true. Compensation tools must come from the frozen
+tool inventory.
+
+Do not change schemas or architecture, add tools, emit tasks/reward/verifier/runtime code, generate
+fixed cases or solutions, call tools, or make a release decision.
+
+Original need:
+{request.need}
+"""
+        )
+
+    @staticmethod
+    def _training_semantics_prompt(request: EnvironmentRequest) -> str:
+        return f"""You are the Task and Curriculum Engineer for a frozen executable Agent world.
+Project purpose: make that world useful for varied reinforcement-learning episodes whose task goal,
+success, failure and termination can be recomputed by framework code instead of trusted from the
+Runtime or an LLM.
+
+Use only the frozen request and TrainingContractContext. Produce exactly
+TrainingSemanticSourceDraft: one compact curriculum plan and the complete ordered task requirements
+for that plan in the same transaction. Preserve the exact frozen world task dimensions and use
+only frozen actors, tools, state paths, rule ids and evidence claim ids. Prefer a small number of
+semantically distinct end-to-end tasks. Every task must be reachable through its required tools,
+declare executable initial/success/failure/terminal RuleDrafts, and use scalar non-overlapping
+task_goal pointers in success and terminal rules. Task rule ids must start with
+`rule:task:<task_type>:`. Coverage is design-stage only, so runtime_implemented and
+verifier_covered remain absent. Framework code will compile task schemas, evaluator bindings,
+RewardSpec and VerificationRequirements.
+
+Do not alter the world, emit raw task JSON Schemas, evaluator answers, reward values, verifier
+implementation, runtime code, fixed task instances, trajectories, solutions, or release decisions.
+Do not use tools.
+
+Original need:
+{request.need}
+"""
+
+    @staticmethod
     def _world_boundary_prompt(request: EnvironmentRequest) -> str:
         return f"""You are the Environment Engineer operating in design-only mode.
 Project purpose: turn a human need into a real Agent environment whose state transitions execute in
@@ -8500,13 +11801,13 @@ privileged or evaluator-only state from leaking through tool observations.
 Use the framework-frozen `request`, `world_boundary`, `world_state`, `target_tool_surface`, and
 `tool_behavior` JSON inputs below. Produce exactly ToolAccessObservationSourceDraft for `{tool_id}`.
 Keep tool_id frozen.
-Define one permission rule and one observation projection. Both `visible_fields_by_actor` and
-`redacted_fields_by_actor` must cover exactly every boundary actor. For each actor independently,
-the visible and redacted lists must be disjoint and together classify every top-level
-observation-schema field exactly once. A field may be visible to one actor and redacted from
-another. Give
-the permission a real denial path: exclude an actor or use a positive-and-negative condition over
-only actor/pre_state/args/reset_config/seed. `required_scopes_by_actor` must cover exactly the
+Define one permission rule and one observation projection. `visible_fields_by_actor` must cover
+exactly every boundary actor and may contain only exact top-level fields from the frozen
+observation_schema. Framework code derives the redacted complement. Do not use output fields,
+state paths, dotted paths, wildcards, or resource names as observation fields. A field may be
+visible to one actor and redacted from another. The permission may exclude an actor, use a
+positive-and-negative condition over only actor/pre_state/args/reset_config/seed, or be
+unconditional for every frozen actor. `required_scopes_by_actor` must cover exactly the
 allowed actors; choose each actor's scopes only from that actor's frozen boundary authorities.
 Permission conditions use the discriminated Rule Draft ADT; ordered clauses must explicitly choose
 `number`, `date`, or `date-time`. A permission condition rule_id must be different from every

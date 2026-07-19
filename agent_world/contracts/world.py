@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 
 from jsonschema import Draft202012Validator, SchemaError  # type: ignore[import-untyped]
 from pydantic import Field, JsonValue, model_validator
+from pydantic_core import PydanticCustomError
 
 from .base import ArtifactRef, Identifier, NonEmptyStr, V2Contract
 
@@ -88,11 +89,20 @@ class RuleConstant(V2Contract):
     @model_validator(mode="after")
     def validate_declared_type(self) -> RuleConstant:
         if self.value_type == "any":
-            raise ValueError("RuleConstant value_type cannot be any")
+            raise PydanticCustomError(
+                "rule_constant_any_forbidden",
+                "RuleConstant value_type cannot be any",
+            )
         if _json_value_type(self.value) != self.value_type:
-            raise ValueError("RuleConstant value does not match value_type")
+            raise PydanticCustomError(
+                "rule_constant_type_mismatch",
+                "RuleConstant value does not match value_type",
+            )
         if isinstance(self.value, float) and not math.isfinite(self.value):
-            raise ValueError("RuleConstant numbers must be finite")
+            raise PydanticCustomError(
+                "rule_constant_non_finite",
+                "RuleConstant numbers must be finite",
+            )
         return self
 
 
@@ -110,7 +120,36 @@ class RuleValueRef(V2Contract):
         return self
 
 
-type RuleAtom = Annotated[RuleConstant | RuleValueRef, Field(discriminator="kind")]
+type RuleLookupKey = Annotated[RuleConstant | RuleValueRef, Field(discriminator="kind")]
+
+
+class RuleLookupByKey(V2Contract):
+    """Bounded primary-key lookup into one state collection.
+
+    The selector is deliberately non-recursive: its key can only be a constant or
+    one direct context reference.  It cannot run callbacks, predicates, arbitrary
+    filters, or candidate code.
+    """
+
+    kind: Literal["lookup_by_key"] = "lookup_by_key"
+    source: Literal["pre_state", "post_state"]
+    collection_pointer: str
+    key_field: Identifier
+    key: RuleLookupKey
+    value_pointer: str = ""
+    value_type: RuleValueType
+
+    @model_validator(mode="after")
+    def validate_pointers(self) -> RuleLookupByKey:
+        _validate_json_pointer(self.collection_pointer)
+        _validate_json_pointer(self.value_pointer)
+        return self
+
+
+type RuleAtom = Annotated[
+    RuleConstant | RuleValueRef | RuleLookupByKey,
+    Field(discriminator="kind"),
+]
 
 
 class RuleArithmetic(V2Contract):
@@ -130,18 +169,24 @@ class RuleArithmetic(V2Contract):
     @model_validator(mode="after")
     def validate_numeric_atoms(self) -> RuleArithmetic:
         if self.left.value_type != "number" or self.right.value_type != "number":
-            raise ValueError("RuleArithmetic operands must declare number value_type")
+            raise PydanticCustomError(
+                "rule_arithmetic_operand_type",
+                "RuleArithmetic operands must declare number value_type",
+            )
         if (
             self.operator in {"divide", "modulo"}
             and isinstance(self.right, RuleConstant)
             and self.right.value == 0
         ):
-            raise ValueError("RuleArithmetic divisor cannot be the constant zero")
+            raise PydanticCustomError(
+                "rule_arithmetic_zero_divisor",
+                "RuleArithmetic divisor cannot be the constant zero",
+            )
         return self
 
 
 type RuleTerm = Annotated[
-    RuleConstant | RuleValueRef | RuleArithmetic,
+    RuleConstant | RuleValueRef | RuleLookupByKey | RuleArithmetic,
     Field(discriminator="kind"),
 ]
 
@@ -173,17 +218,35 @@ class RuleClause(V2Contract):
     def validate_operator_shape(self) -> RuleClause:
         if self.operator in {"exists", "not_exists"}:
             if self.right is not None or self.json_schema is not None or self.ordering is not None:
-                raise ValueError(f"{self.operator} forbids right, json_schema, and ordering")
+                raise PydanticCustomError(
+                    "rule_unary_clause_shape",
+                    "Unary clauses forbid right, json_schema, and ordering",
+                )
             return self
         if self.operator == "schema_valid":
             if self.right is not None or self.json_schema is None or self.ordering is not None:
-                raise ValueError("schema_valid requires json_schema and forbids right and ordering")
+                raise PydanticCustomError(
+                    "rule_schema_clause_shape",
+                    "schema_valid requires json_schema and forbids right and ordering",
+                )
             if not self.json_schema:
-                raise ValueError("schema_valid forbids the tautological empty JSON Schema")
-            _check_json_schema(self.json_schema, f"rule clause {self.clause_id}")
+                raise PydanticCustomError(
+                    "rule_schema_empty",
+                    "schema_valid forbids the tautological empty JSON Schema",
+                )
+            try:
+                _check_json_schema(self.json_schema, f"rule clause {self.clause_id}")
+            except ValueError as exc:
+                raise PydanticCustomError(
+                    "rule_schema_invalid",
+                    "schema_valid requires a valid Draft 2020-12 JSON Schema",
+                ) from exc
             return self
         if self.right is None or self.json_schema is not None:
-            raise ValueError(f"{self.operator} requires right and forbids json_schema")
+            raise PydanticCustomError(
+                "rule_binary_clause_shape",
+                "Binary clauses require right and forbid json_schema",
+            )
         ordered = self.operator in {
             "greater_than",
             "greater_or_equal",
@@ -199,23 +262,35 @@ class RuleClause(V2Contract):
                     # Deterministic migration for already-compiled numeric Rule IR.
                     object.__setattr__(self, "ordering", "number")
                 else:
-                    raise ValueError(f"{self.operator} requires an explicit ordering")
+                    raise PydanticCustomError(
+                        "rule_ordering_required",
+                        "Ordered clauses require an explicit ordering",
+                    )
             assert self.ordering is not None
             allowed_types = {"number", "any"} if self.ordering == "number" else {"string", "any"}
             if (
                 self.left.value_type not in allowed_types
                 or self.right.value_type not in allowed_types
             ):
-                raise ValueError(f"{self.operator} terms do not match {self.ordering} ordering")
+                raise PydanticCustomError(
+                    "rule_ordering_type_mismatch",
+                    "Ordered clause terms must match the declared ordering domain",
+                )
         elif self.ordering is not None:
-            raise ValueError(f"{self.operator} forbids ordering")
+            raise PydanticCustomError(
+                "rule_ordering_forbidden",
+                "Non-ordered clauses forbid ordering",
+            )
         if self.operator in {"contains", "not_contains"} and self.left.value_type not in {
             "array",
             "object",
             "string",
             "any",
         }:
-            raise ValueError(f"{self.operator} requires a container on the left")
+            raise PydanticCustomError(
+                "rule_contains_left_not_container",
+                "Contains clauses require a container on the left",
+            )
         return self
 
 
@@ -238,7 +313,10 @@ class Rule(V2Contract):
     def validate_clauses(self) -> Rule:
         clause_ids = [clause.clause_id for clause in self.clauses]
         if len(set(clause_ids)) != len(clause_ids):
-            raise ValueError("Rule clause_id values must be unique")
+            raise PydanticCustomError(
+                "rule_clause_id_duplicate",
+                "Rule clause_id values must be unique",
+            )
         return self
 
 
@@ -682,6 +760,9 @@ def _rule_sources(rule: Rule) -> set[RuleValueSource]:
     def collect(term: RuleTerm | None) -> None:
         if isinstance(term, RuleValueRef):
             sources.add(term.source)
+        elif isinstance(term, RuleLookupByKey):
+            sources.add(term.source)
+            collect(term.key)
         elif isinstance(term, RuleArithmetic):
             collect(term.left)
             collect(term.right)
@@ -694,14 +775,23 @@ def _rule_sources(rule: Rule) -> set[RuleValueSource]:
 
 def _validate_json_pointer(pointer: str) -> None:
     if pointer and not pointer.startswith("/"):
-        raise ValueError("rule pointer must be empty or an RFC 6901 absolute pointer")
+        raise PydanticCustomError(
+            "rule_pointer_not_absolute",
+            "rule pointer must be empty or an RFC 6901 absolute pointer",
+        )
     if len(pointer) > 4096 or pointer.count("/") > 64:
-        raise ValueError("rule pointer exceeds framework limits")
+        raise PydanticCustomError(
+            "rule_pointer_limit",
+            "rule pointer exceeds framework limits",
+        )
     index = 0
     while index < len(pointer):
         if pointer[index] == "~":
             if index + 1 >= len(pointer) or pointer[index + 1] not in {"0", "1"}:
-                raise ValueError("rule pointer contains an invalid RFC 6901 escape")
+                raise PydanticCustomError(
+                    "rule_pointer_escape",
+                    "rule pointer contains an invalid RFC 6901 escape",
+                )
             index += 2
         else:
             index += 1
@@ -735,6 +825,7 @@ __all__ = [
     "RuleAtom",
     "RuleClause",
     "RuleConstant",
+    "RuleLookupByKey",
     "RuleOrdering",
     "RuleFamily",
     "RuleTerm",

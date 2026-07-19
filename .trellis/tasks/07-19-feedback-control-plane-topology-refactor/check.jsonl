@@ -1,0 +1,6 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": "/home/kelong/.codex/attachments/c1042458-be54-44a8-ae51-9ce42c895fb8/pasted-text.txt", "reason": "User-authored audit criteria: causal feedback value, ten questions, three feedback classes, one-hop repair, diagnostic lane, staged real tests."}
+{"file": "docs/agent-world-environment-generation.zh.md", "reason": "Canonical project purpose and current claimed architecture; audit for implementation drift."}
+{"file": "agent_world/control/feedback.py", "reason": "Current static feedback policy and dynamic result model."}
+{"file": "agent_world/control/repair.py", "reason": "Current repair routing and ledger authorization semantics."}
+{"file": "agent_world/controller.py", "reason": "Actual production DAG, rework loops, invalidation, observability, and release control."}
