@@ -16,6 +16,7 @@ class Budget(V2Contract):
     agent_turns: Annotated[int, Field(ge=0)] = 0
     search_calls: Annotated[int, Field(ge=0)] = 0
     tool_calls: Annotated[int, Field(ge=0)] = 0
+    process_calls: Annotated[int, Field(ge=0)] = 0
     build_seconds: Annotated[float, Field(ge=0)] = 0
     evaluation_episodes: Annotated[int, Field(ge=0)] = 0
     container_seconds: Annotated[float, Field(ge=0)] = 0
@@ -110,10 +111,82 @@ class EnvironmentJob(V2Contract):
         return self
 
 
+class GenerationContext(V2Contract):
+    """The immutable common root for one Direct or Evolve generation graph.
+
+    A context is written by framework code before the first real Agent/tool
+    execution.  It removes the former implicit coupling where Research read a
+    request from Controller state while later nodes consumed only selected
+    artifacts.  Every WorkGraph root now has one auditable request/job,
+    permission, budget and seed closure.
+    """
+
+    context_id: Identifier
+    job_ref: ArtifactRef
+    kind: Literal["generate", "expand"]
+    request_ref: ArtifactRef | None = None
+    anchor_package_refs: tuple[ArtifactRef, ...] = ()
+    expansion_campaign_ref: ArtifactRef | None = None
+    admitted_clue_refs: tuple[ArtifactRef, ...] = ()
+    permissions: PermissionScope
+    budget: Budget
+    release_profile: ReleaseProfile
+    target_identity_policy: Identifier = "identity:environment-package.v3"
+
+    @model_validator(mode="after")
+    def validate_context(self) -> GenerationContext:
+        if self.job_ref.artifact_type != "control.environment_job":
+            raise ValueError("GenerationContext job_ref must be an EnvironmentJob Artifact")
+        if self.request_ref is not None and (
+            self.request_ref.artifact_type != "control.environment_request"
+        ):
+            raise ValueError("GenerationContext request_ref has the wrong artifact type")
+        if self.expansion_campaign_ref is not None and (
+            self.expansion_campaign_ref.artifact_type != "control.expansion_campaign"
+        ):
+            raise ValueError("GenerationContext expansion campaign has the wrong artifact type")
+        if any(ref.artifact_type != "release.record" for ref in self.anchor_package_refs):
+            raise ValueError("GenerationContext anchors must be released Registry records")
+        roots = (
+            self.job_ref,
+            *((self.request_ref,) if self.request_ref is not None else ()),
+            *self.anchor_package_refs,
+            *((self.expansion_campaign_ref,) if self.expansion_campaign_ref is not None else ()),
+            *self.admitted_clue_refs,
+        )
+        if len(set(roots)) != len(roots):
+            raise ValueError("GenerationContext root refs must be unique")
+        if self.kind == "generate":
+            if (
+                self.request_ref is None
+                or self.anchor_package_refs
+                or self.expansion_campaign_ref is not None
+            ):
+                raise ValueError("generate GenerationContext requires only an EnvironmentRequest")
+        elif (
+            self.request_ref is not None
+            or not self.anchor_package_refs
+            or self.expansion_campaign_ref is None
+        ):
+            raise ValueError("expand GenerationContext requires campaign and released anchors")
+        return self
+
+    @property
+    def root_refs(self) -> tuple[ArtifactRef, ...]:
+        return (
+            self.job_ref,
+            *((self.request_ref,) if self.request_ref is not None else ()),
+            *self.anchor_package_refs,
+            *((self.expansion_campaign_ref,) if self.expansion_campaign_ref else ()),
+            *self.admitted_clue_refs,
+        )
+
+
 __all__ = [
     "Budget",
     "BudgetUsage",
     "EnvironmentJob",
+    "GenerationContext",
     "EnvironmentRequest",
     "PermissionScope",
     "ReleaseProfile",

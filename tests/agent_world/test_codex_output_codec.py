@@ -12,8 +12,11 @@ from agent_world.agent_profiles import IsolatedAgentProfileProvider
 from agent_world.config import AgentBackendConfig
 from agent_world.contracts import PermissionScope
 from agent_world.designer.models import (
+    CompactFieldSemanticDraft,
     EnvironmentSemanticSourceDraft,
     ExpansionDesignDraft,
+    ObservationSemanticsSourceDraft,
+    PermissionRuleSourceDraft,
     ToolSchemaIRDraft,
     ToolStateTransitionDraft,
 )
@@ -95,12 +98,26 @@ def test_worker_payload_passes_logical_schema_directly_to_codex_sdk(
 
     payload = CodexSdkBackend._worker_payload(request)
 
-    assert payload["output_schema"] == _provider_output_schema(
-        request.profile.output_schema or {}
-    )
+    assert payload["output_schema"] == _provider_output_schema(request.profile.output_schema or {})
     assert payload["prompt"] == request.prompt
     assert payload["output_schema"]["properties"]["dynamic"] == {
-        "$ref": "#/$defs/AgentWorldJsonObjectIR"
+        "type": "object",
+        "properties": {
+            "aw_object_entries": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "aw_key": {"type": "string"},
+                        "aw_value": {"type": "string"},
+                    },
+                    "required": ["aw_key", "aw_value"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["aw_object_entries"],
+        "additionalProperties": False,
     }
     assert request.profile.output_schema == {
         "type": "object",
@@ -271,6 +288,81 @@ def test_provider_json_ir_round_trips_nested_arbitrary_json() -> None:
         "name": "hotel",
         "values": [3, True, None],
     }
+
+
+@pytest.mark.parametrize(
+    ("model", "field_name"),
+    [
+        (ObservationSemanticsSourceDraft, "visible_fields_by_actor"),
+        (PermissionRuleSourceDraft, "required_scopes_by_actor"),
+    ],
+)
+def test_provider_schema_preserves_typed_map_value_contract(
+    model: type[ObservationSemanticsSourceDraft] | type[PermissionRuleSourceDraft],
+    field_name: str,
+) -> None:
+    provider = _provider_output_schema(model.model_json_schema(mode="validation"))
+
+    encoded_map = provider["properties"][field_name]
+    entry = encoded_map["properties"]["aw_object_entries"]["items"]
+    assert entry["properties"]["aw_key"] == {"$ref": "#/$defs/Identifier"}
+    assert entry["properties"]["aw_value"] == {
+        "type": "array",
+        "items": {"$ref": "#/$defs/Identifier"},
+    }
+
+
+def test_typed_actor_map_decodes_to_json_array_and_strict_semantic_tuple() -> None:
+    provider_output = {
+        "visible_fields_by_actor": {
+            "aw_object_entries": [
+                {"aw_key": "guest", "aw_value": ["booking_id"]},
+                {"aw_key": "staff", "aw_value": []},
+            ]
+        },
+        "consistency": "strong",
+        "staleness_bound_seconds": None,
+    }
+
+    decoded = _decode_provider_json_ir(provider_output)
+    value = ObservationSemanticsSourceDraft.model_validate_json(json.dumps(decoded))
+
+    assert value.visible_fields_by_actor == {
+        "guest": ("booking_id",),
+        "staff": (),
+    }
+
+
+def test_typed_actor_map_does_not_rewrite_object_value_as_empty_array() -> None:
+    provider_output = {
+        "visible_fields_by_actor": {
+            "aw_object_entries": [
+                {"aw_key": "guest", "aw_value": {}},
+            ]
+        },
+        "consistency": "strong",
+        "staleness_bound_seconds": None,
+    }
+
+    decoded = _decode_provider_json_ir(provider_output)
+    with pytest.raises(ValueError, match="tuple_type"):
+        ObservationSemanticsSourceDraft.model_validate_json(json.dumps(decoded))
+
+
+@pytest.mark.parametrize("method", ["python", "json"])
+def test_agent_output_rejects_scalar_string_coercion(method: str) -> None:
+    payload = {
+        "name": "nightly_rate",
+        "value_type": "number",
+        "description": "Nightly booking rate.",
+        "minimum": "1",
+    }
+
+    with pytest.raises(ValueError, match="float_type"):
+        if method == "python":
+            CompactFieldSemanticDraft.model_validate(payload)
+        else:
+            CompactFieldSemanticDraft.model_validate_json(json.dumps(payload))
 
 
 @pytest.mark.asyncio

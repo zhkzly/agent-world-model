@@ -108,7 +108,7 @@ flowchart TB
 
 输入一个 `EnvironmentRequest`，输出一个 released `EnvironmentPackage`，或结构化的 `rejected`、`needs_human`、`budget_exhausted`。成功不依赖 EnvironmentPool、Evolve、Suite、rollout 或训练反馈。
 
-Designer 对外只暴露经过 framework typed validation 的 `evidence_graph` `DesignPhaseCheckpoint`，它绑定同一 `EnvironmentJob`、`EnvironmentRequest` 与完整证据 DAG。恢复时复用该 EvidenceGraph，且本次恢复的 search/fetch/Researcher 调用为零。其后的 WorldArchitecture、SharedToolSemantics、ToolSemanticsBatch、WorldRules 和 TaskCurriculum 不暴露为可任意采用的 phase checkpoint；每个事务只能在 Source/derived Artifacts、当前 compiler 的 `ValidationReport`、唯一 terminal `FeedbackEvaluation` 全部完成后写一个 framework-owned `WorkCommit`。跨进程恢复只可采用同 WorkDefinition、同 coordinate、精确 immutable dependencies、当前 policy/schema digests 和未失效 WorkCommit 全部匹配的 revision；单独 Source、审计事件、未完成模型输出或旧控制对象均无恢复资格。需求语义变化、跨 request 复用、证据过期或来源失效不得隐式采用旧证据，必须进入显式 freshness/adoption policy。
+Designer 对外只暴露经过 framework typed validation 的 `evidence_graph` `DesignPhaseCheckpoint`，它绑定同一 `EnvironmentJob`、`EnvironmentRequest` 与完整证据 DAG。恢复时复用该 EvidenceGraph，且本次恢复的 search/fetch/Researcher 调用为零。其后的 WorldArchitecture、SharedToolSemantics、ToolSemanticsBatch、WorldRules 和 TaskCurriculum 不暴露为可任意采用的 phase checkpoint；每个事务只能在 Source/derived Artifacts、当前 compiler 的 `ValidationReport`、唯一 terminal `FeedbackEvaluation` 全部完成后写一个 framework-owned `WorkCommit`。跨进程恢复必须同时验证 coordinate、精确 immutable dependencies、当前 `acceptance_digest` 和未失效 WorkCommit；`acceptance_digest` 绑定 Claim、依赖拓扑、输出契约、acceptance transform、显式 validator executable revision、assurance 要求和 success maturity。完整 `definition_digest` 仍绑定新 Attempt 的执行预算与权限，`repair_epoch_digest` 仍绑定失败/返工授权，但这些未来执行策略的变化不得追溯性地使已经通过且 acceptance 不变的成功失效。单独 Source、审计事件、未完成模型输出或旧控制对象均无恢复资格。需求语义变化、跨 request 复用、证据过期或来源失效不得隐式采用旧证据，必须进入显式 freshness/adoption policy。
 
 首次通过 Modeling Gate 时，Controller 仍固化 `DesignBaselineCheckpoint`。Controller 不会为了制造“基线前接入”而等待 Discovery，也不会伪称 late evidence 已进入当前 Design：完成的 clue 先确定性写入 provisional Expansion Inbox，再由独立 admission 细化；未完成 work 写成 deferred state，可由 `agent-world discovery resume DISCOVERY_RUN_ID` 在新独立预算下恢复。任何时刻证明 hard claim、工具语义、安全规则或 fidelity 声明错误的新证据仍必须形成 Finding 与 `quarantine_recommended` 信号；真正 quarantine 由框架独立证据政策决定，不能由 LLM admission 单独执行。
 
@@ -212,6 +212,25 @@ EnvironmentRequest
 
 这是 readiness DAG，不是固定直线阶段。多个 EvidenceGraph、WorldSpec、Task、Verifier 或 Candidate revision 可以并存；current 只是 projection。任一 Gate 可以推翻上游 Artifact，rework 创建新 revision，不覆盖旧内容。
 
+#### 3.5.1 拓扑 epoch 与发布因果顺序（2026-07-21 更正）
+
+WorldBehavior 的物理 shard 只有在 Architecture 已被真实证据约束后才能确定；Verifier 的真实
+Challenger batch 数又只能在 TaskCurriculum/Modeling 已冻结 exact `EnvironmentDesign` 后确定。
+因此同一 `EnvironmentJob` 允许三个有因果链接的 `WorkGraphEpoch`，每次只为一个新发现的、有界
+物理成员集冻结拓扑：不可发布的 `bootstrap` 完成 Intake、Research 与 Architecture；不可发布的
+`design` 保留 bootstrap commits 并完成 Behavior、Rules、Curriculum、Modeling 与 framework-owned
+`VerifierPlan`；唯一可发布的 `final` 保留前两者的精确 active commits，再从已提交 VerifierPlan
+派生每个实际 Challenger batch，并追加 Build、Integration、ReleaseAssurance、Observability、Package
+和 RegistryPublication。它们不是三条流水线，仍由同一个 Scheduler、预算和 repair ledger 执行；
+任何隐藏 fan-out、或只到 ModelingBoundary 的 graph 都必须 fail closed。
+
+发布证据不得产生自引用环。预打包 `ReleaseDossier` 只绑定 final graph manifest 与已经完成的
+Design/Candidate/Verifier/Integration/Assurance/Telemetry commit closure，**不能**引用 package、
+reservation 或 `WorkReadinessSnapshot`。Package bytes 和其 WorkCommit 成功后，framework 才投影
+`release_candidate_ready`；Registry 原子 publish 及其 WorkCommit 成功后，才投影 `released`。
+Registry staging 后生成的物理发布回执另称 `PublicationDossier`。旧 `ClaimVector` 不能再作为
+package/Registry 的平行成功权威，迁移完成后删除。
+
 恢复同样按 readiness DAG，而不是按“整条流水线重跑”。任一节点通过后，Controller 必须在启动下一个长耗时 consumer 前立即结算 lease、关闭 `WorkAttempt`、写唯一 `WorkCommit` 和不可变快照；Builder 与 Verifier 并发时，Builder 一完成就必须提交 ImplementationContract、source tar、lineage、CandidateManifest、BuildRecord 与 Candidate，并立即进入 Integration，慢 Verifier 不得推迟或抹掉已经成功的 Build。恢复只采用同一 request/job、同一最终 Design revision、当前 Modeling Gate 仍通过且 Artifact dependency closure 完整的 WorkCommit。Build 恢复还必须逐文件复验 link-free source tar 的 path、mode、size、content hash 和完整 manifest closure，再物化到新的隔离 workspace，并从精确 Design/ImplementationContract 重新生成候选只读的 `inputs/`（不能把它遗漏或塞入 source tar）。Agent continuation 只能从 framework 私有 checkpoint 恢复，并重新验证 workspace、lineage、profile/config/schema、immutable inputs、RepairAction 和 budget lease；不存在这些绑定时显式启动新的真实 Builder，不能伪造 session 或把旧候选假装修好。
 
 ### 3.6 决策权限：Code Router 执行，LLM 只作语义裁判
@@ -235,7 +254,7 @@ flowchart LR
 |---|---|---|---|
 | Agent 提案层 | 解释业务含义、比较证据、提出 World/Task/Verifier 语义、声明候选 workspace、提出单个 episode action | 生成或伪造控制平面事实 | `AssumptionResolutionDraft`、`AdmissionAssessment`、`VerifierIntent`、`CandidateCompletion`、`InteractiveSolveDecision` |
 | Framework 编译/验证层 | schema/reference/type/rule/evidence 检查，把合格提案编译为 Artifact 或 Finding；拒绝越权字段 | 任意接受 Agent 自报的成功、完成或阻塞 | SourceDraft compiler、semantic validator、Runtime Supervisor、Judge executors |
-| Controller 执行层 | 解析 Artifact owner、生成 RepairDirective、控制 backjump/失效/预算/重试、决定 Gate 和调用 Release Kernel | 发明业务规则或替 Agent 补写语义 | `RepairRouter`、`RepairLedger`、budget ledger、Gate policy、Release Kernel |
+| Scheduler / Release Kernel 执行层 | 解析 Artifact owner、生成 `RepairAction`、控制 one-hop backjump/失效/预算/重试、提交 `WorkCommit` 并调用 Release Kernel | 发明业务规则或替 Agent 补写语义 | `WorkScheduler`、`WorkControlRuntime`、`WorkRepairLedger`、budget ledger、Gate policy、Release Kernel |
 
 必须满足下列不变量：
 
@@ -265,8 +284,8 @@ flowchart LR
 flowchart LR
     AO["AgentOutput<br/>无控制权"] -->|"closed schema + exact registry"| SA["Semantic Advisory<br/>业务含义提案"]
     SA -->|"framework compiler<br/>引用/证据/producer 复验"| FF["framework Finding<br/>仍未执行"]
-    FF -->|"RepairRouter<br/>owner 与真实 Artifact 绑定"| RD["RepairDirective"]
-    RD -->|"budget + ledger + jump policy"| EX["Controller 执行"]
+    FF -->|"Repair Router<br/>owner 与真实 Artifact 绑定"| RD["RepairAction"]
+    RD -->|"budget + ledger + jump policy"| EX["Scheduler dispatch"]
 
     AO -.->|"禁止直达"| FF
     SA -.->|"禁止直达"| RD
@@ -285,6 +304,33 @@ flowchart LR
 因此，“LLM 作为 Router”在本项目中只是一种口语误称。真正实现是：LLM 对程序不可判定的业务语义给出受限 advisory，Code Router 对一切执行效果作最终、可复现、可审计的决定。
 
 ### 3.7 Feedback control plane：检查可以多，决策边界必须少而精确
+
+#### 3.7.1 Case-driven change discipline：先证明控制假设，再改变控制面
+
+本项目的目的始终是把自然语言需求编译为真实、可执行、可独立验证和可发布的程序化 Agent
+环境；因此 Foundry 对**生成流水线本身**的状态转移、预算、返工和发布也必须像 Runtime 的世界
+状态一样可证据化、可复现。一次 live trace、一次模型失败或一条 telemetry 曲线都只能提出
+控制假设，不能单独授权扩大 Gate、重构 Scheduler 或改变 RepairPolicy。
+
+每次分析 bad case 或提出控制面修改前，记录必须依序回答：
+
+1. 重述此 case 服务的项目目的、涉及组件的权威边界，以及不能被破坏的控制不变量；
+2. 列出持久 Artifact/Operation/Lease/WorkHead 的观察事实，并严格区分事实、推断和假设；
+3. 将 case 分类为模型语义、输入/输出表示、框架控制、拓扑/Artifact 闭包、基础设施或观测投影，
+   不把不同类别合并为“模型不好”或“验证太严”；
+4. 比较至少两个独立 bad case，并使用历史 case、可重复的确定性回归或源级不变量作交叉检验；
+   单一 case 只能进入调查，不进入结构性重构；
+5. 对会改变 Scheduler、RepairLedger、BudgetLedger、invalidations 或 release authority 的 P0 修改，
+   要求独立审查提出反例，并明确为什么不选择更小的观测或输入表示修正；
+6. 设计修复时写出最小因果范围、替代方案、预期反例、回归矩阵和下一阶段真实验收；通过前不得
+   把 fixture、部分 Design、静态测试或已停止的 live run 称为生成成功。
+
+特别地，`stale` 只表示已提交的因果父 revision 或 definition/input closure 改变后形成的**新
+lineage**；同一 immutable input closure 的再次 semantic proposal 必须经过唯一
+`RepairAction -> WorkRepairLedgerEntry -> WorkAttempt` 链。实时观测必须同时区分 settled
+actual/unknown/conservative usage 与 active reservation，并显示 active repair 的 coordinate、父
+attempt、RepairAction、reason、depth 和 liveness；不能因投影缺失把一份已授权返工误报为新初始
+调用，也不能因 worker 已停止但尚未 reconcile 就擅自释放或重放其 lease。
 
 并非每个 Validator assertion 都注册独立反馈权威。格式、schema、引用、类型、协议、预算等
 叶子检查可以细且多，但同一 `WorkAttempt` 内必须聚合成一个 `ValidationReport`；只有当结果
@@ -330,6 +376,42 @@ Artifact”，不取最小字段；多个字段问题属于同一语义批次时
 - LLM proposal 与 code validation 即使属于同一 WorkAttempt，也必须分别计费和观察，不能合并
   成一个含糊 executor。
 
+每个 production leaf 的执行协议固定为：Scheduler 先持久化并打开 `WorkAttempt`，leaf 只能在
+已授权的 `OperationRun` 内执行**一次**真实 proposal、工具调用或子进程；随后 framework 写聚合
+`ValidationReport`，必要时另写真实执行的 `AssuranceReport`，最后只由 `FeedbackEvaluation` 选择
+`WorkCommit`、`RepairAction` 或 terminal block。leaf 不得自行调用下一轮修复、不得选择别的
+coordinate，也不得把失败包装成新的“组件成功”。这条规则是减少反馈成本的关键：检查可以很多，
+但每个 Artifact 边界只有一个有因果价值的决定。
+
+`ProposalPolicy.replay_mode` 是这个决定的一部分，而不是 executor 的隐含习惯。纯代码边界必须
+标为 `deterministic`，带 idempotency key 的外部写入标为 `idempotent_with_key`，可重新发起且不改变
+语义的检索标为 `queryable`；其余 Agent、构建和可能产生外部副作用的操作一律 `non_replayable`。
+进程在 OperationRun 已打开后异常退出时，恢复器必须保留真实 operation id、租约与 unknown usage，
+写入 `interrupted` attempt 和可审计的恢复 finding；只有上述可重放类别才可由同一 coordinate 的
+既有 repair authority 发起一次本地重试。不得把中断计成零成本，也不得让新的进程在未结算旧租约时
+重新预约预算。
+
+对 Agent proposal，Scheduler 的 dispatch id、已解析的 provider/model/profile/schema digest 在越过
+provider 边界**前**就是已知 provenance。若 SDK 超时、取消或 transport 在 terminal envelope 前失败，
+framework 必须用这些已知事实写 failed `ProposalExecution`、结算完整 unknown reservation，并继续
+Validation/Evaluation；不能因为缺少 provider 回包而要求伪造 provenance、抛出 framework exception
+或遗留 active OperationRun。是否允许后续 retry 仍只取决于 `replay_mode`、RepairPolicy 与硬预算。
+
+DirectJob 的恢复只在重新获得其 durable writer lock、并确认原 worker 已停止后才运行。恢复前必须将
+旧 trace 中仍为 running 的 spans 关闭为 `owner_process_interrupted`，保留已观察到的 SDK 指标；新的
+Scheduler span 继续使用同一 `run_id`。每个 terminal `DirectWorkRun` 必须从 durable scope leases 汇总
+actual 与 unknown usage 并投影到 DirectJob snapshot，不能只把内部 OperationRun 的成本留在另一个数据库。
+**运行中的** `run inspect` 也必须直接读取同一 scope lease ledger：已 settled 的 lease 汇总为实际/unknown/
+conservative usage，active lease 显示保留暴露；不得等整轮 Direct snapshot 写回而把已运行的工作误报为
+零。每个 Scheduler WorkAttempt span 还必须以 Direct root span 为 parent；缺失 parent、尚未取得 provider
+usage 或尚未结算的 lease 都是明确的 `unknown/provisional`，不能用 0 或孤立 span 代替。
+
+一个 `WorkDefinition` 也不得掩盖可变数量的真实模型或工具调用。若 Verifier、ToolSemantics 或
+Research 的物理工作量在 Architecture 之后才由 task/tool 数确定，framework 必须在 final epoch
+冻结明确的 shard coordinates；每个 shard 各有自己的 Proposal/Validation/Feedback/WorkCommit，
+随后只由 code aggregate 绑定精确 child commit set。把 N 个真实 invocation 塞进单个
+`ProposalExecution` 会破坏 token、重试、恢复和因果失效的测量，属于 fail-closed 的拓扑错误。
+
 Generic root schema error、没有 exact path 的机械错误、相同 validator frontier + issue set 的
 重复错误不得继续消耗 LLM correction。它们必须被判为 output-contract/framework defect。
 错误 A 变成字段可定位的错误 B 是进展而不是解决；只有 Contract 仍有同一 RepairTarget 的
@@ -337,11 +419,42 @@ Generic root schema error、没有 exact path 的机械错误、相同 validator
 strict progress 才允许第二次，同时仍受全 run 的硬 Budget ceiling 约束。LLM 永远不能决定
 WorkDefinition、cost、owner、重试、回跳、失效、maturity 或 Gate effect。
 
+对于 shape 已正确、但 compiler/semantic validator 拒绝的 proposal，`ValidationReport` 中的每个 issue
+必须保留安全的 `code + exact path + violated_condition + expected_category`。不得把已知的业务约束压缩为
+“structured/semantic contract violated”；否则 framework 虽然正确地只授权一次局部 correction，Agent 却
+没有可因果修复的信息。无法安全披露 condition/expected 的情况必须改为 framework/output-contract failure，
+而不是授权盲目的 semantic retry；同一 `path+code+condition+expected` 集合才是 no-progress 比较键。
+一旦 Scheduler 授权 semantic local correction，它必须沿 immutable
+`RepairAction -> FeedbackEvaluation -> ValidationReport` 链编译只含 blocker
+`code/path/violated_condition/expected_category` 的 `AgentCorrectionBrief`，并把该简报附加到目标
+Agent 的一次新调用。简报不得投影 `RepairAction` 的 policy、预算、jump、mutation root、坐标、owner、
+invalidates 或 release 字段；模型只重新产出完整的同一 typed semantic artifact，路由与授权仍完全由 code
+拥有。否则“诊断可见但没有进入下一次提示”会让 stateless Agent 原样重试，并被正确但无益地判成 no-progress。
+
+`ValidationReport` 必须保留每个字段级 issue，供审计、A→B 进展比较和 release dossier 使用；但
+`AgentCorrectionBrief` 不能把数十个同构 path 原样塞回模型。framework 必须按安全的
+`code + violated_condition + expected_category` 聚类，给出每类的总出现次数、affected path pattern 和少量
+代表 path，并明确该条件适用于完整 replacement 的每个匹配位置。这不是截断或放宽验证：完整报告仍是唯一
+控制面事实，压缩简报只是让同一个最小语义 Artifact 在一次 bounded correction 中可以被因果地重写。若不同
+condition 的簇多到不能形成可理解的局部修复，应 terminal block 或重构提案边界，不能以无限 correction 掩盖。
+
+工具 Rule 的 namespace、ordinal 与跨 section identity 也不是业务语义。对于
+`ToolSemanticsBatchSourceDraft`，Agent 可省略 `rule_id`，framework 按 frozen
+`tool_id + section + ordinal` 在 source artifact 写入和 Rule IR 编译前确定性派生。更重要的是：
+ToolSemantics 的 `args/tool_result/observation/pre_state/post_state` 已在 Agent 调用前由同一
+`WorldSpec` 冻结，因此 Agent 只能以 `bound_reference` 或 `bound_lookup_by_key` 选择一个
+`FrozenToolRuleBindingCatalog` 的 binding id；framework 再将它确定性展开为 source、RFC 6901
+pointer、collection、primary key、item field 与 value type，并编译原有可执行 Rule IR。不得允许模型
+抄写 raw pointer、collection 或 key/value type，再把机械 `$ref`/拼写错误交给昂贵返工。Agent 仍负责
+“哪条业务关系应成立、选择哪个已有字段、常量/比较/错误语义/evidence”的语义判断；代码负责绑定表、ID
+语法、唯一性、路径、类型与命名空间。该 binding 边界先限于 ToolSemantics；WorldRules/Curriculum 中
+尚未冻结的 task-local 语义不得被伪装成机械 binding。
+
 ## 4. 五个组件的具体职责
 
 | 组件 | 输入 | 核心输出 | 权威 | 明确不得拥有 | 关键验证 |
 |---|---|---|---|---|---|
-| Foundry Controller | EnvironmentJob、当前 Artifact DAG、权限与预算 | WorkOrder、checkpoint、budget lease、Finding route、终态 | 调度、预算、失效传播、是否提交 Release Kernel | 发明世界规则、放宽 Gate | durable CAS、幂等恢复、预算守恒、依赖有效性 |
+| Foundry Controller / Scheduler | EnvironmentJob、GenerationContext、冻结 WorkGraph、权限与预算 | epoch、WorkAttempt/Commit、RepairAction、terminal projection | 调度、预算、失效传播、是否提交 Release Kernel | 发明世界规则、放宽 Gate、把旧组件 retry 当作权威 | durable CAS、幂等恢复、预算守恒、依赖有效性 |
 | Environment Designer | Request/parent、evidence、clue、CoverageMap | 完整 WorldSpec、ToolContractSet、TaskRequirement、VerifierProposal、ImplementationContract、SemanticDelta | 设计 Artifact 的新 revision | 写 Runtime、决定发布 | schema/reference/reachability/permission/invariant/evidence/identity Gate |
 | Environment Builder | 已通过 Modeling Gate 的精确 Design revision | 源码闭包、锁文件、Runtime/Task Materializer、CandidateManifest | 候选 workspace revision | 读取 sealed data、定义 reward、宣布发布 | exact contract、source digest、真实 build/test、依赖闭包 |
 | Environment Judge | Candidate、WorldSpec Rule IR、Task/Verifier contracts、release profile | JudgeEvidence、Finding、JudgeReport | 对 release claims 给出独立证据 | 修改候选、选择 Evolve 父代、任意放宽 policy | 独立进程、真实 episode、property/sealed/deploy Gate |
@@ -450,7 +563,7 @@ Hook 使用 framework 定义的 backend-neutral lifecycle contract，并映射�
 3. **Research**：Researcher 反复执行 plan、真实 search/fetch/extract、冲突核对和 gap 更新；停止由 coverage/risk/budget Gate 决定，不由 Agent 自称完成。
 4. **World modeling**：同一个隔离 Engineer profile 执行少量、有界的语义事务，而不是把每个实体、schema role 和工具语义字段变成独立模型调用。`WorldArchitecture` 一次冻结 identity、authority、实体及紧凑字段语义、生命周期、关系、工具边界与嵌入所属工具的紧凑接口语义；framework 从它确定性编译 Entity/Tool Schema、ID、引用、required、closed shape 和 root assembly。framework 随后从 namespace 与共享状态生成不可由模型修改的 `ToolCouplingPlan`。含五至八个耦合工具的 group 先由一次短 `SharedToolSemantics` 事务冻结 atomicity、concurrency、idempotency、ordering、compensation 与共享 error policy；每个最多四工具的 `ToolSemanticsBatch` 必须实现这份共享合同。所有 batch 完成后，代码生成 `ToolSemanticGroupClosure` 并在 WorldRules 前拒绝跨批冲突。随后单独的 `WorldRules` 事务只表达初态规则和跨实体/工具 invariant；framework 将其编译并与 Schema/Tool contracts 做闭包校验。`TaskCurriculumSemantics` 在完整 WorldModel 编译成功后一次产生 task family、objective、actor/tool scope、difficulty 与 success/failure/terminal RuleDraft；framework 再编译 TaskRequirement、task protocol、Reward 和 VerificationRequirements。
 
-   模型只拥有业务字段意义和 `RuleDraft`/typed source IR，不拥有 `properties/required/additionalProperties/items/anyOf`、case id、seed、public/sealed partition、reward、Gate 或发布字段。framework 确定性编译 Draft 2020-12 schema、核心 Rule IR、projection、task binding 和全局闭包。一个批次中的所有安全问题在同一 validation frontier 聚合；机械问题由代码直接拒绝或规范化，只有仍需业务判断的缺口才允许对整个最小语义批次做一次 correction。工具批次具有独立 commit/repair identity；当前调度器按稳定顺序执行，后续只有在 backend 容量、预算 lease 与提交确定性均得到证明后才可并发，失败批次不得失效已提交 sibling。
+   模型只拥有业务字段意义和 `RuleDraft`/typed source IR，不拥有 `properties/required/additionalProperties/items/anyOf`、case id、seed、public/sealed partition、reward、Gate 或发布字段。工具批次的 Rule ID 则由 framework 的 frozen `tool_id + section + ordinal` 组合，模型可省略该机械字段。对 `SharedToolSemantics`，prompt 必须把冻结 `ordered_tool_ids` 明示为构造约束：atomicity、concurrency、idempotency 三类 domain 各自精确分割该全集；没有证据要求更细分时一个覆盖全集的 domain 是保守合法构造；error policy 至少覆盖全集。这个提示只减少机械遗漏，不替代或放宽 compiler 对实际分组/语义的验证。framework 确定性编译 Draft 2020-12 schema、核心 Rule IR、projection、task binding 和全局闭包。一个批次中的所有安全问题在同一 validation frontier 聚合；机械问题由代码直接拒绝或规范化，只有仍需业务判断的缺口才允许对整个最小语义批次做一次 correction。工具批次具有独立 commit/repair identity；当前调度器按稳定顺序执行，后续只有在 backend 容量、预算 lease 与提交确定性均得到证明后才可并发，失败批次不得失效已提交 sibling。
 
    首次真实 Build 前，Direct Designer 的最坏基础 Agent turn 为 8：Research plan、检索后 synthesis、World Architecture、最多一次 multi-batch Shared Tool Contract、1–2 个 Tool Semantics batch、一次 WorldRules 和一次 Task/Curriculum；加上全 run 最多两次按需 Semantic Repair，硬预留为 10。没有 multi-batch group 时共享事务为零，典型调用仍更少。调用数不得随实体数量线性增长。若 192 KiB 输入投影或单 turn output cap 要求更小批次，Controller 必须在调用前拒绝超过总 turn 上限的 scope，而不是提交巨型 prompt 后靠 retry 消耗预算。
 
@@ -476,7 +589,18 @@ rule id 或等价 Rule 重复均不得放大奖励；Judge 从 envpkg 中的 Rul
 
 Direct job 的持久幂等是成功合同的一部分。publish 后 Controller 若在终态 bookkeeping 前崩溃，可以依据同 owner 的 Registry 事实补齐终态；带未知 Agent/tool 消耗的中断不得静默从头重放。
 
-每个设计子节点跨越真实 Agent 边界前创建 `WorkAttempt` 并记录 scheduled/started；完成时先提交 typed Source/derived Artifact 和一个聚合 `ValidationReport`，再由唯一 terminal `FeedbackEvaluation` 决定是否写 `WorkCommit`。预算 lease、ProposalExecution、RepairAction/RepairLedgerEntry 和终态事件形成同一执行轨迹；普通本地 schema 修复不再制造 Finding/Event/Disposition 权威链。`agent-world run inspect <request-id>` 只读这些持久事实，不解析 Agent 私有 transcript，也不需要模型或研究凭证。EvidenceGraph 是对外稳定 phase checkpoint；WorldArchitecture、SharedToolSemantics、逐批 ToolSemantics、WorldRules 和 TrainingContract 只能通过精确 WorkCommit 自动恢复，不能由 CLI 或 Agent 任意采用。它们可观察、可定向失效且不进入发布包。
+每个设计子节点跨越真实 Agent 边界前创建 `WorkAttempt` 并记录 scheduled/started；完成时先提交 typed Source/derived Artifact 和一个聚合 `ValidationReport`，再由唯一 terminal `FeedbackEvaluation` 决定是否写 `WorkCommit`。预算 lease、ProposalExecution、RepairAction/RepairLedgerEntry 和终态事件形成同一执行轨迹；普通本地 schema 修复不再制造 Finding/Event/Disposition 权威链。`agent-world run inspect <request-id>` 只读这些持久事实，不解析 Agent 私有 transcript，也不需要模型或研究凭证。EvidenceGraph 是对外稳定 phase checkpoint；WorldArchitecture、SharedToolSemantics、逐批 ToolSemantics、WorldRules 和 TrainingContract 只能通过 acceptance 精确匹配的 WorkCommit 自动恢复，不能由 CLI 或 Agent 任意采用。恢复时若当前 running Attempt 将被历史成功取代，framework 必须先释放其真实 lease、写 `interrupted` Attempt，再原子切换 WorkHead；活跃语义 RepairAction 不得被缓存恢复覆盖。它们可观察、可定向失效且不进入发布包。
+
+语义 correction 不是把 `RepairAction` 交给模型。Controller 在第二次 dispatch 前从上游失败报告构造
+data-only `AgentCorrectionBrief`；`invoke_structured_once` 仅将其当作不可信诊断数据附加到原始 bounded
+prompt。这样同一个局部 Agent transaction 获得可执行的修复条件，但不能看到或改写 framework control plane。
+
+一个 Agent proposal 成功返回并不等于该 leaf 已可提交：随后的 deterministic compiler 与 immutable Artifact
+DAG write 仍可能失败。所有 Artifact dependency closure 是集合语义，必须在写入前按 `ArtifactRef` 去重；不得把
+已经在 Scheduler parent input closure 中的 evidence/architecture 等再次附加。若这类 post-proposal framework
+failure 发生，leaf kernel 必须使用已记录的 Agent provenance、actual/unknown usage 终态化当前 OperationRun，并以
+不可重试的 framework error 阻断；绝不能因“模型已经完成而 leaf 还未提交”遗留 active operation，也不能把该错误
+伪装为新的 semantic correction。
 
 真实 backend 若报告明确 `retryable` 的 provider/transport 失败，Designer 只可在当前节点的硬 turn/repair lease 内，用完全相同的 immutable prompt 与新隔离 session 重试；失败的 `InvocationResult` 必须保留在 lineage 中。它不构成语义修正，不能沿用可能残缺的会话状态，也不能绕过 Pydantic/semantic Gate。重试耗尽后，Controller 将 backend code、retryable 标志、尝试次数和安全诊断写入 FailureEvidence/Finding，并继续阻断发布。
 
@@ -679,7 +803,7 @@ Direct Generation 有前台保留容量。Discovery 和 Evolve 使用独立 part
 
 长期真实执行得到的八条控制面经验是目标合同，不是可选优化：
 
-1. 验证是带证据的 `ClaimVector`，不是一个全局布尔值。Claim 至少区分 `unknown / passed / failed / inconclusive / error / not_run / invalidated`，并声明 `observe / reject_revision / block_integration / block_release / quarantine` 效果；未执行的 Gate 不得借用其他 Gate 的 evidence。
+1. 验证是由 `ValidationReport`、可选 `AssuranceReport` 和唯一 `FeedbackEvaluation` 构成的带证据 Claim projection，不是一个全局布尔值，也不是旧 `ClaimVector` 平行发布权威。Claim 至少区分 `unknown / passed / failed / inconclusive / error / not_run / invalidated`，并声明 `observe / reject_revision / block_integration / block_release / quarantine` 效果；未执行的 Gate 不得借用其他 Gate 的 evidence。
 2. Framework 从精确 Artifact 与 Claim dependency closure 推导 `DESIGN_VALID -> BUILD_VALID -> EXECUTABLE -> INTEGRATION_READY -> RELEASE_CANDIDATE -> RELEASED` 成熟度。Agent、候选和 LLM Judge 无权自报成熟度。
 3. Finding 可由任何 Gate、Agent 或工具发现，但 owner 必须由 framework Repair Router 根据失败分类、subject revision、claim producer 和 Artifact DAG 判定；生产者提供的 owner 只能作为不可信 hint。
 4. Challenger 只产生紧凑、typed 的 `VerifierIntent`：选择要攻击的语义、轨迹骨架、变形关系和任务覆盖。Framework 确定性扩展 id、public/sealed 配对、Rule/schema 闭包和 Property family，编译为 Verifier IR；机械闭包不得反复消耗模型 turn。
@@ -830,7 +954,7 @@ environment-package/
 
 Package 不包含 sealed cases、secrets、内部 evaluator 实例、expected output corpus、Agent transcript、绝对 workspace path 或候选定义的消费代码。所有路径必须 package-relative。Manifest 绑定 WorldSpec、Task/Verifier contracts、source tree、依赖、build、JudgeReport 和 release dossier digest。
 
-`envpkg.toml` 采用 framework-owned、flat、canonical TOML 子集，只绑定 package coordinate、Runtime/Task/Evaluator 协议与相对路径、物理 WorldSpec/source tree/`uv.lock` digest、JudgeReport、IntegrationReport、release-candidate ClaimVector、发布前 TelemetryReleaseSummary commitment，以及其余四份 metadata 的 digest；它不绑定 Manifest digest，从而避免 `Manifest -> envpkg.toml -> Manifest` 哈希环。其余文件也是 closed typed contract：`provenance.json` 保存 artifact input refs/digests（其中上述四份发布证据是必需 role）以及分离的 SemanticLineage/ImplementationLineage；`assurance.json` 交叉绑定这四份证据，只投影实际 Judge gate 的 id/status/hard/evidence commitment 和实际预算，不携带 sealed case 细节；`fidelity.json` 只投影 Design 的 fidelity、known divergence、known limits 与 evidence refs，并固定声明它不证明与现实系统等价；`sbom.json` 必须从包内精确 `pyproject.toml`/`uv.lock` 重新解析 virtual root、registry dependency 和 locked wheel URL/hash/size。IntegrationReport、ClaimVector 与 TelemetryReleaseSummary 本身保留为签名 Artifact；package 通过 canonical ref/revision/content hash 绑定它们，而不是复制一份可被消费者误当成运行时输入的内部控制对象。
+`envpkg.toml` 采用 framework-owned、flat、canonical TOML 子集，只绑定 package coordinate、Runtime/Task/Evaluator 协议与相对路径、物理 WorldSpec/source tree/`uv.lock` digest、JudgeReport、IntegrationReport、**pre-package ReleaseDossier** 与发布前 TelemetryReleaseSummary commitment，以及其余四份 metadata 的 digest；它不绑定 Manifest digest，从而避免 `Manifest -> envpkg.toml -> Manifest` 哈希环，也不引用由 Package WorkCommit 才能导出的 readiness。其余文件也是 closed typed contract：`provenance.json` 保存 artifact input refs/digests 以及分离的 SemanticLineage/ImplementationLineage；`assurance.json` 交叉绑定 dossier 中实际 Judge gate 的 id/status/hard/evidence commitment 和实际预算，不携带 sealed case 细节；`fidelity.json` 只投影 Design 的 fidelity、known divergence、known limits 与 evidence refs，并固定声明它不证明与现实系统等价；`sbom.json` 必须从包内精确 `pyproject.toml`/`uv.lock` 重新解析 virtual root、registry dependency 和 locked wheel URL/hash/size。IntegrationReport、ReleaseDossier 与 TelemetryReleaseSummary 本身保留为签名 Artifact；package 通过 canonical ref/revision/content hash 绑定它们，而不是复制一份可被消费者误当成运行时输入的内部控制对象。
 
 SBOM phase 1 对 root 与第三方依赖的 license 一律显式记录为 `unknown`。候选提供的 `license` role 文件只形成 path/hash/size inventory，不能据此推断第三方 license。将来只有通过 hard `supply_chain` Gate 的 typed Judge evidence 才能把单项 metadata 升级为 `verified`；compiler、LLM 文本或文件名都没有这项权力。旧的 `evidence/public-summary.json` 不进入 v3 成功路径。
 
@@ -838,7 +962,7 @@ SBOM phase 1 对 root 与第三方依赖的 license 一律显式记录为 `unkno
 
 Registry 保存 PackageId/version/hash/status、WorldBoundary、WorldSpec/CoverageMap refs、SemanticLineage、ImplementationLineage、Gate evidence、Findings、成本和可选 rollout metrics。它同时提供 EnvironmentPool query view，不另建第二份真相数据库。
 
-发布前 Registry 必须验证：framework manifest producer、JudgeReport producer、package reservation owner、Artifact signatures、source tree digest、envpkg 物理文件、required hard claims 和 release state。Registry 必须从 staging/released tree 独立 canonical-parse 五份 metadata，重新从物理 `pyproject.toml`/`uv.lock` 编译 SBOM 结构，并把它们交叉绑定到物理 WorldSpec、Manifest、EnvironmentDesign、CandidateManifest、ImplementationLineage、JudgeReport、精确最终候选的 ready IntegrationReport、固定七项 release ClaimVector 及强制 TelemetryReleaseSummary；仅验证文件 hash 或让 Controller 自己声称 closure 均不足以发布。Registry 还必须重新检查 Integration 的固定 gate 集、每项 Claim 的 producer/subject/evidence 映射、Modeling Gate 证据、Verifier 与 Judge 的直接依赖关系，以及发布前 request/design/verifier/build/integration/judge 六类节点、至少一次真实 invocation、真实 research.search/fetch/extract 成功操作和 token/search/fetch/document 指标观测的完整性。只有 released version 默认可成为 parent 或进入新 Suite；quarantine/supersede 不修改历史 bytes，但会阻止新 episode 和新 snapshot 默认选中。
+发布前 Registry 必须验证：framework manifest producer、JudgeReport producer、package reservation owner、Artifact signatures、source tree digest、envpkg 物理文件、final WorkGraph 的精确 Package commit、`release_candidate_ready` projection、pre-package ReleaseDossier、required hard claims 和 release state。Registry 必须从 staging/released tree 独立 canonical-parse 五份 metadata，重新从物理 `pyproject.toml`/`uv.lock` 编译 SBOM 结构，并把它们交叉绑定到物理 WorldSpec、Manifest、EnvironmentDesign、CandidateManifest、ImplementationLineage、JudgeReport、精确最终候选的 ready IntegrationReport、ReleaseDossier 与强制 TelemetryReleaseSummary；仅验证文件 hash 或让 Controller 自己声称 closure 均不足以发布。Registry 还必须重新检查 Integration 的固定 gate 集、dossier 的 producer/subject/evidence 映射、Modeling Gate 证据、Verifier 与 Judge 的直接依赖关系，以及发布前 request/design/verifier/build/integration/judge 六类节点、至少一次真实 invocation、真实 research.search/fetch/extract 成功操作和 token/search/fetch/document 指标观测的完整性。它原子 publish 后必须让 Scheduler 提交 RegistryPublication，再由新的 projection 建立 `released`。只有 released version 默认可成为 parent 或进入新 Suite；quarantine/supersede 不修改历史 bytes，但会阻止新 episode 和新 snapshot 默认选中。
 
 ### 12.3 Framework-owned Consumer
 
@@ -881,6 +1005,16 @@ Package 不携带任何候选控制的消费代码。Framework 从 manifest 和�
 
 每个 `WorkSpan` 至少包含 trace/span/parent、run/campaign、五组件、node/operation、attempt/repair depth、input/output refs、scheduled/start/first-progress/end、status/failure 和 usage provenance。时间必须拆分 queue、profile materialization、time-to-first-progress、model generation、tool execution、Artifact commit/fsync、subprocess start、clean install、episode 和 Registry publication；同时报告 wall time、sum work、critical path、parallel savings 与 idle time。实时 inspect 对 `running` span 必须用当前 monotonic/wall checkpoint 报告 elapsed 与 provisional critical path，并明确标为进行中估计；不得因为尚无 `ended_at` 就把已经等待数分钟的工作记为 0。Invocation 在跨越 backend 边界前就必须创建 child span，SDK first-progress/usage 到达时增量更新，终态再结算，不能只在完整返回后一次性补写。
 
+生产 DirectJob 的 `run_id` 同时是 Scheduler 的 trace id；Controller snapshot、WorkSpan、恢复 finding
+和 `run inspect --metrics` 必须按该同一身份关联。独立诊断 harness 可以另建 trace，但不得把它的结果
+投影为生产 DirectJob 的观测或发布证据。
+
+语义终止摘要只列举真正 `blocked` 的逻辑坐标（component/stage/artifact slot/shard），并让其对应的
+ValidationReport、FeedbackEvaluation 与最小 repair target 可追溯；不得把所有等待下游的 hash 坐标
+拼成不可执行的错误说明。相反，冻结图出现 `ready/repair_ready` 但没有 framework executor 的情形是
+独立的 typed infrastructure error：必须输出精确安全坐标和 `scheduler_executor_missing`，不能将其压成
+“unknown coordinate”、伪装成语义 Gate，也不能交给 Agent rework。
+
 资源数据至少覆盖：
 
 - token：input、cached input、output、reasoning output、total、context window、model、provider、reasoning effort、turn/session；
@@ -890,25 +1024,25 @@ Package 不携带任何候选控制的消费代码。Framework 从 manifest 和�
 - Gate/Repair：逐 Claim 状态、成熟度变化、Finding owner/category、attempt、jump distance、before/after blocking claims、invalidated/retained Artifact、same/fresh session、no-progress；
 - Evolve：Source、Policy、Operator、intent/admission/outcome、coverage/diversity/yield、revision/new-package、真实行为 descriptor 与 cost。
 
-每个数值必须标明 `provider / sdk / framework / derived / estimated / unknown` provenance。不可获得的 token 或货币成本为 `null/unknown`，绝不记作 0；backend 无法提供可信 usage 时预算仍按保守 reservation 结算。默认不记录 secret、原始 prompt、sealed case、EvaluatorGoal、expected state 或完整敏感 search query；使用 hash、长度、分类、计数和 commitment。Telemetry 自身也记录写入延迟、批量大小、丢弃/失败和磁盘开销，证明它没有重新制造主流程阻塞。
+每个数值必须标明 `provider / sdk / framework / derived / estimated / unknown` provenance。不可获得的 token 或货币成本为 `null/unknown`，绝不记作 0；其中未定价的兼容 backend 必须产出 `invocation.monetary_cost=null, provenance=unknown`。`monetary_cost` admission 只在调用者显式配置可信定价 envelope 时启用，绝不能由 leaf 暗中预留一个价格；其余 token、turn、wall-time、并发、工具和 repair 预算仍然独立生效。backend 无法提供可信 usage 时预算仍按保守 reservation 结算。默认不记录 secret、原始 prompt、sealed case、EvaluatorGoal、expected state 或完整敏感 search query；使用 hash、长度、分类、计数和 commitment。Telemetry 自身也记录写入延迟、批量大小、丢弃/失败和磁盘开销，证明它没有重新制造主流程阻塞。
 
 CLI 必须支持对 run/campaign 的实时/事后 metrics inspect、JSON/Parquet export、实验 snapshot、compare 和 summarize。每次真实 search、primary/fallback fetch 与 extract 都形成独立实时 span，仅保存 provider、状态、耗时和 query/URL commitment；trace summary/compare 按 run 报告 wall/critical path、节点耗时、token、search/fetch/document、失败与返工分布，并保留 unknown 而不补零。Pre-publish 与 post-publish TelemetryReleaseSummary 都把这些操作/指标类别作为 typed closure，Registry 再次复验。论文指标至少包括 time/token/search/tool 分布、time-to-executable/integration/release、Rework Amplification、Localization Rate、Artifact Retention、Mean Backjump Distance、No-progress Rate、claim/gate yield、coverage gain per search/tool/token、并行节省和 Evolve operator/policy 效率。
 
 ## 14. 目标合同与当前实现状态
 
-本节更新至 2026-07-19，仍是迁移快照，不是 release 宣言。每次声称完成前仍应以当前代码、真实配置、完整测试与 end-to-end evidence 为准。
+本节更新至 2026-07-22，仍是迁移快照，不是 release 宣言。每次声称完成前仍应以当前代码、真实配置、完整测试与 end-to-end evidence 为准。
 
 | 区域 | 当前状态 | 仍需达到的验收 |
 |---|---|---|
-| 真实调用与研究 | 已有真实 Codex InvocationBackend、Search/Fetch/Extract 适配和无伪成功 fallback 的基础 | 在提供真实凭证/endpoint 的环境运行 live Generate，并保存完整 evidence provenance |
-| 控制面 | 新 clean-break 合同、真实 Artifact/lease WorkControlRuntime、不可伪造 flock CAS、显式 DAG supersede、durable repair/budget 恢复、私有 continuation 与 exact WorkCommit 已在隔离 ToolSemantics harness 通过 bad-case；全仓 `525 passed, 2 skipped` | 这套新控制面尚未接管完整生产流水线；必须整体切换 Direct Designer 后立即删除旧 FeedbackContract/RepairTarget/FeedbackResult/SemanticNodeCommit/component retry authority，再迁移 Builder/Verifier/Judge/Release，禁止长期双轨 |
+| 真实调用与研究 | 已有真实 Codex InvocationBackend、Search/Fetch/Extract 适配和无伪成功 fallback。历史隔离 run 已实际提交 `ResearchPlan -> EvidenceAcquisition -> EvidenceSynthesis -> WorldArchitecture`，后续到达 `SharedToolSemantics` 并被 bounded no-progress policy 诚实阻断。2026-07-22 的一个 `grok-4.5` run 以真实 Search/Fetch/Extract、6 次真实 Agent 调用到达 `SharedToolSemantics`：安全 correction brief 使错误从分区遗漏变为 error-policy 覆盖遗漏，第三稿又复现已解决分区错误，故 framework 按 A→B→A 振荡停止；所有 leases/operations 都已终态化。随后新鲜 `grok-4.5` run 完成 4 次真实 Agent 调用、6 次 search 并首次提交 SharedToolSemantics，却暴露后继物理 batch 的 executor 拓扑缺陷；同样无活动 lease/operation。此前另一个 WorldArchitecture timeout 的 pre-dispatch provenance 缺陷也已由 deterministic regression 修复。它们都不是静态证据、模板或手工 Artifact 成功 | 在 executor completeness 修复后，仍须从新 request 真实运行到 Registry；不得把任何 Research/Design 前缀、deterministic regression 或失败 run 当作 live Generate 成功 |
+| 控制面 | `DirectWorkRunner` 已是 Controller 的 Direct 执行路径，使用三 epoch `bootstrap -> design -> final`、完整 leaf registry 和 `WorkScheduler` 驱动 Research 至 Registry。依赖边现为“dependency = 因果失效；input slot = 最小披露”，snapshot 与 dispatch 调用同一输入闭包；Package 只从显式输入闭包组装。每个 Agent 造成的 semantic issue 必须保留 source-facing path、违反条件和期望类别；裸 `ValueError` 只能表示 framework/output-contract 缺陷，不得消耗 Agent 修复额度。实时 inspect 直接投影 Scheduler durable scope lease ledger，WorkAttempt span 继承 Direct root。leaf registry 现按稳定 physical `artifact_slot` 绑定，ready/repair-ready Work 缺 executor 会作为精确 typed infrastructure failure，而非无坐标 semantic block。确定性回归实际驱动 Package→Registry 闭包、真实 Registry 文件系统原子发布与发布前 observability closure；它们只证明框架执行闭环，不代替真实 Agent 生成证据。所有 Agent role 仍只在唯一 SDK 边界映射到隔离 profile，Skills/Hooks/Tools 权限不随 parent Artifact 扩张 | 运行一次真实从 Request 到 Registry 的完整新路径，并逐段确认 Design、Build、Integration、Release、Package、Registry 的实际 Artifact/Span/预算。旧控制对象不得重新取得成功或发布权威；在完整实证前绝不宣称端到端完成 |
 | 能力隔离 | 已有 EffectiveCapabilityPlan、角色 profile 和 workspace/network/credential 边界 | 持续用隔离验收证明 Skills/Hooks/Tools 不发生 ambient 继承 |
 | Evolve Source/Policy | 已有配置化 Source catalog/default selection、真实 two-turn Researcher/Search、冻结 clue context、可替换 ask/tell Policy 与 tool-first Operator | 用 live providers 对多种 Source/policy 做恢复、空 clue、needs-human、纵向与横向 Campaign 验收 |
 | Runtime/Judge | 已有 out-of-process Runtime、Unix RPC、bubblewrap/uv offline supply-chain、Task v3、recipe/interactive reachability 和独立 hard Gates | 用真实 Agent 生成的未知环境持续扩大 property、并发、资源限制与 adversarial sealed 验收 |
 | Task v3 | Builder、Judge、package 与 Consumer 已使用 framework-owned materialization/evaluator 合同 | 用未固定 seed/task 的真实生成 package 证明 materialization 多样性与 reachability，不把预构造合同样本当作生产证明 |
 | envpkg v3/Consumer | 已有 canonical metadata/provenance/assurance/fidelity/SBOM、Registry 物理重解析、SuiteSnapshot 与 framework-owned RPC consumer | 对真实 Agent 输出和含第三方 wheel 的 package 做冷目录、跨 cwd、restart/concurrency 端到端验收 |
 | 可选 Feedback | 已有 Suite digest 绑定的封闭 aggregate CapabilityFeedback recorder、CLI 与 Source 最小投影；feedback 不进入 evidence | 从真实 rollout 聚合信号并证明有/无 feedback 的 Campaign 都保持相同 release Gate |
-| Live end-to-end | 代码路径不得使用模拟 backend | 当前机器没有提供完整模型/search 配置时必须如实标记未执行，不能用离线替身宣称生产闭环完成 |
+| Live end-to-end | 代码路径不得使用模拟 backend；已有真实模型 + 真实 Search/Fetch/Extract + Architecture 的可观测前缀，以及针对“输入披露/依赖闭包” bad case 的 deterministic regression | **仍未完成。** 必须在模型和研究 provider 均可用时，真实运行到 Registry；不能用离线替身、静态证据、fixture 或已完成的前缀宣称生产闭环完成 |
 
 旧 API、旧 CLI、旧 Runtime/Task 协议、固定 stage、固定 environment/task/replay、candidate in-process import、候选自验、stub runner 和双成功路径都不保留。可借鉴的只有真实 SDK continuation、redaction、research provider、artifact/gate 和隔离 workspace 等机制；迁移完成后删除所有过渡桥接。
 

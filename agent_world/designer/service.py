@@ -32,7 +32,6 @@ from agent_world.contracts import (
     CoverageMap,
     CurriculumRequirements,
     DesignBaselineCheckpoint,
-    DesignPhaseCheckpoint,
     EnvironmentDesign,
     EnvironmentJob,
     EnvironmentRequest,
@@ -68,6 +67,7 @@ from agent_world.contracts import (
 )
 from agent_world.contracts.design import _validate_closed_object_schema
 from agent_world.control.assurance import SemanticNodeCommit
+from agent_world.control.continuation_store import NodeContinuationRecord
 from agent_world.control.decision import DesignRevisionMode, StructuredRepairMode
 from agent_world.control.feedback import (
     PRODUCTION_FEEDBACK,
@@ -81,6 +81,23 @@ from agent_world.control.validation import (
     ValidationDiagnostic,
     pydantic_validation_diagnostic,
 )
+from agent_world.control.work import (
+    OperationRun,
+    ProposalExecution,
+    RepairAction,
+    ValidationIssue,
+    ValidationReport,
+    WorkAttempt,
+    WorkCoordinate,
+    WorkDefinition,
+)
+from agent_world.control.code_revision import leaf_code_revision
+from agent_world.control.work_graph import (
+    research_acquisition_work_definition,
+    structured_agent_work_definition,
+)
+from agent_world.control.work_runtime import WorkControlRuntime, WorkRuntimeError
+from agent_world.control.work_store import WorkControlHead
 from agent_world.invocation import (
     AgentOutputAuthority,
     CapabilityResolutionError,
@@ -96,6 +113,7 @@ from agent_world.invocation.contracts import (
 from agent_world.research import (
     ResearchBundle,
     ResearchEvidenceUnavailable,
+    ResearchPermissionError,
     ResearchToolchain,
     SearchQuery,
     build_evidence_passage_pack,
@@ -125,8 +143,11 @@ from .models import (
     InitialStateRulesDraft,
     InitialStateRulesSourceDraft,
     PermissionRuleSourceDraft,
+    ResearchAcquisition,
     ResearchPlan,
     RuleArithmeticDraft,
+    RuleBoundLookupByKeyDraft,
+    RuleBoundReferenceDraft,
     RuleConstantDraft,
     RuleDraft,
     RuleLookupByKeyDraft,
@@ -198,8 +219,16 @@ from .models import (
     WorldToolInventoryDraft,
     WorldToolPlanInventoryDraft,
 )
+from .research_materialization import (
+    materialize_research_evidence as _materialize_research_evidence,
+)
 from .rule_context import RuleContextCatalog, validate_rule_context
 from .validation import StructuredSemanticError, StructuredSemanticIssue
+from .validators import (
+    validate_evidence_synthesis_references,
+    validate_grounded_evidence_graph,
+    validate_research_plan_coverage,
+)
 
 _CANONICAL_RULE_PROPERTY = {
     "initial_state": "initial_state",
@@ -220,11 +249,27 @@ MAX_STATE_ENTITIES = 12
 MAX_DESIGN_FANOUT_CONCURRENCY = 3
 MAX_WORLD_CLOSURE_CONTEXT_BYTES = 192 * 1024
 DIRECT_DESIGN_BASE_TURNS = 8
-DIRECT_DESIGN_EVIDENCE_BASE_TURNS = 5
 DIRECT_DESIGN_MAX_CORRECTIONS = 2
 DIRECT_DESIGN_MAX_TURNS = DIRECT_DESIGN_BASE_TURNS + DIRECT_DESIGN_MAX_CORRECTIONS
 MAX_INLINE_FROZEN_INPUT_BYTES = 1024 * 1024
 _TRANSPORT_ARTIFACT_FIELD = "artifact_json"
+
+# Acceptance-critical version of the semantic-layer scaffold/compiler code.  It
+# is derived from the source of the modules that author every semantic design
+# leaf, so editing any of them bumps this id, which flows into each semantic
+# WorkDefinition's ``acceptance_digest`` and prevents a historical commit built
+# by now-stale code from being reused across runs or across sibling scopes.
+# Research authoring code is deliberately excluded so that editing a semantic
+# leaf never invalidates the (expensive) Research reuse — Research stays covered
+# by its own hand-bumped ``validator_revision_id``.
+_SEMANTIC_LAYER_MODULES = (
+    "agent_world.designer.final_design_leaves",
+    "agent_world.designer.final_design_compiler",
+    "agent_world.designer.models",
+    "agent_world.designer.rule_context",
+    "agent_world.designer.one_shot",
+)
+_SEMANTIC_LAYER_REVISION = leaf_code_revision(*_SEMANTIC_LAYER_MODULES, label="semantic")
 
 
 class AgentProfileProvider(Protocol):
@@ -337,6 +382,19 @@ _DESIGN_RESEARCH_USAGE: ContextVar[BudgetUsage | None] = ContextVar(
     "agent_world_design_research_usage",
     default=None,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredWorkSpec:
+    """Exact source Artifact boundary for one WorkDefinition proposal."""
+
+    definition: WorkDefinition
+    input_refs: tuple[ArtifactRef, ...]
+    artifact_id: str
+    artifact_type: str
+    dependencies: tuple[ArtifactRef, ...]
+
+
 _DESIGN_REPAIR_AUTHORITY: ContextVar[StructuredRepairAuthority | None] = ContextVar(
     "agent_world_design_repair_authority",
     default=None,
@@ -411,9 +469,7 @@ class ToolSemanticsRepairProjection:
                 # Error declarations and operational reliability form one closed
                 # reference graph.  Freezing either side would make a valid repair
                 # impossible or encourage relabelling a business error as a timeout.
-                scopes.extend(
-                    (f"tools/{tool_index}/errors", f"tools/{tool_index}/reliability")
-                )
+                scopes.extend((f"tools/{tool_index}/errors", f"tools/{tool_index}/reliability"))
             elif section in self._sections:
                 scopes.append(f"tools/{tool_index}/{section}")
             elif section in {"behavior", "complete_semantics"}:
@@ -473,7 +529,10 @@ class ToolSemanticsRepairProjection:
                 baseline_parent = baseline_parent[part]
                 correction_parent = correction_parent[part]
             baseline_parent[parts[-1]] = correction_parent[parts[-1]]
-        return cast(TModel, type(baseline).model_validate(baseline_value))
+        return cast(
+            TModel,
+            type(baseline).model_validate_json(canonical_json_bytes(baseline_value)),
+        )
 
 
 @overload
@@ -548,13 +607,11 @@ class EnvironmentDesigner:
         request_ref: ArtifactRef,
         workspace: Path,
         invocation_budget: Budget,
-        phase_checkpoint_ref: ArtifactRef | None = None,
-        repair_authority: StructuredRepairAuthority | None = None,
+        work_runtime: WorkControlRuntime | None = None,
     ) -> DesignBundle:
         """Generate while preserving real research usage on downstream failure."""
 
         token = _DESIGN_RESEARCH_USAGE.set(BudgetUsage())
-        authority_token = _DESIGN_REPAIR_AUTHORITY.set(repair_authority)
         try:
             return await self._generate(
                 job=job,
@@ -563,14 +620,13 @@ class EnvironmentDesigner:
                 request_ref=request_ref,
                 workspace=workspace,
                 invocation_budget=invocation_budget,
-                phase_checkpoint_ref=phase_checkpoint_ref,
+                work_runtime=work_runtime,
             )
         except DesignerError as exc:
             if exc.research_usage == BudgetUsage():
                 exc.research_usage = _DESIGN_RESEARCH_USAGE.get() or BudgetUsage()
             raise
         finally:
-            _DESIGN_REPAIR_AUTHORITY.reset(authority_token)
             _DESIGN_RESEARCH_USAGE.reset(token)
 
     async def _generate(
@@ -582,7 +638,7 @@ class EnvironmentDesigner:
         request_ref: ArtifactRef,
         workspace: Path,
         invocation_budget: Budget,
-        phase_checkpoint_ref: ArtifactRef | None = None,
+        work_runtime: WorkControlRuntime | None = None,
     ) -> DesignBundle:
         """Run the bounded semantic-transaction generation path.
 
@@ -592,12 +648,14 @@ class EnvironmentDesigner:
         bindings between a small number of coherent semantic transactions.
         """
 
+        if work_runtime is None:
+            raise WorkRuntimeError("Direct generation requires WorkControlRuntime")
+
         self._validate_generate_inputs(
             job=job,
             job_ref=job_ref,
             request=request,
             request_ref=request_ref,
-            phase_checkpoint_ref=phase_checkpoint_ref,
         )
         workspace = workspace.expanduser().resolve()  # noqa: ASYNC240
         workspace.mkdir(parents=True, exist_ok=True)
@@ -610,8 +668,8 @@ class EnvironmentDesigner:
             request_ref=request_ref,
             workspace=workspace,
             meter=meter,
+            work_runtime=work_runtime,
             fetch_budget=job.budget.tool_calls - job.budget.search_calls,
-            phase_checkpoint_ref=phase_checkpoint_ref,
         )
         _DESIGN_RESEARCH_USAGE.set(evidence_phase.research_usage)
         evidence_graph = evidence_phase.evidence_graph
@@ -620,73 +678,72 @@ class EnvironmentDesigner:
         def validate_architecture(value: WorldArchitectureSourceDraft) -> None:
             self._compile_architecture_skeleton(value, evidence_graph=evidence_graph)
 
-        cached_architecture = self._load_validated_design_node(
-            artifact_id=f"{job.job_id}:world-architecture-source",
-            artifact_type="design.world_architecture_source",
-            model=WorldArchitectureSourceDraft,
-            required_dependencies=(evidence_graph_ref,),
-            semantic_validator=validate_architecture,
-            job_ref=job_ref,
+        self._record_design_node_started(
             node="world_architecture",
-            detail=None,
+            subject_ref=evidence_graph_ref,
+            job_ref=job_ref,
         )
-        if cached_architecture is None:
-            self._record_design_node_started(
-                node="world_architecture",
-                subject_ref=evidence_graph_ref,
-                job_ref=job_ref,
-            )
-            architecture, architecture_results = await self.run_structured_agent(
-                role="environment-engineer",
-                lineage_id=f"{job.job_id}.world-architecture",
-                workspace=workspace / "world-architecture",
-                model=WorldArchitectureSourceDraft,
-                prompt=self._with_frozen_inputs(
-                    self._world_architecture_prompt(request),
-                    request=request,
-                    evidence_claim_catalog=evidence_graph.claims,
-                    evidence_conflicts=evidence_graph.conflicts,
-                    evidence_unresolved_questions=evidence_graph.unresolved_questions,
+        architecture_definition = structured_agent_work_definition(
+            scope_id=job.job_id,
+            stage="world_architecture",
+            artifact_slot="world_architecture",
+            dependency_coordinates=(
+                WorkCoordinate(
+                    scope_id=job.job_id,
+                    component="research",
+                    stage="evidence_synthesis",
+                    artifact_slot="evidence_synthesis",
                 ),
-                semantic_validator=validate_architecture,
-                permissions=job.permissions,
-                budget=meter,
-                capability_requirement=NodeCapabilityRequirement.structured_output(
-                    node_id="environment-engineer.world-architecture",
-                    role="environment-engineer",
-                ),
-                feedback_contract_id="feedback.design.world_architecture",
-                semantic_transaction="design.world-architecture",
-                repair_projection=RootSectionRepairProjection(
-                    allowed_roots=frozenset(
-                        {"boundary", "state_entities", "tool_inventory"}
-                    ),
-                    resolve_roots=self._architecture_repair_roots,
-                ),
-                repair_target=RepairTargetRef(
-                    target_id=self._stable_id(
-                        "repair-target", job.job_id, "world-architecture"
-                    ),
-                    component="design",
-                    artifact_slot="world_architecture",
-                    lineage_id=f"{job.job_id}.world-architecture",
-                    immutable_input_refs=(request_ref, evidence_graph_ref),
-                    allowed_mutation_paths=(
-                        "/boundary",
-                        "/state_entities",
-                        "/tool_inventory",
-                    ),
-                ),
-            )
-            architecture_ref = self.artifacts.put_json(
+            ),
+            claim_id="design.architecture.closed",
+            claim="World boundary, state entities, and tool inventory form one closed vocabulary.",
+            timing_reason="Behavior generation requires a frozen world vocabulary.",
+            output_contract_id="contract:world-architecture-source",
+            acceptance_transform_id="framework.root-section-projection.v2",
+            implementation_revision_id=_SEMANTIC_LAYER_REVISION,
+            validator_revision_id="framework.validator.world-architecture.v2",
+            allowed_mutation_roots=(
+                "/boundary",
+                "/state_entities",
+                "/tool_inventory",
+            ),
+            agent_wall_seconds=min(600.0, meter.remaining_wall_seconds),
+            agent_token_limit=meter.rollout_token_limit,
+        )
+        architecture_inputs = (request_ref, evidence_graph_ref)
+        architecture, architecture_ref, architecture_results = await self.execute_structured_work(
+            runtime=work_runtime,
+            work=StructuredWorkSpec(
+                definition=architecture_definition,
+                input_refs=architecture_inputs,
                 artifact_id=f"{job.job_id}:world-architecture-source",
                 artifact_type="design.world_architecture_source",
-                value=architecture,
-                dependencies=(evidence_graph_ref,),
-            )
-        else:
-            architecture, architecture_ref = cached_architecture
-            architecture_results = ()
+                dependencies=architecture_inputs,
+            ),
+            role="environment-engineer",
+            lineage_id=f"{job.job_id}.world-architecture",
+            workspace=workspace / "world-architecture",
+            model=WorldArchitectureSourceDraft,
+            prompt=self._with_frozen_inputs(
+                self._world_architecture_prompt(request),
+                request=request,
+                evidence_claim_catalog=evidence_graph.claims,
+                evidence_conflicts=evidence_graph.conflicts,
+                evidence_unresolved_questions=evidence_graph.unresolved_questions,
+            ),
+            semantic_validator=validate_architecture,
+            permissions=job.permissions,
+            budget=meter,
+            capability_requirement=NodeCapabilityRequirement.structured_output(
+                node_id="environment-engineer.world-architecture",
+                role="environment-engineer",
+            ),
+            semantic_transaction="design.world-architecture",
+            repair_projection=RootSectionRepairProjection(
+                allowed_roots=frozenset({"boundary", "state_entities", "tool_inventory"}),
+                resolve_roots=self._architecture_repair_roots,
+            ),
+        )
         skeleton = self._compile_architecture_skeleton(
             architecture,
             evidence_graph=evidence_graph,
@@ -700,38 +757,12 @@ class EnvironmentDesigner:
             value=skeleton,
             dependencies=(architecture_ref, evidence_graph_ref),
         )
-        if cached_architecture is None:
-            self._record_design_node(
-                node="world_architecture",
-                subject_ref=architecture_ref,
-                job_ref=job_ref,
-                related_refs=(evidence_graph_ref, skeleton_ref),
-            )
-            self._record_feedback_pass(
-                contract_id="feedback.design.world_architecture",
-                subject_ref=architecture_ref,
-                component="design",
-                artifact_slot="world_architecture",
-                lineage_id=f"{job.job_id}.world-architecture",
-                immutable_input_refs=(request_ref, evidence_graph_ref),
-                evidence_refs=(skeleton_ref, evidence_graph_ref),
-                summary="The committed world architecture compiled to one closed skeleton.",
-                invocation_results=architecture_results,
-                allowed_mutation_paths=(
-                    "/boundary",
-                    "/state_entities",
-                    "/tool_inventory",
-                ),
-            )
-            self._commit_semantic_node(
-                job_ref=job_ref,
-                node="world_architecture",
-                detail=None,
-                subject_ref=architecture_ref,
-                immutable_input_refs=(evidence_graph_ref,),
-                derived_refs=(skeleton_ref,),
-                model=WorldArchitectureSourceDraft,
-            )
+        self._record_design_node(
+            node="world_architecture",
+            subject_ref=architecture_ref,
+            job_ref=job_ref,
+            related_refs=(evidence_graph_ref, skeleton_ref),
+        )
 
         coupling_plan = self._compile_tool_coupling_plan(
             architecture,
@@ -762,62 +793,66 @@ class EnvironmentDesigner:
                 )
 
             shared_dependencies = (coupling_plan_ref, skeleton_ref, evidence_graph_ref)
-            cached_shared = self._load_validated_design_node(
-                artifact_id=f"{job.job_id}:shared-tool-semantics-source:{group.group_id}",
-                artifact_type="design.shared_tool_semantics_source",
-                model=SharedToolSemanticsSourceDraft,
-                required_dependencies=shared_dependencies,
-                semantic_validator=validate_shared_source,
-                job_ref=job_ref,
+            self._record_design_node_started(
                 node="shared_tool_semantics",
+                subject_ref=coupling_plan_ref,
+                job_ref=job_ref,
                 detail=group.group_id,
             )
-            if cached_shared is None:
-                self._record_design_node_started(
-                    node="shared_tool_semantics",
-                    subject_ref=coupling_plan_ref,
-                    job_ref=job_ref,
-                    detail=group.group_id,
-                )
-                shared_source, current_results = await self.run_structured_agent(
-                    role="environment-engineer",
-                    lineage_id=f"{job.job_id}.shared-tool-semantics.{group.group_id}",
-                    workspace=workspace / "shared-tool-semantics" / group.group_id,
-                    model=SharedToolSemanticsSourceDraft,
-                    prompt=self._with_frozen_inputs(
-                        self._shared_tool_semantics_prompt(request),
-                        request=request,
-                        evidence_claim_catalog=evidence_graph.claims,
-                        world_skeleton=skeleton,
-                        coupling_group=group,
-                    ),
-                    semantic_validator=validate_shared_source,
-                    permissions=job.permissions,
-                    budget=meter,
-                    capability_requirement=NodeCapabilityRequirement.structured_output(
-                        node_id="environment-engineer.shared-tool-semantics",
-                        role="environment-engineer",
-                    ),
-                    feedback_contract_id="feedback.design.shared_tool_semantics",
-                    semantic_transaction="design.shared-tool-semantics",
-                    repair_target=self._shared_tool_semantics_repair_target(
-                        job_id=job.job_id,
-                        group_id=group.group_id,
-                        immutable_input_refs=shared_dependencies,
-                    ),
-                )
-                shared_source_ref = self.artifacts.put_json(
-                    artifact_id=(
-                        f"{job.job_id}:shared-tool-semantics-source:{group.group_id}"
-                    ),
+            shared_definition = structured_agent_work_definition(
+                scope_id=job.job_id,
+                stage="shared_tool_semantics",
+                artifact_slot="shared_tool_semantics",
+                group_id=group.group_id,
+                dependency_coordinates=(architecture_definition.coordinate,),
+                claim_id="design.shared_behavior.closed",
+                claim="Cross-batch atomicity, ordering, compensation, and error policy close.",
+                timing_reason="Tool batches require one frozen shared coupling policy.",
+                output_contract_id="contract:shared-tool-semantics-source.v2",
+                executor_revision_id="framework.codex-structured-protocol.v3",
+                implementation_revision_id=_SEMANTIC_LAYER_REVISION,
+                validator_revision_id="framework.validator.shared-tool-semantics.v2",
+                allowed_mutation_roots=(
+                    "/atomicity_domains",
+                    "/concurrency_domains",
+                    "/idempotency_domains",
+                    "/ordering_constraints",
+                    "/compensation_edges",
+                    "/error_policies",
+                ),
+                agent_wall_seconds=min(600.0, meter.remaining_wall_seconds),
+                agent_token_limit=meter.rollout_token_limit,
+            )
+            shared_source, shared_source_ref, current_results = await self.execute_structured_work(
+                runtime=work_runtime,
+                work=StructuredWorkSpec(
+                    definition=shared_definition,
+                    input_refs=shared_dependencies,
+                    artifact_id=(f"{job.job_id}:shared-tool-semantics-source:{group.group_id}"),
                     artifact_type="design.shared_tool_semantics_source",
-                    value=shared_source,
                     dependencies=shared_dependencies,
-                )
-                shared_results.extend(current_results)
-            else:
-                shared_source, shared_source_ref = cached_shared
-                current_results = ()
+                ),
+                role="environment-engineer",
+                lineage_id=f"{job.job_id}.shared-tool-semantics.{group.group_id}",
+                workspace=workspace / "shared-tool-semantics" / group.group_id,
+                model=SharedToolSemanticsSourceDraft,
+                prompt=self._with_frozen_inputs(
+                    self._shared_tool_semantics_prompt(request),
+                    request=request,
+                    evidence_claim_catalog=evidence_graph.claims,
+                    world_skeleton=skeleton,
+                    coupling_group=group,
+                ),
+                semantic_validator=validate_shared_source,
+                permissions=job.permissions,
+                budget=meter,
+                capability_requirement=NodeCapabilityRequirement.structured_output(
+                    node_id="environment-engineer.shared-tool-semantics",
+                    role="environment-engineer",
+                ),
+                semantic_transaction="design.shared-tool-semantics",
+            )
+            shared_results.extend(current_results)
             contract = self._compile_shared_tool_semantics_contract(
                 shared_source,
                 group=group,
@@ -831,43 +866,13 @@ class EnvironmentDesigner:
             )
             shared_contracts[group.group_id] = contract
             shared_contract_refs[group.group_id] = contract_ref
-            if cached_shared is None:
-                self._record_design_node(
-                    node="shared_tool_semantics",
-                    subject_ref=shared_source_ref,
-                    job_ref=job_ref,
-                    related_refs=(coupling_plan_ref, contract_ref),
-                    detail=group.group_id,
-                )
-                self._record_feedback_pass(
-                    contract_id="feedback.design.shared_tool_semantics",
-                    subject_ref=shared_source_ref,
-                    component="design",
-                    artifact_slot="shared_tool_semantics",
-                    lineage_id=f"{job.job_id}.shared-tool-semantics.{group.group_id}",
-                    batch_id=group.group_id,
-                    immutable_input_refs=shared_dependencies,
-                    evidence_refs=(contract_ref,),
-                    summary="The shared multi-batch tool policy compiled and closed.",
-                    invocation_results=current_results,
-                    allowed_mutation_paths=(
-                        "/atomicity_domains",
-                        "/concurrency_domains",
-                        "/idempotency_domains",
-                        "/ordering_constraints",
-                        "/compensation_edges",
-                        "/error_policies",
-                    ),
-                )
-                self._commit_semantic_node(
-                    job_ref=job_ref,
-                    node="shared_tool_semantics",
-                    detail=group.group_id,
-                    subject_ref=shared_source_ref,
-                    immutable_input_refs=shared_dependencies,
-                    derived_refs=(contract_ref,),
-                    model=SharedToolSemanticsSourceDraft,
-                )
+            self._record_design_node(
+                node="shared_tool_semantics",
+                subject_ref=shared_source_ref,
+                job_ref=job_ref,
+                related_refs=(coupling_plan_ref, contract_ref),
+                detail=group.group_id,
+            )
 
         semantic_drafts: dict[str, ToolSemanticsDraft] = {}
         semantic_refs: list[ArtifactRef] = []
@@ -902,18 +907,15 @@ class EnvironmentDesigner:
                     SharedToolSemanticsContract, ...
                 ] = target_shared_contracts,
             ) -> None:
-                compiled = self._compile_tool_semantics_batch(
+                compiled = self._compile_and_validate_tool_semantics_batch(
                     value,
                     expected_tool_ids=expected,
                     skeleton=skeleton,
                     evidence_graph=evidence_graph,
+                    contracts=expected_contracts,
                 )
                 if tuple(item.tool_id for item in compiled) != expected:
                     raise ValueError("compiled tool batch changed frozen tool order")
-                self._validate_tool_batch_against_shared_contracts(
-                    compiled,
-                    contracts=expected_contracts,
-                )
 
             dependencies = (
                 architecture_ref,
@@ -922,76 +924,88 @@ class EnvironmentDesigner:
                 coupling_plan_ref,
                 *target_shared_refs,
             )
-            cached_batch = self._load_validated_design_node(
-                artifact_id=f"{job.job_id}:tool-semantics-source:{batch_id}",
-                artifact_type="design.tool_semantics_batch_source",
-                model=ToolSemanticsBatchSourceDraft,
-                required_dependencies=dependencies,
-                semantic_validator=validate_batch,
-                job_ref=job_ref,
+            self._record_design_node_started(
                 node="tool_semantics_batch",
+                subject_ref=skeleton_ref,
+                job_ref=job_ref,
                 detail=batch_id,
             )
-            if cached_batch is None:
-                self._record_design_node_started(
-                    node="tool_semantics_batch",
-                    subject_ref=skeleton_ref,
-                    job_ref=job_ref,
-                    detail=batch_id,
-                )
-                batch_source, batch_results = await self.run_structured_agent(
-                    role="environment-engineer",
-                    lineage_id=f"{job.job_id}.tool-semantics.{batch_id}",
-                    workspace=batch_workspace,
-                    model=ToolSemanticsBatchSourceDraft,
-                    prompt=self._with_frozen_inputs(
-                        self._tool_semantics_batch_prompt(request, tool_ids=tool_ids),
-                        request=request,
-                        evidence_claim_catalog=evidence_graph.claims,
-                        world_skeleton=skeleton,
-                        coupling_groups=target_groups,
-                        shared_tool_contracts=target_shared_contracts,
-                        target_tool_plans=tuple(plan_by_id[tool_id] for tool_id in tool_ids),
-                        target_tool_surfaces=tuple(
-                            surface_by_id[tool_id] for tool_id in tool_ids
-                        ),
-                        rule_context_catalogs={
-                            tool_id: RuleContextCatalog.for_tool(
-                                state=skeleton.state,
-                                surface=surface_by_id[tool_id].surface,
-                            ).prompt_projection()
-                            for tool_id in tool_ids
-                        },
+            batch_definition = structured_agent_work_definition(
+                scope_id=job.job_id,
+                stage="tool_semantics_batch",
+                artifact_slot="tool_semantics_batch",
+                group_id="tool-semantics-batches",
+                shard_id=batch_id,
+                dependency_coordinates=(
+                    architecture_definition.coordinate,
+                    *(
+                        WorkCoordinate(
+                            scope_id=job.job_id,
+                            component="design",
+                            stage="shared_tool_semantics",
+                            artifact_slot="shared_tool_semantics",
+                            group_id=group.group_id,
+                        )
+                        for group in target_groups
+                        if group.group_id in shared_contract_refs
                     ),
-                    semantic_validator=validate_batch,
-                    permissions=job.permissions,
-                    budget=meter,
-                    capability_requirement=NodeCapabilityRequirement.structured_output(
-                        node_id="environment-engineer.tool-semantics-batch",
-                        role="environment-engineer",
-                    ),
-                    feedback_contract_id="feedback.design.tool_semantics",
-                    semantic_transaction="design.tool-semantics-batch",
-                    repair_projection=ToolSemanticsRepairProjection(),
-                    repair_target=RepairTargetRef(
-                        target_id=self._stable_id("repair-target", job.job_id, batch_id),
-                        component="design",
-                        artifact_slot="tool_semantics_batch",
-                        lineage_id=f"{job.job_id}.tool-semantics.{batch_id}",
-                        batch_id=batch_id,
-                        immutable_input_refs=dependencies,
-                        allowed_mutation_paths=("/tools",),
-                    ),
-                )
-                batch_ref = self.artifacts.put_json(
+                ),
+                claim_id="design.tool_semantics.compiles",
+                claim=(
+                    "The exact tool batch compiles against frozen state, Rule context, "
+                    "authority, visibility, reliability, and shared constraints."
+                ),
+                timing_reason="World rules require every tool transition to be executable.",
+                output_contract_id="contract:tool-semantics-batch-source",
+                acceptance_transform_id="framework.tool-semantics-projection.v4",
+                executor_revision_id="framework.codex-structured-protocol.v3",
+                implementation_revision_id=_SEMANTIC_LAYER_REVISION,
+                validator_revision_id="framework.validator.tool-semantics-batch.v8",
+                allowed_mutation_roots=("/tools",),
+                agent_wall_seconds=min(600.0, meter.remaining_wall_seconds),
+                agent_token_limit=meter.rollout_token_limit,
+                maximum_process_recoveries=1,
+            )
+            batch_source, batch_ref, batch_results = await self.execute_structured_work(
+                runtime=work_runtime,
+                work=StructuredWorkSpec(
+                    definition=batch_definition,
+                    input_refs=dependencies,
                     artifact_id=f"{job.job_id}:tool-semantics-source:{batch_id}",
                     artifact_type="design.tool_semantics_batch_source",
-                    value=batch_source,
                     dependencies=dependencies,
-                )
-            else:
-                batch_source, batch_ref = cached_batch
-                batch_results = ()
+                ),
+                role="environment-engineer",
+                lineage_id=f"{job.job_id}.tool-semantics.{batch_id}",
+                workspace=batch_workspace,
+                model=ToolSemanticsBatchSourceDraft,
+                prompt=self._with_frozen_inputs(
+                    self._tool_semantics_batch_prompt(request, tool_ids=tool_ids),
+                    request=request,
+                    evidence_claim_catalog=evidence_graph.claims,
+                    world_skeleton=skeleton,
+                    coupling_groups=target_groups,
+                    shared_tool_contracts=target_shared_contracts,
+                    target_tool_plans=tuple(plan_by_id[tool_id] for tool_id in tool_ids),
+                    target_tool_surfaces=tuple(surface_by_id[tool_id] for tool_id in tool_ids),
+                    rule_context_catalogs={
+                        tool_id: RuleContextCatalog.for_tool(
+                            state=skeleton.state,
+                            surface=surface_by_id[tool_id].surface,
+                        ).prompt_projection()
+                        for tool_id in tool_ids
+                    },
+                ),
+                semantic_validator=validate_batch,
+                permissions=job.permissions,
+                budget=meter,
+                capability_requirement=NodeCapabilityRequirement.structured_output(
+                    node_id="environment-engineer.tool-semantics-batch",
+                    role="environment-engineer",
+                ),
+                semantic_transaction="design.tool-semantics-batch",
+                repair_projection=ToolSemanticsRepairProjection(),
+            )
             compiled_batch = self._compile_tool_semantics_batch(
                 batch_source,
                 expected_tool_ids=tool_ids,
@@ -1015,36 +1029,13 @@ class EnvironmentDesigner:
                 semantic_refs.append(semantic_ref)
                 semantic_ref_by_id[semantics.tool_id] = semantic_ref
             semantic_results.extend(batch_results)
-            if cached_batch is None:
-                self._record_design_node(
-                    node="tool_semantics_batch",
-                    subject_ref=batch_ref,
-                    job_ref=job_ref,
-                    related_refs=(skeleton_ref, *semantic_refs[-len(compiled_batch) :]),
-                    detail=batch_id,
-                )
-                self._record_feedback_pass(
-                    contract_id="feedback.design.tool_semantics",
-                    subject_ref=batch_ref,
-                    component="design",
-                    artifact_slot="tool_semantics_batch",
-                    lineage_id=f"{job.job_id}.tool-semantics.{batch_id}",
-                    batch_id=batch_id,
-                    immutable_input_refs=dependencies,
-                    evidence_refs=tuple(semantic_refs[-len(compiled_batch) :]),
-                    summary="The committed tool batch compiled against the frozen world skeleton.",
-                    invocation_results=batch_results,
-                    allowed_mutation_paths=("/tools",),
-                )
-                self._commit_semantic_node(
-                    job_ref=job_ref,
-                    node="tool_semantics_batch",
-                    detail=batch_id,
-                    subject_ref=batch_ref,
-                    immutable_input_refs=dependencies,
-                    derived_refs=tuple(semantic_refs[-len(compiled_batch) :]),
-                    model=ToolSemanticsBatchSourceDraft,
-                )
+            self._record_design_node(
+                node="tool_semantics_batch",
+                subject_ref=batch_ref,
+                job_ref=job_ref,
+                related_refs=(skeleton_ref, *semantic_refs[-len(compiled_batch) :]),
+                detail=batch_id,
+            )
 
         group_closure_refs: list[ArtifactRef] = []
         for group in coupling_plan.groups:
@@ -1086,24 +1077,65 @@ class EnvironmentDesigner:
 
         state_schema_irs, tool_schema_irs = self._compile_architecture_schema_irs(architecture)
 
+        def compile_world_rule_sections(
+            rules: WorldRuleSemanticsSourceDraft,
+        ) -> tuple[InitialStateRulesDraft, WorldClosureDraft]:
+            issues: list[SafeValidationIssue] = []
+            initial_state_rules: InitialStateRulesDraft | None = None
+            closure: WorldClosureDraft | None = None
+            try:
+                initial_state_rules = self._compile_initial_state_rules_source(
+                    rules.initial_state_rules
+                )
+            except StructuredValidationError as exc:
+                issues.extend(exc.diagnostic.issues)
+            except (StructuredSemanticError, ValidationError, ValueError) as exc:
+                issues.extend(
+                    self._prefixed_validation_issues(
+                        exc,
+                        prefix=("initial_state_rules",),
+                    )
+                )
+            try:
+                closure = self._compile_world_closure_source(
+                    WorldClosureSourceDraft(invariants=rules.invariants)
+                )
+            except StructuredValidationError as exc:
+                issues.extend(exc.diagnostic.issues)
+            except (StructuredSemanticError, ValidationError, ValueError) as exc:
+                issues.extend(
+                    self._prefixed_validation_issues(
+                        exc,
+                        prefix=("invariants",),
+                    )
+                )
+            if issues:
+                raise StructuredValidationError(
+                    ValidationDiagnostic(
+                        owner_component="design",
+                        validation_phase="world_rules_preflight",
+                        frontier_ordinal=40,
+                        issues=tuple(issues),
+                    )
+                )
+            assert initial_state_rules is not None and closure is not None
+            return initial_state_rules, closure
+
         def compose_world_source(
             rules: WorldRuleSemanticsSourceDraft,
         ) -> WorldSemanticSourceIRDraft:
+            initial_state_rules, closure = compile_world_rule_sections(rules)
             return WorldSemanticSourceIRDraft(
                 boundary=boundary,
                 state_inventory=state_inventory,
                 state_entity_schemas=state_schema_irs,
-                initial_state_rules=self._compile_initial_state_rules_source(
-                    rules.initial_state_rules
-                ),
+                initial_state_rules=initial_state_rules,
                 tool_inventory=tool_plan_inventory,
                 tool_schemas=tool_schema_irs,
                 tool_semantics=tuple(
                     semantic_drafts[item.tool_id] for item in tool_plan_inventory.tools
                 ),
-                closure=self._compile_world_closure_source(
-                    WorldClosureSourceDraft(invariants=rules.invariants)
-                ),
+                closure=closure,
             )
 
         def validate_world_rules(value: WorldRuleSemanticsSourceDraft) -> None:
@@ -1119,92 +1151,84 @@ class EnvironmentDesigner:
             coupling_plan_ref,
             *group_closure_refs,
         )
-        cached_world_rules = self._load_validated_design_node(
-            artifact_id=f"{job.job_id}:world-rules-source",
-            artifact_type="design.world_rules_source",
-            model=WorldRuleSemanticsSourceDraft,
-            required_dependencies=world_rule_dependencies,
-            semantic_validator=validate_world_rules,
-            job_ref=job_ref,
+        self._record_design_node_started(
             node="world_rules",
-            detail=None,
+            subject_ref=skeleton_ref,
+            job_ref=job_ref,
         )
-        if cached_world_rules is None:
-            self._record_design_node_started(
-                node="world_rules",
-                subject_ref=skeleton_ref,
-                job_ref=job_ref,
-            )
-            world_rules_source, world_rule_results = await self.run_structured_agent(
-                role="environment-engineer",
-                lineage_id=f"{job.job_id}.world-rules",
-                workspace=workspace / "world-rules",
-                model=WorldRuleSemanticsSourceDraft,
-                prompt=self._with_frozen_inputs(
-                    self._world_rules_prompt(request),
-                    request=request,
-                    evidence_claim_catalog=evidence_graph.claims,
-                    world_skeleton=skeleton,
-                    tool_semantics=tuple(
-                        semantic_drafts[item.tool_id] for item in tool_plan_inventory.tools
-                    ),
-                ),
-                semantic_validator=validate_world_rules,
-                permissions=job.permissions,
-                budget=meter,
-                capability_requirement=NodeCapabilityRequirement.structured_output(
-                    node_id="environment-engineer.world-rules",
-                    role="environment-engineer",
-                ),
-                feedback_contract_id="feedback.design.world_rules",
-                semantic_transaction="design.world-rules",
-                repair_target=RepairTargetRef(
-                    target_id=self._stable_id("repair-target", job.job_id, "world-rules"),
+        world_rules_definition = structured_agent_work_definition(
+            scope_id=job.job_id,
+            stage="world_rules",
+            artifact_slot="world_rules",
+            dependency_coordinates=tuple(
+                WorkCoordinate(
+                    scope_id=job.job_id,
                     component="design",
-                    artifact_slot="world_rules",
-                    lineage_id=f"{job.job_id}.world-rules",
-                    immutable_input_refs=world_rule_dependencies,
-                    allowed_mutation_paths=("/initial_state_rules", "/invariants"),
-                ),
-            )
-            world_rules_ref = self.artifacts.put_json(
+                    stage="tool_semantics_batch",
+                    artifact_slot="tool_semantics_batch",
+                    group_id="tool-semantics-batches",
+                    shard_id=f"tool-batch-{index + 1}",
+                )
+                for index, _tool_ids in enumerate(coupling_plan.execution_batches)
+            ),
+            claim_id="design.world_rules.compiles",
+            claim="Reset rules and global invariants compile over the exact executable behavior.",
+            timing_reason="Task generation requires a resettable invariant-closed world.",
+            output_contract_id="contract:world-rules-source",
+            acceptance_transform_id="framework.root-section-projection.v2",
+            executor_revision_id="framework.codex-structured-protocol.v2",
+            implementation_revision_id=_SEMANTIC_LAYER_REVISION,
+            validator_revision_id="framework.validator.world-rules.v2",
+            allowed_mutation_roots=("/initial_state_rules", "/invariants"),
+            agent_wall_seconds=min(600.0, meter.remaining_wall_seconds),
+            agent_token_limit=meter.rollout_token_limit,
+            maximum_automatic_backjump=0,
+        )
+        (
+            world_rules_source,
+            world_rules_ref,
+            world_rule_results,
+        ) = await self.execute_structured_work(
+            runtime=work_runtime,
+            work=StructuredWorkSpec(
+                definition=world_rules_definition,
+                input_refs=world_rule_dependencies,
                 artifact_id=f"{job.job_id}:world-rules-source",
                 artifact_type="design.world_rules_source",
-                value=world_rules_source,
                 dependencies=world_rule_dependencies,
-            )
-            self._record_design_node(
-                node="world_rules",
-                subject_ref=world_rules_ref,
-                job_ref=job_ref,
-                related_refs=(skeleton_ref, coupling_plan_ref, *group_closure_refs),
-            )
-            self._record_feedback_pass(
-                contract_id="feedback.design.world_rules",
-                subject_ref=world_rules_ref,
-                component="design",
-                artifact_slot="world_rules",
-                lineage_id=f"{job.job_id}.world-rules",
-                immutable_input_refs=world_rule_dependencies,
-                evidence_refs=(skeleton_ref, coupling_plan_ref, *group_closure_refs),
-                summary=(
-                    "Reset and invariant rules compiled over the exact world and tool semantics."
+            ),
+            role="environment-engineer",
+            lineage_id=f"{job.job_id}.world-rules",
+            workspace=workspace / "world-rules",
+            model=WorldRuleSemanticsSourceDraft,
+            prompt=self._with_frozen_inputs(
+                self._world_rules_prompt(request),
+                request=request,
+                evidence_claim_catalog=evidence_graph.claims,
+                world_skeleton=skeleton,
+                tool_semantics=tuple(
+                    semantic_drafts[item.tool_id] for item in tool_plan_inventory.tools
                 ),
-                invocation_results=world_rule_results,
-                allowed_mutation_paths=("/initial_state_rules", "/invariants"),
-            )
-            self._commit_semantic_node(
-                job_ref=job_ref,
-                node="world_rules",
-                detail=None,
-                subject_ref=world_rules_ref,
-                immutable_input_refs=world_rule_dependencies,
-                derived_refs=(),
-                model=WorldRuleSemanticsSourceDraft,
-            )
-        else:
-            world_rules_source, world_rules_ref = cached_world_rules
-            world_rule_results = ()
+            ),
+            semantic_validator=validate_world_rules,
+            permissions=job.permissions,
+            budget=meter,
+            capability_requirement=NodeCapabilityRequirement.structured_output(
+                node_id="environment-engineer.world-rules",
+                role="environment-engineer",
+            ),
+            semantic_transaction="design.world-rules",
+            repair_projection=RootSectionRepairProjection(
+                allowed_roots=frozenset({"initial_state_rules", "invariants"}),
+                resolve_roots=self._world_rules_repair_roots,
+            ),
+        )
+        self._record_design_node(
+            node="world_rules",
+            subject_ref=world_rules_ref,
+            job_ref=job_ref,
+            related_refs=(skeleton_ref, coupling_plan_ref, *group_closure_refs),
+        )
 
         world_source = compose_world_source(world_rules_source)
         world_model = self._compile_world_semantic_source(
@@ -1242,61 +1266,53 @@ class EnvironmentDesigner:
             )
 
         training_dependencies = (world_source_ref, evidence_graph_ref)
-        cached_training = self._load_validated_design_node(
-            artifact_id=f"{job.job_id}:task-curriculum-source",
-            artifact_type="design.task_curriculum_source",
-            model=TrainingSemanticSourceDraft,
-            required_dependencies=training_dependencies,
-            semantic_validator=validate_training,
-            job_ref=job_ref,
+        self._record_design_node_started(
             node="task_curriculum",
-            detail=None,
+            subject_ref=world_source_ref,
+            job_ref=job_ref,
         )
-        if cached_training is None:
-            self._record_design_node_started(
-                node="task_curriculum",
-                subject_ref=world_source_ref,
-                job_ref=job_ref,
-            )
-            training_source, training_results = await self.run_structured_agent(
-                role="environment-engineer",
-                lineage_id=f"{job.job_id}.task-curriculum",
-                workspace=workspace / "task-curriculum",
-                model=TrainingSemanticSourceDraft,
-                prompt=self._with_frozen_inputs(
-                    self._training_semantics_prompt(request),
-                    request=request,
-                    training_contract_context=training_context,
-                ),
-                semantic_validator=validate_training,
-                permissions=job.permissions,
-                budget=meter,
-                capability_requirement=NodeCapabilityRequirement.structured_output(
-                    node_id="environment-engineer.task-curriculum",
-                    role="environment-engineer",
-                ),
-                feedback_contract_id="feedback.design.task_curriculum",
-                semantic_transaction="design.task-curriculum",
-                repair_target=RepairTargetRef(
-                    target_id=self._stable_id(
-                        "repair-target", job.job_id, "task-curriculum"
-                    ),
-                    component="design",
-                    artifact_slot="task_curriculum",
-                    lineage_id=f"{job.job_id}.task-curriculum",
-                    immutable_input_refs=training_dependencies,
-                    allowed_mutation_paths=("/curriculum_plan", "/task_requirements"),
-                ),
-            )
-            training_source_ref = self.artifacts.put_json(
+        training_definition = structured_agent_work_definition(
+            scope_id=job.job_id,
+            stage="task_curriculum",
+            artifact_slot="task_curriculum",
+            dependency_coordinates=(world_rules_definition.coordinate,),
+            claim_id="design.curriculum.compiles",
+            claim="Tasks, rewards, and verification requirements compile against the world.",
+            timing_reason="Builder and Verifier must consume one frozen executable curriculum.",
+            output_contract_id="contract:task-curriculum-source",
+            implementation_revision_id=_SEMANTIC_LAYER_REVISION,
+            allowed_mutation_roots=("/curriculum_plan", "/task_requirements"),
+            agent_wall_seconds=min(600.0, meter.remaining_wall_seconds),
+            agent_token_limit=meter.rollout_token_limit,
+            maximum_automatic_backjump=0,
+        )
+        training_source, training_source_ref, training_results = await self.execute_structured_work(
+            runtime=work_runtime,
+            work=StructuredWorkSpec(
+                definition=training_definition,
+                input_refs=training_dependencies,
                 artifact_id=f"{job.job_id}:task-curriculum-source",
                 artifact_type="design.task_curriculum_source",
-                value=training_source,
                 dependencies=training_dependencies,
-            )
-        else:
-            training_source, training_source_ref = cached_training
-            training_results = ()
+            ),
+            role="environment-engineer",
+            lineage_id=f"{job.job_id}.task-curriculum",
+            workspace=workspace / "task-curriculum",
+            model=TrainingSemanticSourceDraft,
+            prompt=self._with_frozen_inputs(
+                self._training_semantics_prompt(request),
+                request=request,
+                training_contract_context=training_context,
+            ),
+            semantic_validator=validate_training,
+            permissions=job.permissions,
+            budget=meter,
+            capability_requirement=NodeCapabilityRequirement.structured_output(
+                node_id="environment-engineer.task-curriculum",
+                role="environment-engineer",
+            ),
+            semantic_transaction="design.task-curriculum",
+        )
         semantic_source = self._compose_environment_semantic_source(
             world_source,
             training_source,
@@ -1310,37 +1326,13 @@ class EnvironmentDesigner:
             design_draft,
             job.release_profile.minimum_coverage_dimensions,
         )
-        if cached_training is None:
-            self._record_design_node(
-                node="task_curriculum",
-                subject_ref=training_source_ref,
-                job_ref=job_ref,
-                related_refs=training_dependencies,
-            )
-            self._record_feedback_pass(
-                contract_id="feedback.design.task_curriculum",
-                subject_ref=training_source_ref,
-                component="design",
-                artifact_slot="task_curriculum",
-                lineage_id=f"{job.job_id}.task-curriculum",
-                immutable_input_refs=training_dependencies,
-                evidence_refs=training_dependencies,
-                summary=(
-                    "The committed task curriculum compiled against the frozen executable world."
-                ),
-                invocation_results=training_results,
-                allowed_mutation_paths=("/curriculum_plan", "/task_requirements"),
-            )
-            self._commit_semantic_node(
-                job_ref=job_ref,
-                node="task_curriculum",
-                detail=None,
-                subject_ref=training_source_ref,
-                immutable_input_refs=training_dependencies,
-                derived_refs=(),
-                model=TrainingSemanticSourceDraft,
-            )
-        return self._persist_initial_design(
+        self._record_design_node(
+            node="task_curriculum",
+            subject_ref=training_source_ref,
+            job_ref=job_ref,
+            related_refs=training_dependencies,
+        )
+        initial = self._persist_initial_design(
             job=job,
             job_ref=job_ref,
             request=request,
@@ -1360,6 +1352,36 @@ class EnvironmentDesigner:
                 *training_results,
             ),
         )
+        if not self._assumption_closure_issues(initial):
+            return initial
+        closed = await self._revise_assumption_closure(
+            job=job,
+            job_ref=job_ref,
+            request_ref=request_ref,
+            previous=initial,
+            finding_refs=(),
+            workspace=workspace / "assumption-closure",
+            meter=meter,
+            work_runtime=work_runtime,
+            dependency_coordinate=training_definition.coordinate,
+        )
+        return DesignBundle(
+            evidence_graph=closed.evidence_graph,
+            evidence_graph_ref=closed.evidence_graph_ref,
+            coverage_map=closed.coverage_map,
+            coverage_map_ref=closed.coverage_map_ref,
+            world_spec=closed.world_spec,
+            world_spec_ref=closed.world_spec_ref,
+            design=closed.design,
+            design_ref=closed.design_ref,
+            baseline=closed.baseline,
+            baseline_ref=closed.baseline_ref,
+            research_usage=initial.research_usage,
+            invocation_usage=closed.invocation_usage,
+            invocation_results=(*initial.invocation_results, *closed.invocation_results),
+            invocation_observed_actual=closed.invocation_observed_actual,
+            invocation_unknown_upper_bound=closed.invocation_unknown_upper_bound,
+        )
 
     def _validate_generate_inputs(
         self,
@@ -1368,7 +1390,6 @@ class EnvironmentDesigner:
         job_ref: ArtifactRef,
         request: EnvironmentRequest,
         request_ref: ArtifactRef,
-        phase_checkpoint_ref: ArtifactRef | None,
     ) -> None:
         if job.kind != "generate":
             raise ValueError("generate() only accepts a GenerateJob")
@@ -1390,11 +1411,10 @@ class EnvironmentDesigner:
                 "budget",
                 "direct generation requires seven semantic transactions plus two repair turns",
             )
-        if phase_checkpoint_ref is None:
-            if job.budget.search_calls < 1:
-                raise DesignerError("budget", "direct generation requires real search")
-            if job.budget.tool_calls - job.budget.search_calls < 1:
-                raise DesignerError("budget", "tool_calls must reserve a real fetch")
+        if job.budget.search_calls < 1:
+            raise DesignerError("budget", "direct generation requires real search")
+        if job.budget.tool_calls - job.budget.search_calls < 2:
+            raise DesignerError("budget", "tool_calls must reserve a real fetch and extract")
 
     @staticmethod
     def _validate_architecture_source(source: WorldArchitectureSourceDraft) -> None:
@@ -1438,9 +1458,7 @@ class EnvironmentDesigner:
                     "Each state entity requires at least one primary-key field.",
                 )
             lifecycle_indexes = [
-                field_index
-                for field_index, field in enumerate(item.fields)
-                if field.lifecycle
+                field_index for field_index, field in enumerate(item.fields) if field.lifecycle
             ]
             if len(lifecycle_indexes) > 1:
                 add(
@@ -1539,6 +1557,31 @@ class EnvironmentDesigner:
         return ("boundary", "state_entities", "tool_inventory")
 
     @staticmethod
+    def _world_rules_repair_roots(
+        diagnostic: ValidationDiagnostic,
+    ) -> tuple[str, ...]:
+        """Route a WorldRules finding to its code-owned source root.
+
+        Rule compilation predates the root-section source model and some leaf
+        diagnostics therefore begin at ``initial_state_constraints``.  The
+        routing is deterministic: no Agent chooses its own repair authority.
+        Failures without either owned root are not authorized for Agent repair;
+        they indicate an upstream defect or an incomplete framework diagnostic.
+        """
+
+        roots: list[str] = []
+        for issue in diagnostic.issues:
+            root = issue.location[0] if issue.location else None
+            if root in {"initial_state_rules", "invariants"}:
+                roots.append(cast(str, root))
+            elif root == "initial_state_constraints":
+                roots.append("initial_state_rules")
+        # Empty means the failure is not causally attributable to either
+        # Agent-owned root.  Do not broaden repair authority to hide a missing
+        # validator or an upstream defect.
+        return tuple(dict.fromkeys(roots))
+
+    @staticmethod
     def _compile_architecture_state_inventory(
         source: WorldArchitectureSourceDraft,
     ) -> StateEntityInventoryDraft:
@@ -1628,40 +1671,41 @@ class EnvironmentDesigner:
             )
         )
 
+    @classmethod
     def _compile_architecture_skeleton(
-        self,
+        cls,
         source: WorldArchitectureSourceDraft,
         *,
         evidence_graph: EvidenceGraph,
     ) -> WorldSkeletonDraft:
-        self._validate_architecture_source(source)
-        boundary = self._compile_architecture_boundary(source)
-        state_inventory = self._compile_architecture_state_inventory(source)
-        self._validate_world_boundary_draft(boundary, evidence_graph=evidence_graph)
-        self._validate_state_entity_inventory_draft(
+        cls._validate_architecture_source(source)
+        boundary = cls._compile_architecture_boundary(source)
+        state_inventory = cls._compile_architecture_state_inventory(source)
+        cls._validate_world_boundary_draft(boundary, evidence_graph=evidence_graph)
+        cls._validate_state_entity_inventory_draft(
             state_inventory,
             boundary=boundary,
             evidence_graph=evidence_graph,
         )
-        state_schema_irs, tool_schema_irs = self._compile_architecture_schema_irs(source)
+        state_schema_irs, tool_schema_irs = cls._compile_architecture_schema_irs(source)
         entities: list[StateEntitySchema] = []
         for state_plan, entity_schema_ir in zip(
             state_inventory.entities,
             state_schema_irs,
             strict=True,
         ):
-            self._validate_state_entity_schema_ir_draft(
+            cls._validate_state_entity_schema_ir_draft(
                 entity_schema_ir,
                 plan=state_plan,
             )
             entities.append(
-                self._compose_state_entity_schema(
+                cls._compose_state_entity_schema(
                     state_plan,
-                    self._compile_state_entity_schema_ir(entity_schema_ir),
+                    cls._compile_state_entity_schema_ir(entity_schema_ir),
                 )
             )
-        state_shape = self._compose_world_state_shape(state_inventory, tuple(entities))
-        self._validate_world_state_shape_draft(
+        state_shape = cls._compose_world_state_shape(state_inventory, tuple(entities))
+        cls._validate_world_state_shape_draft(
             state_shape,
             boundary=boundary,
             evidence_graph=evidence_graph,
@@ -1669,14 +1713,14 @@ class EnvironmentDesigner:
         # Architecture freezes schema closure only. Executable reset rules are
         # authored in the later WorldRules transaction against this exact shape.
         initial_rules = InitialStateRulesDraft()
-        self._validate_initial_state_rules_draft(
+        cls._validate_initial_state_rules_draft(
             initial_rules,
             state_shape=state_shape,
             evidence_graph=evidence_graph,
         )
-        state = self._compose_world_state(state_shape, initial_rules)
-        tool_plan_inventory = self._compile_architecture_tool_inventory(source)
-        self._validate_world_tool_plan_inventory_draft(
+        state = cls._compose_world_state(state_shape, initial_rules)
+        tool_plan_inventory = cls._compile_architecture_tool_inventory(source)
+        cls._validate_world_tool_plan_inventory_draft(
             tool_plan_inventory,
             boundary=boundary,
             evidence_graph=evidence_graph,
@@ -1688,13 +1732,13 @@ class EnvironmentDesigner:
             for schema_kind in ("input", "output", "observation"):
                 tool_schema_ir = tool_schema_irs[schema_index]
                 schema_index += 1
-                self._validate_tool_schema_ir_draft(
+                cls._validate_tool_schema_ir_draft(
                     tool_schema_ir,
                     plan=tool_plan,
                     schema_kind=schema_kind,
                 )
-                schema = self._compile_tool_schema_ir(tool_schema_ir)
-                self._validate_tool_schema_draft(
+                schema = cls._compile_tool_schema_ir(tool_schema_ir)
+                cls._validate_tool_schema_draft(
                     schema,
                     plan=tool_plan,
                     schema_kind=schema_kind,
@@ -1706,16 +1750,16 @@ class EnvironmentDesigner:
                 output_schema=compiled["output"].json_schema,
                 observation_schema=compiled["observation"].json_schema,
             )
-            self._validate_tool_surface_schemas_draft(schemas, plan=tool_plan)
-            surfaces.append(self._compose_tool_surface(tool_plan, schemas))
+            cls._validate_tool_surface_schemas_draft(schemas, plan=tool_plan)
+            surfaces.append(cls._compose_tool_surface(tool_plan, schemas))
         inventory = WorldToolInventoryDraft(tool_surfaces=tuple(surfaces))
-        self._validate_world_tool_inventory_draft(
+        cls._validate_world_tool_inventory_draft(
             inventory,
             boundary=boundary,
             evidence_graph=evidence_graph,
         )
-        skeleton = self._compose_world_skeleton(boundary, state, inventory)
-        self._validate_world_skeleton(skeleton, evidence_graph=evidence_graph)
+        skeleton = cls._compose_world_skeleton(boundary, state, inventory)
+        cls._validate_world_skeleton(skeleton, evidence_graph=evidence_graph)
         return skeleton
 
     @staticmethod
@@ -1970,6 +2014,7 @@ class EnvironmentDesigner:
         evidence_graph: EvidenceGraph,
     ) -> None:
         members = set(group.ordered_tool_ids)
+        frozen_tool_ids = ", ".join(group.ordered_tool_ids)
         issues: list[StructuredSemanticIssue] = []
 
         def validate_partition(label: str, domains: Sequence[Any]) -> None:
@@ -1982,6 +2027,10 @@ class EnvironmentDesigner:
                             code="shared_contract_tool_unknown",
                             location=(label, index, "member_tool_ids"),
                             message="A shared domain may reference only frozen group tools.",
+                            violated_condition=(
+                                "a shared domain references a tool outside the frozen group"
+                            ),
+                            expected_category=("only frozen group tool IDs: " + frozen_tool_ids),
                         )
                     )
                 seen.extend(domain.member_tool_ids)
@@ -1992,6 +2041,11 @@ class EnvironmentDesigner:
                         location=(label,),
                         message=(
                             "Shared domains must partition every frozen group tool exactly once."
+                        ),
+                        violated_condition=("shared domains omit or duplicate a frozen group tool"),
+                        expected_category=(
+                            "one exact, non-overlapping partition of frozen tool IDs: "
+                            + frozen_tool_ids
                         ),
                     )
                 )
@@ -2011,6 +2065,12 @@ class EnvironmentDesigner:
                         code="shared_ordering_tool_invalid",
                         location=("ordering_constraints", index),
                         message="Ordering must connect two distinct frozen group tools.",
+                        violated_condition=(
+                            "ordering endpoints are not two distinct frozen group tools"
+                        ),
+                        expected_category=(
+                            "two distinct frozen tool IDs selected from: " + frozen_tool_ids
+                        ),
                     )
                 )
             if not set(constraint.evidence_claim_ids) <= known_claims:
@@ -2019,6 +2079,10 @@ class EnvironmentDesigner:
                         code="shared_ordering_evidence_unknown",
                         location=("ordering_constraints", index, "evidence_claim_ids"),
                         message="Ordering evidence must use only supplied claim ids.",
+                        violated_condition=(
+                            "ordering evidence cites a claim outside the frozen EvidenceGraph"
+                        ),
+                        expected_category="only claim IDs supplied in the frozen claim catalog",
                     )
                 )
         for index, edge in enumerate(source.compensation_edges):
@@ -2032,6 +2096,12 @@ class EnvironmentDesigner:
                         code="shared_compensation_tool_invalid",
                         location=("compensation_edges", index),
                         message="Compensation must connect two distinct frozen group tools.",
+                        violated_condition=(
+                            "compensation endpoints are not two distinct frozen group tools"
+                        ),
+                        expected_category=(
+                            "two distinct frozen tool IDs selected from: " + frozen_tool_ids
+                        ),
                     )
                 )
         error_members: list[str] = []
@@ -2042,6 +2112,10 @@ class EnvironmentDesigner:
                         code="shared_error_tool_unknown",
                         location=("error_policies", index, "member_tool_ids"),
                         message="Shared error policies may reference only frozen group tools.",
+                        violated_condition=(
+                            "an error policy references a tool outside the frozen group"
+                        ),
+                        expected_category=("only frozen group tool IDs: " + frozen_tool_ids),
                     )
                 )
             error_members.extend(policy.member_tool_ids)
@@ -2050,7 +2124,14 @@ class EnvironmentDesigner:
                 StructuredSemanticIssue(
                     code="shared_error_coverage",
                     location=("error_policies",),
-                    message="Every frozen group tool requires at least one shared error policy.",
+                    message=("Every frozen group tool requires at least one shared error policy."),
+                    violated_condition=(
+                        "shared error policies do not cover every frozen group tool"
+                    ),
+                    expected_category=(
+                        "one or more policies whose member_tool_ids cover every frozen tool: "
+                        + frozen_tool_ids
+                    ),
                 )
             )
         if issues:
@@ -2081,19 +2162,23 @@ class EnvironmentDesigner:
         )
 
     @staticmethod
-    def _validate_tool_batch_against_shared_contracts(
-        compiled: tuple[ToolSemanticsDraft, ...],
+    def _validate_tool_source_batch_against_shared_contracts(
+        source_batch: ToolSemanticsBatchSourceDraft,
         *,
         contracts: Sequence[SharedToolSemanticsContract],
     ) -> None:
+        """Validate frozen cross-tool policy before deeper Rule compilation.
+
+        Every checked field is already shape-valid in the SourceDraft and compiles
+        without semantic reinterpretation.  Running this boundary first prevents a
+        later Rule error from hiding immutable shared-policy failures and creating a
+        false regression on the repair turn.
+        """
+
         issues: list[StructuredSemanticIssue] = []
-        for tool_index, item in enumerate(compiled):
+        for tool_index, item in enumerate(source_batch.tools):
             contract = next(
-                (
-                    candidate
-                    for candidate in contracts
-                    if item.tool_id in candidate.member_tool_ids
-                ),
+                (candidate for candidate in contracts if item.tool_id in candidate.member_tool_ids),
                 None,
             )
             if contract is None:
@@ -2114,24 +2199,24 @@ class EnvironmentDesigner:
                 for domain in source.idempotency_domains
                 if item.tool_id in domain.member_tool_ids
             )
-            semantics = item.semantics
+            reliability = item.reliability
             for code, location, matches, message in (
                 (
                     "shared_atomicity_mismatch",
                     ("reliability", "transaction", "atomicity"),
-                    semantics.transaction.atomicity == atomicity,
+                    reliability.transaction.atomicity == atomicity,
                     "Tool atomicity must match its frozen shared domain.",
                 ),
                 (
                     "shared_isolation_mismatch",
                     ("reliability", "concurrency", "isolation"),
-                    semantics.concurrency.isolation == isolation,
+                    reliability.concurrency.isolation == isolation,
                     "Tool isolation must match its frozen shared domain.",
                 ),
                 (
                     "shared_idempotency_mismatch",
                     ("reliability", "idempotency", "mode"),
-                    semantics.idempotency.mode == idempotency_mode,
+                    reliability.idempotency.mode == idempotency_mode,
                     "Tool idempotency mode must match its frozen shared domain.",
                 ),
             ):
@@ -2143,15 +2228,18 @@ class EnvironmentDesigner:
                             message=message,
                         )
                     )
-            error_by_suffix = {
-                error.error_code.rsplit(":", maxsplit=1)[-1]: error
-                for error in semantics.errors
-            }
             for policy in source.error_policies:
                 if item.tool_id not in policy.member_tool_ids:
                     continue
-                error = error_by_suffix.get(policy.required_error_suffix)
-                if error is None or error.retryable != policy.retryable:
+                matches_policy = any(
+                    EnvironmentDesigner._identifier_has_suffix(
+                        error.error_code,
+                        policy.required_error_suffix,
+                    )
+                    and error.retryable == policy.retryable
+                    for error in item.errors.errors
+                )
+                if not matches_policy:
                     issues.append(
                         StructuredSemanticIssue(
                             code="shared_error_policy_mismatch",
@@ -2164,7 +2252,7 @@ class EnvironmentDesigner:
                     )
             for edge in source.compensation_edges:
                 if edge.failure_tool_id == item.tool_id and (
-                    edge.compensation_tool_id not in semantics.rollback.compensation_tools
+                    edge.compensation_tool_id not in reliability.rollback.compensation_tools
                 ):
                     issues.append(
                         StructuredSemanticIssue(
@@ -2176,6 +2264,70 @@ class EnvironmentDesigner:
         if issues:
             raise StructuredSemanticError(tuple(issues))
 
+    @staticmethod
+    def _identifier_has_suffix(identifier: str, suffix: str) -> bool:
+        """Match a complete final Identifier segment, independent of its separator."""
+
+        return identifier == suffix or any(
+            identifier.endswith(f"{separator}{suffix}") for separator in ".:_-"
+        )
+
+    def _compile_and_validate_tool_semantics_batch(
+        self,
+        source: ToolSemanticsBatchSourceDraft,
+        *,
+        expected_tool_ids: tuple[str, ...],
+        skeleton: WorldSkeletonDraft,
+        evidence_graph: EvidenceGraph,
+        contracts: Sequence[SharedToolSemanticsContract],
+    ) -> tuple[ToolSemanticsDraft, ...]:
+        """Aggregate independent shared-policy and local-compiler diagnostics."""
+
+        self._validate_tool_semantics_batch_identity(
+            source,
+            expected_tool_ids=expected_tool_ids,
+        )
+        issues: list[SafeValidationIssue] = []
+        compiled: tuple[ToolSemanticsDraft, ...] | None = None
+        try:
+            self._validate_tool_source_batch_against_shared_contracts(
+                source,
+                contracts=contracts,
+            )
+        except (
+            StructuredSemanticError,
+            StructuredValidationError,
+            ValidationError,
+            ValueError,
+        ) as exc:
+            issues.extend(self._prefixed_validation_issues(exc, prefix=()))
+        try:
+            compiled = self._compile_tool_semantics_batch(
+                source,
+                expected_tool_ids=expected_tool_ids,
+                skeleton=skeleton,
+                evidence_graph=evidence_graph,
+            )
+        except (
+            StructuredSemanticError,
+            StructuredValidationError,
+            ValidationError,
+            ValueError,
+        ) as exc:
+            issues.extend(self._prefixed_validation_issues(exc, prefix=()))
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_semantics_batch_preflight",
+                    frontier_ordinal=30,
+                    issues=tuple(dict.fromkeys(issues)),
+                )
+            )
+        if compiled is None:
+            raise AssertionError("tool semantics compiler produced neither output nor diagnostic")
+        return compiled
+
     def _compile_tool_semantics_batch(
         self,
         source: ToolSemanticsBatchSourceDraft,
@@ -2184,46 +2336,11 @@ class EnvironmentDesigner:
         skeleton: WorldSkeletonDraft,
         evidence_graph: EvidenceGraph,
     ) -> tuple[ToolSemanticsDraft, ...]:
-        if tuple(item.tool_id for item in source.tools) != expected_tool_ids:
-            raise StructuredValidationError(
-                ValidationDiagnostic(
-                    owner_component="design",
-                    validation_phase="tool_semantics_batch_identity",
-                    frontier_ordinal=10,
-                    issues=(
-                        SafeValidationIssue(
-                            "tool_batch_identity_drift",
-                            ("tools",),
-                            "Batch length, order and tool ids must equal the frozen target batch.",
-                        ),
-                    ),
-                )
-            )
-        identity_issues = tuple(
-            SafeValidationIssue(
-                "tool_semantics_nested_identity",
-                ("tools", index),
-                "nested identity must preserve the parent frozen tool id in every section.",
-            )
-            for index, item in enumerate(source.tools)
-            if {
-                item.conditions.tool_id,
-                item.state_transition.tool_id,
-                item.errors.tool_id,
-                item.access_observation.tool_id,
-                item.reliability.tool_id,
-            }
-            != {item.tool_id}
+        self._validate_tool_semantics_batch_identity(
+            source,
+            expected_tool_ids=expected_tool_ids,
         )
-        if identity_issues:
-            raise StructuredValidationError(
-                ValidationDiagnostic(
-                    owner_component="design",
-                    validation_phase="tool_semantics_batch_identity",
-                    frontier_ordinal=10,
-                    issues=identity_issues,
-                )
-            )
+
         issues: list[SafeValidationIssue] = []
         compiled: list[ToolSemanticsDraft] = []
         for tool_index, item in enumerate(source.tools):
@@ -2357,6 +2474,49 @@ class EnvironmentDesigner:
                 for candidate in skeleton.tool_surfaces
                 if candidate.surface.tool_id == item.tool_id
             )
+            context_catalog: RuleContextCatalog | None = None
+            context_rules: list[tuple[tuple[str | int, ...], Rule]] = []
+            if isinstance(conditions, ToolConditionsDraft):
+                context_rules.extend(
+                    (("conditions", "preconditions", rule_index), rule)
+                    for rule_index, rule in enumerate(conditions.preconditions)
+                )
+                context_rules.extend(
+                    (("conditions", "postconditions", rule_index), rule)
+                    for rule_index, rule in enumerate(conditions.postconditions)
+                )
+            if isinstance(transition, ToolStateTransitionDraft):
+                context_rules.extend(
+                    (("state_transition", "transition", rule_index), rule)
+                    for rule_index, rule in enumerate(transition.transition)
+                )
+            if isinstance(errors, ToolErrorsDraft):
+                context_rules.extend(
+                    (("errors", "errors", error_index, "when"), error.when)
+                    for error_index, error in enumerate(errors.errors)
+                )
+            if context_rules:
+                context_catalog = RuleContextCatalog.for_tool(
+                    state=skeleton.state,
+                    surface=surface,
+                )
+                for rule_path, rule in context_rules:
+                    for issue in validate_rule_context(rule, catalog=context_catalog):
+                        issues.append(
+                            SafeValidationIssue(
+                                code=issue.code,
+                                location=(
+                                    "tools",
+                                    tool_index,
+                                    *rule_path,
+                                    *issue.location,
+                                ),
+                                message=issue.message,
+                                retryable=issue.retryable,
+                                violated_condition=issue.violated_condition,
+                                expected_category=issue.expected_category,
+                            )
+                        )
             access: ToolAccessObservationDraft | None = None
             try:
                 access = self._compile_tool_access_observation_source(
@@ -2381,6 +2541,36 @@ class EnvironmentDesigner:
                         prefix=("tools", tool_index, "access_observation"),
                     )
                 )
+            if (
+                isinstance(access, ToolAccessObservationDraft)
+                and access.permission.condition is not None
+            ):
+                if context_catalog is None:
+                    context_catalog = RuleContextCatalog.for_tool(
+                        state=skeleton.state,
+                        surface=surface,
+                    )
+                for issue in validate_rule_context(
+                    access.permission.condition,
+                    catalog=context_catalog,
+                ):
+                    issues.append(
+                        SafeValidationIssue(
+                            code=issue.code,
+                            location=(
+                                "tools",
+                                tool_index,
+                                "access_observation",
+                                "permission",
+                                "condition",
+                                *issue.location,
+                            ),
+                            message=issue.message,
+                            retryable=issue.retryable,
+                            violated_condition=issue.violated_condition,
+                            expected_category=issue.expected_category,
+                        )
+                    )
             reliability: ToolReliabilityDraft | None = None
             try:
                 reliability = self._compile_tool_reliability_source(item.reliability)
@@ -2414,43 +2604,6 @@ class EnvironmentDesigner:
                 tool_id=item.tool_id,
                 semantics=self._compose_tool_semantics(behavior, access, reliability),
             )
-            context_catalog = RuleContextCatalog.for_tool(
-                state=skeleton.state,
-                surface=surface,
-            )
-            context_rules: tuple[tuple[tuple[str | int, ...], Rule], ...] = tuple(
-                (role_path, rule)
-                for role, rules in (
-                    ("preconditions", behavior.preconditions),
-                    ("transition", behavior.transition),
-                    ("postconditions", behavior.postconditions),
-                )
-                for rule_index, rule in enumerate(rules)
-                for role_path in (("behavior", role, rule_index),)
-            ) + tuple(
-                (("behavior", "errors", error_index, "when"), error.when)
-                for error_index, error in enumerate(behavior.errors)
-            )
-            if access.permission.condition is not None:
-                context_rules = (
-                    *context_rules,
-                    (
-                        ("access_observation", "permission", "condition"),
-                        access.permission.condition,
-                    ),
-                )
-            for rule_path, rule in context_rules:
-                for issue in validate_rule_context(rule, catalog=context_catalog):
-                    issues.append(
-                        SafeValidationIssue(
-                            code=issue.code,
-                            location=("tools", tool_index, *rule_path, *issue.location),
-                            message=issue.message,
-                            retryable=issue.retryable,
-                            violated_condition=issue.violated_condition,
-                            expected_category=issue.expected_category,
-                        )
-                    )
             try:
                 self._validate_tool_semantics_draft(
                     semantics,
@@ -2486,6 +2639,53 @@ class EnvironmentDesigner:
         return tuple(compiled)
 
     @staticmethod
+    def _validate_tool_semantics_batch_identity(
+        source: ToolSemanticsBatchSourceDraft,
+        *,
+        expected_tool_ids: tuple[str, ...],
+    ) -> None:
+        if tuple(item.tool_id for item in source.tools) != expected_tool_ids:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_semantics_batch_identity",
+                    frontier_ordinal=10,
+                    issues=(
+                        SafeValidationIssue(
+                            "tool_batch_identity_drift",
+                            ("tools",),
+                            "Batch length, order and tool ids must equal the frozen target batch.",
+                        ),
+                    ),
+                )
+            )
+        identity_issues = tuple(
+            SafeValidationIssue(
+                "tool_semantics_nested_identity",
+                ("tools", index),
+                "nested identity must preserve the parent frozen tool id in every section.",
+            )
+            for index, item in enumerate(source.tools)
+            if {
+                item.conditions.tool_id,
+                item.state_transition.tool_id,
+                item.errors.tool_id,
+                item.access_observation.tool_id,
+                item.reliability.tool_id,
+            }
+            != {item.tool_id}
+        )
+        if identity_issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_semantics_batch_identity",
+                    frontier_ordinal=10,
+                    issues=identity_issues,
+                )
+            )
+
+    @staticmethod
     def _prefixed_validation_issues(
         exc: StructuredSemanticError | StructuredValidationError | ValidationError | ValueError,
         *,
@@ -2497,8 +2697,13 @@ class EnvironmentDesigner:
                     issue.code,
                     (*prefix, *issue.location),
                     issue.message,
-                    violated_condition=f"semantic contract {issue.code}",
-                    expected_category="a value satisfying the named semantic contract",
+                    violated_condition=(
+                        issue.violated_condition or f"semantic contract {issue.code}"
+                    ),
+                    expected_category=(
+                        issue.expected_category
+                        or "a value satisfying the named semantic contract"
+                    ),
                 )
                 for issue in exc.issues
             )
@@ -2735,210 +2940,175 @@ class EnvironmentDesigner:
         request_ref: ArtifactRef,
         workspace: Path,
         meter: DesignerInvocationBudget,
+        work_runtime: WorkControlRuntime,
         fetch_budget: int,
-        phase_checkpoint_ref: ArtifactRef | None,
     ) -> _EvidencePhaseBundle:
-        if phase_checkpoint_ref is not None:
-            checkpoint = self.artifacts.get_json(
-                phase_checkpoint_ref,
-                DesignPhaseCheckpoint,
-            )
-            self.artifacts.require_exact_json(
-                phase_checkpoint_ref,
-                checkpoint,
-                artifact_types=("design.phase_checkpoint",),
-            )
-            if (
-                checkpoint.phase != "evidence_graph"
-                or checkpoint.job_ref != job_ref
-                or checkpoint.request_ref != request_ref
-                or checkpoint.world_skeleton_ref is not None
-            ):
-                raise DesignerError(
-                    "checkpoint.binding",
-                    "evidence checkpoint does not bind the requested job and request",
-                )
-            expected = self._evidence_graph_checkpoint(
-                job_ref=job_ref,
-                request_ref=request_ref,
-                evidence_graph_ref=checkpoint.evidence_graph_ref,
-            )
-            if checkpoint != expected:
-                raise DesignerError(
-                    "checkpoint.integrity",
-                    "evidence checkpoint fingerprint or ABI differs from exact inputs",
-                )
-            evidence_graph = self.artifacts.get_json(
-                checkpoint.evidence_graph_ref,
-                EvidenceGraph,
-            )
-            self.artifacts.require_exact_json(
-                checkpoint.evidence_graph_ref,
-                evidence_graph,
-                artifact_types=("design.evidence_graph",),
-            )
-            dependencies = self.artifacts.dependencies(checkpoint.evidence_graph_ref)
-            if request_ref not in dependencies:
-                raise DesignerError(
-                    "checkpoint.dependencies",
-                    "EvidenceGraph is not dependency-bound to the checkpoint request",
-                )
-            self._validate_checkpoint_evidence_graph(evidence_graph)
-            self._write_json(
-                workspace / "resumed-evidence-checkpoint.json",
-                checkpoint.model_dump(mode="json"),
-            )
-            self.artifacts.record_event(
-                event_type="design_phase_resumed",
-                subject_ref=phase_checkpoint_ref,
-                related_refs=(job_ref, request_ref, checkpoint.evidence_graph_ref),
-                details=(KeyValue(key="phase", value=checkpoint.phase),),
-            )
-            self.research.record_checkpoint_reuse(
-                checkpoint_ref=phase_checkpoint_ref,
-                evidence_graph_ref=checkpoint.evidence_graph_ref,
-            )
-            return _EvidencePhaseBundle(
-                evidence_graph=evidence_graph,
-                evidence_graph_ref=checkpoint.evidence_graph_ref,
-                research_usage=BudgetUsage(),
-                invocation_results=(),
-            )
-
         self._record_design_node_started(
             node="research_plan",
             subject_ref=job_ref,
             job_ref=job_ref,
         )
-        research_plan, plan_results = await self.run_structured_agent(
+        research_plan_definition = structured_agent_work_definition(
+            scope_id=job.job_id,
+            component="research",
+            stage="research_plan",
+            artifact_slot="research_plan",
+            dependency_coordinates=(),
+            claim_id="research.plan.valid",
+            claim=(
+                "The bounded research plan covers workflow, tools, state, authority, "
+                "errors, and risks before any real search is spent."
+            ),
+            timing_reason="Real search must consume a validated bounded query plan.",
+            output_contract_id="contract:research-plan",
+            acceptance_transform_id="framework.direct-structured-output.v3",
+            validator_revision_id="framework.validator.research-plan.v3",
+            agent_role="researcher",
+            allowed_mutation_roots=("/",),
+            agent_wall_seconds=min(600.0, meter.remaining_wall_seconds),
+            agent_token_limit=meter.rollout_token_limit,
+        )
+
+        def validate_research_plan(value: ResearchPlan) -> None:
+            self._validate_research_plan_coverage(value)
+
+        research_plan, plan_ref, plan_results = await self.execute_structured_work(
+            runtime=work_runtime,
+            work=StructuredWorkSpec(
+                definition=research_plan_definition,
+                input_refs=(job_ref, request_ref),
+                artifact_id=f"{job.job_id}:research-plan",
+                artifact_type="design.research_plan",
+                dependencies=(job_ref, request_ref),
+            ),
             role="researcher",
             lineage_id=f"{job.job_id}.research-plan",
             workspace=workspace / "research",
             model=ResearchPlan,
             prompt=self._research_plan_prompt(request),
+            semantic_validator=validate_research_plan,
             permissions=job.permissions,
             budget=meter,
             semantic_transaction="research.plan",
-            feedback_contract_id="feedback.research.plan",
-            repair_target=RepairTargetRef(
-                target_id=self._stable_id("repair-target", job.job_id, "research-plan"),
-                component="design",
-                artifact_slot="research_plan",
-                lineage_id=f"{job.job_id}.research-plan",
-                immutable_input_refs=(job_ref, request_ref),
-                allowed_mutation_paths=("/",),
-            ),
-        )
-        plan_ref = self.artifacts.put_json(
-            artifact_id=f"{job.job_id}:research-plan",
-            artifact_type="design.research_plan",
-            value=research_plan,
-            dependencies=(job_ref, request_ref),
         )
         self._record_design_node(
             node="research_plan",
             subject_ref=plan_ref,
             job_ref=job_ref,
         )
-        self._record_feedback_pass(
-            contract_id="feedback.research.plan",
-            subject_ref=plan_ref,
-            component="design",
-            artifact_slot="research_plan",
-            lineage_id=f"{job.job_id}.research-plan",
-            immutable_input_refs=(job_ref, request_ref),
-            evidence_refs=(request_ref,),
-            summary="The bounded query plan passed the structured research contract.",
-            invocation_results=plan_results,
-            allowed_mutation_paths=("/",),
+        self._validate_research_plan_coverage(research_plan)
+        acquisition_definition = research_acquisition_work_definition(
+            scope_id=job.job_id,
+            dependency_coordinate=research_plan_definition.coordinate,
+            wall_seconds=min(600.0, meter.remaining_wall_seconds),
+            maximum_search_calls=min(job.budget.search_calls, len(research_plan.queries)),
+            maximum_tool_calls=job.budget.tool_calls,
         )
-        queries = tuple(
-            SearchQuery(
-                text=item.text,
-                language=item.language,
-            )
-            for item in research_plan.queries[: job.budget.search_calls]
-        )
-        self.artifacts.record_event(
-            event_type="design_research_started",
-            subject_ref=plan_ref,
-            related_refs=(job_ref,),
-            details=(KeyValue(key="query_count", value=len(queries)),),
-        )
-        try:
-            research_bundle = await self.research.run(
-                queries,
-                request_permissions=request.permissions,
-                run_permissions=job.permissions,
-                allowed_source_kinds=request.allowed_source_kinds,
-                maximum_tool_calls=job.budget.tool_calls,
-                results_per_query=max(1, min(10, fetch_budget)),
-                max_documents=max(1, min(24, fetch_budget)),
-                seed_urls=research_plan.known_source_urls,
-                require_evidence=True,
-            )
-        except ResearchEvidenceUnavailable as exc:
-            raise DesignerError(
-                "research.fetch",
-                str(exc),
-                results=meter.results,
-                budget_usage=meter.usage,
-                budget_observed_actual=meter.observed_actual,
-                budget_unknown_upper_bound=meter.unknown_upper_bound,
-                research_usage=BudgetUsage(
-                    search_calls=exc.search_calls,
-                    tool_calls=exc.search_calls + exc.fetch_calls,
-                ),
-                failure_code=exc.failure_code,
-                infrastructure_error=exc.reason == "upstream_unavailable",
-                budget_exhausted=exc.reason == "budget_exhausted",
-            ) from exc
-        except Exception as exc:
-            raise DesignerError(
-                "research.fetch",
-                str(exc),
-                results=meter.results,
-                budget_usage=meter.usage,
-                budget_observed_actual=meter.observed_actual,
-                budget_unknown_upper_bound=meter.unknown_upper_bound,
-            ) from exc
-
-        evidence, source_refs = self.materialize_research_evidence(job.job_id, research_bundle)
-        self.artifacts.record_event(
-            event_type="design_research_completed",
-            subject_ref=plan_ref,
-            related_refs=self._unique_refs((job_ref, *source_refs)),
-            details=(
-                KeyValue(key="search_calls", value=research_bundle.search_calls),
-                KeyValue(key="fetch_calls", value=research_bundle.fetch_calls),
-                KeyValue(key="document_count", value=len(research_bundle.documents)),
-                KeyValue(key="failure_count", value=len(research_bundle.failures)),
+        synthesis_definition = structured_agent_work_definition(
+            scope_id=job.job_id,
+            component="research",
+            stage="evidence_synthesis",
+            artifact_slot="evidence_synthesis",
+            dependency_coordinates=(acquisition_definition.coordinate,),
+            claim_id="research.evidence.grounded",
+            claim=(
+                "Observed claims bind real fetched passages while conflicts and unknowns "
+                "remain explicit."
             ),
+            timing_reason="Architecture may consume only grounded evidence.",
+            output_contract_id="contract:evidence-synthesis",
+            agent_role="researcher",
+            allowed_mutation_roots=("/",),
+            agent_wall_seconds=min(600.0, meter.remaining_wall_seconds),
+            agent_token_limit=meter.rollout_token_limit,
         )
+        work_runtime.register_definition(synthesis_definition)
+        acquisition, acquisition_ref = await self._acquire_research_evidence(
+            job=job,
+            job_ref=job_ref,
+            request=request,
+            request_ref=request_ref,
+            plan=research_plan,
+            plan_ref=plan_ref,
+            definition=acquisition_definition,
+            fetch_budget=fetch_budget,
+            runtime=work_runtime,
+            meter=meter,
+        )
+        evidence = acquisition.evidence
+        source_refs = acquisition.source_refs
+        passage_pack_ref = acquisition.passage_pack_ref
+        passage_pack = self.artifacts.get_json(passage_pack_ref, EvidencePassagePack)
         synthesis_workspace = workspace / "evidence-synthesis"
         synthesis_workspace.mkdir(parents=True, exist_ok=True)
-        passage_pack = build_evidence_passage_pack(
-            pack_id=self._stable_id("evidence-passage-pack", request.request_id),
-            need=request.need,
-            query_texts=tuple(
-                value for item in research_plan.queries for value in (item.text, item.rationale)
-            )
-            + research_plan.target_coverage_dimensions,
-            evidence=evidence,
-            bundle=research_bundle,
-        )
-        passage_pack_ref = self.artifacts.put_json(
-            artifact_id=f"{job.job_id}:evidence-passage-pack",
-            artifact_type="design.evidence_passage_pack",
-            value=passage_pack,
-            dependencies=(plan_ref, request_ref, *source_refs),
-        )
         self._record_design_node(
             node="evidence_passage_pack",
             subject_ref=passage_pack_ref,
             job_ref=job_ref,
-            related_refs=(plan_ref,),
+            related_refs=(plan_ref, acquisition_ref),
         )
+        evidence_inputs = (plan_ref, acquisition_ref, passage_pack_ref, request_ref, *source_refs)
+        synthesis_head = work_runtime.heads.read_head(synthesis_definition.coordinate)
+        synthesis_attempt = (
+            work_runtime.artifacts.get_json(synthesis_head.attempt_ref, WorkAttempt)
+            if synthesis_head is not None and synthesis_head.status == "committed"
+            else None
+        )
+        if synthesis_attempt is not None and synthesis_attempt.input_refs == evidence_inputs:
+            with work_runtime.heads.exclusive(synthesis_definition.coordinate) as lock:
+                active_synthesis = work_runtime.heads.require_active_commit(
+                    definition=synthesis_definition,
+                    input_refs=evidence_inputs,
+                    artifacts=work_runtime.artifacts,
+                )
+                if active_synthesis is None:
+                    active_synthesis = work_runtime.reactivate_historical_commit(
+                        lock,
+                        definition=synthesis_definition,
+                        input_refs=evidence_inputs,
+                    )
+            if active_synthesis is None:
+                raise WorkRuntimeError(
+                    "committed EvidenceSynthesis lacks an exact active WorkCommit"
+                )
+            synthesis_commit, synthesis_commit_ref = active_synthesis
+            synthesis_refs = tuple(
+                ref
+                for ref in synthesis_commit.output_refs
+                if ref.artifact_type == "design.evidence_synthesis"
+            )
+            if len(synthesis_refs) != 1:
+                raise WorkRuntimeError(
+                    "EvidenceSynthesis WorkCommit lacks one exact synthesis Artifact"
+                )
+            synthesis_ref = synthesis_refs[0]
+            graph_candidates = tuple(
+                ref
+                for ref in self.artifacts.list_revisions(f"{job.job_id}:evidence-graph")
+                if ref.artifact_type == "design.evidence_graph"
+                and synthesis_ref in self.artifacts.dependencies(ref)
+                and acquisition_ref in self.artifacts.dependencies(ref)
+                and request_ref in self.artifacts.dependencies(ref)
+            )
+            if len(graph_candidates) != 1:
+                raise WorkRuntimeError(
+                    "EvidenceSynthesis WorkCommit lacks one derived EvidenceGraph"
+                )
+            evidence_graph_ref = graph_candidates[0]
+            evidence_graph = self.artifacts.get_json(evidence_graph_ref, EvidenceGraph)
+            self._validate_grounded_evidence_graph(evidence_graph)
+            self.artifacts.record_event(
+                event_type="design_work_commit_reused",
+                subject_ref=synthesis_commit_ref,
+                related_refs=(synthesis_ref, evidence_graph_ref),
+                details=(KeyValue(key="node", value="evidence_synthesis"),),
+            )
+            return _EvidencePhaseBundle(
+                evidence_graph=evidence_graph,
+                evidence_graph_ref=evidence_graph_ref,
+                research_usage=BudgetUsage(),
+                invocation_results=(),
+            )
 
         def validate_synthesis(value: EvidenceSynthesis) -> None:
             self._validate_evidence_synthesis_references(value, evidence)
@@ -2972,7 +3142,15 @@ class EnvironmentDesigner:
             subject_ref=plan_ref,
             job_ref=job_ref,
         )
-        synthesis, synthesis_results = await self.run_structured_agent(
+        synthesis, synthesis_ref, synthesis_results = await self.execute_structured_work(
+            runtime=work_runtime,
+            work=StructuredWorkSpec(
+                definition=synthesis_definition,
+                input_refs=evidence_inputs,
+                artifact_id=f"{job.job_id}:evidence-synthesis",
+                artifact_type="design.evidence_synthesis",
+                dependencies=evidence_inputs,
+            ),
             role="researcher",
             lineage_id=f"{job.job_id}.evidence-synthesis",
             workspace=synthesis_workspace,
@@ -2986,45 +3164,16 @@ class EnvironmentDesigner:
             permissions=job.permissions,
             budget=meter,
             semantic_transaction="research.evidence-synthesis",
-            feedback_contract_id="feedback.research.evidence",
-            repair_target=RepairTargetRef(
-                target_id=self._stable_id(
-                    "repair-target", job.job_id, "evidence-synthesis"
-                ),
-                component="design",
-                artifact_slot="evidence_synthesis",
-                lineage_id=f"{job.job_id}.evidence-synthesis",
-                immutable_input_refs=(plan_ref, passage_pack_ref, request_ref, *source_refs),
-                allowed_mutation_paths=("/",),
-            ),
             capability_requirement=NodeCapabilityRequirement.structured_output(
                 node_id="researcher.evidence-synthesis",
                 role="researcher",
             ),
         )
-        synthesis_ref = self.artifacts.put_json(
-            artifact_id=f"{job.job_id}:evidence-synthesis",
-            artifact_type="design.evidence_synthesis",
-            value=synthesis,
-            dependencies=(plan_ref, passage_pack_ref, request_ref, *source_refs),
-        )
         self._record_design_node(
             node="evidence_synthesis",
             subject_ref=synthesis_ref,
             job_ref=job_ref,
-            related_refs=(plan_ref,),
-        )
-        self._record_feedback_pass(
-            contract_id="feedback.research.evidence",
-            subject_ref=synthesis_ref,
-            component="design",
-            artifact_slot="evidence_synthesis",
-            lineage_id=f"{job.job_id}.evidence-synthesis",
-            immutable_input_refs=(plan_ref, passage_pack_ref, request_ref, *source_refs),
-            evidence_refs=(passage_pack_ref, *source_refs),
-            summary="Observed claims bind fetched source passages with conflicts preserved.",
-            invocation_results=synthesis_results,
-            allowed_mutation_paths=("/",),
+            related_refs=(plan_ref, acquisition_ref),
         )
         evidence_graph = EvidenceGraph(
             graph_id=self._stable_id("evidence-graph", request.request_id),
@@ -3038,7 +3187,7 @@ class EnvironmentDesigner:
             artifact_id=f"{job.job_id}:evidence-graph",
             artifact_type="design.evidence_graph",
             value=evidence_graph,
-            dependencies=(request_ref, synthesis_ref, *source_refs),
+            dependencies=(request_ref, acquisition_ref, synthesis_ref, *source_refs),
         )
         self._record_design_node(
             node="evidence_graph",
@@ -3047,322 +3196,497 @@ class EnvironmentDesigner:
             related_refs=(synthesis_ref,),
         )
 
-        self._validate_checkpoint_evidence_graph(evidence_graph)
-        checkpoint = self._evidence_graph_checkpoint(
-            job_ref=job_ref,
-            request_ref=request_ref,
-            evidence_graph_ref=evidence_graph_ref,
-        )
-        checkpoint_ref = self.artifacts.put_json(
-            artifact_id=f"{job.job_id}:phase-checkpoint:evidence-graph",
-            artifact_type="design.phase_checkpoint",
-            value=checkpoint,
-            dependencies=(job_ref, request_ref, evidence_graph_ref),
-        )
-        self._record_design_node(
-            node="evidence_graph_checkpoint",
-            subject_ref=checkpoint_ref,
-            job_ref=job_ref,
-            related_refs=(evidence_graph_ref,),
-        )
+        self._validate_grounded_evidence_graph(evidence_graph)
         return _EvidencePhaseBundle(
             evidence_graph=evidence_graph,
             evidence_graph_ref=evidence_graph_ref,
-            research_usage=BudgetUsage(
-                search_calls=research_bundle.search_calls,
-                tool_calls=research_bundle.search_calls + research_bundle.fetch_calls,
-            ),
+            research_usage=acquisition.usage,
             invocation_results=(*plan_results, *synthesis_results),
         )
 
-    async def resume_from_phase_checkpoint(
+    async def _acquire_research_evidence(
         self,
         *,
         job: EnvironmentJob,
         job_ref: ArtifactRef,
         request: EnvironmentRequest,
         request_ref: ArtifactRef,
-        phase_checkpoint_ref: ArtifactRef,
-        workspace: Path,
-        invocation_budget: Budget,
-        repair_authority: StructuredRepairAuthority | None = None,
-    ) -> DesignBundle:
-        """Resume the batched path only from its evidence transaction boundary."""
+        plan: ResearchPlan,
+        plan_ref: ArtifactRef,
+        definition: WorkDefinition,
+        fetch_budget: int,
+        runtime: WorkControlRuntime,
+        meter: DesignerInvocationBudget,
+    ) -> tuple[ResearchAcquisition, ArtifactRef]:
+        """Run the real search/fetch/extract leaf under one OperationRun.
 
-        token = _DESIGN_COMPLETION_INDEX_SCOPE.set(_DesignCompletionIndexScope())
-        authority_token = _DESIGN_REPAIR_AUTHORITY.set(repair_authority)
-        try:
-            checkpoint = self.artifacts.get_json(
-                phase_checkpoint_ref,
-                DesignPhaseCheckpoint,
+        Search is intentionally separate from the synthesis Agent transaction:
+        if the network/toolchain fails, code can classify it as an infrastructure
+        outcome without asking the Researcher to rewrite a query plan blindly.
+        """
+
+        definition = runtime.register_definition(definition)
+        with runtime.heads.exclusive(definition.coordinate) as lock:
+            active = runtime.heads.require_active_commit(
+                definition=definition,
+                input_refs=(plan_ref,),
+                artifacts=runtime.artifacts,
             )
-            if checkpoint.phase != "evidence_graph":
-                raise DesignerError(
-                    "checkpoint.abi",
-                    "only batched evidence checkpoints can enter the production generation path",
+            if active is None:
+                active = runtime.reactivate_historical_commit(
+                    lock,
+                    definition=definition,
+                    input_refs=(plan_ref,),
                 )
-            return await self.generate(
-                job=job,
-                job_ref=job_ref,
-                request=request,
+            if active is not None:
+                commit, _commit_ref = active
+                records = tuple(
+                    ref
+                    for ref in commit.output_refs
+                    if ref.artifact_type == "design.research_acquisition"
+                )
+                if len(records) != 1:
+                    raise WorkRuntimeError(
+                        "Research acquisition WorkCommit lacks its exact result Artifact"
+                    )
+                record = self.artifacts.get_json(records[0], ResearchAcquisition)
+                self.artifacts.require_exact_json(
+                    records[0],
+                    record,
+                    artifact_types=("design.research_acquisition",),
+                )
+                return record, records[0]
+
+            head = runtime.heads.read_head(definition.coordinate)
+            if head is None:
+                head = runtime.begin(
+                    lock,
+                    definition=definition,
+                    input_refs=(plan_ref,),
+                    elapsed_wall_seconds=0,
+                )
+            elif (
+                head.definition_digest != definition.definition_digest
+                or head.input_fingerprint != runtime.heads.input_fingerprint((plan_ref,))
+            ):
+                head = runtime.supersede_stale(
+                    lock,
+                    definition=definition,
+                    input_refs=(plan_ref,),
+                    previous=head,
+                    elapsed_wall_seconds=0,
+                )
+            if head.status != "running" or head.active_operation_ref is not None:
+                raise WorkRuntimeError("Research acquisition requires an idle running WorkAttempt")
+            head = runtime.schedule_operation(
+                lock,
+                definition=definition,
+                kind="proposal",
+                replay_mode="non_replayable",
+                elapsed_wall_seconds=0,
+                input_refs=(plan_ref, request_ref),
+            )
+            head = runtime.start_operation(
+                lock,
+                definition=definition,
+                dispatch_id=f"research-acquisition:{head.attempt_ref.revision_id}",
+            )
+            attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+            operation_ref = head.active_operation_ref
+            if operation_ref is None:
+                raise WorkRuntimeError("started research acquisition lacks OperationRun")
+            operation = self.artifacts.get_json(operation_ref, OperationRun)
+            started_at = operation.started_at or datetime.now(UTC)
+            queries = tuple(
+                SearchQuery(text=item.text, language=item.language)
+                for item in plan.queries[: definition.proposal_policy.budget.search_calls]
+            )
+            self.artifacts.record_event(
+                event_type="research_acquisition_started",
+                subject_ref=plan_ref,
+                related_refs=(job_ref,),
+                details=(KeyValue(key="query_count", value=len(queries)),),
+            )
+            try:
+                research_bundle = await self.research.run(
+                    queries,
+                    request_permissions=request.permissions,
+                    run_permissions=job.permissions,
+                    allowed_source_kinds=request.allowed_source_kinds,
+                    maximum_tool_calls=definition.proposal_policy.budget.tool_calls,
+                    results_per_query=max(1, min(10, fetch_budget)),
+                    max_documents=max(1, min(24, fetch_budget)),
+                    seed_urls=plan.known_source_urls,
+                    require_evidence=True,
+                )
+            except ResearchPermissionError as exc:
+                unknown = BudgetUsage(
+                    search_calls=definition.proposal_policy.budget.search_calls,
+                    tool_calls=definition.proposal_policy.budget.tool_calls,
+                )
+                execution = ProposalExecution(
+                    execution_id=f"research-acquisition:{attempt.attempt_id}",
+                    attempt_id=attempt.attempt_id,
+                    executor="real_tools",
+                    operation=definition.proposal_policy.operation,
+                    status="failed",
+                    error_code="research_permission_denied",
+                    unknown_upper_bound=unknown,
+                    conservative_committed=unknown,
+                    started_at=started_at,
+                    finished_at=datetime.now(UTC),
+                    duration_ms=max(
+                        0,
+                        int((datetime.now(UTC) - started_at).total_seconds() * 1000),
+                    ),
+                )
+                runtime.checkpoint_proposal(
+                    lock,
+                    definition=definition,
+                    execution=execution,
+                )
+                report = self._research_acquisition_failure_report(
+                    attempt=attempt,
+                    definition=definition,
+                    code="research_permission_denied",
+                    retryable=False,
+                )
+                runtime.schedule_operation(
+                    lock,
+                    definition=definition,
+                    kind="validation",
+                    replay_mode="deterministic",
+                    elapsed_wall_seconds=0,
+                )
+                runtime.start_operation(
+                    lock,
+                    definition=definition,
+                    dispatch_id=f"research-acquisition-validation:{attempt.attempt_id}",
+                )
+                runtime.checkpoint_validation(
+                    lock,
+                    definition=definition,
+                    report=report,
+                    observed_actual=BudgetUsage(),
+                )
+                runtime.evaluate(
+                    lock,
+                    definition=definition,
+                    report=report,
+                    elapsed_wall_seconds=0,
+                )
+                raise DesignerError(
+                    "research.permission",
+                    str(exc),
+                    results=meter.results,
+                    budget_usage=meter.usage,
+                    budget_observed_actual=meter.observed_actual,
+                    budget_unknown_upper_bound=meter.unknown_upper_bound,
+                    research_usage=unknown,
+                    failure_code="research_permission_denied",
+                    requires_permission=True,
+                ) from exc
+            except ResearchEvidenceUnavailable as exc:
+                usage = BudgetUsage(
+                    search_calls=exc.search_calls,
+                    tool_calls=exc.search_calls + exc.fetch_calls + exc.extract_calls,
+                )
+                execution = ProposalExecution(
+                    execution_id=f"research-acquisition:{attempt.attempt_id}",
+                    attempt_id=attempt.attempt_id,
+                    executor="real_tools",
+                    operation=definition.proposal_policy.operation,
+                    status="failed",
+                    error_code=exc.failure_code,
+                    observed_actual=usage,
+                    conservative_committed=usage,
+                    started_at=started_at,
+                    finished_at=datetime.now(UTC),
+                    duration_ms=max(
+                        0,
+                        int((datetime.now(UTC) - started_at).total_seconds() * 1000),
+                    ),
+                )
+                head = runtime.checkpoint_proposal(
+                    lock,
+                    definition=definition,
+                    execution=execution,
+                )
+                report = self._research_acquisition_failure_report(
+                    attempt=attempt,
+                    definition=definition,
+                    code=exc.failure_code,
+                    retryable=exc.reason == "upstream_unavailable",
+                )
+                head = runtime.schedule_operation(
+                    lock,
+                    definition=definition,
+                    kind="validation",
+                    replay_mode="deterministic",
+                    elapsed_wall_seconds=0,
+                )
+                runtime.start_operation(
+                    lock,
+                    definition=definition,
+                    dispatch_id=f"research-acquisition-validation:{attempt.attempt_id}",
+                )
+                runtime.checkpoint_validation(
+                    lock,
+                    definition=definition,
+                    report=report,
+                    observed_actual=BudgetUsage(),
+                )
+                runtime.evaluate(
+                    lock,
+                    definition=definition,
+                    report=report,
+                    elapsed_wall_seconds=0,
+                )
+                raise DesignerError(
+                    "research.fetch",
+                    str(exc),
+                    results=meter.results,
+                    budget_usage=meter.usage,
+                    budget_observed_actual=meter.observed_actual,
+                    budget_unknown_upper_bound=meter.unknown_upper_bound,
+                    research_usage=usage,
+                    failure_code=exc.failure_code,
+                    infrastructure_error=exc.reason == "upstream_unavailable",
+                    budget_exhausted=exc.reason == "budget_exhausted",
+                ) from exc
+            except Exception as exc:
+                unknown = BudgetUsage(
+                    search_calls=definition.proposal_policy.budget.search_calls,
+                    tool_calls=definition.proposal_policy.budget.tool_calls,
+                )
+                execution = ProposalExecution(
+                    execution_id=f"research-acquisition:{attempt.attempt_id}",
+                    attempt_id=attempt.attempt_id,
+                    executor="real_tools",
+                    operation=definition.proposal_policy.operation,
+                    status="interrupted",
+                    error_code="research_toolchain_interrupted",
+                    unknown_upper_bound=unknown,
+                    conservative_committed=unknown,
+                    started_at=started_at,
+                    finished_at=datetime.now(UTC),
+                    duration_ms=max(
+                        0,
+                        int((datetime.now(UTC) - started_at).total_seconds() * 1000),
+                    ),
+                )
+                runtime.checkpoint_proposal(
+                    lock,
+                    definition=definition,
+                    execution=execution,
+                )
+                report = self._research_acquisition_failure_report(
+                    attempt=attempt,
+                    definition=definition,
+                    code="research_toolchain_interrupted",
+                    retryable=True,
+                )
+                runtime.schedule_operation(
+                    lock,
+                    definition=definition,
+                    kind="validation",
+                    replay_mode="deterministic",
+                    elapsed_wall_seconds=0,
+                )
+                runtime.start_operation(
+                    lock,
+                    definition=definition,
+                    dispatch_id=f"research-acquisition-validation:{attempt.attempt_id}",
+                )
+                runtime.checkpoint_validation(
+                    lock,
+                    definition=definition,
+                    report=report,
+                    observed_actual=BudgetUsage(),
+                )
+                runtime.evaluate(
+                    lock,
+                    definition=definition,
+                    report=report,
+                    elapsed_wall_seconds=0,
+                )
+                raise DesignerError(
+                    "research.fetch",
+                    str(exc),
+                    results=meter.results,
+                    budget_usage=meter.usage,
+                    budget_observed_actual=meter.observed_actual,
+                    budget_unknown_upper_bound=meter.unknown_upper_bound,
+                    research_usage=unknown,
+                    failure_code="research_toolchain_interrupted",
+                    infrastructure_error=True,
+                ) from exc
+
+            evidence, source_refs = self.materialize_research_evidence(job.job_id, research_bundle)
+            passage_pack = build_evidence_passage_pack(
+                pack_id=self._stable_id("evidence-passage-pack", request.request_id),
+                need=request.need,
+                query_texts=tuple(
+                    value for item in plan.queries for value in (item.text, item.rationale)
+                )
+                + plan.target_coverage_dimensions,
+                evidence=evidence,
+                bundle=research_bundle,
+            )
+            passage_pack_ref = self.artifacts.put_json(
+                artifact_id=f"{job.job_id}:evidence-passage-pack",
+                artifact_type="design.evidence_passage_pack",
+                value=passage_pack,
+                dependencies=(plan_ref, request_ref, *source_refs),
+            )
+            usage = BudgetUsage(
+                search_calls=research_bundle.search_calls,
+                tool_calls=(
+                    research_bundle.search_calls
+                    + research_bundle.fetch_calls
+                    + research_bundle.extract_calls
+                ),
+            )
+            record = ResearchAcquisition(
+                acquisition_id=self._stable_id(
+                    "research-acquisition", plan_ref.revision_id, passage_pack_ref.revision_id
+                ),
+                plan_ref=plan_ref,
                 request_ref=request_ref,
-                workspace=workspace,
-                invocation_budget=invocation_budget,
-                phase_checkpoint_ref=phase_checkpoint_ref,
-                repair_authority=repair_authority,
+                evidence=evidence,
+                source_refs=source_refs,
+                passage_pack_ref=passage_pack_ref,
+                usage=usage,
             )
-        finally:
-            _DESIGN_REPAIR_AUTHORITY.reset(authority_token)
-            _DESIGN_COMPLETION_INDEX_SCOPE.reset(token)
-
-    def adopt_latest_phase_checkpoint(
-        self,
-        *,
-        job: EnvironmentJob,
-        job_ref: ArtifactRef,
-        request: EnvironmentRequest,
-        request_ref: ArtifactRef,
-    ) -> ArtifactRef:
-        """Adopt the only production checkpoint in the batched Designer ABI."""
-
-        return self.adopt_evidence_graph_checkpoint(
-            job=job,
-            job_ref=job_ref,
-            request=request,
-            request_ref=request_ref,
-        )
-
-    def adopt_evidence_graph_checkpoint(
-        self,
-        *,
-        job: EnvironmentJob,
-        job_ref: ArtifactRef,
-        request: EnvironmentRequest,
-        request_ref: ArtifactRef,
-    ) -> ArtifactRef:
-        """Adopt a committed EvidenceGraph only after exact typed revalidation."""
-
-        if job.kind != "generate" or job.request_ref != request_ref:
-            raise ValueError("checkpoint adoption requires its exact Direct Generate job")
-        self.artifacts.require_exact_json(
-            job_ref,
-            job,
-            artifact_types=("control.environment_job",),
-        )
-        self.artifacts.require_exact_json(
-            request_ref,
-            request,
-            artifact_types=("control.environment_request",),
-        )
-        existing = tuple(
-            ref
-            for ref in self.artifacts.list_revisions(
-                f"{job.job_id}:phase-checkpoint:evidence-graph"
+            record_ref = self.artifacts.put_json(
+                artifact_id=f"{job.job_id}:research-acquisition",
+                artifact_type="design.research_acquisition",
+                value=record,
+                dependencies=(plan_ref, request_ref, passage_pack_ref, *source_refs),
             )
-            if ref.artifact_type == "design.phase_checkpoint"
-        )
-        if len(existing) == 1:
-            return existing[0]
-        if existing:
-            raise DesignerError(
-                "checkpoint.ambiguous",
-                "multiple EvidenceGraph checkpoint revisions require explicit selection",
+            execution = ProposalExecution(
+                execution_id=f"research-acquisition:{attempt.attempt_id}",
+                attempt_id=attempt.attempt_id,
+                executor="real_tools",
+                operation=definition.proposal_policy.operation,
+                status="completed",
+                output_commitment=record_ref.content_hash,
+                observed_actual=usage,
+                conservative_committed=usage,
+                started_at=started_at,
+                finished_at=datetime.now(UTC),
+                duration_ms=max(
+                    0,
+                    int((datetime.now(UTC) - started_at).total_seconds() * 1000),
+                ),
             )
-        evidence_refs = tuple(
-            ref
-            for ref in self.artifacts.list_revisions(f"{job.job_id}:evidence-graph")
-            if ref.artifact_type == "design.evidence_graph"
-        )
-        if len(evidence_refs) != 1:
-            raise DesignerError(
-                "checkpoint.unavailable",
-                "expected exactly one committed EvidenceGraph for evidence recovery",
+            head = runtime.checkpoint_proposal(
+                lock,
+                definition=definition,
+                execution=execution,
+                output_refs=(record_ref,),
             )
-        evidence_graph_ref = evidence_refs[0]
-        evidence_graph = self.artifacts.get_json(evidence_graph_ref, EvidenceGraph)
-        self.artifacts.require_exact_json(
-            evidence_graph_ref,
-            evidence_graph,
-            artifact_types=("design.evidence_graph",),
-        )
-        if request_ref not in self.artifacts.dependencies(evidence_graph_ref):
-            raise DesignerError(
-                "checkpoint.dependencies",
-                "committed EvidenceGraph is not dependency-bound to the recovered request",
+            attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+            report = ValidationReport(
+                report_id=f"report:{attempt.attempt_id}:evidence-acquisition",
+                attempt_id=attempt.attempt_id,
+                coordinate=definition.coordinate,
+                policy_id=definition.validation_policy.policy_id,
+                policy_digest=definition.validation_policy.content_digest(),
+                subject_refs=(record_ref,),
+                status="passed",
+                validation_phase=definition.validation_policy.validation_phase,
+                frontier_ordinal=definition.validation_policy.frontier_ordinal,
+                passed_check_ids=(definition.required_claim_id,),
+                evidence_refs=(passage_pack_ref, *source_refs),
+                diagnostic_quality="not_applicable",
+                evaluated_at=datetime.now(UTC),
             )
-        self._validate_checkpoint_evidence_graph(evidence_graph)
-        checkpoint = self._evidence_graph_checkpoint(
-            job_ref=job_ref,
-            request_ref=request_ref,
-            evidence_graph_ref=evidence_graph_ref,
-        )
-        checkpoint_ref = self.artifacts.put_json(
-            artifact_id=f"{job.job_id}:phase-checkpoint:evidence-graph",
-            artifact_type="design.phase_checkpoint",
-            value=checkpoint,
-            dependencies=(job_ref, request_ref, evidence_graph_ref),
-        )
-        self.artifacts.record_event(
-            event_type="design_phase_checkpoint_adopted",
-            subject_ref=checkpoint_ref,
-            related_refs=(job_ref, evidence_graph_ref),
-            details=(KeyValue(key="phase", value=checkpoint.phase),),
-        )
-        return checkpoint_ref
-
-    def _retired_adopt_world_skeleton_checkpoint(
-        self,
-        *,
-        job: EnvironmentJob,
-        job_ref: ArtifactRef,
-        request: EnvironmentRequest,
-        request_ref: ArtifactRef,
-    ) -> ArtifactRef:
-        """Retained temporarily for source archaeology; never a runnable success path."""
-
-        raise DesignerError(
-            "checkpoint.abi",
-            "world_skeleton adoption belongs to the retired microsharded Designer ABI",
-        )
-
-        if job.kind != "generate" or job.request_ref != request_ref:
-            raise ValueError("checkpoint adoption requires its exact Direct Generate job")
-        self.artifacts.require_exact_json(
-            job_ref,
-            job,
-            artifact_types=("control.environment_job",),
-        )
-        self.artifacts.require_exact_json(
-            request_ref,
-            request,
-            artifact_types=("control.environment_request",),
-        )
-        existing = tuple(
-            ref
-            for ref in self.artifacts.list_revisions(
-                f"{job.job_id}:phase-checkpoint:world-skeleton"
+            runtime.schedule_operation(
+                lock,
+                definition=definition,
+                kind="validation",
+                replay_mode="deterministic",
+                elapsed_wall_seconds=0,
+                input_refs=(plan_ref, record_ref),
             )
-            if ref.artifact_type == "design.phase_checkpoint"
-        )
-        if len(existing) == 1:
-            return existing[0]
-        if existing:
-            raise DesignerError(
-                "checkpoint.ambiguous",
-                "multiple world-skeleton checkpoint revisions require explicit selection",
+            runtime.start_operation(
+                lock,
+                definition=definition,
+                dispatch_id=f"research-acquisition-validation:{attempt.attempt_id}",
             )
-
-        def unique_ref(artifact_id: str, artifact_type: str) -> ArtifactRef:
-            refs = tuple(
-                ref
-                for ref in self.artifacts.list_revisions(artifact_id)
-                if ref.artifact_type == artifact_type
+            head = runtime.checkpoint_validation(
+                lock,
+                definition=definition,
+                report=report,
+                observed_actual=BudgetUsage(),
             )
-            if len(refs) != 1:
-                raise DesignerError(
-                    "checkpoint.unavailable",
-                    f"expected exactly one committed {artifact_type} for skeleton recovery",
-                )
-            return refs[0]
-
-        evidence_graph_ref = unique_ref(
-            f"{job.job_id}:evidence-graph",
-            "design.evidence_graph",
-        )
-        skeleton_ref = unique_ref(
-            f"{job.job_id}:world-skeleton",
-            "design.world_skeleton",
-        )
-        evidence_graph = self.artifacts.get_json(evidence_graph_ref, EvidenceGraph)
-        skeleton = self.artifacts.get_json(skeleton_ref, WorldSkeletonDraft)
-        self.artifacts.require_exact_json(
-            evidence_graph_ref,
-            evidence_graph,
-            artifact_types=("design.evidence_graph",),
-        )
-        self.artifacts.require_exact_json(
-            skeleton_ref,
-            skeleton,
-            artifact_types=("design.world_skeleton",),
-        )
-        if evidence_graph_ref not in self.artifacts.dependencies(skeleton_ref):
-            raise DesignerError(
-                "checkpoint.dependencies",
-                "committed WorldSkeleton is not bound to the recovered EvidenceGraph",
+            head = runtime.evaluate(
+                lock,
+                definition=definition,
+                report=report,
+                output_refs=(record_ref,),
+                elapsed_wall_seconds=0,
             )
-        self._validate_world_skeleton(
-            skeleton,
-            evidence_graph=evidence_graph,
-            allow_task_dimension_rework=True,
-        )
-        checkpoint = self._world_skeleton_checkpoint(
-            job_ref=job_ref,
-            request_ref=request_ref,
-            evidence_graph_ref=evidence_graph_ref,
-            skeleton_ref=skeleton_ref,
-        )
-        checkpoint_ref = self.artifacts.put_json(
-            artifact_id=f"{job.job_id}:phase-checkpoint:world-skeleton",
-            artifact_type="design.phase_checkpoint",
-            value=checkpoint,
-            dependencies=(job_ref, request_ref, evidence_graph_ref, skeleton_ref),
-        )
-        self.artifacts.record_event(
-            event_type="design_phase_checkpoint_adopted",
-            subject_ref=checkpoint_ref,
-            related_refs=(job_ref, evidence_graph_ref, skeleton_ref),
-            details=(KeyValue(key="phase", value=checkpoint.phase),),
-        )
-        return checkpoint_ref
+            if head.status != "committed":
+                raise WorkRuntimeError("passing research acquisition did not commit")
+            self.artifacts.record_event(
+                event_type="research_acquisition_completed",
+                subject_ref=record_ref,
+                related_refs=self._unique_refs((job_ref, plan_ref, *source_refs)),
+                details=(
+                    KeyValue(key="search_calls", value=research_bundle.search_calls),
+                    KeyValue(key="fetch_calls", value=research_bundle.fetch_calls),
+                    KeyValue(key="extract_calls", value=research_bundle.extract_calls),
+                    KeyValue(key="document_count", value=len(research_bundle.documents)),
+                    KeyValue(key="failure_count", value=len(research_bundle.failures)),
+                ),
+            )
+            return record, record_ref
 
     @staticmethod
-    def _validate_checkpoint_evidence_graph(evidence_graph: EvidenceGraph) -> None:
-        if not any(
-            claim.kind == "observed" and claim.status == "supported" and claim.evidence_ids
-            for claim in evidence_graph.claims
-        ):
+    def _research_acquisition_failure_report(
+        *,
+        attempt: WorkAttempt,
+        definition: WorkDefinition,
+        code: str,
+        retryable: bool,
+    ) -> ValidationReport:
+        issue = ValidationIssue(
+            code=code,
+            path=("acquisition",),
+            violated_condition=(
+                "the bounded real research operation produced no admissible evidence"
+            ),
+            expected_category="at least one fetched and extracted allowed source body",
+            retryable=retryable,
+        )
+        return ValidationReport(
+            report_id=f"report:{attempt.attempt_id}:{code}",
+            attempt_id=attempt.attempt_id,
+            coordinate=definition.coordinate,
+            policy_id=definition.validation_policy.policy_id,
+            policy_digest=definition.validation_policy.content_digest(),
+            status="error" if retryable else "failed",
+            validation_phase=definition.validation_policy.validation_phase,
+            frontier_ordinal=definition.validation_policy.frontier_ordinal,
+            issues=(issue,),
+            diagnostic_quality="actionable" if retryable else "insufficient",
+            evaluated_at=datetime.now(UTC),
+        )
+
+    @staticmethod
+    def _validate_grounded_evidence_graph(evidence_graph: EvidenceGraph) -> None:
+        try:
+            validate_grounded_evidence_graph(evidence_graph)
+        except StructuredSemanticError as exc:
             raise DesignerError(
-                "checkpoint.evidence",
-                "EvidenceGraph lacks a supported observed claim with source evidence",
-            )
+                "research.evidence", "EvidenceGraph lacks a supported claim"
+            ) from exc
 
-    def _evidence_graph_checkpoint(
-        self,
-        *,
-        job_ref: ArtifactRef,
-        request_ref: ArtifactRef,
-        evidence_graph_ref: ArtifactRef,
-    ) -> DesignPhaseCheckpoint:
-        refs = (job_ref, request_ref, evidence_graph_ref)
-        fingerprint = sha256_digest("\0".join(ref.revision_id for ref in refs).encode("utf-8"))
-        return DesignPhaseCheckpoint(
-            checkpoint_id=self._stable_id("design-phase-checkpoint", fingerprint),
-            phase="evidence_graph",
-            job_ref=job_ref,
-            request_ref=request_ref,
-            evidence_graph_ref=evidence_graph_ref,
-            input_fingerprint=fingerprint,
-        )
-
-    def _world_skeleton_checkpoint(
-        self,
-        *,
-        job_ref: ArtifactRef,
-        request_ref: ArtifactRef,
-        evidence_graph_ref: ArtifactRef,
-        skeleton_ref: ArtifactRef,
-    ) -> DesignPhaseCheckpoint:
-        refs = (job_ref, request_ref, evidence_graph_ref, skeleton_ref)
-        fingerprint = sha256_digest("\0".join(ref.revision_id for ref in refs).encode("utf-8"))
-        return DesignPhaseCheckpoint(
-            checkpoint_id=self._stable_id("design-phase-checkpoint", fingerprint),
-            phase="world_skeleton",
-            job_ref=job_ref,
-            request_ref=request_ref,
-            evidence_graph_ref=evidence_graph_ref,
-            world_skeleton_ref=skeleton_ref,
-            input_fingerprint=fingerprint,
-        )
+    @staticmethod
+    def _validate_research_plan_coverage(plan: ResearchPlan) -> None:
+        validate_research_plan_coverage(plan)
 
     def _load_validated_design_node(
         self,
@@ -4003,6 +4327,8 @@ class EnvironmentDesigner:
         finding_refs: tuple[ArtifactRef, ...],
         workspace: Path,
         meter: DesignerInvocationBudget,
+        work_runtime: WorkControlRuntime | None = None,
+        dependency_coordinate: WorkCoordinate | None = None,
     ) -> DesignBundle:
         """Close evidence questions without regenerating unrelated world semantics."""
 
@@ -4117,27 +4443,51 @@ class EnvironmentDesigner:
             *finding_refs,
         )
         closure_artifact_id = f"{job.job_id}:assumption-closure:{previous.design.revision + 1}"
-        reusable_closure = self._load_validated_design_node(
-            artifact_id=closure_artifact_id,
-            artifact_type="design.assumption_closure",
-            model=EvidenceAssumptionClosureDraft,
-            required_dependencies=closure_dependencies,
-            semantic_validator=validate_closure,
-            job_ref=job_ref,
-            node="assumption_closure",
-            detail=str(previous.design.revision + 1),
-        )
-        if reusable_closure is not None:
-            closure, closure_ref = reusable_closure
-            invocation_results: tuple[InvocationResult, ...] = ()
-        else:
+        if work_runtime is not None:
+            if dependency_coordinate is None:
+                raise ValueError(
+                    "work-controlled assumption closure requires its exact dependency coordinate"
+                )
             self._record_design_node_started(
                 node="assumption_closure",
                 subject_ref=previous.evidence_graph_ref,
                 job_ref=job_ref,
                 detail=str(previous.design.revision + 1),
             )
-            closure, invocation_results = await self.run_structured_agent(
+            closure_definition = structured_agent_work_definition(
+                scope_id=job.job_id,
+                stage="assumption_closure",
+                artifact_slot="assumption_closure",
+                dependency_coordinates=(dependency_coordinate,),
+                claim_id="design.assumptions.typed",
+                claim=(
+                    "Every model-owned uncertainty has one exact typed disposition bound to "
+                    "an auditable Claim and Fidelity statement, or remains explicitly human-owned."
+                ),
+                timing_reason=(
+                    "Modeling policy must inspect explicit decisions rather than infer that a "
+                    "later WorldSpec silently answered earlier research questions."
+                ),
+                output_contract_id="contract:evidence-assumption-closure",
+                implementation_revision_id=_SEMANTIC_LAYER_REVISION,
+                validator_revision_id="framework.validator.assumption-closure.v2",
+                agent_role="researcher",
+                allowed_mutation_roots=("/resolutions",),
+                agent_wall_seconds=min(600.0, meter.remaining_wall_seconds),
+                agent_token_limit=meter.rollout_token_limit,
+                maximum_local_corrections=1,
+                strict_progress_bonus_corrections=1,
+                maximum_automatic_backjump=0,
+            )
+            closure, closure_ref, invocation_results = await self.execute_structured_work(
+                runtime=work_runtime,
+                work=StructuredWorkSpec(
+                    definition=closure_definition,
+                    input_refs=closure_dependencies,
+                    artifact_id=closure_artifact_id,
+                    artifact_type="design.assumption_closure",
+                    dependencies=closure_dependencies,
+                ),
                 role="researcher",
                 lineage_id=(
                     f"{job.job_id}.assumption-closure.revision.{previous.design.revision + 1}"
@@ -4159,12 +4509,7 @@ class EnvironmentDesigner:
                     node_id="researcher.assumption-closure",
                     role="researcher",
                 ),
-            )
-            closure_ref = self.artifacts.put_json(
-                artifact_id=closure_artifact_id,
-                artifact_type="design.assumption_closure",
-                value=closure,
-                dependencies=closure_dependencies,
+                semantic_transaction="design.assumption-closure",
             )
             self._record_design_node(
                 node="assumption_closure",
@@ -4173,6 +4518,69 @@ class EnvironmentDesigner:
                 related_refs=closure_dependencies,
                 detail=str(previous.design.revision + 1),
             )
+        else:
+            if dependency_coordinate is not None:
+                raise ValueError(
+                    "legacy assumption closure cannot bind a WorkCoordinate without a runtime"
+                )
+            reusable_closure = self._load_validated_design_node(
+                artifact_id=closure_artifact_id,
+                artifact_type="design.assumption_closure",
+                model=EvidenceAssumptionClosureDraft,
+                required_dependencies=closure_dependencies,
+                semantic_validator=validate_closure,
+                job_ref=job_ref,
+                node="assumption_closure",
+                detail=str(previous.design.revision + 1),
+            )
+            if reusable_closure is not None:
+                closure, closure_ref = reusable_closure
+                invocation_results = ()
+            else:
+                self._record_design_node_started(
+                    node="assumption_closure",
+                    subject_ref=previous.evidence_graph_ref,
+                    job_ref=job_ref,
+                    detail=str(previous.design.revision + 1),
+                )
+                closure, invocation_results = await self.run_structured_agent(
+                    role="researcher",
+                    lineage_id=(
+                        f"{job.job_id}.assumption-closure.revision.{previous.design.revision + 1}"
+                    ),
+                    workspace=closure_workspace,
+                    model=EvidenceAssumptionClosureDraft,
+                    prompt=self._with_frozen_inputs(
+                        self._assumption_closure_prompt(),
+                        assumption_issues=issues,
+                        evidence_claim_catalog=previous.evidence_graph.claims,
+                        world_boundary=previous.world_spec.boundary,
+                        world_fidelity=previous.world_spec.fidelity,
+                        world_tool_surfaces=tuple(
+                            tool.surface for tool in previous.world_spec.tools
+                        ),
+                    ),
+                    semantic_validator=validate_closure,
+                    permissions=job.permissions,
+                    budget=meter,
+                    capability_requirement=NodeCapabilityRequirement.structured_output(
+                        node_id="researcher.assumption-closure",
+                        role="researcher",
+                    ),
+                )
+                closure_ref = self.artifacts.put_json(
+                    artifact_id=closure_artifact_id,
+                    artifact_type="design.assumption_closure",
+                    value=closure,
+                    dependencies=closure_dependencies,
+                )
+                self._record_design_node(
+                    node="assumption_closure",
+                    subject_ref=closure_ref,
+                    job_ref=job_ref,
+                    related_refs=closure_dependencies,
+                    detail=str(previous.design.revision + 1),
+                )
         new_claims = tuple(item.claim for item in closure.resolutions if item.claim is not None)
         new_fidelity = tuple(
             item.fidelity for item in closure.resolutions if item.fidelity is not None
@@ -4359,6 +4767,1226 @@ class EnvironmentDesigner:
             raise ValueError("assumption closure claim references unknown claims")
         if not set(resolution.fidelity.evidence_claim_ids) <= available_claim_ids:
             raise ValueError("assumption closure fidelity references unknown claims")
+
+    async def execute_structured_work(
+        self,
+        *,
+        runtime: WorkControlRuntime,
+        work: StructuredWorkSpec,
+        role: str,
+        lineage_id: str,
+        workspace: Path,
+        model: type[TOutput],
+        prompt: str,
+        permissions: PermissionScope,
+        budget: DesignerInvocationBudget,
+        semantic_validator: Callable[[TOutput], None] | None = None,
+        capability_requirement: NodeCapabilityRequirement | None = None,
+        semantic_transaction: str | None = None,
+        repair_projection: (
+            RootSectionRepairProjection | ToolSemanticsRepairProjection | None
+        ) = None,
+    ) -> tuple[TOutput, ArtifactRef, tuple[InvocationResult, ...]]:
+        """Execute one WorkDefinition under the framework-owned control loop.
+
+        The component performs one real proposal and deterministic validation at
+        a time.  It cannot choose retry counts or consume a correction by itself;
+        only ``WorkControlRuntime`` can authorize the next WorkAttempt.
+        """
+
+        definition = runtime.register_definition(work.definition)
+        if tuple(work.dependencies) != tuple(work.input_refs):
+            raise WorkRuntimeError(
+                "structured source dependencies must equal immutable Work inputs"
+            )
+        workspace.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
+        assert_agent_output_advisory(
+            model,
+            authority=AgentOutputAuthority.SEMANTIC_ADVISORY,
+        )
+        schema = model.model_json_schema(mode="validation")
+        schema_digest = sha256_digest(canonical_json_bytes(schema))
+        requirement = capability_requirement or NodeCapabilityRequirement.structured_read(
+            node_id=f"{role}.structured-output",
+            role=role,
+        )
+        immutable_prompt = prompt
+        current_prompt = prompt
+        session = None
+        previous_candidate: TOutput | None = None
+        pending_repair_roots: tuple[str, ...] = ()
+        invocation_results: list[InvocationResult] = []
+        last_result: InvocationResult | None = None
+        repair_mode = "initial"
+
+        def correction_from_report(
+            report: ValidationReport,
+            roots: tuple[str, ...],
+        ) -> str:
+            diagnostics = "\n".join(
+                (
+                    f"- {issue.code} at /"
+                    + "/".join(str(part) for part in issue.path)
+                    + f": {issue.violated_condition}; expected {issue.expected_category}"
+                )
+                for issue in report.issues
+            )
+            return (
+                "The previous structured output failed deterministic framework validation. "
+                "Correct only the authorized artifact and do not change scope or invent "
+                "evidence. "
+                + (
+                    f"Framework code will restore every path outside these roots: {roots}. "
+                    if roots
+                    else ""
+                )
+                + "Return the complete corrected artifact. Validation errors:\n"
+                + diagnostics
+            )
+
+        with runtime.heads.exclusive(definition.coordinate) as lock:
+            active = runtime.heads.require_active_commit(
+                definition=definition,
+                input_refs=work.input_refs,
+                artifacts=runtime.artifacts,
+            )
+            if active is None:
+                active = runtime.reactivate_historical_commit(
+                    lock,
+                    definition=definition,
+                    input_refs=work.input_refs,
+                )
+            if active is not None:
+                commit, _commit_ref = active
+                output_refs = tuple(
+                    ref for ref in commit.output_refs if ref.artifact_type == work.artifact_type
+                )
+                if len(output_refs) != 1:
+                    raise WorkRuntimeError(
+                        "active structured WorkCommit lacks its unique source Artifact"
+                    )
+                output_ref = output_refs[0]
+                return self.artifacts.get_json(output_ref, model), output_ref, ()
+
+            try:
+                supported_revisions = tuple(
+                    getattr(
+                        self.backend,
+                        "supported_executor_revision_ids",
+                        ("framework.executor.v1",),
+                    )
+                )
+                if definition.proposal_policy.executor_revision_id not in supported_revisions:
+                    raise WorkRuntimeError(
+                        "InvocationBackend does not prove support for executor revision "
+                        f"{definition.proposal_policy.executor_revision_id}"
+                    )
+                profile = self.profiles.resolve(
+                    role=role,
+                    lineage_id=lineage_id,
+                    workspace=workspace,
+                    output_schema=schema,
+                    permissions=permissions,
+                    requirement=requirement,
+                    rollout_token_limit=definition.proposal_policy.budget.llm_tokens,
+                )
+            except CapabilityResolutionError as exc:
+                raise DesignerError(
+                    "agent.permissions",
+                    str(exc),
+                    requires_permission=True,
+                    lineage_id=lineage_id,
+                ) from exc
+
+            head = runtime.heads.read_head(definition.coordinate)
+            recovering_running = head is not None and head.status == "running"
+            if head is None:
+                head = runtime.begin(
+                    lock,
+                    definition=definition,
+                    input_refs=work.input_refs,
+                    elapsed_wall_seconds=0,
+                )
+            elif (
+                head.definition_digest != definition.definition_digest
+                or head.input_fingerprint != runtime.heads.input_fingerprint(work.input_refs)
+            ):
+                head = runtime.supersede_stale(
+                    lock,
+                    definition=definition,
+                    input_refs=work.input_refs,
+                    previous=head,
+                    elapsed_wall_seconds=0,
+                )
+                recovering_running = False
+            elif head.status == "repair_authorized":
+                prior_attempt = runtime.artifacts.get_json(head.attempt_ref, WorkAttempt)
+                if (
+                    head.evaluation_ref is None
+                    or head.repair_action_ref is None
+                    or prior_attempt.validation_report_ref is None
+                ):
+                    raise WorkRuntimeError("authorized repair lacks exact authority refs")
+                source_report = runtime.artifacts.get_json(
+                    prior_attempt.validation_report_ref,
+                    ValidationReport,
+                )
+                action = runtime.artifacts.get_json(
+                    head.repair_action_ref,
+                    RepairAction,
+                )
+                pending_repair_roots = action.allowed_mutation_roots
+                if action.decision == "local_correction":
+                    if (
+                        prior_attempt.continuation_commitment is None
+                        or runtime.continuations is None
+                        or runtime.continuation_workspace_root is None
+                    ):
+                        raise WorkRuntimeError(
+                            "semantic repair cannot resume without exact private continuation"
+                        )
+                    continuation_workspace_root = runtime.continuation_workspace_root
+                    record = runtime.continuations.load_commitment(
+                        prior_attempt.continuation_commitment,
+                        workspace_root=continuation_workspace_root,
+                    )
+                    prior_proposal_refs = runtime.proposal_execution_refs(prior_attempt)
+                    if record is None and prior_proposal_refs:
+                        record = runtime.continuations.find_repair_binding(
+                            work_id=definition.work_id,
+                            attempt_id=prior_attempt.attempt_id,
+                            definition_digest=definition.definition_digest,
+                            proposal_policy_digest=(definition.proposal_policy.content_digest()),
+                            input_fingerprint=runtime.heads.input_fingerprint(work.input_refs),
+                            source_report_ref=prior_attempt.validation_report_ref,
+                            source_evaluation_ref=head.evaluation_ref,
+                            repair_action_ref=head.repair_action_ref,
+                            previous_execution_ref=prior_proposal_refs[-1],
+                            workspace_root=continuation_workspace_root,
+                        )
+                        if record is not None:
+                            head = runtime.bind_repair_continuation(
+                                lock,
+                                definition=definition,
+                                record=record,
+                            )
+                    if record is not None and Path(record.workspace) != profile.workspace:
+                        continuation_workspace = Path(record.workspace)
+                        if (
+                            continuation_workspace.name != "workspace"
+                            or continuation_workspace.parent.name != ".agent-runtime"
+                        ):
+                            raise WorkRuntimeError(
+                                "continuation workspace does not match the isolated profile layout"
+                            )
+                        try:
+                            profile = self.profiles.resolve(
+                                role=role,
+                                lineage_id=lineage_id,
+                                workspace=continuation_workspace.parent.parent,
+                                output_schema=schema,
+                                permissions=permissions,
+                                requirement=requirement,
+                                rollout_token_limit=(definition.proposal_policy.budget.llm_tokens),
+                            )
+                        except CapabilityResolutionError as exc:
+                            raise DesignerError(
+                                "agent.permissions",
+                                str(exc),
+                                requires_permission=True,
+                                lineage_id=lineage_id,
+                            ) from exc
+                    if (
+                        record is None
+                        or record.work_id != definition.work_id
+                        or record.attempt_id != prior_attempt.attempt_id
+                        or record.definition_digest != definition.definition_digest
+                        or record.input_fingerprint
+                        != runtime.heads.input_fingerprint(work.input_refs)
+                        or record.source_report_ref != prior_attempt.validation_report_ref
+                        or record.source_evaluation_ref != head.evaluation_ref
+                        or record.repair_action_ref != head.repair_action_ref
+                        or record.model != profile.model
+                        or record.profile_digest != f"sha256:{profile.profile_hash}"
+                        or record.output_schema_digest != schema_digest
+                    ):
+                        raise WorkRuntimeError(
+                            "private continuation does not bind the authorized repair"
+                        )
+                    session = record.restore_session()
+                    previous_candidate = (
+                        model.model_validate_json(canonical_json_bytes(record.previous_candidate))
+                        if record.previous_candidate is not None
+                        else None
+                    )
+                    pending_repair_roots = record.allowed_mutation_roots
+                    repair_mode = "continuation"
+                else:
+                    session = None
+                    repair_mode = "backend_retry"
+                correction_prompt = correction_from_report(
+                    source_report,
+                    pending_repair_roots,
+                )
+                current_prompt = (
+                    correction_prompt
+                    if session is not None
+                    else f"{immutable_prompt}\n\n{correction_prompt}"
+                )
+                head = runtime.begin_authorized_repair(lock, definition=definition)
+            elif head.status != "running":
+                raise DesignerError(
+                    f"agent.{role}.work_terminal",
+                    (
+                        f"WorkDefinition is terminal with status {head.status}; "
+                        f"head_definition={head.definition_digest}; "
+                        f"current_definition={definition.definition_digest}; "
+                        f"head_inputs={head.input_fingerprint}; "
+                        "current_inputs="
+                        f"{runtime.heads.input_fingerprint(work.input_refs)}"
+                    ),
+                    lineage_id=lineage_id,
+                )
+
+            def restart_semantic_execution(
+                interrupted: WorkAttempt,
+                *,
+                reason_code: str,
+            ) -> bool:
+                """Retry transport/process work without evaluating semantic progress."""
+
+                nonlocal current_prompt, pending_repair_roots, repair_mode, session
+                if interrupted.repair_action_ref is None:
+                    return False
+                action = runtime.artifacts.get_json(
+                    interrupted.repair_action_ref,
+                    RepairAction,
+                )
+                if action.decision not in {"local_correction", "parent_correction"}:
+                    return False
+                entry = next(
+                    (
+                        item
+                        for item in runtime.repairs.entries_for(
+                            definition,
+                            input_refs=interrupted.input_refs,
+                        )
+                        if item.repair_action_ref == interrupted.repair_action_ref
+                    ),
+                    None,
+                )
+                if entry is None or entry.outcome != "authorized":
+                    raise WorkRuntimeError(
+                        "interrupted semantic execution lacks open ledger authority"
+                    )
+                if previous_candidate is None:
+                    raise WorkRuntimeError(
+                        "interrupted semantic execution lacks its baseline candidate"
+                    )
+                source_report = runtime.artifacts.get_json(
+                    entry.report_before_ref,
+                    ValidationReport,
+                )
+                pending_repair_roots = action.allowed_mutation_roots
+                session = None
+                current_prompt = f"{immutable_prompt}\n\n" + correction_from_report(
+                    source_report, pending_repair_roots
+                )
+                repair_mode = "process_recovery"
+                recovered_head = runtime.restart_interrupted_repair(
+                    lock,
+                    definition=definition,
+                    reason_code=reason_code,
+                    elapsed_wall_seconds=0,
+                )
+                if recovered_head.status != "running":
+                    raise DesignerError(
+                        f"agent.{role}.interrupted",
+                        "semantic correction exhausted physical recovery",
+                        validation_issues=(reason_code,),
+                        infrastructure_error=True,
+                        lineage_id=lineage_id,
+                    )
+                return True
+
+            def abort_semantic_execution(
+                interrupted: WorkAttempt,
+                *,
+                reason_code: str,
+            ) -> bool:
+                if interrupted.repair_action_ref is None:
+                    return False
+                action = runtime.artifacts.get_json(
+                    interrupted.repair_action_ref,
+                    RepairAction,
+                )
+                if action.decision not in {"local_correction", "parent_correction"}:
+                    return False
+                runtime.abort_interrupted_repair(
+                    lock,
+                    definition=definition,
+                    reason_code=reason_code,
+                )
+                return True
+
+            def checkpoint_report_boundary(
+                current_head: WorkControlHead,
+                report: ValidationReport,
+            ) -> WorkControlHead:
+                if current_head.active_operation_ref is None:
+                    current_head = runtime.schedule_operation(
+                        lock,
+                        definition=definition,
+                        kind="validation",
+                        replay_mode="deterministic",
+                        elapsed_wall_seconds=0,
+                    )
+                assert current_head.active_operation_ref is not None
+                active = runtime.artifacts.get_json(
+                    current_head.active_operation_ref,
+                    OperationRun,
+                )
+                if active.status == "scheduled":
+                    current_head = runtime.start_operation(
+                        lock,
+                        definition=definition,
+                        dispatch_id=f"validation:{report.attempt_id}",
+                    )
+                return runtime.checkpoint_validation(
+                    lock,
+                    definition=definition,
+                    report=report,
+                    observed_actual=BudgetUsage(),
+                )
+
+            if recovering_running:
+                recovery_candidate = runtime.artifacts.get_json(
+                    head.attempt_ref,
+                    WorkAttempt,
+                )
+                if not runtime.proposal_execution_refs(recovery_candidate):
+                    active_operation = (
+                        runtime.artifacts.get_json(
+                            head.active_operation_ref,
+                            OperationRun,
+                        )
+                        if head.active_operation_ref is not None
+                        else None
+                    )
+                    if active_operation is None or active_operation.status == "scheduled":
+                        recovering_running = False
+
+            if recovering_running:
+                interrupted_attempt = runtime.artifacts.get_json(
+                    head.attempt_ref,
+                    WorkAttempt,
+                )
+                if interrupted_attempt.started_at is None:
+                    raise WorkRuntimeError("running WorkAttempt lacks started_at")
+                if not runtime.proposal_execution_refs(interrupted_attempt):
+                    if head.active_operation_ref is None:
+                        raise WorkRuntimeError("dispatched recovery lacks its active OperationRun")
+                    active_operation = runtime.artifacts.get_json(
+                        head.active_operation_ref,
+                        OperationRun,
+                    )
+                    if (
+                        active_operation.status != "running"
+                        or active_operation.dispatch_id is None
+                        or active_operation.started_at is None
+                    ):
+                        raise WorkRuntimeError("recovery cannot invent an undispatched proposal")
+                    now = datetime.now(UTC)
+                    unknown = BudgetUsage(
+                        llm_tokens=definition.proposal_policy.budget.llm_tokens,
+                        agent_turns=1,
+                    )
+                    interrupted_execution = ProposalExecution(
+                        execution_id=f"execution:recovery:{interrupted_attempt.attempt_id}",
+                        attempt_id=interrupted_attempt.attempt_id,
+                        executor="agent",
+                        executor_revision_id=(definition.proposal_policy.executor_revision_id),
+                        operation=definition.proposal_policy.operation,
+                        status="interrupted",
+                        invocation_id=active_operation.dispatch_id,
+                        provider=profile.model_provider or "openai",
+                        model=profile.model,
+                        profile_digest=f"sha256:{profile.profile_hash}",
+                        output_schema_digest=schema_digest,
+                        error_code="process_interrupted_before_checkpoint",
+                        unknown_upper_bound=unknown,
+                        conservative_committed=unknown,
+                        started_at=active_operation.started_at,
+                        finished_at=now,
+                        duration_ms=max(
+                            0,
+                            int((now - active_operation.started_at).total_seconds() * 1000),
+                        ),
+                    )
+                    head = runtime.checkpoint_proposal(
+                        lock,
+                        definition=definition,
+                        execution=interrupted_execution,
+                    )
+                    interrupted_attempt = runtime.artifacts.get_json(
+                        head.attempt_ref,
+                        WorkAttempt,
+                    )
+                recovery_report = runtime.recover_pending_validation(
+                    definition=definition,
+                    attempt=interrupted_attempt,
+                )
+                if recovery_report is None and interrupted_attempt.repair_action_ref is not None:
+                    interrupted_action = runtime.artifacts.get_json(
+                        interrupted_attempt.repair_action_ref,
+                        RepairAction,
+                    )
+                    if interrupted_action.decision in {
+                        "local_correction",
+                        "parent_correction",
+                    }:
+                        entry = next(
+                            (
+                                item
+                                for item in runtime.repairs.entries_for(
+                                    definition,
+                                    input_refs=interrupted_attempt.input_refs,
+                                )
+                                if item.repair_action_ref == interrupted_attempt.repair_action_ref
+                            ),
+                            None,
+                        )
+                        if entry is None or entry.outcome != "authorized":
+                            raise WorkRuntimeError(
+                                "interrupted semantic correction lacks open ledger authority"
+                            )
+                        if (
+                            interrupted_attempt.continuation_commitment is None
+                            or runtime.continuations is None
+                            or runtime.continuation_workspace_root is None
+                        ):
+                            raise WorkRuntimeError(
+                                "interrupted semantic correction lacks exact continuation"
+                            )
+                        source_report = runtime.artifacts.get_json(
+                            entry.report_before_ref,
+                            ValidationReport,
+                        )
+                        record = runtime.continuations.load_commitment(
+                            interrupted_attempt.continuation_commitment,
+                            workspace_root=runtime.continuation_workspace_root,
+                        )
+                        if record is not None and Path(record.workspace) != profile.workspace:
+                            continuation_workspace = Path(record.workspace)
+                            if (
+                                continuation_workspace.name != "workspace"
+                                or continuation_workspace.parent.name != ".agent-runtime"
+                            ):
+                                raise WorkRuntimeError(
+                                    "continuation workspace does not match isolated layout"
+                                )
+                            try:
+                                profile = self.profiles.resolve(
+                                    role=role,
+                                    lineage_id=lineage_id,
+                                    workspace=continuation_workspace.parent.parent,
+                                    output_schema=schema,
+                                    permissions=permissions,
+                                    requirement=requirement,
+                                    rollout_token_limit=(
+                                        definition.proposal_policy.budget.llm_tokens
+                                    ),
+                                )
+                            except CapabilityResolutionError as exc:
+                                raise DesignerError(
+                                    "agent.permissions",
+                                    str(exc),
+                                    requires_permission=True,
+                                    lineage_id=lineage_id,
+                                ) from exc
+                        if (
+                            record is None
+                            or record.work_id != definition.work_id
+                            or record.attempt_id != source_report.attempt_id
+                            or record.definition_digest != definition.definition_digest
+                            or record.input_fingerprint
+                            != runtime.heads.input_fingerprint(work.input_refs)
+                            or record.source_report_ref != entry.report_before_ref
+                            or record.source_evaluation_ref != entry.source_evaluation_ref
+                            or record.repair_action_ref != entry.repair_action_ref
+                            or record.model != profile.model
+                            or record.profile_digest != f"sha256:{profile.profile_hash}"
+                            or record.output_schema_digest != schema_digest
+                            or record.previous_candidate is None
+                            or record.allowed_mutation_roots
+                            != interrupted_action.allowed_mutation_roots
+                        ):
+                            raise WorkRuntimeError("interrupted semantic continuation is not exact")
+                        previous_candidate = model.model_validate_json(
+                            canonical_json_bytes(record.previous_candidate)
+                        )
+                        pending_repair_roots = record.allowed_mutation_roots
+                        session = None
+                        current_prompt = f"{immutable_prompt}\n\n" + correction_from_report(
+                            source_report,
+                            pending_repair_roots,
+                        )
+                        repair_mode = "process_recovery"
+                        head = runtime.restart_interrupted_repair(
+                            lock,
+                            definition=definition,
+                            reason_code="process_interrupted_after_proposal",
+                            elapsed_wall_seconds=0,
+                        )
+                        if head.status != "running":
+                            raise DesignerError(
+                                f"agent.{role}.interrupted",
+                                "semantic correction exhausted process recovery",
+                                validation_issues=("process_interrupted_after_proposal",),
+                                infrastructure_error=True,
+                                lineage_id=lineage_id,
+                            )
+                        recovery_report = None
+                    else:
+                        recovery_report = self._work_error_report(
+                            attempt=interrupted_attempt,
+                            definition=definition,
+                            code="process_interrupted_after_proposal",
+                            retryable=True,
+                        )
+                elif recovery_report is None:
+                    recovery_report = self._work_error_report(
+                        attempt=interrupted_attempt,
+                        definition=definition,
+                        code="process_interrupted_after_proposal",
+                        retryable=True,
+                    )
+
+                if recovery_report is None:
+                    # A semantic RepairAction remains open; its physical child
+                    # attempt has already been restarted with the original
+                    # report, candidate and mutation roots.
+                    pass
+                else:
+                    recovered_outputs = (
+                        recovery_report.subject_refs
+                        if recovery_report.status == "passed" and recovery_report.subject_refs
+                        else ()
+                    )
+                    head = checkpoint_report_boundary(head, recovery_report)
+                    head = runtime.evaluate(
+                        lock,
+                        definition=definition,
+                        report=recovery_report,
+                        output_refs=recovered_outputs,
+                        elapsed_wall_seconds=0,
+                    )
+                if head.status == "committed":
+                    active = runtime.heads.require_active_commit(
+                        definition=definition,
+                        input_refs=work.input_refs,
+                        artifacts=runtime.artifacts,
+                    )
+                    if active is None:
+                        raise WorkRuntimeError(
+                            "recovered passing report did not produce an active commit"
+                        )
+                    commit, _commit_ref = active
+                    output_refs = tuple(
+                        ref for ref in commit.output_refs if ref.artifact_type == work.artifact_type
+                    )
+                    if len(output_refs) != 1:
+                        raise WorkRuntimeError(
+                            "recovered WorkCommit lacks its unique source Artifact"
+                        )
+                    output_ref = output_refs[0]
+                    return self.artifacts.get_json(output_ref, model), output_ref, ()
+                if recovery_report is None:
+                    pass
+                elif head.status != "repair_authorized":
+                    raise DesignerError(
+                        f"agent.{role}.interrupted",
+                        "interrupted WorkAttempt exhausted its infrastructure retry",
+                        validation_issues=("process_interrupted_after_proposal",),
+                        infrastructure_error=True,
+                        lineage_id=lineage_id,
+                    )
+                elif head.repair_action_ref is None:
+                    raise WorkRuntimeError("recovered repair lacks its exact RepairAction")
+                else:
+                    session = None
+                    recovered_action = runtime.artifacts.get_json(
+                        head.repair_action_ref,
+                        RepairAction,
+                    )
+                    pending_repair_roots = recovered_action.allowed_mutation_roots
+                    repair_mode = (
+                        "fresh_session"
+                        if recovered_action.decision == "local_correction"
+                        else "backend_retry"
+                    )
+                    current_prompt = f"{immutable_prompt}\n\n" + correction_from_report(
+                        recovery_report,
+                        pending_repair_roots,
+                    )
+                    head = runtime.begin_authorized_repair(lock, definition=definition)
+
+            while True:
+                invocation_id = f"inv-{uuid.uuid4().hex}"
+                if head.active_operation_ref is None:
+                    head = runtime.schedule_operation(
+                        lock,
+                        definition=definition,
+                        kind="proposal",
+                        replay_mode="queryable",
+                        elapsed_wall_seconds=0,
+                    )
+                assert head.active_operation_ref is not None
+                active_operation = runtime.artifacts.get_json(
+                    head.active_operation_ref,
+                    OperationRun,
+                )
+                if active_operation.status == "scheduled":
+                    head = runtime.start_operation(
+                        lock,
+                        definition=definition,
+                        dispatch_id=invocation_id,
+                    )
+                else:
+                    raise WorkRuntimeError(
+                        "proposal dispatch must be recovered before another invocation"
+                    )
+                attempt = runtime.artifacts.get_json(head.attempt_ref, WorkAttempt)
+                started_at = datetime.now(UTC)
+                try:
+                    budget.authorize_turn(correction=attempt.ordinal > 1)
+                    async with asyncio.timeout(definition.proposal_policy.budget.wall_seconds):
+                        result = await self.backend.invoke(
+                            InvocationRequest(
+                                invocation_id=invocation_id,
+                                prompt=current_prompt,
+                                profile=profile,
+                                session=session,
+                                metadata={
+                                    "role": role,
+                                    "lineage_id": lineage_id,
+                                    "semantic_transaction": (
+                                        semantic_transaction or definition.proposal_policy.operation
+                                    ),
+                                    "work_id": definition.work_id,
+                                    "attempt_id": attempt.attempt_id,
+                                    "attempt": attempt.ordinal,
+                                    "repair_mode": repair_mode,
+                                },
+                            )
+                        )
+                except (DesignerBudgetExhausted, TimeoutError) as exc:
+                    finished_at = datetime.now(UTC)
+                    crossed_backend = not isinstance(exc, DesignerBudgetExhausted)
+                    unknown = BudgetUsage(
+                        llm_tokens=(
+                            definition.proposal_policy.budget.llm_tokens if crossed_backend else 0
+                        ),
+                        agent_turns=1 if crossed_backend else 0,
+                    )
+                    execution = ProposalExecution(
+                        execution_id=f"execution:{invocation_id}",
+                        attempt_id=attempt.attempt_id,
+                        executor="agent",
+                        executor_revision_id=(definition.proposal_policy.executor_revision_id),
+                        operation=definition.proposal_policy.operation,
+                        status="interrupted" if crossed_backend else "budget_exhausted",
+                        invocation_id=invocation_id,
+                        provider=profile.model_provider or "openai",
+                        model=profile.model,
+                        profile_digest=f"sha256:{profile.profile_hash}",
+                        output_schema_digest=schema_digest,
+                        error_code=(
+                            "invocation_timeout" if crossed_backend else "budget_exhausted"
+                        ),
+                        unknown_upper_bound=unknown,
+                        conservative_committed=unknown,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        duration_ms=max(
+                            0,
+                            int((finished_at - started_at).total_seconds() * 1000),
+                        ),
+                    )
+                    head = runtime.checkpoint_proposal(
+                        lock,
+                        definition=definition,
+                        execution=execution,
+                    )
+                    checkpointed_attempt = runtime.artifacts.get_json(
+                        head.attempt_ref,
+                        WorkAttempt,
+                    )
+                    if crossed_backend and restart_semantic_execution(
+                        checkpointed_attempt,
+                        reason_code="invocation_timeout",
+                    ):
+                        head = runtime.heads.read_head(definition.coordinate)
+                        assert head is not None
+                        continue
+                    if abort_semantic_execution(
+                        checkpointed_attempt,
+                        reason_code=(
+                            "invocation_timeout" if crossed_backend else "budget_exhausted"
+                        ),
+                    ):
+                        raise DesignerError(
+                            f"agent.{role}.budget",
+                            "structured Work invocation could not continue",
+                            last_result,
+                            results=tuple(invocation_results),
+                            validation_issues=(
+                                "invocation_timeout" if crossed_backend else "budget_exhausted",
+                            ),
+                            budget_exhausted=not crossed_backend,
+                            infrastructure_error=crossed_backend,
+                            lineage_id=lineage_id,
+                        ) from exc
+                    report = self._work_error_report(
+                        attempt=checkpointed_attempt,
+                        definition=definition,
+                        code="invocation_timeout" if crossed_backend else "budget_exhausted",
+                        retryable=crossed_backend,
+                    )
+                    head = checkpoint_report_boundary(head, report)
+                    head = runtime.evaluate(
+                        lock,
+                        definition=definition,
+                        report=report,
+                        elapsed_wall_seconds=0,
+                    )
+                    if not crossed_backend or head.status != "repair_authorized":
+                        raise DesignerError(
+                            f"agent.{role}.budget",
+                            "structured Work invocation timed out",
+                            last_result,
+                            results=tuple(invocation_results),
+                            validation_issues=(
+                                "invocation_timeout" if crossed_backend else "budget_exhausted",
+                            ),
+                            budget_exhausted=not crossed_backend,
+                            infrastructure_error=crossed_backend,
+                            lineage_id=lineage_id,
+                        ) from exc
+                    session = None
+                    current_prompt = immutable_prompt
+                    repair_mode = "backend_retry"
+                    head = runtime.begin_authorized_repair(lock, definition=definition)
+                    continue
+
+                finished_at = datetime.now(UTC)
+                budget.record_result(result)
+                invocation_results.append(result)
+                last_result = result
+                tokens = (
+                    max(0, result.usage.turn.total_tokens)
+                    if result.usage is not None and result.usage.turn is not None
+                    else 0
+                )
+                actual = BudgetUsage(llm_tokens=tokens, agent_turns=1)
+                unknown = BudgetUsage(
+                    llm_tokens=(
+                        0
+                        if result.usage is not None and result.usage.turn is not None
+                        else definition.proposal_policy.budget.llm_tokens
+                    )
+                )
+                committed = self._add_budget_usage(actual, unknown)
+                output_commitment = (
+                    sha256_digest(canonical_json_bytes(result.structured_output))
+                    if result.structured_output is not None
+                    else None
+                )
+                execution = ProposalExecution(
+                    execution_id=f"execution:{result.invocation_id}",
+                    attempt_id=attempt.attempt_id,
+                    executor="agent",
+                    executor_revision_id=definition.proposal_policy.executor_revision_id,
+                    operation=definition.proposal_policy.operation,
+                    status=(
+                        "completed"
+                        if result.succeeded and output_commitment is not None
+                        else "failed"
+                    ),
+                    invocation_id=result.invocation_id,
+                    provider=profile.model_provider or "openai",
+                    model=profile.model,
+                    profile_digest=f"sha256:{profile.profile_hash}",
+                    output_schema_digest=schema_digest,
+                    output_commitment=output_commitment if result.succeeded else None,
+                    continuation_commitment=(
+                        sha256_digest(
+                            canonical_json_bytes(
+                                {
+                                    "thread_id": result.session.thread_id,
+                                    "lineage_id": result.session.lineage_id,
+                                    "profile_hash": result.session.profile_hash,
+                                    "codex_config_sha256": (result.session.codex_config_sha256),
+                                }
+                            )
+                        )
+                        if result.session is not None
+                        else None
+                    ),
+                    error_code=(
+                        None
+                        if result.succeeded and output_commitment is not None
+                        else "transport_output_missing"
+                        if result.succeeded
+                        else result.error.code
+                        if result.error is not None
+                        else f"backend_{result.status.value}"
+                    ),
+                    observed_actual=actual,
+                    unknown_upper_bound=unknown,
+                    conservative_committed=committed,
+                    started_at=started_at,
+                    finished_at=finished_at,
+                    duration_ms=result.duration_ms,
+                )
+                if not result.succeeded:
+                    head = runtime.checkpoint_proposal(
+                        lock,
+                        definition=definition,
+                        execution=execution,
+                    )
+                    attempt = runtime.artifacts.get_json(head.attempt_ref, WorkAttempt)
+                    retryable = bool(result.error is not None and result.error.retryable)
+                    code = execution.error_code or "backend_failed"
+                    if retryable and restart_semantic_execution(
+                        attempt,
+                        reason_code=code,
+                    ):
+                        head = runtime.heads.read_head(definition.coordinate)
+                        assert head is not None
+                        continue
+                    if abort_semantic_execution(attempt, reason_code=code):
+                        message = result.error.message if result.error else result.status.value
+                        raise DesignerError(
+                            f"agent.{role}",
+                            message,
+                            result,
+                            results=tuple(invocation_results),
+                            validation_issues=(code,),
+                            infrastructure_error=True,
+                            lineage_id=lineage_id,
+                        )
+                    report = self._work_error_report(
+                        attempt=attempt,
+                        definition=definition,
+                        code=code,
+                        retryable=retryable,
+                    )
+                    head = checkpoint_report_boundary(head, report)
+                    head = runtime.evaluate(
+                        lock,
+                        definition=definition,
+                        report=report,
+                        elapsed_wall_seconds=0,
+                    )
+                    if not retryable or head.status != "repair_authorized":
+                        message = result.error.message if result.error else result.status.value
+                        raise DesignerError(
+                            f"agent.{role}",
+                            message,
+                            result,
+                            results=tuple(invocation_results),
+                            validation_issues=(code,),
+                            lineage_id=lineage_id,
+                        )
+                    session = None
+                    current_prompt = immutable_prompt
+                    repair_mode = "backend_retry"
+                    head = runtime.begin_authorized_repair(lock, definition=definition)
+                    continue
+
+                head = runtime.checkpoint_proposal(
+                    lock,
+                    definition=definition,
+                    execution=execution,
+                )
+                head = runtime.schedule_operation(
+                    lock,
+                    definition=definition,
+                    kind="validation",
+                    replay_mode="deterministic",
+                    elapsed_wall_seconds=0,
+                )
+                head = runtime.start_operation(
+                    lock,
+                    definition=definition,
+                    dispatch_id=f"validation:{attempt.attempt_id}",
+                )
+                try:
+                    validation_stage: Literal["transport", "shape", "semantic"] = "transport"
+                    if result.structured_output is None:
+                        raise self._transport_validation_error(
+                            "transport_output_missing",
+                            "The backend must return one complete structured artifact.",
+                        )
+                    transport_error = self._transport_envelope_error(result.structured_output)
+                    if transport_error is not None:
+                        raise transport_error
+                    validation_stage = "shape"
+                    output = model.model_validate_json(
+                        canonical_json_bytes(result.structured_output)
+                    )
+                    if (
+                        repair_projection is not None
+                        and previous_candidate is not None
+                        and pending_repair_roots
+                    ):
+                        output = repair_projection.merge(
+                            previous_candidate,
+                            output,
+                            roots=pending_repair_roots,
+                        )
+                    if semantic_validator is not None:
+                        validation_stage = "semantic"
+                        previous_candidate = output
+                        semantic_validator(output)
+                except (ValidationError, ValueError) as exc:
+                    attempt = runtime.artifacts.get_json(head.attempt_ref, WorkAttempt)
+                    diagnostic = self._validation_diagnostic(
+                        exc,
+                        model=model,
+                        validation_stage=validation_stage,
+                    ) or ValidationDiagnostic(
+                        owner_component="design",
+                        validation_phase="framework_diagnostic",
+                        frontier_ordinal=0,
+                        issues=(
+                            SafeValidationIssue(
+                                "framework_diagnostic_incomplete",
+                                ("semantic_output",),
+                                "Framework validation did not provide a safe typed diagnostic.",
+                                retryable=False,
+                                violated_condition="untyped validation failure",
+                                expected_category="a field-addressable diagnostic",
+                            ),
+                        ),
+                    )
+                    report = self._work_validation_report(
+                        attempt=attempt,
+                        definition=definition,
+                        diagnostic=diagnostic,
+                    )
+                    pending_repair_roots = (
+                        repair_projection.roots(diagnostic)
+                        if repair_projection is not None and report.repair_actionable
+                        else ()
+                    )
+                    self._assert_work_repair_projection_authorized(
+                        pending_repair_roots,
+                        definition=definition,
+                    )
+                    head = checkpoint_report_boundary(head, report)
+                    head = runtime.evaluate(
+                        lock,
+                        definition=definition,
+                        report=report,
+                        elapsed_wall_seconds=0,
+                        repair_mutation_roots=(
+                            tuple(f"/{root.strip('/')}" for root in pending_repair_roots)
+                            if repair_projection is not None and report.repair_actionable
+                            else None
+                        ),
+                    )
+                    if head.status != "repair_authorized":
+                        raise DesignerError(
+                            f"agent.{role}.output",
+                            diagnostic.feedback,
+                            result,
+                            results=tuple(invocation_results),
+                            validation_issues=diagnostic.issue_codes,
+                            lineage_id=lineage_id,
+                        ) from exc
+                    session = result.session
+                    correction_prompt = correction_from_report(
+                        report,
+                        pending_repair_roots,
+                    )
+                    current_prompt = (
+                        correction_prompt
+                        if session is not None
+                        else f"{immutable_prompt}\n\n{correction_prompt}"
+                    )
+                    repair_mode = "continuation" if session is not None else "fresh_session"
+                    if session is not None:
+                        if runtime.continuations is None:
+                            raise WorkRuntimeError(
+                                "same-session semantic repair requires a continuation store"
+                            ) from exc
+                        terminal_attempt = runtime.artifacts.get_json(
+                            head.attempt_ref,
+                            WorkAttempt,
+                        )
+                        terminal_proposal_refs = runtime.proposal_execution_refs(terminal_attempt)
+                        if (
+                            terminal_attempt.validation_report_ref is None
+                            or head.evaluation_ref is None
+                            or head.repair_action_ref is None
+                            or not terminal_proposal_refs
+                        ):
+                            raise WorkRuntimeError(
+                                "authorized semantic repair lacks its exact authority chain"
+                            ) from exc
+                        record = NodeContinuationRecord.capture(
+                            work_id=definition.work_id,
+                            attempt_id=terminal_attempt.attempt_id,
+                            session=session,
+                            model=profile.model,
+                            output_schema_digest=schema_digest,
+                            definition_digest=definition.definition_digest,
+                            proposal_policy_digest=definition.proposal_policy.content_digest(),
+                            input_fingerprint=runtime.heads.input_fingerprint(work.input_refs),
+                            previous_candidate=(
+                                previous_candidate.model_dump(mode="json")
+                                if previous_candidate is not None
+                                else None
+                            ),
+                            allowed_mutation_roots=pending_repair_roots,
+                            source_report_ref=terminal_attempt.validation_report_ref,
+                            source_evaluation_ref=head.evaluation_ref,
+                            repair_action_ref=head.repair_action_ref,
+                            previous_execution_ref=terminal_proposal_refs[-1],
+                        )
+                        head = runtime.bind_repair_continuation(
+                            lock,
+                            definition=definition,
+                            record=record,
+                        )
+                    head = runtime.begin_authorized_repair(lock, definition=definition)
+                    continue
+
+                output_ref = self.artifacts.put_json(
+                    artifact_id=work.artifact_id,
+                    artifact_type=work.artifact_type,
+                    value=output,
+                    dependencies=work.dependencies,
+                )
+                attempt = runtime.artifacts.get_json(head.attempt_ref, WorkAttempt)
+                passed = ValidationReport(
+                    report_id=f"report:{attempt.attempt_id}:passed",
+                    attempt_id=attempt.attempt_id,
+                    coordinate=definition.coordinate,
+                    policy_id=definition.validation_policy.policy_id,
+                    policy_digest=definition.validation_policy.content_digest(),
+                    subject_refs=(output_ref,),
+                    status="passed",
+                    validation_phase=definition.validation_policy.validation_phase,
+                    frontier_ordinal=definition.validation_policy.frontier_ordinal + 100,
+                    passed_check_ids=(definition.required_claim_id,),
+                    diagnostic_quality="not_applicable",
+                    evaluated_at=datetime.now(UTC),
+                )
+                head = checkpoint_report_boundary(head, passed)
+                head = runtime.evaluate(
+                    lock,
+                    definition=definition,
+                    report=passed,
+                    output_refs=(output_ref,),
+                    elapsed_wall_seconds=0,
+                )
+                if head.status != "committed":
+                    raise WorkRuntimeError("passing structured work did not commit")
+                return output, output_ref, tuple(invocation_results)
+
+    @staticmethod
+    def _add_budget_usage(left: BudgetUsage, right: BudgetUsage) -> BudgetUsage:
+        return BudgetUsage.model_validate(
+            {
+                field: getattr(left, field) + getattr(right, field)
+                for field in BudgetUsage.model_fields
+                if field != "schema_version"
+            }
+        )
+
+    @staticmethod
+    def _work_error_report(
+        *,
+        attempt: WorkAttempt,
+        definition: WorkDefinition,
+        code: str,
+        retryable: bool,
+    ) -> ValidationReport:
+        issue = ValidationIssue(
+            code=code,
+            path=("invocation",),
+            violated_condition="the real InvocationBackend did not complete successfully",
+            expected_category="one successful backend result",
+            retryable=retryable,
+        )
+        return ValidationReport(
+            report_id=f"report:{attempt.attempt_id}:{code}",
+            attempt_id=attempt.attempt_id,
+            coordinate=definition.coordinate,
+            policy_id=definition.validation_policy.policy_id,
+            policy_digest=definition.validation_policy.content_digest(),
+            status="error" if retryable else "failed",
+            validation_phase="invocation",
+            frontier_ordinal=0,
+            issues=(issue,),
+            diagnostic_quality="actionable" if retryable else "insufficient",
+            evaluated_at=datetime.now(UTC),
+        )
+
+    @staticmethod
+    def _work_validation_report(
+        *,
+        attempt: WorkAttempt,
+        definition: WorkDefinition,
+        diagnostic: ValidationDiagnostic,
+    ) -> ValidationReport:
+        issues = tuple(
+            ValidationIssue(
+                code=issue.code,
+                path=issue.location,
+                violated_condition=(
+                    issue.violated_condition or "the deterministic contract was violated"
+                ),
+                expected_category=(
+                    issue.expected_category or "a value satisfying the typed contract"
+                ),
+                retryable=issue.retryable,
+            )
+            for issue in diagnostic.issues
+        )
+        quality: Literal["actionable", "insufficient"] = (
+            "actionable" if issues and all(issue.actionable for issue in issues) else "insufficient"
+        )
+        return ValidationReport(
+            report_id=f"report:{attempt.attempt_id}:validation",
+            attempt_id=attempt.attempt_id,
+            coordinate=definition.coordinate,
+            policy_id=definition.validation_policy.policy_id,
+            policy_digest=definition.validation_policy.content_digest(),
+            status="failed",
+            validation_phase=diagnostic.validation_phase,
+            frontier_ordinal=diagnostic.frontier_ordinal,
+            issues=issues,
+            diagnostic_quality=quality,
+            evaluated_at=datetime.now(UTC),
+        )
+
+    @staticmethod
+    def _assert_work_repair_projection_authorized(
+        roots: tuple[str, ...],
+        *,
+        definition: WorkDefinition,
+    ) -> None:
+        allowed = tuple(path.rstrip("/") or "/" for path in definition.allowed_mutation_roots)
+        for root in roots:
+            projected = "/" + root.strip("/")
+            if not any(projected == path or projected.startswith(path + "/") for path in allowed):
+                raise WorkRuntimeError(
+                    f"repair projection path {projected} exceeds WorkDefinition authority"
+                )
 
     async def run_structured_agent(
         self,
@@ -4857,9 +6485,7 @@ class EnvironmentDesigner:
         allowed = tuple(path.rstrip("/") or "/" for path in repair_target.allowed_mutation_paths)
         for root in roots:
             projected = "/" + root.strip("/")
-            if not any(
-                projected == path or projected.startswith(path + "/") for path in allowed
-            ):
+            if not any(projected == path or projected.startswith(path + "/") for path in allowed):
                 raise DesignerError(
                     "repair.projection_authority",
                     f"Repair projection path {projected} exceeds the target mutation authority.",
@@ -4996,7 +6622,6 @@ class EnvironmentDesigner:
                 ("tool access/observation must target", "access_tool_identity"),
                 ("permission references unknown actors", "access_unknown_actor"),
                 ("allowed actors lack required scopes", "access_scope_authority"),
-                ("a universally allowed tool requires", "access_denial_missing"),
                 ("a universal permission condition requires", "access_case_coverage"),
                 ("permission condition requires family", "access_rule_family"),
                 ("permission rule id must start", "access_rule_identity"),
@@ -5086,187 +6711,19 @@ class EnvironmentDesigner:
         value: EvidenceSynthesis,
         evidence: tuple[Evidence, ...],
     ) -> None:
-        """Report every evidence/claim reference failure in one repair packet.
-
-        ``EvidenceGraph`` intentionally remains the durable invariant owner, but
-        its model validator stops at the first bad reference.  A model repair
-        needs the complete bounded set so it does not fix one id and discover
-        another on the next expensive turn.
-        """
-
-        evidence_ids = {item.evidence_id for item in evidence}
-        usable_evidence_ids = {
-            item.evidence_id for item in evidence if item.retrieval_status != "failed"
-        }
-        claim_ids = [claim.claim_id for claim in value.claims]
-        claim_id_set = set(claim_ids)
-        issues: list[StructuredSemanticIssue] = []
-        if len(claim_ids) != len(claim_id_set):
-            issues.append(
-                StructuredSemanticIssue(
-                    code="claim_id_duplicate",
-                    location=("claims",),
-                    message="claim_id values must be unique",
-                )
-            )
-        claim_id_counts = {claim_id: claim_ids.count(claim_id) for claim_id in claim_id_set}
-        for index, claim in enumerate(value.claims):
-            claim_anchor: str | int = (
-                claim.claim_id if claim_id_counts[claim.claim_id] == 1 else index
-            )
-            for evidence_index, evidence_id in enumerate(claim.evidence_ids):
-                if evidence_id not in evidence_ids:
-                    issues.append(
-                        StructuredSemanticIssue(
-                            code="evidence_reference_unknown",
-                            location=(
-                                "claims",
-                                claim_anchor,
-                                "evidence_ids",
-                                evidence_index,
-                            ),
-                            message=(
-                                f"claim {claim.claim_id} references an id outside the exact "
-                                "allowed evidence-id list; copy allowed ids byte-for-byte"
-                            ),
-                        )
-                    )
-            for field_name, related_values in (
-                ("supports_claim_ids", claim.supports_claim_ids),
-                ("contradicts_claim_ids", claim.contradicts_claim_ids),
-            ):
-                for related_index, related_id in enumerate(related_values):
-                    if related_id not in claim_id_set:
-                        issues.append(
-                            StructuredSemanticIssue(
-                                code="claim_reference_unknown",
-                                location=(
-                                    "claims",
-                                    claim_anchor,
-                                    field_name,
-                                    related_index,
-                                ),
-                                message=(
-                                    f"claim {claim.claim_id} references a claim_id absent from "
-                                    "this complete synthesis"
-                                ),
-                            )
-                        )
-            related_ids = set(claim.supports_claim_ids) | set(claim.contradicts_claim_ids)
-            if claim.claim_id in related_ids:
-                issues.append(
-                    StructuredSemanticIssue(
-                        code="claim_reference_self",
-                        location=("claims", claim_anchor),
-                        message=f"claim {claim.claim_id} cannot support or contradict itself",
-                    )
-                )
-            if claim.kind == "observed":
-                for evidence_index, evidence_id in enumerate(claim.evidence_ids):
-                    if evidence_id in evidence_ids and evidence_id not in usable_evidence_ids:
-                        issues.append(
-                            StructuredSemanticIssue(
-                                code="observed_claim_failed_evidence",
-                                location=(
-                                    "claims",
-                                    claim_anchor,
-                                    "evidence_ids",
-                                    evidence_index,
-                                ),
-                                message=(
-                                    f"observed claim {claim.claim_id} may reference only "
-                                    "successful or partial retrievals"
-                                ),
-                            )
-                        )
-        for conflict in value.conflicts:
-            for claim_index, claim_id in enumerate(conflict.claim_ids):
-                if claim_id not in claim_id_set:
-                    issues.append(
-                        StructuredSemanticIssue(
-                            code="conflict_claim_reference_unknown",
-                            location=("conflicts", conflict.conflict_id, "claim_ids", claim_index),
-                            message=(
-                                f"conflict {conflict.conflict_id} references a claim_id absent "
-                                "from this complete synthesis"
-                            ),
-                        )
-                    )
-        if issues:
-            raise StructuredSemanticError(tuple(issues))
+        validate_evidence_synthesis_references(value, evidence)
 
     def materialize_research_evidence(
         self, job_id: str, bundle: ResearchBundle
     ) -> tuple[tuple[Evidence, ...], tuple[ArtifactRef, ...]]:
-        evidence: list[Evidence] = []
-        all_refs: list[ArtifactRef] = []
-        for index, document in enumerate(bundle.documents):
-            try:
-                assert_safe_research_document(document)
-            except ResearchSafetyError as exc:
-                raise DesignerError("research.safety", str(exc)) from exc
-            suffix = document.raw_sha256[:20]
-            raw_ref = self.research_artifacts.put_blob(
-                artifact_id=f"{job_id}:source-raw:{suffix}",
-                artifact_type="evidence.raw_content",
-                content=document.source.body,
-                media_type=document.source.media_type,
+        try:
+            return _materialize_research_evidence(
+                job_id=job_id,
+                bundle=bundle,
+                artifacts=self.research_artifacts,
             )
-            metadata = {
-                "requested_url": document.source.requested_url,
-                "final_url": document.source.final_url,
-                "fetched_at": document.source.fetched_at.isoformat(),
-                "status_code": document.source.status_code,
-                "media_type": document.source.media_type,
-                "response_headers": list(document.source.response_headers),
-                "fetcher": document.source.fetcher,
-                "network_assurance": document.source.network_assurance,
-                "resolved_addresses": list(document.source.resolved_addresses),
-            }
-            metadata_ref = self.research_artifacts.put_json(
-                artifact_id=f"{job_id}:source-meta:{suffix}",
-                artifact_type="evidence.response_metadata",
-                value=metadata,
-                dependencies=(raw_ref,),
-            )
-            content_ref = self.research_artifacts.put_blob(
-                artifact_id=f"{job_id}:source-text:{document.text_sha256[:20]}",
-                artifact_type="evidence.extracted_content",
-                content=document.text.encode("utf-8"),
-                media_type="text/plain;charset=utf-8",
-                dependencies=(raw_ref, metadata_ref),
-            )
-            # This is a catalog preview only. stage_research_sources gives the Researcher the
-            # complete, bounded extracted body and its provenance; the preview is never evidence.
-            observed = re.sub(r"\s+", " ", document.text).strip()[:600]
-            evidence.append(
-                Evidence(
-                    evidence_id=self._stable_id(
-                        "evidence", document.source.final_url, document.text_sha256, str(index)
-                    ),
-                    source_kind="web",
-                    source_uri=document.source.final_url,
-                    retrieved_at=document.source.fetched_at,
-                    retrieval_status="success",
-                    raw_content_hash=f"sha256:{document.raw_sha256}",
-                    content_hash=f"sha256:{document.text_sha256}",
-                    fetcher=document.source.fetcher,
-                    fetcher_version="agent-world-0.2",
-                    extractor=document.extractor,
-                    extractor_version=document.extractor_version,
-                    title=document.title,
-                    source_risk="medium",
-                    observed_summary=observed,
-                    content_ref=content_ref,
-                    raw_content_ref=raw_ref,
-                    response_metadata_ref=metadata_ref,
-                )
-            )
-            all_refs.extend((raw_ref, metadata_ref, content_ref))
-        # Distinct URLs can legitimately serve byte-identical content.  Keep
-        # each Evidence observation (including its own response metadata), but
-        # expose a revision-unique dependency set to the immutable Artifact DAG.
-        return tuple(evidence), self._unique_refs(all_refs)
+        except ResearchSafetyError as exc:
+            raise DesignerError("research.safety", str(exc)) from exc
 
     def _require_exact_design_bundle(self, bundle: DesignBundle) -> None:
         self.artifacts.require_exact_json(
@@ -5660,9 +7117,7 @@ class EnvironmentDesigner:
             artifact_id=feedback_result.result_id,
             artifact_type="control.feedback_result",
             value=feedback_result,
-            dependencies=self._unique_refs(
-                (diagnostic_ref, *failed_target.immutable_input_refs)
-            ),
+            dependencies=self._unique_refs((diagnostic_ref, *failed_target.immutable_input_refs)),
         )
 
     @staticmethod
@@ -6818,7 +8273,14 @@ class EnvironmentDesigner:
 
     @staticmethod
     def _compile_rule_term_draft(
-        draft: RuleConstantDraft | RuleReferenceDraft | RuleLookupByKeyDraft | RuleArithmeticDraft,
+        draft: (
+            RuleConstantDraft
+            | RuleReferenceDraft
+            | RuleBoundReferenceDraft
+            | RuleLookupByKeyDraft
+            | RuleBoundLookupByKeyDraft
+            | RuleArithmeticDraft
+        ),
     ) -> RuleConstant | RuleValueRef | RuleLookupByKey | RuleArithmetic:
         """Compile one Agent-facing term into the closed core Rule IR."""
 
@@ -6829,6 +8291,10 @@ class EnvironmentDesigner:
                 source=draft.source,
                 pointer=draft.pointer,
                 value_type=draft.value_type,
+            )
+        if isinstance(draft, RuleBoundReferenceDraft | RuleBoundLookupByKeyDraft):
+            raise ValueError(
+                "bound ToolSemantics Rule terms require deterministic binding materialization"
             )
         if isinstance(draft, RuleLookupByKeyDraft):
             key = EnvironmentDesigner._compile_rule_term_draft(draft.key)
@@ -6863,7 +8329,9 @@ class EnvironmentDesigner:
         def validate_term(
             term: RuleConstantDraft
             | RuleReferenceDraft
+            | RuleBoundReferenceDraft
             | RuleLookupByKeyDraft
+            | RuleBoundLookupByKeyDraft
             | RuleArithmeticDraft,
             location: tuple[str | int, ...],
         ) -> str:
@@ -6899,6 +8367,25 @@ class EnvironmentDesigner:
                 return term.value_type
             if isinstance(term, RuleReferenceDraft):
                 return term.value_type
+            if isinstance(term, RuleBoundReferenceDraft | RuleBoundLookupByKeyDraft):
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="rule_binding_materialization_required",
+                        location=location,
+                        message=(
+                            "Bound Rule terms must be expanded against the frozen Tool "
+                            "binding catalog before core Rule compilation."
+                        ),
+                        violated_condition=(
+                            "a bound ToolSemantics term reached a compiler without its "
+                            "frozen binding catalog"
+                        ),
+                        expected_category=(
+                            "a materialized reference or lookup_by_key core Rule term"
+                        ),
+                    )
+                )
+                return "any"
             if isinstance(term, RuleLookupByKeyDraft):
                 validate_term(term.key, (*location, "key"))
                 return term.value_type
@@ -6930,9 +8417,7 @@ class EnvironmentDesigner:
             left_type = validate_term(clause.left, ("clauses", index, "left"))
             right = getattr(clause, "right", None)
             right_type = (
-                validate_term(right, ("clauses", index, "right"))
-                if right is not None
-                else None
+                validate_term(right, ("clauses", index, "right")) if right is not None else None
             )
             ordering = getattr(clause, "ordering", None)
             if ordering is not None and right_type is not None:
@@ -6952,12 +8437,21 @@ class EnvironmentDesigner:
             raise StructuredSemanticError(tuple(issues))
 
     @staticmethod
-    def _compile_rule_draft(draft: RuleDraft) -> Rule:
+    def _compile_rule_draft(
+        draft: RuleDraft,
+        *,
+        rule_id: str | None = None,
+    ) -> Rule:
         """Compile one Agent Rule through the canonical executable IR validator."""
 
         EnvironmentDesigner._validate_rule_source_draft(draft)
+        resolved_rule_id = rule_id or draft.rule_id
+        if resolved_rule_id is None:
+            raise ValueError("rule_id must be supplied by this source boundary or its compiler")
         try:
-            return Rule.model_validate_json(draft.model_dump_json())
+            value = draft.model_dump(mode="json")
+            value["rule_id"] = resolved_rule_id
+            return Rule.model_validate_json(json.dumps(value))
         except ValidationError as exc:
             raise StructuredValidationError(
                 pydantic_validation_diagnostic(
@@ -6974,6 +8468,7 @@ class EnvironmentDesigner:
         *,
         path: tuple[str | int, ...],
         path_suffix: tuple[str | int, ...] = (),
+        rule_id_prefix: str | None = None,
     ) -> tuple[Rule, ...]:
         """Compile sibling Rules while retaining every exact failing Rule path."""
 
@@ -6981,7 +8476,16 @@ class EnvironmentDesigner:
         issues: list[SafeValidationIssue] = []
         for index, draft in enumerate(drafts):
             try:
-                compiled.append(EnvironmentDesigner._compile_rule_draft(draft))
+                compiled.append(
+                    EnvironmentDesigner._compile_rule_draft(
+                        draft,
+                        rule_id=(
+                            f"{rule_id_prefix}:{index}"
+                            if rule_id_prefix is not None
+                            else None
+                        ),
+                    )
+                )
             except (
                 StructuredSemanticError,
                 StructuredValidationError,
@@ -7012,7 +8516,7 @@ class EnvironmentDesigner:
         return InitialStateRulesDraft(
             initial_state_constraints=EnvironmentDesigner._compile_rule_sequence(
                 source.initial_state_constraints,
-                path=("initial_state_constraints",),
+                path=("initial_state_rules", "initial_state_constraints"),
             )
         )
 
@@ -7044,10 +8548,12 @@ class EnvironmentDesigner:
             preconditions=EnvironmentDesigner._compile_rule_sequence(
                 source.preconditions,
                 path=("preconditions",),
+                rule_id_prefix=f"rule:{source.tool_id}:precondition",
             ),
             postconditions=EnvironmentDesigner._compile_rule_sequence(
                 source.postconditions,
                 path=("postconditions",),
+                rule_id_prefix=f"rule:{source.tool_id}:postcondition",
             ),
         )
 
@@ -7071,6 +8577,7 @@ class EnvironmentDesigner:
             transition=EnvironmentDesigner._compile_rule_sequence(
                 source.transition,
                 path=("transition",),
+                rule_id_prefix=f"rule:{source.tool_id}:transition",
             ),
         )
 
@@ -7091,6 +8598,7 @@ class EnvironmentDesigner:
             tuple(error.when for error in source.errors),
             path=("errors",),
             path_suffix=("when",),
+            rule_id_prefix=f"rule:{source.tool_id}:error",
         )
         return ToolErrorsDraft(
             tool_id=source.tool_id,
@@ -7108,7 +8616,11 @@ class EnvironmentDesigner:
         )
 
     @staticmethod
-    def _compile_permission_source(source: PermissionRuleSourceDraft) -> PermissionRule:
+    def _compile_permission_source(
+        source: PermissionRuleSourceDraft,
+        *,
+        rule_id: str | None = None,
+    ) -> PermissionRule:
         issues: list[SafeValidationIssue] = []
         if source.condition is not None and source.condition.family != "permission":
             issues.append(
@@ -7151,7 +8663,7 @@ class EnvironmentDesigner:
             allowed_actors=source.allowed_actors,
             required_scopes_by_actor=source.required_scopes_by_actor,
             condition=(
-                EnvironmentDesigner._compile_rule_draft(source.condition)
+                EnvironmentDesigner._compile_rule_draft(source.condition, rule_id=rule_id)
                 if source.condition is not None
                 else None
             ),
@@ -7188,7 +8700,10 @@ class EnvironmentDesigner:
         )
         return ToolAccessObservationDraft(
             tool_id=source.tool_id,
-            permission=EnvironmentDesigner._compile_permission_source(source.permission),
+            permission=EnvironmentDesigner._compile_permission_source(
+                source.permission,
+                rule_id=f"rule:{source.tool_id}:permission:0",
+            ),
             observation=observation,
         )
 
@@ -7234,8 +8749,9 @@ class EnvironmentDesigner:
         source: WorldClosureSourceDraft,
     ) -> WorldClosureDraft:
         return WorldClosureDraft(
-            invariants=tuple(
-                EnvironmentDesigner._compile_rule_draft(rule) for rule in source.invariants
+            invariants=EnvironmentDesigner._compile_rule_sequence(
+                source.invariants,
+                path=("invariants",),
             )
         )
 
@@ -7458,12 +8974,11 @@ class EnvironmentDesigner:
             tool_id=draft.tool_id,
             expected_tool_id=expected_tool_id,
             families=(
-                (draft.preconditions, "precondition"),
-                (draft.postconditions, "postcondition"),
+                (draft.preconditions, "precondition", ("preconditions",)),
+                (draft.postconditions, "postcondition", ("postconditions",)),
             ),
             skeleton=skeleton,
             evidence_graph=evidence_graph,
-            label="tool conditions",
         )
 
     @staticmethod
@@ -7479,10 +8994,9 @@ class EnvironmentDesigner:
         EnvironmentDesigner._validate_tool_rule_shard(
             tool_id=draft.tool_id,
             expected_tool_id=expected_tool_id,
-            families=((draft.transition, "transition"),),
+            families=((draft.transition, "transition", ("transition",)),),
             skeleton=skeleton,
             evidence_graph=evidence_graph,
-            label="tool state transition",
         )
 
     @staticmethod
@@ -7490,45 +9004,120 @@ class EnvironmentDesigner:
         *,
         tool_id: str,
         expected_tool_id: str,
-        families: Sequence[tuple[Sequence[Rule], str]],
+        families: Sequence[tuple[Sequence[Rule], str, tuple[str, ...]]],
         skeleton: WorldSkeletonDraft,
         evidence_graph: EvidenceGraph,
-        label: str,
     ) -> None:
+        """Report all proposal-owned Rule shard errors with stable source paths.
+
+        This is deliberately not a ``ValueError`` boundary.  A Rule shard is
+        authored by the Environment Engineer, so its cross-field problems must
+        become a single actionable correction packet rather than look like a
+        framework fault.  The compiler-owned state/evidence inputs are already
+        frozen before this method runs.
+        """
+
+        issues: list[StructuredSemanticIssue] = []
         if tool_id != expected_tool_id:
-            raise ValueError(f"{label} must target {expected_tool_id}, got {tool_id}")
-        for rules, expected_family in families:
-            invalid = [rule.rule_id for rule in rules if rule.family != expected_family]
-            if invalid:
-                raise ValueError(
-                    f"{label} rules require family {expected_family}: {sorted(invalid)}"
+            issues.append(
+                StructuredSemanticIssue(
+                    code="tool_rule_tool_identity",
+                    location=("tool_id",),
+                    message="Tool rule semantics must preserve the frozen tool identity.",
+                    violated_condition="tool_id must equal the assigned frozen tool",
+                    expected_category="the assigned frozen tool identifier",
                 )
-        all_rules = [rule for rules, _family in families for rule in rules]
-        rule_ids = [rule.rule_id for rule in all_rules]
-        if len(set(rule_ids)) != len(rule_ids):
-            raise ValueError(f"{label} rule_id values must be unique")
+            )
+
+        all_rules: list[tuple[Rule, tuple[str | int, ...]]] = []
+        for rules, expected_family, collection_path in families:
+            for index, rule in enumerate(rules):
+                rule_path: tuple[str | int, ...] = (*collection_path, index)
+                all_rules.append((rule, rule_path))
+                if rule.family != expected_family:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="tool_rule_family",
+                            location=(*rule_path, "family"),
+                            message="Rule family must match this frozen tool behavior section.",
+                            violated_condition="the Rule family must match its tool section",
+                            expected_category=f"the {expected_family} Rule family",
+                        )
+                    )
+
+        rule_id_positions: dict[str, list[tuple[str | int, ...]]] = {}
+        for rule, rule_path in all_rules:
+            rule_id_positions.setdefault(rule.rule_id, []).append(rule_path)
+        for locations in rule_id_positions.values():
+            if len(locations) > 1:
+                issues.extend(
+                    StructuredSemanticIssue(
+                        code="tool_rule_id_duplicate",
+                        location=(*location, "rule_id"),
+                        message="Every Rule id in one tool behavior shard must be unique.",
+                        violated_condition="tool Rule ids must be unique in one behavior shard",
+                        expected_category="a unique Rule identifier",
+                    )
+                    for location in locations
+                )
+
         expected_prefix = f"rule:{expected_tool_id}:"
-        invalid_ids = [rule_id for rule_id in rule_ids if not rule_id.startswith(expected_prefix)]
-        if invalid_ids:
-            raise ValueError(
-                f"tool rule ids must start with {expected_prefix}: {sorted(invalid_ids)}"
-            )
+        for rule, rule_path in all_rules:
+            if not rule.rule_id.startswith(expected_prefix):
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_rule_id_prefix",
+                        location=(*rule_path, "rule_id"),
+                        message="Rule id must use the assigned frozen tool namespace prefix.",
+                        violated_condition="tool Rule ids must use the frozen tool prefix",
+                        expected_category="a Rule identifier in the assigned tool namespace",
+                    )
+                )
+
         state_rule_ids = {rule.rule_id for rule in skeleton.state.initial_state_constraints}
-        if collisions := set(rule_ids) & state_rule_ids:
-            raise ValueError(f"tool rules collide with state rule ids: {sorted(collisions)}")
-        if any(
-            value == "task_goal"
-            for rule in all_rules
-            for value in EnvironmentDesigner._nested_values(
-                rule.model_dump(mode="json"),
-                "source",
-            )
-        ):
-            raise ValueError(f"{label} cannot read evaluator-only task_goal")
-        referenced_claims = {claim_id for rule in all_rules for claim_id in rule.evidence_claim_ids}
+        for rule, rule_path in all_rules:
+            if rule.rule_id in state_rule_ids:
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_rule_id_state_collision",
+                        location=(*rule_path, "rule_id"),
+                        message="Tool Rule ids must not collide with initial-state Rule ids.",
+                        violated_condition="tool and initial-state Rule ids must be disjoint",
+                        expected_category="a Rule identifier not used by initial-state rules",
+                    )
+                )
+            if any(
+                value == "task_goal"
+                for value in EnvironmentDesigner._nested_values(
+                    rule.model_dump(mode="json"),
+                    "source",
+                )
+            ):
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_rule_evaluator_goal_leak",
+                        location=(*rule_path, "clauses"),
+                        message="Tool behavior Rules may not read evaluator-only task_goal state.",
+                        violated_condition="tool behavior must not read evaluator-only task_goal",
+                        expected_category="a public tool execution context source",
+                    )
+                )
+
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        if unknown := referenced_claims - known_claims:
-            raise ValueError(f"{label} references unknown evidence claims: {sorted(unknown)}")
+        for rule, rule_path in all_rules:
+            for claim_index, claim_id in enumerate(rule.evidence_claim_ids):
+                if claim_id not in known_claims:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="tool_rule_evidence_unknown",
+                            location=(*rule_path, "evidence_claim_ids", claim_index),
+                            message="Rule evidence refs must exist in the frozen EvidenceGraph.",
+                            violated_condition="every Rule evidence ref must be frozen",
+                            expected_category="an evidence claim id present in the EvidenceGraph",
+                        )
+                    )
+        if issues:
+            raise StructuredSemanticError(tuple(issues))
 
     @staticmethod
     def _validate_tool_errors_draft(
@@ -7544,20 +9133,42 @@ class EnvironmentDesigner:
         EnvironmentDesigner._validate_tool_rule_shard(
             tool_id=draft.tool_id,
             expected_tool_id=expected_tool_id,
-            families=((error_rules, "error_condition"),),
+            families=((error_rules, "error_condition", ("errors",)),),
             skeleton=skeleton,
             evidence_graph=evidence_graph,
-            label="tool errors",
         )
         error_codes = [item.error_code for item in draft.errors]
-        if len(set(error_codes)) != len(error_codes):
-            raise ValueError("tool behavior error codes must be unique")
-        referenced_claims = {
-            claim_id for error in draft.errors for claim_id in error.evidence_claim_ids
-        }
+        issues: list[StructuredSemanticIssue] = []
+        error_code_positions: dict[str, list[int]] = {}
+        for index, error_code in enumerate(error_codes):
+            error_code_positions.setdefault(error_code, []).append(index)
+        for positions in error_code_positions.values():
+            if len(positions) > 1:
+                issues.extend(
+                    StructuredSemanticIssue(
+                        code="tool_error_code_duplicate",
+                        location=("errors", index, "error_code"),
+                        message="Each declared tool error code must be unique.",
+                        violated_condition="tool error codes must be unique",
+                        expected_category="a unique tool error code",
+                    )
+                    for index in positions
+                )
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        if unknown := referenced_claims - known_claims:
-            raise ValueError(f"tool errors reference unknown evidence claims: {sorted(unknown)}")
+        for error_index, error in enumerate(draft.errors):
+            for claim_index, claim_id in enumerate(error.evidence_claim_ids):
+                if claim_id not in known_claims:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="tool_error_evidence_unknown",
+                            location=("errors", error_index, "evidence_claim_ids", claim_index),
+                            message="Error evidence refs must exist in the frozen EvidenceGraph.",
+                            violated_condition="every error evidence ref must be frozen",
+                            expected_category="an evidence claim id present in the EvidenceGraph",
+                        )
+                    )
+        if issues:
+            raise StructuredSemanticError(tuple(issues))
 
     @staticmethod
     def _compose_tool_behavior(
@@ -7568,7 +9179,17 @@ class EnvironmentDesigner:
         """Deterministically assemble conditions, state effects, and errors."""
 
         if len({conditions.tool_id, state_transition.tool_id, errors.tool_id}) != 1:
-            raise ValueError("tool behavior shards do not preserve one frozen tool identity")
+            raise StructuredSemanticError(
+                (
+                    StructuredSemanticIssue(
+                        code="tool_behavior_component_identity",
+                        location=("tool_id",),
+                        message="All behavior components must preserve one frozen tool identity.",
+                        violated_condition="all behavior components must target one tool",
+                        expected_category="one shared frozen tool identifier",
+                    ),
+                )
+            )
         return ToolBehaviorDraft(
             tool_id=conditions.tool_id,
             preconditions=conditions.preconditions,
@@ -7587,53 +9208,56 @@ class EnvironmentDesigner:
     ) -> None:
         """Validate the transition/error shard before the other semantic shards exist."""
 
+        issues: list[StructuredSemanticIssue] = []
         if draft.tool_id != expected_tool_id:
-            raise ValueError(f"tool behavior must target {expected_tool_id}, got {draft.tool_id}")
-        families = (
-            (draft.preconditions, "precondition"),
-            (draft.transition, "transition"),
-            (draft.postconditions, "postcondition"),
-            (tuple(item.when for item in draft.errors), "error_condition"),
-        )
-        for rules, expected_family in families:
-            invalid = [rule.rule_id for rule in rules if rule.family != expected_family]
-            if invalid:
-                raise ValueError(
-                    f"tool behavior rules require family {expected_family}: {sorted(invalid)}"
+            issues.append(
+                StructuredSemanticIssue(
+                    code="tool_behavior_identity",
+                    location=("tool_id",),
+                    message="Composed behavior must preserve the frozen tool identity.",
+                    violated_condition="tool_id must equal the assigned frozen tool",
+                    expected_category="the assigned frozen tool identifier",
                 )
-        error_codes = [item.error_code for item in draft.errors]
-        if len(set(error_codes)) != len(error_codes):
-            raise ValueError("tool behavior error codes must be unique")
-        all_rules = [
-            *draft.preconditions,
-            *draft.transition,
-            *draft.postconditions,
-            *(item.when for item in draft.errors),
-        ]
-        rule_ids = [rule.rule_id for rule in all_rules]
-        if len(set(rule_ids)) != len(rule_ids):
-            raise ValueError("tool behavior rule_id values must be unique")
-        state_rule_ids = {rule.rule_id for rule in skeleton.state.initial_state_constraints}
-        if collisions := set(rule_ids) & state_rule_ids:
-            raise ValueError(f"tool rules collide with state rule ids: {sorted(collisions)}")
-        expected_prefix = f"rule:{expected_tool_id}:"
-        invalid_ids = [rule_id for rule_id in rule_ids if not rule_id.startswith(expected_prefix)]
-        if invalid_ids:
-            raise ValueError(
-                f"tool rule ids must start with {expected_prefix}: {sorted(invalid_ids)}"
             )
-        if any(
-            value == "task_goal"
-            for rule in all_rules
-            for value in EnvironmentDesigner._nested_values(rule.model_dump(mode="json"), "source")
-        ):
-            raise ValueError("WorldSpec tool behavior cannot read evaluator-only task_goal")
-        referenced_claims = {claim_id for rule in all_rules for claim_id in rule.evidence_claim_ids}
-        for error in draft.errors:
-            referenced_claims.update(error.evidence_claim_ids)
-        known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        if unknown := referenced_claims - known_claims:
-            raise ValueError(f"tool behavior references unknown evidence claims: {sorted(unknown)}")
+        error_codes = [item.error_code for item in draft.errors]
+        error_code_positions: dict[str, list[int]] = {}
+        for index, error_code in enumerate(error_codes):
+            error_code_positions.setdefault(error_code, []).append(index)
+        for positions in error_code_positions.values():
+            if len(positions) > 1:
+                issues.extend(
+                    StructuredSemanticIssue(
+                        code="tool_behavior_error_code_duplicate",
+                        location=("errors", index, "error_code"),
+                        message="Each composed tool behavior error code must be unique.",
+                        violated_condition="tool error codes must be unique",
+                        expected_category="a unique tool error code",
+                    )
+                    for index in positions
+                )
+        rule_paths = [
+            *((rule, ("preconditions", index)) for index, rule in enumerate(draft.preconditions)),
+            *((rule, ("transition", index)) for index, rule in enumerate(draft.transition)),
+            *((rule, ("postconditions", index)) for index, rule in enumerate(draft.postconditions)),
+            *((error.when, ("errors", index, "when")) for index, error in enumerate(draft.errors)),
+        ]
+        rule_id_positions: dict[str, list[tuple[str | int, ...]]] = {}
+        for rule, path in rule_paths:
+            rule_id_positions.setdefault(rule.rule_id, []).append(path)
+        for locations in rule_id_positions.values():
+            if len(locations) > 1:
+                issues.extend(
+                    StructuredSemanticIssue(
+                        code="tool_behavior_rule_id_duplicate",
+                        location=(*location, "rule_id"),
+                        message="Rule ids must be unique across the complete tool behavior.",
+                        violated_condition="tool Rule ids must be unique across components",
+                        expected_category="a Rule identifier unique in this tool behavior",
+                    )
+                    for location in locations
+                )
+        if issues:
+            raise StructuredSemanticError(tuple(issues))
 
     @staticmethod
     def _validate_tool_access_observation_draft(
@@ -7685,18 +9309,18 @@ class EnvironmentDesigner:
                             message="scope must be one of this actor's frozen authorities",
                         )
                     )
-        if set(permission.allowed_actors) == actors:
-            if (
-                permission.condition is not None
-                and permission.condition.case_sensitivity != "positive_and_negative"
-            ):
-                issues.append(
-                    StructuredSemanticIssue(
-                        code="access_case_coverage",
-                        location=("permission", "condition", "case_sensitivity"),
-                        message="a universal permission condition requires positive_and_negative",
-                    )
+        if (
+            set(permission.allowed_actors) == actors
+            and permission.condition is not None
+            and permission.condition.case_sensitivity != "positive_and_negative"
+        ):
+            issues.append(
+                StructuredSemanticIssue(
+                    code="access_case_coverage",
+                    location=("permission", "condition", "case_sensitivity"),
+                    message="a universal permission condition requires positive_and_negative",
                 )
+            )
         if permission.condition is not None:
             if permission.condition.family != "permission":
                 issues.append(
@@ -7932,7 +9556,17 @@ class EnvironmentDesigner:
         """Deterministically assemble three independently validated semantic shards."""
 
         if len({behavior.tool_id, access.tool_id, reliability.tool_id}) != 1:
-            raise ValueError("tool semantic shards do not preserve one frozen tool identity")
+            raise StructuredSemanticError(
+                (
+                    StructuredSemanticIssue(
+                        code="tool_semantics_component_identity",
+                        location=("tool_id",),
+                        message="Behavior, access, and reliability must preserve one tool id.",
+                        violated_condition="all tool semantic components must target one tool",
+                        expected_category="one shared frozen tool identifier",
+                    ),
+                )
+            )
         return ToolSemantics(
             preconditions=behavior.preconditions,
             transition=behavior.transition,
@@ -7956,10 +9590,19 @@ class EnvironmentDesigner:
         skeleton: WorldSkeletonDraft,
         evidence_graph: EvidenceGraph,
     ) -> None:
-        """Validate one behavior node against the frozen shared skeleton."""
+        """Validate the final proposal-owned cross-component semantic closure."""
 
+        issues: list[StructuredSemanticIssue] = []
         if draft.tool_id != expected_tool_id:
-            raise ValueError(f"tool semantics must target {expected_tool_id}, got {draft.tool_id}")
+            issues.append(
+                StructuredSemanticIssue(
+                    code="tool_semantics_identity",
+                    location=("tool_id",),
+                    message="Complete tool semantics must preserve the frozen tool identity.",
+                    violated_condition="tool_id must equal the assigned frozen tool",
+                    expected_category="the assigned frozen tool identifier",
+                )
+            )
         surfaces = {item.surface.tool_id: item.surface for item in skeleton.tool_surfaces}
         surface = surfaces[expected_tool_id]
         actors = {item.actor for item in skeleton.boundary.actors_and_authority}
@@ -7967,24 +9610,52 @@ class EnvironmentDesigner:
             item.actor: set(item.authorities) for item in skeleton.boundary.actors_and_authority
         }
         semantics = draft.semantics
-        unknown_actors = set(semantics.permission.allowed_actors) - actors
-        if unknown_actors:
-            raise ValueError(f"permission references unknown actors: {sorted(unknown_actors)}")
-        missing_scopes = {
-            actor: set(semantics.permission.required_scopes_by_actor[actor]) - authorities[actor]
-            for actor in semantics.permission.allowed_actors
-            if set(semantics.permission.required_scopes_by_actor[actor]) - authorities[actor]
-        }
-        if missing_scopes:
-            raise ValueError(f"allowed actors lack required scopes: {missing_scopes}")
-        if (
-            set(semantics.permission.allowed_actors) == actors
-            and semantics.permission.condition is not None
-        ):
-            if semantics.permission.condition.case_sensitivity != "positive_and_negative":
-                raise ValueError(
-                    "a universal permission condition requires positive-and-negative cases"
+        allowed_actors = semantics.permission.allowed_actors
+        for actor_index, actor in enumerate(allowed_actors):
+            if actor not in actors:
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_semantics_permission_actor_unknown",
+                        location=("semantics", "permission", "allowed_actors", actor_index),
+                        message="Every allowed actor must be in the frozen world boundary.",
+                        violated_condition="permission actors must be frozen boundary actors",
+                        expected_category="a declared boundary actor identifier",
+                    )
                 )
+        for actor in set(allowed_actors) & actors:
+            for scope_index, scope in enumerate(
+                semantics.permission.required_scopes_by_actor[actor]
+            ):
+                if scope not in authorities[actor]:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="tool_semantics_permission_scope_unknown",
+                            location=(
+                                "semantics",
+                                "permission",
+                                "required_scopes_by_actor",
+                                actor,
+                                scope_index,
+                            ),
+                            message="Required scopes must be authorities granted to that actor.",
+                            violated_condition="permission scopes must be frozen actor authorities",
+                            expected_category="an authority declared for this actor",
+                        )
+                    )
+        if (
+            set(allowed_actors) == actors
+            and semantics.permission.condition is not None
+            and semantics.permission.condition.case_sensitivity != "positive_and_negative"
+        ):
+            issues.append(
+                StructuredSemanticIssue(
+                    code="tool_semantics_permission_case_coverage",
+                    location=("semantics", "permission", "condition", "case_sensitivity"),
+                    message="A universal permission condition needs positive_and_negative cases.",
+                    violated_condition="universal permission conditions need both case polarities",
+                    expected_category="positive_and_negative case sensitivity",
+                )
+            )
         if semantics.permission.condition is not None:
             permission_sources = {
                 value
@@ -8002,75 +9673,209 @@ class EnvironmentDesigner:
                 "seed",
             }
             if invalid_sources:
-                raise ValueError(
-                    f"permission condition reads post-execution sources: {sorted(invalid_sources)}"
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_semantics_permission_source_leak",
+                        location=("semantics", "permission", "condition"),
+                        message=(
+                            "Permission conditions may read only actor, pre_state, args, "
+                            "reset_config, or seed."
+                        ),
+                        violated_condition="permission conditions use public pre-execution sources",
+                        expected_category="a public pre-execution Rule source",
+                    )
                 )
 
         visible_by_actor = semantics.observation.visible_fields_by_actor
         if set(visible_by_actor) != actors:
-            raise ValueError("observation visibility must cover exactly every boundary actor")
+            issues.append(
+                StructuredSemanticIssue(
+                    code="tool_semantics_observation_actor_coverage",
+                    location=("semantics", "observation", "visible_fields_by_actor"),
+                    message="Visible-field projections must cover exactly every boundary actor.",
+                    violated_condition="visible projections cover all and only boundary actors",
+                    expected_category="a projection mapping keyed by every boundary actor",
+                )
+            )
         redacted_by_actor = semantics.observation.redacted_fields_by_actor
         if set(redacted_by_actor) != actors:
-            raise ValueError("observation redaction must cover exactly every boundary actor")
+            issues.append(
+                StructuredSemanticIssue(
+                    code="tool_semantics_observation_actor_coverage",
+                    location=("semantics", "observation", "redacted_fields_by_actor"),
+                    message="Redacted-field projections must cover exactly every boundary actor.",
+                    violated_condition="redacted projections cover all and only boundary actors",
+                    expected_category="a projection mapping keyed by every boundary actor",
+                )
+            )
         observation_properties = surface.observation_schema.get("properties")
         if surface.observation_schema.get("type") != "object" or not isinstance(
             observation_properties,
             dict,
         ):
-            raise ValueError("tool observation schema must be an object with explicit properties")
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_semantics_framework_input",
+                    frontier_ordinal=30,
+                    issues=(
+                        SafeValidationIssue(
+                            "framework_tool_observation_schema_invalid",
+                            ("semantics", "observation"),
+                            "The frozen tool observation schema is not a closed object.",
+                            retryable=False,
+                            violated_condition="compiled observations require an object schema",
+                            expected_category="a framework-compiled closed object schema",
+                        ),
+                    ),
+                )
+            )
         observation_fields = set(observation_properties)
-        for actor, visible_fields in visible_by_actor.items():
+        for actor in actors & set(visible_by_actor) & set(redacted_by_actor):
+            visible_fields = visible_by_actor[actor]
             redacted_fields = redacted_by_actor[actor]
             if set(visible_fields) & set(redacted_fields):
-                raise ValueError(
-                    f"observation fields cannot be visible and redacted for actor {actor}"
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_semantics_observation_overlap",
+                        location=("semantics", "observation", "visible_fields_by_actor", actor),
+                        message="A field cannot be both visible and redacted for one actor.",
+                        violated_condition="visible and redacted fields must be disjoint",
+                        expected_category="disjoint visible and redacted field sets",
+                    )
                 )
             if set(visible_fields) | set(redacted_fields) != observation_fields:
-                raise ValueError(
-                    "observation visibility/redaction must classify every field exactly once "
-                    f"for actor {actor}"
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_semantics_observation_classification",
+                        location=("semantics", "observation", "visible_fields_by_actor", actor),
+                        message="Each actor must classify every frozen observation field once.",
+                        violated_condition="visible and redacted fields partition observations",
+                        expected_category="a complete non-overlapping field classification",
+                    )
                 )
         known_tools = set(surfaces)
-        unknown_compensation = set(semantics.rollback.compensation_tools) - known_tools
-        if unknown_compensation:
-            raise ValueError(f"rollback references unknown tools: {sorted(unknown_compensation)}")
+        for tool_index, compensation_tool in enumerate(semantics.rollback.compensation_tools):
+            if compensation_tool not in known_tools:
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_semantics_compensation_tool_unknown",
+                        location=("semantics", "rollback", "compensation_tools", tool_index),
+                        message="Every rollback compensation tool must be in the frozen inventory.",
+                        violated_condition="compensation tools must be frozen tools",
+                        expected_category="a tool identifier in the frozen inventory",
+                    )
+                )
 
-        rules = [
-            *semantics.preconditions,
-            *semantics.transition,
-            *semantics.postconditions,
-            *(item.when for item in semantics.errors),
+        rule_paths = [
+            *(
+                (rule, ("semantics", "preconditions", index))
+                for index, rule in enumerate(semantics.preconditions)
+            ),
+            *(
+                (rule, ("semantics", "transition", index))
+                for index, rule in enumerate(semantics.transition)
+            ),
+            *(
+                (rule, ("semantics", "postconditions", index))
+                for index, rule in enumerate(semantics.postconditions)
+            ),
+            *(
+                (error.when, ("semantics", "errors", index, "when"))
+                for index, error in enumerate(semantics.errors)
+            ),
         ]
         if semantics.permission.condition is not None:
-            rules.append(semantics.permission.condition)
-        rule_ids = [rule.rule_id for rule in rules]
-        if len(set(rule_ids)) != len(rule_ids):
-            raise ValueError("tool semantics rule_id values must be unique")
+            rule_paths.append(
+                (semantics.permission.condition, ("semantics", "permission", "condition"))
+            )
+        rule_id_positions: dict[str, list[tuple[str | int, ...]]] = {}
+        for rule, rule_path in rule_paths:
+            rule_id_positions.setdefault(rule.rule_id, []).append(rule_path)
+        for locations in rule_id_positions.values():
+            if len(locations) > 1:
+                issues.extend(
+                    StructuredSemanticIssue(
+                        code="tool_semantics_rule_id_duplicate",
+                        location=(*location, "rule_id"),
+                        message="Rule ids must be unique across complete tool semantics.",
+                        violated_condition="tool semantic Rule ids must be unique",
+                        expected_category="a Rule identifier unique in this tool semantics",
+                    )
+                    for location in locations
+                )
         state_rule_ids = {rule.rule_id for rule in skeleton.state.initial_state_constraints}
-        if collisions := set(rule_ids) & state_rule_ids:
-            raise ValueError(f"tool rules collide with state rule ids: {sorted(collisions)}")
+        for rule, rule_path in rule_paths:
+            if rule.rule_id in state_rule_ids:
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_semantics_rule_id_state_collision",
+                        location=(*rule_path, "rule_id"),
+                        message="Tool Rule ids must not collide with initial-state Rule ids.",
+                        violated_condition="tool and initial-state Rule ids must be disjoint",
+                        expected_category="a Rule identifier not used by initial-state rules",
+                    )
+                )
         expected_prefix = f"rule:{expected_tool_id}:"
-        invalid_ids = [
-            rule.rule_id for rule in rules if not rule.rule_id.startswith(expected_prefix)
-        ]
-        if invalid_ids:
-            raise ValueError(
-                f"tool rule ids must start with {expected_prefix}: {sorted(invalid_ids)}"
-            )
-        if any(
-            value == "task_goal"
-            for rule in rules
-            for value in EnvironmentDesigner._nested_values(rule.model_dump(mode="json"), "source")
-        ):
-            raise ValueError("WorldSpec tool behavior cannot read evaluator-only task_goal")
-        referenced_claims = {claim_id for rule in rules for claim_id in rule.evidence_claim_ids}
-        for error in semantics.errors:
-            referenced_claims.update(error.evidence_claim_ids)
+        for rule, rule_path in rule_paths:
+            if not rule.rule_id.startswith(expected_prefix):
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_semantics_rule_id_prefix",
+                        location=(*rule_path, "rule_id"),
+                        message="Rule id must use the assigned frozen tool namespace prefix.",
+                        violated_condition="tool Rule ids must use the frozen tool prefix",
+                        expected_category="a Rule identifier in the assigned tool namespace",
+                    )
+                )
+            if any(
+                value == "task_goal"
+                for value in EnvironmentDesigner._nested_values(
+                    rule.model_dump(mode="json"), "source"
+                )
+            ):
+                issues.append(
+                    StructuredSemanticIssue(
+                        code="tool_semantics_evaluator_goal_leak",
+                        location=(*rule_path, "clauses"),
+                        message="Tool behavior Rules may not read evaluator-only task_goal state.",
+                        violated_condition="tool behavior must not read evaluator-only task_goal",
+                        expected_category="a public tool execution context source",
+                    )
+                )
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        if unknown := referenced_claims - known_claims:
-            raise ValueError(
-                f"tool semantics references unknown evidence claims: {sorted(unknown)}"
-            )
+        for rule, rule_path in rule_paths:
+            for claim_index, claim_id in enumerate(rule.evidence_claim_ids):
+                if claim_id not in known_claims:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="tool_semantics_evidence_unknown",
+                            location=(*rule_path, "evidence_claim_ids", claim_index),
+                            message="Rule evidence refs must exist in the frozen EvidenceGraph.",
+                            violated_condition="every Rule evidence ref must be frozen",
+                            expected_category="an evidence claim id present in the EvidenceGraph",
+                        )
+                    )
+        for error_index, error in enumerate(semantics.errors):
+            for claim_index, claim_id in enumerate(error.evidence_claim_ids):
+                if claim_id not in known_claims:
+                    issues.append(
+                        StructuredSemanticIssue(
+                            code="tool_semantics_error_evidence_unknown",
+                            location=(
+                                "semantics",
+                                "errors",
+                                error_index,
+                                "evidence_claim_ids",
+                                claim_index,
+                            ),
+                            message="Error evidence refs must exist in the frozen EvidenceGraph.",
+                            violated_condition="every error evidence ref must be frozen",
+                            expected_category="an evidence claim id present in the EvidenceGraph",
+                        )
+                    )
+        if issues:
+            raise StructuredSemanticError(tuple(issues))
 
     @staticmethod
     def _nested_values(value: object, key: str) -> tuple[object, ...]:
@@ -8902,11 +10707,13 @@ class EnvironmentDesigner:
         world: WorldModelDraft,
         training: TrainingContractDraft,
     ) -> EnvironmentDesignDraft:
-        return EnvironmentDesignDraft.model_validate(
-            {
-                **world.model_dump(mode="json"),
-                **training.model_dump(mode="json"),
-            }
+        return EnvironmentDesignDraft.model_validate_json(
+            canonical_json_bytes(
+                {
+                    **world.model_dump(mode="json"),
+                    **training.model_dump(mode="json"),
+                }
+            )
         )
 
     def _compile_semantic_source(
@@ -8976,8 +10783,8 @@ class EnvironmentDesigner:
         self._validate_design_draft(compiled, evidence_graph)
         return compiled
 
+    @staticmethod
     def _compile_world_semantic_source(
-        self,
         source: WorldSemanticSourceIRDraft,
         *,
         evidence_graph: EvidenceGraph,
@@ -8986,8 +10793,8 @@ class EnvironmentDesigner:
         """Compile the shared Direct-repair/Evolve typed world source."""
 
         boundary = source.boundary
-        self._validate_world_boundary_draft(boundary, evidence_graph=evidence_graph)
-        self._validate_state_entity_inventory_draft(
+        EnvironmentDesigner._validate_world_boundary_draft(boundary, evidence_graph=evidence_graph)
+        EnvironmentDesigner._validate_state_entity_inventory_draft(
             source.state_inventory,
             boundary=boundary,
             evidence_graph=evidence_graph,
@@ -8998,29 +10805,33 @@ class EnvironmentDesigner:
             source.state_entity_schemas,
             strict=True,
         ):
-            self._validate_state_entity_schema_ir_draft(
+            EnvironmentDesigner._validate_state_entity_schema_ir_draft(
                 state_schema_ir,
                 plan=state_plan,
             )
-            compiled_state_schema = self._compile_state_entity_schema_ir(state_schema_ir)
-            entities.append(self._compose_state_entity_schema(state_plan, compiled_state_schema))
-        state_shape = self._compose_world_state_shape(
+            compiled_state_schema = EnvironmentDesigner._compile_state_entity_schema_ir(
+                state_schema_ir
+            )
+            entities.append(
+                EnvironmentDesigner._compose_state_entity_schema(state_plan, compiled_state_schema)
+            )
+        state_shape = EnvironmentDesigner._compose_world_state_shape(
             source.state_inventory,
             tuple(entities),
         )
-        self._validate_world_state_shape_draft(
+        EnvironmentDesigner._validate_world_state_shape_draft(
             state_shape,
             boundary=boundary,
             evidence_graph=evidence_graph,
         )
-        self._validate_initial_state_rules_draft(
+        EnvironmentDesigner._validate_initial_state_rules_draft(
             source.initial_state_rules,
             state_shape=state_shape,
             evidence_graph=evidence_graph,
         )
-        state = self._compose_world_state(state_shape, source.initial_state_rules)
+        state = EnvironmentDesigner._compose_world_state(state_shape, source.initial_state_rules)
 
-        self._validate_world_tool_plan_inventory_draft(
+        EnvironmentDesigner._validate_world_tool_plan_inventory_draft(
             source.tool_inventory,
             boundary=boundary,
             evidence_graph=evidence_graph,
@@ -9032,13 +10843,13 @@ class EnvironmentDesigner:
             for schema_kind in ("input", "output", "observation"):
                 tool_schema_ir = source.tool_schemas[schema_index]
                 schema_index += 1
-                self._validate_tool_schema_ir_draft(
+                EnvironmentDesigner._validate_tool_schema_ir_draft(
                     tool_schema_ir,
                     plan=tool_plan,
                     schema_kind=schema_kind,
                 )
-                compiled_tool_schema = self._compile_tool_schema_ir(tool_schema_ir)
-                self._validate_tool_schema_draft(
+                compiled_tool_schema = EnvironmentDesigner._compile_tool_schema_ir(tool_schema_ir)
+                EnvironmentDesigner._validate_tool_schema_draft(
                     compiled_tool_schema,
                     plan=tool_plan,
                     schema_kind=schema_kind,
@@ -9050,16 +10861,25 @@ class EnvironmentDesigner:
                 output_schema=compiled_by_kind["output"].json_schema,
                 observation_schema=compiled_by_kind["observation"].json_schema,
             )
-            self._validate_tool_surface_schemas_draft(surface_schemas, plan=tool_plan)
-            surface_drafts.append(self._compose_tool_surface(tool_plan, surface_schemas))
+            EnvironmentDesigner._validate_tool_surface_schemas_draft(
+                surface_schemas,
+                plan=tool_plan,
+            )
+            surface_drafts.append(
+                EnvironmentDesigner._compose_tool_surface(tool_plan, surface_schemas)
+            )
         tool_surface_inventory = WorldToolInventoryDraft(tool_surfaces=tuple(surface_drafts))
-        self._validate_world_tool_inventory_draft(
+        EnvironmentDesigner._validate_world_tool_inventory_draft(
             tool_surface_inventory,
             boundary=boundary,
             evidence_graph=evidence_graph,
         )
-        skeleton = self._compose_world_skeleton(boundary, state, tool_surface_inventory)
-        self._validate_world_skeleton(skeleton, evidence_graph=evidence_graph)
+        skeleton = EnvironmentDesigner._compose_world_skeleton(
+            boundary,
+            state,
+            tool_surface_inventory,
+        )
+        EnvironmentDesigner._validate_world_skeleton(skeleton, evidence_graph=evidence_graph)
 
         tools: list[ToolContract] = []
         for surface, semantics in zip(
@@ -9067,7 +10887,7 @@ class EnvironmentDesigner:
             source.tool_semantics,
             strict=True,
         ):
-            self._validate_tool_semantics_draft(
+            EnvironmentDesigner._validate_tool_semantics_draft(
                 semantics,
                 expected_tool_id=surface.surface.tool_id,
                 skeleton=skeleton,
@@ -9080,13 +10900,13 @@ class EnvironmentDesigner:
                     evidence_claim_ids=surface.evidence_claim_ids,
                 )
             )
-        world = self._compose_world_model(
+        world = EnvironmentDesigner._compose_world_model(
             skeleton,
             tuple(tools),
             source.closure,
             task_dimensions=boundary.task_dimensions,
         )
-        self._validate_world_model_draft(
+        EnvironmentDesigner._validate_world_model_draft(
             world,
             evidence_graph=evidence_graph,
             evidence_graph_ref=evidence_graph_ref,
@@ -9428,7 +11248,9 @@ Produce exactly SharedToolSemanticsSourceDraft. Partition every group tool exact
 atomicity, concurrency and idempotency domains. Add only genuine cross-tool ordering and
 compensation edges. Error policies use the final identifier suffix that every named member tool
 must declare (for example `timeout`), with one shared retryability decision. Every group tool must
-appear in at least one error policy. Use only exact frozen tool ids and supplied evidence claim ids.
+appear in at least one error policy. Idempotency domains use exactly the same closed vocabulary as
+the downstream ToolContract: `not_supported`, `natural`, or `idempotency_key`. Use only exact
+frozen tool ids and supplied evidence claim ids.
 
 This is a short shared contract, not per-tool behavior: do not emit schemas, preconditions,
 transitions, observations, complete errors, tasks, verifier code, runtime code, fixed cases, Gate
@@ -9445,8 +11267,7 @@ Original need:
         tool_ids: tuple[str, ...],
     ) -> str:
         ids = json.dumps(tool_ids, ensure_ascii=False)
-        return (
-            f"""You are the Tool Semantics Engineer for one frozen programmatic Agent world.
+        return f"""You are the Tool Semantics Engineer for one frozen programmatic Agent world.
 Project purpose: replace hallucinated state changes with executable business rules that a Runtime
 and an independent Judge can both evaluate. This transaction owns the coupled behavior of exactly
 the ordered tool ids {ids}; the framework owns their identities, schemas, state, protocols, and
@@ -9493,7 +11314,6 @@ fixed cases or solutions, call tools, or make a release decision.
 Original need:
 {request.need}
 """
-        )
 
     @staticmethod
     def _training_semantics_prompt(request: EnvironmentRequest) -> str:

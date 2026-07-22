@@ -14,7 +14,21 @@ from typing import Literal
 
 from pydantic import ValidationError
 
-ValidationOwner = Literal["design", "verifier", "build", "judge"]
+# A safe diagnostic belongs to the framework component that owns the failed
+# boundary.  This is intentionally broader than the set of Agent-capable
+# components: code-only release and registry leaves also need field-addressable
+# failures, even though their repair policy normally denies a semantic retry.
+ValidationOwner = Literal[
+    "controller",
+    "research",
+    "design",
+    "verifier",
+    "build",
+    "integration",
+    "judge",
+    "release",
+    "registry",
+]
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 _SAFE_LOCATION_PART = re.compile(r"[^A-Za-z0-9_-]")
@@ -57,6 +71,17 @@ _SAFE_PYDANTIC_MESSAGES = {
     "rule_pointer_not_absolute": "Use an empty pointer or an absolute RFC 6901 pointer.",
     "rule_pointer_limit": "Keep the RFC 6901 pointer within framework limits.",
     "rule_pointer_escape": "Use only ~0 and ~1 RFC 6901 escape sequences.",
+    "compact_field_string_constraints": (
+        "Use string value_type when setting string_format or enum_values."
+    ),
+    "compact_field_numeric_bounds": (
+        "Use integer or number value_type when setting minimum or maximum."
+    ),
+    "compact_field_bounds_order": "Set minimum less than or equal to maximum.",
+    "compact_field_enum_unique": "Use unique enum_values.",
+    "state_field_lifecycle_contract": (
+        "Use a mutable string lifecycle field with non-empty enum_values."
+    ),
 }
 _GENERIC_NON_ACTIONABLE_CODES = frozenset(
     {
@@ -75,7 +100,7 @@ _SAFE_EXPECTED_CATEGORIES = {
     "float_type": "a numeric value",
     "bool_type": "a boolean value",
     "list_type": "an array value",
-    "tuple_type": "an array with the declared fixed shape",
+    "tuple_type": "a JSON array matching the declared item schema",
     "dict_type": "an object value",
     "literal_error": "one of the closed literal alternatives",
     "enum": "one of the closed enum alternatives",
@@ -98,6 +123,26 @@ _SAFE_EXPECTED_CATEGORIES = {
     "rule_pointer_not_absolute": "an empty or absolute RFC 6901 pointer",
     "rule_pointer_limit": "an RFC 6901 pointer within framework limits",
     "rule_pointer_escape": "valid RFC 6901 escape sequences",
+    "compact_field_string_constraints": "a string field when using string constraints",
+    "compact_field_numeric_bounds": "an integer or number field when using numeric bounds",
+    "compact_field_bounds_order": "a minimum less than or equal to maximum",
+    "compact_field_enum_unique": "unique enum_values",
+    "state_field_lifecycle_contract": (
+        "a mutable string lifecycle field with non-empty enum_values"
+    ),
+}
+_SAFE_VIOLATED_CONDITIONS = {
+    "compact_field_string_constraints": (
+        "string_format and enum_values are valid only for string fields"
+    ),
+    "compact_field_numeric_bounds": (
+        "minimum and maximum are valid only for integer or number fields"
+    ),
+    "compact_field_bounds_order": "minimum must not exceed maximum",
+    "compact_field_enum_unique": "enum_values must be unique",
+    "state_field_lifecycle_contract": (
+        "lifecycle requires mutable role, string value_type, and non-empty enum_values"
+    ),
 }
 
 
@@ -267,7 +312,10 @@ def pydantic_validation_diagnostic(
                     raw_error_type,
                     "Value does not satisfy the closed structured-output schema at this field.",
                 ),
-                violated_condition=f"closed schema constraint {raw_error_type}",
+                violated_condition=_SAFE_VIOLATED_CONDITIONS.get(
+                    raw_error_type,
+                    f"closed schema constraint {raw_error_type}",
+                ),
                 expected_category=expected,
             )
         )

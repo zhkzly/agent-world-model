@@ -17,6 +17,7 @@ from pathlib import Path
 from pydantic import AwareDatetime, JsonValue, model_validator
 
 from agent_world.contracts import (
+    ArtifactRef,
     ContentHash,
     Identifier,
     NonEmptyStr,
@@ -45,10 +46,18 @@ class NodeContinuationRecord(V2Contract):
     codex_config_digest: ContentHash
     model: NonEmptyStr
     output_schema_digest: ContentHash
+    definition_digest: ContentHash
+    proposal_policy_digest: ContentHash
+    input_fingerprint: ContentHash
     previous_candidate: JsonValue | None = None
     candidate_commitment: ContentHash | None = None
     allowed_mutation_roots: tuple[NonEmptyStr, ...] = ()
+    source_report_ref: ArtifactRef
+    source_evaluation_ref: ArtifactRef
+    repair_action_ref: ArtifactRef
+    previous_execution_ref: ArtifactRef
     session_commitment: ContentHash
+    record_commitment: ContentHash
     created_at: AwareDatetime
 
     @model_validator(mode="after")
@@ -76,6 +85,33 @@ class NodeContinuationRecord(V2Contract):
         )
         if self.session_commitment != expected_session:
             raise ValueError("continuation session commitment mismatch")
+        expected_record = self.compute_record_commitment(
+            work_id=self.work_id,
+            attempt_id=self.attempt_id,
+            definition_digest=self.definition_digest,
+            proposal_policy_digest=self.proposal_policy_digest,
+            input_fingerprint=self.input_fingerprint,
+            session_commitment=self.session_commitment,
+            candidate_commitment=self.candidate_commitment,
+            allowed_mutation_roots=self.allowed_mutation_roots,
+            source_report_ref=self.source_report_ref,
+            source_evaluation_ref=self.source_evaluation_ref,
+            repair_action_ref=self.repair_action_ref,
+            previous_execution_ref=self.previous_execution_ref,
+        )
+        if self.record_commitment != expected_record:
+            raise ValueError("continuation record commitment mismatch")
+        expected_id = self.continuation_id_for(expected_record)
+        if self.continuation_id != expected_id:
+            raise ValueError("continuation id is not derived from its record commitment")
+        expected_types = (
+            (self.source_report_ref.artifact_type, "control.validation_report"),
+            (self.source_evaluation_ref.artifact_type, "control.feedback_evaluation"),
+            (self.repair_action_ref.artifact_type, "control.repair_action"),
+            (self.previous_execution_ref.artifact_type, "control.proposal_execution"),
+        )
+        if any(actual != expected for actual, expected in expected_types):
+            raise ValueError("continuation authority ref has the wrong Artifact type")
         return self
 
     @staticmethod
@@ -103,6 +139,45 @@ class NodeContinuationRecord(V2Contract):
             )
         )
 
+    @staticmethod
+    def compute_record_commitment(
+        *,
+        work_id: str,
+        attempt_id: str,
+        definition_digest: str,
+        proposal_policy_digest: str,
+        input_fingerprint: str,
+        session_commitment: str,
+        candidate_commitment: str | None,
+        allowed_mutation_roots: tuple[str, ...],
+        source_report_ref: ArtifactRef,
+        source_evaluation_ref: ArtifactRef,
+        repair_action_ref: ArtifactRef,
+        previous_execution_ref: ArtifactRef,
+    ) -> ContentHash:
+        return sha256_digest(
+            canonical_json_bytes(
+                {
+                    "work_id": work_id,
+                    "attempt_id": attempt_id,
+                    "definition_digest": definition_digest,
+                    "proposal_policy_digest": proposal_policy_digest,
+                    "input_fingerprint": input_fingerprint,
+                    "session_commitment": session_commitment,
+                    "candidate_commitment": candidate_commitment,
+                    "allowed_mutation_roots": allowed_mutation_roots,
+                    "source_report_ref": source_report_ref.model_dump(mode="json"),
+                    "source_evaluation_ref": source_evaluation_ref.model_dump(mode="json"),
+                    "repair_action_ref": repair_action_ref.model_dump(mode="json"),
+                    "previous_execution_ref": previous_execution_ref.model_dump(mode="json"),
+                }
+            )
+        )
+
+    @staticmethod
+    def continuation_id_for(record_commitment: str) -> Identifier:
+        return f"continuation:{record_commitment.removeprefix('sha256:')[:24]}"
+
     @classmethod
     def capture(
         cls,
@@ -112,8 +187,15 @@ class NodeContinuationRecord(V2Contract):
         session: InvocationSession,
         model: str,
         output_schema_digest: ContentHash,
+        definition_digest: ContentHash,
+        proposal_policy_digest: ContentHash,
+        input_fingerprint: ContentHash,
         previous_candidate: JsonValue | None,
         allowed_mutation_roots: tuple[str, ...],
+        source_report_ref: ArtifactRef,
+        source_evaluation_ref: ArtifactRef,
+        repair_action_ref: ArtifactRef,
+        previous_execution_ref: ArtifactRef,
     ) -> NodeContinuationRecord:
         candidate_commitment = (
             sha256_digest(canonical_json_bytes(previous_candidate))
@@ -132,11 +214,22 @@ class NodeContinuationRecord(V2Contract):
             model=model,
             output_schema_digest=output_schema_digest,
         )
-        identity = hashlib.sha256(
-            f"{work_id}\0{attempt_id}\0{session_commitment}".encode()
-        ).hexdigest()[:24]
+        record_commitment = cls.compute_record_commitment(
+            work_id=work_id,
+            attempt_id=attempt_id,
+            definition_digest=definition_digest,
+            proposal_policy_digest=proposal_policy_digest,
+            input_fingerprint=input_fingerprint,
+            session_commitment=session_commitment,
+            candidate_commitment=candidate_commitment,
+            allowed_mutation_roots=allowed_mutation_roots,
+            source_report_ref=source_report_ref,
+            source_evaluation_ref=source_evaluation_ref,
+            repair_action_ref=repair_action_ref,
+            previous_execution_ref=previous_execution_ref,
+        )
         return cls(
-            continuation_id=f"continuation:{identity}",
+            continuation_id=cls.continuation_id_for(record_commitment),
             work_id=work_id,
             attempt_id=attempt_id,
             thread_id=session.thread_id,
@@ -146,10 +239,18 @@ class NodeContinuationRecord(V2Contract):
             codex_config_digest=config_digest,
             model=model,
             output_schema_digest=output_schema_digest,
+            definition_digest=definition_digest,
+            proposal_policy_digest=proposal_policy_digest,
+            input_fingerprint=input_fingerprint,
             previous_candidate=previous_candidate,
             candidate_commitment=candidate_commitment,
             allowed_mutation_roots=allowed_mutation_roots,
+            source_report_ref=source_report_ref,
+            source_evaluation_ref=source_evaluation_ref,
+            repair_action_ref=repair_action_ref,
+            previous_execution_ref=previous_execution_ref,
             session_commitment=session_commitment,
+            record_commitment=record_commitment,
             created_at=datetime.now(UTC),
         )
 
@@ -223,13 +324,49 @@ class NodeContinuationStore:
 
     def load_exact(
         self,
-        continuation_id: Identifier,
         *,
-        work_id: Identifier,
-        session_commitment: ContentHash,
-        model: str,
-        output_schema_digest: ContentHash,
+        expected: NodeContinuationRecord,
+        workspace_root: Path,
     ) -> NodeContinuationRecord | None:
+        expected = NodeContinuationRecord.model_validate(expected.model_dump(mode="python"))
+        path = self._path(expected.continuation_id)
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ContinuationStoreError("cannot safely read continuation state") from exc
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            raw = stream.read()
+        try:
+            record = NodeContinuationRecord.model_validate_json(raw)
+        except Exception as exc:
+            raise ContinuationStoreError("invalid private continuation state") from exc
+        if record != expected:
+            raise ContinuationStoreError("continuation state does not match exact authority")
+        root = workspace_root.expanduser().resolve(strict=True)
+        workspace = Path(record.workspace)
+        try:
+            resolved = workspace.resolve(strict=True)
+            resolved.relative_to(root)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise ContinuationStoreError(
+                "continuation workspace is outside its authorized root"
+            ) from exc
+        if workspace.is_symlink() or not resolved.is_dir():
+            raise ContinuationStoreError("continuation workspace is not a safe directory")
+        return record
+
+    def load_commitment(
+        self,
+        record_commitment: ContentHash,
+        *,
+        workspace_root: Path,
+    ) -> NodeContinuationRecord | None:
+        """Load the immutable record named by a public WorkAttempt commitment."""
+
+        continuation_id = NodeContinuationRecord.continuation_id_for(record_commitment)
         path = self._path(continuation_id)
         flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -244,15 +381,72 @@ class NodeContinuationStore:
             record = NodeContinuationRecord.model_validate_json(raw)
         except Exception as exc:
             raise ContinuationStoreError("invalid private continuation state") from exc
-        if (
-            record.continuation_id != continuation_id
-            or record.work_id != work_id
-            or record.session_commitment != session_commitment
-            or record.model != model
-            or record.output_schema_digest != output_schema_digest
-        ):
-            return None
+        if record.record_commitment != record_commitment:
+            raise ContinuationStoreError("continuation commitment does not match its record")
+        root = workspace_root.expanduser().resolve(strict=True)
+        workspace = Path(record.workspace)
+        try:
+            resolved = workspace.resolve(strict=True)
+            resolved.relative_to(root)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise ContinuationStoreError(
+                "continuation workspace is outside its authorized root"
+            ) from exc
+        if workspace.is_symlink() or not resolved.is_dir():
+            raise ContinuationStoreError("continuation workspace is not a safe directory")
         return record
+
+    def find_repair_binding(
+        self,
+        *,
+        work_id: Identifier,
+        attempt_id: Identifier,
+        definition_digest: ContentHash,
+        proposal_policy_digest: ContentHash,
+        input_fingerprint: ContentHash,
+        source_report_ref: ArtifactRef,
+        source_evaluation_ref: ArtifactRef,
+        repair_action_ref: ArtifactRef,
+        previous_execution_ref: ArtifactRef,
+        workspace_root: Path,
+    ) -> NodeContinuationRecord | None:
+        """Recover a record saved before its public head binding CAS."""
+
+        matches: list[NodeContinuationRecord] = []
+        for path in sorted(self.root.glob("*.json")):
+            if path.is_symlink() or not path.is_file():
+                raise ContinuationStoreError("continuation store contains an unsafe entry")
+            flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(path, flags)
+            except OSError as exc:
+                raise ContinuationStoreError("cannot safely read continuation state") from exc
+            with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                raw = stream.read()
+            try:
+                record = NodeContinuationRecord.model_validate_json(raw)
+            except Exception as exc:
+                raise ContinuationStoreError("invalid private continuation state") from exc
+            if (
+                record.work_id == work_id
+                and record.attempt_id == attempt_id
+                and record.definition_digest == definition_digest
+                and record.proposal_policy_digest == proposal_policy_digest
+                and record.input_fingerprint == input_fingerprint
+                and record.source_report_ref == source_report_ref
+                and record.source_evaluation_ref == source_evaluation_ref
+                and record.repair_action_ref == repair_action_ref
+                and record.previous_execution_ref == previous_execution_ref
+            ):
+                matches.append(record)
+        if len(matches) > 1:
+            raise ContinuationStoreError(
+                "repair authority binds conflicting continuation records"
+            )
+        if not matches:
+            return None
+        record = matches[0]
+        return self.load_exact(expected=record, workspace_root=workspace_root)
 
     def _path(self, continuation_id: str) -> Path:
         key = hashlib.sha256(continuation_id.encode("utf-8")).hexdigest()

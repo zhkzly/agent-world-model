@@ -27,6 +27,8 @@ from agent_world.consumer import (
 )
 from agent_world.contracts import (
     ArtifactRef,
+    BudgetUsage,
+    EnvironmentJob,
     EnvironmentSuiteSnapshot,
     ExpansionCampaign,
     SuiteSelectionRequest,
@@ -36,8 +38,10 @@ from agent_world.control import (
     CampaignRunCheckpoint,
     CampaignStore,
     DirectJobStore,
+    DurableLeaseBudgetCoordinator,
     JobRunSnapshot,
     TelemetryStore,
+    WorkControlStore,
 )
 from agent_world.controller import FoundryController
 from agent_world.designer import (
@@ -192,6 +196,7 @@ class DirectRunReader:
     _store: DirectJobStore = field(repr=False)
     _artifacts: ArtifactStore = field(repr=False)
     _telemetry: TelemetryStore = field(repr=False)
+    _work_heads: WorkControlStore | None = field(default=None, repr=False)
 
     def inspect(self, request_id: str, *, include_metrics: bool = False) -> dict[str, object]:
         head = self._store.read_head(request_id)
@@ -243,11 +248,27 @@ class DirectRunReader:
         observed_spans = self._telemetry.active_work(run_id)
         spans = observed_spans if snapshot.status == "running" else ()
         orphaned_spans = observed_spans if snapshot.status != "running" else ()
-        leases = tuple(
-            self._artifacts.get_json(ref, BudgetLease)
-            for ref in snapshot.latest_artifact_refs
-            if ref.artifact_type == "control.budget_lease"
-        )
+        # A DirectJob snapshot is a terminal summary, not a mutable duplicate
+        # of Scheduler state.  For a live run the Scheduler scope ledger is
+        # updated before dispatch and after every operation, so it is the
+        # authority for in-flight budget observation.  Old runs without a
+        # scope ledger retain the snapshot-only compatibility projection.
+        scheduler_budget = self._scheduler_budget(snapshot)
+        if scheduler_budget is None:
+            leases = tuple(
+                self._artifacts.get_json(ref, BudgetLease)
+                for ref in snapshot.latest_artifact_refs
+                if ref.artifact_type == "control.budget_lease"
+            )
+            observed_actual = snapshot.observed_actual_budget
+            unknown_upper_bound = snapshot.unknown_upper_bound_budget
+            conservative_committed = snapshot.conservative_committed_budget
+            budget_source = "direct_job_terminal_snapshot"
+        else:
+            leases, observed_actual, unknown_upper_bound, conservative_committed = (
+                scheduler_budget
+            )
+            budget_source = "scheduler_scope_lease_ledger"
         observed_active_leases = tuple(lease for lease in leases if lease.status == "active")
         active_leases = observed_active_leases if snapshot.status == "running" else ()
         reserved_exposure: dict[str, int | float] = {}
@@ -267,13 +288,10 @@ class DirectRunReader:
             "orphaned_spans": list(orphaned_spans),
             "builder_workspace": self._latest_builder_workspace(snapshot),
             "usage": {
-                "observed_actual": snapshot.observed_actual_budget.model_dump(mode="json"),
-                "unknown_upper_bound": snapshot.unknown_upper_bound_budget.model_dump(
-                    mode="json"
-                ),
-                "conservative_committed": (
-                    snapshot.conservative_committed_budget.model_dump(mode="json")
-                ),
+                "projection_source": budget_source,
+                "observed_actual": observed_actual.model_dump(mode="json"),
+                "unknown_upper_bound": unknown_upper_bound.model_dump(mode="json"),
+                "conservative_committed": conservative_committed.model_dump(mode="json"),
                 "inflight_observed": {
                     "llm_tokens": None,
                     "event_count": sum(
@@ -291,6 +309,50 @@ class DirectRunReader:
                 ),
             },
         }
+
+    def _scheduler_budget(
+        self,
+        snapshot: JobRunSnapshot,
+    ) -> tuple[tuple[BudgetLease, ...], BudgetUsage, BudgetUsage, BudgetUsage] | None:
+        """Read the Scheduler ledger for one Direct job without mutating it.
+
+        A missing ledger is expected only for an older terminal run.  A
+        malformed existing ledger must surface as an inspection failure rather
+        than being hidden behind a misleading zero budget.
+        """
+
+        if self._work_heads is None:
+            return None
+        job = self._artifacts.get_json(snapshot.job_ref, EnvironmentJob)
+        coordinator = DurableLeaseBudgetCoordinator(
+            self._work_heads.root / "scope-budgets"
+        )
+        try:
+            ledger = coordinator.snapshot(scope_id=job.job_id)
+        except ValueError:
+            return None
+        settled = tuple(lease for lease in ledger.leases if lease.status == "settled")
+        return (
+            ledger.leases,
+            self._sum_lease_usage(settled, "observed_actual"),
+            self._sum_lease_usage(settled, "unknown_upper_bound"),
+            self._sum_lease_usage(settled, "conservative_committed"),
+        )
+
+    @staticmethod
+    def _sum_lease_usage(
+        leases: tuple[BudgetLease, ...],
+        attribute: str,
+    ) -> BudgetUsage:
+        fields = tuple(
+            name for name in BudgetUsage.model_fields if name != "schema_version"
+        )
+        return BudgetUsage.model_validate(
+            {
+                name: sum(getattr(getattr(lease, attribute), name) for lease in leases)
+                for name in fields
+            }
+        )
 
     def _latest_builder_workspace(
         self,
@@ -354,7 +416,13 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
     controller_artifacts = artifacts.issue_writer(
         producer="framework",
         allowed_artifact_types=("environment_package_manifest",),
-        allowed_artifact_type_prefixes=("control.", "discovery.", "expansion.", "release."),
+        allowed_artifact_type_prefixes=(
+            "control.",
+            "design.",
+            "discovery.",
+            "expansion.",
+            "release.",
+        ),
         allowed_event_type_prefixes=(
             "design_",
             "discovery_",
@@ -615,6 +683,7 @@ def open_direct_runs(config: FoundryConfig) -> DirectRunReader:
             config.state_root / "telemetry",
             commit_batch_size=config.observability.commit_batch_size,
         ),
+        WorkControlStore(config.state_root / "work-control"),
     )
 
 
@@ -675,7 +744,11 @@ def _collect_secret_canaries(
                 environment,
                 agent.api_key_environment,
                 purpose="model credential",
-                minimum=8,
+                # API-compatible gateways legitimately issue compact opaque
+                # credentials.  The redactor's exact-value protection starts
+                # at four bytes, so requiring a longer token here would make
+                # a real configured backend unusable without adding safety.
+                minimum=4,
             )
         )
     else:

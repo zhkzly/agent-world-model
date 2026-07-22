@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -22,6 +23,7 @@ from agent_world.contracts import (
     StateSchema,
     ToolContract,
     ToolError,
+    WorldSpec,
 )
 from agent_world.control.validation import (
     StructuredValidationError,
@@ -159,7 +161,7 @@ def _inputs(tmp_path: Path):  # type: ignore[no-untyped-def]
 def test_tool_access_observation_reports_all_missing_fields_by_actor(
     tmp_path: Path,
 ) -> None:
-    _, skeleton, _, tool_draft, _ = _inputs(tmp_path)
+    world, skeleton, _, tool_draft, _ = _inputs(tmp_path)
     access = ToolAccessObservationDraft(
         tool_id=tool_draft.tool_id,
         permission=tool_draft.semantics.permission,
@@ -186,19 +188,15 @@ def test_tool_access_observation_reports_all_missing_fields_by_actor(
     )
     assert properties
     missing_locations = {
-        issue.location
-        for issue in raised.value.issues
-        if issue.code == "observation_field_missing"
+        issue.location for issue in raised.value.issues if issue.code == "observation_field_missing"
     }
-    assert missing_locations == {
-        ("observation", "classification", actor) for actor in actors
-    }
+    assert missing_locations == {("observation", "classification", actor) for actor in actors}
 
 
 def test_public_tool_may_allow_every_frozen_actor_without_invented_condition(
     tmp_path: Path,
 ) -> None:
-    _, skeleton, _, tool_draft, _ = _inputs(tmp_path)
+    world, skeleton, _, tool_draft, _ = _inputs(tmp_path)
     actors = tuple(item.actor for item in skeleton.boundary.actors_and_authority)
     permission = tool_draft.semantics.permission.model_copy(
         update={
@@ -218,6 +216,12 @@ def test_public_tool_may_allow_every_frozen_actor_without_invented_condition(
         expected_tool_id=tool_draft.tool_id,
         skeleton=skeleton,
     )
+    public_tool = world.tools[0].model_copy(
+        update={"semantics": tool_draft.semantics.model_copy(update={"permission": permission})}
+    )
+    WorldSpec.model_validate(
+        world.model_copy(update={"tools": (public_tool,)}).model_dump(mode="python")
+    )
 
 
 def test_tool_access_observation_routes_permission_rule_id_collision(
@@ -232,14 +236,10 @@ def test_tool_access_observation_routes_permission_rule_id_collision(
         postconditions=semantics.postconditions,
         errors=semantics.errors,
     )
-    colliding_condition = semantics.preconditions[0].model_copy(
-        update={"family": "permission"}
-    )
+    colliding_condition = semantics.preconditions[0].model_copy(update={"family": "permission"})
     access = ToolAccessObservationDraft(
         tool_id=tool_draft.tool_id,
-        permission=semantics.permission.model_copy(
-            update={"condition": colliding_condition}
-        ),
+        permission=semantics.permission.model_copy(update={"condition": colliding_condition}),
         observation=semantics.observation,
     )
 
@@ -251,9 +251,7 @@ def test_tool_access_observation_routes_permission_rule_id_collision(
             behavior=behavior,
         )
 
-    assert [issue.code for issue in raised.value.issues] == [
-        "access_rule_identity_collision"
-    ]
+    assert [issue.code for issue in raised.value.issues] == ["access_rule_identity_collision"]
     assert raised.value.issues[0].location == (
         "permission",
         "condition",
@@ -274,9 +272,7 @@ def test_tool_access_observation_does_not_echo_unknown_rejected_field(
     rejected_field = "rejected-secret-field"
     visible = dict(access.observation.visible_fields_by_actor)
     visible[actor] = (*visible[actor], rejected_field)
-    invalid_projection = access.observation.model_copy(
-        update={"visible_fields_by_actor": visible}
-    )
+    invalid_projection = access.observation.model_copy(update={"visible_fields_by_actor": visible})
 
     with pytest.raises(StructuredSemanticError) as raised:
         EnvironmentDesigner._validate_tool_access_observation_draft(
@@ -1843,26 +1839,28 @@ def test_tool_schema_ir_rejects_cycles_before_compilation() -> None:
         reads_state_entities=("booking",),
         evidence_claim_ids=("claim:booking",),
     )
-    draft = ToolSchemaIRDraft.model_validate(
-        {
-            "tool_id": plan.tool_id,
-            "schema_kind": "input",
-            "root_node_id": "root",
-            "nodes": [
-                {
-                    "node_id": "root",
-                    "kind": "object",
-                    "properties": [
-                        {"name": "children", "node_id": "children", "required": True}
-                    ],
-                },
-                {
-                    "node_id": "children",
-                    "kind": "array",
-                    "items_node_id": "root",
-                },
-            ],
-        }
+    draft = ToolSchemaIRDraft.model_validate_json(
+        json.dumps(
+            {
+                "tool_id": plan.tool_id,
+                "schema_kind": "input",
+                "root_node_id": "root",
+                "nodes": [
+                    {
+                        "node_id": "root",
+                        "kind": "object",
+                        "properties": [
+                            {"name": "children", "node_id": "children", "required": True}
+                        ],
+                    },
+                    {
+                        "node_id": "children",
+                        "kind": "array",
+                        "items_node_id": "root",
+                    },
+                ],
+            }
+        )
     )
 
     with pytest.raises(StructuredValidationError) as captured:
@@ -1897,13 +1895,65 @@ def test_tool_semantics_cannot_drift_from_the_frozen_surface(tmp_path: Path) -> 
     _, skeleton, graph, tool_draft, _ = _inputs(tmp_path)
     drifted = tool_draft.model_copy(update={"tool_id": "counter.replace"})
 
-    with pytest.raises(ValueError, match="must target counter.increment"):
+    with pytest.raises(StructuredSemanticError) as raised:
         EnvironmentDesigner._validate_tool_semantics_draft(
             drifted,
             expected_tool_id="counter.increment",
             skeleton=skeleton,
             evidence_graph=graph,
         )
+
+    assert [(issue.code, issue.location) for issue in raised.value.issues] == [
+        ("tool_semantics_identity", ("tool_id",)),
+    ]
+
+
+def test_tool_rule_shard_failure_is_field_addressable_before_feedback_routing(
+    tmp_path: Path,
+) -> None:
+    """Regression for the live batch that previously produced opaque ValueError roots."""
+
+    _, skeleton, graph, tool_draft, _ = _inputs(tmp_path)
+    invalid_precondition = tool_draft.semantics.preconditions[0].model_copy(
+        update={
+            "rule_id": "rule:wrong-tool:precondition",
+            "evidence_claim_ids": ("claim:not-frozen",),
+        }
+    )
+    conditions = ToolConditionsDraft(
+        tool_id=tool_draft.tool_id,
+        preconditions=(invalid_precondition,),
+        postconditions=tool_draft.semantics.postconditions,
+    )
+
+    with pytest.raises(StructuredSemanticError) as raised:
+        EnvironmentDesigner._validate_tool_conditions_draft(
+            conditions,
+            expected_tool_id=tool_draft.tool_id,
+            skeleton=skeleton,
+            evidence_graph=graph,
+        )
+
+    assert {(issue.code, issue.location) for issue in raised.value.issues} == {
+        ("tool_rule_id_prefix", ("preconditions", 0, "rule_id")),
+        (
+            "tool_rule_evidence_unknown",
+            ("preconditions", 0, "evidence_claim_ids", 0),
+        ),
+    }
+    routed = EnvironmentDesigner._prefixed_validation_issues(
+        raised.value,
+        prefix=("tools", 0, "conditions"),
+    )
+    assert {issue.code for issue in routed} == {
+        "tool_rule_id_prefix",
+        "tool_rule_evidence_unknown",
+    }
+    assert all(issue.code != "framework_diagnostic_incomplete" for issue in routed)
+    assert all(issue.actionable_for_agent for issue in routed)
+    prefix_issue = next(issue for issue in routed if issue.code == "tool_rule_id_prefix")
+    assert prefix_issue.violated_condition == "tool Rule ids must use the frozen tool prefix"
+    assert prefix_issue.expected_category == "a Rule identifier in the assigned tool namespace"
 
 
 def test_validation_diagnostics_expose_only_bounded_code_and_path() -> None:
@@ -1971,9 +2021,7 @@ def test_assumption_closure_requires_typed_claim_and_fidelity() -> None:
         validation_phase="evidenceassumptionclosuredraft_shape",
         frontier_ordinal=10,
     )
-    assert diagnostic.issue_codes == (
-        "schema_assumption_closure_payload_required@root",
-    )
+    assert diagnostic.issue_codes == ("schema_assumption_closure_payload_required@root",)
     assert "Provide both claim and fidelity" in diagnostic.feedback
 
 

@@ -21,17 +21,22 @@ from typing import Annotated, Literal
 from pydantic import AwareDatetime, Field, ValidationError, model_validator
 
 from agent_world.artifact_store import ArtifactWriter
-from agent_world.contracts import ArtifactRef, ContentHash, Identifier, V2Contract
+from agent_world.contracts import ArtifactRef, BudgetUsage, ContentHash, Identifier, V2Contract
 
 from .models import BudgetLease
 from .work import (
+    AssuranceExecution,
+    AssuranceReport,
     FeedbackEvaluation,
+    OperationRun,
     ProposalExecution,
+    ValidationExecution,
     ValidationReport,
     WorkAttempt,
     WorkCommit,
     WorkCoordinate,
     WorkDefinition,
+    work_input_fingerprint,
 )
 
 type WorkHeadStatus = Literal[
@@ -67,10 +72,12 @@ class WorkControlHead(V2Contract):
     coordinate: WorkCoordinate
     work_id: Identifier
     definition_digest: ContentHash
+    acceptance_digest: ContentHash
     input_fingerprint: ContentHash
     revision: Annotated[int, Field(ge=1)]
     status: WorkHeadStatus
     attempt_ref: ArtifactRef
+    active_operation_ref: ArtifactRef | None = None
     evaluation_ref: ArtifactRef | None = None
     repair_action_ref: ArtifactRef | None = None
     commit_ref: ArtifactRef | None = None
@@ -83,6 +90,10 @@ class WorkControlHead(V2Contract):
             raise ValueError("work head scope must match its coordinate")
         if self.attempt_ref.artifact_type != "control.work_attempt":
             raise ValueError("work head attempt_ref has the wrong Artifact type")
+        if self.active_operation_ref is not None and (
+            self.active_operation_ref.artifact_type != "control.operation_run"
+        ):
+            raise ValueError("work head active_operation_ref has the wrong Artifact type")
         if self.evaluation_ref is not None and (
             self.evaluation_ref.artifact_type != "control.feedback_evaluation"
         ):
@@ -97,10 +108,10 @@ class WorkControlHead(V2Contract):
             self.evaluation_ref is None or self.repair_action_ref is None
         ):
             raise ValueError("repair-authorized head requires evaluation and action refs")
-        if self.status == "committed" and (
-            self.evaluation_ref is None or self.commit_ref is None
-        ):
+        if self.status == "committed" and (self.evaluation_ref is None or self.commit_ref is None):
             raise ValueError("committed head requires evaluation and commit refs")
+        if self.status != "running" and self.active_operation_ref is not None:
+            raise ValueError("only running Work may authorize an active operation")
         if self.status != "committed" and self.commit_ref is not None:
             raise ValueError("only committed heads may point to WorkCommit")
         if len(set(self.invalidated_by_refs)) != len(self.invalidated_by_refs):
@@ -244,6 +255,95 @@ class WorkControlStore:
         )
         return next_head
 
+    def supersede_stale(
+        self,
+        lock: WorkControlLock,
+        *,
+        expected_head: WorkControlHead,
+        next_head: WorkControlHead,
+    ) -> WorkControlHead:
+        """Replace a crash-left head whose immutable definition or inputs changed.
+
+        Holding the exclusive coordinate lock proves that no live runner can
+        still publish the previous attempt.  An unchanged definition/input pair
+        is rejected so this operation cannot bypass repair-budget authority.
+        """
+
+        next_head = WorkControlHead.model_validate(next_head.model_dump(mode="python"))
+        self._validate_lock(lock, next_head.coordinate)
+        current = self.read_head(next_head.coordinate)
+        if current != expected_head:
+            raise WorkHeadConflictError("WorkGraph head changed since it was loaded")
+        changed = (
+            next_head.definition_digest != current.definition_digest
+            or next_head.input_fingerprint != current.input_fingerprint
+        )
+        if (
+            not changed
+            or next_head.scope_id != current.scope_id
+            or next_head.coordinate != current.coordinate
+            or next_head.work_id != current.work_id
+            or next_head.revision != current.revision + 1
+            or next_head.status != "running"
+            or next_head.attempt_ref == current.attempt_ref
+            or next_head.commit_ref is not None
+            or next_head.evaluation_ref is not None
+            or not next_head.invalidated_by_refs
+        ):
+            raise WorkHeadConflictError("invalid stale WorkGraph supersede transition")
+        self._atomic_write(
+            self._head_path(next_head.scope_id, next_head.coordinate.coordinate_key),
+            next_head.stable_json_bytes(),
+        )
+        return next_head
+
+    def authorize_causal_repair(
+        self,
+        lock: WorkControlLock,
+        *,
+        expected_head: WorkControlHead,
+        next_head: WorkControlHead,
+    ) -> WorkControlHead:
+        """Install one already-authorized repair on a terminal causal target.
+
+        Normal ``compare_and_swap`` deliberately forbids reopening a terminal
+        head.  This narrow transition is the only exception: a Scheduler has
+        proved a declared one-hop downstream finding and the target's own
+        RepairAction/ledger has already accepted the target-local mutation
+        budget.  The previous attempt remains immutable audit evidence; the
+        following ``begin_authorized_repair`` creates the new physical attempt.
+        """
+
+        next_head = WorkControlHead.model_validate(next_head.model_dump(mode="python"))
+        self._validate_lock(lock, next_head.coordinate)
+        current = self.read_head(next_head.coordinate)
+        if current != expected_head:
+            raise WorkHeadConflictError("WorkGraph head changed before causal repair")
+        if current.status not in {"committed", "failed", "needs_human", "interrupted"}:
+            raise WorkHeadConflictError("causal repair target is not terminal")
+        if (
+            next_head.scope_id != current.scope_id
+            or next_head.coordinate != current.coordinate
+            or next_head.work_id != current.work_id
+            or next_head.definition_digest != current.definition_digest
+            or next_head.acceptance_digest != current.acceptance_digest
+            or next_head.input_fingerprint != current.input_fingerprint
+            or next_head.revision != current.revision + 1
+            or next_head.status != "repair_authorized"
+            or next_head.attempt_ref != current.attempt_ref
+            or next_head.active_operation_ref is not None
+            or next_head.evaluation_ref is None
+            or next_head.repair_action_ref is None
+            or next_head.commit_ref is not None
+            or not next_head.invalidated_by_refs
+        ):
+            raise WorkHeadConflictError("invalid causal repair authorization transition")
+        self._atomic_write(
+            self._head_path(next_head.scope_id, next_head.coordinate.coordinate_key),
+            next_head.stable_json_bytes(),
+        )
+        return next_head
+
     @staticmethod
     def _validate_transition(current: WorkControlHead, next_head: WorkControlHead) -> None:
         immutable = (
@@ -251,6 +351,7 @@ class WorkControlStore:
             "coordinate",
             "work_id",
             "definition_digest",
+            "acceptance_digest",
             "input_fingerprint",
         )
         if any(getattr(current, name) != getattr(next_head, name) for name in immutable):
@@ -268,7 +369,9 @@ class WorkControlStore:
                     "interrupted",
                 }
             ),
-            "repair_authorized": frozenset({"running", "failed", "needs_human"}),
+            "repair_authorized": frozenset(
+                {"repair_authorized", "running", "failed", "needs_human"}
+            ),
             "interrupted": frozenset({"running", "failed", "needs_human"}),
             "committed": frozenset(),
             "failed": frozenset(),
@@ -278,10 +381,20 @@ class WorkControlStore:
             raise WorkHeadConflictError(
                 f"invalid WorkGraph transition: {current.status}->{next_head.status}"
             )
-        if (
-            next_head.status == "running"
-            and next_head.attempt_ref == current.attempt_ref
+        if current.status == next_head.status == "repair_authorized" and (
+            next_head.evaluation_ref != current.evaluation_ref
+            or next_head.repair_action_ref != current.repair_action_ref
+            or next_head.commit_ref is not None
+            or next_head.attempt_ref == current.attempt_ref
         ):
+            raise WorkHeadConflictError(
+                "repair continuation binding must preserve exact repair authority"
+            )
+        if current.active_operation_ref is not None and (
+            next_head.active_operation_ref == current.active_operation_ref
+        ):
+            raise WorkHeadConflictError("active OperationRun must advance or terminate")
+        if next_head.status == "running" and next_head.attempt_ref == current.attempt_ref:
             raise WorkHeadConflictError("a resumed/repaired run requires a new WorkAttempt")
 
     def require_active_commit(
@@ -300,16 +413,172 @@ class WorkControlStore:
         if (
             head.work_id != definition.work_id
             or head.definition_digest != definition.definition_digest
+            or head.acceptance_digest != definition.acceptance_digest
             or head.input_fingerprint != expected_input_fingerprint
         ):
             return None
+        return self._validate_commit_head(
+            head=head,
+            definition=definition,
+            input_refs=input_refs,
+            artifacts=artifacts,
+        )
+
+    def reactivate_historical_commit(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+        artifacts: ArtifactWriter,
+    ) -> tuple[WorkCommit, ArtifactRef] | None:
+        """Restore one exact immutable commit after an unrelated head superseded it.
+
+        This is a cache reactivation, not a new success decision.  The complete
+        proposal/validation/budget authority chain is revalidated before the
+        mutable projection moves.  Ambiguous historical successes are rejected
+        rather than choosing one semantic output by ordering accident.
+        """
+
+        self._validate_lock(lock, definition.coordinate)
+        current = self.read_head(definition.coordinate)
+        if current is None:
+            return None
+        found = self.find_historical_commit(
+            definition=definition,
+            input_refs=input_refs,
+            artifacts=artifacts,
+        )
+        if found is None:
+            return None
+        commit, commit_ref, attempt_ref = found
+        expected_fingerprint = self.input_fingerprint(input_refs)
+        next_head = WorkControlHead(
+            scope_id=definition.coordinate.scope_id,
+            coordinate=definition.coordinate,
+            work_id=definition.work_id,
+            definition_digest=definition.definition_digest,
+            acceptance_digest=definition.acceptance_digest,
+            input_fingerprint=expected_fingerprint,
+            revision=current.revision + 1,
+            status="committed",
+            attempt_ref=attempt_ref,
+            evaluation_ref=commit.feedback_evaluation_ref,
+            commit_ref=commit_ref,
+            invalidated_by_refs=tuple(
+                dict.fromkeys(
+                    (
+                        current.attempt_ref,
+                        *(ref for ref in (current.commit_ref,) if ref is not None),
+                    )
+                )
+            ),
+            updated_at=datetime.now(UTC),
+        )
+        self._validate_commit_head(
+            head=next_head,
+            definition=definition,
+            input_refs=input_refs,
+            artifacts=artifacts,
+        )
+        latest = self.read_head(definition.coordinate)
+        if latest != current:
+            raise WorkHeadConflictError("WorkGraph head changed during historical recovery")
+        self._atomic_write(
+            self._head_path(next_head.scope_id, next_head.coordinate.coordinate_key),
+            next_head.stable_json_bytes(),
+        )
+        return commit, commit_ref
+
+    def find_historical_commit(
+        self,
+        *,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+        artifacts: ArtifactWriter,
+    ) -> tuple[WorkCommit, ArtifactRef, ArtifactRef] | None:
+        """Find one exact prior success without changing the mutable projection."""
+
+        expected_fingerprint = self.input_fingerprint(input_refs)
+        candidates: dict[str, tuple[WorkCommit, ArtifactRef, ArtifactRef]] = {}
+        for commit_ref in artifacts.list_revisions():
+            if commit_ref.artifact_type != "control.work_commit":
+                continue
+            try:
+                commit = artifacts.get_json(commit_ref, WorkCommit)
+            except ValidationError:
+                continue
+            if (
+                commit.work_id != definition.work_id
+                or commit.coordinate != definition.coordinate
+                or commit.acceptance_digest != definition.acceptance_digest
+                or frozenset(commit.input_refs) != frozenset(input_refs)
+            ):
+                continue
+            dependencies = artifacts.dependencies(commit_ref)
+            attempt_refs = tuple(
+                ref for ref in dependencies if ref.artifact_type == "control.work_attempt"
+            )
+            if len(attempt_refs) != 1:
+                continue
+            candidate_head = WorkControlHead(
+                scope_id=definition.coordinate.scope_id,
+                coordinate=definition.coordinate,
+                work_id=definition.work_id,
+                definition_digest=definition.definition_digest,
+                acceptance_digest=definition.acceptance_digest,
+                input_fingerprint=expected_fingerprint,
+                revision=1,
+                status="committed",
+                attempt_ref=attempt_refs[0],
+                evaluation_ref=commit.feedback_evaluation_ref,
+                commit_ref=commit_ref,
+                invalidated_by_refs=(),
+                updated_at=datetime.now(UTC),
+            )
+            try:
+                self._validate_commit_head(
+                    head=candidate_head,
+                    definition=definition,
+                    input_refs=input_refs,
+                    artifacts=artifacts,
+                )
+            except WorkResumeError:
+                continue
+            candidates[commit_ref.revision_id] = (
+                commit,
+                commit_ref,
+                attempt_refs[0],
+            )
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise WorkResumeError(
+                "multiple exact historical WorkCommits require explicit invalidation"
+            )
+        return next(iter(candidates.values()))
+
+    def _validate_commit_head(
+        self,
+        *,
+        head: WorkControlHead,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+        artifacts: ArtifactWriter,
+    ) -> tuple[WorkCommit, ArtifactRef]:
+        """Validate one candidate committed head without consulting current projection."""
+
+        if head.status != "committed" or head.commit_ref is None:
+            raise WorkResumeError("candidate WorkGraph head is not committed")
         commit = artifacts.get_json(head.commit_ref, WorkCommit)
+        original_definition = self._require_commit_definition(
+            commit=commit,
+            artifacts=artifacts,
+        )
         if (
             commit.work_id != definition.work_id
             or commit.coordinate != definition.coordinate
-            or commit.definition_digest != definition.definition_digest
-            or commit.validation_policy_digest
-            != definition.validation_policy.content_digest()
+            or commit.acceptance_digest != definition.acceptance_digest
             or frozenset(commit.input_refs) != frozenset(input_refs)
             or commit.feedback_evaluation_ref != head.evaluation_ref
         ):
@@ -325,16 +594,16 @@ class WorkControlStore:
             or attempt.attempt_id != commit.attempt_id
             or attempt.work_id != definition.work_id
             or attempt.coordinate != definition.coordinate
-            or attempt.definition_digest != definition.definition_digest
-            or attempt.proposal_policy_digest != definition.proposal_policy.content_digest()
-            or attempt.validation_policy_digest
-            != definition.validation_policy.content_digest()
-            or attempt.repair_policy_digest != definition.repair_policy.content_digest()
+            or attempt.definition_digest != commit.definition_digest
+            or attempt.validation_policy_digest != commit.validation_policy_digest
             or frozenset(attempt.input_refs) != frozenset(input_refs)
             or attempt.output_refs != commit.output_refs
+            or attempt.child_commit_refs != commit.child_commit_refs
             or attempt.feedback_evaluation_ref != commit.feedback_evaluation_ref
+            or attempt.operation_run_refs != commit.operation_run_refs
+            or attempt.assurance_report_ref != commit.assurance_report_ref
             or attempt.validation_report_ref is None
-            or not attempt.proposal_execution_refs
+            or len(attempt.operation_run_refs) < 2
         ):
             raise WorkResumeError("active WorkCommit lacks its exact successful WorkAttempt")
         report = artifacts.get_json(attempt.validation_report_ref, ValidationReport)
@@ -346,12 +615,13 @@ class WorkControlStore:
             evaluation.work_id != definition.work_id
             or evaluation.coordinate != definition.coordinate
             or evaluation.attempt_id != commit.attempt_id
-            or evaluation.claim_id != definition.required_claim_id
-            or evaluation.policy_digest != definition.validation_policy.content_digest()
-            or evaluation.effect != definition.validation_policy.effect
+            or evaluation.claim_id != original_definition.required_claim_id
+            or evaluation.acceptance_digest != commit.acceptance_digest
+            or evaluation.policy_digest != commit.validation_policy_digest
+            or evaluation.effect != original_definition.validation_policy.effect
             or evaluation.status != "passed"
             or evaluation.readiness_effect != "satisfies"
-            or evaluation.subject_ref not in commit.output_refs
+            or evaluation.subject_refs != commit.validated_subject_refs
             or not evaluation.releasable
         ):
             raise WorkResumeError("active WorkCommit lacks an exact passing evaluation")
@@ -359,43 +629,148 @@ class WorkControlStore:
             evaluation.validation_report_ref != attempt.validation_report_ref
             or report.attempt_id != attempt.attempt_id
             or report.coordinate != definition.coordinate
-            or report.policy_id != definition.validation_policy.policy_id
-            or report.policy_digest != definition.validation_policy.content_digest()
+            or report.policy_id != original_definition.validation_policy.policy_id
+            or report.policy_digest != commit.validation_policy_digest
             or report.status != "passed"
-            or report.subject_ref != evaluation.subject_ref
+            or report.subject_refs != evaluation.subject_refs
         ):
             raise WorkResumeError("active WorkCommit lacks its exact passing ValidationReport")
-        executions = tuple(
-            artifacts.get_json(ref, ProposalExecution)
-            for ref in attempt.proposal_execution_refs
+        operations = tuple(
+            artifacts.get_json(ref, OperationRun) for ref in attempt.operation_run_refs
+        )
+        if any(
+            operation.attempt_id != attempt.attempt_id
+            or operation.coordinate != definition.coordinate
+            or operation.status != "terminal"
+            or operation.execution_ref is None
+            for operation in operations
+        ):
+            raise WorkResumeError("WorkAttempt contains incomplete OperationRun evidence")
+        proposal_runs = tuple(item for item in operations if item.kind == "proposal")
+        validation_runs = tuple(item for item in operations if item.kind == "validation")
+        assurance_runs = tuple(item for item in operations if item.kind == "assurance")
+        if not proposal_runs or len(validation_runs) != 1:
+            raise WorkResumeError("WorkAttempt lacks proposal or validation OperationRun")
+        proposal_executions = tuple(
+            artifacts.get_json(item.execution_ref, ProposalExecution)
+            for item in proposal_runs
+            if item.execution_ref is not None
         )
         if any(
             execution.attempt_id != attempt.attempt_id
-            or execution.executor != definition.proposal_policy.executor
-            or execution.operation != definition.proposal_policy.operation
+            or execution.executor != original_definition.proposal_policy.executor
+            or execution.operation != original_definition.proposal_policy.operation
             or execution.status != "completed"
-            for execution in executions
+            for execution in proposal_executions
         ):
             raise WorkResumeError("active WorkAttempt lacks exact completed proposal evidence")
-        subject = evaluation.subject_ref
-        assert subject is not None
-        if not any(execution.output_commitment == subject.content_hash for execution in executions):
-            raise WorkResumeError("proposal output commitment does not bind committed subject")
-        lease = artifacts.get_json(attempt.budget_lease_ref, BudgetLease)
-        if (
-            lease.status != "settled"
-            or lease.observed_actual != attempt.observed_actual
-            or lease.unknown_upper_bound != attempt.unknown_upper_bound
-            or lease.conservative_committed != attempt.conservative_committed
+        if not any(
+            execution.output_commitment == subject.content_hash
+            for execution in proposal_executions
+            for subject in evaluation.subject_refs
         ):
-            raise WorkResumeError("active WorkAttempt lacks an exact settled BudgetLease")
+            raise WorkResumeError("proposal output commitment does not bind committed subject")
+        validation_run = validation_runs[0]
+        assert validation_run.execution_ref is not None
+        validation_execution = artifacts.get_json(
+            validation_run.execution_ref,
+            ValidationExecution,
+        )
+        assurance_executions = tuple(
+            artifacts.get_json(item.execution_ref, AssuranceExecution)
+            for item in assurance_runs
+            if item.execution_ref is not None
+        )
+        assurance_report = (
+            artifacts.get_json(attempt.assurance_report_ref, AssuranceReport)
+            if attempt.assurance_report_ref is not None
+            else None
+        )
+        assurance_policy = original_definition.assurance_policy
+        if (
+            assurance_policy is None and (assurance_executions or assurance_report is not None)
+        ) or (
+            assurance_policy is not None and (not assurance_executions or assurance_report is None)
+        ):
+            raise WorkResumeError("assurance executions do not match WorkDefinition policy")
+        if (
+            validation_execution.attempt_id != attempt.attempt_id
+            or validation_execution.policy_id != original_definition.validation_policy.policy_id
+            or validation_execution.validator_id
+            != original_definition.validation_policy.validator_id
+            or validation_execution.validator_revision_id
+            != original_definition.validation_policy.validator_revision_id
+            or validation_execution.status != "completed"
+            or attempt.validation_report_ref not in validation_run.output_refs
+        ):
+            raise WorkResumeError("WorkAttempt lacks exact validation execution evidence")
+        if len(assurance_executions) != len(assurance_runs) or any(
+            execution.attempt_id != attempt.attempt_id
+            or execution.status != "completed"
+            or assurance_policy is None
+            or execution.policy_id != assurance_policy.policy_id
+            or execution.runtime_profile_id != assurance_policy.runtime_profile_id
+            or execution.probe_ids != assurance_policy.probe_ids
+            or execution.evidence_freshness != assurance_policy.evidence_freshness
+            for execution in assurance_executions
+        ):
+            raise WorkResumeError("WorkAttempt lacks exact assurance execution evidence")
+        if assurance_report is not None and (
+            assurance_policy is None
+            or assurance_report.attempt_id != attempt.attempt_id
+            or assurance_report.coordinate != definition.coordinate
+            or assurance_report.policy_id != assurance_policy.policy_id
+            or assurance_report.policy_digest != assurance_policy.content_digest()
+            or assurance_report.runtime_profile_id != assurance_policy.runtime_profile_id
+            or assurance_report.evidence_freshness != assurance_policy.evidence_freshness
+            or tuple(item.probe_id for item in assurance_report.probe_results)
+            != assurance_policy.probe_ids
+            or assurance_report.status != "passed"
+            or commit.assurance_report_ref != attempt.assurance_report_ref
+            or evaluation.assurance_report_ref != attempt.assurance_report_ref
+        ):
+            raise WorkResumeError("WorkAttempt lacks one exact passing AssuranceReport")
+        assurance_evidence_refs = (
+            assurance_report.evidence_refs if assurance_report is not None else ()
+        )
+        if evaluation.assurance_evidence_refs != assurance_evidence_refs:
+            raise WorkResumeError("evaluation does not bind exact assurance evidence")
+        actual = BudgetUsage()
+        unknown = BudgetUsage()
+        committed_usage = BudgetUsage()
+        for operation in operations:
+            owned_lease = artifacts.get_json(operation.budget_lease_ref, BudgetLease)
+            if (
+                owned_lease.status != "settled"
+                or owned_lease.owner_id != operation.operation_run_id
+                or owned_lease.observed_actual != operation.observed_actual
+                or owned_lease.unknown_upper_bound != operation.unknown_upper_bound
+                or owned_lease.conservative_committed != operation.conservative_committed
+            ):
+                raise WorkResumeError("OperationRun lacks its exact settled lease")
+            actual = self._add_usage(actual, owned_lease.observed_actual)
+            unknown = self._add_usage(unknown, owned_lease.unknown_upper_bound)
+            committed_usage = self._add_usage(
+                committed_usage,
+                owned_lease.conservative_committed,
+            )
+        if (
+            actual != attempt.observed_actual
+            or unknown != attempt.unknown_upper_bound
+            or committed_usage != attempt.conservative_committed
+        ):
+            raise WorkResumeError("active WorkAttempt lacks exact settled operation leases")
         commit_dependencies = frozenset(artifacts.dependencies(head.commit_ref))
         required_commit_dependencies = frozenset(
             (
                 head.attempt_ref,
+                *commit.operation_run_refs,
+                *((commit.assurance_report_ref,) if commit.assurance_report_ref else ()),
                 commit.feedback_evaluation_ref,
                 *commit.input_refs,
+                *commit.validated_subject_refs,
                 *commit.output_refs,
+                *commit.child_commit_refs,
             )
         )
         if commit_dependencies != required_commit_dependencies:
@@ -405,11 +780,50 @@ class WorkControlStore:
         return commit, head.commit_ref
 
     @staticmethod
+    def _add_usage(left: BudgetUsage, right: BudgetUsage) -> BudgetUsage:
+        return BudgetUsage.model_validate(
+            {
+                field_name: getattr(left, field_name) + getattr(right, field_name)
+                for field_name in BudgetUsage.model_fields
+                if field_name != "schema_version"
+            }
+        )
+
+    @staticmethod
+    def _require_commit_definition(
+        *,
+        commit: WorkCommit,
+        artifacts: ArtifactWriter,
+    ) -> WorkDefinition:
+        """Recover and verify the immutable definition that authorized a commit."""
+
+        candidates: list[WorkDefinition] = []
+        for ref in artifacts.list_revisions():
+            if (
+                ref.artifact_type != "control.work_definition"
+                or ref.content_hash != commit.definition_digest
+                or frozenset(artifacts.dependencies(ref)) != frozenset(commit.input_refs)
+            ):
+                continue
+            try:
+                candidate = artifacts.get_json(ref, WorkDefinition)
+            except ValidationError:
+                continue
+            if (
+                candidate.work_id == commit.work_id
+                and candidate.coordinate == commit.coordinate
+                and candidate.definition_digest == commit.definition_digest
+                and candidate.acceptance_digest == commit.acceptance_digest
+                and candidate.validation_policy.content_digest() == commit.validation_policy_digest
+            ):
+                candidates.append(candidate)
+        if not candidates or any(candidate != candidates[0] for candidate in candidates[1:]):
+            raise WorkResumeError("WorkCommit lacks one exact originating WorkDefinition")
+        return candidates[0]
+
+    @staticmethod
     def input_fingerprint(refs: tuple[ArtifactRef, ...]) -> ContentHash:
-        if len(set(refs)) != len(refs):
-            raise ValueError("WorkGraph input refs must be unique")
-        body = "\0".join(sorted(ref.revision_id for ref in refs)).encode("utf-8")
-        return "sha256:" + hashlib.sha256(body).hexdigest()
+        return work_input_fingerprint(refs)
 
     @staticmethod
     def new_head(
@@ -423,6 +837,7 @@ class WorkControlStore:
             coordinate=definition.coordinate,
             work_id=definition.work_id,
             definition_digest=definition.definition_digest,
+            acceptance_digest=definition.acceptance_digest,
             input_fingerprint=WorkControlStore.input_fingerprint(input_refs),
             revision=1,
             status="running",

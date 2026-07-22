@@ -324,6 +324,26 @@ real progress, while A-to-B-to-A within one RepairTarget family is oscillation a
 - Correct: keep unresolved questions, policy decisions and known divergences as distinct semantics,
   and stop automatic repair when its issue fingerprint makes no progress.
 
+## Work identity, successful acceptance, and repair epochs
+
+- `definition_digest` binds the complete policy for a new execution: executor, budgets,
+  deadlines, validation, repair routing, mutation authority, and topology.
+- `acceptance_digest` alone decides whether an immutable passing `WorkCommit` remains reusable.
+  It binds exact inputs separately plus coordinate, Claim, dependency topology, output contract,
+  acceptance transform, explicit validator executable revision, assurance requirements, and
+  success maturity.
+- `repair_epoch_digest` binds full definition, exact inputs, validation policy, and repair policy;
+  progress, retry ordinals, and no-progress decisions never cross epochs.
+- Changing token/time limits, timing prose, or repair/recovery caps must not invalidate an already
+  accepted output. Changing input refs, Claim, schema/transform, validator revision, assurance, or
+  maturity must fail closed and require a new success.
+- Before reactivating historical success over a running head, release its real active lease, persist
+  an interrupted attempt, then atomically repoint the head. Never replace active semantic repair
+  authority with cache recovery.
+- Bad case: adding one process-recovery field changes every full WorkDefinition digest and reruns
+  ResearchPlan/Evidence despite unchanged acceptance. Required regression tests must distinguish
+  policy-only changes from validator/schema changes and verify no orphaned lease remains.
+
 ## Judge Finding groups and executable RepairAction accounting
 
 ### 1. Scope / Trigger
@@ -555,3 +575,772 @@ delta = compile_semantic_delta(parent, design)
 - Every clause family round-trips Draft -> core Rule -> evaluator.
 - Temporal comparisons execute dates/date-times and reject invalid/unbounded values.
 - Static audit asserts no reachable hidden model validators for every direct Agent source root.
+
+## Scheduler-owned research closure and exact tool accounting
+
+### 1. Scope / Trigger
+
+- Applies when implementing or changing `ResearchPlanLeaf`, `ResearchAcquisitionLeaf`,
+  `EvidenceSynthesisLeaf`, `ResearchToolchain`, or a research `WorkDefinition`.
+
+### 2. Signatures
+
+- `research_plan_work_definition(scope_id, agent_wall_seconds, agent_token_limit)`
+- `research_acquisition_work_definition(scope_id, dependency_coordinate, wall_seconds,
+  maximum_search_calls, maximum_tool_calls)`
+- `research_synthesis_work_definition(scope_id, dependency_coordinate, agent_wall_seconds,
+  agent_token_limit)`
+- `ResearchBundle(search_calls, fetch_calls, extract_calls)`
+
+### 3. Contracts
+
+- Every research WorkAttempt retains exactly one external `control.generation_context`; downstream
+  parent outputs are additional causal inputs, never a replacement for this root authority.
+- Plan outputs exactly one `design.research_plan`. Acquisition outputs exactly one
+  `design.research_acquisition`, one passage pack, and every raw/metadata/extracted source ref.
+  Synthesis consumes that full acquisition closure and outputs exactly one synthesis plus one
+  `design.evidence_graph`; it cannot read mutable Designer state or run tools.
+- A successful admitted document spends and observes one search/fetch/extract sequence. The
+  maximum tool budget must reserve every planned search plus at least one fetch and extraction;
+  with a configured fallback fetcher it also reserves the potential fallback fetch.
+- Reused checkpoints record unknown historical search/fetch/extract counts rather than zero or a
+  fabricated successful operation.
+
+### 4. Validation & Error Matrix
+
+- Missing/mismatched `GenerationContext`, request, parent record, passage pack, or source closure
+  -> non-repairable framework preflight failure.
+- Unknown claim/evidence reference or no supported observed claim -> field-addressed Agent
+  validation failure; Scheduler alone may authorize its bounded local correction.
+- Research provider outage -> real-tools infrastructure outcome; no blind query rewrite.
+- Tool budget insufficient for `search + fetch + extract` -> fail before external work.
+
+### 5. Good/Base/Bad Cases
+
+- Good: plan -> real acquisition -> synthesis has three WorkCommits, and the synthesis attempt
+  input closure contains context, record, passage pack and source refs.
+- Base: an empty Search result reports one real search and zero fetch/extract calls.
+- Bad: count extract as free, let synthesis reread an old source workspace, or pass only a source
+  URL/summary to the model.
+
+### 6. Tests Required
+
+- Assert `ResearchToolchain` counts search, fetch and extract separately and never exceeds the
+  declared aggregate tool budget.
+- Assert Scheduler integration commits Plan/Acquisition/Synthesis in order and EvidenceGraph
+  claims bind the acquired evidence ids.
+- Assert checkpoint-reuse telemetry has unknown, not zero, extract metrics.
+- Assert a source contract with fewer than `search_calls + 2` tool calls fails validation.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: aggregate only the calls that used a network socket.
+usage = BudgetUsage(tool_calls=bundle.search_calls + bundle.fetch_calls)
+
+# Correct: extraction is a real tool/process boundary and remains observable.
+usage = BudgetUsage(
+    tool_calls=bundle.search_calls + bundle.fetch_calls + bundle.extract_calls
+)
+```
+
+## Scheduler-owned operation-budget terminalization
+
+### 1. Scope / Trigger
+
+- Applies when a leaf asks the framework to schedule a real model, tool, validator or assurance
+  operation after its `WorkAttempt` has already begun. It is especially important for an
+  otherwise-authorized local repair whose remaining global budget cannot admit another operation.
+
+### 2. Signatures
+
+- `WorkScheduler.dispatch_one(...)`
+- `WorkControlRuntime.terminate_budget_exhausted(lock, definition, dimensions)`
+- `WorkRepairLedger.exhaust_budget(entry_id)`
+
+### 3. Contracts
+
+- Admission is framework-owned: a leaf may request an operation but cannot turn an insufficient
+  global `BudgetLedger` into a local retry, a fabricated proposal, or an unclosed running attempt.
+- Scheduler catches `BudgetExceeded` only while no `OperationRun` is active. Once an external
+  operation is running, its executor must settle that operation; swallowing it would hide
+  unknown real cost.
+- Terminalization writes a safe budget-exhaustion evidence Artifact, an error
+  `ValidationReport`, a blocking `FeedbackEvaluation`, and a terminal `WorkAttempt` with status
+  `budget_exhausted`; the `WorkHead` becomes `failed`.
+- If the failed admission was an authorized repair, its exact `RepairAction` ledger entry closes
+  as `exhausted`. This is accounting, not semantic no-progress and it never grants another turn.
+- The terminal report names only valid numeric budget dimensions and never claims that the Agent,
+  search provider, validator or candidate code executed.
+
+### 4. Validation & Error Matrix
+
+- Initial operation has sufficient lease -> normal single leaf execution and normal settlement.
+- Authorized repair has no remaining `repair_attempts`/operation capacity -> deterministic
+  `budget_exhausted` terminalization before the second real execution.
+- `BudgetExceeded` while an `OperationRun` is active -> framework error; preserve the active run
+  for its executor/recovery path rather than inventing a terminal result.
+- Unknown budget dimension or a non-running head -> framework invariant failure, never a
+  user-facing semantic repair.
+
+### 5. Good/Base/Bad Cases
+
+- Good: the first acquisition outage creates one local repair authorization; a second acquisition
+  is admitted and either produces real tool telemetry or a real provider outcome.
+- Base: the initial acquisition cannot reserve tools, so it terminates once with exact budget
+  evidence and no external call.
+- Bad: start a second WorkAttempt, let lease admission raise, then leave the head `running` with
+  no active operation; a later scheduler pass must not be forced to guess whether an Agent ran.
+
+### 6. Tests Required
+
+- Drive a real Scheduler leaf through a failed first proposal, then deny the authorized repair at
+  global budget admission; assert only the first proposal executed and the ledger is `exhausted`.
+- Assert an Agent/backend error that returned no candidate output still receives its terminal
+  report/evaluation instead of failing output-slot validation before routing.
+- Assert terminalization rejects an active `OperationRun` and does not erase unknown execution
+  cost.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: a repair was allowed by policy, so let the leaf retry even after global admission failed.
+await leaf_executor(context)  # can leave a running WorkAttempt with no operation
+
+# Correct: policy authorization and budget admission are separate facts.
+try:
+    await leaf_executor(context)
+except BudgetExceeded as error:
+    await runtime.terminate_budget_exhausted(lock, definition, error.dimensions)
+```
+
+## Scheduler-owned interrupted-operation recovery
+
+### 1. Scope / Trigger
+
+- Applies when a process exits after `OperationRun` is persisted but before proposal, validation,
+  assurance, or budget settlement reaches a terminal state. It is a control-plane recovery path,
+  not a second executor implementation.
+
+### 2. Signatures
+
+- `ProposalPolicy.replay_mode: deterministic | idempotent_with_key | queryable | non_replayable`
+- `WorkControlRuntime.reconcile_abandoned_operation(lock, definition)`
+- `DirectWorkRunner._reconcile_abandoned_operations(graph, runtime)`
+
+### 3. Contracts
+
+- Reconciliation runs only while the durable DirectJob owner lock proves there is no concurrent
+  executor. It preserves the original operation id and settles token/turn/tool use as `unknown`,
+  never as zero.
+- Recovery writes a terminal interrupted attempt, an error validation report, and a typed feedback
+  decision. A local infrastructure retry is possible only for `deterministic`,
+  `idempotent_with_key`, or `queryable` policy and must still consume the existing repair/budget
+  authority; `non_replayable` fails closed.
+- `research_acquisition_work_definition` is `queryable`; a model/code-generation leaf remains
+  `non_replayable` unless its provider supplies a real idempotency guarantee.
+- A production DirectJob passes its controller `run_id` to the Scheduler as the unique telemetry
+  trace id. Diagnostic harness traces cannot be attached to a production run projection.
+- On recovery, close every pre-existing running span for that trace as
+  `owner_process_interrupted`, retaining provider metrics, before creating the replacement root.
+  Project the exact settled scope-lease actual/unknown totals into the DirectJob snapshot.
+- A terminal Direct summary names only truly blocked logical coordinates, never opaque coordinate
+  hashes or merely waiting descendants.
+
+### 4. Validation & Error Matrix
+
+- Interrupted queryable research -> interrupted evidence plus one existing local repair route.
+- Interrupted non-replayable agent invocation -> terminal block with unknown usage; no blind
+  prompt replay.
+- Old operation lease present before new reservation -> reconcile first; never report a false
+  `budget_exhausted` caused by an orphaned reservation.
+- Any attempt to reconcile without the durable owner lock -> framework invariant failure.
+
+### 5. Tests Required
+
+- Parameterize queryable and non-replayable Operations. Assert identical unknown usage accounting
+  but repair authorization only for queryable.
+- Interrupt a Direct graph between scheduler persistence and executor return, restart it, and
+  assert metrics, Controller snapshot, and leaf spans share exactly one run id.
+
+## Typed infrastructure retryability
+
+### 1. Scope / Trigger
+
+- Applies when a real model, search, fetch, parser, build, or judge operation reaches a terminal
+  execution error. A status of `error` alone is never retry authority.
+
+### 2. Signatures
+
+- `LeafExecutionFailure(..., retryable: bool = True)`
+- `ValidationReport.infrastructure_retryable -> bool`
+- `WorkControlRuntime._authorize_next_or_fail(...)`
+
+### 3. Contracts
+
+- A leaf emits one safe error code, causal operation path, expected remedy category, and explicit
+  retryability. It never opens a second attempt itself.
+- `ValidationReport.infrastructure_retryable` is true only for an `error` report whose blocker
+  diagnostics are explicitly retryable. Empty/opaque error reports fail closed.
+- Scheduler still checks the single `RepairPolicy` and global budget before creating an
+  `infrastructure_retry` RepairAction. `retryable=True` is necessary but never sufficient.
+- `ResearchAcquisition` marks an all-search `upstream_unavailable` result non-retryable: repeating
+  the same provider and full query envelope is not a causal repair. Process interruption remains
+  eligible only through replay-mode recovery (`queryable`, `deterministic`, or
+  `idempotent_with_key`).
+
+### 4. Validation & Error Matrix
+
+- Typed transient/replay-safe failure plus retry budget -> one Scheduler-authorized retry.
+- `retryable=False` provider/configuration/permission boundary -> terminal blocking evaluation;
+  no RepairAction and no second external call.
+- Empty/generic error report -> terminal block; framework must add a typed diagnostic before any
+  retry policy can apply.
+- Interrupted `queryable` operation -> recovery report with an explicit retryable issue and
+  conservative unknown usage; `non_replayable` interruption remains terminal.
+
+### 5. Good/Base/Bad Cases
+
+- Good: an interrupted idempotent search is reconciled, charged, and retried once under its
+  existing repair policy.
+- Base: one unavailable search provider creates safe failure evidence and leaves no active lease.
+- Bad: convert every provider `error` to `infrastructure_retry`, consume a fresh full search budget,
+  and then report `budget_exhausted` without gaining information.
+
+### 6. Tests Required
+
+- Give a leaf enough global budget and `maximum_infrastructure_retries=1`, raise
+  `LeafExecutionFailure(retryable=False)`, and assert exactly one proposal invocation, no
+  RepairAction, and a terminal typed report.
+- Parameterize interrupted queryable/non-replayable operations; assert only the former exposes an
+  explicit retryable recovery diagnostic.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: the status discards causal retry information.
+if report.status == "error":
+    authorize_infrastructure_retry()
+
+# Correct: code uses the leaf's typed, safe classification plus global policy.
+if report.infrastructure_retryable and policy.permits_infrastructure_retry:
+    authorize_infrastructure_retry()
+```
+
+## Actionable semantic diagnostics and live Scheduler observation
+
+### 1. Scope / Trigger
+
+- Applies to every shape-valid structured Agent proposal rejected by a semantic compiler, and to
+  every `run inspect` while a Scheduler-owned Direct run is active.
+- Introduced after a real hotel run reached `shared_tool_semantics`: the validator knew the exact
+  violated shared-tool constraints, but the leaf conversion replaced them with a generic contract
+  message.  The one authorized correction therefore had no usable cause.
+
+### 2. Contracts
+
+- `StructuredSemanticIssue` carries a closed code, exact location, safe `violated_condition` and
+  safe `expected_category`.  `invoke_structured_once` must preserve all four fields in the
+  `LeafValidationFailure`, then in `ValidationReport` and the bounded RepairAction packet.
+- A Scheduler-authorized semantic correction must compile its immutable
+  `RepairAction -> FeedbackEvaluation -> ValidationReport` chain into an `AgentCorrectionBrief`
+  containing only blocker `(code, path, violated_condition, expected_category)` facts. The new
+  one-shot invocation appends that brief to the original bounded prompt and returns a complete
+  replacement output. It must never project repair policy, budget, action id, mutation authority,
+  graph coordinate, invalidation, owner, or release state into Agent-facing text.
+- Known semantic diagnostics may never be collapsed to generic text before an Agent correction.
+  If the condition cannot be safely disclosed, it is a framework/output-contract failure and does
+  not consume a semantic correction.
+- No-progress equality uses the safe issue tuple `(code, path, violated_condition,
+  expected_category)`, not a coarse `value_error` or category label.
+- `DurableLeaseBudgetCoordinator` is the live Direct budget authority.  `run inspect` sums its
+  settled leases for observed/unknown/conservative usage and exposes active lease reservation.
+  `JobRunSnapshot` remains the terminal summary, not a competing mutable control plane.
+- A Scheduler `WorkAttempt` span must use the active Direct root span as `parent_span_id` when
+  both trace ids agree.  A mismatched active trace is a framework error; missing provider usage is
+  `unknown`, never zero.
+- Agent dispatch identity plus resolved provider/model/profile/schema are known before the SDK
+  call.  A timeout or pre-envelope transport exception must carry that provenance through the
+  failed ProposalExecution, settle the complete unknown reservation, and reach one terminal
+  Validation/Evaluation.  It must never strand the non-replayable OperationRun because a terminal
+  provider envelope did not arrive.
+
+### 3. Required Tests
+
+- Shape-valid semantic failure retains its exact safe condition and expected category through the
+  one-shot boundary.
+- A live reader with a stale zero Direct snapshot but one settled plus one active scope lease
+  reports ledger usage and active reservation.
+- A Scheduler deterministic leaf started below an activated Direct root has that root as its
+  telemetry parent.
+- A timed-out one-shot Agent turn preserves its Scheduler dispatch provenance for terminal
+  settlement.
+- A real Scheduler correction dispatch receives no brief on attempt one and the exact safe
+  blocker brief on attempt two; the repair ledger resolves only after that second proposal commits.
+- A completed Agent turn followed by compiler/Artifact materialization failure settles the same
+  Proposal OperationRun with its known actual/unknown usage and non-retryable framework evidence.
+  It must not leave a running WorkHead or spend a second Agent turn. Artifact dependency closures
+  are set-like: deduplicate `ArtifactRef`s before every immutable write.
+
+## Repair-lineage telemetry is a read-only projection
+
+### 1. Scope / Trigger
+
+- Applies when `WorkControlRuntime` starts an initial `WorkAttempt`, a Scheduler-authorized repair,
+  a stale supersession, or a physical recovery; it also applies to the child real-Agent invocation.
+- Use this rule after any trace appears to show a repeated proposal without a repair, before changing
+  Scheduler, `WorkRepairLedger`, budget, invalidation, or release code.
+
+### 2. Signatures
+
+- `WorkControlRuntime._start_attempt_span(..., repair_action, repair_action_ref, repair_mode,
+  process_recovery_ordinal) -> (trace_id, span_id)`
+- Work span fields: `attempt`, `repair_depth`; attributes: `repair_mode`,
+  `repair_action_revision`, `repair_decision`, `repair_attempt_ordinal`,
+  `process_recovery_ordinal`.
+- `InvocationRequest.metadata`: `repair_mode`, `repair_attempt_charge`.
+
+### 3. Contracts
+
+- The span may read a durable `RepairAction` only to project it. `repair_depth` is that action's
+  semantic `repair_attempt_ordinal`, not the physical WorkAttempt ordinal.
+- Initial and stale-supersession attempts have depth zero. An authorized repair reports its durable
+  decision; a physical recovery retains that semantic depth and reports `process_recovery`.
+- Invocation metadata is derived from immutable `WorkAttempt` state and is observational only. No
+  telemetry field may authorize a repair, reserve/settle budget, route invalidation, or affect
+  readiness/release.
+
+### 4. Validation & Error Matrix
+
+- Action without its exact `ArtifactRef`, or vice versa -> `WorkRuntimeError`; do not write a
+  partial causal projection.
+- Negative recovery ordinal -> `WorkRuntimeError`.
+- Missing provider metrics -> unknown usage; never infer repair authority from a child span alone.
+- A stopped worker with active operations -> recovery reconciliation; telemetry must not free or
+  replay its lease.
+
+### 5. Good / Base / Bad Cases
+
+- Good: a local correction's second physical attempt has depth one and the exact action revision;
+  its child invocation says `authorized_repair`.
+- Base: initial proposal is depth zero and `initial`.
+- Bad: default every retry span to `repair_depth=0`/`initial`, then treat the observation as a
+  Scheduler bypass and rewrite repair authority from one trace.
+
+### 6. Tests Required
+
+- Drive initial proposal -> authorized correction -> interrupted physical recovery; assert span
+  modes, semantic depth, exact action revision, and recovery ordinal.
+- Parameterize initial/authorized-repair/process-recovery `WorkAttempt`s through
+  `invoke_structured_once`; assert child metadata but no extra invocation/retry.
+- Compare at least two historical live traces before changing any execution-control rule.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: telemetry defaults create a false control-plane diagnosis.
+telemetry.start_span(attempt=attempt.ordinal)
+
+# Correct: the durable action is projected, never interpreted as authority.
+telemetry.start_span(
+    attempt=attempt.ordinal,
+    repair_depth=repair_action.repair_attempt_ordinal,
+    attributes={"repair_mode": repair_action.decision},
+)
+```
+
+## Causal dependencies versus input disclosure
+
+### 1. Scope / Trigger
+
+- Applies to every Scheduler-dispatched Direct/Evolve leaf. It was introduced after a real hotel
+  run completed Research through WorldArchitecture and then failed before the first Design Agent:
+  `shared_tool_semantics` depended on EvidenceSynthesis but did not need its full synthesis
+  Artifact.
+
+### 2. Signatures
+
+- `WorkScheduler.resolve_inputs(coordinate: WorkCoordinate) -> ResolvedWorkInputs`
+- `WorkScheduler.snapshot() -> WorkScheduleSnapshot`
+- `WorkScheduler._all_input_refs(definition, parent_commits) -> tuple[ArtifactRef, ...]`
+
+### 3. Contracts
+
+- `WorkDefinition.dependency_coordinates` are causal edges only: parent changes invalidate the
+  child and parent WorkCommit refs remain in scheduler lineage.
+- `WorkDefinition.input_slots` are a least-privilege disclosure contract: only parent
+  `consumer_refs` whose type is explicitly declared enter `WorkExecutionContext.parent_output_refs`
+  and the WorkAttempt input fingerprint.
+- Direct/Evolve graph compilation uses `strict_input_contracts=True`: every dependent leaf must
+  declare a non-empty input contract, and each non-external slot must have a sufficient typed output
+  from a direct dependency. This runs before any provider, search, Builder, or Judge call.
+- Generic diagnostic graphs may omit slots while being assembled; they are never a production
+  success path. An empty-slot diagnostic consumer retains full parent outputs only for framework
+  harness compatibility, never for a strict Direct/Evolve graph.
+- Package is an explicit closure consumer. It must receive Design, WorldSpec, Candidate, manifest,
+  build record, implementation lineage, Verifier IR, Integration report, Judge report and telemetry
+  summary via declared slots; it must not discover these by reading arbitrary active WorkHeads.
+
+### 4. Validation & Error Matrix
+
+- Direct dependency lacks a producer for a required non-external typed slot -> graph freeze error
+  before an external operation.
+- Parent commit is absent/stale -> child is `waiting`/`stale`; it cannot receive an inferred
+  artifact through a head lookup.
+- Parent has both allowed and sealed outputs -> resolve, dispatch, and snapshot reuse retain only
+  the allowed output; every parent commit ref remains in lineage.
+- Snapshot recomputes a different closure from dispatch -> framework defect. Both paths must call
+  the same input-closure helper; do not repair it by widening the child's declared inputs.
+
+### 5. Good / Base / Bad Cases
+
+- Good: a Design leaf causally depends on EvidenceSynthesis yet consumes only the declared
+  architecture/coupling artifacts; recovery reuses its exact commit.
+- Base: a root-only leaf consumes only `GenerationContext` and has no parent commit.
+- Bad: dispatch filters sealed output but snapshot fingerprints every parent output, so recovery
+  marks a correct least-privilege commit stale and Package/Registry never become ready.
+
+### 6. Tests Required
+
+- A strict graph declaring an input type with no direct producer must reject at graph freeze.
+- A committed parent exposing one allowed and one sealed artifact must resolve only the allowed
+  ref for a child that declares the allowed type; its parent WorkCommit lineage remains present.
+- A real Direct graph reconstructed from committed bootstrap outputs must pass strict closure before
+  the first downstream Agent dispatch.
+- Assert the same least-privilege closure makes the downstream work `ready` in `snapshot()` after
+  it was already accepted by `resolve_inputs()`.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: causality accidentally becomes blanket data access.
+parent_output_refs.extend(parent_commit.consumer_refs)
+
+# Correct: causality and disclosure are separate, typed relations.
+parent_commit_refs.append(parent_commit_ref)
+parent_output_refs.extend(
+    ref for ref in parent_commit.consumer_refs
+    if ref.artifact_type in declared_input_types
+)
+```
+
+## Shared-tool semantic transaction completion
+
+### 1. Scope / Trigger
+
+- Applies to `SharedToolSemanticsLeaf` whenever a frozen `ToolCouplingGroupPlan` has more than
+  one tool. A real hotel run demonstrated that an otherwise semantic proposal can repeatedly omit
+  one member from domain coverage and exhaust its bounded local repair budget.
+
+### 2. Signatures
+
+- `_shared_prompt(inputs, architecture, coupling_group, evidence) -> str`
+- `ToolCouplingGroupPlan.ordered_tool_ids`
+- `SharedToolSemanticsSourceDraft.{atomicity_domains, concurrency_domains,
+  idempotency_domains, error_policies}`
+
+### 3. Contracts
+
+- The frozen ordered ids are the only legal member vocabulary. Each of the first three domain
+  collections partitions that exact set once; error policies cover every member at least once.
+- The Agent may choose semantic grouping. When evidence does not establish a finer distinction,
+  one domain over the complete set is an explicitly permitted conservative construction.
+- The prompt is a construction aid only. `compile_shared_tool_semantics` remains the sole
+  validator; it may reject an implausible or inconsistent semantic policy and its safe issue set
+  remains the only input to a bounded correction.
+
+### 4. Validation & Error Matrix
+
+- Omitted or duplicated domain member -> `shared_contract_partition`, local semantic correction
+  only when the safe report is actionable.
+- Error policies omit a frozen member -> `shared_error_coverage`, same bounded route.
+- A resolved partition failure reappears after a different failure -> A→B→A oscillation; stop
+  rather than add an unbounded third semantic repair.
+
+### 5. Good / Base / Bad Cases
+
+- Good: one complete domain and one complete error policy cover every frozen tool; compiler then
+  validates the selected atomicity/concurrency/idempotency semantics.
+- Base: evidence justifies several domains, but every frozen id still appears exactly once in each
+  domain class.
+- Bad: encode a hotel-specific output, auto-fill the Agent draft in framework code, or weaken the
+  compiler because the model omitted a member.
+
+### 6. Tests Required
+
+- Assert the rendered prompt names the exact-partition, conservative full-domain, and error
+  coverage constraints and includes the frozen ids.
+- Preserve the existing compiler regression for partition diagnostics and the Scheduler regression
+  for safe correction-brief disclosure/no-progress stopping.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: hide a repeated-model formatting failure by accepting partial coverage.
+if missing_members:
+    accept_partial_shared_contract()
+
+# Correct: guide construction, then keep the deterministic boundary authoritative.
+prompt_requires_complete_frozen_coverage()
+compile_shared_tool_semantics(source, group=group, evidence_graph=evidence)
+```
+
+## Frozen-graph executor completeness
+
+### 1. Scope / Trigger
+
+- Applies to each Direct/Evolve epoch after topology freeze and before its first external operation.
+  A real hotel run committed shared tool semantics, then revealed a ready physical tool batch with
+  no registered leaf because its semantic stage and artifact slot intentionally had different names.
+
+### 2. Signatures
+
+- `DirectWorkRunner._design_executors(...) -> dict[work_id, WorkExecutor]`
+- `WorkScheduler.run_until_stalled(executors=...) -> tuple[WorkDispatchResult, ...]`
+- `WorkExecutorMissingError(coordinates: tuple[WorkCoordinate, ...])`
+
+### 3. Contracts
+
+- A leaf binding represents the physical executor contract; route it by the stable `artifact_slot`
+  when a semantic `stage` names a broader lifecycle position.
+- A `ready` or `repair_ready` Work without a binding is a typed framework integration failure, not
+  semantic feedback, not an LLM routing question, and not a retryable empty scheduler result.
+- The error may disclose only safe coordinate fields. Controller maps it to
+  `scheduler_executor_missing`; it must not create RepairAction/AgentCorrectionBrief or charge a
+  new Agent envelope.
+
+### 4. Validation & Error Matrix
+
+- `world_behavior` plus `tool_semantics_batch` slot -> ToolSemanticsBatch leaf is registered.
+- Ready/repair-ready definition absent from executor mapping -> fail closed with all exact safe
+  coordinates.
+- Waiting descendant with a missing parent -> remain waiting; it is not an executor-missing error.
+- Terminal semantic `blocked` work -> keep its ValidationReport/FeedbackEvaluation route; do not
+  conflate it with executor wiring.
+
+### 5. Good / Base / Bad Cases
+
+- Good: SharedToolSemantics commits, each ready ToolSemanticsBatch has a leaf, and the next
+  Scheduler wave dispatches it.
+- Base: an epoch has no ready dynamic work because it is waiting for an uncommitted causal parent.
+- Bad: return an empty scheduler result, later project `unknown scheduler coordinate`, or hand the
+  missing framework binding to an Agent for repair.
+
+### 6. Tests Required
+
+- A real scheduler graph with a ready definition and `{}` executors raises
+  `WorkExecutorMissingError` containing that coordinate.
+- A physical tool batch whose stage is `world_behavior` and slot is `tool_semantics_batch` appears
+  in Direct's executor mapping.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: a semantic lifecycle name is mistaken for the physical executor kind.
+if definition.coordinate.stage == "tool_semantics_batch":
+    bind_tool_batch_leaf()
+
+# Correct: the frozen output slot is the physical leaf contract.
+if definition.coordinate.artifact_slot == "tool_semantics_batch":
+    bind_tool_batch_leaf()
+```
+
+## Explicit monetary admission and unknown-price telemetry
+
+### 1. Scope / Trigger
+
+- Applies when an Invocation backend supplies no trustworthy price, which is normal for a
+  compatible endpoint. A live Direct run reached two parallel tool-batch leaves, but an old leaf
+  default silently reserved one monetary unit for each and rejected both before provider dispatch.
+
+### 2. Contracts
+
+- `OperationBudget.monetary_cost == 0` means no monetary admission policy was configured. It does
+  not mean a provider measured a zero price.
+- A leaf may reserve a nonzero monetary amount only when its framework caller explicitly supplies
+  a measured-price envelope. Tests that synthesize price must also supply that envelope.
+- `InvocationUsage.monetary_cost: float | None` is optional provider evidence. If absent,
+  telemetry writes `invocation.monetary_cost` with `value=null` and `provenance=unknown`.
+- Token, turn, wall-time, concurrency, tool, and bounded-repair envelopes remain hard even when
+  monetary admission is absent. Never use price ambiguity to grant an unlimited loop.
+
+### 3. Error Matrix
+
+- Unpriced compatible provider + default tool batch -> dispatch is admissible; cost metric is
+  unknown, not zero.
+- Explicit measured-price envelope + proposal over limit -> deterministic budget exhaustion before
+  another external call.
+- Invalid negative/nonfinite provider price -> contract error; never store or aggregate it.
+
+### 4. Tests Required
+
+- Assert the default ToolSemanticsBatch monetary reservation is zero.
+- Assert an unpriced Invocation produces a nullable unknown cost metric.
+- Preserve the explicit-envelope settlement test that rejects an over-spend.
+
+## ToolSemantics proposal diagnostics must never cross as raw `ValueError`
+
+### 1. Scope / Trigger
+
+- Applies to `ToolConditionsDraft`, `ToolStateTransitionDraft`, `ToolErrorsDraft`,
+  `ToolBehaviorDraft`, and `ToolSemanticsDraft` after their source shape has compiled.
+- A live hotel run reached parallel physical tool batches and exposed raw cross-field validation
+  errors as non-actionable `framework_diagnostic_incomplete` roots.
+
+### 2. Contracts
+
+- A failure caused by Agent-authored tool semantics must be a `StructuredSemanticIssue` with a
+  stable code, exact source-facing path, safe `violated_condition`, and safe
+  `expected_category`.
+- `_prefixed_validation_issues` preserves a StructuredSemanticIssue's condition/category; it may
+  only use generic fallback text when the issue deliberately omitted those fields.
+- Compiler-owned frozen-input corruption remains a non-retryable framework diagnostic. Do not
+  relabel it as candidate repair just to obtain another Agent turn.
+- Behavior-level validation owns only cross-component conditions. It must not duplicate every
+  condition/transition/error Rule failure already reported by the corresponding source section.
+
+### 3. Tests Required
+
+- Start with a compiled non-fixture world, make a tool Rule use the wrong frozen namespace and an
+  unknown evidence id, then assert both exact paths remain actionable after batch prefixing.
+- Assert neither issue is `framework_diagnostic_incomplete` and that their condition/category
+  reach the routed `SafeValidationIssue` unchanged.
+
+## Architecture Agent-output diagnostics must use an explicit safe error allowlist
+
+### 1. Scope / Trigger
+
+- Applies to every `WorldArchitectureSourceDraft` nested `AgentOutput` validator and its
+  `invoke_structured_once -> pydantic_validation_diagnostic -> ValidationReport` boundary.
+- A real `gpt-5.3-codex-spark` hotel run returned a shape-level Architecture proposal with
+  60 field-addressable Pydantic `value_error` items. The former generic projection correctly
+  blocked blind repair, but hid the safe contracts needed for one causal replacement.
+
+### 2. Signatures
+
+- Agent-output validators raise an allowlisted `PydanticCustomError(code, safe_message)` for a
+  proposal-owned contract.
+- `pydantic_validation_diagnostic(...) -> ValidationDiagnostic` maps the same code to a stable
+  `schema_<code>`, safe `violated_condition`, and `expected_category`.
+- Unknown Pydantic `value_error` and `assertion_error` remain
+  `framework_diagnostic_incomplete(retryable=False)`.
+
+### 3. Contracts
+
+- `CompactFieldSemanticDraft` must expose explicit safe codes for string-only
+  format/enumeration, numeric-only bounds, bound ordering, and duplicate enumerations.
+- `StateFieldSourceDraft` must expose an explicit safe code for the lifecycle contract:
+  mutable role, string value type, and non-empty enum values.
+- The code, path, condition, and expected category may enter the bounded
+  `AgentCorrectionBrief`; rejected values, Pydantic message context, RepairAction fields,
+  budgets, coordinates, and release state may not.
+
+### 4. Validation & Error Matrix
+
+- Allowlisted Architecture source-model condition -> actionable `schema_<code>` at the nested
+  source path; at most the existing Scheduler-authorized local correction may consume it.
+- Unknown raw validator error -> non-actionable framework diagnostic; no RepairAction.
+- Shape-valid Architecture compiler failure -> use an explicit `StructuredValidationError` only
+  when the compiler can provide a safe source-facing condition; otherwise remain a framework
+  blocker.
+
+### 5. Good / Base / Bad Cases
+
+- Good: a numeric field with `string_format=email` returns
+  `schema_compact_field_string_constraints` and a safe correction condition.
+- Base: a valid string lifecycle field with enum values produces no validation issue.
+- Bad: map every Pydantic `value_error` to an actionable retry, or include raw exception text in
+  the prompt/report.
+
+### 6. Tests Required
+
+- Exercise `invoke_structured_once` through an Architecture-field root for string constraint and
+  lifecycle violations; assert exactly one invocation and the code/path/condition/category.
+- Exercise an unknown raw `ValueError`; assert `framework_diagnostic_incomplete` remains
+  non-retryable.
+- Keep a compiler-boundary matrix separate from source-model validation. A historical
+  ToolSemantics `ValueError` symptom is not proof that Architecture has the same source-level
+  cause.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: safe location, but no safe causal condition; the model must guess.
+raise ValueError("minimum cannot exceed maximum")
+
+# Correct: closed code/message become a safe ValidationReport issue.
+raise PydanticCustomError(
+    "compact_field_bounds_order",
+    "minimum cannot exceed maximum",
+)
+```
+
+## ToolSemantics mechanical identities and bounded correction projection
+
+### 1. Scope / Trigger
+
+- Applies to every production `ToolSemanticsBatchSourceDraft` and its one Scheduler-authorized
+  correction.
+- A live hotel run produced 96--187 safe blockers per batch. Most were repeated Rule namespace or
+  schema-selector failures, so forwarding every exact path made the correction prompt larger while
+  adding no causal decision value.
+
+### 2. Contracts
+
+- The framework derives every tool Rule id from the frozen `tool_id`, semantic section and ordinal:
+  `rule:<tool_id>:<section>:<ordinal>`. An Agent may omit `rule_id`; any submitted value is replaced
+  before the source artifact and core Rule IR are committed.
+- The Agent still owns only business Rule meaning, references, evidence and typed relations. It
+  never owns namespaces, cross-artifact identity or control-plane identifiers.
+- `ValidationReport` retains all exact `ValidationIssue` instances. `AgentCorrectionBrief` is a
+  prompt-only, data-only projection grouped by `(code, violated_condition, expected_category)`;
+  each cluster has occurrence count, affected normalized path patterns and at most three exact
+  representative paths.
+- The projection must never include RepairAction policy, budget, coordinate, mutation authority,
+  invalidation, owner or release data. A cluster means every matching occurrence in the complete
+  replacement, not merely the displayed sample paths.
+
+### 3. Tests Required
+
+- Compile a ToolConditions source whose submitted Rule id has an arbitrary value; assert the
+  compiled Rule has the framework-derived namespace and ordinal.
+- Construct sixteen repeated pointer diagnostics; assert one correction cluster preserves count,
+  normalized scope and three representatives while the full issue tuple remains intact.
+
+## Frozen Tool Rule bindings, not Agent-authored state addressing
+
+### 1. Scope / Trigger
+
+- Applies only to production `ToolSemanticsBatchSourceDraft`, after `WorldSkeleton` and its exact
+  `ToolSurface` schemas are frozen.
+- A real hotel run showed composed state collections use local JSON Schema `$ref` entries. An
+  inline-only RuleContextCatalog therefore disclosed no item fields/primary keys and expanded one
+  mechanical selector mistake into 132--148 field diagnostics.
+
+### 2. Contracts
+
+- Rule context resolution must dereference only finite local `#` / RFC 6901 references. External,
+  missing, or cyclic refs are framework-invalid context and never trigger semantic Agent repair.
+- The Tool Agent may author `bound_reference(binding_id)` or `bound_lookup_by_key(binding_id, key)`.
+  It chooses business relations and existing binding ids; it does not author raw source, RFC 6901
+  pointer, collection pointer, primary-key field, selected item pointer, or value type.
+- A lookup binding is indivisible: framework derives collection + source + one primary key + one
+  selected item field/value type together. The Agent may provide only a constant or another bound
+  reference as the lookup key.
+- The deterministic materializer must expand bindings before the existing executable core Rule IR
+  compiler. Runtime, Judge and Builder continue to consume only `RuleValueRef` /
+  `RuleLookupByKey`; the bound forms never enter executable artifacts.
+- Any raw or unknown Tool binding is a stable, local, actionable compiler failure. It must not be
+  accepted as a compatibility form, silently guessed, or converted into a global retry.
+- Do not apply this rule wholesale to WorldRules/Curriculum: task-local goal semantics are not
+  necessarily frozen at ToolSemantics time.
+
+### 3. Tests Required
+
+- Use a composed root schema whose collection item is `{"$ref":"#/$defs/entity"}`; catalog prompt
+  projection must disclose the resolved collection, primary key and item fields, and a valid lookup
+  must close.
+- Materialize a bound args reference plus a bound post-state collection lookup and assert the exact
+  raw Designer Rule source is framework-derived.
+- A raw `/bookings/status` Tool reference must fail with `tool_rule_binding_required` before core
+  Rule compilation.

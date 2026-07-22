@@ -29,8 +29,8 @@ if __package__ in {None, ""}:
 from agent_world.invocation.redaction import Redactor  # noqa: E402
 
 PROTOCOL_VERSION = "agent-world.codex-worker.v1"
-SUPPORTED_SDK_VERSION = "0.1.0b3"
-SUPPORTED_RUNTIME_VERSION = "0.137.0a4"
+SUPPORTED_SDK_VERSION = "0.144.4"
+SUPPORTED_RUNTIME_VERSION = "0.144.4"
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESULT_RESERVE_BYTES = 64 * 1024
 
@@ -181,6 +181,49 @@ def _completed_turn_payload(
     if not isinstance(turn, dict) or turn.get("id") != expected_turn_id:
         return None
     return turn
+
+
+def _compact_notification_payload(
+    method: str,
+    event_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project SDK notifications to bounded telemetry metadata.
+
+    Codex delta notifications may repeat a growing text buffer.  Forwarding
+    those buffers across the private NDJSON protocol makes protocol bytes grow
+    much faster than model tokens and can terminate an otherwise healthy turn.
+    The worker itself retains the full notification long enough to extract the
+    final answer, terminal turn and token usage; the parent needs only event
+    ordering, stable identities, phases, statuses and numeric usage.
+    """
+
+    compact: dict[str, Any] = {}
+    for key in ("threadId", "turnId"):
+        value = event_payload.get(key)
+        if isinstance(value, str):
+            compact[key] = value
+    for key in ("turn", "item"):
+        value = event_payload.get(key)
+        if not isinstance(value, dict):
+            continue
+        projected = {
+            field: value[field]
+            for field in ("id", "type", "phase", "status")
+            if isinstance(value.get(field), str)
+        }
+        if projected:
+            compact[key] = projected
+    token_usage = event_payload.get("tokenUsage")
+    if isinstance(token_usage, dict):
+        compact["tokenUsage"] = {
+            key: value
+            for key, value in token_usage.items()
+            if isinstance(key, str)
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        }
+    compact["sourceMethod"] = method
+    return compact
 
 
 def _validated_codex_binary(path_text: str, expected_digest: str) -> Path:
@@ -522,7 +565,6 @@ async def _run(payload: dict[str, Any]) -> None:
                 async with asyncio.timeout(remaining):
                     async for notification in turn.stream():
                         event_payload = _notification_payload(notification.payload)
-                        emitter.event(notification.method, event_payload)
                         item = event_payload.get("item")
                         if isinstance(item, dict) and item.get("type") == "agentMessage":
                             text = item.get("text")
@@ -539,6 +581,13 @@ async def _run(payload: dict[str, Any]) -> None:
                             notification.method,
                             event_payload,
                             turn_id,
+                        )
+                        emitter.event(
+                            notification.method,
+                            _compact_notification_payload(
+                                notification.method,
+                                event_payload,
+                            ),
                         )
                         if terminal_turn is not None:
                             completed_turn = terminal_turn

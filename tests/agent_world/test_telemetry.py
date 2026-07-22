@@ -11,7 +11,13 @@ import pytest
 
 from agent_world.contracts import ArtifactRef, sha256_digest
 from agent_world.control import MetricPoint, TelemetryError, TelemetryStore
-from agent_world.invocation import InvocationRequest
+from agent_world.control.telemetry import _invocation_metrics
+from agent_world.invocation import (
+    InvocationRequest,
+    InvocationResult,
+    InvocationStatus,
+    InvocationUsage,
+)
 
 
 def _ref(name: str) -> ArtifactRef:
@@ -88,6 +94,42 @@ def test_sqlite_telemetry_records_unknown_usage_and_real_exports(tmp_path: Path)
     assert experiment["snapshot_digest"].startswith("sha256:")
     assert Path(store.health()["database"]).is_file()
     store.close()
+
+
+def test_unpriced_invocation_records_unknown_monetary_cost_not_zero() -> None:
+    request = cast(
+        InvocationRequest,
+        SimpleNamespace(
+            profile=SimpleNamespace(
+                model="compatible-model",
+                model_provider="openai",
+                reasoning_effort=SimpleNamespace(value="medium"),
+                profile_id="profile:test",
+            ),
+            metadata={},
+        ),
+    )
+    result = InvocationResult(
+        invocation_id="invocation:unpriced",
+        status=InvocationStatus.COMPLETED,
+        session=None,
+        turn_id="turn:unpriced",
+        final_text="{}",
+        structured_output={},
+        usage=InvocationUsage(),
+        events=(),
+        error=None,
+        duration_ms=1,
+    )
+
+    metric = next(
+        point
+        for point in _invocation_metrics(request, result)
+        if point.name == "invocation.monetary_cost"
+    )
+
+    assert metric.value is None
+    assert metric.provenance == "unknown"
 
 
 def test_telemetry_rejects_secret_bearing_fields(tmp_path: Path) -> None:
@@ -169,6 +211,40 @@ def test_live_trace_reports_running_time_as_provisional(tmp_path: Path) -> None:
         assert complete["provisional"] is False
         assert complete["open_span_count"] == 0
         assert complete["terminal_span_count"] == 2
+
+
+def test_recovery_closes_orphaned_trace_spans_without_erasing_provider_metrics(
+    tmp_path: Path,
+) -> None:
+    with TelemetryStore(tmp_path / "telemetry", commit_batch_size=1) as store:
+        root = store.start_span(
+            trace_id="run:abandoned",
+            component="controller",
+            operation="direct.generate",
+            run_id="run:abandoned",
+        )
+        child = store.start_span(
+            trace_id="run:abandoned",
+            component="invocation",
+            operation="agent.invoke",
+            parent_span_id=root.span_id,
+            run_id="run:abandoned",
+        )
+        store.record_metrics(
+            "run:abandoned",
+            child.span_id,
+            (MetricPoint("invocation.events.observed_delta", 1, "events", "sdk"),),
+        )
+
+        assert store.reconcile_abandoned_trace("run:abandoned") == 2
+        inspected = store.inspect_trace("run:abandoned")
+
+        assert inspected["summary"]["open_span_count"] == 0
+        assert inspected["summary"]["metrics_sum"]["invocation.events.observed_delta"] == 1
+        assert {row["status"] for row in inspected["spans"]} == {"error"}
+        assert {row["error_code"] for row in inspected["spans"]} == {
+            "owner_process_interrupted"
+        }
 
 
 def test_semantic_transaction_costs_are_aggregated_without_prompt_content(

@@ -115,7 +115,7 @@ def test_expansion_config_reserves_source_intake_and_one_real_candidate() -> Non
                         llm_tokens=100,
                         agent_turns=2,
                         search_calls=3,
-                        tool_calls=4,
+                        tool_calls=5,
                         wall_seconds=50,
                     ),
                 ),

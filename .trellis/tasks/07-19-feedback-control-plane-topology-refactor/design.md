@@ -101,6 +101,57 @@ clues.  A deterministic adapter creates a common `GenerationContext`:
 Every common stage receives this context.  Expansion proposals produce full stage outputs,
 not source-code splice patches.  The compiler checks permitted delta against parents.
 
+### 4.3 Topology epochs, not a second pipeline
+
+The physical member sets for WorldBehavior and Verifier Intent become knowable at different
+causal points: grounded Architecture determines tool-coupling batches, while the committed
+ModelingBoundary determines the actual TaskCurriculum and therefore the Challenger batch plan.
+Freezing a fictitious complete graph before either fact is known would be as misleading as
+allowing an arbitrary partial graph to publish. The solution is one Direct Job with three
+explicitly linked **topology epochs**, not three workflows:
+
+1. `bootstrap` is diagnostic-only and contains `Intake → ResearchPlan → Acquire →
+   EvidenceSynthesis → Architecture`.  It may run real tools and Agent calls, but cannot
+   establish any release maturity.
+2. The framework derives bounded behavior groups from committed Architecture, retains the exact
+   bootstrap commits, and freezes `design`. `design` completes shared/tool semantics, rules,
+   curriculum, ModelingBoundary and one deterministic `VerifierPlan`; it cannot publish.
+3. The framework freezes `final` only from that committed design closure and its exact
+   `VerifierBatchPlan`. It materializes precisely those Challenger batch coordinates, then Build,
+   Integration, ReleaseAssurance, Package and Registry coordinates. The Scheduler continues from
+   retained commits; it never recomputes prompts or creates a shadow Design. Only `final` is
+   eligible for release and it must contain the complete required closure.
+
+`WorkGraphEpoch` binds the same job/context, exact predecessor manifest and retained commit
+closure. A successor epoch is rejected if a retained coordinate's definition, inputs or active
+commit differs. This gives both dynamic fan-outs a real freeze point while keeping resume, budget
+and repair authority singular; the epoch freezes add no Agent turn themselves.
+
+### 4.4 Break the package/readiness cycle
+
+The former package design admitted a Design-only production graph because it embedded a
+`WorkReadinessSnapshot` in a `ClaimVector` inside the package, while that snapshot itself needs
+the Package WorkCommit.  The resulting cycle was hidden by fixtures, not resolved by code.
+
+The replacement has a strict temporal order:
+
+```mermaid
+flowchart LR
+    A["Pre-package committed closure"] --> D["ReleaseDossier\nno package/readiness self-reference"]
+    D --> P["Package bytes + Package WorkCommit"]
+    P --> R["ReadinessProjection\nrelease_candidate_ready"]
+    R --> G["Registry prepare/publish + publication WorkCommit"]
+    G --> F["ReadinessProjection\nreleased"]
+```
+
+`ReleaseDossier` is framework-authored pre-package evidence: final graph manifest, exact Design,
+Candidate, Verifier, Integration, ReleaseAssurance and telemetry commits/reports, release policy
+and their dependency closure.  It contains neither package manifest, reservation nor readiness.
+Package metadata binds this dossier reference.  A separately named `PublicationDossier` is
+written by Registry only after reservation/staging facts exist.  The retired `ClaimVector` is not
+an alternative success authority and is removed from envpkg metadata, Registry validation and
+the production controller.
+
 ## 5. Work and feedback data model
 
 ```mermaid
@@ -127,6 +178,12 @@ Static executable policy:
 - required Claim and success maturity;
 - hard wall/token/tool/process budgets.
 
+`WorkDefinition` is a boundary policy, not the whole scheduler.  Before production cutover it
+also binds explicit input/output Artifact slot contracts (accepted Artifact types, cardinality,
+producer ownership and confidentiality), while graph-level `WorkGroup`/`JoinPolicy` owns dynamic
+physical shards and exact aggregate readiness.  This prevents a Builder workspace, Verifier shard
+or Judge evidence bundle from being accepted merely because an arbitrary ArtifactRef exists.
+
 ### WorkAttempt / WorkCommit
 
 `WorkAttempt` replaces separate top-level NodeAttempt and semantic transaction attempt
@@ -142,6 +199,12 @@ retained if their exact dependencies are unchanged.
 Records what expensive work was attempted without granting validity: real InvocationResult,
 search/fetch execution, Candidate workspace journal or subprocess evidence.  It owns cost and
 capability provenance, not routing.
+
+Validation and assurance have symmetric execution records.  `ValidationExecution` accounts for
+the deterministic validator revision, elapsed time and actual/unknown process/tool usage;
+`AssuranceExecution` binds real probe ids, runtime profile/image commitment, freshness and
+evidence refs.  `ValidationReport` is the diagnostic result of those executions, not their cost
+or provenance container.
 
 ### ValidationReport
 
@@ -165,6 +228,19 @@ record.  Local schema corrections do not additionally produce framework Findings
 
 `Finding` remains only for cross-boundary execution failure, hard semantic conflict,
 permission/risk or release-policy evidence requiring causal attribution.
+
+### WorkGroup / JoinPolicy / scheduler
+
+The graph manifest freezes every logical coordinate plus any materialized physical member before
+that member may start.  `WorkGroup` defines the member coordinate pattern, bounded fan-out,
+aggregate output contract and `all`/explicit-threshold join.  Successful siblings remain active;
+failure blocks only the aggregate consumer and never authorizes sibling cancellation or
+invalidation by itself.
+
+One scheduler is the only production caller allowed to begin/supersede a WorkAttempt, reserve a
+lease, create a RepairAction, invalidate descendants or project readiness.  Components return
+proposal/execution evidence only.  Recursive Controller calls and component-owned `while`/retry
+loops are forbidden semantic control paths.
 
 ## 6. Code router and LLM boundary
 
@@ -306,8 +382,11 @@ Agent to the hot path or automatically change policy.
 
 On restart, Controller rebuilds active state from WorkCommit, terminal FeedbackEvaluation,
 RepairLedgerEntry and BudgetLedger.  Running attempts without a terminal event are settled
-as interrupted/unknown before rescheduling.  Exactly matching commits are reused; old live
-stores are not migrated.
+as interrupted/unknown before rescheduling.  Reuse requires exact inputs and acceptance identity,
+while new execution and repair continue to use full definition and repair-epoch identities.  A
+policy-only budget/recovery change therefore cannot invalidate a successful semantic Artifact,
+but a Claim, transform, validator executable revision, assurance or maturity change does.  Old
+live stores are not migrated.
 
 Registry accepts only a package whose source/design/assurance/claim digests match active
 commits and whose required usage dimensions are present or explicitly allowed unknown by
@@ -337,3 +416,149 @@ Historical Artifacts remain read-only bad-case evidence, not compatibility input
 - The Verifier straggler hang must be isolated from sandbox/subprocess behavior before its
   production supervisor is changed.
 
+## 16. 2026-07-21 production cutover decision: one Direct runner, never an adapter
+
+The audit found that the implementation cannot safely switch `FoundryController.generate()` by
+wrapping the existing `EnvironmentDesigner.generate()` in one Scheduler leaf. That method owns
+its own `WorkControlRuntime`, component-local correction loop, historical feedback writes and
+multi-node commits. Treating it as one proposal would create two active retry/commit authorities
+inside one WorkAttempt and would hide the actual causal owner of a failed semantic transaction.
+
+The replacement is a **DirectWorkRunner**, not a compatibility adapter. It is the sole
+production caller of `WorkScheduler` and receives only immutable `GenerationContext`, exact
+components, a per-run workspace root and the `TelemetryStore` trace identity. It has no LLM
+prompt logic, no semantic retry loop and no release projection. Its responsibility is restricted
+to: freeze topology, resolve the executor by exact `work_id`, run ready work, persist epoch
+boundaries, and translate the resulting active Registry commit into the public `GenerateResult`.
+
+```mermaid
+flowchart TB
+    C["GenerationContext"] --> B["Bootstrap: ResearchPlan -> Acquire -> Synthesis -> Architecture"]
+    B --> A["Architecture artifacts: Skeleton + CouplingPlan"]
+    A --> D["Design epoch: behavior / rules / curriculum / modeling -> deterministic VerifierPlan"]
+    D --> F["Final epoch: retain exact design closure + materialize Challenger batches"]
+    F --> T["One-attempt leaves: Builder || Verifier -> Integration -> Assurance"]
+    T --> R["Observability -> Package -> Registry"]
+    R --> G["Registry release record -> public GenerateResult"]
+```
+
+### 16.1 Leaf contract
+
+Every leaf gets only `WorkExecutionContext` and its already-open `WorkAttempt`. It performs one
+of three bounded proposal kinds and returns immutable outputs through `SchedulerLeafExecutor`:
+
+| Leaf family | Real work | Framework-owned validation / output |
+|---|---|---|
+| Research plan, synthesis, Architecture, behavior, rules, curriculum | exactly one real structured `InvocationBackend` turn using the role-isolated profile | typed source artifact plus deterministic compiler validation; a failed schema returns `ValidationIssue` paths, never an exception string |
+| Acquisition | exactly one bounded `ResearchToolchain.run(search, fetch, extract)` | normalized source/evidence/passage artifacts and measured tool counts |
+| Modeling | no Agent | compile the exact Design closure and policy gate |
+| Build / Verifier / Integration / Assurance / Package / Registry | existing real one-attempt leaves | their own typed independent evidence and the common kernel |
+
+The shared `one_structured_turn` helper may resolve a profile and invoke the real backend once,
+but it must not call `FeedbackContract`, `RepairLedger`, `WorkControlRuntime.begin`,
+`execute_structured_work`, or a component-local retry loop. Agent output errors are translated
+to a safe `LeafValidationFailure` while retaining actual invocation provenance; the Scheduler is
+the only code that may create a repair attempt.
+
+### 16.2 Three topology epochs
+
+Bootstrap is diagnostic-only because Architecture is needed to discover the bounded tool
+coupling/behavior shard set. It contains exactly `research_plan`, `evidence_acquisition`,
+`evidence_synthesis` and `world_architecture`. Once Architecture commits, framework code derives
+the coupling plan from the exact Architecture artifact; no Agent chooses graph coordinates. It
+then freezes the non-releasable `design` graph, retaining the four byte-identical bootstrap
+commits and completing ModelingBoundary plus a deterministic `VerifierPlan`. Only after that plan
+commits does it freeze the releasable `final` graph, retaining the exact design closure and
+materializing precisely its real Challenger batches plus Build through Registry. A successor graph
+with a missing retained commit, changed predecessor definition/input, invented batch count, or a
+Modeling-only terminal is rejected before any Builder call.
+
+### 16.3 Repair and recovery decisions
+
+- A deterministic proposal/schema failure returns one complete `ValidationReport`; it can receive
+  at most the WorkDefinition's Scheduler-authorized local correction.
+- Acquisition transport failure is `real_tools` infrastructure recovery only. It cannot ask the
+  Researcher to rewrite a plan unless a distinct plan validation claim fails.
+- Modeling, Package, observability and Registry have zero semantic correction budget. Registry
+  may reconcile only an idempotent/queryable durable publication transaction.
+- A direct parent route is explicit only for Integration/ReleaseAssurance -> Build; design leaves
+  do not infer cross-stage backjumps from category text.
+- On restart, the runner restores frozen epoch/active commit closure before scheduling; no legacy
+`DirectJobSnapshot`, `ClaimVector` or component session becomes release evidence.
+
+### 16.5 Implemented first slice (2026-07-21; not yet a production cutover)
+
+The first two primitives now exist and are covered by Scheduler integration tests:
+
+1. `designer.one_shot.invoke_structured_once` resolves one isolated profile and makes **one**
+   backend call using the existing Scheduler `dispatch_id` as its invocation identity. It has no
+   session continuation, no `FeedbackContract`, no `RepairLedger`, and no retry. JSON transport,
+   Pydantic shape, and typed semantic errors become safe path-addressed `LeafValidationFailure`;
+   an untyped validator error becomes non-retryable `framework_diagnostic_incomplete`.
+2. `designer.ResearchPlanLeaf` loads only the immutable `GenerationContext`, proves the
+   context/job/request/permission closure, invokes that one-shot primitive, and commits an exact
+   `design.research_plan` Artifact through `SchedulerLeafExecutor`.
+3. Scheduler input resolution and committed-work reuse derive one identical input closure:
+   the immutable external root plus only the typed parent consumer refs allowed by the child’s
+   declared `input_slots`. Parent `WorkCommit` refs remain causal lineage but are not blanket
+   data disclosure. This prevents both an old downstream commit surviving a changed root and a
+   least-privilege downstream commit being falsely marked `stale` during recovery.
+
+The integration tests use a protocol boundary double only to make malformed/valid structured JSON
+deterministic. They prove no hidden local retry and real Artifact/WorkControl state transitions;
+they are explicitly **not** a claim that Research, Build or Registry live E2E has run. The next
+slice is Acquisition, where real `ResearchToolchain.run()` must execute outside the WorkHead lock
+and produce an exact evidence/passage closure before Synthesis can be added.
+
+### 16.6 Research bootstrap closure implemented (2026-07-21; not live E2E)
+
+The bootstrap now covers all three research boundaries under one Scheduler graph:
+
+1. `research_plan_work_definition` declares the external `GenerationContext` input and exactly one
+   ResearchPlan output; it prevents a root-only plan from hiding Controller state.
+2. `ResearchAcquisitionLeaf` calls the real `ResearchToolchain.run()` after Scheduler has opened
+   its Proposal OperationRun, then commits a public `ResearchAcquisition`, hash-bound passage pack
+   and every raw/metadata/extracted source ref. `ResearchBundle` now counts `search_calls`,
+   `fetch_calls` and `extract_calls`; all three contribute to `tool_calls` and telemetry.
+3. `research_synthesis_work_definition` accepts only the context plus that committed acquisition
+   closure. `EvidenceSynthesisLeaf` receives one tool-free Researcher turn, validates every claim
+   reference against the exact evidence ids and persists the derived EvidenceGraph. It cannot read
+   Designer state or initiate research.
+
+The local integration regression executes those three WorkDefinitions with the actual toolchain
+protocol and materializer. Its model transports are test doubles solely for deterministic schema
+coverage; it is not a live Search/provider or release claim.
+
+### 16.7 Architecture bootstrap closure implemented (2026-07-21; not live E2E)
+
+`world_architecture_work_definition` now consumes exactly the external GenerationContext plus the
+committed EvidenceSynthesis/EvidenceGraph lineage and produces exactly three artifacts:
+`design.world_architecture_source`, `design.world_skeleton`, and
+`design.tool_coupling_plan`. `WorldArchitectureLeaf` invokes one isolated Engineer turn, sees a
+bounded claim/conflict/unknown catalog rather than raw source bodies, and immediately calls the
+stateless deterministic compiler. It has no Designer session, feedback ledger, retry loop, or
+mutable evidence cache.
+
+The compiler was made class-bound rather than instance-bound and is exposed through a narrow
+pure compilation module; this reuse is deliberately limited to schema/coupling mechanics, not the
+legacy Designer orchestration. A single explicit adapter maps the WorkGraph identifier
+`environment_engineer` to the pre-existing isolated profile capability identifier
+`environment-engineer`; individual leaves cannot choose or alias profiles.
+
+The four-node regression runs `ResearchPlan -> real local Search/Fetch/Extract ->
+EvidenceSynthesis -> WorldArchitecture`, validates all artifact slots/closures, then freezes a
+diagnostic bootstrap epoch. The model transports remain local protocol doubles only for a
+deterministic Scheduler/Artifact assertion. This proves neither a real provider search nor a
+released environment. The next boundary is final-epoch derivation from the committed coupling
+plan, followed by behavior/rules/curriculum/modeling leaves.
+
+### 16.4 Controller deletion boundary
+
+`FoundryController.generate()` now delegates only to `DirectWorkRunner`; the Runner is the sole
+Direct production work graph owner from Research through Registry. The old `_run_design`, old
+`FeedbackContract`/`RepairLedger` success path, pre-Scheduler package projection and component
+semantic retry loops must remain unreachable from this route and be deleted rather than retained
+as fallback authority. A deterministic Package-to-Registry closure test now drives the real
+Scheduler, PackageLeaf, Registry filesystem transaction and final `WorkCommit`; it is evidence
+for the framework closure only. It is not a live hotel end-to-end acceptance, which still needs
+a real provider-backed Request-to-Registry run.

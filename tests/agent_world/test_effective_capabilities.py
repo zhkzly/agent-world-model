@@ -70,6 +70,25 @@ def test_resolved_profile_clamps_timeout_to_node_budget(tmp_path: Path) -> None:
     assert profile.allowed_builtin_tools == ()
 
 
+def test_structured_environment_engineer_event_budget_tracks_token_budget(
+    tmp_path: Path,
+) -> None:
+    profile = _provider().resolve(
+        role="environment-engineer",
+        lineage_id="engineer-event-budget",
+        workspace=tmp_path / "environment-engineer",
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.structured_output(
+            node_id="environment-engineer.event-budget",
+            role="environment-engineer",
+        ),
+        rollout_token_limit=65_536,
+    )
+
+    assert profile.limits.max_events == 65_536
+
+
 def test_exact_node_requirement_discards_broader_external_job_grants() -> None:
     requirement = NodeCapabilityRequirement.isolated_build(
         node_id="environment-engineer.runtime-build"

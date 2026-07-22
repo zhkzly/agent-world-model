@@ -208,16 +208,20 @@ def test_profile_resolver_materializes_explicit_openai_compatible_base_url(
         materialization_root=tmp_path / "research-compatible-provider",
         source_environment={
             "PATH": "/usr/bin:/bin",
-            "COMPATIBLE_API_KEY": "redacted-test-key",
+            "COMPATIBLE_API_KEY": "test-placeholder-not-a-real-key",
         },
     )
 
     config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
     assert 'openai_base_url = "https://provider.example.test/v1"' in config_text
     assert profile.openai_base_url == "https://provider.example.test/v1"
-    assert profile.worker_environment()["OPENAI_API_KEY"] == "redacted-test-key"
-    assert "redacted-test-key" not in config_text
-    assert "redacted-test-key" not in json.dumps(profile.to_public_dict(), sort_keys=True)
+    assert profile.worker_environment()["OPENAI_API_KEY"] == (
+        "test-placeholder-not-a-real-key"
+    )
+    assert "test-placeholder-not-a-real-key" not in config_text
+    assert "test-placeholder-not-a-real-key" not in json.dumps(
+        profile.to_public_dict(), sort_keys=True
+    )
     verify_resolved_profile(profile)
 
 

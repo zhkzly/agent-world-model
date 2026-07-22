@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from agent_world.contracts import ArtifactRef, BudgetUsage, sha256_digest
 from agent_world.control.work import (
+    ArtifactSlotContract,
     AssurancePolicy,
     FeedbackEvaluation,
     OperationBudget,
@@ -94,7 +95,7 @@ def _passed_report() -> ValidationReport:
         coordinate=_coordinate(),
         policy_id="validation:world-behavior",
         policy_digest=_hash("validation:world-behavior:v1"),
-        subject_ref=_ref("behavior", "design.world_behavior"),
+        subject_refs=(_ref("behavior", "design.world_behavior"),),
         status="passed",
         validation_phase="tool_semantics",
         frontier_ordinal=30,
@@ -122,6 +123,7 @@ def test_work_policies_separate_agent_validation_and_real_execution() -> None:
     validation = ValidationPolicy(
         policy_id="validation:world-behavior",
         validator_id="validator:world-behavior",
+        validator_revision_id="framework.validator.world-behavior.v1",
         validation_phase="tool_semantics",
         frontier_ordinal=20,
         claim_id="design.behavior.valid",
@@ -162,6 +164,113 @@ def test_work_policies_separate_agent_validation_and_real_execution() -> None:
     assert definition.assurance_policy is not None
     assert definition.assurance_policy.budget.process_calls == 2
 
+
+def _behavior_definition(*, implementation_revision_id: str) -> WorkDefinition:
+    return WorkDefinition(
+        work_id="work:world-behavior",
+        coordinate=_coordinate(),
+        claim="The exact tool behavior compiles against the frozen world schema.",
+        timing_reason="World rules require committed executable tool semantics.",
+        dependency_coordinates=(_coordinate("architecture", stage="world_architecture"),),
+        proposal_policy=ProposalPolicy(
+            policy_id="proposal:world-behavior",
+            executor="agent",
+            implementation_revision_id=implementation_revision_id,
+            operation="design.world_behavior",
+            agent_role="environment_engineer",
+            capability_profile_id="profile:design",
+            output_contract_id="contract:world-behavior-source",
+            budget=OperationBudget(
+                wall_seconds=300.0,
+                first_progress_seconds=60.0,
+                llm_tokens=40_000,
+                agent_turns=1,
+            ),
+        ),
+        validation_policy=ValidationPolicy(
+            policy_id="validation:world-behavior",
+            validator_id="validator:world-behavior",
+            validator_revision_id="framework.validator.world-behavior.v1",
+            validation_phase="tool_semantics",
+            frontier_ordinal=20,
+            claim_id="design.behavior.valid",
+            effect="block_compile",
+            budget=OperationBudget(wall_seconds=3.0),
+        ),
+        repair_policy=RepairPolicy(policy_id="repair:world-behavior"),
+        required_claim_id="design.behavior.valid",
+        allowed_mutation_roots=("/tools",),
+        success_maturity="design_behavior_valid",
+    )
+
+
+def test_implementation_revision_is_acceptance_critical_and_gates_reuse() -> None:
+    """Editing leaf code (a new implementation_revision_id) must break reuse.
+
+    ``acceptance_digest`` is the identity a historical commit must still satisfy
+    to be reused across runs/scopes.  A leaf-code change flows in through
+    ``implementation_revision_id`` so a stale output is never silently reused —
+    the invariant that keeps a generated environment from lying.
+    """
+
+    base = _behavior_definition(implementation_revision_id="framework.impl.aaaa000000000000")
+    same = _behavior_definition(implementation_revision_id="framework.impl.aaaa000000000000")
+    edited = _behavior_definition(implementation_revision_id="framework.impl.bbbb111111111111")
+
+    # Identical code + inputs → identical acceptance identity → reuse is allowed.
+    assert base.acceptance_digest == same.acceptance_digest
+    # Edited leaf code → different acceptance identity → historical reuse blocked.
+    assert base.acceptance_digest != edited.acceptance_digest
+
+
+def test_leaf_code_revision_changes_with_source_and_model() -> None:
+    from agent_world.control.code_revision import leaf_code_revision
+
+    this_module = "tests.agent_world.test_work_control_contracts"
+    a = leaf_code_revision(this_module)
+    b = leaf_code_revision(this_module)
+    with_model = leaf_code_revision(this_module, model="claude-opus-4-8")
+    other_model = leaf_code_revision(this_module, model="claude-sonnet-5")
+
+    assert a == b  # stable across calls for identical source
+    assert a.startswith("framework.impl.")
+    assert with_model != a  # model identity participates
+    assert with_model != other_model  # different model → different revision
+    with pytest.raises(ValueError):
+        leaf_code_revision()  # at least one module required
+    with pytest.raises(ValueError):
+        leaf_code_revision("agent_world.this_module_does_not_exist")
+
+
+def test_artifact_slots_reject_ambiguous_types_and_wrong_output_owner() -> None:
+    input_slot = ArtifactSlotContract(
+        slot_id="architecture-input",
+        direction="input",
+        artifact_types=("design.world_architecture_source",),
+        minimum_count=1,
+        maximum_count=1,
+        producer_component="design",
+    )
+    assert input_slot.matching_refs((_ref("architecture", "design.world_architecture_source"),))
+    with pytest.raises(ValidationError, match="external producer"):
+        ArtifactSlotContract(
+            slot_id="candidate-output",
+            direction="output",
+            artifact_types=("build.environment_candidate",),
+            minimum_count=1,
+            maximum_count=1,
+            producer_component="external",
+        )
+    with pytest.raises(ValidationError, match="minimum cannot exceed"):
+        ArtifactSlotContract(
+            slot_id="invalid-count",
+            direction="input",
+            artifact_types=("design.world_spec",),
+            minimum_count=2,
+            maximum_count=1,
+            producer_component="design",
+        )
+
     with pytest.raises(ValidationError, match="Agent proposal requires"):
         ProposalPolicy(
             policy_id="proposal:invalid-agent",
@@ -173,6 +282,7 @@ def test_work_policies_separate_agent_validation_and_real_execution() -> None:
         ValidationPolicy(
             policy_id="validation:invalid",
             validator_id="validator:invalid",
+            validator_revision_id="framework.validator.invalid.v1",
             validation_phase="schema",
             frontier_ordinal=1,
             claim_id="design.invalid",
@@ -212,6 +322,7 @@ def test_work_contracts_are_closed_and_definition_rejects_self_dependency() -> N
     validation = ValidationPolicy(
         policy_id="validation:code",
         validator_id="validator:code",
+        validator_revision_id="framework.validator.code.v1",
         validation_phase="compile",
         frontier_ordinal=1,
         claim_id="design.compiles",
@@ -298,8 +409,15 @@ def test_progress_classifier_covers_real_no_progress_and_frontier_bad_cases() ->
 
     assert classify_progress(previous, _passed_report()) == "resolved"
     assert classify_progress(previous, _report("report:same", (issue_a, issue_b))) == "unchanged"
+    assert classify_progress(previous, _report("report:shrunk", (issue_b,))) == "strict_progress"
     assert (
-        classify_progress(previous, _report("report:shrunk", (issue_b,)))
+        classify_progress(
+            previous,
+            _report(
+                "report:next-sibling-obligation",
+                (_issue("rule_pointer_unreachable", ("tools", 1, "pointer")),),
+            ),
+        )
         == "strict_progress"
     )
     assert (
@@ -336,10 +454,7 @@ def test_progress_classifier_detects_a_to_b_to_a_oscillation_and_reintroduction(
         (issue_a, _issue("permission_missing", ("tools", 1, "permission"))),
         frontier=30,
     )
-    assert (
-        classify_progress(then_b, current_with_old_a, history=(first_a,))
-        == "regressed"
-    )
+    assert classify_progress(then_b, current_with_old_a, history=(first_a,)) == "regressed"
 
 
 def test_feedback_evaluation_derives_readiness_and_diagnostic_is_non_releasable() -> None:
@@ -351,11 +466,12 @@ def test_feedback_evaluation_derives_readiness_and_diagnostic_is_non_releasable(
         work_id="work:behavior",
         coordinate=_coordinate(),
         claim_id="design.behavior.valid",
+        acceptance_digest=_hash("acceptance:world-behavior"),
         policy_digest=_hash("validation:world-behavior:v1"),
         status="passed",
         effect="block_compile",
         readiness_effect="satisfies",
-        subject_ref=subject_ref,
+        subject_refs=(subject_ref,),
         validation_report_ref=report_ref,
         evaluated_at=datetime.now(UTC),
     )
@@ -385,6 +501,10 @@ def test_work_attempt_commit_and_diagnostic_lifecycle_are_fail_closed() -> None:
     now = datetime.now(UTC)
     output = _ref("behavior", "design.world_behavior")
     evaluation = _ref("evaluation", "control.feedback_evaluation")
+    operation_refs = (
+        _ref("proposal-operation", "control.operation_run"),
+        _ref("validation-operation", "control.operation_run"),
+    )
     attempt = WorkAttempt(
         attempt_id="attempt:behavior:1",
         work_id="work:behavior",
@@ -395,11 +515,8 @@ def test_work_attempt_commit_and_diagnostic_lifecycle_are_fail_closed() -> None:
         proposal_policy_digest=_hash("proposal"),
         validation_policy_digest=_hash("validation"),
         repair_policy_digest=_hash("repair"),
-        budget_lease_ref=_ref("budget", "control.budget_lease"),
+        operation_run_refs=operation_refs,
         output_refs=(output,),
-        proposal_execution_refs=(
-            _ref("proposal-execution", "control.proposal_execution"),
-        ),
         feedback_evaluation_ref=evaluation,
         scheduled_at=now,
         started_at=now + timedelta(seconds=1),
@@ -412,25 +529,22 @@ def test_work_attempt_commit_and_diagnostic_lifecycle_are_fail_closed() -> None:
         coordinate=attempt.coordinate,
         attempt_id=attempt.attempt_id,
         definition_digest=attempt.definition_digest,
+        acceptance_digest=_hash("acceptance"),
         validation_policy_digest=attempt.validation_policy_digest,
+        validated_subject_refs=attempt.output_refs,
         output_refs=attempt.output_refs,
         feedback_evaluation_ref=evaluation,
+        operation_run_refs=operation_refs,
         committed_at=now + timedelta(seconds=4),
     )
     assert commit.aggregate is False
 
     with pytest.raises(ValidationError, match="successful work requires"):
-        WorkAttempt.model_validate(
-            {**attempt.model_dump(mode="python"), "output_refs": ()}
-        )
+        WorkAttempt.model_validate({**attempt.model_dump(mode="python"), "output_refs": ()})
     with pytest.raises(ValidationError, match="never releasable"):
-        WorkAttempt.model_validate(
-            {**attempt.model_dump(mode="python"), "diagnostic_only": True}
-        )
+        WorkAttempt.model_validate({**attempt.model_dump(mode="python"), "diagnostic_only": True})
     with pytest.raises(ValidationError, match="aggregate commits"):
-        WorkCommit.model_validate(
-            {**commit.model_dump(mode="python"), "aggregate": True}
-        )
+        WorkCommit.model_validate({**commit.model_dump(mode="python"), "aggregate": True})
 
 
 def test_proposal_execution_and_repair_ledger_bind_real_usage_and_reports() -> None:
@@ -464,6 +578,9 @@ def test_proposal_execution_and_repair_ledger_bind_real_usage_and_reports() -> N
         entry_id="work-repair-ledger:1",
         work_id="work:behavior",
         coordinate=_coordinate(),
+        repair_epoch_digest=_hash("repair-epoch"),
+        definition_digest=_hash("definition"),
+        input_fingerprint=_hash("inputs"),
         repair_policy_digest=_hash("repair"),
         repair_action_ref=_ref("repair-action", "control.repair_action"),
         decision="local_correction",
@@ -473,7 +590,6 @@ def test_proposal_execution_and_repair_ledger_bind_real_usage_and_reports() -> N
         progress="strict_progress",
         outcome="progressed",
         repair_attempt_ordinal=1,
-        budget_lease_ref=_ref("repair-budget", "control.budget_lease"),
         observed_actual=actual,
         unknown_upper_bound=unknown,
         conservative_committed=committed,
@@ -496,6 +612,9 @@ def test_repair_action_enforces_local_one_hop_and_human_boundaries() -> None:
     local = RepairAction(
         action_id="repair:local:1",
         repair_policy_id="repair:world-behavior",
+        repair_epoch_digest=_hash("repair-epoch"),
+        definition_digest=_hash("definition"),
+        input_fingerprint=_hash("inputs"),
         source_evaluation_ref=evaluation_ref,
         current_coordinate=current,
         target_coordinate=current,
@@ -526,13 +645,9 @@ def test_repair_action_enforces_local_one_hop_and_human_boundaries() -> None:
             {**parent_action.model_dump(mode="python"), "causal_evidence_refs": ()}
         )
     with pytest.raises(ValidationError, match="distance-two"):
-        RepairAction.model_validate(
-            {**parent_action.model_dump(mode="python"), "jump_distance": 2}
-        )
+        RepairAction.model_validate({**parent_action.model_dump(mode="python"), "jump_distance": 2})
     with pytest.raises(ValidationError, match="only an executing"):
-        RepairAction.model_validate(
-            {**local.model_dump(mode="python"), "repair_attempt_charge": 0}
-        )
+        RepairAction.model_validate({**local.model_dump(mode="python"), "repair_attempt_charge": 0})
 
 
 def test_repair_policy_has_one_total_attempt_ceiling() -> None:

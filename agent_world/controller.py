@@ -41,7 +41,6 @@ from agent_world.contracts import (
     CoverageLevel,
     CoverageMap,
     DesignBaselineCheckpoint,
-    DesignPhaseCheckpoint,
     DiscoveryRunSpec,
     EnvironmentDesign,
     EnvironmentJob,
@@ -54,6 +53,7 @@ from agent_world.contracts import (
     ExpansionSourceCatalog,
     Finding,
     GateResult,
+    GenerationContext,
     IdentityDecision,
     IntegrationReport,
     JudgeReport,
@@ -92,11 +92,13 @@ from agent_world.control import (
     ErrorAuditPolicy,
     ExpansionCandidateAttempt,
     FeedbackResult,
+    GenerationWorkGraph,
     JobRunSnapshot,
     LeaseBudgetLedger,
     MetricPoint,
     NodeAttempt,
     NodeCommit,
+    NodeContinuationStore,
     NodeKind,
     QuarantineReviewBundle,
     QuarantineReviewPolicy,
@@ -112,15 +114,21 @@ from agent_world.control import (
     TelemetryReleaseSummary,
     TelemetryStore,
     ValidationDiagnostic,
+    WorkControlRuntime,
+    WorkControlStore,
+    WorkExecutorMissingError,
+    WorkReadinessProjection,
+    WorkReadinessSnapshot,
     WorkSpan,
     claim,
+    deterministic_boundary_work_definition,
     new_direct_job_head,
     reduce_maturity,
+    restore_work_budget_ledger,
 )
+from agent_world.control.direct_runner import DirectWorkRun, DirectWorkRunner
 from agent_world.designer import (
     DIRECT_DESIGN_BASE_TURNS,
-    DIRECT_DESIGN_EVIDENCE_BASE_TURNS,
-    DIRECT_DESIGN_MAX_CORRECTIONS,
     AdmissionBundle,
     DesignBundle,
     DesignerBudgetPlanError,
@@ -250,13 +258,9 @@ class DiscoveryLaneState(V2Contract):
         if self.status == "quarantine_dismissed" and (
             not self.recommendation_refs or not self.quarantine_review_refs
         ):
-            raise ValueError(
-                "dismissed quarantine requires recommendation and review refs"
-            )
+            raise ValueError("dismissed quarantine requires recommendation and review refs")
         if self.status == "quarantine_confirmed" and (
-            not self.recommendation_refs
-            or not self.quarantine_review_refs
-            or not self.finding_refs
+            not self.recommendation_refs or not self.quarantine_review_refs or not self.finding_refs
         ):
             raise ValueError(
                 "confirmed quarantine requires recommendation, review, and Finding refs"
@@ -335,13 +339,9 @@ class DiscoveryResumeResult(V2Contract):
         if self.status == "quarantine_dismissed" and (
             not self.recommendation_refs or not self.quarantine_review_refs
         ):
-            raise ValueError(
-                "dismissed quarantine requires recommendation and review refs"
-            )
+            raise ValueError("dismissed quarantine requires recommendation and review refs")
         if self.status == "quarantine_confirmed" and (
-            not self.recommendation_refs
-            or not self.quarantine_review_refs
-            or not self.finding_refs
+            not self.recommendation_refs or not self.quarantine_review_refs or not self.finding_refs
         ):
             raise ValueError(
                 "confirmed quarantine requires recommendation, review, and Finding refs"
@@ -461,6 +461,7 @@ class _DiscoveryLane:
     bundle: DiscoveryBundle | None = None
     admission: AdmissionBundle | None = None
     quarantine_reviews: tuple[QuarantineReviewBundle, ...] = ()
+
 
 @dataclass(frozen=True, slots=True)
 class _ReleasePlan:
@@ -609,12 +610,28 @@ class FoundryController:
         self.telemetry = telemetry
         self.error_audit_policy = error_audit_policy or ErrorAuditPolicy()
         self.code_router = CodeRouter()
-        self.quarantine_review_policy = QuarantineReviewPolicy(
-            artifact_store=self.artifacts
-        )
+        self.quarantine_review_policy = QuarantineReviewPolicy(artifact_store=self.artifacts)
         self.workspace_root = (config.state_root / "runs").expanduser().resolve()
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.direct_jobs = DirectJobStore(config.state_root / "direct-jobs")
+        self.work_control = WorkControlStore(config.state_root / "work-control")
+        self.direct_work_runner = (
+            DirectWorkRunner(
+                artifacts=self.artifacts,
+                heads=self.work_control,
+                designer=self.designer,
+                builder=self.builder,
+                verifier_compiler=self.verifier_compiler,
+                judge=self.judge,
+                registry=self.registry,
+                telemetry=self.telemetry,
+                workspace_root=self.workspace_root / "scheduler-direct",
+                structured_turn_token_limit=config.agent.structured_turn_token_limit,
+                structured_turn_wall_seconds=config.agent.structured_invocation_timeout_seconds,
+            )
+            if self.telemetry is not None
+            else None
+        )
         self.campaign_store = CampaignStore(config.state_root / "campaigns")
         self.expansion_runner = ExpansionCampaignRunner(
             artifact_store=self.expansion_artifacts,
@@ -756,21 +773,9 @@ class FoundryController:
                 request=request,
                 request_ref=head.request_ref,
             )
-            phase_checkpoint_ref = None
-            if recovered_design is None:
-                phase_checkpoint_ref = self.designer.adopt_latest_phase_checkpoint(
-                    job=job,
-                    job_ref=head.job_ref,
-                    request=request,
-                    request_ref=head.request_ref,
-                )
             resume_subject_ref = (
-                recovered_design.bundle.design_ref
-                if recovered_design is not None
-                else phase_checkpoint_ref
+                recovered_design.bundle.design_ref if recovered_design is not None else head.job_ref
             )
-            if resume_subject_ref is None:
-                raise DirectJobStoreError("Direct resume found no adoptable design checkpoint")
             self.artifacts.record_event(
                 event_type="generation_resume_requested",
                 subject_ref=resume_subject_ref,
@@ -786,140 +791,9 @@ class FoundryController:
                 job=job,
                 job_ref=head.job_ref,
                 request_ref=head.request_ref,
-                phase_checkpoint_ref=phase_checkpoint_ref,
                 recovered_design=recovered_design,
                 prior_head=head,
             )
-
-    async def cancel_abandoned_generation(self, request_id: str) -> GenerateResult:
-        """Finalize a running checkpoint after its owning process has exited.
-
-        The Direct-job writer lock is held for an entire live generation.  Acquiring
-        it here therefore proves that no controller process still owns the run; this
-        operation never sends a signal to live Agent work and never rewrites an
-        immutable snapshot or head in place.
-        """
-
-        with self.direct_jobs.exclusive(request_id) as direct_lock:
-            head = self.direct_jobs.read_head(request_id)
-            if head is None:
-                raise DirectJobStoreError("Direct Generation request does not exist")
-            if head.status != "running" or head.result_ref is not None:
-                raise DirectJobResumeRequiredError(
-                    "only an abandoned running Direct Generation can be cancelled"
-                )
-            if self._registry_release_for_direct_job(head.job_ref) is not None:
-                raise DirectJobStoreError(
-                    "a Registry release exists; abandoned cancellation cannot supersede it"
-                )
-
-            request = self.artifacts.get_json(head.request_ref, EnvironmentRequest)
-            job = self.artifacts.get_json(head.job_ref, EnvironmentJob)
-            snapshot = self.artifacts.get_json(head.snapshot_ref, JobRunSnapshot)
-            self.artifacts.require_exact_json(
-                head.request_ref,
-                request,
-                artifact_types=("control.environment_request",),
-            )
-            self.artifacts.require_exact_json(
-                head.job_ref,
-                job,
-                artifact_types=("control.environment_job",),
-            )
-            self.artifacts.require_exact_json(
-                head.snapshot_ref,
-                snapshot,
-                artifact_types=("control.job_run_snapshot",),
-            )
-            if (
-                request.request_id != request_id
-                or job.kind != "generate"
-                or job.request_ref != head.request_ref
-                or snapshot.run_id != head.run_id
-                or snapshot.job_ref != head.job_ref
-                or snapshot.revision != head.snapshot_revision
-                or snapshot.status != "running"
-            ):
-                raise DirectJobStoreError(
-                    "abandoned Direct Generation head differs from its immutable inputs"
-                )
-
-            run = self._restore_direct_run(head, snapshot, direct_lock)
-            failure_code = "operator_cancelled"
-            failure_summary = (
-                "Direct Generation was explicitly cancelled after its owning process exited."
-            )
-            latest_lease_refs = {
-                ref.artifact_id: ref
-                for ref in snapshot.latest_artifact_refs
-                if ref.artifact_type == "control.budget_lease"
-                and ref.artifact_id.startswith(f"{run.run_id}:budget-lease:")
-            }
-            abandoned_usage_by_owner: dict[str, BudgetUsage] = {}
-            for lease_ref in latest_lease_refs.values():
-                lease = self.artifacts.get_json(lease_ref, BudgetLease)
-                if lease.status != "active":
-                    continue
-                lease_ledger = LeaseBudgetLedger(lease.reserved, leases=(lease,))
-                unknown = self._budget_as_usage(lease.reserved).model_copy(
-                    update={"wall_seconds": 0.0}
-                )
-                terminal_lease = lease_ledger.settle(
-                    lease.lease_id,
-                    BudgetUsage(),
-                    unknown_upper_bound=unknown,
-                )
-                run.ledger.consume_uncertain(
-                    observed_actual=terminal_lease.observed_actual,
-                    unknown_upper_bound=terminal_lease.unknown_upper_bound,
-                )
-                terminal_ref = self._persist_budget_lease(
-                    run,
-                    terminal_lease,
-                    previous_ref=lease_ref,
-                )
-                run.remember(terminal_ref)
-                abandoned_usage_by_owner[lease.owner_id] = self._add_usage(
-                    abandoned_usage_by_owner.get(lease.owner_id, BudgetUsage()),
-                    terminal_lease.conservative_committed,
-                )
-            for attempt in tuple(run.attempts):
-                if attempt.status == "running":
-                    self._finish_attempt(
-                        run,
-                        attempt.attempt_id,
-                        status="failed",
-                        failure_code=failure_code,
-                        failure_summary=failure_summary,
-                        usage=abandoned_usage_by_owner.get(
-                            attempt.attempt_id,
-                            attempt.budget_usage,
-                        ),
-                    )
-            final_snapshot_ref = await self._persist_snapshot(
-                run,
-                status="failed",
-                failure_code=failure_code,
-                failure_summary=failure_summary,
-            )
-            self.artifacts.record_event(
-                event_type="generation_cancelled_by_operator",
-                subject_ref=final_snapshot_ref,
-                related_refs=(head.snapshot_ref, head.job_ref),
-                reason_code=failure_code,
-            )
-            final_snapshot = self.artifacts.get_json(
-                final_snapshot_ref,
-                JobRunSnapshot,
-            )
-            if run.direct_head is None:
-                raise DirectJobStoreError("cancelled Direct Generation lost its durable head")
-            result = self._direct_failure_result_from_snapshot(
-                head=run.direct_head,
-                snapshot=final_snapshot,
-            )
-            self._complete_direct_result(run, result)
-            return result
 
     async def _generate_new_locked(
         self,
@@ -969,7 +843,6 @@ class FoundryController:
             job=job,
             job_ref=job_ref,
             request_ref=request_ref,
-            phase_checkpoint_ref=None,
             recovered_design=None,
             prior_head=None,
         )
@@ -985,473 +858,363 @@ class FoundryController:
         job: EnvironmentJob,
         job_ref: ArtifactRef,
         request_ref: ArtifactRef,
-        phase_checkpoint_ref: ArtifactRef | None,
         recovered_design: _RecoveredDesignCheckpoint | None,
         prior_head: DirectJobHead | None,
     ) -> GenerateResult:
-        selected_budget = request.budget
-        selected_request_id = request.request_id
-        run_id = f"run:{uuid.uuid4().hex}"
-        run = _RunState(
-            run_id=run_id,
+        # Direct Generation has one executable success path: the durable
+        # three-epoch WorkGraph runner.  DirectJobStore is only its idempotent
+        # result index; it no longer owns component-local orchestration.
+        return await self._execute_scheduler_direct_locked(
+            request=request,
+            request_fingerprint=request_fingerprint,
+            direct_lock=direct_lock,
+            job=job,
             job_ref=job_ref,
-            ledger=BudgetLedger(selected_budget),
-            direct_request_id=selected_request_id,
+            request_ref=request_ref,
+            prior_head=prior_head,
+        )
+
+    async def _execute_scheduler_direct_locked(
+        self,
+        *,
+        request: EnvironmentRequest,
+        request_fingerprint: str,
+        direct_lock: DirectJobLock,
+        job: EnvironmentJob,
+        job_ref: ArtifactRef,
+        request_ref: ArtifactRef,
+        prior_head: DirectJobHead | None,
+    ) -> GenerateResult:
+        """Project the Scheduler terminal state into the durable public result.
+
+        ``DirectJobStore`` remains an idempotency/result index, not a second
+        workflow engine: research, design, build, verifier, repair and release
+        all occur exclusively under :class:`DirectWorkRunner`.
+        """
+
+        # This is a deterministic admission decision, not a shortened Direct
+        # path: with no wall capacity the framework must create one durable
+        # terminal result before requiring telemetry, a Runner, or any Agent
+        # capability.  It prevents a misconfigured executor from obscuring
+        # the more fundamental guarantee that no model/tool work was started.
+        if request.budget.wall_seconds <= 0:
+            run = _RunState(
+                run_id=f"run:{uuid.uuid4().hex}",
+                job_ref=job_ref,
+                ledger=BudgetLedger(request.budget),
+                direct_request_id=request.request_id,
+                direct_request_fingerprint=request_fingerprint,
+                direct_request_ref=request_ref,
+                direct_lock=direct_lock,
+                direct_head=prior_head,
+                allow_direct_restart=prior_head is not None,
+            )
+            run.remember(request_ref, job_ref)
+            # DirectJobStore deliberately requires an initial running revision
+            # before any terminal projection, even when deterministic admission
+            # prevents the first executable operation.
+            await self._persist_snapshot(run, status="running")
+            snapshot_ref = await self._persist_snapshot(
+                run,
+                status="budget_exhausted",
+                failure_code="wall_budget_missing",
+                failure_summary=(
+                    "Direct Generation has no positive wall-time budget; no Agent, tool, "
+                    "build, or Judge operation was dispatched."
+                ),
+            )
+            result = GenerateResult(
+                run_id=run.run_id,
+                status="budget_exhausted",
+                request_ref=request_ref,
+                job_ref=job_ref,
+                final_snapshot_ref=snapshot_ref,
+                failure_code="wall_budget_missing",
+                failure_summary=(
+                    "Direct Generation has no positive wall-time budget; no Agent, tool, "
+                    "build, or Judge operation was dispatched."
+                ),
+            )
+            self._complete_direct_result(run, result)
+            return result
+        if self.direct_work_runner is None:
+            raise DirectJobStoreError("Direct WorkGraph requires configured telemetry")
+        run = _RunState(
+            run_id=f"run:{uuid.uuid4().hex}",
+            job_ref=job_ref,
+            ledger=BudgetLedger(request.budget),
+            direct_request_id=request.request_id,
             direct_request_fingerprint=request_fingerprint,
             direct_request_ref=request_ref,
             direct_lock=direct_lock,
             direct_head=prior_head,
             allow_direct_restart=prior_head is not None,
         )
-        if self.telemetry is not None:
-            run.telemetry_root_span = self.telemetry.start_span(
-                trace_id=run_id,
-                component="controller",
-                operation="direct.generate",
-                run_id=run_id,
-                node="request",
-                input_refs=(request_ref, job_ref),
-                attributes={
-                    "request_id_hash": self._hashed_session(selected_request_id),
-                    "release_profile": request.release_profile.profile_id,
-                    "discovery_enabled": enable_discovery,
-                },
-            )
-            self.telemetry.activate_trace(
-                trace_id=run_id,
-                run_id=run_id,
-                parent_span_id=run.telemetry_root_span.span_id,
-            )
         run.remember(request_ref, job_ref)
-        if phase_checkpoint_ref is not None:
-            run.remember(phase_checkpoint_ref)
-        if prior_head is not None and prior_head.result_ref is not None:
-            run.remember(prior_head.result_ref)
-        request_attempt = self._start_attempt(run, "request", (request_ref,))
-        self._finish_attempt(run, request_attempt, status="passed", output_refs=(job_ref,))
+        context_ref = self._scheduler_context_for(
+            job=job,
+            job_ref=job_ref,
+            request=request,
+            request_ref=request_ref,
+            prior_head=prior_head,
+        )
+        run.remember(context_ref)
         await self._persist_snapshot(run, status="running")
         self.artifacts.record_event(
             event_type="generation_started",
             subject_ref=job_ref,
-            related_refs=(request_ref,),
-            details=(KeyValue(key="run_id", value=run_id),),
+            related_refs=(request_ref, context_ref),
+            details=(KeyValue(key="engine", value="scheduler-workgraph"),),
+        )
+        try:
+            outcome = await self.direct_work_runner.run(
+                context_ref=context_ref,
+                run_id=run.run_id,
+            )
+        except Exception as exc:
+            return await self._project_scheduler_execution_error(
+                run=run,
+                request_ref=request_ref,
+                job_ref=job_ref,
+                error=exc,
+            )
+        return await self._project_scheduler_outcome(
+            run=run,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            outcome=outcome,
         )
 
-        lane: _DiscoveryLane | None = None
-        reservation: PackageVersionReservation | None = None
-        started = time.monotonic()
-        try:
-            if selected_budget.wall_seconds <= 0:
-                raise _GenerationHalt(
-                    status="budget_exhausted",
-                    code="wall_budget_missing",
-                    summary="Direct Generation requires a positive wall-time budget.",
-                )
-            if enable_discovery:
-                try:
-                    lane = await self._start_discovery(
-                        run=run,
-                        job=job,
-                        job_ref=job_ref,
-                        request=request,
-                        request_ref=request_ref,
-                        budget=selected_discovery_budget,
-                    )
-                except Exception as exc:
-                    # Discovery is an optional coverage lane.  Failure to start
-                    # it is durable evidence, never a Direct Generation gate.
-                    failure_ref = self.artifacts.put_json(
-                        artifact_id=f"{run.run_id}:discovery-start-failure",
-                        artifact_type="control.failure_evidence",
-                        value={
-                            "run_id": run.run_id,
-                            "node": "discovery",
-                            "failure_code": "discovery_start_failed",
-                            "error_type": self._safe_identifier(type(exc).__name__),
-                        },
-                        dependencies=(job_ref,),
-                    )
-                    run.remember(failure_ref)
-                    self._finish_discovery_attempt(
-                        run,
-                        status="failed",
-                        output_refs=(failure_ref,),
-                        failure_code="discovery_start_failed",
-                    )
-                    self.artifacts.record_event(
-                        event_type="discovery_not_started",
-                        subject_ref=failure_ref,
-                        related_refs=(job_ref,),
-                        reason_code="discovery_start_failed",
-                    )
-                    await self._persist_snapshot(run, status="running")
-            async with asyncio.timeout(selected_budget.wall_seconds):
-                if recovered_design is None:
-                    design = await self._run_design(
-                        run=run,
-                        job=job,
-                        job_ref=job_ref,
-                        request=request,
-                        request_ref=request_ref,
-                        phase_checkpoint_ref=phase_checkpoint_ref,
-                    )
-                else:
-                    if prior_head is None:
-                        raise DirectJobStoreError(
-                            "complete Design checkpoint adoption requires its prior snapshot"
-                        )
-                    design = recovered_design.bundle
-                    recovered_outputs = (
-                        design.evidence_graph_ref,
-                        design.coverage_map_ref,
-                        design.world_spec_ref,
-                        design.design_ref,
-                        design.baseline_ref,
-                        recovered_design.modeling_gate_ref,
-                    )
-                    checkpoint_input_ref = prior_head.snapshot_ref
-                    design_attempt = self._start_attempt(
-                        run,
-                        "design",
-                        (checkpoint_input_ref,),
-                    )
-                    run.remember(*recovered_outputs)
-                    self._finish_attempt(
-                        run,
-                        design_attempt,
-                        status="passed",
-                        output_refs=recovered_outputs,
-                        usage=BudgetUsage(),
-                    )
-                    await self._persist_snapshot(run, status="running")
-                    self.artifacts.record_event(
-                        event_type="generation_checkpoint_adopted",
-                        subject_ref=design.design_ref,
-                        related_refs=(
-                            recovered_design.modeling_gate_ref,
-                            checkpoint_input_ref,
-                        ),
-                        reason_code="exact_design_checkpoint",
-                    )
-                    self.designer.research.record_checkpoint_reuse(
-                        checkpoint_ref=checkpoint_input_ref,
-                        evidence_graph_ref=design.evidence_graph_ref,
-                    )
-                    run.research_checkpoint_reuse = (
-                        checkpoint_input_ref,
-                        design.evidence_graph_ref,
-                    )
-                while True:
-                    try:
-                        if lane is not None:
-                            await self._poll_discovery(run, lane, design)
+    async def _recover_abandoned_scheduler_direct_locked(
+        self,
+        *,
+        head: DirectJobHead,
+        request: EnvironmentRequest,
+        job: EnvironmentJob,
+        snapshot: JobRunSnapshot,
+        direct_lock: DirectJobLock,
+    ) -> GenerateResult:
+        """Resume one durable Scheduler graph after the Direct owner lock is reacquired.
 
-                        release_plan = self._prepare_direct_release_plan(
-                            run=run,
-                            job=job,
-                            request=request,
-                            design=design,
-                        )
-                        run.remember(
-                            release_plan.identity_ref,
-                            release_plan.semantic_lineage_ref,
-                            release_plan.evidence_summary_ref,
-                        )
-                        reservation = self._reserve_release_coordinate(
-                            run=run,
-                            package_id=release_plan.package_id,
-                            version=release_plan.version,
-                        )
-                        allow_build_recovery = True
-                        if prior_head is not None and prior_head.result_ref is not None:
-                            prior_result = self.artifacts.get_json(
-                                prior_head.result_ref,
-                                GenerateResult,
-                            )
-                            self.artifacts.require_exact_json(
-                                prior_head.result_ref,
-                                prior_result,
-                                artifact_types=("control.generate_result",),
-                            )
-                            allow_build_recovery = (
-                                prior_result.failure_code
-                                != "recovered_build_requires_fresh_codegen"
-                            )
-                        recovered_build = (
-                            self.builder.recover_committed_candidate(
-                                design=design.design,
-                                design_ref=design.design_ref,
-                                workspace=self._workspace_for(
-                                    run.run_id,
-                                    "builder-recovery",
-                                ),
-                            )
-                            if allow_build_recovery
-                            else None
-                        )
-                        compiled, build = await self._compile_and_build(
-                            run,
-                            job,
-                            design,
-                            recovered_build=recovered_build,
-                        )
-                        if lane is not None:
-                            await self._poll_discovery(run, lane, design)
-                        judge_bundle, build = await self._judge_and_repair(
-                            run=run,
-                            job=job,
-                            design=design,
-                            compiled=compiled,
-                            build=build,
-                        )
-                        if lane is not None:
-                            self._freeze_discovery_for_release(run, lane, design)
+        The caller's lock establishes that no Controller still owns the Direct
+        run.  Scheduler reconciliation then settles any persisted OperationRun
+        before normal wave scheduling.  This is intentionally not the old
+        snapshot-only cancellation path: the WorkGraph owns operation cost,
+        replay authority, and the resulting terminal coordinate.
+        """
 
-                        break
-                    except _DesignReworkRequired as correction:
-                        if reservation is not None:
-                            self._release_reservation_if_active(reservation, run.job_ref)
-                            reservation = None
-                        design = await self._run_direct_design_revision(
-                            run=run,
-                            job=job,
-                            job_ref=job_ref,
-                            request=request,
-                            request_ref=request_ref,
-                            previous=design,
-                            correction=correction,
-                        )
-
-                self._charge_wall(run, started)
-                manifest_ref, release_ref, release = self._release(
-                    run=run,
-                    job=job,
-                    design=design,
-                    build=build,
-                    judge_bundle=judge_bundle,
-                    plan=release_plan,
-                    reservation=reservation,
-                )
-                if run.telemetry_root_span is not None and self.telemetry is not None:
-                    self._close_open_telemetry_spans(run, error_code="controller_terminal")
-                    run.telemetry_root_span.finish(
-                        status="passed",
-                        output_refs=(manifest_ref, release_ref),
-                    )
-                    self.telemetry.flush()
-                    run.remember(
-                        self._ensure_final_telemetry_summary(
-                            run,
-                            dependencies=(manifest_ref, release_ref),
-                        )
-                    )
-                final_snapshot_ref = await self._persist_snapshot(
-                    run,
-                    status="released",
-                    release_ref=release_ref,
-                )
-                self.artifacts.record_event(
-                    event_type="generation_released",
-                    subject_ref=final_snapshot_ref,
-                    related_refs=(manifest_ref, release_ref),
-                )
-                result = GenerateResult(
-                    run_id=run_id,
-                    status="released",
-                    request_ref=request_ref,
-                    job_ref=job_ref,
-                    final_snapshot_ref=final_snapshot_ref,
-                    discovery_run_ref=lane.spec_ref if lane else None,
-                    discovery_state_ref=lane.state_ref if lane else None,
-                    expansion_inbox_ref=(
-                        lane.admission.inbox_ref if lane and lane.admission else None
-                    ),
-                    finding_refs=tuple(run.findings.values()),
-                    package_manifest_ref=manifest_ref,
-                    release_ref=release_ref,
-                    release=release,
-                )
-                self._complete_direct_result(run, result)
-                return result
-        except TimeoutError:
-            halt = _GenerationHalt(
-                status="budget_exhausted",
-                code="generation_wall_timeout",
-                summary="Direct Generation reached its wall-time budget before release.",
-            )
-        except BudgetExceeded as exc:
-            halt = _GenerationHalt(
-                status="budget_exhausted",
-                code="generation_budget_exhausted",
-                summary=(
-                    f"Direct Generation exhausted budget dimensions: {', '.join(exc.dimensions)}."
-                ),
-            )
-        except _GenerationHalt as exc:
-            halt = exc
-        except asyncio.CancelledError:
-            if lane is not None:
-                await self._defer_discovery(run, lane, reason="generation_cancelled")
-            await self._persist_snapshot(
-                run,
-                status="failed",
-                failure_code="generation_cancelled",
-                failure_summary="Direct Generation was cancelled before release.",
-            )
-            if run.telemetry_root_span is not None and self.telemetry is not None:
-                self._close_open_telemetry_spans(run, error_code="generation_cancelled")
-                run.telemetry_root_span.finish(
-                    status="cancelled",
-                    error_code="generation_cancelled",
-                )
-                self.telemetry.flush()
-            raise
-        except DirectJobStoreError as exc:
-            # Registry publish is the irreversible commit point.  Even a Direct
-            # head CAS/fsync failure after that point must converge to Registry
-            # truth instead of escaping as an unpublished control-plane error.
-            committed_release = self._registry_release_for_direct_job(run.job_ref)
-            if committed_release is not None and run.direct_head is not None:
-                if run.telemetry_root_span is not None and self.telemetry is not None:
-                    self._close_open_telemetry_spans(
-                        run,
-                        error_code="post_publish_reconciliation",
-                    )
-                    if not run.telemetry_root_span.closed:
-                        run.telemetry_root_span.finish(
-                            status="error",
-                            error_code="post_publish_reconciliation",
-                        )
-                    self.telemetry.flush()
-                durable_snapshot = self.artifacts.get_json(
-                    run.direct_head.snapshot_ref,
-                    JobRunSnapshot,
-                )
-                recovered = await self._recover_direct_release(
-                    head=run.direct_head,
-                    snapshot=durable_snapshot,
-                    release=committed_release,
-                    direct_lock=direct_lock,
-                )
-                self.artifacts.record_event(
-                    event_type="generation_reconciled_after_publish_error",
-                    subject_ref=recovered.final_snapshot_ref,
-                    related_refs=(committed_release.manifest_ref,),
-                    reason_code="post_publish_reconciliation",
-                    details=(KeyValue(key="error_type", value=type(exc).__name__),),
-                )
-                return recovered
-            if run.telemetry_root_span is not None and self.telemetry is not None:
-                self._close_open_telemetry_spans(run, error_code="direct_job_store_error")
-                if not run.telemetry_root_span.closed:
-                    run.telemetry_root_span.finish(
-                        status="error",
-                        error_code="direct_job_store_error",
-                    )
-                self.telemetry.flush()
-            raise
-        except Exception as exc:  # A programming/infrastructure failure is not a package.
-            committed_release = self._registry_release_for_direct_job(run.job_ref)
-            if committed_release is not None and run.direct_head is not None:
-                if run.telemetry_root_span is not None and self.telemetry is not None:
-                    self._close_open_telemetry_spans(
-                        run,
-                        error_code="post_publish_reconciliation",
-                    )
-                    if not run.telemetry_root_span.closed:
-                        run.telemetry_root_span.finish(
-                            status="error",
-                            error_code="post_publish_reconciliation",
-                        )
-                    self.telemetry.flush()
-                durable_snapshot = self.artifacts.get_json(
-                    run.direct_head.snapshot_ref,
-                    JobRunSnapshot,
-                )
-                recovered = await self._recover_direct_release(
-                    head=run.direct_head,
-                    snapshot=durable_snapshot,
-                    release=committed_release,
-                    direct_lock=direct_lock,
-                )
-                self.artifacts.record_event(
-                    event_type="generation_reconciled_after_publish_error",
-                    subject_ref=recovered.final_snapshot_ref,
-                    related_refs=(committed_release.manifest_ref,),
-                    reason_code="post_publish_reconciliation",
-                    details=(KeyValue(key="error_type", value=type(exc).__name__),),
-                )
-                return recovered
-            if run.direct_head is not None and run.direct_head.status != "running":
+        if self.direct_work_runner is None:
+            # A historical snapshot can prove that an Agent already ran but
+            # cannot prove a Scheduler graph/OperationRun closure.  Such work
+            # is non-replayable: treating the missing control plane as an
+            # invitation to reissue the prompt would double-spend real model
+            # work and falsify idempotency.  This guard is deliberately before
+            # the telemetry configuration error so old stores fail closed with
+            # their actual safety reason.
+            consumed = snapshot.observed_actual_budget.model_dump()
+            unknown = snapshot.unknown_upper_bound_budget.model_dump()
+            if any(value != 0 for value in (*consumed.values(), *unknown.values())):
                 raise DirectJobResumeRequiredError(
-                    "Direct Generation reached a terminal checkpoint but result finalization "
-                    "was interrupted; retry the identical request-id for recovery"
-                ) from exc
-            finding_ref = self._control_failure_finding(
-                run,
-                node="release",
-                event_kind=ControlEventKind.RELEASE_POLICY_FAILURE,
-                code="unexpected_controller_failure",
-                error_type=type(exc).__name__,
-                exception=exc,
+                    "durable Direct Generation checkpoint contains possibly consumed "
+                    "Agent/tool work; the framework will not replay it without a "
+                    "recoverable Scheduler operation closure"
+                )
+            raise DirectJobStoreError("Direct WorkGraph requires configured telemetry")
+        run = self._restore_direct_run(head, snapshot, direct_lock)
+        context_ref = self._scheduler_context_for(
+            job=job,
+            job_ref=head.job_ref,
+            request=request,
+            request_ref=head.request_ref,
+            prior_head=head,
+        )
+        run.remember(context_ref)
+        self.artifacts.record_event(
+            event_type="generation_scheduler_recovery_started",
+            subject_ref=head.snapshot_ref,
+            related_refs=(head.request_ref, head.job_ref, context_ref),
+            details=(KeyValue(key="run_id", value=head.run_id),),
+        )
+        try:
+            outcome = await self.direct_work_runner.run(
+                context_ref=context_ref,
+                run_id=run.run_id,
+                recovering=True,
             )
-            halt = _GenerationHalt(
-                status="failed",
-                code="unexpected_controller_failure",
-                summary=f"Controller stopped without release ({type(exc).__name__}).",
-                finding_refs=(finding_ref,),
+        except Exception as exc:
+            return await self._project_scheduler_execution_error(
+                run=run,
+                request_ref=head.request_ref,
+                job_ref=head.job_ref,
+                error=exc,
             )
+        return await self._project_scheduler_outcome(
+            run=run,
+            request_ref=head.request_ref,
+            job_ref=head.job_ref,
+            outcome=outcome,
+        )
 
-        if lane is not None:
-            await self._defer_discovery(run, lane, reason=halt.code)
-        if reservation is not None:
-            self._release_reservation_if_active(reservation, run.job_ref)
-        run.remember_findings(*halt.finding_refs)
-        self._charge_wall(run, started, clamp=True)
+    async def _project_scheduler_execution_error(
+        self,
+        *,
+        run: _RunState,
+        request_ref: ArtifactRef,
+        job_ref: ArtifactRef,
+        error: Exception,
+    ) -> GenerateResult:
+        """Persist a Scheduler infrastructure failure without inventing semantic repair."""
+
+        if isinstance(error, WorkExecutorMissingError):
+            failure_code = "scheduler_executor_missing"
+            summary = str(error)
+        else:
+            failure_code = "scheduler_direct_execution_error"
+            summary = f"Scheduler Direct execution stopped ({type(error).__name__})."
         final_snapshot_ref = await self._persist_snapshot(
             run,
-            status=halt.status,
-            failure_code=halt.code,
-            failure_summary=halt.summary,
-        )
-        self.artifacts.record_event(
-            event_type="generation_terminal",
-            subject_ref=final_snapshot_ref,
-            related_refs=tuple(halt.finding_refs),
-            reason_code=halt.code,
-            details=(KeyValue(key="status", value=halt.status),),
+            status="failed",
+            failure_code=failure_code,
+            failure_summary=summary,
         )
         result = GenerateResult(
-            run_id=run_id,
-            status=halt.status,
+            run_id=run.run_id,
+            status="failed",
             request_ref=request_ref,
             job_ref=job_ref,
             final_snapshot_ref=final_snapshot_ref,
-            discovery_run_ref=lane.spec_ref if lane else None,
-            discovery_state_ref=lane.state_ref if lane else None,
-            expansion_inbox_ref=lane.admission.inbox_ref if lane and lane.admission else None,
-            finding_refs=tuple(run.findings.values()),
-            failure_code=halt.code,
-            failure_summary=halt.summary,
+            failure_code=failure_code,
+            failure_summary=summary,
         )
         self._complete_direct_result(run, result)
-        if run.telemetry_root_span is not None and self.telemetry is not None:
-            self._close_open_telemetry_spans(run, error_code=halt.code)
-            telemetry_status = cast(
-                Literal["failed", "needs_human", "budget_exhausted"],
-                {
-                    "failed": "failed",
-                    "needs_human": "needs_human",
-                    "budget_exhausted": "budget_exhausted",
-                }[halt.status],
-            )
-            run.telemetry_root_span.finish(
-                status=telemetry_status,
-                error_code=halt.code,
-                output_refs=(final_snapshot_ref,),
-            )
-            self.telemetry.flush()
         return result
+
+    async def _project_scheduler_outcome(
+        self,
+        *,
+        run: _RunState,
+        request_ref: ArtifactRef,
+        job_ref: ArtifactRef,
+        outcome: DirectWorkRun,
+    ) -> GenerateResult:
+        """Project one already-terminal Scheduler outcome into DirectJob state."""
+
+        try:
+            run.ledger.consume_uncertain(
+                observed_actual=outcome.observed_actual,
+                unknown_upper_bound=outcome.unknown_upper_bound,
+            )
+        except BudgetExceeded as exc:
+            raise DirectJobStoreError(
+                "Scheduler outcome exceeds the DirectJob budget authority"
+            ) from exc
+
+        if outcome.status == "released":
+            if outcome.package_manifest_ref is None or outcome.release_ref is None:
+                raise DirectJobStoreError("released Scheduler outcome lacks Registry closure")
+            release = self.artifacts.get_json(outcome.release_ref, ReleaseRecord)
+            run.remember(
+                outcome.bootstrap_epoch_ref,
+                *(
+                    (outcome.design_epoch_ref,)
+                    if outcome.design_epoch_ref is not None
+                    else ()
+                ),
+                *(
+                    (outcome.final_epoch_ref,)
+                    if outcome.final_epoch_ref is not None
+                    else ()
+                ),
+                outcome.package_manifest_ref,
+                outcome.release_ref,
+            )
+            final_snapshot_ref = await self._persist_snapshot(
+                run,
+                status="released",
+                release_ref=outcome.release_ref,
+            )
+            result = GenerateResult(
+                run_id=run.run_id,
+                status="released",
+                request_ref=request_ref,
+                job_ref=job_ref,
+                final_snapshot_ref=final_snapshot_ref,
+                package_manifest_ref=outcome.package_manifest_ref,
+                release_ref=outcome.release_ref,
+                release=release,
+            )
+            self._complete_direct_result(run, result)
+            return result
+        blocked = ", ".join(outcome.blocked_coordinates) or "unknown scheduler coordinate"
+        run.remember(
+            outcome.bootstrap_epoch_ref,
+            *((outcome.design_epoch_ref,) if outcome.design_epoch_ref is not None else ()),
+            *((outcome.final_epoch_ref,) if outcome.final_epoch_ref is not None else ()),
+        )
+        final_snapshot_ref = await self._persist_snapshot(
+            run,
+            status="failed",
+            failure_code="scheduler_direct_blocked",
+            failure_summary=f"Scheduler Direct stopped at: {blocked}",
+        )
+        result = GenerateResult(
+            run_id=run.run_id,
+            status="failed",
+            request_ref=request_ref,
+            job_ref=job_ref,
+            final_snapshot_ref=final_snapshot_ref,
+            failure_code="scheduler_direct_blocked",
+            failure_summary=f"Scheduler Direct stopped at: {blocked}",
+        )
+        self._complete_direct_result(run, result)
+        return result
+
+    def _scheduler_context_for(
+        self,
+        *,
+        job: EnvironmentJob,
+        job_ref: ArtifactRef,
+        request: EnvironmentRequest,
+        request_ref: ArtifactRef,
+        prior_head: DirectJobHead | None,
+    ) -> ArtifactRef:
+        """Reuse the exact Scheduler root on resume; never fork a shadow graph."""
+
+        if prior_head is not None:
+            snapshot = self.artifacts.get_json(prior_head.snapshot_ref, JobRunSnapshot)
+            contexts = tuple(
+                ref
+                for ref in snapshot.latest_artifact_refs
+                if ref.artifact_type == "control.generation_context"
+            )
+            if len(contexts) == 1:
+                context = self.artifacts.get_json(contexts[0], GenerationContext)
+                if (
+                    context.job_ref == job_ref
+                    and context.request_ref == request_ref
+                    and context.permissions == request.permissions
+                    and context.budget == request.budget
+                    and context.release_profile == request.release_profile
+                ):
+                    return contexts[0]
+            if contexts:
+                raise DirectJobStoreError("resumed Direct job has an incompatible Scheduler root")
+        context = GenerationContext(
+            context_id=f"generation-context:{job.job_id}",
+            job_ref=job_ref,
+            kind="generate",
+            request_ref=request_ref,
+            permissions=request.permissions,
+            budget=request.budget,
+            release_profile=request.release_profile,
+        )
+        return self.artifacts.put_json(
+            artifact_id=context.context_id,
+            artifact_type="control.generation_context",
+            value=context,
+            dependencies=context.root_refs,
+        )
+
 
     async def resume_discovery(
         self,
@@ -2188,7 +1951,9 @@ class FoundryController:
                 exc,
                 default_code=(
                     "framework_invariant_violation"
-                    if exc.framework_invariant or exc.infrastructure_error
+                    if exc.framework_invariant
+                    else "expansion_designer_infrastructure_error"
+                    if exc.infrastructure_error
                     else f"expansion_{self._safe_identifier(exc.stage)}"
                 ),
             )
@@ -2977,9 +2742,7 @@ class FoundryController:
             finding_refs = tuple(
                 item.finding_ref for item in reviews if item.finding_ref is not None
             )
-            reviewed_status: Literal[
-                "quarantine_dismissed", "quarantine_confirmed"
-            ] = (
+            reviewed_status: Literal["quarantine_dismissed", "quarantine_confirmed"] = (
                 "quarantine_confirmed" if finding_refs else "quarantine_dismissed"
             )
             reviewed_state = state.model_copy(
@@ -3156,9 +2919,7 @@ class FoundryController:
                     ),
                     timeout=active_budget.wall_seconds,
                 )
-                invocation_actual, invocation_unknown = self._designer_bundle_settlement(
-                    admission
-                )
+                invocation_actual, invocation_unknown = self._designer_bundle_settlement(admission)
                 ledger.consume_uncertain(
                     observed_actual=invocation_actual,
                     unknown_upper_bound=invocation_unknown,
@@ -3176,13 +2937,9 @@ class FoundryController:
                 )
             review_refs = tuple(item.decision_ref for item in terminal_reviews)
             finding_refs = tuple(
-                item.finding_ref
-                for item in terminal_reviews
-                if item.finding_ref is not None
+                item.finding_ref for item in terminal_reviews if item.finding_ref is not None
             )
-            terminal_status: Literal[
-                "admitted", "quarantine_dismissed", "quarantine_confirmed"
-            ] = (
+            terminal_status: Literal["admitted", "quarantine_dismissed", "quarantine_confirmed"] = (
                 "quarantine_confirmed"
                 if finding_refs
                 else "quarantine_dismissed"
@@ -3876,9 +3633,7 @@ class FoundryController:
         if lane.admission_task is not None and lane.admission_task.done():
             try:
                 admission = lane.admission_task.result()
-                invocation_actual, invocation_unknown = self._designer_bundle_settlement(
-                    admission
-                )
+                invocation_actual, invocation_unknown = self._designer_bundle_settlement(admission)
                 lane.ledger.consume_uncertain(
                     observed_actual=invocation_actual,
                     unknown_upper_bound=invocation_unknown,
@@ -4049,9 +3804,7 @@ class FoundryController:
         finding_refs = tuple(item[1] for item in finding_pairs)
         run.remember_findings(*finding_refs)
         validated_revisions = {
-            ref.revision_id
-            for item in reviews
-            for ref in item.decision.validated_evidence_refs
+            ref.revision_id for item in reviews for ref in item.decision.validated_evidence_refs
         }
         additional_evidence = tuple(
             evidence
@@ -4132,13 +3885,9 @@ class FoundryController:
             clue_refs=lane.bundle.clue_refs,
             admission_decision_refs=lane.admission.decision_refs,
             recommendation_refs=lane.admission.recommendation_refs,
-            quarantine_review_refs=tuple(
-                item.decision_ref for item in lane.quarantine_reviews
-            ),
+            quarantine_review_refs=tuple(item.decision_ref for item in lane.quarantine_reviews),
             finding_refs=tuple(
-                item.finding_ref
-                for item in lane.quarantine_reviews
-                if item.finding_ref is not None
+                item.finding_ref for item in lane.quarantine_reviews if item.finding_ref is not None
             ),
             inbox_ref=lane.admission.inbox_ref,
         )
@@ -4196,9 +3945,7 @@ class FoundryController:
                             if exc.budget_usage is not None
                             else self._budget_as_usage(lane.invocation_budget)
                         )
-                        lane.ledger.consume(
-                            self._add_usage(invocation_usage, exc.research_usage)
-                        )
+                        lane.ledger.consume(self._add_usage(invocation_usage, exc.research_usage))
                 else:
                     lane.ledger.consume(self._budget_as_usage(lane.invocation_budget))
                 lane.discovery_accounted = True
@@ -4428,37 +4175,12 @@ class FoundryController:
         job_ref: ArtifactRef,
         request: EnvironmentRequest,
         request_ref: ArtifactRef,
-        phase_checkpoint_ref: ArtifactRef | None = None,
     ) -> DesignBundle:
-        resumed = phase_checkpoint_ref is not None
-        checkpoint_phase: Literal["evidence_graph", "world_skeleton"] | None = None
-        if phase_checkpoint_ref is not None:
-            checkpoint = self.artifacts.get_json(
-                phase_checkpoint_ref,
-                DesignPhaseCheckpoint,
-            )
-            self.artifacts.require_exact_json(
-                phase_checkpoint_ref,
-                checkpoint,
-                artifact_types=("design.phase_checkpoint",),
-            )
-            checkpoint_phase = checkpoint.phase
-        if checkpoint_phase == "world_skeleton":
-            raise DirectJobStoreError(
-                "world_skeleton belongs to the retired microsharded Designer ABI"
-            )
-        if checkpoint_phase == "evidence_graph":
-            base_turns = DIRECT_DESIGN_EVIDENCE_BASE_TURNS
-        else:
-            base_turns = DIRECT_DESIGN_BASE_TURNS
         work = self._reserve_designer_work(
             run,
-            purpose="direct-design-resume" if resumed else "direct-design",
-            base_turns=base_turns,
-            maximum_corrections=min(
-                DIRECT_DESIGN_MAX_CORRECTIONS,
-                self.designer.maximum_structured_reworks,
-            ),
+            purpose="direct-design",
+            base_turns=DIRECT_DESIGN_BASE_TURNS,
+            maximum_corrections=job.budget.repair_attempts,
             controller_owns_structured_repairs=True,
         )
         attempt_id = self._start_attempt(
@@ -4467,7 +4189,6 @@ class FoundryController:
             (
                 job_ref,
                 request_ref,
-                *((phase_checkpoint_ref,) if phase_checkpoint_ref else ()),
                 work.lease_ref,
             ),
         )
@@ -4475,31 +4196,26 @@ class FoundryController:
         work_settled = False
         settled_invocation_usage = BudgetUsage()
         try:
-            if phase_checkpoint_ref is None:
-                bundle = await self.designer.generate(
-                    job=job,
-                    job_ref=job_ref,
-                    request=request,
-                    request_ref=request_ref,
-                    workspace=self._workspace_for(run.run_id, "design"),
-                    invocation_budget=work.lease.reserved,
-                    repair_authority=self._structured_repair_authority(run),
-                )
-            else:
-                bundle = await self.designer.resume_from_phase_checkpoint(
-                    job=job,
-                    job_ref=job_ref,
-                    request=request,
-                    request_ref=request_ref,
-                    phase_checkpoint_ref=phase_checkpoint_ref,
-                    workspace=self._workspace_for(run.run_id, "design-resume"),
-                    invocation_budget=work.lease.reserved,
-                    repair_authority=self._structured_repair_authority(run),
-                )
-                run.research_checkpoint_reuse = (
-                    phase_checkpoint_ref,
-                    bundle.evidence_graph_ref,
-                )
+            work_runtime = WorkControlRuntime(
+                artifacts=self.artifacts,
+                heads=self.work_control,
+                budget=restore_work_budget_ledger(
+                    self.artifacts,
+                    reserved=work.lease.reserved,
+                    scope_id=job.job_id,
+                ),
+                continuations=NodeContinuationStore(self.work_control.root / "continuations"),
+                continuation_workspace_root=self.config.state_root / "runs",
+            )
+            bundle = await self.designer.generate(
+                job=job,
+                job_ref=job_ref,
+                request=request,
+                request_ref=request_ref,
+                workspace=self._workspace_for(run.run_id, "design"),
+                invocation_budget=work.lease.reserved,
+                work_runtime=work_runtime,
+            )
             invocation_actual, invocation_unknown = self._designer_bundle_settlement(bundle)
             self._settle_designer_work(
                 run,
@@ -4517,6 +4233,89 @@ class FoundryController:
                 design=bundle,
             )
             run.remember(modeling_gate_ref)
+            pre_boundary_graph = GenerationWorkGraph.compile(
+                work_runtime.definitions,
+                # Legacy Direct orchestration has not been replaced by the
+                # Scheduler-owned full vertical graph.  Its Design checkpoint
+                # remains useful diagnostic evidence, but must never be
+                # represented as a production/release topology.
+                mode="diagnostic",
+            )
+            modeling_definition = deterministic_boundary_work_definition(
+                scope_id=job.job_id,
+                component="design",
+                stage="modeling_boundary",
+                artifact_slot="environment_design",
+                dependency_coordinates=pre_boundary_graph.required_terminal_coordinates,
+                claim_id="design.modeling_boundary.passed",
+                claim=(
+                    "The exact design satisfies release-profile risk, evidence, coverage, "
+                    "and unresolved-assumption policy."
+                ),
+                timing_reason="Builder and Verifier may consume only a policy-closed design.",
+                effect="block_compile",
+                success_maturity="modeling_closed",
+            )
+            final_design_refs = (
+                bundle.evidence_graph_ref,
+                bundle.coverage_map_ref,
+                bundle.world_spec_ref,
+                bundle.design_ref,
+                bundle.baseline_ref,
+            )
+            modeling_head = work_runtime.execute_deterministic_boundary(
+                definition=modeling_definition,
+                input_refs=final_design_refs,
+                # The modeling Claim validates the exact Design revision.  The
+                # Gate is causal evidence, not the object downstream Builder and
+                # Verifier consume; WorkCommit.consumer_refs therefore exposes
+                # the Design as its validated subject and keeps the Gate only as
+                # new validation evidence.
+                subject_ref=bundle.design_ref,
+                output_refs=(modeling_gate_ref,),
+                issues=tuple(
+                    (
+                        self._safe_identifier(failure),
+                        ("modeling_boundary", index),
+                        failure,
+                        "a release-profile modeling condition that passes",
+                    )
+                    for index, failure in enumerate(policy_failures)
+                ),
+            )
+            graph = GenerationWorkGraph.compile(
+                work_runtime.definitions,
+                mode="diagnostic",
+                required_terminal_coordinates=(modeling_definition.coordinate,),
+            )
+            manifest = graph.manifest(
+                topology_id="topology:direct-environment-generation-v2",
+                external_root_refs=(job_ref, request_ref),
+            )
+            manifest_ref = self.artifacts.put_json(
+                artifact_id=f"{job.job_id}:work-graph-manifest",
+                artifact_type="control.work_graph_manifest",
+                value=manifest,
+                dependencies=(job_ref, request_ref),
+            )
+            readiness = WorkReadinessProjection.project(
+                graph=graph,
+                manifest=manifest,
+                manifest_ref=manifest_ref,
+                work_store=self.work_control,
+                artifacts=self.artifacts,
+            )
+            readiness_ref = self.artifacts.put_json(
+                artifact_id=f"{job.job_id}:design-readiness",
+                artifact_type="control.work_readiness",
+                value=readiness,
+                dependencies=(
+                    manifest_ref,
+                    *readiness.satisfied_commit_refs,
+                    *readiness.blocking_evaluation_refs,
+                ),
+            )
+            run.remember(manifest_ref, readiness_ref)
             if policy_failures:
                 finding_ref = self._control_failure_finding(
                     run,
@@ -4540,20 +4339,18 @@ class FoundryController:
                     ),
                     usage=usage,
                 )
-                finding = self.artifacts.get_json(finding_ref, Finding)
                 await self._persist_snapshot(run, status="running")
-                return await self._run_direct_design_revision(
-                    run=run,
-                    job=job,
-                    job_ref=job_ref,
-                    request=request,
-                    request_ref=request_ref,
-                    previous=bundle,
-                    correction=_DesignReworkRequired(
-                        findings=(finding,),
-                        finding_refs=(finding_ref,),
-                        revision_mode=self._design_revision_mode_for_finding(finding),
-                    ),
+                raise _GenerationHalt(
+                    status="failed",
+                    code="modeling_gate_failed",
+                    summary="Framework Modeling Boundary rejected the design revision.",
+                    finding_refs=(finding_ref,),
+                )
+            if modeling_head.status != "committed" or readiness.status != "ready":
+                raise _GenerationHalt(
+                    status="failed",
+                    code="design_work_graph_not_ready",
+                    summary="Production Design WorkGraph did not reach exact ready state.",
                 )
             outputs = (
                 bundle.evidence_graph_ref,
@@ -4562,6 +4359,8 @@ class FoundryController:
                 bundle.design_ref,
                 bundle.baseline_ref,
                 modeling_gate_ref,
+                manifest_ref,
+                readiness_ref,
             )
             run.remember(*outputs)
             self._finish_attempt(
@@ -4607,7 +4406,9 @@ class FoundryController:
                 exc,
                 default_code=(
                     "framework_invariant_violation"
-                    if exc.framework_invariant or exc.infrastructure_error
+                    if exc.framework_invariant
+                    else "designer_infrastructure_error"
+                    if exc.infrastructure_error
                     else f"design_{self._safe_identifier(exc.stage)}"
                 ),
             )
@@ -5140,32 +4941,6 @@ class FoundryController:
                 design.world_spec_ref,
             ),
         )
-        feedback_target = RepairTargetRef(
-            target_id=self._stable_id(
-                "feedback-target",
-                "feedback.design.modeling_gate",
-                design.design_ref.revision_id,
-            ),
-            component="design",
-            artifact_slot="environment_design",
-            lineage_id=f"{job.job_id}.modeling-gate",
-            immutable_input_refs=(
-                design.evidence_graph_ref,
-                design.coverage_map_ref,
-                design.world_spec_ref,
-            ),
-            committed_subject_ref=design.design_ref,
-            allowed_mutation_paths=("/",),
-        )
-        self._record_feedback_result(
-            contract_id="feedback.design.modeling_gate",
-            status="passed" if status == "pass" else "failed",
-            subject_ref=design.design_ref,
-            evidence_refs=(gate_ref,),
-            diagnostic_ref=gate_ref if failures else None,
-            target=feedback_target,
-            summary=gate.summary,
-        )
         return gate_ref, tuple(failures)
 
     def _record_feedback_result(
@@ -5427,9 +5202,7 @@ class FoundryController:
                     item for item in branch_ledger.leases if item.lease_id == lease.lease_id
                 )
                 terminal = (
-                    branch_ledger.release(lease.lease_id)
-                    if current.status == "active"
-                    else current
+                    branch_ledger.release(lease.lease_id) if current.status == "active" else current
                 )
                 branch_terminal_leases[lease.lease_id] = terminal
             terminal_ref = branch_terminal_refs.get(lease.lease_id)
@@ -5695,9 +5468,7 @@ class FoundryController:
                     except BaseException as exc:  # task result is terminal evidence
                         child_result = exc
                     if attempt_id == build_attempt:
-                        await terminalize_builder(
-                            cast(BuildBundle | BaseException, child_result)
-                        )
+                        await terminalize_builder(cast(BuildBundle | BaseException, child_result))
                     else:
                         await terminalize_verifier(
                             cast(CompiledVerifier | BaseException, child_result)
@@ -5757,6 +5528,7 @@ class FoundryController:
                         )
                         pending[cast(asyncio.Task[object], verifier_task)] = "verifier"
                     if build is not None:
+
                         def active_verifier_reservation() -> Budget | None:
                             current = next(
                                 item
@@ -5777,9 +5549,7 @@ class FoundryController:
                         )
                         pending[cast(asyncio.Task[object], integration_task)] = "integration"
                 elif kind == "verifier":
-                    await terminalize_verifier(
-                        cast(CompiledVerifier | BaseException, result)
-                    )
+                    await terminalize_verifier(cast(CompiledVerifier | BaseException, result))
                 elif isinstance(result, BaseException):
                     integration_error = result
                 else:
@@ -6334,8 +6104,8 @@ class FoundryController:
                         f"integration_repair_{unsupported[0].owner_node}_{unsupported[0].action}"
                     ),
                     summary=(
-                        "Integration finding is not owned by the current Builder revision; "
-                        "the bounded router refused a long backjump."
+                        "Integration repair was rejected by the bounded router: "
+                        f"{unsupported[0].decision_reason}."
                     ),
                     finding_refs=finding_refs,
                 )
@@ -6499,9 +6269,7 @@ class FoundryController:
                     failure_invocation_usage,
                 )
                 if isinstance(exc, asyncio.CancelledError):
-                    repair_status: Literal[
-                        "failed", "needs_human", "budget_exhausted"
-                    ] = "failed"
+                    repair_status: Literal["failed", "needs_human", "budget_exhausted"] = "failed"
                     code = "integration_builder_repair_cancelled"
                 elif isinstance(exc, BudgetExceeded):
                     repair_status = "budget_exhausted"
@@ -6528,9 +6296,7 @@ class FoundryController:
                 self._terminate_repair_routes(
                     run,
                     routes,
-                    outcome=(
-                        "exhausted" if repair_status == "budget_exhausted" else "escalated"
-                    ),
+                    outcome=("exhausted" if repair_status == "budget_exhausted" else "escalated"),
                     retained_refs=(integrated.report_ref, design.design_ref),
                     usage=failure_usage,
                 )
@@ -7035,12 +6801,10 @@ class FoundryController:
                     failure_invocation_usage = BudgetUsage()
                     if verifier_work is not None:
                         if isinstance(exc, VerifierCompilationError):
-                            failure_actual, failure_unknown = (
-                                self._verifier_result_settlement(
-                                    exc,
-                                    budget=verifier_rework_budget,
-                                    base_turns=verifier_base_turns,
-                                )
+                            failure_actual, failure_unknown = self._verifier_result_settlement(
+                                exc,
+                                budget=verifier_rework_budget,
+                                base_turns=verifier_base_turns,
                             )
                         else:
                             failure_actual = BudgetUsage()
@@ -7060,9 +6824,9 @@ class FoundryController:
                     )
                     if isinstance(exc, asyncio.CancelledError):
                         verifier_code = "verifier_rework_cancelled"
-                        verifier_status: Literal[
-                            "failed", "needs_human", "budget_exhausted"
-                        ] = "failed"
+                        verifier_status: Literal["failed", "needs_human", "budget_exhausted"] = (
+                            "failed"
+                        )
                     else:
                         verifier_code, verifier_status = self._verifier_error(exc)
                     self._finish_attempt(
@@ -7310,9 +7074,7 @@ class FoundryController:
                     failure_invocation_usage,
                 )
                 if isinstance(exc, asyncio.CancelledError):
-                    repair_status: Literal[
-                        "failed", "needs_human", "budget_exhausted"
-                    ] = "failed"
+                    repair_status: Literal["failed", "needs_human", "budget_exhausted"] = "failed"
                     code = "builder_repair_cancelled"
                 elif isinstance(exc, BudgetExceeded):
                     repair_status = "budget_exhausted"
@@ -7337,9 +7099,7 @@ class FoundryController:
                 self._terminate_repair_routes(
                     run,
                     routes,
-                    outcome=(
-                        "exhausted" if repair_status == "budget_exhausted" else "escalated"
-                    ),
+                    outcome=("exhausted" if repair_status == "budget_exhausted" else "escalated"),
                     retained_refs=(judge_bundle.report_ref, design.design_ref),
                     usage=failure_usage,
                 )
@@ -7752,7 +7512,27 @@ class FoundryController:
             if ref.artifact_type == "control.modeling_gate"
             and self.artifacts.get_json(ref, GateResult).subject_ref == design.design_ref
         )
-        if not integration_refs or len(verifier_refs) != 1 or len(modeling_gate_refs) != 1:
+        work_manifest_refs = tuple(
+            ref
+            for attempt in run.attempts
+            if attempt.node == "design" and attempt.status == "passed"
+            for ref in attempt.output_refs
+            if ref.artifact_type == "control.work_graph_manifest"
+        )
+        readiness_refs = tuple(
+            ref
+            for attempt in run.attempts
+            if attempt.node == "design" and attempt.status == "passed"
+            for ref in attempt.output_refs
+            if ref.artifact_type == "control.work_readiness"
+        )
+        if (
+            not integration_refs
+            or len(verifier_refs) != 1
+            or len(modeling_gate_refs) != 1
+            or len(work_manifest_refs) != 1
+            or len(readiness_refs) != 1
+        ):
             raise _GenerationHalt(
                 status="failed",
                 code="release_evidence_closure_incomplete",
@@ -7764,8 +7544,20 @@ class FoundryController:
         integration_ref = integration_refs[-1]
         verifier_ref = verifier_refs[0]
         modeling_gate_ref = modeling_gate_refs[0]
+        work_manifest_ref = work_manifest_refs[0]
+        readiness_ref = readiness_refs[0]
+        readiness = self.artifacts.get_json(
+            readiness_ref,
+            WorkReadinessSnapshot,
+        )
         modeling_gate = self.artifacts.get_json(modeling_gate_ref, GateResult)
-        if modeling_gate.status != "pass" or not modeling_gate.hard:
+        if (
+            modeling_gate.status != "pass"
+            or not modeling_gate.hard
+            or readiness.manifest_ref != work_manifest_ref
+            or readiness.status != "ready"
+            or not readiness.release_candidate_ready
+        ):
             raise _GenerationHalt(
                 status="failed",
                 code="release_modeling_gate_not_final_design",
@@ -7939,9 +7731,7 @@ class FoundryController:
         integration_claim_id, integration_effect = self._release_feedback_claim_policy(
             "feedback.integration.runtime"
         )
-        judge_claim_id, judge_effect = self._release_feedback_claim_policy(
-            "feedback.judge.release"
-        )
+        judge_claim_id, judge_effect = self._release_feedback_claim_policy("feedback.judge.release")
         observability_claim_id, observability_effect = self._release_feedback_claim_policy(
             "feedback.controller.observability"
         )
@@ -7953,8 +7743,13 @@ class FoundryController:
                 status="passed",
                 effect=design_effect,
                 summary="The exact EnvironmentDesign passed framework modeling gates.",
-                evidence_refs=(modeling_gate_ref,),
-                dependency_refs=(design.design_ref, design.world_spec_ref),
+                evidence_refs=(modeling_gate_ref, work_manifest_ref, readiness_ref),
+                dependency_refs=(
+                    design.design_ref,
+                    design.world_spec_ref,
+                    work_manifest_ref,
+                    readiness_ref,
+                ),
                 evaluated_at=evaluated_at,
             ),
             claim(
@@ -8144,19 +7939,7 @@ class FoundryController:
                 code="research_checkpoint_not_final_design",
                 summary="Adopted research does not feed the final EnvironmentDesign.",
             )
-        if checkpoint_ref.artifact_type == "design.phase_checkpoint":
-            checkpoint = self.artifacts.get_json(checkpoint_ref, DesignPhaseCheckpoint)
-            self.artifacts.require_exact_json(
-                checkpoint_ref,
-                checkpoint,
-                artifact_types=("design.phase_checkpoint",),
-            )
-            checkpoint_valid = (
-                checkpoint.job_ref == run.job_ref
-                and checkpoint.request_ref == job.request_ref
-                and checkpoint.evidence_graph_ref == evidence_graph_ref
-            )
-        elif checkpoint_ref.artifact_type == "control.job_run_snapshot":
+        if checkpoint_ref.artifact_type == "control.job_run_snapshot":
             snapshot = self.artifacts.get_json(checkpoint_ref, JobRunSnapshot)
             self.artifacts.require_exact_json(
                 checkpoint_ref,
@@ -8438,7 +8221,7 @@ class FoundryController:
             implementation_lineage_ref=build.implementation_lineage_ref,
             judge_report_ref=judge_bundle.report_ref,
             integration_report_ref=integration_report_ref,
-            claim_vector_ref=claim_vector_ref,
+            release_dossier_ref=claim_vector_ref,
             telemetry_summary_ref=telemetry_summary_ref,
             pyproject_bytes=(build.project_root / "pyproject.toml").read_bytes(),
             uv_lock_bytes=(build.project_root / "uv.lock").read_bytes(),
@@ -8458,7 +8241,7 @@ class FoundryController:
             implementation_lineage_ref=build.implementation_lineage_ref,
             judge_report_ref=judge_bundle.report_ref,
             integration_report_ref=integration_report_ref,
-            claim_vector_ref=claim_vector_ref,
+            release_dossier_ref=claim_vector_ref,
             telemetry_summary_ref=telemetry_summary_ref,
             runtime=build.candidate.runtime,
             task_materializer=build.candidate.task_materializer,
@@ -9033,9 +8816,9 @@ class FoundryController:
         )
         if current is None:
             raise ValueError("unknown structured RepairLedger entry")
-        progress_evidence: Literal[
-            "none", "issue_set_changed", "validation_stage_advanced"
-        ] = "none"
+        progress_evidence: Literal["none", "issue_set_changed", "validation_stage_advanced"] = (
+            "none"
+        )
         if remaining_diagnostic is not None:
             if remaining_diagnostic.owner_component != current.target_node:
                 raise ValueError("remaining diagnostic owner does not match RepairLedger target")
@@ -9074,21 +8857,15 @@ class FoundryController:
             entry_id,
             blocking_claim_ids_after=safe_remaining,
             retained_refs=(
-                (current.resolved_owner_ref,)
-                if current.resolved_owner_ref is not None
-                else ()
+                (current.resolved_owner_ref,) if current.resolved_owner_ref is not None else ()
             ),
             session_strategy="continued" if continued_session else "fresh",
             progress_evidence=progress_evidence,
             validation_phase_after=(
-                remaining_diagnostic.validation_phase
-                if remaining_diagnostic is not None
-                else None
+                remaining_diagnostic.validation_phase if remaining_diagnostic is not None else None
             ),
             validation_frontier_after=(
-                remaining_diagnostic.frontier_ordinal
-                if remaining_diagnostic is not None
-                else None
+                remaining_diagnostic.frontier_ordinal if remaining_diagnostic is not None else None
             ),
             usage=BudgetUsage(repair_attempts=1),
         )
@@ -9251,9 +9028,7 @@ class FoundryController:
                 "repair_context": list(safe_context),
                 **diagnostic,
             },
-            dependencies=self._unique_refs(
-                (subject, event_ref, disposition_ref, *causal_refs)
-            ),
+            dependencies=self._unique_refs((subject, event_ref, disposition_ref, *causal_refs)),
         )
         fingerprint = sha256_digest(
             canonical_json_bytes(
@@ -9319,9 +9094,7 @@ class FoundryController:
         """Read only the typed CodeRouter disposition, never Finding prose."""
 
         disposition_refs = tuple(
-            ref
-            for ref in finding.evidence_refs
-            if ref.artifact_type == "control.event_disposition"
+            ref for ref in finding.evidence_refs if ref.artifact_type == "control.event_disposition"
         )
         if not disposition_refs:
             return DesignRevisionMode.FULL_SEMANTIC_REVISION
@@ -9415,6 +9188,14 @@ class FoundryController:
             run = self._restore_direct_run(head, snapshot, direct_lock)
             self._complete_direct_result(run, result)
             return result
+        if head.status == "running":
+            return await self._recover_abandoned_scheduler_direct_locked(
+                head=head,
+                request=request,
+                job=job,
+                snapshot=snapshot,
+                direct_lock=direct_lock,
+            )
         raise DirectJobResumeRequiredError(
             "durable Direct Generation checkpoint exists but has no terminal result; "
             "the framework will not replay possibly consumed Agent/tool work"
@@ -10142,9 +9923,7 @@ class FoundryController:
                 frontier.append(dependent)
 
         invalidated_output_refs: list[ArtifactRef] = []
-        causal_revision_ids = set(descendants) | {
-            item.revision_id for item in superseded_refs
-        }
+        causal_revision_ids = set(descendants) | {item.revision_id for item in superseded_refs}
         for index, attempt in enumerate(run.attempts):
             if attempt.status in {"pending", "running", "invalidated"}:
                 continue
@@ -10233,9 +10012,7 @@ class FoundryController:
         known = tuple(self._token_total(item.usage) for item in results)
         known_total = sum(value for value in known if value is not None)
         inferred_unknown_bounds = tuple(
-            self.config.agent.structured_turn_token_limit
-            for value in known
-            if value is None
+            self.config.agent.structured_turn_token_limit for value in known if value is None
         )
         all_unknown_bounds = (*inferred_unknown_bounds, *unknown_token_upper_bounds)
         started_turns = len(results) + len(unknown_token_upper_bounds)
@@ -10986,9 +10763,7 @@ class FoundryController:
         if exc.budget_exhausted:
             return (
                 "budget_exhausted",
-                FoundryController._safe_identifier(
-                    exc.failure_code or "agent_budget_exhausted"
-                ),
+                FoundryController._safe_identifier(exc.failure_code or "agent_budget_exhausted"),
             )
         if exc.failure_code is not None:
             return "failed", FoundryController._safe_identifier(exc.failure_code)

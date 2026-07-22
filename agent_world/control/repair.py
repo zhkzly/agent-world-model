@@ -355,6 +355,7 @@ class RepairRouter:
             None,
         )
         jump_distance = self._jump_distance(current_node, owner)
+        requested_jump_distance = jump_distance
         causal = tuple(
             dict.fromkeys(ref for item, _finding_ref in findings for ref in item.evidence_refs)
         )
@@ -371,6 +372,12 @@ class RepairRouter:
             ).hexdigest()
         )
         active_ledger = ledger or RepairLedger()
+        prior_no_progress = any(
+            item.finding_fingerprint == action_fingerprint
+            and item.target_node == owner
+            and item.outcome == "no_progress"
+            for item in active_ledger.entries
+        )
         entry = active_ledger.authorize(
             finding=finding,
             finding_ref=finding_ref,
@@ -407,11 +414,18 @@ class RepairRouter:
             if "repair" in disclosures
             else "public"
         )
-        reason = (
-            "automatic backjump rejected by distance/attempt policy"
-            if action == "reject" and owner != "release"
-            else "framework failure taxonomy and Artifact ownership"
-        )
+        if action != "reject" or owner == "release":
+            reason = "framework failure taxonomy and Artifact ownership"
+        elif owner_ref is None:
+            reason = "repair owner Artifact could not be resolved"
+        elif prior_no_progress:
+            reason = "prior repair left the blocking Claim set unchanged"
+        elif requested_jump_distance >= 2:
+            reason = "automatic repair would exceed the maximum backjump distance"
+        elif entry.outcome == "exhausted":
+            reason = "local repair attempt limit is exhausted"
+        else:
+            reason = "bounded repair policy rejected the requested action"
         return RepairDirective(
             directive_id=f"repair:{digest}",
             finding_ref=finding_ref,

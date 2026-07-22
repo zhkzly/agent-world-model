@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -14,14 +15,11 @@ from agent_world.contracts import (
     Budget,
     BudgetUsage,
     Claim,
-    DesignPhaseCheckpoint,
     EnvironmentJob,
     EnvironmentRequest,
     Evidence,
-    EvidenceGraph,
     KeyValue,
     PermissionScope,
-    ReleaseProfile,
     sha256_digest,
 )
 from agent_world.control import StructuredRepairMode
@@ -114,8 +112,9 @@ register_agent_output_contract(
 
 
 def test_rule_source_rejects_ordering_type_mismatch_at_clause_path() -> None:
-    rule = RuleDraft.model_validate(
-        {
+    rule = RuleDraft.model_validate_json(
+        json.dumps(
+            {
                 "rule_id": "rule:hotel.search:result_count",
                 "family": "transition",
                 "description": "Result count is non-negative.",
@@ -140,7 +139,8 @@ def test_rule_source_rejects_ordering_type_mismatch_at_clause_path() -> None:
                 ],
                 "case_sensitivity": "positive_only",
                 "evidence_claim_ids": [],
-        }
+            }
+        )
     )
 
     with pytest.raises(StructuredSemanticError) as captured:
@@ -152,27 +152,29 @@ def test_rule_source_rejects_ordering_type_mismatch_at_clause_path() -> None:
 
 def test_rule_source_rejects_non_numeric_arithmetic_and_zero_divisor() -> None:
     def rule_with(term: RuleArithmeticDraft) -> RuleDraft:
-        return RuleDraft.model_validate(
-            {
-                "rule_id": "rule:arithmetic",
-                "family": "transition",
-                "description": "Validate an arithmetic term.",
-                "boolean_operator": "all",
-                "clauses": [
-                    {
-                        "clause_id": "arithmetic_equal",
-                        "operator": "equal",
-                        "left": term.model_dump(mode="json"),
-                        "right": {
-                            "kind": "constant",
-                            "value_type": "number",
-                            "value": 1,
-                        },
-                    }
-                ],
-                "case_sensitivity": "positive_only",
-                "evidence_claim_ids": [],
-            }
+        return RuleDraft.model_validate_json(
+            json.dumps(
+                {
+                    "rule_id": "rule:arithmetic",
+                    "family": "transition",
+                    "description": "Validate an arithmetic term.",
+                    "boolean_operator": "all",
+                    "clauses": [
+                        {
+                            "clause_id": "arithmetic_equal",
+                            "operator": "equal",
+                            "left": term.model_dump(mode="json"),
+                            "right": {
+                                "kind": "constant",
+                                "value_type": "number",
+                                "value": 1,
+                            },
+                        }
+                    ],
+                    "case_sensitivity": "positive_only",
+                    "evidence_claim_ids": [],
+                }
+            )
         )
 
     non_numeric = RuleArithmeticDraft(
@@ -202,33 +204,35 @@ def test_rule_source_rejects_non_numeric_arithmetic_and_zero_divisor() -> None:
 
 
 def test_rule_compiler_preserves_live_relative_pointer_paths_and_expectations() -> None:
-    source = ToolConditionsSourceDraft.model_validate(
-        {
-            "tool_id": "hotel.booking.get",
-            "preconditions": [
-                {
-                    "rule_id": "rule:hotel.booking.get:exists",
-                    "family": "precondition",
-                    "description": "The booking exists.",
-                    "boolean_operator": "all",
-                    "clauses": [
-                        {
-                            "clause_id": "booking_exists",
-                            "operator": "exists",
-                            "left": {
-                                "kind": "reference",
-                                "source": "pre_state",
-                                "pointer": "bookings/booking_id",
-                                "value_type": "string",
-                            },
-                            "negate": False,
-                        }
-                    ],
-                    "case_sensitivity": "positive_only",
-                    "evidence_claim_ids": [],
-                }
-            ],
-        }
+    source = ToolConditionsSourceDraft.model_validate_json(
+        json.dumps(
+            {
+                "tool_id": "hotel.booking.get",
+                "preconditions": [
+                    {
+                        "rule_id": "rule:hotel.booking.get:exists",
+                        "family": "precondition",
+                        "description": "The booking exists.",
+                        "boolean_operator": "all",
+                        "clauses": [
+                            {
+                                "clause_id": "booking_exists",
+                                "operator": "exists",
+                                "left": {
+                                    "kind": "reference",
+                                    "source": "pre_state",
+                                    "pointer": "bookings/booking_id",
+                                    "value_type": "string",
+                                },
+                                "negate": False,
+                            }
+                        ],
+                        "case_sensitivity": "positive_only",
+                        "evidence_claim_ids": [],
+                    }
+                ],
+            }
+        )
     )
 
     with pytest.raises(StructuredValidationError) as captured:
@@ -477,9 +481,7 @@ async def test_untyped_semantic_error_never_spends_a_repair_turn(
         )
 
     assert captured.value.stage == "agent.environment-engineer.framework_diagnostic"
-    assert captured.value.validation_issues == (
-        "framework_diagnostic_incomplete@semantic_output",
-    )
+    assert captured.value.validation_issues == ("framework_diagnostic_incomplete@semantic_output",)
     assert len(captured.value.results) == 1
     assert len(backend.requests) == 1
     assert backend.requests[0].metadata["repair_mode"] == "initial"
@@ -743,9 +745,7 @@ def test_known_tool_identity_drift_is_typed_and_unknown_value_error_is_not_retry
         prefix=("tools", 0, "reliability"),
     )
 
-    assert known[0].issue_code == (
-        "reliability_tool_identity_drift@tools.0.reliability.tool_id"
-    )
+    assert known[0].issue_code == ("reliability_tool_identity_drift@tools.0.reliability.tool_id")
     assert known[0].actionable_for_agent
     assert known[0].expected_category == "tool_id equal to the assigned batch tool_id"
     assert unknown[0].code == "framework_diagnostic_incomplete"
@@ -1653,121 +1653,6 @@ def test_resumable_multi_candidate_nodes_use_latest_semantic_commit(tmp_path: Pa
             detail=node_name,
         )
         assert reused == (_Output(value="second"), expected[node_name])
-
-
-@pytest.mark.asyncio
-async def test_evidence_checkpoint_resume_reuses_exact_graph_without_research(
-    tmp_path: Path,
-) -> None:
-    store = ArtifactStore(tmp_path / "artifacts")
-    writer = store.issue_writer(
-        producer="designer-evidence-resume-test",
-        allowed_artifact_type_prefixes=("control.", "design."),
-        allowed_event_type_prefixes=("design_",),
-    )
-    profile = ReleaseProfile(profile_id="release:test")
-    request = EnvironmentRequest(
-        request_id="request:evidence-resume",
-        need="Generate a real local booking environment.",
-        budget=Budget(agent_turns=32, search_calls=2, tool_calls=4, wall_seconds=120),
-        release_profile=profile,
-    )
-    request_ref = writer.put_json(
-        artifact_id="request:evidence-resume",
-        artifact_type="control.environment_request",
-        value=request,
-    )
-    job = EnvironmentJob(
-        job_id="job:evidence-resume",
-        kind="generate",
-        request_ref=request_ref,
-        budget=request.budget,
-        release_profile=profile,
-    )
-    job_ref = writer.put_json(
-        artifact_id="job:evidence-resume",
-        artifact_type="control.environment_job",
-        value=job,
-        dependencies=(request_ref,),
-    )
-    content_hash = sha256_digest(b"observed booking workflow")
-    graph = EvidenceGraph(
-        graph_id="graph:evidence-resume",
-        revision=1,
-        evidence=(
-            Evidence(
-                evidence_id="evidence:booking",
-                source_kind="web",
-                source_uri="https://example.invalid/booking",
-                retrieved_at=datetime.now(UTC),
-                retrieval_status="success",
-                raw_content_hash=content_hash,
-                content_hash=content_hash,
-                fetcher="test-fetcher",
-                fetcher_version="1",
-                extractor="test-extractor",
-                extractor_version="1",
-                observed_summary="A fetched source describes a booking workflow.",
-            ),
-        ),
-        claims=(
-            Claim(
-                claim_id="claim:booking",
-                kind="observed",
-                statement="The workflow creates a reservation after availability checks.",
-                confidence=0.9,
-                evidence_ids=("evidence:booking",),
-                status="supported",
-            ),
-        ),
-    )
-    graph_ref = writer.put_json(
-        artifact_id="job:evidence-resume:evidence-graph",
-        artifact_type="design.evidence_graph",
-        value=graph,
-        dependencies=(request_ref,),
-    )
-    designer = EnvironmentDesigner(
-        artifact_store=writer,
-        research_artifact_store=writer,
-        invocation_backend=cast(InvocationBackend, object()),
-        profile_provider=cast(AgentProfileProvider, object()),
-        research_toolchain=ResearchToolchain(
-            cast(Any, object()),
-            cast(Any, object()),
-            cast(Any, object()),
-        ),
-    )
-
-    checkpoint_ref = designer.adopt_latest_phase_checkpoint(
-        job=job,
-        job_ref=job_ref,
-        request=request,
-        request_ref=request_ref,
-    )
-    checkpoint = writer.get_json(checkpoint_ref, DesignPhaseCheckpoint)
-    assert checkpoint.phase == "evidence_graph"
-    assert checkpoint.evidence_graph_ref == graph_ref
-
-    workspace = tmp_path / "resume"
-    workspace.mkdir()
-    resumed = await designer._prepare_evidence_phase(  # noqa: SLF001
-        job=job,
-        job_ref=job_ref,
-        request=request,
-        request_ref=request_ref,
-        workspace=workspace,
-        meter=DesignerInvocationBudget(Budget(llm_tokens=100, agent_turns=1, wall_seconds=30)),
-        fetch_budget=0,
-        phase_checkpoint_ref=checkpoint_ref,
-    )
-
-    assert resumed.evidence_graph == graph
-    assert resumed.evidence_graph_ref == graph_ref
-    assert resumed.research_usage == BudgetUsage()
-    assert resumed.invocation_results == ()
-    assert (workspace / "resumed-evidence-checkpoint.json").is_file()
-    assert store.list_events()[-1].event_type == "design_phase_resumed"
 
 
 def test_access_semantic_failure_is_classified_without_generated_values() -> None:

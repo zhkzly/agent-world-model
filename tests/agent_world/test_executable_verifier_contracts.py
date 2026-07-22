@@ -17,8 +17,10 @@ from agent_world.contracts import (
     CurriculumRequirements,
     DifficultyDimension,
     EnvironmentDesign,
+    EnvironmentJob,
     EvaluatorGoalBinding,
     FidelityStatement,
+    GenerationContext,
     IdempotencySemantics,
     ObservationSemantics,
     ParameterizedSolveRecipe,
@@ -26,6 +28,7 @@ from agent_world.contracts import (
     PermissionRule,
     PermissionScope,
     RecipePointer,
+    ReleaseProfile,
     RetrySemantics,
     RewardSpec,
     RollbackSemantics,
@@ -53,13 +56,37 @@ from agent_world.contracts import (
     WorldSpec,
     sha256_digest,
 )
-from agent_world.control import StructuredValidationError
+from agent_world.control import (
+    ArtifactSlotContract,
+    GenerationWorkGraph,
+    LeaseBudgetLedger,
+    OperationBudget,
+    OperationRun,
+    ProposalExecution,
+    ProposalPolicy,
+    RepairPolicy,
+    SchedulerLeafExecutor,
+    StructuredValidationError,
+    ValidationPolicy,
+    WorkAttempt,
+    WorkCommit,
+    WorkControlRuntime,
+    WorkControlStore,
+    WorkCoordinate,
+    WorkDefinition,
+    WorkGroupDefinition,
+    WorkScheduler,
+    deterministic_boundary_work_definition,
+)
 from agent_world.invocation import InvocationError, InvocationResult, InvocationStatus
+from agent_world.invocation.codex_sdk import _terminate_process_tree
 from agent_world.judge import compiler as verifier_compiler_module
 from agent_world.judge.compiler import VerifierCompilationError, VerifierCompiler
+from agent_world.judge.leaf import VerifierAggregateLeaf, VerifierBatchLeaf, VerifierPlanLeaf
 from agent_world.judge.models import (
     PropertyExpectationIntent,
     RuntimeActionObservation,
+    VerifierBatchPlan,
     VerifierCaseIntent,
     VerifierDraft,
     VerifierIntent,
@@ -846,6 +873,599 @@ def test_verifier_intent_compiles_one_based_ordinal_to_zero_based_index() -> Non
     }
 
 
+def test_verifier_batch_plan_is_deterministic_and_persisted_before_challenger_work(
+    tmp_path: Path,
+) -> None:
+    """A future Scheduler shard receives frozen scope, never hidden compiler fan-out."""
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    design_writer = store.issue_writer(
+        producer="environment-designer",
+        allowed_artifact_type_prefixes=("design.",),
+    )
+    judge_writer = store.issue_writer(
+        producer="environment-judge",
+        allowed_artifact_type_prefixes=("judge.",),
+    )
+    design = _design()
+    design_ref = design_writer.put_json(
+        artifact_id="design:verifier-plan",
+        artifact_type="design.environment_design",
+        value=design,
+    )
+    world_spec_ref = design_writer.put_json(
+        artifact_id="world:verifier-plan",
+        artifact_type="design.world_spec",
+        value=design.world_spec,
+    )
+    compiler = VerifierCompiler(
+        artifact_store=judge_writer,
+        invocation_backend=object(),  # type: ignore[arg-type]
+        profile_provider=object(),  # type: ignore[arg-type]
+    )
+
+    first = compiler.build_batch_plan(
+        design=design,
+        design_ref=design_ref,
+        world_spec_ref=world_spec_ref,
+    )
+    second = compiler.build_batch_plan(
+        design=design,
+        design_ref=design_ref,
+        world_spec_ref=world_spec_ref,
+    )
+    plan_ref = compiler.persist_batch_plan(first)
+
+    assert first == second
+    assert first.plan_digest == second.plan_digest
+    assert tuple(item.batch_index for item in first.batches) == tuple(range(len(first.batches)))
+    assert tuple(task for item in first.batches for task in item.task_types) == tuple(
+        task.task_type for task in design.curriculum.task_types
+    )
+    assert store.get_json(plan_ref, VerifierBatchPlan) == first
+
+
+@pytest.mark.asyncio
+async def test_one_shot_verifier_batch_uses_the_scheduler_dispatch_and_never_retries(
+    tmp_path: Path,
+) -> None:
+    """One physical WorkDefinition maps to exactly one Challenger request."""
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    design_writer = store.issue_writer(
+        producer="environment-designer",
+        allowed_artifact_type_prefixes=("design.",),
+    )
+    judge_writer = store.issue_writer(
+        producer="environment-judge",
+        allowed_artifact_type_prefixes=("judge.",),
+    )
+    design = _design()
+    design_ref = design_writer.put_json(
+        artifact_id="design:one-shot-verifier",
+        artifact_type="design.environment_design",
+        value=design,
+    )
+    world_spec_ref = design_writer.put_json(
+        artifact_id="world:one-shot-verifier",
+        artifact_type="design.world_spec",
+        value=design.world_spec,
+    )
+    rules = design_rule_index(design)
+    source_draft = _draft(design)
+    intent = VerifierIntent(
+        cases=tuple(
+            VerifierCaseIntent(
+                task_type=case.task_type,
+                evaluator_goal=case.evaluator_goal,
+                actor=case.actor,
+                reset_config=case.reset_config,
+                actions=case.actions,
+                expectations=tuple(
+                    PropertyExpectationIntent(
+                        kind={"error_condition": "error_semantics"}.get(
+                            rules[assertion.rule_id].family,
+                            rules[assertion.rule_id].family,
+                        ),  # type: ignore[arg-type]
+                        after_action_ordinal=assertion.action_index + 1,
+                        expected=assertion.expected,
+                    )
+                    for assertion in case.assertions
+                ),
+            )
+            for case in source_draft.cases
+        ),
+        solve_recipes=source_draft.solve_recipes,
+    )
+
+    class Profile:
+        rollout_token_limit = 1_000
+
+    class Profiles:
+        def resolve(self, **_kwargs: object) -> Profile:
+            return Profile()
+
+    class OneShotBackend:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def invoke(self, request: object) -> InvocationResult:
+            self.requests.append(request)
+            return InvocationResult(
+                invocation_id=request.invocation_id,  # type: ignore[attr-defined]
+                status=InvocationStatus.COMPLETED,
+                session=None,
+                turn_id="turn:one-shot",
+                final_text="completed",
+                structured_output=intent.model_dump(mode="json"),
+                usage=None,
+                events=(),
+                error=None,
+                duration_ms=1,
+            )
+
+    backend = OneShotBackend()
+    compiler = VerifierCompiler(
+        artifact_store=judge_writer,
+        invocation_backend=backend,  # type: ignore[arg-type]
+        profile_provider=Profiles(),  # type: ignore[arg-type]
+        maximum_structured_reworks=2,
+    )
+    plan = compiler.build_batch_plan(
+        design=design,
+        design_ref=design_ref,
+        world_spec_ref=world_spec_ref,
+    )
+    plan_ref = compiler.persist_batch_plan(plan)
+
+    result = await compiler.compile_batch_once(
+        design=design,
+        design_ref=design_ref,
+        world_spec_ref=world_spec_ref,
+        plan=plan,
+        plan_ref=plan_ref,
+        batch_index=0,
+        workspace=tmp_path / "workspace",
+        lineage_id="lineage:one-shot",
+        budget=Budget(llm_tokens=1_000, agent_turns=1, wall_seconds=30),
+        permissions=PermissionScope(),
+        invocation_id="dispatch:verifier-batch:1",
+    )
+
+    assert result.succeeded
+    assert result.invocation.invocation_id == "dispatch:verifier-batch:1"
+    assert result.checkpoint_ref is not None
+    assert result.draft_ref is not None
+    assert len(backend.requests) == 1
+    assert backend.requests[0].invocation_id == "dispatch:verifier-batch:1"  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_verifier_leaves_commit_plan_and_one_physical_batch(
+    tmp_path: Path,
+) -> None:
+    """Plan -> batch runs through the shared kernel without compiler-internal retries."""
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    design_writer = store.issue_writer(
+        producer="environment-designer",
+        allowed_artifact_type_prefixes=("design.",),
+    )
+    judge_writer = store.issue_writer(
+        producer="environment-judge",
+        allowed_artifact_type_prefixes=("judge.",),
+    )
+    control_writer = store.issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.",),
+    )
+    design = _design()
+    design_ref = design_writer.put_json(
+        artifact_id="design:scheduler-verifier",
+        artifact_type="design.environment_design",
+        value=design,
+    )
+    world_spec_ref = design_writer.put_json(
+        artifact_id="world:scheduler-verifier",
+        artifact_type="design.world_spec",
+        value=design.world_spec,
+    )
+    request_ref = control_writer.put_json(
+        artifact_id="request:scheduler-verifier",
+        artifact_type="control.environment_request",
+        value={"need": "scheduler verifier closure"},
+    )
+    job = EnvironmentJob(
+        job_id="job:scheduler-verifier",
+        kind="generate",
+        request_ref=request_ref,
+        permissions=PermissionScope(),
+        budget=Budget(llm_tokens=1_000, agent_turns=1, wall_seconds=300),
+        release_profile=ReleaseProfile(profile_id="release:scheduler-verifier"),
+    )
+    job_ref = control_writer.put_json(
+        artifact_id=job.job_id,
+        artifact_type="control.environment_job",
+        value=job,
+        dependencies=(request_ref,),
+    )
+    generation = GenerationContext(
+        context_id="context:scheduler-verifier",
+        job_ref=job_ref,
+        kind="generate",
+        request_ref=request_ref,
+        permissions=job.permissions,
+        budget=job.budget,
+        release_profile=job.release_profile,
+    )
+    context_ref = control_writer.put_json(
+        artifact_id=generation.context_id,
+        artifact_type="control.generation_context",
+        value=generation,
+        dependencies=generation.root_refs,
+    )
+    modeling_definition = deterministic_boundary_work_definition(
+        scope_id="job:scheduler-verifier",
+        component="design",
+        stage="modeling_boundary",
+        artifact_slot="environment_design",
+        dependency_coordinates=(),
+        claim_id="design.modeling.closed",
+        claim="A frozen Design and WorldSpec are available to deterministic planning.",
+        timing_reason="Verifier planning may consume only committed Modeling outputs.",
+        effect="block_compile",
+        success_maturity="design_compiled",
+    )
+    plan_coordinate = WorkCoordinate(
+        scope_id="job:scheduler-verifier",
+        component="verifier",
+        stage="verifier_plan",
+        artifact_slot="verifier_batch_plan",
+    )
+    plan_definition = WorkDefinition(
+        work_id="work:verifier-plan:scheduler-test",
+        coordinate=plan_coordinate,
+        claim="Verifier task partition is deterministically frozen.",
+        timing_reason="A Challenger must not select its own task partition.",
+        dependency_coordinates=(modeling_definition.coordinate,),
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:verifier-plan",
+                direction="output",
+                artifact_types=("judge.verifier_batch_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="verifier",
+                confidentiality="framework_private",
+            ),
+        ),
+        proposal_policy=ProposalPolicy(
+            policy_id="proposal:verifier-plan:scheduler-test",
+            executor="code",
+            operation="verifier.plan",
+            budget=OperationBudget(wall_seconds=30),
+        ),
+        validation_policy=ValidationPolicy(
+            policy_id="validation:verifier-plan:scheduler-test",
+            validator_id="validator:verifier-plan",
+            validator_revision_id="framework.validator.verifier-plan.v1",
+            validation_phase="verifier_plan",
+            frontier_ordinal=10,
+            claim_id="verifier.plan.frozen",
+            effect="block_release",
+            budget=OperationBudget(wall_seconds=30),
+        ),
+        repair_policy=RepairPolicy(
+            policy_id="repair:verifier-plan:scheduler-test",
+            maximum_local_corrections=0,
+            strict_progress_bonus_corrections=0,
+            maximum_infrastructure_retries=0,
+            maximum_total_repair_attempts=0,
+        ),
+        required_claim_id="verifier.plan.frozen",
+        success_maturity="verifier_plan_frozen",
+    )
+    batch_coordinate = WorkCoordinate(
+        scope_id="job:scheduler-verifier",
+        component="verifier",
+        stage="verifier_intent_batch",
+        artifact_slot="verifier_intent_checkpoint",
+        group_id="scheduler-verifier-batches",
+        shard_id="batch-1",
+    )
+    batch_definition = WorkDefinition(
+        work_id="work:verifier-batch:scheduler-test",
+        coordinate=batch_coordinate,
+        claim="One exact Challenger batch compiles verifier intent.",
+        timing_reason="Every real Challenger turn must have independent provenance.",
+        dependency_coordinates=(plan_coordinate,),
+        input_slots=(
+            ArtifactSlotContract(
+                slot_id="input:verifier-plan",
+                direction="input",
+                artifact_types=("judge.verifier_batch_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="verifier",
+                confidentiality="framework_private",
+            ),
+        ),
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:verifier-checkpoint",
+                direction="output",
+                artifact_types=("judge.verifier_intent_checkpoint",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="verifier",
+            ),
+            ArtifactSlotContract(
+                slot_id="output:verifier-draft",
+                direction="output",
+                artifact_types=("judge.verifier_batch_draft",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="verifier",
+                confidentiality="sealed",
+            ),
+        ),
+        proposal_policy=ProposalPolicy(
+            policy_id="proposal:verifier-batch:scheduler-test",
+            executor="agent",
+            operation="verifier.compile_intent_batch",
+            budget=OperationBudget(wall_seconds=30, llm_tokens=1_000, agent_turns=1),
+            agent_role="challenger",
+            capability_profile_id="profile:challenger",
+            output_contract_id="contract:verifier-intent-batch.v3",
+        ),
+        validation_policy=ValidationPolicy(
+            policy_id="validation:verifier-batch:scheduler-test",
+            validator_id="validator:verifier-intent-batch",
+            validator_revision_id="framework.validator.verifier-intent-batch.v3",
+            validation_phase="verifier_intent_batch",
+            frontier_ordinal=20,
+            claim_id="verifier.intent.batch.valid",
+            effect="block_release",
+            budget=OperationBudget(wall_seconds=30),
+        ),
+        repair_policy=RepairPolicy(
+            policy_id="repair:verifier-batch:scheduler-test",
+            maximum_local_corrections=1,
+            strict_progress_bonus_corrections=1,
+            maximum_infrastructure_retries=1,
+            maximum_total_repair_attempts=3,
+        ),
+        required_claim_id="verifier.intent.batch.valid",
+        allowed_mutation_roots=("/cases", "/properties", "/coverage"),
+        success_maturity="verifier_batch_compiled",
+    )
+    aggregate_coordinate = WorkCoordinate(
+        scope_id="job:scheduler-verifier",
+        component="verifier",
+        stage="verifier_intent",
+        artifact_slot="verifier_bundle",
+        group_id="scheduler-verifier-batches",
+    )
+    aggregate_definition = WorkDefinition(
+        work_id="work:verifier-aggregate:scheduler-test",
+        coordinate=aggregate_coordinate,
+        claim="Exact verifier batches form one complete Verifier IR.",
+        timing_reason="Release consumes a deterministic aggregate, never a partial batch.",
+        dependency_coordinates=(batch_coordinate,),
+        input_slots=(
+            ArtifactSlotContract(
+                slot_id="input:verifier-checkpoint",
+                direction="input",
+                artifact_types=("judge.verifier_intent_checkpoint",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="verifier",
+                confidentiality="framework_private",
+            ),
+            ArtifactSlotContract(
+                slot_id="input:verifier-draft",
+                direction="input",
+                artifact_types=("judge.verifier_batch_draft",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="verifier",
+                confidentiality="sealed",
+            ),
+        ),
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:verifier-ir",
+                direction="output",
+                artifact_types=("judge.verifier_ir_projection",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="verifier",
+                confidentiality="sealed",
+            ),
+        ),
+        proposal_policy=ProposalPolicy(
+            policy_id="proposal:verifier-aggregate:scheduler-test",
+            executor="code",
+            operation="verifier.aggregate",
+            budget=OperationBudget(wall_seconds=30),
+        ),
+        validation_policy=ValidationPolicy(
+            policy_id="validation:verifier-aggregate:scheduler-test",
+            validator_id="validator:verifier-aggregate",
+            validator_revision_id="framework.validator.verifier-aggregate.v3",
+            validation_phase="verifier_intent",
+            frontier_ordinal=30,
+            claim_id="verifier.intent.valid",
+            effect="block_release",
+            budget=OperationBudget(wall_seconds=30),
+        ),
+        repair_policy=RepairPolicy(
+            policy_id="repair:verifier-aggregate:scheduler-test",
+            maximum_local_corrections=0,
+            strict_progress_bonus_corrections=0,
+            maximum_infrastructure_retries=0,
+            maximum_total_repair_attempts=0,
+        ),
+        required_claim_id="verifier.intent.valid",
+        success_maturity="verifier_compiled",
+    )
+    group = WorkGroupDefinition(
+        group_id="scheduler-verifier-batches",
+        scope_id="job:scheduler-verifier",
+        member_coordinates=(batch_coordinate,),
+        aggregate_coordinate=aggregate_coordinate,
+    )
+    graph = GenerationWorkGraph.compile(
+        (modeling_definition, plan_definition, batch_definition, aggregate_definition),
+        groups=(group,),
+        mode="diagnostic",
+    )
+    manifest = graph.manifest(
+        topology_id="topology:scheduler-verifier-leaf",
+        external_root_refs=(context_ref,),
+    )
+    manifest_ref = control_writer.put_json(
+        artifact_id=manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(context_ref,),
+    )
+    rules = design_rule_index(design)
+    source_draft = _draft(design)
+    intent = VerifierIntent(
+        cases=tuple(
+            VerifierCaseIntent(
+                task_type=case.task_type,
+                evaluator_goal=case.evaluator_goal,
+                actor=case.actor,
+                reset_config=case.reset_config,
+                actions=case.actions,
+                expectations=tuple(
+                    PropertyExpectationIntent(
+                        kind={"error_condition": "error_semantics"}.get(
+                            rules[assertion.rule_id].family,
+                            rules[assertion.rule_id].family,
+                        ),  # type: ignore[arg-type]
+                        after_action_ordinal=assertion.action_index + 1,
+                        expected=assertion.expected,
+                    )
+                    for assertion in case.assertions
+                ),
+            )
+            for case in source_draft.cases
+        ),
+        solve_recipes=source_draft.solve_recipes,
+    )
+
+    class Profile:
+        model_provider = "openai-compatible"
+        model = "grok-4.5"
+        profile_hash = "a" * 64
+        rollout_token_limit = 1_000
+
+    class Profiles:
+        def resolve(self, **_kwargs: object) -> Profile:
+            return Profile()
+
+    class Backend:
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def invoke(self, request: object) -> InvocationResult:
+            self.requests.append(request)
+            return InvocationResult(
+                invocation_id=request.invocation_id,  # type: ignore[attr-defined]
+                status=InvocationStatus.COMPLETED,
+                session=None,
+                turn_id="turn:scheduler-verifier",
+                final_text="completed",
+                structured_output=intent.model_dump(mode="json"),
+                usage=None,
+                events=(),
+                error=None,
+                duration_ms=1,
+            )
+
+    backend = Backend()
+    compiler = VerifierCompiler(
+        artifact_store=judge_writer,
+        invocation_backend=backend,  # type: ignore[arg-type]
+        profile_provider=Profiles(),  # type: ignore[arg-type]
+    )
+    heads = WorkControlStore(tmp_path / "work-control")
+    runtime = WorkControlRuntime(
+        artifacts=control_writer,
+        heads=heads,
+        budget=LeaseBudgetLedger(Budget(llm_tokens=1_000, agent_turns=1, wall_seconds=300)),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=modeling_definition,
+        input_refs=(context_ref,),
+        subject_ref=design_ref,
+        output_refs=(design_ref, world_spec_ref),
+    )
+    scheduler = WorkScheduler(
+        graph=graph,
+        manifest=manifest,
+        manifest_ref=manifest_ref,
+        heads=heads,
+        artifacts=control_writer,
+        runtime=runtime,
+    )
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+    plan_leaf = VerifierPlanLeaf(compiler=compiler, kernel=kernel)
+    batch_leaf = VerifierBatchLeaf(
+        compiler=compiler,
+        workspace_root=tmp_path / "verifier-workspace",
+        kernel=kernel,
+    )
+    aggregate_leaf = VerifierAggregateLeaf(
+        compiler=compiler,
+        kernel=kernel,
+    )
+
+    async def execute_plan(context) -> None:
+        await plan_leaf.execute(context, definition=plan_definition)
+
+    async def execute_batch(context) -> None:
+        await batch_leaf.execute(context, definition=batch_definition)
+
+    async def execute_aggregate(context) -> None:
+        await aggregate_leaf.execute(context, definition=aggregate_definition)
+
+    results = await scheduler.run_until_stalled(
+        executors={
+            plan_definition.work_id: execute_plan,
+            batch_definition.work_id: execute_batch,
+            aggregate_definition.work_id: execute_aggregate,
+        }
+    )
+
+    assert tuple(item.after_state for item in results) == (
+        "committed",
+        "committed",
+        "committed",
+    )
+    assert len(backend.requests) == 1
+    batch_head = heads.read_head(batch_coordinate)
+    assert batch_head is not None and batch_head.commit_ref is not None
+    batch_attempt = control_writer.get_json(batch_head.attempt_ref, WorkAttempt)
+    assert len(batch_attempt.output_refs) == 2
+    proposal_run = next(
+        control_writer.get_json(ref, OperationRun)
+        for ref in batch_attempt.operation_run_refs
+        if control_writer.get_json(ref, OperationRun).kind == "proposal"
+    )
+    assert proposal_run.execution_ref is not None
+    proposal = control_writer.get_json(proposal_run.execution_ref, ProposalExecution)
+    assert proposal.invocation_id == backend.requests[0].invocation_id  # type: ignore[attr-defined]
+    aggregate_head = heads.read_head(aggregate_coordinate)
+    assert aggregate_head is not None and aggregate_head.commit_ref is not None
+    aggregate_commit = control_writer.get_json(aggregate_head.commit_ref, WorkCommit)
+    assert aggregate_commit.aggregate
+    assert aggregate_commit.child_commit_refs == (batch_head.commit_ref,)
+
+
 @pytest.mark.asyncio
 async def test_verifier_code_router_retries_retryable_backend_failure_fresh(
     tmp_path: Path,
@@ -973,8 +1593,7 @@ async def test_verifier_supervisor_cancels_real_straggler_and_keeps_success_chec
             process = self.processes.get(invocation_id)
             if process is None or process.returncode is not None:
                 return False
-            process.terminate()
-            await asyncio.wait_for(process.wait(), timeout=1)
+            await _terminate_process_tree(process, grace_seconds=1)
             return True
 
     backend = ProcessCancellationBackend()

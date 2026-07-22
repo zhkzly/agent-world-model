@@ -30,9 +30,17 @@ from agent_world.contracts import (
     Budget,
     BudgetUsage,
     CurriculumSamplingPolicy,
+    EnvironmentJob,
+    ReleaseProfile,
     sha256_digest,
 )
-from agent_world.control import BudgetLease, JobRunSnapshot, NodeAttempt
+from agent_world.control import (
+    BudgetLease,
+    DurableLeaseBudgetCoordinator,
+    JobRunSnapshot,
+    NodeAttempt,
+    WorkControlStore,
+)
 from agent_world.controller import FoundryController
 from agent_world.designer import (
     EnvironmentDesigner,
@@ -123,6 +131,39 @@ def test_auth_file_error_never_contains_credential_material(tmp_path: Path) -> N
 
         assert canary not in str(captured.value)
         assert "permissions" in str(captured.value)
+
+
+def test_application_accepts_short_opaque_api_key_and_still_seals_its_canary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compatible gateway token needs the same no-leak protection as a long key."""
+
+    credential = "tok_6x"
+    environment_name = "AGENT_WORLD_TEST_SHORT_OPAQUE_KEY"
+    monkeypatch.setenv(environment_name, credential)
+    config = FoundryConfig(
+        state_root=tmp_path / "state",
+        agent=AgentBackendConfig(
+            model="configured-real-model",
+            api_key_environment=environment_name,
+        ),
+        research=ResearchConfig(
+            provider="searxng",
+            searxng_base_url=HttpUrl("http://127.0.0.1:18080"),
+            searxng_allow_private_endpoint=True,
+            use_jina_reader_fallback=False,
+        ),
+    )
+
+    app = build_application(config)
+    with pytest.raises(UnsafeArtifactError):
+        app.controller.artifacts.put_blob(
+            artifact_id="short-credential-leak-attempt",
+            artifact_type="control.security_probe",
+            content=f"prefix {credential} suffix".encode(),
+            media_type="text/plain",
+        )
 
 
 def test_module_and_installed_console_help_are_executable() -> None:
@@ -327,6 +368,100 @@ def test_direct_run_reader_exposes_live_progress_and_budget_without_content() ->
     assert terminal_active["orphaned_spans"] == [telemetry_span]
     assert terminal_active["usage"]["active_lease_count"] == 0
     assert terminal_active["usage"]["orphaned_lease_count"] == 2
+
+
+def test_direct_run_reader_uses_scheduler_ledger_for_live_budget(tmp_path: Path) -> None:
+    """A live Direct read must not project the stale summary as zero usage."""
+
+    def ref(name: str, artifact_type: str) -> ArtifactRef:
+        digest = sha256_digest(name.encode())
+        return ArtifactRef(
+            artifact_id=name,
+            revision_id=digest,
+            artifact_type=artifact_type,
+            content_hash=digest,
+            media_type="application/json",
+            size_bytes=0,
+        )
+
+    job_ref = ref("job:scheduler-live", "control.environment_job")
+    request_ref = ref("request:scheduler-live", "control.environment_request")
+    snapshot_ref = ref("run:scheduler-live:state", "control.job_run_snapshot")
+    job = EnvironmentJob(
+        job_id="job:scheduler-live",
+        kind="generate",
+        request_ref=request_ref,
+        release_profile=ReleaseProfile(profile_id="release:scheduler-live"),
+    )
+    snapshot = JobRunSnapshot(
+        run_id="run:scheduler-live",
+        job_ref=job_ref,
+        revision=1,
+        status="running",
+        reserved_budget=Budget(llm_tokens=1_000, agent_turns=4, wall_seconds=120),
+        observed_actual_budget=BudgetUsage(),
+        unknown_upper_bound_budget=BudgetUsage(),
+        conservative_committed_budget=BudgetUsage(),
+    )
+    heads = WorkControlStore(tmp_path / "work-control")
+    coordinator = DurableLeaseBudgetCoordinator(heads.root / "scope-budgets")
+    coordinator.initialize(scope_id=job.job_id, reserved=snapshot.reserved_budget)
+    coordinator.reserve(
+        scope_id=job.job_id,
+        lease_id="lease:settled",
+        owner_id="operation:settled",
+        requested=Budget(llm_tokens=400, agent_turns=1, wall_seconds=30),
+        elapsed_wall_seconds=0,
+    )
+    coordinator.settle(
+        scope_id=job.job_id,
+        lease_id="lease:settled",
+        observed_actual=BudgetUsage(llm_tokens=240, agent_turns=1),
+        unknown_upper_bound=BudgetUsage(llm_tokens=40),
+    )
+    coordinator.reserve(
+        scope_id=job.job_id,
+        lease_id="lease:active",
+        owner_id="operation:active",
+        requested=Budget(llm_tokens=500, agent_turns=2, wall_seconds=60),
+        elapsed_wall_seconds=1,
+    )
+    head = SimpleNamespace(
+        run_id=snapshot.run_id,
+        job_ref=job_ref,
+        request_ref=request_ref,
+        snapshot_ref=snapshot_ref,
+        model_dump=lambda **_kwargs: {"run_id": snapshot.run_id},
+    )
+
+    class FakeArtifacts:
+        def get_json(self, target: ArtifactRef, model: object) -> Any:
+            del model
+            return {snapshot_ref: snapshot, job_ref: job}[target]
+
+        def list_events_for_run(self, *_args: object, **_kwargs: object) -> tuple[()]:
+            return ()
+
+        def list_revisions(self, *_args: object, **_kwargs: object) -> tuple[()]:
+            return ()
+
+    reader = DirectRunReader(
+        SimpleNamespace(read_head=lambda _request_id: head),  # type: ignore[arg-type]
+        FakeArtifacts(),  # type: ignore[arg-type]
+        SimpleNamespace(active_work=lambda _run_id: ()),  # type: ignore[arg-type]
+        heads,
+    )
+
+    usage = reader.inspect("request:scheduler-live")["active_work"]["usage"]
+
+    assert usage["projection_source"] == "scheduler_scope_lease_ledger"
+    assert usage["observed_actual"]["llm_tokens"] == 240
+    assert usage["unknown_upper_bound"]["llm_tokens"] == 40
+    assert usage["conservative_committed"]["llm_tokens"] == 280
+    assert usage["active_lease_count"] == 1
+    assert usage["active_reserved_exposure"]["llm_tokens"] == 500
+    assert usage["active_reserved_exposure"]["agent_turns"] == 2
+    assert usage["active_reserved_exposure"]["wall_seconds"] == 60
 
 
 def test_metrics_cli_exposes_multi_run_summary_and_baseline_comparison() -> None:

@@ -269,7 +269,7 @@ class EvidenceBackedExpansionSource:
                 usage = self._observed_usage(
                     meter=meter,
                     search_calls=exc.search_calls,
-                    fetch_calls=exc.fetch_calls,
+                    tool_calls=exc.search_calls + exc.fetch_calls + exc.extract_calls,
                     elapsed=time.monotonic() - started,
                     maximum=request.descriptor.budget,
                 )
@@ -364,7 +364,9 @@ class EvidenceBackedExpansionSource:
             usage = self._observed_usage(
                 meter=meter,
                 search_calls=research.search_calls,
-                fetch_calls=research.fetch_calls,
+                tool_calls=(
+                    research.search_calls + research.fetch_calls + research.extract_calls
+                ),
                 elapsed=time.monotonic() - started,
                 maximum=request.descriptor.budget,
             )
@@ -683,7 +685,7 @@ class EvidenceBackedExpansionSource:
         *,
         meter: DesignerInvocationBudget,
         search_calls: int,
-        fetch_calls: int,
+        tool_calls: int,
         elapsed: float,
         maximum: Budget,
     ) -> BudgetUsage:
@@ -692,7 +694,7 @@ class EvidenceBackedExpansionSource:
             llm_tokens=invoked.llm_tokens,
             agent_turns=invoked.agent_turns,
             search_calls=search_calls,
-            tool_calls=search_calls + fetch_calls,
+            tool_calls=tool_calls,
             repair_attempts=invoked.repair_attempts,
             wall_seconds=min(maximum.wall_seconds, max(0.0, elapsed)),
             monetary_cost=invoked.monetary_cost,

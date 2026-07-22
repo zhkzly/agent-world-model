@@ -332,6 +332,16 @@ class InvocationUsage:
     turn: TokenBreakdown | None = None
     thread_total: TokenBreakdown | None = None
     model_context_window: int | None = None
+    # Compatibility providers frequently expose token usage but no trustworthy
+    # price.  `None` is intentional: callers must preserve it as unknown,
+    # rather than manufacturing a zero-dollar observation.
+    monetary_cost: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.monetary_cost is not None and (
+            not math.isfinite(self.monetary_cost) or self.monetary_cost < 0
+        ):
+            raise ValueError("monetary_cost must be finite and non-negative when reported")
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,6 +384,10 @@ class InvocationResult:
 @runtime_checkable
 class InvocationBackend(Protocol):
     """Contract implemented by real Agent adapters only."""
+
+    @property
+    def supported_executor_revision_ids(self) -> tuple[str, ...]:
+        """Framework execution protocols the adapter can actually honor."""
 
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
         """Execute one new or continued Agent turn."""

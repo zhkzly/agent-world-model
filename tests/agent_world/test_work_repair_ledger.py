@@ -9,6 +9,8 @@ from agent_world.control.work import (
     RepairAction,
     ValidationIssue,
     ValidationReport,
+    repair_epoch_digest,
+    work_input_fingerprint,
 )
 from agent_world.control.work_graph import tool_semantics_batch_definition
 from agent_world.control.work_repair import WorkRepairDenied, WorkRepairLedger
@@ -65,7 +67,7 @@ def _report(
         coordinate=definition.coordinate,
         policy_id=definition.validation_policy.policy_id,
         policy_digest=definition.validation_policy.content_digest(),
-        subject_ref=subject_ref,
+        subject_refs=((subject_ref,) if subject_ref is not None else ()),
         status=status,
         validation_phase="tool_semantics" if frontier else "invocation_backend",
         frontier_ordinal=frontier,
@@ -81,23 +83,28 @@ def _authorization(
     ordinal: int,
     report: ValidationReport,
     decision: str = "local_correction",
+    reason_code: str = "actionable_validation_failure",
+    definition=None,
+    input_refs: tuple[ArtifactRef, ...] | None = None,
 ) -> tuple[RepairAction, ArtifactRef, ArtifactRef, ArtifactRef, ArtifactRef]:
-    definition = _definition()
+    definition = definition or _definition()
     evaluation_ref = _ref(f"evaluation:{ordinal}", "control.feedback_evaluation")
+    input_refs = input_refs or (_ref("world-skeleton", "design.world_skeleton"),)
     action = RepairAction(
         action_id=f"repair-action:{ordinal}",
         repair_policy_id=definition.repair_policy.policy_id,
+        repair_epoch_digest=repair_epoch_digest(definition, input_refs),
+        definition_digest=definition.definition_digest,
+        input_fingerprint=work_input_fingerprint(input_refs),
         source_evaluation_ref=evaluation_ref,
         current_coordinate=definition.coordinate,
         target_coordinate=definition.coordinate,
         decision=decision,
         jump_distance=0,
         repair_attempt_ordinal=ordinal,
-        immutable_input_refs=(
-            _ref("world-skeleton", "design.world_skeleton"),
-        ),
+        immutable_input_refs=input_refs,
         allowed_mutation_roots=("/tools",) if decision == "local_correction" else (),
-        reason_code="actionable_validation_failure",
+        reason_code=reason_code,
         repair_attempt_charge=1,
         authorized_at=datetime.now(UTC),
     )
@@ -110,20 +117,119 @@ def _authorization(
     )
 
 
-def _authorize(ledger: WorkRepairLedger, report: ValidationReport, ordinal: int):
+def _authorize(
+    ledger: WorkRepairLedger,
+    report: ValidationReport,
+    ordinal: int,
+    *,
+    definition=None,
+    input_refs: tuple[ArtifactRef, ...] | None = None,
+):
+    definition = definition or _definition()
+    input_refs = input_refs or (_ref("world-skeleton", "design.world_skeleton"),)
     action, action_ref, evaluation_ref, report_ref, budget_ref = _authorization(
         ordinal=ordinal,
         report=report,
+        definition=definition,
+        input_refs=input_refs,
     )
     return ledger.authorize(
-        definition=_definition(),
+        definition=definition,
         action=action,
         action_ref=action_ref,
         evaluation_ref=evaluation_ref,
         report=report,
         report_ref=report_ref,
-        budget_lease_ref=budget_ref,
     )
+
+
+def test_repair_epoch_isolates_definition_and_input_revisions() -> None:
+    ledger = WorkRepairLedger()
+    definition = _definition()
+    input_refs = (_ref("world-skeleton", "design.world_skeleton"),)
+    report = _report("old-definition", (_issue("reference_missing"),))
+    old = _authorize(
+        ledger,
+        report,
+        1,
+        definition=definition,
+        input_refs=input_refs,
+    )
+    ledger.complete(
+        old.entry_id,
+        report_before=report,
+        report_after=_report("same-old-definition", (_issue("reference_missing"),)),
+        report_after_ref=_ref(
+            "report:same-old-definition",
+            "control.validation_report",
+        ),
+    )
+
+    revised_definition = definition.model_copy(
+        update={
+            "proposal_policy": definition.proposal_policy.model_copy(
+                update={"acceptance_transform_id": "framework.revision.v2"}
+            )
+        }
+    )
+    assert ledger.entries_for(revised_definition, input_refs=input_refs) == ()
+    revised = _authorize(
+        ledger,
+        report,
+        1,
+        definition=revised_definition,
+        input_refs=input_refs,
+    )
+    assert revised.repair_attempt_ordinal == 1
+
+    changed_inputs = (_ref("world-skeleton-v2", "design.world_skeleton"),)
+    assert ledger.entries_for(revised_definition, input_refs=changed_inputs) == ()
+
+
+def test_local_repair_accepts_minimal_authorized_subtree_and_rejects_escape() -> None:
+    ledger = WorkRepairLedger()
+    definition = _definition().model_copy(
+        update={
+            "allowed_mutation_roots": (
+                "/boundary",
+                "/state_entities",
+                "/tool_inventory",
+            )
+        }
+    )
+    report = _report("unknown-actor", (_issue("architecture_visibility_actor_unknown"),))
+    action, action_ref, evaluation_ref, report_ref, budget_ref = _authorization(
+        ordinal=1,
+        report=report,
+        definition=definition,
+    )
+    action = action.model_copy(update={"allowed_mutation_roots": ("/state_entities",)})
+
+    entry = ledger.authorize(
+        definition=definition,
+        action=action,
+        action_ref=action_ref,
+        evaluation_ref=evaluation_ref,
+        report=report,
+        report_ref=report_ref,
+    )
+    assert entry.decision == "local_correction"
+
+    escaped = action.model_copy(
+        update={
+            "action_id": "repair-action:escape",
+            "allowed_mutation_roots": ("/curriculum",),
+        }
+    )
+    with pytest.raises(WorkRepairDenied, match="repair_mutation_authority_mismatch"):
+        WorkRepairLedger().authorize(
+            definition=definition,
+            action=escaped,
+            action_ref=_ref("action:escape", "control.repair_action"),
+            evaluation_ref=evaluation_ref,
+            report=report,
+            report_ref=report_ref,
+        )
 
 
 def test_strict_progress_grants_one_bonus_then_unchanged_is_terminal() -> None:
@@ -216,7 +322,6 @@ def test_generic_diagnostic_denied_and_infrastructure_budget_is_separate() -> No
         evaluation_ref=evaluation_ref,
         report=error_report,
         report_ref=report_ref,
-        budget_lease_ref=budget_ref,
     )
     semantic_report = _report("semantic", (_issue("reference_missing"),), frontier=20)
     completed = ledger.complete(
@@ -227,3 +332,51 @@ def test_generic_diagnostic_denied_and_infrastructure_budget_is_separate() -> No
     )
     assert completed.progress == "strict_progress"
     assert completed.decision == "infrastructure_retry"
+
+
+def test_process_recovery_does_not_consume_provider_retry_allowance() -> None:
+    ledger = WorkRepairLedger()
+    error_report = _report(
+        "provider-error",
+        (_issue("provider_timeout"),),
+        frontier=0,
+        status="error",
+        quality="actionable",
+    )
+    action, action_ref, evaluation_ref, report_ref, budget_ref = _authorization(
+        ordinal=1,
+        report=error_report,
+        decision="infrastructure_retry",
+        reason_code="retryable_infrastructure_failure",
+    )
+    ledger.authorize(
+        definition=_definition(),
+        action=action,
+        action_ref=action_ref,
+        evaluation_ref=evaluation_ref,
+        report=error_report,
+        report_ref=report_ref,
+    )
+
+    interrupted = _report(
+        "process-interrupted",
+        (_issue("process_interrupted_before_checkpoint"),),
+        frontier=0,
+        status="error",
+        quality="actionable",
+    )
+    action, action_ref, evaluation_ref, report_ref, budget_ref = _authorization(
+        ordinal=2,
+        report=interrupted,
+        decision="infrastructure_retry",
+        reason_code="process_interrupted",
+    )
+    recovered = ledger.authorize(
+        definition=_definition(),
+        action=action,
+        action_ref=action_ref,
+        evaluation_ref=evaluation_ref,
+        report=interrupted,
+        report_ref=report_ref,
+    )
+    assert recovered.reason_code == "process_interrupted"

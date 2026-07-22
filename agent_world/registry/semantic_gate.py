@@ -283,9 +283,7 @@ def validate_package_release_bindings(
         )
     if candidate_manifest.public_verifier_ref != manifest.public_verifier_ref:
         raise PackageSemanticError("CandidateManifest and manifest public verifier refs differ")
-    candidate_files = tuple(
-        item for item in manifest.files if item.role not in _FRAMEWORK_ROLES
-    )
+    candidate_files = tuple(item for item in manifest.files if item.role not in _FRAMEWORK_ROLES)
     if candidate_files != candidate_manifest.files:
         raise PackageSemanticError(
             "physical manifest candidate files differ from CandidateManifest"
@@ -306,7 +304,7 @@ def validate_package_release_bindings(
         implementation_lineage_ref=manifest.implementation_lineage_ref,
         judge_report_ref=manifest.judge_report_ref,
         integration_report_ref=manifest.integration_report_ref,
-        claim_vector_ref=manifest.claim_vector_ref,
+        release_dossier_ref=manifest.release_dossier_ref,
         telemetry_summary_ref=manifest.telemetry_summary_ref,
         public_verifier_ref=manifest.public_verifier_ref,
         materializer_protocol_ref=manifest.task_materializer.output_schema_ref,
@@ -321,7 +319,7 @@ def validate_package_release_bindings(
         version=manifest.version,
         report_ref=manifest.judge_report_ref,
         integration_report_ref=manifest.integration_report_ref,
-        claim_vector_ref=manifest.claim_vector_ref,
+        release_dossier_ref=manifest.release_dossier_ref,
         telemetry_summary_ref=manifest.telemetry_summary_ref,
     )
     if contracts.assurance != expected_assurance:
@@ -419,8 +417,8 @@ def _validate_core_bindings(
         "judge_report_content_hash": manifest.judge_report_ref.content_hash,
         "integration_report_revision_id": manifest.integration_report_ref.revision_id,
         "integration_report_content_hash": manifest.integration_report_ref.content_hash,
-        "claim_vector_revision_id": manifest.claim_vector_ref.revision_id,
-        "claim_vector_content_hash": manifest.claim_vector_ref.content_hash,
+        "release_dossier_revision_id": manifest.release_dossier_ref.revision_id,
+        "release_dossier_content_hash": manifest.release_dossier_ref.content_hash,
         "telemetry_summary_revision_id": manifest.telemetry_summary_ref.revision_id,
         "telemetry_summary_content_hash": manifest.telemetry_summary_ref.content_hash,
         "provenance_hash": sha256_digest(provenance_bytes),
@@ -437,8 +435,7 @@ def _validate_core_bindings(
         or provenance.version != manifest.version
         or provenance.world_spec_hash != manifest.world_spec_hash
         or provenance.candidate_source_tree_digest != manifest.candidate_source_tree_digest
-        or provenance.dependency_lock_hash
-        != manifest.lineage.implementation.dependency_lock_hash
+        or provenance.dependency_lock_hash != manifest.lineage.implementation.dependency_lock_hash
         or provenance.semantic_lineage != manifest.lineage.semantic
         or provenance.implementation_lineage != manifest.lineage.implementation
     ):
@@ -448,7 +445,7 @@ def _validate_core_bindings(
         or assurance.version != manifest.version
         or assurance.report_ref != manifest.judge_report_ref
         or assurance.integration_report_ref != manifest.integration_report_ref
-        or assurance.claim_vector_ref != manifest.claim_vector_ref
+        or assurance.release_dossier_ref != manifest.release_dossier_ref
         or assurance.telemetry_summary_ref != manifest.telemetry_summary_ref
         or assurance.candidate_ref != manifest.candidate_ref
         or assurance.candidate_source_tree_digest != manifest.candidate_source_tree_digest
@@ -479,8 +476,7 @@ def _without_verified_licenses(sbom: EnvironmentSbom) -> EnvironmentSbom:
         update={
             "virtual_root": sbom.virtual_root.model_copy(update={"license": unknown}),
             "registry_dependencies": tuple(
-                item.model_copy(update={"license": unknown})
-                for item in sbom.registry_dependencies
+                item.model_copy(update={"license": unknown}) for item in sbom.registry_dependencies
             ),
         }
     )
@@ -522,12 +518,8 @@ def validate_package_identity(
         raise PackageSemanticError("SemanticLineage does not bind the physical WorldSpec")
     if identity.boundary_after_hash != boundary_hash:
         raise PackageSemanticError("IdentityDecision does not bind the physical WorldBoundary")
-    if semantic.tool_contract_set_after_hash not in _tool_contract_set_hashes(
-        contracts.world_spec
-    ):
-        raise PackageSemanticError(
-            "SemanticLineage does not bind the physical ToolContract set"
-        )
+    if semantic.tool_contract_set_after_hash not in _tool_contract_set_hashes(contracts.world_spec):
+        raise PackageSemanticError("SemanticLineage does not bind the physical ToolContract set")
     if len(parents) != len(semantic.semantic_parent_refs):
         raise PackageSemanticError("Registry semantic parent closure is incomplete")
 
@@ -618,9 +610,7 @@ def _matches_before_state(semantic: Any, parent: SemanticParent) -> bool:
 
 
 def _tool_contract_set_hashes(world_spec: WorldSpec) -> frozenset[str]:
-    as_declared = [
-        item.model_dump(mode="json", exclude_none=False) for item in world_spec.tools
-    ]
+    as_declared = [item.model_dump(mode="json", exclude_none=False) for item in world_spec.tools]
     sorted_tools = [
         item.model_dump(mode="json", exclude_none=False)
         for item in sorted(world_spec.tools, key=lambda item: item.surface.tool_id)

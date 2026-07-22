@@ -61,6 +61,9 @@ from agent_world.invocation import (
 
 from .models import (
     BoundVerifierCaseIntent,
+    VerifierBatchDraft,
+    VerifierBatchPlan,
+    VerifierBatchPlanItem,
     VerifierDraft,
     VerifierIntent,
     VerifierIntentCheckpoint,
@@ -194,6 +197,7 @@ class VerifierCompilationError(RuntimeError):
         invocation_results: Sequence[InvocationResult] = (),
         unknown_token_upper_bounds: Sequence[int] = (),
         checkpoint_refs: Sequence[ArtifactRef] = (),
+        profile: ResolvedAgentProfile | None = None,
     ) -> None:
         super().__init__(message)
         self.result = result
@@ -204,6 +208,7 @@ class VerifierCompilationError(RuntimeError):
         self.invocation_results = results
         self.unknown_token_upper_bounds = tuple(unknown_token_upper_bounds)
         self.checkpoint_refs = tuple(checkpoint_refs)
+        self.profile = profile
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +217,37 @@ class CompiledVerifier:
     verifier_ref: ArtifactRef
     invocation_results: tuple[InvocationResult, ...]
     checkpoint_refs: tuple[ArtifactRef, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledVerifierBatch:
+    """Result of exactly one physical Challenger invocation.
+
+    A semantic rejection is represented as a typed safe diagnostic instead of a
+    compiler-owned retry.  The Scheduler leaf converts it to one
+    ``ValidationReport`` and the global repair policy decides whether another
+    physical WorkAttempt exists.
+    """
+
+    plan_ref: ArtifactRef
+    plan: VerifierBatchPlan
+    batch: VerifierBatchPlanItem
+    profile: ResolvedAgentProfile
+    invocation: InvocationResult
+    draft: VerifierDraft | None = None
+    checkpoint_ref: ArtifactRef | None = None
+    draft_ref: ArtifactRef | None = None
+    validation_diagnostic: ValidationDiagnostic | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        return (
+            self.invocation.succeeded
+            and self.validation_diagnostic is None
+            and self.draft is not None
+            and self.checkpoint_ref is not None
+            and self.draft_ref is not None
+        )
 
 
 TOutput = TypeVar("TOutput", bound=BaseModel)
@@ -255,6 +291,337 @@ class VerifierCompiler:
         if task_count < 1 or task_count > self.maximum_task_shards:
             raise ValueError("task_count is outside Verifier task policy")
         return (task_count + self.maximum_tasks_per_batch - 1) // (self.maximum_tasks_per_batch)
+
+    def build_batch_plan(
+        self,
+        *,
+        design: EnvironmentDesign,
+        design_ref: ArtifactRef,
+        world_spec_ref: ArtifactRef,
+    ) -> VerifierBatchPlan:
+        """Freeze the exact physical Challenger partition for one Design revision.
+
+        This is framework code, not a planning Agent: task order, Rule ownership,
+        property coverage and semantic-case quota all derive from immutable Design
+        bytes. Scheduler leaves consume the persisted plan instead of invoking a
+        compiler-internal concurrent fan-out.
+        """
+
+        self.artifacts.require_exact_json(
+            design_ref,
+            design,
+            artifact_types=("design.environment_design", "expansion.environment_design"),
+        )
+        self.artifacts.require_exact_json(
+            world_spec_ref,
+            design.world_spec,
+            artifact_types=("design.world_spec", "expansion.world_spec"),
+        )
+        tasks = design.curriculum.task_types
+        if len(tasks) > self.maximum_task_shards:
+            raise VerifierCompilationError(
+                f"Verifier compilation exceeds {self.maximum_task_shards} task shards"
+            )
+        task_batches = tuple(
+            tasks[index : index + self.maximum_tasks_per_batch]
+            for index in range(0, len(tasks), self.maximum_tasks_per_batch)
+        )
+        if not task_batches:
+            raise VerifierCompilationError("Verifier compilation requires at least one task batch")
+        rule_assignments = self._assign_required_rules(design)
+        property_assignments = self._assign_required_property_families(design, rule_assignments)
+        case_quotas = self._semantic_case_quotas(len(task_batches))
+        batch_items: list[VerifierBatchPlanItem] = []
+        for batch_index, task_batch in enumerate(task_batches):
+            task_types = tuple(task.task_type for task in task_batch)
+            required_rule_ids = tuple(
+                rule_id for task in task_batch for rule_id in rule_assignments[task.task_type]
+            )
+            required_property_families = tuple(
+                sorted(
+                    {
+                        family
+                        for task in task_batch
+                        for family in property_assignments[task.task_type]
+                    }
+                )
+            )
+            require_metamorphic = bool(design.verification.required_metamorphic_relations) and (
+                batch_index == 0
+            )
+            context = self._challenger_context(
+                design,
+                task_types=task_types,
+                required_rule_ids=required_rule_ids,
+                required_property_families=required_property_families,
+                require_metamorphic=require_metamorphic,
+            )
+            context["semantic_case_limit"] = case_quotas[batch_index]
+            batch_items.append(
+                VerifierBatchPlanItem(
+                    batch_id=f"verifier-batch:{batch_index + 1}",
+                    batch_index=batch_index,
+                    task_types=task_types,
+                    required_rule_ids=required_rule_ids,
+                    required_property_families=required_property_families,
+                    semantic_case_limit=case_quotas[batch_index],
+                    require_metamorphic=require_metamorphic,
+                    context_hash=sha256_digest(canonical_json_bytes(context)),
+                )
+            )
+        plan_identity = sha256_digest(
+            canonical_json_bytes(
+                {
+                    "design_ref": design_ref.revision_id,
+                    "world_spec_ref": world_spec_ref.revision_id,
+                    "maximum_tasks_per_batch": self.maximum_tasks_per_batch,
+                    "batches": [item.model_dump(mode="json") for item in batch_items],
+                }
+            )
+        ).removeprefix("sha256:")
+        return VerifierBatchPlan(
+            plan_id=f"verifier-plan:{plan_identity[:24]}",
+            design_ref=design_ref,
+            world_spec_ref=world_spec_ref,
+            maximum_tasks_per_batch=self.maximum_tasks_per_batch,
+            batches=tuple(batch_items),
+        )
+
+    def persist_batch_plan(self, plan: VerifierBatchPlan) -> ArtifactRef:
+        """Persist one frozen plan for Scheduler recovery and shard input binding."""
+
+        return self.artifacts.put_json(
+            artifact_id=plan.plan_id,
+            artifact_type="judge.verifier_batch_plan",
+            value=plan,
+            dependencies=(plan.design_ref, plan.world_spec_ref),
+        )
+
+    async def compile_batch_once(
+        self,
+        *,
+        design: EnvironmentDesign,
+        design_ref: ArtifactRef,
+        world_spec_ref: ArtifactRef,
+        plan: VerifierBatchPlan,
+        plan_ref: ArtifactRef,
+        batch_index: int,
+        workspace: Path,
+        lineage_id: str,
+        budget: Budget,
+        permissions: PermissionScope,
+        invocation_id: str,
+    ) -> CompiledVerifierBatch:
+        """Run exactly one planned Challenger turn; never authorize an internal retry.
+
+        ``invocation_id`` is the Scheduler dispatch identity, so the durable
+        OperationRun, backend request and eventual ProposalExecution all bind
+        the same physical call.  Any semantic rejection returns a safe
+        ``ValidationDiagnostic`` to the caller rather than starting a hidden
+        continuation or choosing a repair route.
+        """
+
+        if budget.agent_turns != 1 or budget.llm_tokens < 1:
+            raise ValueError("one-shot Verifier batch requires exactly one Agent turn")
+        self.artifacts.require_exact_json(
+            plan_ref,
+            plan,
+            artifact_types=("judge.verifier_batch_plan",),
+        )
+        if plan.design_ref != design_ref or plan.world_spec_ref != world_spec_ref:
+            raise VerifierCompilationError("Verifier batch plan does not bind this frozen Design")
+        self.artifacts.require_exact_json(
+            design_ref,
+            design,
+            artifact_types=("design.environment_design", "expansion.environment_design"),
+        )
+        self.artifacts.require_exact_json(
+            world_spec_ref,
+            design.world_spec,
+            artifact_types=("design.world_spec", "expansion.world_spec"),
+        )
+        if not 0 <= batch_index < len(plan.batches):
+            raise VerifierCompilationError("Verifier batch index is outside the frozen plan")
+        batch = plan.batches[batch_index]
+        workspace = workspace.expanduser().resolve()  # noqa: ASYNC240 - bounded setup I/O
+        workspace.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240 - bounded setup I/O
+        context = self._challenger_context(
+            design,
+            task_types=batch.task_types,
+            required_rule_ids=batch.required_rule_ids,
+            required_property_families=batch.required_property_families,
+            require_metamorphic=batch.require_metamorphic,
+        )
+        context["semantic_case_limit"] = batch.semantic_case_limit
+        if sha256_digest(canonical_json_bytes(context)) != batch.context_hash:
+            raise VerifierCompilationError("Verifier batch plan context commitment mismatch")
+        self._write_json(workspace / "verifier-context.json", context)
+        try:
+            assert_agent_output_advisory(
+                VerifierIntent,
+                authority=AgentOutputAuthority.SEMANTIC_ADVISORY,
+            )
+            profile = self.profiles.resolve(
+                role="challenger",
+                lineage_id=f"{lineage_id}.batch.{batch_index}",
+                workspace=workspace,
+                output_schema=VerifierIntent.model_json_schema(mode="validation"),
+                permissions=permissions,
+                requirement=NodeCapabilityRequirement.structured_output(
+                    node_id="challenger.verifier-compile-batch",
+                    role="challenger",
+                ),
+                rollout_token_limit=budget.llm_tokens,
+                invocation_timeout_seconds=budget.wall_seconds,
+            )
+        except CapabilityResolutionError as exc:
+            raise VerifierCompilationError(
+                str(exc),
+                permission_denied=True,
+            ) from exc
+        try:
+            invocation = await self.backend.invoke(
+                InvocationRequest(
+                    invocation_id=invocation_id,
+                    prompt=self._prompt(context),
+                    profile=profile,
+                    session=None,
+                    metadata={
+                        "role": "challenger",
+                        "lineage_id": lineage_id,
+                        "batch_id": batch.batch_id,
+                        "batch_index": batch.batch_index,
+                        "mode": "scheduler_one_shot",
+                    },
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise VerifierCompilationError(
+                f"Verifier backend raised {type(exc).__name__}",
+                unknown_token_upper_bounds=(budget.llm_tokens,),
+            ) from exc
+        if invocation.invocation_id != invocation_id:
+            raise VerifierCompilationError(
+                "Verifier backend returned a mismatched invocation id",
+                result=invocation,
+                profile=profile,
+            )
+        outcome = CompiledVerifierBatch(
+            plan_ref=plan_ref,
+            plan=plan,
+            batch=batch,
+            profile=profile,
+            invocation=invocation,
+        )
+        if not invocation.succeeded:
+            return outcome
+        try:
+            if invocation.structured_output is None:
+                raise ValueError("Challenger returned no structured output")
+            intent = VerifierIntent.model_validate_json(
+                canonical_json_bytes(invocation.structured_output)
+            )
+            self._validate_planned_intent(intent, design=design, batch=batch)
+        except (ValidationError, ValueError) as exc:
+            return outcome.__class__(
+                plan_ref=plan_ref,
+                plan=plan,
+                batch=batch,
+                profile=profile,
+                invocation=invocation,
+                validation_diagnostic=self._validation_diagnostic(exc),
+            )
+        try:
+            checkpoint_ref = self._persist_intent_checkpoint(
+                lineage_id=lineage_id,
+                batch_index=batch.batch_index,
+                context=context,
+                intent=intent,
+                invocation_results=(invocation,),
+                design_ref=design_ref,
+                world_spec_ref=world_spec_ref,
+                plan_ref=plan_ref,
+            )
+            draft = self._compile_intent(
+                intent,
+                design,
+                allowed_task_types=batch.task_types,
+                required_rule_ids=batch.required_rule_ids,
+                required_property_families=batch.required_property_families,
+                require_metamorphic=batch.require_metamorphic,
+            )
+            self._validate_draft(
+                draft,
+                design,
+                allowed_task_types=batch.task_types,
+                required_rule_ids=batch.required_rule_ids,
+                required_property_families=batch.required_property_families,
+                require_metamorphic=batch.require_metamorphic,
+            )
+            batch_draft = VerifierBatchDraft(
+                draft_id=f"verifier-batch-draft:{lineage_id}:{batch.batch_id}",
+                plan_ref=plan_ref,
+                batch_id=batch.batch_id,
+                checkpoint_ref=checkpoint_ref,
+                draft=draft,
+            )
+            draft_ref = self.artifacts.put_json(
+                artifact_id=batch_draft.draft_id,
+                artifact_type="judge.verifier_batch_draft",
+                value=batch_draft,
+                dependencies=(plan_ref, checkpoint_ref, design_ref, world_spec_ref),
+            )
+        except Exception as exc:
+            raise VerifierCompilationError(
+                "framework failed to compile a validated one-shot Verifier batch",
+                result=invocation,
+                invocation_results=(invocation,),
+                profile=profile,
+            ) from exc
+        return outcome.__class__(
+            plan_ref=plan_ref,
+            plan=plan,
+            batch=batch,
+            profile=profile,
+            invocation=invocation,
+            draft=draft,
+            checkpoint_ref=checkpoint_ref,
+            draft_ref=draft_ref,
+        )
+
+    @staticmethod
+    def _validate_planned_intent(
+        intent: VerifierIntent,
+        *,
+        design: EnvironmentDesign,
+        batch: VerifierBatchPlanItem,
+    ) -> None:
+        if len(intent.cases) > batch.semantic_case_limit:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="verifier",
+                    validation_phase="intent_capacity",
+                    frontier_ordinal=5,
+                    issues=(
+                        SafeValidationIssue(
+                            "intent_case_capacity_exceeded",
+                            ("cases",),
+                            "Return no more semantic trajectories than the "
+                            "framework-provided semantic_case_limit.",
+                        ),
+                    ),
+                )
+            )
+        VerifierCompiler._validate_intent(
+            intent,
+            design,
+            allowed_task_types=batch.task_types,
+            required_rule_ids=batch.required_rule_ids,
+            required_property_families=batch.required_property_families,
+            require_metamorphic=batch.require_metamorphic,
+        )
 
     async def compile(
         self,
@@ -1664,6 +2031,7 @@ class VerifierCompiler:
         invocation_results: Sequence[InvocationResult],
         design_ref: ArtifactRef,
         world_spec_ref: ArtifactRef,
+        plan_ref: ArtifactRef | None = None,
     ) -> ArtifactRef:
         bound_cases = self._bind_intent_cases(intent)
         sealed = tuple(item for item in bound_cases if item.partition == "sealed")
@@ -1685,7 +2053,11 @@ class VerifierCompiler:
             artifact_id=f"{lineage_id}:verifier-intent-batch:{batch_index}",
             artifact_type="judge.verifier_intent_checkpoint",
             value=checkpoint,
-            dependencies=(design_ref, world_spec_ref),
+            dependencies=(
+                design_ref,
+                world_spec_ref,
+                *((plan_ref,) if plan_ref is not None else ()),
+            ),
         )
 
     @staticmethod
@@ -2357,6 +2729,7 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
 __all__ = [
     "ChallengerProfileProvider",
     "CompiledVerifier",
+    "CompiledVerifierBatch",
     "VerifierCompilationError",
     "VerifierCompiler",
 ]

@@ -3,8 +3,21 @@
 from agent_world.judge.compiler import (
     ChallengerProfileProvider,
     CompiledVerifier,
+    CompiledVerifierBatch,
     VerifierCompilationError,
     VerifierCompiler,
+)
+from agent_world.judge.leaf import (
+    IntegrationLeaf,
+    ReleaseAssuranceLeaf,
+    VerifierAggregateLeaf,
+    VerifierBatchLeaf,
+    VerifierPlanLeaf,
+)
+from agent_world.judge.models import (
+    VerifierBatchDraft,
+    VerifierBatchPlan,
+    VerifierBatchPlanItem,
 )
 from agent_world.judge.protocol import (
     DEFAULT_PROTOCOL_LIMITS,
@@ -60,8 +73,10 @@ __all__ = [
     "CleanCandidate",
     "CleanCandidateBuilder",
     "CompiledVerifier",
+    "CompiledVerifierBatch",
     "EnvironmentJudge",
     "InstallRecord",
+    "IntegrationLeaf",
     "InteractiveChallengerStrategy",
     "IntegrationBundle",
     "IsolationPolicy",
@@ -72,6 +87,7 @@ __all__ = [
     "ProtocolLimits",
     "ProtocolViolation",
     "ResourceLimits",
+    "ReleaseAssuranceLeaf",
     "RuntimeErrorDetail",
     "RuntimeOperation",
     "RuntimeProcessCrashed",
@@ -85,6 +101,12 @@ __all__ = [
     "ValidatedLaunch",
     "VerifierCompilationError",
     "VerifierCompiler",
+    "VerifierBatchDraft",
+    "VerifierBatchPlan",
+    "VerifierBatchPlanItem",
+    "VerifierAggregateLeaf",
+    "VerifierBatchLeaf",
+    "VerifierPlanLeaf",
     "decode_response",
     "encode_request",
     "make_request",

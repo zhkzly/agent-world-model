@@ -15,7 +15,6 @@ from .base import (
 )
 from .design import (
     CurriculumRequirements,
-    DesignPhaseCheckpoint,
     DifficultyDimension,
     EnvironmentDesign,
     EvaluatorGoalBinding,
@@ -87,6 +86,7 @@ from .jobs import (
     BudgetUsage,
     EnvironmentJob,
     EnvironmentRequest,
+    GenerationContext,
     PermissionScope,
     ReleaseProfile,
 )
@@ -202,6 +202,7 @@ from .world import (
     ActorBoundary,
     ConcurrencySemantics,
     FidelityStatement,
+    IdempotencyMode,
     IdempotencySemantics,
     ObservationSemantics,
     PermissionRule,
@@ -266,7 +267,6 @@ __all__ = [
     "CurriculumRequirements",
     "CurriculumSamplingPolicy",
     "DesignBaselineCheckpoint",
-    "DesignPhaseCheckpoint",
     "DifficultyDimension",
     "DiscoveryAdmissionDecision",
     "DiscoveryQuarantineRecommendation",
@@ -310,9 +310,11 @@ __all__ = [
     "FrameworkPackagePayload",
     "FrameworkPackageRole",
     "GateResult",
+    "GenerationContext",
     "Identifier",
     "IdentityDecision",
     "IntegrationReport",
+    "IdempotencyMode",
     "IdempotencySemantics",
     "ImplementationLineage",
     "InstalledComponentEvidence",

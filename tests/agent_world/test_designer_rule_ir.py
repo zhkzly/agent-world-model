@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -29,7 +30,7 @@ from agent_world.judge.rules import (
 def _temporal_error_source() -> dict[str, object]:
     return {
         "tool_id": "agent-world.runtime.v2.quote_availability",
-        "errors": [
+        "errors": (
             {
                 "error_code": "invalid_stay_window",
                 "when": {
@@ -37,7 +38,7 @@ def _temporal_error_source() -> dict[str, object]:
                     "family": "error_condition",
                     "description": "Check-out must be later than check-in.",
                     "boolean_operator": "all",
-                    "clauses": [
+                    "clauses": (
                         {
                             "clause_id": "non_increasing_window",
                             "operator": "less_or_equal",
@@ -55,17 +56,17 @@ def _temporal_error_source() -> dict[str, object]:
                                 "value_type": "string",
                             },
                             "negate": False,
-                        }
-                    ],
+                        },
+                    ),
                     "case_sensitivity": "positive_and_negative",
-                    "evidence_claim_ids": [],
+                    "evidence_claim_ids": (),
                 },
                 "observation": "Check-out must be later than check-in.",
                 "state_effect": "none",
                 "retryable": False,
-                "evidence_claim_ids": [],
-            }
-        ],
+                "evidence_claim_ids": (),
+            },
+        ),
     }
 
 
@@ -90,7 +91,9 @@ def _context(*, check_in: str, check_out: str) -> RuleExecutionContext:
 def test_agent_rule_schema_expresses_operator_specific_clause_shapes() -> None:
     schema = RuleDraft.model_json_schema(mode="validation")
     validator = Draft202012Validator(schema)
-    valid = _temporal_error_source()["errors"][0]["when"]  # type: ignore[index]
+    valid = json.loads(
+        json.dumps(_temporal_error_source()["errors"][0]["when"])  # type: ignore[index]
+    )
     assert not tuple(validator.iter_errors(valid))
 
     existence_with_right = {
@@ -134,6 +137,7 @@ def test_temporal_rule_draft_compiles_and_executes_without_llm_repair() -> None:
     compiled = EnvironmentDesigner._compile_tool_errors_source(source)
     rule = compiled.errors[0].when
 
+    assert rule.rule_id == "rule:agent-world.runtime.v2.quote_availability:error:0"
     assert rule.clauses[0].ordering == "date"
     assert evaluate_rule(
         rule,
@@ -155,13 +159,13 @@ def test_lookup_by_key_rule_compiles_and_executes_against_collection_state() -> 
     source = ToolConditionsSourceDraft.model_validate(
         {
             "tool_id": "hotel.booking.get",
-            "postconditions": [
+            "postconditions": (
                 {
                     "rule_id": "rule:hotel.booking.get:confirmed",
                     "family": "postcondition",
                     "description": "The selected booking is confirmed.",
                     "boolean_operator": "all",
-                    "clauses": [
+                    "clauses": (
                         {
                             "clause_id": "selected_booking_confirmed",
                             "operator": "equal",
@@ -185,15 +189,16 @@ def test_lookup_by_key_rule_compiles_and_executes_against_collection_state() -> 
                                 "value": "confirmed",
                             },
                             "negate": False,
-                        }
-                    ],
+                        },
+                    ),
                     "case_sensitivity": "positive_only",
-                    "evidence_claim_ids": [],
-                }
-            ],
+                    "evidence_claim_ids": (),
+                },
+            ),
         }
     )
     rule = EnvironmentDesigner._compile_tool_conditions_source(source).postconditions[0]
+    assert rule.rule_id == "rule:hotel.booking.get:postcondition:0"
     context = RuleExecutionContext(
         actor="guest",
         pre_state={"bookings": []},

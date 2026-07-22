@@ -36,11 +36,11 @@ from agent_world.contracts import (
     sha256_digest,
 )
 from agent_world.control import (
-    ClaimVector,
     DirectJobResumeRequiredError,
     DirectRequestConflictError,
     JobRunSnapshot,
     MetricPoint,
+    ReleaseDossier,
     TelemetryReleaseSummary,
     TelemetryStore,
     new_direct_job_head,
@@ -245,10 +245,10 @@ def test_controller_reconciles_registry_event_failure_after_atomic_publish(
     registry = EnvironmentRegistry(state_root / "registry", store)
     release_profile = ReleaseProfile(
         profile_id="registry-post-commit-fault",
-        required_hard_gates=("runtime_protocol", "clean_deployment"),
+        required_hard_gates=("runtime_protocol", "task_reachability", "clean_deployment"),
     )
     controller = _direct_controller(state_root, store, registry, release_profile)
-    graph = _release_graph(tmp_path, store)
+    graph = _release_graph(tmp_path, store, release_profile=release_profile)
     reservation = _reserve(registry, graph)
     prepared = registry.prepare(
         candidate_workspace=graph.workspace,
@@ -290,7 +290,7 @@ def test_direct_generate_recovers_published_job_and_retries_without_agent_replay
     registry = EnvironmentRegistry(state_root / "registry", store)
     release_profile = ReleaseProfile(
         profile_id="registry-integration",
-        required_hard_gates=("runtime_protocol", "clean_deployment"),
+        required_hard_gates=("runtime_protocol", "task_reachability", "clean_deployment"),
     )
     controller = _direct_controller(
         state_root,
@@ -330,7 +330,12 @@ def test_direct_generate_recovers_published_job_and_retries_without_agent_replay
         dependencies=(request_ref,),
     )
 
-    graph = _release_graph(tmp_path, store, owner_ref=job_ref)
+    graph = _release_graph(
+        tmp_path,
+        store,
+        owner_ref=job_ref,
+        release_profile=release_profile,
+    )
     reservation = _reserve(registry, graph)
     prepared = registry.prepare(
         candidate_workspace=graph.workspace,
@@ -884,7 +889,7 @@ def test_expansion_uses_all_frozen_pool_parents_and_revokes_quarantine(
         llm_tokens=2,
         agent_turns=2,
         search_calls=1,
-        tool_calls=2,
+        tool_calls=3,
         wall_seconds=10,
     )
     source_catalog = ExpansionSourceCatalog(
@@ -901,7 +906,7 @@ def test_expansion_uses_all_frozen_pool_parents_and_revokes_quarantine(
         llm_tokens=2,
         agent_turns=8,
         search_calls=1,
-        tool_calls=2,
+        tool_calls=3,
         wall_seconds=300,
     )
     candidate_budget = Budget(agent_turns=2, wall_seconds=60)
@@ -1170,21 +1175,13 @@ def test_expired_prepared_release_cannot_publish_or_claim_success(tmp_path: Path
     assert registry.inspect_reservation(reservation.reservation_id).status == "expired"
 
 
-def test_registry_rejects_nonpassing_judge_evidence(tmp_path: Path) -> None:
+def test_nonpassing_judge_evidence_cannot_assemble_a_package(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path / "artifact-store")
-    graph = _release_graph(tmp_path, store, judge_passes=False)
-    registry = EnvironmentRegistry(tmp_path / "registry", store)
-    reservation = _reserve(registry, graph)
-
-    with pytest.raises(ReleaseRejectedError, match="Judge verdict is not pass"):
-        registry.prepare(
-            candidate_workspace=graph.workspace,
-            manifest_ref=graph.manifest_ref,
-            judge_report_ref=graph.report_ref,
-            release_profile=graph.release_profile,
-            reservation=reservation,
-            framework_payloads=graph.framework_payloads,
-        )
+    # Package is the first release-candidate artifact.  A failed Judge must
+    # not get that far and rely on a later Registry rejection: its evidence is
+    # not an admissible package closure.
+    with pytest.raises(ValueError, match="source-bound passing JudgeReport"):
+        _release_graph(tmp_path, store, judge_passes=False)
 
 
 def test_registry_rejects_source_tree_not_verified_by_judge(tmp_path: Path) -> None:
@@ -1215,7 +1212,7 @@ def test_registry_rejects_source_tree_not_verified_by_judge(tmp_path: Path) -> N
     registry = EnvironmentRegistry(tmp_path / "registry", store)
     reservation = _reserve(registry, graph)
 
-    with pytest.raises(ReleaseRejectedError, match="different candidate source trees"):
+    with pytest.raises(ReleaseRejectedError, match="bind different revisions"):
         registry.prepare(
             candidate_workspace=graph.workspace,
             manifest_ref=wrong_manifest_ref,
@@ -1236,10 +1233,7 @@ def test_registry_rejects_generic_reachability_evidence(tmp_path: Path) -> None:
         value={"status": "pass", "claim": "all generated tasks are reachable"},
         dependencies=(graph.candidate_ref,),
     )
-    manifest = store.get_json(graph.manifest_ref, EnvironmentPackageManifest)
     report = store.get_json(graph.report_ref, JudgeReport)
-    claim_vector = store.get_json(manifest.claim_vector_ref, ClaimVector)
-    assert claim_vector.verifier_ref is not None
     gate_results = tuple(
         gate.model_copy(update={"evidence_refs": (generic_ref,)})
         if gate.gate_id == "task_reachability"
@@ -1257,91 +1251,16 @@ def test_registry_rejects_generic_reachability_evidence(tmp_path: Path) -> None:
             "evaluation_evidence_refs": evidence_refs,
         }
     )
-    generic_report_ref = _judge_writer(store).put_json(
-        artifact_id="judge-report:generic-reachability",
-        artifact_type="judge_report",
-        value=generic_report,
-        dependencies=(graph.candidate_ref, claim_vector.verifier_ref, *evidence_refs),
-    )
-    telemetry = store.get_json(manifest.telemetry_summary_ref, TelemetryReleaseSummary)
-    generic_telemetry_ref = _framework_writer(store).put_json(
-        artifact_id="telemetry-summary:generic-reachability",
-        artifact_type="release.telemetry_summary",
-        value=telemetry,
-        dependencies=(graph.owner_ref, graph.candidate_ref, generic_report_ref),
-    )
-    generic_claims = tuple(
-        item.model_copy(update={"evidence_refs": (generic_report_ref,)})
-        if item.claim_id == "release_judge.valid"
-        else item.model_copy(update={"evidence_refs": (generic_telemetry_ref,)})
-        if item.claim_id == "observability.release_ready"
-        else item
-        for item in claim_vector.claims
-    )
-    generic_claim_vector = claim_vector.model_copy(
-        update={
-            "release_judge_ref": generic_report_ref,
-            "telemetry_ref": generic_telemetry_ref,
-            "claims": generic_claims,
-        }
-    )
-    generic_claim_vector_ref = _framework_writer(store).put_json(
-        artifact_id="claim-vector:generic-reachability",
-        artifact_type="release.claim_vector",
-        value=generic_claim_vector,
-        dependencies=(
-            *(
-                ref
-                for ref in store.dependencies(manifest.claim_vector_ref)
-                if ref not in {graph.report_ref, manifest.telemetry_summary_ref}
-            ),
-            generic_report_ref,
-            generic_telemetry_ref,
-        ),
-    )
-    generic_manifest = manifest.model_copy(
-        update={
-            "judge_report_ref": generic_report_ref,
-            "claim_vector_ref": generic_claim_vector_ref,
-            "telemetry_summary_ref": generic_telemetry_ref,
-        }
-    )
-    generic_manifest_ref = _framework_writer(store).put_json(
-        artifact_id="manifest:generic-reachability",
-        artifact_type="environment_package_manifest",
-        value=generic_manifest,
-        dependencies=(
-            *(
-                ref
-                for ref in store.dependencies(graph.manifest_ref)
-                if ref
-                not in {
-                    graph.report_ref,
-                    manifest.claim_vector_ref,
-                    manifest.telemetry_summary_ref,
-                }
-            ),
-            generic_report_ref,
-            generic_claim_vector_ref,
-            generic_telemetry_ref,
-        ),
-    )
     registry = EnvironmentRegistry(tmp_path / "registry", store)
-    reservation = _reserve(registry, graph)
 
     with pytest.raises(
         ReleaseRejectedError,
         match="typed public reachability evidence",
     ):
-        registry.prepare(
-            candidate_workspace=graph.workspace,
-            manifest_ref=generic_manifest_ref,
-            judge_report_ref=generic_report_ref,
-            release_profile=graph.release_profile,
-            reservation=reservation,
-            framework_payloads=graph.framework_payloads,
+        registry._validate_reachability_release_evidence(  # noqa: SLF001
+            generic_report,
+            {item.gate_id: item for item in generic_report.gate_results},
         )
-    assert registry.list() == ()
 
 
 def test_registry_rejects_incomplete_integration_gate_closure(tmp_path: Path) -> None:
@@ -1369,7 +1288,7 @@ def test_registry_rejects_incomplete_integration_gate_closure(tmp_path: Path) ->
         ),
     )
     registry = EnvironmentRegistry(tmp_path / "registry", store)
-    with pytest.raises(ReleaseRejectedError, match="gate closure is not canonical"):
+    with pytest.raises(ReleaseRejectedError, match="bind different revisions"):
         registry.prepare(
             candidate_workspace=graph.workspace,
             manifest_ref=revised_manifest_ref,
@@ -1380,36 +1299,39 @@ def test_registry_rejects_incomplete_integration_gate_closure(tmp_path: Path) ->
         )
 
 
-def test_registry_rejects_claim_with_wrong_evidence_semantics(tmp_path: Path) -> None:
+def test_registry_rejects_dossier_without_the_exact_prepackage_closure(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path / "artifacts")
     graph = _release_graph(tmp_path, store)
     manifest = store.get_json(graph.manifest_ref, EnvironmentPackageManifest)
-    vector = store.get_json(manifest.claim_vector_ref, ClaimVector)
-    wrong_claims = tuple(
-        item.model_copy(update={"evidence_refs": (manifest.telemetry_summary_ref,)})
-        if item.claim_id == "verifier.valid"
-        else item
-        for item in vector.claims
+    dossier = store.get_json(manifest.release_dossier_ref, ReleaseDossier)
+    missing_commit = dossier.prepackage_commit_refs[-1]
+    truncated_dossier = dossier.model_copy(
+        update={"prepackage_commit_refs": dossier.prepackage_commit_refs[:-1]}
     )
-    wrong_vector = vector.model_copy(update={"claims": wrong_claims})
-    wrong_vector_ref = _framework_writer(store).put_json(
-        artifact_id="claim-vector:wrong-verifier-evidence",
-        artifact_type="release.claim_vector",
-        value=wrong_vector,
-        dependencies=store.dependencies(manifest.claim_vector_ref),
+    truncated_dossier_ref = _framework_writer(store).put_json(
+        artifact_id="release-dossier:missing-observability-commit",
+        artifact_type="release.dossier",
+        value=truncated_dossier,
+        dependencies=tuple(
+            ref
+            for ref in store.dependencies(manifest.release_dossier_ref)
+            if ref != missing_commit
+        ),
     )
-    revised_manifest = manifest.model_copy(update={"claim_vector_ref": wrong_vector_ref})
+    revised_manifest = manifest.model_copy(
+        update={"release_dossier_ref": truncated_dossier_ref}
+    )
     revised_manifest_ref = _framework_writer(store).put_json(
-        artifact_id="manifest:wrong-claim-evidence",
+        artifact_id="manifest:missing-prepackage-commit",
         artifact_type="environment_package_manifest",
         value=revised_manifest,
         dependencies=tuple(
-            wrong_vector_ref if ref == manifest.claim_vector_ref else ref
+            truncated_dossier_ref if ref == manifest.release_dossier_ref else ref
             for ref in store.dependencies(graph.manifest_ref)
         ),
     )
     registry = EnvironmentRegistry(tmp_path / "registry", store)
-    with pytest.raises(ReleaseRejectedError, match="evidence semantics are invalid"):
+    with pytest.raises(ReleaseRejectedError, match="WorkCommit coordinates are not canonical"):
         registry.prepare(
             candidate_workspace=graph.workspace,
             manifest_ref=revised_manifest_ref,
@@ -1440,32 +1362,23 @@ def test_registry_rejects_incomplete_release_telemetry(tmp_path: Path) -> None:
         value=incomplete_telemetry,
         dependencies=store.dependencies(manifest.telemetry_summary_ref),
     )
-    vector = store.get_json(manifest.claim_vector_ref, ClaimVector)
-    revised_claims = tuple(
-        item.model_copy(update={"evidence_refs": (incomplete_telemetry_ref,)})
-        if item.claim_id == "observability.release_ready"
-        else item
-        for item in vector.claims
+    dossier = store.get_json(manifest.release_dossier_ref, ReleaseDossier)
+    revised_dossier = dossier.model_copy(
+        update={"telemetry_summary_ref": incomplete_telemetry_ref}
     )
-    revised_vector = vector.model_copy(
-        update={
-            "telemetry_ref": incomplete_telemetry_ref,
-            "claims": revised_claims,
-        }
-    )
-    revised_vector_ref = _framework_writer(store).put_json(
-        artifact_id="claim-vector:missing-telemetry-node",
-        artifact_type="release.claim_vector",
-        value=revised_vector,
+    revised_dossier_ref = _framework_writer(store).put_json(
+        artifact_id="release-dossier:missing-telemetry-node",
+        artifact_type="release.dossier",
+        value=revised_dossier,
         dependencies=tuple(
             incomplete_telemetry_ref if ref == manifest.telemetry_summary_ref else ref
-            for ref in store.dependencies(manifest.claim_vector_ref)
+            for ref in store.dependencies(manifest.release_dossier_ref)
         ),
     )
     revised_manifest = manifest.model_copy(
         update={
             "telemetry_summary_ref": incomplete_telemetry_ref,
-            "claim_vector_ref": revised_vector_ref,
+            "release_dossier_ref": revised_dossier_ref,
         }
     )
     revised_manifest_ref = _framework_writer(store).put_json(
@@ -1475,14 +1388,14 @@ def test_registry_rejects_incomplete_release_telemetry(tmp_path: Path) -> None:
         dependencies=tuple(
             incomplete_telemetry_ref
             if ref == manifest.telemetry_summary_ref
-            else revised_vector_ref
-            if ref == manifest.claim_vector_ref
+            else revised_dossier_ref
+            if ref == manifest.release_dossier_ref
             else ref
             for ref in store.dependencies(graph.manifest_ref)
         ),
     )
     registry = EnvironmentRegistry(tmp_path / "registry", store)
-    with pytest.raises(ReleaseRejectedError, match="complete release trace"):
+    with pytest.raises(ReleaseRejectedError, match="does not prove its frozen final-graph output"):
         registry.prepare(
             candidate_workspace=graph.workspace,
             manifest_ref=revised_manifest_ref,

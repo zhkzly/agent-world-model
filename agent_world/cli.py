@@ -120,15 +120,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="resume a failed Direct Generation from its last verified phase checkpoint",
     )
     run_resume.add_argument("request_id")
-    run_cancel = run_commands.add_parser(
-        "cancel",
-        help=(
-            "finalize an abandoned running checkpoint after its owning process exited; "
-            "the Direct writer lock prevents cancelling live work"
-        ),
-    )
-    run_cancel.add_argument("request_id")
-
     metrics = commands.add_parser(
         "metrics",
         help="inspect or export credential-free operational telemetry",
@@ -394,11 +385,6 @@ async def _dispatch(args: argparse.Namespace) -> int:
             result = await app.controller.resume_generation(args.request_id)
             _write_json(result)
             return EXIT_OK if result.status == "released" else EXIT_NOT_RELEASED
-        if args.run_command == "cancel":
-            app = build_application(config)
-            result = await app.controller.cancel_abandoned_generation(args.request_id)
-            _write_json(result)
-            return EXIT_NOT_RELEASED
         raise RuntimeError("unreachable run command")
     if args.command == "metrics":
         telemetry = open_telemetry(config)

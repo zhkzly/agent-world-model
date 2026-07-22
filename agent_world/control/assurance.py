@@ -192,8 +192,17 @@ class TelemetryReleaseSummary(V2Contract):
     @model_validator(mode="after")
     def validate_trace_cut(self) -> TelemetryReleaseSummary:
         if self.cut_stage == "pre_publish":
-            if not self.provisional or self.open_span_count != 1:
-                raise ValueError("pre-publish telemetry requires exactly one open root span")
+            # A Scheduler-owned pre-package cut is taken *inside* the
+            # Observability work attempt.  At that instant the long-lived
+            # generation root and this one closure attempt are both live; no
+            # other worker may remain live.  Older direct-controller traces
+            # have only the root while the control-plane migration is in
+            # progress, so retain that narrower shape temporarily.  The new
+            # Observability leaf always emits the two-span form.
+            if not self.provisional or self.open_span_count not in {1, 2}:
+                raise ValueError(
+                    "pre-publish telemetry requires one root or root plus observability span"
+                )
         elif self.provisional or self.open_span_count:
             raise ValueError("post-publish telemetry must be terminal")
         if self.summary.get("as_of_ns") != self.as_of_ns:
@@ -239,10 +248,7 @@ class ResearchCheckpointReuseEvidence(V2Contract):
             raise ValueError("research reuse job_ref has the wrong artifact type")
         if self.request_ref.artifact_type != "control.environment_request":
             raise ValueError("research reuse request_ref has the wrong artifact type")
-        if self.checkpoint_ref.artifact_type not in {
-            "design.phase_checkpoint",
-            "control.job_run_snapshot",
-        }:
+        if self.checkpoint_ref.artifact_type != "control.job_run_snapshot":
             raise ValueError("research reuse requires a typed resumable checkpoint")
         if self.evidence_graph_ref.artifact_type != "design.evidence_graph":
             raise ValueError("research reuse must bind an EvidenceGraph")

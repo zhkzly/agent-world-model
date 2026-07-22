@@ -181,7 +181,11 @@ class SelectiveFailureFetchTransport(CountedFetchTransport):
 class CountedExtractor:
     name = "counted-extractor"
 
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def extract(self, source: FetchedDocument) -> ExtractedDocument:
+        self.calls += 1
         text = source.body.decode()
         return ExtractedDocument(
             source=source,
@@ -240,6 +244,7 @@ def test_research_unavailable_summary_distinguishes_search_from_fetch_attrition(
         ),
         search_calls=1,
         fetch_calls=0,
+        extract_calls=0,
     )
 
     summary = bundle.evidence_unavailable_summary()
@@ -263,12 +268,13 @@ async def test_no_evidence_preserves_typed_reason_and_observed_calls() -> None:
             request_permissions=PermissionScope(),
             run_permissions=PermissionScope(),
             allowed_source_kinds=("web",),
-            maximum_tool_calls=2,
+            maximum_tool_calls=3,
             require_evidence=True,
         )
     assert empty_failure.value.reason == "true_empty"
     assert empty_failure.value.search_calls == 1
     assert empty_failure.value.fetch_calls == 0
+    assert empty_failure.value.extract_calls == 0
 
     unavailable = ResearchToolchain(
         UnavailableSearchTransport(),
@@ -281,7 +287,7 @@ async def test_no_evidence_preserves_typed_reason_and_observed_calls() -> None:
             request_permissions=PermissionScope(),
             run_permissions=PermissionScope(),
             allowed_source_kinds=("web",),
-            maximum_tool_calls=2,
+            maximum_tool_calls=3,
             require_evidence=True,
         )
     assert unavailable_failure.value.reason == "upstream_unavailable"
@@ -290,6 +296,7 @@ async def test_no_evidence_preserves_typed_reason_and_observed_calls() -> None:
     )
     assert unavailable_failure.value.search_calls == 1
     assert unavailable_failure.value.fetch_calls == 0
+    assert unavailable_failure.value.extract_calls == 0
     assert "secret query" not in str(unavailable_failure.value)
     assert "must-not-cross-boundary" not in str(unavailable_failure.value)
 
@@ -307,7 +314,7 @@ async def test_partial_search_attrition_is_degraded_empty_not_total_outage() -> 
             request_permissions=PermissionScope(),
             run_permissions=PermissionScope(),
             allowed_source_kinds=("web",),
-            maximum_tool_calls=2,
+            maximum_tool_calls=3,
             require_evidence=True,
         )
     assert captured.value.reason == "degraded_empty"
@@ -352,7 +359,7 @@ async def test_partial_success_failure_projection_contains_only_hashes() -> None
         request_permissions=PermissionScope(),
         run_permissions=PermissionScope(),
         allowed_source_kinds=("web",),
-        maximum_tool_calls=3,
+        maximum_tool_calls=5,
         results_per_query=2,
         max_documents=2,
         require_evidence=True,
@@ -395,7 +402,7 @@ async def test_research_records_each_real_search_fetch_and_extract_span(
         request_permissions=PermissionScope(),
         run_permissions=PermissionScope(),
         allowed_source_kinds=("web",),
-        maximum_tool_calls=2,
+        maximum_tool_calls=3,
         results_per_query=1,
         max_documents=1,
     )
@@ -407,6 +414,7 @@ async def test_research_records_each_real_search_fetch_and_extract_span(
     assert operations.count("research.fetch") == 1
     assert operations.count("research.extract") == 1
     assert inspected["summary"]["metrics_sum"]["research.search.calls"] == 1
+    assert inspected["summary"]["metrics_sum"]["research.extract.calls"] == 1
     serialized = str(inspected)
     assert query_text not in serialized
     assert "https://source-0.example.test/document" not in serialized
@@ -449,6 +457,7 @@ def test_research_checkpoint_reuse_is_observed_without_fake_tool_calls(
     ] == ["research.checkpoint_reuse"]
     assert inspected["summary"]["unknown_measurements"] == {
         "research.documents.extracted": 1,
+        "research.extract.calls": 1,
         "research.fetch.calls": 1,
         "research.search.calls": 1,
     }
@@ -456,13 +465,14 @@ def test_research_checkpoint_reuse_is_observed_without_fake_tool_calls(
 
 
 @pytest.mark.asyncio
-async def test_research_meter_counts_three_searches_plus_nine_fetches_exactly() -> None:
+async def test_research_meter_counts_all_search_fetch_and_extract_calls_exactly() -> None:
     search = CountedSearchTransport()
     fetch = CountedFetchTransport()
+    extract = CountedExtractor()
     toolchain = ResearchToolchain(
         search,
         fetch,
-        CountedExtractor(),
+        extract,
         max_parallel_fetches=9,
     )
 
@@ -471,14 +481,15 @@ async def test_research_meter_counts_three_searches_plus_nine_fetches_exactly() 
         request_permissions=PermissionScope(),
         run_permissions=PermissionScope(),
         allowed_source_kinds=("web",),
-        maximum_tool_calls=12,
+        maximum_tool_calls=21,
         results_per_query=12,
         max_documents=12,
     )
 
     assert search.calls == bundle.search_calls == 3
     assert fetch.calls == bundle.fetch_calls == 9
-    assert search.calls + fetch.calls == 12
+    assert extract.calls == bundle.extract_calls == 9
+    assert search.calls + fetch.calls + extract.calls == 21
     assert len(bundle.documents) == 9
 
 
@@ -486,10 +497,11 @@ async def test_research_meter_counts_three_searches_plus_nine_fetches_exactly() 
 async def test_known_source_urls_are_fetched_before_empty_search_results() -> None:
     search = EmptySearchTransport()
     fetch = CountedFetchTransport()
+    extract = CountedExtractor()
     toolchain = ResearchToolchain(
         search,
         fetch,
-        CountedExtractor(),
+        extract,
         max_parallel_fetches=2,
     )
     known_urls = (
@@ -502,7 +514,7 @@ async def test_known_source_urls_are_fetched_before_empty_search_results() -> No
         request_permissions=PermissionScope(),
         run_permissions=PermissionScope(),
         allowed_source_kinds=("web",),
-        maximum_tool_calls=3,
+        maximum_tool_calls=5,
         results_per_query=10,
         max_documents=2,
         seed_urls=known_urls,
@@ -510,6 +522,7 @@ async def test_known_source_urls_are_fetched_before_empty_search_results() -> No
 
     assert search.calls == bundle.search_calls == 1
     assert fetch.calls == bundle.fetch_calls == 2
+    assert extract.calls == bundle.extract_calls == 2
     assert tuple(item.source.requested_url for item in bundle.documents) == known_urls
 
 
@@ -530,7 +543,7 @@ async def test_independent_search_queries_run_with_bounded_concurrency() -> None
         request_permissions=PermissionScope(),
         run_permissions=PermissionScope(),
         allowed_source_kinds=("web",),
-        maximum_tool_calls=4,
+        maximum_tool_calls=5,
         max_documents=1,
         seed_urls=("https://docs.example.test/evidence",),
     )

@@ -23,13 +23,13 @@ from agent_world.contracts import (
     FRAMEWORK_PACKAGE_LAYOUT,
     ArtifactRef,
     CandidateManifest,
-    DesignPhaseCheckpoint,
     EnvironmentDesign,
     EnvironmentJob,
     EnvironmentPackageManifest,
     EnvironmentSuiteSnapshot,
     FrameworkPackagePayload,
     GateResult,
+    GenerationContext,
     ImplementationLineage,
     IntegrationReport,
     JudgeReport,
@@ -44,8 +44,16 @@ from agent_world.contracts import (
 from agent_world.control import (
     ClaimVector,
     JobRunSnapshot,
+    ReleaseDossier,
     ResearchCheckpointReuseEvidence,
     TelemetryReleaseSummary,
+    WorkAttempt,
+    WorkCommit,
+    WorkControlStore,
+    WorkGraphEpoch,
+    WorkGraphManifest,
+    WorkGraphNodeBinding,
+    WorkReadinessSnapshot,
 )
 
 from .models import (
@@ -53,9 +61,9 @@ from .models import (
     PackageCoordinate,
     PackageVersionReservation,
     PreparedRelease,
+    PublicationDossier,
     RegistryEvent,
     RegistryIndex,
-    ReleaseDossier,
     ReleaseRecord,
     ReleaseStatus,
 )
@@ -70,6 +78,9 @@ from .semantic_gate import (
 MANIFEST_ARTIFACT_TYPE = "environment_package_manifest"
 JUDGE_REPORT_ARTIFACT_TYPE = "judge_report"
 INTEGRATION_REPORT_ARTIFACT_TYPE = "judge.integration_report"
+RELEASE_DOSSIER_ARTIFACT_TYPE = "release.dossier"
+# Kept only so the retired, unreachable audit reader can deserialize historic
+# bad-case artifacts until the legacy method is deleted with its fixtures.
 CLAIM_VECTOR_ARTIFACT_TYPE = "release.claim_vector"
 TELEMETRY_SUMMARY_ARTIFACT_TYPE = "release.telemetry_summary"
 _MANIFEST_NAME = "manifest.json"
@@ -257,6 +268,7 @@ class EnvironmentRegistry:
         root: str | os.PathLike[str],
         artifact_store: ArtifactStore,
         *,
+        work_store: WorkControlStore | None = None,
         known_secret_canaries: Sequence[str | bytes] = (),
         reservation_ttl_seconds: float = _DEFAULT_RESERVATION_TTL_SECONDS,
     ) -> None:
@@ -268,6 +280,11 @@ class EnvironmentRegistry:
             raise RegistryIntegrityError("Registry root must be a real directory")
         self._root = requested.resolve(strict=True)
         self._artifact_store = artifact_store
+        # The Registry does not recreate readiness from a dossier's self-report.
+        # It reads the same durable Work heads that the Scheduler uses.  The
+        # conventional state-root location keeps standalone deployments usable;
+        # Controller construction passes its exact store explicitly.
+        self._work_store = work_store or WorkControlStore(self._root.parent / "work-control")
         self._framework_producers = _FRAMEWORK_PRODUCERS
         self._judge_producers = _JUDGE_PRODUCERS
         self._reservation_ttl_seconds = self._validate_reservation_ttl(reservation_ttl_seconds)
@@ -497,7 +514,7 @@ class EnvironmentRegistry:
                 manifest_ref=manifest_ref,
                 judge_report_ref=judge_report_ref,
                 integration_report_ref=manifest.integration_report_ref,
-                claim_vector_ref=manifest.claim_vector_ref,
+                release_dossier_ref=manifest.release_dossier_ref,
                 telemetry_summary_ref=manifest.telemetry_summary_ref,
                 release_profile=release_profile,
                 passed_hard_gates=passed_gates,
@@ -1007,6 +1024,296 @@ class EnvironmentRegistry:
     def _suite_snapshot_path(self, snapshot_id: str) -> Path:
         return self._safe_path("suite-snapshots", f"{snapshot_id}.json")
 
+    def _load_release_evidence(
+        self,
+        manifest_ref: ArtifactRef,
+        judge_report_ref: ArtifactRef,
+        release_profile: ReleaseProfile,
+        *,
+        reservation_owner_ref: ArtifactRef,
+    ) -> tuple[EnvironmentPackageManifest, JudgeReport, tuple[str, ...]]:
+        """Revalidate the acyclic pre-package dossier before physical publish.
+
+        This method intentionally overrides the retired ClaimVector-based
+        implementation above while the clean-break migration deletes its old
+        helpers.  The executable Registry path now accepts only a final graph
+        epoch and pre-package WorkCommit closure; a package cannot cite its own
+        readiness to manufacture release eligibility.
+        """
+
+        if manifest_ref.artifact_type != MANIFEST_ARTIFACT_TYPE:
+            raise ReleaseRejectedError(f"manifest artifact_type must be {MANIFEST_ARTIFACT_TYPE}")
+        if judge_report_ref.artifact_type != JUDGE_REPORT_ARTIFACT_TYPE:
+            raise ReleaseRejectedError(
+                f"JudgeReport artifact_type must be {JUDGE_REPORT_ARTIFACT_TYPE}"
+            )
+        self._assert_produced_by(manifest_ref, self._framework_producers, "framework")
+        self._assert_produced_by(judge_report_ref, self._judge_producers, "Judge")
+        manifest = self._artifact_store.get_json(manifest_ref, EnvironmentPackageManifest)
+        report = self._artifact_store.get_json(judge_report_ref, JudgeReport)
+        dossier_ref = manifest.release_dossier_ref
+        if dossier_ref.artifact_type != RELEASE_DOSSIER_ARTIFACT_TYPE:
+            raise ReleaseRejectedError("manifest ReleaseDossier has the wrong artifact type")
+        self._assert_produced_by(dossier_ref, self._framework_producers, "framework")
+        dossier = self._artifact_store.get_json(dossier_ref, ReleaseDossier)
+        integration = self._artifact_store.get_json(
+            manifest.integration_report_ref,
+            IntegrationReport,
+        )
+        telemetry = self._artifact_store.get_json(
+            manifest.telemetry_summary_ref,
+            TelemetryReleaseSummary,
+        )
+        epoch = self._artifact_store.get_json(dossier.final_epoch_ref, WorkGraphEpoch)
+        graph_manifest = self._artifact_store.get_json(
+            dossier.final_manifest_ref,
+            WorkGraphManifest,
+        )
+        if (
+            manifest.judge_report_ref != judge_report_ref
+            or dossier.final_epoch_ref.artifact_type != "control.work_graph_epoch"
+            or epoch.epoch_kind != "final"
+            or epoch.context_ref != dossier.context_ref
+            or epoch.manifest_ref != dossier.final_manifest_ref
+            or graph_manifest.mode != "production"
+            or not graph_manifest.releasable
+            or graph_manifest.external_root_refs != (dossier.context_ref,)
+        ):
+            raise ReleaseRejectedError("ReleaseDossier does not bind one final generation graph")
+        expected_dossier_refs = {
+            "design_ref": manifest.design_ref,
+            "candidate_ref": manifest.candidate_ref,
+            "candidate_manifest_ref": manifest.candidate_manifest_ref,
+            "build_record_ref": manifest.build_record_ref,
+            "implementation_lineage_ref": manifest.implementation_lineage_ref,
+            "integration_report_ref": manifest.integration_report_ref,
+            "judge_report_ref": judge_report_ref,
+            "telemetry_summary_ref": manifest.telemetry_summary_ref,
+        }
+        if any(getattr(dossier, name) != ref for name, ref in expected_dossier_refs.items()):
+            raise ReleaseRejectedError(
+                "ReleaseDossier and package manifest bind different revisions"
+            )
+        if dossier.release_profile != release_profile:
+            raise ReleaseRejectedError("ReleaseDossier and Registry release policy differ")
+        # ``build.public_verifier`` is the public candidate self-check while
+        # ``judge.verifier_ir_projection`` is the independent Judge contract.
+        # They must never be collapsed to one reference.  What publication
+        # needs is proof that the exact JudgeReport consumed the IR named by the
+        # dossier; the manifest separately binds its public self-check.
+        if dossier.verifier_ref not in self._artifact_store.dependencies(judge_report_ref):
+            raise ReleaseRejectedError("JudgeReport does not bind the ReleaseDossier Verifier IR")
+        if not dossier.prepackage_commit_refs:
+            raise ReleaseRejectedError("ReleaseDossier has no pre-package WorkCommit closure")
+        for commit_ref in dossier.prepackage_commit_refs:
+            commit = self._artifact_store.get_json(commit_ref, WorkCommit)
+            if commit.diagnostic_only or not commit.releasable:
+                raise ReleaseRejectedError(
+                    "diagnostic WorkCommit cannot establish release evidence"
+                )
+        dossier_dependencies = set(self._artifact_store.dependencies(dossier_ref))
+        required_dossier_dependencies = {
+            dossier.context_ref,
+            dossier.final_epoch_ref,
+            dossier.final_manifest_ref,
+            *dossier.prepackage_commit_refs,
+            dossier.design_ref,
+            dossier.candidate_ref,
+            dossier.candidate_manifest_ref,
+            dossier.build_record_ref,
+            dossier.implementation_lineage_ref,
+            dossier.verifier_ref,
+            dossier.integration_report_ref,
+            dossier.judge_report_ref,
+            dossier.telemetry_summary_ref,
+        }
+        if not required_dossier_dependencies <= dossier_dependencies:
+            raise ReleaseRejectedError("ReleaseDossier dependency closure is incomplete")
+        self._require_active_release_commit_closure(
+            graph_manifest=graph_manifest,
+            dossier=dossier,
+            manifest_ref=manifest_ref,
+        )
+        if (
+            report.candidate_ref != manifest.candidate_ref
+            or report.candidate_source_tree_digest != manifest.candidate_source_tree_digest
+            or report.verdict != "pass"
+            or any(item.hard and item.status != "pass" for item in report.gate_results)
+            or any(item.blocks_release for item in report.findings)
+        ):
+            raise ReleaseRejectedError("JudgeReport is not a passing exact-candidate release proof")
+        if (
+            integration.status != "ready"
+            or integration.candidate_ref != manifest.candidate_ref
+            or integration.candidate_source_tree_digest != manifest.candidate_source_tree_digest
+            or any(item.status != "pass" for item in integration.gate_results)
+            or any(item.blocks_release for item in integration.findings)
+        ):
+            raise ReleaseRejectedError("IntegrationReport is not ready for the exact Candidate")
+        if (
+            telemetry.cut_stage != "pre_publish"
+            or telemetry.trace_id != telemetry.run_id
+            or telemetry.invocation_count < 1
+        ):
+            raise ReleaseRejectedError("telemetry is not a valid pre-publish commitment")
+        gates = {item.gate_id: item for item in report.gate_results}
+        required = tuple(sorted(release_profile.required_hard_gates))
+        if not required or any(
+            gate_id not in gates or not gates[gate_id].hard or gates[gate_id].status != "pass"
+            for gate_id in required
+        ):
+            raise ReleaseRejectedError("required hard gate did not pass")
+        self._validate_reachability_release_evidence(report, gates)
+        manifest_dependencies = set(self._artifact_store.dependencies(manifest_ref))
+        required_manifest_dependencies = {
+            manifest.design_ref,
+            manifest.world_spec_ref,
+            manifest.candidate_ref,
+            manifest.candidate_manifest_ref,
+            manifest.build_record_ref,
+            manifest.implementation_lineage_ref,
+            manifest.judge_report_ref,
+            manifest.integration_report_ref,
+            manifest.release_dossier_ref,
+            manifest.telemetry_summary_ref,
+            manifest.public_verifier_ref,
+            manifest.task_materializer.output_schema_ref,
+            manifest.task_materializer.curriculum_ref,
+        }
+        if not required_manifest_dependencies <= manifest_dependencies:
+            raise ReleaseRejectedError("package manifest dependency closure is incomplete")
+        if reservation_owner_ref not in self._artifact_store.dependencies(dossier.context_ref):
+            # The context itself binds its Job; accept an exact Job root only.
+            context = self._artifact_store.get_json(dossier.context_ref, GenerationContext)
+            if context.job_ref != reservation_owner_ref:
+                raise ReleaseRejectedError(
+                    "ReleaseDossier context does not bind the reservation owner"
+                )
+        return manifest, report, required
+
+    def _require_active_release_commit_closure(
+        self,
+        *,
+        graph_manifest: WorkGraphManifest,
+        dossier: ReleaseDossier,
+        manifest_ref: ArtifactRef,
+    ) -> None:
+        """Prove dossier evidence is live Scheduler authority, not a hand-built DAG.
+
+        A ``ReleaseDossier`` is deliberately immutable and pre-package, so it
+        cannot by itself tell whether an upstream repair superseded one of its
+        WorkCommits.  The Registry must therefore reread the exact mutable
+        heads, validate their definition identity against the frozen final graph,
+        and additionally require the Package commit that occurs after dossier
+        assembly.  This is the causal cut that prevents either a stale dossier or
+        a Design-only graph from manufacturing a release candidate.
+        """
+
+        bindings: dict[tuple[str, str], WorkGraphNodeBinding] = {
+            (binding.coordinate.component, binding.coordinate.stage): binding
+            for binding in graph_manifest.node_bindings
+        }
+        expected_outputs: dict[tuple[str, str], tuple[ArtifactRef, ...]] = {
+            ("design", "modeling_boundary"): (dossier.design_ref,),
+            (
+                "build",
+                "candidate_build",
+            ): (
+                dossier.candidate_ref,
+                dossier.candidate_manifest_ref,
+                dossier.build_record_ref,
+                dossier.implementation_lineage_ref,
+            ),
+            ("verifier", "verifier_intent"): (dossier.verifier_ref,),
+            ("integration", "runtime_integration"): (dossier.integration_report_ref,),
+            ("judge", "release_assurance"): (dossier.judge_report_ref,),
+            ("release", "observability_closure"): (dossier.telemetry_summary_ref,),
+        }
+        commit_by_coordinate: dict[tuple[str, str], ArtifactRef] = {}
+        for commit_ref in dossier.prepackage_commit_refs:
+            self._assert_produced_by(commit_ref, self._framework_producers, "framework")
+            commit = self._artifact_store.get_json(commit_ref, WorkCommit)
+            commit_key = (commit.coordinate.component, commit.coordinate.stage)
+            if commit_key in commit_by_coordinate:
+                raise ReleaseRejectedError("ReleaseDossier repeats a WorkCommit coordinate")
+            commit_by_coordinate[commit_key] = commit_ref
+
+        if set(commit_by_coordinate) != set(expected_outputs):
+            raise ReleaseRejectedError("ReleaseDossier WorkCommit coordinates are not canonical")
+        for key, expected_refs in expected_outputs.items():
+            binding = bindings.get(key)
+            if binding is None:
+                raise ReleaseRejectedError("final WorkGraph omits a required release coordinate")
+            commit_ref = commit_by_coordinate[key]
+            commit = self._artifact_store.get_json(commit_ref, WorkCommit)
+            if (
+                commit.coordinate != binding.coordinate
+                or commit.work_id != binding.work_id
+                or commit.definition_digest != binding.definition_digest
+                or commit.diagnostic_only
+                or not commit.releasable
+                or not set(expected_refs) <= set(commit.consumer_refs)
+            ):
+                raise ReleaseRejectedError(
+                    "ReleaseDossier WorkCommit does not prove its frozen final-graph output"
+                )
+            self._require_active_head_commit(binding, commit, commit_ref)
+
+        package_binding = bindings.get(("release", "package"))
+        if package_binding is None:
+            raise ReleaseRejectedError("final WorkGraph omits the Package coordinate")
+        package_head = self._work_store.read_head(package_binding.coordinate)
+        if (
+            package_head is None
+            or package_head.status != "committed"
+            or package_head.commit_ref is None
+        ):
+            raise ReleaseRejectedError("Package has not committed before Registry publication")
+        package_commit = self._artifact_store.get_json(package_head.commit_ref, WorkCommit)
+        if (
+            package_commit.coordinate != package_binding.coordinate
+            or package_commit.work_id != package_binding.work_id
+            or package_commit.definition_digest != package_binding.definition_digest
+            or package_commit.diagnostic_only
+            or not package_commit.releasable
+            or manifest_ref not in package_commit.consumer_refs
+        ):
+            raise ReleaseRejectedError("Package WorkCommit does not bind the exact manifest")
+        self._require_active_head_commit(
+            package_binding,
+            package_commit,
+            package_head.commit_ref,
+        )
+
+    def _require_active_head_commit(
+        self,
+        binding: WorkGraphNodeBinding,
+        commit: WorkCommit,
+        commit_ref: ArtifactRef,
+    ) -> None:
+        """Check one frozen binding against the Scheduler's current durable head."""
+
+        head = self._work_store.read_head(binding.coordinate)
+        if (
+            head is None
+            or head.status != "committed"
+            or head.commit_ref != commit_ref
+            or head.definition_digest != binding.definition_digest
+            or head.acceptance_digest != commit.acceptance_digest
+            or head.evaluation_ref != commit.feedback_evaluation_ref
+        ):
+            raise ReleaseRejectedError("ReleaseDossier WorkCommit is not active in WorkControl")
+        attempt = self._artifact_store.get_json(head.attempt_ref, WorkAttempt)
+        if (
+            attempt.attempt_id != commit.attempt_id
+            or attempt.work_id != binding.work_id
+            or attempt.coordinate != binding.coordinate
+            or attempt.definition_digest != binding.definition_digest
+            or attempt.input_refs != commit.input_refs
+            or attempt.feedback_evaluation_ref != commit.feedback_evaluation_ref
+        ):
+            raise ReleaseRejectedError("active WorkHead and WorkCommit attempt closure differ")
+
     @staticmethod
     def _snapshot_id(
         registry_revision: int,
@@ -1133,7 +1440,7 @@ class EnvironmentRegistry:
             )
             return updated_record
 
-    def _load_release_evidence(
+    def _load_legacy_claim_vector_evidence(
         self,
         manifest_ref: ArtifactRef,
         judge_report_ref: ArtifactRef,
@@ -1152,7 +1459,7 @@ class EnvironmentRegistry:
         manifest = self._artifact_store.get_json(manifest_ref, EnvironmentPackageManifest)
         report = self._artifact_store.get_json(judge_report_ref, JudgeReport)
         integration_ref = manifest.integration_report_ref
-        claim_vector_ref = manifest.claim_vector_ref
+        claim_vector_ref = manifest.release_dossier_ref
         telemetry_ref = manifest.telemetry_summary_ref
         if integration_ref.artifact_type != INTEGRATION_REPORT_ARTIFACT_TYPE:
             raise ReleaseRejectedError("manifest IntegrationReport has the wrong artifact type")
@@ -1233,18 +1540,50 @@ class EnvironmentRegistry:
         verifier_ref = claim_vector.verifier_ref
         if verifier_ref is None:
             raise ReleaseRejectedError("release ClaimVector omits its Verifier")
-        modeling_refs = claims["design.valid"].evidence_refs
-        if len(modeling_refs) != 1 or modeling_refs[0].artifact_type != "control.modeling_gate":
-            raise ReleaseRejectedError("design.valid must cite one Modeling Gate")
+        design_evidence_refs = claims["design.valid"].evidence_refs
+        modeling_refs = tuple(
+            ref for ref in design_evidence_refs if ref.artifact_type == "control.modeling_gate"
+        )
+        work_manifest_refs = tuple(
+            ref
+            for ref in design_evidence_refs
+            if ref.artifact_type == "control.work_graph_manifest"
+        )
+        readiness_refs = tuple(
+            ref for ref in design_evidence_refs if ref.artifact_type == "control.work_readiness"
+        )
+        if (
+            len(modeling_refs) != 1
+            or len(work_manifest_refs) != 1
+            or len(readiness_refs) != 1
+            or len(design_evidence_refs) != 3
+        ):
+            raise ReleaseRejectedError(
+                "design.valid must cite Modeling Gate, WorkGraph manifest and readiness"
+            )
         modeling_gate = self._artifact_store.get_json(modeling_refs[0], GateResult)
+        work_manifest = self._artifact_store.get_json(
+            work_manifest_refs[0],
+            WorkGraphManifest,
+        )
+        readiness = self._artifact_store.get_json(
+            readiness_refs[0],
+            WorkReadinessSnapshot,
+        )
         if (
             modeling_gate.status != "pass"
             or not modeling_gate.hard
             or modeling_gate.subject_ref != manifest.design_ref
+            or work_manifest.mode != "production"
+            or not work_manifest.releasable
+            or readiness.manifest_ref != work_manifest_refs[0]
+            or readiness.graph_digest != work_manifest.graph_digest
+            or readiness.status != "ready"
+            or not readiness.release_candidate_ready
         ):
-            raise ReleaseRejectedError("design.valid Modeling Gate is not exact and passing")
+            raise ReleaseRejectedError("design.valid production WorkGraph is not exact and ready")
         expected_evidence = {
-            "design.valid": modeling_refs,
+            "design.valid": design_evidence_refs,
             "build.valid": (manifest.build_record_ref, manifest.candidate_manifest_ref),
             "runtime.executable": (integration_ref,),
             "integration.ready": (integration_ref,),
@@ -1332,17 +1671,7 @@ class EnvironmentRegistry:
                 raise ReleaseRejectedError(
                     "research checkpoint provenance does not bind the final design"
                 )
-            if provenance.checkpoint_ref.artifact_type == "design.phase_checkpoint":
-                checkpoint = self._artifact_store.get_json(
-                    provenance.checkpoint_ref,
-                    DesignPhaseCheckpoint,
-                )
-                checkpoint_valid = (
-                    checkpoint.job_ref == reservation_owner_ref
-                    and checkpoint.request_ref == provenance.request_ref
-                    and checkpoint.evidence_graph_ref == provenance.evidence_graph_ref
-                )
-            elif provenance.checkpoint_ref.artifact_type == "control.job_run_snapshot":
+            if provenance.checkpoint_ref.artifact_type == "control.job_run_snapshot":
                 snapshot = self._artifact_store.get_json(
                     provenance.checkpoint_ref,
                     JobRunSnapshot,
@@ -1395,7 +1724,7 @@ class EnvironmentRegistry:
             manifest.implementation_lineage_ref,
             manifest.judge_report_ref,
             manifest.integration_report_ref,
-            manifest.claim_vector_ref,
+            manifest.release_dossier_ref,
             manifest.telemetry_summary_ref,
             manifest.public_verifier_ref,
             manifest.task_materializer.output_schema_ref,
@@ -1676,7 +2005,7 @@ class EnvironmentRegistry:
         manifest: EnvironmentPackageManifest,
         *,
         include_dossier: bool,
-        dossier: ReleaseDossier | None = None,
+        dossier: PublicationDossier | None = None,
     ) -> None:
         if root.is_symlink() or not root.is_dir():
             raise RegistryIntegrityError("staging tree is missing or unsafe")
@@ -1796,7 +2125,7 @@ class EnvironmentRegistry:
             manifest_ref=prepared.manifest_ref,
             judge_report_ref=prepared.judge_report_ref,
             integration_report_ref=prepared.integration_report_ref,
-            claim_vector_ref=prepared.claim_vector_ref,
+            release_dossier_ref=prepared.release_dossier_ref,
             telemetry_summary_ref=prepared.telemetry_summary_ref,
             candidate_ref=manifest.candidate_ref,
             design_ref=manifest.design_ref,
@@ -1819,22 +2148,22 @@ class EnvironmentRegistry:
         staging: Path,
         manifest: EnvironmentPackageManifest,
         prepared: PreparedRelease,
-    ) -> ReleaseDossier:
+    ) -> PublicationDossier:
         path = staging / _DOSSIER_NAME
         if path.exists() or path.is_symlink():
             dossier_bytes = self._read_file(path, "staging release dossier missing")
             try:
-                dossier = ReleaseDossier.model_validate_json(dossier_bytes)
+                dossier = PublicationDossier.model_validate_json(dossier_bytes)
             except Exception as exc:
                 raise RegistryIntegrityError("staging release dossier is invalid") from exc
-            expected = ReleaseDossier(
+            expected = PublicationDossier(
                 coordinate=prepared.coordinate,
                 reservation_id=prepared.reservation_id,
                 reservation_owner_ref=prepared.reservation_owner_ref,
                 manifest_ref=prepared.manifest_ref,
                 judge_report_ref=prepared.judge_report_ref,
                 integration_report_ref=prepared.integration_report_ref,
-                claim_vector_ref=prepared.claim_vector_ref,
+                release_dossier_ref=prepared.release_dossier_ref,
                 telemetry_summary_ref=prepared.telemetry_summary_ref,
                 candidate_ref=manifest.candidate_ref,
                 release_profile=prepared.release_profile,
@@ -1847,14 +2176,14 @@ class EnvironmentRegistry:
                 raise RegistryIntegrityError("staging release dossier does not match preparation")
             return dossier
         self._verify_staging(staging, manifest, include_dossier=False)
-        dossier = ReleaseDossier(
+        dossier = PublicationDossier(
             coordinate=prepared.coordinate,
             reservation_id=prepared.reservation_id,
             reservation_owner_ref=prepared.reservation_owner_ref,
             manifest_ref=prepared.manifest_ref,
             judge_report_ref=prepared.judge_report_ref,
             integration_report_ref=prepared.integration_report_ref,
-            claim_vector_ref=prepared.claim_vector_ref,
+            release_dossier_ref=prepared.release_dossier_ref,
             telemetry_summary_ref=prepared.telemetry_summary_ref,
             candidate_ref=manifest.candidate_ref,
             release_profile=prepared.release_profile,
@@ -1875,17 +2204,17 @@ class EnvironmentRegistry:
     ) -> ReleaseRecord:
         dossier_bytes = self._read_file(path / _DOSSIER_NAME, "unindexed release dossier missing")
         try:
-            dossier = ReleaseDossier.model_validate_json(dossier_bytes)
+            dossier = PublicationDossier.model_validate_json(dossier_bytes)
         except Exception as exc:
             raise RegistryIntegrityError("unindexed release dossier is invalid") from exc
-        expected = ReleaseDossier(
+        expected = PublicationDossier(
             coordinate=prepared.coordinate,
             reservation_id=prepared.reservation_id,
             reservation_owner_ref=prepared.reservation_owner_ref,
             manifest_ref=prepared.manifest_ref,
             judge_report_ref=prepared.judge_report_ref,
             integration_report_ref=prepared.integration_report_ref,
-            claim_vector_ref=prepared.claim_vector_ref,
+            release_dossier_ref=prepared.release_dossier_ref,
             telemetry_summary_ref=prepared.telemetry_summary_ref,
             candidate_ref=manifest.candidate_ref,
             release_profile=prepared.release_profile,
@@ -1939,19 +2268,19 @@ class EnvironmentRegistry:
         if sha256_digest(dossier_bytes) != record.dossier_hash:
             raise RegistryIntegrityError(f"release dossier changed: {record.release_id}")
         try:
-            dossier = ReleaseDossier.model_validate_json(dossier_bytes)
+            dossier = PublicationDossier.model_validate_json(dossier_bytes)
         except Exception as exc:
             raise RegistryIntegrityError(
                 f"release dossier is invalid: {record.release_id}"
             ) from exc
-        expected_dossier = ReleaseDossier(
+        expected_dossier = PublicationDossier(
             coordinate=record.coordinate,
             reservation_id=record.reservation_id,
             reservation_owner_ref=record.reservation_owner_ref,
             manifest_ref=record.manifest_ref,
             judge_report_ref=record.judge_report_ref,
             integration_report_ref=record.integration_report_ref,
-            claim_vector_ref=record.claim_vector_ref,
+            release_dossier_ref=record.release_dossier_ref,
             telemetry_summary_ref=record.telemetry_summary_ref,
             candidate_ref=record.candidate_ref,
             release_profile=record.release_profile,
@@ -1973,7 +2302,7 @@ class EnvironmentRegistry:
             manifest.candidate_ref != record.candidate_ref
             or manifest.design_ref != record.design_ref
             or manifest.integration_report_ref != record.integration_report_ref
-            or manifest.claim_vector_ref != record.claim_vector_ref
+            or manifest.release_dossier_ref != record.release_dossier_ref
             or manifest.telemetry_summary_ref != record.telemetry_summary_ref
             or manifest.public_verifier_ref != record.public_verifier_ref
             or manifest.lineage != record.lineage
@@ -2294,7 +2623,7 @@ class EnvironmentRegistry:
             and release.manifest_ref == prepared.manifest_ref
             and release.judge_report_ref == prepared.judge_report_ref
             and release.integration_report_ref == prepared.integration_report_ref
-            and release.claim_vector_ref == prepared.claim_vector_ref
+            and release.release_dossier_ref == prepared.release_dossier_ref
             and release.telemetry_summary_ref == prepared.telemetry_summary_ref
             and release.release_profile == prepared.release_profile
             and release.file_count == prepared.file_count

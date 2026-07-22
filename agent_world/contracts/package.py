@@ -41,9 +41,7 @@ from .runtime import (
 from .world import FidelityStatement
 
 ENVPKG_METADATA_PACKAGE_PATH: Literal["envpkg.toml"] = "envpkg.toml"
-PROVENANCE_PACKAGE_PATH: Literal["evidence/provenance.json"] = (
-    "evidence/provenance.json"
-)
+PROVENANCE_PACKAGE_PATH: Literal["evidence/provenance.json"] = "evidence/provenance.json"
 ASSURANCE_PACKAGE_PATH: Literal["evidence/assurance.json"] = "evidence/assurance.json"
 FIDELITY_PACKAGE_PATH: Literal["evidence/fidelity.json"] = "evidence/fidelity.json"
 SBOM_PACKAGE_PATH: Literal["sbom/sbom.json"] = "sbom/sbom.json"
@@ -74,9 +72,7 @@ FRAMEWORK_PACKAGE_LAYOUT: tuple[tuple[str, FrameworkPackageRole], ...] = (
     (SBOM_PACKAGE_PATH, "sbom"),
 )
 _FRAMEWORK_ROLE_BY_PATH: dict[str, str] = dict(FRAMEWORK_PACKAGE_LAYOUT)
-_FRAMEWORK_PATH_BY_ROLE: dict[str, str] = {
-    role: path for path, role in FRAMEWORK_PACKAGE_LAYOUT
-}
+_FRAMEWORK_PATH_BY_ROLE: dict[str, str] = {role: path for path, role in FRAMEWORK_PACKAGE_LAYOUT}
 _FRAMEWORK_ROLES = frozenset(_FRAMEWORK_PATH_BY_ROLE)
 
 _CANDIDATE_SOURCE_ROLES = frozenset(
@@ -113,16 +109,17 @@ class FrameworkPackagePayload:
 class TrustedEvaluatorSpec(V2Contract):
     """Portable data consumed by the framework-owned closed Rule interpreter."""
 
-    protocol: Literal["agent-world.trusted-evaluator.v2"] = (
-        "agent-world.trusted-evaluator.v2"
-    )
+    protocol: Literal["agent-world.trusted-evaluator.v2"] = "agent-world.trusted-evaluator.v2"
     world_spec_hash: ContentHash
     curriculum_hash: ContentHash
     reward: RewardSpec
     task_goal_source: Literal["task_goal"] = "task_goal"
-    authoritative_outputs: tuple[
-        Literal["reward", "terminated", "succeeded", "failed"], ...
-    ] = ("reward", "terminated", "succeeded", "failed")
+    authoritative_outputs: tuple[Literal["reward", "terminated", "succeeded", "failed"], ...] = (
+        "reward",
+        "terminated",
+        "succeeded",
+        "failed",
+    )
     runtime_reward_policy: Literal["ignore_diagnostic_values"] = "ignore_diagnostic_values"
 
     @classmethod
@@ -137,9 +134,7 @@ class TrustedEvaluatorSpec(V2Contract):
 class TrustedEvaluatorDescriptor(V2Contract):
     """Package-relative inputs sufficient to re-run trusted evaluation."""
 
-    protocol: Literal["agent-world.trusted-evaluator.v2"] = (
-        "agent-world.trusted-evaluator.v2"
-    )
+    protocol: Literal["agent-world.trusted-evaluator.v2"] = "agent-world.trusted-evaluator.v2"
     rule_ir_path: Literal["world/rule_ir.json"] = "world/rule_ir.json"
     world_spec_path: Literal["world/world_spec.json"] = "world/world_spec.json"
     curriculum_path: Literal["tasks/curriculum.json"] = "tasks/curriculum.json"
@@ -219,7 +214,7 @@ type ProvenanceInputRole = Literal[
     "build_record",
     "judge_report",
     "integration_report",
-    "claim_vector",
+    "release_dossier",
     "telemetry_summary",
     "implementation_lineage",
     "implementation_contract",
@@ -265,7 +260,7 @@ class PackageProvenance(V2Contract):
             "build_record",
             "judge_report",
             "integration_report",
-            "claim_vector",
+            "release_dossier",
             "telemetry_summary",
             "implementation_lineage",
             "implementation_contract",
@@ -293,14 +288,12 @@ class AssuranceGateCommitment(V2Contract):
 
 class PackageAssurance(V2Contract):
     format: Literal["agent-world.assurance.v1"] = "agent-world.assurance.v1"
-    disclosure: Literal["commitments_only_no_private_cases"] = (
-        "commitments_only_no_private_cases"
-    )
+    disclosure: Literal["commitments_only_no_private_cases"] = "commitments_only_no_private_cases"
     package_id: Identifier
     version: NonEmptyStr
     report_ref: ArtifactRef
     integration_report_ref: ArtifactRef
-    claim_vector_ref: ArtifactRef
+    release_dossier_ref: ArtifactRef
     telemetry_summary_ref: ArtifactRef
     report_id: Identifier
     report_revision: Annotated[int, Field(ge=1)]
@@ -436,9 +429,7 @@ class EnvPackageMetadata(V2Contract):
     """Canonical flat TOML bootstrap; deliberately excludes any manifest hash."""
 
     format: Literal["envpkg-v3"] = "envpkg-v3"
-    metadata_protocol: Literal["agent-world.envpkg.metadata.v1"] = (
-        "agent-world.envpkg.metadata.v1"
-    )
+    metadata_protocol: Literal["agent-world.envpkg.metadata.v1"] = "agent-world.envpkg.metadata.v1"
     package_id: Identifier
     version: NonEmptyStr
     runtime_protocol: Literal["agent-world.runtime.v2"] = "agent-world.runtime.v2"
@@ -467,8 +458,8 @@ class EnvPackageMetadata(V2Contract):
     judge_report_content_hash: ContentHash
     integration_report_revision_id: ContentHash
     integration_report_content_hash: ContentHash
-    claim_vector_revision_id: ContentHash
-    claim_vector_content_hash: ContentHash
+    release_dossier_revision_id: ContentHash
+    release_dossier_content_hash: ContentHash
     telemetry_summary_revision_id: ContentHash
     telemetry_summary_content_hash: ContentHash
     provenance_path: Literal["evidence/provenance.json"] = PROVENANCE_PACKAGE_PATH
@@ -532,7 +523,7 @@ class EnvironmentPackageManifest(V2Contract):
     implementation_lineage_ref: ArtifactRef
     judge_report_ref: ArtifactRef
     integration_report_ref: ArtifactRef
-    claim_vector_ref: ArtifactRef
+    release_dossier_ref: ArtifactRef
     telemetry_summary_ref: ArtifactRef
     runtime: RuntimeLaunch
     task_materializer: TaskMaterializerDescriptor
@@ -550,6 +541,8 @@ class EnvironmentPackageManifest(V2Contract):
 
     @model_validator(mode="after")
     def validate_manifest_closure(self) -> EnvironmentPackageManifest:
+        if self.release_dossier_ref.artifact_type != "release.dossier":
+            raise ValueError("package manifest must bind a pre-package ReleaseDossier")
         paths = [item.path for item in self.files]
         if len(set(paths)) != len(paths):
             raise ValueError("package file paths must be unique")
@@ -684,7 +677,7 @@ def compile_package_provenance(
     implementation_lineage_ref: ArtifactRef,
     judge_report_ref: ArtifactRef,
     integration_report_ref: ArtifactRef,
-    claim_vector_ref: ArtifactRef,
+    release_dossier_ref: ArtifactRef,
     telemetry_summary_ref: ArtifactRef,
     public_verifier_ref: ArtifactRef,
     materializer_protocol_ref: ArtifactRef,
@@ -703,7 +696,7 @@ def compile_package_provenance(
         ProvenanceInputCommitment(role="build_record", ref=build_record_ref),
         ProvenanceInputCommitment(role="judge_report", ref=judge_report_ref),
         ProvenanceInputCommitment(role="integration_report", ref=integration_report_ref),
-        ProvenanceInputCommitment(role="claim_vector", ref=claim_vector_ref),
+        ProvenanceInputCommitment(role="release_dossier", ref=release_dossier_ref),
         ProvenanceInputCommitment(role="telemetry_summary", ref=telemetry_summary_ref),
         ProvenanceInputCommitment(
             role="implementation_lineage",
@@ -767,7 +760,7 @@ def compile_package_assurance(
     version: str,
     report_ref: ArtifactRef,
     integration_report_ref: ArtifactRef,
-    claim_vector_ref: ArtifactRef,
+    release_dossier_ref: ArtifactRef,
     telemetry_summary_ref: ArtifactRef,
 ) -> PackageAssurance:
     if report.candidate_source_tree_digest is None:
@@ -791,7 +784,7 @@ def compile_package_assurance(
         version=version,
         report_ref=report_ref,
         integration_report_ref=integration_report_ref,
-        claim_vector_ref=claim_vector_ref,
+        release_dossier_ref=release_dossier_ref,
         telemetry_summary_ref=telemetry_summary_ref,
         report_id=report.report_id,
         report_revision=report.revision,
@@ -830,9 +823,7 @@ def compile_package_fidelity(
         )
     )
     limits = tuple(dict.fromkeys((*known_limits, *design.unresolved_questions)))
-    evidence_refs = tuple(
-        dict.fromkeys((design.evidence_graph_ref, design.coverage_map_ref))
-    )
+    evidence_refs = tuple(dict.fromkeys((design.evidence_graph_ref, design.coverage_map_ref)))
     return PackageFidelity(
         package_id=package_id,
         version=version,
@@ -867,9 +858,8 @@ def compile_environment_sbom(
         (pyproject_file, pyproject_bytes),
         (lock_file, uv_lock_bytes),
     ):
-        if (
-            descriptor.content_hash != sha256_digest(content)
-            or descriptor.size_bytes != len(content)
+        if descriptor.content_hash != sha256_digest(content) or descriptor.size_bytes != len(
+            content
         ):
             raise ValueError(
                 f"SBOM input bytes differ from candidate descriptor: {descriptor.path}"
@@ -946,9 +936,7 @@ def compile_environment_sbom(
                 or size <= 0
             ):
                 raise ValueError(f"SBOM dependency {name} wheel lacks URL/hash/size")
-            wheels.append(
-                SbomLockedWheel(url=url, content_hash=digest, size_bytes=size)
-            )
+            wheels.append(SbomLockedWheel(url=url, content_hash=digest, size_bytes=size))
         registry_dependencies.append(
             SbomRegistryDependency(
                 name=name,
@@ -1027,7 +1015,7 @@ def compile_framework_package_payloads(
     implementation_lineage_ref: ArtifactRef,
     judge_report_ref: ArtifactRef,
     integration_report_ref: ArtifactRef,
-    claim_vector_ref: ArtifactRef,
+    release_dossier_ref: ArtifactRef,
     telemetry_summary_ref: ArtifactRef,
     pyproject_bytes: bytes,
     uv_lock_bytes: bytes,
@@ -1065,7 +1053,7 @@ def compile_framework_package_payloads(
         implementation_lineage_ref=implementation_lineage_ref,
         judge_report_ref=judge_report_ref,
         integration_report_ref=integration_report_ref,
-        claim_vector_ref=claim_vector_ref,
+        release_dossier_ref=release_dossier_ref,
         telemetry_summary_ref=telemetry_summary_ref,
         public_verifier_ref=candidate_manifest.public_verifier_ref,
         materializer_protocol_ref=candidate_manifest.task_materializer.output_schema_ref,
@@ -1078,7 +1066,7 @@ def compile_framework_package_payloads(
         version=version,
         report_ref=judge_report_ref,
         integration_report_ref=integration_report_ref,
-        claim_vector_ref=claim_vector_ref,
+        release_dossier_ref=release_dossier_ref,
         telemetry_summary_ref=telemetry_summary_ref,
     )
     fidelity = compile_package_fidelity(
@@ -1123,8 +1111,8 @@ def compile_framework_package_payloads(
         judge_report_content_hash=judge_report_ref.content_hash,
         integration_report_revision_id=integration_report_ref.revision_id,
         integration_report_content_hash=integration_report_ref.content_hash,
-        claim_vector_revision_id=claim_vector_ref.revision_id,
-        claim_vector_content_hash=claim_vector_ref.content_hash,
+        release_dossier_revision_id=release_dossier_ref.revision_id,
+        release_dossier_content_hash=release_dossier_ref.content_hash,
         telemetry_summary_revision_id=telemetry_summary_ref.revision_id,
         telemetry_summary_content_hash=telemetry_summary_ref.content_hash,
         provenance_hash=sha256_digest(provenance_bytes),
@@ -1263,8 +1251,8 @@ _ENVPKG_TOML_FIELDS = (
     "judge_report_content_hash",
     "integration_report_revision_id",
     "integration_report_content_hash",
-    "claim_vector_revision_id",
-    "claim_vector_content_hash",
+    "release_dossier_revision_id",
+    "release_dossier_content_hash",
     "telemetry_summary_revision_id",
     "telemetry_summary_content_hash",
     "provenance_path",
@@ -1286,9 +1274,11 @@ def _canonical_envpkg_toml(metadata: EnvPackageMetadata) -> bytes:
         if isinstance(value, str):
             encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
         elif isinstance(value, tuple | list):
-            encoded = "[" + ",".join(
-                json.dumps(item, ensure_ascii=False, allow_nan=False) for item in value
-            ) + "]"
+            encoded = (
+                "["
+                + ",".join(json.dumps(item, ensure_ascii=False, allow_nan=False) for item in value)
+                + "]"
+            )
         else:
             raise TypeError(f"unsupported canonical envpkg TOML field: {key}")
         lines.append(f"{key} = {encoded}\n")

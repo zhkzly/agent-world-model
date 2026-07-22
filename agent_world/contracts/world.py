@@ -77,6 +77,7 @@ type RuleFamily = Literal[
     "sampling",
 ]
 type RuleOrdering = Literal["number", "date", "date-time"]
+type IdempotencyMode = Literal["not_supported", "natural", "idempotency_key"]
 
 
 class RuleConstant(V2Contract):
@@ -444,7 +445,7 @@ class ObservationSemantics(V2Contract):
 
 
 class IdempotencySemantics(V2Contract):
-    mode: Literal["not_supported", "natural", "idempotency_key"]
+    mode: IdempotencyMode
     key_field: Identifier | None = None
     retention_seconds: Annotated[float, Field(gt=0)] | None = None
     duplicate_observation: NonEmptyStr
@@ -660,11 +661,10 @@ class WorldSpec(V2Contract):
                         f"sources: {sorted(invalid_permission_sources)}"
                     )
             if set(tool.semantics.permission.allowed_actors) == actors:
-                if permission_condition is None:
-                    raise ValueError(
-                        f"tool {tool.surface.tool_id} has no executable permission denial path"
-                    )
-                if permission_condition.case_sensitivity != "positive_and_negative":
+                if (
+                    permission_condition is not None
+                    and permission_condition.case_sensitivity != "positive_and_negative"
+                ):
                     raise ValueError(
                         f"tool {tool.surface.tool_id} permission condition must require positive "
                         "and negative verification when every actor is statically allowed"
@@ -815,6 +815,7 @@ __all__ = [
     "ActorBoundary",
     "ConcurrencySemantics",
     "FidelityStatement",
+    "IdempotencyMode",
     "IdempotencySemantics",
     "ObservationSemantics",
     "PermissionRule",

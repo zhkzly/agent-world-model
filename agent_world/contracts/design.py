@@ -8,7 +8,7 @@ from typing import Annotated, Literal, cast
 from jsonschema import Draft202012Validator, SchemaError  # type: ignore[import-untyped]
 from pydantic import Field, JsonValue, model_validator
 
-from .base import ArtifactRef, ContentHash, Identifier, NonEmptyStr, V2Contract
+from .base import ArtifactRef, Identifier, NonEmptyStr, V2Contract
 from .reachability import ReachabilityPolicy
 from .world import Rule, RuleArithmetic, RuleLookupByKey, RuleTerm, RuleValueRef, WorldSpec
 
@@ -646,30 +646,8 @@ class EnvironmentDesign(V2Contract):
         return self
 
 
-class DesignPhaseCheckpoint(V2Contract):
-    """Exact resumable boundary in the evidence-to-world compilation graph."""
-
-    checkpoint_id: Identifier
-    phase: Literal["evidence_graph", "world_skeleton"]
-    compiler_abi: Literal["designer-v4"] = "designer-v4"
-    job_ref: ArtifactRef
-    request_ref: ArtifactRef
-    evidence_graph_ref: ArtifactRef
-    world_skeleton_ref: ArtifactRef | None = None
-    input_fingerprint: ContentHash
-
-    @model_validator(mode="after")
-    def validate_phase_payload(self) -> DesignPhaseCheckpoint:
-        if self.phase == "evidence_graph" and self.world_skeleton_ref is not None:
-            raise ValueError("evidence_graph checkpoint cannot bind a WorldSkeleton")
-        if self.phase == "world_skeleton" and self.world_skeleton_ref is None:
-            raise ValueError("world_skeleton checkpoint must bind a WorldSkeleton")
-        return self
-
-
 __all__ = [
     "CurriculumRequirements",
-    "DesignPhaseCheckpoint",
     "DifficultyDimension",
     "EnvironmentDesign",
     "EvaluatorGoalBinding",

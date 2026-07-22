@@ -633,6 +633,7 @@ class TelemetryStore:
         points = (
             MetricPoint("research.search.calls", bundle.search_calls, "calls", "framework"),
             MetricPoint("research.fetch.calls", bundle.fetch_calls, "calls", "framework"),
+            MetricPoint("research.extract.calls", bundle.extract_calls, "calls", "framework"),
             MetricPoint(
                 "research.search.results",
                 sum(len(item.hits) for item in bundle.searches),
@@ -799,6 +800,50 @@ class TelemetryStore:
                 )
             self._touch(len(rows))
             self.flush()
+
+    def reconcile_abandoned_trace(
+        self,
+        trace_id: str,
+        *,
+        error_code: str = "owner_process_interrupted",
+    ) -> int:
+        """Close spans left by a dead DirectJob owner before recovery starts.
+
+        The caller must already hold the durable DirectJob writer lock. This
+        is observability reconciliation only: it never cancels a live worker
+        and it preserves the original span timing and provider metrics.
+        """
+
+        if not trace_id or not error_code:
+            raise ValueError("trace recovery requires trace_id and error_code")
+        now_ns = time.time_ns()
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT span_id, started_at_ns
+                FROM spans
+                WHERE trace_id = ? AND status = 'running'
+                ORDER BY started_at_ns, span_id
+                """,
+                (trace_id,),
+            ).fetchall()
+            for row in rows:
+                self._connection.execute(
+                    """
+                    UPDATE spans
+                    SET status = 'error', ended_at_ns = ?, duration_ns = ?, error_code = ?
+                    WHERE span_id = ? AND status = 'running'
+                    """,
+                    (
+                        now_ns,
+                        max(0, now_ns - int(row["started_at_ns"])),
+                        error_code,
+                        row["span_id"],
+                    ),
+                )
+            self._touch(len(rows))
+            self.flush()
+        return len(rows)
 
     def summarize_traces(self, trace_ids: Sequence[str]) -> dict[str, Any]:
         """Aggregate comparable, credential-free experiment measures across runs."""
@@ -1198,6 +1243,16 @@ def _invocation_metrics(
                 labels,
             )
         )
+    monetary_cost = result.usage.monetary_cost if result.usage else None
+    metrics.append(
+        MetricPoint(
+            "invocation.monetary_cost",
+            monetary_cost,
+            "currency",
+            "provider" if monetary_cost is not None else "unknown",
+            labels,
+        )
+    )
     return tuple(metrics)
 
 
@@ -1378,6 +1433,7 @@ def _trace_measurements(inspected: Mapping[str, Any]) -> dict[str, Any]:
         "tokens_reasoning_output": metric("invocation.tokens.reasoning_output"),
         "search_calls": metric("research.search.calls"),
         "fetch_calls": metric("research.fetch.calls"),
+        "extract_calls": metric("research.extract.calls"),
         "documents_extracted": metric("research.documents.extracted"),
         "research_failures": metric("research.failures"),
         "repair_authorizations": float(

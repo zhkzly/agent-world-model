@@ -30,6 +30,7 @@ from agent_world.control.models import (
     RepairDirective,
     RepairLedgerEntry,
 )
+from agent_world.control.release_dossier import ReleaseDossier
 from agent_world.designer import models as designer_models
 from agent_world.invocation.authority import (
     EXECUTION_AUTHORITY_MODELS,
@@ -41,7 +42,7 @@ from agent_world.invocation.authority import (
     registered_agent_output_contracts,
 )
 from agent_world.judge.models import VerifierIntent
-from agent_world.registry.models import ReleaseDossier, ReleaseRecord
+from agent_world.registry.models import ReleaseRecord
 
 
 def test_authority_inventory_is_bound_to_real_framework_contracts() -> None:

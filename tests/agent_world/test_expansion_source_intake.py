@@ -134,7 +134,7 @@ def test_resume_never_replays_unknown_source_lease_and_freezes_context(
             llm_tokens=200,
             agent_turns=2,
             search_calls=1,
-            tool_calls=2,
+            tool_calls=3,
             wall_seconds=30,
         )
         candidate_budget = Budget(
@@ -146,7 +146,7 @@ def test_resume_never_replays_unknown_source_lease_and_freezes_context(
             llm_tokens=400,
             agent_turns=4,
             search_calls=1,
-            tool_calls=2,
+            tool_calls=3,
             wall_seconds=120,
         )
         catalog = ExpansionSourceCatalog(

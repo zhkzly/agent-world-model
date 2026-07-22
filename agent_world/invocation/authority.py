@@ -56,7 +56,7 @@ EXECUTION_AUTHORITY_MODELS = frozenset(
         ("agent_world.control.models", "NodeAttempt"),
         ("agent_world.control.models", "RepairDirective"),
         ("agent_world.control.models", "RepairLedgerEntry"),
-        ("agent_world.registry.models", "ReleaseDossier"),
+        ("agent_world.control.release_dossier", "ReleaseDossier"),
         ("agent_world.registry.models", "ReleaseRecord"),
     }
 )

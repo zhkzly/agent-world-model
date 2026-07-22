@@ -27,12 +27,14 @@ class ResearchEvidenceUnavailable(RuntimeError):
         reason: ResearchEvidenceUnavailableReason,
         search_calls: int,
         fetch_calls: int,
+        extract_calls: int,
         summary: str,
     ) -> None:
         super().__init__(summary)
         self.reason = reason
         self.search_calls = search_calls
         self.fetch_calls = fetch_calls
+        self.extract_calls = extract_calls
         self.failure_code = (
             "research_infrastructure_upstream_unavailable"
             if reason == "upstream_unavailable"
@@ -152,6 +154,7 @@ class ResearchBundle:
     failures: tuple[FetchFailure, ...]
     search_calls: int
     fetch_calls: int
+    extract_calls: int
 
     def evidence_unavailable_summary(self) -> str:
         """Return one credential/URL-free stage aggregate for failed admission."""
@@ -166,6 +169,7 @@ class ResearchBundle:
         return (
             "research evidence unavailable: "
             f"hits={hit_count}, fetch_calls={self.fetch_calls}, "
+            f"extract_calls={self.extract_calls}, "
             f"upstream_failures={upstream_count}, admitted_documents={len(self.documents)}, "
             f"failures={failure_summary or 'none'}"
         )
@@ -182,7 +186,7 @@ class ResearchBundle:
             return "upstream_unavailable"
         if hit_count == 0 and not self.failures:
             return "degraded_empty" if upstream_count else "true_empty"
-        if hit_count or self.fetch_calls or any(
+        if hit_count or self.fetch_calls or self.extract_calls or any(
             failure.stage in {"fetch", "extract", "safety"} for failure in self.failures
         ):
             return "fetch_attrition"
@@ -198,6 +202,7 @@ class ResearchBundle:
                 reason=self.evidence_unavailable_reason(),
                 search_calls=self.search_calls,
                 fetch_calls=self.fetch_calls,
+                extract_calls=self.extract_calls,
                 summary=self.evidence_unavailable_summary(),
             )
         return self

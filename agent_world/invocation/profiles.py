@@ -464,7 +464,7 @@ class ProfileResolver:
                 raise CredentialResolutionError(
                     f"credential handle {handle!r} is unavailable from its configured source"
                 )
-            if len(value) < 8:
+            if len(value) < 5:
                 raise CredentialResolutionError(
                     f"credential handle {handle!r} is too short for safe redaction"
                 )
@@ -841,7 +841,6 @@ def _render_codex_config(
         "auth_elicitation = false",
         "browser_use = false",
         "browser_use_external = false",
-        "browser_use_full_cdp_access = false",
         "computer_use = false",
         "enable_mcp_apps = false",
         f"hooks = {_toml_bool(bool(spec.hooks))}",

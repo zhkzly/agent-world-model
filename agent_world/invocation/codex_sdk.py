@@ -74,6 +74,12 @@ def _reject_json_constant(value: str) -> None:
 class CodexSdkBackend:
     """Invoke the pinned Codex Python SDK in a new process for every turn."""
 
+    supported_executor_revision_ids = (
+        "framework.executor.v1",
+        "framework.codex-structured-protocol.v2",
+        "framework.codex-structured-protocol.v3",
+    )
+
     def __init__(
         self,
         *,
@@ -554,8 +560,47 @@ def _normalize_provider_schema_node(
         and additional is not None
         and additional is not False
     ):
-        used_ir.add(_JSON_OBJECT_IR)
-        return {"$ref": f"#/$defs/{_JSON_OBJECT_IR}"}
+        if additional is True or additional == {}:
+            used_ir.add(_JSON_OBJECT_IR)
+            return {"$ref": f"#/$defs/{_JSON_OBJECT_IR}"}
+        if not isinstance(additional, dict):
+            raise TypeError("provider map additionalProperties must be a schema object")
+        property_names = value.get("propertyNames", {"type": "string"})
+        if not isinstance(property_names, dict):
+            raise TypeError("provider map propertyNames must be a schema object")
+        entries: JsonObject = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "aw_key": _normalize_provider_schema_node(
+                        property_names,
+                        used_ir=used_ir,
+                    ),
+                    "aw_value": _normalize_provider_schema_node(
+                        additional,
+                        used_ir=used_ir,
+                    ),
+                },
+                "required": ["aw_key", "aw_value"],
+                "additionalProperties": False,
+            },
+        }
+        for source_key, target_key in (
+            ("minProperties", "minItems"),
+            ("maxProperties", "maxItems"),
+        ):
+            if source_key in value:
+                entries[target_key] = value[source_key]
+        normalized_map: JsonObject = {
+            "type": "object",
+            "properties": {"aw_object_entries": entries},
+            "required": ["aw_object_entries"],
+            "additionalProperties": False,
+        }
+        if isinstance(value.get("description"), str):
+            normalized_map["description"] = value["description"]
+        return normalized_map
     normalized: JsonObject = {}
     for key, child in value.items():
         if key in _PROVIDER_SCHEMA_OMIT_KEYS:
@@ -835,27 +880,50 @@ async def _terminate_process_tree(
     *,
     grace_seconds: float,
 ) -> None:
+    """Terminate a worker whether or not it owns a separate POSIX process group.
+
+    Real SDK workers are launched in their own session, but the cancellation
+    primitive is also used by recovery and must remain correct for a worker
+    observed between ``create_subprocess_exec`` and session establishment.  In
+    that race ``killpg(pid, ...)`` raises ``ProcessLookupError`` even though
+    the direct child is still alive.  Falling back to the child signal keeps
+    cancellation bounded rather than leaving the caller to wait for its full
+    invocation timeout.
+    """
+
     if process.returncode is not None:
         return
-    try:
+
+    def signal_process_tree(signal_value: int) -> None:
+        if process.returncode is not None:
+            return
         if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
-    except ProcessLookupError:
-        return
+            try:
+                os.killpg(process.pid, signal_value)
+                return
+            except ProcessLookupError:
+                # The child can exist without a process group with its own
+                # pid during startup.  Signal the direct child in that case.
+                pass
+        try:
+            if signal_value == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except ProcessLookupError:
+            return
+
+    signal_process_tree(signal.SIGTERM)
+    # Yield once so the asyncio child watcher can observe a signal sent during
+    # subprocess startup before the bounded wait begins.
+    await asyncio.sleep(0)
     try:
         await asyncio.wait_for(process.wait(), timeout=grace_seconds)
         return
     except TimeoutError:
         pass
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
-    except ProcessLookupError:
-        return
+    signal_process_tree(signal.SIGKILL)
+    await asyncio.sleep(0)
     try:
         await asyncio.wait_for(process.wait(), timeout=grace_seconds)
     except TimeoutError:

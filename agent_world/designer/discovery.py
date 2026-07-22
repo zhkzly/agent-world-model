@@ -147,7 +147,7 @@ class DiscoveryService:
                 budget_unknown_upper_bound=meter.unknown_upper_bound,
                 research_usage=BudgetUsage(
                     search_calls=exc.search_calls,
-                    tool_calls=exc.search_calls + exc.fetch_calls,
+                    tool_calls=exc.search_calls + exc.fetch_calls + exc.extract_calls,
                 ),
                 failure_code=exc.failure_code,
                 infrastructure_error=exc.reason == "upstream_unavailable",
@@ -239,7 +239,7 @@ class DiscoveryService:
             evidence=evidence,
             research_usage=BudgetUsage(
                 search_calls=research.search_calls,
-                tool_calls=research.search_calls + research.fetch_calls,
+                tool_calls=research.search_calls + research.fetch_calls + research.extract_calls,
             ),
             invocation_usage=meter.usage,
             invocation_results=(*plan_results, *synthesis_results),

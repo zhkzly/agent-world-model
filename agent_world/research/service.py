@@ -165,9 +165,15 @@ class ResearchToolchain:
     ) -> ResearchBundle:
         if not queries:
             raise ValueError("research requires at least one query")
-        if maximum_tool_calls < len(queries) + 1:
+        minimum_required_calls = len(queries) + 2
+        if self.fallback_fetcher is not None:
+            # A configured fallback is an actual potential network tool call.
+            # Reserve it up front so a primary failure cannot leave a fetched
+            # but unextractable body or silently escape the Work budget.
+            minimum_required_calls += 1
+        if maximum_tool_calls < minimum_required_calls:
             raise ValueError(
-                "research maximum_tool_calls must reserve every search and at least one fetch"
+                "research maximum_tool_calls must reserve every search, fetch, and extract"
             )
         access = ResearchAccessPolicy.create(
             request_permissions=request_permissions,
@@ -181,14 +187,23 @@ class ResearchToolchain:
         search_records: list[SearchRecord] = []
         failures: list[FetchFailure] = []
         tool_calls_used = 0
+        search_calls_used = 0
+        fetch_calls_used = 0
+        extract_calls_used = 0
         tool_call_lock = asyncio.Lock()
 
-        async def authorize_tool_call() -> bool:
-            nonlocal tool_calls_used
+        async def authorize_tool_call(kind: Literal["search", "fetch", "extract"]) -> bool:
+            nonlocal tool_calls_used, search_calls_used, fetch_calls_used, extract_calls_used
             async with tool_call_lock:
                 if tool_calls_used >= maximum_tool_calls:
                     return False
                 tool_calls_used += 1
+                if kind == "search":
+                    search_calls_used += 1
+                elif kind == "fetch":
+                    fetch_calls_used += 1
+                else:
+                    extract_calls_used += 1
                 return True
 
         search_semaphore = asyncio.Semaphore(self.max_parallel_searches)
@@ -197,7 +212,7 @@ class ResearchToolchain:
             query: SearchQuery,
         ) -> SearchRecord | FetchFailure | ResearchPermissionError:
             async with search_semaphore:
-                if not await authorize_tool_call():
+                if not await authorize_tool_call("search"):
                     return FetchFailure.redacted(
                         stage="search",
                         error_type="ResearchBudgetExceeded",
@@ -269,13 +284,13 @@ class ResearchToolchain:
             if len(urls) >= max_documents:
                 break
 
-        remaining_for_fetch = maximum_tool_calls - tool_calls_used
-        if self.fallback_fetcher is not None:
-            # Reserve one possible Reader call per primary URL. Unused fallback
-            # capacity is intentionally not spent on an unbudgeted extra primary.
-            maximum_primary_urls = max(1, remaining_for_fetch // 2)
-        else:
-            maximum_primary_urls = remaining_for_fetch
+        remaining_for_documents = maximum_tool_calls - tool_calls_used
+        # A document is evidence only after both fetching and extraction.  When
+        # a fallback fetcher is configured, reserve that additional network
+        # operation for every selected URL; unused fallback capacity remains
+        # visible as unused reservation instead of becoming unbudgeted work.
+        calls_per_document = 3 if self.fallback_fetcher is not None else 2
+        maximum_primary_urls = remaining_for_documents // calls_per_document
         urls = urls[:maximum_primary_urls]
 
         semaphore = asyncio.Semaphore(self.max_parallel_fetches)
@@ -284,7 +299,7 @@ class ResearchToolchain:
             url: str,
         ) -> tuple[ExtractedDocument | None, FetchFailure | None]:
             async with semaphore:
-                if not await authorize_tool_call():
+                if not await authorize_tool_call("fetch"):
                     return None, FetchFailure.redacted(
                         stage="fetch",
                         error_type="ResearchBudgetExceeded",
@@ -325,7 +340,7 @@ class ResearchToolchain:
                         )
                     fallback_span: WorkSpan | None = None
                     try:
-                        if not await authorize_tool_call():
+                        if not await authorize_tool_call("fetch"):
                             return None, FetchFailure.redacted(
                                 stage="fetch",
                                 error_type="ResearchBudgetExceeded",
@@ -365,6 +380,13 @@ class ResearchToolchain:
                             identity=url,
                             message=f"primary={primary_exc}; fallback={fallback_exc}",
                         )
+                if not await authorize_tool_call("extract"):
+                    return None, FetchFailure.redacted(
+                        stage="extract",
+                        error_type="ResearchBudgetExceeded",
+                        identity=url,
+                        message="extract was blocked by maximum_tool_calls",
+                    )
                 extract_span = self._start_operation_span(
                     operation="research.extract",
                     provider=self.extractor.name,
@@ -426,8 +448,9 @@ class ResearchToolchain:
             searches=tuple(search_records),
             documents=tuple(documents),
             failures=tuple(failures),
-            search_calls=len(queries),
-            fetch_calls=tool_calls_used - len(queries),
+            search_calls=search_calls_used,
+            fetch_calls=fetch_calls_used,
+            extract_calls=extract_calls_used,
         )
         if self.telemetry is not None:
             current = self.telemetry.current_trace()
@@ -511,6 +534,7 @@ class ResearchToolchain:
             metrics=(
                 MetricPoint("research.search.calls", None, "calls", "unknown"),
                 MetricPoint("research.fetch.calls", None, "calls", "unknown"),
+                MetricPoint("research.extract.calls", None, "calls", "unknown"),
                 MetricPoint(
                     "research.documents.extracted",
                     None,

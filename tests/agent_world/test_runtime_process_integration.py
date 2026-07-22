@@ -24,10 +24,12 @@ from agent_world.contracts import (
     Budget,
     EnvironmentPackageManifest,
     JudgeReport,
+    PackageFile,
     RolloutAction,
     SuiteSelectionRequest,
     TaskMaterializerCall,
     candidate_source_tree_digest,
+    sha256_digest,
 )
 from agent_world.contracts.supply_chain import (
     StaticAssuranceEvidence,
@@ -41,10 +43,12 @@ from agent_world.judge import (
     IsolationUnavailable,
     LaunchContract,
     ProtocolViolation,
+    RuntimeProcessCrashed,
     RuntimeSupervisor,
     decode_response,
     make_request,
 )
+from agent_world.judge.assurance import inspect_static_sources
 from agent_world.judge.service import (
     _candidate_failure_summary,
     _runtime_contract_mismatch_paths,
@@ -103,6 +107,49 @@ def test_candidate_component_visibility_uses_public_source_dependency_lattice() 
         "environment/runtime.py",
         "environment/world.py",
     )
+
+
+def test_static_assurance_rejects_runtime_import_of_isolated_materializer(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "candidate"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "runtime.py").write_text(
+        "from .materializer import materialize\n",
+        encoding="utf-8",
+    )
+    (package / "materializer.py").write_text(
+        "def materialize():\n    return {}\n",
+        encoding="utf-8",
+    )
+
+    def declared(path: str, role: str) -> PackageFile:
+        data = (tmp_path / path).read_bytes()
+        return PackageFile(
+            path=path,
+            role=role,  # type: ignore[arg-type]
+            content_hash=sha256_digest(data),
+            size_bytes=len(data),
+            executable=False,
+        )
+
+    manifest = SimpleNamespace(
+        files=(
+            declared("candidate/__init__.py", "runtime"),
+            declared("candidate/runtime.py", "runtime"),
+            declared("candidate/materializer.py", "task_materializer"),
+        )
+    )
+
+    inspection = inspect_static_sources(tmp_path, manifest)  # type: ignore[arg-type]
+
+    assert "static_component_import_boundary_violation" in inspection.failure_codes
+    assert inspection.component_import_violations == (
+        "candidate/runtime.py->candidate/materializer.py",
+    )
+    runtime_evidence = next(item for item in inspection.files if item.path.endswith("runtime.py"))
+    assert "static_component_import_boundary_violation" in runtime_evidence.failure_codes
 
 
 def test_runtime_contract_diff_reports_all_repair_coordinates(tmp_path: Path) -> None:
@@ -164,6 +211,25 @@ def test_protocol_failure_summary_preserves_missing_and_extra_coordinates() -> N
     assert _candidate_failure_summary(failure) == (
         "response.result[handshake].tools[0] has invalid keys; missing=name; "
         "extra=schema_version,transport"
+    )
+
+
+def test_runtime_crash_summary_discloses_only_safe_candidate_owned_coordinates() -> None:
+    failure = RuntimeProcessCrashed(
+        "runtime_process_crashed",
+        "runtime exited without a response",
+        details={
+            "exit_code": 1,
+            "stderr": (
+                'Traceback (most recent call last):\n  File "/workspace/candidate/runtime.py"\n'
+                "ModuleNotFoundError: No module named 'candidate.materializer'\n"
+            ),
+        },
+    )
+
+    assert _candidate_failure_summary(failure) == (
+        "runtime exited without a response; exit_code=1; "
+        "stderr_exception=ModuleNotFoundError; missing_module=candidate.materializer"
     )
 
 
@@ -404,6 +470,51 @@ async def test_clean_build_and_runtime_supervisor_execute_complete_abi_v2(
         different_seed = await reset_in_fresh_process(11_000_002)
         assert replay_first == replay_second
         assert replay_first["state_digest"] != different_seed["state_digest"]
+
+
+@pytest.mark.asyncio
+async def test_real_role_isolation_crash_returns_builder_safe_import_coordinates(
+    tmp_path: Path,
+) -> None:
+    source, uv_path, uv_cache = write_candidate_project(tmp_path)
+    runtime_path = source / "runtime.py"
+    runtime_source = runtime_path.read_text(encoding="utf-8")
+    runtime_path.write_text(
+        runtime_source.replace(
+            "from __future__ import annotations\n",
+            "from __future__ import annotations\nimport task_materializer\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    files = candidate_files(source)
+    source_digest = candidate_source_tree_digest(files)
+    builder = CleanCandidateBuilder(
+        build_isolation=await _require_real_isolation("build"),
+        uv_path=uv_path,
+        uv_cache_dir=uv_cache,
+        timeout_seconds=60,
+    )
+
+    async with builder.materialize(
+        source,
+        expected_source_files=files,
+        expected_source_tree_digest=source_digest,
+    ) as clean:
+        supervisor = RuntimeSupervisor(
+            clean.root,
+            LaunchContract(argv=(".venv/bin/python", "runtime.py")),
+            visible_workspace_paths=("runtime.py",),
+            isolation=await _require_real_isolation(),
+            request_timeout_seconds=5,
+        )
+        with pytest.raises(RuntimeProcessCrashed) as captured:
+            await supervisor.start()
+
+    assert _candidate_failure_summary(captured.value) == (
+        "runtime exited without a response; exit_code=1; "
+        "stderr_exception=ModuleNotFoundError; missing_module=task_materializer"
+    )
 
 
 @pytest.mark.asyncio

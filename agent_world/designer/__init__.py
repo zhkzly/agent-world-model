@@ -4,6 +4,7 @@ from agent_world.control.repair import StructuredRepairAuthority, StructuredRepa
 
 from .budget import DesignerBudgetPlanError, derive_designer_invocation_budget
 from .discovery import AdmissionBundle, DiscoveryBundle, DiscoveryService
+from .evidence_synthesis_leaf import EvidenceSynthesisLeaf
 from .expansion import (
     AskBudget,
     EnvironmentExpansionPolicy,
@@ -30,9 +31,15 @@ from .expansion_source import (
     ExpansionSourceRouter,
     project_capability_feedback_for_source,
 )
+from .one_shot import (
+    StructuredProfileProvider,
+    StructuredTurnResult,
+    invoke_structured_once,
+)
+from .research_acquisition_leaf import ResearchAcquisitionLeaf
+from .research_leaf import ResearchPlanLeaf
 from .service import (
     DIRECT_DESIGN_BASE_TURNS,
-    DIRECT_DESIGN_EVIDENCE_BASE_TURNS,
     DIRECT_DESIGN_MAX_CORRECTIONS,
     DIRECT_DESIGN_MAX_TURNS,
     AgentProfileProvider,
@@ -40,6 +47,7 @@ from .service import (
     DesignerError,
     EnvironmentDesigner,
 )
+from .world_architecture_leaf import WorldArchitectureLeaf
 
 __all__ = [
     "AskBudget",
@@ -47,7 +55,6 @@ __all__ = [
     "AgentProfileProvider",
     "DesignBundle",
     "DIRECT_DESIGN_BASE_TURNS",
-    "DIRECT_DESIGN_EVIDENCE_BASE_TURNS",
     "DIRECT_DESIGN_MAX_CORRECTIONS",
     "DIRECT_DESIGN_MAX_TURNS",
     "DiscoveryBundle",
@@ -55,6 +62,7 @@ __all__ = [
     "DesignerError",
     "DesignerBudgetPlanError",
     "EnvironmentDesigner",
+    "EvidenceSynthesisLeaf",
     "EnvironmentExpansionPolicy",
     "EvidenceBackedExpansionSource",
     "EvolutionaryArchivePolicy",
@@ -69,12 +77,18 @@ __all__ = [
     "ParentDescriptor",
     "PolicyCheckpoint",
     "RandomSearchPolicy",
+    "ResearchPlanLeaf",
+    "ResearchAcquisitionLeaf",
     "ResolvedExpansionClue",
     "ResolvedExpansionParent",
     "StopDecision",
     "StructuredRepairAuthority",
+    "StructuredProfileProvider",
+    "StructuredTurnResult",
     "StructuredRepairDenied",
     "WideSearchPolicy",
+    "WorldArchitectureLeaf",
     "derive_designer_invocation_budget",
     "project_capability_feedback_for_source",
+    "invoke_structured_once",
 ]

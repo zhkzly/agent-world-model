@@ -486,6 +486,58 @@ class EnvironmentBuilder:
             ),
         )
 
+    def materialize_exact_candidate(
+        self,
+        *,
+        candidate: EnvironmentCandidate,
+        candidate_ref: ArtifactRef,
+        workspace: Path,
+    ) -> Path:
+        """Restore exactly one committed Candidate source closure without an Agent.
+
+        Judge leaves must not rely on the Builder process' in-memory workspace:
+        a Scheduler restart can happen between Build and Integration.  The
+        candidate's immutable source snapshot and manifest are therefore the
+        sole recovery inputs.  This is deliberately narrower than
+        :meth:`recover_committed_candidate`: no "latest candidate" selection
+        is allowed, because the caller already binds one exact Candidate ref.
+        """
+
+        self.artifacts.require_exact_json(
+            candidate_ref,
+            candidate,
+            artifact_types=("build.environment_candidate",),
+        )
+        manifest = self.artifacts.get_json(
+            candidate.candidate_manifest_ref,
+            CandidateManifest,
+        )
+        self.artifacts.require_exact_json(
+            candidate.candidate_manifest_ref,
+            manifest,
+            artifact_types=("build.candidate_manifest",),
+        )
+        if (
+            manifest.candidate_id != candidate.candidate_id
+            or manifest.design_ref != candidate.design_ref
+            or manifest.implementation_lineage_ref != candidate.implementation_lineage_ref
+            or manifest.runtime != candidate.runtime
+            or manifest.task_materializer != candidate.task_materializer
+            or manifest.public_self_check != candidate.public_self_check
+        ):
+            raise BuilderError("recovery", "candidate and manifest do not bind one closure")
+        snapshot_ref = candidate.source_workspace_snapshot_ref
+        if (
+            snapshot_ref.artifact_type != "build.source_workspace_snapshot"
+            or snapshot_ref.media_type != "application/x-tar"
+        ):
+            raise BuilderError("recovery", "candidate source snapshot has an invalid contract")
+        return self._materialize_verified_snapshot(
+            workspace=workspace,
+            source=self.artifacts.get_blob(snapshot_ref),
+            manifest=manifest,
+        )
+
     @staticmethod
     def _materialize_verified_snapshot(
         *,
@@ -574,6 +626,42 @@ class EnvironmentBuilder:
                 raise
         return project_root
 
+    async def build_once(
+        self,
+        *,
+        design: EnvironmentDesign,
+        design_ref: ArtifactRef,
+        workspace: Path,
+        budget: Budget,
+        permissions: PermissionScope,
+        parent_workspace_refs: Sequence[ArtifactRef] = (),
+        run_id: str,
+        attempt_id: str,
+        proposal_invocation_id: str | None = None,
+    ) -> BuildBundle:
+        """Execute exactly one real Engineer proposal for a scheduler WorkAttempt.
+
+        This is the production leaf shape used by the replacement WorkGraph:
+        it may generate and deterministically validate one Candidate, but it may
+        not authorize a corrective turn.  An actionable failure is returned to
+        the framework Scheduler, which alone decides whether a RepairAction can
+        create a later ``repair_once`` attempt.
+        """
+
+        return await self._build(
+            design=design,
+            design_ref=design_ref,
+            workspace=workspace,
+            budget=budget,
+            permissions=permissions,
+            parent_workspace_refs=parent_workspace_refs,
+            repair_authority=None,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            allow_precommit_rework=False,
+            proposal_invocation_id=proposal_invocation_id,
+        )
+
     async def build(
         self,
         *,
@@ -587,7 +675,43 @@ class EnvironmentBuilder:
         run_id: str,
         attempt_id: str,
     ) -> BuildBundle:
-        """Run one real Engineer turn and commit a framework-authored candidate."""
+        """Legacy multi-turn façade pending the complete Controller cutover.
+
+        New WorkGraph leaf executors must call :meth:`build_once`; this method
+        remains only while the old Controller path is being removed as one
+        vertical migration, rather than exposing a second production authority.
+        """
+
+        return await self._build(
+            design=design,
+            design_ref=design_ref,
+            workspace=workspace,
+            budget=budget,
+            permissions=permissions,
+            parent_workspace_refs=parent_workspace_refs,
+            repair_authority=repair_authority,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            allow_precommit_rework=True,
+            proposal_invocation_id=None,
+        )
+
+    async def _build(
+        self,
+        *,
+        design: EnvironmentDesign,
+        design_ref: ArtifactRef,
+        workspace: Path,
+        budget: Budget,
+        permissions: PermissionScope,
+        parent_workspace_refs: Sequence[ArtifactRef],
+        repair_authority: StructuredRepairAuthority | None,
+        run_id: str,
+        attempt_id: str,
+        allow_precommit_rework: bool,
+        proposal_invocation_id: str | None,
+    ) -> BuildBundle:
+        """Run an Engineer proposal, optionally through the legacy correction loop."""
 
         self.artifacts.require_exact_json(
             design_ref,
@@ -615,7 +739,11 @@ class EnvironmentBuilder:
         )
         lineage_id = self._stable_id("implementation", design_ref.revision_id)
         candidate_id = self._stable_id("candidate", lineage_id)
-        turn_limit = min(budget.agent_turns, self.maximum_precommit_reworks + 1)
+        turn_limit = (
+            min(budget.agent_turns, self.maximum_precommit_reworks + 1)
+            if allow_precommit_rework
+            else 1
+        )
         per_turn_token_limit, per_turn_timeout_seconds = self._initial_turn_envelope(
             budget,
             turn_limit=turn_limit,
@@ -762,6 +890,7 @@ class EnvironmentBuilder:
                     lineage_id=lineage_id,
                     attempt=turn_index + 1,
                     error_state=state,
+                    invocation_id=(proposal_invocation_id if turn_index == 0 else None),
                 )
             except BuilderError as exc:
                 if exc.invocation is not None:
@@ -778,6 +907,8 @@ class EnvironmentBuilder:
                         invocation=exc.invocation,
                     ) from exc
                 if (
+                    allow_precommit_rework
+                    and
                     exc.stage == "agent.output"
                     and exc.state is not None
                     and exc.state.invocation_session is not None
@@ -818,6 +949,8 @@ class EnvironmentBuilder:
                         invocation=aggregate,
                     ) from exc
                 if (
+                    allow_precommit_rework
+                    and
                     exc.stage == "candidate.validation"
                     and state.invocation_session is not None
                     and turn_index + 1 < turn_limit
@@ -1160,8 +1293,9 @@ class EnvironmentBuilder:
         lineage_id: str,
         attempt: int,
         error_state: BuilderSessionState,
+        invocation_id: str | None = None,
     ) -> tuple[CandidateCompletion, InvocationSession, BuildInvocationSummary]:
-        invocation_id = f"build-{hashlib.sha256(os.urandom(32)).hexdigest()[:24]}"
+        invocation_id = invocation_id or f"build-{hashlib.sha256(os.urandom(32)).hexdigest()[:24]}"
         invocation_started = time.monotonic()
         self._persist_workspace_progress(error_state, status="turn_started")
         heartbeat = asyncio.create_task(

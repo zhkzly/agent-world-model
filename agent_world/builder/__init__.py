@@ -1,5 +1,6 @@
 """Environment Builder: frozen design to real, untrusted candidate project."""
 
+from .leaf import BuilderLeaf
 from .models import (
     BuilderWorkspaceProgress,
     BuildRecord,
@@ -34,6 +35,7 @@ __all__ = [
     "BuildRecord",
     "BuilderWorkspaceProgress",
     "BuilderError",
+    "BuilderLeaf",
     "BuilderSessionState",
     "CandidateCompletion",
     "CandidateFileDeclaration",

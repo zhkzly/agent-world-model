@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
-from pydantic.config import ExtraValues
 from pydantic_core import PydanticCustomError
 
 from agent_world.agent_output_authority import (
@@ -15,14 +14,17 @@ from agent_world.agent_output_authority import (
 )
 from agent_world.contracts import (
     ArtifactRef,
+    BudgetUsage,
     Claim,
     ConcurrencySemantics,
     ContentHash,
     CoverageDimension,
     CurriculumRequirements,
     DifficultyDimension,
+    Evidence,
     EvidenceConflict,
     FidelityStatement,
+    IdempotencyMode,
     IdempotencySemantics,
     Identifier,
     ObservationSemantics,
@@ -51,37 +53,6 @@ from agent_world.contracts import (
 class AgentOutput(SemanticAdvisoryOutput, BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
 
-    @classmethod
-    def model_validate(
-        cls,
-        obj: Any,
-        *,
-        strict: bool | None = None,
-        extra: ExtraValues | None = None,
-        from_attributes: bool | None = None,
-        context: Any | None = None,
-        by_alias: bool | None = None,
-        by_name: bool | None = None,
-    ) -> Self:
-        """Validate a JSON response without rejecting JSON arrays for tuple fields.
-
-        Codex structured output is JSON, so arrays necessarily arrive as ``list``
-        values.  The durable contracts remain strict after construction; this
-        boundary only enables Pydantic's JSON-compatible list-to-tuple parsing.
-        The provider output schema still rejects scalar type mismatches before
-        this method and the framework performs semantic validation afterwards.
-        """
-
-        return super().model_validate(
-            obj,
-            strict=False if strict is None else strict,
-            extra=extra,
-            from_attributes=from_attributes,
-            context=context,
-            by_alias=by_alias,
-            by_name=by_name,
-        )
-
 
 class PlannedSearchQuery(AgentOutput):
     text: Annotated[str, Field(min_length=1)]
@@ -95,6 +66,41 @@ class ResearchPlan(AgentOutput):
     target_coverage_dimensions: Annotated[tuple[str, ...], Field(min_length=1)]
     known_source_urls: tuple[str, ...] = ()
     stop_conditions: Annotated[tuple[str, ...], Field(min_length=1)]
+
+
+class ResearchAcquisition(V2Contract):
+    """Durable real-tools closure consumed by one EvidenceSynthesis leaf.
+
+    The record contains only normalized evidence and content-addressed refs.
+    Query text, provider response bodies and credentials remain in the bounded
+    research Artifact closure rather than in Scheduler control state.
+    """
+
+    acquisition_id: str
+    plan_ref: ArtifactRef
+    request_ref: ArtifactRef
+    evidence: tuple[Evidence, ...]
+    source_refs: tuple[ArtifactRef, ...]
+    passage_pack_ref: ArtifactRef
+    usage: BudgetUsage
+
+    @model_validator(mode="after")
+    def validate_acquisition(self) -> ResearchAcquisition:
+        if self.plan_ref.artifact_type != "design.research_plan":
+            raise ValueError("ResearchAcquisition must bind one ResearchPlan")
+        if self.request_ref.artifact_type != "control.environment_request":
+            raise ValueError("ResearchAcquisition must bind one EnvironmentRequest")
+        if self.passage_pack_ref.artifact_type != "design.evidence_passage_pack":
+            raise ValueError("ResearchAcquisition must bind one EvidencePassagePack")
+        if not self.evidence or not self.source_refs:
+            raise ValueError("ResearchAcquisition requires normalized evidence and source refs")
+        if len({item.evidence_id for item in self.evidence}) != len(self.evidence):
+            raise ValueError("ResearchAcquisition evidence ids must be unique")
+        if len(set(self.source_refs)) != len(self.source_refs):
+            raise ValueError("ResearchAcquisition source refs must be unique")
+        if self.usage.search_calls < 1 or self.usage.tool_calls < self.usage.search_calls:
+            raise ValueError("ResearchAcquisition usage must retain real tool accounting")
+        return self
 
 
 class EvidenceSynthesis(AgentOutput):
@@ -312,22 +318,28 @@ class CompactFieldSemanticDraft(AgentOutput):
 
     @model_validator(mode="after")
     def validate_type_constraints(self) -> CompactFieldSemanticDraft:
-        if self.value_type != "string" and (
-            self.string_format != "none" or self.enum_values
-        ):
-            raise ValueError("format and enum values are valid only for string fields")
+        if self.value_type != "string" and (self.string_format != "none" or self.enum_values):
+            raise PydanticCustomError(
+                "compact_field_string_constraints",
+                "string_format and enum_values require value_type=string",
+            )
         if self.value_type not in {"integer", "number"} and (
             self.minimum is not None or self.maximum is not None
         ):
-            raise ValueError("numeric bounds are valid only for integer/number fields")
-        if (
-            self.minimum is not None
-            and self.maximum is not None
-            and self.minimum > self.maximum
-        ):
-            raise ValueError("field minimum cannot exceed maximum")
+            raise PydanticCustomError(
+                "compact_field_numeric_bounds",
+                "minimum and maximum require value_type=integer or number",
+            )
+        if self.minimum is not None and self.maximum is not None and self.minimum > self.maximum:
+            raise PydanticCustomError(
+                "compact_field_bounds_order",
+                "minimum cannot exceed maximum",
+            )
         if len(set(self.enum_values)) != len(self.enum_values):
-            raise ValueError("field enum values must be unique")
+            raise PydanticCustomError(
+                "compact_field_enum_unique",
+                "enum_values must not contain duplicates",
+            )
         return self
 
 
@@ -335,12 +347,8 @@ class ToolInterfaceSourceDraft(AgentOutput):
     """Schema meaning owned by exactly one enclosing tool source."""
 
     input_fields: Annotated[tuple[CompactFieldSemanticDraft, ...], Field(max_length=32)] = ()
-    output_fields: Annotated[
-        tuple[CompactFieldSemanticDraft, ...], Field(max_length=32)
-    ] = ()
-    observation_fields: Annotated[
-        tuple[CompactFieldSemanticDraft, ...], Field(max_length=32)
-    ] = ()
+    output_fields: Annotated[tuple[CompactFieldSemanticDraft, ...], Field(max_length=32)] = ()
+    observation_fields: Annotated[tuple[CompactFieldSemanticDraft, ...], Field(max_length=32)] = ()
 
     @model_validator(mode="after")
     def validate_field_sets(self) -> ToolInterfaceSourceDraft:
@@ -515,8 +523,22 @@ class RuleReferenceDraft(AgentOutput):
     value_type: RuleValueType
 
 
+class RuleBoundReferenceDraft(AgentOutput):
+    """One ToolSemantics reference selected from a frozen framework catalog.
+
+    The Agent chooses *which* visible business value matters.  The catalog id
+    is then deterministically expanded into source, RFC 6901 pointer, and
+    value type before executable Rule IR is compiled.  Raw reference fields
+    remain available only to source boundaries whose schema is not frozen yet
+    (for example task-local goal semantics).
+    """
+
+    kind: Literal["bound_reference"]
+    binding_id: Identifier
+
+
 RuleLookupKeyDraft = Annotated[
-    RuleConstantDraft | RuleReferenceDraft,
+    RuleConstantDraft | RuleReferenceDraft | RuleBoundReferenceDraft,
     Field(discriminator="kind"),
 ]
 
@@ -533,8 +555,27 @@ class RuleLookupByKeyDraft(AgentOutput):
     value_type: RuleValueType
 
 
+class RuleBoundLookupByKeyDraft(AgentOutput):
+    """One frozen collection-field selection for ToolSemantics.
+
+    ``binding_id`` owns collection pointer, primary key, selected item field,
+    source, and value type as one indivisible framework fact.  The Agent can
+    still choose the business relation and supply its key expression, but it
+    cannot accidentally splice a collection from one entity to a field or key
+    from another.
+    """
+
+    kind: Literal["bound_lookup_by_key"]
+    binding_id: Identifier
+    key: RuleLookupKeyDraft
+
+
 RuleAtomDraft = Annotated[
-    RuleConstantDraft | RuleReferenceDraft | RuleLookupByKeyDraft,
+    RuleConstantDraft
+    | RuleReferenceDraft
+    | RuleBoundReferenceDraft
+    | RuleLookupByKeyDraft
+    | RuleBoundLookupByKeyDraft,
     Field(discriminator="kind"),
 ]
 
@@ -549,7 +590,12 @@ class RuleArithmeticDraft(AgentOutput):
 
 
 RuleTermDraft = Annotated[
-    RuleConstantDraft | RuleReferenceDraft | RuleLookupByKeyDraft | RuleArithmeticDraft,
+    RuleConstantDraft
+    | RuleReferenceDraft
+    | RuleBoundReferenceDraft
+    | RuleLookupByKeyDraft
+    | RuleBoundLookupByKeyDraft
+    | RuleArithmeticDraft,
     Field(discriminator="kind"),
 ]
 
@@ -663,7 +709,12 @@ RuleClauseDraft = Annotated[
 class RuleDraft(AgentOutput):
     """Agent-facing Rule ADT deterministically compiled into the core Rule IR."""
 
-    rule_id: Identifier
+    # A rule id names a framework IR object; it is not business semantics.  A
+    # ToolSemanticsBatch therefore derives this value from its frozen tool id,
+    # section and ordinal before the proposal is persisted or compiled.  Other
+    # older source boundaries still require it during their own compilation,
+    # which lets this migration remain local to the production tool leaf.
+    rule_id: Identifier | None = None
     family: RuleFamily
     description: Annotated[str, Field(min_length=1)]
     boolean_operator: Literal["all", "any"]
@@ -1228,8 +1279,9 @@ class StateFieldSourceDraft(CompactFieldSemanticDraft):
         if self.lifecycle and (
             self.role != "mutable" or self.value_type != "string" or not self.enum_values
         ):
-            raise ValueError(
-                "a lifecycle field must be mutable, string-valued and declare enum values"
+            raise PydanticCustomError(
+                "state_field_lifecycle_contract",
+                "lifecycle requires mutable string field with non-empty enum_values",
             )
         return self
 
@@ -1277,9 +1329,7 @@ class WorldBoundarySourceDraft(AgentOutput):
     """Boundary meaning without duplicated resource or visibility indexes."""
 
     primary_domain: Identifier
-    actors_and_authority: Annotated[
-        tuple[ActorAuthoritySourceDraft, ...], Field(min_length=1)
-    ]
+    actors_and_authority: Annotated[tuple[ActorAuthoritySourceDraft, ...], Field(min_length=1)]
     systems_of_record: Annotated[tuple[Identifier, ...], Field(min_length=1)]
     transition_authorities: Annotated[tuple[Identifier, ...], Field(min_length=1)]
     tool_namespaces: Annotated[tuple[Identifier, ...], Field(min_length=1)]
@@ -1407,7 +1457,7 @@ class SharedConcurrencyDomainSourceDraft(AgentOutput):
 class SharedIdempotencyDomainSourceDraft(AgentOutput):
     domain_id: Identifier
     member_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=8)]
-    mode: Literal["none", "natural", "idempotency_key"]
+    mode: IdempotencyMode
     rationale: Annotated[str, Field(min_length=1)]
 
 
@@ -1427,7 +1477,15 @@ class SharedCompensationEdgeSourceDraft(AgentOutput):
 class SharedErrorPolicySourceDraft(AgentOutput):
     policy_id: Identifier
     member_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=8)]
-    required_error_suffix: Identifier
+    required_error_suffix: Annotated[
+        Identifier,
+        Field(
+            description=(
+                "Required final Identifier segment of a matching tool error code. "
+                "Any Identifier separator '.', ':', '_', or '-' may precede the segment."
+            )
+        ),
+    ]
     retryable: bool
     rationale: Annotated[str, Field(min_length=1)]
 
@@ -1502,7 +1560,82 @@ class ToolSemanticsBatchSourceDraft(AgentOutput):
         tool_ids = tuple(item.tool_id for item in self.tools)
         if len(set(tool_ids)) != len(tool_ids):
             raise ValueError("tool semantics batch tool ids must be unique")
+        # The agent owns the meaning of a Rule, never its namespace.  This
+        # removes a repeated mechanical failure class from the most expensive
+        # semantic node while keeping every final Rule identity stable,
+        # inspectable and derived from immutable source position.
+        # Pydantic top-level ``after`` validators must return this instance;
+        # returning ``model_copy`` is ignored by normal ``__init__``
+        # construction.  Mutating this local validated model is safe because
+        # the canonicalization is pure and every nested value remains the same
+        # closed source type.
+        self.tools = tuple(_canonicalize_tool_semantic_rule_ids(item) for item in self.tools)
         return self
+
+
+def _canonicalize_tool_semantic_rule_ids(
+    source: ToolSemanticSourceDraft,
+) -> ToolSemanticSourceDraft:
+    """Apply deterministic Rule namespaces to one frozen tool source draft."""
+
+    tool_id = source.tool_id
+
+    def canonicalize(
+        rules: tuple[RuleDraft, ...],
+        section: str,
+    ) -> tuple[RuleDraft, ...]:
+        return tuple(
+            rule.model_copy(update={"rule_id": f"rule:{tool_id}:{section}:{index}"})
+            for index, rule in enumerate(rules)
+        )
+
+    conditions = source.conditions.model_copy(
+        update={
+            "preconditions": canonicalize(source.conditions.preconditions, "precondition"),
+            "postconditions": canonicalize(source.conditions.postconditions, "postcondition"),
+        }
+    )
+    transition = source.state_transition.model_copy(
+        update={"transition": canonicalize(source.state_transition.transition, "transition")}
+    )
+    errors = source.errors.model_copy(
+        update={
+            "errors": tuple(
+                error.model_copy(
+                    update={
+                        "when": error.when.model_copy(
+                            update={"rule_id": f"rule:{tool_id}:error:{index}"}
+                        )
+                    }
+                )
+                for index, error in enumerate(source.errors.errors)
+            )
+        }
+    )
+    permission = source.access_observation.permission
+    access_observation = source.access_observation.model_copy(
+        update={
+            "permission": permission.model_copy(
+                update={
+                    "condition": (
+                        permission.condition.model_copy(
+                            update={"rule_id": f"rule:{tool_id}:permission:0"}
+                        )
+                        if permission.condition is not None
+                        else None
+                    )
+                }
+            )
+        }
+    )
+    return source.model_copy(
+        update={
+            "conditions": conditions,
+            "state_transition": transition,
+            "errors": errors,
+            "access_observation": access_observation,
+        }
+    )
 
 
 class TrainingSemanticSourceDraft(AgentOutput):
@@ -1807,9 +1940,12 @@ __all__ = [
     "PermissionRuleSourceDraft",
     "ObservationSemanticsSourceDraft",
     "PlannedSearchQuery",
+    "ResearchAcquisition",
     "ResearchPlan",
     "RuleArithmeticDraft",
     "RuleAtomDraft",
+    "RuleBoundLookupByKeyDraft",
+    "RuleBoundReferenceDraft",
     "RuleClauseDraft",
     "RuleConstantDraft",
     "RuleLookupByKeyDraft",

@@ -16,7 +16,7 @@ Foundry 支持两种互斥的模型认证方式：
 ```text
 Git branch: codex-agent-world-runtime-redesign
 Python: 3.12
-model: gpt-5.4-mini
+model: 由 agent.model 显式选择（当前实验优先 grok-4.5；备用 gpt-5.4-mini）
 认证方式: chatgpt_auth_file 或 api_key_environment
 Codex 安装方式/版本
 研究 provider: searxng 或 jina
@@ -88,7 +88,7 @@ Foundry TOML 使用绝对路径：
 
 ```toml
 [agent]
-model = "gpt-5.4-mini"
+model = "YOUR_CODEX_MODEL"
 codex_bin = "/absolute/resolved/path/to/codex"
 chatgpt_auth_file = "/home/NEW_USER/.codex/auth.json"
 ```
@@ -103,7 +103,7 @@ chatgpt_auth_file = "/home/NEW_USER/.codex/auth.json"
 
 ```toml
 [agent]
-model = "gpt-5.4-mini"
+model = "YOUR_OPENAI_COMPATIBLE_MODEL"
 model_provider = "openai"
 codex_bin = "/absolute/resolved/path/to/codex"
 openai_base_url = "https://YOUR-ENDPOINT.example/v1"
@@ -158,7 +158,7 @@ uv run agent-world --config ~/.config/agent-world/config.toml doctor
 uv run agent-world --config ~/.config/agent-world/config.toml doctor --live-agent
 ```
 
-第一条检查本机依赖和配置；第二条会真实消耗一次 `gpt-5.4-mini` Codex SDK 调用，用来证明凭证、隔离 profile、SDK 和模型路径可以工作，不是 mock。Research 也恢复后，执行完整生产预检：
+第一条检查本机依赖和配置；第二条会真实消耗一次当前 `agent.model` 所选的 Codex SDK 调用，用来证明凭证、隔离 profile、SDK 和模型路径可以工作，不是 mock。Research 也恢复后，执行完整生产预检：
 
 ```bash
 uv run agent-world --config ~/.config/agent-world/config.toml doctor --production

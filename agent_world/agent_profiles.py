@@ -307,9 +307,7 @@ class IsolatedAgentProfileProvider:
         default_limits = InvocationLimits()
         structured_event_limit = (
             max(default_limits.max_events, rollout_token_limit)
-            if role == "challenger"
-            and output_schema is not None
-            and rollout_token_limit is not None
+            if output_schema is not None and rollout_token_limit is not None
             else default_limits.max_events
         )
         return AgentProfileSpec(

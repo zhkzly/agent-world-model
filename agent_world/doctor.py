@@ -330,7 +330,10 @@ def _authentication_check(config: FoundryConfig) -> DoctorCheck:
     agent = config.agent
     if agent.api_key_environment is not None:
         value = os.environ.get(agent.api_key_environment)
-        if value and len(value) >= 8:
+        # Match application assembly: Redactor.from_values protects exact
+        # credential values from four bytes onward, including short opaque
+        # tokens issued by OpenAI-compatible gateways.
+        if value and len(value.encode("utf-8")) >= 4:
             return DoctorCheck(
                 check="model_authentication",
                 status="pass",
@@ -386,15 +389,25 @@ def _executable_check(name: str, executable: str | None) -> DoctorCheck:
 
 async def _codex_runtime_check(config: FoundryConfig) -> DoctorCheck:
     binary = config.agent.codex_bin
+    runtime_source = "explicit"
     if binary is None:
-        return DoctorCheck(
-            check="codex_runtime",
-            status="fail",
-            summary=(
-                "configure agent.codex_bin explicitly; the SDK-bundled beta runtime may be "
-                "rejected by the live Codex service"
-            ),
-        )
+        try:
+            from codex_cli_bin import bundled_codex_path  # type: ignore[import-untyped]
+
+            sdk_version = importlib.metadata.version("openai-codex")
+            runtime_version = importlib.metadata.version("openai-codex-cli-bin")
+            if sdk_version != runtime_version:
+                raise OSError(
+                    "SDK-bundled Codex runtime version does not match openai-codex"
+                )
+            binary = bundled_codex_path()
+            runtime_source = "SDK-bundled"
+        except (ImportError, importlib.metadata.PackageNotFoundError, OSError) as exc:
+            return DoctorCheck(
+                check="codex_runtime",
+                status="fail",
+                summary=f"SDK-bundled Codex runtime unavailable: {exc}",
+            )
     try:
         if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
             raise OSError("configured Codex runtime is not a real executable file")
@@ -458,7 +471,9 @@ async def _codex_runtime_check(config: FoundryConfig) -> DoctorCheck:
         return DoctorCheck(
             check="codex_runtime",
             status="pass",
-            summary=f"explicit {version} executable and rollout-budget schema ready",
+            summary=(
+                f"{runtime_source} {version} executable and rollout-budget schema ready"
+            ),
         )
     except (OSError, TimeoutError) as exc:
         return DoctorCheck(check="codex_runtime", status="fail", summary=str(exc))

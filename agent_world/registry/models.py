@@ -89,8 +89,8 @@ class PackageVersionReservation(V2Contract):
         return self
 
 
-class ReleaseDossier(V2Contract):
-    """Framework-authored public release evidence; excluded from its own digest."""
+class PublicationDossier(V2Contract):
+    """Registry-authored physical publication receipt; excluded from its own digest."""
 
     coordinate: PackageCoordinate
     reservation_id: Identifier
@@ -98,7 +98,7 @@ class ReleaseDossier(V2Contract):
     manifest_ref: ArtifactRef
     judge_report_ref: ArtifactRef
     integration_report_ref: ArtifactRef
-    claim_vector_ref: ArtifactRef
+    release_dossier_ref: ArtifactRef
     telemetry_summary_ref: ArtifactRef
     candidate_ref: ArtifactRef
     release_profile: ReleaseProfile
@@ -119,7 +119,7 @@ class ReleaseRecord(V2Contract):
     manifest_ref: ArtifactRef
     judge_report_ref: ArtifactRef
     integration_report_ref: ArtifactRef
-    claim_vector_ref: ArtifactRef
+    release_dossier_ref: ArtifactRef
     telemetry_summary_ref: ArtifactRef
     candidate_ref: ArtifactRef
     design_ref: ArtifactRef
@@ -160,7 +160,7 @@ class PreparedRelease(V2Contract):
     manifest_ref: ArtifactRef
     judge_report_ref: ArtifactRef
     integration_report_ref: ArtifactRef
-    claim_vector_ref: ArtifactRef
+    release_dossier_ref: ArtifactRef
     telemetry_summary_ref: ArtifactRef
     release_profile: ReleaseProfile
     passed_hard_gates: tuple[Identifier, ...]
@@ -259,7 +259,7 @@ __all__ = [
     "PreparedRelease",
     "RegistryEvent",
     "RegistryIndex",
-    "ReleaseDossier",
+    "PublicationDossier",
     "ReleaseRecord",
     "ReleaseStatus",
     "ReservationStatus",

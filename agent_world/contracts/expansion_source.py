@@ -55,8 +55,10 @@ class ExpansionSourceDescriptor(V2Contract):
             raise ValueError("evidence-backed ExpansionSource requires two real Agent turns")
         if self.budget.search_calls < 1:
             raise ValueError("evidence-backed ExpansionSource requires a real search call")
-        if self.budget.tool_calls <= self.budget.search_calls:
-            raise ValueError("ExpansionSource must reserve at least one fetch beyond search calls")
+        if self.budget.tool_calls < self.budget.search_calls + 2:
+            raise ValueError(
+                "ExpansionSource must reserve one fetch and one extract beyond search calls"
+            )
         prohibited = {
             "build_seconds": self.budget.build_seconds,
             "evaluation_episodes": self.budget.evaluation_episodes,

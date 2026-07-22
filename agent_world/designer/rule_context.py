@@ -19,11 +19,69 @@ from agent_world.contracts import (
     RuleLookupByKey,
     RuleTerm,
     RuleValueRef,
+    RuleValueSource,
     RuleValueType,
     StateSchema,
     ToolSurface,
+    canonical_json_bytes,
+    sha256_digest,
 )
 from agent_world.control.validation import SafeValidationIssue
+
+from .models import (
+    RuleArithmeticDraft,
+    RuleBoundLookupByKeyDraft,
+    RuleBoundReferenceDraft,
+    RuleClauseDraft,
+    RuleConstantDraft,
+    RuleDraft,
+    RuleLookupByKeyDraft,
+    RuleReferenceDraft,
+    ToolSemanticsBatchSourceDraft,
+    ToolSemanticSourceDraft,
+    WorldSkeletonDraft,
+)
+from .validation import StructuredSemanticError, StructuredSemanticIssue
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenRuleReferenceBinding:
+    """One framework-owned direct Rule reference exposed to a Tool Agent."""
+
+    binding_id: str
+    source: RuleValueSource
+    pointer: str
+    value_type: RuleValueType
+
+    def prompt_projection(self) -> dict[str, str]:
+        return {
+            "binding_id": self.binding_id,
+            "source": self.source,
+            "pointer": self.pointer,
+            "value_type": self.value_type,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenRuleLookupBinding:
+    """One indivisible collection/key/value selection owned by framework code."""
+
+    binding_id: str
+    source: Literal["pre_state", "post_state"]
+    collection_pointer: str
+    key_field: str
+    value_pointer: str
+    value_type: RuleValueType
+
+    def prompt_projection(self) -> dict[str, str]:
+        return {
+            "binding_id": self.binding_id,
+            "source": self.source,
+            "collection_pointer": self.collection_pointer,
+            "key_field": self.key_field,
+            "value_pointer": self.value_pointer,
+            "value_type": self.value_type,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,22 +91,39 @@ class RuleContextCatalog:
     schemas: dict[str, dict[str, JsonValue]]
     collection_keys: dict[str, tuple[str, ...]]
     collection_fields: dict[str, tuple[str, ...]]
+    reference_bindings: dict[str, FrozenRuleReferenceBinding]
+    lookup_bindings: dict[str, FrozenRuleLookupBinding]
 
     @classmethod
     def for_tool(cls, *, state: StateSchema, surface: ToolSurface) -> RuleContextCatalog:
         collection_keys: dict[str, tuple[str, ...]] = {}
         collection_fields: dict[str, tuple[str, ...]] = {}
-        properties = state.root_state_schema.get("properties")
+        state_root = state.root_state_schema
+        resolved_root = _dereference_schema(state_root, document=state_root)
+        properties = (
+            resolved_root.schema.get("properties")
+            if resolved_root.failure is None and resolved_root.schema is not None
+            else None
+        )
         if isinstance(properties, dict):
             for root_name, root_schema in properties.items():
                 if not isinstance(root_name, str) or not isinstance(root_schema, dict):
                     continue
-                if root_schema.get("type") != "array":
+                resolved_collection = _dereference_schema(root_schema, document=state_root)
+                if (
+                    resolved_collection.failure is not None
+                    or resolved_collection.schema is None
+                    or resolved_collection.schema.get("type") != "array"
+                ):
                     continue
-                items = root_schema.get("items")
+                items = resolved_collection.schema.get("items")
                 if not isinstance(items, dict):
                     continue
-                item_properties = items.get("properties")
+                resolved_items = _dereference_schema(items, document=state_root)
+                if resolved_items.failure is not None or resolved_items.schema is None:
+                    continue
+                item_schema = resolved_items.schema
+                item_properties = item_schema.get("properties")
                 if isinstance(item_properties, dict):
                     collection_fields[f"/{_escape_token(root_name)}"] = tuple(
                         sorted(str(key) for key in item_properties)
@@ -56,20 +131,30 @@ class RuleContextCatalog:
                 matches = tuple(
                     entity
                     for entity in state.entities
-                    if entity.json_schema == items
+                    if entity.json_schema == item_schema
                 )
                 if len(matches) == 1:
                     collection_keys[f"/{_escape_token(root_name)}"] = matches[0].primary_key_fields
-        return cls(
-            schemas={
-                "args": surface.input_schema,
-                "tool_result": surface.output_schema,
-                "observation": surface.observation_schema,
-                "pre_state": state.root_state_schema,
-                "post_state": state.root_state_schema,
-            },
+        schemas = {
+            "args": surface.input_schema,
+            "tool_result": surface.output_schema,
+            "observation": surface.observation_schema,
+            "pre_state": state.root_state_schema,
+            "post_state": state.root_state_schema,
+        }
+        catalog = cls(
+            schemas=schemas,
             collection_keys=collection_keys,
             collection_fields=collection_fields,
+            reference_bindings={},
+            lookup_bindings={},
+        )
+        return cls(
+            schemas=schemas,
+            collection_keys=collection_keys,
+            collection_fields=collection_fields,
+            reference_bindings=_derive_reference_bindings(catalog),
+            lookup_bindings=_derive_lookup_bindings(catalog),
         )
 
     def prompt_projection(self) -> dict[str, object]:
@@ -83,8 +168,441 @@ class RuleContextCatalog:
                     "item_fields": list(self.collection_fields.get(pointer, ())),
                 }
                 for pointer in sorted(self.collection_fields)
-            ]
+            ],
+            "reference_bindings": [
+                item.prompt_projection()
+                for item in sorted(
+                    self.reference_bindings.values(),
+                    key=lambda item: item.binding_id,
+                )
+            ],
+            "lookup_bindings": [
+                item.prompt_projection()
+                for item in sorted(self.lookup_bindings.values(), key=lambda item: item.binding_id)
+            ],
         }
+
+
+def materialize_tool_semantics_bindings(
+    source: ToolSemanticsBatchSourceDraft,
+    *,
+    skeleton: WorldSkeletonDraft,
+) -> ToolSemanticsBatchSourceDraft:
+    """Expand Tool Agent binding choices into the closed executable Rule source.
+
+    Tool semantics is the only current source boundary whose rule context is
+    completely frozen before an Agent turn.  It therefore must not accept raw
+    pointers, collection names, primary-key names, or declared value types as
+    model-authored facts.  The Agent selects binding ids; this function derives
+    the concrete Rule IR inputs and rejects every unbound escape hatch before
+    legacy deterministic compilation is reached.
+    """
+
+    surfaces = {item.surface.tool_id: item.surface for item in skeleton.tool_surfaces}
+    issues: list[StructuredSemanticIssue] = []
+    materialized_tools: list[ToolSemanticSourceDraft] = []
+
+    for tool_index, tool in enumerate(source.tools):
+        surface = surfaces.get(tool.tool_id)
+        if surface is None:
+            issues.append(
+                StructuredSemanticIssue(
+                    code="tool_rule_binding_catalog_missing",
+                    location=("tools", tool_index, "tool_id"),
+                    message="The frozen ToolSurface has no Rule binding catalog.",
+                    violated_condition="the ToolSemantics source names no frozen ToolSurface",
+                    expected_category="one tool id from the frozen Tool batch",
+                )
+            )
+            materialized_tools.append(tool)
+            continue
+        catalog = RuleContextCatalog.for_tool(state=skeleton.state, surface=surface)
+        conditions = tool.conditions.model_copy(
+            update={
+                "preconditions": tuple(
+                    _materialize_rule_bindings(
+                        rule,
+                        catalog=catalog,
+                        issues=issues,
+                        path=("tools", tool_index, "conditions", "preconditions", rule_index),
+                    )
+                    for rule_index, rule in enumerate(tool.conditions.preconditions)
+                ),
+                "postconditions": tuple(
+                    _materialize_rule_bindings(
+                        rule,
+                        catalog=catalog,
+                        issues=issues,
+                        path=("tools", tool_index, "conditions", "postconditions", rule_index),
+                    )
+                    for rule_index, rule in enumerate(tool.conditions.postconditions)
+                ),
+            }
+        )
+        transition = tool.state_transition.model_copy(
+            update={
+                "transition": tuple(
+                    _materialize_rule_bindings(
+                        rule,
+                        catalog=catalog,
+                        issues=issues,
+                        path=("tools", tool_index, "state_transition", "transition", rule_index),
+                    )
+                    for rule_index, rule in enumerate(tool.state_transition.transition)
+                )
+            }
+        )
+        errors = tool.errors.model_copy(
+            update={
+                "errors": tuple(
+                    error.model_copy(
+                        update={
+                            "when": _materialize_rule_bindings(
+                                error.when,
+                                catalog=catalog,
+                                issues=issues,
+                                path=("tools", tool_index, "errors", "errors", error_index, "when"),
+                            )
+                        }
+                    )
+                    for error_index, error in enumerate(tool.errors.errors)
+                )
+            }
+        )
+        permission = tool.access_observation.permission
+        access_observation = tool.access_observation.model_copy(
+            update={
+                "permission": permission.model_copy(
+                    update={
+                        "condition": (
+                            _materialize_rule_bindings(
+                                permission.condition,
+                                catalog=catalog,
+                                issues=issues,
+                                path=(
+                                    "tools",
+                                    tool_index,
+                                    "access_observation",
+                                    "permission",
+                                    "condition",
+                                ),
+                            )
+                            if permission.condition is not None
+                            else None
+                        )
+                    }
+                )
+            }
+        )
+        materialized_tools.append(
+            tool.model_copy(
+                update={
+                    "conditions": conditions,
+                    "state_transition": transition,
+                    "errors": errors,
+                    "access_observation": access_observation,
+                }
+            )
+        )
+
+    if issues:
+        raise StructuredSemanticError(tuple(issues))
+    return source.model_copy(update={"tools": tuple(materialized_tools)})
+
+
+def _materialize_rule_bindings(
+    rule: RuleDraft,
+    *,
+    catalog: RuleContextCatalog,
+    issues: list[StructuredSemanticIssue],
+    path: tuple[str | int, ...],
+) -> RuleDraft:
+    clauses = tuple(
+        _materialize_clause_bindings(
+            clause,
+            catalog=catalog,
+            issues=issues,
+            path=(*path, "clauses", clause_index),
+        )
+        for clause_index, clause in enumerate(rule.clauses)
+    )
+    return rule.model_copy(update={"clauses": clauses})
+
+
+def _materialize_clause_bindings(
+    clause: RuleClauseDraft,
+    *,
+    catalog: RuleContextCatalog,
+    issues: list[StructuredSemanticIssue],
+    path: tuple[str | int, ...],
+) -> RuleClauseDraft:
+    """Transform the term-bearing portion of one closed RuleClause source."""
+
+    left = getattr(clause, "left", None)
+    if left is None:
+        return clause
+    updates: dict[str, object] = {
+        "left": _materialize_term_bindings(
+            left,
+            catalog=catalog,
+            issues=issues,
+            path=(*path, "left"),
+        )
+    }
+    right = getattr(clause, "right", None)
+    if right is not None:
+        updates["right"] = _materialize_term_bindings(
+            right,
+            catalog=catalog,
+            issues=issues,
+            path=(*path, "right"),
+        )
+    return clause.model_copy(update=updates)
+
+
+def _materialize_term_bindings(
+    term: object,
+    *,
+    catalog: RuleContextCatalog,
+    issues: list[StructuredSemanticIssue],
+    path: tuple[str | int, ...],
+) -> object:
+    if isinstance(term, RuleConstantDraft):
+        return term
+    if isinstance(term, RuleBoundReferenceDraft):
+        binding = catalog.reference_bindings.get(term.binding_id)
+        if binding is None:
+            _binding_issue(
+                issues,
+                code="tool_rule_binding_unknown",
+                path=(*path, "binding_id"),
+                expected=_reference_binding_expectation(catalog),
+            )
+            return term
+        return RuleReferenceDraft(
+            kind="reference",
+            source=binding.source,
+            pointer=binding.pointer,
+            value_type=binding.value_type,
+        )
+    if isinstance(term, RuleBoundLookupByKeyDraft):
+        lookup_binding = catalog.lookup_bindings.get(term.binding_id)
+        if lookup_binding is None:
+            _binding_issue(
+                issues,
+                code="tool_rule_binding_unknown",
+                path=(*path, "binding_id"),
+                expected=_lookup_binding_expectation(catalog),
+            )
+            return term
+        key = _materialize_term_bindings(
+            term.key,
+            catalog=catalog,
+            issues=issues,
+            path=(*path, "key"),
+        )
+        if not isinstance(key, RuleConstantDraft | RuleReferenceDraft):
+            _binding_issue(
+                issues,
+                code="tool_rule_lookup_key_binding_required",
+                path=(*path, "key"),
+                expected="a constant or one frozen reference binding",
+            )
+            return term
+        return RuleLookupByKeyDraft(
+            kind="lookup_by_key",
+            source=lookup_binding.source,
+            collection_pointer=lookup_binding.collection_pointer,
+            key_field=lookup_binding.key_field,
+            key=key,
+            value_pointer=lookup_binding.value_pointer,
+            value_type=lookup_binding.value_type,
+        )
+    if isinstance(term, RuleReferenceDraft | RuleLookupByKeyDraft):
+        _binding_issue(
+            issues,
+            code="tool_rule_binding_required",
+            path=path,
+            expected="a bound_reference or bound_lookup_by_key from the frozen catalog",
+        )
+        return term
+    if isinstance(term, RuleArithmeticDraft):
+        return term.model_copy(
+            update={
+                "left": _materialize_term_bindings(
+                    term.left,
+                    catalog=catalog,
+                    issues=issues,
+                    path=(*path, "left"),
+                ),
+                "right": _materialize_term_bindings(
+                    term.right,
+                    catalog=catalog,
+                    issues=issues,
+                    path=(*path, "right"),
+                ),
+            }
+        )
+    raise TypeError(f"unsupported Tool Rule term: {type(term).__name__}")
+
+
+def _binding_issue(
+    issues: list[StructuredSemanticIssue],
+    *,
+    code: str,
+    path: tuple[str | int, ...],
+    expected: str,
+) -> None:
+    issues.append(
+        StructuredSemanticIssue(
+            code=code,
+            location=path,
+            message="ToolSemantics must select only one framework-derived Rule binding.",
+            violated_condition=(
+                "the ToolSemantics source used a Rule reference that is not bound "
+                "to the frozen execution schema"
+            ),
+            expected_category=expected,
+        )
+    )
+
+
+def _derive_reference_bindings(
+    catalog: RuleContextCatalog,
+) -> dict[str, FrozenRuleReferenceBinding]:
+    bindings: dict[str, FrozenRuleReferenceBinding] = {}
+    for source, schema in sorted(catalog.schemas.items()):
+        if source not in {"args", "tool_result", "observation", "pre_state", "post_state"}:
+            continue
+        for pointer, value_type in _iter_direct_schema_bindings(schema, document=schema):
+            binding_id = _binding_id(
+                "reference",
+                {
+                    "source": source,
+                    "pointer": pointer,
+                    "value_type": value_type,
+                },
+            )
+            bindings[binding_id] = FrozenRuleReferenceBinding(
+                binding_id=binding_id,
+                source=cast(RuleValueSource, source),
+                pointer=pointer,
+                value_type=value_type,
+            )
+    return bindings
+
+
+def _derive_lookup_bindings(
+    catalog: RuleContextCatalog,
+) -> dict[str, FrozenRuleLookupBinding]:
+    bindings: dict[str, FrozenRuleLookupBinding] = {}
+    for source in ("pre_state", "post_state"):
+        schema = catalog.schemas[source]
+        for collection_pointer, fields in sorted(catalog.collection_fields.items()):
+            keys = catalog.collection_keys.get(collection_pointer, ())
+            collection = _resolve_schema_pointer(
+                schema,
+                collection_pointer,
+                document=schema,
+            )
+            if (
+                collection.failure is not None
+                or collection.schema is None
+                or collection.schema.get("type") != "array"
+            ):
+                continue
+            raw_items = collection.schema.get("items")
+            if not isinstance(raw_items, dict):
+                continue
+            item = _dereference_schema(raw_items, document=schema)
+            if item.failure is not None or item.schema is None:
+                continue
+            for key_field in keys:
+                for field in fields:
+                    value = _resolve_schema_pointer(
+                        item.schema,
+                        f"/{_escape_token(field)}",
+                        document=schema,
+                    )
+                    if value.failure is not None or value.schema is None:
+                        continue
+                    value_type = _schema_binding_value_type(value.schema)
+                    value_pointer = f"/{_escape_token(field)}"
+                    binding_id = _binding_id(
+                        "lookup",
+                        {
+                            "source": source,
+                            "collection_pointer": collection_pointer,
+                            "key_field": key_field,
+                            "value_pointer": value_pointer,
+                            "value_type": value_type,
+                        },
+                    )
+                    bindings[binding_id] = FrozenRuleLookupBinding(
+                        binding_id=binding_id,
+                        source=source,
+                        collection_pointer=collection_pointer,
+                        key_field=key_field,
+                        value_pointer=value_pointer,
+                        value_type=value_type,
+                    )
+    return bindings
+
+
+def _iter_direct_schema_bindings(
+    schema: dict[str, JsonValue],
+    *,
+    document: dict[str, JsonValue],
+) -> tuple[tuple[str, RuleValueType], ...]:
+    """Enumerate direct pointers without fabricating selectors through arrays."""
+
+    collected: list[tuple[str, RuleValueType]] = []
+
+    def visit(value: dict[str, JsonValue], pointer: str) -> None:
+        resolved = _dereference_schema(value, document=document)
+        if resolved.failure is not None or resolved.schema is None:
+            return
+        current = resolved.schema
+        collected.append((pointer, _schema_binding_value_type(current)))
+        if current.get("type") != "object":
+            return
+        properties = current.get("properties")
+        if not isinstance(properties, dict):
+            return
+        for field, child in sorted(properties.items()):
+            if isinstance(field, str) and isinstance(child, dict):
+                visit(child, _join_pointer(pointer, field))
+
+    visit(schema, "")
+    return tuple(collected)
+
+
+def _schema_binding_value_type(schema: dict[str, JsonValue]) -> RuleValueType:
+    values = _schema_value_types(schema)
+    return next(iter(values)) if len(values) == 1 else "any"
+
+
+def _binding_id(kind: str, payload: dict[str, object]) -> str:
+    digest = sha256_digest(canonical_json_bytes(payload)).removeprefix("sha256:")
+    return f"binding:{kind}:{digest[:24]}"
+
+
+def _join_pointer(parent: str, token: str) -> str:
+    return f"{parent}/{_escape_token(token)}" if parent else f"/{_escape_token(token)}"
+
+
+def _reference_binding_expectation(catalog: RuleContextCatalog) -> str:
+    return _bounded_expectation(
+        "one frozen reference binding id",
+        tuple(sorted(catalog.reference_bindings)),
+    )
+
+
+def _lookup_binding_expectation(catalog: RuleContextCatalog) -> str:
+    return _bounded_expectation(
+        "one frozen lookup binding id",
+        tuple(sorted(catalog.lookup_bindings)),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +627,7 @@ def validate_rule_context(
             schema = catalog.schemas.get(term.source)
             if schema is None:
                 return
-            resolution = _resolve_schema_pointer(schema, term.pointer)
+            resolution = _resolve_schema_pointer(schema, term.pointer, document=schema)
             if resolution.failure is not None:
                 issues.append(
                     _reference_failure(
@@ -132,7 +650,11 @@ def validate_rule_context(
             root = catalog.schemas.get(term.source)
             if root is None:
                 return
-            collection = _resolve_schema_pointer(root, term.collection_pointer)
+            collection = _resolve_schema_pointer(
+                root,
+                term.collection_pointer,
+                document=root,
+            )
             if collection.failure is not None or collection.schema is None:
                 issues.append(
                     _reference_failure(
@@ -155,14 +677,39 @@ def validate_rule_context(
                     )
                 )
                 return
-            item_schema = collection.schema["items"]
-            assert isinstance(item_schema, dict)
+            raw_item_schema = collection.schema["items"]
+            assert isinstance(raw_item_schema, dict)
+            item_resolution = _dereference_schema(raw_item_schema, document=root)
+            if item_resolution.failure is not None or item_resolution.schema is None:
+                issues.append(
+                    SafeValidationIssue(
+                        code="framework_rule_context_schema_invalid",
+                        location=(*path, "collection_pointer"),
+                        message=(
+                            "The frozen Rule context catalog contains an unresolved "
+                            "collection item schema."
+                        ),
+                        retryable=False,
+                        violated_condition=(
+                            "the framework context collection item schema cannot be resolved"
+                        ),
+                        expected_category="one closed local JSON Schema item definition",
+                    )
+                )
+                return
+            item_schema = item_resolution.schema
             item_properties = item_schema.get("properties")
-            key_schema = (
+            raw_key_schema = (
                 item_properties.get(term.key_field)
                 if isinstance(item_properties, dict)
                 else None
             )
+            key_resolution = (
+                _dereference_schema(raw_key_schema, document=root)
+                if isinstance(raw_key_schema, dict)
+                else _Resolution(None, "missing")
+            )
+            key_schema = key_resolution.schema if key_resolution.failure is None else None
             if not isinstance(key_schema, dict):
                 declared_fields = (
                     tuple(sorted(str(key) for key in item_properties))
@@ -195,7 +742,11 @@ def validate_rule_context(
                         ),
                     )
                 )
-            value = _resolve_schema_pointer(item_schema, term.value_pointer)
+            value = _resolve_schema_pointer(
+                item_schema,
+                term.value_pointer,
+                document=root,
+            )
             if value.failure is not None or value.schema is None:
                 if value.failure == "missing" and isinstance(item_properties, dict):
                     issues.append(
@@ -251,11 +802,23 @@ def validate_rule_context(
     return tuple(dict.fromkeys(issues))
 
 
-def _resolve_schema_pointer(schema: dict[str, JsonValue], pointer: str) -> _Resolution:
-    current = schema
+def _resolve_schema_pointer(
+    schema: dict[str, JsonValue],
+    pointer: str,
+    *,
+    document: dict[str, JsonValue],
+) -> _Resolution:
+    current_resolution = _dereference_schema(schema, document=document)
+    if current_resolution.failure is not None or current_resolution.schema is None:
+        return current_resolution
+    current = current_resolution.schema
     if pointer == "":
         return _Resolution(current)
     for raw_token in pointer.removeprefix("/").split("/"):
+        current_resolution = _dereference_schema(current, document=document)
+        if current_resolution.failure is not None or current_resolution.schema is None:
+            return current_resolution
+        current = current_resolution.schema
         token = raw_token.replace("~1", "/").replace("~0", "~")
         schema_type = current.get("type")
         if schema_type == "object":
@@ -274,7 +837,59 @@ def _resolve_schema_pointer(schema: dict[str, JsonValue], pointer: str) -> _Reso
             current = items
             continue
         return _Resolution(None, "missing")
+    return _dereference_schema(current, document=document)
+
+
+def _dereference_schema(
+    schema: dict[str, JsonValue],
+    *,
+    document: dict[str, JsonValue],
+) -> _Resolution:
+    """Resolve a finite chain of local JSON Schema ``$ref`` values.
+
+    WorldState composes entity schemas under ``$defs`` and root collections
+    point at those definitions.  Rule references target the *resolved* runtime
+    shape, not the transport representation of that schema.  External or
+    cyclic references are deliberately rejected as invalid framework context;
+    the Designer never follows a network reference while compiling an
+    executable environment.
+    """
+
+    current = schema
+    visited: set[str] = set()
+    while "$ref" in current:
+        raw_ref = current.get("$ref")
+        if not isinstance(raw_ref, str) or not raw_ref.startswith("#"):
+            return _Resolution(None, "invalid_schema")
+        if raw_ref in visited:
+            return _Resolution(None, "invalid_schema")
+        visited.add(raw_ref)
+        target = _resolve_local_ref(document, raw_ref)
+        if target is None:
+            return _Resolution(None, "invalid_schema")
+        current = target
     return _Resolution(current)
+
+
+def _resolve_local_ref(
+    document: dict[str, JsonValue],
+    reference: str,
+) -> dict[str, JsonValue] | None:
+    """Resolve one local RFC 6901 fragment without accepting external refs."""
+
+    if reference == "#":
+        return document
+    if not reference.startswith("#/"):
+        return None
+    current: JsonValue = document
+    for raw_token in reference[2:].split("/"):
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, dict):
+            return None
+        current = current.get(token)
+        if current is None:
+            return None
+    return current if isinstance(current, dict) else None
 
 
 def _reference_failure(
@@ -371,4 +986,10 @@ def _bounded_expectation(label: str, values: tuple[str, ...]) -> str:
     return rendered if len(rendered) <= 512 else f"{rendered[:509]}..."
 
 
-__all__ = ["RuleContextCatalog", "validate_rule_context"]
+__all__ = [
+    "FrozenRuleLookupBinding",
+    "FrozenRuleReferenceBinding",
+    "RuleContextCatalog",
+    "materialize_tool_semantics_bindings",
+    "validate_rule_context",
+]

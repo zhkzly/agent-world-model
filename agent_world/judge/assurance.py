@@ -77,6 +77,7 @@ class StaticSourceInspection:
     secret_scan_passed: bool
     strict_data_parse_passed: bool
     python_compile_passed: bool
+    component_import_violations: tuple[str, ...]
     failure_codes: tuple[str, ...]
 
 
@@ -89,6 +90,9 @@ def inspect_static_sources(root: Path, manifest: CandidateManifest) -> StaticSou
     secret_ok = True
     data_ok = True
     python_ok = True
+    component_import_violations: set[str] = set()
+    python_trees: dict[str, ast.Module] = {}
+    declared_by_path = {item.path: item for item in manifest.files}
 
     for declared in sorted(manifest.files, key=lambda item: item.path):
         path = _manifest_path(root, declared)
@@ -142,6 +146,7 @@ def inspect_static_sources(root: Path, manifest: CandidateManifest) -> StaticSou
             else:
                 try:
                     tree = ast.parse(text, filename=declared.path, mode="exec")
+                    python_trees[declared.path] = tree
                     ast_valid = True
                     compile(tree, declared.path, "exec", dont_inherit=True, optimize=0)
                     compile_valid = True
@@ -185,14 +190,139 @@ def inspect_static_sources(root: Path, manifest: CandidateManifest) -> StaticSou
             )
         )
 
+    violations_by_source = _component_import_violations(
+        declared_by_path=declared_by_path,
+        python_trees=python_trees,
+    )
+    if violations_by_source:
+        failures.add("static_component_import_boundary_violation")
+        component_import_violations.update(
+            violation
+            for violations in violations_by_source.values()
+            for violation in violations
+        )
+        file_evidence = [
+            (
+                evidence.model_copy(
+                    update={
+                        "failure_codes": tuple(
+                            sorted(
+                                {
+                                    *evidence.failure_codes,
+                                    "static_component_import_boundary_violation",
+                                }
+                            )
+                        )
+                    }
+                )
+                if evidence.path in violations_by_source
+                else evidence
+            )
+            for evidence in file_evidence
+        ]
+
     return StaticSourceInspection(
         files=tuple(file_evidence),
         forbidden_pattern_scan_passed=forbidden_ok,
         secret_scan_passed=secret_ok,
         strict_data_parse_passed=data_ok,
         python_compile_passed=python_ok,
+        component_import_violations=tuple(sorted(component_import_violations)),
         failure_codes=tuple(sorted(failures)),
     )
+
+
+_COMPONENT_IMPORT_ROLES: dict[str, frozenset[str]] = {
+    "runtime": frozenset({"runtime"}),
+    "task_materializer": frozenset({"runtime", "task_materializer"}),
+    "public_verifier": frozenset({"runtime", "task_materializer", "public_verifier"}),
+}
+
+
+def _component_import_violations(
+    *,
+    declared_by_path: dict[str, PackageFile],
+    python_trees: dict[str, ast.Module],
+) -> dict[str, tuple[str, ...]]:
+    """Reject declared cross-role imports that cannot exist in the isolated file view."""
+
+    module_paths = {
+        module: path
+        for path in python_trees
+        if (module := _module_name_for_path(path)) is not None
+    }
+    violations: dict[str, tuple[str, ...]] = {}
+    for source_path, tree in python_trees.items():
+        source = declared_by_path[source_path]
+        allowed_roles = _COMPONENT_IMPORT_ROLES.get(source.role)
+        if allowed_roles is None:
+            continue
+        source_module = _module_name_for_path(source_path)
+        if source_module is None:
+            continue
+        imported_paths = {
+            target_path
+            for imported_module in _declared_import_modules(tree, source_path, source_module)
+            if (target_path := _declared_module_path(imported_module, module_paths)) is not None
+        }
+        source_violations = tuple(
+            f"{source_path}->{target_path}"
+            for target_path in sorted(imported_paths)
+            if declared_by_path[target_path].role not in allowed_roles
+        )
+        if source_violations:
+            violations[source_path] = source_violations
+    return violations
+
+
+def _module_name_for_path(path: str) -> str | None:
+    pure = PurePosixPath(path)
+    if pure.suffix != ".py":
+        return None
+    parts = list(pure.with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts) if parts else None
+
+
+def _declared_import_modules(
+    tree: ast.Module,
+    source_path: str,
+    source_module: str,
+) -> set[str]:
+    imported: set[str] = set()
+    is_package = PurePosixPath(source_path).name == "__init__.py"
+    package_parts = source_module.split(".") if is_package else source_module.split(".")[:-1]
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+            continue
+        if not isinstance(node, ast.ImportFrom):
+            continue
+        if node.level:
+            keep = len(package_parts) - node.level + 1
+            if keep < 0:
+                continue
+            base_parts = package_parts[:keep]
+        else:
+            base_parts = []
+        if node.module:
+            base_parts.extend(node.module.split("."))
+        base = ".".join(base_parts)
+        if base:
+            imported.add(base)
+        for alias in node.names:
+            if alias.name != "*":
+                imported.add(".".join((*base_parts, alias.name)))
+    return imported
+
+
+def _declared_module_path(module: str, module_paths: dict[str, str]) -> str | None:
+    parts = module.split(".")
+    for size in range(len(parts), 0, -1):
+        if (path := module_paths.get(".".join(parts[:size]))) is not None:
+            return path
+    return None
 
 
 def inspect_supply_chain(

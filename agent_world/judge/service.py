@@ -236,6 +236,22 @@ def _candidate_failure_summary(exc: BaseException) -> str:
     """Preserve deterministic protocol coordinates in Builder-safe feedback."""
 
     summary = str(exc)
+    if isinstance(exc, RuntimeProcessCrashed):
+        crash_coordinates: list[str] = []
+        exit_code = exc.details.get("exit_code")
+        if isinstance(exit_code, int):
+            crash_coordinates.append(f"exit_code={exit_code}")
+        stderr = exc.details.get("stderr")
+        if isinstance(stderr, str):
+            exception_name = _python_stderr_exception_name(stderr)
+            if exception_name is not None:
+                crash_coordinates.append(f"stderr_exception={exception_name}")
+            missing_module = _python_missing_module(stderr)
+            if missing_module is not None:
+                crash_coordinates.append(f"missing_module={missing_module}")
+        if crash_coordinates:
+            summary += "; " + "; ".join(crash_coordinates)
+        return summary
     if not isinstance(exc, ProtocolViolation):
         return summary
     details = exc.details
@@ -249,6 +265,25 @@ def _candidate_failure_summary(exc: BaseException) -> str:
     if coordinates:
         summary += "; " + "; ".join(coordinates)
     return summary
+
+
+_PYTHON_EXCEPTION_LINE = re.compile(
+    r"(?m)^(?P<exception>[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))(?::|$)"
+)
+_PYTHON_MISSING_MODULE = re.compile(
+    r"(?m)^ModuleNotFoundError: No module named ['\"]"
+    r"(?P<module>[A-Za-z_][A-Za-z0-9_.]*)['\"]$"
+)
+
+
+def _python_stderr_exception_name(stderr: str) -> str | None:
+    matches = tuple(_PYTHON_EXCEPTION_LINE.finditer(stderr[-16_384:]))
+    return matches[-1].group("exception") if matches else None
+
+
+def _python_missing_module(stderr: str) -> str | None:
+    matches = tuple(_PYTHON_MISSING_MODULE.finditer(stderr[-16_384:]))
+    return matches[-1].group("module") if matches else None
 
 
 def _schema_validation_coordinates(errors: Sequence[Any]) -> tuple[str, ...]:
@@ -1637,6 +1672,10 @@ class EnvironmentJudge:
                 item.path for item in evidence.public_tests if not item.passed
             )
             summary = "Static assurance failed: " + ", ".join(evidence.failure_codes)
+            if inspection.component_import_violations:
+                summary += "; component import violations: " + ", ".join(
+                    inspection.component_import_violations
+                )
             if failed_public_tests:
                 summary += "; failed public tests: " + ", ".join(failed_public_tests)
         return _AssuranceGateResult(

@@ -35,6 +35,7 @@ from agent_world.builder.models import TaskMaterializerContract, ToolBindingRequ
 from agent_world.contracts import (
     ActorBoundary,
     ArtifactRef,
+    Budget,
     BudgetUsage,
     CandidateManifest,
     ConcurrencySemantics,
@@ -44,11 +45,13 @@ from agent_world.contracts import (
     DifficultyDimension,
     EnvironmentCandidate,
     EnvironmentDesign,
+    EnvironmentJob,
     EnvironmentPackageManifest,
     EvaluatorGoalBinding,
     FidelityStatement,
     FrameworkPackagePayload,
     GateResult,
+    GenerationContext,
     IdempotencySemantics,
     IdentityDecision,
     ImplementationLineage,
@@ -60,6 +63,7 @@ from agent_world.contracts import (
     ParameterizedSolveRecipe,
     ParameterizedSolveStep,
     PermissionRule,
+    PermissionScope,
     PublicSelfCheckDescriptor,
     ReachabilityPublicEvidence,
     RecipeLiteral,
@@ -97,7 +101,24 @@ from agent_world.contracts import (
     compile_framework_package_payloads,
     sha256_digest,
 )
-from agent_world.control import ClaimVector, TelemetryReleaseSummary, claim, reduce_maturity
+from agent_world.control import (
+    GenerationWorkGraph,
+    LeaseBudgetLedger,
+    ProposalExecution,
+    ReleaseDossierCompiler,
+    TelemetryReleaseSummary,
+    ValidationReport,
+    WorkAttempt,
+    WorkControlRuntime,
+    WorkControlStore,
+    WorkDefinition,
+    WorkGraphEpochRuntime,
+    compile_design_work_graph,
+    complete_generation_work_graph,
+    deterministic_boundary_work_definition,
+    verifier_plan_work_definition,
+)
+from agent_world.judge import VerifierBatchPlan, VerifierBatchPlanItem
 from agent_world.task_materialization import compile_task_materializer_output_schema
 
 RUNTIME_SOURCE = r"""from __future__ import annotations
@@ -369,6 +390,7 @@ class ReleaseGraph:
     framework_payloads: tuple[FrameworkPackagePayload, ...]
     package_id: str
     version: str
+    package_closure: _PrePackageFixtureClosure
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +413,24 @@ class JudgeCandidateGraph:
     implementation_lineage: ImplementationLineage
     package_id: str
     version: str
+
+
+@dataclass(frozen=True, slots=True)
+class _PrePackageFixtureClosure:
+    """Test-only holder for the real WorkControl authority used by Registry tests.
+
+    The counter Runtime remains a deterministic test candidate, but publication
+    evidence is intentionally not faked: every ReleaseDossier input is backed
+    by a durable final WorkGraph epoch and its currently active WorkCommit.
+    """
+
+    dossier_ref: ArtifactRef
+    runtime: WorkControlRuntime
+    graph: GenerationWorkGraph
+    final_epoch_ref: ArtifactRef
+    final_manifest_ref: ArtifactRef
+    package_definition: WorkDefinition
+    package_input_refs: tuple[ArtifactRef, ...]
 
 
 def _unique_dependencies(refs: tuple[ArtifactRef, ...]) -> tuple[ArtifactRef, ...]:
@@ -419,6 +459,572 @@ def framework_writer(store: ArtifactStore) -> ArtifactWriter:
         ),
         allowed_artifact_type_prefixes=("control.", "design.", "release."),
     )
+
+
+def _fixture_boundary(
+    *,
+    scope_id: str,
+    component: str,
+    stage: str,
+    dependencies: tuple[WorkDefinition, ...] = (),
+) -> WorkDefinition:
+    """Make a code-owned test boundary without weakening the production graph."""
+
+    return deterministic_boundary_work_definition(
+        scope_id=scope_id,
+        component=component,  # type: ignore[arg-type]
+        stage=stage,
+        artifact_slot=stage,
+        dependency_coordinates=tuple(item.coordinate for item in dependencies),
+        claim_id=f"fixture.{component}.{stage}.passed",
+        claim=f"Fixture {component}/{stage} committed its exact typed output.",
+        timing_reason="Registry tests require a real active WorkCommit closure.",
+        effect="block_release",
+        success_maturity=f"fixture_{stage}_closed",
+    )
+
+
+def _commit_prepackage_fixture_closure(
+    store: ArtifactStore,
+    *,
+    owner_ref: ArtifactRef,
+    design_ref: ArtifactRef,
+    candidate_ref: ArtifactRef,
+    candidate_manifest_ref: ArtifactRef,
+    build_record_ref: ArtifactRef,
+    implementation_lineage_ref: ArtifactRef,
+    verifier_ref: ArtifactRef,
+    integration_report_ref: ArtifactRef,
+    judge_report_ref: ArtifactRef,
+    telemetry_summary_ref: ArtifactRef,
+    release_profile: ReleaseProfile,
+) -> _PrePackageFixtureClosure:
+    """Create a complete, active final epoch for a real Registry test package.
+
+    This intentionally replaces the former Design-only ``ClaimVector`` fixture.
+    The test candidate is still exercised by real child processes elsewhere; this
+    helper is only its framework-control provenance, with actual WorkControl
+    heads and exact final-graph commits instead of a manually asserted readiness
+    bit.
+    """
+
+    writer = framework_writer(store)
+    scope_suffix = design_ref.revision_id.removeprefix("sha256:")[:24]
+    scope_id = f"release-fixture:{scope_suffix}"
+    request_ref = writer.put_json(
+        artifact_id=f"request:release-fixture:{scope_suffix}",
+        artifact_type="control.environment_request",
+        value={"need": "fixture registry package"},
+    )
+    fixture_budget = Budget(
+        llm_tokens=100_000,
+        agent_turns=16,
+        search_calls=100,
+        tool_calls=100,
+        process_calls=100,
+        build_seconds=10_000,
+        evaluation_episodes=100,
+        container_seconds=10_000,
+        live_probe_cost=100,
+        repair_attempts=16,
+        wall_seconds=10_000,
+    )
+    context = GenerationContext(
+        context_id=f"context:release-fixture:{scope_suffix}",
+        job_ref=owner_ref,
+        kind="generate",
+        request_ref=request_ref,
+        permissions=PermissionScope(),
+        budget=fixture_budget,
+        release_profile=release_profile,
+    )
+    context_ref = writer.put_json(
+        artifact_id=context.context_id,
+        artifact_type="control.generation_context",
+        value=context,
+        dependencies=context.root_refs,
+    )
+    heads = WorkControlStore(store.root.parent / "work-control")
+    runtime = WorkControlRuntime(
+        artifacts=writer,
+        heads=heads,
+        budget=LeaseBudgetLedger(fixture_budget),
+    )
+
+    plan = _fixture_boundary(scope_id=scope_id, component="research", stage="research_plan")
+    acquisition = _fixture_boundary(
+        scope_id=scope_id,
+        component="research",
+        stage="evidence_acquisition",
+        dependencies=(plan,),
+    )
+    synthesis = _fixture_boundary(
+        scope_id=scope_id,
+        component="research",
+        stage="evidence_synthesis",
+        dependencies=(acquisition,),
+    )
+    architecture = _fixture_boundary(
+        scope_id=scope_id,
+        component="design",
+        stage="world_architecture",
+        dependencies=(synthesis,),
+    )
+    bootstrap_definitions = (plan, acquisition, synthesis, architecture)
+    bootstrap_graph = GenerationWorkGraph.compile(bootstrap_definitions, mode="diagnostic")
+    epochs = WorkGraphEpochRuntime(artifacts=writer, heads=heads)
+    _, _, _, bootstrap_epoch_ref = epochs.freeze_bootstrap(
+        context_ref=context_ref,
+        graph=bootstrap_graph,
+        topology_id=f"topology:release-fixture-bootstrap:{scope_suffix}",
+    )
+
+    def stage_output(stage: str, inputs: tuple[ArtifactRef, ...]) -> ArtifactRef:
+        return writer.put_json(
+            artifact_id=f"fixture-output:{scope_suffix}:{stage}",
+            artifact_type="control.fixture_stage_output",
+            value={"stage": stage},
+            dependencies=inputs,
+        )
+
+    bootstrap_inputs: tuple[ArtifactRef, ...] = (context_ref,)
+    bootstrap_outputs: dict[str, ArtifactRef] = {}
+    for definition in bootstrap_definitions:
+        output_ref = stage_output(definition.coordinate.stage, bootstrap_inputs)
+        runtime.execute_deterministic_boundary(
+            definition=definition,
+            input_refs=bootstrap_inputs,
+            subject_ref=output_ref,
+            output_refs=(output_ref,),
+        )
+        bootstrap_outputs[definition.coordinate.stage] = output_ref
+        # Every WorkAttempt carries the immutable GenerationContext.  The
+        # fixture must use the same input closure as Scheduler recovery or its
+        # otherwise-valid commits are correctly classified as stale.
+        bootstrap_inputs = (context_ref, output_ref)
+
+    behavior = _fixture_boundary(
+        scope_id=scope_id,
+        component="design",
+        stage="tool_semantics_batch",
+        dependencies=(architecture,),
+    )
+    rules = _fixture_boundary(
+        scope_id=scope_id,
+        component="design",
+        stage="world_rules",
+        dependencies=(behavior,),
+    )
+    curriculum = _fixture_boundary(
+        scope_id=scope_id,
+        component="design",
+        stage="task_curriculum",
+        dependencies=(rules,),
+    )
+    modeling = _fixture_boundary(
+        scope_id=scope_id,
+        component="design",
+        stage="modeling_boundary",
+        dependencies=(curriculum,),
+    )
+    verifier_plan = verifier_plan_work_definition(
+        scope_id=scope_id,
+        modeling_coordinate=modeling.coordinate,
+    )
+    design_graph = compile_design_work_graph(
+        scope_id=scope_id,
+        design_definitions=(*bootstrap_definitions, behavior, rules, curriculum),
+        modeling_definition=modeling,
+        verifier_plan_definition=verifier_plan,
+    )
+    _, _, _, design_epoch_ref = epochs.freeze_design(
+        context_ref=context_ref,
+        bootstrap_epoch_ref=bootstrap_epoch_ref,
+        graph=design_graph,
+        topology_id=f"topology:release-fixture-design:{scope_suffix}",
+    )
+
+    behavior_inputs = (context_ref, bootstrap_outputs["world_architecture"])
+    behavior_ref = stage_output("tool-semantics", behavior_inputs)
+    runtime.execute_deterministic_boundary(
+        definition=behavior,
+        input_refs=behavior_inputs,
+        subject_ref=behavior_ref,
+        output_refs=(behavior_ref,),
+    )
+    rules_inputs = (context_ref, behavior_ref)
+    rules_ref = stage_output("world-rules", rules_inputs)
+    runtime.execute_deterministic_boundary(
+        definition=rules,
+        input_refs=rules_inputs,
+        subject_ref=rules_ref,
+        output_refs=(rules_ref,),
+    )
+    curriculum_inputs = (context_ref, rules_ref)
+    curriculum_output_ref = stage_output("task-curriculum", curriculum_inputs)
+    runtime.execute_deterministic_boundary(
+        definition=curriculum,
+        input_refs=curriculum_inputs,
+        subject_ref=curriculum_output_ref,
+        output_refs=(curriculum_output_ref,),
+    )
+    fixture_design = store.get_json(design_ref, EnvironmentDesign)
+    fixture_world_spec_ref = writer.put_json(
+        artifact_id=f"fixture-output:{scope_suffix}:world-spec",
+        artifact_type="design.world_spec",
+        value=fixture_design.world_spec,
+        dependencies=(design_ref,),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=modeling,
+        input_refs=(context_ref, curriculum_output_ref),
+        subject_ref=design_ref,
+        output_refs=(design_ref, fixture_world_spec_ref),
+    )
+    verifier_plan_value = VerifierBatchPlan(
+        plan_id=f"verifier-plan:fixture:{scope_suffix}",
+        design_ref=design_ref,
+        world_spec_ref=fixture_world_spec_ref,
+        maximum_tasks_per_batch=2,
+        batches=(
+            VerifierBatchPlanItem(
+                batch_id="verifier-batch:1",
+                batch_index=0,
+                task_types=("fixture-booking",),
+                required_rule_ids=(),
+                required_property_families=(),
+                semantic_case_limit=2,
+                context_hash=sha256_digest(b"fixture-verifier-plan"),
+            ),
+        ),
+    )
+    fixture_judge_writer = judge_writer(store)
+    verifier_plan_ref = fixture_judge_writer.put_json(
+        artifact_id=f"fixture-output:{scope_suffix}:verifier-plan",
+        artifact_type="judge.verifier_batch_plan",
+        value=verifier_plan_value,
+        dependencies=(design_ref, fixture_world_spec_ref),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=verifier_plan,
+        input_refs=(context_ref, design_ref, fixture_world_spec_ref),
+        subject_ref=verifier_plan_ref,
+        output_refs=(verifier_plan_ref,),
+    )
+
+    final_graph = complete_generation_work_graph(
+        scope_id=scope_id,
+        design_graph=design_graph,
+        verifier_batch_count=len(verifier_plan_value.batches),
+    )
+    # Registry integration is deliberately independent of live Builder model
+    # availability.  The Candidate passed to this helper was assembled and
+    # executed by the real child-process fixture above; this test-only graph
+    # records that already-existing Candidate as a code boundary so Registry
+    # tests exercise publication, recovery and package closure rather than
+    # inventing a second fake code-generation implementation.
+    production_build = next(
+        item
+        for item in final_graph.definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("build", "candidate_build")
+    )
+    fixture_build = deterministic_boundary_work_definition(
+        scope_id=scope_id,
+        component="build",  # type: ignore[arg-type]
+        stage="candidate_build",
+        artifact_slot=production_build.coordinate.artifact_slot,
+        dependency_coordinates=production_build.dependency_coordinates,
+        claim_id="fixture.build.candidate.recorded",
+        claim="A pre-executed fixture Candidate is recorded for Registry provenance tests.",
+        timing_reason="Registry tests do not execute the production Builder Agent.",
+        effect="block_integration",
+        success_maturity="candidate_built",
+    ).model_copy(update={"input_slots": production_build.input_slots})
+    final_graph = GenerationWorkGraph.compile(
+        tuple(
+            fixture_build if item.coordinate == production_build.coordinate else item
+            for item in final_graph.definitions
+        ),
+        mode="production",
+        required_terminal_coordinates=final_graph.required_terminal_coordinates,
+        groups=final_graph.groups,
+        milestones=final_graph.milestones,
+    )
+    build = next(
+        item
+        for item in final_graph.definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("build", "candidate_build")
+    )
+    verifier_batch = next(
+        item
+        for item in final_graph.definitions
+        if (item.coordinate.component, item.coordinate.stage)
+        == ("verifier", "verifier_intent_batch")
+    )
+    verifier = next(
+        item
+        for item in final_graph.definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("verifier", "verifier_intent")
+    )
+    integration = next(
+        item
+        for item in final_graph.definitions
+        if (item.coordinate.component, item.coordinate.stage)
+        == ("integration", "runtime_integration")
+    )
+    release_assurance = next(
+        item
+        for item in final_graph.definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("judge", "release_assurance")
+    )
+    observability = next(
+        item
+        for item in final_graph.definitions
+        if (item.coordinate.component, item.coordinate.stage)
+        == ("release", "observability_closure")
+    )
+    package = next(
+        item
+        for item in final_graph.definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("release", "package")
+    )
+    _, final_manifest_ref, _, final_epoch_ref = epochs.freeze_final(
+        context_ref=context_ref,
+        design_epoch_ref=design_epoch_ref,
+        graph=final_graph,
+        topology_id=f"topology:release-fixture-final:{scope_suffix}",
+    )
+
+    runtime.execute_deterministic_boundary(
+        definition=build,
+        input_refs=(context_ref, design_ref),
+        subject_ref=candidate_ref,
+        output_refs=(
+            candidate_ref,
+            candidate_manifest_ref,
+            build_record_ref,
+            implementation_lineage_ref,
+        ),
+    )
+    verifier_checkpoint_ref = fixture_judge_writer.put_json(
+        artifact_id=f"fixture-output:{scope_suffix}:verifier-checkpoint",
+        artifact_type="judge.verifier_intent_checkpoint",
+        value={"fixture": "checkpoint"},
+        dependencies=(verifier_plan_ref,),
+    )
+    verifier_draft_ref = fixture_judge_writer.put_json(
+        artifact_id=f"fixture-output:{scope_suffix}:verifier-draft",
+        artifact_type="judge.verifier_batch_draft",
+        value={"fixture": "draft"},
+        dependencies=(verifier_plan_ref,),
+    )
+    # A physical Challenger batch is a real final-epoch member.  Recording
+    # only its aggregate verifier projection hid an uncommitted prerequisite,
+    # which made the scheduler correctly stall before Package while the fixture
+    # incorrectly pretended the closure was complete.
+    _commit_fixture_agent_boundary(
+        store,
+        runtime=runtime,
+        definition=verifier_batch,
+        input_refs=(context_ref, verifier_plan_ref),
+        subject_ref=verifier_checkpoint_ref,
+        output_refs=(verifier_checkpoint_ref, verifier_draft_ref),
+    )
+    verifier_batch_head = runtime.heads.read_head(verifier_batch.coordinate)
+    assert verifier_batch_head is not None and verifier_batch_head.commit_ref is not None
+    runtime.execute_deterministic_boundary(
+        definition=verifier,
+        input_refs=(context_ref, verifier_draft_ref),
+        subject_ref=verifier_ref,
+        output_refs=(verifier_ref,),
+        child_commit_refs=(verifier_batch_head.commit_ref,),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=integration,
+        input_refs=(context_ref, candidate_ref),
+        subject_ref=integration_report_ref,
+        output_refs=(integration_report_ref,),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=release_assurance,
+        input_refs=(
+            context_ref,
+            candidate_ref,
+            integration_report_ref,
+            verifier_ref,
+        ),
+        subject_ref=judge_report_ref,
+        output_refs=(judge_report_ref,),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=observability,
+        input_refs=(context_ref,),
+        subject_ref=telemetry_summary_ref,
+        output_refs=(telemetry_summary_ref,),
+    )
+    _dossier, dossier_ref = ReleaseDossierCompiler(artifacts=writer, heads=heads).compile(
+        final_epoch_ref=final_epoch_ref,
+        graph=final_graph,
+        manifest_ref=final_manifest_ref,
+        design_ref=design_ref,
+        candidate_ref=candidate_ref,
+        candidate_manifest_ref=candidate_manifest_ref,
+        build_record_ref=build_record_ref,
+        implementation_lineage_ref=implementation_lineage_ref,
+        verifier_ref=verifier_ref,
+        integration_report_ref=integration_report_ref,
+        judge_report_ref=judge_report_ref,
+        telemetry_summary_ref=telemetry_summary_ref,
+        release_profile=release_profile,
+    )
+    return _PrePackageFixtureClosure(
+        dossier_ref=dossier_ref,
+        runtime=runtime,
+        graph=final_graph,
+        final_epoch_ref=final_epoch_ref,
+        final_manifest_ref=final_manifest_ref,
+        package_definition=package,
+        package_input_refs=(
+            design_ref,
+            fixture_world_spec_ref,
+            candidate_ref,
+            candidate_manifest_ref,
+            build_record_ref,
+            implementation_lineage_ref,
+            verifier_ref,
+            integration_report_ref,
+            judge_report_ref,
+            telemetry_summary_ref,
+        ),
+    )
+
+
+def _commit_fixture_package(
+    closure: _PrePackageFixtureClosure,
+    *,
+    manifest_ref: ArtifactRef,
+) -> None:
+    closure.runtime.execute_deterministic_boundary(
+        definition=closure.package_definition,
+        input_refs=closure.package_input_refs,
+        subject_ref=manifest_ref,
+        output_refs=(manifest_ref,),
+    )
+
+
+def _commit_fixture_agent_boundary(
+    store: ArtifactStore,
+    *,
+    runtime: WorkControlRuntime,
+    definition: WorkDefinition,
+    input_refs: tuple[ArtifactRef, ...],
+    subject_ref: ArtifactRef,
+    output_refs: tuple[ArtifactRef, ...],
+) -> None:
+    """Record a closed Agent-shaped WorkCommit for Registry-only fixture graphs.
+
+    This does not emulate a production Challenger invocation and never reaches
+    ``FoundryController``.  It exercises the real WorkControl operation,
+    validation, feedback and commit lifecycle so release-closure tests cannot
+    erase a required physical verifier shard merely because their Candidate is
+    prebuilt.  Live Direct acceptance remains responsible for a real isolated
+    Challenger invocation.
+    """
+
+    with runtime.heads.exclusive(definition.coordinate) as lock:
+        head = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=input_refs,
+            elapsed_wall_seconds=0,
+        )
+        head = runtime.schedule_operation(
+            lock,
+            definition=definition,
+            kind="proposal",
+            replay_mode=definition.proposal_policy.replay_mode,
+            elapsed_wall_seconds=0,
+        )
+        dispatch_id = f"fixture:{definition.work_id}:proposal"
+        head = runtime.start_operation(
+            lock,
+            definition=definition,
+            dispatch_id=dispatch_id,
+        )
+        attempt = store.get_json(head.attempt_ref, WorkAttempt)
+        now = datetime.now(UTC)
+        unknown = BudgetUsage(
+            llm_tokens=definition.proposal_policy.budget.llm_tokens,
+            agent_turns=definition.proposal_policy.budget.agent_turns,
+        )
+        proposal = ProposalExecution(
+            execution_id=f"fixture-execution:{definition.work_id}",
+            attempt_id=attempt.attempt_id,
+            executor="agent",
+            executor_revision_id=definition.proposal_policy.executor_revision_id,
+            operation=definition.proposal_policy.operation,
+            status="completed",
+            invocation_id=dispatch_id,
+            provider="fixture",
+            model="fixture-static-verifier-intent",
+            profile_digest=sha256_digest(b"fixture-challenger-profile"),
+            output_schema_digest=sha256_digest(b"fixture-verifier-intent-schema"),
+            output_commitment=subject_ref.content_hash,
+            continuation_commitment=sha256_digest(b"fixture-no-provider-session"),
+            observed_actual=BudgetUsage(),
+            unknown_upper_bound=unknown,
+            conservative_committed=unknown,
+            started_at=now,
+            finished_at=now,
+            duration_ms=0,
+        )
+        runtime.checkpoint_proposal(
+            lock,
+            definition=definition,
+            execution=proposal,
+            output_refs=output_refs,
+        )
+        head = runtime.schedule_operation(
+            lock,
+            definition=definition,
+            kind="validation",
+            replay_mode="deterministic",
+            elapsed_wall_seconds=0,
+        )
+        head = runtime.start_operation(
+            lock,
+            definition=definition,
+            dispatch_id=f"fixture:{definition.work_id}:validation",
+        )
+        attempt = store.get_json(head.attempt_ref, WorkAttempt)
+        report = ValidationReport(
+            report_id=f"fixture-report:{definition.work_id}",
+            attempt_id=attempt.attempt_id,
+            coordinate=definition.coordinate,
+            policy_id=definition.validation_policy.policy_id,
+            policy_digest=definition.validation_policy.content_digest(),
+            status="passed",
+            validation_phase=definition.validation_policy.validation_phase,
+            frontier_ordinal=definition.validation_policy.frontier_ordinal,
+            passed_check_ids=(definition.required_claim_id,),
+            subject_refs=output_refs,
+            evidence_refs=(subject_ref,),
+            diagnostic_quality="not_applicable",
+            evaluated_at=datetime.now(UTC),
+        )
+        runtime.checkpoint_validation(
+            lock,
+            definition=definition,
+            report=report,
+            observed_actual=BudgetUsage(),
+        )
+        runtime.evaluate(
+            lock,
+            definition=definition,
+            report=report,
+            output_refs=output_refs,
+            elapsed_wall_seconds=0,
+        )
 
 
 def judge_writer(store: ArtifactStore) -> ArtifactWriter:
@@ -1271,32 +1877,6 @@ def commit_judged_manifest(
         ),
         implementation=graph.implementation_lineage,
     )
-    modeling_gate = GateResult(
-        gate_id="modeling",
-        status="pass",
-        hard=True,
-        subject_ref=graph.design_ref,
-        evidence_refs=(
-            graph.design.evidence_graph_ref,
-            graph.design.coverage_map_ref,
-            graph.world_spec_ref,
-        ),
-        duration_seconds=0,
-        summary="Framework modeling policy passed for the real Judge graph.",
-    )
-    modeling_gate_ref = framework_writer(store).put_json(
-        artifact_id="modeling-gate:counter-judge-e2e",
-        artifact_type="control.modeling_gate",
-        value=modeling_gate,
-        dependencies=_unique_dependencies(
-            (
-                graph.design_ref,
-                graph.design.evidence_graph_ref,
-                graph.design.coverage_map_ref,
-                graph.world_spec_ref,
-            )
-        ),
-    )
     telemetry_metrics_summary: dict[str, JsonValue] = {
         "as_of_ns": 1,
         "open_span_count": 1,
@@ -1345,122 +1925,19 @@ def commit_judged_manifest(
         value=telemetry,
         dependencies=(graph.owner_ref, graph.candidate_ref, judge_report_ref),
     )
-    evaluated_at = datetime.now(UTC)
-    release_claims = (
-        claim(
-            claim_id="design.valid",
-            subject_ref=graph.design_ref,
-            producer="framework",
-            status="passed",
-            effect="block_integration",
-            summary="Final design passed modeling policy.",
-            evidence_refs=(modeling_gate_ref,),
-            dependency_refs=(graph.design_ref, graph.world_spec_ref),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="build.valid",
-            subject_ref=graph.candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_integration",
-            summary="Candidate source closure passed.",
-            evidence_refs=(
-                graph.candidate.build_artifact_ref,
-                graph.candidate.candidate_manifest_ref,
-            ),
-            dependency_refs=(graph.design_ref,),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="runtime.executable",
-            subject_ref=graph.candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_integration",
-            summary="Real runtime execution passed.",
-            evidence_refs=(integration_report_ref,),
-            dependency_refs=(graph.candidate_ref,),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="integration.ready",
-            subject_ref=graph.candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_release",
-            summary="Integration gates passed.",
-            evidence_refs=(integration_report_ref,),
-            dependency_refs=(graph.candidate_ref,),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="verifier.valid",
-            subject_ref=graph.candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_release",
-            summary="Verifier projection is bound.",
-            evidence_refs=(graph.verifier_ref,),
-            dependency_refs=(graph.design_ref, graph.world_spec_ref),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="release_judge.valid",
-            subject_ref=graph.candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_release",
-            summary="Release Judge passed.",
-            evidence_refs=(judge_report_ref,),
-            dependency_refs=(integration_report_ref, graph.verifier_ref),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="observability.release_ready",
-            subject_ref=graph.candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_release",
-            summary="Pre-release telemetry is complete.",
-            evidence_refs=(telemetry_ref,),
-            dependency_refs=(graph.owner_ref,),
-            evaluated_at=evaluated_at,
-        ),
-    )
-    maturity, blockers = reduce_maturity(release_claims)
-    claim_vector = ClaimVector(
-        vector_id="claim-vector:counter-judge-e2e",
-        revision=1,
+    closure = _commit_prepackage_fixture_closure(
+        store,
+        owner_ref=graph.owner_ref,
         design_ref=graph.design_ref,
         candidate_ref=graph.candidate_ref,
-        integration_ref=integration_report_ref,
+        candidate_manifest_ref=graph.candidate.candidate_manifest_ref,
+        build_record_ref=graph.candidate.build_artifact_ref,
+        implementation_lineage_ref=graph.candidate.implementation_lineage_ref,
         verifier_ref=graph.verifier_ref,
-        release_judge_ref=judge_report_ref,
-        telemetry_ref=telemetry_ref,
-        claims=release_claims,
-        maturity=maturity,
-        blocking_claim_ids=blockers,
-    )
-    claim_vector_ref = framework_writer(store).put_json(
-        artifact_id="claim-vector:counter-judge-e2e",
-        artifact_type="release.claim_vector",
-        value=claim_vector,
-        dependencies=_unique_dependencies(
-            (
-                graph.design_ref,
-                graph.world_spec_ref,
-                modeling_gate_ref,
-                graph.owner_ref,
-                graph.candidate_ref,
-                graph.candidate.build_artifact_ref,
-                graph.candidate.candidate_manifest_ref,
-                integration_report_ref,
-                graph.verifier_ref,
-                judge_report_ref,
-                telemetry_ref,
-            )
-        ),
+        integration_report_ref=integration_report_ref,
+        judge_report_ref=judge_report_ref,
+        telemetry_summary_ref=telemetry_ref,
+        release_profile=graph.release_profile,
     )
     framework_payloads = compile_framework_package_payloads(
         graph.design,
@@ -1478,7 +1955,7 @@ def commit_judged_manifest(
         implementation_lineage_ref=graph.candidate.implementation_lineage_ref,
         judge_report_ref=judge_report_ref,
         integration_report_ref=integration_report_ref,
-        claim_vector_ref=claim_vector_ref,
+        release_dossier_ref=closure.dossier_ref,
         telemetry_summary_ref=telemetry_ref,
         pyproject_bytes=(graph.workspace / "pyproject.toml").read_bytes(),
         uv_lock_bytes=(graph.workspace / "uv.lock").read_bytes(),
@@ -1498,7 +1975,7 @@ def commit_judged_manifest(
         implementation_lineage_ref=graph.candidate.implementation_lineage_ref,
         judge_report_ref=judge_report_ref,
         integration_report_ref=integration_report_ref,
-        claim_vector_ref=claim_vector_ref,
+        release_dossier_ref=closure.dossier_ref,
         telemetry_summary_ref=telemetry_ref,
         runtime=graph.candidate.runtime,
         task_materializer=graph.candidate.task_materializer,
@@ -1525,9 +2002,8 @@ def commit_judged_manifest(
                 graph.candidate.build_artifact_ref,
                 judge_report_ref,
                 integration_report_ref,
-                claim_vector_ref,
+                closure.dossier_ref,
                 telemetry_ref,
-                modeling_gate_ref,
                 graph.candidate.public_verifier_ref,
                 graph.candidate.task_materializer.output_schema_ref,
                 graph.candidate.task_materializer.curriculum_ref,
@@ -1536,6 +2012,7 @@ def commit_judged_manifest(
             )
         ),
     )
+    _commit_fixture_package(closure, manifest_ref=manifest_ref)
     return manifest, manifest_ref, framework_payloads
 
 
@@ -1546,8 +2023,10 @@ def build_release_graph(
     runtime_bytes: bytes | None = None,
     judge_passes: bool = True,
     owner_ref: ArtifactRef | None = None,
+    release_profile: ReleaseProfile | None = None,
     world_spec_bytes_override: bytes | None = None,
     variant: str = "",
+    commit_package: bool = True,
 ) -> ReleaseGraph:
     if variant and (
         not variant[0].isalnum()
@@ -1557,6 +2036,17 @@ def build_release_graph(
 
     def scoped(identifier: str) -> str:
         return f"{identifier}:{variant}" if variant else identifier
+
+    if release_profile is None:
+        release_profile = ReleaseProfile(
+            profile_id=scoped("registry-v3-integration"),
+            required_hard_gates=(
+                "runtime_protocol",
+                "task_materialization",
+                "task_reachability",
+                "clean_deployment",
+            ),
+        )
 
     workspace, uv_path, uv_cache_dir = write_candidate_project(root)
     if runtime_bytes is not None:
@@ -1629,11 +2119,24 @@ def build_release_graph(
         dependencies=(coverage_ref, world_spec_ref),
     )
     if owner_ref is None:
+        owner_request_ref = commit_json(
+            store,
+            scoped("request:counter-v3"),
+            "control.environment_request",
+            {"need": "fixture counter environment"},
+        )
         owner_ref = commit_json(
             store,
             scoped("job:counter-v3"),
             "control.environment_job",
-            {"job_id": scoped("job:counter-v3"), "kind": "generate"},
+            EnvironmentJob(
+                job_id=scoped("job:counter-v3"),
+                kind="generate",
+                request_ref=owner_request_ref,
+                budget=Budget(),
+                release_profile=release_profile,
+            ),
+            dependencies=(owner_request_ref,),
         )
     completion = CandidateCompletion(
         status="completed",
@@ -1865,15 +2368,6 @@ def build_release_graph(
         ),
         dependencies=(candidate_ref,),
     )
-    release_profile = ReleaseProfile(
-        profile_id=scoped("registry-v3-integration"),
-        required_hard_gates=(
-            "runtime_protocol",
-            "task_materialization",
-            "task_reachability",
-            "clean_deployment",
-        ),
-    )
     passing_gates = tuple(
         GateResult(
             gate_id=gate_id,
@@ -1921,21 +2415,6 @@ def build_release_graph(
         artifact_type="judge.integration_report",
         value=integration_report,
         dependencies=(candidate_ref, world_spec_ref, evaluation_ref),
-    )
-    modeling_gate = GateResult(
-        gate_id="modeling",
-        status="pass",
-        hard=True,
-        subject_ref=design_ref,
-        evidence_refs=(design.evidence_graph_ref, coverage_ref, world_spec_ref),
-        duration_seconds=0,
-        summary="Framework modeling policy passed.",
-    )
-    modeling_gate_ref = framework_writer(store).put_json(
-        artifact_id=scoped("modeling-gate:counter-v3"),
-        artifact_type="control.modeling_gate",
-        value=modeling_gate,
-        dependencies=(design_ref, design.evidence_graph_ref, coverage_ref, world_spec_ref),
     )
     compiler_report = JudgeReport(
         report_id=(
@@ -2037,119 +2516,21 @@ def build_release_graph(
         artifact_id=scoped("telemetry-summary:counter-v3"),
         artifact_type="release.telemetry_summary",
         value=telemetry_summary,
-        dependencies=(owner_ref, candidate_ref, compiler_report_ref),
+        dependencies=(owner_ref, candidate_ref, report_ref),
     )
-    evaluated_at = datetime.now(UTC)
-    release_claims = (
-        claim(
-            claim_id="design.valid",
-            subject_ref=design_ref,
-            producer="framework",
-            status="passed",
-            effect="block_integration",
-            summary="Final design passed modeling policy.",
-            evidence_refs=(modeling_gate_ref,),
-            dependency_refs=(design_ref, world_spec_ref),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="build.valid",
-            subject_ref=candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_integration",
-            summary="Candidate source closure passed.",
-            evidence_refs=(build_record_ref, candidate_manifest_ref),
-            dependency_refs=(design_ref,),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="runtime.executable",
-            subject_ref=candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_integration",
-            summary="Real runtime execution passed.",
-            evidence_refs=(integration_report_ref,),
-            dependency_refs=(candidate_ref,),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="integration.ready",
-            subject_ref=candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_release",
-            summary="Integration gates passed.",
-            evidence_refs=(integration_report_ref,),
-            dependency_refs=(candidate_ref,),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="verifier.valid",
-            subject_ref=candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_release",
-            summary="Verifier projection is bound.",
-            evidence_refs=(verifier_ref,),
-            dependency_refs=(design_ref, world_spec_ref),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="release_judge.valid",
-            subject_ref=candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_release",
-            summary="Release Judge passed.",
-            evidence_refs=(compiler_report_ref,),
-            dependency_refs=(integration_report_ref, verifier_ref),
-            evaluated_at=evaluated_at,
-        ),
-        claim(
-            claim_id="observability.release_ready",
-            subject_ref=candidate_ref,
-            producer="framework",
-            status="passed",
-            effect="block_release",
-            summary="Pre-release telemetry is complete.",
-            evidence_refs=(telemetry_summary_ref,),
-            dependency_refs=(owner_ref,),
-            evaluated_at=evaluated_at,
-        ),
-    )
-    maturity, blocking_claim_ids = reduce_maturity(release_claims)
-    claim_vector = ClaimVector(
-        vector_id=scoped("claim-vector:counter-v3"),
-        revision=1,
+    closure = _commit_prepackage_fixture_closure(
+        store,
+        owner_ref=owner_ref,
         design_ref=design_ref,
         candidate_ref=candidate_ref,
-        integration_ref=integration_report_ref,
+        candidate_manifest_ref=candidate_manifest_ref,
+        build_record_ref=build_record_ref,
+        implementation_lineage_ref=implementation_lineage_ref,
         verifier_ref=verifier_ref,
-        release_judge_ref=compiler_report_ref,
-        telemetry_ref=telemetry_summary_ref,
-        claims=release_claims,
-        maturity=maturity,
-        blocking_claim_ids=blocking_claim_ids,
-    )
-    claim_vector_ref = framework_writer(store).put_json(
-        artifact_id=scoped("claim-vector:counter-v3"),
-        artifact_type="release.claim_vector",
-        value=claim_vector,
-        dependencies=(
-            design_ref,
-            world_spec_ref,
-            modeling_gate_ref,
-            owner_ref,
-            candidate_ref,
-            candidate_manifest_ref,
-            build_record_ref,
-            integration_report_ref,
-            verifier_ref,
-            compiler_report_ref,
-            telemetry_summary_ref,
-        ),
+        integration_report_ref=integration_report_ref,
+        judge_report_ref=report_ref,
+        telemetry_summary_ref=telemetry_summary_ref,
+        release_profile=release_profile,
     )
     boundary_hash = design.world_spec.boundary.content_digest()
     package_id = f"env:{boundary_hash.removeprefix('sha256:')[:32]}"
@@ -2188,7 +2569,7 @@ def build_release_graph(
             package_id=package_id,
             version=version,
             candidate_manifest=candidate_manifest,
-            judge_report=compiler_report,
+            judge_report=report,
             integration_report=integration_report,
             lineage=lineage,
             design_ref=design_ref,
@@ -2197,9 +2578,9 @@ def build_release_graph(
             candidate_manifest_ref=candidate_manifest_ref,
             build_record_ref=build_record_ref,
             implementation_lineage_ref=implementation_lineage_ref,
-            judge_report_ref=compiler_report_ref,
+            judge_report_ref=report_ref,
             integration_report_ref=integration_report_ref,
-            claim_vector_ref=claim_vector_ref,
+            release_dossier_ref=closure.dossier_ref,
             telemetry_summary_ref=telemetry_summary_ref,
             pyproject_bytes=(workspace / "pyproject.toml").read_bytes(),
             uv_lock_bytes=(workspace / "uv.lock").read_bytes(),
@@ -2231,7 +2612,7 @@ def build_release_graph(
         implementation_lineage_ref=implementation_lineage_ref,
         judge_report_ref=report_ref,
         integration_report_ref=integration_report_ref,
-        claim_vector_ref=claim_vector_ref,
+        release_dossier_ref=closure.dossier_ref,
         telemetry_summary_ref=telemetry_summary_ref,
         runtime=runtime,
         task_materializer=task_materializer,
@@ -2254,16 +2635,17 @@ def build_release_graph(
             implementation_lineage_ref,
             report_ref,
             integration_report_ref,
-            claim_vector_ref,
+            closure.dossier_ref,
             telemetry_summary_ref,
             verifier_ref,
-            modeling_gate_ref,
             public_verifier_ref,
             materializer_protocol_ref,
             curriculum_ref,
             implementation_ref,
         ),
     )
+    if commit_package:
+        _commit_fixture_package(closure, manifest_ref=manifest_ref)
     return ReleaseGraph(
         workspace=workspace,
         uv_path=uv_path,
@@ -2276,6 +2658,7 @@ def build_release_graph(
         framework_payloads=tuple(framework_payloads),
         package_id=package_id,
         version=version,
+        package_closure=closure,
     )
 
 

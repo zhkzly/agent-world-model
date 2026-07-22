@@ -21,6 +21,8 @@ class StructuredSemanticIssue:
     code: str
     location: tuple[str | int, ...]
     message: str
+    violated_condition: str | None = None
+    expected_category: str | None = None
 
     def __post_init__(self) -> None:
         if _SAFE_CODE.fullmatch(self.code) is None:
@@ -29,6 +31,12 @@ class StructuredSemanticIssue:
             raise ValueError("semantic issue location cannot be empty")
         if not self.message or len(self.message) > 512:
             raise ValueError("semantic issue message must contain at most 512 characters")
+        for field_name, value in (
+            ("violated_condition", self.violated_condition),
+            ("expected_category", self.expected_category),
+        ):
+            if value is not None and (not value or len(value) > 512):
+                raise ValueError(f"{field_name} must contain at most 512 characters")
 
     @property
     def issue_code(self) -> str:

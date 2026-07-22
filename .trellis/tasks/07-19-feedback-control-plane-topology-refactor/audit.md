@@ -441,3 +441,523 @@ all exercise it with real provider output.  Acceptance requires that its proposa
 validation, terminal Claim evaluation, repair authorization, continuation checkpoint, cost and
 commit all come from one WorkDefinition.  Only after this slice passes preserved bad cases may
 the same mechanism replace other semantic boundaries.
+
+## BC-18: policy-only definition change caused unnecessary upstream work
+
+A real resume after adding process-recovery authority changed the full WorkDefinition digest for
+every semantic node. ResearchPlan itself was restored from immutable history without another LLM
+turn, but the pre-search EvidenceSynthesis checkpoint lookup considered only the current mutable
+head; it therefore performed six new searches and fifteen fetches before a new 28-second synthesis.
+
+Decision after independent adversarial review:
+
+- keep `definition_digest` for complete future execution authority;
+- add `acceptance_digest` for immutable successful output reuse;
+- keep `repair_epoch_digest` for exact failure/repair history;
+- require an explicit validator executable revision in acceptance identity;
+- release any superseded running lease and persist `interrupted` before historical reactivation;
+- never let cache reactivation replace an active semantic RepairAction.
+
+Regression proof: policy-only budget/recovery/timing changes preserve acceptance and reactivate the
+exact WorkCommit; validator revision changes fail closed; no active BudgetLease remains orphaned.
+
+## BC-19: a Design-only cutover was mistaken for a production control-plane cutover
+
+Independent call-graph audits confirmed that the new Work control plane terminates at
+ModelingBoundary.  Builder, Verifier, Integration, ReleaseAssurance, Package, Registry, late
+Design revision and Expansion still execute through combinations of NodeAttempt, FeedbackResult,
+the legacy RepairLedger and component-local retry loops.  A live hotel run therefore exercises
+"new Design + old downstream" and cannot prove the framework refactor complete.
+
+Required regression and deletion condition:
+
+- one production graph manifest binds Research through Registry before downstream scheduling;
+- Builder and Verifier complete out of order while exact successful siblings remain committed;
+- Integration starts from a committed Candidate without waiting for Verifier;
+- release readiness is derived only from active WorkCommits and FeedbackEvaluations;
+- an import/call-graph check rejects production imports/calls of FeedbackContract,
+  FeedbackResult, the legacy RepairLedger, NodeAttempt/NodeCommit and component semantic retry
+  counters after cutover.
+
+## BC-20: the initial Work kernel was too narrow for downstream execution
+
+The current WorkDefinition is sufficient for one structured semantic proposal but does not yet
+prove an exact Builder workspace/output closure, validation/assurance execution cost, dynamic
+shard join, or WorkAttempt telemetry ownership.  Merely wrapping downstream services would create
+a cosmetic single vocabulary while leaving the actual scheduler and evidence authority split.
+
+Decision: add explicit Artifact slot contracts, ValidationExecution, AssuranceExecution,
+WorkGroup/JoinPolicy and scheduler-owned telemetry before downstream cutover.  Leaf probes remain
+inside one report; these additions model execution authority and joins, not more product gates.
+## BC-21 — Design-only WorkGraph masquerades as package release evidence
+
+- Live/source fact: the production manifest currently terminates at `modeling_boundary`, while
+  Builder, Verifier, Integration, Judge and Registry remain under legacy authorities.
+- Failure: Registry accepts the Design readiness Artifact as the WorkGraph proof for a complete
+  package; a later Direct Design revision does not emit replacement graph/readiness at all.
+- Required regression: only a full Research-to-Registry manifest with an exact
+  `release_candidate` milestone may enter package preparation, and only RegistryPublication may
+  establish `released`.
+- Proof class: source-proven; full production replacement pending.
+
+## BC-22 — Completed assurance execution hides failed probes
+
+- Reproduction: a process can finish and write evidence saying Reset/Step failed while the old
+  contract records only `AssuranceExecution.status=completed`.
+- Failure: a passing deterministic report can then satisfy the boundary without typed probe
+  verdicts.
+- Regression: `AssuranceReport` binds the exact policy/runtime/freshness and every required probe;
+  any failed/inconclusive/error probe prevents WorkCommit.
+- Proof class: deterministic regression implemented; real Integration cutover pending.
+
+## BC-23 — Parent revision leaves stale child and aggregate commits active
+
+- Reproduction: child resume used its own historical `attempt.input_refs`, so a replaced parent
+  could not make it stale. Aggregate readiness also lacked exact child-commit binding.
+- Regression: Scheduler recomputes expected inputs topologically from current parent commits;
+  stale descendants are not active, blocked groups expose exact evaluation refs, and aggregate
+  commits bind every frozen child commit.
+- Proof class: deterministic regression implemented; scheduler production dispatch pending.
+
+## BC-24 — Read-only Scheduler hid a broken executable input fingerprint
+
+- Reproduction: the first call to real `WorkScheduler.dispatch_one()` reached
+  `resolve_inputs()` and failed because `WorkCoordinate` and `ArtifactRef` model objects were sent
+  directly to canonical JSON serialization.
+- Failure: all previous scheduler tests asserted only state projection; no test proved the object
+  could dispatch even one ready leaf, so a core handoff defect remained invisible.
+- Regression: a two-node Package -> Registry graph is driven by `run_until_stalled`; each leaf
+  executes under the real WorkControlRuntime and commits before the next node resolves inputs.
+- Proof class: deterministic real framework execution implemented; production component registry
+  pending.
+
+## BC-25 — Execution evidence was authorized after the expensive work
+
+- Reproduction: validation and assurance reports could be constructed before their lease and
+  dispatch authority existed; proposal attempts did not distinguish never-dispatched from
+  dispatched-but-unknown work.  Two processes could also reserve the same scope budget snapshot.
+- Failure: recovery could replay a real model/process call, undercount unknown consumption or
+  oversell a global job budget while still producing apparently valid evidence.
+- Regression: `OperationRun` owns a durable scheduled -> running -> terminal lifecycle; the Work
+  head must point to running before execution.  A persistent flock-serialized scope ledger admits
+  only one of two real processes competing for the same `agent_turns=1` capacity, and terminal
+  settlement is idempotent.
+- Proof class: crash/accounting kernel regression implemented; every production leaf still needs
+  migration before this protects the complete Direct path.
+
+## BC-26 — an authorized repair could fail budget admission and strand a running attempt
+
+Live scheduler bootstrap for the unmodified need `用户预订宾馆` exercised a real tool-provider
+outage. The first Acquisition operation created an infrastructure report and the policy
+authorized its bounded local retry. In the first budget envelope the second attempt could not
+reserve the global repair/tool capacity. Before this correction, `BudgetExceeded` escaped leaf
+dispatch after the new WorkAttempt had started; no `OperationRun` existed, but the WorkHead
+remained `running` and recovery could not tell whether any external work had occurred.
+
+The repair is deliberately framework-owned rather than a looser retry: Scheduler may terminalize
+only a no-active-operation admission failure. It records safe exhausted dimensions, report and
+evaluation, marks the attempt `budget_exhausted`, fails the head and closes the authorized
+RepairAction ledger entry as `exhausted`. An active operation remains the executor's/recovery
+responsibility because its cost may be unknown. The regression drives the exact failed-proposal
+then unaffordable-repair sequence and proves that only the first proposal invocation occurred.
+
+## BC-27 — real bootstrap distinguishes an available model from an unavailable research provider
+
+An isolated real structured invocation using the explicit configured OpenAI-compatible endpoint
+and `grok-4.5` completed in about 2.8 seconds. The inherited process endpoint differed, so the
+test used only a per-process override; it did not edit user authentication or global config.
+The subsequent four-node scheduler bootstrap used the same real model and the actual
+Search/Fetch/Extract toolchain. `ResearchPlan` committed. `ResearchAcquisition` made two policy-
+bounded real tool attempts and both reported the external provider unavailable; it became
+`blocked`, so EvidenceSynthesis and WorldArchitecture correctly did not dispatch.
+
+This is negative live evidence, not a partial pass and not a model/codegen diagnosis. It proves
+the model adapter/control route and provider-failure routing separately, but it cannot establish
+an EvidenceGraph, EnvironmentDesign, Candidate or release. Future live tests must reuse the
+committed Plan only when its exact inputs remain valid, change/repair the actual research provider
+configuration, and retain this outage outcome rather than replacing it with static evidence.
+
+## BC-28 — least-privilege dispatch and recovery used different input closures
+
+The strict Direct graph correctly treats a dependency as causal lineage and `input_slots` as
+artifact disclosure. `resolve_inputs()` therefore passed only declared typed parent outputs to a
+child. `snapshot()`, however, rebuilt the historical input fingerprint from **all** parent
+consumer refs. The resulting WorkCommit was accepted at dispatch but became immediately `stale`
+during recovery/reconciliation. This can leave a valid final graph permanently unable to open
+Package and Registry while every local leaf appears successful.
+
+Root category: cross-layer contract plus change-propagation failure. The initial least-privilege
+fix changed dispatch but missed the reuse path. The structural correction is one shared helper for
+the exact external-root plus typed-parent-output closure, used by both snapshot and dispatch;
+parent commit refs remain lineage only. The deterministic regression commits a parent with one
+allowed and one sealed output, verifies that the child receives only the allowed ref, and verifies
+the child is `ready` in a fresh snapshot. Separate real Package→Registry Scheduler closure and
+pre-package observability tests confirm downstream readiness reaches publication without a
+Controller fallback. This is framework execution evidence, not a live generated-environment
+claim.
+
+## Bug Analysis: BC-28 input-closure drift
+
+### 1. Root Cause Category
+
+- **Category**: B/C — cross-layer contract plus change-propagation failure.
+- **Specific Cause**: dispatch enforced typed disclosure while snapshot/reuse reconstructed an
+  all-parent-output fingerprint. The code had two representations of the same WorkAttempt input
+  closure, so acceptance and recovery disagreed.
+
+### 2. Why Fixes Failed
+
+1. The first least-privilege change fixed only `resolve_inputs()`, because its immediate live
+   symptom was an undeclared artifact reaching the next Agent.
+2. Existing tests inspected resolved inputs but did not reconcile a committed child in a fresh
+   Scheduler snapshot; downstream publication therefore had no regression covering reuse.
+
+### 3. Prevention Mechanisms
+
+| Priority | Mechanism | Specific Action | Status |
+|---|---|---|---|
+| P0 | Architecture | One `_all_input_refs` helper is the only fingerprint closure authority | DONE |
+| P0 | Test | Allowed/sealed parent test asserts dispatch and snapshot both accept the child | DONE |
+| P1 | Code-spec | Causality/disclosure contract specifies snapshot parity and error matrix | DONE |
+| P1 | Integration | Package→Registry Scheduler closure exercises downstream readiness | DONE |
+
+### 4. Systematic Expansion
+
+- **Similar Issues**: every recovery/cache/invalidation path must use the same accepted-input
+  transform as initial dispatch; direct head lookup is forbidden for Package closure.
+- **Design Improvement**: dependency lineage and artifact disclosure are separate typed relations,
+  not one overloaded parent-output list.
+- **Process Improvement**: after any scheduler change, test one initial dispatch and one fresh
+  snapshot/recovery before spending a real model turn.
+
+### 5. Knowledge Capture
+
+- [x] Updated the backend executable contract.
+- [x] Recorded the bad case and deterministic regression.
+- [x] Updated the source-of-truth migration status without claiming live E2E.
+
+## BC-29 — actionable semantic feedback and live accounting were projected away
+
+The post-BC-28 real hotel run completed its real research and Architecture prefix, then reached
+`shared_tool_semantics`.  Its deterministic semantic validator reported four exact classes:
+partitioning of frozen tool ids, compensation endpoints, and missing error-policy coverage.  The
+leaf boundary converted each into a `ValidationIssue` with only the generic text “the deterministic
+structured-output contract was violated.”  One local correction was therefore authorized with no
+usable condition or allowed category; it returned the same issue tuple and the Scheduler correctly
+stopped it as `repair_no_progress_terminal`.
+
+The same run showed a separate observation contradiction: the Scheduler had already reserved and
+settled durable operation leases, but the DirectJob terminal snapshot had not yet been written.
+`run inspect` consequently displayed zero use and zero active leases while telemetry showed a
+running real invocation.  Scheduler work spans also lacked the Direct root parent despite sharing
+the same trace id.
+
+Root category: B/C cross-layer information-loss and duplicated projection authority.  This is not
+a reason to widen repair budgets or weaken validation: code knew the diagnostic and the accounting,
+but discarded it while crossing boundaries.
+
+The correction is structural:
+
+1. `StructuredSemanticIssue` now carries safe condition/category values and the one-shot boundary
+   preserves them in the report used by RepairAction; the no-progress key remains exact and local.
+2. `run inspect` reads the immutable Scheduler scope lease ledger for active Direct runs, sums only
+   settled actual/unknown commitments and separately exposes active reservation.  The final
+   DirectJob snapshot remains a terminal projection, not a second mutable scheduler.
+3. WorkAttempt spans inherit the active matching Direct root; a mismatched active trace fails
+   rather than silently forming a disconnected trace tree.
+
+Regression evidence is intentionally deterministic and non-claiming: a semantic boundary test
+preserves the exact safe feedback, a ledger test disproves stale-zero observation, and a real
+Scheduler deterministic leaf proves the span tree.  A new live run is still required; this bad
+case must not be marked resolved merely because its information path is repaired.
+
+## BC-30 — a real Agent timeout stranded its dispatched non-replayable operation
+
+The next `grok-4.5` hotel Direct run committed ResearchPlan, real Acquisition and EvidenceSynthesis,
+then WorldArchitecture exceeded its declared 360-second operation budget. `invoke_structured_once`
+correctly constructed `LeafExecutionFailure(agent_invocation_timeout)` with the entire reserved
+token envelope as unknown.  It had already resolved the isolated profile and issued Scheduler
+dispatch id, but it created `AgentExecutionProvenance` only after a terminal provider result.
+`SchedulerLeafExecutor._finish_exception` therefore rejected the timeout as an agent failure
+without provenance, raised `WorkRuntimeError`, and Controller projected a broad Direct failure
+while the WorkHead/OperationRun remained active.
+
+Root category: B/C boundary-ordering defect. The provider timeout is an expected real execution
+outcome, not a model semantic correction and not authority to replay a non-replayable call.
+
+The correction constructs provenance immediately after the profile and dispatch id are bound,
+before `backend.invoke`. Timeout, cancellation-envelope and transport failures now carry that
+provenance into failed ProposalExecution, lease settlement and typed Evaluation. A deterministic
+hanging-backend regression proves the exact timeout contains the dispatch id/profile/model and the
+existing Scheduler backend-error test proves such a failure becomes a terminal evaluation. A fresh
+live request is still required; the prior failed head/result remains immutable evidence and is not
+replayed or manually edited.
+
+## BC-31 — a correctly authorized semantic correction was invoked without its diagnostics
+
+The next real hotel run reached `shared_tool_semantics`, where deterministic validation produced
+three safe, field-addressable failures: exact frozen-tool partition coverage for atomicity and
+concurrency domains, plus error-policy coverage. The Scheduler correctly authorized one local
+repair. Its second Agent request, however, was byte-for-byte equivalent in remediation knowledge:
+`WorkExecutionContext` carried `repair_action_ref`, but every production Agent leaf ignored it
+when building its prompt. The stateless model consequently returned the same invalid semantic
+proposal and the RepairLedger correctly denied it as `repair_no_progress_terminal`.
+
+Root category: B/C control-to-executor information-loss. This was neither a reason to weaken the
+compiler nor evidence that an additional blind retry would help. `RepairAction` must remain code
+authority; the missing capability was a narrow, safe projection of the rejected conditions.
+
+The structural fix adds `AgentCorrectionBrief`. `SchedulerLeafExecutor` follows the immutable
+`RepairAction -> FeedbackEvaluation -> ValidationReport` chain, verifies that it binds the target
+`WorkDefinition`, and exposes only blocking `code/path/violated_condition/expected_category`
+facts. `invoke_structured_once` appends this data-only brief to a fresh call for every production
+Agent leaf. It exposes no action id, budget, mutation root, routing coordinate, owner,
+invalidation, or release data. Infrastructure retries receive no brief because they have no
+rejected semantic candidate. Regression tests prove both the exact Scheduler two-attempt path and
+the rendered-prompt confidentiality boundary. A fresh live run is in progress; BC-31 is not a
+release claim until that run demonstrates the affected production leaf behavior.
+
+## BC-32 — post-proposal Artifact materialization both rejected a valid correction and stranded it
+
+The BC-31 live rerun proved that SharedTool correction dispatch received a new real Agent call. Its
+second output passed the deterministic shared-tool compiler and committed
+`design.shared_tool_semantics_source`. The next immutable write failed before the corresponding
+contract Artifact: Final Design appended `architecture_ref` and `evidence_ref` to a dependency
+tuple that already contained both through the Scheduler parent-input closure. ArtifactStore
+correctly rejected duplicate DAG edges.
+
+The generic leaf exception path then lost the already completed Agent provenance and attempted an
+Agent failure without it. The framework raised `WorkRuntimeError`, Direct projected a broad error,
+and the WorkHead retained a running Proposal OperationRun even though its scope lease had been
+settled. This is framework control failure, not a model semantic failure; neither a relaxed
+validator nor another correction can repair it.
+
+The correction makes all Final Design immutable dependency closures set-like through one
+`_unique_refs` transform. It also records `AgentProposalOutcome` after a successful structured
+turn. If subsequent compiler/Artifact materialization raises, Scheduler consumes that task-local
+provenance to terminalize the current operation with measured usage and a non-retryable
+`agent_postproposal_framework_error`; no active WorkHead or blind retry remains. Regression drives
+the exact post-Agent generic exception and asserts terminal operations, measured token/turn usage,
+and a blocked non-retryable report. A new real run is required after this correction; BC-32 remains
+immutable bad-case evidence.
+
+## BC-33 — bounded correction exposed avoidable shared-contract construction load
+
+The first post-BC-32 real `用户预订宾馆` run reached the new `SharedToolSemantics` path with real
+research and six real Agent calls. Its first shared-contract output omitted frozen members from
+atomicity/concurrency partitions. The safe correction brief was demonstrably delivered: the next
+proposal resolved that issue but exposed missing error-policy coverage. The third proposal
+reintroduced the original partition failure. The global RepairLedger therefore classified the
+sequence as A→B→A oscillation and stopped it with no active lease or OperationRun.
+
+This is a good control-plane outcome: code did not treat the changed issue code as “no progress,”
+did not leak RepairAction controls, and did not spend unlimited model calls. It also reveals a
+prompt-design issue: the model had to repeat the same frozen tool set across several structurally
+complete collections without an explicit construction invariant.
+
+The correction is deliberately not a hotel fixture or compiler relaxation. The shared-tool prompt
+now names `coupling_group.ordered_tool_ids` as the only vocabulary, requires exact coverage for
+the three domain collections and error-policy coverage, and permits one full-set domain where no
+evidence warrants a finer split. The deterministic compiler remains the authority and the
+existing A→B→A cap remains unchanged. A prompt-contract regression ensures this generic rule and
+the frozen ids remain present. The full deterministic suite passed after the change; a new live
+request remains required before claiming an executable EnvironmentPackage.
+
+## BC-34 — a committed semantic leaf exposed an unbound physical successor
+
+A fresh real `grok-4.5` hotel Direct request completed live Research, EvidenceSynthesis and
+WorldArchitecture, then committed `SharedToolSemantics` on its first proposal. This is evidence
+that BC-33's generic frozen-set construction rule helped at its intended semantic boundary; it did
+not use a hotel fixture, compiler relaxation, or extra correction. The next `ToolSemanticsBatch`
+was ready in the frozen Design graph, yet Direct stopped before dispatching it.
+
+The cause was framework topology drift. `tool_semantics_batch_definition` intentionally gives its
+physical batch the semantic stage `world_behavior` and the stable artifact slot
+`tool_semantics_batch`. `DirectWorkRunner` selected the leaf by the old stage spelling
+`tool_semantics_batch`, so it omitted an executor. `WorkScheduler.run_until_stalled` then treated a
+ready-but-unbound node as ordinary stalling, while Direct's blocked projection listed only terminal
+semantic `blocked` nodes; the public result consequently said `unknown scheduler coordinate` even
+though the frozen graph contained an exact ready coordinate.
+
+This is neither an Agent failure nor a Validator finding. The structural correction binds the
+ToolSemantics leaf by its stable artifact slot, and `WorkScheduler` now raises typed
+`WorkExecutorMissingError` with safe coordinate fields whenever a ready/repair-ready Work has no
+executor. Controller projects that type as `scheduler_executor_missing`; it cannot enter a Repair
+ledger or spend another model turn. Deterministic regressions prove both the precise missing
+coordinate and the otherwise differing `world_behavior`/`tool_semantics_batch` pair. The failed
+run remains immutable evidence (four real Agent turns, six searches, no active lease or operation)
+and must not be resumed; a new request is still required before any release claim.
+
+## BC-35 — an unconfigured monetary envelope blocked real parallel tool batches
+
+The next live hotel run proved BC-34: both physical ToolSemanticsBatch coordinates were actually
+dispatched after SharedToolSemantics committed. Before either provider call, both closed as
+`budget_exhausted(monetary_cost)`. The Direct budget intentionally defaults to zero monetary cost
+for a provider that reports no trustworthy price, but `tool_semantics_batch_definition` alone
+silently defaulted each batch to a one-unit monetary reservation. This made a normal two-batch
+topology impossible even though no monetary policy had been configured.
+
+The correction removes that implicit one-unit envelope. A leaf has zero monetary reservation unless
+its caller explicitly declares a measured-price limit; tests that synthesize an observed price now
+pass their own explicit envelope and still prove settlement rejects overspend. Thus zero is no
+longer a fabricated observed price or a hidden per-leaf budget: it means no monetary admission
+policy was configured. Provider price availability remains observable as unknown and must not be
+claimed as zero in experiment reporting. A fresh run is required to exercise the now-dispatched
+batch proposals and downstream Builder/Registry path.
+
+## BC-36 — ToolSemantics cross-field checks classified candidate mistakes as framework defects
+
+The first post-BC-35 real hotel run crossed both parallel ToolSemanticsBatch provider dispatches.
+Each batch then returned a mixture of legitimate candidate semantics failures (for example Rule
+namespace/evidence closure and access/reliability constraints) and sixteen
+`framework_diagnostic_incomplete` findings rooted at `conditions`, `state_transition`, `errors`,
+and `behavior`. The Scheduler correctly refused a blind correction because that code means the
+framework has not disclosed a safe causal condition. The problem was in the validator boundary:
+several proposal-owned cross-field checks still raised raw `ValueError`; their known safe paths
+were lost when the batch aggregator converted them to a report.
+
+This is not a reason to relax the semantic compiler, add a global LLM judge, or increase retries.
+It is a feedback-contract defect. The correction converts proposal-owned tool Rule, error-code,
+behavior and final cross-component closure failures into `StructuredSemanticIssue` values with
+stable code, source-facing path, violated condition and expected category. The prefixing boundary
+now preserves those latter two values instead of overwriting them with generic text. Frozen schema
+corruption remains a non-retryable framework diagnostic. Behavior validation keeps only
+cross-component uniqueness rather than repeating every per-section Rule failure.
+
+The regression starts from a real compiled counter world, introduces a wrong tool Rule prefix and
+an unknown evidence reference, and proves the exact `tools.0.conditions...` issues remain
+actionable through the feedback router with no `framework_diagnostic_incomplete`. A fresh live
+hotel request is still required: this deterministic bad-case proof establishes feedback quality,
+not an EnvironmentPackage release.
+
+## BC-37 — mechanically authored Rule IDs and repeated diagnostics overwhelmed one local repair
+
+The next `用户预订宾馆` live run proved BC-35 and BC-36 at the dispatch boundary: all ToolSemantics
+calls reached the provider and every semantic issue was actionable. It nevertheless stopped at the
+two physical batches after one authorized correction each. Initial/corrected reports contained
+96/136 and 187/180 blockers respectively. The dominant classes were repeated `tool_rule_id_prefix`,
+`rule_lookup_key_field_missing` and `rule_pointer_unreachable`; passing the whole issue list to the
+second prompt asked a single Engineer to repair many copies of the same schema construction mistake.
+
+This is neither a reason to loosen pointer/authority/reliability validation nor evidence that the
+budget is too small. Rule namespace and ordinal are framework identity mechanics, not business
+semantics, so ToolSemanticsBatch now deterministically writes `rule:<tool>:<section>:<ordinal>` and
+the Agent may omit `rule_id`. The full immutable ValidationReport still records every exact issue.
+Only the data-only AgentCorrectionBrief is compressed by safe `(code, condition, expected)` clusters
+with count, normalized affected paths and up to three representative paths; its prompt states that
+each cluster applies to all matching replacement fields. RepairAction authority remains hidden.
+
+Focused regressions prove canonical Rule IDs and a sixteen-issue pointer cluster with intact scope.
+The new prompt also receives RuleContextCatalog projections and exact selector construction rules.
+A further real Direct run is required to measure whether the revised proposal boundary reaches the
+downstream Builder/Verifier/Registry path; BC-37 is not a release claim.
+
+## BC-38 — frozen WorldSpec `$ref` hid selector facts, so Tool batch repair rewrote an impossible contract
+
+A later real `用户预订宾馆` Direct run reached both physical ToolSemantics batches with six real
+Agent calls, real search/fetch/extract, and no monetary admission rejection. One batch corrected
+successfully. The other changed from 132 to 148 actionable blockers: every one was either
+`rule_lookup_key_field_missing` or `rule_pointer_unreachable`. Scheduler consumed exactly the two
+declared local repairs and terminated the failing batch as no-progress; it did not reopen
+Research, Architecture, SharedToolSemantics, or its successful sibling.
+
+Inspection of the immutable frozen state schema showed the real cause. WorldState collections have
+`items: {"$ref":"#/$defs/<entity>"}`. The original RuleContextCatalog and pointer validator read
+only inline item `properties`, so their prompt projection contained no collection item fields or
+primary keys, and the validator could only tell the Agent the generic category “one of the item
+fields”. The Agent was asked to copy selector facts that framework code had failed to expose.
+
+The first deterministic correction resolves finite local JSON-Schema `$ref` chains, rejects
+external/cyclic references, and uses resolved entity schemas for catalog, pointer and type closure.
+The broader correction removes the remaining mechanical transcription surface for the production
+ToolSemantics leaf: the Agent must choose `bound_reference` or `bound_lookup_by_key` binding ids
+from a per-tool frozen catalog. Framework code expands each id into source, pointer, collection,
+primary key, selected item field and value type before the unchanged executable Rule compiler/Judge
+ABI runs. Raw ToolSemantics references/selectors now fail closed; WorldRules and Curriculum retain
+their own source forms until their contexts are equally frozen. This is neither a compiler
+relaxation nor a new retry loop. It reduces the Agent's role to business relation selection and
+keeps exact runtime state addressing programmatic.
+
+Focused schema, compiler, scheduler and WorldSpec tests pass. A complete suite and a new live
+request remain required; the failed run is immutable bad-case evidence, not release evidence.
+
+## BC-39 — a partial telemetry projection falsely suggested that authorized repairs bypassed control
+
+The fresh `hotel-booking-live-grok-20260722-bound-rule-bindings` request was intentionally stopped
+after its first two physical ToolSemantics batches failed and both second calls had begun. A
+superficial live trace showed two new spans with `attempt=1`, `repair_depth=0`,
+`repair_mode=initial`, while `run inspect` showed only settled repair charges. That first
+projection was incorrectly interpreted as the same coordinates restarting without a RepairAction.
+
+Durable control artifacts falsified that conclusion. Both active attempts were `ordinal=2`, bound
+the exact same immutable input closure as their parent attempt, had `repair_attempt_charge=1`, and
+each referenced a distinct local `RepairAction` with `target_coordinate=current_coordinate`,
+`jump_distance=0`, `repair_attempt_ordinal=1` and source `FeedbackEvaluation`. Historical live
+evidence provides the required comparison: one earlier ToolSemantics shard committed after this
+same authorized chain, while an independent sibling terminalized as
+`repair_denied_repair_no_progress_terminal`; deterministic repair and recovery regressions likewise
+reject an unauthorized continuation or duplicate charge.
+
+Root classification is therefore **observability projection**, not a Scheduler/RepairLedger control
+escape. `WorkControlRuntime._start_attempt_span()` records the durable ordinal but leaves telemetry
+at its default repair depth, and the running CLI view does not yet project each active repair's
+lineage or distinguish its active reservation from settled usage. The stopped process left active
+operations that must be reconciled by the existing recovery path; they must not be silently freed
+or replayed.
+
+This case also produced two different first-attempt content failures: one opaque frozen binding
+selection failure and one permission-scope coverage failure. They are evidence for a separate
+ToolSemantics input/output-representation investigation, not evidence for a single common control
+defect. No execution-control refactor is authorized from BC-39. Before any semantic-IR/prompt
+change, collect cross-request issue distributions, repair yield, token/time cost and an independent
+review; then compare an input representation improvement against framework-derived permission
+closure and against retaining the current bounded repair boundary.
+
+### BC-39 follow-up — evidence-constrained observability correction
+
+The correction scope is deliberately observational. The three independent live requests
+`hotel-booking-live-grok-20260721-feedback-typed`,
+`hotel-booking-live-grok-20260722-bounded-feedback`, and
+`hotel-booking-live-grok-20260722-bound-rule-bindings` each contained an ordinal-two
+ToolSemantics attempt whose telemetry projection said `repair_depth=0`. The bounded-feedback run
+also contains a successful ordinal-two attempt, so this is not a stopped-process artefact.
+
+`WorkControlRuntime` now reads the already durable `RepairAction` only when it starts the
+corresponding telemetry span. It records the semantic repair depth, decision, action revision and
+process-recovery ordinal. Initial and stale-supersession attempts remain depth zero. The real-Agent
+one-shot envelope likewise labels a child invocation as `authorized_repair` or `process_recovery`
+from the existing immutable WorkAttempt; this label is never read by Scheduler, Repair Ledger,
+budget admission, validation, invalidation or release code.
+
+The regression drives one initial ToolSemantics attempt, one authorized local correction and one
+physical process recovery under the same semantic action. It proves their projected modes/depths,
+the exact action revision and one recovery ordinal. Focused lint and 17 deterministic scheduler,
+one-shot and runtime tests passed. This is still not proof of a completed generated environment,
+does not reconcile the intentionally stopped live job, and does not authorize a ToolSemantics
+representation or control-plane redesign without further multi-case evidence.
+
+## BC-40 — Architecture source-model validators erased known field contracts before repair
+
+A fresh real `gpt-5.3-codex-spark` run for `用户预订宾馆` completed real ResearchPlan,
+Search/Fetch/Extract and EvidenceSynthesis, then completed its WorldArchitecture Agent
+invocation. The subsequent Pydantic parse recorded 60 non-actionable
+`framework_diagnostic_incomplete` issues at `state_entities.*.fields.*` and
+`tool_inventory.*.interface.*`, plus four ordinary `schema_too_short` issues. No RepairAction
+was created, every operation/lease terminalized, and no Builder/Judge/Registry suffix ran.
+
+The fail-closed terminal was correct: the generic error contract cannot safely authorize an Agent
+to guess. Independent audit established that this is an Architecture **source-model** boundary:
+the nested field/lifecycle validators raised raw Pydantic `ValueError`, and
+`pydantic_validation_diagnostic` intentionally maps unknown `value_error` to a non-retryable
+framework diagnostic. It is not evidence of Scheduler, BudgetLedger, RepairLedger or release
+authority failure. Two earlier ToolSemanticsBatch reports share the same generic symptom but use
+a different compiler path; they do not prove a common source-level root.
+
+The bounded correction changes only two repeatedly observed Architecture source contracts:
+compact field type/bounds/enum relations and lifecycle field semantics now raise allowlisted
+`PydanticCustomError` values. Their safe code, path, condition and expected category survive the
+one-shot boundary. Unknown raw validators remain non-actionable, and no routing/budget/retry
+policy changes. Deterministic one-shot regressions cover both known contracts and the unknown
+fallback; focused tests, Ruff and mypy pass. A new real run is required to show that the
+Architecture WorkCommit and any subsequent repair are actually produced. This bad-case fix is not
+a release claim.

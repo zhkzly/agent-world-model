@@ -79,6 +79,7 @@ def _inputs() -> tuple[tuple[Evidence, ...], ResearchBundle, tuple[str, ...]]:
             failures=(),
             search_calls=0,
             fetch_calls=2,
+            extract_calls=2,
         ),
         texts,
     )
@@ -186,6 +187,7 @@ def test_passage_pack_binds_trimmed_html_text_to_exact_source_offsets() -> None:
             failures=(),
             search_calls=0,
             fetch_calls=1,
+            extract_calls=1,
         ),
     )
 
@@ -237,6 +239,7 @@ def test_research_materialization_deduplicates_shared_raw_revision_dependencies(
             failures=(),
             search_calls=0,
             fetch_calls=2,
+            extract_calls=2,
         ),
     )
 

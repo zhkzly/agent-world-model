@@ -101,6 +101,34 @@ async def test_doctor_executes_real_offline_clean_build_and_runtime_probe(
     assert not report.production_ready
 
 
+@pytest.mark.asyncio
+async def test_doctor_accepts_short_opaque_api_key_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Doctor must agree with application assembly on redaction-safe key length."""
+
+    environment_name = "AGENT_WORLD_TEST_SHORT_OPAQUE_KEY"
+    monkeypatch.setenv(environment_name, "tok_6x")
+    config = FoundryConfig(
+        state_root=tmp_path / "state",
+        agent=AgentBackendConfig(
+            model="doctor-readiness-probe",
+            api_key_environment=environment_name,
+        ),
+        research=ResearchConfig(
+            provider="searxng",
+            searxng_base_url=HttpUrl("http://127.0.0.1:18080"),
+            searxng_allow_private_endpoint=True,
+            use_jina_reader_fallback=False,
+        ),
+        judge=JudgeConfig(),
+    )
+
+    report = await run_doctor(config)
+    assert _check(report.checks, "model_authentication").status == "pass"
+
+
 def test_judge_config_rejects_removed_online_build_policy() -> None:
     with pytest.raises(ValidationError):
         JudgeConfig.model_validate(

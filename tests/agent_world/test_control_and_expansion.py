@@ -72,7 +72,6 @@ from agent_world.control import (
     ErrorAuditPolicy,
     JobRunSnapshot,
     LeaseBudgetLedger,
-    NodeAttempt,
     RepairLedger,
     RepairRouter,
     StructuredRepairMode,
@@ -555,134 +554,6 @@ def test_direct_terminal_failure_is_recovered_without_replaying_generation(
     assert first.failure_summary == "Independent verification rejected the candidate."
     completed_head = controller.direct_jobs.read_head(request_id)
     assert completed_head is not None
-    assert completed_head.result_ref is not None
-
-
-def test_abandoned_direct_generation_is_cancelled_with_a_new_terminal_revision(
-    tmp_path: Path,
-) -> None:
-    controller = _real_controller(tmp_path / "foundry")
-    request_id = "request:cancel-abandoned"
-    request = EnvironmentRequest(
-        request_id=request_id,
-        need="Generate a real local inventory workflow environment.",
-        permissions=PermissionScope(),
-        budget=controller.config.generation_budget.model_copy(update={"monetary_cost": 5.0}),
-        release_profile=controller.config.release_profile,
-    )
-    fingerprint = controller._direct_request_fingerprint(  # noqa: SLF001
-        request,
-        enable_discovery=False,
-        discovery_budget=controller.config.discovery_budget,
-    )
-    request_ref = controller.artifacts.put_json(
-        artifact_id="request-artifact:cancel-abandoned",
-        artifact_type="control.environment_request",
-        value=request,
-    )
-    job = EnvironmentJob(
-        job_id="generate-job:cancel-abandoned",
-        kind="generate",
-        request_ref=request_ref,
-        permissions=request.permissions,
-        budget=request.budget,
-        release_profile=request.release_profile,
-    )
-    job_ref = controller.artifacts.put_json(
-        artifact_id="generate-job:cancel-abandoned:job",
-        artifact_type="control.environment_job",
-        value=job,
-        dependencies=(request_ref,),
-    )
-    lease = LeaseBudgetLedger(request.budget).reserve(
-        lease_id="lease:abandoned-builder",
-        owner_id="attempt:abandoned-builder",
-        requested=Budget(
-            llm_tokens=100,
-            agent_turns=1,
-            build_seconds=10,
-            wall_seconds=30,
-            monetary_cost=1,
-        ),
-        elapsed_wall_seconds=0,
-    )
-    lease_ref = controller.artifacts.put_json(
-        artifact_id=f"run:cancel-abandoned:budget-lease:{lease.lease_id}",
-        artifact_type="control.budget_lease",
-        value=lease,
-        dependencies=(job_ref,),
-    )
-    running = JobRunSnapshot(
-        run_id="run:cancel-abandoned",
-        job_ref=job_ref,
-        revision=1,
-        status="running",
-        reserved_budget=request.budget,
-        observed_actual_budget=BudgetUsage(),
-        unknown_upper_bound_budget=BudgetUsage(),
-        conservative_committed_budget=BudgetUsage(),
-        attempts=(
-            NodeAttempt(
-                attempt_id=lease.owner_id,
-                node="build",
-                ordinal=1,
-                status="running",
-                started_at=datetime.now(UTC),
-                input_refs=(job_ref, lease_ref),
-            ),
-        ),
-        latest_artifact_refs=(lease_ref,),
-    )
-    running_ref = controller.artifacts.put_json(
-        artifact_id="run:cancel-abandoned:state",
-        artifact_type="control.job_run_snapshot",
-        value=running,
-        dependencies=(job_ref,),
-    )
-    with controller.direct_jobs.exclusive(request_id) as lock:
-        controller.direct_jobs.compare_and_swap(
-            lock,
-            expected_head=None,
-            next_head=new_direct_job_head(
-                request_id=request_id,
-                request_fingerprint=fingerprint,
-                request_ref=request_ref,
-                job_ref=job_ref,
-                run_id=running.run_id,
-                snapshot_ref=running_ref,
-                snapshot_revision=1,
-                status="running",
-            ),
-        )
-
-    result = asyncio.run(controller.cancel_abandoned_generation(request_id))
-
-    assert result.status == "failed"
-    assert result.failure_code == "operator_cancelled"
-    assert result.final_snapshot_ref != running_ref
-    terminal = controller.artifacts.get_json(result.final_snapshot_ref, JobRunSnapshot)
-    assert terminal.revision == 2
-    assert terminal.status == "failed"
-    assert terminal.failure_code == "operator_cancelled"
-    assert terminal.observed_actual_budget == BudgetUsage()
-    assert terminal.unknown_upper_bound_budget == BudgetUsage(
-        llm_tokens=100,
-        agent_turns=1,
-        build_seconds=10,
-        monetary_cost=1,
-    )
-    assert terminal.attempts[0].status == "failed"
-    assert terminal.attempts[0].budget_usage == terminal.unknown_upper_bound_budget
-    terminal_lease = next(
-        controller.artifacts.get_json(ref, type(lease))
-        for ref in controller.artifacts.list_revisions(lease_ref.artifact_id)
-        if controller.artifacts.get_json(ref, type(lease)).status == "settled"
-    )
-    assert terminal_lease.status == "settled"
-    assert terminal_lease.unknown_upper_bound == terminal.unknown_upper_bound_budget
-    completed_head = controller.direct_jobs.read_head(request_id)
-    assert completed_head is not None
-    assert completed_head.status == "failed"
     assert completed_head.result_ref is not None
 
 
@@ -1410,7 +1281,7 @@ def test_campaign_resume_settles_unknown_leased_candidate_and_tells_policy(
         llm_tokens=100,
         agent_turns=2,
         search_calls=1,
-        tool_calls=2,
+        tool_calls=3,
         wall_seconds=30,
     )
     campaign_budget = Budget(
@@ -1885,6 +1756,7 @@ def test_repair_ledger_restore_stops_immediately_after_identical_no_progress(
     )
     assert second.action == "reject"
     assert second.ledger_entry_id is not None
+    assert second.decision_reason == "prior repair left the blocking Claim set unchanged"
     assert [entry.attempt_ordinal for entry in restored.entries] == [1, 2]
     assert restored.entries[-1].outcome == "exhausted"
 

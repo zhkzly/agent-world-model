@@ -41,7 +41,8 @@ ArtifactStore 在恢复后仍会校验上述 content-addressed revision。只迁
 
 完整、可逐项执行的迁移步骤见 [Codex 凭证与本机运行能力迁移](codex-credential-migration.zh.md)。该文档分别说明 ChatGPT 文件认证和 API-key/兼容 Base URL 认证、`CODEX_HOME` 隔离、权限要求、真实 doctor 验证和常见失败。
 
-生产路径使用真实 `CodexSdkBackend`，模型固定为 `gpt-5.4-mini`。迁移后需要重新安装支持当前 SDK 协议的 Codex 预览版，并通过当前机器的 `command -v codex` 设置 `agent.codex_bin`；不要继续使用旧机器上带版本哈希的绝对路径。
+生产路径使用真实 `CodexSdkBackend`，模型由显式 `agent.model` 配置决定；当前实验优先
+`grok-4.5`，在额度或兼容服务不可用时才显式切换为 `gpt-5.4-mini`。迁移后需要重新安装支持当前 SDK 协议的 Codex 预览版，并通过当前机器的 `command -v codex` 设置 `agent.codex_bin`；不要继续使用旧机器上带版本哈希的绝对路径。
 
 本机登录认证的来源通常是：
 
