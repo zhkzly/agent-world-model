@@ -626,11 +626,14 @@ class IntegrationLeaf:
                 )
             )
         for index, finding in enumerate(item for item in report.findings if item.blocks_release):
+            # Prefer suggested_repair: it carries crash/protocol coordinates.
+            # finding.summary is often the fixed "{gate} did not pass." label.
+            condition = (finding.suggested_repair or finding.summary).strip() or finding.summary
             issues.append(
                 ValidationIssue(
                     code=f"{stage}_finding_{finding.category}"[:120],
                     path=(stage, "finding", index),
-                    violated_condition=finding.summary[:512],
+                    violated_condition=condition[:512],
                     expected_category="a Candidate and verifier closure satisfying this finding",
                     retryable=finding.owner not in {"permissions", "release_policy"},
                 )

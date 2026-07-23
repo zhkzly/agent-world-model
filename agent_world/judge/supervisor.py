@@ -1344,12 +1344,21 @@ class RuntimeSupervisor:
                 pass
 
     def _crashed_error(self, message: str) -> RuntimeProcessCrashed:
+        launch = self._validated_launch or self.launch
+        argv = tuple(launch.argv)
+        cwd = (
+            self._validated_launch.cwd_relative
+            if self._validated_launch is not None
+            else getattr(self.launch, "cwd", ".")
+        )
         return RuntimeProcessCrashed(
             "runtime_process_crashed",
             message,
             details={
                 "exit_code": self._process.returncode if self._process is not None else None,
                 "stderr": self.stderr,
+                "launch_argv": list(argv),
+                "launch_cwd": str(cwd),
             },
         )
 

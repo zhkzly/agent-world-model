@@ -323,6 +323,35 @@ def test_judge_root_cause_fingerprint_is_stable_across_candidate_revisions() -> 
     assert first.finding_id != second.finding_id
 
 
+def test_judge_finding_fingerprint_tracks_actionable_repair_coordinates() -> None:
+    """Crash-coordinate changes must create a new progress identity for repair."""
+
+    evidence = _ref("runtime-evidence")
+    first = EnvironmentJudge._finding(  # noqa: SLF001
+        "run:one",
+        "runtime_protocol",
+        _ref("candidate:one"),
+        evidence,
+        owner="build",
+        summary="runtime_protocol did not pass.",
+        suggested_repair="runtime exited without a response; exit_code=1",
+    )
+    second = EnvironmentJudge._finding(  # noqa: SLF001
+        "run:one",
+        "runtime_protocol",
+        _ref("candidate:one"),
+        evidence,
+        owner="build",
+        summary="runtime_protocol did not pass.",
+        suggested_repair=(
+            "runtime exited without a response; exit_code=1; "
+            "stderr_exception=ModuleNotFoundError; missing_module=candidate.materializer"
+        ),
+    )
+
+    assert first.fingerprint != second.fingerprint
+
+
 def test_default_budget_covers_canonical_two_task_reachability(tmp_path: Path) -> None:
     available = _config(tmp_path).generation_budget
     required = _judge(tmp_path).required_evaluation_budget(

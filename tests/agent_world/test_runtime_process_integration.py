@@ -233,6 +233,32 @@ def test_runtime_crash_summary_discloses_only_safe_candidate_owned_coordinates()
     )
 
 
+def test_runtime_crash_evidence_persists_launch_and_stderr_coordinates() -> None:
+    from agent_world.judge.service import _candidate_failure_evidence
+
+    failure = RuntimeProcessCrashed(
+        "runtime_process_crashed",
+        "runtime exited without a response",
+        details={
+            "exit_code": 1,
+            "stderr": (
+                'Traceback (most recent call last):\n  File "/workspace/candidate/runtime.py"\n'
+                "ModuleNotFoundError: No module named 'candidate.materializer'\n"
+            ),
+            "launch_argv": [".venv/bin/python", "-m", "candidate.runtime"],
+            "launch_cwd": ".",
+        },
+    )
+
+    evidence = _candidate_failure_evidence(failure)
+    assert evidence["exit_code"] == 1
+    assert evidence["missing_module"] == "candidate.materializer"
+    assert evidence["stderr_exception"] == "ModuleNotFoundError"
+    assert evidence["launch_argv"] == [".venv/bin/python", "-m", "candidate.runtime"]
+    assert evidence["launch_cwd"] == "."
+    assert "candidate.materializer" in evidence["message"]
+
+
 async def _evaluate_real_judge_graph(
     *,
     state_root: Path,
@@ -513,8 +539,11 @@ async def test_real_role_isolation_crash_returns_builder_safe_import_coordinates
 
     assert _candidate_failure_summary(captured.value) == (
         "runtime exited without a response; exit_code=1; "
-        "stderr_exception=ModuleNotFoundError; missing_module=task_materializer"
+        "stderr_exception=ModuleNotFoundError; missing_module=task_materializer; "
+        "launch_argv=.venv/bin/python,runtime.py; launch_cwd=."
     )
+    assert captured.value.details["launch_argv"] == [".venv/bin/python", "runtime.py"]
+    assert captured.value.details["launch_cwd"] == "."
 
 
 @pytest.mark.asyncio

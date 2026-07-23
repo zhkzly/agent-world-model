@@ -249,6 +249,14 @@ def _candidate_failure_summary(exc: BaseException) -> str:
             missing_module = _python_missing_module(stderr)
             if missing_module is not None:
                 crash_coordinates.append(f"missing_module={missing_module}")
+        launch_argv = exc.details.get("launch_argv")
+        if isinstance(launch_argv, (list, tuple)) and launch_argv:
+            crash_coordinates.append(
+                "launch_argv=" + ",".join(str(item) for item in launch_argv)
+            )
+        launch_cwd = exc.details.get("launch_cwd")
+        if isinstance(launch_cwd, str) and launch_cwd:
+            crash_coordinates.append(f"launch_cwd={launch_cwd}")
         if crash_coordinates:
             summary += "; " + "; ".join(crash_coordinates)
         return summary
@@ -265,6 +273,47 @@ def _candidate_failure_summary(exc: BaseException) -> str:
     if coordinates:
         summary += "; " + "; ".join(coordinates)
     return summary
+
+
+def _candidate_failure_evidence(exc: BaseException) -> dict[str, Any]:
+    """Persist actionable crash/protocol coordinates into gate evidence blobs."""
+
+    record: dict[str, Any] = {
+        "failure_class": type(exc).__name__,
+        "message": _candidate_failure_summary(exc),
+    }
+    if isinstance(exc, RuntimeProcessCrashed):
+        details = dict(exc.details)
+        exit_code = details.get("exit_code")
+        if isinstance(exit_code, int) or exit_code is None:
+            record["exit_code"] = exit_code
+        stderr = details.get("stderr")
+        if isinstance(stderr, str):
+            # Bound evidence size while keeping the tail that usually holds the traceback.
+            record["stderr_tail"] = stderr[-4_096:]
+            exception_name = _python_stderr_exception_name(stderr)
+            if exception_name is not None:
+                record["stderr_exception"] = exception_name
+            missing_module = _python_missing_module(stderr)
+            if missing_module is not None:
+                record["missing_module"] = missing_module
+        launch_argv = details.get("launch_argv")
+        if isinstance(launch_argv, (list, tuple)):
+            record["launch_argv"] = [str(item) for item in launch_argv]
+        launch_cwd = details.get("launch_cwd")
+        if isinstance(launch_cwd, str):
+            record["launch_cwd"] = launch_cwd
+        return record
+    if isinstance(exc, ProtocolViolation):
+        record["protocol_code"] = exc.code
+        record["protocol_details"] = dict(exc.details)
+        return record
+    if isinstance(exc, _RuntimeContractFailure):
+        record["mismatch_paths"] = list(exc.mismatch_paths)
+        return record
+    if isinstance(exc, _CandidateTaskFailure) and exc.details:
+        record["failure_details"] = dict(exc.details)
+    return record
 
 
 _PYTHON_EXCEPTION_LINE = re.compile(
@@ -1803,16 +1852,7 @@ class EnvironmentJudge:
             summary = "Runtime handshake exactly matches the frozen WorldSpec."
         except (ProtocolViolation, RuntimeProcessCrashed, RuntimeRequestTimeout, ValueError) as exc:
             failure_summary = _candidate_failure_summary(exc)
-            record = {
-                "status": "fail",
-                "failure_class": type(exc).__name__,
-                "message": failure_summary,
-            }
-            if isinstance(exc, ProtocolViolation):
-                record["protocol_code"] = exc.code
-                record["protocol_details"] = dict(exc.details)
-            if isinstance(exc, _RuntimeContractFailure):
-                record["mismatch_paths"] = list(exc.mismatch_paths)
+            record = {"status": "fail", **_candidate_failure_evidence(exc)}
             status = "fail"
             summary = failure_summary
         evidence_ref = self._evidence(
@@ -1894,16 +1934,7 @@ class EnvironmentJudge:
             summary = "Runtime handshake and reproducible unknown-seed lifecycle passed."
         except (ProtocolViolation, RuntimeProcessCrashed, RuntimeRequestTimeout, ValueError) as exc:
             failure_summary = _candidate_failure_summary(exc)
-            record = {
-                "status": "fail",
-                "failure_class": type(exc).__name__,
-                "message": failure_summary,
-            }
-            if isinstance(exc, ProtocolViolation):
-                record["protocol_code"] = exc.code
-                record["protocol_details"] = dict(exc.details)
-            if isinstance(exc, _RuntimeContractFailure):
-                record["mismatch_paths"] = list(exc.mismatch_paths)
+            record = {"status": "fail", **_candidate_failure_evidence(exc)}
             status = "fail"
             summary = failure_summary
         evidence_ref = self._evidence(
@@ -2178,15 +2209,13 @@ class EnvironmentJudge:
         ) as exc:
             record = {
                 "status": "fail",
-                "failure_class": type(exc).__name__,
                 "framework_call_count": len(calls),
                 "runtime_reset_count": episodes,
                 "candidate_output_authority": "public_goal_and_initial_config_only",
+                **_candidate_failure_evidence(exc),
             }
-            if isinstance(exc, _CandidateTaskFailure) and exc.details:
-                record["failure_details"] = exc.details
             status = "fail"
-            summary = str(exc)
+            summary = _candidate_failure_summary(exc)
             owner = "build"
             envelopes = ()
         except JudgeInfrastructureError as exc:
@@ -2194,6 +2223,7 @@ class EnvironmentJudge:
                 "status": "error",
                 "failure_class": exc.code,
                 "framework_call_count": len(calls),
+                "message": str(exc),
             }
             status = "error"
             summary = str(exc)
@@ -3675,12 +3705,16 @@ class EnvironmentJudge:
         disclosure: Literal["public", "repair", "sealed_summary"] = "repair",
         blocks_release: bool = True,
     ) -> Finding:
+        # Progress identity must include actionable repair coordinates. Using only
+        # the fixed "{gate} did not pass." summary made Integration crash loops
+        # appear as no_progress even when exit_code/stderr/launch coords changed.
         fingerprint = sha256_digest(
             canonical_json_bytes(
                 {
                     "category": category,
                     "owner": owner,
                     "summary": " ".join(summary.casefold().split()),
+                    "suggested_repair": " ".join(suggested_repair.casefold().split()),
                 }
             )
         )

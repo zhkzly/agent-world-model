@@ -27,6 +27,12 @@ public schemas and constants into candidate source or declared package data. Nev
 `../inputs`, workspace paths, Codex state, prior Judge artifacts, or undisclosed evidence at
 runtime or from public tests.
 
+Runtime, Task Materializer, and public verifier are role-isolated file views. The Runtime module
+must not import the materializer (or any task_materializer-role file). Duplicate any shared pure
+helpers into the Runtime package, or keep helpers in runtime-role modules only. A Judge clean
+sandbox hides materializer files from the Runtime process; `from .materializer import ...` causes
+`ModuleNotFoundError` and Integration failure.
+
 ## Required project
 
 Create or repair only `candidate/` as a Python 3.12 uv virtual project:
