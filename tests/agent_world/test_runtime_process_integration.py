@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from v3_fixture import (
+    SEEDED_RUNTIME_SOURCE,
     JudgeCandidateGraph,
     build_judge_candidate_graph,
     build_release_graph,
@@ -35,6 +36,7 @@ from agent_world.contracts.supply_chain import (
     StaticAssuranceEvidence,
     SupplyChainEvidence,
 )
+from agent_world.control.telemetry import TelemetryStore
 from agent_world.judge import (
     CandidateSandboxRunner,
     CleanCandidateBuilder,
@@ -324,6 +326,67 @@ async def test_integration_runs_before_verifier_and_cannot_authorize_release(
         "clean_deployment",
     }
     assert all(item.status == "pass" for item in integrated.report.gate_results)
+
+
+@pytest.mark.asyncio
+async def test_integration_protocol_evidence_keeps_real_handshake_crash_scene(
+    tmp_path: Path,
+) -> None:
+    """A real Runtime exit retains its bounded scene in evidence and Tier B."""
+
+    crash_marker = "phase-one-handshake-crash"
+    runtime_source = SEEDED_RUNTIME_SOURCE.replace(
+        "\nfor raw_line in sys.stdin:\n",
+        (
+            f"\nsys.stderr.write({crash_marker!r} + '\\n')\n"
+            "raise SystemExit(17)\n\n"
+            "for raw_line in sys.stdin:\n"
+        ),
+    )
+    store = ArtifactStore(tmp_path / "artifacts")
+    graph = build_judge_candidate_graph(tmp_path, store, runtime_source=runtime_source)
+    run_id = "phase-one-real-handshake-crash"
+    with TelemetryStore(tmp_path / "telemetry") as telemetry:
+        judge = EnvironmentJudge(
+            artifact_store=judge_writer(store),
+            clean_builder=CleanCandidateBuilder(
+                build_isolation=await _require_real_isolation("build"),
+                uv_path=graph.uv_path,
+                uv_cache_dir=graph.uv_cache_dir,
+                timeout_seconds=60,
+            ),
+            runtime_isolation=await _require_real_isolation(),
+            telemetry=telemetry,
+        )
+        async with judge.clean_builder.materialize(
+            graph.workspace,
+            expected_source_files=graph.candidate_manifest.files,
+            expected_source_tree_digest=graph.candidate_manifest.candidate_source_tree_digest,
+        ) as clean:
+            status, evidence_ref, _summary = await judge._integration_protocol_gate(  # noqa: SLF001
+                run_id,
+                clean,
+                graph.candidate,
+                graph.candidate_ref,
+                graph.candidate_manifest,
+                graph.design.world_spec,
+                graph.world_spec_ref,
+                telemetry_trace_id=run_id,
+                coordinate_key=None,
+            )
+        events = telemetry.inspect_trace(run_id)["events"]
+
+    evidence = store.get_json(evidence_ref)
+    assert status == "fail"
+    assert evidence["failure_class"] == "RuntimeProcessCrashed"
+    assert evidence["exit_code"] == 17
+    assert crash_marker in evidence["stderr"]
+    assert evidence["launch_argv"] == [".venv/bin/python", "-m", "runtime"]
+    assert len(events) == 1
+    assert events[0]["event_type"] == "runtime_subprocess_scene"
+    event_payload = json.loads(events[0]["payload_json"])
+    assert event_payload["exit_code"] == 17
+    assert crash_marker in event_payload["stderr_tail"]
 
 
 @pytest.mark.asyncio

@@ -504,6 +504,8 @@ class IntegrationLeaf:
                     release_profile=self.release_profile,
                     budget=budget,
                     run_id=f"{self.run_id}:integration:{attempt.attempt_id}",
+                    telemetry_trace_id=attempt.telemetry_trace_id,
+                    coordinate_key=definition.coordinate.coordinate_key,
                 )
             except Exception as exc:
                 raise LeafExecutionFailure(
@@ -761,6 +763,8 @@ class ReleaseAssuranceLeaf(IntegrationLeaf):
                         self.workspace_root / f"{attempt.attempt_id}-reachability"
                     ),
                     run_id=f"{self.run_id}:release:{attempt.attempt_id}",
+                    telemetry_trace_id=attempt.telemetry_trace_id,
+                    coordinate_key=definition.coordinate.coordinate_key,
                 )
             except Exception as exc:
                 raise LeafExecutionFailure(

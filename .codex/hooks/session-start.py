@@ -391,6 +391,15 @@ def _build_compact_current_state(
     else:
         lines.append("Current task: none.")
 
+    try:
+        from observability_hint import failed_direct_observability_hint
+
+        observability_hint = failed_direct_observability_hint()
+    except Exception:
+        observability_hint = None
+    if observability_hint is not None:
+        lines.append(observability_hint)
+
     if get_tasks_dir and iter_active_tasks:
         try:
             task_count = sum(1 for _ in iter_active_tasks(get_tasks_dir(repo_root)))

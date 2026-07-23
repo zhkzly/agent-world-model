@@ -162,6 +162,7 @@ from agent_world.judge import (
     VerifierCompilationError,
     VerifierCompiler,
 )
+from agent_world.observability import ObservabilityRoot, SceneProjector
 from agent_world.registry import (
     EnvironmentRegistry,
     PackageVersionReservation,
@@ -594,6 +595,7 @@ class FoundryController:
         registry: EnvironmentRegistry,
         telemetry: TelemetryStore | None = None,
         error_audit_policy: ErrorAuditPolicy | None = None,
+        known_secret_canaries: Sequence[str | bytes] = (),
     ) -> None:
         self.config = config
         self.artifacts = artifact_store
@@ -615,6 +617,13 @@ class FoundryController:
         self.workspace_root.mkdir(parents=True, exist_ok=True)
         self.direct_jobs = DirectJobStore(config.state_root / "direct-jobs")
         self.work_control = WorkControlStore(config.state_root / "work-control")
+        self.scene_projector = SceneProjector(
+            root=ObservabilityRoot(config.state_root),
+            artifacts=self.artifacts,
+            heads=self.work_control,
+            telemetry=self.telemetry,
+            known_secret_canaries=known_secret_canaries,
+        )
         self.direct_work_runner = (
             DirectWorkRunner(
                 artifacts=self.artifacts,
@@ -628,6 +637,7 @@ class FoundryController:
                 workspace_root=self.workspace_root / "scheduler-direct",
                 structured_turn_token_limit=config.agent.structured_turn_token_limit,
                 structured_turn_wall_seconds=config.agent.structured_invocation_timeout_seconds,
+                projector=self.scene_projector,
             )
             if self.telemetry is not None
             else None
@@ -4207,6 +4217,8 @@ class FoundryController:
                 repair_scope_id=job.job_id,
                 continuations=NodeContinuationStore(self.work_control.root / "continuations"),
                 continuation_workspace_root=self.config.state_root / "runs",
+                projector=self.scene_projector,
+                run_id=run.run_id,
             )
             bundle = await self.designer.generate(
                 job=job,

@@ -198,6 +198,78 @@ class WorkControlStore:
             raise WorkControlStoreError("WorkGraph head coordinate mismatch")
         return head
 
+    def read_scope_heads(self, scope_id: str) -> tuple[WorkControlHead, ...]:
+        """Return every durable head in one stable scope partition.
+
+        Head filenames are intentionally one-way hashes, so an agent-facing
+        projection must validate the durable JSON records rather than infer a
+        coordinate from a filename.  This method is read-only and does not
+        grant any scheduling authority.
+        """
+
+        if not scope_id:
+            raise WorkControlStoreError("scope id cannot be empty")
+        return tuple(
+            head
+            for head in self._read_all_heads()
+            if head.scope_id == scope_id
+        )
+
+    def latest_scope_id(self) -> str | None:
+        """Return the most recently updated durable scope without scheduling it.
+
+        The read-side observability CLI needs a deterministic ``--latest``
+        selector, but must not infer a scope from cache directory names.  Heads
+        remain the only authority for that choice.
+        """
+
+        heads = self._read_all_heads()
+        if not heads:
+            return None
+        latest = max(
+            heads,
+            key=lambda item: (
+                item.updated_at,
+                item.scope_id,
+                item.coordinate.coordinate_key,
+            ),
+        )
+        return latest.scope_id
+
+    def _read_all_heads(self) -> tuple[WorkControlHead, ...]:
+        directory = self.root / "heads"
+        if directory.is_symlink() or not directory.is_dir():
+            raise WorkControlStoreError("Work control heads must be a real directory")
+        heads: list[WorkControlHead] = []
+        for entry in sorted(directory.iterdir(), key=lambda item: item.name):
+            name = entry.name
+            digest = name.removesuffix(".json")
+            if (
+                not name.endswith(".json")
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                continue
+            flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(entry, flags)
+            except OSError as exc:
+                raise WorkControlStoreError("cannot safely read WorkGraph head") from exc
+            with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                raw = stream.read()
+            try:
+                head = WorkControlHead.model_validate_json(raw)
+            except Exception as exc:
+                raise WorkControlStoreError("invalid WorkGraph head") from exc
+            expected_path = self._head_path(
+                head.scope_id,
+                head.coordinate.coordinate_key,
+            )
+            if expected_path != entry:
+                raise WorkControlStoreError("WorkGraph head path does not match its identity")
+            heads.append(head)
+        return tuple(sorted(heads, key=lambda item: item.coordinate.coordinate_key))
+
     def compare_and_swap(
         self,
         lock: WorkControlLock,

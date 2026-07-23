@@ -1455,6 +1455,7 @@ def build_judge_candidate_graph(
     *,
     public_test_source: str = PUBLIC_TEST_SOURCE,
     project_license: str | None = "MIT",
+    runtime_source: str = SEEDED_RUNTIME_SOURCE,
 ) -> JudgeCandidateGraph:
     """Create real candidate bytes and the typed inputs consumed by EnvironmentJudge.
 
@@ -1467,7 +1468,7 @@ def build_judge_candidate_graph(
         public_test_source=public_test_source,
         project_license=project_license,
     )
-    (workspace / "runtime.py").write_text(SEEDED_RUNTIME_SOURCE, encoding="utf-8")
+    (workspace / "runtime.py").write_text(runtime_source, encoding="utf-8")
     (workspace / "task_materializer.py").write_text(
         SEEDED_TASK_MATERIALIZER_SOURCE,
         encoding="utf-8",

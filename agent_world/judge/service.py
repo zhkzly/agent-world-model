@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
@@ -63,6 +63,11 @@ from agent_world.contracts.supply_chain import (
     PublicTestExecution,
     StaticAssuranceEvidence,
     SupplyChainEvidence,
+)
+from agent_world.observability.subprocess_scene import (
+    RuntimeSubprocessScene,
+    runtime_subprocess_scene,
+    safe_dynamic_text,
 )
 from agent_world.task_materialization import (
     TaskMaterializationError,
@@ -111,6 +116,9 @@ from .task_semantics import (
 )
 from .visibility import actor_projection_schema, component_visible_paths
 
+if TYPE_CHECKING:
+    from agent_world.control.telemetry import TelemetryStore
+
 GateStatus = Literal["pass", "fail", "inconclusive", "error"]
 FindingOwner = Literal[
     "design",
@@ -120,6 +128,13 @@ FindingOwner = Literal[
     "permissions",
     "release_policy",
 ]
+_CONTENT_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _is_content_hash(value: object) -> bool:
+    """Keep telemetry coordinate correlation to an opaque, non-secret key."""
+
+    return isinstance(value, str) and _CONTENT_HASH_PATTERN.fullmatch(value) is not None
 
 _CANONICAL_GATES = (
     "schema",
@@ -265,6 +280,44 @@ def _candidate_failure_summary(exc: BaseException) -> str:
     if coordinates:
         summary += "; " + "; ".join(coordinates)
     return summary
+
+
+def _runtime_protocol_failure_record(
+    exc: BaseException,
+    *,
+    candidate: EnvironmentCandidate,
+    known_secret_canaries: Sequence[str | bytes] = (),
+) -> tuple[dict[str, Any], str]:
+    """Retain only exception-specific, bounded Runtime failure facts."""
+
+    failure_summary = safe_dynamic_text(
+        _candidate_failure_summary(exc),
+        known_secret_canaries=known_secret_canaries,
+    )
+    record: dict[str, Any] = {
+        "status": "fail",
+        "failure_class": type(exc).__name__,
+        "message": failure_summary,
+    }
+    if isinstance(exc, RuntimeProcessCrashed):
+        scene = runtime_subprocess_scene(
+            operation="handshake",
+            exit_code=exc.details.get("exit_code"),
+            stderr=exc.details.get("stderr"),
+            launch_argv=candidate.runtime.argv,
+            known_secret_canaries=known_secret_canaries,
+        )
+        record.update(scene.evidence_fields())
+    elif isinstance(exc, RuntimeRequestTimeout):
+        timeout_seconds = exc.details.get("timeout_seconds")
+        if isinstance(timeout_seconds, (int, float)) and not isinstance(timeout_seconds, bool):
+            record["timeout_seconds"] = timeout_seconds
+    elif isinstance(exc, _RuntimeContractFailure):
+        record["mismatch_paths"] = list(exc.mismatch_paths)
+    elif isinstance(exc, ProtocolViolation):
+        record["protocol_code"] = exc.code
+        record["protocol_details"] = dict(exc.details)
+    return record, failure_summary
 
 
 _PYTHON_EXCEPTION_LINE = re.compile(
@@ -514,14 +567,24 @@ class EnvironmentJudge:
         interactive_challenger: InteractiveChallengerStrategy | None = None,
         clean_builder: CleanCandidateBuilder | None = None,
         runtime_isolation: IsolationPolicy | None = None,
+        telemetry: TelemetryStore | None = None,
+        known_secret_canaries: Sequence[str | bytes] = (),
     ) -> None:
         self.artifacts = artifact_store
         self.interactive_challenger = interactive_challenger
         self.clean_builder = clean_builder or CleanCandidateBuilder()
         self.runtime_isolation = runtime_isolation or IsolationPolicy(purpose="runtime")
+        self.telemetry = telemetry
+        self._known_secret_canaries = tuple(known_secret_canaries)
         if self.runtime_isolation.purpose != "runtime":
             raise ValueError("EnvironmentJudge Runtime isolation must be purpose=runtime")
         self.sandbox_runner = CandidateSandboxRunner(isolation=self.runtime_isolation)
+
+    @property
+    def known_secret_canaries(self) -> tuple[str | bytes, ...]:
+        """Return the process-private canaries for nested Judge construction."""
+
+        return self._known_secret_canaries
 
     @staticmethod
     def required_evaluation_episodes(
@@ -650,6 +713,8 @@ class EnvironmentJudge:
         release_profile: ReleaseProfile,
         budget: Budget,
         run_id: str | None = None,
+        telemetry_trace_id: str | None = None,
+        coordinate_key: str | None = None,
     ) -> IntegrationBundle:
         """Exercise a Build as soon as it exists, independently of Verifier creation.
 
@@ -872,6 +937,8 @@ class EnvironmentJudge:
                     manifest,
                     world_spec,
                     world_spec_ref,
+                    telemetry_trace_id=telemetry_trace_id or integration_id,
+                    coordinate_key=coordinate_key,
                 )
                 self._record_gate(
                     gate_id="runtime_protocol",
@@ -1029,6 +1096,8 @@ class EnvironmentJudge:
         budget: Budget,
         reachability_workspace: Path,
         run_id: str | None = None,
+        telemetry_trace_id: str | None = None,
+        coordinate_key: str | None = None,
     ) -> JudgeBundle:
         self.artifacts.require_exact_json(
             candidate_ref,
@@ -1271,6 +1340,8 @@ class EnvironmentJudge:
                     world_spec_ref,
                     verifier,
                     design,
+                    telemetry_trace_id=telemetry_trace_id or run_id,
+                    coordinate_key=coordinate_key,
                 )
                 episodes += protocol_episodes
                 self._record_gate(
@@ -1781,11 +1852,20 @@ class EnvironmentJudge:
         manifest: CandidateManifest,
         world_spec: WorldSpec,
         world_spec_ref: ArtifactRef,
+        *,
+        telemetry_trace_id: str,
+        coordinate_key: str | None,
     ) -> tuple[GateStatus, ArtifactRef, str]:
         """Verify the exact Runtime surface without consuming a Verifier case."""
 
         try:
-            async with self._supervisor(clean, candidate, manifest) as supervisor:
+            async with self._supervisor(
+                clean,
+                candidate,
+                manifest,
+                run_id=telemetry_trace_id,
+                coordinate_key=coordinate_key,
+            ) as supervisor:
                 response = supervisor.handshake_response
                 if response is None or not response.ok or response.result is None:
                     raise _CandidateTaskFailure("Runtime handshake did not succeed")
@@ -1802,17 +1882,11 @@ class EnvironmentJudge:
             status: GateStatus = "pass"
             summary = "Runtime handshake exactly matches the frozen WorldSpec."
         except (ProtocolViolation, RuntimeProcessCrashed, RuntimeRequestTimeout, ValueError) as exc:
-            failure_summary = _candidate_failure_summary(exc)
-            record = {
-                "status": "fail",
-                "failure_class": type(exc).__name__,
-                "message": failure_summary,
-            }
-            if isinstance(exc, ProtocolViolation):
-                record["protocol_code"] = exc.code
-                record["protocol_details"] = dict(exc.details)
-            if isinstance(exc, _RuntimeContractFailure):
-                record["mismatch_paths"] = list(exc.mismatch_paths)
+            record, failure_summary = _runtime_protocol_failure_record(
+                exc,
+                candidate=candidate,
+                known_secret_canaries=self._known_secret_canaries,
+            )
             status = "fail"
             summary = failure_summary
         evidence_ref = self._evidence(
@@ -1834,10 +1908,19 @@ class EnvironmentJudge:
         world_spec_ref: ArtifactRef,
         verifier: VerifierIR,
         design: EnvironmentDesign,
+        *,
+        telemetry_trace_id: str,
+        coordinate_key: str | None,
     ) -> tuple[GateStatus, ArtifactRef, str, int]:
         episodes = 0
         try:
-            async with self._supervisor(clean, candidate, manifest) as supervisor:
+            async with self._supervisor(
+                clean,
+                candidate,
+                manifest,
+                run_id=telemetry_trace_id,
+                coordinate_key=coordinate_key,
+            ) as supervisor:
                 response = supervisor.handshake_response
                 if response is None or not response.ok or response.result is None:
                     raise _CandidateTaskFailure("Runtime handshake did not succeed")
@@ -1893,17 +1976,11 @@ class EnvironmentJudge:
             status: GateStatus = "pass"
             summary = "Runtime handshake and reproducible unknown-seed lifecycle passed."
         except (ProtocolViolation, RuntimeProcessCrashed, RuntimeRequestTimeout, ValueError) as exc:
-            failure_summary = _candidate_failure_summary(exc)
-            record = {
-                "status": "fail",
-                "failure_class": type(exc).__name__,
-                "message": failure_summary,
-            }
-            if isinstance(exc, ProtocolViolation):
-                record["protocol_code"] = exc.code
-                record["protocol_details"] = dict(exc.details)
-            if isinstance(exc, _RuntimeContractFailure):
-                record["mismatch_paths"] = list(exc.mismatch_paths)
+            record, failure_summary = _runtime_protocol_failure_record(
+                exc,
+                candidate=candidate,
+                known_secret_canaries=self._known_secret_canaries,
+            )
             status = "fail"
             summary = failure_summary
         evidence_ref = self._evidence(
@@ -3240,6 +3317,9 @@ class EnvironmentJudge:
         clean: CleanCandidate,
         candidate: EnvironmentCandidate,
         manifest: CandidateManifest,
+        *,
+        run_id: str | None = None,
+        coordinate_key: str | None = None,
     ) -> RuntimeSupervisor:
         runtime = candidate.runtime
         return RuntimeSupervisor(
@@ -3249,7 +3329,45 @@ class EnvironmentJudge:
             isolation=self.runtime_isolation,
             request_timeout_seconds=runtime.request_timeout_seconds,
             shutdown_grace_seconds=runtime.shutdown_timeout_seconds,
+            on_subprocess_scene=(
+                (
+                    lambda scene: self._record_runtime_subprocess_scene(
+                        run_id,
+                        scene,
+                        coordinate_key=coordinate_key,
+                    )
+                )
+                if run_id is not None
+                else None
+            ),
+            known_secret_canaries=self._known_secret_canaries,
         )
+
+    def _record_runtime_subprocess_scene(
+        self,
+        run_id: str,
+        scene: RuntimeSubprocessScene,
+        *,
+        coordinate_key: str | None = None,
+    ) -> None:
+        """Persist one non-authoritative crash event without affecting Judge flow."""
+
+        if self.telemetry is None:
+            return
+        try:
+            payload = scene.telemetry_payload()
+            if _is_content_hash(coordinate_key):
+                payload["coordinate_key"] = coordinate_key
+            self.telemetry.record_event(
+                trace_id=run_id,
+                event_type="runtime_subprocess_scene",
+                payload=payload,
+            )
+            self.telemetry.flush()
+        except Exception:
+            # Losing a projection is observable only when the caller later reads
+            # the durable Judge evidence; it must never change the WorkAttempt.
+            return
 
     @staticmethod
     def _role_visible_paths(
@@ -3619,7 +3737,10 @@ class EnvironmentJudge:
         return self.artifacts.put_json(
             artifact_id=f"{run_id}:evidence:{safe_label}",
             artifact_type="judge.evaluation_evidence",
-            value=_sanitize_evidence(value),
+            value=_sanitize_evidence(
+                value,
+                known_secret_canaries=self._known_secret_canaries,
+            ),
             dependencies=dependencies,
         )
 
@@ -3981,7 +4102,11 @@ _SENSITIVE_EVIDENCE_KEYS = frozenset(
 )
 
 
-def _sanitize_evidence(value: Any) -> Any:
+def _sanitize_evidence(
+    value: Any,
+    *,
+    known_secret_canaries: Sequence[str | bytes] = (),
+) -> Any:
     if isinstance(value, dict):
         sanitized: dict[str, Any] = {}
         for key, child in value.items():
@@ -3990,10 +4115,18 @@ def _sanitize_evidence(value: Any) -> Any:
                 digest = hashlib.sha256(str(key).encode()).hexdigest()[:12]
                 sanitized[f"redacted_field_{digest}"] = "[redacted]"
             else:
-                sanitized[str(key)] = _sanitize_evidence(child)
+                sanitized[str(key)] = _sanitize_evidence(
+                    child,
+                    known_secret_canaries=known_secret_canaries,
+                )
         return sanitized
     if isinstance(value, (list, tuple)):
-        return [_sanitize_evidence(item) for item in value]
+        return [
+            _sanitize_evidence(item, known_secret_canaries=known_secret_canaries)
+            for item in value
+        ]
+    if isinstance(value, str):
+        return safe_dynamic_text(value, known_secret_canaries=known_secret_canaries)
     return value
 
 

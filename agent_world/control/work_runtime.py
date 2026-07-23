@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.contracts import (
@@ -49,6 +49,9 @@ from .work import (
 )
 from .work_repair import WorkRepairDenied, WorkRepairLedger
 from .work_store import WorkControlHead, WorkControlLock, WorkControlStore
+
+if TYPE_CHECKING:
+    from agent_world.observability.projector import SceneProjector
 
 
 class WorkRuntimeError(RuntimeError):
@@ -120,6 +123,7 @@ class WorkControlRuntime:
         continuations: NodeContinuationStore | None = None,
         continuation_workspace_root: Path | None = None,
         telemetry: TelemetryStore | None = None,
+        projector: SceneProjector | None = None,
         trace_id: str | None = None,
         run_id: str | None = None,
     ) -> None:
@@ -136,6 +140,7 @@ class WorkControlRuntime:
         )
         self.continuations = continuations
         self.telemetry = telemetry
+        self.projector = projector
         self.trace_id = trace_id
         self.run_id = run_id
         if telemetry is not None and trace_id is None:
@@ -2954,8 +2959,18 @@ class WorkControlRuntime:
         error_code: str | None = None,
         output_refs: tuple[ArtifactRef, ...] = (),
     ) -> None:
+        # This cache projection is deliberately independent from Telemetry.
+        # Development and recovery runs with no TelemetryStore still need a
+        # Tier A scene, while a projector failure must never alter a durable
+        # WorkAttempt transition that already completed its head CAS.
+        if self.projector is not None:
+            try:
+                self.projector.project_attempt(attempt=attempt, run_id=self.run_id)
+            except Exception as exc:
+                self._record_projection_runtime_failure(attempt, exc)
         if self.telemetry is None or attempt.telemetry_span_id is None:
             return
+        self._record_attempt_terminal_event(attempt)
         started_at = attempt.started_at or attempt.scheduled_at
         finished_at = attempt.finished_at or datetime.now(UTC)
         self.telemetry.finish_span(
@@ -2974,6 +2989,64 @@ class WorkControlRuntime:
             ),
         )
         self.telemetry.flush()
+
+    def _record_attempt_terminal_event(self, attempt: WorkAttempt) -> None:
+        """Best-effort Tier B replay evidence, never lifecycle authority.
+
+        The WorkAttempt head CAS and immutable terminal Artifact already exist
+        before this method is reached.  Keep only scalar, credential-free
+        facts in telemetry; failures here must not turn a completed attempt
+        into a runtime failure.
+        """
+
+        if self.telemetry is None or attempt.telemetry_trace_id is None:
+            return
+        try:
+            frontier_ordinal: int | None = None
+            if attempt.validation_report_ref is not None:
+                report = self.artifacts.get_json(
+                    attempt.validation_report_ref,
+                    ValidationReport,
+                )
+                if (
+                    report.attempt_id == attempt.attempt_id
+                    and report.coordinate == attempt.coordinate
+                ):
+                    frontier_ordinal = report.frontier_ordinal
+            self.telemetry.record_event(
+                trace_id=attempt.telemetry_trace_id,
+                span_id=attempt.telemetry_span_id,
+                event_type="work.attempt_terminal",
+                payload={
+                    "attempt_id_hash": sha256_digest(attempt.attempt_id.encode("utf-8")),
+                    "coordinate_key": attempt.coordinate.coordinate_key,
+                    "attempt_ordinal": attempt.ordinal,
+                    "attempt_status": attempt.status,
+                    "frontier_ordinal": frontier_ordinal,
+                },
+            )
+            self.telemetry.flush()
+        except Exception:
+            return
+
+    def _record_projection_runtime_failure(self, attempt: WorkAttempt, exc: Exception) -> None:
+        """Record a last-resort projection failure without changing WorkAttempt flow."""
+
+        if self.telemetry is None or attempt.telemetry_trace_id is None:
+            return
+        try:
+            self.telemetry.record_event(
+                trace_id=attempt.telemetry_trace_id,
+                span_id=attempt.telemetry_span_id,
+                event_type="observability_projection_failed",
+                payload={
+                    "error_class": type(exc).__name__,
+                    "coordinate_key": attempt.coordinate.coordinate_key,
+                },
+            )
+            self.telemetry.flush()
+        except Exception:
+            return
 
     @staticmethod
     def _validate_slot_refs(

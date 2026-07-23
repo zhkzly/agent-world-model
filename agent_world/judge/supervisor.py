@@ -32,6 +32,10 @@ from agent_world.judge.protocol import (
     encode_request,
     make_request,
 )
+from agent_world.observability.subprocess_scene import (
+    RuntimeSubprocessScene,
+    runtime_subprocess_scene,
+)
 
 _SANDBOX_TMP = PurePosixPath("/") / "tmp"
 _SANDBOX_HOME = _SANDBOX_TMP / "home"
@@ -1100,6 +1104,8 @@ class RuntimeSupervisor:
         request_timeout_seconds: float = 10.0,
         shutdown_grace_seconds: float = 2.0,
         max_stderr_bytes: int = 256 * 1024,
+        on_subprocess_scene: Callable[[RuntimeSubprocessScene], None] | None = None,
+        known_secret_canaries: Sequence[str | bytes] = (),
     ) -> None:
         self.project_root = Path(project_root).resolve(strict=True)
         self.launch = launch
@@ -1112,6 +1118,8 @@ class RuntimeSupervisor:
         self.request_timeout_seconds = request_timeout_seconds
         self.shutdown_grace_seconds = shutdown_grace_seconds
         self.max_stderr_bytes = max_stderr_bytes
+        self._on_subprocess_scene = on_subprocess_scene
+        self._known_secret_canaries = tuple(known_secret_canaries)
         if request_timeout_seconds <= 0 or shutdown_grace_seconds <= 0 or max_stderr_bytes <= 0:
             raise ValueError("supervisor timeouts and output limits must be positive")
 
@@ -1234,7 +1242,10 @@ class RuntimeSupervisor:
                 async with self._request_lock:
                     if process.returncode is not None:
                         await self._refresh_stderr(wait_for_eof=True)
-                        raise self._crashed_error("runtime exited before request")
+                        raise self._crashed_error(
+                            "runtime exited before request",
+                            operation=request.operation,
+                        )
                     assert process.stdin is not None
                     assert process.stdout is not None
                     process.stdin.write(encode_request(request, limits=self.protocol_limits))
@@ -1253,7 +1264,10 @@ class RuntimeSupervisor:
                     if not raw:
                         await process.wait()
                         await self._refresh_stderr(wait_for_eof=True)
-                        raise self._crashed_error("runtime exited without a response")
+                        raise self._crashed_error(
+                            "runtime exited without a response",
+                            operation=request.operation,
+                        )
                     return decode_response(
                         raw,
                         expected_request=request,
@@ -1274,7 +1288,10 @@ class RuntimeSupervisor:
             raise
         except (BrokenPipeError, ConnectionResetError) as exc:
             await self._refresh_stderr()
-            error = self._crashed_error("runtime communication channel closed")
+            error = self._crashed_error(
+                "runtime communication channel closed",
+                operation=request.operation,
+            )
             await self.terminate()
             raise error from exc
 
@@ -1343,8 +1360,13 @@ class RuntimeSupervisor:
             except asyncio.CancelledError:
                 pass
 
-    def _crashed_error(self, message: str) -> RuntimeProcessCrashed:
-        return RuntimeProcessCrashed(
+    def _crashed_error(
+        self,
+        message: str,
+        *,
+        operation: RuntimeOperation | str | None = None,
+    ) -> RuntimeProcessCrashed:
+        error = RuntimeProcessCrashed(
             "runtime_process_crashed",
             message,
             details={
@@ -1352,6 +1374,26 @@ class RuntimeSupervisor:
                 "stderr": self.stderr,
             },
         )
+        callback = self._on_subprocess_scene
+        if callback is not None:
+            operation_name = (
+                operation.value if isinstance(operation, RuntimeOperation) else operation
+            )
+            try:
+                callback(
+                    runtime_subprocess_scene(
+                        operation=operation_name or "unknown",
+                        exit_code=error.details.get("exit_code"),
+                        stderr=error.details.get("stderr"),
+                        launch_argv=self.launch.argv,
+                        known_secret_canaries=self._known_secret_canaries,
+                    )
+                )
+            except Exception:
+                # Observability is strictly a side effect: Runtime failure routing
+                # must remain correct when its projection cannot be recorded.
+                return error
+        return error
 
 
 @dataclass(frozen=True, slots=True)

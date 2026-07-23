@@ -6,6 +6,9 @@ __pycache__/
 # package registries, and SDK session state. They are audit data, not source.
 .agent-world-live/
 
+# Explicitly opt-in local diagnostics; never stage raw debug transcripts.
+observability/**/_debug/
+
 # Runtime pipeline outputs can include generated projects, traces, SDK state,
 # local logs, and agent workspaces. Keep the committed seed sample visible.
 outputs/*

@@ -18,6 +18,7 @@ from agent_world.app import (
     open_campaigns,
     open_consumption,
     open_direct_runs,
+    open_observability,
     open_registry,
     open_telemetry,
 )
@@ -40,6 +41,7 @@ from agent_world.control import (
     DirectRequestConflictError,
 )
 from agent_world.doctor import run_doctor
+from agent_world.observability import ObservabilityError
 from agent_world.registry import RegistryError
 
 EXIT_OK = 0
@@ -120,6 +122,84 @@ def build_parser() -> argparse.ArgumentParser:
         help="resume a failed Direct Generation from its last verified phase checkpoint",
     )
     run_resume.add_argument("request_id")
+
+    observe = commands.add_parser(
+        "observe",
+        help="read bounded, secret-screened durable WorkAttempt diagnostics",
+    )
+    observe_commands = observe.add_subparsers(dest="observe_command", required=True)
+    observe_scene = observe_commands.add_parser(
+        "scene",
+        help="read the current scope map and rebuild a stale cache from durable facts",
+    )
+    observe_scene.add_argument("scope_id", nargs="?")
+    observe_scene.add_argument("--latest", action="store_true")
+    observe_coordinate = observe_commands.add_parser(
+        "coordinate",
+        help="read one current coordinate terrain view",
+    )
+    observe_coordinate.add_argument("scope_id")
+    observe_coordinate.add_argument("coordinate")
+    observe_subprocess = observe_commands.add_parser(
+        "subprocess",
+        help="read one correlated Runtime subprocess crash scene",
+    )
+    observe_subprocess.add_argument("scope_id")
+    observe_subprocess.add_argument("coordinate")
+    observe_candidate = observe_commands.add_parser(
+        "candidate",
+        help="read the exact generated source file targeted by a failed gate",
+    )
+    observe_candidate.add_argument("scope_id")
+    observe_candidate.add_argument("coordinate")
+    observe_contract = observe_commands.add_parser(
+        "contract",
+        help="read the frozen WorldSpec surface and verifier expectations",
+    )
+    observe_contract.add_argument("scope_id")
+    observe_contract.add_argument("coordinate")
+    observe_rebuild = observe_commands.add_parser(
+        "rebuild",
+        help="force a Tier A scene rebuild from durable heads and Tier B events",
+    )
+    observe_rebuild.add_argument("scope_id", nargs="?")
+    observe_rebuild.add_argument("--latest", action="store_true")
+    observe_frontier_diff = observe_commands.add_parser(
+        "frontier-diff",
+        help="compare two retained unresolved frontiers for one coordinate",
+    )
+    observe_frontier_diff.add_argument("scope_id")
+    observe_frontier_diff.add_argument("coordinate")
+    observe_frontier_diff.add_argument(
+        "--from",
+        dest="from_attempt_ordinal",
+        type=int,
+        metavar="N",
+    )
+    observe_frontier_diff.add_argument(
+        "--to",
+        dest="to_attempt_ordinal",
+        type=int,
+        metavar="N",
+    )
+    observe_compare = observe_commands.add_parser(
+        "compare",
+        help="compare first diverging coordinate status across two scopes",
+    )
+    observe_compare.add_argument(
+        "--scope",
+        dest="scope_ids",
+        action="append",
+        required=True,
+        metavar="SCOPE",
+    )
+    observe_replay = observe_commands.add_parser(
+        "replay",
+        help="reconstruct compact terminal attempt history from Tier B telemetry",
+    )
+    observe_replay.add_argument("scope_id")
+    observe_replay.add_argument("coordinate")
+
     metrics = commands.add_parser(
         "metrics",
         help="inspect or export credential-free operational telemetry",
@@ -346,6 +426,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except LocalConsumerError as exc:
         _write_error(exc.code, str(exc))
         return EXIT_OPERATION_FAILED
+    except ObservabilityError as exc:
+        _write_error(exc.code, str(exc))
+        return EXIT_OPERATION_FAILED
     except Exception as exc:  # fail closed without exposing backend/auth exception text
         _write_error("operation_failed", f"operation failed ({type(exc).__name__})")
         return EXIT_OPERATION_FAILED
@@ -386,6 +469,55 @@ async def _dispatch(args: argparse.Namespace) -> int:
             _write_json(result)
             return EXIT_OK if result.status == "released" else EXIT_NOT_RELEASED
         raise RuntimeError("unreachable run command")
+    if args.command == "observe":
+        reader = open_observability(config)
+        if args.observe_command == "scene":
+            scope_id = _observe_scope_id(args, reader)
+            _write_json(reader.scene_payload(scope_id))
+            return EXIT_OK
+        if args.observe_command == "coordinate":
+            _write_json(reader.coordinate(args.scope_id, args.coordinate))
+            return EXIT_OK
+        if args.observe_command == "subprocess":
+            _write_json(reader.subprocess(args.scope_id, args.coordinate))
+            return EXIT_OK
+        if args.observe_command == "candidate":
+            _write_json(reader.candidate(args.scope_id, args.coordinate))
+            return EXIT_OK
+        if args.observe_command == "contract":
+            _write_json(reader.contract(args.scope_id, args.coordinate))
+            return EXIT_OK
+        if args.observe_command == "rebuild":
+            scope_id = _observe_scope_id(args, reader)
+            _write_json(reader.scene_payload(scope_id, force_rebuild=True))
+            return EXIT_OK
+        if args.observe_command == "frontier-diff":
+            _write_json(
+                reader.frontier_diff(
+                    args.scope_id,
+                    args.coordinate,
+                    from_attempt_ordinal=args.from_attempt_ordinal,
+                    to_attempt_ordinal=args.to_attempt_ordinal,
+                )
+            )
+            return EXIT_OK
+        if args.observe_command == "compare":
+            if len(args.scope_ids) != 2:
+                raise ObservabilityError(
+                    "observe compare requires exactly two --scope values",
+                    code="observability_selector_invalid",
+                )
+            _write_json(
+                reader.compare(
+                    baseline_scope_id=args.scope_ids[0],
+                    candidate_scope_id=args.scope_ids[1],
+                )
+            )
+            return EXIT_OK
+        if args.observe_command == "replay":
+            _write_json(reader.replay(args.scope_id, args.coordinate))
+            return EXIT_OK
+        raise RuntimeError("unreachable observe command")
     if args.command == "metrics":
         telemetry = open_telemetry(config)
         if args.metrics_command == "status":
@@ -610,6 +742,26 @@ def _job_permissions(config: FoundryConfig) -> PermissionScope:
     return PermissionScope(
         network_domains=network_domains,
         credential_handles=handles,
+    )
+
+
+def _observe_scope_id(args: argparse.Namespace, reader: Any) -> str:
+    """Resolve the two explicitly supported scene selectors without guessing."""
+
+    scope_id = getattr(args, "scope_id", None)
+    latest = bool(getattr(args, "latest", False))
+    if latest and scope_id is not None:
+        raise ObservabilityError(
+            "use either one scope id or --latest",
+            code="observability_selector_invalid",
+        )
+    if latest:
+        return reader.latest_scope_id()
+    if isinstance(scope_id, str) and scope_id:
+        return scope_id
+    raise ObservabilityError(
+        "one scope id or --latest is required",
+        code="observability_selector_invalid",
     )
 
 

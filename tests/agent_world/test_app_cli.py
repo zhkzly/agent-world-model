@@ -13,10 +13,11 @@ from typing import Any
 
 import pytest
 from pydantic import HttpUrl
+from v3_fixture import build_judge_candidate_graph
 
 from agent_world.agent_profiles import IsolatedAgentProfileProvider
 from agent_world.app import ApplicationConfigurationError, DirectRunReader, build_application
-from agent_world.artifact_store import ArtifactStoreError, UnsafeArtifactError
+from agent_world.artifact_store import ArtifactStore, ArtifactStoreError, UnsafeArtifactError
 from agent_world.builder import BuilderWorkspaceProgress, EnvironmentBuilder
 from agent_world.cli import (
     _parse_capability_signal,
@@ -38,9 +39,22 @@ from agent_world.control import (
     BudgetLease,
     DurableLeaseBudgetCoordinator,
     JobRunSnapshot,
+    LeaseBudgetLedger,
     NodeAttempt,
+    TelemetryStore,
+    WorkControlRuntime,
     WorkControlStore,
 )
+from agent_world.control.work import (
+    OperationRun,
+    ProposalExecution,
+    ValidationIssue,
+    ValidationReport,
+    WorkAttempt,
+    WorkCoordinate,
+    WorkDefinition,
+)
+from agent_world.control.work_graph import tool_semantics_batch_definition
 from agent_world.controller import FoundryController
 from agent_world.designer import (
     EnvironmentDesigner,
@@ -52,6 +66,11 @@ from agent_world.judge import (
     EnvironmentJudge,
     InteractiveChallengerStrategy,
     VerifierCompiler,
+)
+from agent_world.observability import (
+    ObservabilityRoot,
+    SceneProjector,
+    runtime_subprocess_scene,
 )
 from agent_world.registry import EnvironmentRegistry
 
@@ -78,6 +97,196 @@ def _write_auth_file(path: Path, secret: str, *, mode: int = 0o600) -> None:
         encoding="utf-8",
     )
     path.chmod(mode)
+
+
+def _observe_execution(attempt: WorkAttempt, definition: WorkDefinition) -> ProposalExecution:
+    now = datetime.now(UTC)
+    actual = BudgetUsage(llm_tokens=100, agent_turns=1, monetary_cost=0.1)
+    return ProposalExecution(
+        execution_id=f"execution:observe:{attempt.ordinal}",
+        attempt_id=attempt.attempt_id,
+        executor="agent",
+        operation=definition.proposal_policy.operation,
+        status="completed",
+        invocation_id=f"invocation:observe:{attempt.ordinal}",
+        provider="openai",
+        model="gpt-5.4-mini",
+        profile_digest=sha256_digest(b"observe-profile"),
+        output_schema_digest=sha256_digest(b"observe-schema"),
+        output_commitment=sha256_digest(f"observe:{attempt.ordinal}".encode()),
+        continuation_commitment=sha256_digest(b"observe-continuation"),
+        observed_actual=actual,
+        conservative_committed=actual,
+        started_at=now,
+        finished_at=now + timedelta(milliseconds=10),
+        duration_ms=10,
+    )
+
+
+def _seed_observe_scope(tmp_path: Path, canary: str) -> tuple[str, str, WorkControlStore]:
+    """Create a real typed Candidate/source closure and failed WorkAttempt.
+
+    This fixture exercises the same source tar, BuildRecord, WorkControl CAS,
+    Tier B event and pure projector path that the CLI reads.  It deliberately
+    does not fabricate a production success path.
+    """
+
+    state_root = tmp_path / "state"
+    store = ArtifactStore(state_root / "artifacts", known_secret_canaries=(canary,))
+    fixture_root = tmp_path / "candidate-fixture"
+    fixture_root.mkdir()
+    candidate_graph = build_judge_candidate_graph(fixture_root, store)
+    artifacts = store.issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.",),
+    )
+    heads = WorkControlStore(state_root / "work-control")
+    telemetry = TelemetryStore(state_root / "telemetry")
+    projector = SceneProjector(
+        root=ObservabilityRoot(state_root),
+        artifacts=artifacts,
+        heads=heads,
+        telemetry=telemetry,
+        known_secret_canaries=(canary,),
+    )
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(
+            Budget(
+                llm_tokens=10_000,
+                agent_turns=5,
+                repair_attempts=3,
+                tool_calls=10,
+                process_calls=10,
+                evaluation_episodes=10,
+                wall_seconds=1_000,
+                monetary_cost=5,
+            )
+        ),
+        telemetry=telemetry,
+        projector=projector,
+        trace_id="trace:observe-cli",
+        run_id="run:observe-cli",
+    )
+    scope_id = "job:observe-cli"
+    base = tool_semantics_batch_definition(
+        job_id=scope_id,
+        group_id="group:observe",
+        batch_id="batch:observe",
+        dependency_coordinates=(),
+        agent_wall_seconds=120,
+        agent_token_limit=1_000,
+        agent_monetary_limit=1,
+    )
+    coordinate = WorkCoordinate(
+        scope_id=scope_id,
+        component="integration",
+        stage="runtime_integration",
+        artifact_slot="integration_report",
+    )
+    definition = WorkDefinition.model_validate(
+        base.model_copy(update={"coordinate": coordinate}).model_dump(mode="python")
+    )
+
+    with heads.exclusive(definition.coordinate) as lock:
+        head = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(candidate_graph.design_ref, candidate_graph.candidate_ref),
+            elapsed_wall_seconds=0,
+        )
+        attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+        assert attempt.telemetry_trace_id is not None
+        subprocess_payload = runtime_subprocess_scene(
+            operation="handshake",
+            exit_code=17,
+            stderr="candidate runtime exited before response",
+            launch_argv=(".venv/bin/python", "-m", "runtime"),
+            known_secret_canaries=(canary,),
+        ).telemetry_payload()
+        subprocess_payload["coordinate_key"] = definition.coordinate.coordinate_key
+        telemetry.record_event(
+            trace_id=attempt.telemetry_trace_id,
+            event_type="runtime_subprocess_scene",
+            payload=subprocess_payload,
+        )
+        runtime.schedule_operation(
+            lock,
+            definition=definition,
+            kind="proposal",
+            replay_mode="queryable",
+            elapsed_wall_seconds=0,
+        )
+        head = runtime.start_operation(
+            lock,
+            definition=definition,
+            dispatch_id=f"invocation:observe:{attempt.ordinal}",
+        )
+        operation = artifacts.get_json(head.active_operation_ref, OperationRun)
+        assert operation.started_at is not None
+        execution = _observe_execution(
+            artifacts.get_json(head.attempt_ref, WorkAttempt),
+            definition,
+        ).model_copy(
+            update={
+                "started_at": operation.started_at,
+                "finished_at": operation.started_at + timedelta(milliseconds=10),
+            }
+        )
+        head = runtime.checkpoint_proposal(
+            lock,
+            definition=definition,
+            execution=execution,
+        )
+        current_attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+        report = ValidationReport(
+            report_id="report:observe-cli",
+            attempt_id=current_attempt.attempt_id,
+            coordinate=definition.coordinate,
+            policy_id=definition.validation_policy.policy_id,
+            policy_digest=definition.validation_policy.content_digest(),
+            status="failed",
+            validation_phase=definition.validation_policy.validation_phase,
+            frontier_ordinal=20,
+            issues=(
+                ValidationIssue(
+                    code="integration_gate_runtime_protocol_fail",
+                    path=("integration", "gate", 0),
+                    violated_condition="Runtime handshake crashed before a response.",
+                    expected_category="the frozen Runtime v2 handshake contract",
+                ),
+            ),
+            diagnostic_quality="actionable",
+            evaluated_at=datetime.now(UTC),
+        )
+        runtime.schedule_operation(
+            lock,
+            definition=definition,
+            kind="validation",
+            replay_mode="deterministic",
+            elapsed_wall_seconds=0,
+        )
+        runtime.start_operation(
+            lock,
+            definition=definition,
+            dispatch_id="observe-validation",
+        )
+        head = runtime.checkpoint_validation(
+            lock,
+            definition=definition,
+            report=report,
+            observed_actual=BudgetUsage(),
+        )
+        head = runtime.evaluate(
+            lock,
+            definition=definition,
+            report=report,
+            elapsed_wall_seconds=0,
+        )
+    assert head.status == "repair_authorized"
+    telemetry.close()
+    return scope_id, definition.coordinate.coordinate_key, heads
 
 
 def test_production_app_assembles_real_components_and_secret_canaries(tmp_path: Path) -> None:
@@ -241,6 +450,137 @@ def test_direct_run_cli_exposes_offline_progress_inspection() -> None:
     assert resumed.command == "run"
     assert resumed.run_command == "resume"
     assert resumed.request_id == "request:abc"
+
+
+def test_observe_cli_exposes_phase_four_query_syntax() -> None:
+    parser = build_parser()
+
+    frontier_diff = parser.parse_args(
+        [
+            "observe",
+            "frontier-diff",
+            "job:alpha",
+            "sha256:" + "a" * 64,
+            "--from",
+            "1",
+            "--to",
+            "2",
+        ]
+    )
+    comparison = parser.parse_args(
+        ["observe", "compare", "--scope", "job:alpha", "--scope", "job:beta"]
+    )
+    replay = parser.parse_args(
+        ["observe", "replay", "job:alpha", "sha256:" + "b" * 64]
+    )
+
+    assert frontier_diff.from_attempt_ordinal == 1
+    assert frontier_diff.to_attempt_ordinal == 2
+    assert comparison.scope_ids == ["job:alpha", "job:beta"]
+    assert replay.coordinate == "sha256:" + "b" * 64
+
+
+def test_observe_cli_rebuilds_stale_scene_and_reads_real_candidate_contract(
+    tmp_path: Path,
+) -> None:
+    canary = "observe-cli-model-canary"
+    scope_id, coordinate_key, heads = _seed_observe_scope(tmp_path, canary)
+    config_path = tmp_path / "foundry.toml"
+    config_path.write_text(
+        "\n".join(
+            (
+                'state_root = "state"',
+                "",
+                "[agent]",
+                'model = "configured-real-model"',
+                'api_key_environment = "AGENT_WORLD_OBSERVE_TEST_KEY"',
+                "",
+                "[research]",
+                'provider = "searxng"',
+                'searxng_base_url = "http://127.0.0.1:18080"',
+                "searxng_allow_private_endpoint = true",
+                "use_jina_reader_fallback = false",
+            )
+        ),
+        encoding="utf-8",
+    )
+    environment = {**os.environ, "AGENT_WORLD_OBSERVE_TEST_KEY": canary}
+
+    def observe(*arguments: str) -> dict[str, object]:
+        completed = subprocess.run(  # noqa: S603 - fixed interpreter and local module
+            (
+                sys.executable,
+                "-m",
+                "agent_world.cli",
+                "--config",
+                str(config_path),
+                "observe",
+                *arguments,
+            ),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=environment,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stderr == ""
+        parsed = json.loads(completed.stdout)
+        assert isinstance(parsed, dict)
+        return parsed
+
+    scene = observe("scene", "--latest")
+    assert scene["cache_status"] == "hit"
+    assert scene["stuck_coordinate"] is not None
+
+    candidate = observe("candidate", scope_id, coordinate_key)
+    assert candidate["path"] == "runtime.py"
+    assert "counter" in str(candidate["source"])
+    assert candidate["read_only"] is True
+
+    contract = observe("contract", scope_id, coordinate_key)
+    assert contract["read_only_reference"] is True
+    assert contract["do_not_modify"] == ["world_spec", "gate"]
+    tool_surface = contract["world_spec_tool_surface"]
+    assert isinstance(tool_surface, list)
+    assert tool_surface[0]["tool_id"] == "counter.increment"
+
+    subprocess_scene = observe("subprocess", scope_id, coordinate_key)
+    assert subprocess_scene["subprocess"]["exit_code"] == 17
+    assert "before response" in subprocess_scene["subprocess"]["stderr_tail"]
+
+    replay = observe("replay", scope_id, coordinate_key)
+    assert replay["source"] == "tier_b_telemetry"
+    assert replay["attempts"][0]["status"] == "failed"
+
+    current = heads.read_head(
+        WorkCoordinate(
+            scope_id=scope_id,
+            component="integration",
+            stage="runtime_integration",
+            artifact_slot="integration_report",
+        )
+    )
+    assert current is not None
+    with heads.exclusive(current.coordinate) as lock:
+        heads.compare_and_swap(
+            lock,
+            expected_head=current,
+            next_head=current.model_copy(
+                update={
+                    "revision": current.revision + 1,
+                    "status": "failed",
+                    "repair_action_ref": None,
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
+        )
+
+    rebuilt = observe("scene", scope_id)
+    assert rebuilt["cache_status"] == "rebuilt_after_stale_watermark"
+    assert rebuilt["stale_cache_hint_suppressed"] is True
+    assert rebuilt["next_action_hint"] is None
+    assert rebuilt["overall_status"] == "failed"
 
 
 def test_direct_run_reader_exposes_live_progress_and_budget_without_content() -> None:

@@ -60,6 +60,7 @@ from agent_world.judge import (
     IsolationPolicy,
     VerifierCompiler,
 )
+from agent_world.observability import DebugTranscriptWriter, ObservabilityReader, ObservabilityRoot
 from agent_world.registry import (
     EnvironmentRegistry,
     ReleaseRecord,
@@ -572,6 +573,8 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         ),
         clean_builder=clean_builder,
         runtime_isolation=IsolationPolicy(purpose="runtime"),
+        telemetry=telemetry,
+        known_secret_canaries=canaries,
     )
     controller = FoundryController(
         config=config,
@@ -587,6 +590,7 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         judge=judge,
         registry=registry,
         telemetry=telemetry,
+        known_secret_canaries=canaries,
     )
     return FoundryApplication(
         config=config,
@@ -684,6 +688,57 @@ def open_direct_runs(config: FoundryConfig) -> DirectRunReader:
             commit_batch_size=config.observability.commit_batch_size,
         ),
         WorkControlStore(config.state_root / "work-control"),
+    )
+
+
+def open_observability(config: FoundryConfig) -> ObservabilityReader:
+    """Open the secret-screened, read-side Agent observability plane.
+
+    The reader needs in-memory canaries to re-screen source and Tier B text
+    before displaying it.  It does not construct an InvocationBackend or make
+    an external model call.
+    """
+
+    if ".agent-world-live" in config.state_root.parts:
+        # This is a lexical guard deliberately placed before any filesystem
+        # access.  Live auth state is never an observability input.
+        raise ApplicationConfigurationError(
+            "observability cannot access the reserved live state directory"
+        )
+    environment = _authorized_environment(config, os.environ)
+    canaries = _collect_secret_canaries(config, environment)
+    _prepare_state_root(config.state_root)
+    artifacts = ArtifactStore(
+        config.state_root / "artifacts",
+        known_secret_canaries=canaries,
+    )
+    artifacts.seal_capability_issuance()
+    return ObservabilityReader(
+        root=ObservabilityRoot(config.state_root),
+        artifacts=artifacts,
+        heads=WorkControlStore(config.state_root / "work-control"),
+        telemetry=TelemetryStore(
+            config.state_root / "telemetry",
+            commit_batch_size=config.observability.commit_batch_size,
+        ),
+        known_secret_canaries=canaries,
+        tier_a_keep_last_scopes=config.observability.tier_a_keep_last_scopes,
+    )
+
+
+def open_debug_transcripts(config: FoundryConfig) -> DebugTranscriptWriter:
+    """Open the explicitly opt-in local transcript sink without workflow authority."""
+
+    if ".agent-world-live" in config.state_root.parts:
+        raise ApplicationConfigurationError(
+            "observability cannot access the reserved live state directory"
+        )
+    environment = _authorized_environment(config, os.environ)
+    canaries = _collect_secret_canaries(config, environment)
+    _prepare_state_root(config.state_root)
+    return DebugTranscriptWriter(
+        root=ObservabilityRoot(config.state_root),
+        known_secret_canaries=canaries,
     )
 
 
@@ -894,5 +949,6 @@ __all__ = [
     "open_campaigns",
     "open_consumption",
     "open_direct_runs",
+    "open_observability",
     "open_registry",
 ]

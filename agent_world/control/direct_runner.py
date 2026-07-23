@@ -75,6 +75,7 @@ from .work_store import WorkControlStore, WorkResumeError
 
 if TYPE_CHECKING:
     from agent_world.designer import EnvironmentDesigner
+    from agent_world.observability.projector import SceneProjector
 
 
 class DirectWorkRunnerError(RuntimeError):
@@ -120,6 +121,7 @@ class DirectWorkRunner:
     structured_turn_token_limit: int
     structured_turn_wall_seconds: float
     maximum_concurrency: int = 4
+    projector: SceneProjector | None = None
 
     async def run(
         self,
@@ -196,6 +198,7 @@ class DirectWorkRunner:
             budget=LeaseBudgetLedger(context.budget),
             repair_scope_id=job.job_id,
             telemetry=self.telemetry,
+            projector=self.projector,
             trace_id=trace_id,
             run_id=run_id,
         )
@@ -529,6 +532,8 @@ class DirectWorkRunner:
             artifact_store=self.judge.artifacts,
             clean_builder=self.judge.clean_builder,
             runtime_isolation=self.judge.runtime_isolation,
+            telemetry=self.judge.telemetry,
+            known_secret_canaries=self.judge.known_secret_canaries,
         )
         dossier_compiler = ReleaseDossierCompiler(artifacts=self.artifacts, heads=self.heads)
         executors: dict[str, object] = {}

@@ -187,6 +187,7 @@ class ObservabilityConfig(ConfigModel):
     """Production telemetry policy; secrets and sealed content are never captured."""
 
     commit_batch_size: int = Field(default=32, ge=1, le=4096)
+    tier_a_keep_last_scopes: int = Field(default=64, ge=1, le=4096)
 
 
 def _expansion_campaign_budget() -> Budget:
