@@ -21,3 +21,4 @@ external/research/*/
 
 .tmp-hotel-candidate/
 scripts/_tmp_*
+.agent-world-live-cursor/
