@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from datetime import UTC, datetime
 
 from agent_world.artifact_store import ArtifactWriter
@@ -42,12 +43,22 @@ class WorkRepairLedger:
         self._entries = list(entries)
 
     @classmethod
-    def restore(cls, artifacts: ArtifactWriter) -> WorkRepairLedger:
-        """Restore one terminal-or-active revision per durable ledger entry id."""
+    def restore(cls, artifacts: ArtifactWriter, *, scope_id: str) -> WorkRepairLedger:
+        """Restore one exact WorkGraph scope without parsing unrelated history.
+
+        Old live stores are retained as audit evidence, not a compatibility
+        input to a new Direct job.  Read only the untyped coordinate envelope
+        needed to select this scope, then validate the current typed contract.
+        A malformed entry in the requested scope still fails closed.
+        """
 
         grouped: dict[str, list[WorkRepairLedgerEntry]] = {}
         for ref in artifacts.list_revisions():
             if ref.artifact_type != "control.work_repair_ledger_entry":
+                continue
+            raw = artifacts.get_json(ref)
+            coordinate = raw.get("coordinate") if isinstance(raw, Mapping) else None
+            if not isinstance(coordinate, Mapping) or coordinate.get("scope_id") != scope_id:
                 continue
             grouped.setdefault(ref.artifact_id, []).append(
                 artifacts.get_json(ref, WorkRepairLedgerEntry)
@@ -222,6 +233,7 @@ class WorkRepairLedger:
         history: tuple[ValidationReport, ...] = (),
         observed_actual: BudgetUsage | None = None,
         unknown_upper_bound: BudgetUsage | None = None,
+        force_no_progress: bool = False,
     ) -> WorkRepairLedgerEntry:
         report_before = ValidationReport.model_validate(report_before.model_dump(mode="python"))
         report_after = ValidationReport.model_validate(report_after.model_dump(mode="python"))
@@ -247,6 +259,12 @@ class WorkRepairLedger:
             # Transport recovery is code-observable progress, but it does not
             # consume or manufacture a semantic-correction bonus.
             progress = "strict_progress"
+        if force_no_progress:
+            # A semantic correction that ended in an infrastructure error has
+            # no comparable semantic candidate.  It cannot earn a progress
+            # bonus merely because its original blockers are absent from a
+            # transport report.
+            progress = "unknown"
         outcome = (
             "resolved"
             if progress == "resolved"

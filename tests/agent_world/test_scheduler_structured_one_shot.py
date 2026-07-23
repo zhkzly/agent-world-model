@@ -36,6 +36,7 @@ from agent_world.designer.models import CompactFieldSemanticDraft, StateFieldSou
 from agent_world.designer.one_shot import invoke_structured_once
 from agent_world.designer.validation import StructuredSemanticError, StructuredSemanticIssue
 from agent_world.invocation import (
+    InvocationError,
     InvocationRequest,
     InvocationResult,
     InvocationStatus,
@@ -141,6 +142,25 @@ class _HangingOutputBackend(_MalformedOutputBackend):
         raise AssertionError("the Scheduler timeout must cancel this invocation")
 
 
+class _ProviderRejectedBackend(_MalformedOutputBackend):
+    """Expose a known terminal provider rejection through the normal adapter result."""
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        result = await super().invoke(request)
+        return replace(
+            result,
+            status=InvocationStatus.FAILED,
+            structured_output=None,
+            error=InvocationError(
+                code="turn_failed_provider_rejected",
+                message="safe test-only provider rejection",
+                # A generic worker flag must not override the fixed terminal
+                # compatibility classification at the Scheduler boundary.
+                retryable=True,
+            ),
+        )
+
+
 def _definition():
     return structured_agent_work_definition(
         scope_id="job:one-shot",
@@ -230,6 +250,123 @@ async def test_one_shot_returns_safe_field_feedback_without_component_retry(
     assert failure.observed_actual.llm_tokens == 11
     assert failure.observed_actual.agent_turns == 1
     assert failure.unknown_upper_bound.llm_tokens == 989
+
+
+@pytest.mark.asyncio
+async def test_one_shot_marks_provider_contract_rejection_non_retryable(
+    tmp_path: Path,
+) -> None:
+    """A known provider contract rejection must not authorize a blind re-dispatch."""
+
+    definition = _definition()
+    backend = _ProviderRejectedBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    with pytest.raises(LeafExecutionFailure) as captured:
+        await invoke_structured_once(
+            backend=backend,
+            profiles=profiles,
+            definition=definition,
+            attempt=_attempt(definition),
+            dispatch_id="dispatch:one-shot:provider-rejected",
+            lineage_id="lineage:one-shot:provider-rejected",
+            workspace=tmp_path / "provider-rejected",
+            model=_StrictOneShotOutput,
+            prompt="Produce the requested title object.",
+            permissions=PermissionScope(),
+        )
+
+    failure = captured.value
+    assert len(backend.requests) == 1
+    assert failure.code == "agent_backend_turn_failed_provider_rejected"
+    assert failure.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_one_shot_declares_json_envelope_without_weakening_local_validation(
+    tmp_path: Path,
+) -> None:
+    definition = _definition()
+    backend = _SemanticOutputBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+            structured_output_transport="json_envelope",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    turn = await invoke_structured_once(
+        backend=backend,
+        profiles=profiles,
+        definition=definition,
+        attempt=_attempt(definition),
+        dispatch_id="dispatch:one-shot:json-envelope",
+        lineage_id="lineage:one-shot:json-envelope",
+        workspace=tmp_path / "json-envelope",
+        model=_StrictOneShotOutput,
+        prompt="Produce the requested title object.",
+        permissions=PermissionScope(),
+    )
+
+    assert turn.output.title == "Hotel booking"
+    assert len(backend.requests) == 1
+    assert "Structured-output transport requirement:" in backend.requests[0].prompt
+    assert '"title"' in backend.requests[0].prompt
+
+
+@pytest.mark.asyncio
+async def test_one_shot_can_use_a_compact_envelope_protocol_without_changing_the_model(
+    tmp_path: Path,
+) -> None:
+    """A compact prompt contract changes transport text, never local parsing."""
+
+    definition = _definition()
+    backend = _SemanticOutputBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+            structured_output_transport="json_envelope",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+    protocol = "compact-protocol-test.v1: return one title string field."
+
+    turn = await invoke_structured_once(
+        backend=backend,
+        profiles=profiles,
+        definition=definition,
+        attempt=_attempt(definition),
+        dispatch_id="dispatch:one-shot:compact-envelope",
+        lineage_id="lineage:one-shot:compact-envelope",
+        workspace=tmp_path / "compact-envelope",
+        model=_StrictOneShotOutput,
+        prompt="Produce the requested title object.",
+        permissions=PermissionScope(),
+        json_envelope_protocol=protocol,
+    )
+
+    assert turn.output == _StrictOneShotOutput(title="Hotel booking")
+    assert len(backend.requests) == 1
+    assert protocol in backend.requests[0].prompt
+    assert '"title"' not in backend.requests[0].prompt
 
 
 @pytest.mark.asyncio

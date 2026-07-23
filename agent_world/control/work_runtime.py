@@ -116,6 +116,7 @@ class WorkControlRuntime:
         heads: WorkControlStore,
         budget: LeaseBudgetLedger,
         repairs: WorkRepairLedger | None = None,
+        repair_scope_id: str | None = None,
         continuations: NodeContinuationStore | None = None,
         continuation_workspace_root: Path | None = None,
         telemetry: TelemetryStore | None = None,
@@ -126,7 +127,13 @@ class WorkControlRuntime:
         self.heads = heads
         self.budget = budget
         self.budget_coordinator = DurableLeaseBudgetCoordinator(self.heads.root / "scope-budgets")
-        self.repairs = repairs if repairs is not None else WorkRepairLedger.restore(artifacts)
+        self.repairs = (
+            repairs
+            if repairs is not None
+            else WorkRepairLedger.restore(artifacts, scope_id=repair_scope_id)
+            if repair_scope_id is not None
+            else WorkRepairLedger()
+        )
         self.continuations = continuations
         self.telemetry = telemetry
         self.trace_id = trace_id
@@ -1397,9 +1404,14 @@ class WorkControlRuntime:
         if report.status == "error" and attempt.repair_action_ref is not None:
             action = self.artifacts.get_json(attempt.repair_action_ref, RepairAction)
             if action.decision in {"local_correction", "parent_correction"}:
-                raise WorkRuntimeError(
-                    "infrastructure evidence cannot evaluate semantic repair progress"
-                )
+                # A transport/infrastructure error during an already-authorized
+                # semantic repair cannot establish semantic progress and must
+                # not mint a second, independent infrastructure retry.  It
+                # still has to pass through normal terminal settlement: that
+                # closes the active repair ledger entry and prevents the
+                # WorkHead from being stranded in ``running`` after its
+                # Proposal/Validation operations were both settled.
+                allow_infrastructure_retry = False
         if report.attempt_id != attempt.attempt_id:
             raise WorkRuntimeError("ValidationReport belongs to another WorkAttempt")
         if report.coordinate != definition.coordinate:
@@ -2669,6 +2681,10 @@ class WorkControlRuntime:
             history=tuple(history),
             observed_actual=attempt.observed_actual,
             unknown_upper_bound=attempt.unknown_upper_bound,
+            force_no_progress=(
+                report_after.status == "error"
+                and entry.decision in {"local_correction", "parent_correction"}
+            ),
         )
         prior_refs = self.artifacts.list_revisions(updated.entry_id)
         dependencies: tuple[ArtifactRef, ...] = (

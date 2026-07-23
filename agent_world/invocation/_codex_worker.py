@@ -183,6 +183,55 @@ def _completed_turn_payload(
     return turn
 
 
+def _terminal_turn_failure_code(error: object) -> str:
+    """Return a safe, actionable class for a terminal provider failure.
+
+    Provider error payloads can contain the request, endpoint, or credential
+    hints.  They must not cross the worker boundary verbatim, but collapsing
+    every terminal failure to ``turn_failed`` makes a real production probe
+    impossible to diagnose.  Keep only a small, fixed taxonomy inferred from
+    the provider's declared code/type and message.
+    """
+
+    if not isinstance(error, Mapping):
+        return "turn_failed_provider_rejected"
+    declared_fragments = [
+        value.lower()
+        for key in ("code", "type")
+        if isinstance(value := error.get(key), str)
+    ]
+    message = error.get("message")
+    message_fragment = message.lower() if isinstance(message, str) else ""
+    categories = (
+        ("authentication", ("unauthorized", "forbidden", "authentication", "api key")),
+        ("model_unavailable", ("model_not_found", "model not found", "unsupported model")),
+        ("rate_limited", ("rate_limit", "rate limit", "too many requests")),
+        ("quota_exhausted", ("insufficient_quota", "quota exceeded", "billing")),
+        (
+            "context_window",
+            ("context window", "context length", "maximum context", "too many tokens"),
+        ),
+        (
+            "output_limit",
+            ("output token", "max output", "completion token", "maximum output"),
+        ),
+        (
+            "output_schema",
+            ("response format", "output schema", "json schema", "invalid schema"),
+        ),
+        ("content_filtered", ("content filter", "safety filter", "policy violation")),
+        ("invalid_request", ("invalid_request", "invalid request", "bad request")),
+        ("provider_timeout", ("timeout", "timed out", "deadline exceeded")),
+        ("provider_unavailable", ("internal server", "service unavailable", "server_error")),
+    )
+    for fragments in (declared_fragments, (message_fragment,)):
+        summary = " ".join(fragments)
+        for category, markers in categories:
+            if any(marker in summary for marker in markers):
+                return f"turn_failed_{category}"
+    return "turn_failed_provider_rejected"
+
+
 def _compact_notification_payload(
     method: str,
     event_payload: Mapping[str, Any],
@@ -287,6 +336,9 @@ async def _run(payload: dict[str, Any]) -> None:
         max_events=int(limits.get("max_events", 20_000)),
         max_protocol_bytes=int(limits.get("max_protocol_bytes", 32 * 1024 * 1024)),
     )
+    structured_output_transport = payload.get("structured_output_transport", "provider_schema")
+    if structured_output_transport not in {"provider_schema", "json_envelope"}:
+        raise ValueError("unsupported structured output transport")
 
     authentication_kind = _require_string(payload.get("authentication_kind"), "authentication_kind")
     api_key: str | None = None
@@ -691,7 +743,11 @@ async def _run(payload: dict[str, Any]) -> None:
             _status_result(
                 status="failed" if turn_status == "failed" else "cancelled",
                 started=started,
-                code=f"turn_{turn_status or 'unknown'}",
+                code=(
+                    _terminal_turn_failure_code(error)
+                    if turn_status == "failed"
+                    else f"turn_{turn_status or 'unknown'}"
+                ),
                 message=str(error_message or f"Codex turn ended with {turn_status!r}"),
                 retryable=turn_status == "failed",
                 thread_id=thread_id,
@@ -745,6 +801,7 @@ async def _run(payload: dict[str, Any]) -> None:
             turn_id=turn_id,
             final_text=final_text,
             structured_output=structured_output,
+            structured_output_transport=structured_output_transport,
             usage=usage,
             backend_version=sdk_version,
         )

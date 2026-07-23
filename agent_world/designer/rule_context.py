@@ -7,6 +7,7 @@ frozen execution-context schemas before Builder receives the design.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
 
@@ -158,7 +159,26 @@ class RuleContextCatalog:
         )
 
     def prompt_projection(self) -> dict[str, object]:
-        """Bounded non-secret selector catalog for the semantic Agent prompt."""
+        """Bounded non-secret selector catalog for the semantic Agent prompt.
+
+        A lookup binding is an indivisible selection, but the individual
+        records share their state source, collection, and primary key with
+        many sibling value fields.  Project those shared dimensions once per
+        group instead of repeating them for every binding.  The immutable
+        binding digests are also needlessly large in a provider prompt, so the
+        projection supplies compact deterministic aliases.  This is strictly
+        transport compaction: both maps below resolve back to the complete,
+        framework-owned vocabulary before source materialization.
+        """
+
+        lookup_groups: dict[
+            tuple[str, str, str], list[tuple[str, FrozenRuleLookupBinding]]
+        ] = {}
+        for alias, binding in self.prompt_lookup_bindings().items():
+            lookup_groups.setdefault(
+                (binding.source, binding.collection_pointer, binding.key_field),
+                [],
+            ).append((alias, binding))
 
         return {
             "collections": [
@@ -170,23 +190,115 @@ class RuleContextCatalog:
                 for pointer in sorted(self.collection_fields)
             ],
             "reference_bindings": [
-                item.prompt_projection()
-                for item in sorted(
-                    self.reference_bindings.values(),
-                    key=lambda item: item.binding_id,
-                )
+                {
+                    "binding_id": alias,
+                    "source": binding.source,
+                    "pointer": binding.pointer,
+                    "value_type": binding.value_type,
+                }
+                for alias, binding in self.prompt_reference_bindings().items()
             ],
-            "lookup_bindings": [
-                item.prompt_projection()
-                for item in sorted(self.lookup_bindings.values(), key=lambda item: item.binding_id)
+            "lookup_binding_groups": [
+                {
+                    "source": source,
+                    "collection_pointer": collection_pointer,
+                    "key_field": key_field,
+                    "value_bindings": [
+                        {
+                            "binding_id": alias,
+                            "value_pointer": binding.value_pointer,
+                            "value_type": binding.value_type,
+                        }
+                        for alias, binding in group
+                    ],
+                }
+                for (source, collection_pointer, key_field), group in sorted(lookup_groups.items())
             ],
         }
+
+    def prompt_reference_bindings(self) -> dict[str, FrozenRuleReferenceBinding]:
+        """Return the exact compact prompt aliases for direct references."""
+
+        return _prompt_binding_aliases(self.reference_bindings, prefix="ref")
+
+    def prompt_lookup_bindings(self) -> dict[str, FrozenRuleLookupBinding]:
+        """Return the exact compact prompt aliases for collection lookups."""
+
+        return _prompt_binding_aliases(self.lookup_bindings, prefix="lookup")
+
+    def resolve_reference_binding(self, identifier: str) -> FrozenRuleReferenceBinding | None:
+        """Resolve an immutable id or one prompt-only alias without guessing."""
+
+        return self.reference_bindings.get(identifier) or self.prompt_reference_bindings().get(
+            identifier
+        )
+
+    def resolve_lookup_binding(self, identifier: str) -> FrozenRuleLookupBinding | None:
+        """Resolve an immutable id or one prompt-only alias without guessing."""
+
+        return self.lookup_bindings.get(identifier) or self.prompt_lookup_bindings().get(identifier)
+
+    def restricted_to_state_roots(
+        self,
+        state_root_fields: frozenset[str],
+    ) -> RuleContextCatalog:
+        """Return the exact Rule vocabulary one tool may receive.
+
+        Architecture already declares every tool's read/write entity footprint.
+        A semantic batch must not receive bindings for unrelated state roots:
+        doing so both expands the Agent context quadratically across a batch and
+        permits a local tool to accidentally author rules against state it does
+        not own.  Keep non-state bindings (args, result and observation) whole;
+        filter only ``pre_state`` and ``post_state`` bindings by their first
+        root JSON-pointer token.
+
+        The returned catalog is used for both prompt projection and source
+        materialization, making the disclosure boundary executable rather than
+        merely an instruction to the Agent.
+        """
+
+        allowed_roots = frozenset(state_root_fields)
+
+        def state_binding_allowed(source: str, pointer: str) -> bool:
+            if source not in {"pre_state", "post_state"}:
+                return True
+            root = _first_pointer_token(pointer)
+            return root is not None and root in allowed_roots
+
+        def collection_allowed(pointer: str) -> bool:
+            root = _first_pointer_token(pointer)
+            return root is not None and root in allowed_roots
+
+        return RuleContextCatalog(
+            schemas=self.schemas,
+            collection_keys={
+                pointer: fields
+                for pointer, fields in self.collection_keys.items()
+                if collection_allowed(pointer)
+            },
+            collection_fields={
+                pointer: fields
+                for pointer, fields in self.collection_fields.items()
+                if collection_allowed(pointer)
+            },
+            reference_bindings={
+                binding_id: binding
+                for binding_id, binding in self.reference_bindings.items()
+                if state_binding_allowed(binding.source, binding.pointer)
+            },
+            lookup_bindings={
+                binding_id: binding
+                for binding_id, binding in self.lookup_bindings.items()
+                if collection_allowed(binding.collection_pointer)
+            },
+        )
 
 
 def materialize_tool_semantics_bindings(
     source: ToolSemanticsBatchSourceDraft,
     *,
     skeleton: WorldSkeletonDraft,
+    catalogs_by_tool: Mapping[str, RuleContextCatalog] | None = None,
 ) -> ToolSemanticsBatchSourceDraft:
     """Expand Tool Agent binding choices into the closed executable Rule source.
 
@@ -216,7 +328,26 @@ def materialize_tool_semantics_bindings(
             )
             materialized_tools.append(tool)
             continue
-        catalog = RuleContextCatalog.for_tool(state=skeleton.state, surface=surface)
+        catalog = (
+            catalogs_by_tool.get(tool.tool_id)
+            if catalogs_by_tool is not None
+            else RuleContextCatalog.for_tool(state=skeleton.state, surface=surface)
+        )
+        if catalog is None:
+            issues.append(
+                StructuredSemanticIssue(
+                    code="tool_rule_binding_visibility_missing",
+                    location=("tools", tool_index, "tool_id"),
+                    message="The frozen ToolSurface has no disclosed Rule binding catalog.",
+                    violated_condition=(
+                        "the ToolSemantics source must bind exactly the framework-disclosed "
+                        "Rule vocabulary for its declared state footprint"
+                    ),
+                    expected_category="one tool id with a frozen Rule binding catalog",
+                )
+            )
+            materialized_tools.append(tool)
+            continue
         conditions = tool.conditions.model_copy(
             update={
                 "preconditions": tuple(
@@ -370,7 +501,7 @@ def _materialize_term_bindings(
     if isinstance(term, RuleConstantDraft):
         return term
     if isinstance(term, RuleBoundReferenceDraft):
-        binding = catalog.reference_bindings.get(term.binding_id)
+        binding = catalog.resolve_reference_binding(term.binding_id)
         if binding is None:
             _binding_issue(
                 issues,
@@ -386,7 +517,7 @@ def _materialize_term_bindings(
             value_type=binding.value_type,
         )
     if isinstance(term, RuleBoundLookupByKeyDraft):
-        lookup_binding = catalog.lookup_bindings.get(term.binding_id)
+        lookup_binding = catalog.resolve_lookup_binding(term.binding_id)
         if lookup_binding is None:
             _binding_issue(
                 issues,
@@ -587,21 +718,50 @@ def _binding_id(kind: str, payload: dict[str, object]) -> str:
     return f"binding:{kind}:{digest[:24]}"
 
 
+def _prompt_binding_aliases[TBinding](
+    bindings: Mapping[str, TBinding],
+    *,
+    prefix: str,
+) -> dict[str, TBinding]:
+    """Assign compact deterministic aliases to one frozen binding vocabulary.
+
+    The Agent sees aliases only in a frozen prompt projection and can select
+    only one of them. The source materializer resolves an alias before any
+    executable Rule compiler sees it, so aliases cannot author source,
+    pointers, keys, types, or an unlisted binding.
+    """
+
+    width = max(1, len(str(len(bindings))))
+    return {
+        f"{prefix}-{ordinal:0{width}d}": binding
+        for ordinal, (_original_id, binding) in enumerate(sorted(bindings.items()), start=1)
+    }
+
+
+def _first_pointer_token(pointer: str) -> str | None:
+    """Return the unescaped first token of a non-root JSON pointer."""
+
+    if not pointer.startswith("/"):
+        return None
+    token = pointer.removeprefix("/").split("/", 1)[0]
+    return token.replace("~1", "/").replace("~0", "~")
+
+
 def _join_pointer(parent: str, token: str) -> str:
     return f"{parent}/{_escape_token(token)}" if parent else f"/{_escape_token(token)}"
 
 
 def _reference_binding_expectation(catalog: RuleContextCatalog) -> str:
     return _bounded_expectation(
-        "one frozen reference binding id",
-        tuple(sorted(catalog.reference_bindings)),
+        "one frozen reference binding id or prompt alias",
+        tuple(catalog.prompt_reference_bindings()),
     )
 
 
 def _lookup_binding_expectation(catalog: RuleContextCatalog) -> str:
     return _bounded_expectation(
-        "one frozen lookup binding id",
-        tuple(sorted(catalog.lookup_bindings)),
+        "one frozen lookup binding id or prompt alias",
+        tuple(catalog.prompt_lookup_bindings()),
     )
 
 

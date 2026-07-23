@@ -961,3 +961,205 @@ policy changes. Deterministic one-shot regressions cover both known contracts an
 fallback; focused tests, Ruff and mypy pass. A new real run is required to show that the
 Architecture WorkCommit and any subsequent repair are actually produced. This bad-case fix is not
 a release claim.
+
+## BC-41 — the configured model gateway terminates TLS before the request reaches the model
+
+The first current-head API-key readiness probe with the explicit
+`gpt-5.3-codex-spark` profile passed state-root, credential-handle presence, SDK/runtime version,
+isolation, clean build, and isolated-profile materialization. Its real Codex turn nonetheless
+ended at the provider boundary. The adapter initially collapsed that terminal outcome to a generic
+doctor exception; after a diagnostic-only correction it reported the bounded safe category
+`turn_failed_provider_rejected`. No provider message, endpoint, credential, or raw response was
+recorded.
+
+An independent lower-level control falsified the hypothesis that this was a local Python, curl,
+or general outbound-TLS failure. An HTTP/1.1 model-directory request to the explicitly configured
+base URL terminated during TLS negotiation and returned no HTTP response (`TLS EOF`, status 000).
+A no-credential control request to the public OpenAI API completed TLS and returned its expected
+HTTP 401. Thus the current hard limit is the configured gateway/base URL connection or certificate
+path, before a request can be authenticated or evaluated for model/schema compatibility.
+
+The code correction is deliberately diagnostic only: terminal provider failure is projected to a
+small fixed safe taxonomy rather than exposing raw provider text. It does not retry, change model,
+relax validation, fall back to a different endpoint, or claim that the key/model is invalid. A
+fresh Direct request-to-Registry campaign is blocked until the user supplies or restores a
+TLS-reachable, Codex-compatible API base URL. The existing failed probe is negative evidence and
+must not be resumed as a successful run.
+
+## BC-42 — a provider-compatible outer envelope still failed on a recursive logical Rule schema
+
+Current-head Spark evidence replaced BC-41's transport hypothesis with a narrower, reproducible
+output-contract limitation. The current endpoint passed `doctor --production`, including a real
+tool-free Agent turn and real Search/Fetch/Extract. A first Direct run exposed a historical,
+cross-scope `WorkRepairLedger` parse failure; the ledger is now restored only after exact scope
+filtering, so unreadable foreign legacy rows cannot block the selected job. That repair is
+independent of this provider case.
+
+The next Direct run reached Research, WorldArchitecture and SharedToolSemantics with real tools and
+model calls, but the gateway rejected the nested provider output schema. `json_envelope` was
+introduced as a strict transport compatibility layer: the provider receives only
+`{"artifact_json": string}`; the inner document still passes the unchanged Pydantic model,
+RuleContext materializer and deterministic compiler. A real SharedToolSemantics probe then
+completed and locally validated, proving that the outer-envelope path itself is viable.
+
+Two subsequent full Direct attempts falsified two tempting surface explanations. R3 carried about
+221KB of ToolSemantics prompt before the envelope contract; its repeated full-state Rule catalogs
+were reduced to per-tool declared state footprints, with the restricted catalog also used for
+materialization. The same historical inputs now measure about 68KB before the envelope. R4/R5
+telemetry further showed that a configured one-call backend semaphore serializes provider progress;
+two running telemetry spans may include a queued call and do not prove concurrent provider calls.
+Neither context bloat nor backend concurrency explains the remaining failure.
+
+R5 completed Research, Architecture and SharedToolSemantics, then stopped at both ToolSemantics
+batches after their one authorized repairs. Their actual request sizes were about 70KB and 117KB,
+both below R3. Three real compatibility controls under the exact same Engineer profile then
+discriminated the cause without saving raw provider text: a small logical schema completed, while a
+minimal request containing only the `ToolSemanticsBatch` logical schema failed, and a minimal
+request containing only the recursive `RuleDraft` logical schema also failed. Both failing probes
+returned the safe `turn_failed_provider_rejected` category after provider output began. This is a
+cross-layer contract limitation between the gateway and recursive logical schema delivery, not a
+semantic compiler, retry, E2E research, or release success.
+
+The permitted correction is narrow: retain the shallow provider envelope and every local
+Pydantic/compiler acceptance rule, but replace only the Agent-visible recursive JSON-Schema text
+with a versioned compact Rule/output protocol that is semantically equivalent for the affected
+ToolSemantics, WorldRules and Curriculum boundaries. The framework must reject any inner document
+that fails the existing typed/semantic checks. Forbidden responses are increasing repair ceilings,
+dropping inner validation, treating a probe as a release, switching models/endpoints implicitly,
+or adding a hotel-specific example/fixture path. A fresh Direct-to-Registry run remains required.
+
+## BC-43 — compact text protocol completion is not typed ToolSemantics compatibility
+
+The first two real non-release Spark probes of `rule-output-protocol.v1` reached a completed
+provider turn through the shallow envelope, so they no longer reproduce BC-42's provider-schema
+rejection. Neither probe passed the unchanged inner source model and compiler, so neither is C3
+success or a reason to begin a fresh Direct campaign.
+
+The first probe ended with safe shape-category failures only. One bounded prompt-contract revision
+then made the non-placeholder/nonnull construction requirements explicit. The revised probe still
+ended at the existing local Pydantic boundary with four safe, field-addressed defects: an actor
+array had the wrong shape, a transaction atomicity literal was unsupported, a concurrency
+description was not a string, and no valid Tool batch member survived validation. Both operations
+recorded only safe categories, paths, profile/model identity and usage; no raw model output,
+provider text, endpoint, or credential entered an Artifact or this audit.
+
+This distinguishes a gateway transport failure from a model-output-contract failure. The next step
+is **not** a third prose-only retry, a larger repair allowance, coercion/defaulting of rejected
+fields, or a Direct-to-Registry launch. A further change must first demonstrate a strictly more
+machine-checkable nonrecursive protocol representation, or make an explicit profile decision,
+then run one new bounded probe under a new protocol/profile revision. Existing Pydantic,
+RuleContext materialization, and compiler gates remain unchanged.
+
+## BC-44 — known provider rejection was retried as generic infrastructure
+
+A fresh real Direct request reached real ResearchPlan, Search/Fetch/Extract, EvidenceSynthesis,
+WorldArchitecture and SharedToolSemantics, then reached both physical ToolSemantics batches under
+the live Engineer profile. The batches used the shallow envelope, compact text Rule protocol,
+unchanged Pydantic/compiler gates, the production structured-turn limit, and the explicitly
+selected Engineer reasoning profile. Both stopped at the safe provider-terminal category
+`turn_failed_provider_rejected`; no ToolSemantics artifact, Candidate, Judge result, Package, or
+Registry release exists for this request.
+
+The same run exposed a separate Scheduler bug. `invoke_structured_once` propagated the worker's
+generic `retryable=True` flag for every failed terminal result. The Scheduler therefore spent its
+one infrastructure retry for each provider rejection with unchanged inputs, then correctly ended
+the Direct request as `scheduler_direct_blocked`. That second dispatch did not test a changed
+protocol, profile, budget, endpoint, or semantic correction, so it was exactly the loop this task
+must forbid.
+
+### 1. Root Cause Category
+
+- **B — Cross-Layer Contract:** a shallow output envelope and compact output protocol do not yet
+  establish compatibility for the full frozen ToolSemantics request; the provider still rejects it.
+- **D — Test Coverage Gap:** the one-shot boundary did not test a known terminal safe code against
+  Scheduler retry authority, so a generic backend flag crossed a control-plane boundary.
+
+### 2. Why earlier work was insufficient
+
+1. Replacing the recursive generated output-schema prompt removed one measured rejection mode, but
+   a small/manual compatibility control was not equivalent to the complete frozen batch input.
+2. Raising Engineer reasoning and using the production token cap were valid discriminating changes,
+   but both still ended in the safe provider-terminal category.
+3. The previous retry tests exercised transient/provider-like failures, not a known contract
+   rejection falsely marked retryable by the backend adapter.
+
+### 3. Prevention mechanisms
+
+| Priority | Mechanism | Specific action | Status |
+| --- | --- | --- | --- |
+| P0 | Runtime | Map `turn_failed_provider_rejected` to a non-retryable leaf error before Scheduler evaluation. | Done |
+| P0 | Test | Backend may claim retryable; the one-shot test must still reject a second identical dispatch. | Done |
+| P1 | Integration | A new full-input compatibility revision needs a bounded discriminating probe before another Direct request. | Pending |
+| P1 | Audit | Record only safe terminal category, profile identity, stage and budget facts; never provider text or secrets. | Done |
+
+### 4. Systematic expansion
+
+- Other fixed terminal categories (authentication, invalid request, context/output limits and
+  filtering) need their own explicit retry classifications before they can spend infrastructure
+  budget; this change intentionally covers only observed `provider_rejected` evidence.
+- Full prompt/input closure, not only generated output schema size, is a compatibility boundary.
+  The next hypothesis must measure and reduce a deterministic full-input projection without
+  weakening frozen binding or compiler acceptance.
+
+### 5. Knowledge capture
+
+- The backend code-spec now requires this terminal classification and the exact regression.
+- Scope-aware RepairLedger restoration is covered by the existing restart test after supplying the
+  explicit scope required by the clean-break API.
+- The failed request is terminal audit evidence and must not be resumed or treated as an E2E pass.
+
+## BC-45 — infrastructure error inside semantic repair left a running WorkHead
+
+R7 is a fresh real request after the measured input-projection revision. It committed Research,
+real Search/Fetch/Extract, EvidenceSynthesis, WorldArchitecture and an initial SharedToolSemantics
+proposal. Its authorized semantic correction returned the safe terminal
+`agent_backend_structured_output_transport_invalid`. `evaluate()` rejected the error because a
+semantic RepairAction was active, leaving the WorkHead running and collapsing Direct to generic
+`scheduler_direct_execution_error`; no ToolSemantics, Candidate, Judge, Package or Registry
+artifact exists.
+
+The runtime now terminalizes this case, prevents a second infrastructure retry, and closes the
+active semantic RepairLedger entry as `progress=unknown`, `outcome=no_progress`. The BC-45
+regression proves the head is failed rather than stranded. R7 remains terminal evidence and is
+not resumed.
+
+## BC-46 — shallow envelope decoder rejected an object-valued gateway variant
+
+R7's authorized SharedToolSemantics correction ended at the safe
+`structured_output_transport_invalid` boundary. Raw provider output is intentionally unavailable,
+so that category does not prove which malformed envelope form occurred. It does prove that a
+fresh full campaign without a transport-boundary change would be unjustified.
+
+The next causal compatibility revision is deliberately narrow and testable: the existing decoder
+already accepts a gateway that omits the shallow envelope and returns the logical document
+directly. It now also decodes `{"artifact_json": {...}}`, a compatible gateway variant that
+honours the field name but not the requested string wire type. The resulting document must still
+pass the unchanged JSON-mode Pydantic source model and deterministic compiler; scalar, array and
+malformed-string values remain transport-invalid. This neither exposes the R7 payload nor accepts
+a business artifact merely because transport decoding succeeded.
+
+Focused codec/Scheduler regressions pass. This is a compatibility hypothesis, not proof that R7
+had that exact envelope shape and not a Registry claim. The next fresh real Direct request is the
+only allowed discriminator; R7 remains terminal and is not resumed.
+
+## BC-47 — full ToolSemantics prompt remains provider-incompatible after prior boundaries pass
+
+R8 is a new real request after BC-46. It completed real ResearchPlan, Search/Fetch/Extract,
+EvidenceSynthesis and WorldArchitecture (including bounded repairs), then passed SharedToolSemantics
+after one bounded repair. Both physical ToolSemantics batches nevertheless ended at the safe
+`turn_failed_provider_rejected` category. The Direct controller terminalized as
+`scheduler_direct_blocked`; there is no Candidate, Judge, Package or Registry result. The observed
+non-retry behavior confirms BC-44 rather than bypassing the problem.
+
+The remaining hypothesis is prompt-volume/representation rather than the shallow output envelope:
+each full batch still repeats opaque 42-character immutable binding digests throughout its frozen
+Rule catalog, even after grouping lookup fields. A deterministic prompt projection now exposes
+short aliases such as `ref-01` and `lookup-01`, derived by sorted immutable binding id. At source
+materialization each alias must resolve exactly to its original frozen binding before the unchanged
+Rule compiler runs. Raw pointers, foreign aliases, unknown aliases, and all local business
+validation remain rejected. Tests prove alias round-trip and prove no long binding digest appears
+in the projected catalog.
+
+This is a new causal input revision, not proof that byte reduction alone will satisfy the gateway.
+Run no resume or identical retry; only a fresh real request may test it after the full regression
+gate. R8 remains terminal audit evidence.

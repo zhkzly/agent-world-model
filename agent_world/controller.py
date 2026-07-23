@@ -4204,6 +4204,7 @@ class FoundryController:
                     reserved=work.lease.reserved,
                     scope_id=job.job_id,
                 ),
+                repair_scope_id=job.job_id,
                 continuations=NodeContinuationStore(self.work_control.root / "continuations"),
                 continuation_workspace_root=self.config.state_root / "runs",
             )

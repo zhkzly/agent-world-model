@@ -33,6 +33,7 @@ from agent_world.control.work import ValidationIssue, WorkAttempt, WorkDefinitio
 from agent_world.control.work_scheduler import WorkExecutionContext
 from agent_world.invocation import InvocationBackend
 
+from .compact_rule_protocol import tool_semantics_batch_protocol
 from .final_design_compiler import (
     compile_shared_tool_semantics,
     compile_tool_semantics_batch,
@@ -206,6 +207,11 @@ class ToolSemanticsBatchLeaf:
             )
             tool_ids = _batch_tool_ids(plan, definition)
             contracts = _batch_shared_contracts(context, plan, tool_ids, self.kernel)
+            rule_contexts = _tool_batch_rule_contexts(
+                architecture,
+                skeleton,
+                tool_ids,
+            )
 
             def validate(value: ToolSemanticsBatchSourceDraft) -> None:
                 compile_tool_semantics_batch(
@@ -214,6 +220,7 @@ class ToolSemanticsBatchLeaf:
                     skeleton=skeleton,
                     evidence_graph=evidence,
                     contracts=contracts,
+                    rule_contexts_by_tool=rule_contexts,
                 )
 
             turn = await invoke_structured_once(
@@ -240,6 +247,7 @@ class ToolSemanticsBatchLeaf:
                     tool_ids,
                     contracts,
                     evidence,
+                    rule_contexts,
                 ),
                 permissions=inputs.context.permissions,
                 semantic_validator=validate,
@@ -247,6 +255,11 @@ class ToolSemanticsBatchLeaf:
                     context,
                     definition=definition,
                 ),
+                # A measured compatible gateway rejects the generated recursive
+                # RuleDraft schema when it is copied into the prompt.  This only
+                # replaces that prompt text for json_envelope transport; the
+                # original source model and compiler still accept the result.
+                json_envelope_protocol=tool_semantics_batch_protocol(),
             )
             compiled = compile_tool_semantics_batch(
                 turn.output,
@@ -254,6 +267,7 @@ class ToolSemanticsBatchLeaf:
                 skeleton=skeleton,
                 evidence_graph=evidence,
                 contracts=contracts,
+                rule_contexts_by_tool=rule_contexts,
             )
             dependencies = _input_refs(context)
             source_ref = self.kernel.runtime.artifacts.put_json(
@@ -840,8 +854,11 @@ def _tool_batch_prompt(
     tool_ids: tuple[str, ...],
     contracts: tuple[SharedToolSemanticsContract, ...],
     evidence: EvidenceGraph,
+    rule_contexts: dict[str, RuleContextCatalog],
 ) -> str:
     surfaces = {item.surface.tool_id: item.surface for item in skeleton.tool_surfaces}
+    plans = {item.tool_id: item for item in architecture.tool_inventory.tools}
+    roots = {item.entity: item.root_field for item in architecture.state_entities}
     return _prompt(
         inputs,
         role="one physical tool-behavior batch",
@@ -852,6 +869,8 @@ def _tool_batch_prompt(
             "owned: omit rule_id whenever the output schema permits it; code derives the stable "
             "tool/section/ordinal namespace. For every Rule value use only bound_reference or "
             "bound_lookup_by_key and select its binding_id from this tool's rule_context_catalog. "
+            "Those binding_id values are compact frozen aliases; never invent one or substitute "
+            "a long digest from another context. "
             "Never emit raw source, pointer, value_type, collection_pointer, key_field, or "
             "value_pointer fields: framework code expands the selected binding against the frozen "
             "WorldSpec. A bound lookup's key may be a constant or a bound_reference. This prevents "
@@ -862,22 +881,91 @@ def _tool_batch_prompt(
             "redactions. Every reliability error reference must name an error declared by that "
             "tool, "
             "and shared contracts are mandatory."
+            " The rule_context_catalog for each tool is the complete allowed Rule vocabulary "
+            "for that tool's declared state footprint. lookup_binding_groups factor each lookup "
+            "binding: source, collection_pointer and key_field apply to every value_bindings "
+            "entry in its group, while each entry's binding_id still selects that complete "
+            "frozen lookup. A missing binding or state root is forbidden rather than an "
+            "invitation to infer it."
         ),
         context={
-            "architecture": architecture.model_dump(mode="json"),
-            "world_skeleton": skeleton.model_dump(mode="json"),
+            "world_boundary": {
+                "primary_domain": architecture.boundary.primary_domain,
+                "actors_and_authority": tuple(
+                    item.model_dump(mode="json")
+                    for item in architecture.boundary.actors_and_authority
+                ),
+                "systems_of_record": architecture.boundary.systems_of_record,
+                "transition_authorities": architecture.boundary.transition_authorities,
+                "core_invariants": architecture.boundary.core_invariants,
+            },
+            "target_tools": tuple(
+                {
+                    "tool_id": tool_id,
+                    "description": surfaces[tool_id].description,
+                    "transport": surfaces[tool_id].transport,
+                    "reads_state_entities": plans[tool_id].reads_state_entities,
+                    "writes_state_entities": plans[tool_id].writes_state_entities,
+                    "state_footprint": tuple(
+                        {
+                            "entity": entity_id,
+                            "root_field": roots[entity_id],
+                        }
+                        for entity_id in dict.fromkeys(
+                            (
+                                *plans[tool_id].reads_state_entities,
+                                *plans[tool_id].writes_state_entities,
+                            )
+                        )
+                    ),
+                    "input_schema": surfaces[tool_id].input_schema,
+                    "output_schema": surfaces[tool_id].output_schema,
+                    "observation_schema": surfaces[tool_id].observation_schema,
+                }
+                for tool_id in tool_ids
+            ),
             "target_tool_ids": tool_ids,
             "shared_contracts": tuple(item.model_dump(mode="json") for item in contracts),
             "rule_context_catalogs": {
-                tool_id: RuleContextCatalog.for_tool(
-                    state=skeleton.state,
-                    surface=surfaces[tool_id],
-                ).prompt_projection()
+                tool_id: rule_contexts[tool_id].prompt_projection()
                 for tool_id in tool_ids
             },
             "claims": _claim_catalog(evidence),
         },
     )
+
+
+def _tool_batch_rule_contexts(
+    architecture: WorldArchitectureSourceDraft,
+    skeleton: WorldSkeletonDraft,
+    tool_ids: tuple[str, ...],
+) -> dict[str, RuleContextCatalog]:
+    """Disclose and enforce only each tool's declared state footprint."""
+
+    surfaces = {item.surface.tool_id: item.surface for item in skeleton.tool_surfaces}
+    plans = {item.tool_id: item for item in architecture.tool_inventory.tools}
+    roots = {item.entity: item.root_field for item in architecture.state_entities}
+    contexts: dict[str, RuleContextCatalog] = {}
+    for tool_id in tool_ids:
+        surface = surfaces.get(tool_id)
+        plan = plans.get(tool_id)
+        if surface is None or plan is None:
+            raise LeafExecutionFailure(
+                code="preflight_tool_batch_surface_plan_missing",
+                category="Tool behavior requires one matching frozen surface and plan per tool",
+            )
+        entity_ids = frozenset((*plan.reads_state_entities, *plan.writes_state_entities))
+        missing_entities = entity_ids - roots.keys()
+        if missing_entities:
+            raise LeafExecutionFailure(
+                code="preflight_tool_batch_state_footprint_invalid",
+                category="Tool behavior state footprint must reference frozen state entities",
+            )
+        contexts[tool_id] = RuleContextCatalog.for_tool(
+            state=skeleton.state,
+            surface=surface,
+        ).restricted_to_state_roots(frozenset(roots[entity_id] for entity_id in entity_ids))
+    return contexts
 
 
 def _world_rules_prompt(

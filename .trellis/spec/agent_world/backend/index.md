@@ -220,6 +220,62 @@ architecture output and deterministic compiler work, but must not increase Agent
 Validation diagnostics still use stable field paths and monotonic frontiers; A-to-B progress is
 real progress, while A-to-B-to-A within one RepairTarget family is oscillation and stops locally.
 
+## Control-plane bad-case admission before a structural refactor
+
+### 1. Scope / Trigger
+
+Apply before changing Scheduler, RepairLedger, BudgetLedger, invalidation, release authority,
+semantic proposal representation, or an alleged cross-scope reuse policy because of a live run,
+telemetry observation, or a new design plan.
+
+### 2. Signatures
+
+- ValidationReport(issue.code, issue.path, issue.violated_condition, issue.expected_category)
+- FeedbackEvaluation(subject_ref, validation_policy_digest, terminal_decision)
+- RepairAction -> WorkRepairLedgerEntry -> WorkAttempt
+- WorkCommit(job_ref, request_ref, acceptance_digest, immutable_input_closure)
+
+### 3. Contracts
+
+- Record each claim as confirmed fact, reproducible hypothesis, or unverified plan assertion,
+  together with its exact bad-case/Artifact references.
+- A one-off live trace may authorize observability or a local fail-closed repair only. A
+  Scheduler/Repair/Release redesign needs two independent cases or one case plus a deterministic
+  regression that reproduces the same causal mechanism.
+- Reuse is only for the exact job/request/acceptance closure unless an explicit freshness and
+  adoption policy authorizes another scope. A natural-language need fingerprint is never enough.
+- Issue progress is the code-defined issue/frontier/lineage lattice; raw issue count alone is not
+  a progress metric.
+
+### 4. Validation & Error Matrix
+
+- Missing safe path/condition/category -> framework_diagnostic_incomplete, no Agent repair.
+- Repeated normalized issue state -> no-progress terminal; a recurring ancestor -> oscillation
+  terminal.
+- Ready coordinate without an exact executor -> scheduler_executor_missing, no semantic repair.
+- Reuse with a changed job/request/acceptance closure -> reject adoption before dispatch.
+
+### 5. Good / Base / Bad Cases
+
+- Good: BC-29/31 preserve safe semantic diagnostics and one authorized correction.
+- Base: BC-17 may advance a validation frontier while exposing a different issue set; it is not
+  evidence that issue count must shrink.
+- Bad: BC-39 telemetry looked like an unauthorized retry, but durable artifacts proved it was an
+  observability defect; do not redesign control authority from the projection.
+
+### 6. Tests Required
+
+- The changed boundary has a failing-then-passing deterministic regression and its bad-case IDs.
+- A current-head live acceptance is run only after production preflight; it records profile digest,
+  model, usage provenance and exact Artifact refs without credentials or provider transcripts.
+- Any reuse change proves both exact-closure reuse and fail-closed cross-scope rejection.
+
+### 7. Wrong vs Correct
+
+- Wrong: infer a global typed-hole redesign or cross-campaign cache from one expensive run.
+- Correct: isolate the mechanical contract, prove it with a bounded regression and independent
+  evidence, then preserve the real semantic and fresh-execution gates.
+
 ## Batched tool semantics and WorldRules
 
 ### 1. Scope / Trigger
@@ -1322,8 +1378,10 @@ raise PydanticCustomError(
 - Rule context resolution must dereference only finite local `#` / RFC 6901 references. External,
   missing, or cyclic refs are framework-invalid context and never trigger semantic Agent repair.
 - The Tool Agent may author `bound_reference(binding_id)` or `bound_lookup_by_key(binding_id, key)`.
-  It chooses business relations and existing binding ids; it does not author raw source, RFC 6901
-  pointer, collection pointer, primary-key field, selected item pointer, or value type.
+  It chooses business relations and one frozen binding selector; in a compact provider prompt that
+  selector may be a deterministic opaque alias which materializes to exactly one immutable binding.
+  It does not author raw source, RFC 6901 pointer, collection pointer, primary-key field, selected
+  item pointer, or value type.
 - A lookup binding is indivisible: framework derives collection + source + one primary key + one
   selected item field/value type together. The Agent may provide only a constant or another bound
   reference as the lookup key.
@@ -1332,6 +1390,9 @@ raise PydanticCustomError(
   `RuleLookupByKey`; the bound forms never enter executable artifacts.
 - Any raw or unknown Tool binding is a stable, local, actionable compiler failure. It must not be
   accepted as a compatibility form, silently guessed, or converted into a global retry.
+- A compact alias is a prompt/input projection, never an executable ABI: it must resolve to one
+  member of the exact frozen catalog before Rule compilation. Unknown aliases, aliases from another
+  tool/context, scalar shortcuts and raw bindings fail at the same materialization boundary.
 - Do not apply this rule wholesale to WorldRules/Curriculum: task-local goal semantics are not
   necessarily frozen at ToolSemantics time.
 
@@ -1342,5 +1403,151 @@ raise PydanticCustomError(
   must close.
 - Materialize a bound args reference plus a bound post-state collection lookup and assert the exact
   raw Designer Rule source is framework-derived.
+- Assert prompt aliases are deterministic, omit long immutable binding digests, and each alias
+  reconstructs exactly one original reference or lookup binding; the output compiler must still
+  reject an unknown alias.
 - A raw `/bookings/status` Tool reference must fail with `tool_rule_binding_required` before core
   Rule compilation.
+
+## Recursive structured-output transport compatibility
+
+### 1. Scope / Trigger
+
+- Applies when a real configured provider accepts the shallow `json_envelope` schema but rejects a
+  prompt carrying a recursive logical Pydantic schema, especially `RuleDraft`-bearing output.
+- This is established only by a real profile-matched probe with safe status/token observations;
+  a unit double cannot classify a provider limit.
+
+### 2. Contracts
+
+- Provider request transport may constrain only the shallow `{"artifact_json": string}` schema.
+  Decode either its JSON-string document or a compatibility gateway's object-valued
+  `artifact_json` document, then require the exact same original Pydantic source model, frozen
+  RuleContext materialization and deterministic compiler. Scalars, arrays and malformed JSON are
+  transport-invalid. Do not create a permissive transport success path.
+- A rule-bearing leaf may substitute a versioned compact **Agent-facing protocol** for the generated
+  recursive JSON Schema text only after a real rejection. The protocol describes a strict existing
+  source-model subset; it does not introduce a DSL, raw expression text, raw pointers, unsupported
+  rule variants, fixture data or a special environment branch.
+- The compact protocol must explicitly state every required output root and permitted bound term
+  form. Prompt text never authorizes a retry, changes release policy, or overrides local validation.
+- A small-schema control completion does not prove Design, Builder, Judge or Registry success.
+
+### 3. Tests Required
+
+- Exact-envelope JSON-string and object-valued decode, plus Pydantic/model/compiler acceptance of
+  a compact-protocol-shaped document; scalar/array payloads remain rejected.
+- Rejection of missing roots, raw Tool references/selectors and unsupported compact forms at the
+  same existing local validation boundary.
+- A real profile-matched transport probe that stores only safe result category and measured usage;
+  the subsequent full Direct E2E is still mandatory.
+
+### 4. Validation & Error Matrix
+
+- Provider rejects the outer request before a result -> safe backend terminal such as
+  `turn_failed_provider_rejected`; preserve measured/unknown usage and do not classify a model
+  proposal.
+- Provider completes the shallow envelope but the decoded document raises a typed
+  `schema_*`/semantic compiler issue -> `LeafValidationFailure` with safe code and path. This is
+  a failed compact-protocol probe, not transport success.
+- Provider completes, the unchanged source model parses, frozen bindings materialize, and the
+  deterministic compiler accepts -> compact-protocol probe passes. It is still non-release
+  evidence and does not establish Design, Builder, Judge, Package, or Registry success.
+- Repeated safe shape failures for one compact-protocol revision -> stop that revision before a
+  full Direct request. Any new protocol revision or explicit profile decision requires a new
+  bad-case admission and a bounded probe; never loop by changing only prose or retries.
+
+### 5. Good / Base / Bad Cases
+
+- Good: a real configured Engineer profile returns one compact ToolSemantics document whose exact
+  inner JSON passes `ToolSemanticsBatchSourceDraft`, `RuleContextCatalog` materialization, and
+  `compile_tool_semantics_batch`.
+- Base: a shallow-envelope small-schema control completes. It proves the endpoint can run an
+  InvocationBackend turn, not that a recursive Rule-bearing proposal is compatible.
+- Bad: provider output reaches Pydantic but supplies a scalar where a frozen actor array is
+  required, an unsupported transaction literal, a non-string concurrency description, or no valid
+  tool member. Do not expose the rejected payload, coerce it, retry it as an infrastructure error,
+  or start a full Direct campaign from this result.
+
+### 6. Tests Required
+
+- The one-shot transport test must prove that an explicit compact protocol replaces generated
+  recursive-schema prompt text while the original output model still parses the returned object.
+- A ToolSemantics regression must construct a compact-protocol-shaped JSON document, pass it
+  through JSON-mode Pydantic parsing and the real batch compiler, then prove a raw reference fails
+  as `tool_rule_binding_required` at the existing materializer boundary.
+- A live probe records only safe terminal category, safe issue code/path, profile digest, model,
+  and observed/unknown usage. It must neither persist raw output nor write a releasable Artifact.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: a gateway completed, so skip the typed ToolSemantics boundary.
+if invocation.succeeded:
+    mark_compact_transport_compatible()
+
+# Correct: completion must traverse the existing inner acceptance chain.
+source = ToolSemanticsBatchSourceDraft.model_validate_json(inner_json)
+compile_tool_semantics_batch(source, rule_contexts_by_tool=frozen_catalogs)
+mark_probe_passed_only_after_compilation()
+```
+
+## Terminal provider rejection is not infrastructure retry authority
+
+### 1. Scope / Trigger
+
+- Applies when one real Agent `InvocationResult` is unsuccessful with the safe terminal code
+  `turn_failed_provider_rejected`.
+- A completed provider stream ending in this category is evidence that the active request contract
+  is incompatible. It is not evidence of a transient network interruption.
+
+### 2. Signatures
+
+- `invoke_structured_once(...) -> LeafExecutionFailure` maps the terminal code to
+  `agent_backend_turn_failed_provider_rejected` with `retryable=False`.
+- Existing Scheduler evaluation consumes that flag through `ValidationReport.infrastructure_retryable`;
+  a false value must terminate the WorkHead without a `RepairAction`.
+
+### 3. Contracts
+
+- The failure retains only the safe code, bounded category, real invocation provenance, and
+  observed/unknown budget usage. It never persists provider text, request payload, endpoint, or
+  credentials.
+- A new call requires a causal external change such as a measured input/protocol revision or an
+  explicit profile/endpoint decision. It must use a fresh request or approved new attempt, never a
+  resume of the rejected request.
+- Do not broaden this rule to timeouts, rate limits, or explicit provider-unavailable categories
+  without their own evidence and retry contract.
+
+### 4. Validation & Error Matrix
+
+- `turn_failed_provider_rejected` -> non-retryable terminal error; no infrastructure retry.
+- local Pydantic/compiler failure with safe fields -> normal Scheduler-owned semantic correction
+  only when its existing repair policy authorizes one.
+- timeout/rate-limit/provider-unavailable -> retain their configured infrastructure policy; do not
+  infer their behavior from a compatibility rejection.
+
+### 5. Good / Base / Bad Cases
+
+- Good: a fake backend marks the rejection retryable, but the one-shot boundary still returns a
+  non-retryable failure and the Scheduler cannot redispatch it.
+- Base: a provider timeout remains classified by its own retry policy.
+- Bad: propagate a generic backend `retryable=True` flag for a known provider rejection and spend
+  a second identical ToolSemantics call.
+
+### 6. Tests Required
+
+- Return `InvocationStatus.FAILED` with `turn_failed_provider_rejected` and an intentionally true
+  backend retry flag; assert one-shot emits the safe prefixed code with `retryable is False`.
+- Run Scheduler/Repair recovery tests with an exact `repair_scope_id`; assert scope filtering does
+  not discard an active same-scope RepairLedger entry after a process restart.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: generic worker retryability spends an identical call after a contract rejection.
+retryable = result.error.retryable
+
+# Correct: the fixed terminal taxonomy overrides that generic flag.
+retryable = safe_code not in {"turn_failed_provider_rejected"}
+```

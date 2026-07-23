@@ -67,6 +67,7 @@ from agent_world.contracts import (
 )
 from agent_world.contracts.design import _validate_closed_object_schema
 from agent_world.control.assurance import SemanticNodeCommit
+from agent_world.control.code_revision import leaf_code_revision
 from agent_world.control.continuation_store import NodeContinuationRecord
 from agent_world.control.decision import DesignRevisionMode, StructuredRepairMode
 from agent_world.control.feedback import (
@@ -91,7 +92,6 @@ from agent_world.control.work import (
     WorkCoordinate,
     WorkDefinition,
 )
-from agent_world.control.code_revision import leaf_code_revision
 from agent_world.control.work_graph import (
     research_acquisition_work_definition,
     structured_agent_work_definition,

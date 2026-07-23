@@ -562,3 +562,22 @@ as fallback authority. A deterministic Package-to-Registry closure test now driv
 Scheduler, PackageLeaf, Registry filesystem transaction and final `WorkCommit`; it is evidence
 for the framework closure only. It is not a live hotel end-to-end acceptance, which still needs
 a real provider-backed Request-to-Registry run.
+
+### 16.8 Provider-compatible logical output delivery
+
+`ResolvedAgentProfile.output_schema` remains the authoritative local typed contract. A
+`json_envelope` provider transport constrains only one outer object with an `artifact_json` string;
+the decoded inner object is always parsed by the original Pydantic model and then by the unchanged
+deterministic compiler. It is never an alternate success path.
+
+Some compatible gateways reject a recursive JSON Schema when it is copied verbatim into the model
+prompt, even when they accept the shallow outer schema. For such a measured profile, a Rule-bearing
+leaf must pass a versioned compact output protocol instead of the generated recursive JSON Schema.
+That protocol may describe only a strict, framework-supported subset of the logical Rule ADT and
+must name exact required roots, bounded term forms and forbidden raw bindings. It must not hide a
+field, add a free-form expression language, or change the local Pydantic/compiler ABI.
+
+Each compact protocol needs (1) a deterministic test that a conforming document parses into the
+unchanged source model, (2) a negative test proving malformed/raw/unbound forms still fail at the
+same local boundary, and (3) a real transport probe recording only profile/model digest, safe
+terminal category and token counts. Full E2E remains the only release evidence.

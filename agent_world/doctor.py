@@ -21,6 +21,7 @@ from agent_world.contracts import PermissionScope
 from agent_world.invocation import (
     CodexSdkBackend,
     InvocationRequest,
+    InvocationResult,
     InvocationStatus,
     NodeCapabilityRequirement,
 )
@@ -305,14 +306,13 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                     profile=profile,
                 )
             )
-        if (
-            result.status is not InvocationStatus.COMPLETED
-            or result.structured_output != {"status": "ok"}
-            or result.session is None
-            or result.backend_version is None
-        ):
-            code = result.error.code if result.error is not None else result.status.value
-            raise RuntimeError(f"Codex backend contract failed ({code})")
+        failure_code = _live_agent_failure_code(result)
+        if failure_code is not None:
+            return DoctorCheck(
+                check="live_agent",
+                status="fail",
+                summary=f"real Codex SDK turn failed ({failure_code})",
+            )
         return DoctorCheck(
             check="live_agent",
             status="pass",
@@ -324,6 +324,20 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
             status="fail",
             summary=f"real Codex SDK turn failed ({type(exc).__name__})",
         )
+
+
+def _live_agent_failure_code(result: InvocationResult) -> str | None:
+    """Classify a live probe result without disclosing provider diagnostics."""
+
+    if result.status is not InvocationStatus.COMPLETED:
+        return result.error.code if result.error is not None else result.status.value
+    if result.structured_output != {"status": "ok"}:
+        return "structured_output_mismatch"
+    if result.session is None:
+        return "missing_session"
+    if result.backend_version is None:
+        return "missing_backend_version"
+    return None
 
 
 def _authentication_check(config: FoundryConfig) -> DoctorCheck:

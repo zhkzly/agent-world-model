@@ -194,6 +194,7 @@ class DirectWorkRunner:
             artifacts=self.artifacts,
             heads=self.heads,
             budget=LeaseBudgetLedger(context.budget),
+            repair_scope_id=job.job_id,
             telemetry=self.telemetry,
             trace_id=trace_id,
             run_id=run_id,

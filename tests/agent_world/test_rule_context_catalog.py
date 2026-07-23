@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from agent_world.contracts import (
     Rule,
     RuleClause,
@@ -225,6 +227,63 @@ def test_local_defs_are_resolved_for_catalog_prompt_and_lookup_validation() -> N
     assert issues == ()
 
 
+def test_prompt_projection_uses_compact_aliases_without_losing_frozen_bindings() -> None:
+    """Prompt compaction cannot alter the frozen lookup vocabulary."""
+
+    catalog = _catalog()
+    projection = catalog.prompt_projection()
+    groups = projection["lookup_binding_groups"]
+    assert isinstance(groups, list)
+    assert "lookup_bindings" not in projection
+
+    projected = {
+        (
+            group["source"],
+            group["collection_pointer"],
+            group["key_field"],
+            value["binding_id"],
+            value["value_pointer"],
+            value["value_type"],
+        )
+        for group in groups
+        if isinstance(group, dict)
+        for value in group["value_bindings"]
+        if isinstance(value, dict)
+    }
+    aliases = catalog.prompt_lookup_bindings()
+    frozen = {
+        (
+            binding.source,
+            binding.collection_pointer,
+            binding.key_field,
+            alias,
+            binding.value_pointer,
+            binding.value_type,
+        )
+        for alias, binding in aliases.items()
+    }
+
+    assert projected == frozen
+    assert all(alias.startswith("lookup-") for alias in aliases)
+    assert all(
+        catalog.resolve_lookup_binding(alias) is binding for alias, binding in aliases.items()
+    )
+    reference_aliases = catalog.prompt_reference_bindings()
+    assert all(alias.startswith("ref-") for alias in reference_aliases)
+    assert all(
+        catalog.resolve_reference_binding(alias) is binding
+        for alias, binding in reference_aliases.items()
+    )
+    serialized_projection = json.dumps(projection, sort_keys=True)
+    assert "binding:reference:" not in serialized_projection
+    assert "binding:lookup:" not in serialized_projection
+    legacy = [
+        binding.prompt_projection()
+        for binding in sorted(catalog.lookup_bindings.values(), key=lambda item: item.binding_id)
+    ]
+    assert len(json.dumps(groups, sort_keys=True)) < len(json.dumps(legacy, sort_keys=True))
+
+
 def test_bound_tool_terms_expand_only_from_frozen_local_defs_catalog() -> None:
     catalog = _catalog_with_local_entity_refs()
     args_booking_id = next(
@@ -242,10 +301,20 @@ def test_bound_tool_terms_expand_only_from_frozen_local_defs_catalog() -> None:
             and item.value_pointer == "/status"
         )
     )
+    args_booking_alias = next(
+        alias
+        for alias, binding in catalog.prompt_reference_bindings().items()
+        if binding == args_booking_id
+    )
+    booking_status_alias = next(
+        alias
+        for alias, binding in catalog.prompt_lookup_bindings().items()
+        if binding == booking_status
+    )
     issues: list[StructuredSemanticIssue] = []
 
     direct = _materialize_term_bindings(
-        RuleBoundReferenceDraft(kind="bound_reference", binding_id=args_booking_id.binding_id),
+        RuleBoundReferenceDraft(kind="bound_reference", binding_id=args_booking_alias),
         catalog=catalog,
         issues=issues,
         path=("clauses", 0, "left"),
@@ -253,10 +322,10 @@ def test_bound_tool_terms_expand_only_from_frozen_local_defs_catalog() -> None:
     lookup = _materialize_term_bindings(
         RuleBoundLookupByKeyDraft(
             kind="bound_lookup_by_key",
-            binding_id=booking_status.binding_id,
+            binding_id=booking_status_alias,
             key=RuleBoundReferenceDraft(
                 kind="bound_reference",
-                binding_id=args_booking_id.binding_id,
+                binding_id=args_booking_alias,
             ),
         ),
         catalog=catalog,

@@ -238,6 +238,38 @@ Run each stage with real dependencies and retain exact Artifact refs:
 No stage is skipped because an earlier stage was expensive.  A completed prior Artifact is
 reused by digest; no manual edits are permitted.
 
+### 2026-07-23 BC-42 transport-contract correction
+
+Before another Direct campaign, add one bounded C3 implementation gate:
+
+1. Preserve `json_envelope` outer-schema behavior and all local Pydantic/Rule/compiler checks.
+2. Add a versioned compact Agent-facing protocol for recursive Rule-bearing outputs. It must cover
+   ToolSemantics first and be reusable by WorldRules/Curriculum; it cannot be a hotel fixture,
+   free-form rule language, or a schema-validation bypass.
+3. Prove the compact protocol rejects raw/unbound Tool Rule terms through the existing
+   RuleContextCatalog/materializer and preserves the original typed output model.
+4. Run a real compatibility probe showing the compact ToolSemantics contract completes under the
+   configured profile. Then run a fresh complete Direct request; only Registry release plus the
+   required consumer checks closes E1.
+
+Stop if the compact probe fails, if a conforming compact document cannot parse to the existing
+source model, or if any acceptance is moved from framework code into prompt text. Do not raise
+retries or manually repair failed R5 artifacts.
+
+### 2026-07-23 BC-43 C3 result: compact text is not yet a live compatibility pass
+
+Two bounded non-release probes under the configured Spark Engineer profile completed their
+shallow-envelope provider turns but failed the unchanged inner ToolSemantics Pydantic boundary.
+The second probe retained four safe field paths/categories (actor-array shape, transaction enum,
+concurrency text and batch-member survival); it neither persisted raw output nor changed any
+repair/release authority. Therefore C3 is still blocked and no fresh Direct request may start.
+
+Any next C3 revision needs a causal difference that is stronger than another prose reminder: a
+machine-checkable, nonrecursive strict-subset protocol representation or an explicit profile
+decision. It must retain the exact source model, frozen binding materializer and compiler, add
+failing-then-passing deterministic tests, and use one fresh bounded probe. A third same-profile,
+same-protocol prompt retry is prohibited.
+
 ## Phase 9: canonical and negative live acceptance
 
 1. Start a fresh run from exactly `用户预订宾馆` using configured real search and the explicit
@@ -388,3 +420,76 @@ ProposalExecution + Validation/Evaluation under the existing replay policy. Focu
 14 deterministic one-shot/Scheduler tests pass. This is not a retry relaxation and does not repair
 or replay the failed run; increase an explicit per-run wall policy only when a fresh real request is
 authorized to spend it.
+
+### 2026-07-23 plan calibration and bad-case admission
+
+The new plans under docs/plans were reviewed against the canonical source contract, the current
+Direct/Expand call paths, and BC-01--BC-40. Their calibration lives in
+docs/plans/refactor-plan-calibration.md; the original documents remain preserved as evidence and
+hypotheses rather than being rewritten as history. The material decisions are: (1) a semantic
+hole may be mechanically derived only where its catalog is fully frozen; it cannot pretend that
+WorldRules/Curriculum's still-coupled business semantics are independent, (2) progress uses the
+existing normalized issue/frontier/lineage lattice rather than a raw issue-count decrease, (3) no
+cross-request or cross-campaign reuse is inferred from a need fingerprint, (4) exact-key
+Integration reuse retains an independent fresh deployment, and (5) E1 is a Direct milestone while
+F1 is required before this all-path refactor can be archived. The next real profile is
+gpt-5.3-codex-spark with API key/base URL only through named, isolated environment handles.
+
+### 2026-07-23 live Spark readiness boundary
+
+The real API-key Spark doctor probe is not an E2E acceptance substitute. It passed all local
+execution and isolation checks, then failed at the real provider turn. The worker now preserves a
+fixed safe terminal failure category instead of collapsing that outcome to a generic doctor
+exception; it never stores provider text, endpoint, or credentials. A lower-level HTTP/1.1
+model-directory control to the configured base URL ended at TLS before HTTP, while a no-credential
+public OpenAI TLS control returned HTTP 401. This is retained as BC-41 gateway evidence, not a
+reason to change retries, model, endpoint, or acceptance policy. Do not start a fresh generation
+campaign until a TLS-reachable Codex-compatible base URL is available; do not resume the failed
+probe.
+
+### 2026-07-23 BC-44 Direct result and retry boundary
+
+A fresh real request reached the actual ToolSemantics batches after real Search/Fetch/Extract,
+Architecture and SharedToolSemantics. The full frozen ToolSemantics input still ended at the safe
+provider rejection boundary despite the shallow envelope, compact Rule protocol, production token
+limit and selected Engineer reasoning profile. The request ended `scheduler_direct_blocked`; it
+has no Candidate, Judge, Package or Registry release and must not be resumed.
+
+The run also proved that a known provider contract rejection was incorrectly treated as generic
+infrastructure retry authority. `invoke_structured_once` now marks only the observed
+`turn_failed_provider_rejected` terminal code non-retryable before Scheduler evaluation, so no
+identical second request can be spent under a RepairAction. Focused Scheduler/Repair regressions
+pass, including exact-scope ledger recovery after restart. This does not solve full-input gateway
+compatibility: the next move must be a measured, deterministic input/protocol change with a new
+bounded compatibility proof, not a retry, resume, validation relaxation, or release claim.
+
+### 2026-07-23 BC-45 semantic-repair transport settlement
+
+R7 exposed a control-plane lifecycle defect after real Architecture and SharedToolSemantics: a
+safe transport terminal during an already-authorized semantic repair raised inside `evaluate()`
+and stranded the WorkHead. The runtime now settles that attempt as terminal failure, records the
+semantic ledger outcome as unknown/no-progress, and forbids a second infrastructure retry.
+This changes no acceptance contract and R7 is not resumed.
+
+### 2026-07-23 BC-46 shallow-envelope object compatibility
+
+The safe R7 transport category withholds raw provider output, so it cannot justify a claim about
+the exact failed envelope shape. It does justify testing a bounded decoder asymmetry before any
+fresh full request: direct logical documents were already accepted, but an
+`artifact_json`-wrapped logical object was rejected solely because the compatibility gateway did
+not preserve the requested inner string wire type. The decoder now unwraps only that object form;
+the original Pydantic and compiler chain remain mandatory and scalars/arrays/malformed JSON still
+fail transport validation. This is a fresh compatibility hypothesis with codec and Scheduler
+regressions, not a mock, retry relaxation or live-release result.
+
+### 2026-07-23 BC-47 compact frozen Rule-binding aliases
+
+R8 passed through WorldArchitecture and SharedToolSemantics but both full ToolSemantics batches
+still reached the provider-rejected terminal. It did not make an identical retry: Scheduler
+terminalized the request with no later candidate or release artifact. The next measured
+representation change replaces only long opaque binding digests in the Tool prompt with
+deterministic frozen aliases. Materialization maps an alias back to exactly one original binding
+before the existing Rule compiler; aliases cannot author pointers, state selectors, key fields,
+types, source data or a business rule. Focused regressions prove exact round-trip and digest-free
+prompt projection. This remains a compatibility hypothesis requiring a fresh request after the
+full suite; it is not a release claim.

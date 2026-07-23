@@ -666,6 +666,82 @@ def test_process_recovery_keeps_semantic_baseline_and_charges_repair_once(
         assert sum(item.conservative_committed.repair_attempts for item in snapshot.leases) == 1
 
 
+def test_infrastructure_error_during_semantic_repair_terminalizes_without_retry(
+    tmp_path: Path,
+) -> None:
+    """BC-45: a failed repair transport cannot strand a running WorkHead."""
+
+    artifacts, heads, _budget, runtime, definition, input_ref = _harness(tmp_path)
+    issue = ValidationIssue(
+        code="tool_rule_binding_required",
+        path=("tools", 0, "conditions"),
+        violated_condition="Tool rules must use frozen binding ids.",
+        expected_category="one frozen bound reference or lookup id",
+    )
+    with heads.exclusive(definition.coordinate) as lock:
+        head = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(input_ref,),
+            elapsed_wall_seconds=0,
+        )
+        head = _checkpoint_proposal(
+            runtime,
+            artifacts,
+            lock,
+            definition,
+            head,
+            _execution(_attempt(artifacts, head), 1),
+        )
+        baseline = _failed_report(
+            _attempt(artifacts, head), definition, "semantic-baseline", (issue,)
+        )
+        head = _checkpoint_validation_and_evaluate(
+            runtime, artifacts, lock, definition, head, baseline
+        )
+        assert head.status == "repair_authorized"
+
+        head = runtime.begin_authorized_repair(lock, definition=definition)
+        head = _checkpoint_proposal(
+            runtime,
+            artifacts,
+            lock,
+            definition,
+            head,
+            _execution(_attempt(artifacts, head), 2),
+        )
+        transport_error = ValidationReport(
+            report_id="report:repair-transport-error",
+            attempt_id=_attempt(artifacts, head).attempt_id,
+            coordinate=definition.coordinate,
+            policy_id=definition.validation_policy.policy_id,
+            policy_digest=definition.validation_policy.content_digest(),
+            status="error",
+            validation_phase="tool_semantics",
+            frontier_ordinal=20,
+            issues=(
+                ValidationIssue(
+                    code="agent_backend_structured_output_transport_invalid",
+                    path=("operation",),
+                    violated_condition="The provider transport rejected the proposal envelope.",
+                    expected_category="a configuration change outside this repair",
+                    retryable=True,
+                ),
+            ),
+            diagnostic_quality="actionable",
+            evaluated_at=datetime.now(UTC),
+        )
+        head = _checkpoint_validation_and_evaluate(
+            runtime, artifacts, lock, definition, head, transport_error
+        )
+
+    assert head.status == "failed"
+    assert head.repair_action_ref is None
+    entry = runtime.repairs.entries_for(definition, input_refs=(input_ref,))[0]
+    assert entry.progress == "unknown"
+    assert entry.outcome == "no_progress"
+
+
 def test_work_attempt_telemetry_projects_authorized_repair_and_recovery(
     tmp_path: Path,
 ) -> None:
@@ -786,6 +862,7 @@ def test_repaired_tool_batch_creates_only_exact_resumable_work_commit(tmp_path: 
                 reserved=budget.reserved,
                 scope_id=definition.coordinate.scope_id,
             ),
+            repair_scope_id=definition.coordinate.scope_id,
         )
         head = runtime.begin_authorized_repair(lock, definition=definition)
         output_ref = artifacts.put_json(

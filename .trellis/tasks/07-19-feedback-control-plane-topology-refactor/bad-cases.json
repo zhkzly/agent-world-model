@@ -120,6 +120,30 @@
       "proof": "source",
       "summary": "The new WorkDefinition/ValidationReport/FeedbackEvaluation/RepairAction control vocabulary is tested but explicitly not wired into orchestration; production still uses FeedbackContract plus component-local loops and the legacy RepairLedger.",
       "required_regression": "Every production boundary is instantiated from one executable WorkDefinition and no component loop can retry, jump, invalidate or establish readiness outside its RepairPolicy and FeedbackEvaluation."
+    },
+    {
+      "id": "BC-44",
+      "proof": "live-and-regression",
+      "summary": "A full ToolSemantics provider rejection was classified as generic retryable infrastructure and spent one identical second attempt per physical batch.",
+      "required_regression": "The known safe terminal code turn_failed_provider_rejected must reach Scheduler as non-retryable even if the backend sets a generic retryable flag; a failed Direct request is never resumed as release evidence."
+    },
+    {
+      "id": "BC-45",
+      "proof": "live-and-regression",
+      "summary": "An infrastructure terminal during an authorized semantic repair raised from evaluation and left the WorkHead running instead of reaching a settled failure.",
+      "required_regression": "A semantic-repair transport error terminalizes the head, closes the active repair entry as unknown/no_progress, and cannot mint an infrastructure retry."
+    },
+    {
+      "id": "BC-46",
+      "proof": "safe-live-symptom-and-regression",
+      "summary": "R7 safely reported an invalid shallow transport envelope without retaining raw output; the exact form is unknown, so object-valued artifact_json decoding is a bounded compatibility hypothesis rather than a diagnosis.",
+      "required_regression": "A JSON-string or object-valued artifact_json decodes only into the unchanged local Pydantic/compiler acceptance chain; scalar, array and malformed JSON values remain transport-invalid, and a fresh request is required to assess the hypothesis."
+    },
+    {
+      "id": "BC-47",
+      "proof": "live-and-regression",
+      "summary": "R8 passed Architecture and SharedToolSemantics but both complete ToolSemantics batches still received safe provider rejection; no identical retry, candidate, judge, package, or release followed.",
+      "required_regression": "Compact prompt aliases must deterministically resolve to exactly one frozen original Rule binding before the unchanged materializer/compiler; unknown or foreign aliases and raw pointers remain rejected, and only a fresh request may assess the reduced representation."
     }
   ]
 }

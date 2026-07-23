@@ -13,7 +13,7 @@ import os
 import signal
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -495,10 +495,14 @@ class CodexSdkBackend:
             "developer_instructions": profile.developer_instructions,
             "sandbox": profile.sandbox.value,
             "output_schema": (
-                _provider_output_schema(output_schema)
+                _transport_output_schema(
+                    output_schema,
+                    transport=profile.structured_output_transport,
+                )
                 if output_schema is not None
                 else None
             ),
+            "structured_output_transport": profile.structured_output_transport,
             "thread_id": request.session.thread_id if request.session else None,
             "authentication_kind": profile.authentication_kind,
             "authentication_environment": profile.authentication_environment,
@@ -517,6 +521,22 @@ class CodexSdkBackend:
                 "max_protocol_bytes": limits.max_protocol_bytes,
             },
         }
+
+
+def _transport_output_schema(schema: JsonObject, *, transport: str) -> JsonObject:
+    if transport == "provider_schema":
+        return _provider_output_schema(schema)
+    if transport == "json_envelope":
+        # The inner source contract travels in the prompt and remains subject
+        # to local Pydantic/compiler validation. This outer contract exists
+        # only for OpenAI-compatible gateways that reject nested schemas.
+        return {
+            "type": "object",
+            "properties": {"artifact_json": {"type": "string"}},
+            "required": ["artifact_json"],
+            "additionalProperties": False,
+        }
+    raise ValueError("unsupported structured output transport")
 
 
 def _provider_output_schema(schema: JsonObject) -> JsonObject:
@@ -742,6 +762,32 @@ def _decode_provider_json_ir(value: JsonValue) -> JsonValue:
     if keys == {"aw_object_entries"}:
         return _decode_provider_json_entries(value["aw_object_entries"])
     return {key: _decode_provider_json_ir(item) for key, item in value.items()}
+
+
+def _decode_json_envelope(value: JsonValue) -> JsonValue:
+    """Decode a shallow envelope, or preserve a gateway's direct JSON object.
+
+    A compatibility gateway can ignore a requested output schema and return the
+    logical document directly. That document still receives the exact same
+    local Pydantic validation; accepting it avoids reclassifying a usable typed
+    proposal as a transport failure.  Some compatible gateways enforce the
+    outer object name but not its string-valued field and return the logical
+    JSON object directly under ``artifact_json``.  That is still only an
+    encoding variation: it is passed through the same exact local Pydantic and
+    deterministic compiler checks as a decoded string.  Scalars and arrays
+    remain invalid, so this never accepts an abbreviated or untyped candidate.
+    """
+
+    if not isinstance(value, Mapping) or set(value) != {"artifact_json"}:
+        return value
+    encoded = value["artifact_json"]
+    if isinstance(encoded, Mapping):
+        return json_compatible(encoded)
+    if not isinstance(encoded, str):
+        raise ValueError(
+            "structured output envelope artifact_json must be a JSON string or object"
+        )
+    return json_compatible(json.loads(encoded, parse_constant=_reject_json_constant))
 
 
 def _decode_provider_json_entries(value: JsonValue) -> JsonObject:
@@ -988,7 +1034,24 @@ def _result_from_worker(
     structured_output: JsonValue | None = None
     if raw.get("structured_output") is not None:
         provider_output = json_compatible(redactor.value(raw["structured_output"]))
-        structured_output = _decode_provider_json_ir(provider_output)
+        transport = raw.get("structured_output_transport", "provider_schema")
+        try:
+            if transport == "provider_schema":
+                structured_output = _decode_provider_json_ir(provider_output)
+            elif transport == "json_envelope":
+                structured_output = _decode_json_envelope(provider_output)
+            else:
+                raise ValueError("worker returned an unsupported structured output transport")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return _local_failure(
+                request,
+                status=InvocationStatus.FAILED,
+                code="structured_output_transport_invalid",
+                message="worker returned an invalid structured output transport envelope",
+                started=started,
+                events=events,
+                worker_exit_code=worker_exit_code,
+            )
 
     duration_ms = max(0, int((time.monotonic() - started) * 1000))
     return InvocationResult(

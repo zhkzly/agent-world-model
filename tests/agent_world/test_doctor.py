@@ -16,7 +16,8 @@ from agent_world.config import (
     JudgeConfig,
     ResearchConfig,
 )
-from agent_world.doctor import DoctorCheck, run_doctor
+from agent_world.doctor import DoctorCheck, _live_agent_failure_code, run_doctor
+from agent_world.invocation import InvocationError, InvocationResult, InvocationStatus
 from agent_world.judge import IsolationPolicy, IsolationUnavailable
 
 
@@ -137,6 +138,27 @@ def test_judge_config_rejects_removed_online_build_policy() -> None:
                 "allow_build_network": True,
             }
         )
+
+
+def test_live_agent_probe_retains_only_safe_backend_failure_code() -> None:
+    result = InvocationResult(
+        invocation_id="doctor-live-agent-round-trip",
+        status=InvocationStatus.FAILED,
+        session=None,
+        turn_id=None,
+        final_text=None,
+        structured_output=None,
+        usage=None,
+        events=(),
+        error=InvocationError(
+            code="provider_invalid_request",
+            message="raw provider text must not reach doctor output",
+        ),
+        duration_ms=1,
+        backend_version="test-backend",
+    )
+
+    assert _live_agent_failure_code(result) == "provider_invalid_request"
 
 
 def test_doctor_cli_reports_offline_cache_blocker_as_structured_failure(

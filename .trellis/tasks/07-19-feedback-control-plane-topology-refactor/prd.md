@@ -196,8 +196,10 @@ their replacement regressions pass.
 
 - Python commands and lock/install/test operations use `uv`.
 - Production Agent calls use the real InvocationBackend/Codex adapter and the exact explicit
-  configured model; current live preference is `grok-4.5`, with `gpt-5.4-mini` only as an
-  explicit quota/availability fallback. No scattered SDK calls or ambient provider selection.
+  configured model. Current live acceptance uses gpt-5.3-codex-spark through an API-key profile
+  with a credential-free explicitly materialized base URL; its key and URL are injected only from
+  approved environment handles. A different model requires an explicit recorded availability
+  decision. No scattered SDK calls or ambient provider selection is permitted.
 - A failure in telemetry persistence cannot silently publish an unauditable package.
 - Recovery after process interruption is idempotent from durable WorkCommit and ledger state.
 - No test may claim product E2E success through a fake invocation backend, mock environment,
@@ -225,8 +227,8 @@ their replacement regressions pass.
 - [ ] A real staged run exercises Designer, Builder, Integration, Runtime Reset/Step,
       materializer, Release Judge, packaging and Registry separately.
 - [ ] A fresh real request `用户预订宾馆` completes Research through Registry using actual
-      search, the explicit configured profile (`grok-4.5` preferred; `gpt-5.4-mini` only as a
-      documented quota/availability fallback), real subprocesses, no mocks and no manual Artifact edits.
+      search, the explicit gpt-5.3-codex-spark API-key profile, real subprocesses, no mocks and
+      no manual Artifact edits.
 - [ ] A separate real negative run proves actionable feedback and bounded local rework.
 - [ ] The final report includes time/token/search/tool/rework/reuse/invalidation distributions
       and explicitly unknown dimensions.

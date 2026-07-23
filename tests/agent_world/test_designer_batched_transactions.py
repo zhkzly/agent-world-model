@@ -1,20 +1,41 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from pydantic import BaseModel
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
+from pydantic import BaseModel, JsonValue
+from v3_fixture import portable_counter_contracts
 
-from agent_world.contracts import ArtifactRef, EvidenceGraph, IdempotencySemantics
+from agent_world.artifact_store import ArtifactStore
+from agent_world.contracts import (
+    ArtifactRef,
+    EvidenceGraph,
+    IdempotencySemantics,
+    StateEntitySchema,
+    StateSchema,
+    ToolSurface,
+)
 from agent_world.control.feedback import RepairTargetRef
 from agent_world.control.validation import (
     SafeValidationIssue,
     StructuredValidationError,
     ValidationDiagnostic,
 )
-from agent_world.designer.final_design_leaves import _shared_prompt
+from agent_world.designer.compact_rule_protocol import (
+    COMPACT_RULE_PROTOCOL_VERSION,
+    tool_semantics_batch_protocol,
+    tool_semantics_batch_protocol_schema,
+)
+from agent_world.designer.final_design_compiler import compile_tool_semantics_batch
+from agent_world.designer.final_design_leaves import (
+    _shared_prompt,
+    _tool_batch_prompt,
+    _tool_batch_rule_contexts,
+)
 from agent_world.designer.models import (
     CompactFieldSemanticDraft,
     PermissionRuleSourceDraft,
@@ -35,6 +56,7 @@ from agent_world.designer.models import (
     ToolSemanticsBatchSourceDraft,
     ToolSemanticSourceDraft,
     ToolStateTransitionSourceDraft,
+    ToolSurfaceDraft,
     ToolSurfacePlan,
     ToolSurfaceSourceDraft,
     WorldArchitectureSourceDraft,
@@ -42,6 +64,7 @@ from agent_world.designer.models import (
     WorldToolPlanInventoryDraft,
     WorldToolSourceInventoryDraft,
 )
+from agent_world.designer.rule_context import RuleContextCatalog
 from agent_world.designer.service import (
     DesignerError,
     EnvironmentDesigner,
@@ -275,6 +298,455 @@ def test_shared_tool_prompt_requires_a_complete_frozen_tool_partition() -> None:
     assert "one domain containing the complete frozen list" in prompt
     assert "collectively cover every frozen tool ID" in prompt
     assert all(tool_id in prompt for tool_id in tool_ids)
+
+
+def test_tool_batch_prompt_discloses_only_the_target_tool_state_footprint() -> None:
+    """BC-42: a batch cannot repeat unrelated world state for every tool."""
+
+    booking_schema: dict[str, JsonValue] = {
+        "type": "object",
+        "properties": {"booking_id": {"type": "string"}, "status": {"type": "string"}},
+        "required": ["booking_id", "status"],
+        "additionalProperties": False,
+    }
+    private_schema: dict[str, JsonValue] = {
+        "type": "object",
+        "properties": {"secret_id": {"type": "string"}},
+        "required": ["secret_id"],
+        "additionalProperties": False,
+    }
+    state = StateSchema(
+        entities=(
+            StateEntitySchema(
+                entity="booking",
+                json_schema=booking_schema,
+                primary_key_fields=("booking_id",),
+            ),
+            StateEntitySchema(
+                entity="private_record",
+                json_schema=private_schema,
+                primary_key_fields=("secret_id",),
+            ),
+        ),
+        root_state_schema={
+            "$defs": {"booking": booking_schema, "private_record": private_schema},
+            "type": "object",
+            "properties": {
+                "bookings": {"type": "array", "items": {"$ref": "#/$defs/booking"}},
+                "private_records": {
+                    "type": "array",
+                    "items": {"$ref": "#/$defs/private_record"},
+                },
+            },
+            "required": ["bookings", "private_records"],
+            "additionalProperties": False,
+        },
+    )
+    target_surface = ToolSurface(
+        tool_id="hotel.booking.get",
+        namespace="hotel.booking",
+        name="get",
+        description="Get one hotel booking.",
+        transport="runtime",
+        input_schema={
+            "type": "object",
+            "properties": {"booking_id": {"type": "string"}},
+            "required": ["booking_id"],
+            "additionalProperties": False,
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+            "additionalProperties": False,
+        },
+        observation_schema={
+            "type": "object",
+            "properties": {"status": {"type": "string"}},
+            "required": ["status"],
+            "additionalProperties": False,
+        },
+    )
+    unrelated_surface = target_surface.model_copy(
+        update={
+            "tool_id": "hotel.private.list",
+            "namespace": "hotel.private",
+            "name": "list",
+            "description": "List private records.",
+        }
+    )
+    architecture = SimpleNamespace(
+        boundary=SimpleNamespace(
+            primary_domain="hotel",
+            actors_and_authority=(
+                SimpleNamespace(model_dump=lambda **_kwargs: {"actor": "guest"}),
+            ),
+            systems_of_record=("hotel_system",),
+            transition_authorities=("hotel",),
+            core_invariants=("Bookings remain attributable.",),
+        ),
+        state_entities=(
+            SimpleNamespace(entity="booking", root_field="bookings"),
+            SimpleNamespace(entity="private_record", root_field="private_records"),
+        ),
+        tool_inventory=SimpleNamespace(
+            tools=(
+                SimpleNamespace(
+                    tool_id="hotel.booking.get",
+                    reads_state_entities=("booking",),
+                    writes_state_entities=(),
+                ),
+                SimpleNamespace(
+                    tool_id="hotel.private.list",
+                    reads_state_entities=("private_record",),
+                    writes_state_entities=(),
+                ),
+            )
+        ),
+    )
+    skeleton = SimpleNamespace(
+        state=state,
+        tool_surfaces=(
+            SimpleNamespace(surface=target_surface),
+            SimpleNamespace(surface=unrelated_surface),
+        ),
+    )
+    tool_ids = ("hotel.booking.get",)
+    contexts = _tool_batch_rule_contexts(cast(Any, architecture), cast(Any, skeleton), tool_ids)
+    prompt = _tool_batch_prompt(
+        cast(Any, SimpleNamespace(request=SimpleNamespace(need="retrieve a booking"))),
+        cast(Any, architecture),
+        cast(Any, skeleton),
+        tool_ids,
+        (),
+        EvidenceGraph(graph_id="evidence:hotel", revision=1),
+        contexts,
+    )
+    frozen = json.loads(prompt.split("Frozen context:\n", maxsplit=1)[1])
+
+    assert "architecture" not in frozen
+    assert "world_skeleton" not in frozen
+    assert [item["tool_id"] for item in frozen["target_tools"]] == ["hotel.booking.get"]
+    assert "private_records" not in prompt
+    catalog = frozen["rule_context_catalogs"]["hotel.booking.get"]
+    assert catalog["collections"] == [
+        {
+            "collection_pointer": "/bookings",
+            "primary_key_fields": ["booking_id"],
+            "item_fields": ["booking_id", "status"],
+        }
+    ]
+    assert all(
+        item["source"] not in {"pre_state", "post_state"}
+        or item["pointer"].startswith("/bookings")
+        for item in catalog["reference_bindings"]
+    )
+
+
+def test_restricted_rule_catalog_keeps_tool_io_but_removes_unowned_state_bindings() -> None:
+    state = StateSchema(
+        entities=(
+            StateEntitySchema(
+                entity="booking",
+                json_schema={
+                    "type": "object",
+                    "properties": {"booking_id": {"type": "string"}},
+                    "required": ["booking_id"],
+                    "additionalProperties": False,
+                },
+                primary_key_fields=("booking_id",),
+            ),
+            StateEntitySchema(
+                entity="private_record",
+                json_schema={
+                    "type": "object",
+                    "properties": {"secret_id": {"type": "string"}},
+                    "required": ["secret_id"],
+                    "additionalProperties": False,
+                },
+                primary_key_fields=("secret_id",),
+            ),
+        ),
+        root_state_schema={
+            "type": "object",
+            "properties": {
+                "bookings": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"booking_id": {"type": "string"}},
+                    },
+                },
+                "private_records": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"secret_id": {"type": "string"}},
+                    },
+                },
+            },
+            "required": ["bookings", "private_records"],
+            "additionalProperties": False,
+        },
+    )
+    surface = ToolSurface(
+        tool_id="hotel.booking.get",
+        namespace="hotel.booking",
+        name="get",
+        description="Get one booking.",
+        transport="runtime",
+        input_schema={"type": "object", "properties": {"booking_id": {"type": "string"}}},
+        output_schema={"type": "object", "properties": {"status": {"type": "string"}}},
+        observation_schema={"type": "object", "properties": {"status": {"type": "string"}}},
+    )
+
+    catalog = RuleContextCatalog.for_tool(state=state, surface=surface).restricted_to_state_roots(
+        frozenset({"bookings"})
+    )
+    projection = catalog.prompt_projection()
+
+    collections = cast(list[dict[str, object]], projection["collections"])
+    reference_bindings = cast(list[dict[str, str]], projection["reference_bindings"])
+    assert collections == [
+        {
+            "collection_pointer": "/bookings",
+            "primary_key_fields": [],
+            "item_fields": ["booking_id"],
+        }
+    ]
+    assert any(item["source"] == "args" for item in reference_bindings)
+    assert all(
+        item["source"] not in {"pre_state", "post_state"}
+        or item["pointer"].startswith("/bookings")
+        for item in reference_bindings
+    )
+
+
+def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
+    tmp_path: Path,
+) -> None:
+    """BC-42: a compact provider prompt still reaches the original compiler."""
+
+    world = portable_counter_contracts(ArtifactStore(tmp_path / "artifacts")).design.world_spec
+    tool = world.tools[0]
+    skeleton = WorldSkeletonDraft(
+        boundary=world.boundary,
+        state=world.state,
+        tool_surfaces=(
+            ToolSurfaceDraft(surface=tool.surface, evidence_claim_ids=("claim:counter",)),
+        ),
+        task_dimensions=world.task_dimensions,
+        fidelity=world.fidelity,
+    )
+    catalog = RuleContextCatalog.for_tool(
+        state=skeleton.state,
+        surface=tool.surface,
+    ).restricted_to_state_roots(frozenset({"counter"}))
+
+    def binding(source: str, pointer: str) -> str:
+        return next(
+            item.binding_id
+            for item in catalog.reference_bindings.values()
+            if item.source == source and item.pointer == pointer
+        )
+
+    def reference(source: str, pointer: str) -> dict[str, str]:
+        return {"kind": "bound_reference", "binding_id": binding(source, pointer)}
+
+    def rule(
+        *,
+        family: str,
+        clause_id: str,
+        left: dict[str, object],
+        operator: str,
+        right: dict[str, object],
+        ordering: str | None = None,
+        case_sensitivity: str = "positive_only",
+    ) -> dict[str, object]:
+        clause: dict[str, object] = {
+            "clause_id": clause_id,
+            "operator": operator,
+            "left": left,
+            "right": right,
+            "negate": False,
+        }
+        if ordering is not None:
+            clause["ordering"] = ordering
+        return {
+            "family": family,
+            "description": f"A {family} rule for the frozen counter tool.",
+            "boolean_operator": "all",
+            "clauses": [clause],
+            "case_sensitivity": case_sensitivity,
+            "evidence_claim_ids": [],
+        }
+
+    amount = reference("args", "/amount")
+    pre_value = reference("pre_state", "/counter/value")
+    post_value = reference("post_state", "/counter/value")
+    result_value = reference("tool_result", "/value")
+    zero: dict[str, object] = {"kind": "constant", "value_type": "number", "value": 0}
+    source_document: dict[str, object] = {
+        "tools": [
+            {
+                "tool_id": tool.surface.tool_id,
+                "conditions": {
+                    "tool_id": tool.surface.tool_id,
+                    "preconditions": [
+                        rule(
+                            family="precondition",
+                            clause_id="positive_amount",
+                            left=amount,
+                            operator="greater_than",
+                            right=zero,
+                            ordering="number",
+                            case_sensitivity="positive_and_negative",
+                        )
+                    ],
+                    "postconditions": [
+                        rule(
+                            family="postcondition",
+                            clause_id="result_matches_state",
+                            left=result_value,
+                            operator="equal",
+                            right=post_value,
+                        )
+                    ],
+                },
+                "state_transition": {
+                    "tool_id": tool.surface.tool_id,
+                    "transition": [
+                        rule(
+                            family="transition",
+                            clause_id="incremented_state",
+                            left=post_value,
+                            operator="equal",
+                            right={
+                                "kind": "arithmetic",
+                                "operator": "add",
+                                "left": pre_value,
+                                "right": amount,
+                            },
+                        )
+                    ],
+                },
+                "errors": {
+                    "tool_id": tool.surface.tool_id,
+                    "errors": [
+                        {
+                            "error_code": "invalid_amount",
+                            "when": rule(
+                                family="error_condition",
+                                clause_id="non_positive_amount",
+                                left=amount,
+                                operator="less_or_equal",
+                                right=zero,
+                                ordering="number",
+                                case_sensitivity="positive_and_negative",
+                            ),
+                            "observation": "amount must be positive",
+                            "state_effect": "none",
+                            "retryable": False,
+                            "evidence_claim_ids": [],
+                        }
+                    ],
+                },
+                "access_observation": {
+                    "tool_id": tool.surface.tool_id,
+                    "permission": {
+                        "permission_id": "permission:counter",
+                        "allowed_actors": ["user"],
+                        "required_scopes_by_actor": {"user": ["counter.write"]},
+                        "condition": None,
+                        "denied_observation": "Permission denied.",
+                    },
+                    "observation": {
+                        "visible_fields_by_actor": {"user": ["counter"], "auditor": []},
+                        "consistency": "strong",
+                        "staleness_bound_seconds": None,
+                    },
+                },
+                "reliability": {
+                    "tool_id": tool.surface.tool_id,
+                    "idempotency": {
+                        "mode": "idempotency_key",
+                        "key_field": "idempotency_key",
+                        "retention_seconds": 3600,
+                        "duplicate_observation": "Return the original result.",
+                    },
+                    "retry": {
+                        "maximum_attempts": 1,
+                        "backoff": "none",
+                        "retryable_error_codes": [],
+                        "requires_same_idempotency_key": True,
+                    },
+                    "timeout": {
+                        "operation_timeout_seconds": 5,
+                        "timeout_error_code": "invalid_amount",
+                        "cancellation_effect": "no_effect",
+                    },
+                    "transaction": {
+                        "atomicity": "atomic",
+                        "commit_point": "After input validation.",
+                        "partial_commit_observable": False,
+                    },
+                    "rollback": {
+                        "supported": True,
+                        "rollback_trigger_codes": ["invalid_amount"],
+                        "compensation_tools": [],
+                        "guarantees": "Invalid updates preserve state.",
+                    },
+                    "concurrency": {
+                        "isolation": "serializable",
+                        "conflict_detection": "The runtime serializes updates.",
+                        "conflict_error_code": None,
+                        "ordering_guarantee": "Committed updates are ordered.",
+                    },
+                },
+            }
+        ]
+    }
+
+    protocol = tool_semantics_batch_protocol()
+    assert COMPACT_RULE_PROTOCOL_VERSION in protocol
+    assert "bound_lookup_by_key" in protocol
+    assert "Never emit reference, lookup_by_key" in protocol
+    protocol_validator = Draft202012Validator(tool_semantics_batch_protocol_schema())
+    assert not tuple(protocol_validator.iter_errors(source_document))
+
+    source = ToolSemanticsBatchSourceDraft.model_validate_json(json.dumps(source_document))
+    compiled = compile_tool_semantics_batch(
+        source,
+        expected_tool_ids=(tool.surface.tool_id,),
+        skeleton=skeleton,
+        evidence_graph=EvidenceGraph(graph_id="evidence:counter", revision=1),
+        contracts=(),
+        rule_contexts_by_tool={tool.surface.tool_id: catalog},
+    )
+    assert compiled[0].tool_id == tool.surface.tool_id
+
+    raw_reference = json.loads(json.dumps(source_document))
+    transition = raw_reference["tools"][0]["state_transition"]["transition"][0]
+    transition["clauses"][0]["left"] = {
+        "kind": "reference",
+        "source": "post_state",
+        "pointer": "/counter/value",
+        "value_type": "number",
+    }
+    assert tuple(protocol_validator.iter_errors(raw_reference))
+    with pytest.raises(StructuredValidationError) as captured:
+        compile_tool_semantics_batch(
+            ToolSemanticsBatchSourceDraft.model_validate_json(json.dumps(raw_reference)),
+            expected_tool_ids=(tool.surface.tool_id,),
+            skeleton=skeleton,
+            evidence_graph=EvidenceGraph(graph_id="evidence:counter", revision=1),
+            contracts=(),
+            rule_contexts_by_tool={tool.surface.tool_id: catalog},
+        )
+    assert any(
+        issue_code.startswith("tool_rule_binding_required@")
+        for issue_code in captured.value.diagnostic.issue_codes
+    )
 
 
 def test_shared_idempotency_uses_the_exact_downstream_tool_vocabulary() -> None:

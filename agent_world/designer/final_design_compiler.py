@@ -8,6 +8,7 @@ FeedbackContract, repair ledger, or retry state is reachable here.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NoReturn
 
@@ -32,7 +33,7 @@ from .models import (
     WorldSemanticSourceIRDraft,
     WorldSkeletonDraft,
 )
-from .rule_context import materialize_tool_semantics_bindings
+from .rule_context import RuleContextCatalog, materialize_tool_semantics_bindings
 from .service import EnvironmentDesigner
 from .validation import StructuredSemanticError
 
@@ -75,11 +76,16 @@ def compile_tool_semantics_batch(
     skeleton: WorldSkeletonDraft,
     evidence_graph: EvidenceGraph,
     contracts: tuple[SharedToolSemanticsContract, ...],
+    rule_contexts_by_tool: Mapping[str, RuleContextCatalog] | None = None,
 ) -> tuple[ToolSemanticsDraft, ...]:
     """Compile one physical batch against frozen local and shared constraints."""
 
     try:
-        materialized = materialize_tool_semantics_bindings(source, skeleton=skeleton)
+        materialized = materialize_tool_semantics_bindings(
+            source,
+            skeleton=skeleton,
+            catalogs_by_tool=rule_contexts_by_tool,
+        )
         return _pure_compiler()._compile_and_validate_tool_semantics_batch(
             materialized,
             expected_tool_ids=expected_tool_ids,

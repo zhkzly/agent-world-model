@@ -47,6 +47,7 @@ class AgentBackendConfig(ConfigModel):
     structured_invocation_timeout_seconds: float = Field(default=2_700, gt=0)
     environment_codegen_invocation_timeout_seconds: float = Field(default=2_700, gt=0)
     max_concurrent_invocations: int = Field(default=1, ge=1, le=32)
+    structured_output_transport: Literal["provider_schema", "json_envelope"] = "provider_schema"
     tool_output_token_limit: int = Field(default=2_048, ge=512, le=32_768)
     structured_turn_token_limit: int = Field(default=65_536, ge=16_384, le=1_048_576)
     environment_codegen_turn_token_limit: int = Field(

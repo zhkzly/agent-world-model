@@ -22,6 +22,7 @@ reasoning_challenger = "medium"
 invocation_timeout_seconds = 2700
 structured_invocation_timeout_seconds = 2700
 environment_codegen_invocation_timeout_seconds = 2700
+structured_output_transport = "provider_schema"
 tool_output_token_limit = 2048
 structured_turn_token_limit = 65536
 environment_codegen_turn_token_limit = 262144
@@ -114,6 +115,12 @@ TOML 中保存的是变量名，不是 key。`openai_base_url` 只允许与 API-
 `openai` provider 配合，不能与 ChatGPT 登录混用，也不能包含用户名、密码、query 或
 fragment。Profile Resolver 会把它写入每次隔离的 `$CODEX_HOME/config.toml` 并纳入 profile
 hash；不会从宿主环境隐式继承兼容端点。
+
+`structured_output_transport` 默认是 `provider_schema`：直接把收窄后的 JSON Schema 交给
+provider。只有已通过真实 probe 证明某个兼容 gateway 会拒绝嵌套 schema 时，才显式设为
+`json_envelope`。后者只把 provider 层收窄为 `{"artifact_json":"..."}`，内部 JSON 仍由
+原始 Pydantic contract、确定性 compiler、Scheduler repair 和所有 Release Gate 验证；它不是
+模板、mock 或放宽输出/发布验收的开关。
 
 ## 三种隔离 Agent Profile
 

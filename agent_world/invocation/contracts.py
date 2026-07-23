@@ -151,6 +151,7 @@ class ResolvedAgentProfile:
     codex_bin: Path | None
     codex_bin_sha256: str | None
     output_schema: JsonObject | None
+    structured_output_transport: str
     rollout_token_limit: int | None
     tool_output_token_limit: int
     limits: InvocationLimits
@@ -189,6 +190,8 @@ class ResolvedAgentProfile:
             raise ValueError("api_key authentication requires an environment name")
         if self.authentication_kind == "chatgpt" and self.authentication_environment is not None:
             raise ValueError("chatgpt authentication must not expose an environment name")
+        if self.structured_output_transport not in {"provider_schema", "json_envelope"}:
+            raise ValueError("unsupported structured output transport")
         if self.rollout_token_limit is not None and self.rollout_token_limit <= 0:
             raise ValueError("rollout_token_limit must be positive when configured")
         if self.tool_output_token_limit <= 0:
@@ -264,6 +267,7 @@ class ResolvedAgentProfile:
             "codex_bin": str(self.codex_bin) if self.codex_bin is not None else None,
             "codex_bin_sha256": self.codex_bin_sha256,
             "output_schema": self.output_schema,
+            "structured_output_transport": self.structured_output_transport,
             "rollout_token_limit": self.rollout_token_limit,
             "tool_output_token_limit": self.tool_output_token_limit,
             "codex_config_sha256": self.codex_config_sha256,

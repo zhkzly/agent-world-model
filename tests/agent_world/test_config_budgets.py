@@ -45,6 +45,7 @@ def test_production_defaults_reserve_full_v3_judge_capacity(tmp_path: Path) -> N
     campaign = config.expansion.campaign_budget
 
     assert config.agent.structured_turn_token_limit == 65_536
+    assert config.agent.structured_output_transport == "provider_schema"
 
     assert direct.llm_tokens == 10_000_000
     assert candidate.llm_tokens == 1_200_000
@@ -102,6 +103,16 @@ def test_openai_base_url_requires_api_key_mode(tmp_path: Path) -> None:
         openai_base_url=HttpUrl("https://provider.example.test/v1"),
     )
     assert str(config.openai_base_url) == "https://provider.example.test/v1"
+
+
+def test_json_envelope_transport_is_explicitly_configured() -> None:
+    config = AgentBackendConfig(
+        model="gpt-5.4-mini",
+        api_key_environment="COMPATIBLE_API_KEY",
+        structured_output_transport="json_envelope",
+    )
+
+    assert config.structured_output_transport == "json_envelope"
 
 
 def test_expansion_config_reserves_source_intake_and_one_real_candidate() -> None:

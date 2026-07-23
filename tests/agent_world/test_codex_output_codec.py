@@ -29,6 +29,7 @@ from agent_world.invocation import (
 )
 from agent_world.invocation.codex_sdk import (
     CodexSdkBackend,
+    _decode_json_envelope,
     _decode_provider_json_ir,
     _provider_output_schema,
 )
@@ -131,6 +132,32 @@ def test_worker_payload_passes_logical_schema_directly_to_codex_sdk(
         "required": ["dynamic"],
         "additionalProperties": False,
     }
+
+
+def test_json_envelope_transport_uses_a_shallow_provider_schema(tmp_path: Path) -> None:
+    request = _request(tmp_path)
+    envelope_request = replace(
+        request,
+        profile=replace(request.profile, structured_output_transport="json_envelope"),
+    )
+
+    payload = CodexSdkBackend._worker_payload(envelope_request)
+
+    assert payload["structured_output_transport"] == "json_envelope"
+    assert payload["output_schema"] == {
+        "type": "object",
+        "properties": {"artifact_json": {"type": "string"}},
+        "required": ["artifact_json"],
+        "additionalProperties": False,
+    }
+
+
+def test_json_envelope_decodes_the_inner_json_document_or_gateway_object() -> None:
+    assert _decode_json_envelope({"artifact_json": '{"status":"ok"}'}) == {"status": "ok"}
+    assert _decode_json_envelope({"artifact_json": {"status": "ok"}}) == {"status": "ok"}
+    assert _decode_json_envelope({"status": "ok"}) == {"status": "ok"}
+    with pytest.raises(ValueError, match="must be a JSON string or object"):
+        _decode_json_envelope({"artifact_json": 7})
 
 
 @pytest.mark.asyncio

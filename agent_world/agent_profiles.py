@@ -353,6 +353,7 @@ class IsolatedAgentProfileProvider:
                 *capability_plan.external.credential_handles,
             ),
             output_schema=output_schema,
+            structured_output_transport=self.config.structured_output_transport,
             rollout_token_limit=rollout_token_limit,
             tool_output_token_limit=self.config.tool_output_token_limit,
             limits=InvocationLimits(
@@ -407,6 +408,7 @@ class IsolatedAgentProfileProvider:
             mcp_servers=(),
             credential_handles=("model-auth",),
             output_schema=output_schema,
+            structured_output_transport=self.config.structured_output_transport,
             rollout_token_limit=rollout_token_limit,
             tool_output_token_limit=self.config.tool_output_token_limit,
             limits=InvocationLimits(timeout_seconds=self.config.invocation_timeout_seconds),

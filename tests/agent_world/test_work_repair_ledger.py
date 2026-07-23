@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
+from agent_world.artifact_store import ArtifactStore
 from agent_world.contracts import ArtifactRef, sha256_digest
 from agent_world.control.work import (
     RepairAction,
@@ -141,6 +143,47 @@ def _authorize(
         report=report,
         report_ref=report_ref,
     )
+
+
+def test_scope_restore_ignores_unparseable_foreign_legacy_ledger_entry(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    artifacts = store.issue_writer(
+        producer="framework",
+        allowed_artifact_type_prefixes=("control.",),
+    )
+    definition = _definition()
+    current = _authorize(
+        WorkRepairLedger(),
+        _report("current", (_issue("reference_missing"),)),
+        1,
+    )
+    artifacts.put_json(
+        artifact_id=current.entry_id,
+        artifact_type="control.work_repair_ledger_entry",
+        value=current,
+    )
+    foreign_legacy = current.model_dump(mode="json")
+    foreign_legacy["entry_id"] = "work-repair-ledger:foreign-legacy"
+    foreign_legacy["coordinate"]["scope_id"] = "job:historical"
+    foreign_legacy["budget_lease_ref"] = _ref(
+        "legacy-budget",
+        "control.budget_lease",
+    ).model_dump(mode="json")
+    foreign_legacy["recovery_budget_lease_refs"] = []
+    artifacts.put_json(
+        artifact_id="work-repair-ledger:foreign-legacy",
+        artifact_type="control.work_repair_ledger_entry",
+        value=foreign_legacy,
+    )
+
+    restored = WorkRepairLedger.restore(
+        artifacts,
+        scope_id=definition.coordinate.scope_id,
+    )
+
+    assert restored.entries == (current,)
 
 
 def test_repair_epoch_isolates_definition_and_input_revisions() -> None:

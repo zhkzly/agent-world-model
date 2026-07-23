@@ -216,6 +216,7 @@ class AgentProfileSpec:
     mcp_servers: tuple[McpServerSpec, ...] = ()
     credential_handles: tuple[str, ...] = ()
     output_schema: JsonObject | None = None
+    structured_output_transport: str = "provider_schema"
     rollout_token_limit: int | None = None
     tool_output_token_limit: int = 2_048
     limits: InvocationLimits = field(default_factory=InvocationLimits)
@@ -318,6 +319,8 @@ class AgentProfileSpec:
             normalized = json_compatible(self.output_schema)
             if not isinstance(normalized, dict):
                 raise TypeError("output_schema must be a JSON object")
+        if self.structured_output_transport not in {"provider_schema", "json_envelope"}:
+            raise ValueError("unsupported structured output transport")
         if self.rollout_token_limit is not None and self.rollout_token_limit <= 0:
             raise ValueError("rollout_token_limit must be positive when configured")
         if self.tool_output_token_limit <= 0:
@@ -521,6 +524,7 @@ class ProfileResolver:
                     "chatgpt" if isinstance(auth_binding, CodexLoginBinding) else "api_key"
                 ),
                 "output_schema": spec.output_schema,
+                "structured_output_transport": spec.structured_output_transport,
                 "rollout_token_limit": spec.rollout_token_limit,
                 "tool_output_token_limit": spec.tool_output_token_limit,
                 "limits": {
@@ -675,6 +679,7 @@ class ProfileResolver:
             codex_bin=spec.codex_bin,
             codex_bin_sha256=spec.codex_bin_sha256,
             output_schema=spec.output_schema,
+            structured_output_transport=spec.structured_output_transport,
             rollout_token_limit=spec.rollout_token_limit,
             tool_output_token_limit=spec.tool_output_token_limit,
             limits=spec.limits,

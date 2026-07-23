@@ -4,6 +4,7 @@ from agent_world.invocation._codex_worker import (
     _compact_notification_payload,
     _completed_turn_payload,
     _notification_payload,
+    _terminal_turn_failure_code,
 )
 
 
@@ -37,6 +38,24 @@ def test_unknown_sdk_notification_is_unwrapped_to_wire_payload() -> None:
     }
 
     assert _notification_payload(UnknownNotification(params=payload)) == payload
+
+
+def test_terminal_turn_failure_retains_only_a_fixed_safe_category() -> None:
+    assert _terminal_turn_failure_code(
+        {
+            "code": "invalid_request_error",
+            "message": "request body includes a private endpoint and API key",
+        }
+    ) == "turn_failed_invalid_request"
+    assert _terminal_turn_failure_code(
+        {"message": "unrecognized opaque provider response 8f4d"}
+    ) == "turn_failed_provider_rejected"
+    assert _terminal_turn_failure_code(
+        {"message": "maximum context length exceeded"}
+    ) == "turn_failed_context_window"
+    assert _terminal_turn_failure_code(
+        {"message": "invalid JSON schema for response format"}
+    ) == "turn_failed_output_schema"
 
 
 def test_worker_compacts_repeated_text_delta_without_losing_progress_metadata() -> None:
