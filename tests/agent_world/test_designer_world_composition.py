@@ -1024,6 +1024,59 @@ def test_curriculum_plan_reports_exact_unknown_world_rule_reference(tmp_path: Pa
     )
 
 
+def test_world_model_reports_unknown_evidence_claim_as_actionable_field(
+    tmp_path: Path,
+) -> None:
+    # An unknown evidence-claim reference must surface as a typed, field-addressed,
+    # actionable diagnostic that never echoes the rejected claim id.  Before this
+    # was a bare ValueError that collapsed to a non-actionable
+    # framework_diagnostic_incomplete, stranding the world_rules leaf.
+    design = portable_counter_contracts(ArtifactStore(tmp_path / "artifacts")).design
+    invariant = design.world_spec.invariants[0].model_copy(
+        update={"evidence_claim_ids": ("claim:not-in-graph",)}
+    )
+    world = WorldModelDraft(
+        boundary=design.world_spec.boundary,
+        state=design.world_spec.state,
+        tools=design.world_spec.tools,
+        invariants=(invariant, *design.world_spec.invariants[1:]),
+        task_dimensions=design.world_spec.task_dimensions,
+        fidelity=design.world_spec.fidelity,
+    )
+
+    # A graph that catalogs every legitimately referenced claim so only the
+    # poisoned invariant reference is unknown.
+    evidence_graph = EvidenceGraph(
+        graph_id="evidence:counter",
+        revision=1,
+        claims=(
+            Claim(
+                claim_id="claim:counter",
+                kind="product_decision",
+                statement="Counter semantics are a deterministic synthetic policy.",
+                confidence=1.0,
+            ),
+        ),
+    )
+
+    with pytest.raises(StructuredValidationError) as captured:
+        EnvironmentDesigner._validate_world_model_draft(  # noqa: SLF001
+            world,
+            evidence_graph=evidence_graph,
+            evidence_graph_ref=design.world_spec.evidence_graph_ref,
+        )
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic.validation_phase == "world_model_semantics"
+    assert diagnostic.issue_codes == (
+        "world_model_evidence_claim_unknown@invariants.0.evidence_claim_ids.0",
+    )
+    for issue in diagnostic.issues:
+        assert issue.actionable_for_agent
+        assert "claim:not-in-graph" not in issue.message
+        assert "claim:" not in issue.message
+
+
 def test_entity_schema_rejects_refs_and_lifecycle_drift() -> None:
     plan = StateEntityPlan(
         entity="reservation",

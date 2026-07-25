@@ -323,3 +323,11 @@ batch-3 是真语义失败（`schema_union_tag_invalid`，路径深至 `tools[0]
 **transport 偶发率累积样本（供 T1.0-B 决策）**：已观测到 **3 次** `agent_backend_direct_provider_unavailable`（batch-4 第一次、batch-3 两次其一 `llm_tokens=0`，模型根本没应答），**0 次** `invalid_json` 复现。即 transport 抖动是 `provider_unavailable` 为主，不是当初推测的 `invalid_json` 为主。每次抖动都被正确分流到 `infrastructure_transport` lane（scene.md 实测），不再误导改冻结设计——**这正是 T1.0-A/E 的价值：抖动不再制造设计漂移压力**。是否做 T1.0-B 有界重试，可据此权衡（当前每次抖动的代价只是重跑一个节点，且已不会污染设计）。
 
 **下一步建议顺序**：①`invalid_json` 偶发率现在可量化了（本次是 `provider_unavailable`，未复现 `invalid_json`）——多跑几次 batch-3/batch-4 收集偶发率，据此决定 T1.0-B 有界重试的必要性与上限；②batch-3 的语义失败已有精确 owner，可作为 T1 语义层第一个真实修复目标；③BC-47 / T2 仍按原顺序排后。
+
+## T2 首次真实 e2e 探明（2026-07-25，`.agent-world-staged/t2-probe*`）
+
+首次真实 `generate`（need = 简单 to-do list，config = doctor-grok45 派生、state_root 落 gitignored `.agent-world-staged`）。反馈环健康推进：Research 3 节点 + `world_architecture` + `shared_tool_semantics` + `world_behavior` 两分片（含 batch-1 一次 `local_correction` 自修成功收敛）全 committed，全程 0 传输抖动。**这实证了本轮修复（三-lane 分类 + 诊断克隆去毒化 + SKILL.md 补全）确实让语义层在真实环里自收敛，不再像旧 main 卡死打转。**
+
+**硬结论 1 — 缺口 A 从推测升级为实锤（第 6 次 provider 事件，首次"挂起型"）**：`world_rules` 节点发起对 grok-4.5 的结构化调用后，进程 `ep_poll` 挂起、CPU 锁在 50s、**27 分钟零字节回包**（attempt 目录写完 profile/config 后彻底静默）。这不是快速 `provider_unavailable` 回错，而是 provider **挂起不回**——单次 LLM 调用**无 per-turn 软超时**，只能干等到 45min 全局 timeout 才触发唯一 1 次 infra 重试。**这正是"卡住/绕圈子"的物理来源。** ⇒ 缺口 A 必须做，且不止"加退避"：**必须给单次 LLM 调用加一个远小于 45min 的 per-turn 软超时 + 指数退避**，否则 provider 挂起会让反馈环干等大半小时。保留"单 backend、无自动模型 fallback"不变量（`routing.py:23` 故意设计 + [[model-quota-fallback]] 人工切换规矩）。
+
+**硬结论 2 — 孤儿 running-head 竞态缺陷（记 owner，暂不改，避免污染 T2 探明）**：手动 kill 挂死的 generate 后，同键 resume 连续两次 `scheduler_direct_execution_error (TelemetryError)`。根因：kill 落在"operation 已清 `active_operation_ref=None` 但 head 未转终态"的窗口，留下 `status=running` 且 `active_operation_ref=None` 的孤儿 head；而 `work_runtime.py:379-380` 的 `reconcile_abandoned_operation` 对 `active_operation_ref is None` 直接 `return head` 不终态化 ⇒ 该 head 永久卡 running，每次 resume 都叠一个 `direct.generate` error root（telemetry 观测到 6 个）。**owner = 代码（恢复逻辑的边界遗漏）**，但属 kill 打断的罕见竞态，非反馈环打转核心；列为独立修复项，不插入当前 T2 探明。规避：污染的 scope 弃用，改用全新 request-id + 全新 state_root 干净重跑（前缀节点仅几分钟，代价小）。

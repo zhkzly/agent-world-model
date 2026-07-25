@@ -7343,13 +7343,22 @@ class EnvironmentDesigner:
                     f"actor {actor.actor} reset visibility references unknown fields: "
                     f"{sorted(unknown)}"
                 )
-        referenced_claims: set[str] = set()
-        for entity in draft.entities:
-            referenced_claims.update(entity.evidence_claim_ids)
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        if unknown := referenced_claims - known_claims:
-            raise ValueError(
-                f"world state shape references unknown evidence claims: {sorted(unknown)}"
+        issues: list[SafeValidationIssue] = []
+        for entity_index, entity in enumerate(draft.entities):
+            issues += EnvironmentDesigner._evidence_claim_closure_issues(
+                entity.evidence_claim_ids,
+                path=("entities", entity_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="world_state_shape_semantics",
+                    frontier_ordinal=40,
+                    issues=tuple(issues),
+                )
             )
 
     @staticmethod
@@ -8031,15 +8040,22 @@ class EnvironmentDesigner:
         rule_ids = [rule.rule_id for rule in draft.initial_state_constraints]
         if len(set(rule_ids)) != len(rule_ids):
             raise ValueError("initial-state rule ids must be unique")
-        referenced_claims = {
-            claim_id
-            for rule in draft.initial_state_constraints
-            for claim_id in rule.evidence_claim_ids
-        }
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        if unknown := referenced_claims - known_claims:
-            raise ValueError(
-                f"initial-state rules reference unknown evidence claims: {sorted(unknown)}"
+        issues: list[SafeValidationIssue] = []
+        for rule_index, rule in enumerate(draft.initial_state_constraints):
+            issues += EnvironmentDesigner._evidence_claim_closure_issues(
+                rule.evidence_claim_ids,
+                path=("initial_state_constraints", rule_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="initial_state_rules_semantics",
+                    frontier_ordinal=40,
+                    issues=tuple(issues),
+                )
             )
 
     @staticmethod
@@ -8073,13 +8089,22 @@ class EnvironmentDesigner:
         undeclared = {item.surface.namespace for item in draft.tool_surfaces} - namespaces
         if undeclared:
             raise ValueError(f"tool namespaces are absent from WorldBoundary: {sorted(undeclared)}")
-        referenced_claims = {
-            claim_id for tool in draft.tool_surfaces for claim_id in tool.evidence_claim_ids
-        }
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        if unknown := referenced_claims - known_claims:
-            raise ValueError(
-                f"tool inventory references unknown evidence claims: {sorted(unknown)}"
+        issues: list[SafeValidationIssue] = []
+        for tool_index, tool in enumerate(draft.tool_surfaces):
+            issues += EnvironmentDesigner._evidence_claim_closure_issues(
+                tool.evidence_claim_ids,
+                path=("tool_surfaces", tool_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_inventory_semantics",
+                    frontier_ordinal=40,
+                    issues=tuple(issues),
+                )
             )
 
     @staticmethod
@@ -8098,7 +8123,8 @@ class EnvironmentDesigner:
             raise ValueError("tool plan inventory tool_id values must be unique")
         namespaces = set(boundary.boundary.tool_namespaces)
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        for item in draft.tools:
+        claim_issues: list[SafeValidationIssue] = []
+        for tool_index, item in enumerate(draft.tools):
             if item.tool_id != f"{item.namespace}.{item.name}":
                 raise ValueError("planned tool_id must equal '<namespace>.<name>'")
             if item.namespace not in namespaces:
@@ -8107,11 +8133,20 @@ class EnvironmentDesigner:
                 )
             if len(set(item.evidence_claim_ids)) != len(item.evidence_claim_ids):
                 raise ValueError(f"planned tool {item.tool_id} evidence claims must be unique")
-            if unknown := set(item.evidence_claim_ids) - known_claims:
-                raise ValueError(
-                    f"planned tool {item.tool_id} references unknown evidence claims: "
-                    f"{sorted(unknown)}"
+            claim_issues += EnvironmentDesigner._evidence_claim_closure_issues(
+                item.evidence_claim_ids,
+                path=("tools", tool_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        if claim_issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_plan_inventory_semantics",
+                    frontier_ordinal=40,
+                    issues=tuple(claim_issues),
                 )
+            )
 
     @staticmethod
     def _validate_tool_surface_schemas_draft(
@@ -8961,23 +8996,45 @@ class EnvironmentDesigner:
                     f"{sorted(unknown)}"
                 )
 
-        referenced_claims: set[str] = set()
-        for entity in draft.state.entities:
-            referenced_claims.update(entity.evidence_claim_ids)
-        for rule in draft.state.initial_state_constraints:
-            referenced_claims.update(rule.evidence_claim_ids)
-        for tool in draft.tool_surfaces:
-            referenced_claims.update(tool.evidence_claim_ids)
-        for fidelity in draft.fidelity:
-            referenced_claims.update(fidelity.evidence_claim_ids)
+        known_claims = {claim.claim_id for claim in evidence_graph.claims}
+        check = EnvironmentDesigner._evidence_claim_closure_issues
+        issues: list[SafeValidationIssue] = []
+        for entity_index, entity in enumerate(draft.state.entities):
+            issues += check(
+                entity.evidence_claim_ids,
+                path=("state", "entities", entity_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        for rule_index, rule in enumerate(draft.state.initial_state_constraints):
+            issues += check(
+                rule.evidence_claim_ids,
+                path=("state", "initial_state_constraints", rule_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        for tool_index, tool in enumerate(draft.tool_surfaces):
+            issues += check(
+                tool.evidence_claim_ids,
+                path=("tool_surfaces", tool_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        for fidelity_index, fidelity in enumerate(draft.fidelity):
+            issues += check(
+                fidelity.evidence_claim_ids,
+                path=("fidelity", fidelity_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
             if fidelity.level == "bounded_approximation" and fidelity.known_divergence is None:
                 raise ValueError("bounded approximation requires known_divergence")
             if fidelity.level == "faithful" and fidelity.known_divergence is not None:
                 raise ValueError("faithful fidelity cannot declare known_divergence")
-        known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        if unknown := referenced_claims - known_claims:
-            raise ValueError(
-                f"world skeleton references unknown evidence claims: {sorted(unknown)}"
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="world_skeleton_semantics",
+                    frontier_ordinal=40,
+                    issues=tuple(issues),
+                )
             )
 
     @staticmethod
@@ -10271,27 +10328,40 @@ class EnvironmentDesigner:
             raise ValueError(
                 f"task requirement {target.task_type} changed frozen plan fields: {changed}"
             )
-        task_rules = (
-            *task.initial_state_constraints,
-            *task.success_conditions,
-            *task.failure_conditions,
-            *task.terminal_conditions,
+        rule_sections = (
+            ("initial_state_constraints", task.initial_state_constraints),
+            ("success_conditions", task.success_conditions),
+            ("failure_conditions", task.failure_conditions),
+            ("terminal_conditions", task.terminal_conditions),
         )
         expected_prefix = f"rule:task:{target.task_type}:"
         invalid_ids = [
-            rule.rule_id for rule in task_rules if not rule.rule_id.startswith(expected_prefix)
+            rule.rule_id
+            for _section, rules in rule_sections
+            for rule in rules
+            if not rule.rule_id.startswith(expected_prefix)
         ]
         if invalid_ids:
             raise ValueError(
                 f"task rule ids must start with {expected_prefix}: {sorted(invalid_ids)}"
             )
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        referenced_claims = {
-            claim_id for rule in task_rules for claim_id in rule.evidence_claim_ids
-        }
-        if unknown := referenced_claims - known_claims:
-            raise ValueError(
-                f"task requirement references unknown evidence claims: {sorted(unknown)}"
+        claim_issues: list[SafeValidationIssue] = []
+        for section, rules in rule_sections:
+            for rule_index, rule in enumerate(rules):
+                claim_issues += EnvironmentDesigner._evidence_claim_closure_issues(
+                    rule.evidence_claim_ids,
+                    path=(section, rule_index, "evidence_claim_ids"),
+                    known_claims=known_claims,
+                )
+        if claim_issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="task_requirement_semantics",
+                    frontier_ordinal=40,
+                    issues=tuple(claim_issues),
+                )
             )
         # Exercise the complete curriculum contract validators for this shard's
         # dimensions, schemas, sampling shape, and task-goal bindings.
@@ -10934,6 +11004,34 @@ class EnvironmentDesigner:
         return world
 
     @staticmethod
+    def _evidence_claim_closure_issues(
+        claim_ids: Sequence[str],
+        *,
+        path: tuple[str | int, ...],
+        known_claims: set[str],
+    ) -> list[SafeValidationIssue]:
+        """Report the exact field position of every unknown evidence claim.
+
+        Evidence claim ids are a closed enum drawn from the frozen evidence
+        graph.  The rejected id is Agent-provided input and must never enter a
+        diagnostic code or message; only the stable code and the field path
+        cross the safe boundary so the Agent learns which field to repair.
+        """
+
+        issues: list[SafeValidationIssue] = []
+        for claim_index, claim_id in enumerate(claim_ids):
+            if claim_id not in known_claims:
+                issues.append(
+                    SafeValidationIssue(
+                        "world_model_evidence_claim_unknown",
+                        (*path, claim_index),
+                        "Use only an exact evidence claim id from the frozen "
+                        "evidence graph, or leave this field empty.",
+                    )
+                )
+        return issues
+
+    @staticmethod
     def _validate_world_model_draft(
         draft: WorldModelDraft,
         *,
@@ -10957,33 +11055,78 @@ class EnvironmentDesigner:
             evidence_graph_ref=evidence_graph_ref,
             coverage_map_ref=evidence_graph_ref,
         )
-        referenced_claims: set[str] = set()
-        for entity in draft.state.entities:
-            referenced_claims.update(entity.evidence_claim_ids)
-        for constraint in draft.state.initial_state_constraints:
-            referenced_claims.update(constraint.evidence_claim_ids)
-        for tool in draft.tools:
-            referenced_claims.update(tool.evidence_claim_ids)
-            semantics = tool.semantics
-            for rule in (
-                *semantics.preconditions,
-                *semantics.transition,
-                *semantics.postconditions,
-            ):
-                referenced_claims.update(rule.evidence_claim_ids)
-            for error in semantics.errors:
-                referenced_claims.update(error.evidence_claim_ids)
-                referenced_claims.update(error.when.evidence_claim_ids)
-            if semantics.permission.condition is not None:
-                referenced_claims.update(semantics.permission.condition.evidence_claim_ids)
-        for invariant in draft.invariants:
-            referenced_claims.update(invariant.evidence_claim_ids)
-        for fidelity in draft.fidelity:
-            referenced_claims.update(fidelity.evidence_claim_ids)
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        if unknown_claims := referenced_claims - known_claims:
-            raise ValueError(
-                f"world model references unknown evidence claims: {sorted(unknown_claims)}"
+        issues: list[SafeValidationIssue] = []
+        check = EnvironmentDesigner._evidence_claim_closure_issues
+
+        for entity_index, entity in enumerate(draft.state.entities):
+            issues += check(
+                entity.evidence_claim_ids,
+                path=("state", "entities", entity_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        for constraint_index, constraint in enumerate(draft.state.initial_state_constraints):
+            issues += check(
+                constraint.evidence_claim_ids,
+                path=("state", "initial_state_constraints", constraint_index,
+                      "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        for tool_index, tool in enumerate(draft.tools):
+            issues += check(
+                tool.evidence_claim_ids,
+                path=("tools", tool_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+            semantics = tool.semantics
+            for section in ("preconditions", "transition", "postconditions"):
+                for rule_index, rule in enumerate(getattr(semantics, section)):
+                    issues += check(
+                        rule.evidence_claim_ids,
+                        path=("tools", tool_index, "semantics", section, rule_index,
+                              "evidence_claim_ids"),
+                        known_claims=known_claims,
+                    )
+            for error_index, error in enumerate(semantics.errors):
+                issues += check(
+                    error.evidence_claim_ids,
+                    path=("tools", tool_index, "semantics", "errors", error_index,
+                          "evidence_claim_ids"),
+                    known_claims=known_claims,
+                )
+                issues += check(
+                    error.when.evidence_claim_ids,
+                    path=("tools", tool_index, "semantics", "errors", error_index,
+                          "when", "evidence_claim_ids"),
+                    known_claims=known_claims,
+                )
+            if semantics.permission.condition is not None:
+                issues += check(
+                    semantics.permission.condition.evidence_claim_ids,
+                    path=("tools", tool_index, "semantics", "permission", "condition",
+                          "evidence_claim_ids"),
+                    known_claims=known_claims,
+                )
+        for invariant_index, invariant in enumerate(draft.invariants):
+            issues += check(
+                invariant.evidence_claim_ids,
+                path=("invariants", invariant_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        for fidelity_index, fidelity in enumerate(draft.fidelity):
+            issues += check(
+                fidelity.evidence_claim_ids,
+                path=("fidelity", fidelity_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="world_model_semantics",
+                    frontier_ordinal=40,
+                    issues=tuple(issues),
+                )
             )
 
     @staticmethod
@@ -10992,50 +11135,103 @@ class EnvironmentDesigner:
         evidence_graph: EvidenceGraph,
     ) -> None:
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        referenced_claims: set[str] = set()
-        for entity in draft.state.entities:
-            referenced_claims.update(entity.evidence_claim_ids)
-        for constraint in draft.state.initial_state_constraints:
-            referenced_claims.update(constraint.evidence_claim_ids)
-        for tool in draft.tools:
-            referenced_claims.update(tool.evidence_claim_ids)
+        check = EnvironmentDesigner._evidence_claim_closure_issues
+        issues: list[SafeValidationIssue] = []
+        for entity_index, entity in enumerate(draft.state.entities):
+            issues += check(
+                entity.evidence_claim_ids,
+                path=("state", "entities", entity_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        for constraint_index, constraint in enumerate(draft.state.initial_state_constraints):
+            issues += check(
+                constraint.evidence_claim_ids,
+                path=("state", "initial_state_constraints", constraint_index,
+                      "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        for tool_index, tool in enumerate(draft.tools):
+            issues += check(
+                tool.evidence_claim_ids,
+                path=("tools", tool_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
             semantics = tool.semantics
-            for rule in (
-                *semantics.preconditions,
-                *semantics.transition,
-                *semantics.postconditions,
-            ):
-                referenced_claims.update(rule.evidence_claim_ids)
-            for error in semantics.errors:
-                referenced_claims.update(error.evidence_claim_ids)
-                referenced_claims.update(error.when.evidence_claim_ids)
+            for section in ("preconditions", "transition", "postconditions"):
+                for rule_index, rule in enumerate(getattr(semantics, section)):
+                    issues += check(
+                        rule.evidence_claim_ids,
+                        path=("tools", tool_index, "semantics", section, rule_index,
+                              "evidence_claim_ids"),
+                        known_claims=known_claims,
+                    )
+            for error_index, error in enumerate(semantics.errors):
+                issues += check(
+                    error.evidence_claim_ids,
+                    path=("tools", tool_index, "semantics", "errors", error_index,
+                          "evidence_claim_ids"),
+                    known_claims=known_claims,
+                )
+                issues += check(
+                    error.when.evidence_claim_ids,
+                    path=("tools", tool_index, "semantics", "errors", error_index,
+                          "when", "evidence_claim_ids"),
+                    known_claims=known_claims,
+                )
             if semantics.permission.condition is not None:
-                referenced_claims.update(semantics.permission.condition.evidence_claim_ids)
-        for invariant in draft.invariants:
-            referenced_claims.update(invariant.evidence_claim_ids)
-        for fidelity in draft.fidelity:
-            referenced_claims.update(fidelity.evidence_claim_ids)
+                issues += check(
+                    semantics.permission.condition.evidence_claim_ids,
+                    path=("tools", tool_index, "semantics", "permission", "condition",
+                          "evidence_claim_ids"),
+                    known_claims=known_claims,
+                )
+        for invariant_index, invariant in enumerate(draft.invariants):
+            issues += check(
+                invariant.evidence_claim_ids,
+                path=("invariants", invariant_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        for fidelity_index, fidelity in enumerate(draft.fidelity):
+            issues += check(
+                fidelity.evidence_claim_ids,
+                path=("fidelity", fidelity_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
         tool_ids = {tool.surface.tool_id for tool in draft.tools}
-        for task in draft.curriculum.task_types:
+        for task_index, task in enumerate(draft.curriculum.task_types):
             missing = set(task.required_tool_ids) - tool_ids
             if missing:
                 raise ValueError(
                     f"task {task.task_type} references unknown tools: {sorted(missing)}"
                 )
-            for rule in (
-                *task.initial_state_constraints,
-                *task.success_conditions,
-                *task.failure_conditions,
-                *task.terminal_conditions,
+            for section in (
+                "initial_state_constraints",
+                "success_conditions",
+                "failure_conditions",
+                "terminal_conditions",
             ):
-                referenced_claims.update(rule.evidence_claim_ids)
-
-        for rule in draft.curriculum.sampling_constraints:
-            referenced_claims.update(rule.evidence_claim_ids)
-
-        unknown_claims = referenced_claims - known_claims
-        if unknown_claims:
-            raise ValueError(f"design references unknown evidence claims: {sorted(unknown_claims)}")
+                for rule_index, rule in enumerate(getattr(task, section)):
+                    issues += check(
+                        rule.evidence_claim_ids,
+                        path=("curriculum", "task_types", task_index, section, rule_index,
+                              "evidence_claim_ids"),
+                        known_claims=known_claims,
+                    )
+        for rule_index, rule in enumerate(draft.curriculum.sampling_constraints):
+            issues += check(
+                rule.evidence_claim_ids,
+                path=("curriculum", "sampling_constraints", rule_index, "evidence_claim_ids"),
+                known_claims=known_claims,
+            )
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="design_draft_semantics",
+                    frontier_ordinal=40,
+                    issues=tuple(issues),
+                )
+            )
 
         all_rules = [*draft.invariants, *draft.state.initial_state_constraints]
         for tool in draft.tools:

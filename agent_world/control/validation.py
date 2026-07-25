@@ -311,6 +311,10 @@ _DESIGNER_SEMANTIC_CONTRACTS = {
         "rules may reference only catalogued constraint ids",
         "constraint references present in the closure catalog",
     ),
+    "world_model_evidence_claim_unknown": (
+        "world model claim references must exist in the frozen evidence graph",
+        "an exact evidence claim id from the frozen evidence graph",
+    ),
     "world_closure_constraint_unreachable": (
         "every catalogued constraint must be referenced by a rule",
         "a catalog with no unreferenced constraints",
