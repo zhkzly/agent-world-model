@@ -95,19 +95,40 @@ class ResearchAcquisition(V2Contract):
     @model_validator(mode="after")
     def validate_acquisition(self) -> ResearchAcquisition:
         if self.plan_ref.artifact_type != "design.research_plan":
-            raise ValueError("ResearchAcquisition must bind one ResearchPlan")
+            raise PydanticCustomError(
+                "research_acquisition_plan_ref_type",
+                "ResearchAcquisition must bind one ResearchPlan",
+            )
         if self.request_ref.artifact_type != "control.environment_request":
-            raise ValueError("ResearchAcquisition must bind one EnvironmentRequest")
+            raise PydanticCustomError(
+                "research_acquisition_request_ref_type",
+                "ResearchAcquisition must bind one EnvironmentRequest",
+            )
         if self.passage_pack_ref.artifact_type != "design.evidence_passage_pack":
-            raise ValueError("ResearchAcquisition must bind one EvidencePassagePack")
+            raise PydanticCustomError(
+                "research_acquisition_passage_pack_ref_type",
+                "ResearchAcquisition must bind one EvidencePassagePack",
+            )
         if not self.evidence or not self.source_refs:
-            raise ValueError("ResearchAcquisition requires normalized evidence and source refs")
+            raise PydanticCustomError(
+                "research_acquisition_evidence_missing",
+                "ResearchAcquisition requires normalized evidence and source refs",
+            )
         if len({item.evidence_id for item in self.evidence}) != len(self.evidence):
-            raise ValueError("ResearchAcquisition evidence ids must be unique")
+            raise PydanticCustomError(
+                "research_acquisition_evidence_id_duplicate",
+                "ResearchAcquisition evidence ids must be unique",
+            )
         if len(set(self.source_refs)) != len(self.source_refs):
-            raise ValueError("ResearchAcquisition source refs must be unique")
+            raise PydanticCustomError(
+                "research_acquisition_source_ref_duplicate",
+                "ResearchAcquisition source refs must be unique",
+            )
         if self.usage.search_calls < 1 or self.usage.tool_calls < self.usage.search_calls:
-            raise ValueError("ResearchAcquisition usage must retain real tool accounting")
+            raise PydanticCustomError(
+                "research_acquisition_usage_accounting",
+                "ResearchAcquisition usage must retain real tool accounting",
+            )
         return self
 
 
@@ -131,7 +152,10 @@ class AssumptionIssueOrigin(AgentOutput):
     @model_validator(mode="after")
     def validate_coverage_dimension(self) -> AssumptionIssueOrigin:
         if (self.source == "coverage_dimension") != (self.coverage_dimension is not None):
-            raise ValueError("coverage_dimension is required only for coverage_dimension origins")
+            raise PydanticCustomError(
+                "assumption_origin_coverage_dimension_binding",
+                "coverage_dimension is required only for coverage_dimension origins",
+            )
         return self
 
 
@@ -296,11 +320,20 @@ class ToolSurfacePlan(AgentOutput):
     @model_validator(mode="after")
     def validate_state_footprint(self) -> ToolSurfacePlan:
         if len(set(self.reads_state_entities)) != len(self.reads_state_entities):
-            raise ValueError("tool plan read-state entities must be unique")
+            raise PydanticCustomError(
+                "tool_plan_read_state_duplicate",
+                "tool plan read-state entities must be unique",
+            )
         if len(set(self.writes_state_entities)) != len(self.writes_state_entities):
-            raise ValueError("tool plan write-state entities must be unique")
+            raise PydanticCustomError(
+                "tool_plan_write_state_duplicate",
+                "tool plan write-state entities must be unique",
+            )
         if not (self.reads_state_entities or self.writes_state_entities):
-            raise ValueError("tool plan must declare a non-empty read/write state footprint")
+            raise PydanticCustomError(
+                "tool_plan_state_footprint_empty",
+                "tool plan must declare a non-empty read/write state footprint",
+            )
         return self
 
 
@@ -367,9 +400,17 @@ class ToolInterfaceSourceDraft(AgentOutput):
         ):
             names = tuple(item.name for item in fields)
             if len(set(names)) != len(names):
-                raise ValueError(f"tool {role} field names must be unique")
+                # ``role`` is a framework literal from the tuple above, never
+                # Agent-supplied text, so it is safe inside a stable code.
+                raise PydanticCustomError(
+                    f"tool_interface_{role}_field_name_duplicate",
+                    "tool interface field names must be unique within one role",
+                )
         if not (self.output_fields or self.observation_fields):
-            raise ValueError("tool interface requires output or observation fields")
+            raise PydanticCustomError(
+                "tool_interface_result_fields_missing",
+                "tool interface requires output or observation fields",
+            )
         return self
 
 
@@ -392,11 +433,20 @@ class ToolSurfaceSourceDraft(AgentOutput):
     @model_validator(mode="after")
     def validate_state_footprint(self) -> ToolSurfaceSourceDraft:
         if len(set(self.reads_state_entities)) != len(self.reads_state_entities):
-            raise ValueError("tool source read-state entities must be unique")
+            raise PydanticCustomError(
+                "tool_source_read_state_duplicate",
+                "tool source read-state entities must be unique",
+            )
         if len(set(self.writes_state_entities)) != len(self.writes_state_entities):
-            raise ValueError("tool source write-state entities must be unique")
+            raise PydanticCustomError(
+                "tool_source_write_state_duplicate",
+                "tool source write-state entities must be unique",
+            )
         if not (self.reads_state_entities or self.writes_state_entities):
-            raise ValueError("tool source must declare a non-empty read/write state footprint")
+            raise PydanticCustomError(
+                "tool_source_state_footprint_empty",
+                "tool source must declare a non-empty read/write state footprint",
+            )
         return self
 
 
@@ -1171,7 +1221,10 @@ class WorldClosureContext(AgentOutput):
     def validate_constraint_catalog(self) -> WorldClosureContext:
         constraint_ids = [item.constraint_id for item in self.constraints]
         if len(set(constraint_ids)) != len(constraint_ids):
-            raise ValueError("world closure constraint ids must be unique")
+            raise PydanticCustomError(
+                "world_closure_constraint_id_duplicate",
+                "world closure constraint ids must be unique",
+            )
         known = set(constraint_ids)
         rules = list(self.initial_state_rules)
         for tool in self.tool_paths:
@@ -1180,14 +1233,18 @@ class WorldClosureContext(AgentOutput):
             rules.extend(tool.postconditions)
             rules.extend(error.when for error in tool.errors)
         referenced = {item for rule in rules for item in rule.constraint_ids}
-        if unknown := referenced - known:
-            raise ValueError(
-                f"world closure rules reference unknown constraints: {sorted(unknown)}"
+        # The unknown/unreachable identifiers are Agent-supplied values, so they
+        # stay out of the diagnostic: the stable code plus the field path is what
+        # makes this repairable without echoing rejected input.
+        if referenced - known:
+            raise PydanticCustomError(
+                "world_closure_constraint_reference_unknown",
+                "world closure rules must reference only catalogued constraint ids",
             )
-        if unreachable := known - referenced:
-            raise ValueError(
-                "world closure constraint catalog contains unreachable entries: "
-                f"{sorted(unreachable)}"
+        if known - referenced:
+            raise PydanticCustomError(
+                "world_closure_constraint_unreachable",
+                "every world closure catalog constraint must be referenced by a rule",
             )
         return self
 
@@ -1264,7 +1321,13 @@ class CurriculumTaskPlan(AgentOutput):
             ("difficulty_dimensions", self.difficulty_dimensions),
         ):
             if len(set(values)) != len(values):
-                raise ValueError(f"task plan {self.task_type} {label} must be unique")
+                # ``label`` is a framework literal from the tuple above; the
+                # Agent-supplied task_type stays out of the code and message and
+                # is already identified by the validated field path.
+                raise PydanticCustomError(
+                    f"task_plan_{label}_duplicate",
+                    "task plan values must be unique within this field",
+                )
         return self
 
 
@@ -1288,19 +1351,29 @@ class CurriculumPlanDraft(AgentOutput):
     def validate_plan_topology(self) -> CurriculumPlanDraft:
         task_ids = [item.task_type for item in self.task_plans]
         if len(set(task_ids)) != len(task_ids):
-            raise ValueError("curriculum task plan ids must be unique")
+            raise PydanticCustomError(
+                "curriculum_task_plan_id_duplicate",
+                "curriculum task plan ids must be unique",
+            )
         dimensions = [item.dimension for item in self.difficulty_dimensions]
         if len(set(dimensions)) != len(dimensions):
-            raise ValueError("curriculum difficulty dimensions must be unique")
+            raise PydanticCustomError(
+                "curriculum_difficulty_dimension_duplicate",
+                "curriculum difficulty dimensions must be unique",
+            )
         dimension_set = set(dimensions)
         for task in self.task_plans:
             if not set(task.difficulty_dimensions) <= dimension_set:
-                raise ValueError(
-                    f"task plan {task.task_type} references unknown difficulty dimensions"
+                raise PydanticCustomError(
+                    "curriculum_task_difficulty_dimension_unknown",
+                    "task plans must reference declared curriculum difficulty dimensions",
                 )
         coverage = [item.dimension for item in self.coverage_dimensions]
         if len(set(coverage)) != len(coverage):
-            raise ValueError("curriculum coverage dimensions must be unique")
+            raise PydanticCustomError(
+                "curriculum_coverage_dimension_duplicate",
+                "curriculum coverage dimensions must be unique",
+            )
         return self
 
 
@@ -1417,13 +1490,17 @@ class WorldSemanticSourceIRDraft(AgentOutput):
         planned_entities = tuple(item.entity for item in self.state_inventory.entities)
         authored_entities = tuple(item.entity for item in self.state_entity_schemas)
         if authored_entities != planned_entities:
-            raise ValueError(
-                "state schema IR shards must preserve state inventory order and identity"
+            raise PydanticCustomError(
+                "state_schema_shard_inventory_mismatch",
+                "state schema IR shards must preserve state inventory order and identity",
             )
         planned_tools = tuple(item.tool_id for item in self.tool_inventory.tools)
         authored_semantics = tuple(item.tool_id for item in self.tool_semantics)
         if authored_semantics != planned_tools:
-            raise ValueError("tool semantics must preserve tool inventory order and identity")
+            raise PydanticCustomError(
+                "tool_semantics_inventory_mismatch",
+                "tool semantics must preserve tool inventory order and identity",
+            )
         expected_schema_shards = tuple(
             (tool_id, schema_kind)
             for tool_id in planned_tools
@@ -1431,8 +1508,9 @@ class WorldSemanticSourceIRDraft(AgentOutput):
         )
         actual_schema_shards = tuple((item.tool_id, item.schema_kind) for item in self.tool_schemas)
         if actual_schema_shards != expected_schema_shards:
-            raise ValueError(
-                "tool schema IR shards must be ordered input/output/observation for every tool"
+            raise PydanticCustomError(
+                "tool_schema_shard_order_mismatch",
+                "tool schema IR shards must be ordered input/output/observation for every tool",
             )
         return self
 
@@ -1475,9 +1553,15 @@ class StateEntitySourceDraft(AgentOutput):
     @model_validator(mode="after")
     def validate_owned_sets(self) -> StateEntitySourceDraft:
         if len(set(self.owned_resource_ids)) != len(self.owned_resource_ids):
-            raise ValueError("state entity owned resources must be unique")
+            raise PydanticCustomError(
+                "state_entity_owned_resource_duplicate",
+                "state entity owned resources must be unique",
+            )
         if len(set(self.visible_to_actor_ids)) != len(self.visible_to_actor_ids):
-            raise ValueError("state entity visible actor ids must be unique")
+            raise PydanticCustomError(
+                "state_entity_visible_actor_duplicate",
+                "state entity visible actor ids must be unique",
+            )
         return self
 
 
@@ -1490,7 +1574,10 @@ class ActorAuthoritySourceDraft(AgentOutput):
     @model_validator(mode="after")
     def validate_authorities(self) -> ActorAuthoritySourceDraft:
         if len(set(self.authorities)) != len(self.authorities):
-            raise ValueError("actor authorities must be unique")
+            raise PydanticCustomError(
+                "actor_authority_duplicate",
+                "actor authorities must be unique",
+            )
         return self
 
 
@@ -1510,7 +1597,10 @@ class WorldBoundarySourceDraft(AgentOutput):
     def validate_unique_boundary_sets(self) -> WorldBoundarySourceDraft:
         actors = tuple(item.actor for item in self.actors_and_authority)
         if len(set(actors)) != len(actors):
-            raise ValueError("boundary actor ids must be unique")
+            raise PydanticCustomError(
+                "boundary_actor_id_duplicate",
+                "boundary actor ids must be unique",
+            )
         for label, values in (
             ("systems_of_record", self.systems_of_record),
             ("transition_authorities", self.transition_authorities),
@@ -1519,7 +1609,11 @@ class WorldBoundarySourceDraft(AgentOutput):
             ("task_dimensions", self.task_dimensions),
         ):
             if len(set(values)) != len(values):
-                raise ValueError(f"boundary source {label} values must be unique")
+                # ``label`` is a framework literal from the tuple above.
+                raise PydanticCustomError(
+                    f"boundary_{label}_duplicate",
+                    "boundary source values must be unique within this field",
+                )
         return self
 
 
@@ -1531,7 +1625,10 @@ class StateEntityFieldsSourceDraft(AgentOutput):
     def validate_unique_fields(self) -> StateEntityFieldsSourceDraft:
         names = tuple(item.name for item in self.fields)
         if len(set(names)) != len(names):
-            raise ValueError("state entity field names must be unique")
+            raise PydanticCustomError(
+                "state_entity_field_name_duplicate",
+                "state entity field names must be unique",
+            )
         return self
 
 
@@ -1579,11 +1676,20 @@ class ToolCouplingGroupPlan(V2Contract):
     def validate_batches(self) -> ToolCouplingGroupPlan:
         flattened = tuple(tool_id for batch in self.batches for tool_id in batch)
         if flattened != self.ordered_tool_ids:
-            raise ValueError("coupling batches must preserve exact group tool order and identity")
+            raise PydanticCustomError(
+                "coupling_batch_group_order_mismatch",
+                "coupling batches must preserve exact group tool order and identity",
+            )
         if self.mode == "single_batch" and len(self.batches) != 1:
-            raise ValueError("single_batch coupling group requires exactly one batch")
+            raise PydanticCustomError(
+                "coupling_single_batch_arity",
+                "single_batch coupling group requires exactly one batch",
+            )
         if self.mode == "multi_batch" and len(self.batches) < 2:
-            raise ValueError("multi_batch coupling group requires at least two batches")
+            raise PydanticCustomError(
+                "coupling_multi_batch_arity",
+                "multi_batch coupling group requires at least two batches",
+            )
         return self
 
 
@@ -1609,13 +1715,20 @@ class ToolCouplingPlan(V2Contract):
         group_ids = tuple(group.group_id for group in self.groups)
         tool_ids = tuple(tool_id for group in self.groups for tool_id in group.ordered_tool_ids)
         if len(set(group_ids)) != len(group_ids):
-            raise ValueError("tool coupling group ids must be unique")
+            raise PydanticCustomError(
+                "coupling_group_id_duplicate",
+                "tool coupling group ids must be unique",
+            )
         if len(set(tool_ids)) != len(tool_ids):
-            raise ValueError("each tool must belong to exactly one coupling group")
+            raise PydanticCustomError(
+                "coupling_tool_group_membership_duplicate",
+                "each tool must belong to exactly one coupling group",
+            )
         scheduled = tuple(tool_id for batch in self.execution_batches for tool_id in batch)
         if set(scheduled) != set(tool_ids) or len(scheduled) != len(tool_ids):
-            raise ValueError(
-                "execution batches must schedule every coupling-plan tool exactly once"
+            raise PydanticCustomError(
+                "coupling_execution_batch_coverage",
+                "execution batches must schedule every coupling-plan tool exactly once",
             )
         return self
 
@@ -1715,7 +1828,10 @@ class ToolSemanticGroupClosure(V2Contract):
     @model_validator(mode="after")
     def validate_member_refs(self) -> ToolSemanticGroupClosure:
         if len(self.semantic_refs) != len(self.member_tool_ids):
-            raise ValueError("group closure requires one semantic ref per member tool")
+            raise PydanticCustomError(
+                "group_closure_semantic_ref_arity",
+                "group closure requires one semantic ref per member tool",
+            )
         return self
 
 
@@ -1789,7 +1905,10 @@ class ToolSemanticsBatchSourceDraft(AgentOutput):
     def validate_unique_tools(self) -> ToolSemanticsBatchSourceDraft:
         tool_ids = tuple(item.tool_id for item in self.tools)
         if len(set(tool_ids)) != len(tool_ids):
-            raise ValueError("tool semantics batch tool ids must be unique")
+            raise PydanticCustomError(
+                "tool_semantics_batch_tool_id_duplicate",
+                "tool semantics batch tool ids must be unique",
+            )
         return self
 
 
@@ -1830,7 +1949,10 @@ class TrainingSemanticSourceDraft(AgentOutput):
         planned = tuple(item.task_type for item in self.curriculum_plan.task_plans)
         authored = tuple(item.task_type for item in self.task_requirements)
         if authored != planned:
-            raise ValueError("task requirements must preserve curriculum plan order and identity")
+            raise PydanticCustomError(
+                "training_task_requirement_plan_mismatch",
+                "task requirements must preserve curriculum plan order and identity",
+            )
         return self
 
 
@@ -1854,8 +1976,10 @@ class EnvironmentSemanticSourceDraft(AgentOutput):
         planned = tuple(item.task_type for item in self.curriculum_plan.task_plans)
         authored = tuple(item.task_type for item in self.task_requirements)
         if authored != planned:
-            raise ValueError(
-                "semantic source task requirements must preserve curriculum plan order and identity"
+            raise PydanticCustomError(
+                "environment_task_requirement_plan_mismatch",
+                "semantic source task requirements must preserve curriculum plan "
+                "order and identity",
             )
         return self
 
@@ -1872,7 +1996,10 @@ class ToolSurfaceDeltaClaimDraft(AgentOutput):
     @model_validator(mode="after")
     def validate_operation(self) -> ToolSurfaceDeltaClaimDraft:
         if (self.operation == "add") != (self.before_hash is None):
-            raise ValueError("add forbids before_hash; remove/modify require it")
+            raise PydanticCustomError(
+                "tool_surface_delta_before_hash_binding",
+                "add forbids before_hash; remove/modify require it",
+            )
         return self
 
 
@@ -1904,7 +2031,10 @@ class ToolSemanticsDeltaClaimDraft(AgentOutput):
     @model_validator(mode="after")
     def validate_operation(self) -> ToolSemanticsDeltaClaimDraft:
         if (self.operation == "add") != (self.before_hash is None):
-            raise ValueError("add forbids before_hash; remove/modify require it")
+            raise PydanticCustomError(
+                "tool_semantics_delta_before_hash_binding",
+                "add forbids before_hash; remove/modify require it",
+            )
         return self
 
 
@@ -1924,7 +2054,10 @@ class TransitionConstraintDeltaClaimDraft(AgentOutput):
     @model_validator(mode="after")
     def validate_operation(self) -> TransitionConstraintDeltaClaimDraft:
         if (self.operation == "add") != (self.before_hash is None):
-            raise ValueError("add forbids before_hash; remove/modify require it")
+            raise PydanticCustomError(
+                "transition_constraint_delta_before_hash_binding",
+                "add forbids before_hash; remove/modify require it",
+            )
         return self
 
 
@@ -1937,7 +2070,10 @@ class TaskScopeDeltaClaimDraft(AgentOutput):
     @model_validator(mode="after")
     def validate_operation(self) -> TaskScopeDeltaClaimDraft:
         if (self.operation == "add") != (self.before_hash is None):
-            raise ValueError("add forbids before_hash; remove/modify require it")
+            raise PydanticCustomError(
+                "task_scope_delta_before_hash_binding",
+                "add forbids before_hash; remove/modify require it",
+            )
         return self
 
 

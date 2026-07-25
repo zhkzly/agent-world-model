@@ -772,3 +772,130 @@ def test_fold_never_guesses_a_candidate_file_for_a_multi_file_gate() -> None:
 
     assert coordinate.candidate_file is None
     assert coordinate.repair_target == "needs_human"
+
+
+def _designer_head(
+    *,
+    validation_status,
+    code: str,
+    violated_condition: str,
+    routes_repair_to_parent: bool = False,
+) -> SceneHead:
+    """A Designer-stage failed head, parameterised by its terminal lane.
+
+    This mirrors the production ``design.world_behavior.tool_semantics_batch``
+    coordinate on attempt 2: the only variable that must decide the repair lane
+    is the terminal ``ValidationReport.status`` (error = infrastructure,
+    failed = a real rejected proposal), never the pipeline stage.
+    """
+
+    issue = SceneIssue(
+        normalized_identity=sha256_digest(f"designer-issue:{code}".encode()),
+        code=code,
+        path=("operation",),
+        violated_condition=violated_condition,
+        expected_category="one fresh execution under the declared replay policy",
+        severity="blocker",
+        actionable=True,
+        gate_id=None,
+        candidate_file=None,
+    )
+    return SceneHead(
+        scope_id="job:designer-lane",
+        coordinate_key=sha256_digest(f"designer-coordinate:{code}".encode()),
+        coordinate_label="design.world_behavior.tool_semantics_batch",
+        head_status="failed",
+        revision=2,
+        attempt_ref_revision=sha256_digest(f"designer-attempt:{code}".encode()),
+        attempt_ref_id=f"attempt:designer:{code}",
+        attempt_ordinal=2,
+        failure_code=code,
+        frontier_ordinal=1,
+        pipeline_stage="Designer",
+        repair_authority="none",
+        input_fingerprint=sha256_digest(b"designer-input"),
+        issues=(issue,),
+        previous_issue_ids=(),
+        run_id=None,
+        graph_digest=sha256_digest(b"designer-graph"),
+        updated_at=datetime.now(UTC),
+        validation_status=validation_status,
+        routes_repair_to_parent=routes_repair_to_parent,
+    )
+
+
+def test_fold_routes_designer_transport_terminal_to_infrastructure_not_design() -> None:
+    """A backend/transport terminal on a Designer coordinate must not tell the
+    agent to edit the frozen WorldSpec.
+
+    This is the deterministic reproduction of the observed thrashing loop: the
+    DirectLlmBackend intermittently returns a completed-but-not-JSON response
+    (``ValidationReport.status == "error"``), and the scene previously routed
+    any Designer-stage issue to ``design_worldspec`` -> ``review_design_worldspec``,
+    driving edits to the frozen design that could never fix a transport fault.
+    """
+
+    head = _designer_head(
+        validation_status="error",
+        code="agent_backend_direct_structured_output_invalid_json",
+        violated_condition="the Agent backend returned a non-success terminal result",
+    )
+
+    scene = fold((head,), ())
+    coordinate = scene.coordinates[0]
+
+    assert coordinate.validation_status == "error"
+    assert coordinate.repair_target == "infrastructure_transport"
+    assert coordinate.repair_target != "design_worldspec"
+    assert scene.index.next_action_hint == "inspect_infrastructure"
+    assert scene.index.next_action_hint != "review_design_worldspec"
+
+
+def test_fold_keeps_genuine_designer_semantic_failure_on_design_lane() -> None:
+    """A rejected proposal that routed its repair upstream stays on the design lane.
+
+    The parent repair route is the leaf's own statement that the defect is not
+    owned here, so the transport and proposal lanes must not blind the scene to a
+    true frozen-design defect.
+    """
+
+    head = _designer_head(
+        validation_status="failed",
+        code="design_world_behavior_semantic_incoherence",
+        violated_condition="The proposed tool semantics contradict the frozen requirements.",
+        routes_repair_to_parent=True,
+    )
+
+    scene = fold((head,), ())
+    coordinate = scene.coordinates[0]
+
+    assert coordinate.validation_status == "failed"
+    assert coordinate.repair_target == "design_worldspec"
+    assert scene.index.next_action_hint == "review_design_worldspec"
+
+
+def test_fold_routes_self_inconsistent_proposal_to_the_proposal_lane() -> None:
+    """A proposal that violates its own contract must be revised, not the design.
+
+    Observed live on ``design.world_behavior.tool_semantics_batch``: the batch
+    referenced a ``timeout_error_code`` it never declared in its own errors
+    section.  That defect lives in the output this coordinate just produced, and
+    no parent repair route was committed, so directing the agent at the frozen
+    WorldSpec would repeat the original thrashing loop with a new failure class.
+    """
+
+    head = _designer_head(
+        validation_status="failed",
+        code="reliability_timeout_error_unknown",
+        violated_condition="semantic contract reliability_timeout_error_unknown",
+        routes_repair_to_parent=False,
+    )
+
+    scene = fold((head,), ())
+    coordinate = scene.coordinates[0]
+
+    assert coordinate.validation_status == "failed"
+    assert coordinate.repair_target == "proposal_semantics"
+    assert coordinate.repair_target != "design_worldspec"
+    assert scene.index.next_action_hint == "revise_proposal"
+    assert scene.index.next_action_hint != "review_design_worldspec"

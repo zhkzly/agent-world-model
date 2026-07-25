@@ -236,6 +236,8 @@ class SceneProjector:
             attempt_ref_id=self._safe(head.attempt_ref.artifact_id),
             attempt_ordinal=attempt.ordinal,
             failure_code=(self._safe(attempt.failure_code) if attempt.failure_code else None),
+            validation_status=(report.status if report is not None else None),
+            routes_repair_to_parent=self._routes_repair_to_parent(report),
             frontier_ordinal=(report.frontier_ordinal if report is not None else 0),
             pipeline_stage=_PIPELINE_STAGE_BY_COMPONENT.get(coordinate.component, "Registry"),
             repair_authority=self._repair_authority(head, attempt, report),
@@ -436,6 +438,22 @@ class SceneProjector:
             self.telemetry.flush()
         except Exception:
             return
+
+    def _routes_repair_to_parent(self, report: ValidationReport | None) -> bool:
+        """Whether this terminal report handed its repair to an ancestor.
+
+        ``SchedulerLeafExecutor`` commits a ``control.parent_repair_route``
+        artifact exactly when a leaf declared a ``parent_repair_target``.  Its
+        presence is therefore the authoritative statement that the defect is not
+        owned by the coordinate that produced the rejected output; its absence
+        means the proposal itself is the repair subject.
+        """
+
+        if report is None:
+            return False
+        return any(
+            ref.artifact_type == "control.parent_repair_route" for ref in report.evidence_refs
+        )
 
     def _repair_authority(
         self,

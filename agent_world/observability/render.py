@@ -35,10 +35,24 @@ def render_scene(scene: RunSceneIndex, coordinates: tuple[CoordinateScene, ...])
                 "Repair target: generated Candidate code. "
                 "WorldSpec and the gate are frozen; do not change either (DRIFT)."
             )
+        elif stuck.repair_target == "proposal_semantics":
+            lines.append(
+                "Repair target: the rejected proposal this coordinate just produced. "
+                "Revise that output so it satisfies its own declared contract; the "
+                "frozen WorldSpec and gate are NOT the repair subject (editing them "
+                "is DRIFT)."
+            )
         elif stuck.repair_target == "design_worldspec":
             lines.append(
                 "Repair target: frozen-design review required. "
                 "Do not mutate the frozen WorldSpec or gate during Candidate repair (DRIFT)."
+            )
+        elif stuck.repair_target == "infrastructure_transport":
+            lines.append(
+                "Repair target: infrastructure/transport terminal, not a design defect. "
+                "The leaf produced no proposal to judge; the frozen WorldSpec and gate "
+                "are NOT the repair subject (editing them is DRIFT). Treat as a bounded "
+                "backend retry or escalate to human review."
             )
         elif stuck.repair_target == "needs_human":
             lines.append("Repair target: needs human review; no single Candidate file is guessed.")
@@ -72,6 +86,19 @@ def render_coordinate(scene: CoordinateScene) -> str:
         lines.append(
             f"Why: {_text(scene.candidate_file)} is the repair subject; "
             "the frozen WorldSpec and gate are not editable (DRIFT)."
+        )
+    elif scene.repair_target == "proposal_semantics":
+        lines.append("Repair target: proposal_semantics")
+        lines.append(
+            "Why: the proposal produced here violates its own declared contract; "
+            "revise this output, not the frozen WorldSpec or gate (DRIFT)."
+        )
+    elif scene.repair_target == "infrastructure_transport":
+        lines.append("Repair target: infrastructure_transport")
+        lines.append(
+            "Why: an infrastructure/transport terminal (no proposal was produced); "
+            "the frozen WorldSpec and gate are not the repair subject (DRIFT). "
+            "Bounded backend retry or human review, not a design edit."
         )
     elif scene.repair_target is not None:
         lines.append(f"Repair target: {scene.repair_target}")

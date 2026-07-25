@@ -38,6 +38,13 @@ type HeadStatus = Literal[
     "needs_human",
     "interrupted",
 ]
+# Mirrors ``agent_world.control.work.ValidationStatus``.  ``error`` is the
+# authoritative marker of an infrastructure/transport terminal (a leaf that
+# could not produce a valid proposal, e.g. a compatible-gateway response that
+# was not JSON) as opposed to ``failed`` (a real proposal whose semantics were
+# deterministically rejected).  The scene must route these two lanes apart so a
+# transport failure never presents the frozen WorldSpec as the repair subject.
+type ValidationStatus = Literal["passed", "failed", "inconclusive", "error"]
 type PipelineStage = Literal[
     "Research",
     "Designer",
@@ -57,6 +64,8 @@ type RepairAuthority = Literal[
 type RepairTarget = Literal[
     "generated_candidate_code",
     "design_worldspec",
+    "proposal_semantics",
+    "infrastructure_transport",
     "needs_human",
 ]
 type StuckReason = Literal[
@@ -77,7 +86,9 @@ type SceneStatus = Literal[
 ]
 type NextActionHint = Literal[
     "inspect_subprocess",
+    "inspect_infrastructure",
     "repair_candidate_code",
+    "revise_proposal",
     "review_design_worldspec",
     "request_human_review",
     "wait_for_running_work",
@@ -165,6 +176,7 @@ class CoordinateScene(V2Contract):
     head_status: HeadStatus
     attempt_ordinal: Annotated[int, Field(ge=1)]
     failure_code: Annotated[NonEmptyStr, Field(max_length=512)] | None = None
+    validation_status: ValidationStatus | None = None
     frontier_ordinal: Annotated[int, Field(ge=0)]
     pipeline_stage: PipelineStage
     unresolved_issue_ids: Annotated[
@@ -301,6 +313,16 @@ class SceneHead:
     graph_digest: str
     updated_at: datetime
     subprocess_available: bool = False
+    # The terminal ValidationReport.status for this head, when one exists.
+    # ``error`` denotes an infrastructure/transport terminal; ``failed`` denotes
+    # a deterministically rejected real proposal.  ``None`` when the head has no
+    # settled validation report yet (running / freshly scheduled).
+    validation_status: ValidationStatus | None = None
+    # True when this head's terminal report routes its repair to an ancestor
+    # coordinate (a ``control.parent_repair_route`` was committed).  A rejected
+    # proposal WITHOUT such a route is repairable where it was produced, so it
+    # must not be presented as a frozen-design defect.
+    routes_repair_to_parent: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,6 +511,7 @@ def _coordinate_scene(head: SceneHead, *, subprocess_available: bool) -> Coordin
         head_status=head.head_status,
         attempt_ordinal=head.attempt_ordinal,
         failure_code=head.failure_code,
+        validation_status=head.validation_status,
         frontier_ordinal=head.frontier_ordinal,
         pipeline_stage=head.pipeline_stage,
         unresolved_issue_ids=shown_issue_ids,
@@ -520,10 +543,27 @@ def _repair_target(
 ) -> RepairTarget | None:
     if head.head_status == "committed":
         return None
+    # An infrastructure/transport terminal (ValidationReport.status == "error")
+    # is not evidence of a design defect: the leaf never produced a proposal to
+    # judge.  It must never route to design_worldspec, or a transient bad-JSON
+    # transport failure would tell the agent to edit the frozen WorldSpec and
+    # thrash.  This check precedes the Designer branch precisely because the
+    # same coordinate can emit both lanes across attempts.
+    if head.validation_status == "error" and head.issues:
+        return "infrastructure_transport"
     if multi_file_gate:
         return "needs_human"
     if head.pipeline_stage == "Designer" and head.issues:
-        return "design_worldspec"
+        # A rejected proposal is only a frozen-design defect when the leaf
+        # actually routed its repair upstream.  Without that route the failure
+        # lives in the output this coordinate just produced -- e.g. a
+        # ToolSemantics batch referencing an error code it never declared -- and
+        # the honest instruction is to revise that proposal, not to edit the
+        # frozen WorldSpec.  Conflating the two is what turned a self-repairable
+        # semantic defect into repeated frozen-design edits.
+        if head.routes_repair_to_parent:
+            return "design_worldspec"
+        return "proposal_semantics"
     if issue is not None and issue.candidate_file is not None:
         return "generated_candidate_code"
     if head.issues or head.head_status == "needs_human":
@@ -621,8 +661,16 @@ def _next_action(scene: CoordinateScene) -> NextActionHint | None:
     reason = _stuck_reason(scene)
     if reason == "subprocess_crash":
         return "inspect_subprocess"
+    # A transport/infra terminal must be inspected as infrastructure even when
+    # the attempt count would otherwise read as thrashing: the loop is caused by
+    # mis-routing, not by an unrepairable design.  This precedes the thrashing
+    # branch so it is not swallowed into request_human_review.
+    if scene.repair_target == "infrastructure_transport":
+        return "inspect_infrastructure"
     if scene.repair_target == "generated_candidate_code":
         return "repair_candidate_code"
+    if scene.repair_target == "proposal_semantics":
+        return "revise_proposal"
     if scene.repair_target == "design_worldspec":
         return "review_design_worldspec"
     if scene.repair_target == "needs_human" or reason in {
