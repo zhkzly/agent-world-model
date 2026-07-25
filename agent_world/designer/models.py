@@ -54,6 +54,14 @@ class AgentOutput(SemanticAdvisoryOutput, BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
 
 
+# Tool semantics was empirically shown to exhaust a 65k-token provider turn
+# when four coupled tools were authored together.  This is a physical work
+# boundary, not an Agent preference: all layers retain the same frozen order
+# while each proposal owns at most two tools.
+MAX_TOOLS_PER_SEMANTICS_BATCH = 2
+MAX_SEMANTICS_BATCHES = 4
+
+
 class PlannedSearchQuery(AgentOutput):
     text: Annotated[str, Field(min_length=1)]
     rationale: Annotated[str, Field(min_length=1)]
@@ -723,6 +731,158 @@ class RuleDraft(AgentOutput):
     evidence_claim_ids: tuple[Identifier, ...] = ()
 
 
+class ToolRuleBoundLookupByReferenceDraft(AgentOutput):
+    """One frozen lookup plus its mechanically compatible reference key.
+
+    ToolSemantics uses a deliberately flat wire representation.  The lookup
+    and reference key are one framework-derived catalog selection, so the
+    Agent cannot combine two individually valid aliases into an invalid pair.
+    """
+
+    kind: Literal["bound_lookup_by_reference"]
+    binding_id: Identifier
+
+
+class ToolRuleBoundLookupByConstantDraft(AgentOutput):
+    """One frozen lookup whose key is an explicitly typed JSON constant."""
+
+    kind: Literal["bound_lookup_by_constant"]
+    binding_id: Identifier
+    key_value_type: Literal["null", "boolean", "number", "string", "array", "object"]
+    key_value: JsonValue
+
+
+ToolRuleAtomDraft = Annotated[
+    RuleConstantDraft
+    | RuleBoundReferenceDraft
+    | ToolRuleBoundLookupByReferenceDraft
+    | ToolRuleBoundLookupByConstantDraft,
+    Field(discriminator="kind"),
+]
+
+
+class ToolRuleArithmeticDraft(AgentOutput):
+    """Bounded ToolSemantics arithmetic over closed, non-recursive atoms."""
+
+    kind: Literal["arithmetic"]
+    operator: Literal["add", "subtract", "multiply", "divide", "modulo"]
+    left: ToolRuleAtomDraft
+    right: ToolRuleAtomDraft
+
+
+ToolRuleTermDraft = Annotated[
+    RuleConstantDraft
+    | RuleBoundReferenceDraft
+    | ToolRuleBoundLookupByReferenceDraft
+    | ToolRuleBoundLookupByConstantDraft
+    | ToolRuleArithmeticDraft,
+    Field(discriminator="kind"),
+]
+
+
+class ToolRuleEqualClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["equal"]
+    left: ToolRuleTermDraft
+    right: ToolRuleTermDraft
+    negate: bool = False
+
+
+class ToolRuleNotEqualClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["not_equal"]
+    left: ToolRuleTermDraft
+    right: ToolRuleTermDraft
+    negate: bool = False
+
+
+class ToolRuleGreaterThanClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["greater_than"]
+    ordering: Literal["number", "date", "date-time"]
+    left: ToolRuleTermDraft
+    right: ToolRuleTermDraft
+    negate: bool = False
+
+
+class ToolRuleGreaterOrEqualClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["greater_or_equal"]
+    ordering: Literal["number", "date", "date-time"]
+    left: ToolRuleTermDraft
+    right: ToolRuleTermDraft
+    negate: bool = False
+
+
+class ToolRuleLessThanClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["less_than"]
+    ordering: Literal["number", "date", "date-time"]
+    left: ToolRuleTermDraft
+    right: ToolRuleTermDraft
+    negate: bool = False
+
+
+class ToolRuleLessOrEqualClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["less_or_equal"]
+    ordering: Literal["number", "date", "date-time"]
+    left: ToolRuleTermDraft
+    right: ToolRuleTermDraft
+    negate: bool = False
+
+
+class ToolRuleContainsClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["contains"]
+    left: ToolRuleTermDraft
+    right: ToolRuleTermDraft
+    negate: bool = False
+
+
+class ToolRuleNotContainsClauseDraft(AgentOutput):
+    clause_id: Identifier
+    operator: Literal["not_contains"]
+    left: ToolRuleTermDraft
+    right: ToolRuleTermDraft
+    negate: bool = False
+
+
+ToolRuleClauseDraft = Annotated[
+    ToolRuleEqualClauseDraft
+    | ToolRuleNotEqualClauseDraft
+    | ToolRuleGreaterThanClauseDraft
+    | ToolRuleGreaterOrEqualClauseDraft
+    | ToolRuleLessThanClauseDraft
+    | ToolRuleLessOrEqualClauseDraft
+    | ToolRuleContainsClauseDraft
+    | ToolRuleNotContainsClauseDraft,
+    Field(discriminator="operator"),
+]
+
+
+class ToolRuleDraft(AgentOutput):
+    """Closed ToolSemantics wire Rule compiled into the general RuleDraft IR.
+
+    WorldRules, Curriculum, and other non-frozen contexts retain RuleDraft.
+    This narrower source exists only where framework code has already frozen a
+    complete reference and collection-binding catalog for one tool.
+    """
+
+    family: Literal[
+        "precondition",
+        "transition",
+        "postcondition",
+        "error_condition",
+        "permission",
+    ]
+    description: Annotated[str, Field(min_length=1)]
+    boolean_operator: Literal["all", "any"]
+    clauses: Annotated[tuple[ToolRuleClauseDraft, ...], Field(min_length=1, max_length=64)]
+    case_sensitivity: Literal["positive_only", "positive_and_negative"]
+    evidence_claim_ids: tuple[Identifier, ...] = ()
+
+
 class ToolErrorSourceDraft(AgentOutput):
     error_code: Identifier
     when: RuleDraft
@@ -733,9 +893,18 @@ class ToolErrorSourceDraft(AgentOutput):
 
 
 class PermissionRuleSourceDraft(AgentOutput):
+    """Agent-owned permission meaning without a duplicated actor-set field.
+
+    The keys of ``required_scopes_by_actor`` are the complete set of actors
+    admitted by this permission. The core ``PermissionRule`` retains its
+    explicit ``allowed_actors`` field for Runtime/Judge consumption, but the
+    compiler derives that mechanical projection from these keys.
+    """
+
     permission_id: Identifier
-    allowed_actors: Annotated[tuple[Identifier, ...], Field(min_length=1)]
-    required_scopes_by_actor: dict[Identifier, tuple[Identifier, ...]]
+    required_scopes_by_actor: Annotated[
+        dict[Identifier, tuple[Identifier, ...]], Field(min_length=1)
+    ]
     condition: RuleDraft | None = None
     denied_observation: Annotated[str, Field(min_length=1)]
 
@@ -1391,9 +1560,19 @@ class ToolCouplingGroupPlan(V2Contract):
         tuple[Literal["namespace", "state_overlap"], ...], Field(min_length=1)
     ]
     mode: Literal["single_batch", "multi_batch"]
+    # Captured pre-BC-17 plans may contain four-tool groups.  They are
+    # read-only diagnostic inputs only: ``derive_final_design_definitions``
+    # rejects an oversized physical batch before any new graph can execute or
+    # release.  Keep this decoder ceiling so test-node can genuinely rerun a
+    # compatible historical two-tool shard without replaying it.
     batches: Annotated[
-        tuple[Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=4)], ...],
-        Field(min_length=1, max_length=2),
+        tuple[
+            Annotated[
+                tuple[Identifier, ...], Field(min_length=1, max_length=4)
+            ],
+            ...,
+        ],
+        Field(min_length=1, max_length=MAX_SEMANTICS_BATCHES),
     ]
 
     @model_validator(mode="after")
@@ -1412,9 +1591,17 @@ class ToolCouplingPlan(V2Contract):
     plan_id: Identifier
     architecture_ref: ArtifactRef
     groups: Annotated[tuple[ToolCouplingGroupPlan, ...], Field(min_length=1, max_length=8)]
+    # See ``ToolCouplingGroupPlan.batches``: new plans are mechanically
+    # emitted at the two-tool cap, while this wider decoder is needed only to
+    # inspect a captured ancestor closure in diagnostic mode.
     execution_batches: Annotated[
-        tuple[Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=4)], ...],
-        Field(min_length=1, max_length=2),
+        tuple[
+            Annotated[
+                tuple[Identifier, ...], Field(min_length=1, max_length=4)
+            ],
+            ...,
+        ],
+        Field(min_length=1, max_length=MAX_SEMANTICS_BATCHES),
     ]
 
     @model_validator(mode="after")
@@ -1539,8 +1726,77 @@ class WorldRuleSemanticsSourceDraft(AgentOutput):
     invariants: Annotated[tuple[RuleDraft, ...], Field(min_length=1, max_length=64)]
 
 
+class ToolRuleConditionsSourceDraft(AgentOutput):
+    tool_id: Identifier
+    preconditions: tuple[ToolRuleDraft, ...] = ()
+    postconditions: tuple[ToolRuleDraft, ...] = ()
+
+
+class ToolRuleStateTransitionSourceDraft(AgentOutput):
+    tool_id: Identifier
+    transition: Annotated[tuple[ToolRuleDraft, ...], Field(min_length=1)]
+
+
+class ToolRuleErrorSourceDraft(AgentOutput):
+    error_code: Identifier
+    when: ToolRuleDraft
+    observation: Annotated[str, Field(min_length=1)]
+    state_effect: Literal["none", "partial", "rolled_back", "unknown"]
+    retryable: bool
+    evidence_claim_ids: tuple[Identifier, ...] = ()
+
+
+class ToolRuleErrorsSourceDraft(AgentOutput):
+    tool_id: Identifier
+    errors: Annotated[tuple[ToolRuleErrorSourceDraft, ...], Field(min_length=1)]
+
+
+class ToolRulePermissionSourceDraft(AgentOutput):
+    permission_id: Identifier
+    required_scopes_by_actor: Annotated[
+        dict[Identifier, tuple[Identifier, ...]], Field(min_length=1)
+    ]
+    condition: ToolRuleDraft | None = None
+    denied_observation: Annotated[str, Field(min_length=1)]
+
+
+class ToolRuleAccessObservationSourceDraft(AgentOutput):
+    tool_id: Identifier
+    permission: ToolRulePermissionSourceDraft
+    observation: ObservationSemanticsSourceDraft
+
+
 class ToolSemanticSourceDraft(AgentOutput):
     """All business semantics for one frozen tool in one transaction batch."""
+
+    tool_id: Identifier
+    conditions: ToolRuleConditionsSourceDraft
+    state_transition: ToolRuleStateTransitionSourceDraft
+    errors: ToolRuleErrorsSourceDraft
+    access_observation: ToolRuleAccessObservationSourceDraft
+    reliability: ToolReliabilitySourceDraft
+
+
+class ToolSemanticsBatchSourceDraft(AgentOutput):
+    """A bounded group of state-coupled tools repaired as one semantic unit."""
+
+    tools: Annotated[
+        tuple[ToolSemanticSourceDraft, ...],
+        Field(min_length=1, max_length=MAX_TOOLS_PER_SEMANTICS_BATCH),
+    ]
+
+    @model_validator(mode="after")
+    def validate_unique_tools(self) -> ToolSemanticsBatchSourceDraft:
+        tool_ids = tuple(item.tool_id for item in self.tools)
+        if len(set(tool_ids)) != len(tool_ids):
+            raise ValueError("tool semantics batch tool ids must be unique")
+        return self
+
+
+class MaterializedToolSemanticSource(BaseModel):
+    """Framework-expanded ToolSemantics source accepted by the Rule compiler."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     tool_id: Identifier
     conditions: ToolConditionsSourceDraft
@@ -1550,92 +1806,15 @@ class ToolSemanticSourceDraft(AgentOutput):
     reliability: ToolReliabilitySourceDraft
 
 
-class ToolSemanticsBatchSourceDraft(AgentOutput):
-    """A bounded group of state-coupled tools repaired as one semantic unit."""
+class MaterializedToolSemanticsBatch(BaseModel):
+    """Non-durable compiler input derived from one closed Agent wire draft."""
 
-    tools: Annotated[tuple[ToolSemanticSourceDraft, ...], Field(min_length=1, max_length=4)]
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    @model_validator(mode="after")
-    def validate_unique_tools(self) -> ToolSemanticsBatchSourceDraft:
-        tool_ids = tuple(item.tool_id for item in self.tools)
-        if len(set(tool_ids)) != len(tool_ids):
-            raise ValueError("tool semantics batch tool ids must be unique")
-        # The agent owns the meaning of a Rule, never its namespace.  This
-        # removes a repeated mechanical failure class from the most expensive
-        # semantic node while keeping every final Rule identity stable,
-        # inspectable and derived from immutable source position.
-        # Pydantic top-level ``after`` validators must return this instance;
-        # returning ``model_copy`` is ignored by normal ``__init__``
-        # construction.  Mutating this local validated model is safe because
-        # the canonicalization is pure and every nested value remains the same
-        # closed source type.
-        self.tools = tuple(_canonicalize_tool_semantic_rule_ids(item) for item in self.tools)
-        return self
-
-
-def _canonicalize_tool_semantic_rule_ids(
-    source: ToolSemanticSourceDraft,
-) -> ToolSemanticSourceDraft:
-    """Apply deterministic Rule namespaces to one frozen tool source draft."""
-
-    tool_id = source.tool_id
-
-    def canonicalize(
-        rules: tuple[RuleDraft, ...],
-        section: str,
-    ) -> tuple[RuleDraft, ...]:
-        return tuple(
-            rule.model_copy(update={"rule_id": f"rule:{tool_id}:{section}:{index}"})
-            for index, rule in enumerate(rules)
-        )
-
-    conditions = source.conditions.model_copy(
-        update={
-            "preconditions": canonicalize(source.conditions.preconditions, "precondition"),
-            "postconditions": canonicalize(source.conditions.postconditions, "postcondition"),
-        }
-    )
-    transition = source.state_transition.model_copy(
-        update={"transition": canonicalize(source.state_transition.transition, "transition")}
-    )
-    errors = source.errors.model_copy(
-        update={
-            "errors": tuple(
-                error.model_copy(
-                    update={
-                        "when": error.when.model_copy(
-                            update={"rule_id": f"rule:{tool_id}:error:{index}"}
-                        )
-                    }
-                )
-                for index, error in enumerate(source.errors.errors)
-            )
-        }
-    )
-    permission = source.access_observation.permission
-    access_observation = source.access_observation.model_copy(
-        update={
-            "permission": permission.model_copy(
-                update={
-                    "condition": (
-                        permission.condition.model_copy(
-                            update={"rule_id": f"rule:{tool_id}:permission:0"}
-                        )
-                        if permission.condition is not None
-                        else None
-                    )
-                }
-            )
-        }
-    )
-    return source.model_copy(
-        update={
-            "conditions": conditions,
-            "state_transition": transition,
-            "errors": errors,
-            "access_observation": access_observation,
-        }
-    )
+    tools: Annotated[
+        tuple[MaterializedToolSemanticSource, ...],
+        Field(min_length=1, max_length=MAX_TOOLS_PER_SEMANTICS_BATCH),
+    ]
 
 
 class TrainingSemanticSourceDraft(AgentOutput):
@@ -1919,6 +2098,8 @@ __all__ = [
     "CurriculumPlanDraft",
     "CurriculumPlanSourceDraft",
     "CurriculumTaskPlan",
+    "MAX_SEMANTICS_BATCHES",
+    "MAX_TOOLS_PER_SEMANTICS_BATCH",
     "CurriculumTaskPlanSourceDraft",
     "DiscoveryClueDraft",
     "DiscoverySynthesis",
@@ -1934,6 +2115,8 @@ __all__ = [
     "ExpansionSemanticDeltaDraft",
     "InitialStateRulesDraft",
     "InitialStateRulesSourceDraft",
+    "MaterializedToolSemanticSource",
+    "MaterializedToolSemanticsBatch",
     "CompactFieldSemanticDraft",
     "StateEntitySourceDraft",
     "IdempotencySourceDraft",
@@ -1997,6 +2180,19 @@ __all__ = [
     "ToolErrorsSourceDraft",
     "ToolReliabilityDraft",
     "ToolReliabilitySourceDraft",
+    "ToolRuleAccessObservationSourceDraft",
+    "ToolRuleArithmeticDraft",
+    "ToolRuleAtomDraft",
+    "ToolRuleBoundLookupByConstantDraft",
+    "ToolRuleBoundLookupByReferenceDraft",
+    "ToolRuleClauseDraft",
+    "ToolRuleConditionsSourceDraft",
+    "ToolRuleDraft",
+    "ToolRuleErrorsSourceDraft",
+    "ToolRuleErrorSourceDraft",
+    "ToolRulePermissionSourceDraft",
+    "ToolRuleStateTransitionSourceDraft",
+    "ToolRuleTermDraft",
     "ToolSemanticsDeltaClaimDraft",
     "ToolSemanticSourceDraft",
     "ToolSemanticGroupClosure",

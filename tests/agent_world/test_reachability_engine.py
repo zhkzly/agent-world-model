@@ -337,12 +337,18 @@ def test_recipe_argument_materialization_is_closed_and_copying() -> None:
 async def test_interactive_solver_hard_caps_each_turn_without_breaking_session(
     tmp_path: Path,
 ) -> None:
-    auth_file = tmp_path / "auth.json"
-    auth_file.write_text('{"tokens":{"access_token":"budget-probe-credential"}}')
-    auth_file.chmod(0o600)
     profiles = IsolatedAgentProfileProvider(
-        AgentBackendConfig(model="configured-model", chatgpt_auth_file=auth_file),
-        source_environment={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+        AgentBackendConfig(
+            model="configured-model",
+            api_key_environment="OPENAI_API_KEY",
+            openai_base_url_environment="OPENAI_BASE_URL",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "LANG": "C.UTF-8",
+            "OPENAI_API_KEY": "budget-probe-credential",
+            "OPENAI_BASE_URL": "https://provider.example.test/v1",
+        },
     )
     backend = _BudgetProbeBackend()
     strategy = InteractiveChallengerStrategy(

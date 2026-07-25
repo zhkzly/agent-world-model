@@ -906,6 +906,12 @@ class ValidationReport(V2Contract):
     issues: tuple[ValidationIssue, ...] = ()
     evidence_refs: tuple[ArtifactRef, ...] = ()
     diagnostic_quality: DiagnosticQuality
+    # A diagnostic run may execute the same validator against real inputs, but
+    # its report is never release evidence.  Keep that fact on the report
+    # itself rather than relying on a CLI-only label that can be lost when the
+    # report is consumed by a later control-plane reader.
+    diagnostic_only: bool = False
+    releasable: bool = True
     evaluated_at: AwareDatetime
 
     @model_validator(mode="after")
@@ -937,6 +943,8 @@ class ValidationReport(V2Contract):
             )
         if self.diagnostic_quality != expected_quality:
             raise ValueError("diagnostic quality is not the framework-derived value")
+        if self.diagnostic_only and self.releasable:
+            raise ValueError("diagnostic validation reports are never releasable")
         return self
 
     @property

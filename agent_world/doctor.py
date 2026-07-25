@@ -7,7 +7,6 @@ import importlib.metadata
 import json
 import os
 import shutil
-import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -146,7 +145,7 @@ async def run_doctor(
                     role="researcher",
                 ),
             )
-            if profile.authentication_kind not in {"api_key", "chatgpt"}:
+            if profile.authentication_kind != "api_key":
                 raise ValueError("profile authentication kind is invalid")
         checks.append(
             DoctorCheck(
@@ -342,40 +341,29 @@ def _live_agent_failure_code(result: InvocationResult) -> str | None:
 
 def _authentication_check(config: FoundryConfig) -> DoctorCheck:
     agent = config.agent
-    if agent.api_key_environment is not None:
-        value = os.environ.get(agent.api_key_environment)
-        # Match application assembly: Redactor.from_values protects exact
-        # credential values from four bytes onward, including short opaque
-        # tokens issued by OpenAI-compatible gateways.
-        if value and len(value.encode("utf-8")) >= 4:
-            return DoctorCheck(
-                check="model_authentication",
-                status="pass",
-                summary="configured API credential handle is available",
-            )
+    value = os.environ.get(agent.api_key_environment)
+    # Match application assembly: Redactor.from_values protects exact
+    # credential values from four bytes onward, including short opaque
+    # tokens issued by OpenAI-compatible gateways.
+    if not value or len(value.encode("utf-8")) < 4:
         return DoctorCheck(
             check="model_authentication",
             status="fail",
             summary="configured API credential environment is absent",
         )
-    assert agent.chatgpt_auth_file is not None
-    path = agent.chatgpt_auth_file
-    try:
-        if path.is_symlink() or not path.is_file():
-            raise OSError("authorized Codex login file is unavailable")
-        mode = stat.S_IMODE(path.stat().st_mode)
-        if mode & 0o077:
-            raise OSError("authorized Codex login file must not be group/world accessible")
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or not value:
-            raise ValueError("authorized Codex login file is not a non-empty JSON object")
+    if agent.openai_base_url_environment is not None and not os.environ.get(
+        agent.openai_base_url_environment
+    ):
         return DoctorCheck(
             check="model_authentication",
-            status="pass",
-            summary="explicit Codex login handle is valid",
+            status="fail",
+            summary="configured API base-URL environment is absent",
         )
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return DoctorCheck(check="model_authentication", status="fail", summary=str(exc))
+    return DoctorCheck(
+        check="model_authentication",
+        status="pass",
+        summary="configured API credential and routing handles are available",
+    )
 
 
 def _research_credential_check(config: FoundryConfig) -> DoctorCheck:

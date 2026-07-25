@@ -52,6 +52,7 @@ from agent_world.invocation import (
     AgentOutputAuthority,
     CapabilityResolutionError,
     InvocationBackend,
+    InvocationExecutionMode,
     InvocationRequest,
     InvocationResult,
     NodeCapabilityRequirement,
@@ -493,6 +494,7 @@ class VerifierCompiler:
                         "batch_index": batch.batch_index,
                         "mode": "scheduler_one_shot",
                     },
+                    execution_mode=InvocationExecutionMode.SINGLE_SHOT_STRUCTURED,
                 )
             )
         except asyncio.CancelledError:
@@ -694,8 +696,7 @@ class VerifierCompiler:
                 required_rule_ids=rule_ids,
                 required_property_families=property_families,
                 require_metamorphic=(
-                    bool(design.verification.required_metamorphic_relations)
-                    and batch_index == 0
+                    bool(design.verification.required_metamorphic_relations) and batch_index == 0
                 ),
             )
             context["semantic_case_limit"] = batch_case_quotas[batch_index]
@@ -1628,8 +1629,7 @@ class VerifierCompiler:
             }
             if not canonical:
                 raise ValueError(
-                    f"VerifierIntent case at index {case_index} "
-                    "requires a canonical expectation"
+                    f"VerifierIntent case at index {case_index} requires a canonical expectation"
                 )
             observed_kinds.update(str(item.kind) for item in case.expectations)
 
@@ -1723,8 +1723,7 @@ class VerifierCompiler:
                 )
                 missing_text = ", ".join(missing)[:320]
                 message = (
-                    f"Add these fields required by the frozen {value_label} schema: "
-                    f"{missing_text}."
+                    f"Add these fields required by the frozen {value_label} schema: {missing_text}."
                     if missing_text
                     else f"Add every field required by the frozen {value_label} schema here."
                 )
@@ -2643,9 +2642,7 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
             raise VerifierCompilationError("Verifier batch count is outside case-capacity policy")
         semantic_capacity = MAX_VERIFIER_CASES // 2
         quotient, remainder = divmod(semantic_capacity, batch_count)
-        quotas = tuple(
-            quotient + (1 if index < remainder else 0) for index in range(batch_count)
-        )
+        quotas = tuple(quotient + (1 if index < remainder else 0) for index in range(batch_count))
         if any(item < 2 for item in quotas):
             raise VerifierCompilationError(
                 "Verifier batch count cannot satisfy minimum semantic case capacity"

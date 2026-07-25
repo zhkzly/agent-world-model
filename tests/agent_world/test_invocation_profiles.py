@@ -12,7 +12,6 @@ from agent_world.invocation import (
     AgentProfileSpec,
     CodexLoginBinding,
     CredentialBinding,
-    CredentialResolutionError,
     EffectiveCapabilityPlan,
     ExternalCapabilitySet,
     ProfileResolutionError,
@@ -21,24 +20,12 @@ from agent_world.invocation import (
     SkillBundleSpec,
     verify_resolved_profile,
 )
+from agent_world.invocation.profiles import API_KEY_RUNTIME_PROVIDER
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 RESEARCH_SKILL = (
     PROJECT_ROOT / "agent_world" / "agent_assets" / "skills" / "research-world-evidence"
 )
-
-
-def _authorized_login(path: Path) -> bytes:
-    content = json.dumps(
-        {
-            "auth_contract": "profile-materialization-only",
-            "tokens": {"access_token": "contract-value-never-sent"},
-        },
-        sort_keys=True,
-    ).encode()
-    path.write_bytes(content)
-    path.chmod(0o600)
-    return content
 
 
 def _profile_spec() -> AgentProfileSpec:
@@ -57,6 +44,8 @@ def _profile_spec() -> AgentProfileSpec:
         profile_id="researcher",
         profile_version="2",
         model="gpt-5.4",
+        model_provider=API_KEY_RUNTIME_PROVIDER,
+        openai_base_url_environment="OPENAI_BASE_URL",
         base_instructions="Use only framework-provided evidence and return typed output.",
         authentication_handle="model-auth",
         effective_capability_plan=capabilities,
@@ -82,11 +71,14 @@ def _profile_spec() -> AgentProfileSpec:
 def test_profile_resolver_materializes_private_capabilities_without_ambient_inheritance(
     tmp_path: Path,
 ) -> None:
-    login_path = tmp_path / "authorized-login.json"
-    login_bytes = _authorized_login(login_path)
     resolver = ProfileResolver(
         credential_bindings={
-            "model-auth": CodexLoginBinding(handle="model-auth", source=login_path.resolve())
+            "model-auth": CredentialBinding(
+                handle="model-auth",
+                source_environment="MODEL_API_KEY",
+                target_environment="OPENAI_API_KEY",
+                purpose="model_api_key",
+            )
         },
         allowed_credential_handles=("model-auth",),
     )
@@ -101,11 +93,13 @@ def test_profile_resolver_materializes_private_capabilities_without_ambient_inhe
         source_environment={
             "PATH": "/usr/bin:/bin",
             "LANG": "C.UTF-8",
+            "MODEL_API_KEY": "contract-key-never-sent",
+            "OPENAI_BASE_URL": "https://provider.example.test/v1",
             "UNDECLARED_SECRET": "must-not-cross-the-profile-boundary",
         },
     )
 
-    assert profile.authentication_kind == "chatgpt"
+    assert profile.authentication_kind == "api_key"
     assert profile.workspace == workspace.resolve()
     assert profile.home != Path.home()
     assert profile.codex_home != Path.home() / ".codex"
@@ -116,21 +110,27 @@ def test_profile_resolver_materializes_private_capabilities_without_ambient_inhe
     assert profile.hooks == ()
     assert profile.allowed_network_domains == ()
     assert "UNDECLARED_SECRET" not in profile.worker_environment()
-    assert profile.secret_values == ()
-
-    copied_login = profile.codex_home / "auth.json"
-    assert copied_login.read_bytes() == login_bytes
+    assert profile.secret_values == (
+        "contract-key-never-sent",
+        "https://provider.example.test/v1",
+    )
+    assert not (profile.codex_home / "auth.json").exists()
     if os.name != "nt":
-        assert copied_login.stat().st_mode & 0o077 == 0
         assert profile.home.stat().st_mode & 0o077 == 0
         assert profile.codex_home.stat().st_mode & 0o077 == 0
         assert profile.workspace.stat().st_mode & 0o077 == 0
 
     public_profile = json.dumps(profile.to_public_dict(), sort_keys=True)
     config_text = (profile.codex_home / "config.toml").read_text()
-    assert "contract-value-never-sent" not in public_profile
-    assert str(login_path) not in public_profile
-    assert "contract-value-never-sent" not in config_text
+    assert "contract-key-never-sent" not in public_profile
+    assert "https://provider.example.test/v1" not in public_profile
+    assert "contract-key-never-sent" not in config_text
+    assert "https://provider.example.test/v1" not in config_text
+    assert 'cli_auth_credentials_store = "keyring"' in config_text
+    assert 'persistence = "none"' in config_text
+    assert "shell_snapshot = false" in config_text
+    assert "sqlite_home =" not in config_text
+    assert "log_dir =" not in config_text
     assert 'web_search = "disabled"' in config_text
     assert 'inherit = "none"' in config_text
     assert f'"{profile.codex_home}" = "deny"' in config_text
@@ -142,6 +142,15 @@ def test_profile_resolver_materializes_private_capabilities_without_ambient_inhe
     assert profile.tool_output_token_limit == 2_048
     verify_resolved_profile(profile)
 
+    auth_path = profile.codex_home / "auth.json"
+    auth_path.write_text("forbidden-runtime-cache", encoding="utf-8")
+    with pytest.raises(
+        ProfileResolutionError,
+        match="file-backed Codex authentication is forbidden",
+    ):
+        verify_resolved_profile(profile)
+    auth_path.unlink()
+
     config_path = profile.codex_home / "config.toml"
     config_path.write_text(config_text + "# changed after resolution\n")
     with pytest.raises(ProfileResolutionError, match="Codex config was modified"):
@@ -151,8 +160,6 @@ def test_profile_resolver_materializes_private_capabilities_without_ambient_inhe
 def test_profile_resolver_mounts_only_the_pinned_custom_codex_runtime(
     tmp_path: Path,
 ) -> None:
-    login_path = tmp_path / "authorized-login.json"
-    _authorized_login(login_path)
     codex_bin = tmp_path / "codex-runtime" / "codex"
     codex_bin.parent.mkdir()
     codex_bin.write_bytes(b"pinned custom codex runtime")
@@ -160,7 +167,12 @@ def test_profile_resolver_mounts_only_the_pinned_custom_codex_runtime(
     codex_digest = hashlib.sha256(codex_bin.read_bytes()).hexdigest()
     resolver = ProfileResolver(
         credential_bindings={
-            "model-auth": CodexLoginBinding(handle="model-auth", source=login_path.resolve())
+            "model-auth": CredentialBinding(
+                handle="model-auth",
+                source_environment="MODEL_API_KEY",
+                target_environment="OPENAI_API_KEY",
+                purpose="model_api_key",
+            )
         },
         allowed_credential_handles=("model-auth",),
     )
@@ -174,7 +186,11 @@ def test_profile_resolver_mounts_only_the_pinned_custom_codex_runtime(
         spec,
         lineage_id="research-custom-runtime",
         materialization_root=tmp_path / "research-custom-runtime",
-        source_environment={"PATH": "/usr/bin:/bin"},
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "MODEL_API_KEY": "test-placeholder-not-a-real-key",
+            "OPENAI_BASE_URL": "https://provider.example.test/v1",
+        },
     )
 
     config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
@@ -183,7 +199,7 @@ def test_profile_resolver_mounts_only_the_pinned_custom_codex_runtime(
     verify_resolved_profile(profile)
 
 
-def test_profile_resolver_materializes_explicit_openai_compatible_base_url(
+def test_profile_resolver_keeps_runtime_base_url_out_of_materialized_files(
     tmp_path: Path,
 ) -> None:
     resolver = ProfileResolver(
@@ -197,65 +213,56 @@ def test_profile_resolver_materializes_explicit_openai_compatible_base_url(
         },
         allowed_credential_handles=("model-auth",),
     )
-    spec = replace(
-        _profile_spec(),
-        openai_base_url="https://provider.example.test/v1",
-    )
-
     profile = resolver.resolve(
-        spec,
+        _profile_spec(),
         lineage_id="research-compatible-provider",
         materialization_root=tmp_path / "research-compatible-provider",
         source_environment={
             "PATH": "/usr/bin:/bin",
             "COMPATIBLE_API_KEY": "test-placeholder-not-a-real-key",
+            "OPENAI_BASE_URL": "https://provider.example.test/v1",
         },
     )
 
     config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
-    assert 'openai_base_url = "https://provider.example.test/v1"' in config_text
-    assert profile.openai_base_url == "https://provider.example.test/v1"
+    assert "https://provider.example.test/v1" not in config_text
+    assert profile.openai_base_url_environment == "OPENAI_BASE_URL"
     assert profile.worker_environment()["OPENAI_API_KEY"] == (
         "test-placeholder-not-a-real-key"
     )
+    assert profile.worker_environment()["OPENAI_BASE_URL"] == "https://provider.example.test/v1"
     assert "test-placeholder-not-a-real-key" not in config_text
-    assert "test-placeholder-not-a-real-key" not in json.dumps(
+    assert "https://provider.example.test/v1" not in json.dumps(
         profile.to_public_dict(), sort_keys=True
     )
     verify_resolved_profile(profile)
 
 
-def test_profile_resolver_rejects_login_files_with_broad_permissions(tmp_path: Path) -> None:
-    login_path = tmp_path / "broad-login.json"
-    _authorized_login(login_path)
-    if os.name == "nt":
-        pytest.skip("POSIX file-mode enforcement is not available on Windows")
-    login_path.chmod(0o644)
-    resolver = ProfileResolver(
-        credential_bindings={
-            "model-auth": CodexLoginBinding(handle="model-auth", source=login_path.resolve())
-        },
-        allowed_credential_handles=("model-auth",),
-    )
-
-    with pytest.raises(CredentialResolutionError, match="permissions are too broad"):
-        resolver.resolve(
-            _profile_spec(),
-            lineage_id="research-lineage-2",
-            materialization_root=tmp_path / "runtime",
-            source_environment={"PATH": "/usr/bin:/bin"},
+def test_profile_resolver_rejects_file_backed_codex_login() -> None:
+    with pytest.raises(ValueError, match="file-backed Codex login is forbidden"):
+        ProfileResolver(
+            credential_bindings={
+                "model-auth": CodexLoginBinding(
+                    handle="model-auth",
+                    source=Path("/nonexistent/auth.json"),
+                )
+            },
+            allowed_credential_handles=("model-auth",),
         )
 
 
 def test_profile_resolver_rejects_undeclared_agent_control_paths(tmp_path: Path) -> None:
-    login_path = tmp_path / "authorized-login.json"
-    _authorized_login(login_path)
     root = tmp_path / "runtime"
     root.mkdir()
     (root / "AGENTS.md").write_text("ambient instructions")
     resolver = ProfileResolver(
         credential_bindings={
-            "model-auth": CodexLoginBinding(handle="model-auth", source=login_path.resolve())
+            "model-auth": CredentialBinding(
+                handle="model-auth",
+                source_environment="MODEL_API_KEY",
+                target_environment="OPENAI_API_KEY",
+                purpose="model_api_key",
+            )
         },
         allowed_credential_handles=("model-auth",),
     )
@@ -265,5 +272,9 @@ def test_profile_resolver_rejects_undeclared_agent_control_paths(tmp_path: Path)
             _profile_spec(),
             lineage_id="research-lineage-3",
             materialization_root=root,
-            source_environment={"PATH": "/usr/bin:/bin"},
+            source_environment={
+                "PATH": "/usr/bin:/bin",
+                "MODEL_API_KEY": "test-placeholder-not-a-real-key",
+                "OPENAI_BASE_URL": "https://provider.example.test/v1",
+            },
         )

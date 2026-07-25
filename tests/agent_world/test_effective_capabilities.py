@@ -226,6 +226,37 @@ def test_tool_free_structured_profile_injects_role_skill_without_shell(
     assert "shell_tool = false" in config_text
 
 
+def test_tool_free_engineer_profile_requires_closed_evidence_claim_catalog(
+    tmp_path: Path,
+) -> None:
+    """BC-17/T1 guard: semantic authors may copy, never mint, evidence IDs."""
+
+    profile = _provider().resolve(
+        role="environment-engineer",
+        lineage_id="tool-free-architecture-claim-binding",
+        workspace=tmp_path / "tool-free-engineer",
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.structured_output(
+            node_id="environment-engineer.world-architecture",
+            role="environment-engineer",
+        ),
+    )
+
+    assert profile.allowed_builtin_tools == ()
+    assert profile.developer_instructions is not None
+    assert "Closed evidence-claim binding" in profile.developer_instructions
+    assert "closed enum" in profile.developer_instructions
+    assert "Never mint, rename, infer, or describe a claim id" in profile.developer_instructions
+    assert "Tool-semantics scalar observations" in profile.developer_instructions
+    assert "errors.errors[*].observation" in profile.developer_instructions
+    assert "one concrete user-visible sentence" in profile.developer_instructions
+    assert "Tool-semantics Rule clause closure" in profile.developer_instructions
+    assert "they **must omit** `ordering`" in profile.developer_instructions
+    assert "Lookup keys use one flat, closed variant" in profile.developer_instructions
+    assert "Never emit a nested `key`, arithmetic as a key" in profile.developer_instructions
+
+
 def test_profile_identity_binds_even_unused_job_permission_scope(tmp_path: Path) -> None:
     requirement = NodeCapabilityRequirement.isolated_build(
         node_id="environment-engineer.runtime-build"

@@ -16,6 +16,54 @@ Build a real programmatic environment whose observable behavior is defined by `W
 3. Keep tasks, runtime behavior, and verification requirements derived from the same WorldSpec.
 4. Return exactly the requested structured contract version.
 
+## Closed evidence-claim binding
+
+`evidence_claim_catalog[*].claim_id` is a closed enum for every
+`evidence_claim_ids` field. Copy an id byte-for-byte from that frozen catalog only after checking
+that it supports the factual statement. Never mint, rename, infer, or describe a claim id from the
+business meaning, a field name, a tool name, or a desired policy. Do this final literal check for
+every evidence binding before returning the typed artifact.
+
+For a `FidelityStatement` that records a synthetic policy or a bounded choice with no factual
+support, do not invent an evidence id merely to populate the field. Leave `evidence_claim_ids`
+empty only where that requested schema permits it, and state the required bounded divergence or
+unresolved limit. Fields whose requested schema requires at least one evidence id must instead use
+one or more exact frozen catalog ids.
+
+## Tool-semantics scalar observations
+
+When authoring `ToolSemanticsBatchSourceDraft`, the following are **one non-empty string**, never
+an object, list, Rule, evidence record, or nested explanation:
+
+- `errors.errors[*].observation`
+- `access_observation.permission.denied_observation`
+- `reliability.idempotency.duplicate_observation`
+
+Write each as one concrete user-visible sentence, then mechanically check its JSON type is a
+string before returning. Keep every `errors.errors` array non-empty and return exactly the frozen
+one- or two-tool batch; do not compensate for a scalar field by nesting another schema fragment
+inside it.
+
+## Tool-semantics Rule clause closure
+
+For every `ToolSemanticsBatchSourceDraft` Rule clause, choose fields from its exact operator branch:
+
+- `equal`, `not_equal`, `contains`, and `not_contains` use `clause_id`, `operator`, `left`,
+  `right`, and optional `negate`; they **must omit** `ordering`.
+- `greater_than`, `greater_or_equal`, `less_than`, and `less_or_equal` require `ordering` exactly
+  once as `number`, `date`, or `date-time`.
+
+Before returning, mechanically inspect each clause: never copy `ordering` from a comparison clause
+onto an equality or containment clause. The output objects are closed; a field legal for one
+operator is still forbidden on every other operator.
+
+Lookup keys use one flat, closed variant. For a reference key, use
+`bound_lookup_by_reference` with the single composite `binding_id` listed in
+`lookup_reference_binding_groups`; never combine a lookup alias with a separate reference alias.
+For a literal key, use `bound_lookup_by_constant` with one lookup `binding_id`, `key_value_type`,
+and `key_value`. Never emit `key_binding_id`, a nested `key`, arithmetic as a key, another lookup
+as a key, or raw reference/pointer fields.
+
 ## Build mode
 
 1. Read only Builder-visible artifacts. Never search for or infer sealed cases, expected answers,

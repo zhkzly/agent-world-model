@@ -6,6 +6,10 @@ __pycache__/
 # package registries, and SDK session state. They are audit data, not source.
 .agent-world-live/
 
+# Normal staged semantic-prefix runs are durable downstream-test inputs, but
+# are still local generated state rather than source.
+.agent-world-staged/
+
 # Explicitly opt-in local diagnostics; never stage raw debug transcripts.
 observability/**/_debug/
 

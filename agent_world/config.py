@@ -18,6 +18,10 @@ from agent_world.contracts import (
     KeyValue,
     ReleaseProfile,
 )
+from agent_world.invocation.runtime_provider import (
+    API_KEY_RUNTIME_PROVIDER,
+    OPENAI_BASE_URL_ENVIRONMENT,
+)
 
 
 class ConfigError(RuntimeError):
@@ -31,13 +35,18 @@ class ConfigModel(BaseModel):
 class AgentBackendConfig(ConfigModel):
     model: str = Field(min_length=1)
     model_provider: str | None = None
-    openai_base_url: HttpUrl | None = None
+    # The actual routing value is intentionally never admitted into TOML,
+    # resolved-profile metadata, or generated Codex configuration.  The
+    # InvocationBackend reads this named environment handle only in its
+    # private worker environment and supplies it through an in-memory SDK
+    # thread override.  It is never serialized into generated Codex config or
+    # passed as a command-line argument.
+    openai_base_url_environment: str | None = None
     codex_bin: Path | None = None
     reasoning_researcher: Literal["low", "medium", "high", "xhigh"] = "medium"
     reasoning_engineer: Literal["low", "medium", "high", "xhigh"] = "medium"
     reasoning_challenger: Literal["low", "medium", "high", "xhigh"] = "medium"
-    chatgpt_auth_file: Path | None = None
-    api_key_environment: str | None = None
+    api_key_environment: str
     engineer_network_domain_ceiling: tuple[str, ...] = (
         "pypi.org",
         "files.pythonhosted.org",
@@ -57,38 +66,21 @@ class AgentBackendConfig(ConfigModel):
     )
 
     @model_validator(mode="after")
-    def exactly_one_authentication_mode(self) -> AgentBackendConfig:
-        configured = sum(
-            value is not None for value in (self.chatgpt_auth_file, self.api_key_environment)
-        )
-        if configured != 1:
-            raise ValueError("configure exactly one of chatgpt_auth_file or api_key_environment")
-        if (
-            self.api_key_environment is not None
-            and re.fullmatch(
-                r"[A-Za-z_][A-Za-z0-9_]*",
-                self.api_key_environment,
-            )
-            is None
-        ):
+    def api_key_environment_contract(self) -> AgentBackendConfig:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", self.api_key_environment) is None:
             raise ValueError("api_key_environment must be an environment-variable name")
-        if self.openai_base_url is not None:
-            if self.chatgpt_auth_file is not None:
-                raise ValueError("openai_base_url requires API-key authentication")
-            if self.model_provider not in {None, "openai"}:
-                raise ValueError(
-                    "openai_base_url only overrides the built-in openai model provider"
-                )
-            parsed = urlsplit(str(self.openai_base_url))
-            if (
-                parsed.username is not None
-                or parsed.password is not None
-                or parsed.query
-                or parsed.fragment
-            ):
-                raise ValueError(
-                    "openai_base_url must not contain credentials, query parameters, or fragments"
-                )
+        if (
+            self.openai_base_url_environment is not None
+            and self.openai_base_url_environment != OPENAI_BASE_URL_ENVIRONMENT
+        ):
+            raise ValueError("openai_base_url_environment must be OPENAI_BASE_URL")
+        if (
+            self.openai_base_url_environment is not None
+            and self.model_provider not in {None, API_KEY_RUNTIME_PROVIDER}
+        ):
+            raise ValueError(
+                "API-key profiles use the framework-owned runtime model provider"
+            )
         if len(self.engineer_network_domain_ceiling) != len(
             set(self.engineer_network_domain_ceiling)
         ):
@@ -452,6 +444,7 @@ def load_foundry_config(path: str | os.PathLike[str] | None = None) -> FoundryCo
         value = tomllib.loads(raw.decode("utf-8"))
     except (UnicodeError, tomllib.TOMLDecodeError) as exc:
         raise ConfigError(f"invalid Foundry TOML {selected_path}: {exc}") from exc
+    _reject_file_backed_agent_credentials(value)
     _reject_embedded_secrets(value)
     value = _normalise_toml_contract_fields(value)
     try:
@@ -462,11 +455,6 @@ def load_foundry_config(path: str | os.PathLike[str] | None = None) -> FoundryCo
     base = selected_path.resolve().parent
     state_root = _resolve_config_path(config.state_root, base)
     agent = config.agent
-    auth_file = (
-        _resolve_config_path(agent.chatgpt_auth_file, base)
-        if agent.chatgpt_auth_file is not None
-        else None
-    )
     codex_bin = _resolve_config_path(agent.codex_bin, base) if agent.codex_bin is not None else None
     judge_cache = (
         _resolve_config_path(config.judge.uv_cache_dir, base)
@@ -476,12 +464,33 @@ def load_foundry_config(path: str | os.PathLike[str] | None = None) -> FoundryCo
     return config.model_copy(
         update={
             "state_root": state_root,
-            "agent": agent.model_copy(
-                update={"chatgpt_auth_file": auth_file, "codex_bin": codex_bin}
-            ),
+            "agent": agent.model_copy(update={"codex_bin": codex_bin}),
             "judge": config.judge.model_copy(update={"uv_cache_dir": judge_cache}),
         }
     )
+
+
+def _reject_file_backed_agent_credentials(value: dict[str, object]) -> None:
+    """Reject legacy config keys without ever reflecting their values.
+
+    An endpoint is deployment routing material under the same no-persistence
+    policy as an API credential.  Accepting the old literal field, even only
+    long enough to transform it, would make a config file a secret-bearing
+    artifact.  The migration is deliberately explicit and value-free.
+    """
+
+    agent = value.get("agent")
+    if not isinstance(agent, dict):
+        return
+    if "openai_base_url" in agent:
+        raise ConfigError(
+            'agent.openai_base_url is forbidden; use '
+            'agent.openai_base_url_environment = "OPENAI_BASE_URL"'
+        )
+    if "chatgpt_auth_file" in agent:
+        raise ConfigError(
+            "agent.chatgpt_auth_file is forbidden; use an API-key environment handle"
+        )
 
 
 def _resolve_config_path(path: Path, base: Path) -> Path:

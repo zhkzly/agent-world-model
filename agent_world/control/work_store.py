@@ -22,6 +22,11 @@ from pydantic import AwareDatetime, Field, ValidationError, model_validator
 
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.contracts import ArtifactRef, BudgetUsage, ContentHash, Identifier, V2Contract
+from agent_world.diagnostic_state import (
+    TEST_NODE_DIAGNOSTIC_MARKER,
+    TEST_NODE_DIAGNOSTIC_MARKER_CONTENT,
+    has_test_node_diagnostic_marker,
+)
 
 from .models import BudgetLease
 from .work import (
@@ -47,7 +52,6 @@ type WorkHeadStatus = Literal[
     "needs_human",
     "interrupted",
 ]
-
 
 class WorkControlStoreError(RuntimeError):
     """Base error for WorkGraph mutable-head coordination."""
@@ -369,6 +373,91 @@ class WorkControlStore:
         )
         return next_head
 
+    def archive_terminal_head_for_diagnostic(
+        self,
+        lock: WorkControlLock,
+        *,
+        expected_head: WorkControlHead,
+    ) -> Path:
+        """Remove one copied terminal head from scheduling without erasing it.
+
+        ``test-node`` needs a fresh physical attempt with the same scope and
+        coordinate key so durable ancestor commits remain resolvable.  Normal
+        supersession deliberately rejects that unchanged input/definition
+        pair, because production code must not use diagnostics to bypass
+        repair authority.  This narrow operation is therefore only suitable
+        for an already-isolated state-root copy: it moves the exact terminal
+        head out of ``heads/`` into an audit directory and leaves every
+        Artifact revision untouched.
+        """
+
+        self._validate_lock(lock, expected_head.coordinate)
+        self._require_diagnostic_archive_marker()
+        current = self.read_head(expected_head.coordinate)
+        if current != expected_head:
+            raise WorkHeadConflictError("WorkGraph head changed before diagnostic archive")
+        if current.status not in {"committed", "failed", "needs_human", "interrupted"}:
+            raise WorkHeadConflictError("diagnostic archive requires a terminal WorkGraph head")
+        source = self._head_path(current.scope_id, current.coordinate.coordinate_key)
+        archive_directory = self.root / "diagnostic-superseded"
+        archive_directory.mkdir(mode=0o700, exist_ok=True)
+        if archive_directory.is_symlink() or not archive_directory.is_dir():
+            raise WorkControlStoreError("diagnostic archive directory must be real")
+        destination = archive_directory / f"{source.stem}-{uuid.uuid4().hex}.json"
+        try:
+            os.replace(source, destination)
+            for directory_path in (archive_directory, source.parent):
+                descriptor = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        except OSError as exc:
+            raise WorkControlStoreError("cannot archive diagnostic WorkGraph head") from exc
+        return destination
+
+    def mark_test_node_diagnostic_clone(self) -> None:
+        """Authorize diagnostic-head archiving for one freshly copied state root.
+
+        This is deliberately not part of normal WorkGraph state transitions.
+        The marker contains only the two public diagnostic flags and is written
+        before the copied root is opened for a test-node dispatch.
+        """
+
+        marker = self.root / TEST_NODE_DIAGNOSTIC_MARKER
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(marker, flags, 0o600)
+        except FileExistsError:
+            self._require_diagnostic_archive_marker()
+            return
+        except OSError as exc:
+            raise WorkControlStoreError("cannot mark test-node diagnostic state") from exc
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                stream.write(TEST_NODE_DIAGNOSTIC_MARKER_CONTENT)
+                stream.flush()
+                os.fsync(stream.fileno())
+            directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as exc:
+            raise WorkControlStoreError("cannot mark test-node diagnostic state") from exc
+
+    def _require_diagnostic_archive_marker(self) -> None:
+        if not has_test_node_diagnostic_marker(self.root):
+            raise WorkControlStoreError(
+                "diagnostic head archive requires an isolated test-node state root"
+            )
+
     def authorize_causal_repair(
         self,
         lock: WorkControlLock,
@@ -489,8 +578,81 @@ class WorkControlStore:
             or head.input_fingerprint != expected_input_fingerprint
         ):
             return None
+        # A correctly marked diagnostic commit is non-active normal authority,
+        # not a corrupt production head.  Returning ``None`` lets ordinary
+        # schedulers hold it stale; the explicit diagnostic path below still
+        # validates its complete authority chain before a marked successor may
+        # consume it.
+        commit = artifacts.get_json(head.commit_ref, WorkCommit)
+        if commit.diagnostic_only:
+            return None
         return self._validate_commit_head(
             head=head,
+            definition=definition,
+            input_refs=input_refs,
+            artifacts=artifacts,
+        )
+
+    def require_diagnostic_commit(
+        self,
+        *,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+        artifacts: ArtifactWriter,
+    ) -> tuple[WorkCommit, ArtifactRef] | None:
+        """Return one exact passed diagnostic commit inside a marked test-node copy.
+
+        This is intentionally separate from :meth:`require_active_commit`.
+        A diagnostic result is never normal release authority, even when its
+        validator passed.  The only permitted consumer is a second isolated
+        diagnostic node whose state root bears the exact test-node marker.
+        """
+
+        if not has_test_node_diagnostic_marker(self.root):
+            raise WorkResumeError(
+                "diagnostic WorkCommit reuse requires an isolated test-node state root"
+            )
+        head = self.read_head(definition.coordinate)
+        if head is None or head.status != "committed" or head.commit_ref is None:
+            return None
+        expected_input_fingerprint = self.input_fingerprint(input_refs)
+        if (
+            head.work_id != definition.work_id
+            or head.definition_digest != definition.definition_digest
+            or head.acceptance_digest != definition.acceptance_digest
+            or head.input_fingerprint != expected_input_fingerprint
+        ):
+            return None
+        return self._validate_commit_head(
+            head=head,
+            definition=definition,
+            input_refs=input_refs,
+            artifacts=artifacts,
+            diagnostic_only=True,
+        )
+
+    def require_active_or_diagnostic_commit(
+        self,
+        *,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+        artifacts: ArtifactWriter,
+    ) -> tuple[WorkCommit, ArtifactRef] | None:
+        """Return normal authority first, then a marker-gated diagnostic commit.
+
+        Callers must opt into this method explicitly.  It is deliberately not
+        used by normal scheduling, epoch freezing, cache recovery, final
+        topology derivation, or release code.
+        """
+
+        active = self.require_active_commit(
+            definition=definition,
+            input_refs=input_refs,
+            artifacts=artifacts,
+        )
+        if active is not None:
+            return active
+        return self.require_diagnostic_commit(
             definition=definition,
             input_refs=input_refs,
             artifacts=artifacts,
@@ -637,6 +799,7 @@ class WorkControlStore:
         definition: WorkDefinition,
         input_refs: tuple[ArtifactRef, ...],
         artifacts: ArtifactWriter,
+        diagnostic_only: bool = False,
     ) -> tuple[WorkCommit, ArtifactRef]:
         """Validate one candidate committed head without consulting current projection."""
 
@@ -683,6 +846,19 @@ class WorkControlStore:
             commit.feedback_evaluation_ref,
             FeedbackEvaluation,
         )
+        expected_releasable = not diagnostic_only
+        expected_readiness = "observes" if diagnostic_only else "satisfies"
+        if (
+            attempt.diagnostic_only != diagnostic_only
+            or attempt.releasable != expected_releasable
+            or commit.diagnostic_only != diagnostic_only
+            or commit.releasable != expected_releasable
+            or report.diagnostic_only != diagnostic_only
+            or report.releasable != expected_releasable
+            or evaluation.diagnostic_only != diagnostic_only
+            or evaluation.releasable != expected_releasable
+        ):
+            raise WorkResumeError("WorkCommit diagnostic authority marking is inconsistent")
         if (
             evaluation.work_id != definition.work_id
             or evaluation.coordinate != definition.coordinate
@@ -692,9 +868,8 @@ class WorkControlStore:
             or evaluation.policy_digest != commit.validation_policy_digest
             or evaluation.effect != original_definition.validation_policy.effect
             or evaluation.status != "passed"
-            or evaluation.readiness_effect != "satisfies"
+            or evaluation.readiness_effect != expected_readiness
             or evaluation.subject_refs != commit.validated_subject_refs
-            or not evaluation.releasable
         ):
             raise WorkResumeError("active WorkCommit lacks an exact passing evaluation")
         if (

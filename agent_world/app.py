@@ -7,9 +7,7 @@ template backend, replay path, fixture registry, or alternate success path.
 
 from __future__ import annotations
 
-import json
 import os
-import stat
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,8 +49,14 @@ from agent_world.designer import (
     ExpansionDesigner,
     ExpansionSourceRouter,
 )
+from agent_world.diagnostic_state import is_marked_test_node_diagnostic_state_root
 from agent_world.expansion_runner import validate_campaign_report_graph
-from agent_world.invocation import CodexSdkBackend
+from agent_world.invocation import (
+    CodexSdkBackend,
+    DirectLlmBackend,
+    InvocationBackend,
+    RoutedInvocationBackend,
+)
 from agent_world.judge import (
     CleanCandidateBuilder,
     EnvironmentJudge,
@@ -68,21 +72,7 @@ from agent_world.registry import (
 )
 from agent_world.research import ResearchToolchain, build_research_toolchain
 
-_MAX_AUTH_FILE_BYTES = 4 * 1024 * 1024
 _MAX_CANARY_BYTES = 8192
-_SENSITIVE_AUTH_KEYS = (
-    "api_key",
-    "apikey",
-    "authorization",
-    "bearer",
-    "cookie",
-    "credential",
-    "password",
-    "refresh",
-    "secret",
-    "session",
-    "token",
-)
 
 
 class ApplicationConfigurationError(RuntimeError):
@@ -97,7 +87,7 @@ class FoundryApplication:
     artifacts: ArtifactStore
     registry: EnvironmentRegistry
     profiles: IsolatedAgentProfileProvider
-    backend: CodexSdkBackend
+    backend: InvocationBackend
     telemetry: TelemetryStore
     research: ResearchToolchain
     designer: EnvironmentDesigner
@@ -266,9 +256,7 @@ class DirectRunReader:
             conservative_committed = snapshot.conservative_committed_budget
             budget_source = "direct_job_terminal_snapshot"
         else:
-            leases, observed_actual, unknown_upper_bound, conservative_committed = (
-                scheduler_budget
-            )
+            leases, observed_actual, unknown_upper_bound, conservative_committed = scheduler_budget
             budget_source = "scheduler_scope_lease_ledger"
         observed_active_leases = tuple(lease for lease in leases if lease.status == "active")
         active_leases = observed_active_leases if snapshot.status == "running" else ()
@@ -295,12 +283,9 @@ class DirectRunReader:
                 "conservative_committed": conservative_committed.model_dump(mode="json"),
                 "inflight_observed": {
                     "llm_tokens": None,
-                    "event_count": sum(
-                        int(item["observed_event_count"]) for item in spans
-                    ),
+                    "event_count": sum(int(item["observed_event_count"]) for item in spans),
                     "protocol_tool_event_count": sum(
-                        int(item["observed_protocol_tool_event_count"])
-                        for item in spans
+                        int(item["observed_protocol_tool_event_count"]) for item in spans
                     ),
                 },
                 "active_reserved_exposure": reserved_exposure,
@@ -325,9 +310,7 @@ class DirectRunReader:
         if self._work_heads is None:
             return None
         job = self._artifacts.get_json(snapshot.job_ref, EnvironmentJob)
-        coordinator = DurableLeaseBudgetCoordinator(
-            self._work_heads.root / "scope-budgets"
-        )
+        coordinator = DurableLeaseBudgetCoordinator(self._work_heads.root / "scope-budgets")
         try:
             ledger = coordinator.snapshot(scope_id=job.job_id)
         except ValueError:
@@ -345,9 +328,7 @@ class DirectRunReader:
         leases: tuple[BudgetLease, ...],
         attribute: str,
     ) -> BudgetUsage:
-        fields = tuple(
-            name for name in BudgetUsage.model_fields if name != "schema_version"
-        )
+        fields = tuple(name for name in BudgetUsage.model_fields if name != "schema_version")
         return BudgetUsage.model_validate(
             {
                 name: sum(getattr(getattr(lease, attribute), name) for lease in leases)
@@ -507,9 +488,18 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         config.state_root / "telemetry",
         commit_batch_size=config.observability.commit_batch_size,
     )
-    backend = CodexSdkBackend(
+    codex_backend = CodexSdkBackend(
         max_concurrent_invocations=config.agent.max_concurrent_invocations,
         telemetry=telemetry,
+    )
+    direct_backend = DirectLlmBackend(
+        max_concurrent_invocations=config.agent.max_concurrent_invocations,
+        telemetry=telemetry,
+    )
+    backend: InvocationBackend = RoutedInvocationBackend(
+        codex_backend=codex_backend,
+        direct_backend=direct_backend,
+        max_concurrent_invocations=config.agent.max_concurrent_invocations,
     )
     research = build_research_toolchain(
         config.research,
@@ -699,7 +689,8 @@ def open_observability(config: FoundryConfig) -> ObservabilityReader:
     an external model call.
     """
 
-    if ".agent-world-live" in config.state_root.parts:
+    is_reserved_live = ".agent-world-live" in config.state_root.parts
+    if is_reserved_live and not is_marked_test_node_diagnostic_state_root(config.state_root):
         # This is a lexical guard deliberately placed before any filesystem
         # access.  Live auth state is never an observability input.
         raise ApplicationConfigurationError(
@@ -729,7 +720,8 @@ def open_observability(config: FoundryConfig) -> ObservabilityReader:
 def open_debug_transcripts(config: FoundryConfig) -> DebugTranscriptWriter:
     """Open the explicitly opt-in local transcript sink without workflow authority."""
 
-    if ".agent-world-live" in config.state_root.parts:
+    is_reserved_live = ".agent-world-live" in config.state_root.parts
+    if is_reserved_live and not is_marked_test_node_diagnostic_state_root(config.state_root):
         raise ApplicationConfigurationError(
             "observability cannot access the reserved live state directory"
         )
@@ -764,8 +756,9 @@ def _authorized_environment(
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
     }
-    if config.agent.api_key_environment is not None:
-        names.add(config.agent.api_key_environment)
+    names.add(config.agent.api_key_environment)
+    if config.agent.openai_base_url_environment is not None:
+        names.add(config.agent.openai_base_url_environment)
     if config.research.jina_api_key_environment is not None:
         names.add(config.research.jina_api_key_environment)
     return {name: source[name] for name in sorted(names) if name in source}
@@ -793,23 +786,27 @@ def _collect_secret_canaries(
 ) -> tuple[bytes, ...]:
     canaries: set[bytes] = set()
     agent = config.agent
-    if agent.api_key_environment is not None:
+    canaries.add(
+        _required_environment_secret(
+            environment,
+            agent.api_key_environment,
+            purpose="model credential",
+            # API-compatible gateways legitimately issue compact opaque
+            # credentials.  The redactor's exact-value protection starts
+            # at four bytes, so requiring a longer token here would make
+            # a real configured backend unusable without adding safety.
+            minimum=4,
+        )
+    )
+    if agent.openai_base_url_environment is not None:
         canaries.add(
             _required_environment_secret(
                 environment,
-                agent.api_key_environment,
-                purpose="model credential",
-                # API-compatible gateways legitimately issue compact opaque
-                # credentials.  The redactor's exact-value protection starts
-                # at four bytes, so requiring a longer token here would make
-                # a real configured backend unusable without adding safety.
+                agent.openai_base_url_environment,
+                purpose="model routing value",
                 minimum=4,
             )
         )
-    else:
-        assert agent.chatgpt_auth_file is not None
-        auth = _read_authorized_auth_json(agent.chatgpt_auth_file)
-        canaries.update(_auth_secret_canaries(auth))
 
     research_name = config.research.jina_api_key_environment
     if research_name is not None:
@@ -849,92 +846,6 @@ def _validate_canary(value: str, *, purpose: str, minimum: int) -> bytes:
             f"{purpose} has an invalid size for safe in-memory redaction"
         )
     return encoded
-
-
-def _read_authorized_auth_json(path: Path) -> dict[str, object]:
-    """Read one explicitly authorized file without following a symlink race."""
-
-    descriptor: int | None = None
-    try:
-        if not path.is_absolute():
-            raise ApplicationConfigurationError(
-                "authorized Codex login file must use an absolute path"
-            )
-        before = os.lstat(path)
-        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-            raise ApplicationConfigurationError("authorized Codex login file is unavailable")
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(path, flags)
-        opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or (
-            opened.st_dev,
-            opened.st_ino,
-        ) != (before.st_dev, before.st_ino):
-            raise ApplicationConfigurationError("authorized Codex login file changed while read")
-        if opened.st_size <= 0 or opened.st_size > _MAX_AUTH_FILE_BYTES:
-            raise ApplicationConfigurationError("authorized Codex login file has an invalid size")
-        if os.name != "nt" and stat.S_IMODE(opened.st_mode) & 0o077:
-            raise ApplicationConfigurationError(
-                "authorized Codex login file permissions are too broad"
-            )
-        chunks: list[bytes] = []
-        remaining = opened.st_size + 1
-        while remaining > 0:
-            chunk = os.read(descriptor, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        raw = b"".join(chunks)
-        if len(raw) != opened.st_size or len(raw) > _MAX_AUTH_FILE_BYTES:
-            raise ApplicationConfigurationError("authorized Codex login file changed while read")
-        parsed = json.loads(raw, parse_constant=_reject_nonfinite_json)
-        if not isinstance(parsed, dict) or not parsed:
-            raise ApplicationConfigurationError("authorized Codex login file is invalid")
-        return parsed
-    except ApplicationConfigurationError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
-        # Never chain parser/OS details: either can contain source paths or raw values.
-        raise ApplicationConfigurationError("authorized Codex login file is invalid") from None
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-
-
-def _auth_secret_canaries(value: Mapping[str, object]) -> tuple[bytes, ...]:
-    canaries: set[bytes] = set()
-
-    def visit(node: object, *, sensitive_parent: bool = False) -> None:
-        if isinstance(node, Mapping):
-            for raw_key, child in node.items():
-                key = str(raw_key).casefold().replace("-", "_")
-                sensitive = sensitive_parent or any(part in key for part in _SENSITIVE_AUTH_KEYS)
-                visit(child, sensitive_parent=sensitive)
-            return
-        if isinstance(node, list):
-            for child in node:
-                visit(child, sensitive_parent=sensitive_parent)
-            return
-        if sensitive_parent and isinstance(node, str) and node:
-            canaries.add(
-                _validate_canary(
-                    node,
-                    purpose="authorized Codex login credential",
-                    minimum=4,
-                )
-            )
-
-    visit(value)
-    if not canaries:
-        raise ApplicationConfigurationError(
-            "authorized Codex login file contains no recognizable credential material"
-        )
-    return tuple(sorted(canaries))
-
-
-def _reject_nonfinite_json(value: str) -> None:
-    raise ValueError(f"non-finite JSON value is forbidden: {value}")
 
 
 __all__ = [

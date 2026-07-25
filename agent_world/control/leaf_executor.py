@@ -370,8 +370,13 @@ class SchedulerLeafExecutor:
                 definition=definition,
                 input_refs=input_refs,
                 attempt=attempt,
-                code="leaf_cancelled",
-                category="cancelled external execution",
+                # An Agent process may have started before the SDK can return
+                # invocation/profile provenance.  The durable record must
+                # preserve that interruption and reserve the unknown proposal
+                # upper bound rather than strand the WorkHead or fabricate an
+                # invocation id.
+                code="process_interrupted_cancelled",
+                category="cancelled external execution before Agent provenance",
             )
             raise
         except ValidationError as exc:
@@ -858,7 +863,10 @@ class SchedulerLeafExecutor:
         if (
             definition.proposal_policy.executor == "agent"
             and agent is None
-            and not code.startswith("preflight_")
+            and not (
+                code.startswith("preflight_")
+                or code.startswith("process_interrupted")
+            )
         ):
             raise WorkRuntimeError(
                 "Agent leaf failures must bind real invocation/profile provenance"
@@ -881,7 +889,7 @@ class SchedulerLeafExecutor:
             executor=definition.proposal_policy.executor,
             executor_revision_id=definition.proposal_policy.executor_revision_id,
             operation=definition.proposal_policy.operation,
-            status="failed",
+            status=("interrupted" if code.startswith("process_interrupted") else "failed"),
             invocation_id=agent.invocation_id if agent else None,
             provider=agent.provider if agent else None,
             model=agent.model if agent else None,

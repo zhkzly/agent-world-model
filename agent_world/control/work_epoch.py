@@ -3,13 +3,17 @@
 Architecture determines physical behavior members, while the compiled
 curriculum determines the real Challenger partition.  The runtime freezes each
 fact only once and retains its exact commits in the next graph; it never turns
-an unknown fan-out into hidden calls inside a nominal leaf.
+an unknown fan-out into hidden calls inside a nominal leaf. Each frozen
+manifest also retains its full immutable WorkDefinition closure, including
+nodes that have not yet dispatched, so a diagnostic test-node can reconstruct
+a real target without replaying its historical output.
 """
 
 from __future__ import annotations
 
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.contracts import ArtifactRef, GenerationContext
+from agent_world.diagnostic_state import has_test_node_diagnostic_marker
 
 from .work import WorkAttempt, WorkCommit
 from .work_graph import GenerationWorkGraph, WorkGraphEpoch, WorkGraphError, WorkGraphManifest
@@ -48,6 +52,7 @@ class WorkGraphEpochRuntime:
             raise WorkGraphError(
                 "bootstrap graph must include grounded Research through Architecture"
             )
+        definition_refs = self._persist_definition_closure(graph, context_ref=context_ref)
         manifest = graph.manifest(
             topology_id=topology_id,
             external_root_refs=(context_ref,),
@@ -56,7 +61,7 @@ class WorkGraphEpochRuntime:
             artifact_id=f"work-graph-manifest:{manifest.graph_id}",
             artifact_type="control.work_graph_manifest",
             value=manifest,
-            dependencies=(context_ref,),
+            dependencies=(context_ref, *definition_refs),
         )
         epoch = WorkGraphEpoch(
             epoch_id=f"epoch:bootstrap:{manifest.graph_digest.removeprefix('sha256:')[:24]}",
@@ -69,7 +74,7 @@ class WorkGraphEpochRuntime:
             artifact_id=epoch.epoch_id,
             artifact_type="control.work_graph_epoch",
             value=epoch,
-            dependencies=(context_ref, manifest_ref),
+            dependencies=(context_ref, manifest_ref, *definition_refs),
         )
         # This load also proves callers cannot pass an arbitrary context-shaped
         # artifact that was never issued under the closed contract.
@@ -100,6 +105,7 @@ class WorkGraphEpochRuntime:
 
         retained = self._require_retained_predecessor_commits(design_manifest, graph)
         self._require_exact_final_verifier_partition(graph, retained)
+        definition_refs = self._persist_definition_closure(graph, context_ref=context_ref)
         manifest = graph.manifest(
             topology_id=topology_id,
             external_root_refs=(context_ref,),
@@ -108,7 +114,7 @@ class WorkGraphEpochRuntime:
             artifact_id=f"work-graph-manifest:{manifest.graph_id}",
             artifact_type="control.work_graph_manifest",
             value=manifest,
-            dependencies=(context_ref, design_epoch_ref, *retained),
+            dependencies=(context_ref, design_epoch_ref, *retained, *definition_refs),
         )
         epoch = WorkGraphEpoch(
             epoch_id=f"epoch:final:{manifest.graph_digest.removeprefix('sha256:')[:24]}",
@@ -123,7 +129,13 @@ class WorkGraphEpochRuntime:
             artifact_id=epoch.epoch_id,
             artifact_type="control.work_graph_epoch",
             value=epoch,
-            dependencies=(context_ref, design_epoch_ref, manifest_ref, *retained),
+            dependencies=(
+                context_ref,
+                design_epoch_ref,
+                manifest_ref,
+                *retained,
+                *definition_refs,
+            ),
         )
         return manifest, manifest_ref, epoch, epoch_ref
 
@@ -134,6 +146,7 @@ class WorkGraphEpochRuntime:
         bootstrap_epoch_ref: ArtifactRef,
         graph: GenerationWorkGraph,
         topology_id: str,
+        allow_diagnostic_predecessors: bool = False,
     ) -> tuple[WorkGraphManifest, ArtifactRef, WorkGraphEpoch, ArtifactRef]:
         """Freeze behavior/curriculum and one deterministic VerifierPlan.
 
@@ -158,7 +171,16 @@ class WorkGraphEpochRuntime:
         if graph.definitions[0].coordinate.scope_id != bootstrap.scope_id:
             raise WorkGraphError("bootstrap and design graph scopes differ")
         self._require_design_terminal(graph)
-        retained = self._require_retained_predecessor_commits(bootstrap_manifest, graph)
+        if allow_diagnostic_predecessors and not has_test_node_diagnostic_marker(self.heads.root):
+            raise WorkGraphError(
+                "diagnostic design successors require an isolated test-node state root"
+            )
+        retained = self._require_retained_predecessor_commits(
+            bootstrap_manifest,
+            graph,
+            allow_diagnostic_predecessors=allow_diagnostic_predecessors,
+        )
+        definition_refs = self._persist_definition_closure(graph, context_ref=context_ref)
         manifest = graph.manifest(
             topology_id=topology_id,
             external_root_refs=(context_ref,),
@@ -167,7 +189,7 @@ class WorkGraphEpochRuntime:
             artifact_id=f"work-graph-manifest:{manifest.graph_id}",
             artifact_type="control.work_graph_manifest",
             value=manifest,
-            dependencies=(context_ref, bootstrap_epoch_ref, *retained),
+            dependencies=(context_ref, bootstrap_epoch_ref, *retained, *definition_refs),
         )
         epoch = WorkGraphEpoch(
             epoch_id=f"epoch:design:{manifest.graph_digest.removeprefix('sha256:')[:24]}",
@@ -182,7 +204,13 @@ class WorkGraphEpochRuntime:
             artifact_id=epoch.epoch_id,
             artifact_type="control.work_graph_epoch",
             value=epoch,
-            dependencies=(context_ref, bootstrap_epoch_ref, manifest_ref, *retained),
+            dependencies=(
+                context_ref,
+                bootstrap_epoch_ref,
+                manifest_ref,
+                *retained,
+                *definition_refs,
+            ),
         )
         return manifest, manifest_ref, epoch, epoch_ref
 
@@ -320,6 +348,8 @@ class WorkGraphEpochRuntime:
         self,
         predecessor_manifest: WorkGraphManifest,
         final_graph: GenerationWorkGraph,
+        *,
+        allow_diagnostic_predecessors: bool = False,
     ) -> tuple[ArtifactRef, ...]:
         retained: list[ArtifactRef] = []
         for binding in predecessor_manifest.node_bindings:
@@ -341,10 +371,18 @@ class WorkGraphEpochRuntime:
             if head is None or head.status != "committed":
                 raise WorkResumeError("next graph cannot retain an uncommitted predecessor node")
             attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
-            active = self.heads.require_active_commit(
-                definition=definition,
-                input_refs=attempt.input_refs,
-                artifacts=self.artifacts,
+            active = (
+                self.heads.require_active_or_diagnostic_commit(
+                    definition=definition,
+                    input_refs=attempt.input_refs,
+                    artifacts=self.artifacts,
+                )
+                if allow_diagnostic_predecessors
+                else self.heads.require_active_commit(
+                    definition=definition,
+                    input_refs=attempt.input_refs,
+                    artifacts=self.artifacts,
+                )
             )
             if active is None:
                 raise WorkResumeError("predecessor WorkCommit is not active for the next graph")
@@ -365,6 +403,30 @@ class WorkGraphEpochRuntime:
         if epoch_ref.artifact_type != "control.work_graph_epoch":
             raise WorkGraphError("final graph predecessor must be a WorkGraphEpoch Artifact")
         return self.artifacts.get_json(epoch_ref, WorkGraphEpoch)
+
+    def _persist_definition_closure(
+        self,
+        graph: GenerationWorkGraph,
+        *,
+        context_ref: ArtifactRef,
+    ) -> tuple[ArtifactRef, ...]:
+        """Persist every immutable definition before an epoch references it.
+
+        Runtime dispatch later writes an input-bound revision for commit
+        authorization. This context-bound revision is deliberately separate:
+        it is the complete topology contract needed to reconstruct an
+        unexecuted sibling in a diagnostic state copy.
+        """
+
+        return tuple(
+            self.artifacts.put_json(
+                artifact_id=f"work-definition:{definition.work_id}",
+                artifact_type="control.work_definition",
+                value=definition,
+                dependencies=(context_ref,),
+            )
+            for definition in graph.definitions
+        )
 
     @staticmethod
     def _require_context_root(graph: GenerationWorkGraph, context_ref: ArtifactRef) -> None:

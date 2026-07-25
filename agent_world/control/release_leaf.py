@@ -645,6 +645,22 @@ class RegistryPublicationLeaf:
             attempt: WorkAttempt,
             _dispatch_id: str,
         ) -> LeafProposal:
+            # ``test-node`` deliberately runs a real Scheduler leaf in an
+            # isolated state copy.  Publishing is the one downstream action
+            # that must not be exercised by that diagnostic authority: a
+            # copied, previously valid Package manifest would otherwise be
+            # enough to reserve and release an environment before this fresh
+            # diagnostic WorkAttempt has even been evaluated.  Stop inside
+            # the leaf so SchedulerLeafExecutor records honest terminal
+            # evidence rather than letting an exception escape a running
+            # head.  T2 can add an explicit non-publishing Registry preflight;
+            # it must never turn this diagnostic path into a release path.
+            if self.kernel.runtime.diagnostic_only:
+                raise LeafExecutionFailure(
+                    code="diagnostic_registry_publication_forbidden",
+                    category="diagnostic-only execution cannot publish to Registry",
+                    retryable=False,
+                )
             manifest_ref = PackageLeaf._one_parent(
                 current_context,
                 "environment_package_manifest",

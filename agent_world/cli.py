@@ -8,6 +8,7 @@ import json
 import sys
 from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, TypeAdapter
@@ -39,6 +40,15 @@ from agent_world.control import (
     DirectJobResumeRequiredError,
     DirectJobStoreError,
     DirectRequestConflictError,
+)
+from agent_world.control.semantic_prefix import (
+    SemanticPrefixError,
+    SemanticPrefixRunner,
+)
+from agent_world.control.test_node import (
+    DiagnosticSuccessorNodeRunner,
+    TestNodeError,
+    TestNodeRunner,
 )
 from agent_world.doctor import run_doctor
 from agent_world.observability import ObservabilityError
@@ -82,6 +92,57 @@ def build_parser() -> argparse.ArgumentParser:
         "--production",
         action="store_true",
         help="run both live probes; only this can report production_ready=true",
+    )
+
+    test_node = commands.add_parser(
+        "test-node",
+        help="copy one captured scope and genuinely rerun exactly one frozen WorkGraph node",
+    )
+    test_node.add_argument("scope_id", help="captured WorkGraph scope id")
+    test_node.add_argument(
+        "target_coordinate",
+        help="exact coordinate key, coordinate JSON, or framework coordinate label",
+    )
+    test_node.add_argument(
+        "--source-state-root",
+        metavar="PATH",
+        help="captured state root to copy; defaults to the configured state root",
+    )
+
+    test_successor_node = commands.add_parser(
+        "test-successor-node",
+        help=(
+            "derive one fresh semantic successor from a marked test-node Architecture "
+            "commit and genuinely dispatch only that new node"
+        ),
+    )
+    test_successor_node.add_argument("scope_id", help="captured WorkGraph scope id")
+    test_successor_node.add_argument(
+        "target_coordinate",
+        help="exact newly derived shared-tool or ToolSemantics batch coordinate",
+    )
+    test_successor_node.add_argument(
+        "--diagnostic-state-root",
+        metavar="PATH",
+        required=True,
+        help="one marked .agent-world-live/test-node-* copy produced by test-node",
+    )
+
+    semantic_prefix = commands.add_parser(
+        "semantic-prefix",
+        help=(
+            "run a fresh normal Direct prefix through ModelingBoundary and "
+            "VerifierPlan without starting Build, Judge, or Registry"
+        ),
+    )
+    semantic_prefix.add_argument(
+        "--need",
+        required=True,
+        help="natural-language environment need for the staged semantic closure",
+    )
+    semantic_prefix.add_argument(
+        "--request-id",
+        help="optional identity for this fresh staged prefix",
     )
 
     generate = commands.add_parser(
@@ -429,6 +490,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ObservabilityError as exc:
         _write_error(exc.code, str(exc))
         return EXIT_OPERATION_FAILED
+    except TestNodeError as exc:
+        _write_error(exc.code, str(exc))
+        return EXIT_OPERATION_FAILED
+    except SemanticPrefixError as exc:
+        _write_error(exc.code, str(exc))
+        return EXIT_OPERATION_FAILED
     except Exception as exc:  # fail closed without exposing backend/auth exception text
         _write_error("operation_failed", f"operation failed ({type(exc).__name__})")
         return EXIT_OPERATION_FAILED
@@ -444,16 +511,50 @@ async def _dispatch(args: argparse.Namespace) -> int:
         )
         _write_json(report)
         return EXIT_OK if report.ok else EXIT_OPERATION_FAILED
+    if args.command == "test-node":
+        test_node_result = await TestNodeRunner(
+            config=config,
+            source_state_root=(
+                Path(args.source_state_root) if args.source_state_root is not None else None
+            ),
+        ).run(
+            scope_id=args.scope_id,
+            target_coordinate=args.target_coordinate,
+        )
+        _write_json(test_node_result)
+        return EXIT_OK
+    if args.command == "test-successor-node":
+        successor_result = await DiagnosticSuccessorNodeRunner(
+            config=config,
+            diagnostic_state_root=Path(args.diagnostic_state_root),
+        ).run(
+            scope_id=args.scope_id,
+            target_coordinate=args.target_coordinate,
+        )
+        _write_json(successor_result)
+        return EXIT_OK
+    if args.command == "semantic-prefix":
+        prefix_result = await SemanticPrefixRunner(config=config).run(
+            need=args.need,
+            request_id=args.request_id,
+            permissions=_job_permissions(config),
+        )
+        _write_json(prefix_result)
+        return (
+            EXIT_OK
+            if prefix_result.run.status == "semantic_prefix_ready"
+            else EXIT_OPERATION_FAILED
+        )
     if args.command == "generate":
         app = build_application(config)
-        result = await app.controller.generate(
+        generation_result = await app.controller.generate(
             args.need,
             request_id=args.request_id,
             permissions=_job_permissions(config),
             enable_discovery=not args.no_discovery,
         )
-        _write_json(result)
-        return EXIT_OK if result.status == "released" else EXIT_NOT_RELEASED
+        _write_json(generation_result)
+        return EXIT_OK if generation_result.status == "released" else EXIT_NOT_RELEASED
     if args.command == "run":
         if args.run_command == "inspect":
             _write_json(
@@ -465,9 +566,9 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return EXIT_OK
         if args.run_command == "resume":
             app = build_application(config)
-            result = await app.controller.resume_generation(args.request_id)
-            _write_json(result)
-            return EXIT_OK if result.status == "released" else EXIT_NOT_RELEASED
+            resume_result = await app.controller.resume_generation(args.request_id)
+            _write_json(resume_result)
+            return EXIT_OK if resume_result.status == "released" else EXIT_NOT_RELEASED
         raise RuntimeError("unreachable run command")
     if args.command == "observe":
         reader = open_observability(config)
@@ -736,9 +837,7 @@ def _job_permissions(config: FoundryConfig) -> PermissionScope:
         else ()
     )
     dependency_domains = config.agent.engineer_dependency_network_domains
-    network_domains = (
-        tuple(sorted({"*", *dependency_domains})) if dependency_domains else ()
-    )
+    network_domains = tuple(sorted({"*", *dependency_domains})) if dependency_domains else ()
     return PermissionScope(
         network_domains=network_domains,
         credential_handles=handles,
@@ -786,9 +885,7 @@ def _resolve_artifact_revision(
         raise ValueError("revision does not resolve to one exact artifact")
     selected = matches[0]
     if selected.artifact_type != expected_artifact_type:
-        raise ValueError(
-            f"revision must reference an exact {expected_artifact_type} artifact"
-        )
+        raise ValueError(f"revision must reference an exact {expected_artifact_type} artifact")
     return selected
 
 

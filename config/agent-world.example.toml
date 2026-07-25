@@ -5,7 +5,9 @@ state_root = "/home/me/.local/state/agent-world"
 [agent]
 model = "YOUR_CODEX_MODEL"
 codex_bin = "/absolute/path/to/a/current/codex"
-chatgpt_auth_file = "/home/me/.codex/auth.json"
+# Names only. The values must be injected into the Foundry process environment.
+api_key_environment = "OPENAI_API_KEY"
+openai_base_url_environment = "OPENAI_BASE_URL"
 reasoning_researcher = "high"
 reasoning_engineer = "xhigh"
 reasoning_challenger = "xhigh"

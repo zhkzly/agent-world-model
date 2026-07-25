@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import pytest
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
-from pydantic import BaseModel, JsonValue
+from pydantic import BaseModel, JsonValue, ValidationError
 from v3_fixture import portable_counter_contracts
 
 from agent_world.artifact_store import ArtifactStore
@@ -24,6 +24,7 @@ from agent_world.control.validation import (
     SafeValidationIssue,
     StructuredValidationError,
     ValidationDiagnostic,
+    pydantic_validation_diagnostic,
 )
 from agent_world.designer.compact_rule_protocol import (
     COMPACT_RULE_PROTOCOL_VERSION,
@@ -38,7 +39,6 @@ from agent_world.designer.final_design_leaves import (
 )
 from agent_world.designer.models import (
     CompactFieldSemanticDraft,
-    PermissionRuleSourceDraft,
     RuleDraft,
     SharedAtomicityDomainSourceDraft,
     SharedConcurrencyDomainSourceDraft,
@@ -46,16 +46,12 @@ from agent_world.designer.models import (
     SharedIdempotencyDomainSourceDraft,
     SharedToolSemanticsContract,
     SharedToolSemanticsSourceDraft,
-    ToolAccessObservationSourceDraft,
     ToolBehaviorDraft,
     ToolConditionsDraft,
-    ToolConditionsSourceDraft,
-    ToolErrorSourceDraft,
-    ToolErrorsSourceDraft,
     ToolInterfaceSourceDraft,
+    ToolRuleDraft,
     ToolSemanticsBatchSourceDraft,
     ToolSemanticSourceDraft,
-    ToolStateTransitionSourceDraft,
     ToolSurfaceDraft,
     ToolSurfacePlan,
     ToolSurfaceSourceDraft,
@@ -84,60 +80,9 @@ class _ProjectionBatch(BaseModel):
 
 
 def test_tool_batch_derives_rule_identity_before_source_artifact_can_be_written() -> None:
-    """Rule namespace is framework mechanics, not an Engineer repair burden."""
+    """Rule namespace is absent from the Agent wire and remains framework mechanics."""
 
-    def rule(family: str, supplied_id: str) -> RuleDraft:
-        return RuleDraft.model_construct(
-            rule_id=supplied_id,
-            family=family,
-            description="A typed business relation.",
-            boolean_operator="all",
-            clauses=(),
-            case_sensitivity="positive_only",
-            evidence_claim_ids=(),
-        )
-
-    tool_id = "hotel.reserve"
-    source = ToolSemanticSourceDraft.model_construct(
-        tool_id=tool_id,
-        conditions=ToolConditionsSourceDraft.model_construct(
-            tool_id=tool_id,
-            preconditions=(rule("precondition", "agent-chosen-pre"),),
-            postconditions=(rule("postcondition", "agent-chosen-post"),),
-        ),
-        state_transition=ToolStateTransitionSourceDraft.model_construct(
-            tool_id=tool_id,
-            transition=(rule("transition", "agent-chosen-transition"),),
-        ),
-        errors=ToolErrorsSourceDraft.model_construct(
-            tool_id=tool_id,
-            errors=(
-                ToolErrorSourceDraft.model_construct(
-                    when=rule("error_condition", "agent-chosen-error"),
-                ),
-            ),
-        ),
-        access_observation=ToolAccessObservationSourceDraft.model_construct(
-            tool_id=tool_id,
-            permission=PermissionRuleSourceDraft.model_construct(
-                condition=rule("permission", "agent-chosen-permission"),
-            ),
-            observation=SimpleNamespace(),
-        ),
-        reliability=SimpleNamespace(),
-    )
-
-    batch = ToolSemanticsBatchSourceDraft(tools=(source,))
-    canonical = batch.tools[0]
-
-    assert canonical.conditions.preconditions[0].rule_id == "rule:hotel.reserve:precondition:0"
-    assert canonical.conditions.postconditions[0].rule_id == "rule:hotel.reserve:postcondition:0"
-    assert canonical.state_transition.transition[0].rule_id == "rule:hotel.reserve:transition:0"
-    assert canonical.errors.errors[0].when.rule_id == "rule:hotel.reserve:error:0"
-    assert (
-        canonical.access_observation.permission.condition.rule_id
-        == "rule:hotel.reserve:permission:0"
-    )
+    assert "rule_id" not in ToolRuleDraft.model_json_schema()["properties"]
 
 
 def test_retired_world_skeleton_resume_is_not_a_public_success_path() -> None:
@@ -165,7 +110,7 @@ def test_read_only_tool_is_valid_but_empty_footprint_is_not() -> None:
         _plan(2, namespace="hotel", reads=())
 
 
-def test_eight_tools_compile_to_at_most_two_stable_batches() -> None:
+def test_bc17_eight_tools_compile_to_at_most_four_stable_two_tool_batches() -> None:
     plans = tuple(
         _plan(
             index,
@@ -180,14 +125,16 @@ def test_eight_tools_compile_to_at_most_two_stable_batches() -> None:
 
     batches = EnvironmentDesigner._tool_semantic_batches(architecture)
 
-    assert len(batches) == 2
-    assert all(1 <= len(batch) <= 4 for batch in batches)
+    assert len(batches) == 4
+    assert all(1 <= len(batch) <= 2 for batch in batches)
+    assert ToolSemanticsBatchSourceDraft.model_json_schema()["properties"]["tools"]["maxItems"] == 2
+    assert tool_semantics_batch_protocol_schema()["properties"]["tools"]["maxItems"] == 2
     assert tuple(tool_id for batch in batches for tool_id in batch) == tuple(
         item.tool_id for item in plans
     )
 
 
-def test_five_coupled_tools_get_one_shared_group_and_two_execution_batches() -> None:
+def test_bc17_five_coupled_tools_keep_one_shared_group_and_three_execution_batches() -> None:
     plans = tuple(
         _plan(index, namespace="hotel", reads=("inventory", "reservations")) for index in range(5)
     )
@@ -211,7 +158,13 @@ def test_five_coupled_tools_get_one_shared_group_and_two_execution_batches() -> 
     assert len(plan.groups) == 1
     assert plan.groups[0].mode == "multi_batch"
     assert plan.groups[0].shared_state_entity_ids == ("inventory", "reservations")
-    assert tuple(map(len, plan.execution_batches)) == (4, 1)
+    expected_batches = (
+        ("hotel.tool-0", "hotel.tool-1"),
+        ("hotel.tool-2", "hotel.tool-3"),
+        ("hotel.tool-4",),
+    )
+    assert plan.groups[0].batches == expected_batches
+    assert plan.execution_batches == expected_batches
 
 
 def test_shared_tool_policy_requires_exact_domain_partitions() -> None:
@@ -271,9 +224,7 @@ def test_shared_tool_policy_requires_exact_domain_partitions() -> None:
             group=cast(Any, group),
             evidence_graph=EvidenceGraph(graph_id="evidence:hotel", revision=1),
         )
-    issue = next(
-        item for item in captured.value.issues if item.code == "shared_contract_partition"
-    )
+    issue = next(item for item in captured.value.issues if item.code == "shared_contract_partition")
     assert issue.violated_condition == "shared domains omit or duplicate a frozen group tool"
     assert issue.expected_category is not None
     assert all(tool_id in issue.expected_category for tool_id in tool_ids)
@@ -437,8 +388,7 @@ def test_tool_batch_prompt_discloses_only_the_target_tool_state_footprint() -> N
         }
     ]
     assert all(
-        item["source"] not in {"pre_state", "post_state"}
-        or item["pointer"].startswith("/bookings")
+        item["source"] not in {"pre_state", "post_state"} or item["pointer"].startswith("/bookings")
         for item in catalog["reference_bindings"]
     )
 
@@ -516,8 +466,7 @@ def test_restricted_rule_catalog_keeps_tool_io_but_removes_unowned_state_binding
     ]
     assert any(item["source"] == "args" for item in reference_bindings)
     assert all(
-        item["source"] not in {"pre_state", "post_state"}
-        or item["pointer"].startswith("/bookings")
+        item["source"] not in {"pre_state", "post_state"} or item["pointer"].startswith("/bookings")
         for item in reference_bindings
     )
 
@@ -655,7 +604,6 @@ def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
                     "tool_id": tool.surface.tool_id,
                     "permission": {
                         "permission_id": "permission:counter",
-                        "allowed_actors": ["user"],
                         "required_scopes_by_actor": {"user": ["counter.write"]},
                         "condition": None,
                         "denied_observation": "Permission denied.",
@@ -709,9 +657,19 @@ def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
 
     protocol = tool_semantics_batch_protocol()
     assert COMPACT_RULE_PROTOCOL_VERSION in protocol
-    assert "bound_lookup_by_key" in protocol
+    assert "bound_lookup_by_reference" in protocol
+    assert "bound_lookup_by_constant" in protocol
+    assert "not emit allowed_actors; framework code derives" in protocol
+    assert "they MUST omit `ordering`" in protocol
+    assert "never emit a nested `key` object" in protocol
+    assert "Never emit key_binding_id" in protocol
     assert "Never emit reference, lookup_by_key" in protocol
-    protocol_validator = Draft202012Validator(tool_semantics_batch_protocol_schema())
+    protocol_schema = tool_semantics_batch_protocol_schema()
+    permission_schema = cast(dict[str, Any], protocol_schema["$defs"])["permission"]
+    assert "allowed_actors" not in permission_schema["required"]
+    assert "allowed_actors" not in permission_schema["properties"]
+    assert permission_schema["properties"]["required_scopes_by_actor"]["minProperties"] == 1
+    protocol_validator = Draft202012Validator(protocol_schema)
     assert not tuple(protocol_validator.iter_errors(source_document))
 
     source = ToolSemanticsBatchSourceDraft.model_validate_json(json.dumps(source_document))
@@ -724,6 +682,90 @@ def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
         rule_contexts_by_tool={tool.surface.tool_id: catalog},
     )
     assert compiled[0].tool_id == tool.surface.tool_id
+    assert compiled[0].semantics.preconditions[0].rule_id.endswith(":precondition:0")
+    assert compiled[0].semantics.transition[0].rule_id.endswith(":transition:0")
+    assert compiled[0].semantics.permission.allowed_actors == ("user",)
+
+    invalid_equal_ordering = json.loads(json.dumps(source_document))
+    invalid_equal_ordering["tools"][0]["conditions"]["postconditions"][0]["clauses"][0][
+        "ordering"
+    ] = "number"
+    assert tuple(protocol_validator.iter_errors(invalid_equal_ordering))
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        ToolSemanticsBatchSourceDraft.model_validate_json(json.dumps(invalid_equal_ordering))
+
+    invalid_nested_lookup = json.loads(json.dumps(source_document))
+    invalid_nested_lookup["tools"][0]["state_transition"]["transition"][0]["clauses"][0][
+        "right"
+    ] = {
+        "kind": "bound_lookup_by_key",
+        "binding_id": "lookup:counter",
+        "key": {
+            "kind": "arithmetic",
+            "operator": "add",
+            "left": zero,
+            "right": zero,
+        },
+    }
+    assert tuple(protocol_validator.iter_errors(invalid_nested_lookup))
+    with pytest.raises(ValidationError) as invalid_lookup:
+        ToolSemanticsBatchSourceDraft.model_validate_json(json.dumps(invalid_nested_lookup))
+    lookup_diagnostic = pydantic_validation_diagnostic(
+        invalid_lookup.value,
+        owner_component="design",
+        validation_phase="tool_semantics_wire",
+        frontier_ordinal=10,
+    )
+    assert lookup_diagnostic.issue_codes[0].startswith("schema_union_tag_invalid@")
+    assert any(code.startswith("schema_too_short@") for code in lookup_diagnostic.issue_codes)
+
+    invalid_split_lookup = json.loads(json.dumps(source_document))
+    invalid_split_lookup["tools"][0]["state_transition"]["transition"][0]["clauses"][0][
+        "right"
+    ] = {
+        "kind": "bound_lookup_by_reference",
+        "binding_id": "lookup-ref-1",
+        "key_binding_id": "ref-1",
+    }
+    assert tuple(protocol_validator.iter_errors(invalid_split_lookup))
+    with pytest.raises(ValidationError, match="extra_forbidden"):
+        ToolSemanticsBatchSourceDraft.model_validate_json(json.dumps(invalid_split_lookup))
+
+    invalid_zero_divisor = json.loads(json.dumps(source_document))
+    invalid_transition = invalid_zero_divisor["tools"][0]["state_transition"]["transition"][0]
+    invalid_transition["clauses"][0]["right"] = {
+        "kind": "arithmetic",
+        "operator": "divide",
+        "left": pre_value,
+        "right": zero,
+    }
+    assert not tuple(protocol_validator.iter_errors(invalid_zero_divisor))
+    with pytest.raises(StructuredValidationError) as captured:
+        compile_tool_semantics_batch(
+            ToolSemanticsBatchSourceDraft.model_validate_json(json.dumps(invalid_zero_divisor)),
+            expected_tool_ids=(tool.surface.tool_id,),
+            skeleton=skeleton,
+            evidence_graph=EvidenceGraph(graph_id="evidence:counter", revision=1),
+            contracts=(),
+            rule_contexts_by_tool={tool.surface.tool_id: catalog},
+        )
+    issue = captured.value.diagnostic.issues[0]
+    assert issue.code == "rule_arithmetic_zero_divisor"
+    assert issue.location == (
+        "tools",
+        0,
+        "state_transition",
+        "transition",
+        0,
+        "clauses",
+        0,
+        "right",
+        "right",
+    )
+    assert issue.retryable is True
+    assert issue.violated_condition == "semantic contract rule_arithmetic_zero_divisor"
+    assert issue.expected_category == "a value satisfying the named semantic contract"
+    assert issue.code != "framework_diagnostic_incomplete"
 
     raw_reference = json.loads(json.dumps(source_document))
     transition = raw_reference["tools"][0]["state_transition"]["transition"][0]
@@ -734,19 +776,41 @@ def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
         "value_type": "number",
     }
     assert tuple(protocol_validator.iter_errors(raw_reference))
-    with pytest.raises(StructuredValidationError) as captured:
-        compile_tool_semantics_batch(
-            ToolSemanticsBatchSourceDraft.model_validate_json(json.dumps(raw_reference)),
-            expected_tool_ids=(tool.surface.tool_id,),
-            skeleton=skeleton,
-            evidence_graph=EvidenceGraph(graph_id="evidence:counter", revision=1),
-            contracts=(),
-            rule_contexts_by_tool={tool.surface.tool_id: catalog},
-        )
-    assert any(
-        issue_code.startswith("tool_rule_binding_required@")
-        for issue_code in captured.value.diagnostic.issue_codes
-    )
+    with pytest.raises(ValidationError, match="union_tag_invalid"):
+        ToolSemanticsBatchSourceDraft.model_validate_json(json.dumps(raw_reference))
+
+    raw_lookup = {
+        "rule_id": "rule:generic:lookup",
+        "family": "invariant",
+        "description": "A generic world rule may use a raw closed-schema lookup.",
+        "boolean_operator": "all",
+        "clauses": [
+            {
+                "clause_id": "raw_lookup_is_still_supported",
+                "operator": "equal",
+                "left": {
+                    "kind": "lookup_by_key",
+                    "source": "post_state",
+                    "collection_pointer": "/bookings",
+                    "key_field": "booking_id",
+                    "key": {
+                        "kind": "reference",
+                        "source": "args",
+                        "pointer": "/booking_id",
+                        "value_type": "string",
+                    },
+                    "value_pointer": "/status",
+                    "value_type": "string",
+                },
+                "right": {"kind": "constant", "value_type": "string", "value": "confirmed"},
+                "negate": False,
+            }
+        ],
+        "case_sensitivity": "positive_only",
+        "evidence_claim_ids": [],
+    }
+    generic_rule = RuleDraft.model_validate_json(json.dumps(raw_lookup))
+    assert generic_rule.clauses[0].left.kind == "lookup_by_key"
 
 
 def test_shared_idempotency_uses_the_exact_downstream_tool_vocabulary() -> None:

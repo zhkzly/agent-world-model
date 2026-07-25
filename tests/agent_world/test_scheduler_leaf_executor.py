@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,6 +20,7 @@ from agent_world.control import (
     LeafValidationFailure,
     LeaseBudgetLedger,
     OperationRun,
+    ProposalExecution,
     RepairAction,
     SchedulerLeafExecutor,
     ValidationIssue,
@@ -256,6 +258,84 @@ async def test_agent_backend_error_with_no_candidate_output_still_reaches_termin
     report = artifacts.get_json(attempt.validation_report_ref, ValidationReport)
     assert report.status == "error"
     assert not report.subject_refs
+
+
+@pytest.mark.asyncio
+async def test_cancelled_agent_before_provenance_is_terminal_unknown_evidence(
+    tmp_path: Path,
+) -> None:
+    """A cancelled live Agent turn may not leave a running head or invent provenance."""
+
+    definition = structured_agent_work_definition(
+        scope_id="job:leaf-kernel",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One isolated Researcher call produces a bounded research plan.",
+        timing_reason="Acquisition cannot begin without an exact plan.",
+        output_contract_id="contract:research-plan",
+        agent_role="researcher",
+        allowed_mutation_roots=("/",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_infrastructure_retries=0,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:research-plan",
+                direction="output",
+                artifact_types=("design.research_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="research",
+            ),
+        ),
+    )
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(llm_tokens=1_000, agent_turns=1, wall_seconds=300),
+    )
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+
+    async def proposal(_context, _attempt: WorkAttempt, _dispatch_id: str) -> LeafProposal:
+        raise asyncio.CancelledError
+
+    async def execute(context) -> None:
+        await leaf.execute(context, definition=definition, proposal_runner=proposal)
+
+    with pytest.raises(asyncio.CancelledError):
+        await scheduler.dispatch_one(
+            definition.coordinate,
+            executors={definition.work_id: execute},
+        )
+
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "failed"
+    attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+    assert attempt.validation_report_ref is not None
+    report = artifacts.get_json(attempt.validation_report_ref, ValidationReport)
+    assert report.status == "error"
+    assert report.issues[0].code == "process_interrupted_cancelled"
+
+    proposal_run = next(
+        artifacts.get_json(ref, OperationRun)
+        for ref in attempt.operation_run_refs
+        if artifacts.get_json(ref, OperationRun).kind == "proposal"
+    )
+    assert proposal_run.status == "terminal"
+    assert proposal_run.error_code == "process_interrupted_cancelled"
+    assert proposal_run.unknown_upper_bound.llm_tokens == 1_000
+    assert proposal_run.unknown_upper_bound.agent_turns == 1
+    assert proposal_run.execution_ref is not None
+    execution = artifacts.get_json(proposal_run.execution_ref, ProposalExecution)
+    assert execution.status == "interrupted"
+    assert execution.invocation_id is None
+    assert execution.provider is None
+    assert execution.model is None
+    assert execution.profile_digest is None
+    assert execution.output_schema_digest is None
 
 
 @pytest.mark.asyncio

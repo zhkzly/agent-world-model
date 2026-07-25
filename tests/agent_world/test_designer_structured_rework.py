@@ -640,7 +640,6 @@ def test_observation_source_derives_redacted_complement() -> None:
         tool_id="hotel.search",
         permission=PermissionRuleSourceDraft(
             permission_id="permission:hotel.search",
-            allowed_actors=("traveler", "auditor"),
             required_scopes_by_actor={"traveler": (), "auditor": ()},
             denied_observation="Caller is not permitted.",
         ),
@@ -663,6 +662,28 @@ def test_observation_source_derives_redacted_complement() -> None:
         "traveler": ("audit_trace",),
         "auditor": (),
     }
+    assert compiled.permission.allowed_actors == ("auditor", "traveler")
+
+
+def test_permission_source_rejects_a_repeated_allowed_actor_projection() -> None:
+    """BC-17: the source map owns the actor set; core derives its projection."""
+
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        PermissionRuleSourceDraft.model_validate(
+            {
+                "permission_id": "permission:hotel.search",
+                "required_scopes_by_actor": {"traveler": ()},
+                "allowed_actors": ("traveler",),
+                "denied_observation": "Caller is not permitted.",
+            }
+        )
+
+    with pytest.raises(ValueError):
+        PermissionRuleSourceDraft(
+            permission_id="permission:hotel.search",
+            required_scopes_by_actor={},
+            denied_observation="Caller is not permitted.",
+        )
 
 
 @pytest.mark.asyncio

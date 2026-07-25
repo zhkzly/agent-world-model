@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from pydantic import model_validator
+
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.builder import BuilderLeaf, EnvironmentBuilder
 from agent_world.contracts import (
@@ -56,7 +58,7 @@ from .leaf_executor import SchedulerLeafExecutor
 from .release_dossier import ReleaseDossierCompiler
 from .release_leaf import ObservabilityLeaf, PackageLeaf, RegistryPublicationLeaf
 from .telemetry import TelemetryStore
-from .work import WorkCommit, WorkDefinition
+from .work import WorkAttempt, WorkCommit, WorkDefinition
 from .work_epoch import WorkGraphEpochRuntime
 from .work_graph import (
     GenerationWorkGraph,
@@ -98,6 +100,74 @@ class DirectWorkRun(V2Contract):
     blocked_coordinates: tuple[str, ...] = ()
 
 
+class SemanticPrefixRun(V2Contract):
+    """One normal Direct semantic closure with no final-epoch execution.
+
+    This is deliberately not a ``DirectWorkRun`` and cannot claim a Package or
+    Registry release.  It exists only to make the exact, active
+    ``ModelingBoundary -> VerifierPlan`` closure available as an input to a
+    later isolated downstream-node test.  The commits themselves are normal
+    Scheduler commits, not diagnostic-test commits or replayed output.
+    """
+
+    run_id: str
+    scope_id: str
+    context_ref: ArtifactRef
+    status: Literal["semantic_prefix_ready", "blocked"]
+    bootstrap_epoch_ref: ArtifactRef
+    design_epoch_ref: ArtifactRef | None = None
+    modeling_commit_ref: ArtifactRef | None = None
+    verifier_plan_commit_ref: ArtifactRef | None = None
+    environment_design_ref: ArtifactRef | None = None
+    verifier_batch_plan_ref: ArtifactRef | None = None
+    observed_actual: BudgetUsage
+    unknown_upper_bound: BudgetUsage
+    blocked_coordinates: tuple[str, ...] = ()
+    diagnostic_only: Literal[False] = False
+    release_attempted: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_terminal_state(self) -> SemanticPrefixRun:
+        ready_refs = (
+            self.design_epoch_ref,
+            self.modeling_commit_ref,
+            self.verifier_plan_commit_ref,
+            self.environment_design_ref,
+            self.verifier_batch_plan_ref,
+        )
+        if self.status == "semantic_prefix_ready":
+            if any(ref is None for ref in ready_refs):
+                raise ValueError("ready semantic prefix requires its complete typed commit closure")
+            if self.blocked_coordinates:
+                raise ValueError("ready semantic prefix cannot name blocked coordinates")
+        elif any(
+            ref is not None
+            for ref in (
+                self.modeling_commit_ref,
+                self.verifier_plan_commit_ref,
+                self.environment_design_ref,
+                self.verifier_batch_plan_ref,
+            )
+        ):
+            raise ValueError("blocked semantic prefix cannot claim active terminal commits")
+        return self
+
+
+@dataclass(slots=True)
+class _SemanticPrefixExecution:
+    """Internal exact state retained between Direct topology epochs."""
+
+    runtime: WorkControlRuntime
+    workspace: Path
+    bootstrap_epoch_ref: ArtifactRef
+    design_epoch_ref: ArtifactRef | None = None
+    design_graph: GenerationWorkGraph | None = None
+    modeling_definition: WorkDefinition | None = None
+    verifier_plan_definition: WorkDefinition | None = None
+    ready: bool = False
+    blocked_coordinates: tuple[str, ...] = ()
+
+
 @dataclass(slots=True)
 class DirectWorkRunner:
     """Execute one complete Direct WorkGraph through Registry publication.
@@ -131,10 +201,7 @@ class DirectWorkRunner:
         recovering: bool = False,
     ) -> DirectWorkRun:
         context, job, request = self._load_context(context_ref)
-        if self.maximum_concurrency < 1:
-            raise DirectWorkRunnerError("maximum_concurrency must be positive")
-        if self.structured_turn_token_limit < 1 or self.structured_turn_wall_seconds <= 0:
-            raise DirectWorkRunnerError("Direct scheduler requires positive structured-turn limits")
+        self._validate_execution_configuration()
 
         # Controller owns DirectJob identity.  The Scheduler must use that
         # exact id for root and child telemetry so ``run inspect --metrics``
@@ -182,6 +249,84 @@ class DirectWorkRunner:
         self.telemetry.flush()
         return outcome
 
+    async def run_semantic_prefix(
+        self,
+        *,
+        context_ref: ArtifactRef,
+        run_id: str | None = None,
+    ) -> SemanticPrefixRun:
+        """Execute real Direct work only through the committed VerifierPlan.
+
+        The normal ``run`` method remains the only production route to a
+        release.  This explicit staged entry is a test-control boundary: it
+        uses the same non-diagnostic Scheduler, role leaves, invocation
+        backend, ArtifactStore, and active-commit rules, then stops before the
+        final epoch exists.  It cannot create a Package or Registry result.
+        """
+
+        context, job, request = self._load_context(context_ref)
+        self._validate_execution_configuration()
+        run_id = run_id or f"semantic-prefix:{context.context_id}"
+        trace_id = run_id
+        root = self.telemetry.start_span(
+            trace_id=trace_id,
+            component="controller",
+            operation="direct.semantic_prefix",
+            run_id=run_id,
+            node="request",
+            input_refs=(context_ref,),
+            attributes={
+                "topology": "bootstrap-design-prefix-v1",
+                "release_attempted": False,
+            },
+        )
+        self.telemetry.activate_trace(
+            trace_id=trace_id,
+            run_id=run_id,
+            parent_span_id=root.span_id,
+        )
+        try:
+            prefix = await self._run_semantic_prefix_under_trace(
+                context_ref=context_ref,
+                context=context,
+                job=job,
+                request=request,
+                run_id=run_id,
+                trace_id=trace_id,
+            )
+            outcome = self._semantic_prefix_outcome(
+                prefix=prefix,
+                context_ref=context_ref,
+                scope_id=job.job_id,
+                run_id=run_id,
+            )
+        except Exception as exc:
+            root.finish(status="error", error_code=type(exc).__name__)
+            self.telemetry.flush()
+            raise
+        output_refs = tuple(
+            ref
+            for ref in (
+                outcome.bootstrap_epoch_ref,
+                outcome.design_epoch_ref,
+                outcome.modeling_commit_ref,
+                outcome.verifier_plan_commit_ref,
+                outcome.environment_design_ref,
+                outcome.verifier_batch_plan_ref,
+            )
+            if ref is not None
+        )
+        if outcome.status == "semantic_prefix_ready":
+            root.finish(status="passed", output_refs=output_refs)
+        else:
+            root.finish(
+                status="failed",
+                error_code="semantic_prefix_blocked",
+                output_refs=output_refs,
+            )
+        self.telemetry.flush()
+        return outcome
+
     async def _run_under_trace(
         self,
         *,
@@ -192,128 +337,43 @@ class DirectWorkRunner:
         run_id: str,
         trace_id: str,
     ) -> DirectWorkRun:
-        runtime = WorkControlRuntime(
-            artifacts=self.artifacts,
-            heads=self.heads,
-            budget=LeaseBudgetLedger(context.budget),
-            repair_scope_id=job.job_id,
-            telemetry=self.telemetry,
-            projector=self.projector,
-            trace_id=trace_id,
-            run_id=run_id,
-        )
-        kernel = SchedulerLeafExecutor(runtime=runtime)
-        epochs = WorkGraphEpochRuntime(artifacts=self.artifacts, heads=self.heads)
-        workspace = self.workspace_root / context.context_id
-        workspace.mkdir(parents=True, exist_ok=True)
-
-        bootstrap_definitions = self._bootstrap_definitions(job)
-        bootstrap_graph = GenerationWorkGraph.compile(
-            bootstrap_definitions,
-            mode="diagnostic",
-            strict_input_contracts=True,
-        )
-        bootstrap_manifest, bootstrap_manifest_ref, _epoch, bootstrap_epoch_ref = (
-            epochs.freeze_bootstrap(
-                context_ref=context_ref,
-                graph=bootstrap_graph,
-                topology_id=f"topology:direct-bootstrap:{context.context_id}",
-            )
-        )
-        bootstrap_snapshot = await self._run_graph(
-            graph=bootstrap_graph,
-            manifest=bootstrap_manifest,
-            manifest_ref=bootstrap_manifest_ref,
-            runtime=runtime,
-            executors=self._bootstrap_executors(
-                context_ref=context_ref,
-                workspace=workspace,
-                kernel=kernel,
-                definitions=bootstrap_definitions,
-            ),
-        )
-        if not self._all_committed(bootstrap_snapshot):
-            usage = self._scope_budget_usage(runtime=runtime, scope_id=job.job_id)
-            return self._persist_outcome(
-                run_id=run_id,
-                context_ref=context_ref,
-                status="blocked",
-                bootstrap_epoch_ref=bootstrap_epoch_ref,
-                observed_actual=usage["observed_actual"],
-                unknown_upper_bound=usage["unknown_upper_bound"],
-                blocked_coordinates=self._blocked_coordinates(bootstrap_snapshot),
-            )
-
-        architecture_definition = self._one_definition(
-            bootstrap_graph,
-            component="design",
-            stage="world_architecture",
-        )
-        architecture_ref = self._active_output(
-            architecture_definition,
-            artifact_type="design.world_architecture_source",
-        )
-        coupling_ref = self._active_output(
-            architecture_definition,
-            artifact_type="design.tool_coupling_plan",
-        )
-        coupling_plan = self.artifacts.get_json(coupling_ref, ToolCouplingPlan)
-        final_design_definitions, modeling = derive_final_design_definitions(
-            scope_id=job.job_id,
-            bootstrap_definitions=bootstrap_definitions,
-            architecture_source_ref=architecture_ref,
-            coupling_plan=coupling_plan,
-            agent_wall_seconds=self._agent_wall(context.budget),
-            agent_token_limit=self._agent_tokens(context.budget),
-        )
-        verifier_plan = verifier_plan_work_definition(
-            scope_id=job.job_id,
-            modeling_coordinate=modeling.coordinate,
-        )
-        design_graph = compile_design_work_graph(
-            scope_id=job.job_id,
-            design_definitions=final_design_definitions,
-            modeling_definition=modeling,
-            verifier_plan_definition=verifier_plan,
-            strict_input_contracts=True,
-        )
-        (
-            design_manifest,
-            design_manifest_ref,
-            _design_epoch,
-            design_epoch_ref,
-        ) = epochs.freeze_design(
+        prefix = await self._run_semantic_prefix_under_trace(
             context_ref=context_ref,
-            bootstrap_epoch_ref=bootstrap_epoch_ref,
-            graph=design_graph,
-            topology_id=f"topology:direct-design:{context.context_id}",
+            context=context,
+            job=job,
+            request=request,
+            run_id=run_id,
+            trace_id=trace_id,
         )
-        design_snapshot = await self._run_graph(
-            graph=design_graph,
-            manifest=design_manifest,
-            manifest_ref=design_manifest_ref,
-            runtime=runtime,
-            executors=self._design_executors(
-                context_ref=context_ref,
-                workspace=workspace,
-                kernel=kernel,
-                graph=design_graph,
-                verifier_plan=verifier_plan,
-            ),
-        )
-        if not self._all_committed(design_snapshot):
+        runtime = prefix.runtime
+        if not prefix.ready:
             usage = self._scope_budget_usage(runtime=runtime, scope_id=job.job_id)
             return self._persist_outcome(
                 run_id=run_id,
                 context_ref=context_ref,
                 status="blocked",
-                bootstrap_epoch_ref=bootstrap_epoch_ref,
-                design_epoch_ref=design_epoch_ref,
+                bootstrap_epoch_ref=prefix.bootstrap_epoch_ref,
+                design_epoch_ref=prefix.design_epoch_ref,
                 observed_actual=usage["observed_actual"],
                 unknown_upper_bound=usage["unknown_upper_bound"],
-                blocked_coordinates=self._blocked_coordinates(design_snapshot),
+                blocked_coordinates=prefix.blocked_coordinates,
             )
 
+        if (
+            prefix.design_graph is None
+            or prefix.design_epoch_ref is None
+            or prefix.verifier_plan_definition is None
+        ):
+            raise DirectWorkRunnerError(
+                "ready semantic prefix lacks its exact Design graph closure"
+            )
+        design_graph = prefix.design_graph
+        bootstrap_epoch_ref = prefix.bootstrap_epoch_ref
+        design_epoch_ref = prefix.design_epoch_ref
+        verifier_plan = prefix.verifier_plan_definition
+        workspace = prefix.workspace
+        epochs = WorkGraphEpochRuntime(artifacts=self.artifacts, heads=self.heads)
+        kernel = SchedulerLeafExecutor(runtime=runtime)
         plan_ref = self._active_output(verifier_plan, artifact_type="judge.verifier_batch_plan")
         plan = self.artifacts.get_json(plan_ref, VerifierBatchPlan)
         final_graph = complete_generation_work_graph(
@@ -381,6 +441,139 @@ class DirectWorkRunner:
             unknown_upper_bound=usage["unknown_upper_bound"],
         )
 
+    async def _run_semantic_prefix_under_trace(
+        self,
+        *,
+        context_ref: ArtifactRef,
+        context: GenerationContext,
+        job: EnvironmentJob,
+        request: EnvironmentRequest,
+        run_id: str,
+        trace_id: str,
+    ) -> _SemanticPrefixExecution:
+        """Run the shared normal bootstrap/design prefix exactly once."""
+
+        # Keep the same typed request load in this shared path even though the
+        # semantic leaves consume it through ``context_ref`` rather than as a
+        # mutable Python argument.
+        _ = request
+        runtime = WorkControlRuntime(
+            artifacts=self.artifacts,
+            heads=self.heads,
+            budget=LeaseBudgetLedger(context.budget),
+            repair_scope_id=job.job_id,
+            telemetry=self.telemetry,
+            projector=self.projector,
+            trace_id=trace_id,
+            run_id=run_id,
+        )
+        kernel = SchedulerLeafExecutor(runtime=runtime)
+        epochs = WorkGraphEpochRuntime(artifacts=self.artifacts, heads=self.heads)
+        workspace = self.workspace_root / context.context_id
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        bootstrap_definitions = self._bootstrap_definitions(job)
+        bootstrap_graph = GenerationWorkGraph.compile(
+            bootstrap_definitions,
+            mode="diagnostic",
+            strict_input_contracts=True,
+        )
+        bootstrap_manifest, bootstrap_manifest_ref, _epoch, bootstrap_epoch_ref = (
+            epochs.freeze_bootstrap(
+                context_ref=context_ref,
+                graph=bootstrap_graph,
+                topology_id=f"topology:direct-bootstrap:{context.context_id}",
+            )
+        )
+        bootstrap_snapshot = await self._run_graph(
+            graph=bootstrap_graph,
+            manifest=bootstrap_manifest,
+            manifest_ref=bootstrap_manifest_ref,
+            runtime=runtime,
+            executors=self._bootstrap_executors(
+                context_ref=context_ref,
+                workspace=workspace,
+                kernel=kernel,
+                definitions=bootstrap_definitions,
+            ),
+        )
+        if not self._all_committed(bootstrap_snapshot):
+            return _SemanticPrefixExecution(
+                runtime=runtime,
+                workspace=workspace,
+                bootstrap_epoch_ref=bootstrap_epoch_ref,
+                blocked_coordinates=self._blocked_coordinates(bootstrap_snapshot),
+            )
+
+        architecture_definition = self._one_definition(
+            bootstrap_graph,
+            component="design",
+            stage="world_architecture",
+        )
+        architecture_ref = self._active_output(
+            architecture_definition,
+            artifact_type="design.world_architecture_source",
+        )
+        coupling_ref = self._active_output(
+            architecture_definition,
+            artifact_type="design.tool_coupling_plan",
+        )
+        coupling_plan = self.artifacts.get_json(coupling_ref, ToolCouplingPlan)
+        final_design_definitions, modeling = derive_final_design_definitions(
+            scope_id=job.job_id,
+            bootstrap_definitions=bootstrap_definitions,
+            architecture_source_ref=architecture_ref,
+            coupling_plan=coupling_plan,
+            agent_wall_seconds=self._agent_wall(context.budget),
+            agent_token_limit=self._agent_tokens(context.budget),
+        )
+        verifier_plan = verifier_plan_work_definition(
+            scope_id=job.job_id,
+            modeling_coordinate=modeling.coordinate,
+        )
+        design_graph = compile_design_work_graph(
+            scope_id=job.job_id,
+            design_definitions=final_design_definitions,
+            modeling_definition=modeling,
+            verifier_plan_definition=verifier_plan,
+            strict_input_contracts=True,
+        )
+        (
+            design_manifest,
+            design_manifest_ref,
+            _design_epoch,
+            design_epoch_ref,
+        ) = epochs.freeze_design(
+            context_ref=context_ref,
+            bootstrap_epoch_ref=bootstrap_epoch_ref,
+            graph=design_graph,
+            topology_id=f"topology:direct-design:{context.context_id}",
+        )
+        design_snapshot = await self._run_graph(
+            graph=design_graph,
+            manifest=design_manifest,
+            manifest_ref=design_manifest_ref,
+            runtime=runtime,
+            executors=self._design_executors(
+                context_ref=context_ref,
+                workspace=workspace,
+                kernel=kernel,
+                graph=design_graph,
+                verifier_plan=verifier_plan,
+            ),
+        )
+        return _SemanticPrefixExecution(
+            runtime=runtime,
+            workspace=workspace,
+            bootstrap_epoch_ref=bootstrap_epoch_ref,
+            design_epoch_ref=design_epoch_ref,
+            design_graph=design_graph,
+            modeling_definition=modeling,
+            verifier_plan_definition=verifier_plan,
+            ready=self._all_committed(design_snapshot),
+            blocked_coordinates=self._blocked_coordinates(design_snapshot),
+        )
+
     def _bootstrap_definitions(self, job: EnvironmentJob) -> tuple[WorkDefinition, ...]:
         agent_wall = self._agent_wall(job.budget)
         agent_tokens = self._agent_tokens(job.budget)
@@ -427,38 +620,49 @@ class DirectWorkRunner:
         plan, acquisition, synthesis, architecture = definitions
         designer = self.designer
         leaves = (
-            (plan, ResearchPlanLeaf(
-                context_ref=context_ref,
-                workspace_root=workspace,
-                backend=designer.backend,
-                profiles=designer.profiles,
-                kernel=kernel,
-            )),
-            (acquisition, ResearchAcquisitionLeaf(
-                context_ref=context_ref,
-                research=designer.research,
-                research_artifacts=designer.research_artifacts,
-                workspace_root=workspace,
-                kernel=kernel,
-            )),
-            (synthesis, EvidenceSynthesisLeaf(
-                context_ref=context_ref,
-                workspace_root=workspace,
-                backend=designer.backend,
-                profiles=designer.profiles,
-                kernel=kernel,
-            )),
-            (architecture, WorldArchitectureLeaf(
-                context_ref=context_ref,
-                workspace_root=workspace,
-                backend=designer.backend,
-                profiles=designer.profiles,
-                kernel=kernel,
-            )),
+            (
+                plan,
+                ResearchPlanLeaf(
+                    context_ref=context_ref,
+                    workspace_root=workspace,
+                    backend=designer.backend,
+                    profiles=designer.profiles,
+                    kernel=kernel,
+                ),
+            ),
+            (
+                acquisition,
+                ResearchAcquisitionLeaf(
+                    context_ref=context_ref,
+                    research=designer.research,
+                    research_artifacts=designer.research_artifacts,
+                    workspace_root=workspace,
+                    kernel=kernel,
+                ),
+            ),
+            (
+                synthesis,
+                EvidenceSynthesisLeaf(
+                    context_ref=context_ref,
+                    workspace_root=workspace,
+                    backend=designer.backend,
+                    profiles=designer.profiles,
+                    kernel=kernel,
+                ),
+            ),
+            (
+                architecture,
+                WorldArchitectureLeaf(
+                    context_ref=context_ref,
+                    workspace_root=workspace,
+                    backend=designer.backend,
+                    profiles=designer.profiles,
+                    kernel=kernel,
+                ),
+            ),
         )
         return {
-            definition.work_id: self._leaf_executor(leaf, definition)
-            for definition, leaf in leaves
+            definition.work_id: self._leaf_executor(leaf, definition) for definition, leaf in leaves
         }
 
     def _design_executors(
@@ -672,6 +876,84 @@ class DirectWorkRunner:
             raise DirectWorkRunnerError("GenerationContext has an inconsistent Direct root closure")
         return context, job, request
 
+    def _validate_execution_configuration(self) -> None:
+        if self.maximum_concurrency < 1:
+            raise DirectWorkRunnerError("maximum_concurrency must be positive")
+        if self.structured_turn_token_limit < 1 or self.structured_turn_wall_seconds <= 0:
+            raise DirectWorkRunnerError("Direct scheduler requires positive structured-turn limits")
+
+    def _semantic_prefix_outcome(
+        self,
+        *,
+        prefix: _SemanticPrefixExecution,
+        context_ref: ArtifactRef,
+        scope_id: str,
+        run_id: str,
+    ) -> SemanticPrefixRun:
+        usage = self._scope_budget_usage(runtime=prefix.runtime, scope_id=scope_id)
+        if not prefix.ready:
+            return self._persist_semantic_prefix_outcome(
+                run_id=run_id,
+                scope_id=scope_id,
+                context_ref=context_ref,
+                status="blocked",
+                bootstrap_epoch_ref=prefix.bootstrap_epoch_ref,
+                design_epoch_ref=prefix.design_epoch_ref,
+                observed_actual=usage["observed_actual"],
+                unknown_upper_bound=usage["unknown_upper_bound"],
+                blocked_coordinates=prefix.blocked_coordinates,
+            )
+        if (
+            prefix.design_epoch_ref is None
+            or prefix.design_graph is None
+            or prefix.modeling_definition is None
+            or prefix.verifier_plan_definition is None
+        ):
+            raise DirectWorkRunnerError(
+                "ready semantic prefix lacks its exact active commit definitions"
+            )
+        modeling_commit_ref = self._active_commit_ref(prefix.modeling_definition)
+        verifier_plan_commit_ref = self._active_commit_ref(prefix.verifier_plan_definition)
+        environment_design_ref = self._active_output(
+            prefix.modeling_definition,
+            artifact_type="design.environment_design",
+        )
+        verifier_batch_plan_ref = self._active_output(
+            prefix.verifier_plan_definition,
+            artifact_type="judge.verifier_batch_plan",
+        )
+        return self._persist_semantic_prefix_outcome(
+            run_id=run_id,
+            scope_id=scope_id,
+            context_ref=context_ref,
+            status="semantic_prefix_ready",
+            bootstrap_epoch_ref=prefix.bootstrap_epoch_ref,
+            design_epoch_ref=prefix.design_epoch_ref,
+            modeling_commit_ref=modeling_commit_ref,
+            verifier_plan_commit_ref=verifier_plan_commit_ref,
+            environment_design_ref=environment_design_ref,
+            verifier_batch_plan_ref=verifier_batch_plan_ref,
+            observed_actual=usage["observed_actual"],
+            unknown_upper_bound=usage["unknown_upper_bound"],
+        )
+
+    def _active_commit_ref(self, definition: WorkDefinition) -> ArtifactRef:
+        """Require one normal active commit; diagnostic adoption is forbidden."""
+
+        head = self.heads.read_head(definition.coordinate)
+        if head is None or head.status != "committed":
+            raise WorkResumeError("required scheduler Work has no committed head")
+        attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        active = self.heads.require_active_commit(
+            definition=definition,
+            input_refs=attempt.input_refs,
+            artifacts=self.artifacts,
+        )
+        if active is None:
+            raise WorkResumeError("required scheduler WorkCommit is not normally active")
+        _commit, commit_ref = active
+        return commit_ref
+
     def _active_output(self, definition: WorkDefinition, *, artifact_type: str) -> ArtifactRef:
         head = self.heads.read_head(definition.coordinate)
         if head is None or head.status != "committed" or head.commit_ref is None:
@@ -738,9 +1020,7 @@ class DirectWorkRunner:
         actual = BudgetUsage()
         unknown = BudgetUsage()
         fields = tuple(
-            field_name
-            for field_name in BudgetUsage.model_fields
-            if field_name != "schema_version"
+            field_name for field_name in BudgetUsage.model_fields if field_name != "schema_version"
         )
         for lease in snapshot.leases:
             if lease.status != "settled":
@@ -760,6 +1040,58 @@ class DirectWorkRunner:
                 }
             )
         return {"observed_actual": actual, "unknown_upper_bound": unknown}
+
+    def _persist_semantic_prefix_outcome(
+        self,
+        *,
+        run_id: str,
+        scope_id: str,
+        context_ref: ArtifactRef,
+        status: Literal["semantic_prefix_ready", "blocked"],
+        bootstrap_epoch_ref: ArtifactRef,
+        observed_actual: BudgetUsage,
+        unknown_upper_bound: BudgetUsage,
+        design_epoch_ref: ArtifactRef | None = None,
+        modeling_commit_ref: ArtifactRef | None = None,
+        verifier_plan_commit_ref: ArtifactRef | None = None,
+        environment_design_ref: ArtifactRef | None = None,
+        verifier_batch_plan_ref: ArtifactRef | None = None,
+        blocked_coordinates: tuple[str, ...] = (),
+    ) -> SemanticPrefixRun:
+        result = SemanticPrefixRun(
+            run_id=run_id,
+            scope_id=scope_id,
+            context_ref=context_ref,
+            status=status,
+            bootstrap_epoch_ref=bootstrap_epoch_ref,
+            design_epoch_ref=design_epoch_ref,
+            modeling_commit_ref=modeling_commit_ref,
+            verifier_plan_commit_ref=verifier_plan_commit_ref,
+            environment_design_ref=environment_design_ref,
+            verifier_batch_plan_ref=verifier_batch_plan_ref,
+            observed_actual=observed_actual,
+            unknown_upper_bound=unknown_upper_bound,
+            blocked_coordinates=blocked_coordinates,
+        )
+        self.artifacts.put_json(
+            artifact_id=f"semantic-prefix-run:{run_id}",
+            artifact_type="control.semantic_prefix_run",
+            value=result,
+            dependencies=tuple(
+                ref
+                for ref in (
+                    context_ref,
+                    bootstrap_epoch_ref,
+                    design_epoch_ref,
+                    modeling_commit_ref,
+                    verifier_plan_commit_ref,
+                    environment_design_ref,
+                    verifier_batch_plan_ref,
+                )
+                if ref is not None
+            ),
+        )
+        return result
 
     def _persist_outcome(
         self,
@@ -815,4 +1147,9 @@ class DirectWorkRunner:
         return min(self.structured_turn_token_limit, max(1, budget.llm_tokens))
 
 
-__all__ = ["DirectWorkRun", "DirectWorkRunner", "DirectWorkRunnerError"]
+__all__ = [
+    "DirectWorkRun",
+    "DirectWorkRunner",
+    "DirectWorkRunnerError",
+    "SemanticPrefixRun",
+]

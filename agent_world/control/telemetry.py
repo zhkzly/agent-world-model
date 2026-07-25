@@ -58,6 +58,7 @@ type UsageProvenance = Literal[
     "estimated",
     "unknown",
 ]
+type InvocationExecutionBackend = Literal["codex_sdk", "direct_llm"]
 
 _SCHEMA_VERSION = 1
 _CURRENT_TRACE: ContextVar[tuple[str, str, str | None, str | None, str | None] | None] = ContextVar(
@@ -570,7 +571,12 @@ class TelemetryStore:
         )
         self.flush()
 
-    def start_invocation(self, request: InvocationRequest) -> WorkSpan:
+    def start_invocation(
+        self,
+        request: InvocationRequest,
+        *,
+        execution_backend: InvocationExecutionBackend | None = None,
+    ) -> WorkSpan:
         """Open a real-Agent span without recording prompt or output content."""
 
         current = self.current_trace()
@@ -596,7 +602,11 @@ class TelemetryStore:
                 "invocation_id_hash": _hash_text(request.invocation_id),
                 "lineage_id_hash": _hash_text(request.profile.lineage_id),
                 "profile_hash": request.profile.profile_hash,
-                "backend": request.profile.backend,
+                # A resolved role profile remains a Codex-isolated capability
+                # profile even when the deliberately narrower Direct adapter
+                # executes one request. Persist only the closed adapter name,
+                # never a provider endpoint or SDK request detail.
+                "backend": execution_backend or request.profile.backend,
                 "model": request.profile.model,
                 "model_provider": request.profile.model_provider or "unknown",
                 "reasoning_effort": request.profile.reasoning_effort.value,
@@ -731,9 +741,9 @@ class TelemetryStore:
         for metric in metric_rows:
             if metric["span_id"] is None or metric["observed"] is None:
                 continue
-            observed_by_span.setdefault(str(metric["span_id"]), {})[
-                str(metric["name"])
-            ] = metric["observed"]
+            observed_by_span.setdefault(str(metric["span_id"]), {})[str(metric["name"])] = metric[
+                "observed"
+            ]
         now_ns = time.time_ns()
         return tuple(
             {
@@ -742,9 +752,7 @@ class TelemetryStore:
                 "observed_event_count": observed_by_span.get(row["span_id"], {}).get(
                     "invocation.events.observed_delta", 0
                 ),
-                "observed_protocol_tool_event_count": observed_by_span.get(
-                    row["span_id"], {}
-                ).get(
+                "observed_protocol_tool_event_count": observed_by_span.get(row["span_id"], {}).get(
                     "invocation.protocol_tool_events.observed_delta", 0
                 ),
                 "observed_token_count": None,
@@ -1122,9 +1130,7 @@ class TelemetryStore:
             str(row[1]) for row in self._connection.execute("PRAGMA table_info(spans)").fetchall()
         }
         if "last_progress_at_ns" not in span_columns:
-            self._connection.execute(
-                "ALTER TABLE spans ADD COLUMN last_progress_at_ns INTEGER"
-            )
+            self._connection.execute("ALTER TABLE spans ADD COLUMN last_progress_at_ns INTEGER")
         row = self._connection.execute("SELECT schema_version FROM telemetry_meta").fetchone()
         if row is None:
             self._connection.execute(
@@ -1212,8 +1218,7 @@ def _invocation_metrics(
             "semantic_transaction",
         )
         or "unknown",
-        "repair_mode": _optional_metadata_string(request.metadata, "repair_mode")
-        or "initial",
+        "repair_mode": _optional_metadata_string(request.metadata, "repair_mode") or "initial",
     }
     metrics: list[MetricPoint] = [
         MetricPoint("invocation.duration_ms", result.duration_ms, "ms", "framework", labels),
@@ -1374,9 +1379,7 @@ def _summarize_trace(
             continue
         value = row["value_integer"] if row["value_integer"] is not None else row["value_real"]
         aggregate[output_name] = float(aggregate.get(output_name, 0.0)) + float(value)
-        repair_aggregate[output_name] = float(
-            repair_aggregate.get(output_name, 0.0)
-        ) + float(value)
+        repair_aggregate[output_name] = float(repair_aggregate.get(output_name, 0.0)) + float(value)
     open_work_ns = sum(effective_duration(row) for row in open_spans)
     numeric: dict[str, float] = {}
     unknown: dict[str, int] = {}

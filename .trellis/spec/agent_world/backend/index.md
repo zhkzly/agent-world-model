@@ -1346,6 +1346,12 @@ raise PydanticCustomError(
 - The framework derives every tool Rule id from the frozen `tool_id`, semantic section and ordinal:
   `rule:<tool_id>:<section>:<ordinal>`. An Agent may omit `rule_id`; any submitted value is replaced
   before the source artifact and core Rule IR are committed.
+- `PermissionRuleSourceDraft.required_scopes_by_actor` is the non-empty, Agent-authored permission
+  actor map. Its keys are the complete allowed actor set; the source contract and compact protocol
+  must not also ask the Agent for `allowed_actors`. The compiler derives a canonical core
+  `PermissionRule.allowed_actors` tuple from those keys, while the core Runtime/Judge contract keeps
+  its defense-in-depth set-closure validation. No actor or scope may be synthesized by framework
+  code.
 - The Agent still owns only business Rule meaning, references, evidence and typed relations. It
   never owns namespaces, cross-artifact identity or control-plane identifiers.
 - `ValidationReport` retains all exact `ValidationIssue` instances. `AgentCorrectionBrief` is a
@@ -1360,6 +1366,9 @@ raise PydanticCustomError(
 
 - Compile a ToolConditions source whose submitted Rule id has an arbitrary value; assert the
   compiled Rule has the framework-derived namespace and ordinal.
+- Assert the source model and versioned compact schema reject a repeated `allowed_actors` field and
+  an empty scope map; compile a valid map and assert the core allowed-actor projection is derived
+  exactly from its keys.
 - Construct sixteen repeated pointer diagnostics; assert one correction cluster preserves count,
   normalized scope and three representatives while the full issue tuple remains intact.
 
@@ -1385,6 +1394,12 @@ raise PydanticCustomError(
 - A lookup binding is indivisible: framework derives collection + source + one primary key + one
   selected item field/value type together. The Agent may provide only a constant or another bound
   reference as the lookup key.
+- A reference-key lookup is one further composite frozen binding, not two independently selected
+  aliases. Framework code derives a pair only when the lookup primary-key field name equals the
+  direct reference's terminal RFC 6901 field name and both frozen value types are identical. One
+  compact alias selects the entire lookup/reference pair; the Tool wire has no `key_binding_id`.
+  This is a mechanical schema relation, not an inferred business equivalence. Constant-key
+  lookups continue to select one frozen lookup plus one explicitly typed literal.
 - The deterministic materializer must expand bindings before the existing executable core Rule IR
   compiler. Runtime, Judge and Builder continue to consume only `RuleValueRef` /
   `RuleLookupByKey`; the bound forms never enter executable artifacts.
@@ -1406,6 +1421,9 @@ raise PydanticCustomError(
 - Assert prompt aliases are deterministic, omit long immutable binding digests, and each alias
   reconstructs exactly one original reference or lookup binding; the output compiler must still
   reject an unknown alias.
+- Assert split lookup/reference aliases cannot inhabit the Tool wire; a composite alias expands to
+  the existing executable `lookup_by_key`, and no pair with a different terminal field or value
+  type enters the frozen catalog.
 - A raw `/bookings/status` Tool reference must fail with `tool_rule_binding_required` before core
   Rule compilation.
 
@@ -1429,6 +1447,13 @@ raise PydanticCustomError(
   recursive JSON Schema text only after a real rejection. The protocol describes a strict existing
   source-model subset; it does not introduce a DSL, raw expression text, raw pointers, unsupported
   rule variants, fixture data or a special environment branch.
+- Every compact Rule clause must state its exact operator-owned field closure. In particular,
+  `equal`/`not_equal`/`contains`/`not_contains` must omit `ordering`, while comparison operators
+  require it. The environment-engineer skill may repeat this exact mechanical check, but no prompt
+  wording may relax the closed source schema.
+- A compact `bound_lookup_by_key.key` is likewise a closed sub-ADT: only a constant or frozen
+  `bound_reference` alias is permitted. Arithmetic, nested lookup, raw reference/pointer, bare
+  identifier, and scalar shortcut forms must remain rejected by the unchanged source model.
 - The compact protocol must explicitly state every required output root and permitted bound term
   form. Prompt text never authorizes a retry, changes release policy, or overrides local validation.
 - A small-schema control completion does not prove Design, Builder, Judge or Registry success.
@@ -1439,6 +1464,10 @@ raise PydanticCustomError(
   a compact-protocol-shaped document; scalar/array payloads remain rejected.
 - Rejection of missing roots, raw Tool references/selectors and unsupported compact forms at the
   same existing local validation boundary.
+- Construct an equality clause carrying `ordering`; assert the compact schema and the unchanged
+  Pydantic source model both reject it before compiler acceptance.
+- Construct a lookup whose `key` carries arithmetic; assert the compact schema and source model
+  reject it before frozen binding materialization.
 - A real profile-matched transport probe that stores only safe result category and measured usage;
   the subsequent full Direct E2E is still mandatory.
 

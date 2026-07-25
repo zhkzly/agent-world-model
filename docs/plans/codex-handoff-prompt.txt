@@ -1,0 +1,30 @@
+你是本仓库(agent-world-model)的开发 agent。任务:按 docs/plans/staged-test-and-debug-plan.md 执行分段测试与调试,目标是让"自然语言需求 → Registry released"的端到端生成真正跑通,并在每一步用可复现的单节点证据推进,而不是盲跳整条 e2e。
+先完整读该文档——它是唯一真理来源;本 prompt 只给指针和硬约束,任何冲突以文档为准。
+
+【不可动红线,任何一步都不许松】
+1. 北极星:生成出的环境,其状态转移 / reward / verifier 永远是可执行代码,绝不是 LLM 文本 / mock / 模板 / 固定回放。"放松校验让它过" = drift = 禁止。
+2. test-node 红线:捕获的上游 commit 只作输入;目标节点必须真正执行,绝不允许把捕获的目标输出当结果回放。
+3. 凭证:任何文件 / artifact / trace / manifest 里只允许出现环境变量名(OPENAI_API_KEY / OPENAI_BASE_URL),绝不写入真实 key / base-url 值。
+4. 绝不为绕过配额或报错而伪造成功。
+5. 未经用户明确同意,不许 git commit / push。
+
+【模型与验证配置(已就绪)】
+- 实盘验证用已建好的 gitignored 配置:AGENT_WORLD_CONFIG=/home/kelong/pycodes/agent-world-model/.agent-world-live/doctor-grok45/config.toml
+  (无需 codex_bin——doctor 的 codex_runtime 用 SDK-bundled codex-cli 0.144.4 已通过;凭证仅 env 变量名)。
+- 首选 grok-4.5;不可用再显式切 gpt-5.4-mini 后 resume,不得造假。
+- 模型可调用性已用 `agent-world doctor --live-agent` 验证过(grok-4.5 pass),这是项目一致的调用路径(CodexSdkBackend → AsyncCodex → gateway)。任何调试不得绕过 InvocationBackend.invoke() 直打 HTTP。
+
+【执行环境已知状态】
+- 本机隔离已开启:kernel.apparmor_restrict_unprivileged_userns=0,doctor 全绿,local_execution_ready=true → T2(Build / Judge / clean_build)可本机执行。
+- 但该开关是临时 sysctl,电脑重启后复位为 =1。若 T2 报 `IsolationUnavailable: bubblewrap ... cannot create the required isolation namespaces` → 这不是代码 bug,是重启后开关复位。处理:请用户重跑 `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` 并用 `unshare --user --map-root-user echo userns-ok` 确认,再继续。绝不因隔离不可用就放松 / 跳过 Judge(= 北极星 drift)。
+
+【反打转硬规则(元层,最重要——照文档执行,这里只重点提醒)】
+- 单节点复现优先:用 `agent-world test-node <scope_id> <target_coordinate>` 隔离重跑单个节点(复制 scope 的 state_root,只 supersede 目标坐标 head,dispatch_one 真实重跑,祖先 commit 原样作输入)。禁止一上来盲跳整条 e2e。输出标 diagnostic_only=true / releasable=false。
+- 每节点有 token / turn 上限;进展用 4 状态格(shrink / advance / regression / A→B→A)判定,不是"必须严格收缩"(BC-17 的 10→30 是真进展)。
+- 同一节点连续多次无状态变化 → 停下,写清根因假设与证据,换轨或上报;禁止 whack-a-mole 式微调。
+- 每次失败先查文档里的 Bad-case 分类路由表,再动手。
+
+【交付顺序(严格,逐段推进)】
+T0(单节点试车台,前提)→ T0.5(双 backend:agentic 走 codex,单发结构化走 DirectLlmBackend)→ T1(语义墙节点:BC-44 → BC-14 → BC-17 → BC-47)→ T2(下游 Build/Judge/Registry,本机可执行)→ T3(真实 e2e「用户预订宾馆」)。
+每阶段产出按文档"最小报告"格式;完成一阶段先报告再进下一阶段,不要一口气跑完全程。
+提示词 / skills 的修复按角色(researcher / environment-engineer / challenger)来改,不是笼统"改提示词"——见文档角色↔skill↔节点映射。

@@ -4,7 +4,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -61,7 +60,7 @@ from agent_world.designer import (
     ExpansionDesigner,
     ExpansionSourceRouter,
 )
-from agent_world.invocation import CodexSdkBackend
+from agent_world.invocation import CodexSdkBackend, DirectLlmBackend, RoutedInvocationBackend
 from agent_world.judge import (
     EnvironmentJudge,
     InteractiveChallengerStrategy,
@@ -75,12 +74,13 @@ from agent_world.observability import (
 from agent_world.registry import EnvironmentRegistry
 
 
-def _filesystem_config(tmp_path: Path, auth_file: Path) -> FoundryConfig:
+def _filesystem_config(tmp_path: Path) -> FoundryConfig:
     return FoundryConfig(
         state_root=tmp_path / "state",
         agent=AgentBackendConfig(
             model="configured-real-model",
-            chatgpt_auth_file=auth_file.resolve(),
+            api_key_environment="OPENAI_API_KEY",
+            openai_base_url_environment="OPENAI_BASE_URL",
         ),
         research=ResearchConfig(
             provider="searxng",
@@ -89,14 +89,6 @@ def _filesystem_config(tmp_path: Path, auth_file: Path) -> FoundryConfig:
             use_jina_reader_fallback=False,
         ),
     )
-
-
-def _write_auth_file(path: Path, secret: str, *, mode: int = 0o600) -> None:
-    path.write_text(
-        json.dumps({"tokens": {"access_token": secret}}),
-        encoding="utf-8",
-    )
-    path.chmod(mode)
 
 
 def _observe_execution(attempt: WorkAttempt, definition: WorkDefinition) -> ProposalExecution:
@@ -289,15 +281,20 @@ def _seed_observe_scope(tmp_path: Path, canary: str) -> tuple[str, str, WorkCont
     return scope_id, definition.coordinate.coordinate_key, heads
 
 
-def test_production_app_assembles_real_components_and_secret_canaries(tmp_path: Path) -> None:
+def test_production_app_assembles_real_components_and_secret_canaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     canary = "credential-canary-A19xQ7mR"
-    with tempfile.TemporaryDirectory(prefix="agent-world-auth-", dir="/tmp") as auth_root:
-        auth_file = Path(auth_root) / "auth.json"
-        _write_auth_file(auth_file, canary)
-        app = build_application(_filesystem_config(tmp_path, auth_file))
+    routing_canary = "https://provider.example.test/v1"
+    monkeypatch.setenv("OPENAI_API_KEY", canary)
+    monkeypatch.setenv("OPENAI_BASE_URL", routing_canary)
+    app = build_application(_filesystem_config(tmp_path))
 
     assert isinstance(app.profiles, IsolatedAgentProfileProvider)
-    assert isinstance(app.backend, CodexSdkBackend)
+    assert isinstance(app.backend, RoutedInvocationBackend)
+    assert isinstance(app.backend.codex_backend, CodexSdkBackend)
+    assert isinstance(app.backend.direct_backend, DirectLlmBackend)
     assert isinstance(app.designer, EnvironmentDesigner)
     assert isinstance(app.expansion_source, ExpansionSourceRouter)
     assert isinstance(app.expansion_designer, ExpansionDesigner)
@@ -328,18 +325,27 @@ def test_production_app_assembles_real_components_and_secret_canaries(tmp_path: 
             content=f"prefix {canary} suffix".encode(),
             media_type="text/plain",
         )
+    with pytest.raises(UnsafeArtifactError):
+        app.controller.artifacts.put_blob(
+            artifact_id="routing-leak-attempt",
+            artifact_type="control.security_probe",
+            content=f"prefix {routing_canary} suffix".encode(),
+            media_type="text/plain",
+        )
 
 
-def test_auth_file_error_never_contains_credential_material(tmp_path: Path) -> None:
+def test_missing_base_url_environment_never_contains_credential_material(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     canary = "credential-that-must-not-appear-B72kL9"
-    with tempfile.TemporaryDirectory(prefix="agent-world-auth-", dir="/tmp") as auth_root:
-        auth_file = Path(auth_root) / "auth.json"
-        _write_auth_file(auth_file, canary, mode=0o644)
-        with pytest.raises(ApplicationConfigurationError) as captured:
-            build_application(_filesystem_config(tmp_path, auth_file))
+    monkeypatch.setenv("OPENAI_API_KEY", canary)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    with pytest.raises(ApplicationConfigurationError) as captured:
+        build_application(_filesystem_config(tmp_path))
 
-        assert canary not in str(captured.value)
-        assert "permissions" in str(captured.value)
+    assert canary not in str(captured.value)
+    assert "routing" in str(captured.value)
 
 
 def test_application_accepts_short_opaque_api_key_and_still_seals_its_canary(
@@ -470,9 +476,7 @@ def test_observe_cli_exposes_phase_four_query_syntax() -> None:
     comparison = parser.parse_args(
         ["observe", "compare", "--scope", "job:alpha", "--scope", "job:beta"]
     )
-    replay = parser.parse_args(
-        ["observe", "replay", "job:alpha", "sha256:" + "b" * 64]
-    )
+    replay = parser.parse_args(["observe", "replay", "job:alpha", "sha256:" + "b" * 64])
 
     assert frontier_diff.from_attempt_ordinal == 1
     assert frontier_diff.to_attempt_ordinal == 2
@@ -843,9 +847,7 @@ def test_feedback_cli_accepts_only_closed_aggregate_signals() -> None:
             "severity": 0.35,
         }
     )
-    parsed = build_parser().parse_args(
-        ["feedback", "record", "suite_abc", "--signal", raw]
-    )
+    parsed = build_parser().parse_args(["feedback", "record", "suite_abc", "--signal", raw])
     signal = _parse_capability_signal(parsed.signal[0])
 
     assert parsed.feedback_command == "record"

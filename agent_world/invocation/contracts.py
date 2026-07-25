@@ -50,6 +50,19 @@ class InvocationStatus(StrEnum):
     BUDGET_EXHAUSTED = "budget_exhausted"
 
 
+class InvocationExecutionMode(StrEnum):
+    """The declared interaction shape for one invocation request.
+
+    The default is deliberately agentic and therefore routes to the Codex SDK.
+    A caller must opt in to ``SINGLE_SHOT_STRUCTURED`` before a profile with no
+    tools can use the direct Responses adapter; this prevents a first turn of a
+    future continuation from silently losing its session semantics.
+    """
+
+    AGENTIC = "agentic"
+    SINGLE_SHOT_STRUCTURED = "single_shot_structured"
+
+
 @dataclass(frozen=True, slots=True)
 class InvocationLimits:
     """Hard local limits enforced by the backend process supervisor."""
@@ -130,7 +143,7 @@ class ResolvedAgentProfile:
     backend: str
     model: str
     model_provider: str | None
-    openai_base_url: str | None
+    openai_base_url_environment: str | None
     reasoning_effort: ReasoningEffort
     base_instructions: str
     developer_instructions: str | None
@@ -184,12 +197,17 @@ class ResolvedAgentProfile:
             raise ValueError("configured Codex binary path must be absolute")
         if self.codex_bin_sha256 is not None and len(self.codex_bin_sha256) != 64:
             raise ValueError("Codex binary digest must be a sha256 hex digest")
-        if self.authentication_kind not in {"api_key", "chatgpt"}:
-            raise ValueError("authentication_kind must be api_key or chatgpt")
-        if self.authentication_kind == "api_key" and not self.authentication_environment:
+        if self.authentication_kind != "api_key":
+            raise ValueError(
+                "ResolvedAgentProfile only supports API-key environment authentication"
+            )
+        if not self.authentication_environment:
             raise ValueError("api_key authentication requires an environment name")
-        if self.authentication_kind == "chatgpt" and self.authentication_environment is not None:
-            raise ValueError("chatgpt authentication must not expose an environment name")
+        if (
+            self.openai_base_url_environment is not None
+            and self.openai_base_url_environment != "OPENAI_BASE_URL"
+        ):
+            raise ValueError("openai_base_url_environment must be OPENAI_BASE_URL")
         if self.structured_output_transport not in {"provider_schema", "json_envelope"}:
             raise ValueError("unsupported structured output transport")
         if self.rollout_token_limit is not None and self.rollout_token_limit <= 0:
@@ -217,6 +235,12 @@ class ResolvedAgentProfile:
 
         return tuple(value for value in self._credential_environment.values() if value)
 
+    @property
+    def sensitive_environment_names(self) -> tuple[str, ...]:
+        """Return only safe names for worker-side redaction materialization."""
+
+        return tuple(sorted(self._credential_environment))
+
     def worker_environment(self) -> dict[str, str]:
         """Build the exact worker environment; no other ambient variables enter."""
 
@@ -243,7 +267,7 @@ class ResolvedAgentProfile:
             "backend": self.backend,
             "model": self.model,
             "model_provider": self.model_provider,
-            "openai_base_url": self.openai_base_url,
+            "openai_base_url_environment": self.openai_base_url_environment,
             "reasoning_effort": self.reasoning_effort.value,
             "lineage_id": self.lineage_id,
             "materialization_root": str(self.materialization_root),
@@ -305,12 +329,20 @@ class InvocationRequest:
     profile: ResolvedAgentProfile
     session: InvocationSession | None = None
     metadata: JsonObject = field(default_factory=dict)
+    execution_mode: InvocationExecutionMode = InvocationExecutionMode.AGENTIC
 
     def __post_init__(self) -> None:
         if not self.invocation_id:
             raise ValueError("invocation_id must not be empty")
         if not self.prompt.strip():
             raise ValueError("prompt must not be empty")
+        if self.execution_mode is InvocationExecutionMode.SINGLE_SHOT_STRUCTURED:
+            if self.session is not None:
+                raise ValueError("single-shot structured requests cannot resume a session")
+            if self.profile.allowed_builtin_tools:
+                raise ValueError("single-shot structured requests cannot declare builtin tools")
+            if self.profile.output_schema is None:
+                raise ValueError("single-shot structured requests require an output schema")
         if self.session is not None:
             if self.session.lineage_id != self.profile.lineage_id:
                 raise ValueError("continued session belongs to a different lineage")

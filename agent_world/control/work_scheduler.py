@@ -21,6 +21,7 @@ from agent_world.contracts import (
     canonical_json_bytes,
     sha256_digest,
 )
+from agent_world.diagnostic_state import has_test_node_diagnostic_marker
 
 from .budget import BudgetExceeded
 from .work import (
@@ -155,6 +156,7 @@ class WorkScheduler:
         heads: WorkControlStore,
         artifacts: ArtifactWriter,
         runtime: WorkControlRuntime | None = None,
+        allow_diagnostic_ancestors: bool = False,
     ) -> None:
         self.graph = graph
         self.manifest = WorkGraphManifest.model_validate(
@@ -164,6 +166,15 @@ class WorkScheduler:
         self.heads = heads
         self.artifacts = artifacts
         self.runtime = runtime
+        if allow_diagnostic_ancestors and (
+            runtime is None
+            or not runtime.diagnostic_only
+            or not has_test_node_diagnostic_marker(heads.root)
+        ):
+            raise WorkRuntimeError(
+                "diagnostic ancestor reuse requires a marked diagnostic runtime"
+            )
+        self.allow_diagnostic_ancestors = allow_diagnostic_ancestors
         self.artifacts.require_exact_json(
             manifest_ref,
             self.manifest,
@@ -211,10 +222,9 @@ class WorkScheduler:
                 committed = (
                     None
                     if expected_inputs is None
-                    else self.heads.require_active_commit(
+                    else self._require_usable_commit(
                         definition=definition,
                         input_refs=expected_inputs,
-                        artifacts=self.artifacts,
                     )
                 )
                 if committed is None:
@@ -546,10 +556,9 @@ class WorkScheduler:
             if head is None or head.status != "committed":
                 raise WorkResumeError("cannot resolve inputs before every parent commits")
             attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
-            active = self.heads.require_active_commit(
+            active = self._require_usable_commit(
                 definition=parent,
                 input_refs=attempt.input_refs,
-                artifacts=self.artifacts,
             )
             if active is None:
                 raise WorkResumeError("parent WorkCommit is no longer active")
@@ -584,6 +593,32 @@ class WorkScheduler:
             parent_commit_refs=tuple(parent_commit_refs),
             parent_output_refs=parent_output_refs,
             input_fingerprint=sha256_digest(canonical_json_bytes(payload)),
+        )
+
+    def _require_usable_commit(
+        self,
+        *,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+    ) -> tuple[WorkCommit, ArtifactRef] | None:
+        """Resolve normal authority, with an explicit diagnostic-only escape hatch.
+
+        The scheduler's normal path never calls the diagnostic method.  The
+        opt-in exists solely for one fresh successor node inside a marked
+        ``test-node`` copy, where the predecessor was itself genuinely
+        executed but deliberately made non-releasable.
+        """
+
+        if self.allow_diagnostic_ancestors:
+            return self.heads.require_active_or_diagnostic_commit(
+                definition=definition,
+                input_refs=input_refs,
+                artifacts=self.artifacts,
+            )
+        return self.heads.require_active_commit(
+            definition=definition,
+            input_refs=input_refs,
+            artifacts=self.artifacts,
         )
 
     def _all_input_refs(

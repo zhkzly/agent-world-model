@@ -1,8 +1,8 @@
 """Real Agent execution boundary for the Environment Foundry.
 
-The package exports one real Codex SDK backend and the immutable contracts used
-by Controller/Designer/Builder.  It intentionally exports no mock, manual,
-template, replay, or generic process backend.
+The package exports explicit Codex-agentic and direct-structured adapters,
+selected only through one ``InvocationBackend`` router. It intentionally
+exports no mock, manual, template, replay, or generic process backend.
 """
 
 from .authority import (
@@ -29,6 +29,7 @@ from .contracts import (
     InvocationBackend,
     InvocationError,
     InvocationEvent,
+    InvocationExecutionMode,
     InvocationLimits,
     InvocationRequest,
     InvocationResult,
@@ -41,6 +42,7 @@ from .contracts import (
     SandboxMode,
     TokenBreakdown,
 )
+from .direct_llm import DirectLlmBackend
 from .profiles import (
     AgentProfileSpec,
     CodexLoginBinding,
@@ -54,6 +56,7 @@ from .profiles import (
     SkillBundleSpec,
     verify_resolved_profile,
 )
+from .routing import RoutedInvocationBackend
 
 __all__ = [
     "AgentAuthorityViolation",
@@ -65,12 +68,14 @@ __all__ = [
     "CredentialBinding",
     "CredentialDescriptor",
     "CredentialResolutionError",
+    "DirectLlmBackend",
     "EffectiveCapabilityPlan",
     "ExternalCapabilitySet",
     "EpisodeActionProposalOutput",
     "HookBundleSpec",
     "InvocationBackend",
     "InvocationError",
+    "InvocationExecutionMode",
     "InvocationEvent",
     "InvocationLimits",
     "InvocationRequest",
@@ -87,6 +92,7 @@ __all__ = [
     "ResolvedAgentProfile",
     "ResolvedBundle",
     "RoleCapabilityMaximum",
+    "RoutedInvocationBackend",
     "SandboxMode",
     "SemanticAdvisoryOutput",
     "SkillBundleSpec",

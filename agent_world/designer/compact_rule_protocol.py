@@ -11,11 +11,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 
-# V1 is the provider-compatible prompt form.  The separate descriptive schema
+# V7 is the provider-compatible prompt form.  The separate descriptive schema
 # below is retained for deterministic contract tests only: a real v2 probe
 # established that this gateway rejects JSON-Schema syntax even when it is
 # acyclic, so it must never be interpolated into the provider prompt.
-COMPACT_RULE_PROTOCOL_VERSION = "rule-output-protocol.v1"
+COMPACT_RULE_PROTOCOL_VERSION = "rule-output-protocol.v7"
 
 
 _TOOL_RULE_DRAFT = """\
@@ -27,24 +27,34 @@ A RULE has only these fields:
 Omit rule_id: framework code derives it. RULE_FAMILY must match the containing
 section: precondition, postcondition, transition, error_condition, or permission.
 
-A CLAUSE has a non-empty clause_id, operator, left, optional right, optional
-ordering, and optional negate. Operators equal, not_equal, contains, and
-not_contains require left and right. greater_than, greater_or_equal, less_than,
-and less_or_equal also require ordering="number"|"date"|"date-time". Do not
-use exists, not_exists, schema_valid, json_schema, or any unlisted clause field.
+A CLAUSE is closed by its operator. equal, not_equal, contains, and not_contains
+have exactly clause_id, operator, left, right, and optional negate; they MUST omit `ordering`.
+greater_than, greater_or_equal, less_than, and less_or_equal
+have exactly clause_id, operator, ordering, left, right, and optional negate;
+they MUST include ordering="number"|"date"|"date-time". Do not use exists,
+not_exists, schema_valid, json_schema, ordering on an equality/containment
+clause, or any unlisted clause field.
 
 For this ToolSemantics protocol, a TERM is exactly one of:
 * {"kind":"constant", "value_type":"null"|"boolean"|"number"|"string"|"array"|"object",
    "value": JSON value}
 * {"kind":"bound_reference", "binding_id": one compact frozen alias from this tool's
    rule_context_catalog}
-* {"kind":"bound_lookup_by_key", "binding_id": one compact frozen lookup alias,
-   "key": a constant or bound_reference}
+* {"kind":"bound_lookup_by_reference", "binding_id": one compact frozen
+   lookup-reference alias}
+* {"kind":"bound_lookup_by_constant", "binding_id": one compact frozen lookup alias,
+   "key_value_type":"null"|"boolean"|"number"|"string"|"array"|"object",
+   "key_value": JSON value}
 * {"kind":"arithmetic", "operator":"add"|"subtract"|"multiply"|"divide"|"modulo",
    "left": ATOM, "right": ATOM}, where ATOM is a constant, bound_reference,
-   or bound_lookup_by_key.
-Never emit reference, lookup_by_key, source, pointer, collection_pointer,
-key_field, value_pointer, raw value_type for a binding, or free-form expression text.
+   bound_lookup_by_reference, or bound_lookup_by_constant.
+Lookup keys are flat and closed: never emit a nested `key` object. Choose one
+bound_lookup_by_reference alias from lookup_reference_binding_groups when the
+framework has frozen a compatible reference key, or bound_lookup_by_constant
+with one lookup alias and a literal key. Never emit key_binding_id.
+Never emit reference, lookup_by_key, bound_lookup_by_key, source,
+pointer, collection_pointer, key_field, value_pointer, raw value_type for a
+binding, or free-form expression text.
 """
 
 
@@ -54,7 +64,7 @@ Compact Rule output protocol: {COMPACT_RULE_PROTOCOL_VERSION}.
 Return the original ToolSemanticsBatchSourceDraft shape, not an abbreviated
 summary. The complete logical root is {{"tools":[TOOL, ...]}}. It contains one
 TOOL for each frozen target tool id, in the exact target order, with no extra
-or missing tools (at most four). Each TOOL has exactly these roots:
+or missing tools (at most two). Each TOOL has exactly these roots:
 * tool_id
 * conditions: {{"tool_id", "preconditions", "postconditions"}}
 * state_transition: {{"tool_id", "transition"}}; transition has at least one RULE
@@ -73,11 +83,14 @@ ERROR is {{"error_code", "when", "observation", "state_effect", "retryable",
 "evidence_claim_ids"}}. state_effect is none|partial|rolled_back|unknown, and
 when is a RULE with family error_condition.
 
-permission is {{"permission_id", "allowed_actors", "required_scopes_by_actor",
-"condition", "denied_observation"}}; condition is null or a RULE with family
-permission. observation is {{"visible_fields_by_actor", "consistency",
-"staleness_bound_seconds"}}, where consistency is strong|read_after_write|eventual|snapshot.
-Use concrete actor-id keys in both actor maps; every map value is an array of
+permission is {{"permission_id", "required_scopes_by_actor", "condition",
+"denied_observation"}}; condition is null or a RULE with family permission.
+The non-empty required_scopes_by_actor map is the complete allowed-actor set:
+its concrete actor-id keys are exactly the actors permitted by this tool. Do
+not emit allowed_actors; framework code derives that core projection. An actor
+absent from this map is not permitted. observation is {{"visible_fields_by_actor",
+"consistency", "staleness_bound_seconds"}}, where consistency is
+strong|read_after_write|eventual|snapshot. Every map value is an array of
 concrete top-level observation field names or scope identifiers as applicable.
 
 idempotency is either {{"mode":"not_supported","duplicate_observation"}},
@@ -111,7 +124,7 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
         "tools": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 4,
+            "maxItems": 2,
             "items": {"$ref": "#/$defs/tool"},
         }
     },
@@ -140,27 +153,34 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
                 "binding_id": {"$ref": "#/$defs/identifier"},
             },
         },
-        "lookup_key": {
-            "oneOf": [
-                {"$ref": "#/$defs/constant"},
-                {"$ref": "#/$defs/bound_reference"},
-            ]
-        },
-        "bound_lookup": {
+        "bound_lookup_by_reference": {
             "type": "object",
-            "required": ["kind", "binding_id", "key"],
+            "required": ["kind", "binding_id"],
             "additionalProperties": False,
             "properties": {
-                "kind": {"const": "bound_lookup_by_key"},
+                "kind": {"const": "bound_lookup_by_reference"},
                 "binding_id": {"$ref": "#/$defs/identifier"},
-                "key": {"$ref": "#/$defs/lookup_key"},
+            },
+        },
+        "bound_lookup_by_constant": {
+            "type": "object",
+            "required": ["kind", "binding_id", "key_value_type", "key_value"],
+            "additionalProperties": False,
+            "properties": {
+                "kind": {"const": "bound_lookup_by_constant"},
+                "binding_id": {"$ref": "#/$defs/identifier"},
+                "key_value_type": {
+                    "enum": ["null", "boolean", "number", "string", "array", "object"]
+                },
+                "key_value": {},
             },
         },
         "atom": {
             "oneOf": [
                 {"$ref": "#/$defs/constant"},
                 {"$ref": "#/$defs/bound_reference"},
-                {"$ref": "#/$defs/bound_lookup"},
+                {"$ref": "#/$defs/bound_lookup_by_reference"},
+                {"$ref": "#/$defs/bound_lookup_by_constant"},
             ]
         },
         "arithmetic": {
@@ -310,7 +330,6 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
             "type": "object",
             "required": [
                 "permission_id",
-                "allowed_actors",
                 "required_scopes_by_actor",
                 "condition",
                 "denied_observation",
@@ -318,13 +337,9 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
             "additionalProperties": False,
             "properties": {
                 "permission_id": {"$ref": "#/$defs/identifier"},
-                "allowed_actors": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {"$ref": "#/$defs/identifier"},
-                },
                 "required_scopes_by_actor": {
                     "type": "object",
+                    "minProperties": 1,
                     "additionalProperties": {"$ref": "#/$defs/identifier_array"},
                 },
                 "condition": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/rule"}]},
@@ -529,13 +544,13 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
 
 
 def tool_semantics_batch_protocol_schema() -> dict[str, object]:
-    """Return an isolated descriptive schema for the compact v2 prompt form."""
+    """Return an isolated descriptive schema for the compact v6 prompt form."""
 
     return deepcopy(_TOOL_SEMANTICS_BATCH_SHAPE)
 
 
 def tool_semantics_batch_protocol() -> str:
-    """Return the compact v1 form for one frozen ToolSemantics batch.
+    """Return the compact v6 form for one frozen ToolSemantics batch.
 
     The reusable Rule section is intentionally separated above so WorldRules
     and Curriculum can adopt a future context-appropriate protocol without

@@ -438,13 +438,15 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
                 coupling_reasons=("namespace", "state_overlap"),
                 mode="multi_batch",
                 batches=(
-                    ("hotel.search", "hotel.hold", "hotel.confirm", "hotel.cancel"),
+                    ("hotel.search", "hotel.hold"),
+                    ("hotel.confirm", "hotel.cancel"),
                     ("hotel.modify",),
                 ),
             ),
         ),
         execution_batches=(
-            ("hotel.search", "hotel.hold", "hotel.confirm", "hotel.cancel"),
+            ("hotel.search", "hotel.hold"),
+            ("hotel.confirm", "hotel.cancel"),
             ("hotel.modify",),
         ),
     )
@@ -471,6 +473,7 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
     assert tuple(item.coordinate.shard_id for item in batches) == (
         "tool-batch-1",
         "tool-batch-2",
+        "tool-batch-3",
     )
     assert all(shared[0].coordinate in item.dependency_coordinates for item in batches)
     assert rules.dependency_coordinates == (
@@ -494,6 +497,16 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
         for item in (*shared, *batches, rules, curriculum)
     )
     assert all(
+        (
+            item.repair_policy.maximum_local_corrections,
+            item.repair_policy.strict_progress_bonus_corrections,
+            item.repair_policy.maximum_infrastructure_retries,
+            item.repair_policy.maximum_total_repair_attempts,
+        )
+        == (1, 1, 1, 3)
+        for item in batches
+    )
+    assert all(
         item.input_slots and item.output_slots
         for item in (*shared, *batches, rules, curriculum)
     )
@@ -505,6 +518,24 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
     )
     assert graph.release_eligible
     assert graph.require(architecture.coordinate) == architecture
+
+    oversized_coupling = coupling.model_copy(
+        update={
+            "execution_batches": (
+                ("hotel.search", "hotel.hold", "hotel.confirm"),
+                ("hotel.cancel", "hotel.modify"),
+            )
+        }
+    )
+    with pytest.raises(WorkGraphError, match="invalid physical batch"):
+        derive_final_design_definitions(
+            scope_id="job:hotel",
+            bootstrap_definitions=(plan, acquisition, synthesis, architecture),
+            architecture_source_ref=oversized_coupling.architecture_ref,
+            coupling_plan=oversized_coupling,
+            agent_wall_seconds=120,
+            agent_token_limit=10_000,
+        )
 
 
 def test_final_design_suffix_does_not_create_shared_contract_for_single_batch_group() -> None:
@@ -734,11 +765,12 @@ def test_tool_semantics_policy_has_one_base_correction_progress_bonus_and_infra_
         batch_id="batch:1",
         dependency_coordinates=(_coordinate("architecture"),),
         agent_wall_seconds=300,
-        agent_token_limit=20_000,
+        agent_token_limit=65_536,
     )
 
     assert definition.coordinate.artifact_slot == "tool_semantics_batch"
     assert definition.proposal_policy.budget.agent_turns == 1
+    assert definition.proposal_policy.budget.llm_tokens == 32_768
     assert definition.proposal_policy.budget.monetary_cost == 0
     assert definition.repair_policy.maximum_local_corrections == 1
     assert definition.repair_policy.strict_progress_bonus_corrections == 1

@@ -46,6 +46,7 @@ from agent_world.invocation import (
     AgentOutputAuthority,
     CapabilityResolutionError,
     InvocationBackend,
+    InvocationExecutionMode,
     InvocationRequest,
     InvocationResult,
     NodeCapabilityRequirement,
@@ -88,6 +89,7 @@ class StructuredProfileProvider(Protocol):
         permissions: PermissionScope,
         requirement: NodeCapabilityRequirement,
         rollout_token_limit: int | None = None,
+        invocation_timeout_seconds: float | None = None,
     ) -> ResolvedAgentProfile: ...
 
 
@@ -164,6 +166,12 @@ async def invoke_structured_once[TOutput: BaseModel](
             permissions=permissions,
             requirement=requirement,
             rollout_token_limit=policy.budget.llm_tokens or None,
+            # The profile's SDK timeout is part of the same bounded physical
+            # operation as the Scheduler lease.  Leaving it at a broader
+            # role/config default would let the HTTP client outlive the
+            # immutable node deadline and make timeout provenance depend on
+            # which cancellation boundary happened to fire first.
+            invocation_timeout_seconds=policy.budget.wall_seconds,
         )
     except CapabilityResolutionError as exc:
         raise LeafExecutionFailure(
@@ -211,6 +219,11 @@ async def invoke_structured_once[TOutput: BaseModel](
             ),
             "repair_attempt_charge": attempt.repair_attempt_charge,
         },
+        # This helper owns one physical proposal only: it never resumes a
+        # session or authorizes an in-function correction. The profile is
+        # tool-free by default, so the application router can use the bounded
+        # direct structured backend while repair/session paths stay Codex.
+        execution_mode=InvocationExecutionMode.SINGLE_SHOT_STRUCTURED,
     )
     # Dispatch identity and the isolated profile are known *before* crossing
     # the provider boundary.  A timeout or transport exception therefore has

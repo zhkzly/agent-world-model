@@ -12,6 +12,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -42,6 +43,10 @@ _PROVIDER_SCHEMA_OMIT_KEYS = frozenset({"default", "discriminator"})
 _JSON_VALUE_IR = "AgentWorldJsonValueIR"
 _JSON_OBJECT_IR = "AgentWorldJsonObjectIR"
 _JSON_ENTRY_IR = "AgentWorldJsonEntryIR"
+# /dev/shm is the fixed kernel tmpfs mount.  TemporaryDirectory creates a
+# mode-0700 child there; falling back to a disk temp directory is forbidden.
+_EPHEMERAL_SQLITE_PARENT = Path("/dev/shm")  # noqa: S108
+_EPHEMERAL_SQLITE_PREFIX = "agent-world-codex-sqlite-"
 
 
 @dataclass(slots=True)
@@ -69,6 +74,43 @@ def _consume_task_result(task: asyncio.Task[object]) -> None:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON number is forbidden: {value}")
+
+
+def _open_ephemeral_sqlite_home() -> tempfile.TemporaryDirectory[str]:
+    """Allocate a memory-backed Codex SQLite home for exactly one worker.
+
+    Codex app-server 0.144.4 creates local SQLite state/log databases even
+    when history, analytics, and feedback are disabled.  That vendor-local
+    state must not live below the durable profile/artifact root because a
+    custom provider's runtime configuration can otherwise be recorded there.
+    A missing memory-backed runtime is a fail-closed configuration error, not
+    a reason to fall back to a disk-backed directory.
+    """
+
+    if (
+        os.name != "posix"
+        or not _EPHEMERAL_SQLITE_PARENT.is_dir()
+        or not os.access(_EPHEMERAL_SQLITE_PARENT, os.W_OK | os.X_OK)
+    ):
+        raise OSError("memory-backed Codex SQLite runtime is unavailable")
+    return tempfile.TemporaryDirectory(
+        prefix=_EPHEMERAL_SQLITE_PREFIX,
+        dir=_EPHEMERAL_SQLITE_PARENT,
+    )
+
+
+def _worker_environment_with_ephemeral_sqlite_home(
+    profile_environment: Mapping[str, str],
+    sqlite_home: Path,
+) -> dict[str, str]:
+    """Add the volatile SQLite root without widening a profile's environment."""
+
+    resolved_sqlite_home = sqlite_home.resolve(strict=True)
+    if not resolved_sqlite_home.is_relative_to(_EPHEMERAL_SQLITE_PARENT):
+        raise ValueError("Codex SQLite runtime must stay in the memory-backed parent")
+    environment = dict(profile_environment)
+    environment["CODEX_SQLITE_HOME"] = str(resolved_sqlite_home)
+    return environment
 
 
 class CodexSdkBackend:
@@ -270,12 +312,44 @@ class CodexSdkBackend:
                 started=started,
             )
 
+        try:
+            with _open_ephemeral_sqlite_home() as sqlite_home_text:
+                return await self._invoke_worker_process(
+                    request,
+                    encoded_payload=encoded_payload,
+                    redactor=redactor,
+                    sqlite_home=Path(sqlite_home_text),
+                    started=started,
+                    on_first_progress=on_first_progress,
+                )
+        except OSError:
+            return _local_failure(
+                request,
+                status=InvocationStatus.NEEDS_HUMAN,
+                code="ephemeral_sqlite_runtime_unavailable",
+                message="memory-backed Codex SQLite isolation is unavailable",
+                started=started,
+            )
+
+    async def _invoke_worker_process(
+        self,
+        request: InvocationRequest,
+        *,
+        encoded_payload: bytes,
+        redactor: Redactor,
+        sqlite_home: Path,
+        started: float,
+        on_first_progress: Callable[[str], None] | None = None,
+    ) -> InvocationResult:
         process_kwargs: dict[str, Any] = {
             "stdin": asyncio.subprocess.PIPE,
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
             "cwd": str(request.profile.materialization_root),
-            "env": request.profile.worker_environment(),
+            "env": _worker_environment_with_ephemeral_sqlite_home(
+                request.profile.worker_environment(),
+                sqlite_home,
+            ),
             "limit": max(8 * 1024 * 1024, request.profile.limits.max_protocol_bytes + 1024),
         }
         if os.name == "posix":
@@ -506,13 +580,10 @@ class CodexSdkBackend:
             "thread_id": request.session.thread_id if request.session else None,
             "authentication_kind": profile.authentication_kind,
             "authentication_environment": profile.authentication_environment,
+            "openai_base_url_environment": profile.openai_base_url_environment,
             "codex_bin": str(profile.codex_bin) if profile.codex_bin is not None else None,
             "codex_bin_sha256": profile.codex_bin_sha256,
-            "credential_environment_names": [
-                descriptor.target_environment
-                for descriptor in profile.credential_descriptors
-                if descriptor.target_environment is not None
-            ],
+            "sensitive_environment_names": list(profile.sensitive_environment_names),
             "hooks_enabled": bool(profile.hooks),
             "limits": {
                 "timeout_seconds": limits.timeout_seconds,

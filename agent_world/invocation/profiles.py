@@ -34,6 +34,7 @@ from .contracts import (
     SandboxMode,
     json_compatible,
 )
+from .runtime_provider import API_KEY_RUNTIME_PROVIDER, OPENAI_BASE_URL_ENVIRONMENT
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -121,10 +122,12 @@ class CredentialBinding:
 
 @dataclass(frozen=True, slots=True)
 class CodexLoginBinding:
-    """Explicit authorization to copy one existing Codex ``auth.json`` file.
+    """Legacy file-backed login descriptor.
 
-    The source path and file contents remain resolver-private.  They are never
-    included in profile hashes, public metadata, worker requests, or logs.
+    It remains import-compatible only so callers receive a deterministic
+    fail-closed error from :class:`ProfileResolver`.  Agent World no longer
+    materializes auth files: credentials and routing are environment-handle
+    only.
     """
 
     handle: str
@@ -205,7 +208,7 @@ class AgentProfileSpec:
     codex_bin: Path | None = None
     codex_bin_sha256: str | None = None
     model_provider: str | None = None
-    openai_base_url: str | None = None
+    openai_base_url_environment: str | None = None
     reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
     developer_instructions: str | None = None
     sandbox: SandboxMode = SandboxMode.READ_ONLY
@@ -238,20 +241,14 @@ class AgentProfileSpec:
             r"[0-9a-f]{64}", self.codex_bin_sha256
         ):
             raise ValueError("codex_bin_sha256 must be lowercase sha256 hex")
-        if self.openai_base_url is not None:
-            parsed_base_url = urlparse(self.openai_base_url)
-            if (
-                parsed_base_url.scheme not in {"http", "https"}
-                or not parsed_base_url.hostname
-                or parsed_base_url.username is not None
-                or parsed_base_url.password is not None
-                or parsed_base_url.query
-                or parsed_base_url.fragment
-            ):
-                raise ValueError("openai_base_url must be a credential-free HTTP(S) origin/path")
-            if self.model_provider not in {None, "openai"}:
+        if self.openai_base_url_environment is not None:
+            if self.openai_base_url_environment != OPENAI_BASE_URL_ENVIRONMENT:
                 raise ValueError(
-                    "openai_base_url only overrides the built-in openai model provider"
+                    "openai_base_url_environment must be the OPENAI_BASE_URL environment name"
+                )
+            if self.model_provider != API_KEY_RUNTIME_PROVIDER:
+                raise ValueError(
+                    "a runtime base-URL environment requires the framework-owned API-key provider"
                 )
         _ensure_unique("builtin tool", self.allowed_builtin_tools)
         unknown_tools = set(self.allowed_builtin_tools) - _SUPPORTED_BUILTIN_TOOLS
@@ -351,6 +348,10 @@ class ProfileResolver:
         self._base_environment_names = tuple(base_environment_names)
         self._max_bundle_files = max_bundle_files
         self._max_bundle_bytes = max_bundle_bytes
+        if any(isinstance(binding, CodexLoginBinding) for binding in self._bindings.values()):
+            raise ValueError(
+                "file-backed Codex login is forbidden; use an API-key environment handle"
+            )
         if not self._allowed_handles:
             raise ValueError("allowed_credential_handles must be explicit and non-empty")
         unknown_environment_names = set(self._base_environment_names) - _SAFE_BASE_ENVIRONMENT_NAMES
@@ -446,22 +447,19 @@ class ProfileResolver:
 
         bindings = {handle: self._bindings[handle] for handle in spec.credential_handles}
         auth_binding = bindings[spec.authentication_handle]
-        if auth_binding.purpose not in {"model_api_key", "codex_login"}:
+        if (
+            not isinstance(auth_binding, CredentialBinding)
+            or auth_binding.purpose != "model_api_key"
+        ):
             raise CredentialResolutionError(
-                "authentication_handle must resolve to a model_api_key or codex_login binding"
-            )
-        if spec.openai_base_url is not None and isinstance(auth_binding, CodexLoginBinding):
-            raise CredentialResolutionError(
-                "openai_base_url requires an API-key authentication binding"
+                "authentication_handle must resolve to a model_api_key environment binding"
             )
         credential_environment: dict[str, str] = {}
         for handle, binding in bindings.items():
             if isinstance(binding, CodexLoginBinding):
-                if handle != spec.authentication_handle:
-                    raise CredentialResolutionError(
-                        "CodexLoginBinding may only be used as authentication_handle"
-                    )
-                continue
+                raise CredentialResolutionError(
+                    "file-backed Codex login is forbidden; use an API-key environment handle"
+                )
             value = source_environment.get(binding.source_environment)
             if value is None or not value:
                 raise CredentialResolutionError(
@@ -472,6 +470,17 @@ class ProfileResolver:
                     f"credential handle {handle!r} is too short for safe redaction"
                 )
             credential_environment[binding.target_environment] = value
+
+        base_url_digest: str | None = None
+        if spec.openai_base_url_environment is not None:
+            base_url = source_environment.get(spec.openai_base_url_environment)
+            if base_url is None or not base_url:
+                raise CredentialResolutionError(
+                    "configured API base-URL environment is unavailable"
+                )
+            _validate_runtime_base_url(base_url)
+            credential_environment[spec.openai_base_url_environment] = base_url
+            base_url_digest = hashlib.sha256(base_url.encode("utf-8")).hexdigest()
 
         for server in spec.mcp_servers:
             for referenced_handle in (
@@ -502,7 +511,8 @@ class ProfileResolver:
                 "profile_version": spec.profile_version,
                 "model": spec.model,
                 "model_provider": spec.model_provider,
-                "openai_base_url": spec.openai_base_url,
+                "openai_base_url_environment": spec.openai_base_url_environment,
+                "openai_base_url_value_digest": base_url_digest,
                 "reasoning_effort": spec.reasoning_effort.value,
                 "base_instructions": spec.base_instructions,
                 "developer_instructions": spec.developer_instructions,
@@ -520,9 +530,7 @@ class ProfileResolver:
                 "credential_handles": list(spec.credential_handles),
                 "authentication_handle": spec.authentication_handle,
                 "codex_bin_sha256": spec.codex_bin_sha256,
-                "authentication_kind": (
-                    "chatgpt" if isinstance(auth_binding, CodexLoginBinding) else "api_key"
-                ),
+                "authentication_kind": "api_key",
                 "output_schema": spec.output_schema,
                 "structured_output_transport": spec.structured_output_transport,
                 "rollout_token_limit": spec.rollout_token_limit,
@@ -591,9 +599,6 @@ class ProfileResolver:
         elif hooks_path.exists():
             raise ProfileResolutionError("unexpected hooks.json exists for a hook-free profile")
 
-        if isinstance(auth_binding, CodexLoginBinding):
-            _copy_codex_login(auth_binding.source, codex_home / "auth.json")
-
         shell_environment = self._base_environment(source_environment)
         shell_environment.update(
             {
@@ -624,9 +629,6 @@ class ProfileResolver:
                 for handle, binding in bindings.items()
                 if isinstance(binding, CredentialBinding)
             },
-            authentication_kind=(
-                "chatgpt" if isinstance(auth_binding, CodexLoginBinding) else "api_key"
-            ),
             shell_environment=shell_environment,
         )
         config_path = codex_home / "config.toml"
@@ -652,7 +654,7 @@ class ProfileResolver:
             backend="codex_sdk",
             model=spec.model,
             model_provider=spec.model_provider,
-            openai_base_url=spec.openai_base_url,
+            openai_base_url_environment=spec.openai_base_url_environment,
             reasoning_effort=spec.reasoning_effort,
             base_instructions=spec.base_instructions,
             developer_instructions=spec.developer_instructions,
@@ -668,14 +670,8 @@ class ProfileResolver:
             skills=tuple(resolved_skills),
             hooks=tuple(resolved_hooks),
             credential_descriptors=descriptors,
-            authentication_kind=(
-                "chatgpt" if isinstance(auth_binding, CodexLoginBinding) else "api_key"
-            ),
-            authentication_environment=(
-                None
-                if isinstance(auth_binding, CodexLoginBinding)
-                else auth_binding.target_environment
-            ),
+            authentication_kind="api_key",
+            authentication_environment=auth_binding.target_environment,
             codex_bin=spec.codex_bin,
             codex_bin_sha256=spec.codex_bin_sha256,
             output_schema=spec.output_schema,
@@ -802,15 +798,16 @@ def _render_codex_config(
     hooks: tuple[ResolvedBundle, ...],
     runtime_read_roots: tuple[Path, ...],
     bindings: Mapping[str, CredentialBinding],
-    authentication_kind: str,
     shell_environment: Mapping[str, str],
 ) -> str:
-    login_method = "chatgpt" if authentication_kind == "chatgpt" else "api"
     web_search_mode = "live" if "web_search" in spec.allowed_builtin_tools else "disabled"
     lines = [
         'approval_policy = "never"',
         f"default_permissions = {_toml_string(_PERMISSIONS_PROFILE)}",
-        f"forced_login_method = {_toml_string(login_method)}",
+        # The worker supplies its custom provider through the per-thread SDK
+        # request config.  Disallow Codex's file credential store so an
+        # accidental login path cannot materialize auth.json here.
+        'cli_auth_credentials_store = "keyring"',
         f"web_search = {_toml_string(web_search_mode)}",
         'file_opener = "none"',
         "hide_agent_reasoning = true",
@@ -819,16 +816,15 @@ def _render_codex_config(
         "project_doc_fallback_filenames = []",
         f"tool_output_token_limit = {spec.tool_output_token_limit}",
         f"project_root_markers = [{_toml_string(_PROJECT_ROOT_MARKER)}]",
-        f"sqlite_home = {_toml_string(str(codex_home / 'state'))}",
-        f"log_dir = {_toml_string(str(codex_home / 'logs'))}",
     ]
-    if spec.openai_base_url is not None:
-        lines.append(f"openai_base_url = {_toml_string(spec.openai_base_url)}")
     lines.extend([
         "",
         "[history]",
-        'persistence = "save-all"',
-        "max_bytes = 16777216",
+        # Codex's normal save-all history and explicit sqlite/log roots can
+        # retain the app-server launch environment.  Agent World has its own
+        # secret-screened invocation evidence and continuation identity, so
+        # the vendor-local history plane must stay off.
+        'persistence = "none"',
         "",
         "[analytics]",
         "enabled = false",
@@ -857,6 +853,11 @@ def _render_codex_config(
         "plugin_sharing = false",
         "plugins = false",
         "remote_plugin = false",
+        # The official Codex shell-snapshot feature captures the app-server
+        # environment before ``shell_environment_policy`` applies.  That
+        # environment necessarily contains the provider's env_key, so disable
+        # the feature rather than relying on post-hoc redaction.
+        "shell_snapshot = false",
         f"shell_tool = {_toml_bool('shell' in spec.allowed_builtin_tools)}",
         "skill_mcp_dependency_install = false",
         "tool_call_mcp_elicitation = false",
@@ -1146,31 +1147,24 @@ def _atomic_write_bytes(path: Path, content: bytes, *, mode: int) -> None:
     temporary.replace(path)
 
 
-def _copy_codex_login(source: Path, destination: Path) -> None:
-    """Copy an explicitly authorized login file without hashing or identifying it."""
+def _validate_runtime_base_url(value: str) -> None:
+    """Validate a routing value without ever reflecting it in diagnostics."""
 
-    if not source.is_absolute():
-        raise CredentialResolutionError("CodexLoginBinding source must be an absolute path")
     try:
-        if source.is_symlink() or not source.is_file():
-            raise CredentialResolutionError("authorized Codex login file is unavailable")
-        stat = source.stat()
-    except OSError:
-        raise CredentialResolutionError("authorized Codex login file is unavailable") from None
-    if stat.st_size <= 0 or stat.st_size > 4 * 1024 * 1024:
-        raise CredentialResolutionError("authorized Codex login file has an invalid size")
-    if os.name != "nt" and stat.st_mode & 0o077:
-        raise CredentialResolutionError("authorized Codex login file permissions are too broad")
-    try:
-        content = source.read_bytes()
-        parsed = json.loads(content, parse_constant=_reject_json_constant)
-    except (OSError, json.JSONDecodeError, ValueError):
-        # Do not retain a chained exception that may contain the private source
-        # path.  The handle is the only login identity allowed in public state.
-        raise CredentialResolutionError("authorized Codex login file is invalid") from None
-    if not isinstance(parsed, dict):
-        raise CredentialResolutionError("authorized Codex login file is invalid")
-    _atomic_write_bytes(destination, content, mode=0o600)
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError as exc:
+        raise CredentialResolutionError("configured API base URL has an invalid port") from exc
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or port is not None and not 0 < port < 65536
+    ):
+        raise CredentialResolutionError("configured API base URL has an unsafe shape")
 
 
 def _atomic_write_json(path: Path, content: Mapping[str, object], *, mode: int) -> None:
@@ -1239,12 +1233,9 @@ def verify_resolved_profile(profile: ResolvedAgentProfile) -> None:
             raise ProfileResolutionError("cannot read materialized hooks config") from exc
         if hooks_path.is_symlink() or hooks_hash != profile.hooks_config_sha256:
             raise ProfileResolutionError("materialized hooks config was modified")
-    if profile.authentication_kind == "chatgpt":
-        auth_path = profile.codex_home / "auth.json"
-        if not auth_path.is_file() or auth_path.is_symlink():
-            raise ProfileResolutionError("materialized ChatGPT login is unavailable")
-        if os.name != "nt" and auth_path.stat().st_mode & 0o077:
-            raise ProfileResolutionError("materialized ChatGPT login permissions changed")
+    auth_path = profile.codex_home / "auth.json"
+    if auth_path.exists() or auth_path.is_symlink():
+        raise ProfileResolutionError("file-backed Codex authentication is forbidden")
     if profile.codex_bin is not None:
         if profile.codex_bin.is_symlink() or not profile.codex_bin.is_file():
             raise ProfileResolutionError("configured Codex binary is unavailable")

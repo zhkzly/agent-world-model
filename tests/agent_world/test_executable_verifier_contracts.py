@@ -78,7 +78,12 @@ from agent_world.control import (
     WorkScheduler,
     deterministic_boundary_work_definition,
 )
-from agent_world.invocation import InvocationError, InvocationResult, InvocationStatus
+from agent_world.invocation import (
+    InvocationError,
+    InvocationExecutionMode,
+    InvocationResult,
+    InvocationStatus,
+)
 from agent_world.invocation.codex_sdk import _terminate_process_tree
 from agent_world.judge import compiler as verifier_compiler_module
 from agent_world.judge.compiler import VerifierCompilationError, VerifierCompiler
@@ -799,9 +804,7 @@ def test_verifier_intent_schema_feedback_reports_exact_safe_field_paths() -> Non
 
     diagnostic = captured.value.diagnostic
     assert diagnostic.validation_phase == "intent_value_schemas"
-    assert {
-        issue.issue_code for issue in diagnostic.issues
-    } == {
+    assert {issue.issue_code for issue in diagnostic.issues} == {
         "intent_reset_config_schema_mismatch@cases.0.reset_config.initial",
         "intent_action_input_schema_mismatch@cases.0.actions.0.arguments.amount",
         "intent_evaluator_goal_schema_mismatch@cases.1.evaluator_goal.target",
@@ -979,6 +982,8 @@ async def test_one_shot_verifier_batch_uses_the_scheduler_dispatch_and_never_ret
     )
 
     class Profile:
+        allowed_builtin_tools: tuple[str, ...] = ()
+        output_schema = {"type": "object"}
         rollout_token_limit = 1_000
 
     class Profiles:
@@ -1038,6 +1043,9 @@ async def test_one_shot_verifier_batch_uses_the_scheduler_dispatch_and_never_ret
     assert result.draft_ref is not None
     assert len(backend.requests) == 1
     assert backend.requests[0].invocation_id == "dispatch:verifier-batch:1"  # type: ignore[attr-defined]
+    assert (  # type: ignore[attr-defined]
+        backend.requests[0].execution_mode is InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
+    )
 
 
 @pytest.mark.asyncio
@@ -1358,8 +1366,10 @@ async def test_scheduler_verifier_leaves_commit_plan_and_one_physical_batch(
     )
 
     class Profile:
+        allowed_builtin_tools: tuple[str, ...] = ()
         model_provider = "openai-compatible"
         model = "grok-4.5"
+        output_schema = {"type": "object"}
         profile_hash = "a" * 64
         rollout_token_limit = 1_000
 
@@ -1447,6 +1457,9 @@ async def test_scheduler_verifier_leaves_commit_plan_and_one_physical_batch(
         "committed",
     )
     assert len(backend.requests) == 1
+    assert (  # type: ignore[attr-defined]
+        backend.requests[0].execution_mode is InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
+    )
     batch_head = heads.read_head(batch_coordinate)
     assert batch_head is not None and batch_head.commit_ref is not None
     batch_attempt = control_writer.get_json(batch_head.attempt_ref, WorkAttempt)

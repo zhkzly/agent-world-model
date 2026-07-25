@@ -18,7 +18,6 @@ from agent_world.contracts import PermissionScope
 from agent_world.invocation import (
     AgentProfileSpec,
     CapabilityResolutionError,
-    CodexLoginBinding,
     CredentialBinding,
     EffectiveCapabilityPlan,
     ExternalCapabilitySet,
@@ -32,7 +31,7 @@ from agent_world.invocation import (
     compile_effective_capability_plan,
 )
 from agent_world.invocation.contracts import JsonObject
-from agent_world.invocation.profiles import ProfileResolver
+from agent_world.invocation.profiles import API_KEY_RUNTIME_PROVIDER, ProfileResolver
 
 _ROLES = frozenset({"researcher", "environment-engineer", "challenger"})
 _SOLVER_NODE_ID = "challenger.reachability-solver"
@@ -67,19 +66,12 @@ class IsolatedAgentProfileProvider:
                 raise ValueError("configured codex_bin must be a real executable file")
             self.codex_bin_sha256 = _sha256(self.codex_bin)
         handle = "model-auth"
-        if config.chatgpt_auth_file is not None:
-            binding: CredentialBinding | CodexLoginBinding = CodexLoginBinding(
-                handle=handle,
-                source=config.chatgpt_auth_file,
-            )
-        else:
-            assert config.api_key_environment is not None
-            binding = CredentialBinding(
-                handle=handle,
-                source_environment=config.api_key_environment,
-                target_environment="OPENAI_API_KEY",
-                purpose="model_api_key",
-            )
+        binding = CredentialBinding(
+            handle=handle,
+            source_environment=config.api_key_environment,
+            target_environment="OPENAI_API_KEY",
+            purpose="model_api_key",
+        )
         self.resolver = ProfileResolver(
             credential_bindings={handle: binding},
             allowed_credential_handles=(handle,),
@@ -249,7 +241,7 @@ class IsolatedAgentProfileProvider:
             "backend": "codex_sdk",
             "model": spec.model,
             "model_provider": spec.model_provider,
-            "openai_base_url": spec.openai_base_url,
+            "openai_base_url_environment": spec.openai_base_url_environment,
             "codex_bin_sha256": spec.codex_bin_sha256,
             "reasoning_effort": spec.reasoning_effort.value,
             "sandbox": spec.sandbox.value,
@@ -258,9 +250,7 @@ class IsolatedAgentProfileProvider:
             "skills": [item.name for item in spec.skills],
             "hooks": [],
             "mcp_servers": [],
-            "authentication_kind": (
-                "chatgpt" if self.config.chatgpt_auth_file is not None else "api_key"
-            ),
+            "authentication_kind": "api_key",
             "effective_capability_plan": capability_plan.to_public_dict(),
         }
 
@@ -314,12 +304,8 @@ class IsolatedAgentProfileProvider:
             profile_id=role,
             profile_version="3",
             model=self.config.model,
-            model_provider=self.config.model_provider,
-            openai_base_url=(
-                str(self.config.openai_base_url)
-                if self.config.openai_base_url is not None
-                else None
-            ),
+            model_provider=API_KEY_RUNTIME_PROVIDER,
+            openai_base_url_environment=self.config.openai_base_url_environment,
             reasoning_effort=ReasoningEffort(reasoning[role]),
             base_instructions=(
                 "Agent World Foundry turns a short human need into a real executable environment "
@@ -379,12 +365,8 @@ class IsolatedAgentProfileProvider:
             profile_id="challenger",
             profile_version="reachability-solver-1",
             model=self.config.model,
-            model_provider=self.config.model_provider,
-            openai_base_url=(
-                str(self.config.openai_base_url)
-                if self.config.openai_base_url is not None
-                else None
-            ),
+            model_provider=API_KEY_RUNTIME_PROVIDER,
+            openai_base_url_environment=self.config.openai_base_url_environment,
             reasoning_effort=ReasoningEffort(self.config.reasoning_challenger),
             base_instructions=(
                 "Agent World Foundry turns a short human need into a real executable "

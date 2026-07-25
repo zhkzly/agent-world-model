@@ -7,6 +7,7 @@ from pydantic import HttpUrl, ValidationError
 
 from agent_world.config import (
     AgentBackendConfig,
+    ConfigError,
     ExpansionConfig,
     ExpansionSourceConfig,
     FoundryConfig,
@@ -89,20 +90,51 @@ def test_production_defaults_reserve_full_v3_judge_capacity(tmp_path: Path) -> N
     assert all(item.descriptor().budget.agent_turns >= 2 for item in config.expansion.sources)
 
 
-def test_openai_base_url_requires_api_key_mode(tmp_path: Path) -> None:
-    with pytest.raises(ValidationError, match="requires API-key authentication"):
+def test_api_key_routing_uses_only_the_standard_environment_handle(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="must be OPENAI_BASE_URL"):
         AgentBackendConfig(
             model="gpt-5.4-mini",
-            chatgpt_auth_file=tmp_path / "codex-auth.json",
-            openai_base_url=HttpUrl("https://provider.example.test/v1"),
+            api_key_environment="COMPATIBLE_API_KEY",
+            openai_base_url_environment="COMPATIBLE_BASE_URL",
         )
 
     config = AgentBackendConfig(
         model="gpt-5.4-mini",
         api_key_environment="COMPATIBLE_API_KEY",
-        openai_base_url=HttpUrl("https://provider.example.test/v1"),
+        openai_base_url_environment="OPENAI_BASE_URL",
     )
-    assert str(config.openai_base_url) == "https://provider.example.test/v1"
+    assert config.openai_base_url_environment == "OPENAI_BASE_URL"
+
+
+def test_legacy_literal_base_url_is_rejected_without_reflecting_its_value(tmp_path: Path) -> None:
+    config_path = tmp_path / "legacy.toml"
+    config_path.write_text(
+        "\n".join(
+            (
+                'state_root = "state"',
+                "",
+                "[agent]",
+                'model = "configured-real-model"',
+                'api_key_environment = "OPENAI_API_KEY"',
+                'openai_base_url = "https://provider.example.test/v1"',
+                "",
+                "[research]",
+                'provider = "searxng"',
+                'searxng_base_url = "http://127.0.0.1:18080"',
+                "searxng_allow_private_endpoint = true",
+                "use_jina_reader_fallback = false",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ConfigError,
+        match="agent.openai_base_url is forbidden",
+    ) as raised:
+        load_foundry_config(config_path)
+
+    assert "provider.example.test" not in str(raised.value)
 
 
 def test_json_envelope_transport_is_explicitly_configured() -> None:

@@ -11,6 +11,8 @@ from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+from agent_world.diagnostic_state import is_marked_test_node_diagnostic_state_root
+
 from .scene import (
     MAX_ROOT_INDEX_ENTRIES,
     CoordinateScene,
@@ -44,7 +46,9 @@ class ObservabilityRoot:
 
     def __init__(self, state_root: str | os.PathLike[str]) -> None:
         requested = Path(state_root).expanduser()
-        if ".agent-world-live" in requested.parts:
+        if ".agent-world-live" in requested.parts and not is_marked_test_node_diagnostic_state_root(
+            requested
+        ):
             raise ObservabilityError(
                 "observability cannot access the reserved live state directory"
             )

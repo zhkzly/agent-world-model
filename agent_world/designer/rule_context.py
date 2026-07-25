@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
 
-from pydantic import JsonValue
+from pydantic import JsonValue, TypeAdapter
 
 from agent_world.contracts import (
     Rule,
@@ -30,6 +30,9 @@ from agent_world.contracts import (
 from agent_world.control.validation import SafeValidationIssue
 
 from .models import (
+    MaterializedToolSemanticsBatch,
+    MaterializedToolSemanticSource,
+    PermissionRuleSourceDraft,
     RuleArithmeticDraft,
     RuleBoundLookupByKeyDraft,
     RuleBoundReferenceDraft,
@@ -38,11 +41,32 @@ from .models import (
     RuleDraft,
     RuleLookupByKeyDraft,
     RuleReferenceDraft,
+    ToolAccessObservationSourceDraft,
+    ToolConditionsSourceDraft,
+    ToolErrorSourceDraft,
+    ToolErrorsSourceDraft,
+    ToolRuleArithmeticDraft,
+    ToolRuleAtomDraft,
+    ToolRuleBoundLookupByConstantDraft,
+    ToolRuleBoundLookupByReferenceDraft,
+    ToolRuleClauseDraft,
+    ToolRuleDraft,
     ToolSemanticsBatchSourceDraft,
-    ToolSemanticSourceDraft,
+    ToolStateTransitionSourceDraft,
     WorldSkeletonDraft,
 )
 from .validation import StructuredSemanticError, StructuredSemanticIssue
+
+_RULE_CLAUSE_ADAPTER: TypeAdapter[RuleClauseDraft] = TypeAdapter(RuleClauseDraft)
+
+type _MaterializedRuleAtom = (
+    RuleConstantDraft
+    | RuleReferenceDraft
+    | RuleBoundReferenceDraft
+    | RuleLookupByKeyDraft
+    | RuleBoundLookupByKeyDraft
+)
+type _MaterializedRuleTerm = _MaterializedRuleAtom | RuleArithmeticDraft
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +95,7 @@ class FrozenRuleLookupBinding:
     source: Literal["pre_state", "post_state"]
     collection_pointer: str
     key_field: str
+    key_value_type: RuleValueType
     value_pointer: str
     value_type: RuleValueType
 
@@ -80,9 +105,19 @@ class FrozenRuleLookupBinding:
             "source": self.source,
             "collection_pointer": self.collection_pointer,
             "key_field": self.key_field,
+            "key_value_type": self.key_value_type,
             "value_pointer": self.value_pointer,
             "value_type": self.value_type,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenRuleLookupReferenceBinding:
+    """One lookup and one schema-compatible direct reference used as its key."""
+
+    binding_id: str
+    lookup_binding: FrozenRuleLookupBinding
+    key_binding: FrozenRuleReferenceBinding
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +129,7 @@ class RuleContextCatalog:
     collection_fields: dict[str, tuple[str, ...]]
     reference_bindings: dict[str, FrozenRuleReferenceBinding]
     lookup_bindings: dict[str, FrozenRuleLookupBinding]
+    lookup_reference_bindings: dict[str, FrozenRuleLookupReferenceBinding]
 
     @classmethod
     def for_tool(cls, *, state: StateSchema, surface: ToolSurface) -> RuleContextCatalog:
@@ -149,13 +185,20 @@ class RuleContextCatalog:
             collection_fields=collection_fields,
             reference_bindings={},
             lookup_bindings={},
+            lookup_reference_bindings={},
         )
+        reference_bindings = _derive_reference_bindings(catalog)
+        lookup_bindings = _derive_lookup_bindings(catalog)
         return cls(
             schemas=schemas,
             collection_keys=collection_keys,
             collection_fields=collection_fields,
-            reference_bindings=_derive_reference_bindings(catalog),
-            lookup_bindings=_derive_lookup_bindings(catalog),
+            reference_bindings=reference_bindings,
+            lookup_bindings=lookup_bindings,
+            lookup_reference_bindings=_derive_lookup_reference_bindings(
+                reference_bindings=reference_bindings,
+                lookup_bindings=lookup_bindings,
+            ),
         )
 
     def prompt_projection(self) -> dict[str, object]:
@@ -172,13 +215,36 @@ class RuleContextCatalog:
         """
 
         lookup_groups: dict[
-            tuple[str, str, str], list[tuple[str, FrozenRuleLookupBinding]]
+            tuple[str, str, str, str], list[tuple[str, FrozenRuleLookupBinding]]
         ] = {}
-        for alias, binding in self.prompt_lookup_bindings().items():
+        for alias, lookup_binding in self.prompt_lookup_bindings().items():
             lookup_groups.setdefault(
-                (binding.source, binding.collection_pointer, binding.key_field),
+                (
+                    lookup_binding.source,
+                    lookup_binding.collection_pointer,
+                    lookup_binding.key_field,
+                    lookup_binding.key_value_type,
+                ),
                 [],
-            ).append((alias, binding))
+            ).append((alias, lookup_binding))
+
+        lookup_reference_groups: dict[
+            tuple[str, str, str, str, str, str],
+            list[tuple[str, FrozenRuleLookupReferenceBinding]],
+        ] = {}
+        for alias, lookup_reference_binding in self.prompt_lookup_reference_bindings().items():
+            lookup = lookup_reference_binding.lookup_binding
+            lookup_reference_groups.setdefault(
+                (
+                    lookup.source,
+                    lookup.collection_pointer,
+                    lookup.key_field,
+                    lookup.key_value_type,
+                    lookup.value_pointer,
+                    lookup.value_type,
+                ),
+                [],
+            ).append((alias, lookup_reference_binding))
 
         return {
             "collections": [
@@ -203,6 +269,7 @@ class RuleContextCatalog:
                     "source": source,
                     "collection_pointer": collection_pointer,
                     "key_field": key_field,
+                    "key_value_type": key_value_type,
                     "value_bindings": [
                         {
                             "binding_id": alias,
@@ -212,7 +279,38 @@ class RuleContextCatalog:
                         for alias, binding in group
                     ],
                 }
-                for (source, collection_pointer, key_field), group in sorted(lookup_groups.items())
+                for (
+                    source,
+                    collection_pointer,
+                    key_field,
+                    key_value_type,
+                ), group in sorted(lookup_groups.items())
+            ],
+            "lookup_reference_binding_groups": [
+                {
+                    "source": source,
+                    "collection_pointer": collection_pointer,
+                    "key_field": key_field,
+                    "key_value_type": key_value_type,
+                    "value_pointer": value_pointer,
+                    "value_type": value_type,
+                    "reference_key_bindings": [
+                        {
+                            "binding_id": alias,
+                            "key_source": binding.key_binding.source,
+                            "key_pointer": binding.key_binding.pointer,
+                        }
+                        for alias, binding in group
+                    ],
+                }
+                for (
+                    source,
+                    collection_pointer,
+                    key_field,
+                    key_value_type,
+                    value_pointer,
+                    value_type,
+                ), group in sorted(lookup_reference_groups.items())
             ],
         }
 
@@ -226,6 +324,16 @@ class RuleContextCatalog:
 
         return _prompt_binding_aliases(self.lookup_bindings, prefix="lookup")
 
+    def prompt_lookup_reference_bindings(
+        self,
+    ) -> dict[str, FrozenRuleLookupReferenceBinding]:
+        """Return aliases whose lookup and reference key are one frozen choice."""
+
+        return _prompt_binding_aliases(
+            self.lookup_reference_bindings,
+            prefix="lookup-ref",
+        )
+
     def resolve_reference_binding(self, identifier: str) -> FrozenRuleReferenceBinding | None:
         """Resolve an immutable id or one prompt-only alias without guessing."""
 
@@ -237,6 +345,16 @@ class RuleContextCatalog:
         """Resolve an immutable id or one prompt-only alias without guessing."""
 
         return self.lookup_bindings.get(identifier) or self.prompt_lookup_bindings().get(identifier)
+
+    def resolve_lookup_reference_binding(
+        self,
+        identifier: str,
+    ) -> FrozenRuleLookupReferenceBinding | None:
+        """Resolve one complete reference-key lookup without independent aliases."""
+
+        return self.lookup_reference_bindings.get(
+            identifier
+        ) or self.prompt_lookup_reference_bindings().get(identifier)
 
     def restricted_to_state_roots(
         self,
@@ -269,6 +387,16 @@ class RuleContextCatalog:
             root = _first_pointer_token(pointer)
             return root is not None and root in allowed_roots
 
+        reference_bindings = {
+            binding_id: binding
+            for binding_id, binding in self.reference_bindings.items()
+            if state_binding_allowed(binding.source, binding.pointer)
+        }
+        lookup_bindings = {
+            binding_id: binding
+            for binding_id, binding in self.lookup_bindings.items()
+            if collection_allowed(binding.collection_pointer)
+        }
         return RuleContextCatalog(
             schemas=self.schemas,
             collection_keys={
@@ -281,16 +409,12 @@ class RuleContextCatalog:
                 for pointer, fields in self.collection_fields.items()
                 if collection_allowed(pointer)
             },
-            reference_bindings={
-                binding_id: binding
-                for binding_id, binding in self.reference_bindings.items()
-                if state_binding_allowed(binding.source, binding.pointer)
-            },
-            lookup_bindings={
-                binding_id: binding
-                for binding_id, binding in self.lookup_bindings.items()
-                if collection_allowed(binding.collection_pointer)
-            },
+            reference_bindings=reference_bindings,
+            lookup_bindings=lookup_bindings,
+            lookup_reference_bindings=_derive_lookup_reference_bindings(
+                reference_bindings=reference_bindings,
+                lookup_bindings=lookup_bindings,
+            ),
         )
 
 
@@ -299,7 +423,7 @@ def materialize_tool_semantics_bindings(
     *,
     skeleton: WorldSkeletonDraft,
     catalogs_by_tool: Mapping[str, RuleContextCatalog] | None = None,
-) -> ToolSemanticsBatchSourceDraft:
+) -> MaterializedToolSemanticsBatch:
     """Expand Tool Agent binding choices into the closed executable Rule source.
 
     Tool semantics is the only current source boundary whose rule context is
@@ -312,7 +436,7 @@ def materialize_tool_semantics_bindings(
 
     surfaces = {item.surface.tool_id: item.surface for item in skeleton.tool_surfaces}
     issues: list[StructuredSemanticIssue] = []
-    materialized_tools: list[ToolSemanticSourceDraft] = []
+    materialized_tools: list[MaterializedToolSemanticSource] = []
 
     for tool_index, tool in enumerate(source.tools):
         surface = surfaces.get(tool.tool_id)
@@ -326,7 +450,6 @@ def materialize_tool_semantics_bindings(
                     expected_category="one tool id from the frozen Tool batch",
                 )
             )
-            materialized_tools.append(tool)
             continue
         catalog = (
             catalogs_by_tool.get(tool.tool_id)
@@ -346,99 +469,157 @@ def materialize_tool_semantics_bindings(
                     expected_category="one tool id with a frozen Rule binding catalog",
                 )
             )
-            materialized_tools.append(tool)
             continue
-        conditions = tool.conditions.model_copy(
-            update={
-                "preconditions": tuple(
-                    _materialize_rule_bindings(
-                        rule,
-                        catalog=catalog,
-                        issues=issues,
-                        path=("tools", tool_index, "conditions", "preconditions", rule_index),
-                    )
-                    for rule_index, rule in enumerate(tool.conditions.preconditions)
-                ),
-                "postconditions": tuple(
-                    _materialize_rule_bindings(
-                        rule,
-                        catalog=catalog,
-                        issues=issues,
-                        path=("tools", tool_index, "conditions", "postconditions", rule_index),
-                    )
-                    for rule_index, rule in enumerate(tool.conditions.postconditions)
-                ),
-            }
-        )
-        transition = tool.state_transition.model_copy(
-            update={
-                "transition": tuple(
-                    _materialize_rule_bindings(
-                        rule,
-                        catalog=catalog,
-                        issues=issues,
-                        path=("tools", tool_index, "state_transition", "transition", rule_index),
-                    )
-                    for rule_index, rule in enumerate(tool.state_transition.transition)
+        conditions = ToolConditionsSourceDraft(
+            tool_id=tool.conditions.tool_id,
+            preconditions=tuple(
+                _materialize_tool_rule_bindings(
+                    rule,
+                    rule_id=f"rule:{tool.tool_id}:precondition:{rule_index}",
+                    catalog=catalog,
+                    issues=issues,
+                    path=("tools", tool_index, "conditions", "preconditions", rule_index),
                 )
-            }
-        )
-        errors = tool.errors.model_copy(
-            update={
-                "errors": tuple(
-                    error.model_copy(
-                        update={
-                            "when": _materialize_rule_bindings(
-                                error.when,
-                                catalog=catalog,
-                                issues=issues,
-                                path=("tools", tool_index, "errors", "errors", error_index, "when"),
-                            )
-                        }
-                    )
-                    for error_index, error in enumerate(tool.errors.errors)
+                for rule_index, rule in enumerate(tool.conditions.preconditions)
+            ),
+            postconditions=tuple(
+                _materialize_tool_rule_bindings(
+                    rule,
+                    rule_id=f"rule:{tool.tool_id}:postcondition:{rule_index}",
+                    catalog=catalog,
+                    issues=issues,
+                    path=("tools", tool_index, "conditions", "postconditions", rule_index),
                 )
-            }
+                for rule_index, rule in enumerate(tool.conditions.postconditions)
+            ),
+        )
+        transition = ToolStateTransitionSourceDraft(
+            tool_id=tool.state_transition.tool_id,
+            transition=tuple(
+                _materialize_tool_rule_bindings(
+                    rule,
+                    rule_id=f"rule:{tool.tool_id}:transition:{rule_index}",
+                    catalog=catalog,
+                    issues=issues,
+                    path=("tools", tool_index, "state_transition", "transition", rule_index),
+                )
+                for rule_index, rule in enumerate(tool.state_transition.transition)
+            ),
+        )
+        errors = ToolErrorsSourceDraft(
+            tool_id=tool.errors.tool_id,
+            errors=tuple(
+                ToolErrorSourceDraft(
+                    error_code=error.error_code,
+                    when=_materialize_tool_rule_bindings(
+                        error.when,
+                        rule_id=f"rule:{tool.tool_id}:error:{error_index}",
+                        catalog=catalog,
+                        issues=issues,
+                        path=("tools", tool_index, "errors", "errors", error_index, "when"),
+                    ),
+                    observation=error.observation,
+                    state_effect=error.state_effect,
+                    retryable=error.retryable,
+                    evidence_claim_ids=error.evidence_claim_ids,
+                )
+                for error_index, error in enumerate(tool.errors.errors)
+            ),
         )
         permission = tool.access_observation.permission
-        access_observation = tool.access_observation.model_copy(
-            update={
-                "permission": permission.model_copy(
-                    update={
-                        "condition": (
-                            _materialize_rule_bindings(
-                                permission.condition,
-                                catalog=catalog,
-                                issues=issues,
-                                path=(
-                                    "tools",
-                                    tool_index,
-                                    "access_observation",
-                                    "permission",
-                                    "condition",
-                                ),
-                            )
-                            if permission.condition is not None
-                            else None
-                        )
-                    }
-                )
-            }
+        access_observation = ToolAccessObservationSourceDraft(
+            tool_id=tool.access_observation.tool_id,
+            permission=PermissionRuleSourceDraft(
+                permission_id=permission.permission_id,
+                required_scopes_by_actor=permission.required_scopes_by_actor,
+                condition=(
+                    _materialize_tool_rule_bindings(
+                        permission.condition,
+                        rule_id=f"rule:{tool.tool_id}:permission:0",
+                        catalog=catalog,
+                        issues=issues,
+                        path=(
+                            "tools",
+                            tool_index,
+                            "access_observation",
+                            "permission",
+                            "condition",
+                        ),
+                    )
+                    if permission.condition is not None
+                    else None
+                ),
+                denied_observation=permission.denied_observation,
+            ),
+            observation=tool.access_observation.observation,
         )
         materialized_tools.append(
-            tool.model_copy(
-                update={
-                    "conditions": conditions,
-                    "state_transition": transition,
-                    "errors": errors,
-                    "access_observation": access_observation,
-                }
+            MaterializedToolSemanticSource(
+                tool_id=tool.tool_id,
+                conditions=conditions,
+                state_transition=transition,
+                errors=errors,
+                access_observation=access_observation,
+                reliability=tool.reliability,
             )
         )
 
     if issues:
         raise StructuredSemanticError(tuple(issues))
-    return source.model_copy(update={"tools": tuple(materialized_tools)})
+    return MaterializedToolSemanticsBatch(tools=tuple(materialized_tools))
+
+
+def _materialize_tool_rule_bindings(
+    rule: ToolRuleDraft,
+    *,
+    rule_id: str,
+    catalog: RuleContextCatalog,
+    issues: list[StructuredSemanticIssue],
+    path: tuple[str | int, ...],
+) -> RuleDraft:
+    clauses = tuple(
+        _materialize_tool_clause_bindings(
+            clause,
+            catalog=catalog,
+            issues=issues,
+            path=(*path, "clauses", clause_index),
+        )
+        for clause_index, clause in enumerate(rule.clauses)
+    )
+    return RuleDraft(
+        rule_id=rule_id,
+        family=rule.family,
+        description=rule.description,
+        boolean_operator=rule.boolean_operator,
+        clauses=clauses,
+        case_sensitivity=rule.case_sensitivity,
+        evidence_claim_ids=rule.evidence_claim_ids,
+    )
+
+
+def _materialize_tool_clause_bindings(
+    clause: ToolRuleClauseDraft,
+    *,
+    catalog: RuleContextCatalog,
+    issues: list[StructuredSemanticIssue],
+    path: tuple[str | int, ...],
+) -> RuleClauseDraft:
+    left = _materialize_term_bindings(
+        clause.left,
+        catalog=catalog,
+        issues=issues,
+        path=(*path, "left"),
+    )
+    right = _materialize_term_bindings(
+        clause.right,
+        catalog=catalog,
+        issues=issues,
+        path=(*path, "right"),
+    )
+    value = clause.model_dump(mode="json")
+    value["left"] = left.model_dump(mode="json")
+    value["right"] = right.model_dump(mode="json")
+    return _RULE_CLAUSE_ADAPTER.validate_python(value)
 
 
 def _materialize_rule_bindings(
@@ -497,12 +678,81 @@ def _materialize_term_bindings(
     catalog: RuleContextCatalog,
     issues: list[StructuredSemanticIssue],
     path: tuple[str | int, ...],
-) -> object:
+) -> _MaterializedRuleTerm:
+    if isinstance(term, ToolRuleBoundLookupByReferenceDraft):
+        lookup_reference_binding = catalog.resolve_lookup_reference_binding(term.binding_id)
+        if lookup_reference_binding is None:
+            _binding_issue(
+                issues,
+                code="tool_rule_binding_unknown",
+                path=(*path, "binding_id"),
+                expected=_lookup_reference_binding_expectation(catalog),
+            )
+            # Keep the surrounding general RuleDraft structurally valid so
+            # all binding issues can be aggregated. The recorded issue makes
+            # this placeholder unreachable from compilation or persistence.
+            return RuleBoundLookupByKeyDraft(
+                kind="bound_lookup_by_key",
+                binding_id=term.binding_id,
+                key=RuleConstantDraft(
+                    kind="constant",
+                    value_type="null",
+                    value=None,
+                ),
+            )
+        lookup = lookup_reference_binding.lookup_binding
+        reference_key = lookup_reference_binding.key_binding
+        return RuleLookupByKeyDraft(
+            kind="lookup_by_key",
+            source=lookup.source,
+            collection_pointer=lookup.collection_pointer,
+            key_field=lookup.key_field,
+            key=RuleReferenceDraft(
+                kind="reference",
+                source=reference_key.source,
+                pointer=reference_key.pointer,
+                value_type=reference_key.value_type,
+            ),
+            value_pointer=lookup.value_pointer,
+            value_type=lookup.value_type,
+        )
+    if isinstance(term, ToolRuleBoundLookupByConstantDraft):
+        return _materialize_term_bindings(
+            RuleBoundLookupByKeyDraft(
+                kind="bound_lookup_by_key",
+                binding_id=term.binding_id,
+                key=RuleConstantDraft(
+                    kind="constant",
+                    value_type=term.key_value_type,
+                    value=term.key_value,
+                ),
+            ),
+            catalog=catalog,
+            issues=issues,
+            path=path,
+        )
+    if isinstance(term, ToolRuleArithmeticDraft):
+        return RuleArithmeticDraft(
+            kind="arithmetic",
+            operator=term.operator,
+            left=_materialize_tool_atom_bindings(
+                term.left,
+                catalog=catalog,
+                issues=issues,
+                path=(*path, "left"),
+            ),
+            right=_materialize_tool_atom_bindings(
+                term.right,
+                catalog=catalog,
+                issues=issues,
+                path=(*path, "right"),
+            ),
+        )
     if isinstance(term, RuleConstantDraft):
         return term
     if isinstance(term, RuleBoundReferenceDraft):
-        binding = catalog.resolve_reference_binding(term.binding_id)
-        if binding is None:
+        reference_binding = catalog.resolve_reference_binding(term.binding_id)
+        if reference_binding is None:
             _binding_issue(
                 issues,
                 code="tool_rule_binding_unknown",
@@ -512,9 +762,9 @@ def _materialize_term_bindings(
             return term
         return RuleReferenceDraft(
             kind="reference",
-            source=binding.source,
-            pointer=binding.pointer,
-            value_type=binding.value_type,
+            source=reference_binding.source,
+            pointer=reference_binding.pointer,
+            value_type=reference_binding.value_type,
         )
     if isinstance(term, RuleBoundLookupByKeyDraft):
         lookup_binding = catalog.resolve_lookup_binding(term.binding_id)
@@ -526,13 +776,13 @@ def _materialize_term_bindings(
                 expected=_lookup_binding_expectation(catalog),
             )
             return term
-        key = _materialize_term_bindings(
+        materialized_key = _materialize_term_bindings(
             term.key,
             catalog=catalog,
             issues=issues,
             path=(*path, "key"),
         )
-        if not isinstance(key, RuleConstantDraft | RuleReferenceDraft):
+        if not isinstance(materialized_key, RuleConstantDraft | RuleReferenceDraft):
             _binding_issue(
                 issues,
                 code="tool_rule_lookup_key_binding_required",
@@ -545,7 +795,7 @@ def _materialize_term_bindings(
             source=lookup_binding.source,
             collection_pointer=lookup_binding.collection_pointer,
             key_field=lookup_binding.key_field,
-            key=key,
+            key=materialized_key,
             value_pointer=lookup_binding.value_pointer,
             value_type=lookup_binding.value_type,
         )
@@ -575,6 +825,24 @@ def _materialize_term_bindings(
             }
         )
     raise TypeError(f"unsupported Tool Rule term: {type(term).__name__}")
+
+
+def _materialize_tool_atom_bindings(
+    term: ToolRuleAtomDraft,
+    *,
+    catalog: RuleContextCatalog,
+    issues: list[StructuredSemanticIssue],
+    path: tuple[str | int, ...],
+) -> _MaterializedRuleAtom:
+    materialized = _materialize_term_bindings(
+        term,
+        catalog=catalog,
+        issues=issues,
+        path=path,
+    )
+    if isinstance(materialized, RuleArithmeticDraft):
+        raise TypeError("Tool Rule atom materialized into recursive arithmetic")
+    return materialized
 
 
 def _binding_issue(
@@ -649,6 +917,14 @@ def _derive_lookup_bindings(
             if item.failure is not None or item.schema is None:
                 continue
             for key_field in keys:
+                key = _resolve_schema_pointer(
+                    item.schema,
+                    f"/{_escape_token(key_field)}",
+                    document=schema,
+                )
+                if key.failure is not None or key.schema is None:
+                    continue
+                key_value_type = _schema_binding_value_type(key.schema)
                 for field in fields:
                     value = _resolve_schema_pointer(
                         item.schema,
@@ -665,6 +941,7 @@ def _derive_lookup_bindings(
                             "source": source,
                             "collection_pointer": collection_pointer,
                             "key_field": key_field,
+                            "key_value_type": key_value_type,
                             "value_pointer": value_pointer,
                             "value_type": value_type,
                         },
@@ -674,9 +951,44 @@ def _derive_lookup_bindings(
                         source=source,
                         collection_pointer=collection_pointer,
                         key_field=key_field,
+                        key_value_type=key_value_type,
                         value_pointer=value_pointer,
                         value_type=value_type,
                     )
+    return bindings
+
+
+def _derive_lookup_reference_bindings(
+    *,
+    reference_bindings: Mapping[str, FrozenRuleReferenceBinding],
+    lookup_bindings: Mapping[str, FrozenRuleLookupBinding],
+) -> dict[str, FrozenRuleLookupReferenceBinding]:
+    """Pair only references mechanically proven compatible with a lookup key.
+
+    A direct reference is eligible when its terminal RFC 6901 field name is
+    the lookup's primary-key field and its frozen value type is identical.
+    No business relation or cross-field equivalence is inferred here.
+    """
+
+    bindings: dict[str, FrozenRuleLookupReferenceBinding] = {}
+    for lookup_id, lookup in sorted(lookup_bindings.items()):
+        for key_id, key in sorted(reference_bindings.items()):
+            if _pointer_terminal_field(key.pointer) != lookup.key_field:
+                continue
+            if key.value_type != lookup.key_value_type:
+                continue
+            binding_id = _binding_id(
+                "lookup_reference",
+                {
+                    "lookup_binding_id": lookup_id,
+                    "key_binding_id": key_id,
+                },
+            )
+            bindings[binding_id] = FrozenRuleLookupReferenceBinding(
+                binding_id=binding_id,
+                lookup_binding=lookup,
+                key_binding=key,
+            )
     return bindings
 
 
@@ -747,6 +1059,15 @@ def _first_pointer_token(pointer: str) -> str | None:
     return token.replace("~1", "/").replace("~0", "~")
 
 
+def _pointer_terminal_field(pointer: str) -> str | None:
+    """Return the decoded terminal field of one non-root RFC 6901 pointer."""
+
+    if not pointer.startswith("/"):
+        return None
+    token = pointer.rsplit("/", 1)[-1]
+    return token.replace("~1", "/").replace("~0", "~")
+
+
 def _join_pointer(parent: str, token: str) -> str:
     return f"{parent}/{_escape_token(token)}" if parent else f"/{_escape_token(token)}"
 
@@ -762,6 +1083,13 @@ def _lookup_binding_expectation(catalog: RuleContextCatalog) -> str:
     return _bounded_expectation(
         "one frozen lookup binding id or prompt alias",
         tuple(catalog.prompt_lookup_bindings()),
+    )
+
+
+def _lookup_reference_binding_expectation(catalog: RuleContextCatalog) -> str:
+    return _bounded_expectation(
+        "one frozen lookup-reference binding id or prompt alias",
+        tuple(catalog.prompt_lookup_reference_bindings()),
     )
 
 
@@ -1148,6 +1476,7 @@ def _bounded_expectation(label: str, values: tuple[str, ...]) -> str:
 
 __all__ = [
     "FrozenRuleLookupBinding",
+    "FrozenRuleLookupReferenceBinding",
     "FrozenRuleReferenceBinding",
     "RuleContextCatalog",
     "materialize_tool_semantics_bindings",

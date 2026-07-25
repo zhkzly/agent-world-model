@@ -108,6 +108,12 @@ class UrlPolicy:
         self._allow_rfc2544_synthetic_egress = allow_rfc2544_synthetic_egress
         self._dns_timeout_seconds = dns_timeout_seconds
 
+    @property
+    def requires_ipv4_transport(self) -> bool:
+        """Whether HTTP transport must match the explicit IPv4 fake-IP policy."""
+
+        return self._allow_rfc2544_synthetic_egress
+
     @staticmethod
     def _normalize_host(value: str) -> str:
         return value.rstrip(".").encode("idna").decode("ascii").lower()
@@ -171,6 +177,11 @@ class UrlPolicy:
                         socket.getaddrinfo,
                         host,
                         port,
+                        family=(
+                            socket.AF_INET
+                            if self._allow_rfc2544_synthetic_egress
+                            else socket.AF_UNSPEC
+                        ),
                         type=socket.SOCK_STREAM,
                     ),
                     timeout=self._dns_timeout_seconds,
@@ -190,8 +201,7 @@ class UrlPolicy:
         synthetic_addresses = tuple(
             address
             for address in addresses
-            if isinstance(address, ipaddress.IPv4Address)
-            and address in _RFC2544_SYNTHETIC_EGRESS
+            if isinstance(address, ipaddress.IPv4Address) and address in _RFC2544_SYNTHETIC_EGRESS
         )
         if not permits_private:
             for address in addresses:
@@ -214,6 +224,14 @@ class UrlPolicy:
     async def validate(self, url: str) -> str:
         await self.resolve(url)
         return url
+
+
+def _async_http_transport(policy: UrlPolicy) -> httpx.AsyncHTTPTransport | None:
+    """Bind synthetic-egress clients to IPv4 without admitting IPv6 ULA peers."""
+
+    if not policy.requires_ipv4_transport:
+        return None
+    return httpx.AsyncHTTPTransport(local_address="0.0.0.0")  # noqa: S104
 
 
 def _exact_jina_origin(value: str, *, official_host: str) -> str:
@@ -350,6 +368,7 @@ class SearxngSearchProvider:
                 timeout=self.timeout_seconds,
                 follow_redirects=False,
                 trust_env=False,
+                transport=_async_http_transport(self._policy),
             ) as client:
                 async with client.stream("GET", target, params=params) as response:
                     await _verify_response_route(
@@ -478,6 +497,7 @@ class BingRssSearchProvider:
                     timeout=self.timeout_seconds,
                     follow_redirects=False,
                     trust_env=False,
+                    transport=_async_http_transport(self._policy),
                 ) as client:
                     async with client.stream("GET", self.endpoint, params=params) as response:
                         await _verify_response_route(
@@ -486,9 +506,7 @@ class BingRssSearchProvider:
                             before=resolution,
                         )
                         if response.is_redirect:
-                            raise ResearchProviderError(
-                                "Bing RSS endpoint redirects are forbidden"
-                            )
+                            raise ResearchProviderError("Bing RSS endpoint redirects are forbidden")
                         response.raise_for_status()
                         response_content = await _read_response_bytes(
                             response,
@@ -603,6 +621,7 @@ class JinaSearchProvider:
                 timeout=self.timeout_seconds,
                 follow_redirects=False,
                 trust_env=False,
+                transport=_async_http_transport(self._policy),
             ) as client:
                 async with client.stream(
                     "GET",
@@ -707,6 +726,7 @@ class HttpFetcher:
             timeout=self.timeout_seconds,
             follow_redirects=False,
             trust_env=False,
+            transport=_async_http_transport(policy),
             headers={
                 "User-Agent": self.user_agent,
                 "Accept": "text/html,text/plain,application/json",
@@ -789,9 +809,7 @@ class JinaReaderFetcher:
             allowed_domains=("r.jina.ai",),
             allow_rfc2544_synthetic_egress=allow_rfc2544_synthetic_egress,
         )
-        if api_key_env is not None and re.fullmatch(
-            r"[A-Za-z_][A-Za-z0-9_]*", api_key_env
-        ) is None:
+        if api_key_env is not None and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env) is None:
             raise ResearchProviderError("Jina API key environment handle is invalid")
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,159}", credential_handle) is None:
             raise ResearchProviderError("Jina credential handle is invalid")
@@ -830,6 +848,7 @@ class JinaReaderFetcher:
                 timeout=self.timeout_seconds,
                 follow_redirects=False,
                 trust_env=False,
+                transport=_async_http_transport(self._origin_policy),
             ) as client:
                 async with client.stream("GET", target, headers=headers) as response:
                     assurance, addresses = await _verify_response_route(

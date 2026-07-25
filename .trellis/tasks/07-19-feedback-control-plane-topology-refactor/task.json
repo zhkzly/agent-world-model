@@ -18,7 +18,9 @@
   "commit": null,
   "pr_url": null,
   "subtasks": [],
-  "children": [],
+  "children": [
+    "07-24-staged-test-sdk-debug"
+  ],
   "parent": "07-13-trustworthy-programmatic-runtime-refactor",
   "relatedFiles": [],
   "notes": "",

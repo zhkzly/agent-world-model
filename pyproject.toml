@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.28.1,<1",
     "jsonschema>=4.26,<5",
     "lxml==6.1.1",
+    "openai>=2.47,<3",
     "openai-codex>=0.144.4,<0.145",
     "packaging>=24,<27",
     "pyarrow>=20,<23",

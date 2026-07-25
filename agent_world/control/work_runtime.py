@@ -126,6 +126,7 @@ class WorkControlRuntime:
         projector: SceneProjector | None = None,
         trace_id: str | None = None,
         run_id: str | None = None,
+        diagnostic_only: bool = False,
     ) -> None:
         self.artifacts = artifacts
         self.heads = heads
@@ -143,6 +144,11 @@ class WorkControlRuntime:
         self.projector = projector
         self.trace_id = trace_id
         self.run_id = run_id
+        # Diagnostic execution may use real model, tool, build, and Judge
+        # operations, but it must never create reusable release evidence.
+        # Keep this at the runtime boundary so every terminal control artifact
+        # receives the same non-releasable classification.
+        self.diagnostic_only = diagnostic_only
         if telemetry is not None and trace_id is None:
             raise WorkRuntimeError("Work telemetry requires one exact trace id")
         if continuations is not None and continuation_workspace_root is None:
@@ -196,6 +202,12 @@ class WorkControlRuntime:
     ) -> tuple[WorkCommit, ArtifactRef] | None:
         """Recover an exact prior success without leaking an interrupted lease."""
 
+        # ``test-node`` deliberately shares immutable ancestor inputs with its
+        # captured scope.  Reusing an equal historical commit here would turn
+        # its target into a replay, so diagnostic execution must always run a
+        # fresh physical attempt through the real leaf.
+        if self.diagnostic_only:
+            return None
         found = self.heads.find_historical_commit(
             definition=definition,
             input_refs=input_refs,
@@ -1141,6 +1153,8 @@ class WorkControlRuntime:
             input_refs=input_refs,
             scheduled_at=now,
             started_at=now,
+            diagnostic_only=self.diagnostic_only,
+            releasable=not self.diagnostic_only,
         )
         attempt_ref = self._persist_attempt(
             attempt,
@@ -1227,6 +1241,8 @@ class WorkControlRuntime:
             input_refs=input_refs,
             scheduled_at=now,
             started_at=now,
+            diagnostic_only=self.diagnostic_only,
+            releasable=not self.diagnostic_only,
         )
         invalidating_refs = tuple(
             dict.fromkeys(
@@ -1312,7 +1328,12 @@ class WorkControlRuntime:
         if operation.kind != "validation" or operation.status != "running":
             raise WorkRuntimeError("active operation is not a running validation")
         attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
-        report = ValidationReport.model_validate(report.model_dump(mode="python"))
+        report = ValidationReport.model_validate(report.model_dump(mode="python")).model_copy(
+            update={
+                "diagnostic_only": self.diagnostic_only,
+                "releasable": not self.diagnostic_only,
+            }
+        )
         if (
             report.attempt_id != attempt.attempt_id
             or report.coordinate != definition.coordinate
@@ -1391,7 +1412,16 @@ class WorkControlRuntime:
         repair_mutation_roots: tuple[str, ...] | None = None,
         allow_infrastructure_retry: bool = True,
     ) -> WorkControlHead:
-        report = ValidationReport.model_validate(report.model_dump(mode="python"))
+        # Callers build reports before handing them to the runtime.  In a
+        # diagnostic run the persisted report is deliberately reclassified at
+        # checkpoint time, so normalize the in-memory counterpart before
+        # proving it against that immutable Artifact below.
+        report = ValidationReport.model_validate(report.model_dump(mode="python")).model_copy(
+            update={
+                "diagnostic_only": self.diagnostic_only,
+                "releasable": not self.diagnostic_only,
+            }
+        )
         # A successful validation proves the complete output closure and must
         # therefore satisfy every declared output slot.  A failed/error
         # proposal can legitimately have no output at all (for example an
@@ -1553,11 +1583,19 @@ class WorkControlRuntime:
             policy_digest=definition.validation_policy.content_digest(),
             status=report.status,
             effect=definition.validation_policy.effect,
-            readiness_effect=("satisfies" if report.status == "passed" else "blocks"),
+            readiness_effect=(
+                "observes"
+                if self.diagnostic_only
+                else "satisfies"
+                if report.status == "passed"
+                else "blocks"
+            ),
             subject_refs=report.subject_refs,
             validation_report_ref=report_ref,
             assurance_report_ref=attempt.assurance_report_ref,
             assurance_evidence_refs=assurance_evidence_refs,
+            diagnostic_only=self.diagnostic_only,
+            releasable=not self.diagnostic_only,
             evaluated_at=datetime.now(UTC),
         )
         evaluation_ref = self.artifacts.put_json(
@@ -1620,6 +1658,8 @@ class WorkControlRuntime:
                 assurance_report_ref=attempt.assurance_report_ref,
                 child_commit_refs=child_commit_refs,
                 aggregate=bool(child_commit_refs),
+                diagnostic_only=self.diagnostic_only,
+                releasable=not self.diagnostic_only,
                 committed_at=datetime.now(UTC),
             )
             commit_ref = self.artifacts.put_json(
@@ -1666,6 +1706,22 @@ class WorkControlRuntime:
                 output_refs=output_refs,
             )
             return committed_head
+        # A test-node run deliberately performs one real target dispatch.  A
+        # failed target is evidence, not permission to create another repair
+        # attempt inside the diagnostic clone.
+        if self.diagnostic_only:
+            failed_head = self._fail_head(
+                lock,
+                head=head,
+                terminal_ref=terminal_ref,
+                evaluation_ref=evaluation_ref,
+            )
+            self._finish_attempt_span(
+                terminal,
+                status=("error" if report.status == "error" else "failed"),
+                error_code=terminal.failure_code,
+            )
+            return failed_head
         if report.status == "error" and not allow_infrastructure_retry:
             failed_head = self._fail_head(
                 lock,
@@ -1761,6 +1817,8 @@ class WorkControlRuntime:
             frontier_ordinal=definition.validation_policy.frontier_ordinal,
             evidence_refs=(evidence_ref,),
             diagnostic_quality="insufficient",
+            diagnostic_only=self.diagnostic_only,
+            releasable=not self.diagnostic_only,
             evaluated_at=now,
         )
         report_ref = self.artifacts.put_json(
@@ -1779,8 +1837,10 @@ class WorkControlRuntime:
             policy_digest=definition.validation_policy.content_digest(),
             status="error",
             effect=definition.validation_policy.effect,
-            readiness_effect="blocks",
+            readiness_effect="observes" if self.diagnostic_only else "blocks",
             validation_report_ref=report_ref,
+            diagnostic_only=self.diagnostic_only,
+            releasable=not self.diagnostic_only,
             evaluated_at=now,
         )
         evaluation_ref = self.artifacts.put_json(

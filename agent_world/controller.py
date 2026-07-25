@@ -126,7 +126,11 @@ from agent_world.control import (
     reduce_maturity,
     restore_work_budget_ledger,
 )
-from agent_world.control.direct_runner import DirectWorkRun, DirectWorkRunner
+from agent_world.control.direct_runner import (
+    DirectWorkRun,
+    DirectWorkRunner,
+    SemanticPrefixRun,
+)
 from agent_world.designer import (
     DIRECT_DESIGN_BASE_TURNS,
     AdmissionBundle,
@@ -720,6 +724,108 @@ class FoundryController:
                 direct_lock=direct_lock,
             )
 
+    async def run_semantic_prefix(
+        self,
+        need: str,
+        *,
+        request_id: str | None = None,
+        permissions: PermissionScope | None = None,
+        budget: Budget | None = None,
+        release_profile: ReleaseProfile | None = None,
+    ) -> SemanticPrefixRun:
+        """Run a fresh normal semantic prefix without creating release state.
+
+        This staged debugging boundary deliberately does not enter
+        ``DirectJobStore`` and cannot return ``GenerateResult``.  The caller
+        supplies a fresh physical state root, while this Controller still owns
+        the canonical Request, Job, GenerationContext, and framework event
+        lineage consumed by the unchanged Scheduler runner.
+        """
+
+        if self.direct_work_runner is None:
+            raise DirectJobStoreError("Direct WorkGraph requires configured telemetry")
+        selected_budget = budget or self.config.generation_budget
+        selected_release = release_profile or self.config.release_profile
+        selected_permissions = permissions or PermissionScope()
+        selected_request_id = request_id or f"semantic-prefix-request:{uuid.uuid4().hex}"
+        request = EnvironmentRequest(
+            request_id=selected_request_id,
+            need=need,
+            permissions=selected_permissions,
+            budget=selected_budget,
+            release_profile=selected_release,
+        )
+        request_ref = self.artifacts.put_json(
+            artifact_id=self._stable_id("request-artifact", selected_request_id),
+            artifact_type="control.environment_request",
+            value=request,
+        )
+        job_id = self._stable_id(
+            "generate-job",
+            selected_request_id,
+            request_ref.revision_id,
+        )
+        job = EnvironmentJob(
+            job_id=job_id,
+            kind="generate",
+            request_ref=request_ref,
+            permissions=selected_permissions,
+            budget=selected_budget,
+            release_profile=selected_release,
+        )
+        job_ref = self.artifacts.put_json(
+            artifact_id=f"{job_id}:job",
+            artifact_type="control.environment_job",
+            value=job,
+            dependencies=(request_ref,),
+        )
+        context = GenerationContext(
+            context_id=f"generation-context:{job_id}",
+            job_ref=job_ref,
+            kind="generate",
+            request_ref=request_ref,
+            permissions=selected_permissions,
+            budget=selected_budget,
+            release_profile=selected_release,
+        )
+        context_ref = self.artifacts.put_json(
+            artifact_id=context.context_id,
+            artifact_type="control.generation_context",
+            value=context,
+            dependencies=context.root_refs,
+        )
+        run_id = f"semantic-prefix:{uuid.uuid4().hex}"
+        self.artifacts.record_event(
+            event_type="generation_semantic_prefix_started",
+            subject_ref=job_ref,
+            related_refs=(request_ref, context_ref),
+            details=(
+                KeyValue(key="engine", value="scheduler-workgraph"),
+                KeyValue(key="release_attempted", value="false"),
+            ),
+        )
+        outcome = await self.direct_work_runner.run_semantic_prefix(
+            context_ref=context_ref,
+            run_id=run_id,
+        )
+        self.artifacts.record_event(
+            event_type="generation_semantic_prefix_finished",
+            subject_ref=job_ref,
+            related_refs=tuple(
+                ref
+                for ref in (
+                    context_ref,
+                    outcome.bootstrap_epoch_ref,
+                    outcome.design_epoch_ref,
+                    outcome.modeling_commit_ref,
+                    outcome.verifier_plan_commit_ref,
+                )
+                if ref is not None
+            ),
+            details=(KeyValue(key="status", value=outcome.status),),
+        )
+        return outcome
+
     async def resume_generation(self, request_id: str) -> GenerateResult:
         """Explicitly restart one failed Direct run from its last verified phase."""
 
@@ -1125,16 +1231,8 @@ class FoundryController:
             release = self.artifacts.get_json(outcome.release_ref, ReleaseRecord)
             run.remember(
                 outcome.bootstrap_epoch_ref,
-                *(
-                    (outcome.design_epoch_ref,)
-                    if outcome.design_epoch_ref is not None
-                    else ()
-                ),
-                *(
-                    (outcome.final_epoch_ref,)
-                    if outcome.final_epoch_ref is not None
-                    else ()
-                ),
+                *((outcome.design_epoch_ref,) if outcome.design_epoch_ref is not None else ()),
+                *((outcome.final_epoch_ref,) if outcome.final_epoch_ref is not None else ()),
                 outcome.package_manifest_ref,
                 outcome.release_ref,
             )
@@ -1224,7 +1322,6 @@ class FoundryController:
             value=context,
             dependencies=context.root_refs,
         )
-
 
     async def resume_discovery(
         self,

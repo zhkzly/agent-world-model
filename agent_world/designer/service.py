@@ -127,6 +127,7 @@ from agent_world.research.security import (
 
 from .budget import DesignerBudgetExhausted, DesignerInvocationBudget
 from .models import (
+    MAX_TOOLS_PER_SEMANTICS_BATCH,
     AssumptionIssue,
     AssumptionIssueOrigin,
     AssumptionResolutionDraft,
@@ -142,6 +143,7 @@ from .models import (
     IdempotencyKeyDraft,
     InitialStateRulesDraft,
     InitialStateRulesSourceDraft,
+    MaterializedToolSemanticsBatch,
     PermissionRuleSourceDraft,
     ResearchAcquisition,
     ResearchPlan,
@@ -222,7 +224,11 @@ from .models import (
 from .research_materialization import (
     materialize_research_evidence as _materialize_research_evidence,
 )
-from .rule_context import RuleContextCatalog, validate_rule_context
+from .rule_context import (
+    RuleContextCatalog,
+    materialize_tool_semantics_bindings,
+    validate_rule_context,
+)
 from .validation import StructuredSemanticError, StructuredSemanticIssue
 from .validators import (
     validate_evidence_synthesis_references,
@@ -263,6 +269,7 @@ _TRANSPORT_ARTIFACT_FIELD = "artifact_json"
 # leaf never invalidates the (expensive) Research reuse — Research stays covered
 # by its own hand-bumped ``validator_revision_id``.
 _SEMANTIC_LAYER_MODULES = (
+    "agent_world.designer.compact_rule_protocol",
     "agent_world.designer.final_design_leaves",
     "agent_world.designer.final_design_compiler",
     "agent_world.designer.models",
@@ -285,6 +292,7 @@ class AgentProfileProvider(Protocol):
         permissions: PermissionScope,
         requirement: NodeCapabilityRequirement,
         rollout_token_limit: int | None = None,
+        invocation_timeout_seconds: float | None = None,
     ) -> ResolvedAgentProfile: ...
 
 
@@ -898,6 +906,13 @@ class EnvironmentDesigner:
                 for group in target_groups
                 if group.group_id in shared_contract_refs
             )
+            rule_contexts = {
+                tool_id: RuleContextCatalog.for_tool(
+                    state=skeleton.state,
+                    surface=surface_by_id[tool_id].surface,
+                )
+                for tool_id in tool_ids
+            }
 
             def validate_batch(
                 value: ToolSemanticsBatchSourceDraft,
@@ -906,9 +921,15 @@ class EnvironmentDesigner:
                 expected_contracts: tuple[
                     SharedToolSemanticsContract, ...
                 ] = target_shared_contracts,
+                expected_rule_contexts: dict[str, RuleContextCatalog] = rule_contexts,
             ) -> None:
-                compiled = self._compile_and_validate_tool_semantics_batch(
+                materialized = materialize_tool_semantics_bindings(
                     value,
+                    skeleton=skeleton,
+                    catalogs_by_tool=expected_rule_contexts,
+                )
+                compiled = self._compile_and_validate_tool_semantics_batch(
+                    materialized,
                     expected_tool_ids=expected,
                     skeleton=skeleton,
                     evidence_graph=evidence_graph,
@@ -956,11 +977,11 @@ class EnvironmentDesigner:
                     "authority, visibility, reliability, and shared constraints."
                 ),
                 timing_reason="World rules require every tool transition to be executable.",
-                output_contract_id="contract:tool-semantics-batch-source",
-                acceptance_transform_id="framework.tool-semantics-projection.v4",
+                output_contract_id="contract:tool-semantics-batch-source.v7",
+                acceptance_transform_id="framework.tool-semantics-projection.v5",
                 executor_revision_id="framework.codex-structured-protocol.v3",
                 implementation_revision_id=_SEMANTIC_LAYER_REVISION,
-                validator_revision_id="framework.validator.tool-semantics-batch.v8",
+                validator_revision_id="framework.validator.tool-semantics-batch.v12",
                 allowed_mutation_roots=("/tools",),
                 agent_wall_seconds=min(600.0, meter.remaining_wall_seconds),
                 agent_token_limit=meter.rollout_token_limit,
@@ -989,11 +1010,8 @@ class EnvironmentDesigner:
                     target_tool_plans=tuple(plan_by_id[tool_id] for tool_id in tool_ids),
                     target_tool_surfaces=tuple(surface_by_id[tool_id] for tool_id in tool_ids),
                     rule_context_catalogs={
-                        tool_id: RuleContextCatalog.for_tool(
-                            state=skeleton.state,
-                            surface=surface_by_id[tool_id].surface,
-                        ).prompt_projection()
-                        for tool_id in tool_ids
+                        tool_id: catalog.prompt_projection()
+                        for tool_id, catalog in rule_contexts.items()
                     },
                 ),
                 semantic_validator=validate_batch,
@@ -1006,8 +1024,13 @@ class EnvironmentDesigner:
                 semantic_transaction="design.tool-semantics-batch",
                 repair_projection=ToolSemanticsRepairProjection(),
             )
-            compiled_batch = self._compile_tool_semantics_batch(
+            materialized_batch = materialize_tool_semantics_bindings(
                 batch_source,
+                skeleton=skeleton,
+                catalogs_by_tool=rule_contexts,
+            )
+            compiled_batch = self._compile_tool_semantics_batch(
+                materialized_batch,
                 expected_tool_ids=tool_ids,
                 skeleton=skeleton,
                 evidence_graph=evidence_graph,
@@ -1959,7 +1982,10 @@ class EnvironmentDesigner:
             if not reasons:
                 # A singleton is a valid independent coupling group.
                 reasons.append("namespace")
-            batches = tuple(ordered[index : index + 4] for index in range(0, len(ordered), 4))
+            batches = tuple(
+                ordered[index : index + MAX_TOOLS_PER_SEMANTICS_BATCH]
+                for index in range(0, len(ordered), MAX_TOOLS_PER_SEMANTICS_BATCH)
+            )
             groups.append(
                 ToolCouplingGroupPlan(
                     group_id=cls._stable_id("tool-coupling-group", *ordered),
@@ -1980,8 +2006,8 @@ class EnvironmentDesigner:
             architecture_ref=architecture_ref,
             groups=tuple(groups),
             execution_batches=tuple(
-                tuple(item.tool_id for item in tools[index : index + 4])
-                for index in range(0, len(tools), 4)
+                tuple(item.tool_id for item in tools[index : index + MAX_TOOLS_PER_SEMANTICS_BATCH])
+                for index in range(0, len(tools), MAX_TOOLS_PER_SEMANTICS_BATCH)
             ),
         )
 
@@ -2163,7 +2189,7 @@ class EnvironmentDesigner:
 
     @staticmethod
     def _validate_tool_source_batch_against_shared_contracts(
-        source_batch: ToolSemanticsBatchSourceDraft,
+        source_batch: MaterializedToolSemanticsBatch,
         *,
         contracts: Sequence[SharedToolSemanticsContract],
     ) -> None:
@@ -2274,7 +2300,7 @@ class EnvironmentDesigner:
 
     def _compile_and_validate_tool_semantics_batch(
         self,
-        source: ToolSemanticsBatchSourceDraft,
+        source: MaterializedToolSemanticsBatch,
         *,
         expected_tool_ids: tuple[str, ...],
         skeleton: WorldSkeletonDraft,
@@ -2330,7 +2356,7 @@ class EnvironmentDesigner:
 
     def _compile_tool_semantics_batch(
         self,
-        source: ToolSemanticsBatchSourceDraft,
+        source: MaterializedToolSemanticsBatch,
         *,
         expected_tool_ids: tuple[str, ...],
         skeleton: WorldSkeletonDraft,
@@ -2640,7 +2666,7 @@ class EnvironmentDesigner:
 
     @staticmethod
     def _validate_tool_semantics_batch_identity(
-        source: ToolSemanticsBatchSourceDraft,
+        source: MaterializedToolSemanticsBatch,
         *,
         expected_tool_ids: tuple[str, ...],
     ) -> None:
@@ -8630,16 +8656,6 @@ class EnvironmentDesigner:
                     "Tool permission conditions must use the permission Rule family.",
                 )
             )
-        allowed = set(source.allowed_actors)
-        scoped = set(source.required_scopes_by_actor)
-        if allowed != scoped:
-            issues.append(
-                SafeValidationIssue(
-                    "permission_scope_actor_coverage",
-                    ("permission", "required_scopes_by_actor"),
-                    "required_scopes_by_actor must cover exactly every allowed actor.",
-                )
-            )
         for actor, scopes in source.required_scopes_by_actor.items():
             if len(set(scopes)) != len(scopes):
                 issues.append(
@@ -8660,7 +8676,11 @@ class EnvironmentDesigner:
             )
         return PermissionRule(
             permission_id=source.permission_id,
-            allowed_actors=source.allowed_actors,
+            # The source map is the Agent's complete semantic choice of who
+            # may access this tool. Its key order is not business meaning, so
+            # derive a canonical core projection instead of asking the Agent
+            # to repeat the same set in a second field.
+            allowed_actors=tuple(sorted(source.required_scopes_by_actor)),
             required_scopes_by_actor=source.required_scopes_by_actor,
             condition=(
                 EnvironmentDesigner._compile_rule_draft(source.condition, rule_id=rule_id)
@@ -11296,10 +11316,11 @@ collection_pointer, the collection primary-key field, an args/reference key, and
 inside the action-targeted record. Do not write fake paths such as `/bookings/status` through an
 array;
 do not use a fixed numeric array index for an action-selected business record. The compiler checks
-all paths and declared value types against the frozen schemas. `required_scopes_by_actor`
-must cover exactly allowed actors and every scope must be copied from that actor's frozen boundary
-authorities; an empty scope list is valid. A tool may be unconditionally available to every frozen
-actor with condition=null. `visible_fields_by_actor` must cover every frozen actor and may contain
+all paths and declared value types against the frozen schemas. `required_scopes_by_actor` is the
+non-empty allowed-actor map: its keys define exactly which frozen actors may access the tool, and
+every scope must be copied from that actor's frozen boundary authorities; an empty scope list is
+valid. A tool may be unconditionally available to every frozen actor with condition=null.
+`visible_fields_by_actor` must cover every frozen actor and may contain
 only exact top-level fields from that tool's frozen observation_schema -- never output-schema
 fields, state paths, dotted paths, wildcards, or resource names. Framework code derives each
 actor's redacted-field complement, so do not emit redacted_fields_by_actor. Every
@@ -11582,8 +11603,9 @@ observation_schema. Framework code derives the redacted complement. Do not use o
 state paths, dotted paths, wildcards, or resource names as observation fields. A field may be
 visible to one actor and redacted from another. The permission may exclude an actor, use a
 positive-and-negative condition over only actor/pre_state/args/reset_config/seed, or be
-unconditional for every frozen actor. `required_scopes_by_actor` must cover exactly the
-allowed actors; choose each actor's scopes only from that actor's frozen boundary authorities.
+unconditional for every frozen actor. `required_scopes_by_actor` is the non-empty allowed-actor
+map: its keys define exactly the actors permitted by this rule; choose each actor's scopes only
+from that actor's frozen boundary authorities.
 Permission conditions use the discriminated Rule Draft ADT; ordered clauses must explicitly choose
 `number`, `date`, or `date-time`. A permission condition rule_id must be different from every
 precondition, transition, postcondition, and error rule_id already present in tool_behavior.

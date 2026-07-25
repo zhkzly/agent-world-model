@@ -22,8 +22,18 @@ from agent_world.agent_output_authority import (
     register_agent_output_contract,
 )
 from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.artifact_store import ArtifactStore
 from agent_world.config import AgentBackendConfig
-from agent_world.contracts import ArtifactRef, PermissionScope, sha256_digest
+from agent_world.contracts import ArtifactRef, Budget, PermissionScope, sha256_digest
+from agent_world.control import (
+    GenerationWorkGraph,
+    LeaseBudgetLedger,
+    SchedulerLeafExecutor,
+    ValidationReport,
+    WorkControlRuntime,
+    WorkControlStore,
+    WorkScheduler,
+)
 from agent_world.control.leaf_executor import (
     AgentCorrectionBrief,
     LeafExecutionFailure,
@@ -37,6 +47,7 @@ from agent_world.designer.one_shot import invoke_structured_once
 from agent_world.designer.validation import StructuredSemanticError, StructuredSemanticIssue
 from agent_world.invocation import (
     InvocationError,
+    InvocationExecutionMode,
     InvocationRequest,
     InvocationResult,
     InvocationStatus,
@@ -243,6 +254,10 @@ async def test_one_shot_returns_safe_field_feedback_without_component_retry(
     failure = captured.value
     assert len(backend.requests) == 1
     assert backend.requests[0].session is None
+    assert backend.requests[0].execution_mode is InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
+    assert backend.requests[0].profile.limits.timeout_seconds == (
+        definition.proposal_policy.budget.wall_seconds
+    )
     assert failure.category == "structured_output_shape"
     assert failure.issues[0].code == "schema_string_type"
     assert failure.issues[0].path == ("title",)
@@ -289,6 +304,103 @@ async def test_one_shot_marks_provider_contract_rejection_non_retryable(
     assert len(backend.requests) == 1
     assert failure.code == "agent_backend_turn_failed_provider_rejected"
     assert failure.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_bc44_provider_rejection_cannot_authorize_a_scheduler_retry(
+    tmp_path: Path,
+) -> None:
+    """BC-44: a generic worker retry flag cannot spend a second physical turn."""
+
+    definition = _definition()
+    assert definition.repair_policy.maximum_infrastructure_retries == 1
+    graph = GenerationWorkGraph.compile((definition,), mode="diagnostic")
+    artifacts = ArtifactStore(tmp_path / "artifacts").issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.", "design."),
+    )
+    context_ref = artifacts.put_json(
+        artifact_id="context:bc-44",
+        artifact_type="control.generation_context",
+        value={"case": "BC-44"},
+    )
+    manifest = graph.manifest(
+        topology_id="topology:bc-44-provider-rejection",
+        external_root_refs=(context_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(context_ref,),
+    )
+    heads = WorkControlStore(tmp_path / "work-control")
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(
+            Budget(
+                llm_tokens=2_000,
+                agent_turns=2,
+                repair_attempts=1,
+                wall_seconds=300,
+            )
+        ),
+    )
+    scheduler = WorkScheduler(
+        graph=graph,
+        manifest=manifest,
+        manifest_ref=manifest_ref,
+        heads=heads,
+        artifacts=artifacts,
+        runtime=runtime,
+    )
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+    backend = _ProviderRejectedBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    async def proposal(_context, attempt: WorkAttempt, dispatch_id: str):
+        return await invoke_structured_once(
+            backend=backend,
+            profiles=profiles,
+            definition=definition,
+            attempt=attempt,
+            dispatch_id=dispatch_id,
+            lineage_id="lineage:bc-44",
+            workspace=tmp_path / "isolated-researcher",
+            model=_StrictOneShotOutput,
+            prompt="Produce the requested title object.",
+            permissions=PermissionScope(),
+        )
+
+    async def execute(context) -> None:
+        await leaf.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == ["blocked"]
+    assert len(backend.requests) == 1
+    assert backend.requests[0].execution_mode is InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
+    head = heads.read_head(definition.coordinate)
+    assert head is not None
+    assert head.status == "failed"
+    assert head.repair_action_ref is None
+    assert not runtime.repairs.entries
+    attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+    assert attempt.validation_report_ref is not None
+    report = artifacts.get_json(attempt.validation_report_ref, ValidationReport)
+    assert report.status == "error"
+    assert report.infrastructure_retryable is False
+    assert report.issues[0].code == "agent_backend_turn_failed_provider_rejected"
 
 
 @pytest.mark.asyncio
@@ -755,9 +867,7 @@ async def test_one_shot_timeout_preserves_dispatch_provenance_for_terminal_settl
         update={
             "proposal_policy": base.proposal_policy.model_copy(
                 update={
-                    "budget": base.proposal_policy.budget.model_copy(
-                        update={"wall_seconds": 0.01}
-                    )
+                    "budget": base.proposal_policy.budget.model_copy(update={"wall_seconds": 0.01})
                 }
             )
         }

@@ -23,6 +23,7 @@ from agent_world.control import (
     deterministic_boundary_work_definition,
     verifier_plan_work_definition,
 )
+from agent_world.control.test_node import TestNodeRunner as NodeRunner
 from agent_world.judge import VerifierBatchPlan, VerifierBatchPlanItem
 
 
@@ -172,11 +173,22 @@ def test_final_epoch_retains_real_bootstrap_commits_without_shadow_design(
         modeling_definition=modeling,
         verifier_plan_definition=verifier_plan,
     )
-    _, _, _, design_epoch_ref = epochs.freeze_design(
+    design_manifest, _, _, design_epoch_ref = epochs.freeze_design(
         context_ref=context_ref,
         bootstrap_epoch_ref=bootstrap_epoch_ref,
         graph=design_graph,
         topology_id="topology:hotel-design",
+    )
+    reconstructed_design = NodeRunner._reconstruct_graph(  # noqa: SLF001 - regression seed
+        artifacts,
+        design_manifest,
+    )
+    assert (
+        reconstructed_design.manifest(
+            topology_id=design_manifest.topology_id,
+            external_root_refs=design_manifest.external_root_refs,
+        )
+        == design_manifest
     )
     design_prior_ref = prior_ref
     design_output_ref: ArtifactRef | None = None

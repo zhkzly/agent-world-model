@@ -4,8 +4,8 @@
 `~/.config/agent-world/config.toml`；CLI 的 `--config` 或环境变量
 `AGENT_WORLD_CONFIG` 可以显式选择其他文件。
 
-配置只保存模型名、端点、预算、隔离策略和凭证“句柄”。API key、登录 token、Cookie、
-private key 等值不得写入 TOML、Artifact、日志、manifest 或 envpkg。
+配置只保存模型名、预算、隔离策略和环境变量“句柄”。API key、base URL、登录 token、Cookie、
+private key 等值不得写入 TOML、Artifact、日志、trace、manifest 或 envpkg。
 
 ## 最小可运行配置
 
@@ -15,7 +15,8 @@ state_root = "/home/me/.local/state/agent-world"
 [agent]
 model = "YOUR_CODEX_MODEL"
 codex_bin = "/absolute/path/to/a/current/codex"
-chatgpt_auth_file = "/home/me/.codex/auth.json"
+api_key_environment = "OPENAI_API_KEY"
+openai_base_url_environment = "OPENAI_BASE_URL"
 reasoning_researcher = "medium"
 reasoning_engineer = "medium"
 reasoning_challenger = "medium"
@@ -77,44 +78,27 @@ policy，不能用它跳过 framework 始终强制的安全检查，也不能让
 校验。若省略则使用 SDK 精确 pin 的 bundled runtime，但 `doctor` 会 fail closed，因为 beta
 SDK 的 bundled CLI 可能已被在线服务拒绝。系统不会在失败时切换成模板、假 backend 或另一模型。
 
-## 模型认证
-
-只允许二选一。
-
-### 显式授权现有 ChatGPT/Codex 登录
+## 模型认证与路由
 
 ```toml
 [agent]
 model = "YOUR_CODEX_MODEL"
-codex_bin = "/absolute/path/to/a/current/codex"
-chatgpt_auth_file = "/absolute/path/to/auth.json"
-```
-
-该路径是用户明确授予 Foundry 的 handle。`ProfileResolver` 会把内容复制到本次 Agent 的
-隔离 `CODEX_HOME`，权限固定为 `0600`；源路径、内容和哈希不进入公共 metadata。系统不会
-自行扫描 `$HOME/.codex`。
-
-### API 环境句柄
-
-```toml
-[agent]
-model = "YOUR_CODEX_MODEL"
-codex_bin = "/absolute/path/to/a/current/codex"
 api_key_environment = "OPENAI_API_KEY"
-# 可选：显式覆盖 Codex 内置 openai provider 的 API 根路径
-openai_base_url = "https://compatible-provider.example/v1"
+openai_base_url_environment = "OPENAI_BASE_URL"
 ```
 
-然后只在启动进程的环境中提供值：
+只在启动 Foundry 的受信任进程环境中提供值：
 
 ```bash
 export OPENAI_API_KEY='...'
+export OPENAI_BASE_URL='...'
 ```
 
-TOML 中保存的是变量名，不是 key。`openai_base_url` 只允许与 API-key 模式和内置
-`openai` provider 配合，不能与 ChatGPT 登录混用，也不能包含用户名、密码、query 或
-fragment。Profile Resolver 会把它写入每次隔离的 `$CODEX_HOME/config.toml` 并纳入 profile
-hash；不会从宿主环境隐式继承兼容端点。
+TOML、`ResolvedAgentProfile`、生成的 `$CODEX_HOME/config.toml` 与所有 Artifact 只出现
+`OPENAI_API_KEY`/`OPENAI_BASE_URL` 这两个名字。实际值仅作为 worker/app-server 的短生命周期环境
+变量；worker 只在 SDK 的单个 thread request config 中选择 framework-owned custom provider，绝不写入
+materialized config、`--config` override 或命令行参数。系统不调用 `login_api_key()`，也不物化
+`auth.json`。base URL 不得带用户名、密码、query 或 fragment；无效或缺失时在真实调用前 fail closed。
 
 `structured_output_transport` 默认是 `provider_schema`：直接把收窄后的 JSON Schema 交给
 provider。只有已通过真实 probe 证明某个兼容 gateway 会拒绝嵌套 schema 时，才显式设为
@@ -430,10 +414,9 @@ structured-output turn，`--live-research` 会真实消费一次 search/fetch/ex
 - Environment Builder、Verifier Compiler、clean-build/runtime 隔离 Judge；
 - 拥有预算、返工路由和发布决策的 `FoundryController`。
 
-模型环境句柄、Jina 环境句柄以及显式授权的 Codex `auth.json` 会在装配时解析。值只作为进程内
-credential 和 Artifact/Registry secret canary 存活，不会进入对象公开描述、异常、事件、Artifact
-或 envpkg。`auth.json` 必须是非 symlink 的普通 JSON 文件，在 POSIX 上不得对 group/world 开放；
-读取使用文件描述符身份复核来拒绝替换竞态。
+模型环境句柄、base-URL 环境句柄和 Jina 环境句柄会在装配时解析。值只作为进程内 credential 和
+Artifact/Registry secret canary 存活，不会进入对象公开描述、异常、事件、Artifact 或 envpkg。
+Codex `auth.json` 不属于支持的认证路径；若它出现在隔离 `CODEX_HOME`，调用会 fail closed。
 
 完整首包流程：
 

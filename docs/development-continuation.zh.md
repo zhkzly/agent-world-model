@@ -39,32 +39,20 @@ ArtifactStore 在恢复后仍会校验上述 content-addressed revision。只迁
 
 ## Codex SDK、认证与 CODEX_HOME
 
-完整、可逐项执行的迁移步骤见 [Codex 凭证与本机运行能力迁移](codex-credential-migration.zh.md)。该文档分别说明 ChatGPT 文件认证和 API-key/兼容 Base URL 认证、`CODEX_HOME` 隔离、权限要求、真实 doctor 验证和常见失败。
+完整、可逐项执行的迁移步骤见 [Codex 凭证与本机运行能力迁移](codex-credential-migration.zh.md)。该文档说明 API-key/base-URL 环境句柄、`CODEX_HOME` 隔离、真实 doctor 验证和常见失败。
 
 生产路径使用真实 `CodexSdkBackend`，模型由显式 `agent.model` 配置决定；当前实验优先
 `grok-4.5`，在额度或兼容服务不可用时才显式切换为 `gpt-5.4-mini`。迁移后需要重新安装支持当前 SDK 协议的 Codex 预览版，并通过当前机器的 `command -v codex` 设置 `agent.codex_bin`；不要继续使用旧机器上带版本哈希的绝对路径。
 
-本机登录认证的来源通常是：
-
-```text
-~/.codex/auth.json
-```
-
-配置中的 `agent.chatgpt_auth_file` 应指向迁移后机器自己的该文件。权限建议设为仅当前用户可读写。ProfileProvider 会把认证临时物化到每次隔离运行的：
-
-```text
-<node-workspace>/.agent-runtime/codex-home/auth.json
-```
-
-这些物化副本、`codex-home/sessions/`、`codex-home/state/` 和 shell snapshots 都是敏感且可重建的运行材料，不属于项目 Artifact，也不能进入 Git、envpkg 或发布 Registry。仓库只保留路径约定和恢复方法，不保存 token、API key 或 auth 文件内容。
+模型凭证和路由只从启动进程的 `OPENAI_API_KEY` 与 `OPENAI_BASE_URL` 读取。ProfileProvider 不复制或物化 `auth.json`；隔离 `codex-home/` 中若出现该文件即 fail closed。`codex-home/sessions/`、`codex-home/state/` 和 shell snapshots 都是可重建运行材料，不属于项目 Artifact，也不能进入 Git、envpkg 或发布 Registry。
 
 ## 迁移后恢复顺序
 
 1. 克隆私有仓库并切换到 `codex-agent-world-runtime-redesign`。
 2. 执行 `uv sync` 重建已删除的 `.venv`。
-3. 安装/确认 Codex 预览版，并在新机器完成登录。
+3. 安装/确认 Codex 预览版，并让 secret manager 向启动进程注入两个环境变量。
 4. 把脱敏后的状态根目录复制到新位置；如果不迁移状态，则准备从 Artifact 生成阶段重新运行。
-5. 更新本机 TOML 配置中的 `state_root`、`agent.codex_bin`、`agent.chatgpt_auth_file` 和 `judge.uv_cache_dir`。
+5. 更新本机 TOML 配置中的 `state_root`、`agent.codex_bin`、`agent.api_key_environment`、`agent.openai_base_url_environment` 和 `judge.uv_cache_dir`。
 6. 先运行相关 lint/测试，再以新的空 workspace 执行 Verifier-only；成功后加载其 `VerifierIR` 运行 Judge。
 
 ## 最近一次框架诊断结论

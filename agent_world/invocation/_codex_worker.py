@@ -27,6 +27,15 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from agent_world.invocation.redaction import Redactor  # noqa: E402
+from agent_world.invocation.runtime_provider import (  # noqa: E402
+    API_KEY_RUNTIME_PROVIDER as _API_KEY_RUNTIME_PROVIDER,
+)
+from agent_world.invocation.runtime_provider import (  # noqa: E402
+    OPENAI_API_KEY_ENVIRONMENT as _OPENAI_API_KEY_ENVIRONMENT,
+)
+from agent_world.invocation.runtime_provider import (  # noqa: E402
+    OPENAI_BASE_URL_ENVIRONMENT as _OPENAI_BASE_URL_ENVIRONMENT,
+)
 
 PROTOCOL_VERSION = "agent-world.codex-worker.v1"
 SUPPORTED_SDK_VERSION = "0.144.4"
@@ -195,6 +204,19 @@ def _terminal_turn_failure_code(error: object) -> str:
 
     if not isinstance(error, Mapping):
         return "turn_failed_provider_rejected"
+
+    # The app-server's declared ``codexErrorInfo`` is a closed protocol enum
+    # (with a few closed HTTP-status wrappers).  Prefer it over provider
+    # message text: it both narrows diagnostics and ensures no opaque provider
+    # payload needs to leave this worker process.
+    codex_error_info = error.get("codexErrorInfo")
+    if codex_error_info is None:
+        # ``_json_value(..., by_alias=True)`` normally yields camel case, but
+        # accept the SDK's Python spelling for forward-compatible unit inputs.
+        codex_error_info = error.get("codex_error_info")
+    structured_code = _codex_error_info_failure_code(codex_error_info)
+    if structured_code is not None:
+        return structured_code
     declared_fragments = [
         value.lower()
         for key in ("code", "type")
@@ -229,6 +251,62 @@ def _terminal_turn_failure_code(error: object) -> str:
         for category, markers in categories:
             if any(marker in summary for marker in markers):
                 return f"turn_failed_{category}"
+    return "turn_failed_provider_rejected"
+
+
+def _codex_error_info_failure_code(value: object) -> str | None:
+    """Map Codex's declared error enum to the worker's closed taxonomy.
+
+    ``TurnError.additionalDetails`` and the provider's free-form ``message``
+    are intentionally excluded.  They can contain request or routing
+    material, whereas enum tags and numeric HTTP status are bounded protocol
+    data safe to consume only for classification.
+    """
+
+    if isinstance(value, str):
+        return {
+            "contextwindowexceeded": "turn_failed_context_window",
+            "sessionbudgetexceeded": "turn_failed_quota_exhausted",
+            "usagelimitexceeded": "turn_failed_quota_exhausted",
+            "serveroverloaded": "turn_failed_provider_unavailable",
+            "internalservererror": "turn_failed_provider_unavailable",
+            "unauthorized": "turn_failed_authentication",
+            "badrequest": "turn_failed_invalid_request",
+            "cyberpolicy": "turn_failed_content_filtered",
+            "sandboxerror": "turn_failed_provider_rejected",
+        }.get(value.replace("_", "").replace("-", "").lower())
+    if not isinstance(value, Mapping):
+        return None
+
+    for field in (
+        "httpConnectionFailed",
+        "responseStreamConnectionFailed",
+        "responseStreamDisconnected",
+        "responseTooManyFailedAttempts",
+    ):
+        transport_error = value.get(field)
+        if not isinstance(transport_error, Mapping):
+            continue
+        status = transport_error.get("httpStatusCode")
+        return _provider_http_status_failure_code(status)
+    return None
+
+
+def _provider_http_status_failure_code(status: object) -> str:
+    """Classify only a declared HTTP status, never a provider response body."""
+
+    if not isinstance(status, int) or isinstance(status, bool):
+        return "turn_failed_provider_rejected"
+    if status in {400, 413, 422}:
+        return "turn_failed_invalid_request"
+    if status in {401, 403}:
+        return "turn_failed_authentication"
+    if status == 429:
+        return "turn_failed_rate_limited"
+    if status in {408, 504}:
+        return "turn_failed_provider_timeout"
+    if 500 <= status <= 599:
+        return "turn_failed_provider_unavailable"
     return "turn_failed_provider_rejected"
 
 
@@ -321,15 +399,101 @@ async def _interrupt(turn: Any, timeout_seconds: float) -> None:
         return
 
 
+def _app_server_environment(
+    worker_environment: Mapping[str, str],
+    runtime_path: Path | None,
+) -> dict[str, str]:
+    """Return the narrowly inherited app-server environment.
+
+    The worker environment is already profile-resolved and contains only the
+    allowlisted runtime variables plus the approved credential handles.  Codex
+    feedback diagnostics otherwise serialize verbose startup context into its
+    local SQLite feedback log, so keep the Rust log filter at ``error``.
+    """
+
+    environment = dict(worker_environment)
+    environment["RUST_LOG"] = "error"
+    if runtime_path is not None:
+        current_path = environment.get("PATH", "")
+        entries = [str(runtime_path)]
+        entries.extend(
+            entry
+            for entry in current_path.split(os.pathsep)
+            if entry and entry != str(runtime_path)
+        )
+        environment["PATH"] = os.pathsep.join(entries)
+    return environment
+
+
+def _app_server_launch_args(codex_binary: Path, *, hooks_enabled: bool) -> tuple[str, ...]:
+    """Build a Codex app-server command without upstream routing material."""
+
+    launch_args = [str(codex_binary), "--strict-config"]
+    if hooks_enabled:
+        # Resolver-vetted hooks are copied into the otherwise empty
+        # CODEX_HOME.  The SDK has no hook-trust API, so automation must use
+        # the official CLI flag with the exact runtime bundled by the SDK.
+        launch_args.append("--dangerously-bypass-hook-trust")
+    launch_args.extend(("app-server", "--listen", "stdio://"))
+    return tuple(launch_args)
+
+
+def _thread_config_for_api_key_provider(base_url: str) -> dict[str, Any]:
+    """Return the private, in-memory custom-provider override for one thread.
+
+    Codex 0.144.4 no longer implicitly authenticates its built-in ``openai``
+    provider from ``OPENAI_API_KEY``.  The app-server accepts this map only as
+    a thread-start/resume request override; it is never written to the
+    materialized ``config.toml`` or passed on the process command line.
+    """
+
+    return {
+        f"model_providers.{_API_KEY_RUNTIME_PROVIDER}": {
+            "name": "Agent World API-key provider",
+            "base_url": base_url,
+            "env_key": _OPENAI_API_KEY_ENVIRONMENT,
+            "wire_api": "responses",
+            # The Scheduler owns retries.  Do not permit invisible provider
+            # retries below the InvocationBackend boundary.
+            "request_max_retries": 0,
+            "stream_max_retries": 0,
+            "supports_websockets": False,
+        }
+    }
+
+
+def _redactor_for_payload(payload: object) -> Redactor:
+    """Build the outermost error redactor without trusting payload contents.
+
+    Most failures become a typed worker result inside :func:`_run`, where the
+    request's resolved sensitive environment names are available.  SDK/config
+    construction can still throw before that inner handler.  The outer NDJSON
+    protocol must therefore independently know the two framework-owned names,
+    and may add only syntactically valid names supplied by the trusted parent.
+    """
+
+    names = {_OPENAI_API_KEY_ENVIRONMENT, _OPENAI_BASE_URL_ENVIRONMENT}
+    if isinstance(payload, Mapping):
+        raw_names = payload.get("sensitive_environment_names")
+        if isinstance(raw_names, list):
+            names.update(
+                value
+                for value in raw_names
+                if isinstance(value, str) and _ENVIRONMENT_NAME.fullmatch(value)
+            )
+    return Redactor.from_values(
+        value for name in names if (value := os.environ.get(name))
+    )
+
+
 async def _run(payload: dict[str, Any]) -> None:
     started = time.monotonic()
-    raw_credential_names = payload.get("credential_environment_names", [])
-    if not isinstance(raw_credential_names, list) or not all(
-        isinstance(name, str) and _ENVIRONMENT_NAME.fullmatch(name) for name in raw_credential_names
+    raw_sensitive_names = payload.get("sensitive_environment_names", [])
+    if not isinstance(raw_sensitive_names, list) or not all(
+        isinstance(name, str) and _ENVIRONMENT_NAME.fullmatch(name) for name in raw_sensitive_names
     ):
-        raise ValueError("credential_environment_names must contain environment names")
-    credential_values = [os.environ[name] for name in raw_credential_names if os.environ.get(name)]
-    redactor = Redactor.from_values(credential_values)
+        raise ValueError("sensitive_environment_names must contain environment names")
+    redactor = _redactor_for_payload(payload)
     limits = _require_object(payload.get("limits"), "limits")
     emitter = Emitter(
         redactor=redactor,
@@ -341,25 +505,50 @@ async def _run(payload: dict[str, Any]) -> None:
         raise ValueError("unsupported structured output transport")
 
     authentication_kind = _require_string(payload.get("authentication_kind"), "authentication_kind")
-    api_key: str | None = None
-    if authentication_kind == "api_key":
-        authentication_environment = _require_string(
-            payload.get("authentication_environment"), "authentication_environment"
-        )
-        api_key = os.environ.pop(authentication_environment, None)
-        if not api_key:
-            emitter.result(
-                _status_result(
-                    status="needs_human",
-                    started=started,
-                    code="authentication_missing",
-                    message="the resolved API-key credential is unavailable in the worker",
-                )
+    if authentication_kind != "api_key":
+        raise ValueError("only API-key environment authentication is supported")
+    authentication_environment = _require_string(
+        payload.get("authentication_environment"), "authentication_environment"
+    )
+    if authentication_environment != _OPENAI_API_KEY_ENVIRONMENT:
+        raise ValueError("API-key authentication must use OPENAI_API_KEY")
+    if not os.environ.get(authentication_environment):
+        emitter.result(
+            _status_result(
+                status="needs_human",
+                started=started,
+                code="authentication_missing",
+                message="the resolved API-key credential is unavailable in the worker",
             )
-            return
-    elif authentication_kind != "chatgpt":
-        raise ValueError(f"unsupported authentication_kind: {authentication_kind!r}")
-
+        )
+        return
+    raw_base_url_environment = payload.get("openai_base_url_environment")
+    if raw_base_url_environment is None:
+        emitter.result(
+            _status_result(
+                status="needs_human",
+                started=started,
+                code="routing_configuration_missing",
+                message="API-key runtime requires the OPENAI_BASE_URL environment handle",
+            )
+        )
+        return
+    base_url_environment = _require_string(
+        raw_base_url_environment, "openai_base_url_environment"
+    )
+    if base_url_environment != _OPENAI_BASE_URL_ENVIRONMENT:
+        raise ValueError("openai_base_url_environment must be OPENAI_BASE_URL")
+    base_url = os.environ.get(base_url_environment)
+    if not base_url:
+        emitter.result(
+            _status_result(
+                status="needs_human",
+                started=started,
+                code="routing_environment_missing",
+                message="the resolved API base-URL environment is unavailable in the worker",
+            )
+        )
+        return
     try:
         from openai_codex import (  # type: ignore[import-not-found]
             ApprovalMode,
@@ -509,52 +698,17 @@ async def _run(payload: dict[str, Any]) -> None:
     completed_turn: dict[str, Any] | None = None
 
     try:
-        app_server_environment = dict(os.environ)
-        if runtime_path is not None:
-            current_path = app_server_environment.get("PATH", "")
-            entries = [str(runtime_path)]
-            entries.extend(
-                entry
-                for entry in current_path.split(os.pathsep)
-                if entry and entry != str(runtime_path)
-            )
-            app_server_environment["PATH"] = os.pathsep.join(entries)
-        launch_args = [str(codex_binary), "--strict-config"]
-        if hooks_enabled:
-            # Resolver-vetted hooks are copied into the otherwise empty
-            # CODEX_HOME.  The SDK has no hook-trust API, so automation must use
-            # the official CLI flag with the exact runtime bundled by the SDK.
-            launch_args.append("--dangerously-bypass-hook-trust")
-        launch_args.extend(("app-server", "--listen", "stdio://"))
+        app_server_environment = _app_server_environment(os.environ, runtime_path)
+        launch_args = _app_server_launch_args(codex_binary, hooks_enabled=hooks_enabled)
         config = CodexConfig(
             cwd=str(workspace),
             env=app_server_environment,
-            launch_args_override=tuple(launch_args),
+            launch_args_override=launch_args,
             client_name="agent_world_foundry",
             client_title="Agent World Foundry",
             client_version=PROTOCOL_VERSION,
         )
         async with AsyncCodex(config) as codex:
-            if authentication_kind == "api_key":
-                try:
-                    await codex.login_api_key(str(api_key))
-                finally:
-                    api_key = None
-            account = await codex.account(refresh_token=False)
-            if getattr(account, "account", None) is None:
-                emitter.result(
-                    _status_result(
-                        status="needs_human",
-                        started=started,
-                        code="authentication_failed",
-                        message=(
-                            "Codex did not report an authenticated account in the isolated home"
-                        ),
-                        backend_version=sdk_version,
-                    )
-                )
-                return
-
             base_instructions = _require_string(
                 payload.get("base_instructions"), "base_instructions"
             )
@@ -563,14 +717,22 @@ async def _run(payload: dict[str, Any]) -> None:
             )
             model = _require_string(payload.get("model"), "model")
             model_provider = _optional_string(payload.get("model_provider"), "model_provider")
+            if model_provider != _API_KEY_RUNTIME_PROVIDER:
+                raise ValueError("API-key profile must use the framework-owned custom provider")
+            thread_config = _thread_config_for_api_key_provider(base_url)
             requested_thread_id = payload.get("thread_id")
             if requested_thread_id is None:
                 thread = await codex.thread_start(
                     approval_mode=ApprovalMode.deny_all,
                     base_instructions=base_instructions,
+                    config=thread_config,
                     cwd=str(workspace),
                     developer_instructions=developer_instructions,
-                    ephemeral=False,
+                    # The SDK's official ephemeral mode prevents Codex from
+                    # persisting session rollout material locally.  Any later
+                    # resume must use the explicit framework-owned thread id
+                    # and otherwise fails closed.
+                    ephemeral=True,
                     model=model,
                     model_provider=model_provider,
                 )
@@ -579,6 +741,7 @@ async def _run(payload: dict[str, Any]) -> None:
                     _require_string(requested_thread_id, "thread_id"),
                     approval_mode=ApprovalMode.deny_all,
                     base_instructions=base_instructions,
+                    config=thread_config,
                     cwd=str(workspace),
                     developer_instructions=developer_instructions,
                     model=model,
@@ -738,17 +901,21 @@ async def _run(payload: dict[str, Any]) -> None:
     turn_status = completed_turn.get("status")
     if turn_status != "completed":
         error = completed_turn.get("error")
-        error_message = error.get("message") if isinstance(error, dict) else None
+        terminal_code = (
+            _terminal_turn_failure_code(error)
+            if turn_status == "failed"
+            else f"turn_{turn_status or 'unknown'}"
+        )
         emitter.result(
             _status_result(
                 status="failed" if turn_status == "failed" else "cancelled",
                 started=started,
-                code=(
-                    _terminal_turn_failure_code(error)
-                    if turn_status == "failed"
-                    else f"turn_{turn_status or 'unknown'}"
-                ),
-                message=str(error_message or f"Codex turn ended with {turn_status!r}"),
+                code=terminal_code,
+                # A provider's terminal ``message`` and ``additionalDetails``
+                # are opaque response text.  Persist only the fixed code so
+                # endpoint, credential, request, and provider transcript
+                # fragments can never cross the worker boundary.
+                message=terminal_code,
                 retryable=turn_status == "failed",
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -810,6 +977,7 @@ async def _run(payload: dict[str, Any]) -> None:
 
 def main() -> int:
     started = time.monotonic()
+    payload: object | None = None
     line = sys.stdin.buffer.readline(8 * 1024 * 1024 + 1)
     if len(line) > 8 * 1024 * 1024:
         _write_encoded(
@@ -836,7 +1004,7 @@ def main() -> int:
         asyncio.run(_run(payload))
         return 0
     except Exception as exc:
-        redactor = Redactor()
+        redactor = _redactor_for_payload(payload)
         _write_encoded(
             _encode_record(
                 {

@@ -17,6 +17,7 @@ from agent_world.designer.models import (
     RuleBoundReferenceDraft,
     RuleLookupByKeyDraft,
     RuleReferenceDraft,
+    ToolRuleBoundLookupByReferenceDraft,
 )
 from agent_world.designer.rule_context import (
     RuleContextCatalog,
@@ -241,6 +242,7 @@ def test_prompt_projection_uses_compact_aliases_without_losing_frozen_bindings()
             group["source"],
             group["collection_pointer"],
             group["key_field"],
+            group["key_value_type"],
             value["binding_id"],
             value["value_pointer"],
             value["value_type"],
@@ -256,6 +258,7 @@ def test_prompt_projection_uses_compact_aliases_without_losing_frozen_bindings()
             binding.source,
             binding.collection_pointer,
             binding.key_field,
+            binding.key_value_type,
             alias,
             binding.value_pointer,
             binding.value_type,
@@ -268,6 +271,44 @@ def test_prompt_projection_uses_compact_aliases_without_losing_frozen_bindings()
     assert all(
         catalog.resolve_lookup_binding(alias) is binding for alias, binding in aliases.items()
     )
+    lookup_reference_aliases = catalog.prompt_lookup_reference_bindings()
+    projected_lookup_references = {
+        (
+            group["source"],
+            group["collection_pointer"],
+            group["key_field"],
+            group["key_value_type"],
+            group["value_pointer"],
+            group["value_type"],
+            item["binding_id"],
+            item["key_source"],
+            item["key_pointer"],
+        )
+        for group in projection["lookup_reference_binding_groups"]
+        if isinstance(group, dict)
+        for item in group["reference_key_bindings"]
+        if isinstance(item, dict)
+    }
+    frozen_lookup_references = {
+        (
+            binding.lookup_binding.source,
+            binding.lookup_binding.collection_pointer,
+            binding.lookup_binding.key_field,
+            binding.lookup_binding.key_value_type,
+            binding.lookup_binding.value_pointer,
+            binding.lookup_binding.value_type,
+            alias,
+            binding.key_binding.source,
+            binding.key_binding.pointer,
+        )
+        for alias, binding in lookup_reference_aliases.items()
+    }
+    assert projected_lookup_references == frozen_lookup_references
+    assert all(alias.startswith("lookup-ref-") for alias in lookup_reference_aliases)
+    assert all(
+        catalog.resolve_lookup_reference_binding(alias) is binding
+        for alias, binding in lookup_reference_aliases.items()
+    )
     reference_aliases = catalog.prompt_reference_bindings()
     assert all(alias.startswith("ref-") for alias in reference_aliases)
     assert all(
@@ -277,6 +318,7 @@ def test_prompt_projection_uses_compact_aliases_without_losing_frozen_bindings()
     serialized_projection = json.dumps(projection, sort_keys=True)
     assert "binding:reference:" not in serialized_projection
     assert "binding:lookup:" not in serialized_projection
+    assert "binding:lookup_reference:" not in serialized_projection
     legacy = [
         binding.prompt_projection()
         for binding in sorted(catalog.lookup_bindings.values(), key=lambda item: item.binding_id)
@@ -311,6 +353,14 @@ def test_bound_tool_terms_expand_only_from_frozen_local_defs_catalog() -> None:
         for alias, binding in catalog.prompt_lookup_bindings().items()
         if binding == booking_status
     )
+    booking_status_reference_alias = next(
+        alias
+        for alias, binding in catalog.prompt_lookup_reference_bindings().items()
+        if (
+            binding.lookup_binding == booking_status
+            and binding.key_binding == args_booking_id
+        )
+    )
     issues: list[StructuredSemanticIssue] = []
 
     direct = _materialize_term_bindings(
@@ -332,6 +382,15 @@ def test_bound_tool_terms_expand_only_from_frozen_local_defs_catalog() -> None:
         issues=issues,
         path=("clauses", 1, "left"),
     )
+    flat_lookup = _materialize_term_bindings(
+        ToolRuleBoundLookupByReferenceDraft(
+            kind="bound_lookup_by_reference",
+            binding_id=booking_status_reference_alias,
+        ),
+        catalog=catalog,
+        issues=issues,
+        path=("clauses", 2, "left"),
+    )
 
     assert issues == []
     assert isinstance(direct, RuleReferenceDraft)
@@ -342,6 +401,7 @@ def test_bound_tool_terms_expand_only_from_frozen_local_defs_catalog() -> None:
         "value_type": "string",
     }
     assert isinstance(lookup, RuleLookupByKeyDraft)
+    assert flat_lookup == lookup
     assert lookup.model_dump(mode="json") == {
         "kind": "lookup_by_key",
         "source": "post_state",
@@ -356,6 +416,27 @@ def test_bound_tool_terms_expand_only_from_frozen_local_defs_catalog() -> None:
         "value_pointer": "/status",
         "value_type": "string",
     }
+
+
+def test_lookup_reference_catalog_pairs_only_same_terminal_field_and_type() -> None:
+    catalog = _catalog_with_local_entity_refs()
+
+    bindings = tuple(catalog.lookup_reference_bindings.values())
+    assert bindings
+    assert all(
+        binding.key_binding.pointer.rsplit("/", 1)[-1]
+        == binding.lookup_binding.key_field
+        for binding in bindings
+    )
+    assert all(
+        binding.key_binding.value_type == binding.lookup_binding.key_value_type
+        for binding in bindings
+    )
+    assert not any(
+        binding.key_binding.pointer == "/status"
+        and binding.lookup_binding.key_field == "booking_id"
+        for binding in bindings
+    )
 
 
 def test_raw_tool_reference_is_rejected_before_core_rule_compilation() -> None:

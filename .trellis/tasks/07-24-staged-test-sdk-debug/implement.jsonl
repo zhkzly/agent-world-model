@@ -1,0 +1,3 @@
+{"file":"docs/plans/staged-test-and-debug-plan.md","reason":"Authoritative staged test/debug order, redlines, bad-case routing, and minimum reports."}
+{"file":"docs/agent-world-environment-generation.zh.md","reason":"Canonical architecture constraints for executable environment generation and InvocationBackend ownership."}
+{"file":".trellis/spec/agent_world/backend/index.md","reason":"Applicable backend invocation, credential, and deterministic verification conventions."}

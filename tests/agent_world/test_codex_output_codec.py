@@ -31,6 +31,7 @@ from agent_world.invocation.codex_sdk import (
     CodexSdkBackend,
     _decode_json_envelope,
     _decode_provider_json_ir,
+    _open_ephemeral_sqlite_home,
     _provider_output_schema,
 )
 
@@ -40,10 +41,12 @@ def _request(tmp_path: Path) -> InvocationRequest:
         AgentBackendConfig(
             model="configured-real-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+            openai_base_url_environment="OPENAI_BASE_URL",
         ),
         source_environment={
             "PATH": "/usr/bin:/bin",
             "AGENT_WORLD_TEST_MODEL_KEY": "test-model-credential",
+            "OPENAI_BASE_URL": "https://provider.example.test/v1",
         },
     )
     logical_schema = {
@@ -101,6 +104,9 @@ def test_worker_payload_passes_logical_schema_directly_to_codex_sdk(
 
     assert payload["output_schema"] == _provider_output_schema(request.profile.output_schema or {})
     assert payload["prompt"] == request.prompt
+    assert payload["openai_base_url_environment"] == "OPENAI_BASE_URL"
+    assert payload["sensitive_environment_names"] == ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
+    assert "provider.example.test" not in json.dumps(payload, sort_keys=True)
     assert payload["output_schema"]["properties"]["dynamic"] == {
         "type": "object",
         "properties": {
@@ -189,6 +195,7 @@ async def test_started_worker_protocol_error_is_retryable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     request = _request(tmp_path)
+    captured_environment: dict[str, str] = {}
 
     class FakeStdin:
         def write(self, _: bytes) -> None:
@@ -214,7 +221,10 @@ async def test_started_worker_protocol_error_is_retryable(
         async def wait(self) -> int:
             return 0
 
-    async def fake_worker(*_: object, **__: object) -> FakeProcess:
+    async def fake_worker(*_: object, **kwargs: object) -> FakeProcess:
+        environment = kwargs.get("env")
+        assert isinstance(environment, dict)
+        captured_environment.update(environment)
         return FakeProcess()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_worker)
@@ -225,6 +235,16 @@ async def test_started_worker_protocol_error_is_retryable(
     assert result.error is not None
     assert result.error.code == "worker_protocol_error"
     assert result.error.retryable is True
+    assert "CODEX_SQLITE_HOME" in captured_environment
+
+
+def test_ephemeral_sqlite_home_is_memory_backed_and_removed_after_use() -> None:
+    with _open_ephemeral_sqlite_home() as sqlite_home_text:
+        sqlite_home = Path(sqlite_home_text)
+        assert sqlite_home.parent == Path("/dev") / "shm"
+        assert sqlite_home.is_dir()
+
+    assert not sqlite_home.exists()
 
 
 def test_provider_schema_compiler_closes_pydantic_objects_and_unions() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 import pytest
 from pydantic import HttpUrl, ValidationError
 
+import agent_world.research.providers as research_providers
 from agent_world.config import ResearchConfig
 from agent_world.contracts import PermissionScope
 from agent_world.research import (
@@ -103,8 +105,7 @@ async def test_real_html_extraction_is_parallel_and_native_parser_stays_out_of_p
         "<h1>Reservation workflow</h1><p>"
         + (
             "A guest selects dates and room inventory before confirming a reservation. "
-            "The service records availability, confirmation, and cancellation state. "
-            * 12
+            "The service records availability, confirmation, and cancellation state. " * 12
         )
         + "</p></main></body></html>"
     ).encode("utf-8")
@@ -223,14 +224,16 @@ async def test_rfc2544_synthetic_egress_is_explicit_and_never_implied(
         host: str,
         port: int,
         *,
+        family: int,
         type: int,
     ) -> list[tuple[int, int, int, str, tuple[str, int]]]:
         assert host == "public.example"
-        assert type == __import__("socket").SOCK_STREAM
+        assert family in {socket.AF_UNSPEC, socket.AF_INET}
+        assert type == socket.SOCK_STREAM
         return [
             (
-                __import__("socket").AF_INET,
-                __import__("socket").SOCK_STREAM,
+                socket.AF_INET,
+                socket.SOCK_STREAM,
                 6,
                 "",
                 ("198.18.0.160", port),
@@ -249,6 +252,90 @@ async def test_rfc2544_synthetic_egress_is_explicit_and_never_implied(
     resolution = await explicit_policy.resolve("https://public.example/reference")
     assert resolution.uses_synthetic_egress
     assert tuple(str(item) for item in resolution.addresses) == ("198.18.0.160",)
+
+
+@pytest.mark.asyncio
+async def test_synthetic_egress_dual_stack_dns_is_restricted_to_ipv4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested_families: list[int] = []
+
+    def dual_stack_fake_ip_getaddrinfo(
+        host: str,
+        port: int,
+        *,
+        family: int,
+        type: int,
+    ) -> list[tuple[int, int, int, str, tuple[object, ...]]]:
+        assert host == "public.example"
+        assert type == socket.SOCK_STREAM
+        requested_families.append(family)
+        if family == socket.AF_INET:
+            return [
+                (
+                    socket.AF_INET,
+                    socket.SOCK_STREAM,
+                    6,
+                    "",
+                    ("198.18.0.160", port),
+                )
+            ]
+        return [
+            (
+                socket.AF_INET6,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                ("fdfe:dcba:9876::cf", port, 0, 0),
+            ),
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                ("198.18.0.160", port),
+            ),
+        ]
+
+    monkeypatch.setattr("socket.getaddrinfo", dual_stack_fake_ip_getaddrinfo)
+    with pytest.raises(ResearchProviderError, match="reserved source address denied"):
+        await UrlPolicy(dns_timeout_seconds=0.5).resolve("https://public.example/reference")
+
+    explicit_policy = UrlPolicy(
+        allow_rfc2544_synthetic_egress=True,
+        dns_timeout_seconds=0.5,
+    )
+    resolution = await explicit_policy.resolve("https://public.example/reference")
+
+    assert requested_families == [socket.AF_UNSPEC, socket.AF_INET]
+    assert resolution.uses_synthetic_egress
+    assert tuple(str(item) for item in resolution.addresses) == ("198.18.0.160",)
+
+
+def test_synthetic_egress_http_transport_is_bound_to_ipv4(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = object()
+    local_addresses: list[str] = []
+
+    def fake_transport(*, local_address: str) -> object:
+        local_addresses.append(local_address)
+        return sentinel
+
+    monkeypatch.setattr(
+        research_providers.httpx,
+        "AsyncHTTPTransport",
+        fake_transport,
+    )
+
+    assert (
+        research_providers._async_http_transport(  # noqa: SLF001
+            UrlPolicy(allow_rfc2544_synthetic_egress=True)
+        )
+        is sentinel
+    )
+    assert research_providers._async_http_transport(UrlPolicy()) is None  # noqa: SLF001
+    assert local_addresses == ["0.0.0.0"]  # noqa: S104
 
 
 @pytest.mark.asyncio
@@ -287,7 +374,7 @@ def test_research_content_is_normalized_and_secret_scanned_without_truncation() 
         )
 
 
-_SERVER_SOURCE = r'''
+_SERVER_SOURCE = r"""
 import json
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -334,7 +421,7 @@ class Handler(BaseHTTPRequestHandler):
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 print(server.server_port, flush=True)
 server.serve_forever()
-'''
+"""
 
 
 @pytest.mark.asyncio

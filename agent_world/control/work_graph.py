@@ -56,6 +56,9 @@ _REQUIRED_PRODUCTION_STAGES = frozenset(
     }
 )
 _BEHAVIOR_STAGES = frozenset({"shared_tool_semantics", "tool_semantics_batch"})
+# BC-17: a four-tool physical batch exhausted a 65,536-token provider turn.
+# Two-tool batches get a hard framework-owned ceiling instead of more retries.
+TOOL_SEMANTICS_BATCH_TOKEN_CEILING = 32_768
 
 
 def _has_complete_production_topology(
@@ -832,18 +835,18 @@ def tool_semantics_batch_definition(
             budget=OperationBudget(
                 wall_seconds=agent_wall_seconds,
                 first_progress_seconds=min(60.0, agent_wall_seconds),
-                llm_tokens=agent_token_limit,
+                llm_tokens=min(agent_token_limit, TOOL_SEMANTICS_BATCH_TOKEN_CEILING),
                 agent_turns=1,
                 monetary_cost=agent_monetary_limit,
             ),
             agent_role="environment_engineer",
             capability_profile_id="profile:environment-engineer",
-            output_contract_id="contract:tool-semantics-batch-source",
+            output_contract_id="contract:tool-semantics-batch-source.v7",
         ),
         validation_policy=ValidationPolicy(
             policy_id=f"validation:tool-semantics:{digest}",
             validator_id="validator:tool-semantics-batch",
-            validator_revision_id="framework.validator.tool-semantics-batch.v1",
+            validator_revision_id="framework.validator.tool-semantics-batch.v5",
             validation_phase="tool_semantics",
             frontier_ordinal=20,
             claim_id=claim_id,
@@ -1901,7 +1904,9 @@ def derive_final_design_definitions(
         or len(scheduled_tool_ids) != len(declared_tool_ids)
     ):
         raise WorkGraphError("ToolCouplingPlan does not freeze an exact tool-batch partition")
-    if any(not batch or len(batch) > 4 for batch in execution_batches):
+    # Defense in depth for unvalidated/model-constructed coupling plans.  The
+    # typed ToolSemantics source contract carries the same two-tool cap.
+    if any(not batch or len(batch) > 2 for batch in execution_batches):
         raise WorkGraphError("ToolCouplingPlan contains an invalid physical batch")
 
     context_slot = ArtifactSlotContract(
