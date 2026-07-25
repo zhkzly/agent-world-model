@@ -303,6 +303,23 @@ def build_breadcrumb(
     return f"<workflow-state>\n{header}\n{body}\n</workflow-state>"
 
 
+def _failed_direct_observability_hint() -> str | None:
+    """Return an advisory scene pointer without making the hook authoritative.
+
+    The sibling ``observability_hint`` module reads only bounded, non-live
+    durable state and never touches the application composition root.  Any
+    failure (missing module, missing config, malformed state) is a silent
+    no-op: this per-prompt breadcrumb must never affect a session.
+    """
+
+    try:
+        from observability_hint import failed_direct_observability_hint
+
+        return failed_direct_observability_hint()
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Entry
 # ---------------------------------------------------------------------------
@@ -378,6 +395,10 @@ def main() -> int:
         parts.append(_codex_mode_banner(config))
         parts.append(breadcrumb)
         breadcrumb = "\n\n".join(parts)
+
+    observability_hint = _failed_direct_observability_hint()
+    if observability_hint is not None:
+        breadcrumb = f"{breadcrumb}\n\n<current-state>\n{observability_hint}\n</current-state>"
 
     # Kiro (CLI userPromptSubmit / IDE promptSubmit) adds a hook's stdout
     # directly to the conversation context — no JSON envelope. Emit the bare
