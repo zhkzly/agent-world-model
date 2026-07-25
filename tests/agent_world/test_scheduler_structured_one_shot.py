@@ -9,6 +9,7 @@ failure to the Scheduler rather than entering the legacy local retry loop.
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,7 +43,13 @@ from agent_world.control.leaf_executor import (
 from agent_world.control.validation import pydantic_validation_diagnostic
 from agent_world.control.work import ValidationIssue, WorkAttempt
 from agent_world.control.work_graph import structured_agent_work_definition
-from agent_world.designer.models import CompactFieldSemanticDraft, StateFieldSourceDraft
+from agent_world.designer.models import (
+    ActorAuthoritySourceDraft,
+    CompactFieldSemanticDraft,
+    StateFieldSourceDraft,
+    ToolInterfaceSourceDraft,
+    ToolSurfacePlan,
+)
 from agent_world.designer.one_shot import invoke_structured_once
 from agent_world.designer.validation import StructuredSemanticError, StructuredSemanticIssue
 from agent_world.invocation import (
@@ -688,6 +695,97 @@ def test_unknown_pydantic_value_error_remains_a_non_actionable_framework_diagnos
     issue = diagnostic.issues[0]
     assert issue.code == "framework_diagnostic_incomplete"
     assert issue.retryable is False
+
+
+@pytest.mark.parametrize(
+    ("model", "payload", "expected_code", "expected_condition", "expected_category"),
+    (
+        (
+            ToolSurfacePlan,
+            {
+                "tool_id": "hotel.search",
+                "namespace": "hotel",
+                "name": "search",
+                "description": "Search bookable hotels.",
+                "transport": "runtime",
+                "reads_state_entities": ["hotel", "hotel"],
+                "writes_state_entities": [],
+                "evidence_claim_ids": ["claim-1"],
+            },
+            "schema_tool_plan_read_state_duplicate",
+            "read-state entities must be unique",
+            "a read-state entity list without repeats",
+        ),
+        (
+            ToolSurfacePlan,
+            {
+                "tool_id": "hotel.search",
+                "namespace": "hotel",
+                "name": "search",
+                "description": "Search bookable hotels.",
+                "transport": "runtime",
+                "reads_state_entities": [],
+                "writes_state_entities": [],
+                "evidence_claim_ids": ["claim-1"],
+            },
+            "schema_tool_plan_state_footprint_empty",
+            "a tool plan must read or write at least one state entity",
+            "a non-empty read/write state footprint",
+        ),
+        (
+            ToolInterfaceSourceDraft,
+            {"input_fields": [], "output_fields": [], "observation_fields": []},
+            "schema_tool_interface_result_fields_missing",
+            "a tool interface must expose a result",
+            "at least one output or observation field",
+        ),
+        (
+            ActorAuthoritySourceDraft,
+            {"actor": "guest", "authorities": ["book", "book"]},
+            "schema_actor_authority_duplicate",
+            "actor authorities must be unique",
+            "an authority list without repeats",
+        ),
+    ),
+)
+def test_bc14_designer_semantic_validators_keep_a_repairable_identity(
+    model: type[BaseModel],
+    payload: dict[str, JsonValue],
+    expected_code: str,
+    expected_condition: str,
+    expected_category: str,
+) -> None:
+    """BC-14: a Rule/ToolSemantics-path violation must stay field-addressable.
+
+    These validators previously raised an untyped ``ValueError``, which the
+    canonical translator could only render as the generic, non-actionable
+    ``framework_diagnostic_incomplete`` -- discarding the real violated
+    condition and denying the Agent any repairable identity.  Each case now
+    proves the stable code, the safe condition, and the expected category all
+    survive translation.
+    """
+
+    # Production validates provider output in JSON mode (see
+    # ``invoke_structured_once``): these contracts are strict, and their tuple
+    # fields arrive as JSON arrays.  Python-mode validation would reject the
+    # shape before the semantic validator under test could run.
+    with pytest.raises(ValidationError) as captured:
+        model.model_validate_json(json.dumps(payload))
+
+    diagnostic = pydantic_validation_diagnostic(
+        captured.value,
+        owner_component="design",
+        validation_phase="semantic_contract",
+        frontier_ordinal=3,
+    )
+
+    codes = {issue.code for issue in diagnostic.issues}
+    assert "framework_diagnostic_incomplete" not in codes
+    issue = next(item for item in diagnostic.issues if item.code == expected_code)
+    assert issue.violated_condition == expected_condition
+    assert issue.expected_category == expected_category
+    assert issue.actionable_for_agent is True
+    assert diagnostic.actionable_for_agent is True
 
 
 @pytest.mark.asyncio

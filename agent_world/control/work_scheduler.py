@@ -188,6 +188,33 @@ class WorkScheduler:
             raise WorkResumeError("scheduler manifest does not bind its executable graph")
         self.external_root_refs = self.manifest.external_root_refs
 
+    def _diagnostic_terminal_blocks(self, evaluation: FeedbackEvaluation) -> bool:
+        """Whether a diagnostic terminal may still be treated as blocking.
+
+        ``FeedbackEvaluation`` *requires* ``readiness_effect == "observes"``
+        whenever ``diagnostic_only`` is set (see its validator): a diagnostic
+        verdict must never claim authority to block the captured graph it was
+        cloned from.  Without this allowance, one diagnostic terminal in a
+        ``test-node`` copy makes ``snapshot()`` unbuildable, so *every* other
+        coordinate in that scope becomes permanently undispatchable -- the
+        diagnostic clone poisons itself.
+
+        Inside a marked diagnostic runtime the copy is already the throwaway
+        artifact, so treating that terminal as locally blocking is exactly the
+        honest reading: the node did terminate, and this scheduler cannot
+        release anything.  The guard deliberately mirrors the conditions of
+        ``allow_diagnostic_ancestors``; a normal release runtime keeps the
+        original strict invariant and can never reach this branch.
+        """
+
+        return (
+            evaluation.diagnostic_only
+            and not evaluation.releasable
+            and self.runtime is not None
+            and self.runtime.diagnostic_only
+            and has_test_node_diagnostic_marker(self.heads.root)
+        )
+
     def snapshot(self) -> WorkScheduleSnapshot:
         active: dict[str, tuple[WorkCommit, ArtifactRef]] = {}
         scheduled: dict[str, ScheduledWork] = {}
@@ -292,7 +319,10 @@ class WorkScheduler:
                     head.evaluation_ref,
                     FeedbackEvaluation,
                 )
-                if evaluation.readiness_effect not in {"blocks", "invalidates"}:
+                if evaluation.readiness_effect not in {
+                    "blocks",
+                    "invalidates",
+                } and not self._diagnostic_terminal_blocks(evaluation):
                     raise WorkResumeError("terminal Work evaluation does not block readiness")
                 scheduled[key] = ScheduledWork(
                     coordinate=definition.coordinate,

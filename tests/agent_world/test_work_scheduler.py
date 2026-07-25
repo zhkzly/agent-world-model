@@ -22,6 +22,7 @@ from agent_world.control import (
     deterministic_boundary_work_definition,
 )
 from agent_world.control.telemetry import TelemetryStore
+from agent_world.control.work_store import WorkResumeError
 
 
 def _definition(
@@ -698,3 +699,136 @@ def test_blocked_group_blocks_aggregate_with_exact_evaluation(tmp_path: Path) ->
     )
     assert aggregate_state.state == "blocked"
     assert len(aggregate_state.blocking_evaluation_refs) == 1
+
+
+def _diagnostic_terminal_scope(tmp_path: Path, *, mark_clone: bool):
+    """Build one scope whose only terminal head is a diagnostic ``observes`` verdict.
+
+    ``FeedbackEvaluation`` requires ``readiness_effect == "observes"`` whenever
+    ``diagnostic_only`` is set, so this is the exact shape every ``test-node``
+    copy acquires once one node terminates inside the clone.
+    """
+
+    scope_id = "job:diagnostic-terminal"
+    coordinate = WorkCoordinate(
+        scope_id=scope_id,
+        component="verifier",
+        stage="verifier_intent",
+        artifact_slot="verifier_intent",
+    )
+    definition = _definition(
+        scope_id=scope_id,
+        component="integration",
+        stage="first",
+        coordinate=coordinate,
+        dependencies=(),
+    )
+    graph = GenerationWorkGraph.compile((definition,), groups=(), mode="diagnostic")
+    artifacts = ArtifactStore(tmp_path / "artifacts").issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.", "verifier."),
+    )
+    heads = WorkControlStore(tmp_path / "heads")
+    if mark_clone:
+        heads.mark_test_node_diagnostic_clone()
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(Budget(wall_seconds=1_000, tool_calls=100)),
+        diagnostic_only=True,
+    )
+    root_ref = artifacts.put_json(
+        artifact_id="request",
+        artifact_type="control.environment_request",
+        value={"need": "hotel"},
+    )
+    failed_ref = artifacts.put_json(
+        artifact_id="failed-intent",
+        artifact_type="verifier.intent",
+        value={"invalid": True},
+        dependencies=(root_ref,),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=definition,
+        input_refs=(root_ref,),
+        subject_ref=failed_ref,
+        output_refs=(failed_ref,),
+        issues=(("invalid_intent", ("intent",), "intent is invalid", "valid intent"),),
+    )
+    manifest = graph.manifest(
+        topology_id="topology:diagnostic-terminal",
+        external_root_refs=(root_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(root_ref,),
+    )
+    return coordinate, graph, manifest, manifest_ref, heads, artifacts, runtime
+
+
+def test_diagnostic_observes_terminal_does_not_poison_its_own_clone(tmp_path: Path) -> None:
+    """A diagnostic terminal must not make its whole clone undispatchable.
+
+    ``snapshot()`` used to require every terminal evaluation to block readiness.
+    But a diagnostic verdict is contractually forbidden from blocking (it must
+    be ``observes``), so a single terminated node inside a ``test-node`` copy
+    raised ``terminal Work evaluation does not block readiness`` and made every
+    other coordinate in that scope permanently undispatchable -- the clone
+    poisoned itself, which is why repeated single-node debugging runs could never
+    reach their target.
+    """
+
+    (
+        coordinate,
+        graph,
+        manifest,
+        manifest_ref,
+        heads,
+        artifacts,
+        runtime,
+    ) = _diagnostic_terminal_scope(tmp_path, mark_clone=True)
+
+    snapshot = WorkScheduler(
+        graph=graph,
+        manifest=manifest,
+        manifest_ref=manifest_ref,
+        heads=heads,
+        artifacts=artifacts,
+        runtime=runtime,
+    ).snapshot()
+
+    state = next(item for item in snapshot.work if item.coordinate == coordinate)
+    assert state.state == "blocked"
+    assert len(state.blocking_evaluation_refs) == 1
+
+
+def test_unmarked_state_root_keeps_the_strict_terminal_readiness_invariant(
+    tmp_path: Path,
+) -> None:
+    """The allowance is scoped to a marked diagnostic clone, nothing wider.
+
+    Without the ``test-node`` marker the original strict invariant still holds,
+    so a normal release scope can never quietly accept a non-blocking terminal.
+    """
+
+    (
+        _coordinate,
+        graph,
+        manifest,
+        manifest_ref,
+        heads,
+        artifacts,
+        runtime,
+    ) = _diagnostic_terminal_scope(tmp_path, mark_clone=False)
+
+    with pytest.raises(WorkResumeError):
+        WorkScheduler(
+            graph=graph,
+            manifest=manifest,
+            manifest_ref=manifest_ref,
+            heads=heads,
+            artifacts=artifacts,
+            runtime=runtime,
+        ).snapshot()
