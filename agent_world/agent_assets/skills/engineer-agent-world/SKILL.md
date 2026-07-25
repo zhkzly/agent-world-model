@@ -57,12 +57,66 @@ Before returning, mechanically inspect each clause: never copy `ordering` from a
 onto an equality or containment clause. The output objects are closed; a field legal for one
 operator is still forbidden on every other operator.
 
+Arithmetic is deliberately **non-recursive**: `arithmetic.left` and `arithmetic.right` are each one
+atom — a constant, a context reference, or a bound lookup — and `value_type` must be `number` on
+both. Never nest another `arithmetic` (or a clause) inside an operand. Express a multi-step
+computation as a declared numeric state field or a bound lookup, not as a nested expression tree;
+there is no expression language here.
+
+Every `state_transition.transition` array is non-empty: a tool that changes state must declare at
+least one transition Rule. Do not emit an empty transition list and rely on prose elsewhere.
+
+Every `binding_id` is a closed enum, and **each term type draws from its own catalog**. The
+namespaces are not interchangeable: pick the term type first, then copy an id byte-for-byte from
+that term's catalog in the provided rule context.
+
+| term type | catalog in the rule context | alias shape |
+| --- | --- | --- |
+| direct reference | `reference_bindings` | `ref-NN` |
+| lookup by literal key | `lookup_binding_groups[*].value_bindings` | `lookup-NN` |
+| lookup by reference key | `lookup_reference_binding_groups[*].reference_key_bindings` | `lookup-ref-NN` |
+
+Copy the alias exactly as listed, including its zero padding (`ref-03`, never `ref-3`). Never use a
+`ref-NN` where the term is a lookup, never use a `lookup-ref-NN` for a direct reference, and never
+mint an id or renumber the sequence. This applies to every term position, including `left` and
+`right` of any `state_transition` clause. Before returning, walk each clause term and confirm its
+`binding_id` appears verbatim in that term type's own catalog.
+
 Lookup keys use one flat, closed variant. For a reference key, use
 `bound_lookup_by_reference` with the single composite `binding_id` listed in
 `lookup_reference_binding_groups`; never combine a lookup alias with a separate reference alias.
 For a literal key, use `bound_lookup_by_constant` with one lookup `binding_id`, `key_value_type`,
 and `key_value`. Never emit `key_binding_id`, a nested `key`, arithmetic as a key, another lookup
 as a key, or raw reference/pointer fields.
+
+## Tool-semantics reliability closure
+
+Every error code named anywhere in `reliability` is a closed enum drawn from the **same tool's own**
+`errors.errors[*].error_code`. Author that `errors` array first, then reference only codes it
+declares:
+
+- `reliability.timeout.timeout_error_code`
+- `reliability.rollback.rollback_trigger_codes[*]`
+- `reliability.concurrency.conflict_error_code` (when not null)
+- `reliability.retry.retryable_error_codes[*]`, which additionally require the referenced error to
+  be declared `retryable: true`
+
+`reliability.compensation` tools are likewise a closed enum over the frozen tool inventory. Never
+invent an operational error code, reuse one from a sibling tool in the batch, or describe a failure
+mode the `errors` section never declared. Before returning, mechanically list this tool's declared
+`error_code` values and confirm every reliability reference is a member of that set, and that each
+retryable reference points at a `retryable: true` error.
+
+## Tool-semantics access closure
+
+`access_observation.permission` binds to the frozen boundary: each `allowed_actors` entry is a
+frozen boundary actor, and each scope is one of that actor's frozen authorities.
+
+When `allowed_actors` covers **every** frozen boundary actor and a `condition` is present, that
+condition is universal and its `case_sensitivity` must be `positive_and_negative`: a rule that
+admits all actors has to state both the positive and the negative case. A `condition` must also use
+family `permission` and the required `rule_id` prefix. Before returning, check whether the actor set
+is exhaustive and, if it is, that `case_sensitivity` is `positive_and_negative`.
 
 ## Build mode
 

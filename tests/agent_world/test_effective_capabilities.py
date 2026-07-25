@@ -254,7 +254,7 @@ def test_tool_free_engineer_profile_requires_closed_evidence_claim_catalog(
     assert "Tool-semantics Rule clause closure" in profile.developer_instructions
     assert "they **must omit** `ordering`" in profile.developer_instructions
     assert "Lookup keys use one flat, closed variant" in profile.developer_instructions
-    assert "Never emit a nested `key`, arithmetic as a key" in profile.developer_instructions
+    assert "a nested `key`, arithmetic as a key" in profile.developer_instructions
 
 
 def test_profile_identity_binds_even_unused_job_permission_scope(tmp_path: Path) -> None:
