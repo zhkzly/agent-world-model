@@ -569,8 +569,7 @@ class GenerationWorkGraph:
 
         for definition in definitions:
             parents = tuple(
-                by_key[parent.coordinate_key]
-                for parent in definition.dependency_coordinates
+                by_key[parent.coordinate_key] for parent in definition.dependency_coordinates
             )
             if parents and not definition.input_slots:
                 raise WorkGraphError(
@@ -1864,8 +1863,7 @@ def derive_final_design_definitions(
     architecture = tuple(
         item
         for item in bootstrap_definitions
-        if (item.coordinate.component, item.coordinate.stage)
-        == ("design", "world_architecture")
+        if (item.coordinate.component, item.coordinate.stage) == ("design", "world_architecture")
     )
     if len(architecture) != 1:
         raise WorkGraphError("final Design derivation requires exactly one Architecture definition")
@@ -1879,8 +1877,7 @@ def derive_final_design_definitions(
     synthesis = tuple(
         item
         for item in bootstrap_definitions
-        if (item.coordinate.component, item.coordinate.stage)
-        == ("research", "evidence_synthesis")
+        if (item.coordinate.component, item.coordinate.stage) == ("research", "evidence_synthesis")
     )
     if len(synthesis) != 1:
         raise WorkGraphError(
@@ -1893,9 +1890,7 @@ def derive_final_design_definitions(
     if not groups or not execution_batches:
         raise WorkGraphError("ToolCouplingPlan must contain groups and execution batches")
 
-    declared_tool_ids = tuple(
-        tool_id for group in groups for tool_id in group.ordered_tool_ids
-    )
+    declared_tool_ids = tuple(tool_id for group in groups for tool_id in group.ordered_tool_ids)
     scheduled_tool_ids = tuple(tool_id for batch in execution_batches for tool_id in batch)
     if (
         not declared_tool_ids
@@ -2104,8 +2099,8 @@ def derive_final_design_definitions(
         claim="Reset rules and cross-tool invariants compile over the exact committed behavior.",
         timing_reason="Task generation needs an executable, invariant-closed world.",
         output_contract_id="contract:world-rules-source.v3",
-        acceptance_transform_id="framework.world-rules-compiler.v3",
-        validator_revision_id="framework.validator.world-rules.v3",
+        acceptance_transform_id="framework.world-rules-compiler.v4",
+        validator_revision_id="framework.validator.world-rules.v4",
         agent_role="environment_engineer",
         allowed_mutation_roots=("/initial_state_rules", "/invariants"),
         agent_wall_seconds=agent_wall_seconds,
@@ -2528,7 +2523,7 @@ def verifier_plan_work_definition(
                     producer_component="verifier",
                     confidentiality="framework_private",
                 ),
-            )
+            ),
         }
     )
 
@@ -2754,7 +2749,7 @@ def _code_component_definition(
                     producer_component=component,
                 )
                 for artifact_type in output_types
-            )
+            ),
         }
     )
 

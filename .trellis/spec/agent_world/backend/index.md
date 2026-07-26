@@ -296,6 +296,14 @@ telemetry observation, or a new design plan.
   behavior are proven.
 - WorldRules owns business initial-state/invariant meaning only. Framework validates every path and
   compiles Rule IR; it never asks the model to repair framework-generated ids or schema syntax.
+- `WorldRuleSemanticsSourceDraft.RuleDraft.rule_id` is optional input mechanics, never business
+  meaning. Before persistence or core compilation, framework code canonicalizes it away and derives
+  `rule:state:<ordinal>` for `initial_state_rules.initial_state_constraints` and
+  `rule:world:<ordinal>` for `invariants` from the frozen section plus ordinal.
+- Rule family remains Agent-owned semantic content: the first section uses `initial_state` and the
+  second uses `invariant`. A wrong family is a safe actionable diagnostic; an identity prefix or
+  duplicate failure is a non-retryable framework invariant and must not enter an
+  `AgentCorrectionBrief`.
 - The full pre-Build Direct proposal graph has at most eight base turns: two research,
   architecture, an optional multi-batch shared contract, one or two tool batches, world rules and
   curriculum. A global WorkGraph budget currently reserves at most two semantic corrections, so
@@ -306,6 +314,9 @@ telemetry observation, or a new design plan.
 
 - Unknown business path in Agent RuleDraft -> local WorldRules correction.
 - Invalid framework-compiled path/id/schema -> framework failure, no semantic correction.
+- Wrong WorldRules source family -> local WorldRules correction with a section-relative path;
+  arbitrary/missing Agent IDs -> canonical source plus deterministic compiled identity, not a
+  correction prompt.
 - Transaction projection above 192 KiB or total turn bound -> reject before invocation.
 - Provider retryable failure below the bound -> bounded fresh-session retry under the same target.
 
@@ -321,6 +332,9 @@ telemetry observation, or a new design plan.
 
 - Assert eight tools form at most two stable batches and nested tool identity drift fails locally.
 - Assert WorldRules compile only after all tool batches and preserve source evidence bindings.
+- Assert arbitrary WorldRules `rule_id` values are absent from the persisted canonical source and
+  compile to the two framework namespaces; assert a wrong section family remains the only
+  corresponding actionable source diagnostic.
 - Measure every real semantic transaction's wall time, tokens, repair mode and projection size.
 
 ### 7. Wrong vs Correct

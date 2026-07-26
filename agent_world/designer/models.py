@@ -767,11 +767,10 @@ RuleClauseDraft = Annotated[
 class RuleDraft(AgentOutput):
     """Agent-facing Rule ADT deterministically compiled into the core Rule IR."""
 
-    # A rule id names a framework IR object; it is not business semantics.  A
-    # ToolSemanticsBatch therefore derives this value from its frozen tool id,
-    # section and ordinal before the proposal is persisted or compiled.  Other
-    # older source boundaries still require it during their own compilation,
-    # which lets this migration remain local to the production tool leaf.
+    # A rule id names a framework IR object; it is not business semantics.
+    # ToolSemanticsBatch and WorldRules derive it from their frozen section and
+    # ordinal before a proposal is persisted or compiled.  Other legacy source
+    # boundaries may still require an identity during their own compilation.
     rule_id: Identifier | None = None
     family: RuleFamily
     description: Annotated[str, Field(min_length=1)]
@@ -1664,9 +1663,7 @@ class ToolCouplingGroupPlan(V2Contract):
     # compatible historical two-tool shard without replaying it.
     batches: Annotated[
         tuple[
-            Annotated[
-                tuple[Identifier, ...], Field(min_length=1, max_length=4)
-            ],
+            Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=4)],
             ...,
         ],
         Field(min_length=1, max_length=MAX_SEMANTICS_BATCHES),
@@ -1702,9 +1699,7 @@ class ToolCouplingPlan(V2Contract):
     # inspect a captured ancestor closure in diagnostic mode.
     execution_batches: Annotated[
         tuple[
-            Annotated[
-                tuple[Identifier, ...], Field(min_length=1, max_length=4)
-            ],
+            Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=4)],
             ...,
         ],
         Field(min_length=1, max_length=MAX_SEMANTICS_BATCHES),

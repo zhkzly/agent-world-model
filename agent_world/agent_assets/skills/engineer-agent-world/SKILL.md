@@ -16,6 +16,25 @@ Build a real programmatic environment whose observable behavior is defined by `W
 3. Keep tasks, runtime behavior, and verification requirements derived from the same WorldSpec.
 4. Return exactly the requested structured contract version.
 
+## WorldRules semantic ownership
+
+When the requested output is `WorldRuleSemanticsSourceDraft`, author only two semantic sections:
+
+- `initial_state_rules.initial_state_constraints` contains reset-validity Rules and every Rule uses
+  family `initial_state`.
+- `invariants` contains cross-tool Rules that hold after reset and every tool transition, and every
+  Rule uses family `invariant`.
+
+`RuleDraft.rule_id` is a framework IR identity, not business meaning. Omit this optional field for
+WorldRules even if it appears in the output schema. Framework code derives stable
+`rule:state:<ordinal>` and `rule:world:<ordinal>` values from the frozen section and ordinal; do
+not guess, copy, repair, or satisfy an ID-prefix convention in model output.
+
+Use only the frozen architecture, state schemas, committed ToolSemantics, and evidence claims. A
+WorldRule is a general executable property, never a fixed scenario, task goal, expected answer, or
+trajectory. Do not restate schema validity as a full `schema_valid` invariant when framework code
+already owns schema validation, and never read evaluator-only `task_goal`.
+
 ## Closed evidence-claim binding
 
 `evidence_claim_catalog[*].claim_id` is a closed enum for every

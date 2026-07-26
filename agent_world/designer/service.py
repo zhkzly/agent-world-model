@@ -1732,6 +1732,7 @@ class EnvironmentDesigner:
             state_shape,
             boundary=boundary,
             evidence_graph=evidence_graph,
+            diagnostic_retryable=False,
         )
         # Architecture freezes schema closure only. Executable reset rules are
         # authored in the later WorldRules transaction against this exact shape.
@@ -1747,6 +1748,7 @@ class EnvironmentDesigner:
             tool_plan_inventory,
             boundary=boundary,
             evidence_graph=evidence_graph,
+            diagnostic_retryable=False,
         )
         schema_index = 0
         surfaces: list[ToolSurfaceDraft] = []
@@ -2727,8 +2729,7 @@ class EnvironmentDesigner:
                         issue.violated_condition or f"semantic contract {issue.code}"
                     ),
                     expected_category=(
-                        issue.expected_category
-                        or "a value satisfying the named semantic contract"
+                        issue.expected_category or "a value satisfying the named semantic contract"
                     ),
                 )
                 for issue in exc.issues
@@ -7320,6 +7321,7 @@ class EnvironmentDesigner:
         *,
         boundary: WorldBoundaryDraft,
         evidence_graph: EvidenceGraph,
+        diagnostic_retryable: bool = True,
     ) -> None:
         # Reuse the durable StateSchema validator for recursive JSON Schema and
         # entity identity closure while this node intentionally owns no Rules.
@@ -7329,27 +7331,56 @@ class EnvironmentDesigner:
             initial_state_constraints=(),
         )
         root_properties = draft.root_state_schema.get("properties")
+        issues: list[SafeValidationIssue] = []
         if draft.root_state_schema.get("type") != "object" or not isinstance(
             root_properties,
             dict,
         ):
-            raise ValueError("root_state_schema must be an object with explicit properties")
-        for actor in boundary.boundary.actors_and_authority:
-            if len(set(actor.visibility)) != len(actor.visibility):
-                raise ValueError(f"actor {actor.actor} reset visibility fields must be unique")
-            unknown = set(actor.visibility) - set(root_properties)
-            if unknown:
-                raise ValueError(
-                    f"actor {actor.actor} reset visibility references unknown fields: "
-                    f"{sorted(unknown)}"
+            issues.append(
+                SafeValidationIssue(
+                    "world_state_shape_root_schema",
+                    ("root_state_schema",),
+                    "The root state schema must be an object with explicit properties.",
+                    retryable=diagnostic_retryable,
                 )
+            )
+            root_properties = {}
+        for actor_index, actor in enumerate(boundary.boundary.actors_and_authority):
+            seen_visibility: set[str] = set()
+            for visibility_index, field_name in enumerate(actor.visibility):
+                location = (
+                    "boundary",
+                    "actors_and_authority",
+                    actor_index,
+                    "visibility",
+                    visibility_index,
+                )
+                if field_name in seen_visibility:
+                    issues.append(
+                        SafeValidationIssue(
+                            "world_state_shape_visibility_duplicate",
+                            location,
+                            "Each actor visibility field may appear only once.",
+                            retryable=diagnostic_retryable,
+                        )
+                    )
+                if field_name not in root_properties:
+                    issues.append(
+                        SafeValidationIssue(
+                            "world_state_shape_visibility_unknown",
+                            location,
+                            "Actor visibility may reference only root state properties.",
+                            retryable=diagnostic_retryable,
+                        )
+                    )
+                seen_visibility.add(field_name)
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        issues: list[SafeValidationIssue] = []
         for entity_index, entity in enumerate(draft.entities):
             issues += EnvironmentDesigner._evidence_claim_closure_issues(
                 entity.evidence_claim_ids,
                 path=("entities", entity_index, "evidence_claim_ids"),
                 known_claims=known_claims,
+                retryable=diagnostic_retryable,
             )
         if issues:
             raise StructuredValidationError(
@@ -8019,30 +8050,41 @@ class EnvironmentDesigner:
             root_state_schema=state_shape.root_state_schema,
             initial_state_constraints=draft.initial_state_constraints,
         )
-        invalid_families = {
-            rule.rule_id
-            for rule in draft.initial_state_constraints
-            if rule.family != "initial_state"
-        }
-        if invalid_families:
-            raise ValueError(
-                f"initial-state rules use the wrong family: {sorted(invalid_families)}"
-            )
-        invalid_ids = {
-            rule.rule_id
-            for rule in draft.initial_state_constraints
-            if not rule.rule_id.startswith("rule:state:")
-        }
-        if invalid_ids:
-            raise ValueError(
-                f"initial-state rule ids must start with rule:state:: {sorted(invalid_ids)}"
-            )
-        rule_ids = [rule.rule_id for rule in draft.initial_state_constraints]
-        if len(set(rule_ids)) != len(rule_ids):
-            raise ValueError("initial-state rule ids must be unique")
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
         issues: list[SafeValidationIssue] = []
+        seen_rule_ids: set[str] = set()
         for rule_index, rule in enumerate(draft.initial_state_constraints):
+            if rule.family != "initial_state":
+                issues.append(
+                    SafeValidationIssue(
+                        "initial_state_rule_family",
+                        ("initial_state_constraints", rule_index, "family"),
+                        "Initial-state rules must use the initial_state family.",
+                    )
+                )
+            if not rule.rule_id.startswith("rule:state:"):
+                issues.append(
+                    SafeValidationIssue(
+                        "initial_state_rule_id_prefix",
+                        ("initial_state_constraints", rule_index, "rule_id"),
+                        "Initial-state Rule ids must use the rule:state: prefix.",
+                        # WorldRules derives this id from the frozen section
+                        # and ordinal.  A bad value here therefore signals a
+                        # framework/compiler defect, never an Agent-owned
+                        # semantic correction.
+                        retryable=False,
+                    )
+                )
+            if rule.rule_id in seen_rule_ids:
+                issues.append(
+                    SafeValidationIssue(
+                        "initial_state_rule_id_duplicate",
+                        ("initial_state_constraints", rule_index, "rule_id"),
+                        "Initial-state Rule ids must be unique.",
+                        retryable=False,
+                    )
+                )
+            seen_rule_ids.add(rule.rule_id)
             issues += EnvironmentDesigner._evidence_claim_closure_issues(
                 rule.evidence_claim_ids,
                 path=("initial_state_constraints", rule_index, "evidence_claim_ids"),
@@ -8078,24 +8120,44 @@ class EnvironmentDesigner:
         boundary: WorldBoundaryDraft,
         evidence_graph: EvidenceGraph,
     ) -> None:
-        if len(draft.tool_surfaces) > MAX_WORLD_TOOL_SURFACES:
-            raise ValueError(
-                f"tool inventory exceeds the {MAX_WORLD_TOOL_SURFACES}-tool design bound"
-            )
-        tool_ids = [item.surface.tool_id for item in draft.tool_surfaces]
-        if len(set(tool_ids)) != len(tool_ids):
-            raise ValueError("tool inventory tool_id values must be unique")
-        namespaces = set(boundary.boundary.tool_namespaces)
-        undeclared = {item.surface.namespace for item in draft.tool_surfaces} - namespaces
-        if undeclared:
-            raise ValueError(f"tool namespaces are absent from WorldBoundary: {sorted(undeclared)}")
-        known_claims = {claim.claim_id for claim in evidence_graph.claims}
         issues: list[SafeValidationIssue] = []
+        if len(draft.tool_surfaces) > MAX_WORLD_TOOL_SURFACES:
+            issues.append(
+                SafeValidationIssue(
+                    "world_tool_inventory_bound",
+                    ("tool_surfaces",),
+                    "Tool inventory must not exceed the framework tool limit.",
+                    retryable=False,
+                )
+            )
+        namespaces = set(boundary.boundary.tool_namespaces)
+        known_claims = {claim.claim_id for claim in evidence_graph.claims}
+        seen_tool_ids: set[str] = set()
         for tool_index, tool in enumerate(draft.tool_surfaces):
+            if tool.surface.tool_id in seen_tool_ids:
+                issues.append(
+                    SafeValidationIssue(
+                        "world_tool_inventory_id_duplicate",
+                        ("tool_surfaces", tool_index, "surface", "tool_id"),
+                        "Tool inventory ids must be unique.",
+                        retryable=False,
+                    )
+                )
+            seen_tool_ids.add(tool.surface.tool_id)
+            if tool.surface.namespace not in namespaces:
+                issues.append(
+                    SafeValidationIssue(
+                        "world_tool_inventory_namespace_unknown",
+                        ("tool_surfaces", tool_index, "surface", "namespace"),
+                        "Tool inventory namespaces must exist in the frozen WorldBoundary.",
+                        retryable=False,
+                    )
+                )
             issues += EnvironmentDesigner._evidence_claim_closure_issues(
                 tool.evidence_claim_ids,
                 path=("tool_surfaces", tool_index, "evidence_claim_ids"),
                 known_claims=known_claims,
+                retryable=False,
             )
         if issues:
             raise StructuredValidationError(
@@ -8113,38 +8175,75 @@ class EnvironmentDesigner:
         *,
         boundary: WorldBoundaryDraft,
         evidence_graph: EvidenceGraph,
+        diagnostic_retryable: bool = True,
     ) -> None:
+        issues: list[SafeValidationIssue] = []
         if len(draft.tools) > MAX_WORLD_TOOL_SURFACES:
-            raise ValueError(
-                f"tool plan inventory exceeds the {MAX_WORLD_TOOL_SURFACES}-tool design bound"
+            issues.append(
+                SafeValidationIssue(
+                    "world_tool_plan_bound",
+                    ("tools",),
+                    "Tool plan inventory must not exceed the framework tool limit.",
+                    retryable=diagnostic_retryable,
+                )
             )
-        tool_ids = [item.tool_id for item in draft.tools]
-        if len(set(tool_ids)) != len(tool_ids):
-            raise ValueError("tool plan inventory tool_id values must be unique")
         namespaces = set(boundary.boundary.tool_namespaces)
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
-        claim_issues: list[SafeValidationIssue] = []
+        seen_tool_ids: set[str] = set()
         for tool_index, item in enumerate(draft.tools):
-            if item.tool_id != f"{item.namespace}.{item.name}":
-                raise ValueError("planned tool_id must equal '<namespace>.<name>'")
-            if item.namespace not in namespaces:
-                raise ValueError(
-                    f"planned tool namespace is absent from WorldBoundary: {item.namespace}"
+            if item.tool_id in seen_tool_ids:
+                issues.append(
+                    SafeValidationIssue(
+                        "world_tool_plan_id_duplicate",
+                        ("tools", tool_index, "tool_id"),
+                        "Tool plan ids must be unique.",
+                        retryable=diagnostic_retryable,
+                    )
                 )
-            if len(set(item.evidence_claim_ids)) != len(item.evidence_claim_ids):
-                raise ValueError(f"planned tool {item.tool_id} evidence claims must be unique")
-            claim_issues += EnvironmentDesigner._evidence_claim_closure_issues(
+            seen_tool_ids.add(item.tool_id)
+            if item.tool_id != f"{item.namespace}.{item.name}":
+                issues.append(
+                    SafeValidationIssue(
+                        "world_tool_plan_id_mismatch",
+                        ("tools", tool_index, "tool_id"),
+                        "tool_id must equal the plan namespace and name.",
+                        retryable=diagnostic_retryable,
+                    )
+                )
+            if item.namespace not in namespaces:
+                issues.append(
+                    SafeValidationIssue(
+                        "world_tool_plan_namespace_unknown",
+                        ("tools", tool_index, "namespace"),
+                        "Tool namespace must exist in the frozen WorldBoundary.",
+                        retryable=diagnostic_retryable,
+                    )
+                )
+            seen_claim_ids: set[str] = set()
+            for claim_index, claim_id in enumerate(item.evidence_claim_ids):
+                if claim_id in seen_claim_ids:
+                    issues.append(
+                        SafeValidationIssue(
+                            "world_tool_plan_evidence_claim_duplicate",
+                            ("tools", tool_index, "evidence_claim_ids", claim_index),
+                            "Tool evidence claim ids must be unique.",
+                            retryable=diagnostic_retryable,
+                        )
+                    )
+                seen_claim_ids.add(claim_id)
+            issues += EnvironmentDesigner._evidence_claim_closure_issues(
                 item.evidence_claim_ids,
                 path=("tools", tool_index, "evidence_claim_ids"),
                 known_claims=known_claims,
+                retryable=diagnostic_retryable,
             )
-        if claim_issues:
+        if issues:
             raise StructuredValidationError(
                 ValidationDiagnostic(
                     owner_component="design",
                     validation_phase="tool_plan_inventory_semantics",
                     frontier_ordinal=40,
-                    issues=tuple(claim_issues),
+                    issues=tuple(issues),
                 )
             )
 
@@ -8155,8 +8254,20 @@ class EnvironmentDesigner:
         plan: ToolSurfacePlan,
     ) -> None:
         if draft.tool_id != plan.tool_id:
-            raise ValueError(
-                f"tool surface schemas must target {plan.tool_id}, got {draft.tool_id}"
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_surface_schemas_semantics",
+                    frontier_ordinal=40,
+                    issues=(
+                        SafeValidationIssue(
+                            "world_tool_surface_schema_target_mismatch",
+                            ("tool_id",),
+                            "Tool surface schemas must target the frozen tool plan.",
+                            retryable=False,
+                        ),
+                    ),
+                )
             )
         for label, schema in (
             ("input", draft.input_schema),
@@ -8176,10 +8287,34 @@ class EnvironmentDesigner:
         plan: ToolSurfacePlan,
         schema_kind: str,
     ) -> None:
+        issues: list[SafeValidationIssue] = []
         if draft.tool_id != plan.tool_id:
-            raise ValueError(f"tool schema must target {plan.tool_id}, got {draft.tool_id}")
+            issues.append(
+                SafeValidationIssue(
+                    "world_tool_schema_target_mismatch",
+                    ("tool_id",),
+                    "Tool schema must target the frozen tool plan.",
+                    retryable=False,
+                )
+            )
         if draft.schema_kind != schema_kind:
-            raise ValueError(f"tool schema kind must remain {schema_kind}, got {draft.schema_kind}")
+            issues.append(
+                SafeValidationIssue(
+                    "world_tool_schema_kind_mismatch",
+                    ("schema_kind",),
+                    "Tool schema kind must match the frozen schema role.",
+                    retryable=False,
+                )
+            )
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="tool_schema_semantics",
+                    frontier_ordinal=40,
+                    issues=tuple(issues),
+                )
+            )
         EnvironmentDesigner._validate_locally_closed_object_schema(
             draft.json_schema,
             subject=f"tool {plan.tool_id} {schema_kind}",
@@ -8541,9 +8676,7 @@ class EnvironmentDesigner:
                     EnvironmentDesigner._compile_rule_draft(
                         draft,
                         rule_id=(
-                            f"{rule_id_prefix}:{index}"
-                            if rule_id_prefix is not None
-                            else None
+                            f"{rule_id_prefix}:{index}" if rule_id_prefix is not None else None
                         ),
                     )
                 )
@@ -8574,10 +8707,29 @@ class EnvironmentDesigner:
     def _compile_initial_state_rules_source(
         source: InitialStateRulesSourceDraft,
     ) -> InitialStateRulesDraft:
+        issues = tuple(
+            SafeValidationIssue(
+                "initial_state_rule_family",
+                ("initial_state_rules", "initial_state_constraints", index, "family"),
+                "Initial-state rules must use the initial_state family.",
+            )
+            for index, rule in enumerate(source.initial_state_constraints)
+            if rule.family != "initial_state"
+        )
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="world_rules_source_compile",
+                    frontier_ordinal=40,
+                    issues=issues,
+                )
+            )
         return InitialStateRulesDraft(
             initial_state_constraints=EnvironmentDesigner._compile_rule_sequence(
                 source.initial_state_constraints,
                 path=("initial_state_rules", "initial_state_constraints"),
+                rule_id_prefix="rule:state",
             )
         )
 
@@ -8803,10 +8955,29 @@ class EnvironmentDesigner:
     def _compile_world_closure_source(
         source: WorldClosureSourceDraft,
     ) -> WorldClosureDraft:
+        issues = tuple(
+            SafeValidationIssue(
+                "world_invariant_rule_family",
+                ("invariants", index, "family"),
+                "World invariants must use the invariant family.",
+            )
+            for index, rule in enumerate(source.invariants)
+            if rule.family != "invariant"
+        )
+        if issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="world_rules_source_compile",
+                    frontier_ordinal=40,
+                    issues=issues,
+                )
+            )
         return WorldClosureDraft(
             invariants=EnvironmentDesigner._compile_rule_sequence(
                 source.invariants,
                 path=("invariants",),
+                rule_id_prefix="rule:world",
             )
         )
 
@@ -8962,71 +9133,146 @@ class EnvironmentDesigner:
     ) -> None:
         """Close identity/state/tool-surface references before behavior fan-out."""
 
+        issues: list[SafeValidationIssue] = []
         try:
             TaskDimensionsDraft(task_dimensions=draft.task_dimensions)
-        except ValidationError as exc:
+        except ValidationError:
             if not allow_task_dimension_rework:
-                raise ValueError(
-                    "world skeleton task dimensions must be stable Identifiers"
-                ) from exc
+                issues.append(
+                    SafeValidationIssue(
+                        "world_skeleton_task_dimension_invalid",
+                        ("task_dimensions",),
+                        "World skeleton task dimensions must be stable identifiers.",
+                        retryable=False,
+                    )
+                )
         if len(draft.tool_surfaces) > MAX_WORLD_TOOL_SURFACES:
-            raise ValueError(
-                f"world skeleton exceeds the {MAX_WORLD_TOOL_SURFACES}-tool design bound"
+            issues.append(
+                SafeValidationIssue(
+                    "world_skeleton_tool_bound",
+                    ("tool_surfaces",),
+                    "World skeleton must not exceed the framework tool limit.",
+                    retryable=False,
+                )
             )
-        tool_ids = [item.surface.tool_id for item in draft.tool_surfaces]
-        if len(set(tool_ids)) != len(tool_ids):
-            raise ValueError("world skeleton tool_id values must be unique")
         namespaces = set(draft.boundary.tool_namespaces)
-        undeclared = {item.surface.namespace for item in draft.tool_surfaces} - namespaces
-        if undeclared:
-            raise ValueError(f"tool namespaces are absent from WorldBoundary: {sorted(undeclared)}")
         root_properties = draft.state.root_state_schema.get("properties")
         if draft.state.root_state_schema.get("type") != "object" or not isinstance(
             root_properties,
             dict,
         ):
-            raise ValueError("root_state_schema must be an object with explicit properties")
-        for actor in draft.boundary.actors_and_authority:
-            if len(set(actor.visibility)) != len(actor.visibility):
-                raise ValueError(f"actor {actor.actor} reset visibility fields must be unique")
-            unknown = set(actor.visibility) - set(root_properties)
-            if unknown:
-                raise ValueError(
-                    f"actor {actor.actor} reset visibility references unknown fields: "
-                    f"{sorted(unknown)}"
+            issues.append(
+                SafeValidationIssue(
+                    "world_skeleton_root_schema",
+                    ("state", "root_state_schema"),
+                    "World skeleton root state schema must be an object with explicit properties.",
+                    retryable=False,
                 )
+            )
+            root_properties = None
+
+        seen_tool_ids: set[str] = set()
+        for tool_index, tool in enumerate(draft.tool_surfaces):
+            if tool.surface.tool_id in seen_tool_ids:
+                issues.append(
+                    SafeValidationIssue(
+                        "world_skeleton_tool_id_duplicate",
+                        ("tool_surfaces", tool_index, "surface", "tool_id"),
+                        "World skeleton tool ids must be unique.",
+                        retryable=False,
+                    )
+                )
+            seen_tool_ids.add(tool.surface.tool_id)
+            if tool.surface.namespace not in namespaces:
+                issues.append(
+                    SafeValidationIssue(
+                        "world_skeleton_tool_namespace_unknown",
+                        ("tool_surfaces", tool_index, "surface", "namespace"),
+                        "World skeleton tool namespaces must exist in the frozen WorldBoundary.",
+                        retryable=False,
+                    )
+                )
+
+        if root_properties is not None:
+            for actor_index, actor in enumerate(draft.boundary.actors_and_authority):
+                seen_visibility: set[str] = set()
+                for visibility_index, field_name in enumerate(actor.visibility):
+                    location = (
+                        "boundary",
+                        "actors_and_authority",
+                        actor_index,
+                        "visibility",
+                        visibility_index,
+                    )
+                    if field_name in seen_visibility:
+                        issues.append(
+                            SafeValidationIssue(
+                                "world_skeleton_visibility_duplicate",
+                                location,
+                                "World skeleton actor visibility fields must be unique.",
+                                retryable=False,
+                            )
+                        )
+                    if field_name not in root_properties:
+                        issues.append(
+                            SafeValidationIssue(
+                                "world_skeleton_visibility_unknown",
+                                location,
+                                "World skeleton actor visibility may reference only root "
+                                "state properties.",
+                                retryable=False,
+                            )
+                        )
+                    seen_visibility.add(field_name)
 
         known_claims = {claim.claim_id for claim in evidence_graph.claims}
         check = EnvironmentDesigner._evidence_claim_closure_issues
-        issues: list[SafeValidationIssue] = []
         for entity_index, entity in enumerate(draft.state.entities):
             issues += check(
                 entity.evidence_claim_ids,
                 path=("state", "entities", entity_index, "evidence_claim_ids"),
                 known_claims=known_claims,
+                retryable=False,
             )
         for rule_index, rule in enumerate(draft.state.initial_state_constraints):
             issues += check(
                 rule.evidence_claim_ids,
                 path=("state", "initial_state_constraints", rule_index, "evidence_claim_ids"),
                 known_claims=known_claims,
+                retryable=False,
             )
         for tool_index, tool in enumerate(draft.tool_surfaces):
             issues += check(
                 tool.evidence_claim_ids,
                 path=("tool_surfaces", tool_index, "evidence_claim_ids"),
                 known_claims=known_claims,
+                retryable=False,
             )
         for fidelity_index, fidelity in enumerate(draft.fidelity):
             issues += check(
                 fidelity.evidence_claim_ids,
                 path=("fidelity", fidelity_index, "evidence_claim_ids"),
                 known_claims=known_claims,
+                retryable=False,
             )
             if fidelity.level == "bounded_approximation" and fidelity.known_divergence is None:
-                raise ValueError("bounded approximation requires known_divergence")
+                issues.append(
+                    SafeValidationIssue(
+                        "world_skeleton_bounded_divergence_missing",
+                        ("fidelity", fidelity_index, "known_divergence"),
+                        "Bounded approximation fidelity requires a known divergence.",
+                        retryable=False,
+                    )
+                )
             if fidelity.level == "faithful" and fidelity.known_divergence is not None:
-                raise ValueError("faithful fidelity cannot declare known_divergence")
+                issues.append(
+                    SafeValidationIssue(
+                        "world_skeleton_faithful_divergence_forbidden",
+                        ("fidelity", fidelity_index, "known_divergence"),
+                        "Faithful fidelity must not declare a known divergence.",
+                        retryable=False,
+                    )
+                )
         if issues:
             raise StructuredValidationError(
                 ValidationDiagnostic(
@@ -10913,6 +11159,7 @@ class EnvironmentDesigner:
             state_shape,
             boundary=boundary,
             evidence_graph=evidence_graph,
+            diagnostic_retryable=False,
         )
         EnvironmentDesigner._validate_initial_state_rules_draft(
             source.initial_state_rules,
@@ -10925,6 +11172,7 @@ class EnvironmentDesigner:
             source.tool_inventory,
             boundary=boundary,
             evidence_graph=evidence_graph,
+            diagnostic_retryable=False,
         )
         surface_drafts: list[ToolSurfaceDraft] = []
         schema_index = 0
@@ -11009,6 +11257,7 @@ class EnvironmentDesigner:
         *,
         path: tuple[str | int, ...],
         known_claims: set[str],
+        retryable: bool = True,
     ) -> list[SafeValidationIssue]:
         """Report the exact field position of every unknown evidence claim.
 
@@ -11027,6 +11276,7 @@ class EnvironmentDesigner:
                         (*path, claim_index),
                         "Use only an exact evidence claim id from the frozen "
                         "evidence graph, or leave this field empty.",
+                        retryable=retryable,
                     )
                 )
         return issues
@@ -11068,8 +11318,7 @@ class EnvironmentDesigner:
         for constraint_index, constraint in enumerate(draft.state.initial_state_constraints):
             issues += check(
                 constraint.evidence_claim_ids,
-                path=("state", "initial_state_constraints", constraint_index,
-                      "evidence_claim_ids"),
+                path=("state", "initial_state_constraints", constraint_index, "evidence_claim_ids"),
                 known_claims=known_claims,
             )
         for tool_index, tool in enumerate(draft.tools):
@@ -11083,28 +11332,53 @@ class EnvironmentDesigner:
                 for rule_index, rule in enumerate(getattr(semantics, section)):
                     issues += check(
                         rule.evidence_claim_ids,
-                        path=("tools", tool_index, "semantics", section, rule_index,
-                              "evidence_claim_ids"),
+                        path=(
+                            "tools",
+                            tool_index,
+                            "semantics",
+                            section,
+                            rule_index,
+                            "evidence_claim_ids",
+                        ),
                         known_claims=known_claims,
                     )
             for error_index, error in enumerate(semantics.errors):
                 issues += check(
                     error.evidence_claim_ids,
-                    path=("tools", tool_index, "semantics", "errors", error_index,
-                          "evidence_claim_ids"),
+                    path=(
+                        "tools",
+                        tool_index,
+                        "semantics",
+                        "errors",
+                        error_index,
+                        "evidence_claim_ids",
+                    ),
                     known_claims=known_claims,
                 )
                 issues += check(
                     error.when.evidence_claim_ids,
-                    path=("tools", tool_index, "semantics", "errors", error_index,
-                          "when", "evidence_claim_ids"),
+                    path=(
+                        "tools",
+                        tool_index,
+                        "semantics",
+                        "errors",
+                        error_index,
+                        "when",
+                        "evidence_claim_ids",
+                    ),
                     known_claims=known_claims,
                 )
             if semantics.permission.condition is not None:
                 issues += check(
                     semantics.permission.condition.evidence_claim_ids,
-                    path=("tools", tool_index, "semantics", "permission", "condition",
-                          "evidence_claim_ids"),
+                    path=(
+                        "tools",
+                        tool_index,
+                        "semantics",
+                        "permission",
+                        "condition",
+                        "evidence_claim_ids",
+                    ),
                     known_claims=known_claims,
                 )
         for invariant_index, invariant in enumerate(draft.invariants):
@@ -11146,8 +11420,7 @@ class EnvironmentDesigner:
         for constraint_index, constraint in enumerate(draft.state.initial_state_constraints):
             issues += check(
                 constraint.evidence_claim_ids,
-                path=("state", "initial_state_constraints", constraint_index,
-                      "evidence_claim_ids"),
+                path=("state", "initial_state_constraints", constraint_index, "evidence_claim_ids"),
                 known_claims=known_claims,
             )
         for tool_index, tool in enumerate(draft.tools):
@@ -11161,28 +11434,53 @@ class EnvironmentDesigner:
                 for rule_index, rule in enumerate(getattr(semantics, section)):
                     issues += check(
                         rule.evidence_claim_ids,
-                        path=("tools", tool_index, "semantics", section, rule_index,
-                              "evidence_claim_ids"),
+                        path=(
+                            "tools",
+                            tool_index,
+                            "semantics",
+                            section,
+                            rule_index,
+                            "evidence_claim_ids",
+                        ),
                         known_claims=known_claims,
                     )
             for error_index, error in enumerate(semantics.errors):
                 issues += check(
                     error.evidence_claim_ids,
-                    path=("tools", tool_index, "semantics", "errors", error_index,
-                          "evidence_claim_ids"),
+                    path=(
+                        "tools",
+                        tool_index,
+                        "semantics",
+                        "errors",
+                        error_index,
+                        "evidence_claim_ids",
+                    ),
                     known_claims=known_claims,
                 )
                 issues += check(
                     error.when.evidence_claim_ids,
-                    path=("tools", tool_index, "semantics", "errors", error_index,
-                          "when", "evidence_claim_ids"),
+                    path=(
+                        "tools",
+                        tool_index,
+                        "semantics",
+                        "errors",
+                        error_index,
+                        "when",
+                        "evidence_claim_ids",
+                    ),
                     known_claims=known_claims,
                 )
             if semantics.permission.condition is not None:
                 issues += check(
                     semantics.permission.condition.evidence_claim_ids,
-                    path=("tools", tool_index, "semantics", "permission", "condition",
-                          "evidence_claim_ids"),
+                    path=(
+                        "tools",
+                        tool_index,
+                        "semantics",
+                        "permission",
+                        "condition",
+                        "evidence_claim_ids",
+                    ),
                     known_claims=known_claims,
                 )
         for invariant_index, invariant in enumerate(draft.invariants):
@@ -11213,8 +11511,14 @@ class EnvironmentDesigner:
                 for rule_index, rule in enumerate(getattr(task, section)):
                     issues += check(
                         rule.evidence_claim_ids,
-                        path=("curriculum", "task_types", task_index, section, rule_index,
-                              "evidence_claim_ids"),
+                        path=(
+                            "curriculum",
+                            "task_types",
+                            task_index,
+                            section,
+                            rule_index,
+                            "evidence_claim_ids",
+                        ),
                         known_claims=known_claims,
                     )
         for rule_index, rule in enumerate(draft.curriculum.sampling_constraints):
@@ -11441,10 +11745,11 @@ Rule IR rather than leaving them as prose or trusting an LLM during rollout.
 
 Use only the frozen request, evidence claim catalog, WorldSkeleton and compiled ToolSemantics.
 Produce exactly WorldRuleSemanticsSourceDraft. Author the smallest complete initial-state and global
-invariant RuleDraft set. Initial rules use family `initial_state` and ids beginning `rule:state:`;
-global rules use family `invariant` and ids beginning `rule:world:`. Every pointer and value type
-must exist in the frozen schemas, cite only supplied claim ids, and never read task_goal. Rules must
-be general properties, not fixed booking cases, expected answers or trajectories.
+invariant RuleDraft set. Initial rules use family `initial_state`; global rules use family
+`invariant`. Rule identities are framework mechanics: omit optional `rule_id`; code derives stable
+`rule:state:<ordinal>` and `rule:world:<ordinal>` identities after the proposal. Every pointer and
+value type must exist in the frozen schemas, cite only supplied claim ids, and never read task_goal.
+Rules must be general properties, not fixed booking cases, expected answers or trajectories.
 
 Do not change state, schemas, tools or tool semantics; do not emit tasks, reward, verifier, runtime
 code or release decisions. Do not use tools.
@@ -11647,10 +11952,11 @@ Use the framework-frozen `request`, `evidence_graph`, `world_boundary`, and `wor
 JSON inputs below. Produce exactly InitialStateRulesSourceDraft. Emit only genuine global
 constraints on valid initial world state; an empty list is correct when the frozen schemas and later
 task materialization fully determine initialization. Every emitted Rule must use family
-`initial_state`, have a rule_id beginning `rule:state:`, use only the closed typed Rule IR, and
-never read evaluator-only task_goal. Use the discriminated clause variants exactly; ordered clauses
-must choose `number`, `date`, or `date-time`. Cite only exact evidence claim ids. Do not modify the
-state shape or emit tools, tasks, reward, verifier, code, replay, or expected answers.
+`initial_state`, use only the closed typed Rule IR, and never read evaluator-only task_goal. Omit
+optional `rule_id`: framework code derives the stable `rule:state:<ordinal>` identity. Use the
+discriminated clause variants exactly; ordered clauses must choose `number`, `date`, or `date-time`.
+Cite only exact evidence claim ids. Do not modify the state shape or emit tools, tasks, reward,
+verifier, code, replay, or expected answers.
 
 Original need:
 {request.need}
@@ -11865,14 +12171,14 @@ and remains in framework custody. The framework retains and validates the comple
 separately. Produce exactly
 WorldClosureSourceDraft containing the global invariants that must hold across reset and every tool
 transition. Do not change or restate the boundary, state, surfaces, or tool semantics.
-Use only the discriminated closed Rule Draft ADT, only exact ids and schemas from the staged inputs,
-and only exact
-evidence claim ids. Invariant rule ids should start with `rule:world:` and must not read task_goal.
-Cover the supplied core_invariants with executable cross-resource Rules rather than prose. Schema
-validity is already enforced independently by the framework, so do not copy the complete root state
-schema into a `schema_valid` invariant. Do not emit tasks, reward, verifier, runtime code, replay
-trajectories, or expected answers. Framework assembly will validate the complete resulting
-WorldSpec and request a same-session correction if closure fails.
+Use only the discriminated closed Rule Draft ADT, exact staged schemas/constraint ids, and exact
+evidence claim ids. Every rule uses family `invariant`; omit optional `rule_id` because framework
+code derives `rule:world:<ordinal>`. Rules must not read task_goal. Cover the supplied
+core_invariants with executable cross-resource Rules rather than prose. Schema validity is already
+enforced independently by the framework, so do not copy the complete root state schema into a
+`schema_valid` invariant. Do not emit tasks, reward, verifier, runtime code, replay trajectories,
+or expected answers. Framework assembly will validate the complete resulting WorldSpec and request
+a same-session correction if closure fails.
 
 Original need:
 {request.need}

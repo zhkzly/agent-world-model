@@ -421,9 +421,7 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
     )
     coupling = ToolCouplingPlan(
         plan_id="plan:hotel-tools",
-        architecture_ref=_artifact_ref(
-            "architecture:hotel", "design.world_architecture_source"
-        ),
+        architecture_ref=_artifact_ref("architecture:hotel", "design.world_architecture_source"),
         groups=(
             ToolCouplingGroupPlan(
                 group_id="group:booking",
@@ -459,12 +457,8 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
         agent_wall_seconds=120,
         agent_token_limit=10_000,
     )
-    shared = tuple(
-        item for item in definitions if item.coordinate.stage == "shared_tool_semantics"
-    )
-    batches = tuple(
-        item for item in definitions if item.coordinate.stage == "world_behavior"
-    )
+    shared = tuple(item for item in definitions if item.coordinate.stage == "shared_tool_semantics")
+    batches = tuple(item for item in definitions if item.coordinate.stage == "world_behavior")
     rules = next(item for item in definitions if item.coordinate.stage == "world_rules")
     curriculum = next(item for item in definitions if item.coordinate.stage == "task_curriculum")
 
@@ -481,6 +475,8 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
         synthesis.coordinate,
         *(item.coordinate for item in batches),
     )
+    assert rules.proposal_policy.acceptance_transform_id == "framework.world-rules-compiler.v4"
+    assert rules.validation_policy.validator_revision_id == "framework.validator.world-rules.v4"
     assert curriculum.dependency_coordinates == (
         synthesis.coordinate,
         architecture.coordinate,
@@ -507,8 +503,7 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
         for item in batches
     )
     assert all(
-        item.input_slots and item.output_slots
-        for item in (*shared, *batches, rules, curriculum)
+        item.input_slots and item.output_slots for item in (*shared, *batches, rules, curriculum)
     )
 
     graph = complete_generation_work_graph(
@@ -570,9 +565,7 @@ def test_final_design_suffix_does_not_create_shared_contract_for_single_batch_gr
 
     assert not [item for item in definitions if item.coordinate.stage == "shared_tool_semantics"]
     assert batch.dependency_coordinates == (architecture.coordinate, synthesis.coordinate)
-    assert all(
-        slot.slot_id != "input:shared-tool-semantics-contract" for slot in batch.input_slots
-    )
+    assert all(slot.slot_id != "input:shared-tool-semantics-contract" for slot in batch.input_slots)
 
 
 def test_final_design_suffix_rejects_a_coupling_plan_from_another_architecture() -> None:
@@ -652,8 +645,7 @@ def test_complete_generation_graph_freezes_every_verifier_agent_batch_as_physica
     assert verifier_plan.proposal_policy.executor == "code"
     assert all(item.dependency_coordinates == (verifier_plan.coordinate,) for item in batches)
     assert all(
-        item.input_slots[0].artifact_types == ("judge.verifier_batch_plan",)
-        for item in batches
+        item.input_slots[0].artifact_types == ("judge.verifier_batch_plan",) for item in batches
     )
     assert all(
         tuple(slot.artifact_types for slot in item.output_slots)
@@ -694,9 +686,7 @@ def test_complete_generation_graph_freezes_every_verifier_agent_batch_as_physica
         if definition.coordinate.stage == "release_assurance"
     )
     assert aggregate.coordinate in release_assurance.dependency_coordinates
-    assert not {
-        item.coordinate for item in batches
-    } & set(release_assurance.dependency_coordinates)
+    assert not {item.coordinate for item in batches} & set(release_assurance.dependency_coordinates)
 
 
 def test_work_group_freezes_members_and_requires_exact_aggregate_join() -> None:

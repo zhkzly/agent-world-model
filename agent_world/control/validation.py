@@ -39,14 +39,10 @@ _SAFE_PYDANTIC_MESSAGES = {
     # expected category to correct the proposal without echoing rejected input.
     "tool_plan_read_state_duplicate": "List each read-state entity at most once.",
     "tool_plan_write_state_duplicate": "List each write-state entity at most once.",
-    "tool_plan_state_footprint_empty": (
-        "Declare at least one read-state or write-state entity."
-    ),
+    "tool_plan_state_footprint_empty": ("Declare at least one read-state or write-state entity."),
     "tool_source_read_state_duplicate": "List each read-state entity at most once.",
     "tool_source_write_state_duplicate": "List each write-state entity at most once.",
-    "tool_source_state_footprint_empty": (
-        "Declare at least one read-state or write-state entity."
-    ),
+    "tool_source_state_footprint_empty": ("Declare at least one read-state or write-state entity."),
     "tool_interface_result_fields_missing": (
         "Declare at least one output field or observation field."
     ),
@@ -60,12 +56,8 @@ _SAFE_PYDANTIC_MESSAGES = {
         "Emit input, output, then observation schema shards for every tool."
     ),
     "tool_semantics_batch_tool_id_duplicate": "Reference each tool at most once per batch.",
-    "group_closure_semantic_ref_arity": (
-        "Provide exactly one semantic ref per member tool."
-    ),
-    "coupling_batch_group_order_mismatch": (
-        "Keep batch members in the frozen group tool order."
-    ),
+    "group_closure_semantic_ref_arity": ("Provide exactly one semantic ref per member tool."),
+    "coupling_batch_group_order_mismatch": ("Keep batch members in the frozen group tool order."),
     "coupling_single_batch_arity": "Emit exactly one batch for a single_batch group.",
     "coupling_multi_batch_arity": "Emit at least two batches for a multi_batch group.",
     "coupling_group_id_duplicate": "Use a unique group_id for every coupling group.",
@@ -115,20 +107,14 @@ _SAFE_PYDANTIC_MESSAGES = {
         "Omit before_hash for add; provide it for remove and modify."
     ),
     "research_acquisition_plan_ref_type": "Bind exactly one design.research_plan ref.",
-    "research_acquisition_request_ref_type": (
-        "Bind exactly one control.environment_request ref."
-    ),
+    "research_acquisition_request_ref_type": ("Bind exactly one control.environment_request ref."),
     "research_acquisition_passage_pack_ref_type": (
         "Bind exactly one design.evidence_passage_pack ref."
     ),
-    "research_acquisition_evidence_missing": (
-        "Provide normalized evidence and source refs."
-    ),
+    "research_acquisition_evidence_missing": ("Provide normalized evidence and source refs."),
     "research_acquisition_evidence_id_duplicate": "Use a unique evidence_id per item.",
     "research_acquisition_source_ref_duplicate": "List each source ref at most once.",
-    "research_acquisition_usage_accounting": (
-        "Report real search and tool call accounting."
-    ),
+    "research_acquisition_usage_accounting": ("Report real search and tool call accounting."),
     "assumption_needs_human_payload_forbidden": (
         "Set both claim and fidelity to null for needs_human."
     ),
@@ -315,6 +301,114 @@ _DESIGNER_SEMANTIC_CONTRACTS = {
         "world model claim references must exist in the frozen evidence graph",
         "an exact evidence claim id from the frozen evidence graph",
     ),
+    "initial_state_rule_family": (
+        "initial-state rules must use family initial_state",
+        "a Rule with family initial_state",
+    ),
+    "initial_state_rule_id_prefix": (
+        "initial-state Rule ids must use the rule:state: prefix",
+        "a Rule id beginning with rule:state:",
+    ),
+    "initial_state_rule_id_duplicate": (
+        "initial-state Rule ids must be unique",
+        "unique Rule ids within initial-state constraints",
+    ),
+    "world_invariant_rule_family": (
+        "world invariants must use family invariant",
+        "a Rule with family invariant",
+    ),
+    "world_state_shape_root_schema": (
+        "root state schema must be an object with explicit properties",
+        "an object state schema with explicit properties",
+    ),
+    "world_state_shape_visibility_duplicate": (
+        "each actor visibility field may appear only once",
+        "a visibility field list without repeats",
+    ),
+    "world_state_shape_visibility_unknown": (
+        "actor visibility may reference only root state properties",
+        "a visibility field declared by the root state schema",
+    ),
+    "world_tool_plan_bound": (
+        "tool plan inventory must not exceed the framework tool limit",
+        "at most the configured number of tool plans",
+    ),
+    "world_tool_plan_id_duplicate": (
+        "tool plan ids must be unique",
+        "a unique tool id within the plan inventory",
+    ),
+    "world_tool_plan_id_mismatch": (
+        "tool id must equal its namespace and name",
+        "a tool id in the form <namespace>.<name>",
+    ),
+    "world_tool_plan_namespace_unknown": (
+        "tool namespace must exist in the frozen WorldBoundary",
+        "a namespace declared by the frozen WorldBoundary",
+    ),
+    "world_tool_plan_evidence_claim_duplicate": (
+        "tool evidence claim ids must be unique",
+        "an evidence claim list without repeats",
+    ),
+    "world_tool_schema_target_mismatch": (
+        "tool schema must target the frozen tool plan",
+        "a schema whose tool_id matches the frozen tool plan",
+    ),
+    "world_tool_schema_kind_mismatch": (
+        "tool schema kind must match the frozen schema role",
+        "a schema_kind matching the frozen schema role",
+    ),
+    "world_tool_surface_schema_target_mismatch": (
+        "tool surface schemas must target the frozen tool plan",
+        "a schema bundle whose tool_id matches the frozen tool plan",
+    ),
+    "world_tool_inventory_bound": (
+        "tool inventory must not exceed the framework tool limit",
+        "at most the configured number of tool surfaces",
+    ),
+    "world_tool_inventory_id_duplicate": (
+        "tool inventory ids must be unique",
+        "a unique tool id in the frozen inventory",
+    ),
+    "world_tool_inventory_namespace_unknown": (
+        "tool inventory namespaces must exist in the frozen WorldBoundary",
+        "a namespace declared by the frozen WorldBoundary",
+    ),
+    "world_skeleton_task_dimension_invalid": (
+        "world skeleton task dimensions must be stable identifiers",
+        "a stable task dimension identifier list",
+    ),
+    "world_skeleton_tool_bound": (
+        "world skeleton must not exceed the framework tool limit",
+        "at most the configured number of tool surfaces",
+    ),
+    "world_skeleton_tool_id_duplicate": (
+        "world skeleton tool ids must be unique",
+        "a unique tool id in the frozen skeleton",
+    ),
+    "world_skeleton_tool_namespace_unknown": (
+        "world skeleton tool namespaces must exist in the frozen WorldBoundary",
+        "a namespace declared by the frozen WorldBoundary",
+    ),
+    "world_skeleton_root_schema": (
+        "world skeleton root state schema must be an object with explicit properties",
+        "an object state schema with explicit properties",
+    ),
+    "world_skeleton_visibility_duplicate": (
+        "world skeleton actor visibility fields must be unique",
+        "a visibility field list without repeats",
+    ),
+    "world_skeleton_visibility_unknown": (
+        "world skeleton actor visibility may reference only root state properties",
+        "a visibility field declared by the root state schema",
+    ),
+    "world_skeleton_bounded_divergence_missing": (
+        "bounded approximation fidelity requires a known divergence",
+        "a non-empty known divergence statement",
+    ),
+    "world_skeleton_faithful_divergence_forbidden": (
+        "faithful fidelity must not declare a known divergence",
+        "a null known divergence",
+    ),
     "world_closure_constraint_unreachable": (
         "every catalogued constraint must be referenced by a rule",
         "a catalog with no unreferenced constraints",
@@ -469,6 +563,24 @@ class SafeValidationIssue:
     expected_category: str | None = None
 
     def __post_init__(self) -> None:
+        # Direct semantic compilers and Pydantic conversion share the same
+        # framework-owned contract registry.  Let a direct SafeValidationIssue
+        # inherit an explicitly registered safe condition/category instead of
+        # requiring each compiler to duplicate that mechanical projection.
+        # Unknown codes remain incomplete; they must not become actionable by
+        # receiving a generic invented explanation.
+        if self.violated_condition is None:
+            object.__setattr__(
+                self,
+                "violated_condition",
+                _SAFE_VIOLATED_CONDITIONS.get(self.code),
+            )
+        if self.expected_category is None:
+            object.__setattr__(
+                self,
+                "expected_category",
+                _SAFE_EXPECTED_CATEGORIES.get(self.code),
+            )
         if _SAFE_IDENTIFIER.fullmatch(self.code) is None:
             raise ValueError("validation issue code must be a safe identifier")
         if not self.location:

@@ -20,6 +20,7 @@ from agent_world.control.validation import StructuredValidationError, Validation
 from .models import (
     EnvironmentDesignDraft,
     EnvironmentSemanticSourceDraft,
+    RuleDraft,
     SharedToolSemanticsContract,
     SharedToolSemanticsSourceDraft,
     ToolCouplingGroupPlan,
@@ -42,6 +43,10 @@ from .validation import StructuredSemanticError
 class CompiledWorldRules:
     """Exact world source and executable model derived from one rules draft."""
 
+    # This is the durable Agent-source artifact.  It deliberately has no
+    # Agent-provided Rule IR identities: those are framework-derived mechanics,
+    # not WorldRules semantics.
+    canonical_source: WorldRuleSemanticsSourceDraft
     source: WorldSemanticSourceIRDraft
     world: WorldModelDraft
 
@@ -108,11 +113,12 @@ def compile_world_rules(
     """Join frozen Architecture/behavior with one rules source into a WorldModel."""
 
     try:
+        canonical_source = _canonicalize_world_rule_source(source)
         initial_state_rules = EnvironmentDesigner._compile_initial_state_rules_source(
-            source.initial_state_rules
+            canonical_source.initial_state_rules
         )
         closure = EnvironmentDesigner._compile_world_closure_source(
-            WorldClosureSourceDraft(invariants=source.invariants)
+            WorldClosureSourceDraft(invariants=canonical_source.invariants)
         )
         boundary = EnvironmentDesigner._compile_architecture_boundary(architecture)
         state_inventory = EnvironmentDesigner._compile_architecture_state_inventory(architecture)
@@ -137,7 +143,33 @@ def compile_world_rules(
         )
     except (StructuredSemanticError, StructuredValidationError, ValidationError, ValueError) as exc:
         _raise_compiler_diagnostic(exc, phase="world_rules_preflight")
-    return CompiledWorldRules(source=world_source, world=world)
+    return CompiledWorldRules(
+        canonical_source=canonical_source,
+        source=world_source,
+        world=world,
+    )
+
+
+def _canonicalize_world_rule_source(
+    source: WorldRuleSemanticsSourceDraft,
+) -> WorldRuleSemanticsSourceDraft:
+    """Discard Agent-supplied names for framework-owned WorldRules IR objects."""
+
+    def without_rule_ids(rules: tuple[RuleDraft, ...]) -> tuple[RuleDraft, ...]:
+        return tuple(rule.model_copy(update={"rule_id": None}) for rule in rules)
+
+    return source.model_copy(
+        update={
+            "initial_state_rules": source.initial_state_rules.model_copy(
+                update={
+                    "initial_state_constraints": without_rule_ids(
+                        source.initial_state_rules.initial_state_constraints
+                    )
+                }
+            ),
+            "invariants": without_rule_ids(source.invariants),
+        }
+    )
 
 
 def compile_training_semantics(

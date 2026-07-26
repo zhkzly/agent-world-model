@@ -119,10 +119,7 @@ class SharedToolSemanticsLeaf:
                     f"{inputs.job.job_id}.shared-tool-semantics.{group_id}.{attempt.ordinal}"
                 ),
                 workspace=(
-                    self.workspace_root
-                    / "shared-tool-semantics"
-                    / group_id
-                    / attempt.attempt_id
+                    self.workspace_root / "shared-tool-semantics" / group_id / attempt.attempt_id
                 ),
                 model=SharedToolSemanticsSourceDraft,
                 prompt=_shared_prompt(
@@ -376,7 +373,7 @@ class WorldRulesLeaf:
             rules_ref = self.kernel.runtime.artifacts.put_json(
                 artifact_id=f"{inputs.context.context_id}:world-rules-source",
                 artifact_type="design.world_rules_source",
-                value=turn.output,
+                value=compiled.canonical_source,
                 dependencies=dependencies,
             )
             source_ref = self.kernel.runtime.artifacts.put_json(
@@ -937,8 +934,7 @@ def _tool_batch_prompt(
             "target_tool_ids": tool_ids,
             "shared_contracts": tuple(item.model_dump(mode="json") for item in contracts),
             "rule_context_catalogs": {
-                tool_id: rule_contexts[tool_id].prompt_projection()
-                for tool_id in tool_ids
+                tool_id: rule_contexts[tool_id].prompt_projection() for tool_id in tool_ids
             },
             "claims": _claim_catalog(evidence),
         },
@@ -989,9 +985,15 @@ def _world_rules_prompt(
         role="world reset and invariant semantics",
         instruction=(
             "Define only initial-state rules and cross-tool invariants with the closed Rule Draft "
-            "ADT. Do not change the frozen architecture or tool semantics, and do not author "
-            "tasks, "
-            "reward, verifier, code, examples or expected answers."
+            "ADT. `initial_state_rules.initial_state_constraints` contains reset-validity Rules "
+            "only and every one uses family `initial_state`; `invariants` contains cross-tool "
+            "Rules that hold after reset and every tool transition and every one uses family "
+            "`invariant`. Rule identities are framework mechanics: omit optional `rule_id`; code "
+            "derives `rule:state:<ordinal>` and `rule:world:<ordinal>` from the frozen section "
+            "and ordinal. Use only the frozen schemas and tool semantics, cite only supplied "
+            "claims, and never read evaluator-only task_goal. Do not change the frozen "
+            "architecture or tool semantics, and do not author tasks, reward, verifier, code, "
+            "examples or expected answers."
         ),
         context={
             "architecture": architecture.model_dump(mode="json"),

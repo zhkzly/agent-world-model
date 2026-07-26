@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 from pydantic import JsonValue, ValidationError
@@ -30,6 +31,8 @@ from agent_world.control.validation import (
     pydantic_validation_diagnostic,
 )
 from agent_world.designer.expansion_service import ExpansionDesigner
+from agent_world.designer.final_design_compiler import compile_world_rules
+from agent_world.designer.final_design_leaves import _world_rules_prompt
 from agent_world.designer.models import (
     ActorAuthoritySourceDraft,
     AssumptionResolutionDraft,
@@ -41,6 +44,11 @@ from agent_world.designer.models import (
     EvidenceAssumptionClosureDraft,
     ExpansionSemanticDeltaDraft,
     InitialStateRulesDraft,
+    InitialStateRulesSourceDraft,
+    RuleConstantDraft,
+    RuleDraft,
+    RuleGreaterOrEqualClauseDraft,
+    RuleReferenceDraft,
     SchemaArrayNodeDraft,
     SchemaIntegerNodeDraft,
     SchemaNullNodeDraft,
@@ -76,7 +84,9 @@ from agent_world.designer.models import (
     WorldBoundarySourceDraft,
     WorldClosureDraft,
     WorldClosureReferenceTerm,
+    WorldClosureSourceDraft,
     WorldModelDraft,
+    WorldRuleSemanticsSourceDraft,
     WorldSemanticSourceIRDraft,
     WorldSkeletonDraft,
     WorldStateDraft,
@@ -156,6 +166,253 @@ def _inputs(tmp_path: Path):  # type: ignore[no-untyped-def]
     )
     invariant = world.invariants[0].model_copy(update={"rule_id": "rule:world:counter-nonnegative"})
     return world, skeleton, graph, tool_draft, WorldClosureDraft(invariants=(invariant,))
+
+
+def _world_rule_source(
+    *,
+    family: Literal["initial_state", "invariant"],
+    rule_id: str | None,
+) -> RuleDraft:
+    """One complete semantic RuleDraft with no fixture-only compiler shortcut."""
+
+    return RuleDraft(
+        rule_id=rule_id,
+        family=family,
+        description="Counter state remains non-negative.",
+        boolean_operator="all",
+        clauses=(
+            RuleGreaterOrEqualClauseDraft(
+                clause_id="counter-non-negative",
+                operator="greater_or_equal",
+                ordering="number",
+                left=RuleReferenceDraft(
+                    kind="reference",
+                    source="pre_state",
+                    pointer="/counter/value",
+                    value_type="number",
+                ),
+                right=RuleConstantDraft(kind="constant", value_type="number", value=0),
+            ),
+        ),
+        case_sensitivity="positive_only",
+    )
+
+
+def _counter_architecture_source(skeleton: WorldSkeletonDraft) -> WorldArchitectureSourceDraft:
+    """Complete frozen Architecture input for WorldRules compiler integration tests."""
+
+    surface = skeleton.tool_surfaces[0]
+    return WorldArchitectureSourceDraft(
+        boundary=WorldBoundarySourceDraft(
+            primary_domain=skeleton.boundary.primary_domain,
+            actors_and_authority=tuple(
+                ActorAuthoritySourceDraft(
+                    actor=actor.actor,
+                    authorities=actor.authorities,
+                )
+                for actor in skeleton.boundary.actors_and_authority
+            ),
+            systems_of_record=skeleton.boundary.systems_of_record,
+            transition_authorities=skeleton.boundary.transition_authorities,
+            tool_namespaces=skeleton.boundary.tool_namespaces,
+            core_invariants=skeleton.boundary.core_invariants,
+            task_dimensions=skeleton.task_dimensions,
+            fidelity=skeleton.fidelity,
+        ),
+        state_entities=(
+            StateEntitySourceDraft(
+                entity="counter",
+                purpose="Own deterministic counter state.",
+                root_field="counter",
+                storage="singleton",
+                system_of_record=skeleton.boundary.systems_of_record[0],
+                owned_resource_ids=("counter",),
+                visible_to_actor_ids=tuple(
+                    actor.actor
+                    for actor in skeleton.boundary.actors_and_authority
+                    if "counter" in actor.visibility
+                ),
+                fields=(
+                    StateFieldSourceDraft(
+                        name="value",
+                        value_type="integer",
+                        description="Current counter value.",
+                        minimum=0,
+                        role="primary_key",
+                    ),
+                ),
+                evidence_claim_ids=("claim:counter",),
+            ),
+        ),
+        tool_inventory=WorldToolSourceInventoryDraft(
+            tools=(
+                ToolSurfaceSourceDraft(
+                    namespace=surface.surface.namespace,
+                    name=surface.surface.name,
+                    description=surface.surface.description,
+                    transport=surface.surface.transport,
+                    writes_state_entities=("counter",),
+                    evidence_claim_ids=surface.evidence_claim_ids,
+                    interface=ToolInterfaceSourceDraft(
+                        input_fields=(
+                            CompactFieldSemanticDraft(
+                                name="amount",
+                                value_type="integer",
+                                description="Increment amount.",
+                                minimum=0,
+                            ),
+                        ),
+                        output_fields=(
+                            CompactFieldSemanticDraft(
+                                name="value",
+                                value_type="integer",
+                                description="Updated counter value.",
+                            ),
+                        ),
+                        observation_fields=(
+                            CompactFieldSemanticDraft(
+                                # Match the already-committed ToolSemantics
+                                # projection exactly.  WorldRules receives
+                                # frozen Architecture plus that behavior, so
+                                # this integration input must preserve the
+                                # public observation field name rather than
+                                # merely a similar scalar shape.
+                                name="counter",
+                                value_type="integer",
+                                description="Visible counter observation.",
+                            ),
+                        ),
+                    ),
+                ),
+            )
+        ),
+    )
+
+
+def test_world_rule_source_derives_framework_rule_ids() -> None:
+    """WorldRules accepts semantic Rules, never Agent-authored IR identities."""
+
+    initial = EnvironmentDesigner._compile_initial_state_rules_source(
+        InitialStateRulesSourceDraft(
+            initial_state_constraints=(
+                _world_rule_source(family="initial_state", rule_id="agent-initial-id"),
+                _world_rule_source(family="initial_state", rule_id=None),
+            )
+        )
+    )
+    closure = EnvironmentDesigner._compile_world_closure_source(
+        WorldClosureSourceDraft(
+            invariants=(
+                _world_rule_source(family="invariant", rule_id="agent-invariant-id"),
+                _world_rule_source(family="invariant", rule_id=None),
+            )
+        )
+    )
+
+    assert tuple(rule.rule_id for rule in initial.initial_state_constraints) == (
+        "rule:state:0",
+        "rule:state:1",
+    )
+    assert tuple(rule.rule_id for rule in closure.invariants) == (
+        "rule:world:0",
+        "rule:world:1",
+    )
+
+
+def test_world_rules_compiler_canonicalizes_agent_rule_ids_before_persisting(
+    tmp_path: Path,
+) -> None:
+    """The production compiler, not only its leaf helpers, owns Rule identities."""
+
+    world, skeleton, graph, tool_semantics, _closure = _inputs(tmp_path)
+    source = WorldRuleSemanticsSourceDraft(
+        initial_state_rules=InitialStateRulesSourceDraft(
+            initial_state_constraints=(
+                _world_rule_source(family="initial_state", rule_id="agent-initial-id"),
+            )
+        ),
+        invariants=(_world_rule_source(family="invariant", rule_id="agent-invariant-id"),),
+    )
+
+    compiled = compile_world_rules(
+        source,
+        architecture=_counter_architecture_source(skeleton),
+        tool_semantics=(tool_semantics,),
+        evidence_graph=graph,
+        evidence_graph_ref=world.evidence_graph_ref,
+    )
+
+    assert (
+        compiled.canonical_source.initial_state_rules.initial_state_constraints[0].rule_id is None
+    )
+    assert compiled.canonical_source.invariants[0].rule_id is None
+    assert compiled.world.state.initial_state_constraints[0].rule_id == "rule:state:0"
+    assert compiled.world.invariants[0].rule_id == "rule:world:0"
+
+
+@pytest.mark.parametrize(
+    ("source", "compiler", "expected_code", "expected_path"),
+    (
+        (
+            InitialStateRulesSourceDraft(
+                initial_state_constraints=(_world_rule_source(family="invariant", rule_id=None),)
+            ),
+            EnvironmentDesigner._compile_initial_state_rules_source,
+            "initial_state_rule_family",
+            ("initial_state_rules", "initial_state_constraints", 0, "family"),
+        ),
+        (
+            WorldClosureSourceDraft(
+                invariants=(_world_rule_source(family="initial_state", rule_id=None),)
+            ),
+            EnvironmentDesigner._compile_world_closure_source,
+            "world_invariant_rule_family",
+            ("invariants", 0, "family"),
+        ),
+    ),
+)
+def test_world_rule_source_reports_section_family_as_actionable(
+    source: InitialStateRulesSourceDraft | WorldClosureSourceDraft,
+    compiler: object,
+    expected_code: str,
+    expected_path: tuple[str | int, ...],
+) -> None:
+    """Semantic family is repairable; framework-generated IDs are not."""
+
+    with pytest.raises(StructuredValidationError) as captured:
+        compiler(source)  # type: ignore[operator]
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic.validation_phase == "world_rules_source_compile"
+    assert diagnostic.issue_codes == (f"{expected_code}@{'.'.join(map(str, expected_path))}",)
+    assert diagnostic.issues[0].actionable_for_agent
+
+
+def test_world_rule_prompts_keep_rule_id_ownership_in_framework() -> None:
+    request = EnvironmentRequest(
+        request_id="request:world-rules-prompt",
+        need="Generate a bounded counter environment.",
+        release_profile=ReleaseProfile(profile_id="release:test"),
+    )
+    active = _world_rules_prompt(
+        SimpleNamespace(request=SimpleNamespace(need=request.need)),
+        SimpleNamespace(model_dump=lambda **_kwargs: {}),
+        (),
+        EvidenceGraph(graph_id="evidence:world-rules-prompt", revision=1),
+    )
+    legacy_world = EnvironmentDesigner._world_rules_prompt(request)
+    legacy_initial = EnvironmentDesigner._initial_state_rules_prompt(request)
+    legacy_closure = EnvironmentDesigner._world_closure_prompt(request)
+
+    assert "initial_state_rules.initial_state_constraints" in active
+    assert "family `initial_state`" in active
+    assert "family `invariant`" in active
+    assert "omit optional `rule_id`" in active
+    assert "rule:state:<ordinal>" in active
+    assert "rule:world:<ordinal>" in active
+    assert "omit optional `rule_id`" in legacy_world
+    assert "optional `rule_id`" in legacy_initial
+    assert "optional `rule_id`" in legacy_closure
 
 
 def test_tool_access_observation_reports_all_missing_fields_by_actor(
@@ -515,93 +772,14 @@ def test_compact_architecture_compiles_full_typed_skeleton_with_framework_tool_i
     tmp_path: Path,
 ) -> None:
     _world, existing, graph, _tool_draft, _closure = _inputs(tmp_path)
-    surface = existing.tool_surfaces[0]
-    source = WorldArchitectureSourceDraft(
-        boundary=WorldBoundarySourceDraft(
-            primary_domain=existing.boundary.primary_domain,
-            actors_and_authority=tuple(
-                ActorAuthoritySourceDraft(
-                    actor=actor.actor,
-                    authorities=actor.authorities,
-                )
-                for actor in existing.boundary.actors_and_authority
-            ),
-            systems_of_record=existing.boundary.systems_of_record,
-            transition_authorities=existing.boundary.transition_authorities,
-            tool_namespaces=existing.boundary.tool_namespaces,
-            core_invariants=existing.boundary.core_invariants,
-            task_dimensions=existing.task_dimensions,
-            fidelity=existing.fidelity,
-        ),
-        state_entities=(
-            StateEntitySourceDraft(
-                entity="counter",
-                purpose="Own deterministic counter state.",
-                root_field="counter",
-                storage="singleton",
-                system_of_record=existing.boundary.systems_of_record[0],
-                owned_resource_ids=("counter",),
-                visible_to_actor_ids=tuple(
-                    actor.actor
-                    for actor in existing.boundary.actors_and_authority
-                    if "counter" in actor.visibility
-                ),
-                fields=(
-                    StateFieldSourceDraft(
-                        name="value",
-                        value_type="integer",
-                        description="Current counter value.",
-                        minimum=0,
-                        role="primary_key",
-                    ),
-                ),
-                evidence_claim_ids=("claim:counter",),
-            ),
-        ),
-        tool_inventory=WorldToolSourceInventoryDraft(
-            tools=(
-                ToolSurfaceSourceDraft(
-                    namespace=surface.surface.namespace,
-                    name=surface.surface.name,
-                    description=surface.surface.description,
-                    transport=surface.surface.transport,
-                    writes_state_entities=("counter",),
-                    evidence_claim_ids=surface.evidence_claim_ids,
-                    interface=ToolInterfaceSourceDraft(
-                        input_fields=(
-                            CompactFieldSemanticDraft(
-                                name="amount",
-                                value_type="integer",
-                                description="Increment amount.",
-                                minimum=0,
-                            ),
-                        ),
-                        output_fields=(
-                            CompactFieldSemanticDraft(
-                                name="value",
-                                value_type="integer",
-                                description="Updated counter value.",
-                            ),
-                        ),
-                        observation_fields=(
-                            CompactFieldSemanticDraft(
-                                name="value",
-                                value_type="integer",
-                                description="Visible counter value.",
-                            ),
-                        ),
-                    ),
-                ),
-            )
-        ),
-    )
+    source = _counter_architecture_source(existing)
 
     compiled = EnvironmentDesigner.__new__(EnvironmentDesigner)._compile_architecture_skeleton(
         source,
         evidence_graph=graph,
     )
 
-    assert compiled.tool_surfaces[0].surface.tool_id == surface.surface.tool_id
+    assert compiled.tool_surfaces[0].surface.tool_id == existing.tool_surfaces[0].surface.tool_id
     assert compiled.state.root_state_schema["additionalProperties"] is False
 
 
@@ -1077,6 +1255,669 @@ def test_world_model_reports_unknown_evidence_claim_as_actionable_field(
         assert "claim:" not in issue.message
 
 
+@pytest.mark.parametrize(
+    (
+        "case",
+        "expected_code",
+        "expected_path",
+        "rejected_value",
+        "expected_condition",
+        "expected_category",
+        "expected_actionable",
+    ),
+    (
+        (
+            "family",
+            "initial_state_rule_family",
+            ("initial_state_constraints", 0, "family"),
+            "rejected-family",
+            "initial-state rules must use family initial_state",
+            "a Rule with family initial_state",
+            True,
+        ),
+        (
+            "id_prefix",
+            "initial_state_rule_id_prefix",
+            ("initial_state_constraints", 0, "rule_id"),
+            "rejected-rule-id",
+            "initial-state Rule ids must use the rule:state: prefix",
+            "a Rule id beginning with rule:state:",
+            False,
+        ),
+        (
+            "duplicate_id",
+            "initial_state_rule_id_duplicate",
+            ("initial_state_constraints", 1, "rule_id"),
+            "rule:state:duplicate",
+            "initial-state Rule ids must be unique",
+            "unique Rule ids within initial-state constraints",
+            False,
+        ),
+    ),
+)
+def test_initial_state_rule_diagnostics_are_safe_and_actionable(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+    expected_path: tuple[str | int, ...],
+    rejected_value: str,
+    expected_condition: str,
+    expected_category: str,
+    expected_actionable: bool,
+) -> None:
+    """WorldRules-owned reset rules retain a safe causal repair identity."""
+
+    _, skeleton, graph, _, closure = _inputs(tmp_path)
+    source_rule = closure.invariants[0]
+    state_shape = WorldStateShapeDraft(
+        entities=skeleton.state.entities,
+        root_state_schema=skeleton.state.root_state_schema,
+    )
+    if case == "family":
+        rules = InitialStateRulesDraft(
+            initial_state_constraints=(
+                source_rule.model_copy(
+                    update={"family": rejected_value, "rule_id": "rule:state:valid"}
+                ),
+            )
+        )
+    elif case == "id_prefix":
+        rules = InitialStateRulesDraft(
+            initial_state_constraints=(
+                source_rule.model_copy(
+                    update={"family": "initial_state", "rule_id": rejected_value}
+                ),
+            )
+        )
+    else:
+        rule = source_rule.model_copy(update={"family": "initial_state", "rule_id": rejected_value})
+        rules = InitialStateRulesDraft(initial_state_constraints=(rule, rule))
+
+    with pytest.raises(StructuredValidationError) as captured:
+        EnvironmentDesigner._validate_initial_state_rules_draft(  # noqa: SLF001
+            rules,
+            state_shape=state_shape,
+            evidence_graph=graph,
+        )
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic.validation_phase == "initial_state_rules_semantics"
+    assert diagnostic.issue_codes == (f"{expected_code}@{'.'.join(map(str, expected_path))}",)
+    issue = diagnostic.issues[0]
+    assert issue.actionable_for_agent is expected_actionable
+    assert issue.violated_condition == expected_condition
+    assert issue.expected_category == expected_category
+    assert rejected_value not in str(diagnostic)
+
+
+@pytest.mark.parametrize(
+    (
+        "case",
+        "expected_code",
+        "expected_path",
+        "rejected_value",
+        "expected_condition",
+        "expected_category",
+    ),
+    (
+        (
+            "root_schema",
+            "world_state_shape_root_schema",
+            ("root_state_schema",),
+            "array",
+            "root state schema must be an object with explicit properties",
+            "an object state schema with explicit properties",
+        ),
+        (
+            "duplicate_visibility",
+            "world_state_shape_visibility_duplicate",
+            ("boundary", "actors_and_authority", 0, "visibility", 1),
+            "counter",
+            "each actor visibility field may appear only once",
+            "a visibility field list without repeats",
+        ),
+        (
+            "unknown_visibility",
+            "world_state_shape_visibility_unknown",
+            ("boundary", "actors_and_authority", 0, "visibility", 1),
+            "rejected-visibility-field",
+            "actor visibility may reference only root state properties",
+            "a visibility field declared by the root state schema",
+        ),
+    ),
+)
+def test_world_state_shape_diagnostics_preserve_source_ownership(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+    expected_path: tuple[str | int, ...],
+    rejected_value: str,
+    expected_condition: str,
+    expected_category: str,
+) -> None:
+    """The same compiler check is actionable only for its proposing source."""
+
+    _, skeleton, graph, _, _ = _inputs(tmp_path)
+    state_shape = WorldStateShapeDraft(
+        entities=skeleton.state.entities,
+        root_state_schema=skeleton.state.root_state_schema,
+    )
+    boundary = WorldBoundaryDraft(
+        boundary=skeleton.boundary,
+        task_dimensions=skeleton.task_dimensions,
+        fidelity=skeleton.fidelity,
+    )
+    if case == "root_schema":
+        state_shape = state_shape.model_copy(update={"root_state_schema": {"type": rejected_value}})
+    else:
+        actor = boundary.boundary.actors_and_authority[0]
+        visibility = (
+            (*actor.visibility, actor.visibility[0])
+            if case == "duplicate_visibility"
+            else (*actor.visibility, rejected_value)
+        )
+        boundary = boundary.model_copy(
+            update={
+                "boundary": boundary.boundary.model_copy(
+                    update={
+                        "actors_and_authority": (
+                            actor.model_copy(update={"visibility": visibility}),
+                            *boundary.boundary.actors_and_authority[1:],
+                        )
+                    }
+                )
+            }
+        )
+
+    for diagnostic_retryable in (True, False):
+        with pytest.raises(StructuredValidationError) as captured:
+            EnvironmentDesigner._validate_world_state_shape_draft(  # noqa: SLF001
+                state_shape,
+                boundary=boundary,
+                evidence_graph=graph,
+                diagnostic_retryable=diagnostic_retryable,
+            )
+
+        issue = captured.value.diagnostic.issues[0]
+        assert issue.code == expected_code
+        assert issue.location == expected_path
+        assert issue.actionable_for_agent is diagnostic_retryable
+        assert issue.violated_condition == expected_condition
+        assert issue.expected_category == expected_category
+        assert rejected_value not in str(captured.value.diagnostic)
+
+
+def test_world_state_shape_frozen_evidence_issue_is_non_actionable(tmp_path: Path) -> None:
+    """A frozen state shape cannot turn an evidence closure check into a retry."""
+
+    _, skeleton, graph, _, _ = _inputs(tmp_path)
+    rejected_value = "rejected-claim"
+    state_shape = WorldStateShapeDraft(
+        entities=(
+            skeleton.state.entities[0].model_copy(update={"evidence_claim_ids": (rejected_value,)}),
+        ),
+        root_state_schema=skeleton.state.root_state_schema,
+    )
+    boundary = WorldBoundaryDraft(
+        boundary=skeleton.boundary,
+        task_dimensions=skeleton.task_dimensions,
+        fidelity=skeleton.fidelity,
+    )
+
+    with pytest.raises(StructuredValidationError) as captured:
+        EnvironmentDesigner._validate_world_state_shape_draft(  # noqa: SLF001
+            state_shape,
+            boundary=boundary,
+            evidence_graph=graph,
+            diagnostic_retryable=False,
+        )
+
+    issue = captured.value.diagnostic.issues[0]
+    assert issue.code == "world_model_evidence_claim_unknown"
+    assert issue.location == ("entities", 0, "evidence_claim_ids", 0)
+    assert not issue.actionable_for_agent
+    assert rejected_value not in str(captured.value.diagnostic)
+
+
+@pytest.mark.parametrize(
+    (
+        "case",
+        "expected_code",
+        "expected_path",
+        "rejected_value",
+        "expected_condition",
+        "expected_category",
+    ),
+    (
+        (
+            "bound",
+            "world_tool_plan_bound",
+            ("tools",),
+            "increment8",
+            "tool plan inventory must not exceed the framework tool limit",
+            "at most the configured number of tool plans",
+        ),
+        (
+            "duplicate_id",
+            "world_tool_plan_id_duplicate",
+            ("tools", 1, "tool_id"),
+            "counter.increment",
+            "tool plan ids must be unique",
+            "a unique tool id within the plan inventory",
+        ),
+        (
+            "id_mismatch",
+            "world_tool_plan_id_mismatch",
+            ("tools", 0, "tool_id"),
+            "rejected.tool",
+            "tool id must equal its namespace and name",
+            "a tool id in the form <namespace>.<name>",
+        ),
+        (
+            "namespace_unknown",
+            "world_tool_plan_namespace_unknown",
+            ("tools", 0, "namespace"),
+            "rejected_namespace",
+            "tool namespace must exist in the frozen WorldBoundary",
+            "a namespace declared by the frozen WorldBoundary",
+        ),
+        (
+            "claim_duplicate",
+            "world_tool_plan_evidence_claim_duplicate",
+            ("tools", 0, "evidence_claim_ids", 1),
+            "claim:counter",
+            "tool evidence claim ids must be unique",
+            "an evidence claim list without repeats",
+        ),
+    ),
+)
+def test_world_tool_plan_inventory_diagnostics_preserve_source_ownership(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+    expected_path: tuple[str | int, ...],
+    rejected_value: str,
+    expected_condition: str,
+    expected_category: str,
+) -> None:
+    """Tool-plan diagnostics remain safe in proposal and frozen-input contexts."""
+
+    _, skeleton, graph, _, _ = _inputs(tmp_path)
+    surface = skeleton.tool_surfaces[0].surface
+    plan = ToolSurfacePlan(
+        tool_id=surface.tool_id,
+        namespace=surface.namespace,
+        name=surface.name,
+        description=surface.description,
+        transport=surface.transport,
+        reads_state_entities=("counter",),
+        evidence_claim_ids=("claim:counter",),
+    )
+    boundary = WorldBoundaryDraft(
+        boundary=skeleton.boundary,
+        task_dimensions=skeleton.task_dimensions,
+        fidelity=skeleton.fidelity,
+    )
+    if case == "bound":
+        tools = tuple(
+            plan.model_copy(
+                update={
+                    "name": f"increment{index}",
+                    "tool_id": f"{plan.namespace}.increment{index}",
+                }
+            )
+            for index in range(MAX_WORLD_TOOL_SURFACES + 1)
+        )
+        inventory = WorldToolPlanInventoryDraft.model_construct(tools=tools)
+    elif case == "duplicate_id":
+        inventory = WorldToolPlanInventoryDraft(tools=(plan, plan))
+    elif case == "id_mismatch":
+        inventory = WorldToolPlanInventoryDraft(
+            tools=(plan.model_copy(update={"tool_id": rejected_value}),)
+        )
+    elif case == "namespace_unknown":
+        inventory = WorldToolPlanInventoryDraft(
+            tools=(
+                plan.model_copy(
+                    update={
+                        "namespace": rejected_value,
+                        "tool_id": f"{rejected_value}.{plan.name}",
+                    }
+                ),
+            )
+        )
+    else:
+        inventory = WorldToolPlanInventoryDraft(
+            tools=(
+                plan.model_copy(update={"evidence_claim_ids": ("claim:counter", rejected_value)}),
+            )
+        )
+
+    for diagnostic_retryable in (True, False):
+        with pytest.raises(StructuredValidationError) as captured:
+            EnvironmentDesigner._validate_world_tool_plan_inventory_draft(  # noqa: SLF001
+                inventory,
+                boundary=boundary,
+                evidence_graph=graph,
+                diagnostic_retryable=diagnostic_retryable,
+            )
+
+        issue = captured.value.diagnostic.issues[0]
+        assert issue.code == expected_code
+        assert issue.location == expected_path
+        assert issue.actionable_for_agent is diagnostic_retryable
+        assert issue.violated_condition == expected_condition
+        assert issue.expected_category == expected_category
+        assert rejected_value not in str(captured.value.diagnostic)
+
+
+@pytest.mark.parametrize(
+    (
+        "case",
+        "expected_code",
+        "expected_path",
+        "rejected_value",
+        "expected_condition",
+        "expected_category",
+    ),
+    (
+        (
+            "bound",
+            "world_tool_inventory_bound",
+            ("tool_surfaces",),
+            "increment8",
+            "tool inventory must not exceed the framework tool limit",
+            "at most the configured number of tool surfaces",
+        ),
+        (
+            "duplicate_id",
+            "world_tool_inventory_id_duplicate",
+            ("tool_surfaces", 1, "surface", "tool_id"),
+            "counter.increment",
+            "tool inventory ids must be unique",
+            "a unique tool id in the frozen inventory",
+        ),
+        (
+            "namespace_unknown",
+            "world_tool_inventory_namespace_unknown",
+            ("tool_surfaces", 0, "surface", "namespace"),
+            "rejected_namespace",
+            "tool inventory namespaces must exist in the frozen WorldBoundary",
+            "a namespace declared by the frozen WorldBoundary",
+        ),
+    ),
+)
+def test_world_tool_inventory_compiler_invariants_are_safe_and_non_actionable(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+    expected_path: tuple[str | int, ...],
+    rejected_value: str,
+    expected_condition: str,
+    expected_category: str,
+) -> None:
+    """Framework-composed ToolSurfaces cannot consume a semantic retry."""
+
+    _, skeleton, graph, _, _ = _inputs(tmp_path)
+    boundary = WorldBoundaryDraft(
+        boundary=skeleton.boundary,
+        task_dimensions=skeleton.task_dimensions,
+        fidelity=skeleton.fidelity,
+    )
+    surface = skeleton.tool_surfaces[0]
+    if case == "bound":
+        tool_surfaces = tuple(
+            surface.model_copy(
+                update={
+                    "surface": surface.surface.model_copy(
+                        update={
+                            "name": f"increment{index}",
+                            "tool_id": f"{surface.surface.namespace}.increment{index}",
+                        }
+                    )
+                }
+            )
+            for index in range(MAX_WORLD_TOOL_SURFACES + 1)
+        )
+        inventory = WorldToolInventoryDraft.model_construct(tool_surfaces=tool_surfaces)
+    elif case == "duplicate_id":
+        inventory = WorldToolInventoryDraft(tool_surfaces=(surface, surface))
+    else:
+        unknown_surface = surface.model_copy(
+            update={
+                "surface": surface.surface.model_copy(
+                    update={
+                        "namespace": rejected_value,
+                        "tool_id": f"{rejected_value}.{surface.surface.name}",
+                    }
+                )
+            }
+        )
+        inventory = WorldToolInventoryDraft(tool_surfaces=(unknown_surface,))
+
+    with pytest.raises(StructuredValidationError) as captured:
+        EnvironmentDesigner._validate_world_tool_inventory_draft(  # noqa: SLF001
+            inventory,
+            boundary=boundary,
+            evidence_graph=graph,
+        )
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic.validation_phase == "tool_inventory_semantics"
+    issue = diagnostic.issues[0]
+    assert issue.code == expected_code
+    assert issue.location == expected_path
+    assert not issue.actionable_for_agent
+    assert issue.violated_condition == expected_condition
+    assert issue.expected_category == expected_category
+    assert rejected_value not in str(diagnostic)
+
+
+@pytest.mark.parametrize(
+    (
+        "case",
+        "expected_code",
+        "expected_path",
+        "rejected_value",
+        "expected_condition",
+        "expected_category",
+    ),
+    (
+        (
+            "task_dimension",
+            "world_skeleton_task_dimension_invalid",
+            ("task_dimensions",),
+            "human readable label",
+            "world skeleton task dimensions must be stable identifiers",
+            "a stable task dimension identifier list",
+        ),
+        (
+            "tool_bound",
+            "world_skeleton_tool_bound",
+            ("tool_surfaces",),
+            "increment8",
+            "world skeleton must not exceed the framework tool limit",
+            "at most the configured number of tool surfaces",
+        ),
+        (
+            "tool_duplicate",
+            "world_skeleton_tool_id_duplicate",
+            ("tool_surfaces", 1, "surface", "tool_id"),
+            "counter.increment",
+            "world skeleton tool ids must be unique",
+            "a unique tool id in the frozen skeleton",
+        ),
+        (
+            "tool_namespace",
+            "world_skeleton_tool_namespace_unknown",
+            ("tool_surfaces", 0, "surface", "namespace"),
+            "rejected_namespace",
+            "world skeleton tool namespaces must exist in the frozen WorldBoundary",
+            "a namespace declared by the frozen WorldBoundary",
+        ),
+        (
+            "root_schema",
+            "world_skeleton_root_schema",
+            ("state", "root_state_schema"),
+            "array",
+            "world skeleton root state schema must be an object with explicit properties",
+            "an object state schema with explicit properties",
+        ),
+        (
+            "visibility_duplicate",
+            "world_skeleton_visibility_duplicate",
+            ("boundary", "actors_and_authority", 0, "visibility", 1),
+            "counter",
+            "world skeleton actor visibility fields must be unique",
+            "a visibility field list without repeats",
+        ),
+        (
+            "visibility_unknown",
+            "world_skeleton_visibility_unknown",
+            ("boundary", "actors_and_authority", 0, "visibility", 1),
+            "rejected_visibility",
+            "world skeleton actor visibility may reference only root state properties",
+            "a visibility field declared by the root state schema",
+        ),
+        (
+            "bounded_divergence",
+            "world_skeleton_bounded_divergence_missing",
+            ("fidelity", 0, "known_divergence"),
+            "bounded_approximation",
+            "bounded approximation fidelity requires a known divergence",
+            "a non-empty known divergence statement",
+        ),
+        (
+            "faithful_divergence",
+            "world_skeleton_faithful_divergence_forbidden",
+            ("fidelity", 0, "known_divergence"),
+            "rejected-divergence",
+            "faithful fidelity must not declare a known divergence",
+            "a null known divergence",
+        ),
+    ),
+)
+def test_world_skeleton_compiler_invariants_are_safe_and_non_actionable(
+    tmp_path: Path,
+    case: str,
+    expected_code: str,
+    expected_path: tuple[str | int, ...],
+    rejected_value: str,
+    expected_condition: str,
+    expected_category: str,
+) -> None:
+    """WorldRules cannot repair a framework-composed skeleton."""
+
+    _, skeleton, graph, _, _ = _inputs(tmp_path)
+    surface = skeleton.tool_surfaces[0]
+    if case == "task_dimension":
+        draft = skeleton.model_copy(update={"task_dimensions": (rejected_value,)})
+    elif case == "tool_bound":
+        tool_surfaces = tuple(
+            surface.model_copy(
+                update={
+                    "surface": surface.surface.model_copy(
+                        update={
+                            "name": f"increment{index}",
+                            "tool_id": f"{surface.surface.namespace}.increment{index}",
+                        }
+                    )
+                }
+            )
+            for index in range(MAX_WORLD_TOOL_SURFACES + 1)
+        )
+        draft = WorldSkeletonDraft.model_construct(
+            boundary=skeleton.boundary,
+            state=skeleton.state,
+            tool_surfaces=tool_surfaces,
+            task_dimensions=skeleton.task_dimensions,
+            fidelity=skeleton.fidelity,
+        )
+    elif case == "tool_duplicate":
+        draft = skeleton.model_copy(update={"tool_surfaces": (surface, surface)})
+    elif case == "tool_namespace":
+        unknown_surface = surface.model_copy(
+            update={
+                "surface": surface.surface.model_copy(
+                    update={
+                        "namespace": rejected_value,
+                        "tool_id": f"{rejected_value}.{surface.surface.name}",
+                    }
+                )
+            }
+        )
+        draft = skeleton.model_copy(update={"tool_surfaces": (unknown_surface,)})
+    elif case == "root_schema":
+        draft = skeleton.model_copy(
+            update={
+                "state": skeleton.state.model_copy(
+                    update={"root_state_schema": {"type": rejected_value}}
+                )
+            }
+        )
+    elif case.startswith("visibility"):
+        actor = skeleton.boundary.actors_and_authority[0]
+        visibility = (
+            (*actor.visibility, actor.visibility[0])
+            if case == "visibility_duplicate"
+            else (*actor.visibility, rejected_value)
+        )
+        boundary = skeleton.boundary.model_copy(
+            update={
+                "actors_and_authority": (
+                    actor.model_copy(update={"visibility": visibility}),
+                    *skeleton.boundary.actors_and_authority[1:],
+                )
+            }
+        )
+        draft = skeleton.model_copy(update={"boundary": boundary})
+    else:
+        fidelity = skeleton.fidelity[0].model_copy(
+            update=(
+                {"level": rejected_value, "known_divergence": None}
+                if case == "bounded_divergence"
+                else {"level": "faithful", "known_divergence": rejected_value}
+            )
+        )
+        draft = skeleton.model_copy(update={"fidelity": (fidelity,)})
+
+    with pytest.raises(StructuredValidationError) as captured:
+        EnvironmentDesigner._validate_world_skeleton(  # noqa: SLF001
+            draft,
+            evidence_graph=graph,
+        )
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic.validation_phase == "world_skeleton_semantics"
+    issue = diagnostic.issues[0]
+    assert issue.code == expected_code
+    assert issue.location == expected_path
+    assert not issue.actionable_for_agent
+    assert issue.violated_condition == expected_condition
+    assert issue.expected_category == expected_category
+    assert rejected_value not in str(diagnostic)
+
+
+@pytest.mark.parametrize(
+    "validator",
+    (
+        EnvironmentDesigner._validate_world_state_shape_draft,
+        EnvironmentDesigner._validate_initial_state_rules_draft,
+        EnvironmentDesigner._validate_world_tool_plan_inventory_draft,
+        EnvironmentDesigner._validate_tool_schema_draft,
+        EnvironmentDesigner._validate_tool_surface_schemas_draft,
+        EnvironmentDesigner._validate_world_tool_inventory_draft,
+        EnvironmentDesigner._validate_world_skeleton,
+    ),
+)
+def test_world_rules_diagnostic_validators_do_not_raise_bare_value_error(
+    validator: object,
+) -> None:
+    """Known WorldRules compiler boundaries cannot fall through one-shot's catch-all."""
+
+    assert "raise ValueError" not in inspect.getsource(validator)
+
+
 def test_entity_schema_rejects_refs_and_lifecycle_drift() -> None:
     plan = StateEntityPlan(
         entity="reservation",
@@ -1512,6 +2353,28 @@ def test_semantic_source_canonically_compiles_task_reward_and_verification(
         evidence_graph_ref=design.evidence_graph_ref,
     )
 
+    poisoned_tool_plan = world_source.tool_inventory.tools[0].model_copy(
+        update={"tool_id": "rejected.tool"}
+    )
+    poisoned_world_source = world_source.model_copy(
+        update={
+            "tool_inventory": world_source.tool_inventory.model_copy(
+                update={"tools": (poisoned_tool_plan,)}
+            )
+        }
+    )
+    with pytest.raises(StructuredValidationError) as captured:
+        EnvironmentDesigner._compile_world_semantic_source(  # noqa: SLF001
+            poisoned_world_source,
+            evidence_graph=graph,
+            evidence_graph_ref=design.evidence_graph_ref,
+        )
+    issue = captured.value.diagnostic.issues[0]
+    assert issue.code == "world_tool_plan_id_mismatch"
+    assert issue.location == ("tools", 0, "tool_id")
+    assert not issue.actionable_for_agent
+    assert "rejected.tool" not in str(captured.value.diagnostic)
+
     compiled_task = compiled.curriculum.task_types[0]
     assert compiled_task.initial_config_schema["properties"] == {
         "counter": {
@@ -1754,7 +2617,7 @@ def test_tool_surface_schema_cannot_drift_or_remain_open() -> None:
         "properties": {},
         "additionalProperties": False,
     }
-    with pytest.raises(ValueError, match="must target booking.reserve"):
+    with pytest.raises(StructuredValidationError) as captured:
         EnvironmentDesigner._validate_tool_surface_schemas_draft(
             ToolSurfaceSchemasDraft(
                 tool_id="booking.cancel",
@@ -1764,7 +2627,15 @@ def test_tool_surface_schema_cannot_drift_or_remain_open() -> None:
             ),
             plan=plan,
         )
-    with pytest.raises(ValueError, match="kind must remain input"):
+    issue = captured.value.diagnostic.issues[0]
+    assert captured.value.diagnostic.validation_phase == "tool_surface_schemas_semantics"
+    assert issue.code == "world_tool_surface_schema_target_mismatch"
+    assert issue.location == ("tool_id",)
+    assert not issue.actionable_for_agent
+    assert issue.violated_condition == "tool surface schemas must target the frozen tool plan"
+    assert issue.expected_category == "a schema bundle whose tool_id matches the frozen tool plan"
+    assert "booking.cancel" not in str(captured.value.diagnostic)
+    with pytest.raises(StructuredValidationError) as captured:
         EnvironmentDesigner._validate_tool_schema_draft(
             ToolSchemaDraft(
                 tool_id="booking.reserve",
@@ -1774,6 +2645,7 @@ def test_tool_surface_schema_cannot_drift_or_remain_open() -> None:
             plan=plan,
             schema_kind="input",
         )
+    assert captured.value.diagnostic.issues[0].code == "world_tool_schema_kind_mismatch"
     with pytest.raises(ValueError, match="additionalProperties=false"):
         EnvironmentDesigner._validate_tool_surface_schemas_draft(
             ToolSurfaceSchemasDraft(
@@ -1802,6 +2674,92 @@ def test_tool_surface_schema_cannot_drift_or_remain_open() -> None:
             plan=plan,
             schema_kind="observation",
         )
+
+
+@pytest.mark.parametrize(
+    (
+        "draft",
+        "schema_kind",
+        "expected_code",
+        "expected_path",
+        "rejected_value",
+        "expected_condition",
+        "expected_category",
+    ),
+    (
+        (
+            ToolSchemaDraft(
+                tool_id="rejected.tool",
+                schema_kind="input",
+                json_schema={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            ),
+            "input",
+            "world_tool_schema_target_mismatch",
+            ("tool_id",),
+            "rejected.tool",
+            "tool schema must target the frozen tool plan",
+            "a schema whose tool_id matches the frozen tool plan",
+        ),
+        (
+            ToolSchemaDraft(
+                tool_id="booking.reserve",
+                schema_kind="output",
+                json_schema={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            ),
+            "input",
+            "world_tool_schema_kind_mismatch",
+            ("schema_kind",),
+            "output",
+            "tool schema kind must match the frozen schema role",
+            "a schema_kind matching the frozen schema role",
+        ),
+    ),
+)
+def test_tool_schema_compiler_invariants_are_safe_and_non_actionable(
+    draft: ToolSchemaDraft,
+    schema_kind: str,
+    expected_code: str,
+    expected_path: tuple[str, ...],
+    rejected_value: str,
+    expected_condition: str,
+    expected_category: str,
+) -> None:
+    """Compiled tool schemas cannot consume an Agent repair attempt."""
+
+    plan = ToolSurfacePlan(
+        tool_id="booking.reserve",
+        namespace="booking",
+        name="reserve",
+        description="Reserve selected inventory.",
+        transport="runtime",
+        reads_state_entities=("booking",),
+        evidence_claim_ids=("claim:booking",),
+    )
+
+    with pytest.raises(StructuredValidationError) as captured:
+        EnvironmentDesigner._validate_tool_schema_draft(  # noqa: SLF001
+            draft,
+            plan=plan,
+            schema_kind=schema_kind,
+        )
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic.validation_phase == "tool_schema_semantics"
+    issue = diagnostic.issues[0]
+    assert issue.code == expected_code
+    assert issue.location == expected_path
+    assert not issue.actionable_for_agent
+    assert issue.violated_condition == expected_condition
+    assert issue.expected_category == expected_category
+    assert rejected_value not in str(diagnostic)
 
 
 def test_tool_schema_ir_compiles_required_arrays_and_unions_to_valid_draft() -> None:
