@@ -359,6 +359,8 @@ class WorkControlRuntime:
         lock: WorkControlLock,
         *,
         definition: WorkDefinition,
+        interrupted_dispatch_code: str = "process_interrupted_after_dispatch",
+        allow_infrastructure_retry: bool = True,
     ) -> WorkControlHead:
         """Terminalize an operation whose previous owning process is gone.
 
@@ -368,7 +370,10 @@ class WorkControlRuntime:
         the immutable replay mode then decides whether the ordinary global
         infrastructure-repair policy may authorize one new attempt.  A merely
         scheduled operation has not crossed the dispatch fence and is
-        cancelled with zero usage.
+        cancelled with zero usage.  A diagnostic runner may supply the exact
+        cancellation code it observed and forbid a follow-up dispatch: its
+        one-node proof must settle the interrupted attempt, not turn a signal
+        into a hidden retry.
 
         The method deliberately writes a normal OperationRun, validation
         report and FeedbackEvaluation.  A crash is therefore observable and
@@ -391,9 +396,7 @@ class WorkControlRuntime:
         was_scheduled = operation.status == "scheduled"
         dispatched = operation.status == "running"
         recovery_code = (
-            "process_interrupted_after_dispatch"
-            if dispatched
-            else "operation_cancelled_before_dispatch"
+            interrupted_dispatch_code if dispatched else "operation_cancelled_before_dispatch"
         )
         evidence_ref = self.artifacts.put_json(
             artifact_id=self._id("operation-recovery", operation.operation_run_id),
@@ -434,16 +437,14 @@ class WorkControlRuntime:
             )
 
         now = datetime.now(UTC)
-        allow_infrastructure_retry = (
+        allow_infrastructure_retry = allow_infrastructure_retry and (
             was_scheduled
             or operation.replay_mode in {"deterministic", "idempotent_with_key", "queryable"}
         )
 
         if operation.kind == "proposal":
             execution_code = (
-                recovery_code
-                if dispatched
-                else "preflight_operation_cancelled_before_dispatch"
+                recovery_code if dispatched else "preflight_operation_cancelled_before_dispatch"
             )
             execution = ProposalExecution(
                 execution_id=self._id("proposal-recovery", attempt.attempt_id),
@@ -499,9 +500,7 @@ class WorkControlRuntime:
                     ),
                 ),
                 evidence_refs=(evidence_ref,),
-                diagnostic_quality=(
-                    "actionable" if allow_infrastructure_retry else "insufficient"
-                ),
+                diagnostic_quality=("actionable" if allow_infrastructure_retry else "insufficient"),
                 evaluated_at=now,
             )
             self.checkpoint_validation(
@@ -628,9 +627,7 @@ class WorkControlRuntime:
                 ),
             ),
             evidence_refs=(evidence_ref,),
-            diagnostic_quality=(
-                "actionable" if allow_infrastructure_retry else "insufficient"
-            ),
+            diagnostic_quality=("actionable" if allow_infrastructure_retry else "insufficient"),
             evaluated_at=datetime.now(UTC),
         )
         self.checkpoint_validation(
@@ -658,6 +655,28 @@ class WorkControlRuntime:
         issues: tuple[tuple[str, tuple[str | int, ...], str, str], ...] = (),
     ) -> WorkControlHead:
         """Execute one real in-process Claim boundary under the same authority chain."""
+
+        with self.artifacts.verified_closure():
+            return self._execute_deterministic_boundary(
+                definition=definition,
+                input_refs=input_refs,
+                subject_ref=subject_ref,
+                output_refs=output_refs,
+                child_commit_refs=child_commit_refs,
+                issues=issues,
+            )
+
+    def _execute_deterministic_boundary(
+        self,
+        *,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+        subject_ref: ArtifactRef,
+        output_refs: tuple[ArtifactRef, ...],
+        child_commit_refs: tuple[ArtifactRef, ...],
+        issues: tuple[tuple[str, tuple[str | int, ...], str, str], ...],
+    ) -> WorkControlHead:
+        """Run the deterministic lifecycle inside one verified Artifact closure."""
 
         definition = self.register_definition(definition)
         if definition.proposal_policy.executor != "code":
@@ -1084,7 +1103,6 @@ class WorkControlRuntime:
                     if isinstance(execution, ProposalExecution)
                     else checkpointed.continuation_commitment
                 ),
-                "first_progress_at": (checkpointed.first_progress_at or execution.finished_at),
                 "first_write_at": (
                     checkpointed.first_write_at or (execution.finished_at if output_refs else None)
                 ),
@@ -1411,6 +1429,7 @@ class WorkControlRuntime:
         elapsed_wall_seconds: float,
         repair_mutation_roots: tuple[str, ...] | None = None,
         allow_infrastructure_retry: bool = True,
+        allow_session_continuation: bool = False,
     ) -> WorkControlHead:
         # Callers build reports before handing them to the runtime.  In a
         # diagnostic run the persisted report is deliberately reclassified at
@@ -1722,7 +1741,16 @@ class WorkControlRuntime:
                 error_code=terminal.failure_code,
             )
             return failed_head
-        if report.status == "error" and not allow_infrastructure_retry:
+        session_continuation_eligible = self._session_continuation_eligible(
+            definition=definition,
+            report=report,
+            allowed=allow_session_continuation,
+        )
+        if (
+            report.status == "error"
+            and not allow_infrastructure_retry
+            and not session_continuation_eligible
+        ):
             failed_head = self._fail_head(
                 lock,
                 head=head,
@@ -1746,6 +1774,7 @@ class WorkControlRuntime:
             evaluation_ref=evaluation_ref,
             elapsed_wall_seconds=elapsed_wall_seconds,
             repair_mutation_roots=repair_mutation_roots,
+            allow_session_continuation=session_continuation_eligible,
         )
         self._finish_attempt_span(
             terminal,
@@ -2076,7 +2105,7 @@ class WorkControlRuntime:
                 "validation_report_ref": None,
                 "feedback_evaluation_ref": None,
                 "repair_action_ref": head.repair_action_ref,
-                "repair_attempt_charge": 1,
+                "repair_attempt_charge": action.repair_attempt_charge,
                 "telemetry_trace_id": telemetry_trace_id,
                 "telemetry_span_id": telemetry_span_id,
                 "recovery_ordinal": 0,
@@ -2192,9 +2221,7 @@ class WorkControlRuntime:
                     "A validated downstream execution exposed a defect attributable to "
                     "this mutable artifact."
                 ),
-                expected_category=(
-                    "a repair confined to the target WorkDefinition mutation roots"
-                ),
+                expected_category=("a repair confined to the target WorkDefinition mutation roots"),
                 retryable=True,
             )
             for index, source_issue in enumerate(source_report.issues)
@@ -2318,6 +2345,85 @@ class WorkControlRuntime:
             lock,
             expected_head=head,
             next_head=next_head,
+        )
+
+    def authorize_diagnostic_infrastructure_retry(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+    ) -> WorkControlHead:
+        """Authorize one exact retryable terminal inside a marked diagnostic run.
+
+        A diagnostic node normally records one terminal result and stops.  An
+        operator may nevertheless request one *infrastructure* retry after a
+        fresh same-route liveness control has recovered.  This method does not
+        reinterpret an arbitrary error as retryable: it reuses the terminal
+        report/evaluation, the frozen definition/input closure, and the
+        ordinary RepairPolicy/WorkRepairLedger before opening the next physical
+        attempt.  Semantic corrections remain forbidden in diagnostics.
+        """
+
+        if not self.diagnostic_only:
+            raise WorkRuntimeError("diagnostic infrastructure retry requires diagnostic runtime")
+        definition = self.register_definition(definition)
+        head = self.heads.read_head(definition.coordinate)
+        if head is None or head.status != "failed":
+            raise WorkRuntimeError(
+                "diagnostic infrastructure retry requires one failed terminal head"
+            )
+        if (
+            head.work_id != definition.work_id
+            or head.definition_digest != definition.definition_digest
+            or head.acceptance_digest != definition.acceptance_digest
+            or head.input_fingerprint != self.heads.input_fingerprint(input_refs)
+        ):
+            raise WorkRuntimeError(
+                "diagnostic infrastructure retry must bind the exact terminal definition and inputs"
+            )
+        attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        if (
+            attempt.input_refs != input_refs
+            or not attempt.diagnostic_only
+            or attempt.releasable
+            or attempt.validation_report_ref is None
+            or head.evaluation_ref is None
+        ):
+            raise WorkRuntimeError(
+                "diagnostic infrastructure retry lacks one exact terminal evidence closure"
+            )
+        report_ref = attempt.validation_report_ref
+        report = self.artifacts.get_json(report_ref, ValidationReport)
+        evaluation = self.artifacts.get_json(head.evaluation_ref, FeedbackEvaluation)
+        if (
+            report.attempt_id != attempt.attempt_id
+            or report.coordinate != definition.coordinate
+            or report.status != "error"
+            or not report.infrastructure_retryable
+            or evaluation.attempt_id != attempt.attempt_id
+            or evaluation.work_id != definition.work_id
+            or evaluation.coordinate != definition.coordinate
+            or evaluation.validation_report_ref != report_ref
+            or evaluation.status != "error"
+            or not evaluation.diagnostic_only
+            or evaluation.releasable
+        ):
+            raise WorkRuntimeError(
+                "diagnostic infrastructure retry requires one safe retryable terminal report"
+            )
+        return self._authorize_next_or_fail(
+            lock,
+            head=head,
+            terminal_attempt=attempt,
+            terminal_ref=head.attempt_ref,
+            definition=definition,
+            report=report,
+            report_ref=report_ref,
+            evaluation_ref=head.evaluation_ref,
+            elapsed_wall_seconds=0,
+            repair_mutation_roots=None,
+            terminal_infrastructure_retry=True,
         )
 
     def restart_interrupted_repair(
@@ -2579,31 +2685,47 @@ class WorkControlRuntime:
         evaluation_ref: ArtifactRef,
         elapsed_wall_seconds: float,
         repair_mutation_roots: tuple[str, ...] | None,
+        terminal_infrastructure_retry: bool = False,
+        allow_session_continuation: bool = False,
     ) -> WorkControlHead:
-        decision: Literal["infrastructure_retry", "local_correction"] = (
-            "infrastructure_retry" if report.status == "error" else "local_correction"
+        decision: Literal[
+            "infrastructure_retry", "local_correction", "session_continuation"
+        ] = (
+            "session_continuation"
+            if allow_session_continuation
+            else "infrastructure_retry"
+            if report.status == "error"
+            else "local_correction"
         )
         process_interrupted = (
             report.status == "error"
             and bool(report.issues)
             and all(issue.code.startswith("process_interrupted") for issue in report.issues)
         )
-        no_local_repair_authority = (
-            decision == "local_correction"
-            and (
-                not report.repair_actionable
-                or definition.repair_policy.maximum_local_corrections == 0
-                or not definition.allowed_mutation_roots
-            )
+        no_local_repair_authority = decision == "local_correction" and (
+            not report.repair_actionable
+            or definition.repair_policy.maximum_local_corrections == 0
+            or not definition.allowed_mutation_roots
         )
-        no_infrastructure_retry_authority = (
-            decision == "infrastructure_retry"
-            and (
-                definition.repair_policy.maximum_infrastructure_retries == 0
-                or not report.infrastructure_retryable
-            )
+        no_infrastructure_retry_authority = decision == "infrastructure_retry" and (
+            definition.repair_policy.maximum_infrastructure_retries == 0
+            or not report.infrastructure_retryable
         )
-        if no_local_repair_authority or no_infrastructure_retry_authority:
+        no_session_continuation_authority = decision == "session_continuation" and (
+            definition.repair_policy.maximum_session_continuations == 0
+            or self.continuations is None
+            or self.continuation_workspace_root is None
+        )
+        if (
+            no_local_repair_authority
+            or no_infrastructure_retry_authority
+            or no_session_continuation_authority
+        ):
+            if terminal_infrastructure_retry:
+                raise WorkRuntimeError(
+                    "diagnostic infrastructure retry is not authorized by the terminal "
+                    "report/policy"
+                )
             # A FeedbackEvaluation records the failed Claim regardless, but an
             # actionable diagnostic cannot manufacture repair authority.  In
             # particular code-owned leaves deliberately have no mutation roots;
@@ -2647,18 +2769,20 @@ class WorkControlRuntime:
                     if repair_mutation_roots is not None
                     else definition.allowed_mutation_roots
                 )
-                if decision == "local_correction"
+                if decision in {"local_correction", "session_continuation"}
                 else ()
             ),
             causal_evidence_refs=(report_ref, evaluation_ref),
             reason_code=(
                 "actionable_validation_failure"
                 if decision == "local_correction"
+                else "provider_output_ceiling"
+                if decision == "session_continuation"
                 else "process_interrupted"
                 if process_interrupted
                 else "retryable_infrastructure_failure"
             ),
-            repair_attempt_charge=1,
+            repair_attempt_charge=(0 if decision == "session_continuation" else 1),
             authorized_at=authorized_at,
         )
         action_ref = self.artifacts.put_json(
@@ -2703,9 +2827,30 @@ class WorkControlRuntime:
                 "attempt_ref": terminal_ref,
                 "evaluation_ref": evaluation_ref,
                 "repair_action_ref": action_ref,
+                "invalidated_by_refs": tuple(
+                    dict.fromkeys(
+                        (
+                            *head.invalidated_by_refs,
+                            terminal_ref,
+                            report_ref,
+                            evaluation_ref,
+                            action_ref,
+                        )
+                    )
+                ),
                 "updated_at": datetime.now(UTC),
             }
         )
+        if terminal_infrastructure_retry:
+            if decision != "infrastructure_retry":
+                raise WorkRuntimeError(
+                    "terminal diagnostic repair may authorize infrastructure retry only"
+                )
+            return self.heads.authorize_infrastructure_retry(
+                lock,
+                expected_head=head,
+                next_head=next_head,
+            )
         return self.heads.compare_and_swap(lock, expected_head=head, next_head=next_head)
 
     def _complete_previous_repair(
@@ -2750,6 +2895,10 @@ class WorkControlRuntime:
                 report_after.status == "error"
                 and entry.decision in {"local_correction", "parent_correction"}
             ),
+            force_strict_progress=(
+                entry.decision == "session_continuation"
+                and self._has_exact_output_limit(report_after)
+            ),
         )
         prior_refs = self.artifacts.list_revisions(updated.entry_id)
         dependencies: tuple[ArtifactRef, ...] = (
@@ -2764,6 +2913,38 @@ class WorkControlRuntime:
             artifact_type="control.work_repair_ledger_entry",
             value=updated,
             dependencies=dependencies,
+        )
+
+    def _session_continuation_eligible(
+        self,
+        *,
+        definition: WorkDefinition,
+        report: ValidationReport,
+        allowed: bool,
+    ) -> bool:
+        """Return whether a leaf proved an exact resumable output-ceiling boundary.
+
+        The Scheduler never infers this from Provider prose.  The leaf must
+        carry an in-memory private session through the same terminal boundary,
+        while the immutable WorkDefinition declares a logical session envelope
+        and the runtime owns a private continuation store.
+        """
+
+        return bool(
+            allowed
+            and self.continuations is not None
+            and self.continuation_workspace_root is not None
+            and definition.proposal_policy.executor == "agent"
+            and definition.proposal_policy.session_token_limit is not None
+            and definition.proposal_policy.session_wall_seconds is not None
+            and definition.repair_policy.maximum_session_continuations > 0
+            and self._has_exact_output_limit(report)
+        )
+
+    @staticmethod
+    def _has_exact_output_limit(report: ValidationReport) -> bool:
+        return report.status == "error" and tuple(issue.code for issue in report.issues) == (
+            "turn_failed_output_limit",
         )
 
     def _fail_head(

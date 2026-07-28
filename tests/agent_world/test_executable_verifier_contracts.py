@@ -856,8 +856,21 @@ def test_verifier_intent_uses_one_based_ordinals_and_reports_all_bad_references(
     assert all(issue.code == "intent_action_ordinal_out_of_range" for issue in diagnostic.issues)
     assert all("after_action_ordinal" in issue.issue_code for issue in diagnostic.issues)
     assert "one-based" in diagnostic.feedback
-    assert "one-based" in VerifierCompiler._prompt({})
-    assert "fewest distinct trajectories" in VerifierCompiler._prompt({})
+    prompt = VerifierCompiler._prompt({})
+    assert "one-based" in prompt
+    assert "fewest distinct trajectories" in prompt
+    assert "`expectations`" in prompt
+    assert "`checks`" in prompt
+    schema = VerifierIntent.model_json_schema(mode="validation")
+    definitions = schema["$defs"]
+    assert isinstance(definitions, dict)
+    case_schema = definitions["VerifierCaseIntent"]
+    assert isinstance(case_schema, dict)
+    properties = case_schema["properties"]
+    assert isinstance(properties, dict)
+    expectations_schema = properties["expectations"]
+    assert isinstance(expectations_schema, dict)
+    assert "literal field name" in str(expectations_schema["description"])
 
 
 def test_verifier_intent_compiles_one_based_ordinal_to_zero_based_index() -> None:

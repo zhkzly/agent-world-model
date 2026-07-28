@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Codex Session Start Hook - Inject Trellis context into Codex sessions.
 
@@ -12,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import warnings
@@ -25,6 +25,7 @@ from pathlib import Path
 # but applied per-stream so we don't depend on host CLI's command wiring.
 if sys.platform.startswith("win"):
     import io as _io
+
     for _stream_name in ("stdin", "stdout", "stderr"):
         _stream = getattr(sys, _stream_name, None)
         if _stream is None:
@@ -32,12 +33,15 @@ if sys.platform.startswith("win"):
         if hasattr(_stream, "reconfigure"):
             try:
                 _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
-            except Exception:
+            except Exception:  # noqa: S110 - hook encoding setup is intentionally best-effort
                 pass
         elif hasattr(_stream, "detach"):
             try:
-                setattr(sys, _stream_name, _io.TextIOWrapper(_stream.detach(), encoding="utf-8", errors="replace"))
-            except Exception:
+                wrapped_stream = _io.TextIOWrapper(
+                    _stream.detach(), encoding="utf-8", errors="replace"
+                )
+                setattr(sys, _stream_name, wrapped_stream)
+            except Exception:  # noqa: S110 - hook encoding setup is intentionally best-effort
                 pass
 
 
@@ -69,21 +73,21 @@ def _normalize_windows_shell_path(path_str: str) -> str:
     m = re.match(r"^/([A-Za-z])/(.*)", p)
     if m:
         drive, rest = m.group(1).upper(), m.group(2)
-        rest = rest.replace('/', '\\')
+        rest = rest.replace("/", "\\")
         return f"{drive}:\\{rest}"
 
     # Cygwin style: /cygdrive/c/Users/...
     m = re.match(r"^/cygdrive/([A-Za-z])/(.*)", p)
     if m:
         drive, rest = m.group(1).upper(), m.group(2)
-        rest = rest.replace('/', '\\')
+        rest = rest.replace("/", "\\")
         return f"{drive}:\\{rest}"
 
     # WSL mounted drive (sometimes leaked into env): /mnt/c/Users/...
     m = re.match(r"^/mnt/([A-Za-z])/(.*)", p)
     if m:
         drive, rest = m.group(1).upper(), m.group(2)
-        rest = rest.replace('/', '\\')
+        rest = rest.replace("/", "\\")
         return f"{drive}:\\{rest}"
 
     return path_str
@@ -91,11 +95,19 @@ def _normalize_windows_shell_path(path_str: str) -> str:
 
 warnings.filterwarnings("ignore")
 
-FIRST_REPLY_NOTICE = """<first-reply-notice>
-On the first visible assistant reply in this session, begin with exactly one short Chinese sentence:
-Trellis SessionStart 已注入：workflow、当前任务状态、开发者身份、git 状态、active tasks、spec 索引已加载。
-Then continue directly with the user's request. This notice is one-shot: do not repeat it after the first assistant reply in the same session.
-</first-reply-notice>"""
+_MAX_SESSION_START_SPEC_INDEXES = 8
+
+FIRST_REPLY_NOTICE = (
+    "<first-reply-notice>\n"
+    "On the first visible assistant reply in this session, begin with exactly one "
+    "short Chinese sentence:\n"
+    "Trellis SessionStart 已注入：workflow、当前任务、项目路径地图、开发者身份、"
+    "git 状态和 spec 索引已加载。\n"
+    "Then continue directly with the user's request. This notice is one-shot: do not "
+    "repeat it after the first assistant reply in the same session.\n"
+    "</first-reply-notice>"
+)
+
 
 def should_skip_injection() -> bool:
     if os.environ.get("TRELLIS_HOOKS") == "0":
@@ -116,7 +128,7 @@ def configure_project_encoding(project_dir: Path) -> None:
 
         configure_encoding()
     except Exception:
-        pass
+        return
 
 
 def _has_curated_jsonl_entry(jsonl_path: Path) -> bool:
@@ -176,7 +188,7 @@ def run_script(script_path: Path, context_key: str | None = None) -> str:
         if context_key:
             env["TRELLIS_CONTEXT_ID"] = context_key
         cmd = [sys.executable, "-W", "ignore", str(script_path)]
-        result = subprocess.run(
+        result = subprocess.run(  # noqa: S603 - fixed local hook script and interpreter
             cmd,
             capture_output=True,
             text=True,
@@ -279,10 +291,7 @@ def _get_task_status(trellis_dir: Path, hook_input: dict) -> str:
                 "Lightweight task can ask for start review with PRD-only; "
                 "complex task must add design.md and implement.md before `task.py start`."
             )
-        return (
-            f"Status: PLANNING\nTask: {task_title}\nPresent: {present_line}\n"
-            f"Next: {next_action}"
-        )
+        return f"Status: PLANNING\nTask: {task_title}\nPresent: {present_line}\nNext: {next_action}"
 
     return (
         f"Status: {task_status.upper()}\nTask: {task_title}\nPresent: {present_line}\n"
@@ -292,9 +301,12 @@ def _get_task_status(trellis_dir: Path, hook_input: dict) -> str:
 
 
 def _run_git(repo_root: Path, args: list[str]) -> str:
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        return ""
     try:
-        result = subprocess.run(
-            ["git", *args],
+        result = subprocess.run(  # noqa: S603 - callers provide fixed Git arguments
+            [git_executable, *args],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -312,8 +324,7 @@ def _run_git(repo_root: Path, args: list[str]) -> str:
 def _format_git_state(repo_root: Path) -> str:
     branch = _run_git(repo_root, ["branch", "--show-current"]) or "(detached)"
     dirty_lines = [
-        line for line in _run_git(repo_root, ["status", "--porcelain"]).splitlines()
-        if line.strip()
+        line for line in _run_git(repo_root, ["status", "--porcelain"]).splitlines() if line.strip()
     ]
     dirty_text = "clean" if not dirty_lines else f"dirty {len(dirty_lines)} paths"
     return f"Git: branch {branch}; {dirty_text}."
@@ -353,6 +364,12 @@ def _collect_spec_index_paths(trellis_dir: Path) -> list[str]:
     return paths
 
 
+def _bounded_spec_index_paths(paths: list[str]) -> tuple[list[str], int]:
+    """Keep the session-start navigation map bounded as the spec tree grows."""
+    shown = paths[:_MAX_SESSION_START_SPEC_INDEXES]
+    return shown, len(paths) - len(shown)
+
+
 def _build_compact_current_state(
     trellis_dir: Path,
     hook_input: dict,
@@ -362,7 +379,12 @@ def _build_compact_current_state(
     lines: list[str] = []
 
     try:
-        from common.paths import get_active_journal_file, get_developer, get_tasks_dir, count_lines  # type: ignore[import-not-found]
+        from common.paths import (  # type: ignore[import-not-found]
+            count_lines,
+            get_active_journal_file,
+            get_developer,
+            get_tasks_dir,
+        )
         from common.tasks import iter_active_tasks  # type: ignore[import-not-found]
     except Exception:
         get_active_journal_file = None  # type: ignore[assignment]
@@ -371,6 +393,7 @@ def _build_compact_current_state(
         count_lines = None  # type: ignore[assignment]
         iter_active_tasks = None  # type: ignore[assignment]
 
+    lines.append(f"Project root: {repo_root}")
     developer = get_developer(repo_root) if get_developer else None
     lines.append(f"Developer: {developer or '(not initialized)'}")
     lines.append(_format_git_state(repo_root))
@@ -388,6 +411,12 @@ def _build_compact_current_state(
             except (json.JSONDecodeError, OSError):
                 pass
         lines.append(f"Current task: {_repo_relative(repo_root, task_dir)}; status={status}.")
+        lines.append(f"Task directory: {task_dir}")
+        task_documents = [
+            name for name in ("prd.md", "design.md", "implement.md") if (task_dir / name).is_file()
+        ]
+        if task_documents:
+            lines.append(f"Task files (read on demand): {', '.join(task_documents)}.")
     else:
         lines.append("Current task: none.")
 
@@ -404,16 +433,18 @@ def _build_compact_current_state(
         try:
             task_count = sum(1 for _ in iter_active_tasks(get_tasks_dir(repo_root)))
             lines.append(
-                f"Active tasks: {task_count} total. Use `python3 ./.trellis/scripts/task.py list --mine` only if needed."
+                f"Active tasks: {task_count} total. "
+                "Use `python3 ./.trellis/scripts/task.py list --mine` only if needed."
             )
         except Exception:
-            pass
+            lines.append("Active task count: unavailable.")
 
     if get_active_journal_file and count_lines:
         journal = get_active_journal_file(repo_root)
         if journal:
             lines.append(
-                f"Journal: {_repo_relative(repo_root, journal)}, {count_lines(journal)} / 2000 lines."
+                f"Journal: {_repo_relative(repo_root, journal)}, "
+                f"{count_lines(journal)} / 2000 lines."
             )
 
     if spec_index_paths:
@@ -423,18 +454,18 @@ def _build_compact_current_state(
 
 
 def _extract_range(content: str, start_header: str, end_header: str) -> str:
-    """Extract lines starting at `## start_header` up to (but excluding) `## end_header`."""
+    """Extract one heading range without assuming the two headings share a level."""
     lines = content.splitlines()
-    start: "int | None" = None
+    start: int | None = None
     end: int = len(lines)
-    start_match = f"## {start_header}"
-    end_match = f"## {end_header}"
+    start_match = re.compile(rf"^#{{1,6}}\s+{re.escape(start_header)}\s*$")
+    end_match = re.compile(rf"^#{{1,6}}\s+{re.escape(end_header)}\s*$")
     for i, line in enumerate(lines):
         stripped = line.strip()
-        if start is None and stripped == start_match:
+        if start is None and start_match.fullmatch(stripped):
             start = i
             continue
-        if start is not None and stripped == end_match:
+        if start is not None and end_match.fullmatch(stripped):
             end = i
             break
     if start is None:
@@ -451,25 +482,44 @@ _BREADCRUMB_TAG_RE = re.compile(
 def _strip_breadcrumb_tag_blocks(content: str) -> str:
     stripped = _BREADCRUMB_TAG_RE.sub("", content)
     stripped = re.sub(r"<!--.*?-->", "", stripped, flags=re.DOTALL)
-    stripped = re.sub(r"^\[(?!/?workflow-state:)/?[^\]\n]+\]\s*\n?", "", stripped, flags=re.MULTILINE)
+    stripped = re.sub(
+        r"^\[(?!/?workflow-state:)/?[^\]\n]+\]\s*\n?",
+        "",
+        stripped,
+        flags=re.MULTILINE,
+    )
     return re.sub(r"\n{3,}", "\n\n", stripped).strip()
 
 
 def _build_workflow_toc(workflow_path: Path) -> str:
-    """Inject only the compact Phase Index summary for SessionStart."""
+    """Inject the Phase Index's short fenced summary, never its later guidance."""
     content = read_file(workflow_path)
     if not content:
         return "No workflow.md found"
 
     out_lines = [
         "# Development Workflow - Session Summary",
-        "Full guide: .trellis/workflow.md. Step detail: `python3 ./.trellis/scripts/get_context.py --mode phase --step <X.Y>`.",
+        "Full guide: .trellis/workflow.md. Step detail: "
+        "`python3 ./.trellis/scripts/get_context.py --mode phase --step <X.Y>`.",
         "",
     ]
 
-    phases = _extract_range(content, "Phase Index", "Phase 1: Plan")
-    if phases:
-        out_lines.append(_strip_breadcrumb_tag_blocks(phases).rstrip())
+    phase_index = _extract_range(content, "Phase Index", "Request Triage")
+    summary_match = re.search(r"```[^\n]*\n(.*?)\n```", phase_index, re.DOTALL)
+    if summary_match:
+        out_lines.extend(
+            [
+                "## Phase Index",
+                "",
+                "```",
+                summary_match.group(1).strip(),
+                "```",
+            ]
+        )
+    else:
+        # A malformed or revised workflow must not cause SessionStart to inject
+        # unbounded guidance. The full document remains available on demand.
+        out_lines.append("Phase index unavailable; read .trellis/workflow.md on demand.")
 
     return "\n".join(out_lines).rstrip()
 
@@ -520,14 +570,17 @@ Trellis compact SessionStart context. Use it to orient the session; load details
 
     if spec_index_paths:
         output.write("## Available indexes (read on demand)\n")
-        for p in spec_index_paths:
+        shown_spec_indexes, omitted_spec_indexes = _bounded_spec_index_paths(spec_index_paths)
+        for p in shown_spec_indexes:
             output.write(f"- {p}\n")
+        if omitted_spec_indexes:
+            output.write(
+                f"- … and {omitted_spec_indexes} more; list them on demand with "
+                "`python3 ./.trellis/scripts/get_context.py --mode packages`\n"
+            )
         output.write("\n")
 
-    output.write(
-        "Discover more via: "
-        "`python3 ./.trellis/scripts/get_context.py --mode packages`\n"
-    )
+    output.write("Discover more via: `python3 ./.trellis/scripts/get_context.py --mode packages`\n")
     output.write("</guidelines>\n\n")
 
     task_status = _get_task_status(trellis_dir, hook_input)

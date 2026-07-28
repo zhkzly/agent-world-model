@@ -190,9 +190,12 @@ def test_scheduler_discloses_only_declared_parent_artifacts(tmp_path: Path) -> N
     assert resolved.parent_commit_refs
     assert resolved.parent_output_refs == (allowed_ref,)
     assert resolved.all_input_refs == (root_ref, allowed_ref)
-    assert next(
-        item for item in scheduler.snapshot().work if item.coordinate == consumer_coordinate
-    ).state == "ready"
+    assert (
+        next(
+            item for item in scheduler.snapshot().work if item.coordinate == consumer_coordinate
+        ).state
+        == "ready"
+    )
 
 
 def test_work_attempt_span_inherits_the_direct_root_trace(tmp_path: Path) -> None:
@@ -257,9 +260,7 @@ def test_work_attempt_span_inherits_the_direct_root_trace(tmp_path: Path) -> Non
         spans = telemetry.inspect_trace("run:trace-parent")["spans"]
 
     work_spans = [
-        item
-        for item in spans
-        if item["operation"] == definition.proposal_policy.operation
+        item for item in spans if item["operation"] == definition.proposal_policy.operation
     ]
     assert len(work_spans) == 1
     assert work_spans[0]["parent_span_id"] == root.span_id
@@ -409,7 +410,7 @@ def test_scheduler_retains_successful_sibling_and_opens_exact_join(tmp_path: Pat
     _commit(
         runtime,
         aggregate,
-            input_refs=(external_ref, first_ref, second_ref),
+        input_refs=(external_ref, first_ref, second_ref),
         output_ref=aggregate_ref,
         child_commit_refs=(first_commit_ref, second_commit_ref),
     )
@@ -539,6 +540,143 @@ async def test_scheduler_dispatches_real_leaf_executors_until_terminal(
     assert tuple(item.coordinate.stage for item in results) == ("package", "publication")
     assert all(item.after_state == "committed" for item in results)
     assert scheduler.snapshot().work[-1].state == "committed"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_reexecutes_terminal_failure_for_new_definition_same_inputs(
+    tmp_path: Path,
+) -> None:
+    """A frozen feedback variant must supersede, not inherit, an old failure.
+
+    This is the real Scheduler-to-leaf boundary used by a feedback-only
+    descendant node: the input closure is intentionally unchanged, while the
+    immutable WorkDefinition changes.  The old terminal verdict must become
+    ``stale`` before any executor/model can be invoked.
+    """
+
+    scope_id = "job:definition-feedback"
+    coordinate = WorkCoordinate(
+        scope_id=scope_id,
+        component="design",
+        stage="world_rules",
+        artifact_slot="world_rules",
+    )
+    original = _definition(
+        scope_id=scope_id,
+        component="design",
+        stage="world_rules",
+        coordinate=coordinate,
+        dependencies=(),
+    )
+    updated = original.model_copy(
+        update={"timing_reason": "Diagnostic feedback changed this exact definition."}
+    )
+    assert original.definition_digest != updated.definition_digest
+    artifacts = ArtifactStore(tmp_path / "artifacts").issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.", "design."),
+    )
+    heads = WorkControlStore(tmp_path / "heads")
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(Budget(wall_seconds=1_000, process_calls=20)),
+    )
+    request_ref = artifacts.put_json(
+        artifact_id="request:definition-feedback",
+        artifact_type="control.environment_request",
+        value={"need": "用户预订宾馆"},
+    )
+    failed_ref = artifacts.put_json(
+        artifact_id="failed:world-rules",
+        artifact_type="design.world_rules",
+        value={"invalid": True},
+        dependencies=(request_ref,),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=original,
+        input_refs=(request_ref,),
+        subject_ref=failed_ref,
+        output_refs=(failed_ref,),
+        issues=(
+            (
+                "invalid_world_rule",
+                ("rules",),
+                "world rules are invalid",
+                "valid world rules",
+            ),
+        ),
+    )
+    original_head = heads.read_head(coordinate)
+    assert original_head is not None
+    assert original_head.status == "failed"
+
+    graph = GenerationWorkGraph.compile((updated,), mode="diagnostic")
+    manifest = graph.manifest(
+        topology_id="topology:definition-feedback",
+        external_root_refs=(request_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(request_ref,),
+    )
+    # The descendant runner creates a fresh diagnostic runtime over the copied
+    # durable heads.  Its in-memory definition registry must therefore contain
+    # only the feedback variant, not the source definition that made the old
+    # failure.
+    execution_runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(Budget(wall_seconds=1_000, process_calls=20)),
+        diagnostic_only=True,
+    )
+    scheduler = WorkScheduler(
+        graph=graph,
+        manifest=manifest,
+        manifest_ref=manifest_ref,
+        heads=heads,
+        artifacts=artifacts,
+        runtime=execution_runtime,
+    )
+
+    scheduled = next(item for item in scheduler.snapshot().work if item.coordinate == coordinate)
+    assert scheduled.state == "stale"
+
+    async def execute(context: WorkExecutionContext) -> None:
+        opened_head = heads.read_head(context.coordinate)
+        assert opened_head is not None
+        assert opened_head.status == "running"
+        assert opened_head.definition_digest == updated.definition_digest
+        output_ref = artifacts.put_json(
+            artifact_id="output:world-rules",
+            artifact_type="design.world_rules",
+            value={"valid": True},
+            dependencies=(request_ref,),
+        )
+        execution_runtime.execute_deterministic_boundary(
+            definition=updated,
+            input_refs=(request_ref,),
+            subject_ref=output_ref,
+            output_refs=(output_ref,),
+        )
+
+    result = await scheduler.dispatch_one(
+        coordinate,
+        executors={updated.work_id: execute},
+    )
+
+    assert result.before_state == "stale"
+    assert result.after_state == "committed"
+    final_head = heads.read_head(coordinate)
+    assert final_head is not None
+    assert final_head.status == "committed"
+    assert final_head.definition_digest == updated.definition_digest
+    assert final_head.revision > original_head.revision
+    original_attempt = artifacts.get_json(original_head.attempt_ref, WorkAttempt)
+    final_attempt = artifacts.get_json(final_head.attempt_ref, WorkAttempt)
+    assert final_attempt.parent_attempt_id == original_attempt.attempt_id
 
 
 @pytest.mark.asyncio

@@ -41,6 +41,7 @@ from agent_world.control import (
     TelemetryStore,
     WorkControlStore,
 )
+from agent_world.control.telemetry import INVOCATION_ACTIVITY_CLASSES
 from agent_world.controller import FoundryController
 from agent_world.designer import (
     DiscoveryService,
@@ -272,6 +273,23 @@ class DirectRunReader:
                     )
                 else:
                     reserved_exposure[name] = reserved_exposure.get(name, 0) + value
+        activity_counts = {activity: 0 for activity in INVOCATION_ACTIVITY_CLASSES}
+        activity_classification_available = False
+        for span in spans:
+            if not bool(span.get("activity_classification_available", False)):
+                continue
+            activity_classification_available = True
+            observed_activity = span.get("observed_activity_event_counts")
+            if not isinstance(observed_activity, Mapping):
+                continue
+            for activity in INVOCATION_ACTIVITY_CLASSES:
+                observed = observed_activity.get(activity)
+                if (
+                    isinstance(observed, (int, float))
+                    and not isinstance(observed, bool)
+                    and observed >= 0
+                ):
+                    activity_counts[activity] += int(observed)
         return {
             "spans": list(spans),
             "orphaned_spans": list(orphaned_spans),
@@ -284,8 +302,9 @@ class DirectRunReader:
                 "inflight_observed": {
                     "llm_tokens": None,
                     "event_count": sum(int(item["observed_event_count"]) for item in spans),
-                    "protocol_tool_event_count": sum(
-                        int(item["observed_protocol_tool_event_count"]) for item in spans
+                    "activity_classification_available": activity_classification_available,
+                    "activity_event_counts": (
+                        activity_counts if activity_classification_available else None
                     ),
                 },
                 "active_reserved_exposure": reserved_exposure,
@@ -540,7 +559,10 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
             config.generation_budget.repair_attempts,
             config.expansion.candidate_budget.repair_attempts,
         ),
-        turn_token_limit=config.agent.environment_codegen_turn_token_limit,
+        # Keep the user-configured multi-turn Builder budget logical.  The
+        # Builder reserves this observed Provider ceiling for one physical
+        # turn and the Scheduler owns any durable continuation.
+        turn_token_limit=config.agent.environment_codegen_physical_turn_token_limit,
         turn_timeout_seconds=config.agent.environment_codegen_invocation_timeout_seconds,
     )
     verifier_compiler = VerifierCompiler(
@@ -550,11 +572,7 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         maximum_structured_reworks=config.judge.maximum_structured_reworks,
         maximum_tasks_per_batch=config.judge.maximum_tasks_per_verifier_batch,
     )
-    clean_builder = CleanCandidateBuilder(
-        build_isolation=IsolationPolicy(purpose="build"),
-        uv_cache_dir=config.judge.uv_cache_dir,
-        timeout_seconds=config.judge.clean_build_timeout_seconds,
-    )
+    clean_builder = _clean_candidate_builder(config)
     judge = EnvironmentJudge(
         artifact_store=judge_artifacts,
         interactive_challenger=InteractiveChallengerStrategy(
@@ -636,11 +654,7 @@ def open_consumption(config: FoundryConfig) -> ConsumptionApplication:
         artifacts,
         reservation_ttl_seconds=config.expansion.version_reservation_ttl_seconds,
     )
-    clean_builder = CleanCandidateBuilder(
-        build_isolation=IsolationPolicy(purpose="build"),
-        uv_cache_dir=config.judge.uv_cache_dir,
-        timeout_seconds=config.judge.clean_build_timeout_seconds,
-    )
+    clean_builder = _clean_candidate_builder(config)
     return ConsumptionApplication(
         registry=RegistryReader(registry),
         rollout=LocalRolloutConsumer(
@@ -717,7 +731,11 @@ def open_observability(config: FoundryConfig) -> ObservabilityReader:
     )
 
 
-def open_debug_transcripts(config: FoundryConfig) -> DebugTranscriptWriter:
+def open_debug_transcripts(
+    config: FoundryConfig,
+    *,
+    enabled: bool | None = None,
+) -> DebugTranscriptWriter:
     """Open the explicitly opt-in local transcript sink without workflow authority."""
 
     is_reserved_live = ".agent-world-live" in config.state_root.parts
@@ -731,6 +749,7 @@ def open_debug_transcripts(config: FoundryConfig) -> DebugTranscriptWriter:
     return DebugTranscriptWriter(
         root=ObservabilityRoot(config.state_root),
         known_secret_canaries=canaries,
+        enabled=enabled,
     )
 
 
@@ -762,6 +781,22 @@ def _authorized_environment(
     if config.research.jina_api_key_environment is not None:
         names.add(config.research.jina_api_key_environment)
     return {name: source[name] for name in sorted(names) if name in source}
+
+
+def _clean_candidate_builder(config: FoundryConfig) -> CleanCandidateBuilder:
+    """Assemble the clean-build boundary with a safe configuration diagnosis."""
+
+    try:
+        return CleanCandidateBuilder(
+            build_isolation=IsolationPolicy(purpose="build"),
+            uv_cache_dir=config.judge.uv_cache_dir,
+            timeout_seconds=config.judge.clean_build_timeout_seconds,
+        )
+    except ValueError as exc:
+        raise ApplicationConfigurationError(
+            "judge clean-build configuration is invalid; "
+            "verify judge.uv_cache_dir is a real directory when configured"
+        ) from exc
 
 
 def _prepare_state_root(path: Path) -> None:
@@ -860,6 +895,7 @@ __all__ = [
     "open_campaigns",
     "open_consumption",
     "open_direct_runs",
+    "open_debug_transcripts",
     "open_observability",
     "open_registry",
 ]

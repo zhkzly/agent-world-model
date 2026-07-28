@@ -35,6 +35,67 @@ WorldRule is a general executable property, never a fixed scenario, task goal, e
 trajectory. Do not restate schema validity as a full `schema_valid` invariant when framework code
 already owns schema validation, and never read evaluator-only `task_goal`.
 
+## CurriculumPlan semantic ownership
+
+When the requested output is `CurriculumPlanSourceDraft`, author only the compact, ordered
+task-family plan. Choose the smallest semantically distinct end-to-end families needed for the
+frozen WorldModel. A plan owns task-family identity, reachable objective, actor/tool scope,
+difficulty, sampling, and design-stage coverage; it does **not** own any task-local Rule section.
+Do not enumerate task instances, trajectories, examples, variants, success/failure/terminal Rules,
+schemas, evaluator bindings, reward, verification policy, code, solutions, or release decisions.
+
+`task_plans` is a physical fan-out authority: framework code freezes exactly one independent
+TaskRequirement Agent turn for each ordered entry. Therefore choose only a small complete family
+set; do not add a family merely to describe a variant. `coverage_dimensions[*].rule_ids` is a
+closed reference field: copy literal IDs only from the runtime Prompt's `coverage_rule_catalog`,
+which contains the frozen world Rule closure. Do not mint an ID or use a task/sampling Rule ID;
+`rule_ids` may be empty when no existing world Rule directly supports that coverage dimension.
+
+`difficulty_dimensions` is also a closed top-level catalog, not a place to invent generic axes.
+Return one `DifficultyDimension` for every id in the runtime Prompt's `task_dimension_catalog`
+(or `world.task_dimensions`), exactly once and in that exact order; do not add, remove, rename,
+or reorder any id. A `task_plans[*].difficulty_dimensions` list may select only applicable ids
+from that complete catalog. Before returning, compare the top-level dimension-id sequence against
+the supplied catalog literally.
+
+Sampling Rules use family `sampling` and never read evaluator-only `task_goal`. Omit
+`RuleDraft.rule_id`: framework code derives `rule:sampling:<ordinal>` after it validates the plan.
+
+## TaskRequirement semantic ownership
+
+When the requested output is `TaskRequirementSourceDraft`, author exactly one task family for the
+provided frozen `target_task_plan`. Preserve its `task_type`, objective, allowed actors, required
+tools, difficulty dimensions, and minimum tool calls exactly. Do not add, remove, rename, reorder,
+or infer another task family. The framework owns task schemas, evaluator bindings, reward,
+verification closure, materialization policy, the physical loop, and Rule identities.
+
+Include all four Rule-list fields even when a permitted list is empty:
+`initial_state_constraints` (may be empty), `success_conditions` (non-empty),
+`failure_conditions` (may be empty), and `terminal_conditions` (non-empty). Every task—not merely
+the curriculum as a whole—needs at least one terminal Rule.
+
+Use these exact Rule-family and source boundaries:
+
+- Initial-state Rules use `initial_state` and may read reset_config/pre_state but never `task_goal`.
+- Success Rules use `task_success`; failure Rules use `task_failure`; terminal Rules use
+  `task_terminal`.
+- Every task has at least one success Rule and at least one terminal Rule that read `task_goal`.
+  Every such pointer is non-root, RFC 6901, scalar (`null`, `boolean`, `number`, or `string`), and
+  non-overlapping with every other task-goal pointer in that task.
+- Evaluator Rules never read Runtime-reported `terminated` or `truncated`.
+
+Omit `RuleDraft.rule_id` from every task Rule. Framework code derives
+`rule:task:<task_type>:<section>:<ordinal>` from the already frozen target; never guess a prefix,
+repair an ID, copy a world Rule ID into a task Rule, or make task semantics depend on an ID
+convention.
+
+Use only frozen actors, tools, state paths, existing world Rule IDs, and exact evidence claim IDs.
+Do not author sampling or coverage, initial-config/public/evaluator JSON Schemas, evaluator
+bindings, reward values, verification policy, task instances, replay cases, trajectories, expected
+answers, or release decisions. Those are framework-owned projections from the frozen world and
+your one-family Rule semantics. `TrainingSemanticSourceDraft` is assembled only by the framework's
+deterministic join; a production Engineer turn must never author the complete aggregate directly.
+
 ## Closed evidence-claim binding
 
 `evidence_claim_catalog[*].claim_id` is a closed enum for every
@@ -48,6 +109,45 @@ support, do not invent an evidence id merely to populate the field. Leave `evide
 empty only where that requested schema permits it, and state the required bounded divergence or
 unresolved limit. Fields whose requested schema requires at least one evidence id must instead use
 one or more exact frozen catalog ids.
+
+## Tool-semantics root and scope
+
+When the requested output is `ToolSemanticsBatchSourceDraft`, return the complete logical root
+directly as `{"tools":[...]}`. Do not wrap it in `tool_semantics`, `artifact_json`, a summary,
+or any other outer object. The `tools` array contains exactly the one or two frozen target tool ids
+in their supplied order. Each TOOL is complete: conditions, state_transition, errors,
+access_observation, and reliability. Do not add a sibling tool merely to explain a dependency.
+
+`ToolRuleDraft.rule_id` is framework-owned identity. Omit it everywhere in a tool batch; framework
+code derives the stable tool/section/ordinal namespace after validation. Never infer or satisfy an
+ID-prefix convention in model output.
+
+## Tool-semantics representation audit
+
+Before returning a `ToolSemanticsBatchSourceDraft`, run a separate JSON-shape pass for **every**
+TOOL. Copy its exact enclosing `tool_id` into each required nested section:
+`conditions.tool_id`, `state_transition.tool_id`, `errors.tool_id`,
+`access_observation.tool_id`, and `reliability.tool_id`. A parent id never makes a nested id
+implicit.
+
+The following values are one non-empty JSON string, never a list or object: every
+`RuleDraft.description`, `errors.errors[*].observation`,
+`access_observation.permission.denied_observation`,
+`reliability.idempotency.duplicate_observation`,
+`reliability.transaction.commit_point`, `reliability.rollback.guarantees`,
+`reliability.concurrency.conflict_detection`, and
+`reliability.concurrency.ordering_guarantee`.
+
+Check the rest of `reliability` by primitive kind, not merely by field name:
+
+- `retry.maximum_attempts` is an integer at least 1; retryable/trigger/compensation code fields are
+  arrays; `retry.requires_same_idempotency_key`, `transaction.partial_commit_observable`, and
+  `rollback.supported` are booleans.
+- `timeout.operation_timeout_seconds` is a positive number;
+  `idempotency_key.retention_seconds` is null or a positive number; and
+  `observation.staleness_bound_seconds` is null or a non-negative number.
+- `concurrency.conflict_error_code` is null or one identifier string. Do not use explanatory prose
+  in place of a boolean, number, null, identifier, or array.
 
 ## Tool-semantics scalar observations
 
@@ -120,47 +220,39 @@ declares:
 - `reliability.retry.retryable_error_codes[*]`, which additionally require the referenced error to
   be declared `retryable: true`
 
-`reliability.compensation` tools are likewise a closed enum over the frozen tool inventory. Never
+`reliability.rollback.compensation_tools` is likewise a closed enum over the frozen tool inventory. Never
 invent an operational error code, reuse one from a sibling tool in the batch, or describe a failure
 mode the `errors` section never declared. Before returning, mechanically list this tool's declared
 `error_code` values and confirm every reliability reference is a member of that set, and that each
 retryable reference points at a `retryable: true` error.
 
+## Tool-semantics shared-contract closure
+
+`shared_contracts` is a frozen cross-tool input, not background prose. For every target tool,
+mechanically compare `reliability.transaction.atomicity`, `reliability.concurrency.isolation`, and
+`reliability.idempotency.mode` with its matching shared domains. For every
+`source.error_policies` entry whose `member_tool_ids` contains that tool, declare at least one
+error whose final `error_code` identifier segment equals `required_error_suffix` and whose
+`retryable` value equals the policy's `retryable` value. For each compensation edge where the tool
+is `failure_tool_id`, include its `compensation_tool_id` in
+`reliability.rollback.compensation_tools`. Do this literal comparison before returning; do not
+replace a frozen shared choice with a plausible local alternative.
+
 ## Tool-semantics access closure
 
-`access_observation.permission` binds to the frozen boundary: each `allowed_actors` entry is a
-frozen boundary actor, and each scope is one of that actor's frozen authorities.
+`access_observation.permission.required_scopes_by_actor` is the non-empty allowed-actor map. Its
+keys are exactly the frozen actors permitted to use the tool; never emit a separate
+`allowed_actors` field because framework code derives that Runtime/Judge projection. Each listed
+scope must be one of that actor's frozen boundary authorities, while an empty scope list remains
+valid. `visible_fields_by_actor` covers every frozen boundary actor and uses only exact top-level
+fields from that tool's frozen observation schema.
 
-When `allowed_actors` covers **every** frozen boundary actor and a `condition` is present, that
-condition is universal and its `case_sensitivity` must be `positive_and_negative`: a rule that
-admits all actors has to state both the positive and the negative case. A `condition` must also use
-family `permission` and the required `rule_id` prefix. Before returning, check whether the actor set
-is exhaustive and, if it is, that `case_sensitivity` is `positive_and_negative`.
+When `required_scopes_by_actor` covers **every** frozen boundary actor and a `condition` is present,
+that condition is universal and its `case_sensitivity` must be `positive_and_negative`: a rule that
+admits all actors has to state both the positive and the negative case. A condition must use family
+`permission` and omit `rule_id`. Before returning, check whether the map keys are exhaustive and,
+if they are, that `case_sensitivity` is `positive_and_negative`.
 
-## Build mode
-
-1. Read only Builder-visible artifacts. Never search for or infer sealed cases, expected answers,
-   case labels, or release decisions.
-2. Create a complete project in the assigned workspace with `pyproject.toml`, `uv.lock`, a
-   non-empty `LICENSE` declared by `[project].license` and file role `license`, a parameterized Task
-   Materializer v3 callable, standalone public-test scripts, and a real Runtime. Do not create candidate,
-   Judge, envpkg, SBOM, supply-chain, or release manifests/results; framework code derives those
-   only after physical inspection.
-3. Keep the uv root virtual and non-installed (`[tool.uv] package = false`); use only locked
-   registry wheels that Judge can install offline without source builds or network access.
-4. Implement `agent-world.runtime.v2` over stdio JSONL: handshake, reset, invoke, snapshot, close.
-   Runtime inputs are task-agnostic; state transitions occur in program code.
-5. The materializer returns only the exact v3 call echo, typed `public_goal`, and
-   `initial_config`. It never authors an instruction, evaluator goal, answer, expected output,
-   solution trace, or evaluation witness; framework code renders/projects/verifies those.
-6. Support unseen seeds, entity identifiers, valid parameters, and action sequences. Do not use
-   fixed replay maps, environment-id branches, fixture registries, generated `verify()`, mocks,
-   stubs, or template-only success.
-7. Make every public test directly runnable as `.venv/bin/python relative/test_path.py` with no
-   network or writable source tree. Run the real build and public tests. Their results support
-   repair and failures block release, but their content never authorizes a PASS verdict.
-
-## Repair mode
-
-Modify the existing candidate in the same workspace and thread. Address disclosed Findings
-without weakening contracts, detecting tests, embedding expected values, or bypassing a gate.
+Candidate planning and code generation use their own exact-node Runtime Skills
+(`engineer-build-planning` and `engineer-environment-codegen`). Do not apply
+their workspace-write instructions to a semantic design turn.

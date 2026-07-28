@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import runpy
 import subprocess
 import sys
 from pathlib import Path
@@ -74,3 +75,26 @@ def test_failed_direct_job_injects_a_safe_observe_scene_pointer(
     assert "<current-state>" in context
     assert f"observe scene {job_id}" in context
     assert "先读 scene.md" in context
+
+
+def test_session_start_exposes_a_compact_navigation_map(tmp_path: Path) -> None:
+    context = _run_hook("session-start.py", tmp_path / "config.toml")
+
+    assert f"Project root: {_REPOSITORY_ROOT}" in context
+    assert "## Phase Index" in context
+    assert "Phase 1: Plan" in context
+    assert "Request Triage" not in context
+    assert "Planning Artifacts" not in context
+    assert len(context) < 3_000
+
+
+def test_session_start_caps_the_injected_spec_index_list() -> None:
+    module = runpy.run_path(str(_REPOSITORY_ROOT / ".codex" / "hooks" / "session-start.py"))
+    cap = module["_MAX_SESSION_START_SPEC_INDEXES"]
+    bounded = module["_bounded_spec_index_paths"]
+    paths = [f".trellis/spec/package-{index}/index.md" for index in range(cap + 3)]
+
+    shown, omitted = bounded(paths)
+
+    assert shown == paths[:cap]
+    assert omitted == 3

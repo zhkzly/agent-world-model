@@ -4,5 +4,6 @@ Do not reconstruct project plans from deleted Goal, Trellis task, journal, workf
 
 Use `docs/agent-world-environment-generation.zh.md` as the architecture source of truth.
 
-- [Agent/LLM node debugging loop](agent-llm-node-debugging.md): required causal process for
-  every uncertain real Agent or LLM result.
+- [Agent World debugging and real-execution loop](agent-llm-node-debugging.md): required
+  causal process for every real failure; use the LLM-specific branch only after it is a
+  supported runtime hypothesis.

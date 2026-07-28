@@ -49,6 +49,7 @@ from agent_world.invocation import (
     CapabilityResolutionError,
     ExternalCapabilitySet,
     InvocationBackend,
+    InvocationError,
     InvocationLimits,
     InvocationRequest,
     InvocationSession,
@@ -58,6 +59,14 @@ from agent_world.invocation import (
     ResolvedAgentProfile,
     assert_agent_output_advisory,
 )
+from agent_world.invocation.redaction import Redactor, redacted_terminal_diagnostic_excerpt
+from agent_world.invocation.structured_diagnostics import (
+    safe_terminal_code,
+    safe_terminal_condition,
+    safe_terminal_details,
+    safe_terminal_expected_category,
+    terminal_failure_retryable,
+)
 from agent_world.task_materialization import compile_task_materializer_output_schema
 
 from .models import (
@@ -65,6 +74,7 @@ from .models import (
     BuildRecord,
     CandidateCompletion,
     ImplementationContract,
+    ImplementationPlan,
     RepairDisclosure,
     RuntimeOperationContract,
     RuntimeWireContract,
@@ -73,6 +83,7 @@ from .models import (
     normalize_candidate_completion_output,
 )
 from .workspace import (
+    CandidateWorkspaceDiagnostic,
     CandidateWorkspaceError,
     CandidateWorkspaceValidator,
     ValidatedCandidateFile,
@@ -146,12 +157,18 @@ class BuilderSessionState:
     workspace: Path
     profile: ResolvedAgentProfile
     invocation_session: InvocationSession | None
+    # The resolved profile may carry a larger logical session envelope.  These
+    # are the bounded reservation limits for one physical Scheduler turn and
+    # therefore also cap unknown usage when a Provider omits metering.
+    physical_turn_token_limit: int
+    physical_turn_timeout_seconds: float
     design: EnvironmentDesign
     design_ref: ArtifactRef
     implementation_contract: ImplementationContract
     implementation_contract_ref: ArtifactRef
     input_hashes: tuple[tuple[str, str], ...]
     parent_workspace_refs: tuple[ArtifactRef, ...]
+    implementation_plan_ref: ArtifactRef | None = None
     prior_snapshot_refs: tuple[ArtifactRef, ...] = ()
     repair_count: int = 0
 
@@ -200,6 +217,9 @@ class BuilderError(RuntimeError):
         state: BuilderSessionState | None = None,
         invocation: BuildInvocationSummary | None = None,
         backend_error_code: str | None = None,
+        backend_retryable: bool = False,
+        backend_error_details: dict[str, JsonValue] | None = None,
+        diagnostic_terminal_excerpt: str | None = None,
         permission_denied: bool = False,
     ) -> None:
         super().__init__(f"{stage}: {message}")
@@ -207,6 +227,12 @@ class BuilderError(RuntimeError):
         self.state = state
         self.invocation = invocation
         self.backend_error_code = backend_error_code
+        self.backend_retryable = backend_retryable
+        self.backend_error_details = dict(backend_error_details or {})
+        # This is a redacted, explicitly opted-in local diagnostic aid.  It
+        # must not flow into artifacts, telemetry, Scheduler feedback, or a
+        # normal Builder error category.
+        self.diagnostic_terminal_excerpt = diagnostic_terminal_excerpt
         self.permission_denied = permission_denied
 
 
@@ -301,6 +327,62 @@ class EnvironmentBuilder:
         )
         return contract, contract_ref
 
+    def _implementation_contract_for_build(
+        self,
+        *,
+        design: EnvironmentDesign,
+        design_ref: ArtifactRef,
+        implementation_plan: ImplementationPlan | None,
+        implementation_plan_ref: ArtifactRef | None,
+    ) -> tuple[ImplementationContract, ArtifactRef]:
+        """Choose the exact contract that a later CandidateBuild may consume.
+
+        A plan is advisory text, but the framework-owned contract it binds is
+        not.  The normal graph passes both values from BuildImplementationPlan;
+        direct callers without that preceding node retain the historical
+        one-step behavior.  No branch accepts an unbound plan or asks the
+        Agent to reconstruct an ArtifactRef from prose.
+        """
+
+        if implementation_plan is None and implementation_plan_ref is None:
+            return self.create_implementation_contract(design=design, design_ref=design_ref)
+        if implementation_plan is None or implementation_plan_ref is None:
+            raise BuilderError(
+                "implementation_plan",
+                "CandidateBuild requires both the exact advisory plan and its ArtifactRef",
+            )
+        self.artifacts.require_exact_json(
+            implementation_plan_ref,
+            implementation_plan,
+            artifact_types=("build.implementation_plan",),
+        )
+        if (
+            implementation_plan.design_ref != design_ref
+            or implementation_plan.world_spec_hash != design.world_spec.content_digest()
+            or implementation_plan.curriculum_hash != design.curriculum.content_digest()
+        ):
+            raise BuilderError(
+                "implementation_plan",
+                "advisory plan does not bind the exact frozen EnvironmentDesign closure",
+            )
+        contract_ref = implementation_plan.implementation_contract_ref
+        contract = self.artifacts.get_json(contract_ref, ImplementationContract)
+        self.artifacts.require_exact_json(
+            contract_ref,
+            contract,
+            artifact_types=("build.implementation_contract",),
+        )
+        if (
+            contract.design_ref != design_ref
+            or contract.world_spec_hash != design.world_spec.content_digest()
+            or contract.curriculum_hash != design.curriculum.content_digest()
+        ):
+            raise BuilderError(
+                "implementation_plan",
+                "implementation plan refers to a contract outside the frozen Design closure",
+            )
+        return contract, contract_ref
+
     def recover_committed_candidate(
         self,
         *,
@@ -342,9 +424,7 @@ class EnvironmentBuilder:
             return None
 
         latest_revision = max(candidate.revision for _, candidate in recovered)
-        latest = tuple(
-            item for item in recovered if item[1].revision == latest_revision
-        )
+        latest = tuple(item for item in recovered if item[1].revision == latest_revision)
         if len(latest) != 1:
             raise BuilderError(
                 "recovery",
@@ -413,12 +493,8 @@ class EnvironmentBuilder:
             ),
             task_materializer=TaskMaterializerContract(
                 task_types=tuple(task.task_type for task in design.curriculum.task_types),
-                minimum_distinct_initial_states=(
-                    design.curriculum.minimum_distinct_initial_states
-                ),
-                minimum_distinct_tasks_per_type=(
-                    design.curriculum.minimum_distinct_tasks_per_type
-                ),
+                minimum_distinct_initial_states=(design.curriculum.minimum_distinct_initial_states),
+                minimum_distinct_tasks_per_type=(design.curriculum.minimum_distinct_tasks_per_type),
             ),
         )
         uv_lock = next((item for item in manifest.files if item.path == "uv.lock"), None)
@@ -435,8 +511,7 @@ class EnvironmentBuilder:
             and candidate.implementation_lineage_ref == manifest.implementation_lineage_ref
             and build_record.candidate_id == candidate_id
             and build_record.candidate_revision == candidate.revision
-            and build_record.implementation_contract_ref
-            == candidate.implementation_contract_ref
+            and build_record.implementation_contract_ref == candidate.implementation_contract_ref
             and build_record.source_snapshot_ref == source_ref
             and build_record.files == manifest.files
             and lineage.implementation_contract_ref == candidate.implementation_contract_ref
@@ -450,7 +525,7 @@ class EnvironmentBuilder:
                 "committed candidate artifact graph does not close over the exact design",
             )
 
-        self._materialize_base_inputs(
+        self.materialize_implementation_inputs(
             workspace=workspace,
             design=design,
             contract=contract,
@@ -638,6 +713,11 @@ class EnvironmentBuilder:
         run_id: str,
         attempt_id: str,
         proposal_invocation_id: str | None = None,
+        session_token_limit: int | None = None,
+        session_wall_seconds: float | None = None,
+        implementation_plan: ImplementationPlan | None = None,
+        implementation_plan_ref: ArtifactRef | None = None,
+        diagnostic_capture_terminal_excerpt: bool = False,
     ) -> BuildBundle:
         """Execute exactly one real Engineer proposal for a scheduler WorkAttempt.
 
@@ -660,6 +740,338 @@ class EnvironmentBuilder:
             attempt_id=attempt_id,
             allow_precommit_rework=False,
             proposal_invocation_id=proposal_invocation_id,
+            session_token_limit=session_token_limit,
+            session_wall_seconds=session_wall_seconds,
+            implementation_plan=implementation_plan,
+            implementation_plan_ref=implementation_plan_ref,
+            diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+        )
+
+    async def resume_output_limited_build(
+        self,
+        *,
+        design: EnvironmentDesign,
+        design_ref: ArtifactRef,
+        workspace: Path,
+        session: InvocationSession,
+        budget: Budget,
+        permissions: PermissionScope,
+        run_id: str,
+        attempt_id: str,
+        attempt_ordinal: int,
+        proposal_invocation_id: str,
+        session_token_limit: int,
+        session_wall_seconds: float,
+        implementation_plan: ImplementationPlan | None = None,
+        implementation_plan_ref: ArtifactRef | None = None,
+        diagnostic_capture_terminal_excerpt: bool = False,
+    ) -> BuildBundle:
+        """Resume one exact Builder session after a closed physical output ceiling.
+
+        This method intentionally performs one physical SDK turn only.  It has
+        no retry loop and receives no raw Provider text.  Scheduler owns the
+        preceding output-limit report, continuation authority and next
+        WorkAttempt; the Builder merely proves that its private session and
+        workspace still bind the frozen CandidateBuild closure.
+        """
+
+        self.artifacts.require_exact_json(
+            design_ref,
+            design,
+            artifact_types=("design.environment_design", "expansion.environment_design"),
+        )
+        self._validate_budget(budget, repair=False)
+        if not isinstance(diagnostic_capture_terminal_excerpt, bool):
+            raise BuilderError(
+                "diagnostic",
+                "Builder diagnostic terminal-excerpt control must be boolean",
+            )
+        if attempt_ordinal < 2:
+            raise BuilderError(
+                "continuation",
+                "output-limit continuation requires a successor physical attempt",
+            )
+        workspace = workspace.expanduser().resolve()  # noqa: ASYNC240 - bounded setup I/O
+        if (
+            workspace.name != "workspace"
+            or workspace.parent.name != ".agent-runtime"
+            or not workspace.is_dir()
+        ):
+            raise BuilderError(
+                "continuation",
+                "continuation workspace does not match the isolated profile layout",
+            )
+        materialization_root = workspace.parent.parent
+        contract, contract_ref = self._implementation_contract_for_build(
+            design=design,
+            design_ref=design_ref,
+            implementation_plan=implementation_plan,
+            implementation_plan_ref=implementation_plan_ref,
+        )
+        per_turn_token_limit, per_turn_timeout_seconds = self._initial_turn_envelope(
+            budget,
+            turn_limit=1,
+        )
+        logical_session_token_limit, logical_session_wall_seconds = self._logical_session_envelope(
+            session_token_limit=session_token_limit,
+            session_wall_seconds=session_wall_seconds,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+        )
+        lineage_id = self._stable_id("implementation", design_ref.revision_id)
+        candidate_id = self._stable_id("candidate", lineage_id)
+        try:
+            assert_agent_output_advisory(
+                CandidateCompletion,
+                authority=AgentOutputAuthority.WORKSPACE_PROPOSAL,
+            )
+            profile = self.profiles.resolve(
+                role="environment-engineer",
+                lineage_id=lineage_id,
+                workspace=materialization_root,
+                output_schema=CandidateCompletion.model_json_schema(mode="validation"),
+                permissions=permissions,
+                requirement=NodeCapabilityRequirement.isolated_build(
+                    node_id="environment-engineer.runtime-build",
+                    external=self.dependency_capabilities,
+                ),
+                rollout_token_limit=logical_session_token_limit,
+                invocation_timeout_seconds=per_turn_timeout_seconds,
+            )
+        except CapabilityResolutionError as exc:
+            raise BuilderError(
+                "permissions",
+                str(exc),
+                permission_denied=True,
+            ) from exc
+        if profile.workspace != workspace:
+            raise BuilderError(
+                "continuation",
+                "resolved Engineer profile does not preserve the continuation workspace",
+            )
+        self._validate_profile_budget(
+            profile,
+            budget,
+            authorized_turns=1,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+        )
+        input_hashes = self.materialize_implementation_inputs(
+            workspace=profile.workspace,
+            design=design,
+            contract=contract,
+            implementation_plan=implementation_plan,
+        )
+        state = BuilderSessionState(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            lineage_id=lineage_id,
+            candidate_id=candidate_id,
+            workspace=profile.workspace,
+            profile=profile,
+            invocation_session=session,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+            design=design,
+            design_ref=design_ref,
+            implementation_contract=contract,
+            implementation_contract_ref=contract_ref,
+            input_hashes=input_hashes,
+            parent_workspace_refs=(),
+            implementation_plan_ref=implementation_plan_ref,
+        )
+        self._validate_repair_session_binding(state)
+        self._verify_framework_inputs(state)
+        completion, next_session, invocation = await self._invoke_engineer(
+            profile=profile,
+            session=session,
+            prompt=self._output_limit_continuation_prompt(),
+            lineage_id=lineage_id,
+            attempt=attempt_ordinal,
+            error_state=state,
+            invocation_id=proposal_invocation_id,
+            diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+        )
+        next_state = replace(state, invocation_session=next_session)
+        return self._validate_and_commit(
+            completion=completion,
+            state=next_state,
+            invocation=invocation,
+        )
+
+    async def resume_validation_repair(
+        self,
+        *,
+        design: EnvironmentDesign,
+        design_ref: ArtifactRef,
+        workspace: Path,
+        session: InvocationSession,
+        budget: Budget,
+        permissions: PermissionScope,
+        run_id: str,
+        attempt_id: str,
+        attempt_ordinal: int,
+        proposal_invocation_id: str,
+        session_token_limit: int,
+        session_wall_seconds: float,
+        correction_feedback: bytes,
+        implementation_plan: ImplementationPlan | None = None,
+        implementation_plan_ref: ArtifactRef | None = None,
+        diagnostic_capture_terminal_excerpt: bool = False,
+    ) -> BuildBundle:
+        """Run one Scheduler-authorized semantic repair in the same workspace.
+
+        This is neither an implicit retry nor a legacy Builder-owned loop.  A
+        preceding ``ValidationReport -> FeedbackEvaluation -> RepairAction``
+        has already selected this one correction.  The caller supplies only
+        the safe data-only correction brief; framework authority, provider
+        routing, and the failed candidate declaration remain outside the
+        runtime Agent prompt.
+        """
+
+        self.artifacts.require_exact_json(
+            design_ref,
+            design,
+            artifact_types=("design.environment_design", "expansion.environment_design"),
+        )
+        self._validate_budget(budget, repair=False)
+        if not correction_feedback:
+            raise BuilderError(
+                "repair",
+                "Scheduler-authorized Builder repair requires non-empty safe feedback",
+            )
+        if not isinstance(diagnostic_capture_terminal_excerpt, bool):
+            raise BuilderError(
+                "diagnostic",
+                "Builder diagnostic terminal-excerpt control must be boolean",
+            )
+        if attempt_ordinal < 2:
+            raise BuilderError(
+                "repair",
+                "semantic Builder repair requires a successor physical attempt",
+            )
+        workspace = workspace.expanduser().resolve()  # noqa: ASYNC240 - bounded setup I/O
+        if (
+            workspace.name != "workspace"
+            or workspace.parent.name != ".agent-runtime"
+            or not workspace.is_dir()
+        ):
+            raise BuilderError(
+                "repair",
+                "semantic repair workspace does not match the isolated profile layout",
+            )
+        materialization_root = workspace.parent.parent
+        contract, contract_ref = self._implementation_contract_for_build(
+            design=design,
+            design_ref=design_ref,
+            implementation_plan=implementation_plan,
+            implementation_plan_ref=implementation_plan_ref,
+        )
+        per_turn_token_limit, per_turn_timeout_seconds = self._initial_turn_envelope(
+            budget,
+            turn_limit=1,
+        )
+        logical_session_token_limit, logical_session_wall_seconds = self._logical_session_envelope(
+            session_token_limit=session_token_limit,
+            session_wall_seconds=session_wall_seconds,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+        )
+        lineage_id = self._stable_id("implementation", design_ref.revision_id)
+        candidate_id = self._stable_id("candidate", lineage_id)
+        try:
+            assert_agent_output_advisory(
+                CandidateCompletion,
+                authority=AgentOutputAuthority.WORKSPACE_PROPOSAL,
+            )
+            profile = self.profiles.resolve(
+                role="environment-engineer",
+                lineage_id=lineage_id,
+                workspace=materialization_root,
+                output_schema=CandidateCompletion.model_json_schema(mode="validation"),
+                permissions=permissions,
+                requirement=NodeCapabilityRequirement.isolated_build(
+                    node_id="environment-engineer.runtime-build",
+                    external=self.dependency_capabilities,
+                ),
+                rollout_token_limit=logical_session_token_limit,
+                invocation_timeout_seconds=per_turn_timeout_seconds,
+            )
+        except CapabilityResolutionError as exc:
+            raise BuilderError(
+                "permissions",
+                str(exc),
+                permission_denied=True,
+            ) from exc
+        if profile.workspace != workspace:
+            raise BuilderError(
+                "repair",
+                "resolved Engineer profile does not preserve the repair workspace",
+            )
+        self._validate_profile_budget(
+            profile,
+            budget,
+            authorized_turns=1,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+        )
+        input_hashes = self.materialize_implementation_inputs(
+            workspace=profile.workspace,
+            design=design,
+            contract=contract,
+            implementation_plan=implementation_plan,
+        )
+        disclosure_name = f"scheduler-repair-{attempt_ordinal}.json"
+        disclosure_path = profile.workspace / "inputs" / disclosure_name
+        self._assert_no_secret_values(correction_feedback, profile.secret_values)
+        self._write_immutable(disclosure_path, correction_feedback)
+        input_hashes = tuple(
+            sorted(
+                (
+                    *input_hashes,
+                    (
+                        disclosure_path.relative_to(profile.workspace).as_posix(),
+                        sha256_digest(correction_feedback),
+                    ),
+                )
+            )
+        )
+        state = BuilderSessionState(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            lineage_id=lineage_id,
+            candidate_id=candidate_id,
+            workspace=profile.workspace,
+            profile=profile,
+            invocation_session=session,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+            design=design,
+            design_ref=design_ref,
+            implementation_contract=contract,
+            implementation_contract_ref=contract_ref,
+            input_hashes=input_hashes,
+            parent_workspace_refs=(),
+            implementation_plan_ref=implementation_plan_ref,
+            repair_count=attempt_ordinal - 1,
+        )
+        self._validate_repair_session_binding(state)
+        self._verify_framework_inputs(state)
+        completion, next_session, invocation = await self._invoke_engineer(
+            profile=profile,
+            session=session,
+            prompt=self._scheduler_repair_prompt(attempt_ordinal, disclosure_name),
+            lineage_id=lineage_id,
+            attempt=attempt_ordinal,
+            error_state=state,
+            invocation_id=proposal_invocation_id,
+            diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+        )
+        next_state = replace(state, invocation_session=next_session)
+        return self._validate_and_commit(
+            completion=completion,
+            state=next_state,
+            invocation=invocation,
         )
 
     async def build(
@@ -674,6 +1086,9 @@ class EnvironmentBuilder:
         repair_authority: StructuredRepairAuthority | None = None,
         run_id: str,
         attempt_id: str,
+        implementation_plan: ImplementationPlan | None = None,
+        implementation_plan_ref: ArtifactRef | None = None,
+        diagnostic_capture_terminal_excerpt: bool = False,
     ) -> BuildBundle:
         """Legacy multi-turn façade pending the complete Controller cutover.
 
@@ -694,6 +1109,11 @@ class EnvironmentBuilder:
             attempt_id=attempt_id,
             allow_precommit_rework=True,
             proposal_invocation_id=None,
+            session_token_limit=None,
+            session_wall_seconds=None,
+            implementation_plan=implementation_plan,
+            implementation_plan_ref=implementation_plan_ref,
+            diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
         )
 
     async def _build(
@@ -710,6 +1130,11 @@ class EnvironmentBuilder:
         attempt_id: str,
         allow_precommit_rework: bool,
         proposal_invocation_id: str | None,
+        session_token_limit: int | None,
+        session_wall_seconds: float | None,
+        implementation_plan: ImplementationPlan | None,
+        implementation_plan_ref: ArtifactRef | None,
+        diagnostic_capture_terminal_excerpt: bool,
     ) -> BuildBundle:
         """Run an Engineer proposal, optionally through the legacy correction loop."""
 
@@ -719,6 +1144,11 @@ class EnvironmentBuilder:
             artifact_types=("design.environment_design", "expansion.environment_design"),
         )
         self._validate_budget(budget, repair=False)
+        if not isinstance(diagnostic_capture_terminal_excerpt, bool):
+            raise BuilderError(
+                "diagnostic",
+                "Builder diagnostic terminal-excerpt control must be boolean",
+            )
         workspace = workspace.expanduser().resolve()  # noqa: ASYNC240 - bounded setup I/O
         workspace.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
         candidate_root = workspace / "candidate"
@@ -728,14 +1158,17 @@ class EnvironmentBuilder:
                 "initial candidate workspace is not empty; refusing to overwrite prior state",
             )
 
-        contract, contract_ref = self.create_implementation_contract(
+        contract, contract_ref = self._implementation_contract_for_build(
             design=design,
             design_ref=design_ref,
+            implementation_plan=implementation_plan,
+            implementation_plan_ref=implementation_plan_ref,
         )
-        input_hashes = self._materialize_base_inputs(
+        input_hashes = self.materialize_implementation_inputs(
             workspace=workspace,
             design=design,
             contract=contract,
+            implementation_plan=implementation_plan,
         )
         lineage_id = self._stable_id("implementation", design_ref.revision_id)
         candidate_id = self._stable_id("candidate", lineage_id)
@@ -747,6 +1180,12 @@ class EnvironmentBuilder:
         per_turn_token_limit, per_turn_timeout_seconds = self._initial_turn_envelope(
             budget,
             turn_limit=turn_limit,
+        )
+        logical_session_token_limit, logical_session_wall_seconds = self._logical_session_envelope(
+            session_token_limit=session_token_limit,
+            session_wall_seconds=session_wall_seconds,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
         )
         try:
             assert_agent_output_advisory(
@@ -763,7 +1202,7 @@ class EnvironmentBuilder:
                     node_id="environment-engineer.runtime-build",
                     external=self.dependency_capabilities,
                 ),
-                rollout_token_limit=per_turn_token_limit,
+                rollout_token_limit=logical_session_token_limit,
                 invocation_timeout_seconds=per_turn_timeout_seconds,
             )
         except CapabilityResolutionError as exc:
@@ -772,7 +1211,13 @@ class EnvironmentBuilder:
                 str(exc),
                 permission_denied=True,
             ) from exc
-        self._validate_profile_budget(profile, budget, authorized_turns=turn_limit)
+        self._validate_profile_budget(
+            profile,
+            budget,
+            authorized_turns=turn_limit,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+        )
         candidate_root = profile.workspace / "candidate"
         if candidate_root.exists() and any(candidate_root.iterdir()):  # noqa: ASYNC240
             raise BuilderError(
@@ -787,16 +1232,22 @@ class EnvironmentBuilder:
             workspace=profile.workspace,
             profile=profile,
             invocation_session=None,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
             design=design,
             design_ref=design_ref,
             implementation_contract=contract,
             implementation_contract_ref=contract_ref,
             input_hashes=input_hashes,
             parent_workspace_refs=self._unique_refs(parent_workspace_refs),
+            implementation_plan_ref=implementation_plan_ref,
         )
         self._verify_framework_inputs(provisional_state)
         state = provisional_state
-        prompt = self._initial_prompt(design)
+        prompt = self._initial_prompt(
+            design,
+            has_implementation_plan=implementation_plan is not None,
+        )
         invocation_summaries: list[BuildInvocationSummary] = []
         active_repair_entry: str | None = None
 
@@ -891,6 +1342,7 @@ class EnvironmentBuilder:
                     attempt=turn_index + 1,
                     error_state=state,
                     invocation_id=(proposal_invocation_id if turn_index == 0 else None),
+                    diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
                 )
             except BuilderError as exc:
                 if exc.invocation is not None:
@@ -899,17 +1351,26 @@ class EnvironmentBuilder:
                 diagnostic = self._validation_diagnostic(exc)
                 await complete_repair(diagnostic.issue_codes, diagnostic)
                 if any(not issue.retryable for issue in diagnostic.issues):
+                    # A backend terminal already has an exact safe owner and
+                    # retry classification.  Rewrapping it as a generic
+                    # framework diagnostic would erase the Provider outcome
+                    # before Scheduler can route it.
+                    if self._backend_terminal_error(exc) is not None:
+                        raise
                     raise BuilderError(
                         "framework.diagnostic",
                         "Builder reached a non-actionable framework diagnostic; refusing "
                         "to spend an Agent repair turn",
                         state=exc.state or state,
                         invocation=exc.invocation,
+                        backend_error_code=exc.backend_error_code,
+                        backend_retryable=exc.backend_retryable,
+                        backend_error_details=exc.backend_error_details,
+                        diagnostic_terminal_excerpt=exc.diagnostic_terminal_excerpt,
                     ) from exc
                 if (
                     allow_precommit_rework
-                    and
-                    exc.stage == "agent.output"
+                    and exc.stage == "agent.output"
                     and exc.state is not None
                     and exc.state.invocation_session is not None
                     and turn_index + 1 < turn_limit
@@ -941,17 +1402,22 @@ class EnvironmentBuilder:
                 diagnostic = self._validation_diagnostic(exc)
                 await complete_repair(diagnostic.issue_codes, diagnostic)
                 if any(not issue.retryable for issue in diagnostic.issues):
+                    if self._backend_terminal_error(exc) is not None:
+                        raise
                     raise BuilderError(
                         "framework.diagnostic",
                         "Builder reached a non-actionable framework diagnostic; refusing "
                         "to spend an Agent repair turn",
                         state=exc.state or state,
                         invocation=aggregate,
+                        backend_error_code=exc.backend_error_code,
+                        backend_retryable=exc.backend_retryable,
+                        backend_error_details=exc.backend_error_details,
+                        diagnostic_terminal_excerpt=exc.diagnostic_terminal_excerpt,
                     ) from exc
                 if (
                     allow_precommit_rework
-                    and
-                    exc.stage == "candidate.validation"
+                    and exc.stage == "candidate.validation"
                     and state.invocation_session is not None
                     and turn_index + 1 < turn_limit
                 ):
@@ -967,6 +1433,40 @@ class EnvironmentBuilder:
     @staticmethod
     def _validation_diagnostic(exc: BuilderError) -> ValidationDiagnostic:
         """Translate Builder validation into stable phases without raw workspace data."""
+
+        backend_terminal = EnvironmentBuilder._backend_terminal_error(exc)
+        if backend_terminal is not None:
+            safe_code = EnvironmentBuilder._safe_backend_issue_code(
+                safe_terminal_code(backend_terminal) or "terminal"
+            )
+            condition = safe_terminal_condition(backend_terminal)
+            expected = safe_terminal_expected_category(backend_terminal)
+            return ValidationDiagnostic(
+                owner_component="build",
+                validation_phase="agent_backend",
+                frontier_ordinal=0,
+                issues=(
+                    SafeValidationIssue(
+                        f"agent_backend_{safe_code}"[:160],
+                        ("provider",),
+                        condition,
+                        retryable=terminal_failure_retryable(backend_terminal),
+                        violated_condition=condition,
+                        expected_category=(
+                            expected
+                            or "a safely classified Provider or transport remediation outside "
+                            "this attempt"
+                        ),
+                    ),
+                ),
+            )
+
+        # A framework diagnostic is only a safety wrapper around an earlier
+        # Builder failure.  Preserve the original typed frontier for an
+        # observer and an authorized correction route; the wrapper itself has
+        # no semantic information to add.
+        if exc.stage == "framework.diagnostic" and isinstance(exc.__cause__, BuilderError):
+            return EnvironmentBuilder._validation_diagnostic(exc.__cause__)
 
         cause = exc.__cause__
         if exc.stage == "agent.output" and isinstance(cause, ValidationError):
@@ -989,6 +1489,13 @@ class EnvironmentBuilder:
                     "Use `package.module:materialize`; do not use a path, filename, or "
                     "call expression.",
                 ),
+                "candidate_path_invalid": (
+                    "completion_path_format",
+                    12,
+                    "candidate_path_invalid",
+                    "Use a normalized candidate-relative POSIX path; do not use an absolute "
+                    "path, `..`, or backslashes.",
+                ),
                 "python_entry_path_invalid": (
                     "completion_entrypoint_format",
                     15,
@@ -1000,6 +1507,25 @@ class EnvironmentBuilder:
                     16,
                     "python_entry_path_not_importable",
                     "The entry path must map to an importable Python module.",
+                ),
+                "python_launch_interpreter_invalid": (
+                    "completion_launch",
+                    17,
+                    "python_launch_interpreter_invalid",
+                    "Start the launch argv with `.venv/bin/python` or `.venv/bin/python3`.",
+                ),
+                "python_launch_argument_invalid": (
+                    "completion_launch",
+                    17,
+                    "python_launch_argument_invalid",
+                    "Use only bounded relative launch arguments without backslashes, NUL, or `..`.",
+                ),
+                "python_launch_entrypoint_mismatch": (
+                    "completion_launch",
+                    17,
+                    "python_launch_entrypoint_mismatch",
+                    "Use `argv=[.venv/bin/python, -m, package.module]`, where the module is "
+                    "derived from the declared `.py` entry_path.",
                 ),
                 "task_materializer_binding_mismatch": (
                     "completion_entrypoint_binding",
@@ -1064,17 +1590,60 @@ class EnvironmentBuilder:
                     "Every public test path must be declared with role `public_test`.",
                 ),
             }
+            conditions: dict[str, tuple[str | None, str | None]] = {
+                "candidate_path_invalid": (
+                    "candidate declarations must use normalized paths relative to the project root",
+                    "one normalized candidate-relative POSIX path",
+                ),
+                "python_entry_path_invalid": (
+                    "a Python component entry_path must be a candidate-relative `.py` file",
+                    "one normalized candidate-relative POSIX `.py` path",
+                ),
+                "python_entry_path_not_importable": (
+                    "a Python component entry_path must derive one importable module",
+                    "a `.py` path whose module segments are valid Python identifiers",
+                ),
+                "python_launch_interpreter_invalid": (
+                    "a Python component must launch through the isolated uv interpreter",
+                    "`.venv/bin/python` or `.venv/bin/python3` as argv[0]",
+                ),
+                "python_launch_argument_invalid": (
+                    "Python launch arguments must be bounded portable relative text",
+                    "a safe relative Python launch argv",
+                ),
+                "python_launch_entrypoint_mismatch": (
+                    "Python launch argv must invoke the module derived from its declared "
+                    "entry_path",
+                    "`python -m package.module` matching entry_path",
+                ),
+                "task_materializer_entrypoint_format": (
+                    "the Task Materializer callable is fixed to `materialize` in one module",
+                    "one `package.module:materialize` entrypoint",
+                ),
+                "task_materializer_binding_mismatch": (
+                    "the Task Materializer entrypoint module must equal the module derived "
+                    "from entry_path",
+                    "`module:materialize` with module mechanically derived from entry_path",
+                ),
+            }
             translated: list[tuple[int, str, SafeValidationIssue]] = []
             for raw, default_issue in zip(raw_errors, fallback.issues, strict=True):
                 error_type = str(raw.get("type", "invalid"))
                 mapped = catalog.get(error_type)
                 if mapped is not None:
                     phase, frontier, code, message = mapped
+                    issue_condition, issue_expected = conditions.get(code, (None, None))
                     translated.append(
                         (
                             frontier,
                             phase,
-                            SafeValidationIssue(code, default_issue.location, message),
+                            SafeValidationIssue(
+                                code,
+                                default_issue.location,
+                                message,
+                                violated_condition=issue_condition,
+                                expected_category=issue_expected,
+                            ),
                         )
                     )
                     continue
@@ -1117,6 +1686,11 @@ class EnvironmentBuilder:
                 ),
             )
         if exc.stage == "candidate.validation":
+            workspace_error = exc.__cause__
+            if isinstance(workspace_error, CandidateWorkspaceError):
+                safe_diagnostic = workspace_error.safe_diagnostic
+                if safe_diagnostic is not None:
+                    return EnvironmentBuilder._workspace_validation_diagnostic(safe_diagnostic)
             message = str(exc)
             groups: tuple[tuple[tuple[str, ...], str, int, str, str], ...] = (
                 (
@@ -1160,7 +1734,13 @@ class EnvironmentBuilder:
                     "dependency_contract",
                     50,
                     "candidate_dependency_contract",
-                    "Correct pyproject.toml and uv.lock to the frozen offline uv policy.",
+                    (
+                        "Inspect candidate/pyproject.toml and candidate/uv.lock together. "
+                        "Keep one non-installed virtual root named [project].name with "
+                        'source { virtual = "." }; every non-root dependency must be a '
+                        "fixed-registry package with locked wheels, and no build/source override "
+                        "may bypass the offline policy."
+                    ),
                 ),
                 (
                     (
@@ -1210,6 +1790,186 @@ class EnvironmentBuilder:
             ),
         )
 
+    @staticmethod
+    def _workspace_validation_diagnostic(
+        diagnostic: CandidateWorkspaceDiagnostic,
+    ) -> ValidationDiagnostic:
+        """Project a safe manifest difference, never candidate-controlled paths.
+
+        A completed Builder turn can leave a useful workspace even when its
+        ``CandidateCompletion.files`` inventory is wrong.  The correction
+        recipient needs to know *which inventory relationship* failed and its
+        scope, then inspect the workspace it already owns.  Re-emitting raw
+        exception paths would make the feedback channel an arbitrary-text
+        carrier, so this projection remains intentionally count-only.
+        """
+
+        count = diagnostic.count
+        plural = "path" if count == 1 else "paths"
+        dependency_details: dict[str, tuple[str, str, str]] = {
+            "dependency_virtual_root_source_invalid": (
+                "candidate_dependency_virtual_root_source_invalid",
+                "the package in uv.lock named by [project].name is not the virtual root",
+                'exactly one package named [project].name with source { virtual = "." }',
+            ),
+            "dependency_virtual_root_name_mismatch": (
+                "candidate_dependency_virtual_root_name_mismatch",
+                "the virtual root package name in uv.lock does not equal [project].name",
+                'exactly one { virtual = "." } package named exactly [project].name',
+            ),
+            "dependency_virtual_root_count": (
+                "candidate_dependency_virtual_root_count",
+                (
+                    "uv.lock contains "
+                    f"{count} package entries named [project].name with source "
+                    '{ virtual = "." }'
+                ),
+                "exactly one virtual, non-installed root package named [project].name",
+            ),
+        }
+        dependency = dependency_details.get(diagnostic.code)
+        if dependency is not None:
+            code, condition, expected = dependency
+            return ValidationDiagnostic(
+                owner_component="build",
+                validation_phase="dependency_contract",
+                frontier_ordinal=50,
+                issues=(
+                    SafeValidationIssue(
+                        code,
+                        ("candidate", "uv.lock"),
+                        (
+                            "Edit only candidate/pyproject.toml and candidate/uv.lock as needed: "
+                            "keep the virtual root non-installed, make its lock package name "
+                            "equal [project].name, and leave every non-root dependency on the "
+                            "approved locked-wheel registry path."
+                        ),
+                        violated_condition=condition,
+                        expected_category=expected,
+                    ),
+                ),
+            )
+        details: dict[str, tuple[str, str, str]] = {
+            "manifest_declared_missing": (
+                "candidate_manifest_declared_missing",
+                (
+                    "CandidateCompletion.files declares "
+                    f"{count} {plural} absent from the final candidate/ tree"
+                ),
+                "a one-for-one declaration of every final regular candidate file",
+            ),
+            "manifest_undeclared_files": (
+                "candidate_manifest_undeclared_files",
+                (
+                    "the final candidate/ tree contains "
+                    f"{count} regular {plural} absent from CandidateCompletion.files"
+                ),
+                "a one-for-one declaration of every final regular candidate file",
+            ),
+            "manifest_declaration_duplicate": (
+                "candidate_manifest_declaration_duplicate",
+                (f"CandidateCompletion.files repeats {count} candidate-relative {plural}"),
+                "one declaration for each final regular candidate file",
+            ),
+            "manifest_empty": (
+                "candidate_manifest_empty",
+                "a completed CandidateCompletion has no regular file in candidate/",
+                "a non-empty final regular candidate file inventory",
+            ),
+            "manifest_file_limit": (
+                "candidate_manifest_file_limit",
+                (
+                    "candidate/ contains "
+                    f"{count} regular files, exceeding the framework file-count limit"
+                ),
+                "a bounded final regular candidate file inventory",
+            ),
+            "manifest_executable_mode": (
+                "candidate_manifest_executable_mode",
+                (
+                    "a final candidate file executable bit disagrees with its "
+                    "CandidateCompletion declaration"
+                ),
+                "an executable declaration matching every final regular file mode",
+            ),
+        }
+        mapped = details.get(diagnostic.code)
+        if mapped is None:
+            return ValidationDiagnostic(
+                owner_component="build",
+                validation_phase="framework_diagnostic",
+                frontier_ordinal=0,
+                issues=(
+                    SafeValidationIssue(
+                        "framework_diagnostic_incomplete",
+                        ("candidate", "files"),
+                        "Candidate workspace validation emitted an unknown safe diagnostic. "
+                        "Do not retry the Agent until the framework feedback is completed.",
+                        retryable=False,
+                    ),
+                ),
+            )
+        code, condition, expected = mapped
+        return ValidationDiagnostic(
+            owner_component="build",
+            validation_phase="manifest_closure",
+            frontier_ordinal=30,
+            issues=(
+                SafeValidationIssue(
+                    code,
+                    ("candidate", "files"),
+                    (
+                        "Inspect the final candidate/ inventory after cleanup, then return one "
+                        "complete CandidateCompletion whose files list and executable flags match "
+                        "that inventory exactly."
+                    ),
+                    violated_condition=condition,
+                    expected_category=expected,
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _backend_terminal_error(exc: BuilderError) -> InvocationError | None:
+        """Reconstruct only safe terminal classification, never provider text."""
+
+        if exc.backend_error_code is None:
+            return None
+        return InvocationError(
+            code=exc.backend_error_code,
+            message=exc.backend_error_code,
+            retryable=exc.backend_retryable,
+            details=exc.backend_error_details,
+        )
+
+    @staticmethod
+    def _diagnostic_terminal_excerpt(
+        error: InvocationError | None,
+        *,
+        profile: ResolvedAgentProfile,
+    ) -> str | None:
+        """Defensively re-scrub one explicitly opted-in worker diagnostic.
+
+        The Codex worker has already redacted this optional field.  Builder
+        repeats the same narrow scrub with its resolved credential values so
+        a future backend cannot accidentally turn the local diagnostic path
+        into a transcript carrier.
+        """
+
+        if error is None:
+            return None
+        return redacted_terminal_diagnostic_excerpt(
+            error.details.get("diagnostic_error_excerpt"),
+            redactor=Redactor.from_values(profile.secret_values),
+        )
+
+    @staticmethod
+    def _safe_backend_issue_code(value: str) -> str:
+        safe = "".join(
+            character if character.isalnum() or character in "._:-" else "_" for character in value
+        ).strip("._:-")
+        return (safe or "terminal")[:120]
+
     async def repair(
         self,
         *,
@@ -1243,7 +2003,13 @@ class EnvironmentBuilder:
                 state=state,
             )
         self._validate_repair_session_binding(state)
-        self._validate_profile_budget(state.profile, budget, authorized_turns=1)
+        self._validate_profile_budget(
+            state.profile,
+            budget,
+            authorized_turns=1,
+            physical_turn_token_limit=state.physical_turn_token_limit,
+            physical_turn_timeout_seconds=state.physical_turn_timeout_seconds,
+        )
         self._verify_framework_inputs(state)
         disclosures = self._repair_disclosures(findings)
         attempt = state.repair_count + 2
@@ -1294,6 +2060,7 @@ class EnvironmentBuilder:
         attempt: int,
         error_state: BuilderSessionState,
         invocation_id: str | None = None,
+        diagnostic_capture_terminal_excerpt: bool = False,
     ) -> tuple[CandidateCompletion, InvocationSession, BuildInvocationSummary]:
         invocation_id = invocation_id or f"build-{hashlib.sha256(os.urandom(32)).hexdigest()[:24]}"
         invocation_started = time.monotonic()
@@ -1304,18 +2071,24 @@ class EnvironmentBuilder:
         )
         try:
             try:
+                metadata: dict[str, JsonValue] = {
+                    "role": "environment-engineer",
+                    "lineage_id": lineage_id,
+                    "attempt": attempt,
+                    "purpose": "compile-environment-candidate",
+                }
+                if diagnostic_capture_terminal_excerpt:
+                    # The local test-node harness is the only caller that
+                    # opts in. The backend returns a worker-redacted excerpt
+                    # which is deliberately kept out of normal feedback.
+                    metadata["diagnostic_capture_terminal_excerpt"] = True
                 result = await self.backend.invoke(
                     InvocationRequest(
                         invocation_id=invocation_id,
                         prompt=prompt,
                         profile=profile,
                         session=session,
-                        metadata={
-                            "role": "environment-engineer",
-                            "lineage_id": lineage_id,
-                            "attempt": attempt,
-                            "purpose": "compile-environment-candidate",
-                        },
+                        metadata=metadata,
                     )
                 )
             except Exception as exc:
@@ -1333,9 +2106,7 @@ class EnvironmentBuilder:
                         usage=None,
                         backend_version=None,
                         total_tokens=0,
-                        unknown_token_upper_bounds=(
-                            profile.rollout_token_limit or 1,
-                        ),
+                        unknown_token_upper_bounds=(error_state.physical_turn_token_limit,),
                     ),
                 ) from exc
         finally:
@@ -1351,7 +2122,7 @@ class EnvironmentBuilder:
             backend_version=result.backend_version,
             total_tokens=self._invocation_token_total(result.usage),
             unknown_token_upper_bounds=(
-                (profile.rollout_token_limit or 1,)
+                (error_state.physical_turn_token_limit,)
                 if result.usage is None or result.usage.turn is None
                 else ()
             ),
@@ -1371,6 +2142,13 @@ class EnvironmentBuilder:
                 state=continued_state,
                 invocation=summary,
                 backend_error_code=result.error.code if result.error else None,
+                backend_retryable=result.error.retryable if result.error else False,
+                backend_error_details=safe_terminal_details(result.error),
+                diagnostic_terminal_excerpt=(
+                    self._diagnostic_terminal_excerpt(result.error, profile=profile)
+                    if diagnostic_capture_terminal_excerpt
+                    else None
+                ),
             )
         if result.session is None:
             raise BuilderError(
@@ -1382,9 +2160,7 @@ class EnvironmentBuilder:
         try:
             if result.structured_output is None:
                 raise ValueError("real backend returned no structured completion")
-            normalized_output = normalize_candidate_completion_output(
-                result.structured_output
-            )
+            normalized_output = normalize_candidate_completion_output(result.structured_output)
             completion = CandidateCompletion.model_validate_json(
                 canonical_json_bytes(normalized_output)
             )
@@ -1464,9 +2240,7 @@ class EnvironmentBuilder:
         if root.is_dir():
             for directory, directory_names, file_names in os.walk(root, followlinks=False):
                 directory_names[:] = sorted(
-                    name
-                    for name in directory_names
-                    if not (Path(directory) / name).is_symlink()
+                    name for name in directory_names if not (Path(directory) / name).is_symlink()
                 )
                 for name in sorted(file_names):
                     path = Path(directory) / name
@@ -1542,8 +2316,7 @@ class EnvironmentBuilder:
     @staticmethod
     def _safe_progress_code(value: str) -> str:
         safe = "".join(
-            character if character.isalnum() or character in "._:-" else "_"
-            for character in value
+            character if character.isalnum() or character in "._:-" else "_" for character in value
         ).strip("._:-")
         return (safe or "workspace_progress_unavailable")[:160]
 
@@ -1569,9 +2342,7 @@ class EnvironmentBuilder:
             turns=sum(item.turns for item in summaries),
             total_tokens=sum(item.total_tokens for item in summaries),
             unknown_token_upper_bounds=tuple(
-                bound
-                for item in summaries
-                for bound in item.unknown_token_upper_bounds
+                bound for item in summaries for bound in item.unknown_token_upper_bounds
             ),
         )
 
@@ -1676,6 +2447,9 @@ class EnvironmentBuilder:
         assert completion.task_materializer is not None
         assert completion.public_self_check is not None
         assert state.invocation_session is not None
+        plan_dependencies = (
+            () if state.implementation_plan_ref is None else (state.implementation_plan_ref,)
+        )
         revision = state.repair_count + 1
         base_id = f"{state.candidate_id}:r{revision}"
         task_schema_ref = self.artifacts.put_json(
@@ -1709,6 +2483,7 @@ class EnvironmentBuilder:
             (
                 state.design_ref,
                 state.implementation_contract_ref,
+                *plan_dependencies,
                 *state.parent_workspace_refs,
                 *state.prior_snapshot_refs[-1:],
             )
@@ -1741,6 +2516,7 @@ class EnvironmentBuilder:
             dependencies=(
                 source_snapshot_ref,
                 state.implementation_contract_ref,
+                *plan_dependencies,
                 *implementation_lineage.parent_workspace_refs,
             ),
         )
@@ -1783,6 +2559,7 @@ class EnvironmentBuilder:
                 state.design_ref,
                 source_snapshot_ref,
                 implementation_lineage_ref,
+                *plan_dependencies,
                 public_verifier_ref,
                 task_schema_ref,
                 curriculum_ref,
@@ -1805,7 +2582,7 @@ class EnvironmentBuilder:
             artifact_id=f"{base_id}:build-record",
             artifact_type="build.record",
             value=build_record,
-            dependencies=(source_snapshot_ref, candidate_manifest_ref),
+            dependencies=(source_snapshot_ref, candidate_manifest_ref, *plan_dependencies),
         )
         candidate = EnvironmentCandidate(
             candidate_id=state.candidate_id,
@@ -1832,6 +2609,7 @@ class EnvironmentBuilder:
                 build_artifact_ref,
                 candidate_manifest_ref,
                 implementation_lineage_ref,
+                *plan_dependencies,
             ),
         )
         committed_state = replace(
@@ -1856,21 +2634,36 @@ class EnvironmentBuilder:
             invocation=invocation,
         )
 
-    def _materialize_base_inputs(
+    def materialize_implementation_inputs(
         self,
         *,
         workspace: Path,
         design: EnvironmentDesign,
         contract: ImplementationContract,
+        implementation_plan: ImplementationPlan | None = None,
     ) -> tuple[tuple[str, str], ...]:
+        """Stage only the frozen bytes an Engineer needs for one implementation.
+
+        The full ``EnvironmentDesign`` is a control-plane container.  It
+        duplicates WorldSpec and adds release/evidence/metadata that the
+        Builder neither owns nor should inspect.  The implementation boundary
+        instead receives the executable world, the curriculum it materializes,
+        the framework-owned ABI contract, and the output schema.  An already
+        committed plan is optional, explicitly advisory text.
+        """
+
         values = {
-            "inputs/environment-design.json": design.stable_json_bytes(),
             "inputs/world-spec.json": design.world_spec.stable_json_bytes(),
+            "inputs/curriculum.json": design.curriculum.stable_json_bytes(),
             "inputs/implementation-contract.json": contract.stable_json_bytes(),
             "inputs/task-materializer-output.schema.json": canonical_json_bytes(
                 self._task_materialization_schema(design)
             ),
         }
+        if implementation_plan is not None:
+            values["inputs/implementation-plan.md"] = (
+                implementation_plan.implementation_strategy.encode("utf-8")
+            )
         hashes: list[tuple[str, str]] = []
         for relative, content in values.items():
             self._write_immutable(workspace / relative, content)
@@ -1986,13 +2779,10 @@ class EnvironmentBuilder:
             )
 
     def repair_turn_requirements(self, state: BuilderSessionState) -> tuple[int, float]:
-        """Return the immutable token/time envelope for one same-session repair."""
+        """Return the physical token/time envelope for one same-session turn."""
 
         self._validate_repair_session_binding(state)
-        token_limit = state.profile.rollout_token_limit
-        if token_limit is None or token_limit <= 0:
-            raise BuilderError("budget", "resolved Engineer profile has no hard token limit")
-        return token_limit, state.profile.limits.supervisor_wall_ceiling_seconds
+        return state.physical_turn_token_limit, state.physical_turn_timeout_seconds
 
     def _initial_turn_envelope(self, budget: Budget, *, turn_limit: int) -> tuple[int, float]:
         """Split one multi-turn Builder lease into immutable per-turn SDK limits."""
@@ -2021,26 +2811,71 @@ class EnvironmentBuilder:
         return per_turn_token_limit, per_turn_timeout_seconds
 
     @staticmethod
+    def _logical_session_envelope(
+        *,
+        session_token_limit: int | None,
+        session_wall_seconds: float | None,
+        physical_turn_token_limit: int,
+        physical_turn_timeout_seconds: float,
+    ) -> tuple[int, float]:
+        """Validate one optional logical session envelope above a physical turn.
+
+        The resolved profile binds the logical rollout budget and the physical
+        lifecycle timeout.  Scheduler leases use the same physical bounds,
+        while the WorkDefinition retains the larger logical session envelope.
+        """
+
+        if (session_token_limit is None) != (session_wall_seconds is None):
+            raise BuilderError(
+                "budget",
+                "Builder logical session token and wall limits must be declared together",
+            )
+        if session_token_limit is None:
+            return physical_turn_token_limit, physical_turn_timeout_seconds
+        if (
+            session_token_limit < physical_turn_token_limit
+            or session_wall_seconds is None
+            or session_wall_seconds < physical_turn_timeout_seconds
+        ):
+            raise BuilderError(
+                "budget",
+                "Builder logical session envelope is smaller than one physical turn",
+            )
+        return session_token_limit, session_wall_seconds
+
+    @staticmethod
     def _validate_profile_budget(
         profile: ResolvedAgentProfile,
         budget: Budget,
         *,
         authorized_turns: int,
+        physical_turn_token_limit: int,
+        physical_turn_timeout_seconds: float,
     ) -> None:
         if authorized_turns <= 0:
             raise BuilderError("budget", "authorized Builder turns must be positive")
         if profile.rollout_token_limit is None:
             raise BuilderError("budget", "resolved Engineer profile has no hard token limit")
-        if profile.rollout_token_limit * authorized_turns > budget.llm_tokens:
+        if profile.rollout_token_limit < physical_turn_token_limit:
             raise BuilderError(
                 "budget",
-                "resolved Engineer per-turn token limit exceeds the total Builder budget",
+                "resolved Engineer rollout limit is smaller than one physical Builder turn",
+            )
+        if profile.limits.timeout_seconds < physical_turn_timeout_seconds:
+            raise BuilderError(
+                "budget",
+                "resolved Engineer lifecycle timeout is smaller than one physical Builder turn",
+            )
+        if physical_turn_token_limit * authorized_turns > budget.llm_tokens:
+            raise BuilderError(
+                "budget",
+                "resolved Engineer physical token envelope exceeds the Builder budget",
             )
         timeout_ceiling = min(budget.build_seconds, budget.wall_seconds)
-        if profile.limits.supervisor_wall_ceiling_seconds * authorized_turns > timeout_ceiling:
+        if physical_turn_timeout_seconds * authorized_turns > timeout_ceiling:
             raise BuilderError(
                 "budget",
-                "resolved Engineer per-turn timeout exceeds the total build/wall budget",
+                "resolved Engineer physical timeout exceeds the total build/wall budget",
             )
 
     def _put_component_file(
@@ -2148,7 +2983,20 @@ class EnvironmentBuilder:
         )
 
     @staticmethod
-    def _initial_prompt(design: EnvironmentDesign) -> str:
+    def _initial_prompt(
+        design: EnvironmentDesign,
+        *,
+        has_implementation_plan: bool,
+    ) -> str:
+        plan_instruction = (
+            "Also read `inputs/implementation-plan.md`. It is advisory implementation guidance "
+            "only: the frozen JSON inputs above remain authoritative."
+            if has_implementation_plan
+            else (
+                "No implementation plan is staged for this direct build; derive the implementation "
+                "order from the frozen JSON inputs."
+            )
+        )
         return f"""You are the isolated Environment Engineer for the Agent World Foundry.
 
 Project purpose: turn a human need into a real executable programmatic environment whose state
@@ -2157,10 +3005,12 @@ Your Builder role is narrower: compile the frozen EnvironmentDesign/WorldSpec in
 Do not change semantics, decide release, or search for sealed/private evaluation material.
 
 Read these immutable framework inputs before editing:
-- inputs/environment-design.json
 - inputs/world-spec.json
+- inputs/curriculum.json
 - inputs/implementation-contract.json
 - inputs/task-materializer-output.schema.json
+
+{plan_instruction}
 
 These inputs exist only while generating. The restored candidate must install, import, start,
 reset, invoke, self-check, and run public tests when only the `candidate/` project tree exists.
@@ -2176,8 +3026,9 @@ agent-world.runtime.v2 exactly as the implementation contract states. Runtime st
 writable `AGENT_WORLD_STATE_DIR`; the installed source tree is read-only under Judge isolation.
 The root project is a virtual, non-installed uv root executed directly from that read-only source
 tree: set `[tool.uv] package = false`, do not declare a build-system, and ensure `uv.lock` records
-the root as `{{ virtual = "." }}`. Dependencies may only be ordinary named requirements resolved to
-hash-pinned wheels from the fixed HTTPS PyPI registry. Do not use editable/workspace, path, Git,
+exactly one root package named exactly `[project].name` with `{{ virtual = "." }}`. Dependencies
+may only be ordinary named requirements resolved to hash-pinned wheels from the fixed HTTPS PyPI
+registry. Do not use editable/workspace, path, Git,
 direct URL, custom index, find-links, build-setting, source-build, or sdist-only install paths.
 Judge installs dependencies with network disabled and no source builds from a framework-prefilled
 read-only uv cache. If an approved wheel is unavailable, return a real blocker; never weaken the
@@ -2205,6 +3056,15 @@ file `candidate/LICENSE` is declared as `LICENSE`. The entrypoint module must ex
 declared entry_path: remove the `.py` suffix, replace `/` with `.`, ignore one leading `src/`, and
 ignore a trailing `__main__`. Thus declared `candidate/materializer.py` binds to
 `candidate.materializer:materialize`; never put a path or filename before the colon.
+Do not confuse a source path with its launch module: `entry_path` must always be a
+candidate-relative `.py` path, whereas runtime and self-check `argv` must use the derived
+dot-separated module after `-m`. For example, `candidate/runtime.py` pairs with
+`[.venv/bin/python, -m, candidate.runtime]`. Before returning, inspect the final regular-file
+inventory and declare every final path exactly once with its fixed role.
+If the materializer file is directly at the project root as `candidate/task_materializer.py`,
+declare `entry_path=task_materializer.py` and `entrypoint=task_materializer:materialize`; only
+use a `candidate.` module prefix when `candidate/` is an actual package directory inside the
+project root.
 Never author `public_instruction`, evaluator goal, answer, expected output, solution trace, or
 evaluation witness. Framework code renders the instruction from the frozen objective and public
 goal, projects the evaluator goal through typed identity bindings, and independently proves task
@@ -2240,6 +3100,26 @@ Frozen design id: {design.design_id}, revision: {design.revision}.
 """
 
     @staticmethod
+    def _output_limit_continuation_prompt() -> str:
+        """Resume one Provider-truncated turn without exposing terminal prose.
+
+        This is intentionally operational rather than a semantic repair brief:
+        no CandidateCompletion was returned for framework validation, so there
+        is no field-level rejection to feed back.  The same thread and
+        workspace already contain the implementation work from the prior
+        physical turn.
+        """
+
+        return """Continue the existing Environment Engineer task in the same workspace.
+
+The previous physical turn ended before it returned a complete structured result. Its workspace
+changes remain available. Inspect `candidate/` and the immutable `inputs/` files, continue the
+remaining implementation and validation work, and preserve every correct file already present.
+Do not restart from a template, do not weaken the frozen contracts, and do not describe the
+interruption. When the candidate is complete, return the full requested CandidateCompletion JSON
+only; it must declare the final complete workspace rather than a patch or partial file list."""
+
+    @staticmethod
     def _repair_prompt(attempt: int, disclosure_filename: str) -> str:
         return f"""Continue the same Environment Engineer thread and modify the existing
 `candidate/` project in the same workspace.
@@ -2260,6 +3140,30 @@ debris, and return only the requested CandidateCompletion relative-path/launch d
 pre-existing assertion truly conflicts with the frozen design, report the blocker instead of
 silently weakening it. If blocked, report it honestly.
 """
+
+    @staticmethod
+    def _scheduler_repair_prompt(attempt: int, disclosure_filename: str) -> str:
+        """Render one data-only correction turn authorized by the Work Scheduler."""
+
+        return f"""Continue the same Environment Engineer thread and modify the existing
+`candidate/` project in the same workspace.
+
+This is one focused correction of a candidate that already completed an Agent turn but was
+rejected by deterministic framework validation. Read only
+`inputs/{disclosure_filename}` for the safe rejected conditions. It contains no hidden evaluator
+data, no release decision, and no instruction to change the frozen design. Preserve working files
+and unrelated public-test behavior.
+
+Before returning, remove only derived debris, inspect the final regular-file inventory under
+`candidate/`, and reconcile it with the full CandidateCompletion you return: every final regular
+file is declared exactly once with the correct role and executable flag, and nothing absent from
+the final tree remains declared. If the correction touches implementation behavior, strengthen a
+focused public regression without weakening unrelated assertions. Do not read or copy `inputs/`
+into the candidate, do not change WorldSpec/Curriculum semantics, and do not claim Judge, Gate, or
+release results.
+
+Return one complete corrected CandidateCompletion JSON only, never a patch or an explanation.
+This is correction attempt {attempt}."""
 
     @staticmethod
     def _unique_refs(refs: Sequence[ArtifactRef]) -> tuple[ArtifactRef, ...]:

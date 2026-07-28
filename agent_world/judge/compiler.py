@@ -2330,6 +2330,10 @@ Produce exactly one compact VerifierIntent structured output. You propose only d
 configs, tool-action trajectories, and family-level expectations such as "transition after action
 N should be true". Never enumerate Rule ids or properties: framework code expands each family
 expectation to the complete frozen Rule closure and rejects uncovered rules deterministically.
+Each item in `cases` must use the literal `expectations` field, never aliases such as `checks`,
+`assertions`, or `properties`. Its expectation items describe `kind`, one-based
+`after_action_ordinal`, and boolean `expected` according to the supplied logical output schema;
+do not add unrecognized case fields.
 For every coverage requirement provide a positive semantic expectation; when
 positive_and_negative is true, also provide a negative expectation. Framework code pairs every
 semantic trajectory into public and sealed cases and assigns both case ids and independent uint64

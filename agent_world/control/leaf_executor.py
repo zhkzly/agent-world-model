@@ -19,7 +19,11 @@ from typing import Literal
 from pydantic import ValidationError
 
 from agent_world.contracts import ArtifactRef, BudgetUsage, canonical_json_bytes, sha256_digest
+from agent_world.invocation import InvocationError
+from agent_world.invocation.contracts import InvocationSession, JsonObject, JsonValue
+from agent_world.invocation.structured_diagnostics import safe_terminal_details
 
+from .continuation_store import NodeContinuationRecord
 from .validation import pydantic_validation_diagnostic
 from .work import (
     AssuranceProbeResult,
@@ -33,9 +37,11 @@ from .work import (
     WorkAttempt,
     WorkCoordinate,
     WorkDefinition,
+    diagnostic_quality_for_issues,
 )
 from .work_runtime import WorkControlRuntime, WorkRuntimeError
 from .work_scheduler import WorkExecutionContext
+from .work_store import WorkControlHead, WorkControlLock
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +54,56 @@ class AgentExecutionProvenance:
     profile_digest: str
     output_schema_digest: str
     continuation_commitment: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LeafSessionContinuation:
+    """Private same-session state held only until Scheduler authorization.
+
+    A leaf may expose this only after a closed Provider physical-turn terminal.
+    It is not an Artifact, telemetry field, or runtime-Agent feedback input.
+    ``SchedulerLeafExecutor`` binds it to private durable storage only after
+    the normal Proposal -> Validation -> Feedback -> RepairAction chain has
+    authorized the exact continuation.
+    """
+
+    session: InvocationSession
+    model: str
+    output_schema_digest: str
+    previous_candidate: JsonValue | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LeafSemanticRepairContinuation:
+    """Private same-session state for one authorized semantic correction.
+
+    This is intentionally distinct from an output-limit continuation.  The
+    prior Agent turn completed and deterministic validation rejected a
+    specific candidate condition, so the Scheduler must first authorize a
+    ``local_correction`` and then attach its safe brief to exactly one
+    successor turn.  Neither this session nor the candidate workspace becomes
+    an Artifact or prompt-visible control-plane object.
+    """
+
+    session: InvocationSession
+    model: str
+    output_schema_digest: str
+    previous_candidate: JsonValue | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LocalTerminalDiagnostic:
+    """One redacted terminal clue for an explicitly opted-in local debug sink.
+
+    This is intentionally not a Work artifact, telemetry payload, or feedback
+    field.  The Scheduler still routes only on the typed ``InvocationError``;
+    a project-execution Agent can inspect this bounded sidecar only when a
+    diagnostic runner has explicitly installed a local sink.
+    """
+
+    code: str
+    terminal_details: JsonObject
+    excerpt: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,13 +136,26 @@ class AgentCorrectionBrief:
         arbitrary prefix of the report.
         """
 
-        grouped: dict[tuple[str, str, str], list[ValidationIssue]] = {}
+        grouped: dict[tuple[str, str, str, str | None], list[ValidationIssue]] = {}
         for issue in self.issues:
-            key = (issue.code, issue.violated_condition, issue.expected_category)
+            key = (
+                issue.code,
+                issue.violated_condition,
+                issue.expected_category,
+                issue.remediation,
+            )
             grouped.setdefault(key, []).append(issue)
 
         clusters: list[dict[str, object]] = []
-        for (code, condition, expected), issues in sorted(grouped.items()):
+        for (code, condition, expected, remediation), issues in sorted(
+            grouped.items(),
+            key=lambda item: (
+                item[0][0],
+                item[0][1],
+                item[0][2],
+                item[0][3] or "",
+            ),
+        ):
             patterns = tuple(
                 dict.fromkeys(
                     tuple("*" if isinstance(part, int) else part for part in issue.path)
@@ -94,16 +163,17 @@ class AgentCorrectionBrief:
                 )
             )
             representatives = tuple(dict.fromkeys(issue.path for issue in issues))[:3]
-            clusters.append(
-                {
-                    "code": code,
-                    "violated_condition": condition,
-                    "expected_category": expected,
-                    "occurrence_count": len(issues),
-                    "affected_path_patterns": patterns[:12],
-                    "representative_paths": representatives,
-                }
-            )
+            cluster: dict[str, object] = {
+                "code": code,
+                "violated_condition": condition,
+                "expected_category": expected,
+                "occurrence_count": len(issues),
+                "affected_path_patterns": patterns[:12],
+                "representative_paths": representatives,
+            }
+            if remediation is not None:
+                cluster["remediation"] = remediation
+            clusters.append(cluster)
         return {
             "total_blocking_issues": len(self.issues),
             "clusters": tuple(clusters),
@@ -191,6 +261,10 @@ class LeafExecutionFailure(RuntimeError):
         unknown_upper_bound: BudgetUsage | None = None,
         agent: AgentExecutionProvenance | None = None,
         retryable: bool = True,
+        expected_category: str | None = None,
+        remediation: str | None = None,
+        terminal_details: JsonObject | None = None,
+        session_continuation: LeafSessionContinuation | None = None,
     ) -> None:
         super().__init__(category)
         self.code = code
@@ -201,6 +275,13 @@ class LeafExecutionFailure(RuntimeError):
         # An execution error is not automatically a useful retry.  The leaf
         # declares that fact; only WorkControlRuntime can authorize a retry.
         self.retryable = retryable
+        self.expected_category = expected_category
+        self.remediation = remediation
+        # This field is reserved for the closed, secret-safe terminal facts
+        # produced by invocation.structured_diagnostics.  It is intentionally
+        # absent for ordinary framework failures.
+        self.terminal_details = terminal_details or {}
+        self.session_continuation = session_continuation
 
 
 class LeafValidationFailure(RuntimeError):
@@ -223,6 +304,7 @@ class LeafValidationFailure(RuntimeError):
         agent: AgentExecutionProvenance | None = None,
         evidence_refs: tuple[ArtifactRef, ...] = (),
         parent_repair_target: WorkCoordinate | None = None,
+        semantic_repair_continuation: LeafSemanticRepairContinuation | None = None,
     ) -> None:
         super().__init__(category)
         if not issues:
@@ -235,11 +317,10 @@ class LeafValidationFailure(RuntimeError):
         self.agent = agent
         self.evidence_refs = evidence_refs
         self.parent_repair_target = parent_repair_target
+        self.semantic_repair_continuation = semantic_repair_continuation
 
 
-type ProposalRunner = Callable[
-    [WorkExecutionContext, WorkAttempt, str], Awaitable[LeafProposal]
-]
+type ProposalRunner = Callable[[WorkExecutionContext, WorkAttempt, str], Awaitable[LeafProposal]]
 type AssuranceRunner = Callable[
     [WorkExecutionContext, WorkAttempt, LeafProposal], Awaitable[LeafAssurance]
 ]
@@ -254,8 +335,50 @@ class SchedulerLeafExecutor:
     then decide whether its declared RepairPolicy permits a physical retry.
     """
 
-    def __init__(self, *, runtime: WorkControlRuntime) -> None:
+    def __init__(
+        self,
+        *,
+        runtime: WorkControlRuntime,
+        local_terminal_diagnostic_sink: Callable[[LocalTerminalDiagnostic], None] | None = None,
+    ) -> None:
         self.runtime = runtime
+        self._local_terminal_diagnostic_sink = local_terminal_diagnostic_sink
+
+    @property
+    def local_terminal_diagnostics_enabled(self) -> bool:
+        """Whether this leaf may request a local-only redacted terminal excerpt."""
+
+        return self._local_terminal_diagnostic_sink is not None
+
+    def record_local_terminal_diagnostic(
+        self,
+        error: InvocationError | None,
+        *,
+        excerpt: str | None,
+    ) -> None:
+        """Forward a pre-scrubbed excerpt only to an explicit local sink.
+
+        The method has no Scheduler state side effect.  It also deliberately
+        refuses to derive text from an ordinary Provider error: the caller may
+        supply text only when the worker was explicitly asked to produce its
+        redacted diagnostic field.
+        """
+
+        sink = self._local_terminal_diagnostic_sink
+        if sink is None or error is None or not isinstance(excerpt, str):
+            return
+        if not 1 <= len(excerpt) <= 512:
+            return
+        details = safe_terminal_details(error)
+        if not details:
+            return
+        sink(
+            LocalTerminalDiagnostic(
+                code=error.code,
+                terminal_details=details,
+                excerpt=excerpt,
+            )
+        )
 
     def agent_correction_brief(
         self,
@@ -350,6 +473,7 @@ class SchedulerLeafExecutor:
                 agent=exc.agent,
                 evidence_refs=exc.evidence_refs,
                 parent_repair_target=exc.parent_repair_target,
+                semantic_repair_continuation=exc.semantic_repair_continuation,
             )
             return
         except LeafExecutionFailure as exc:
@@ -363,6 +487,10 @@ class SchedulerLeafExecutor:
                 unknown_upper_bound=exc.unknown_upper_bound,
                 agent=exc.agent,
                 retryable=exc.retryable,
+                expected_category=exc.expected_category,
+                remediation=exc.remediation,
+                terminal_details=exc.terminal_details,
+                session_continuation=exc.session_continuation,
             )
             return
         except asyncio.CancelledError:
@@ -427,8 +555,7 @@ class SchedulerLeafExecutor:
                         path=issue.location,
                         violated_condition=(issue.violated_condition or issue.message),
                         expected_category=(
-                            issue.expected_category
-                            or "the closed framework contract at this field"
+                            issue.expected_category or "the closed framework contract at this field"
                         ),
                         retryable=issue.retryable,
                     )
@@ -460,8 +587,7 @@ class SchedulerLeafExecutor:
                     attempt=attempt,
                     code="agent_postproposal_framework_error",
                     category=(
-                        "post-proposal framework materialization failed: "
-                        f"{type(exc).__name__}"
+                        f"post-proposal framework materialization failed: {type(exc).__name__}"
                     ),
                     observed_actual=outcome.observed_actual,
                     unknown_upper_bound=outcome.unknown_upper_bound,
@@ -478,6 +604,37 @@ class SchedulerLeafExecutor:
             )
             return
 
+        closure_issue = self._proposal_output_closure_issue(
+            input_refs=input_refs,
+            proposal=proposal,
+        )
+        if closure_issue is not None:
+            await self._finish_validation_failure(
+                definition=definition,
+                input_refs=input_refs,
+                attempt=attempt,
+                issues=(closure_issue,),
+                output_commitment=(
+                    proposal.output_refs[0].content_hash
+                    if proposal.output_refs
+                    else sha256_digest(
+                        canonical_json_bytes(
+                            {
+                                "definition_digest": definition.definition_digest,
+                                "input_refs": tuple(ref.revision_id for ref in input_refs),
+                                "failure_kind": "proposal_output_closure",
+                            }
+                        )
+                    )
+                ),
+                category="deterministic_leaf_output_closure",
+                observed_actual=proposal.observed_actual,
+                unknown_upper_bound=proposal.unknown_upper_bound,
+                agent=proposal.agent,
+                evidence_refs=proposal.validation_evidence_refs,
+                parent_repair_target=None,
+            )
+            return
         if proposal.child_commit_refs and proposal.child_commit_refs != context.parent_commit_refs:
             raise WorkRuntimeError(
                 "aggregate leaf must bind exactly the Scheduler-resolved child WorkCommits"
@@ -672,6 +829,7 @@ class SchedulerLeafExecutor:
         agent: AgentExecutionProvenance | None,
         evidence_refs: tuple[ArtifactRef, ...],
         parent_repair_target: WorkCoordinate | None,
+        semantic_repair_continuation: LeafSemanticRepairContinuation | None = None,
     ) -> None:
         """Persist an actionable failed validation without fabricating an output Artifact."""
 
@@ -717,9 +875,7 @@ class SchedulerLeafExecutor:
             model=agent.model if agent else None,
             profile_digest=agent.profile_digest if agent else None,
             output_schema_digest=agent.output_schema_digest if agent else None,
-            continuation_commitment=(
-                agent.continuation_commitment if agent else None
-            ),
+            continuation_commitment=(agent.continuation_commitment if agent else None),
             output_commitment=output_commitment,
             observed_actual=observed_actual,
             unknown_upper_bound=unknown_upper_bound,
@@ -758,8 +914,9 @@ class SchedulerLeafExecutor:
                 evidence_refs=tuple(
                     dict.fromkeys((*evidence_refs, safe_evidence_ref, *route_refs))
                 ),
-                diagnostic_quality=(
-                    "actionable" if all(issue.actionable for issue in issues) else "insufficient"
+                diagnostic_quality=diagnostic_quality_for_issues(
+                    status="failed",
+                    issues=issues,
                 ),
                 evaluated_at=datetime.now(UTC),
             )
@@ -769,12 +926,73 @@ class SchedulerLeafExecutor:
                 report=report,
                 observed_actual=BudgetUsage(),
             )
-            self.runtime.evaluate(
+            head = self.runtime.evaluate(
                 lock,
                 definition=definition,
                 report=report,
                 elapsed_wall_seconds=0,
             )
+            self._bind_semantic_repair_continuation(
+                lock,
+                definition=definition,
+                head=head,
+                continuation=semantic_repair_continuation,
+                agent=agent,
+            )
+
+    def _bind_semantic_repair_continuation(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        head: WorkControlHead,
+        continuation: LeafSemanticRepairContinuation | None,
+        agent: AgentExecutionProvenance | None,
+    ) -> None:
+        """Persist private Builder-like state after a local correction is authorized."""
+
+        if continuation is None:
+            return
+        if head.status != "repair_authorized":
+            return
+        if head.evaluation_ref is None or head.repair_action_ref is None or agent is None:
+            raise WorkRuntimeError("semantic repair authorization lacks exact Agent facts")
+        action = self.runtime.artifacts.get_json(head.repair_action_ref, RepairAction)
+        if action.decision != "local_correction":
+            raise WorkRuntimeError("semantic repair state cannot bind a different repair mode")
+        if (
+            agent.model != continuation.model
+            or agent.output_schema_digest != continuation.output_schema_digest
+            or agent.profile_digest != f"sha256:{continuation.session.profile_hash}"
+        ):
+            raise WorkRuntimeError("semantic repair provenance does not bind the Agent turn")
+        if self.runtime.continuation_workspace_root is None:
+            raise WorkRuntimeError("semantic repair workspace authority is not configured")
+        terminal_attempt = self.runtime.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        proposal_refs = self.runtime.proposal_execution_refs(terminal_attempt)
+        if terminal_attempt.validation_report_ref is None or not proposal_refs:
+            raise WorkRuntimeError("semantic repair lacks its terminal proposal/report chain")
+        record = NodeContinuationRecord.capture(
+            work_id=definition.work_id,
+            attempt_id=terminal_attempt.attempt_id,
+            session=continuation.session,
+            model=continuation.model,
+            output_schema_digest=continuation.output_schema_digest,
+            definition_digest=definition.definition_digest,
+            proposal_policy_digest=definition.proposal_policy.content_digest(),
+            input_fingerprint=self.runtime.heads.input_fingerprint(terminal_attempt.input_refs),
+            previous_candidate=continuation.previous_candidate,
+            allowed_mutation_roots=action.allowed_mutation_roots,
+            source_report_ref=terminal_attempt.validation_report_ref,
+            source_evaluation_ref=head.evaluation_ref,
+            repair_action_ref=head.repair_action_ref,
+            previous_execution_ref=proposal_refs[-1],
+        )
+        self.runtime.bind_repair_continuation(
+            lock,
+            definition=definition,
+            record=record,
+        )
 
     def _start_assurance(self, definition: WorkDefinition) -> WorkAttempt:
         with self.runtime.heads.exclusive(definition.coordinate) as lock:
@@ -847,6 +1065,86 @@ class SchedulerLeafExecutor:
                 elapsed_wall_seconds=0,
             )
 
+    @staticmethod
+    def _proposal_output_closure_issue(
+        *,
+        input_refs: tuple[ArtifactRef, ...],
+        proposal: LeafProposal,
+    ) -> ValidationIssue | None:
+        """Turn a malformed successful closure into terminal framework feedback.
+
+        ``WorkControlRuntime.evaluate`` must bind every successful output to a
+        validated subject. Checking that relation before validation is
+        checkpointed prevents an implementation mistake from leaving a head
+        running after proposal and validation operations terminalize. This is
+        framework-owned, non-retryable closure evidence, not an Agent repair.
+        """
+
+        if not proposal.output_refs:
+            return ValidationIssue(
+                code="framework_leaf_output_closure_empty",
+                path=("output_refs",),
+                violated_condition=(
+                    "A leaf proposal must bind at least one produced output Artifact."
+                ),
+                expected_category="the complete immutable output closure",
+                retryable=False,
+            )
+        if not proposal.subject_refs:
+            return ValidationIssue(
+                code="framework_leaf_subject_closure_empty",
+                path=("subject_refs",),
+                violated_condition=(
+                    "A leaf proposal must bind at least one validated subject Artifact."
+                ),
+                expected_category="the complete immutable output closure",
+                retryable=False,
+            )
+        if len(set(proposal.output_refs)) != len(proposal.output_refs):
+            return ValidationIssue(
+                code="framework_leaf_output_closure_duplicate",
+                path=("output_refs",),
+                violated_condition=(
+                    "A leaf proposal cannot list one output Artifact more than once."
+                ),
+                expected_category="a unique immutable output closure",
+                retryable=False,
+            )
+        if len(set(proposal.subject_refs)) != len(proposal.subject_refs):
+            return ValidationIssue(
+                code="framework_leaf_subject_closure_duplicate",
+                path=("subject_refs",),
+                violated_condition=(
+                    "A leaf proposal cannot list one validated subject more than once."
+                ),
+                expected_category="a unique immutable subject closure",
+                retryable=False,
+            )
+        if not set(proposal.subject_refs) <= {*input_refs, *proposal.output_refs}:
+            return ValidationIssue(
+                code="framework_leaf_subject_outside_closure",
+                path=("subject_refs",),
+                violated_condition=(
+                    "A validated subject must be an immutable input or an output of this leaf."
+                ),
+                expected_category="the declared input and output closure",
+                retryable=False,
+            )
+        if not proposal.validation_issues and not set(proposal.output_refs) <= set(
+            proposal.subject_refs
+        ):
+            return ValidationIssue(
+                code="framework_passing_output_closure_incomplete",
+                path=("subject_refs",),
+                violated_condition=(
+                    "A passing leaf must bind every produced output Artifact as a validated "
+                    "subject."
+                ),
+                expected_category="the complete immutable output closure",
+                retryable=False,
+            )
+        return None
+
     async def _finish_exception(
         self,
         *,
@@ -859,14 +1157,15 @@ class SchedulerLeafExecutor:
         unknown_upper_bound: BudgetUsage | None = None,
         agent: AgentExecutionProvenance | None = None,
         retryable: bool = True,
+        expected_category: str | None = None,
+        remediation: str | None = None,
+        terminal_details: JsonObject | None = None,
+        session_continuation: LeafSessionContinuation | None = None,
     ) -> None:
         if (
             definition.proposal_policy.executor == "agent"
             and agent is None
-            and not (
-                code.startswith("preflight_")
-                or code.startswith("process_interrupted")
-            )
+            and not (code.startswith("preflight_") or code.startswith("process_interrupted"))
         ):
             raise WorkRuntimeError(
                 "Agent leaf failures must bind real invocation/profile provenance"
@@ -879,6 +1178,7 @@ class SchedulerLeafExecutor:
             code,
             category,
             retryable=retryable,
+            terminal_details=terminal_details,
         )
         now = datetime.now(UTC)
         actual = observed_actual or BudgetUsage()
@@ -920,6 +1220,23 @@ class SchedulerLeafExecutor:
                 dispatch_id=f"dispatch:{attempt.attempt_id}:validation",
             )
             current_attempt = self.runtime.artifacts.get_json(head.attempt_ref, WorkAttempt)
+            issues = (
+                ValidationIssue(
+                    code=code,
+                    path=("operation",),
+                    violated_condition=category[:512],
+                    expected_category=(
+                        expected_category
+                        or (
+                            "one fresh execution under the declared replay policy"
+                            if retryable
+                            else "a configuration or permission change outside this attempt"
+                        )
+                    ),
+                    remediation=remediation,
+                    retryable=retryable,
+                ),
+            )
             report = ValidationReport(
                 report_id=f"validation-report:{current_attempt.attempt_id}:error",
                 attempt_id=current_attempt.attempt_id,
@@ -930,21 +1247,12 @@ class SchedulerLeafExecutor:
                 status="error",
                 validation_phase=definition.validation_policy.validation_phase,
                 frontier_ordinal=definition.validation_policy.frontier_ordinal,
-                issues=(
-                    ValidationIssue(
-                        code=code,
-                        path=("operation",),
-                        violated_condition=category[:512],
-                        expected_category=(
-                            "one fresh execution under the declared replay policy"
-                            if retryable
-                            else "a configuration or permission change outside this attempt"
-                        ),
-                        retryable=retryable,
-                    ),
-                ),
+                issues=issues,
                 evidence_refs=(evidence_ref,),
-                diagnostic_quality="actionable" if retryable else "insufficient",
+                diagnostic_quality=diagnostic_quality_for_issues(
+                    status="error",
+                    issues=issues,
+                ),
                 evaluated_at=datetime.now(UTC),
             )
             self.runtime.checkpoint_validation(
@@ -953,12 +1261,74 @@ class SchedulerLeafExecutor:
                 report=report,
                 observed_actual=BudgetUsage(),
             )
-            self.runtime.evaluate(
+            head = self.runtime.evaluate(
                 lock,
                 definition=definition,
                 report=report,
                 elapsed_wall_seconds=0,
+                allow_session_continuation=session_continuation is not None,
             )
+            self._bind_session_continuation(
+                lock,
+                definition=definition,
+                head=head,
+                continuation=session_continuation,
+                agent=agent,
+            )
+
+    def _bind_session_continuation(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        head: WorkControlHead,
+        continuation: LeafSessionContinuation | None,
+        agent: AgentExecutionProvenance | None,
+    ) -> None:
+        """Persist opaque session state only after normal repair authorization."""
+
+        if continuation is None:
+            return
+        if head.status != "repair_authorized":
+            return
+        if head.evaluation_ref is None or head.repair_action_ref is None or agent is None:
+            raise WorkRuntimeError("session continuation authorization lacks exact Agent facts")
+        action = self.runtime.artifacts.get_json(head.repair_action_ref, RepairAction)
+        if action.decision != "session_continuation":
+            raise WorkRuntimeError("output-limit session state cannot bind a different repair mode")
+        if (
+            agent.model != continuation.model
+            or agent.output_schema_digest != continuation.output_schema_digest
+            or agent.profile_digest != f"sha256:{continuation.session.profile_hash}"
+        ):
+            raise WorkRuntimeError("session continuation provenance does not bind the Agent turn")
+        if self.runtime.continuation_workspace_root is None:
+            raise WorkRuntimeError("session continuation workspace authority is not configured")
+        terminal_attempt = self.runtime.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        proposal_refs = self.runtime.proposal_execution_refs(terminal_attempt)
+        if terminal_attempt.validation_report_ref is None or not proposal_refs:
+            raise WorkRuntimeError("session continuation lacks its terminal proposal/report chain")
+        record = NodeContinuationRecord.capture(
+            work_id=definition.work_id,
+            attempt_id=terminal_attempt.attempt_id,
+            session=continuation.session,
+            model=continuation.model,
+            output_schema_digest=continuation.output_schema_digest,
+            definition_digest=definition.definition_digest,
+            proposal_policy_digest=definition.proposal_policy.content_digest(),
+            input_fingerprint=self.runtime.heads.input_fingerprint(terminal_attempt.input_refs),
+            previous_candidate=continuation.previous_candidate,
+            allowed_mutation_roots=action.allowed_mutation_roots,
+            source_report_ref=terminal_attempt.validation_report_ref,
+            source_evaluation_ref=head.evaluation_ref,
+            repair_action_ref=head.repair_action_ref,
+            previous_execution_ref=proposal_refs[-1],
+        )
+        self.runtime.bind_repair_continuation(
+            lock,
+            definition=definition,
+            record=record,
+        )
 
     async def _finish_assurance_exception(
         self,
@@ -1011,6 +1381,7 @@ class SchedulerLeafExecutor:
         proposal: LeafProposal,
     ) -> ValidationReport:
         issues = proposal.validation_issues
+        status: Literal["failed", "passed"] = "failed" if issues else "passed"
         return ValidationReport(
             report_id=f"validation-report:{attempt.attempt_id}",
             attempt_id=attempt.attempt_id,
@@ -1018,19 +1389,13 @@ class SchedulerLeafExecutor:
             policy_id=definition.validation_policy.policy_id,
             policy_digest=definition.validation_policy.content_digest(),
             subject_refs=proposal.subject_refs,
-            status="failed" if issues else "passed",
+            status=status,
             validation_phase=definition.validation_policy.validation_phase,
             frontier_ordinal=definition.validation_policy.frontier_ordinal,
             passed_check_ids=(() if issues else (definition.required_claim_id,)),
             issues=issues,
             evidence_refs=proposal.validation_evidence_refs,
-            diagnostic_quality=(
-                "actionable"
-                if issues and all(item.actionable for item in issues)
-                else "insufficient"
-                if issues
-                else "not_applicable"
-            ),
+            diagnostic_quality=diagnostic_quality_for_issues(status=status, issues=issues),
             evaluated_at=datetime.now(UTC),
         )
 
@@ -1042,17 +1407,21 @@ class SchedulerLeafExecutor:
         category: str,
         *,
         retryable: bool = True,
+        terminal_details: JsonObject | None = None,
     ) -> ArtifactRef:
+        value: JsonObject = {
+            "attempt_id": attempt.attempt_id,
+            "coordinate": definition.coordinate.model_dump(mode="json"),
+            "failure_code": code,
+            "failure_category": category[:120],
+            "retryable_infrastructure": retryable,
+        }
+        if terminal_details:
+            value["terminal_details"] = terminal_details
         return self.runtime.artifacts.put_json(
             artifact_id=f"leaf-failure:{attempt.attempt_id}:{code}",
             artifact_type="control.leaf_failure_evidence",
-            value={
-                "attempt_id": attempt.attempt_id,
-                "coordinate": definition.coordinate.model_dump(mode="json"),
-                "failure_code": code,
-                "failure_category": category[:120],
-                "retryable_infrastructure": retryable,
-            },
+            value=value,
             dependencies=attempt.input_refs,
         )
 
@@ -1115,6 +1484,8 @@ __all__ = [
     "AgentExecutionProvenance",
     "LeafAssurance",
     "LeafExecutionFailure",
+    "LeafSemanticRepairContinuation",
+    "LeafSessionContinuation",
     "LeafValidationFailure",
     "LeafProposal",
     "SchedulerLeafExecutor",

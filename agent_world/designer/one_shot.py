@@ -31,6 +31,7 @@ from agent_world.control.leaf_executor import (
     AgentCorrectionBrief,
     AgentExecutionProvenance,
     LeafExecutionFailure,
+    LeafSessionContinuation,
     LeafValidationFailure,
     record_agent_proposal_outcome,
 )
@@ -49,21 +50,22 @@ from agent_world.invocation import (
     InvocationExecutionMode,
     InvocationRequest,
     InvocationResult,
+    InvocationSession,
     NodeCapabilityRequirement,
     ResolvedAgentProfile,
     assert_agent_output_advisory,
 )
+from agent_world.invocation.structured_diagnostics import (
+    safe_terminal_code,
+    safe_terminal_condition,
+    safe_terminal_details,
+    safe_terminal_expected_category,
+    safe_terminal_remediation,
+    terminal_failure_retryable,
+)
 
 _TRANSPORT_ARTIFACT_FIELD = "artifact_json"
 _SAFE_BACKEND_CODE = re.compile(r"[^A-Za-z0-9._:-]")
-
-# This is a terminal compatibility diagnosis, not a transient transport outage.
-# Repeating an identical Agent request cannot make a provider that rejected the
-# request contract accept it; a different profile, endpoint, or prompt/input
-# contract must first be selected outside the active attempt.  Keep the list
-# deliberately narrow: timeout/rate-limit/unavailable classifications retain
-# their separately configured infrastructure-recovery policy.
-_NON_RETRYABLE_BACKEND_TERMINAL_CODES = frozenset({"turn_failed_provider_rejected"})
 
 # WorkDefinition uses Python identifiers while the independently versioned
 # capability/profile contracts use their established hyphenated role ids.  The
@@ -119,7 +121,8 @@ async def invoke_structured_once[TOutput: BaseModel](
     semantic_validator: Callable[[TOutput], None] | None = None,
     capability_requirement: NodeCapabilityRequirement | None = None,
     correction_brief: AgentCorrectionBrief | None = None,
-    json_envelope_protocol: str | None = None,
+    logical_output_protocol: str | None = None,
+    session: InvocationSession | None = None,
 ) -> StructuredTurnResult[TOutput]:
     """Run one real Agent turn and translate only safe terminal outcomes.
 
@@ -137,8 +140,8 @@ async def invoke_structured_once[TOutput: BaseModel](
         raise ValueError("Agent WorkDefinition must declare an agent role")
     if not prompt.strip():
         raise ValueError("structured Agent prompt must not be empty")
-    if json_envelope_protocol is not None and not json_envelope_protocol.strip():
-        raise ValueError("json_envelope_protocol must not be empty when supplied")
+    if logical_output_protocol is not None and not logical_output_protocol.strip():
+        raise ValueError("logical_output_protocol must not be empty when supplied")
     prompt = _with_correction_brief(prompt, correction_brief)
 
     assert_agent_output_advisory(model, authority=AgentOutputAuthority.SEMANTIC_ADVISORY)
@@ -165,7 +168,11 @@ async def invoke_structured_once[TOutput: BaseModel](
             output_schema=schema,
             permissions=permissions,
             requirement=requirement,
-            rollout_token_limit=policy.budget.llm_tokens or None,
+            # The Scheduler budget is one observable physical Provider turn.
+            # A declared logical session remains visible to the profile/SDK so
+            # a later authorized continuation retains the user's full session
+            # envelope rather than silently inheriting this turn's slice.
+            rollout_token_limit=(policy.session_token_limit or policy.budget.llm_tokens) or None,
             # The profile's SDK timeout is part of the same bounded physical
             # operation as the Scheduler lease.  Leaving it at a broader
             # role/config default would let the HTTP client outlive the
@@ -188,8 +195,43 @@ async def invoke_structured_once[TOutput: BaseModel](
         prompt = _with_json_envelope_contract(
             prompt,
             schema,
-            logical_protocol=json_envelope_protocol,
+            logical_protocol=logical_output_protocol,
         )
+    elif profile.structured_output_transport == "json_object":
+        prompt = _with_json_object_contract(
+            prompt,
+            schema,
+            logical_protocol=logical_output_protocol,
+        )
+
+    if session is not None:
+        # A session-capable structured turn must remain on the Agentic Codex
+        # route.  The Direct structured adapter has no same-thread semantics,
+        # so treating its output limit as resumable would create a false
+        # continuation path.
+        if not profile.allowed_builtin_tools:
+            raise LeafExecutionFailure(
+                code="preflight_agent_session_continuation_unsupported",
+                category=(
+                    "the resolved structured profile has no Agentic same-session "
+                    "continuation capability"
+                ),
+                retryable=False,
+            )
+        if (
+            session.lineage_id != profile.lineage_id
+            or session.workspace.resolve() != profile.workspace.resolve()
+            or session.profile_hash != profile.profile_hash
+            or session.codex_config_sha256 != profile.codex_config_sha256
+        ):
+            raise LeafExecutionFailure(
+                code="preflight_agent_session_continuation_binding_invalid",
+                category=(
+                    "the resumed structured Agent session does not bind the exact "
+                    "profile, workspace, and lineage"
+                ),
+                retryable=False,
+            )
 
     request = InvocationRequest(
         # The Scheduler created this opaque dispatch id under the active
@@ -200,6 +242,7 @@ async def invoke_structured_once[TOutput: BaseModel](
         invocation_id=dispatch_id,
         prompt=prompt,
         profile=profile,
+        session=session,
         metadata={
             "work_id": definition.work_id,
             "coordinate": definition.coordinate.coordinate_key,
@@ -220,10 +263,14 @@ async def invoke_structured_once[TOutput: BaseModel](
             "repair_attempt_charge": attempt.repair_attempt_charge,
         },
         # This helper owns one physical proposal only: it never resumes a
-        # session or authorizes an in-function correction. The profile is
-        # tool-free by default, so the application router can use the bounded
-        # direct structured backend while repair/session paths stay Codex.
-        execution_mode=InvocationExecutionMode.SINGLE_SHOT_STRUCTURED,
+        # session or authorizes an in-function correction. Tool-free profiles
+        # can use the direct structured adapter, while declared read-only
+        # shell access is a real Agent turn and must stay on the Codex route.
+        execution_mode=(
+            InvocationExecutionMode.AGENTIC
+            if profile.allowed_builtin_tools
+            else InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
+        ),
     )
     # Dispatch identity and the isolated profile are known *before* crossing
     # the provider boundary.  A timeout or transport exception therefore has
@@ -266,18 +313,38 @@ async def invoke_structured_once[TOutput: BaseModel](
         )
     observed_actual, unknown_upper_bound = _usage_for_result(definition, result)
     if not result.succeeded:
-        raw_code = result.error.code if result.error is not None else result.status.value
+        raw_code = safe_terminal_code(result.error) or result.status.value
         safe_code = _SAFE_BACKEND_CODE.sub("-", raw_code).strip("-.") or "terminal"
+        session_continuation = None
+        failure_code = f"agent_backend_{safe_code}"[:160]
+        # The Scheduler recognizes only this exact closed adapter terminal as
+        # a same-session continuation candidate.  Keep the opaque thread id
+        # private; the leaf kernel will persist it only after the normal
+        # Validation -> Feedback -> RepairAction authorization chain succeeds.
+        if (
+            raw_code == "turn_failed_output_limit"
+            and result.session is not None
+            and policy.session_token_limit is not None
+            and policy.session_wall_seconds is not None
+            and definition.repair_policy.maximum_session_continuations > 0
+        ):
+            failure_code = "turn_failed_output_limit"
+            session_continuation = LeafSessionContinuation(
+                session=result.session,
+                model=agent.model,
+                output_schema_digest=schema_digest,
+            )
         raise LeafExecutionFailure(
-            code=f"agent_backend_{safe_code}"[:160],
-            category="the Agent backend returned a non-success terminal result",
+            code=failure_code,
+            category=safe_terminal_condition(result.error),
             observed_actual=observed_actual,
             unknown_upper_bound=unknown_upper_bound,
             agent=agent,
-            # The worker classifies terminal provider outcomes safely, but do
-            # not let a backend's generic retry flag turn this known
-            # compatibility rejection into an identical second dispatch.
-            retryable=safe_code not in _NON_RETRYABLE_BACKEND_TERMINAL_CODES,
+            retryable=terminal_failure_retryable(result.error),
+            expected_category=safe_terminal_expected_category(result.error),
+            remediation=safe_terminal_remediation(result.error),
+            terminal_details=safe_terminal_details(result.error),
+            session_continuation=session_continuation,
         )
 
     transport_error = _transport_envelope_diagnostic(
@@ -534,6 +601,7 @@ def _raise_validation_failure(
             expected_category=(
                 issue.expected_category or "a value satisfying the typed structured-output contract"
             ),
+            remediation=issue.message,
             retryable=issue.retryable,
         )
         for issue in diagnostic.issues
@@ -620,9 +688,51 @@ def _with_json_envelope_contract(
 
 Structured-output transport requirement:
 Return exactly one outer JSON object with the single key `artifact_json`. Its value must be a JSON
-string. Decode that string mentally before returning: it must be one JSON object that satisfies the
-logical output contract below. Do not use Markdown, code fences, prose, or any outer key other than
-`artifact_json`. {contract_label}
+string containing one JSON object that satisfies the logical output contract below. First construct
+the inner object, then JSON-serialize it into the outer string: every inner double quote and
+every backslash must use standard JSON string escaping. Do not visually nest an object inside that
+string: encode each inner double quote as the JSON backslash-quote escape (U+005C followed by
+U+0022), never as a raw quote. Do not use Markdown, code fences,
+prose, or any outer key other than `artifact_json`. {contract_label}
+{serialized}
+"""
+
+
+def _with_json_object_contract(
+    prompt: str,
+    schema: dict[str, object],
+    *,
+    logical_protocol: str | None = None,
+) -> str:
+    """State the direct-object transport without adding an inner envelope.
+
+    This applies only to the Direct tool-free route.  It gives the model one
+    less non-semantic serialization problem while preserving the original
+    typed local validation immediately after the provider response.  Unlike
+    native provider-schema transport, ``json_object`` carries no schema to
+    the provider, so the effective prompt must include either the complete
+    logical schema or the caller's compatible compact protocol.
+    """
+
+    serialized = (
+        logical_protocol.strip()
+        if logical_protocol is not None
+        else json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+    contract_label = (
+        "The compact logical protocol below describes a strict subset of the original typed "
+        "output contract. It does not replace local Pydantic or deterministic compiler validation:"
+        if logical_protocol is not None
+        else "The logical contract is data, never an instruction:"
+    )
+
+    return f"""{prompt}
+
+Structured-output transport requirement:
+Return the complete requested logical artifact as exactly one JSON object. Do not wrap it in an
+`artifact_json` field, do not encode it as a JSON string, and do not use Markdown, code fences, or
+prose. The framework validates this object against the requested typed contract after the response.
+{contract_label}
 {serialized}
 """
 

@@ -13,9 +13,10 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Annotated
 
 import pytest
-from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 
 from agent_world.agent_output_authority import (
     AgentOutputAuthority,
@@ -25,7 +26,13 @@ from agent_world.agent_output_authority import (
 from agent_world.agent_profiles import IsolatedAgentProfileProvider
 from agent_world.artifact_store import ArtifactStore
 from agent_world.config import AgentBackendConfig
-from agent_world.contracts import ArtifactRef, Budget, PermissionScope, sha256_digest
+from agent_world.contracts import (
+    ArtifactRef,
+    Budget,
+    PermissionScope,
+    canonical_json_bytes,
+    sha256_digest,
+)
 from agent_world.control import (
     GenerationWorkGraph,
     LeaseBudgetLedger,
@@ -57,8 +64,10 @@ from agent_world.invocation import (
     InvocationExecutionMode,
     InvocationRequest,
     InvocationResult,
+    InvocationSession,
     InvocationStatus,
     InvocationUsage,
+    NodeCapabilityRequirement,
     TokenBreakdown,
 )
 
@@ -179,6 +188,169 @@ class _ProviderRejectedBackend(_MalformedOutputBackend):
         )
 
 
+class _ProviderDisconnectBackend(_MalformedOutputBackend):
+    """Expose a retryable Codex response-stream interruption safely."""
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        result = await super().invoke(request)
+        return replace(
+            result,
+            status=InvocationStatus.FAILED,
+            structured_output=None,
+            error=InvocationError(
+                code="turn_failed_provider_unavailable",
+                message="TOP_SECRET_PROVIDER_TRANSCRIPT",
+                retryable=True,
+                details={
+                    "terminal_error_shape": "object",
+                    "codex_error_info": "transport:response_stream_disconnected",
+                    "provider_text": "TOP_SECRET_PROVIDER_TRANSCRIPT",
+                },
+            ),
+        )
+
+
+class _QuotaExhaustedBackend(_MalformedOutputBackend):
+    """Expose a non-retryable Provider-account terminal through the normal adapter."""
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        result = await super().invoke(request)
+        return replace(
+            result,
+            status=InvocationStatus.FAILED,
+            structured_output=None,
+            error=InvocationError(
+                code="turn_failed_quota_exhausted",
+                message="TOP_SECRET_PROVIDER_TRANSCRIPT",
+                retryable=True,
+            ),
+        )
+
+
+class _SessionBudgetExhaustedBackend(_MalformedOutputBackend):
+    """Expose a closed session-budget terminal without retaining provider text."""
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        result = await super().invoke(request)
+        return replace(
+            result,
+            status=InvocationStatus.FAILED,
+            structured_output=None,
+            error=InvocationError(
+                code="turn_failed_session_budget_exhausted",
+                message="TOP_SECRET_PROVIDER_TRANSCRIPT",
+                retryable=True,
+                details={
+                    "terminal_error_shape": "object",
+                    "codex_error_info": "enum:sessionbudgetexceeded",
+                    "provider_text": "TOP_SECRET_PROVIDER_TRANSCRIPT",
+                },
+            ),
+        )
+
+
+class _DirectInvalidJsonBackend(_MalformedOutputBackend):
+    """Return a safe Direct-adapter parse classification with hostile raw fields."""
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        result = await super().invoke(request)
+        return replace(
+            result,
+            status=InvocationStatus.FAILED,
+            structured_output=None,
+            error=InvocationError(
+                code="direct_structured_output_invalid_json",
+                message="TOP_SECRET_PROVIDER_TRANSCRIPT",
+                # A malformed Direct response is an incompatibility terminal,
+                # even if an arbitrary backend incorrectly labels it retryable.
+                retryable=True,
+                details={
+                    "response_shape": "markdown_fence",
+                    "parse_failure": "syntax",
+                    "parse_offset": 0,
+                    "response_characters": 73,
+                    "provider_text": "TOP_SECRET_PROVIDER_TRANSCRIPT",
+                },
+            ),
+        )
+
+
+class _DirectOutputLimitBackend(_MalformedOutputBackend):
+    """Return a safe Direct-adapter output-ceiling terminal."""
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        result = await super().invoke(request)
+        return replace(
+            result,
+            status=InvocationStatus.FAILED,
+            structured_output=None,
+            usage=InvocationUsage(turn=TokenBreakdown(total_tokens=1_000)),
+            error=InvocationError(
+                code="direct_output_limit",
+                message="safe test-only output limit",
+                retryable=True,
+                details={
+                    "terminal_status": "incomplete",
+                    "terminal_reason": "max_output_tokens",
+                    "configured_max_output_tokens": 65_536,
+                },
+            ),
+        )
+
+
+class _DirectProviderStreamStalledBackend(_MalformedOutputBackend):
+    """Return a started-then-silent Direct stream terminal with no transcript."""
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        result = await super().invoke(request)
+        return replace(
+            result,
+            status=InvocationStatus.FAILED,
+            structured_output=None,
+            error=InvocationError(
+                code="direct_provider_stream_stalled",
+                message="TOP_SECRET_PROVIDER_TRANSCRIPT",
+                retryable=True,
+                details={
+                    "waiting_phase": "direct_awaiting_stream_event",
+                    "idle_timeout_seconds": 300,
+                    "observed_provider_event_count": 4,
+                    "provider_text": "TOP_SECRET_PROVIDER_TRANSCRIPT",
+                },
+            ),
+        )
+
+
+class _AgenticOutputLimitBackend(_MalformedOutputBackend):
+    """Return one resumable Codex physical-turn output ceiling."""
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        result = await super().invoke(request)
+        profile = request.profile
+        return replace(
+            result,
+            status=InvocationStatus.FAILED,
+            structured_output=None,
+            usage=InvocationUsage(turn=TokenBreakdown(total_tokens=125_000)),
+            session=InvocationSession(
+                thread_id="private-output-limit-thread",
+                lineage_id=profile.lineage_id,
+                workspace=profile.workspace,
+                profile_hash=profile.profile_hash,
+                codex_config_sha256=profile.codex_config_sha256,
+            ),
+            error=InvocationError(
+                code="turn_failed_output_limit",
+                message="safe test-only Agent output limit",
+                retryable=False,
+                details={
+                    "terminal_status": "incomplete",
+                    "terminal_reason": "max_output_tokens",
+                },
+            ),
+        )
+
+
 def _definition():
     return structured_agent_work_definition(
         scope_id="job:one-shot",
@@ -268,10 +440,147 @@ async def test_one_shot_returns_safe_field_feedback_without_component_retry(
     assert failure.category == "structured_output_shape"
     assert failure.issues[0].code == "schema_string_type"
     assert failure.issues[0].path == ("title",)
+    assert failure.issues[0].remediation == (
+        "Return a string value; the rejected value has safe JSON type `number`."
+    )
+    assert failure.issues[0].violated_condition == (
+        "closed schema constraint string_type; received JSON type `number`"
+    )
     assert failure.agent is not None
     assert failure.observed_actual.llm_tokens == 11
     assert failure.observed_actual.agent_turns == 1
     assert failure.unknown_upper_bound.llm_tokens == 989
+
+
+@pytest.mark.asyncio
+async def test_structured_read_uses_one_real_agentic_turn(tmp_path: Path) -> None:
+    """A declared shell-read node must not silently route through Direct LLM."""
+
+    definition = _definition()
+    backend = _StaticOutputBackend({"title": "Frozen input inspection"})
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-read-agent-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    result = await invoke_structured_once(
+        backend=backend,
+        profiles=profiles,
+        definition=definition,
+        attempt=_attempt(definition),
+        dispatch_id="dispatch:structured-read:1",
+        lineage_id="lineage:structured-read",
+        workspace=tmp_path / "isolated-reader",
+        model=_StrictOneShotOutput,
+        prompt="Read the staged frozen inputs and return the requested title object.",
+        permissions=PermissionScope(),
+        capability_requirement=NodeCapabilityRequirement.structured_read(
+            node_id="researcher.frozen-input-inspection",
+            role="researcher",
+        ),
+    )
+
+    assert result.output.title == "Frozen input inspection"
+    assert len(backend.requests) == 1
+    assert backend.requests[0].execution_mode is InvocationExecutionMode.AGENTIC
+    assert backend.requests[0].profile.allowed_builtin_tools == ("shell",)
+
+
+def test_missing_pydantic_field_has_an_explicit_safe_repair_condition() -> None:
+    """A correction brief can distinguish an omitted field from an opaque schema failure."""
+
+    with pytest.raises(ValidationError) as captured:
+        _StrictOneShotOutput.model_validate({})
+
+    diagnostic = pydantic_validation_diagnostic(
+        captured.value,
+        owner_component="design",
+        validation_phase="task_curriculum",
+        frontier_ordinal=10,
+    )
+
+    issue = diagnostic.issues[0]
+    assert issue.code == "schema_missing"
+    assert issue.location == ("title",)
+    assert issue.message == (
+        "Include the named required field; it cannot be omitted from the structured output."
+    )
+    assert issue.violated_condition == "the named field is required by the closed output schema"
+    assert issue.expected_category == (
+        "the named required field with a value satisfying its closed output schema"
+    )
+    assert issue.actionable_for_agent is True
+
+
+def test_pydantic_shape_feedback_discloses_safe_kind_and_length_not_raw_input() -> None:
+    """A repair can see structural facts without receiving rejected model content."""
+
+    class ShapeProbe(BaseModel):
+        model_config = ConfigDict(strict=True)
+
+        values: Annotated[tuple[str, ...], Field(min_length=2)]
+
+    with pytest.raises(ValidationError) as captured:
+        ShapeProbe.model_validate_json(json.dumps({"values": [{"private": "do-not-persist"}]}))
+
+    diagnostic = pydantic_validation_diagnostic(
+        captured.value,
+        owner_component="design",
+        validation_phase="tool_semantics",
+        frontier_ordinal=20,
+    )
+
+    issues = {issue.code: issue for issue in diagnostic.issues}
+    type_issue = issues["schema_string_type"]
+    length_issue = issues["schema_too_short"]
+    assert type_issue.message == (
+        "Return a string value; the rejected value has safe JSON type `object`."
+    )
+    assert type_issue.violated_condition == (
+        "closed schema constraint string_type; received JSON type `object`"
+    )
+    assert length_issue.message == (
+        "Return at least 2 items; the response has 1 items, but only 0 passed nested item "
+        "validation. Fix the item errors at their reported paths."
+    )
+    assert length_issue.violated_condition == (
+        "closed schema minimum length 2; response length 1, validated length 0"
+    )
+    assert "private" not in diagnostic.feedback
+    assert "do-not-persist" not in diagnostic.feedback
+
+
+def test_pydantic_numeric_floor_feedback_discloses_the_safe_schema_bound() -> None:
+    """A correction can select a valid retry count without seeing raw output."""
+
+    class RetryProbe(BaseModel):
+        model_config = ConfigDict(strict=True)
+
+        maximum_attempts: Annotated[int, Field(ge=1)]
+
+    with pytest.raises(ValidationError) as captured:
+        RetryProbe.model_validate({"maximum_attempts": 0})
+
+    diagnostic = pydantic_validation_diagnostic(
+        captured.value,
+        owner_component="design",
+        validation_phase="tool_semantics",
+        frontier_ordinal=20,
+    )
+
+    issue = diagnostic.issues[0]
+    assert issue.code == "schema_greater_than_equal"
+    assert issue.location == ("maximum_attempts",)
+    assert issue.message == "Return a numeric value greater than or equal to 1."
+    assert issue.violated_condition == "closed schema lower bound 1 (inclusive)"
+    assert issue.expected_category == "a numeric value greater than or equal to 1"
+    assert issue.actionable_for_agent is True
 
 
 @pytest.mark.asyncio
@@ -311,6 +620,381 @@ async def test_one_shot_marks_provider_contract_rejection_non_retryable(
     assert len(backend.requests) == 1
     assert failure.code == "agent_backend_turn_failed_provider_rejected"
     assert failure.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_one_shot_routes_codex_stream_disconnect_to_bounded_infrastructure_recovery(
+    tmp_path: Path,
+) -> None:
+    """A closed stream-interruption fact is not a semantic correction request."""
+
+    definition = _definition()
+    backend = _ProviderDisconnectBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    with pytest.raises(LeafExecutionFailure) as captured:
+        await invoke_structured_once(
+            backend=backend,
+            profiles=profiles,
+            definition=definition,
+            attempt=_attempt(definition),
+            dispatch_id="dispatch:one-shot:provider-disconnect",
+            lineage_id="lineage:one-shot:provider-disconnect",
+            workspace=tmp_path / "provider-disconnect",
+            model=_StrictOneShotOutput,
+            prompt="Produce the requested title object.",
+            permissions=PermissionScope(),
+        )
+
+    failure = captured.value
+    assert len(backend.requests) == 1
+    assert failure.code == "agent_backend_turn_failed_provider_unavailable"
+    assert failure.category == (
+        "the Codex Provider response stream disconnected before a terminal response"
+    )
+    assert failure.expected_category == (
+        "a recovered Codex Provider route followed by an authorized bounded infrastructure "
+        "retry; do not issue a model correction"
+    )
+    assert failure.retryable is True
+    assert "TOP_SECRET_PROVIDER_TRANSCRIPT" not in failure.category
+
+
+@pytest.mark.asyncio
+async def test_one_shot_routes_direct_started_stream_stall_to_liveness_recovery(
+    tmp_path: Path,
+) -> None:
+    """A silent stream gets transport feedback, never a fabricated model correction."""
+
+    definition = _definition()
+    backend = _DirectProviderStreamStalledBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    with pytest.raises(LeafExecutionFailure) as captured:
+        await invoke_structured_once(
+            backend=backend,
+            profiles=profiles,
+            definition=definition,
+            attempt=_attempt(definition),
+            dispatch_id="dispatch:one-shot:direct-stream-stalled",
+            lineage_id="lineage:one-shot:direct-stream-stalled",
+            workspace=tmp_path / "direct-stream-stalled",
+            model=_StrictOneShotOutput,
+            prompt="Produce the requested title object.",
+            permissions=PermissionScope(),
+        )
+
+    failure = captured.value
+    assert len(backend.requests) == 1
+    assert failure.code == "agent_backend_direct_provider_stream_stalled"
+    assert failure.category == (
+        "the Direct Provider stream emitted 4 event(s) then yielded no next event for 300 seconds"
+    )
+    assert failure.expected_category == (
+        "a profile-matched Direct Provider liveness control and either a corrected Direct "
+        "stream/route boundary or one Scheduler-authorized fresh physical execution; do not "
+        "change the Prompt or Runtime Skill without semantic output"
+    )
+    assert failure.remediation == (
+        "Inspect the safe Provider-event count, idle interval, and local waiting heartbeat; "
+        "run one profile-matched Direct control. If that control passes, treat this as one "
+        "stalled stream and repair the Direct route/proxy/adapter boundary or use only an "
+        "existing Scheduler-authorized retry."
+    )
+    assert failure.retryable is True
+    assert failure.terminal_details == {
+        "waiting_phase": "direct_awaiting_stream_event",
+        "idle_timeout_seconds": 300,
+        "observed_provider_event_count": 4,
+    }
+    assert "TOP_SECRET_PROVIDER_TRANSCRIPT" not in repr(failure)
+
+
+@pytest.mark.asyncio
+async def test_one_shot_routes_provider_quota_to_external_recovery(
+    tmp_path: Path,
+) -> None:
+    """Quota exhaustion is not an Agent correction or an identical retry."""
+
+    definition = _definition()
+    backend = _QuotaExhaustedBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    with pytest.raises(LeafExecutionFailure) as captured:
+        await invoke_structured_once(
+            backend=backend,
+            profiles=profiles,
+            definition=definition,
+            attempt=_attempt(definition),
+            dispatch_id="dispatch:one-shot:quota-exhausted",
+            lineage_id="lineage:one-shot:quota-exhausted",
+            workspace=tmp_path / "quota-exhausted",
+            model=_StrictOneShotOutput,
+            prompt="Produce the requested title object.",
+            permissions=PermissionScope(),
+        )
+
+    failure = captured.value
+    assert len(backend.requests) == 1
+    assert failure.code == "agent_backend_turn_failed_quota_exhausted"
+    assert failure.category == "the configured Provider reported that its quota is exhausted"
+    assert failure.expected_category == (
+        "restored Provider quota or an explicitly authorized model/provider route; "
+        "do not issue a model correction or blind retry"
+    )
+    assert failure.retryable is False
+    assert "TOP_SECRET_PROVIDER_TRANSCRIPT" not in failure.category
+    assert failure.remediation == (
+        "Restore quota or select an explicitly authorized Provider/model route; do not replay "
+        "this physical attempt."
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_shot_routes_session_budget_to_a_new_declared_envelope(
+    tmp_path: Path,
+) -> None:
+    """A session cap is neither account quota nor a semantic repair signal."""
+
+    definition = _definition()
+    backend = _SessionBudgetExhaustedBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    with pytest.raises(LeafExecutionFailure) as captured:
+        await invoke_structured_once(
+            backend=backend,
+            profiles=profiles,
+            definition=definition,
+            attempt=_attempt(definition),
+            dispatch_id="dispatch:one-shot:session-budget-exhausted",
+            lineage_id="lineage:one-shot:session-budget-exhausted",
+            workspace=tmp_path / "session-budget-exhausted",
+            model=_StrictOneShotOutput,
+            prompt="Produce the requested title object.",
+            permissions=PermissionScope(),
+        )
+
+    failure = captured.value
+    assert len(backend.requests) == 1
+    assert failure.code == "agent_backend_turn_failed_session_budget_exhausted"
+    assert failure.category == (
+        "the Codex Agent session exhausted its declared rollout token budget before returning "
+        "a result"
+    )
+    assert failure.expected_category == (
+        "a new diagnostic definition with a larger declared rollout-token budget, a smaller or "
+        "split effective runtime input, or a narrower Runtime Skill scope; do not issue a model "
+        "correction or blind retry"
+    )
+    assert failure.retryable is False
+    assert failure.terminal_details == {
+        "terminal_error_shape": "object",
+        "codex_error_info": "enum:sessionbudgetexceeded",
+    }
+    assert "TOP_SECRET_PROVIDER_TRANSCRIPT" not in repr(failure.terminal_details)
+
+
+@pytest.mark.asyncio
+async def test_one_shot_projects_safe_direct_json_diagnostic_without_blind_retry(
+    tmp_path: Path,
+) -> None:
+    """The scheduler receives parser facts, never the provider transcript."""
+
+    definition = _definition()
+    backend = _DirectInvalidJsonBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    with pytest.raises(LeafExecutionFailure) as captured:
+        await invoke_structured_once(
+            backend=backend,
+            profiles=profiles,
+            definition=definition,
+            attempt=_attempt(definition),
+            dispatch_id="dispatch:one-shot:invalid-json",
+            lineage_id="lineage:one-shot:invalid-json",
+            workspace=tmp_path / "invalid-json",
+            model=_StrictOneShotOutput,
+            prompt="Produce the requested title object.",
+            permissions=PermissionScope(),
+        )
+
+    failure = captured.value
+    assert len(backend.requests) == 1
+    assert failure.code == "agent_backend_direct_structured_output_invalid_json"
+    assert failure.category == (
+        "structured JSON response invalid (shape=markdown_fence; parse=syntax; offset=0; chars=73)"
+    )
+    assert failure.retryable is False
+    assert "TOP_SECRET_PROVIDER_TRANSCRIPT" not in failure.category
+
+
+@pytest.mark.asyncio
+async def test_one_shot_projects_output_limit_as_a_new_policy_choice(
+    tmp_path: Path,
+) -> None:
+    """A ceiling terminal directs a new declared policy, never an in-attempt retry."""
+
+    definition = _definition().model_copy(
+        update={
+            "proposal_policy": _definition().proposal_policy.model_copy(
+                update={
+                    "budget": _definition().proposal_policy.budget.model_copy(
+                        update={"llm_tokens": 65_536}
+                    )
+                }
+            )
+        }
+    )
+    backend = _DirectOutputLimitBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    with pytest.raises(LeafExecutionFailure) as captured:
+        await invoke_structured_once(
+            backend=backend,
+            profiles=profiles,
+            definition=definition,
+            attempt=_attempt(definition),
+            dispatch_id="dispatch:one-shot:output-limit",
+            lineage_id="lineage:one-shot:output-limit",
+            workspace=tmp_path / "output-limit",
+            model=_StrictOneShotOutput,
+            prompt="Produce the requested title object.",
+            permissions=PermissionScope(),
+        )
+
+    failure = captured.value
+    assert len(backend.requests) == 1
+    assert failure.code == "agent_backend_direct_output_limit"
+    assert failure.category == (
+        "the provider stopped because the declared structured output token limit was exhausted "
+        "(max_output_tokens=65536)"
+    )
+    assert failure.expected_category == (
+        "a new diagnostic definition with an explicitly changed structured output-token budget "
+        "(the failed attempt declared 65536) or a smaller bounded structured response; never "
+        "a blind retry of this attempt"
+    )
+    assert failure.retryable is False
+
+
+@pytest.mark.asyncio
+async def test_agentic_output_limit_retains_only_a_private_resumable_session(
+    tmp_path: Path,
+) -> None:
+    """A 5M logical session does not turn one Provider ceiling into completion."""
+
+    definition = structured_agent_work_definition(
+        scope_id="job:one-shot",
+        component="design",
+        stage="world_rules",
+        artifact_slot="world_rules",
+        dependency_coordinates=(),
+        claim_id="design.world_rules.compiles",
+        claim="One read-only Agent proposal compiles the frozen world rules.",
+        timing_reason="The next physical Agent turn may resume only after a closed ceiling.",
+        output_contract_id="contract:world-rules",
+        agent_role="environment_engineer",
+        allowed_mutation_roots=("/implementation-plan",),
+        agent_wall_seconds=720,
+        agent_token_limit=125_000,
+        session_token_limit=5_000_000,
+        session_wall_seconds=28_800,
+        maximum_session_continuations=39,
+    )
+    backend = _AgenticOutputLimitBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    with pytest.raises(LeafExecutionFailure) as captured:
+        await invoke_structured_once(
+            backend=backend,
+            profiles=profiles,
+            definition=definition,
+            attempt=_attempt(definition),
+            dispatch_id="dispatch:one-shot:agentic-output-limit",
+            lineage_id="lineage:one-shot:agentic-output-limit",
+            workspace=tmp_path / "agentic-output-limit",
+            model=_StrictOneShotOutput,
+            prompt="Produce the requested title object.",
+            permissions=PermissionScope(),
+            capability_requirement=NodeCapabilityRequirement.structured_read(
+                node_id="environment-engineer.implementation-plan",
+                role="environment-engineer",
+            ),
+        )
+
+    failure = captured.value
+    assert len(backend.requests) == 1
+    assert backend.requests[0].execution_mode is InvocationExecutionMode.AGENTIC
+    assert backend.requests[0].profile.rollout_token_limit == 5_000_000
+    assert failure.code == "turn_failed_output_limit"
+    assert failure.session_continuation is not None
+    assert failure.session_continuation.session.thread_id == "private-output-limit-thread"
+    assert failure.session_continuation.output_schema_digest == sha256_digest(
+        canonical_json_bytes(_StrictOneShotOutput.model_json_schema(mode="validation"))
+    )
 
 
 @pytest.mark.asyncio
@@ -444,11 +1128,51 @@ async def test_one_shot_declares_json_envelope_without_weakening_local_validatio
     assert turn.output.title == "Hotel booking"
     assert len(backend.requests) == 1
     assert "Structured-output transport requirement:" in backend.requests[0].prompt
+    assert "every inner double quote" in backend.requests[0].prompt
+    assert "every backslash" in backend.requests[0].prompt
+    assert "U+005C followed by" in backend.requests[0].prompt
     assert '"title"' in backend.requests[0].prompt
 
 
 @pytest.mark.asyncio
-async def test_one_shot_can_use_a_compact_envelope_protocol_without_changing_the_model(
+async def test_one_shot_declares_direct_json_object_without_an_inner_envelope(
+    tmp_path: Path,
+) -> None:
+    definition = _definition()
+    backend = _SemanticOutputBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+            structured_output_transport="json_object",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    turn = await invoke_structured_once(
+        backend=backend,
+        profiles=profiles,
+        definition=definition,
+        attempt=_attempt(definition),
+        dispatch_id="dispatch:one-shot:json-object",
+        lineage_id="lineage:one-shot:json-object",
+        workspace=tmp_path / "json-object",
+        model=_StrictOneShotOutput,
+        prompt="Produce the requested title object.",
+        permissions=PermissionScope(),
+    )
+
+    assert turn.output.title == "Hotel booking"
+    assert len(backend.requests) == 1
+    assert "Return the complete requested logical artifact" in backend.requests[0].prompt
+    assert "Do not wrap it in an\n`artifact_json` field" in backend.requests[0].prompt
+
+
+@pytest.mark.asyncio
+async def test_one_shot_can_use_a_compact_logical_protocol_without_changing_the_model(
     tmp_path: Path,
 ) -> None:
     """A compact prompt contract changes transport text, never local parsing."""
@@ -479,7 +1203,48 @@ async def test_one_shot_can_use_a_compact_envelope_protocol_without_changing_the
         model=_StrictOneShotOutput,
         prompt="Produce the requested title object.",
         permissions=PermissionScope(),
-        json_envelope_protocol=protocol,
+        logical_output_protocol=protocol,
+    )
+
+    assert turn.output == _StrictOneShotOutput(title="Hotel booking")
+    assert len(backend.requests) == 1
+    assert protocol in backend.requests[0].prompt
+    assert '"title"' not in backend.requests[0].prompt
+
+
+@pytest.mark.asyncio
+async def test_one_shot_carries_a_compact_logical_protocol_over_json_object(
+    tmp_path: Path,
+) -> None:
+    """A Direct JSON object still needs its logical output instructions."""
+
+    definition = _definition()
+    backend = _SemanticOutputBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+            structured_output_transport="json_object",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+    protocol = "compact-protocol-test.v1: return one title string field."
+
+    turn = await invoke_structured_once(
+        backend=backend,
+        profiles=profiles,
+        definition=definition,
+        attempt=_attempt(definition),
+        dispatch_id="dispatch:one-shot:compact-object",
+        lineage_id="lineage:one-shot:compact-object",
+        workspace=tmp_path / "compact-object",
+        model=_StrictOneShotOutput,
+        prompt="Produce the requested title object.",
+        permissions=PermissionScope(),
+        logical_output_protocol=protocol,
     )
 
     assert turn.output == _StrictOneShotOutput(title="Hotel booking")
@@ -543,6 +1308,9 @@ async def test_one_shot_preserves_actionable_structured_semantic_details(
     assert issue.violated_condition == "shared domains omit or duplicate a frozen group tool"
     assert issue.expected_category == (
         "one exact partition of frozen tool IDs: hotel.search, hotel.reserve"
+    )
+    assert (
+        issue.remediation == "Shared domains must partition every frozen group tool exactly once."
     )
 
 
@@ -815,6 +1583,7 @@ async def test_one_shot_renders_only_safe_local_correction_diagnostics(
                 expected_category=(
                     "one exact partition of frozen tool IDs: hotel.search, hotel.reserve"
                 ),
+                remediation="Partition the listed frozen tool ids exactly once.",
             ),
         )
     )
@@ -838,6 +1607,7 @@ async def test_one_shot_renders_only_safe_local_correction_diagnostics(
     assert "Deterministic local-correction brief" in rendered
     assert "shared domains omit or duplicate a frozen group tool" in rendered
     assert "hotel.search, hotel.reserve" in rendered
+    assert "Partition the listed frozen tool ids exactly once." in rendered
     assert "repair_policy_id" not in rendered
     assert "allowed_mutation_roots" not in rendered
     assert "target_coordinate" not in rendered

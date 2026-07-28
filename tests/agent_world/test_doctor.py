@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -10,14 +11,28 @@ from pathlib import Path
 import pytest
 from pydantic import HttpUrl, ValidationError
 
+import agent_world.doctor as doctor_module
 from agent_world.config import (
     AgentBackendConfig,
     FoundryConfig,
     JudgeConfig,
     ResearchConfig,
 )
-from agent_world.doctor import DoctorCheck, _live_agent_failure_code, run_doctor
-from agent_world.invocation import InvocationError, InvocationResult, InvocationStatus
+from agent_world.control import TelemetryStore
+from agent_world.doctor import (
+    DoctorCheck,
+    _live_agent_check,
+    _live_agent_failure_code,
+    _live_agent_probe_rollout_token_limit,
+    run_doctor,
+)
+from agent_world.invocation import (
+    InvocationError,
+    InvocationRequest,
+    InvocationResult,
+    InvocationSession,
+    InvocationStatus,
+)
 from agent_world.judge import IsolationPolicy, IsolationUnavailable
 
 
@@ -159,6 +174,192 @@ def test_live_agent_probe_retains_only_safe_backend_failure_code() -> None:
     )
 
     assert _live_agent_failure_code(result) == "provider_invalid_request"
+
+
+def test_live_agent_probe_uses_the_largest_configured_real_agent_envelope(
+    tmp_path: Path,
+) -> None:
+    config = FoundryConfig(
+        state_root=tmp_path / "state",
+        agent=AgentBackendConfig(
+            model="doctor-readiness-probe",
+            api_key_environment="AGENT_WORLD_TEST_ABSENT_MODEL_KEY",
+            structured_turn_token_limit=65_536,
+            environment_codegen_turn_token_limit=5_000_000,
+        ),
+        research=ResearchConfig(
+            provider="searxng",
+            searxng_base_url=HttpUrl("http://127.0.0.1:18080"),
+            searxng_allow_private_endpoint=True,
+            use_jina_reader_fallback=False,
+        ),
+        judge=JudgeConfig(),
+    )
+
+    assert _live_agent_probe_rollout_token_limit(config) == 5_000_000
+
+
+@pytest.mark.asyncio
+async def test_live_agent_probe_publishes_live_safe_trace_and_terminal_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A constructed backend proves Doctor's live liveness boundary, not a unit stub."""
+
+    environment_name = "AGENT_WORLD_TEST_OBSERVABLE_DOCTOR_KEY"
+    monkeypatch.setenv(environment_name, "test-key")
+    config = FoundryConfig(
+        state_root=tmp_path / "state",
+        agent=AgentBackendConfig(
+            model="doctor-readiness-probe",
+            api_key_environment=environment_name,
+            structured_turn_token_limit=65_536,
+            environment_codegen_turn_token_limit=5_000_000,
+            structured_invocation_timeout_seconds=28_800,
+        ),
+        research=ResearchConfig(
+            provider="searxng",
+            searxng_base_url=HttpUrl("http://127.0.0.1:18080"),
+            searxng_allow_private_endpoint=True,
+            use_jina_reader_fallback=False,
+        ),
+        judge=JudgeConfig(),
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    received: list[InvocationRequest] = []
+
+    class HoldingBackend:
+        def __init__(self, *, telemetry: TelemetryStore) -> None:
+            self.telemetry = telemetry
+
+        async def invoke(self, request: InvocationRequest) -> InvocationResult:
+            received.append(request)
+            span = self.telemetry.start_invocation(request)
+            span.first_progress()
+            entered.set()
+            await release.wait()
+            span.finish(status="passed")
+            return InvocationResult(
+                invocation_id=request.invocation_id,
+                status=InvocationStatus.COMPLETED,
+                session=InvocationSession(
+                    thread_id="doctor-test-thread",
+                    lineage_id=request.profile.lineage_id,
+                    workspace=request.profile.workspace,
+                    profile_hash=request.profile.profile_hash,
+                    codex_config_sha256=request.profile.codex_config_sha256,
+                ),
+                turn_id="doctor-test-turn",
+                final_text=None,
+                structured_output={"status": "ok"},
+                usage=None,
+                events=(),
+                error=None,
+                duration_ms=1,
+                backend_version="test-backend",
+            )
+
+    monkeypatch.setattr(doctor_module, "CodexSdkBackend", HoldingBackend)
+    check_task = asyncio.create_task(_live_agent_check(config))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+
+    status_path = config.state_root / "doctor-live-agent.json"
+    running = json.loads(status_path.read_text(encoding="utf-8"))
+    assert running["status"] == "running"
+    assert running["rollout_token_limit"] == 5_000_000
+    assert running["wall_timeout_seconds"] == 28_800
+    assert received and received[0].metadata["trace_id"] == running["trace_id"]
+    assert received[0].metadata["run_id"] == running["trace_id"]
+
+    with TelemetryStore(config.state_root / "telemetry") as reader:
+        active = reader.active_work(running["trace_id"])
+    assert len(active) == 1
+    assert active[0]["first_progress_at_ns"] is not None
+    assert active[0]["last_progress_at_ns"] is not None
+
+    release.set()
+    check = await check_task
+    assert check.status == "pass"
+    terminal = json.loads(status_path.read_text(encoding="utf-8"))
+    assert terminal["status"] == "passed"
+    assert terminal["trace_id"] == running["trace_id"]
+    serialized = json.dumps(terminal, sort_keys=True)
+    assert "production InvocationBackend readiness probe" not in serialized
+    assert "test-key" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_live_agent_probe_status_does_not_expose_provider_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment_name = "AGENT_WORLD_TEST_DOCTOR_FAILURE_KEY"
+    monkeypatch.setenv(environment_name, "test-key")
+    config = FoundryConfig(
+        state_root=tmp_path / "state",
+        agent=AgentBackendConfig(
+            model="doctor-readiness-probe",
+            api_key_environment=environment_name,
+        ),
+        research=ResearchConfig(
+            provider="searxng",
+            searxng_base_url=HttpUrl("http://127.0.0.1:18080"),
+            searxng_allow_private_endpoint=True,
+            use_jina_reader_fallback=False,
+        ),
+        judge=JudgeConfig(),
+    )
+
+    class FailingBackend:
+        def __init__(self, *, telemetry: TelemetryStore) -> None:
+            self.telemetry = telemetry
+
+        async def invoke(self, request: InvocationRequest) -> InvocationResult:
+            span = self.telemetry.start_invocation(request)
+            span.finish(status="failed", error_code="provider_invalid_request")
+            return InvocationResult(
+                invocation_id=request.invocation_id,
+                status=InvocationStatus.FAILED,
+                session=None,
+                turn_id=None,
+                final_text=None,
+                structured_output=None,
+                usage=None,
+                events=(),
+                error=InvocationError(
+                    code="turn_failed_unclassified_codex_error",
+                    message="provider-secret-text-must-not-be-persisted",
+                    details={
+                        "terminal_error_shape": "object",
+                        "codex_error_info": "absent",
+                        "advisory_text_signals": ["request_or_schema_compatibility"],
+                        "diagnostic_error_excerpt": "unsupported response_format [REDACTED_URL]",
+                        "provider_message": "provider-secret-text-must-not-be-persisted",
+                    },
+                ),
+                duration_ms=1,
+                backend_version="test-backend",
+            )
+
+    monkeypatch.setattr(doctor_module, "CodexSdkBackend", FailingBackend)
+    check = await _live_agent_check(config)
+
+    assert check.status == "fail"
+    status = json.loads((config.state_root / "doctor-live-agent.json").read_text(encoding="utf-8"))
+    assert status["status"] == "failed"
+    assert status["failure_code"] == "turn_failed_unclassified_codex_error"
+    assert status["terminal_details"] == {
+        "advisory_text_signals": ["request_or_schema_compatibility"],
+        "codex_error_info": "absent",
+        "terminal_error_shape": "object",
+    }
+    debug_path = Path(status["debug_feedback_path"])
+    debug = json.loads(await asyncio.to_thread(debug_path.read_text, encoding="utf-8"))
+    assert debug["terminal_error_excerpt"] == "unsupported response_format [REDACTED_URL]"
+    assert debug["trace_id"] == status["trace_id"]
+    assert "provider-secret-text-must-not-be-persisted" not in json.dumps(status, sort_keys=True)
+    assert "provider-secret-text-must-not-be-persisted" not in json.dumps(debug, sort_keys=True)
 
 
 def test_doctor_cli_reports_offline_cache_blocker_as_structured_failure(

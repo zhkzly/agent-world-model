@@ -1,0 +1,4 @@
+interface:
+  display_name: "Runtime Agent LLM Remediation"
+  short_description: "Choose evidence-based runtime model remediation"
+  default_prompt: "Use $agent-world-llm-remediation after observing this real runtime Agent or LLM failure."

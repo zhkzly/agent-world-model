@@ -19,6 +19,7 @@ from pydantic_core import PydanticCustomError
 
 from agent_world.agent_output_authority import (
     AgentOutputAuthority,
+    SemanticAdvisoryOutput,
     WorkspaceProposalOutput,
     register_agent_output_contract,
 )
@@ -47,6 +48,39 @@ type CandidateFileRole = Literal[
 ]
 
 
+class _PythonEntryPathError(ValueError):
+    """One safe, typed failure while deriving a Python module from a path."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class _PythonLaunchError(ValueError):
+    """One safe, typed failure in a candidate Python launch declaration."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+_PYTHON_ENTRY_PATH_MESSAGES = {
+    "python_entry_path_invalid": (
+        "Python entry path must be a normalized package-relative POSIX `.py` path"
+    ),
+    "python_entry_path_not_importable": "Python entry path must map to an importable Python module",
+}
+_PYTHON_LAUNCH_MESSAGES = {
+    "python_launch_interpreter_invalid": (
+        "Python launch argv must start with the clean uv environment interpreter"
+    ),
+    "python_launch_argument_invalid": "Python launch argv contains an unsafe argument",
+    "python_launch_entrypoint_mismatch": (
+        "Python launch argv must run the declared entry path with `python -m package.module`"
+    ),
+}
+
+
 def validate_relative_path(value: str, *, allow_dot: bool = False) -> str:
     """Validate a portable path without consulting the host filesystem."""
 
@@ -71,31 +105,63 @@ def validate_relative_path(value: str, *, allow_dot: bool = False) -> str:
 
 
 def _module_name_for_path(value: str) -> str:
-    path = PurePosixPath(validate_relative_path(value))
+    try:
+        path = PurePosixPath(validate_relative_path(value))
+    except ValueError as exc:
+        raise _PythonEntryPathError("python_entry_path_invalid") from exc
     if path.suffix != ".py":
-        raise ValueError("Python entry path must end in .py")
+        raise _PythonEntryPathError("python_entry_path_invalid")
     parts = list(path.with_suffix("").parts)
     if parts and parts[0] == "src":
         parts.pop(0)
     if parts and parts[-1] == "__main__":
         parts.pop()
     if not parts or any(re.fullmatch(r"[A-Za-z_]\w*", part) is None for part in parts):
-        raise ValueError("Python entry path does not map to an importable module")
+        raise _PythonEntryPathError("python_entry_path_not_importable")
     return ".".join(parts)
+
+
+def _validate_candidate_relative_path(value: str) -> str:
+    """Expose path-format failures as safe CandidateCompletion diagnostics."""
+
+    try:
+        return validate_relative_path(value)
+    except ValueError as exc:
+        raise PydanticCustomError(
+            "candidate_path_invalid",
+            "candidate paths must be normalized package-relative POSIX paths",
+        ) from exc
+
+
+def _validate_python_entry_path(value: str) -> str:
+    """Require both a portable source path and an importable Python module."""
+
+    try:
+        _module_name_for_path(value)
+    except _PythonEntryPathError as exc:
+        raise PydanticCustomError(exc.code, _PYTHON_ENTRY_PATH_MESSAGES[exc.code]) from exc
+    return value
 
 
 def _validate_python_argv(argv: tuple[str, ...], entry_path: str) -> None:
     if argv[0] not in {".venv/bin/python", ".venv/bin/python3"}:
-        raise ValueError("command must use the clean uv environment interpreter")
+        raise _PythonLaunchError("python_launch_interpreter_invalid")
     if any("\x00" in item or "\\" in item or len(item) > 512 for item in argv):
-        raise ValueError("Python argv contains an unsafe argument")
+        raise _PythonLaunchError("python_launch_argument_invalid")
     if any(PurePosixPath(item).is_absolute() or ".." in PurePosixPath(item).parts for item in argv):
-        raise ValueError("Python argv cannot contain absolute or parent-relative paths")
+        raise _PythonLaunchError("python_launch_argument_invalid")
     expected_module = _module_name_for_path(entry_path)
     if len(argv) < 3 or argv[1] != "-m" or argv[2] != expected_module:
-        raise ValueError(
-            "Python command must launch the declared entry_path as `python -m package.module`"
-        )
+        raise _PythonLaunchError("python_launch_entrypoint_mismatch")
+
+
+def _validate_python_launch(argv: tuple[str, ...], entry_path: str) -> None:
+    """Convert launch mechanics into field-addressable structured diagnostics."""
+
+    try:
+        _validate_python_argv(argv, entry_path)
+    except _PythonLaunchError as exc:
+        raise PydanticCustomError(exc.code, _PYTHON_LAUNCH_MESSAGES[exc.code]) from exc
 
 
 class RuntimeOperationContract(V2Contract):
@@ -258,6 +324,45 @@ class ImplementationContract(V2Contract):
         return self
 
 
+class ImplementationPlanDraft(SemanticAdvisoryOutput, V2Contract):
+    """Text-first Engineer preparation for one later CandidateBuild turn.
+
+    This is deliberately advisory: it can improve a later Agent's working
+    plan, but cannot declare candidate files, alter frozen semantics, or carry
+    scheduler/release authority.
+    """
+
+    implementation_strategy: Annotated[NonEmptyStr, Field(max_length=12_000)]
+
+
+class ImplementationPlan(V2Contract):
+    """Framework-bound advisory plan for one exact Design/contract closure."""
+
+    plan_id: Identifier
+    design_ref: ArtifactRef
+    implementation_contract_ref: ArtifactRef
+    world_spec_hash: ContentHash
+    curriculum_hash: ContentHash
+    implementation_strategy: Annotated[NonEmptyStr, Field(max_length=12_000)]
+
+    @model_validator(mode="after")
+    def validate_bindings(self) -> ImplementationPlan:
+        if self.design_ref.artifact_type not in {
+            "design.environment_design",
+            "expansion.environment_design",
+        }:
+            raise ValueError("implementation plan must bind one EnvironmentDesign")
+        if self.implementation_contract_ref.artifact_type != "build.implementation_contract":
+            raise ValueError("implementation plan must bind one ImplementationContract")
+        return self
+
+
+register_agent_output_contract(
+    ImplementationPlanDraft,
+    authority=AgentOutputAuthority.SEMANTIC_ADVISORY,
+)
+
+
 class CandidateFileDeclaration(V2Contract):
     """Agent declaration of one relative file; hashes are framework-owned."""
 
@@ -268,7 +373,7 @@ class CandidateFileDeclaration(V2Contract):
     @field_validator("path")
     @classmethod
     def validate_path(cls, value: str) -> str:
-        return validate_relative_path(value)
+        return _validate_candidate_relative_path(value)
 
 
 class CandidateRuntimeDeclaration(V2Contract):
@@ -284,11 +389,11 @@ class CandidateRuntimeDeclaration(V2Contract):
     @field_validator("entry_path")
     @classmethod
     def validate_entry_path(cls, value: str) -> str:
-        return validate_relative_path(value)
+        return _validate_python_entry_path(value)
 
     @model_validator(mode="after")
     def validate_launch(self) -> CandidateRuntimeDeclaration:
-        _validate_python_argv(self.argv, self.entry_path)
+        _validate_python_launch(self.argv, self.entry_path)
         return self
 
 
@@ -311,24 +416,12 @@ class CandidateTaskMaterializerDeclaration(V2Contract):
     @field_validator("entry_path")
     @classmethod
     def validate_entry_path(cls, value: str) -> str:
-        try:
-            return validate_relative_path(value)
-        except ValueError as exc:
-            raise PydanticCustomError(
-                "python_entry_path_invalid",
-                "task materializer entry path must be a normalized package-relative path",
-            ) from exc
+        return _validate_python_entry_path(value)
 
     @model_validator(mode="after")
     def validate_module_matches_path(self) -> CandidateTaskMaterializerDeclaration:
         module, _separator, _function = self.entrypoint.partition(":")
-        try:
-            expected_module = _module_name_for_path(self.entry_path)
-        except ValueError as exc:
-            raise PydanticCustomError(
-                "python_entry_path_not_importable",
-                "task materializer entry path must map to an importable Python module",
-            ) from exc
+        expected_module = _module_name_for_path(self.entry_path)
         if module != expected_module:
             raise PydanticCustomError(
                 "task_materializer_binding_mismatch",
@@ -344,11 +437,11 @@ class CandidatePublicSelfCheckDeclaration(V2Contract):
     @field_validator("entry_path")
     @classmethod
     def validate_entry_path(cls, value: str) -> str:
-        return validate_relative_path(value)
+        return _validate_python_entry_path(value)
 
     @model_validator(mode="after")
     def validate_launch(self) -> CandidatePublicSelfCheckDeclaration:
-        _validate_python_argv(self.argv, self.entry_path)
+        _validate_python_launch(self.argv, self.entry_path)
         return self
 
 
@@ -363,12 +456,13 @@ def normalize_candidate_completion_output(value: JsonValue) -> JsonValue:
     inspect or mutate the filesystem here.  Physical closure remains the independent
     responsibility of :class:`CandidateWorkspaceValidator`.
 
-    The callable name ``materialize`` is fixed by the implementation contract.  A
-    bare value can consequently be completed from one lexically importable
-    ``entry_path`` without asking an Agent to make a semantic choice.  Every other
-    malformed callable remains invalid. Component declarations and file roles also
-    repeat one fixed relationship. Normalize that relationship only when every
-    referenced path is unique and no path claims conflicting component roles.
+    The callable name ``materialize`` is fixed by the implementation contract.
+    Its module is uniquely derived from one lexically importable ``entry_path``;
+    normalize any ``*:materialize`` spelling to that canonical representation
+    without asking an Agent to make a semantic choice. An arbitrary callable
+    remains invalid. Component declarations and file roles also repeat one fixed
+    relationship. Normalize that relationship only when every referenced path is
+    unique and no path claims conflicting component roles.
     """
 
     if not isinstance(value, dict):
@@ -382,9 +476,8 @@ def normalize_candidate_completion_output(value: JsonValue) -> JsonValue:
         declarations = tuple(item for item in files if isinstance(item, dict))
         raw_paths = tuple(item.get("path") for item in declarations)
         prefix = "candidate/"
-        can_strip_file_namespace = (
-            len(declarations) == len(files)
-            and all(isinstance(path, str) and path.startswith(prefix) for path in raw_paths)
+        can_strip_file_namespace = len(declarations) == len(files) and all(
+            isinstance(path, str) and path.startswith(prefix) for path in raw_paths
         )
         if can_strip_file_namespace:
             stripped_paths = tuple(str(path)[len(prefix) :] for path in raw_paths)
@@ -493,17 +586,26 @@ def normalize_candidate_completion_output(value: JsonValue) -> JsonValue:
                     by_path[path]["role"] = next(iter(roles))
 
     task_materializer = proposal.get("task_materializer")
-    if (
-        isinstance(task_materializer, dict)
-        and task_materializer.get("entrypoint") == "materialize"
-    ):
+    if isinstance(task_materializer, dict):
+        entrypoint = task_materializer.get("entrypoint")
+        materialize_callable = entrypoint == "materialize" or (
+            isinstance(entrypoint, str) and entrypoint.endswith(":materialize")
+        )
         entry_path = task_materializer.get("entry_path")
-        declared_task_paths = {
-            item.get("path")
-            for item in files
-            if isinstance(item, dict) and item.get("role") == "task_materializer"
-        } if isinstance(files, list) else set()
-        if isinstance(entry_path, str) and entry_path in declared_task_paths:
+        declared_task_paths = (
+            {
+                item.get("path")
+                for item in files
+                if isinstance(item, dict) and item.get("role") == "task_materializer"
+            }
+            if isinstance(files, list)
+            else set()
+        )
+        if (
+            materialize_callable
+            and isinstance(entry_path, str)
+            and entry_path in declared_task_paths
+        ):
             try:
                 module = _module_name_for_path(entry_path)
             except ValueError:
@@ -533,7 +635,7 @@ class CandidateCompletion(WorkspaceProposalOutput, V2Contract):
     @field_validator("public_test_paths")
     @classmethod
     def validate_public_test_paths(cls, values: tuple[str, ...]) -> tuple[str, ...]:
-        return tuple(validate_relative_path(value) for value in values)
+        return tuple(_validate_candidate_relative_path(value) for value in values)
 
     @model_validator(mode="after")
     def validate_status_and_declarations(self) -> CandidateCompletion:
@@ -727,6 +829,8 @@ __all__ = [
     "CandidateRuntimeDeclaration",
     "CandidateTaskMaterializerDeclaration",
     "ImplementationContract",
+    "ImplementationPlan",
+    "ImplementationPlanDraft",
     "RUNTIME_ABI_V2",
     "RUNTIME_OPERATIONS",
     "RepairDisclosure",

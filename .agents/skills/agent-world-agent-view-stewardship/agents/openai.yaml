@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Agent View Stewardship"
+  short_description: "Keep project Agent context compact and navigable"
+  default_prompt: "Use $agent-world-agent-view-stewardship to improve this project-execution Agent view."

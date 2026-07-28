@@ -317,7 +317,11 @@ telemetry observation, or a new design plan.
 - Wrong WorldRules source family -> local WorldRules correction with a section-relative path;
   arbitrary/missing Agent IDs -> canonical source plus deterministic compiled identity, not a
   correction prompt.
-- Transaction projection above 192 KiB or total turn bound -> reject before invocation.
+- A framework-owned fixed input-byte, hidden output-token, or arbitrary short first-progress/
+  first-write deadline must not reject, truncate, or prematurely cancel a ToolSemantics
+  transaction. First-progress/first-write remain observations; record any real
+  Provider/transport physical terminal safely, then select a route, transport, workspace-input,
+  or topology change from evidence.
 - Provider retryable failure below the bound -> bounded fresh-session retry under the same target.
 
 ### 5. Good/Base/Bad Cases

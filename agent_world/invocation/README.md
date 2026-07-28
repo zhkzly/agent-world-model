@@ -43,15 +43,22 @@ path. The application-wide semaphore applies across both transports.
    `--config` or argv, calls `login_api_key()`, scans for a global login, copies
    `auth.json`, or puts either value in profile metadata, worker payloads,
    events, or logs.  The bundled Codex app-server's unavoidable SQLite state
-   plane is redirected to a per-invocation memory-backed directory and removed
-   by the backend supervisor before any durable result is returned.
+   plane is redirected to a memory-backed directory. A persisted Codex thread
+   retains that private directory only while its owning backend instance remains
+   live; it is removed when the session is released or the backend exits. A
+   durable `InvocationSession` record never exposes the directory, so a
+   restarted backend fails closed rather than pretending that a bare thread id
+   restores a conversation.
 4. Agentic requests selected for `CodexSdkBackend.invoke()` verify the
    materialization, start the fixed
    `_codex_worker.py` in a dedicated process, and that worker calls the pinned
    `openai_codex.AsyncCodex` runtime. A new request uses `thread_start`; a
-   repair request with `InvocationSession` uses `thread_resume` and is rejected
-   unless profile hash, generated Codex-config hash, lineage and absolute
-   workspace are identical.
+   repair request with `InvocationSession` uses `thread_resume` only when the
+   exact private runtime checkpoint is still owned by that backend; otherwise
+   it returns `session_runtime_unavailable`. In both cases profile hash,
+   generated Codex-config hash, lineage and absolute workspace must be
+   identical. Scheduler policy—not the adapter—may then authorize a fresh
+   session with an explicit RepairPacket.
 5. The worker passes `output_schema` and explicit reasoning effort to the SDK,
    streams typed notifications, records token usage, and redacts credential
    material before writing NDJSON. A soft timeout requests `turn.interrupt()`;

@@ -14,12 +14,16 @@ from .paths import ObservabilityError, ObservabilityRoot
 from .projector import SceneProjector
 from .query import ObservabilityReader, SceneRead
 from .scene import (
+    BudgetExhaustion,
+    CandidateWorkspaceLiveness,
     CoordinatePointer,
     CoordinateScene,
     FrontierDiff,
     FrontierRecord,
     ObservabilityIndex,
     RunSceneIndex,
+    RuntimeAgentActivityCounts,
+    RuntimeAgentLiveness,
     Scene,
     SceneHead,
     SceneIssue,
@@ -37,6 +41,8 @@ from .subprocess_scene import (
 )
 
 __all__ = [
+    "BudgetExhaustion",
+    "CandidateWorkspaceLiveness",
     "CoordinatePointer",
     "CoordinateScene",
     "DebugTranscriptStatus",
@@ -51,6 +57,8 @@ __all__ = [
     "ObservabilityReader",
     "ObservabilityRoot",
     "RunSceneIndex",
+    "RuntimeAgentActivityCounts",
+    "RuntimeAgentLiveness",
     "RuntimeSubprocessScene",
     "Scene",
     "SceneHead",

@@ -30,6 +30,7 @@ from agent_world.designer.compact_rule_protocol import (
     COMPACT_RULE_PROTOCOL_VERSION,
     tool_semantics_batch_protocol,
     tool_semantics_batch_protocol_schema,
+    tool_semantics_representation_audit,
 )
 from agent_world.designer.final_design_compiler import compile_tool_semantics_batch
 from agent_world.designer.final_design_leaves import (
@@ -41,6 +42,7 @@ from agent_world.designer.models import (
     CompactFieldSemanticDraft,
     RuleDraft,
     SharedAtomicityDomainSourceDraft,
+    SharedCompensationEdgeSourceDraft,
     SharedConcurrencyDomainSourceDraft,
     SharedErrorPolicySourceDraft,
     SharedIdempotencyDomainSourceDraft,
@@ -375,6 +377,10 @@ def test_tool_batch_prompt_discloses_only_the_target_tool_state_footprint() -> N
     )
     frozen = json.loads(prompt.split("Frozen context:\n", maxsplit=1)[1])
 
+    assert 'The complete logical root is exactly {"tools":[...]}' in prompt
+    assert "independent JSON representation audit for every target tool" in prompt
+    assert "reliability.tool_id" in prompt
+    assert "rollback guarantee" in prompt
     assert "architecture" not in frozen
     assert "world_skeleton" not in frozen
     assert [item["tool_id"] for item in frozen["target_tools"]] == ["hotel.booking.get"]
@@ -469,6 +475,33 @@ def test_restricted_rule_catalog_keeps_tool_io_but_removes_unowned_state_binding
         item["source"] not in {"pre_state", "post_state"} or item["pointer"].startswith("/bookings")
         for item in reference_bindings
     )
+
+
+def test_targeted_tool_semantics_protocol_repeats_the_exact_batch_at_the_final_gate() -> None:
+    """The late protocol tells a stateless model which frozen batch it owns."""
+
+    generic = tool_semantics_batch_protocol()
+    targeted = tool_semantics_batch_protocol(
+        target_tool_ids=("todo.localstorage.add_task", "todo.localstorage.mark_task_done"),
+    )
+
+    assert "Invocation-specific final completion gate" not in generic
+    assert "Invocation-specific final completion gate" in targeted
+    assert '["todo.localstorage.add_task","todo.localstorage.mark_task_done"]' in targeted
+    assert "Return exactly 2 tools in this order" in targeted
+    assert "conditions, state_transition,\nerrors, access_observation, and reliability" in targeted
+    assert tool_semantics_representation_audit() in targeted
+    assert "reliability.tool_id is required" in targeted
+    assert "rollback.guarantees is one non-empty\nJSON string" in targeted
+    assert "maximum_attempts is an integer greater\nthan or equal to 1" in targeted
+    assert "maximum_attempts=1 and an empty retryable_error_codes list" in " ".join(
+        targeted.split()
+    )
+
+    with pytest.raises(ValueError, match="exact unique target-tool batch"):
+        tool_semantics_batch_protocol(target_tool_ids=())
+    with pytest.raises(ValueError, match="exact unique target-tool batch"):
+        tool_semantics_batch_protocol(target_tool_ids=("tool:a", "tool:a"))
 
 
 def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
@@ -664,6 +697,9 @@ def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
     assert "never emit a nested `key` object" in protocol
     assert "Never emit key_binding_id" in protocol
     assert "Never emit reference, lookup_by_key" in protocol
+    assert "Pre-serialization representation audit" in protocol
+    assert "rollback.guarantees" in protocol
+    assert "concurrency.conflict_error_code is either null or one identifier string" in protocol
     protocol_schema = tool_semantics_batch_protocol_schema()
     permission_schema = cast(dict[str, Any], protocol_schema["$defs"])["permission"]
     assert "allowed_actors" not in permission_schema["required"]
@@ -878,6 +914,13 @@ def test_shared_policy_failures_are_visible_before_rule_compilation() -> None:
                 rationale="Transient provider timeouts are retryable.",
             ),
         ),
+        compensation_edges=(
+            SharedCompensationEdgeSourceDraft(
+                failure_tool_id="hotel.search",
+                compensation_tool_id="hotel.reserve",
+                rationale="A failed search rolls back its provisional reservation hold.",
+            ),
+        ),
     )
     contract = SharedToolSemanticsContract(
         contract_id="shared-contract:hotel",
@@ -899,9 +942,15 @@ def test_shared_policy_failures_are_visible_before_rule_compilation() -> None:
             state_transition=SimpleNamespace(transition=None),
             errors=SimpleNamespace(errors=errors),
             reliability=SimpleNamespace(
-                transaction=SimpleNamespace(atomicity="atomic"),
-                concurrency=SimpleNamespace(isolation="serializable"),
-                idempotency=SimpleNamespace(mode="natural"),
+                transaction=SimpleNamespace(
+                    atomicity="atomic" if include_timeout else "best_effort"
+                ),
+                concurrency=SimpleNamespace(
+                    isolation="serializable" if include_timeout else "read_committed"
+                ),
+                idempotency=SimpleNamespace(
+                    mode="natural" if include_timeout else "not_supported"
+                ),
                 rollback=SimpleNamespace(compensation_tools=()),
             ),
         )
@@ -916,7 +965,38 @@ def test_shared_policy_failures_are_visible_before_rule_compilation() -> None:
         )
 
     assert tuple((issue.code, issue.location) for issue in captured.value.issues) == (
+        (
+            "shared_atomicity_mismatch",
+            ("tools", 0, "reliability", "transaction", "atomicity"),
+        ),
+        (
+            "shared_isolation_mismatch",
+            ("tools", 0, "reliability", "concurrency", "isolation"),
+        ),
+        (
+            "shared_idempotency_mismatch",
+            ("tools", 0, "reliability", "idempotency", "mode"),
+        ),
         ("shared_error_policy_mismatch", ("tools", 0, "errors")),
+        (
+            "shared_compensation_mismatch",
+            ("tools", 0, "reliability", "rollback"),
+        ),
+    )
+    issues = {issue.code: issue for issue in captured.value.issues}
+    assert issues["shared_atomicity_mismatch"].expected_category == (
+        "transaction.atomicity=`atomic`"
+    )
+    assert issues["shared_isolation_mismatch"].expected_category == (
+        "concurrency.isolation=`serializable`"
+    )
+    assert issues["shared_idempotency_mismatch"].expected_category == (
+        "idempotency.mode=`natural`"
+    )
+    assert "error-policy:timeout" in issues["shared_error_policy_mismatch"].message
+    assert "`timeout`" in issues["shared_error_policy_mismatch"].expected_category
+    assert issues["shared_compensation_mismatch"].expected_category == (
+        "rollback.compensation_tools containing `hotel.reserve`"
     )
 
 

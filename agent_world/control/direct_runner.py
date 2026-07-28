@@ -3,9 +3,8 @@
 This is the production replacement for the former Controller component loops.
 It does not call ``EnvironmentDesigner.generate`` or any legacy repair
 orchestrator.  Each model, research-tool, runtime, and release action is a
-Scheduler leaf with one durable WorkAttempt, while this runner owns only the
-three topology freezes required to turn discovered cardinality into physical
-work.
+Scheduler leaf with one durable WorkAttempt, while this runner owns the four
+topology freezes required to turn discovered cardinality into physical work.
 """
 
 from __future__ import annotations
@@ -17,7 +16,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import model_validator
 
 from agent_world.artifact_store import ArtifactWriter
-from agent_world.builder import BuilderLeaf, EnvironmentBuilder
+from agent_world.builder import BuilderLeaf, BuildPlanningLeaf, EnvironmentBuilder
 from agent_world.contracts import (
     ArtifactRef,
     Budget,
@@ -34,13 +33,15 @@ from agent_world.designer import (
     WorldArchitectureLeaf,
 )
 from agent_world.designer.final_design_leaves import (
+    CurriculumPlanLeaf,
     ModelingBoundaryLeaf,
     SharedToolSemanticsLeaf,
-    TaskCurriculumLeaf,
+    TaskCurriculumJoinLeaf,
+    TaskRequirementLeaf,
     ToolSemanticsBatchLeaf,
     WorldRulesLeaf,
 )
-from agent_world.designer.models import ToolCouplingPlan
+from agent_world.designer.models import CurriculumPlanSourceDraft, ToolCouplingPlan
 from agent_world.judge import (
     EnvironmentJudge,
     IntegrationLeaf,
@@ -54,17 +55,20 @@ from agent_world.judge import (
 from agent_world.registry import EnvironmentRegistry, ReleaseRecord
 
 from .budget import LeaseBudgetLedger
+from .continuation_store import NodeContinuationStore
 from .leaf_executor import SchedulerLeafExecutor
 from .release_dossier import ReleaseDossierCompiler
 from .release_leaf import ObservabilityLeaf, PackageLeaf, RegistryPublicationLeaf
 from .telemetry import TelemetryStore
-from .work import WorkAttempt, WorkCommit, WorkDefinition
+from .work import WorkAttempt, WorkCommit, WorkCoordinate, WorkDefinition
 from .work_epoch import WorkGraphEpochRuntime
 from .work_graph import (
     GenerationWorkGraph,
     compile_design_work_graph,
+    compile_world_work_graph,
     complete_generation_work_graph,
-    derive_final_design_definitions,
+    derive_task_requirement_design_definitions,
+    derive_world_plan_definitions,
     research_acquisition_work_definition,
     research_plan_work_definition,
     research_synthesis_work_definition,
@@ -94,6 +98,7 @@ class DirectWorkRun(V2Contract):
     observed_actual: BudgetUsage
     unknown_upper_bound: BudgetUsage
     design_epoch_ref: ArtifactRef | None = None
+    world_epoch_ref: ArtifactRef | None = None
     final_epoch_ref: ArtifactRef | None = None
     package_manifest_ref: ArtifactRef | None = None
     release_ref: ArtifactRef | None = None
@@ -115,6 +120,7 @@ class SemanticPrefixRun(V2Contract):
     context_ref: ArtifactRef
     status: Literal["semantic_prefix_ready", "blocked"]
     bootstrap_epoch_ref: ArtifactRef
+    world_epoch_ref: ArtifactRef | None = None
     design_epoch_ref: ArtifactRef | None = None
     modeling_commit_ref: ArtifactRef | None = None
     verifier_plan_commit_ref: ArtifactRef | None = None
@@ -160,6 +166,7 @@ class _SemanticPrefixExecution:
     runtime: WorkControlRuntime
     workspace: Path
     bootstrap_epoch_ref: ArtifactRef
+    world_epoch_ref: ArtifactRef | None = None
     design_epoch_ref: ArtifactRef | None = None
     design_graph: GenerationWorkGraph | None = None
     modeling_definition: WorkDefinition | None = None
@@ -190,6 +197,9 @@ class DirectWorkRunner:
     workspace_root: Path
     structured_turn_token_limit: int
     structured_turn_wall_seconds: float
+    environment_codegen_session_token_limit: int
+    environment_codegen_session_wall_seconds: float
+    environment_codegen_physical_turn_token_limit: int
     maximum_concurrency: int = 4
     projector: SceneProjector | None = None
 
@@ -217,7 +227,7 @@ class DirectWorkRunner:
             run_id=run_id,
             node="request",
             input_refs=(context_ref,),
-            attributes={"topology": "three-epoch-direct-v1"},
+            attributes={"topology": "four-epoch-direct-v2"},
         )
         self.telemetry.activate_trace(
             trace_id=trace_id,
@@ -276,7 +286,7 @@ class DirectWorkRunner:
             node="request",
             input_refs=(context_ref,),
             attributes={
-                "topology": "bootstrap-design-prefix-v1",
+                "topology": "bootstrap-world-design-prefix-v2",
                 "release_attempted": False,
             },
         )
@@ -308,6 +318,7 @@ class DirectWorkRunner:
             ref
             for ref in (
                 outcome.bootstrap_epoch_ref,
+                outcome.world_epoch_ref,
                 outcome.design_epoch_ref,
                 outcome.modeling_commit_ref,
                 outcome.verifier_plan_commit_ref,
@@ -353,6 +364,7 @@ class DirectWorkRunner:
                 context_ref=context_ref,
                 status="blocked",
                 bootstrap_epoch_ref=prefix.bootstrap_epoch_ref,
+                world_epoch_ref=prefix.world_epoch_ref,
                 design_epoch_ref=prefix.design_epoch_ref,
                 observed_actual=usage["observed_actual"],
                 unknown_upper_bound=usage["unknown_upper_bound"],
@@ -369,6 +381,7 @@ class DirectWorkRunner:
             )
         design_graph = prefix.design_graph
         bootstrap_epoch_ref = prefix.bootstrap_epoch_ref
+        world_epoch_ref = prefix.world_epoch_ref
         design_epoch_ref = prefix.design_epoch_ref
         verifier_plan = prefix.verifier_plan_definition
         workspace = prefix.workspace
@@ -379,6 +392,14 @@ class DirectWorkRunner:
         final_graph = complete_generation_work_graph(
             scope_id=job.job_id,
             design_graph=design_graph,
+            implementation_plan_token_limit=self._codegen_physical_turn_tokens(context.budget),
+            implementation_plan_wall_seconds=self._codegen_session_wall(context.budget),
+            implementation_plan_session_token_limit=self._codegen_session_tokens(context.budget),
+            implementation_plan_session_wall_seconds=self._codegen_session_wall(context.budget),
+            builder_token_limit=self._codegen_physical_turn_tokens(context.budget),
+            builder_wall_seconds=self._codegen_session_wall(context.budget),
+            builder_session_token_limit=self._codegen_session_tokens(context.budget),
+            builder_session_wall_seconds=self._codegen_session_wall(context.budget),
             verifier_batch_count=len(plan.batches),
             strict_input_contracts=True,
         )
@@ -412,6 +433,7 @@ class DirectWorkRunner:
                 context_ref=context_ref,
                 status="blocked",
                 bootstrap_epoch_ref=bootstrap_epoch_ref,
+                world_epoch_ref=world_epoch_ref,
                 design_epoch_ref=design_epoch_ref,
                 final_epoch_ref=final_epoch_ref,
                 observed_actual=usage["observed_actual"],
@@ -433,6 +455,7 @@ class DirectWorkRunner:
             context_ref=context_ref,
             status="released",
             bootstrap_epoch_ref=bootstrap_epoch_ref,
+            world_epoch_ref=world_epoch_ref,
             design_epoch_ref=design_epoch_ref,
             final_epoch_ref=final_epoch_ref,
             package_manifest_ref=package_manifest_ref,
@@ -457,11 +480,15 @@ class DirectWorkRunner:
         # semantic leaves consume it through ``context_ref`` rather than as a
         # mutable Python argument.
         _ = request
+        workspace = self.workspace_root / context.context_id
+        workspace.mkdir(parents=True, exist_ok=True)
         runtime = WorkControlRuntime(
             artifacts=self.artifacts,
             heads=self.heads,
             budget=LeaseBudgetLedger(context.budget),
             repair_scope_id=job.job_id,
+            continuations=NodeContinuationStore(workspace / ".continuations"),
+            continuation_workspace_root=workspace,
             telemetry=self.telemetry,
             projector=self.projector,
             trace_id=trace_id,
@@ -469,8 +496,6 @@ class DirectWorkRunner:
         )
         kernel = SchedulerLeafExecutor(runtime=runtime)
         epochs = WorkGraphEpochRuntime(artifacts=self.artifacts, heads=self.heads)
-        workspace = self.workspace_root / context.context_id
-        workspace.mkdir(parents=True, exist_ok=True)
 
         bootstrap_definitions = self._bootstrap_definitions(job)
         bootstrap_graph = GenerationWorkGraph.compile(
@@ -519,13 +544,78 @@ class DirectWorkRunner:
             artifact_type="design.tool_coupling_plan",
         )
         coupling_plan = self.artifacts.get_json(coupling_ref, ToolCouplingPlan)
-        final_design_definitions, modeling = derive_final_design_definitions(
+        world_definitions, modeling_template = derive_world_plan_definitions(
             scope_id=job.job_id,
             bootstrap_definitions=bootstrap_definitions,
             architecture_source_ref=architecture_ref,
             coupling_plan=coupling_plan,
             agent_wall_seconds=self._agent_wall(context.budget),
             agent_token_limit=self._agent_tokens(context.budget),
+        )
+        world_graph = compile_world_work_graph(
+            scope_id=job.job_id,
+            world_definitions=world_definitions,
+            strict_input_contracts=True,
+        )
+        (
+            world_manifest,
+            world_manifest_ref,
+            _world_epoch,
+            world_epoch_ref,
+        ) = epochs.freeze_world(
+            context_ref=context_ref,
+            bootstrap_epoch_ref=bootstrap_epoch_ref,
+            graph=world_graph,
+            topology_id=f"topology:direct-world:{context.context_id}",
+        )
+        world_snapshot = await self._run_graph(
+            graph=world_graph,
+            manifest=world_manifest,
+            manifest_ref=world_manifest_ref,
+            runtime=runtime,
+            executors=self._design_executors(
+                context_ref=context_ref,
+                workspace=workspace,
+                kernel=kernel,
+                graph=world_graph,
+                verifier_plan=None,
+            ),
+        )
+        if not self._all_committed(world_snapshot):
+            return _SemanticPrefixExecution(
+                runtime=runtime,
+                workspace=workspace,
+                bootstrap_epoch_ref=bootstrap_epoch_ref,
+                world_epoch_ref=world_epoch_ref,
+                blocked_coordinates=self._blocked_coordinates(world_snapshot),
+            )
+
+        curriculum_plan_definition = self._one_definition(
+            world_graph,
+            component="design",
+            stage="curriculum_plan",
+        )
+        curriculum_plan_ref = self._active_output(
+            curriculum_plan_definition,
+            artifact_type="design.curriculum_plan_source",
+        )
+        curriculum_plan = self.artifacts.get_json(
+            curriculum_plan_ref,
+            CurriculumPlanSourceDraft,
+        )
+        final_design_definitions, modeling = derive_task_requirement_design_definitions(
+            scope_id=job.job_id,
+            world_definitions=world_definitions,
+            curriculum_plan_ref=curriculum_plan_ref,
+            curriculum_plan=curriculum_plan,
+            modeling_template=modeling_template,
+            agent_wall_seconds=self._agent_wall(context.budget),
+            agent_token_limit=self._agent_tokens(context.budget),
+        )
+        task_requirement_order = tuple(
+            item.coordinate
+            for item in final_design_definitions
+            if (item.coordinate.component, item.coordinate.stage) == ("design", "task_requirement")
         )
         verifier_plan = verifier_plan_work_definition(
             scope_id=job.job_id,
@@ -543,9 +633,9 @@ class DirectWorkRunner:
             design_manifest_ref,
             _design_epoch,
             design_epoch_ref,
-        ) = epochs.freeze_design(
+        ) = epochs.freeze_design_from_world(
             context_ref=context_ref,
-            bootstrap_epoch_ref=bootstrap_epoch_ref,
+            world_epoch_ref=world_epoch_ref,
             graph=design_graph,
             topology_id=f"topology:direct-design:{context.context_id}",
         )
@@ -561,11 +651,14 @@ class DirectWorkRunner:
                 graph=design_graph,
                 verifier_plan=verifier_plan,
             ),
+            stop_after_first_block=True,
+            preferred_order=task_requirement_order,
         )
         return _SemanticPrefixExecution(
             runtime=runtime,
             workspace=workspace,
             bootstrap_epoch_ref=bootstrap_epoch_ref,
+            world_epoch_ref=world_epoch_ref,
             design_epoch_ref=design_epoch_ref,
             design_graph=design_graph,
             modeling_definition=modeling,
@@ -672,7 +765,7 @@ class DirectWorkRunner:
         workspace: Path,
         kernel: SchedulerLeafExecutor,
         graph: GenerationWorkGraph,
-        verifier_plan: WorkDefinition,
+        verifier_plan: WorkDefinition | None,
     ) -> dict[str, object]:
         designer = self.designer
         executors: dict[str, object] = {}
@@ -703,17 +796,27 @@ class DirectWorkRunner:
                     profiles=designer.profiles,
                     kernel=kernel,
                 )
-            elif stage == "task_curriculum":
-                leaf = TaskCurriculumLeaf(
+            elif stage == "curriculum_plan":
+                leaf = CurriculumPlanLeaf(
                     context_ref=context_ref,
                     workspace_root=workspace,
                     backend=designer.backend,
                     profiles=designer.profiles,
                     kernel=kernel,
                 )
+            elif stage == "task_requirement":
+                leaf = TaskRequirementLeaf(
+                    context_ref=context_ref,
+                    workspace_root=workspace,
+                    backend=designer.backend,
+                    profiles=designer.profiles,
+                    kernel=kernel,
+                )
+            elif stage == "task_curriculum":
+                leaf = TaskCurriculumJoinLeaf(context_ref=context_ref, kernel=kernel)
             elif stage == "modeling_boundary":
                 leaf = ModelingBoundaryLeaf(context_ref=context_ref, kernel=kernel)
-            elif definition.coordinate == verifier_plan.coordinate:
+            elif verifier_plan is not None and definition.coordinate == verifier_plan.coordinate:
                 leaf = VerifierPlanLeaf(compiler=self.verifier_compiler, kernel=kernel)
             if leaf is not None:
                 executors[definition.work_id] = self._leaf_executor(leaf, definition)
@@ -744,7 +847,13 @@ class DirectWorkRunner:
         for definition in graph.definitions:
             stage = definition.coordinate.stage
             leaf: object | None = None
-            if stage == "candidate_build":
+            if stage == "implementation_plan":
+                leaf = BuildPlanningLeaf(
+                    builder=self.builder,
+                    workspace_root=workspace / "builder-plan",
+                    kernel=kernel,
+                )
+            elif stage == "candidate_build":
                 leaf = BuilderLeaf(
                     builder=self.builder,
                     workspace_root=workspace / "builder",
@@ -815,6 +924,8 @@ class DirectWorkRunner:
         manifest_ref: ArtifactRef,
         runtime: WorkControlRuntime,
         executors: dict[str, object],
+        stop_after_first_block: bool = False,
+        preferred_order: tuple[WorkCoordinate, ...] = (),
     ) -> WorkScheduleSnapshot:
         scheduler = WorkScheduler(
             graph=graph,
@@ -830,6 +941,52 @@ class DirectWorkRunner:
         # allow an active lease to turn a recovery into a misleading budget
         # exhaustion.
         self._reconcile_abandoned_operations(graph=graph, runtime=runtime)
+        if stop_after_first_block:
+            preferred_keys = {
+                coordinate.coordinate_key: index for index, coordinate in enumerate(preferred_order)
+            }
+            for _dispatch_count in range(128):
+                snapshot = scheduler.snapshot()
+                missing = tuple(
+                    item.coordinate
+                    for item in snapshot.work
+                    if item.state in {"ready", "repair_ready"}
+                    and graph.require(item.coordinate).work_id not in executors
+                )
+                if missing:
+                    rendered = ", ".join(item.coordinate_key for item in missing)
+                    raise DirectWorkRunnerError(
+                        f"sequential graph has no executor for required work: {rendered}"
+                    )
+                ready: list[WorkCoordinate] = []
+                for item in snapshot.work:
+                    if (
+                        item.state not in {"ready", "repair_ready", "stale"}
+                        or graph.require(item.coordinate).work_id not in executors
+                    ):
+                        continue
+                    if item.state == "stale":
+                        try:
+                            scheduler.resolve_inputs(item.coordinate)
+                        except WorkResumeError:
+                            continue
+                    ready.append(item.coordinate)
+                if not ready:
+                    return snapshot
+                ready.sort(
+                    key=lambda coordinate: (
+                        preferred_keys.get(coordinate.coordinate_key, len(preferred_keys)),
+                        coordinate.coordinate_key,
+                    )
+                )
+                await scheduler.dispatch_one(
+                    ready[0],
+                    executors=executors,  # type: ignore[arg-type]
+                )
+                terminal_snapshot = scheduler.snapshot()
+                if any(item.state == "blocked" for item in terminal_snapshot.work):
+                    return terminal_snapshot
+            raise DirectWorkRunnerError("sequential graph exceeded its bounded dispatch budget")
         await scheduler.run_until_stalled(
             executors=executors,  # type: ignore[arg-type]
             maximum_concurrency=self.maximum_concurrency,
@@ -881,6 +1038,14 @@ class DirectWorkRunner:
             raise DirectWorkRunnerError("maximum_concurrency must be positive")
         if self.structured_turn_token_limit < 1 or self.structured_turn_wall_seconds <= 0:
             raise DirectWorkRunnerError("Direct scheduler requires positive structured-turn limits")
+        if (
+            self.environment_codegen_session_token_limit < 1
+            or self.environment_codegen_session_wall_seconds <= 0
+            or self.environment_codegen_physical_turn_token_limit < 1
+        ):
+            raise DirectWorkRunnerError(
+                "Direct scheduler requires positive Environment Builder session/turn limits"
+            )
 
     def _semantic_prefix_outcome(
         self,
@@ -898,6 +1063,7 @@ class DirectWorkRunner:
                 context_ref=context_ref,
                 status="blocked",
                 bootstrap_epoch_ref=prefix.bootstrap_epoch_ref,
+                world_epoch_ref=prefix.world_epoch_ref,
                 design_epoch_ref=prefix.design_epoch_ref,
                 observed_actual=usage["observed_actual"],
                 unknown_upper_bound=usage["unknown_upper_bound"],
@@ -928,6 +1094,7 @@ class DirectWorkRunner:
             context_ref=context_ref,
             status="semantic_prefix_ready",
             bootstrap_epoch_ref=prefix.bootstrap_epoch_ref,
+            world_epoch_ref=prefix.world_epoch_ref,
             design_epoch_ref=prefix.design_epoch_ref,
             modeling_commit_ref=modeling_commit_ref,
             verifier_plan_commit_ref=verifier_plan_commit_ref,
@@ -1051,6 +1218,7 @@ class DirectWorkRunner:
         bootstrap_epoch_ref: ArtifactRef,
         observed_actual: BudgetUsage,
         unknown_upper_bound: BudgetUsage,
+        world_epoch_ref: ArtifactRef | None = None,
         design_epoch_ref: ArtifactRef | None = None,
         modeling_commit_ref: ArtifactRef | None = None,
         verifier_plan_commit_ref: ArtifactRef | None = None,
@@ -1064,6 +1232,7 @@ class DirectWorkRunner:
             context_ref=context_ref,
             status=status,
             bootstrap_epoch_ref=bootstrap_epoch_ref,
+            world_epoch_ref=world_epoch_ref,
             design_epoch_ref=design_epoch_ref,
             modeling_commit_ref=modeling_commit_ref,
             verifier_plan_commit_ref=verifier_plan_commit_ref,
@@ -1082,6 +1251,7 @@ class DirectWorkRunner:
                 for ref in (
                     context_ref,
                     bootstrap_epoch_ref,
+                    world_epoch_ref,
                     design_epoch_ref,
                     modeling_commit_ref,
                     verifier_plan_commit_ref,
@@ -1102,6 +1272,7 @@ class DirectWorkRunner:
         bootstrap_epoch_ref: ArtifactRef,
         observed_actual: BudgetUsage,
         unknown_upper_bound: BudgetUsage,
+        world_epoch_ref: ArtifactRef | None = None,
         design_epoch_ref: ArtifactRef | None = None,
         final_epoch_ref: ArtifactRef | None = None,
         package_manifest_ref: ArtifactRef | None = None,
@@ -1115,6 +1286,7 @@ class DirectWorkRunner:
             bootstrap_epoch_ref=bootstrap_epoch_ref,
             observed_actual=observed_actual,
             unknown_upper_bound=unknown_upper_bound,
+            world_epoch_ref=world_epoch_ref,
             design_epoch_ref=design_epoch_ref,
             final_epoch_ref=final_epoch_ref,
             package_manifest_ref=package_manifest_ref,
@@ -1130,6 +1302,7 @@ class DirectWorkRunner:
                 for ref in (
                     context_ref,
                     bootstrap_epoch_ref,
+                    world_epoch_ref,
                     design_epoch_ref,
                     final_epoch_ref,
                     package_manifest_ref,
@@ -1145,6 +1318,22 @@ class DirectWorkRunner:
 
     def _agent_tokens(self, budget: Budget) -> int:
         return min(self.structured_turn_token_limit, max(1, budget.llm_tokens))
+
+    def _codegen_session_tokens(self, budget: Budget) -> int:
+        return min(self.environment_codegen_session_token_limit, max(1, budget.llm_tokens))
+
+    def _codegen_session_wall(self, budget: Budget) -> float:
+        return min(
+            self.environment_codegen_session_wall_seconds,
+            max(1.0, budget.build_seconds),
+            max(1.0, budget.wall_seconds),
+        )
+
+    def _codegen_physical_turn_tokens(self, budget: Budget) -> int:
+        return min(
+            self.environment_codegen_physical_turn_token_limit,
+            self._codegen_session_tokens(budget),
+        )
 
 
 __all__ = [

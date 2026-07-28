@@ -63,6 +63,9 @@ class _StdoutCapture:
     overflowed: bool
 
 
+type _ProgressCallback = Callable[[str, Mapping[str, Any] | None], None]
+
+
 def _consume_task_result(task: asyncio.Task[object]) -> None:
     """Drain a detached cleanup task without surfacing cancellation noise."""
 
@@ -77,12 +80,14 @@ def _reject_json_constant(value: str) -> None:
 
 
 def _open_ephemeral_sqlite_home() -> tempfile.TemporaryDirectory[str]:
-    """Allocate a memory-backed Codex SQLite home for exactly one worker.
+    """Allocate one memory-backed Codex SQLite home.
 
     Codex app-server 0.144.4 creates local SQLite state/log databases even
     when history, analytics, and feedback are disabled.  That vendor-local
     state must not live below the durable profile/artifact root because a
     custom provider's runtime configuration can otherwise be recorded there.
+    A backend can retain this volatile directory only for an active private
+    Agent session; it remains outside Artifacts, telemetry, and the workspace.
     A missing memory-backed runtime is a fail-closed configuration error, not
     a reason to fall back to a disk-backed directory.
     """
@@ -121,6 +126,10 @@ class CodexSdkBackend:
         "framework.codex-structured-protocol.v2",
         "framework.codex-structured-protocol.v3",
     )
+    # This adapter retains the vendor-local SQLite checkpoint only for its
+    # own lifetime. Expose the limitation as a closed diagnostic fact; a bare
+    # InvocationSession never authorizes another thread after a restart.
+    session_continuity_scope = "same_backend_instance"
 
     def __init__(
         self,
@@ -133,6 +142,12 @@ class CodexSdkBackend:
         self._worker_path = Path(__file__).with_name("_codex_worker.py").resolve()
         self._active: dict[str, _ActiveWorker] = {}
         self._cancelled: set[str] = set()
+        # A Codex thread created as persisted must reuse the exact volatile
+        # SQLite state when a later worker resumes it.  The mapping belongs to
+        # this backend instance only: it is never serialized into Artifacts or
+        # telemetry, and a process restart fails closed rather than pretending
+        # that a bare thread id can restore private local runtime state.
+        self._session_sqlite_homes: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._lock = asyncio.Lock()
         self._capacity = asyncio.Semaphore(max_concurrent_invocations)
         self._telemetry = telemetry
@@ -141,6 +156,22 @@ class CodexSdkBackend:
     @property
     def telemetry_failures(self) -> int:
         return self._telemetry_failures
+
+    async def close_session(self, session: InvocationSession) -> bool:
+        """Release the volatile local state for one no-longer-resumable thread.
+
+        The public continuation record deliberately contains no filesystem
+        location.  This explicit backend-local cleanup hook is for lifecycle
+        owners once Scheduler authority says no additional physical turn may
+        use the session.
+        """
+
+        async with self._lock:
+            runtime = self._session_sqlite_homes.pop(session.thread_id, None)
+        if runtime is None:
+            return False
+        runtime.cleanup()
+        return True
 
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
         # Queueing is controller/backend scheduling, not model execution.  Acquire
@@ -157,12 +188,15 @@ class CodexSdkBackend:
             async with self._capacity:
                 queue_duration_ms = (time.perf_counter_ns() - queue_started) / 1_000_000
 
-                def mark_provider_progress(method: str) -> None:
+                def mark_provider_progress(
+                    method: str,
+                    event_payload: Mapping[str, Any] | None = None,
+                ) -> None:
                     nonlocal telemetry_progress_disabled
                     if telemetry_span is None or telemetry_progress_disabled:
                         return
                     try:
-                        telemetry_span.progress(method)
+                        telemetry_span.progress(method, event_payload)
                     except Exception:
                         self._telemetry_failures += 1
                         telemetry_progress_disabled = True
@@ -204,15 +238,13 @@ class CodexSdkBackend:
         self,
         request: InvocationRequest,
         *,
-        on_first_progress: Callable[[str], None] | None = None,
+        on_first_progress: _ProgressCallback | None = None,
     ) -> InvocationResult:
         """Bound the complete parent-side worker lifecycle and account its elapsed time."""
 
         started = time.monotonic()
         limits = request.profile.limits
-        normal_lifecycle_ceiling = (
-            limits.timeout_seconds + limits.interrupt_grace_seconds + 0.5
-        )
+        normal_lifecycle_ceiling = limits.timeout_seconds + limits.interrupt_grace_seconds + 0.5
         invocation_task = asyncio.create_task(
             self._invoke_with_capacity(
                 request,
@@ -275,7 +307,7 @@ class CodexSdkBackend:
         self,
         request: InvocationRequest,
         *,
-        on_first_progress: Callable[[str], None] | None = None,
+        on_first_progress: _ProgressCallback | None = None,
     ) -> InvocationResult:
         started = time.monotonic()
         redactor = Redactor.from_values(request.profile.secret_values)
@@ -312,16 +344,51 @@ class CodexSdkBackend:
                 started=started,
             )
 
+        sqlite_runtime: tempfile.TemporaryDirectory[str] | None = None
+        owns_sqlite_runtime = False
         try:
-            with _open_ephemeral_sqlite_home() as sqlite_home_text:
-                return await self._invoke_worker_process(
-                    request,
-                    encoded_payload=encoded_payload,
-                    redactor=redactor,
-                    sqlite_home=Path(sqlite_home_text),
-                    started=started,
-                    on_first_progress=on_first_progress,
-                )
+            if request.session is None:
+                sqlite_runtime = _open_ephemeral_sqlite_home()
+                owns_sqlite_runtime = True
+            else:
+                async with self._lock:
+                    sqlite_runtime = self._session_sqlite_homes.get(request.session.thread_id)
+                if sqlite_runtime is None:
+                    return _local_failure(
+                        request,
+                        status=InvocationStatus.FAILED,
+                        code="session_runtime_unavailable",
+                        message=(
+                            "the private volatile Codex runtime state for the requested "
+                            "session is unavailable"
+                        ),
+                        started=started,
+                    )
+
+            result = await self._invoke_worker_process(
+                request,
+                encoded_payload=encoded_payload,
+                redactor=redactor,
+                sqlite_home=Path(sqlite_runtime.name),
+                started=started,
+                on_first_progress=on_first_progress,
+            )
+            if request.session is None and result.session is not None:
+                async with self._lock:
+                    existing = self._session_sqlite_homes.get(result.session.thread_id)
+                    if existing is not None and existing is not sqlite_runtime:
+                        return _local_failure(
+                            request,
+                            status=InvocationStatus.FAILED,
+                            code="session_runtime_binding_conflict",
+                            message=(
+                                "a returned Codex thread id is already bound to another runtime"
+                            ),
+                            started=started,
+                        )
+                    self._session_sqlite_homes[result.session.thread_id] = sqlite_runtime
+                owns_sqlite_runtime = False
+            return result
         except OSError:
             return _local_failure(
                 request,
@@ -330,6 +397,9 @@ class CodexSdkBackend:
                 message="memory-backed Codex SQLite isolation is unavailable",
                 started=started,
             )
+        finally:
+            if owns_sqlite_runtime and sqlite_runtime is not None:
+                sqlite_runtime.cleanup()
 
     async def _invoke_worker_process(
         self,
@@ -339,7 +409,7 @@ class CodexSdkBackend:
         redactor: Redactor,
         sqlite_home: Path,
         started: float,
-        on_first_progress: Callable[[str], None] | None = None,
+        on_first_progress: _ProgressCallback | None = None,
     ) -> InvocationResult:
         process_kwargs: dict[str, Any] = {
             "stdin": asyncio.subprocess.PIPE,
@@ -585,6 +655,13 @@ class CodexSdkBackend:
             "codex_bin_sha256": profile.codex_bin_sha256,
             "sensitive_environment_names": list(profile.sensitive_environment_names),
             "hooks_enabled": bool(profile.hooks),
+            # Explicit diagnostic controls may request a redacted terminal
+            # excerpt for a local, non-artifact Code-Agent view. This never
+            # changes ordinary runtime traffic or the Scheduler's feedback
+            # routing; absent metadata remains false.
+            "diagnostic_capture_terminal_excerpt": (
+                request.metadata.get("diagnostic_capture_terminal_excerpt") is True
+            ),
             "limits": {
                 "timeout_seconds": limits.timeout_seconds,
                 "interrupt_grace_seconds": limits.interrupt_grace_seconds,
@@ -598,9 +675,10 @@ def _transport_output_schema(schema: JsonObject, *, transport: str) -> JsonObjec
     if transport == "provider_schema":
         return _provider_output_schema(schema)
     if transport == "json_envelope":
-        # The inner source contract travels in the prompt and remains subject
-        # to local Pydantic/compiler validation. This outer contract exists
-        # only for OpenAI-compatible gateways that reject nested schemas.
+        # Profile construction injects the inner source contract into the
+        # runtime instructions and local Pydantic/compiler validation still
+        # owns acceptance. This outer contract exists only for
+        # OpenAI-compatible gateways that reject nested schemas.
         return {
             "type": "object",
             "properties": {"artifact_json": {"type": "string"}},
@@ -646,11 +724,7 @@ def _normalize_provider_schema_node(
         used_ir.add(_JSON_VALUE_IR)
         return {"$ref": f"#/$defs/{_JSON_VALUE_IR}"}
     additional = value.get("additionalProperties")
-    if (
-        value.get("type") == "object"
-        and additional is not None
-        and additional is not False
-    ):
+    if value.get("type") == "object" and additional is not None and additional is not False:
         if additional is True or additional == {}:
             used_ir.add(_JSON_OBJECT_IR)
             return {"$ref": f"#/$defs/{_JSON_OBJECT_IR}"}
@@ -710,8 +784,7 @@ def _normalize_provider_schema_node(
             if not isinstance(child, list):
                 raise TypeError(f"provider schema {key} must be an array")
             normalized[target_key] = [
-                _normalize_provider_schema_node(item, used_ir=used_ir)
-                for item in child
+                _normalize_provider_schema_node(item, used_ir=used_ir) for item in child
             ]
         elif key == "items":
             normalized[target_key] = _normalize_provider_schema_node(
@@ -792,9 +865,7 @@ def _provider_json_ir_defs() -> JsonObject:
         },
         _JSON_OBJECT_IR: {
             "type": "object",
-            "properties": {
-                "aw_object_entries": {"type": "array", "items": entry_ref}
-            },
+            "properties": {"aw_object_entries": {"type": "array", "items": entry_ref}},
             "required": ["aw_object_entries"],
             "additionalProperties": False,
         },
@@ -855,9 +926,7 @@ def _decode_json_envelope(value: JsonValue) -> JsonValue:
     if isinstance(encoded, Mapping):
         return json_compatible(encoded)
     if not isinstance(encoded, str):
-        raise ValueError(
-            "structured output envelope artifact_json must be a JSON string or object"
-        )
+        raise ValueError("structured output envelope artifact_json must be a JSON string or object")
     return json_compatible(json.loads(encoded, parse_constant=_reject_json_constant))
 
 
@@ -882,7 +951,7 @@ async def _capture_stdout(
     *,
     request: InvocationRequest,
     redactor: Redactor,
-    on_first_progress: Callable[[str], None] | None = None,
+    on_first_progress: _ProgressCallback | None = None,
 ) -> _StdoutCapture:
     if stream is None:
         return _StdoutCapture([], None, ["worker stdout was not connected"], False)
@@ -931,8 +1000,9 @@ async def _capture_stdout(
             ):
                 errors.append("worker event ordering or shape is invalid")
                 continue
+            safe_payload = redactor.object(payload)
             if on_first_progress is not None:
-                on_first_progress(method)
+                on_first_progress(method, safe_payload)
             expected_sequence += 1
             if len(events) >= request.profile.limits.max_events:
                 overflowed = True
@@ -941,7 +1011,7 @@ async def _capture_stdout(
                 InvocationEvent(
                     sequence=sequence,
                     method=method,
-                    payload=redactor.object(payload),
+                    payload=safe_payload,
                 )
             )
         elif record_type == "result":

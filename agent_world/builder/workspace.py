@@ -100,8 +100,33 @@ _FORBIDDEN_UV_CONFIGURATION_KEYS = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateWorkspaceDiagnostic:
+    """Safe, non-content evidence for one candidate-workspace rejection.
+
+    The validator may need raw paths internally to reject an untrusted tree,
+    but those paths are not safe control-plane feedback: a model can choose a
+    path name and encode arbitrary text in it.  This compact companion keeps
+    the *kind* and cardinality of a manifest mismatch so a later authorized
+    Engineer correction can inspect its own workspace without receiving raw
+    exception text.
+    """
+
+    code: str
+    count: int | None = None
+
+
 class CandidateWorkspaceError(RuntimeError):
     """The candidate workspace is unsafe or contradicts its declaration."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        safe_diagnostic: CandidateWorkspaceDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.safe_diagnostic = safe_diagnostic
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +218,13 @@ class CandidateWorkspaceValidator:
         resolved_root = requested.resolve(strict=True)
         declarations = {item.path: item for item in completion.files}
         if len(declarations) != len(completion.files):
-            raise CandidateWorkspaceError("candidate file declarations are not unique")
+            raise CandidateWorkspaceError(
+                "candidate file declarations are not unique",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "manifest_declaration_duplicate",
+                    len(completion.files) - len(declarations),
+                ),
+            )
 
         actual: dict[str, tuple[bytes, os.stat_result]] = {}
         total_bytes = 0
@@ -254,13 +285,34 @@ class CandidateWorkspaceValidator:
         declared_paths = set(declarations)
         actual_paths = set(actual)
         if missing := sorted(declared_paths - actual_paths):
-            raise CandidateWorkspaceError(f"declared files are missing: {missing}")
+            raise CandidateWorkspaceError(
+                f"declared files are missing: {missing}",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "manifest_declared_missing",
+                    len(missing),
+                ),
+            )
         if undeclared := sorted(actual_paths - declared_paths):
-            raise CandidateWorkspaceError(f"candidate contains undeclared files: {undeclared}")
+            raise CandidateWorkspaceError(
+                f"candidate contains undeclared files: {undeclared}",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "manifest_undeclared_files",
+                    len(undeclared),
+                ),
+            )
         if not actual_paths:
-            raise CandidateWorkspaceError("candidate project is empty")
+            raise CandidateWorkspaceError(
+                "candidate project is empty",
+                safe_diagnostic=CandidateWorkspaceDiagnostic("manifest_empty", 0),
+            )
         if len(actual_paths) > self.max_files:
-            raise CandidateWorkspaceError("candidate exceeds the file-count limit")
+            raise CandidateWorkspaceError(
+                "candidate exceeds the file-count limit",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "manifest_file_limit",
+                    len(actual_paths),
+                ),
+            )
 
         forbidden_bytes = tuple(
             value.encode("utf-8")
@@ -279,7 +331,11 @@ class CandidateWorkspaceValidator:
             executable = bool(file_stat.st_mode & 0o111)
             if executable != declaration.executable:
                 raise CandidateWorkspaceError(
-                    f"executable mode contradicts declaration: {relative}"
+                    f"executable mode contradicts declaration: {relative}",
+                    safe_diagnostic=CandidateWorkspaceDiagnostic(
+                        "manifest_executable_mode",
+                        1,
+                    ),
                 )
             files.append(
                 ValidatedCandidateFile(
@@ -504,9 +560,7 @@ class CandidateWorkspaceValidator:
                 try:
                     requirement = Requirement(raw)
                 except InvalidRequirement as exc:
-                    raise CandidateWorkspaceError(
-                        f"invalid dependency requirement: {raw}"
-                    ) from exc
+                    raise CandidateWorkspaceError(f"invalid dependency requirement: {raw}") from exc
                 if requirement.url is not None:
                     raise CandidateWorkspaceError(
                         f"direct URL/path dependency is prohibited: {requirement.name}"
@@ -528,13 +582,21 @@ class CandidateWorkspaceValidator:
                 if source != root_source:
                     raise CandidateWorkspaceError(
                         "uv.lock must contain a virtual, non-installed root project; "
-                        "editable/path/registry root sources are prohibited"
+                        "editable/path/registry root sources are prohibited",
+                        safe_diagnostic=CandidateWorkspaceDiagnostic(
+                            "dependency_virtual_root_source_invalid"
+                        ),
                     )
                 root_count += 1
                 continue
-            if source.get("registry") not in _APPROVED_REGISTRY_URLS or set(source) != {
-                "registry"
-            }:
+            if source == root_source:
+                raise CandidateWorkspaceError(
+                    "uv.lock virtual root package name must equal pyproject project.name",
+                    safe_diagnostic=CandidateWorkspaceDiagnostic(
+                        "dependency_virtual_root_name_mismatch"
+                    ),
+                )
+            if source.get("registry") not in _APPROVED_REGISTRY_URLS or set(source) != {"registry"}:
                 raise CandidateWorkspaceError(
                     f"dependency {name} must come from the fixed HTTPS PyPI registry; "
                     "path/Git/URL/editable sources are prohibited"
@@ -559,7 +621,11 @@ class CandidateWorkspaceValidator:
                 )
         if root_count != 1:
             raise CandidateWorkspaceError(
-                "uv.lock must contain exactly one virtual, non-installed root project source"
+                "uv.lock must contain exactly one virtual, non-installed root project source",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "dependency_virtual_root_count",
+                    root_count,
+                ),
             )
 
     @staticmethod
@@ -632,6 +698,7 @@ class CandidateWorkspaceValidator:
 
 
 __all__ = [
+    "CandidateWorkspaceDiagnostic",
     "CandidateWorkspaceError",
     "CandidateWorkspaceValidator",
     "ValidatedCandidateFile",

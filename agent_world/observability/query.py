@@ -24,7 +24,13 @@ from agent_world.contracts import (
     sha256_digest,
 )
 from agent_world.control.telemetry import TelemetryStore
-from agent_world.control.work import ValidationReport, WorkAttempt
+from agent_world.control.work import (
+    ArtifactSlotContract,
+    ValidationReport,
+    WorkAttempt,
+    WorkCoordinate,
+    WorkDefinition,
+)
 from agent_world.control.work_store import WorkControlHead, WorkControlStore
 
 from .paths import ObservabilityError, ObservabilityRoot
@@ -144,7 +150,7 @@ class ObservabilityReader:
         )
 
     def contract(self, scope_id: str, coordinate: str) -> dict[str, object]:
-        """Render the frozen tool surface and public verifier requirements only."""
+        """Render a safe Candidate contract or its exact WorkDefinition fallback."""
 
         return self._read(
             "contract",
@@ -501,7 +507,18 @@ class ObservabilityReader:
         self._coordinate(scope_id, coordinate)
         head = self._head_for_coordinate(scope_id, coordinate)
         attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
-        _candidate_ref, candidate = self._candidate_for_attempt(attempt)
+        try:
+            _candidate_ref, candidate = self._candidate_for_attempt(attempt)
+        except ObservabilityError as exc:
+            if exc.code != "observability_candidate_unavailable":
+                raise
+            # Design and research nodes do not yet have an EnvironmentCandidate,
+            # but their scene still points an investigating Code Agent here.  A
+            # durable WorkDefinition is the safe, read-only contract available
+            # at that boundary; do not advertise a Candidate contract that the
+            # node cannot possibly own.
+            definition = self._work_definition_for_head(head)
+            return self._work_definition_contract(scope_id, head, definition)
         if candidate.design_ref.artifact_type not in {
             "design.environment_design",
             "expansion.environment_design",
@@ -545,6 +562,117 @@ class ObservabilityReader:
                 ],
                 "minimum_unknown_seed_episodes": verification.minimum_unknown_seed_episodes,
             },
+        }
+
+    def _work_definition_for_head(self, head: WorkControlHead) -> WorkDefinition:
+        """Recover one exact immutable definition without trusting a cache hint."""
+
+        candidates: list[WorkDefinition] = []
+        for ref in self.artifacts.list_revisions():
+            if (
+                ref.artifact_type != "control.work_definition"
+                or ref.content_hash != head.definition_digest
+            ):
+                continue
+            try:
+                definition = self.artifacts.get_json(ref, WorkDefinition)
+            except ValueError:
+                continue
+            if (
+                definition.work_id == head.work_id
+                and definition.coordinate == head.coordinate
+                and definition.definition_digest == head.definition_digest
+                and definition.acceptance_digest == head.acceptance_digest
+            ):
+                candidates.append(definition)
+        if not candidates or any(item != candidates[0] for item in candidates[1:]):
+            raise ObservabilityError(
+                "this coordinate lacks one exact durable WorkDefinition",
+                code="observability_contract_unavailable",
+            )
+        return candidates[0]
+
+    def _work_definition_contract(
+        self,
+        scope_id: str,
+        head: WorkControlHead,
+        definition: WorkDefinition,
+    ) -> dict[str, object]:
+        """Project the compact contract a design-stage investigator can use.
+
+        This is deliberately a path map to framework-owned policy, not a copy
+        of a rendered runtime Prompt, mounted Runtime Skill, model response,
+        repair authority, or budget ledger.  Those remain available only from
+        their dedicated safe views when a diagnosis requires them.
+        """
+
+        return {
+            "scope_id": self._projector.safe_scope_id(scope_id),
+            "coordinate_key": head.coordinate.coordinate_key,
+            "contract_kind": "work_definition",
+            "read_only_reference": True,
+            "do_not_modify": ["framework_work_definition", "control_plane"],
+            "work": {
+                "work_id": self._safe(definition.work_id),
+                "required_claim_id": self._safe(definition.required_claim_id),
+                "success_maturity": self._safe(definition.success_maturity),
+                "dependencies": [
+                    self._safe_coordinate(item) for item in definition.dependency_coordinates
+                ],
+                "allowed_mutation_roots": [
+                    self._safe(item) for item in definition.allowed_mutation_roots
+                ],
+            },
+            "proposal": {
+                "executor": definition.proposal_policy.executor,
+                "operation": self._safe(definition.proposal_policy.operation),
+                "replay_mode": definition.proposal_policy.replay_mode,
+                "agent_role": definition.proposal_policy.agent_role,
+                "capability_profile_id": self._safe_optional(
+                    definition.proposal_policy.capability_profile_id
+                ),
+                "output_contract_id": self._safe_optional(
+                    definition.proposal_policy.output_contract_id
+                ),
+                "implementation_revision_id": self._safe(
+                    definition.proposal_policy.implementation_revision_id
+                ),
+            },
+            "validation": {
+                "validator_id": self._safe(definition.validation_policy.validator_id),
+                "validator_revision_id": self._safe(
+                    definition.validation_policy.validator_revision_id
+                ),
+                "validation_phase": self._safe(definition.validation_policy.validation_phase),
+                "frontier_ordinal": definition.validation_policy.frontier_ordinal,
+                "effect": definition.validation_policy.effect,
+            },
+            "input_slots": [self._safe_slot(slot) for slot in definition.input_slots],
+            "output_slots": [self._safe_slot(slot) for slot in definition.output_slots],
+        }
+
+    def _safe_coordinate(self, coordinate: WorkCoordinate) -> dict[str, object]:
+        """Render only the public identity fields of a dependency coordinate."""
+
+        return {
+            "component": coordinate.component,
+            "stage": self._safe(coordinate.stage),
+            "artifact_slot": self._safe(coordinate.artifact_slot),
+            "group_id": self._safe_optional(coordinate.group_id),
+            "shard_id": self._safe_optional(coordinate.shard_id),
+        }
+
+    def _safe_slot(self, slot: ArtifactSlotContract) -> dict[str, object]:
+        """Project one immutable Artifact slot without its concrete inputs."""
+
+        return {
+            "slot_id": self._safe(slot.slot_id),
+            "direction": slot.direction,
+            "artifact_types": [self._safe(item) for item in slot.artifact_types],
+            "minimum_count": slot.minimum_count,
+            "maximum_count": slot.maximum_count,
+            "producer_component": slot.producer_component,
+            "confidentiality": slot.confidentiality,
         }
 
     def _rebuild_scene(self, scope_id: str) -> Scene:
@@ -855,6 +983,9 @@ class ObservabilityReader:
             value,
             known_secret_canaries=self.known_secret_canaries,
         )
+
+    def _safe_optional(self, value: str | None) -> str | None:
+        return None if value is None else self._safe(value)
 
     @staticmethod
     def _read(label: str, operation: Any) -> Any:

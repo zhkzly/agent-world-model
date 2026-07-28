@@ -45,7 +45,7 @@ type ValidationEffect = Literal[
     "quarantine",
 ]
 type ValidationStatus = Literal["passed", "failed", "inconclusive", "error"]
-type DiagnosticQuality = Literal["not_applicable", "actionable", "insufficient"]
+type DiagnosticQuality = Literal["not_applicable", "actionable", "informative", "insufficient"]
 type EvaluationStatus = Literal[
     "passed",
     "failed",
@@ -67,6 +67,7 @@ type RepairDecision = Literal[
     "local_correction",
     "parent_correction",
     "infrastructure_retry",
+    "session_continuation",
     "request_human",
     "reject",
 ]
@@ -332,6 +333,12 @@ class ProposalPolicy(V2Contract):
     # to distinguish a query that may be repeated from an Agent/codegen turn
     # whose interrupted outcome must remain terminal.
     replay_mode: ReplayMode = "non_replayable"
+    # A long-running Agent session may span several Provider-owned physical
+    # turns.  The normal OperationBudget still reserves exactly one physical
+    # turn; these two fields declare the immutable logical session envelope
+    # used to materialize and resume the same Provider session.
+    session_token_limit: Annotated[int, Field(ge=1)] | None = None
+    session_wall_seconds: Annotated[float, Field(gt=0)] | None = None
     agent_role: AgentRole | None = None
     capability_profile_id: Identifier | None = None
     output_contract_id: Identifier | None = None
@@ -353,8 +360,20 @@ class ProposalPolicy(V2Contract):
                 )
             if self.budget.agent_turns < 1 or self.budget.llm_tokens < 1:
                 raise ValueError("Agent proposal requires numeric turn and token limits")
+            if (self.session_token_limit is None) != (self.session_wall_seconds is None):
+                raise ValueError("Agent logical session token and wall limits must be declared together")
+            if self.session_token_limit is not None and (
+                self.session_token_limit < self.budget.llm_tokens
+                or self.session_wall_seconds is None
+                or self.session_wall_seconds < self.budget.wall_seconds
+            ):
+                raise ValueError(
+                    "Agent logical session envelope cannot be smaller than one physical turn"
+                )
         elif self.agent_role is not None or self.output_contract_id is not None:
             raise ValueError("non-Agent proposal cannot declare Agent role/output contract")
+        elif self.session_token_limit is not None or self.session_wall_seconds is not None:
+            raise ValueError("non-Agent proposal cannot declare a logical Agent session envelope")
         if self.executor != "agent" and self.acceptance_transform_id is not None:
             raise ValueError("only an Agent proposal may declare an acceptance transform")
         if self.executor == "real_tools" and (
@@ -431,6 +450,11 @@ class RepairPolicy(V2Contract):
     maximum_local_corrections: Annotated[int, Field(ge=0, le=1)] = 1
     strict_progress_bonus_corrections: Annotated[int, Field(ge=0, le=1)] = 1
     maximum_infrastructure_retries: Annotated[int, Field(ge=0)] = 1
+    # Provider output ceilings are neither semantic corrections nor transient
+    # infrastructure retries.  This count is derived from the declared logical
+    # session envelope and the physical-turn reservation; it is separately
+    # metered by Agent/token/wall budgets rather than repair_attempts.
+    maximum_session_continuations: Annotated[int, Field(ge=0)] = 0
     maximum_process_recoveries: Annotated[int, Field(ge=0, le=2)] = 2
     maximum_automatic_backjump: Annotated[int, Field(ge=0, le=1)] = 0
     maximum_total_repair_attempts: Annotated[int, Field(ge=0)] = 3
@@ -518,14 +542,15 @@ class WorkDefinition(V2Contract):
             )
         if any(item.producer_component != self.coordinate.component for item in self.output_slots):
             raise ValueError("output Artifact slot owner must match Work coordinate component")
-        semantic_repair = (
+        mutation_repair = (
             self.repair_policy.maximum_local_corrections
             or self.repair_policy.strict_progress_bonus_corrections
             or self.repair_policy.maximum_automatic_backjump
+            or self.repair_policy.maximum_session_continuations
         )
-        if semantic_repair != bool(self.allowed_mutation_roots):
+        if bool(mutation_repair) != bool(self.allowed_mutation_roots):
             raise ValueError(
-                "semantic repair policy and allowed mutation roots must be declared together"
+                "mutable repair/continuation policy and allowed mutation roots must be declared together"
             )
         if bool(self.repair_target_coordinates) != bool(
             self.repair_policy.maximum_automatic_backjump
@@ -574,9 +599,7 @@ class WorkDefinition(V2Contract):
                     ),
                     "output_contract_id": self.proposal_policy.output_contract_id,
                     "acceptance_transform_id": (self.proposal_policy.acceptance_transform_id),
-                    "implementation_revision_id": (
-                        self.proposal_policy.implementation_revision_id
-                    ),
+                    "implementation_revision_id": (self.proposal_policy.implementation_revision_id),
                     "tool_ids": self.proposal_policy.tool_ids,
                     "validation": {
                         "validator_id": validation.validator_id,
@@ -684,9 +707,8 @@ class ProposalExecution(V2Contract):
             and self.error_code.startswith("process_interrupted")
         )
         if self.executor == "agent" and any(value is None for value in agent_fields):
-            if (
-                not (agent_preflight_failure or agent_interrupted_before_provenance)
-                or any(value is not None for value in agent_fields)
+            if not (agent_preflight_failure or agent_interrupted_before_provenance) or any(
+                value is not None for value in agent_fields
             ):
                 raise ValueError(
                     "Agent execution requires invocation/profile/model/schema evidence "
@@ -859,6 +881,10 @@ class ValidationIssue(V2Contract):
     path: Annotated[tuple[str | int, ...], Field(min_length=1)]
     violated_condition: Annotated[NonEmptyStr, Field(max_length=512)]
     expected_category: Annotated[NonEmptyStr, Field(max_length=512)]
+    # ``remediation`` is framework-authored safe guidance, never a rejected
+    # model value.  It lets a later authorized correction distinguish the
+    # concrete next edit from the durable condition/expectation identity.
+    remediation: Annotated[NonEmptyStr, Field(max_length=512)] | None = None
     severity: Literal["warning", "blocker"] = "blocker"
     retryable: bool = True
 
@@ -877,6 +903,22 @@ class ValidationIssue(V2Contract):
         return self.retryable and self.code not in _GENERIC_ISSUE_CODES and not root_only
 
     @property
+    def informative(self) -> bool:
+        """Whether feedback names one safe next debugging route without authorizing repair.
+
+        A non-retryable external terminal can still be enough for a Code Agent
+        to act on: it may direct an adapter, profile, Provider, or observability
+        change while explicitly forbidding an in-attempt Agent correction.  Do
+        not label that case ``insufficient`` merely because Scheduler cannot
+        spend another turn.  Framework-authored remediation is the deliberate
+        proof that the feedback identifies a bounded next action.
+        """
+
+        return self.actionable or (
+            self.code not in _GENERIC_ISSUE_CODES and self.remediation is not None
+        )
+
+    @property
     def normalized_identity(self) -> ContentHash:
         return sha256_digest(
             canonical_json_bytes(
@@ -888,6 +930,23 @@ class ValidationIssue(V2Contract):
                 }
             )
         )
+
+
+def diagnostic_quality_for_issues(
+    *,
+    status: ValidationStatus,
+    issues: tuple[ValidationIssue, ...],
+) -> DiagnosticQuality:
+    """Derive diagnostic quality independently from repair authority."""
+
+    if status == "passed":
+        return "not_applicable"
+    blockers = tuple(issue for issue in issues if issue.severity == "blocker")
+    if blockers and all(issue.actionable for issue in blockers):
+        return "actionable"
+    if blockers and all(issue.informative for issue in blockers):
+        return "informative"
+    return "insufficient"
 
 
 class ValidationReport(V2Contract):
@@ -930,17 +989,15 @@ class ValidationReport(V2Contract):
                 raise ValueError("passed validation report cannot contain blockers")
             if not self.subject_refs:
                 raise ValueError("passed validation report must bind validated subjects")
-            expected_quality: DiagnosticQuality = "not_applicable"
         else:
             if self.status == "failed" and not blockers:
                 raise ValueError("failed validation report requires at least one blocker")
             if not self.issues and not self.evidence_refs:
                 raise ValueError("non-passing validation requires diagnostics or evidence")
-            expected_quality = (
-                "actionable"
-                if blockers and all(item.actionable for item in blockers)
-                else "insufficient"
-            )
+        expected_quality = diagnostic_quality_for_issues(
+            status=self.status,
+            issues=self.issues,
+        )
         if self.diagnostic_quality != expected_quality:
             raise ValueError("diagnostic quality is not the framework-derived value")
         if self.diagnostic_only and self.releasable:
@@ -969,8 +1026,8 @@ class ValidationReport(V2Contract):
         """
 
         blockers = tuple(issue for issue in self.issues if issue.severity == "blocker")
-        return self.status == "error" and bool(blockers) and all(
-            issue.retryable for issue in blockers
+        return (
+            self.status == "error" and bool(blockers) and all(issue.retryable for issue in blockers)
         )
 
     @property
@@ -1291,7 +1348,12 @@ class WorkRepairLedgerEntry(V2Contract):
     input_fingerprint: ContentHash | None = None
     repair_policy_digest: ContentHash
     repair_action_ref: ArtifactRef
-    decision: Literal["local_correction", "parent_correction", "infrastructure_retry"]
+    decision: Literal[
+        "local_correction",
+        "parent_correction",
+        "infrastructure_retry",
+        "session_continuation",
+    ]
     reason_code: Identifier = "legacy_unspecified"
     source_evaluation_ref: ArtifactRef
     report_before_ref: ArtifactRef
@@ -1400,15 +1462,21 @@ class RepairAction(V2Contract):
         ):
             if _duplicates(values):
                 raise ValueError("repair inputs, mutation roots, and evidence must be unique")
-        executes = self.decision in {
+        physical_attempt = self.decision in {
+            "local_correction",
+            "parent_correction",
+            "infrastructure_retry",
+            "session_continuation",
+        }
+        charged_repair = self.decision in {
             "local_correction",
             "parent_correction",
             "infrastructure_retry",
         }
-        if executes != (self.repair_attempt_charge == 1):
+        if charged_repair != (self.repair_attempt_charge == 1):
             raise ValueError("only an executing repair action consumes one repair attempt")
-        if executes != (self.repair_attempt_ordinal >= 1):
-            raise ValueError("only an executing repair action has a positive attempt ordinal")
+        if physical_attempt != (self.repair_attempt_ordinal >= 1):
+            raise ValueError("only a physical continuation or repair has a positive attempt ordinal")
         if self.jump_distance >= 2 and self.decision != "request_human":
             raise ValueError("distance-two repair requires human authority")
         if self.decision == "local_correction":
@@ -1421,11 +1489,18 @@ class RepairAction(V2Contract):
                 raise ValueError("parent correction must target a distinct coordinate")
         if self.decision == "infrastructure_retry" and self.jump_distance != 0:
             raise ValueError("infrastructure retry cannot backjump")
+        if self.decision == "session_continuation":
+            if self.jump_distance != 0 or self.target_coordinate != self.current_coordinate:
+                raise ValueError("session continuation must target the current coordinate")
+            if not (self.immutable_input_refs and self.allowed_mutation_roots):
+                raise ValueError(
+                    "session continuation requires exact immutable inputs and mutation roots"
+                )
         if self.decision in {"local_correction", "parent_correction"} and not (
             self.immutable_input_refs and self.allowed_mutation_roots
         ):
             raise ValueError("semantic correction requires immutable inputs and mutation roots")
-        if not executes and self.allowed_mutation_roots:
+        if not physical_attempt and self.allowed_mutation_roots:
             raise ValueError("non-executing decision cannot grant mutation authority")
         return self
 
@@ -1572,6 +1647,7 @@ __all__ = [
     "WorkDefinition",
     "WorkRepairLedgerEntry",
     "classify_progress",
+    "diagnostic_quality_for_issues",
     "repair_epoch_digest",
     "work_input_fingerprint",
 ]

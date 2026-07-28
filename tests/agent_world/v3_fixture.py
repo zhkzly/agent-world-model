@@ -30,6 +30,7 @@ from agent_world.builder import (
     CandidateWorkspaceValidator,
     EnvironmentBuilder,
     ImplementationContract,
+    ImplementationPlan,
 )
 from agent_world.builder.models import TaskMaterializerContract, ToolBindingRequirement
 from agent_world.contracts import (
@@ -615,11 +616,23 @@ def _commit_prepackage_fixture_closure(
         stage="world_rules",
         dependencies=(behavior,),
     )
+    curriculum_plan = _fixture_boundary(
+        scope_id=scope_id,
+        component="design",
+        stage="curriculum_plan",
+        dependencies=(rules,),
+    )
+    task_requirement = _fixture_boundary(
+        scope_id=scope_id,
+        component="design",
+        stage="task_requirement",
+        dependencies=(curriculum_plan,),
+    )
     curriculum = _fixture_boundary(
         scope_id=scope_id,
         component="design",
         stage="task_curriculum",
-        dependencies=(rules,),
+        dependencies=(curriculum_plan, task_requirement),
     )
     modeling = _fixture_boundary(
         scope_id=scope_id,
@@ -633,7 +646,14 @@ def _commit_prepackage_fixture_closure(
     )
     design_graph = compile_design_work_graph(
         scope_id=scope_id,
-        design_definitions=(*bootstrap_definitions, behavior, rules, curriculum),
+        design_definitions=(
+            *bootstrap_definitions,
+            behavior,
+            rules,
+            curriculum_plan,
+            task_requirement,
+            curriculum,
+        ),
         modeling_definition=modeling,
         verifier_plan_definition=verifier_plan,
     )
@@ -660,7 +680,23 @@ def _commit_prepackage_fixture_closure(
         subject_ref=rules_ref,
         output_refs=(rules_ref,),
     )
-    curriculum_inputs = (context_ref, rules_ref)
+    curriculum_plan_inputs = (context_ref, rules_ref)
+    curriculum_plan_ref = stage_output("curriculum-plan", curriculum_plan_inputs)
+    runtime.execute_deterministic_boundary(
+        definition=curriculum_plan,
+        input_refs=curriculum_plan_inputs,
+        subject_ref=curriculum_plan_ref,
+        output_refs=(curriculum_plan_ref,),
+    )
+    task_requirement_inputs = (context_ref, curriculum_plan_ref)
+    task_requirement_ref = stage_output("task-requirement", task_requirement_inputs)
+    runtime.execute_deterministic_boundary(
+        definition=task_requirement,
+        input_refs=task_requirement_inputs,
+        subject_ref=task_requirement_ref,
+        output_refs=(task_requirement_ref,),
+    )
+    curriculum_inputs = (context_ref, curriculum_plan_ref, task_requirement_ref)
     curriculum_output_ref = stage_output("task-curriculum", curriculum_inputs)
     runtime.execute_deterministic_boundary(
         definition=curriculum,
@@ -712,6 +748,27 @@ def _commit_prepackage_fixture_closure(
         output_refs=(verifier_plan_ref,),
     )
 
+    candidate = store.get_json(candidate_ref, EnvironmentCandidate)
+    implementation_contract_ref = candidate.implementation_contract_ref
+    fixture_builder_writer = builder_writer(store)
+    implementation_plan_value = ImplementationPlan(
+        plan_id=f"implementation-plan:fixture:{scope_suffix}",
+        design_ref=design_ref,
+        implementation_contract_ref=implementation_contract_ref,
+        world_spec_hash=fixture_design.world_spec.content_digest(),
+        curriculum_hash=fixture_design.curriculum.content_digest(),
+        implementation_strategy=(
+            "Fixture provenance plan: the already-executed candidate maps the frozen WorldSpec "
+            "to its Runtime and Task Materializer closure."
+        ),
+    )
+    implementation_plan_ref = fixture_builder_writer.put_json(
+        artifact_id=implementation_plan_value.plan_id,
+        artifact_type="build.implementation_plan",
+        value=implementation_plan_value,
+        dependencies=(design_ref, implementation_contract_ref),
+    )
+
     final_graph = complete_generation_work_graph(
         scope_id=scope_id,
         design_graph=design_graph,
@@ -723,11 +780,28 @@ def _commit_prepackage_fixture_closure(
     # records that already-existing Candidate as a code boundary so Registry
     # tests exercise publication, recovery and package closure rather than
     # inventing a second fake code-generation implementation.
+    production_plan = next(
+        item
+        for item in final_graph.definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("build", "implementation_plan")
+    )
     production_build = next(
         item
         for item in final_graph.definitions
         if (item.coordinate.component, item.coordinate.stage) == ("build", "candidate_build")
     )
+    fixture_plan = deterministic_boundary_work_definition(
+        scope_id=scope_id,
+        component="build",  # type: ignore[arg-type]
+        stage="implementation_plan",
+        artifact_slot=production_plan.coordinate.artifact_slot,
+        dependency_coordinates=production_plan.dependency_coordinates,
+        claim_id="fixture.build.implementation-plan.recorded",
+        claim="A pre-executed fixture implementation plan is recorded for provenance tests.",
+        timing_reason="Registry tests do not execute the production planning Agent.",
+        effect="block_integration",
+        success_maturity="implementation_planned",
+    ).model_copy(update={"input_slots": production_plan.input_slots})
     fixture_build = deterministic_boundary_work_definition(
         scope_id=scope_id,
         component="build",  # type: ignore[arg-type]
@@ -742,7 +816,11 @@ def _commit_prepackage_fixture_closure(
     ).model_copy(update={"input_slots": production_build.input_slots})
     final_graph = GenerationWorkGraph.compile(
         tuple(
-            fixture_build if item.coordinate == production_build.coordinate else item
+            fixture_plan
+            if item.coordinate == production_plan.coordinate
+            else fixture_build
+            if item.coordinate == production_build.coordinate
+            else item
             for item in final_graph.definitions
         ),
         mode="production",
@@ -754,6 +832,11 @@ def _commit_prepackage_fixture_closure(
         item
         for item in final_graph.definitions
         if (item.coordinate.component, item.coordinate.stage) == ("build", "candidate_build")
+    )
+    implementation_plan = next(
+        item
+        for item in final_graph.definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("build", "implementation_plan")
     )
     verifier_batch = next(
         item
@@ -796,8 +879,14 @@ def _commit_prepackage_fixture_closure(
     )
 
     runtime.execute_deterministic_boundary(
-        definition=build,
+        definition=implementation_plan,
         input_refs=(context_ref, design_ref),
+        subject_ref=implementation_plan_ref,
+        output_refs=(implementation_contract_ref, implementation_plan_ref),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=build,
+        input_refs=(context_ref, design_ref, implementation_contract_ref, implementation_plan_ref),
         subject_ref=candidate_ref,
         output_refs=(
             candidate_ref,

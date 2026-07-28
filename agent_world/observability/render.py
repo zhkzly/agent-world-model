@@ -30,6 +30,7 @@ def render_scene(scene: RunSceneIndex, coordinates: tuple[CoordinateScene, ...])
             lines.append(f"Reason: {scene.stuck_reason}")
         if stuck.top_issues:
             lines.append(_why_line(stuck, stuck.top_issues[0]))
+        _append_timing(lines, stuck)
         if stuck.repair_target == "generated_candidate_code" and stuck.candidate_file is not None:
             lines.append(
                 "Repair target: generated Candidate code. "
@@ -78,6 +79,7 @@ def render_coordinate(scene: CoordinateScene) -> str:
         f"Progress: {scene.frontier_progress}",
         f"Repair authority: {scene.repair_authority}",
     ]
+    _append_timing(lines, scene)
     if scene.failure_code is not None:
         lines.append(f"Failure code: {_text(scene.failure_code)}")
     if scene.candidate_file is not None:
@@ -123,11 +125,94 @@ def _why_line(scene: CoordinateScene, issue: TopIssue) -> str:
 
 def _issue_line(issue: TopIssue) -> str:
     location = "/".join(_text(str(part)) for part in issue.path)
-    return (
+    line = (
         f"- [{issue.severity}] {_text(issue.code)} at {location}: "
         f"{_text(issue.violated_condition)} "
         f"(expected {_text(issue.expected_category)})"
     )
+    if issue.remediation is not None:
+        line += f" Fix: {_text(issue.remediation)}"
+    return line
+
+
+def _append_timing(lines: list[str], scene: CoordinateScene) -> None:
+    """Render the safe durable timing facts without introducing live state."""
+
+    if scene.attempt_elapsed_ms is not None:
+        label = "Elapsed (running estimate)" if scene.attempt_elapsed_estimated else "Elapsed"
+        lines.append(f"{label}: {scene.attempt_elapsed_ms} ms")
+    if scene.first_progress_elapsed_ms is not None:
+        lines.append(f"First progress: {scene.first_progress_elapsed_ms} ms")
+    if scene.terminal_failure_phase is not None:
+        failure = f"Terminal failure phase: {scene.terminal_failure_phase}"
+        if scene.terminal_failure_elapsed_ms is not None:
+            failure += f" ({scene.terminal_failure_elapsed_ms} ms)"
+        lines.append(failure)
+    if scene.last_completed_phase is not None:
+        lines.append(f"Last completed phase: {scene.last_completed_phase}")
+    budget_exhaustion = scene.budget_exhaustion
+    if budget_exhaustion is not None:
+        details = [
+            "Budget exhaustion: " + ", ".join(budget_exhaustion.exhausted_dimensions)
+        ]
+        if budget_exhaustion.during_authorized_repair:
+            details.append("before a Scheduler-authorized repair")
+        if budget_exhaustion.operation_not_started:
+            details.append("no operation ran in this attempt")
+        lines.append("; ".join(details) + ".")
+        if budget_exhaustion.operation_not_started:
+            lines.append(
+                "Next permitted action: reconcile the finite run budget for a fresh request; "
+                "do not retry this terminal attempt."
+            )
+    runtime_agent = scene.runtime_agent_liveness
+    if runtime_agent is not None:
+        details = [f"started +{runtime_agent.started_elapsed_ms} ms"]
+        if runtime_agent.first_progress_elapsed_ms is not None:
+            details.append(f"first progress +{runtime_agent.first_progress_elapsed_ms} ms")
+        if runtime_agent.last_progress_elapsed_ms is not None:
+            details.append(f"last progress +{runtime_agent.last_progress_elapsed_ms} ms")
+        if runtime_agent.last_local_heartbeat_elapsed_ms is not None:
+            heartbeat = (
+                "local heartbeat "
+                f"+{runtime_agent.last_local_heartbeat_elapsed_ms} ms"
+            )
+            if runtime_agent.last_local_heartbeat_phase is not None:
+                heartbeat += f" phase={runtime_agent.last_local_heartbeat_phase}"
+            details.append(heartbeat + " (not Provider progress)")
+        if runtime_agent.terminal_elapsed_ms is not None:
+            details.append(f"terminal +{runtime_agent.terminal_elapsed_ms} ms")
+        details.append(f"events={runtime_agent.observed_event_count}")
+        if runtime_agent.activity is None:
+            details.append("activity=unavailable (legacy or no typed SDK item event)")
+        else:
+            activity_parts = tuple(
+                f"{label}={count}"
+                for label, count in (
+                    ("reasoning-events", runtime_agent.activity.reasoning_event_count),
+                    ("message-events", runtime_agent.activity.agent_message_event_count),
+                    ("command-events", runtime_agent.activity.command_event_count),
+                    ("file-change-events", runtime_agent.activity.file_change_event_count),
+                    ("tool-events", runtime_agent.activity.tool_event_count),
+                    ("other-events", runtime_agent.activity.other_event_count),
+                    ("unclassified-events", runtime_agent.activity.unclassified_event_count),
+                )
+                if count
+            )
+            details.append(
+                "activity=" + (", ".join(activity_parts) if activity_parts else "none observed")
+            )
+        lines.append(f"Runtime Agent liveness: {'; '.join(details)}")
+    workspace = scene.candidate_workspace_liveness
+    if workspace is not None:
+        heartbeat = (
+            f"Candidate workspace heartbeat: {workspace.status}; "
+            f"observed +{workspace.observed_elapsed_ms} ms; files={workspace.file_count}; "
+            f"bytes={workspace.total_bytes}"
+        )
+        if workspace.error_code is not None:
+            heartbeat += f"; error={_text(workspace.error_code)}"
+        lines.append(heartbeat)
 
 
 def _coordinate_by_key(

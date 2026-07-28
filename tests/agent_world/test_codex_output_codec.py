@@ -24,6 +24,7 @@ from agent_world.invocation import (
     InvocationLimits,
     InvocationRequest,
     InvocationResult,
+    InvocationSession,
     InvocationStatus,
     NodeCapabilityRequirement,
 )
@@ -106,6 +107,7 @@ def test_worker_payload_passes_logical_schema_directly_to_codex_sdk(
     assert payload["prompt"] == request.prompt
     assert payload["openai_base_url_environment"] == "OPENAI_BASE_URL"
     assert payload["sensitive_environment_names"] == ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
+    assert payload["diagnostic_capture_terminal_excerpt"] is False
     assert "provider.example.test" not in json.dumps(payload, sort_keys=True)
     assert payload["output_schema"]["properties"]["dynamic"] == {
         "type": "object",
@@ -156,6 +158,21 @@ def test_json_envelope_transport_uses_a_shallow_provider_schema(tmp_path: Path) 
         "required": ["artifact_json"],
         "additionalProperties": False,
     }
+
+
+def test_worker_payload_forwards_terminal_excerpt_capture_only_when_explicitly_opted_in(
+    tmp_path: Path,
+) -> None:
+    request = _request(tmp_path)
+    diagnostic_request = replace(
+        request,
+        metadata={"diagnostic_capture_terminal_excerpt": True},
+    )
+
+    assert (
+        CodexSdkBackend._worker_payload(diagnostic_request)["diagnostic_capture_terminal_excerpt"]
+        is True
+    )
 
 
 def test_json_envelope_decodes_the_inner_json_document_or_gateway_object() -> None:
@@ -245,6 +262,140 @@ def test_ephemeral_sqlite_home_is_memory_backed_and_removed_after_use() -> None:
         assert sqlite_home.is_dir()
 
     assert not sqlite_home.exists()
+
+
+@pytest.mark.asyncio
+async def test_backend_reuses_private_sqlite_home_for_a_resumed_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = CodexSdkBackend()
+    initial = _request(tmp_path)
+    observed_homes: list[Path] = []
+
+    async def fake_worker(
+        request: InvocationRequest,
+        *,
+        sqlite_home: Path,
+        **_: object,
+    ) -> InvocationResult:
+        observed_homes.append(sqlite_home)
+        return InvocationResult(
+            invocation_id=request.invocation_id,
+            status=InvocationStatus.COMPLETED,
+            session=InvocationSession(
+                thread_id="retained-thread",
+                lineage_id=request.profile.lineage_id,
+                workspace=request.profile.workspace,
+                profile_hash=request.profile.profile_hash,
+                codex_config_sha256=request.profile.codex_config_sha256,
+            ),
+            turn_id="turn:test",
+            final_text="completed",
+            structured_output=None,
+            usage=None,
+            events=(),
+            error=None,
+            duration_ms=1,
+            backend_version="test",
+        )
+
+    monkeypatch.setattr(backend, "_invoke_worker_process", fake_worker)
+
+    first = await backend._invoke_with_capacity(initial)
+    assert first.session is not None
+    second = await backend._invoke_with_capacity(
+        replace(initial, invocation_id="codec-contract-resume", session=first.session)
+    )
+
+    assert second.succeeded
+    assert observed_homes[0] == observed_homes[1]
+    assert observed_homes[0].is_dir()
+    assert await backend.close_session(first.session) is True
+    assert not observed_homes[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_resume_without_private_runtime_state_fails_before_a_worker_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = CodexSdkBackend()
+    initial = _request(tmp_path)
+    session = InvocationSession(
+        thread_id="missing-private-runtime",
+        lineage_id=initial.profile.lineage_id,
+        workspace=initial.profile.workspace,
+        profile_hash=initial.profile.profile_hash,
+        codex_config_sha256=initial.profile.codex_config_sha256,
+    )
+
+    async def unexpected_worker(**_: object) -> InvocationResult:
+        raise AssertionError("a missing session runtime must fail before worker startup")
+
+    monkeypatch.setattr(backend, "_invoke_worker_process", unexpected_worker)
+
+    result = await backend._invoke_with_capacity(
+        replace(initial, invocation_id="codec-contract-missing-runtime", session=session)
+    )
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "session_runtime_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_session_from_a_previous_backend_instance_fails_closed_before_worker_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A thread id is not mistaken for its missing private SQLite checkpoint."""
+
+    first_backend = CodexSdkBackend()
+    initial = _request(tmp_path)
+
+    async def first_worker(
+        request: InvocationRequest,
+        **_: object,
+    ) -> InvocationResult:
+        return InvocationResult(
+            invocation_id=request.invocation_id,
+            status=InvocationStatus.COMPLETED,
+            session=InvocationSession(
+                thread_id="prior-backend-thread",
+                lineage_id=request.profile.lineage_id,
+                workspace=request.profile.workspace,
+                profile_hash=request.profile.profile_hash,
+                codex_config_sha256=request.profile.codex_config_sha256,
+            ),
+            turn_id="turn:first",
+            final_text="completed",
+            structured_output=None,
+            usage=None,
+            events=(),
+            error=None,
+            duration_ms=1,
+            backend_version="test",
+        )
+
+    monkeypatch.setattr(first_backend, "_invoke_worker_process", first_worker)
+    first = await first_backend._invoke_with_capacity(initial)
+    assert first.session is not None
+
+    restarted_backend = CodexSdkBackend()
+
+    async def unexpected_worker(**_: object) -> InvocationResult:
+        raise AssertionError("a restarted backend must not fabricate a resumed worker")
+
+    monkeypatch.setattr(restarted_backend, "_invoke_worker_process", unexpected_worker)
+    resumed = await restarted_backend._invoke_with_capacity(
+        replace(initial, invocation_id="codec-contract-restarted", session=first.session)
+    )
+
+    assert resumed.status is InvocationStatus.FAILED
+    assert resumed.error is not None
+    assert resumed.error.code == "session_runtime_unavailable"
+    assert await first_backend.close_session(first.session) is True
 
 
 def test_provider_schema_compiler_closes_pydantic_objects_and_unions() -> None:

@@ -21,6 +21,7 @@ per-leaf later without changing the acceptance contract.
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Mapping
 from pathlib import Path
 
 from agent_world.contracts import canonical_json_bytes, sha256_digest
@@ -43,18 +44,20 @@ def leaf_code_revision(
     *module_names: str,
     model: str | None = None,
     label: str = "impl",
+    assets: Mapping[str, Path] | None = None,
 ) -> str:
     """Return a stable acceptance-critical revision id for a leaf implementation.
 
     ``module_names`` are the dotted module paths whose source authors the leaf's
-    behavior.  ``model`` binds the Agent model identity when the leaf's output
-    depends on it.  The result is stable across processes for identical source
-    and model, and changes whenever any named module's source changes.
+    behavior. ``assets`` optionally binds named, in-tree runtime assets such as
+    a mounted Runtime Skill. ``model`` binds the Agent model identity when the
+    leaf's output depends on it. The result is stable across processes for
+    identical inputs and changes whenever a named module or asset changes.
     """
 
     if not module_names:
         raise ValueError("leaf_code_revision requires at least one module name")
-    payload = {
+    payload: dict[str, object] = {
         "protocol": "framework.leaf-code-revision.v1",
         "modules": {
             name: sha256_digest(_module_source_bytes(name))
@@ -62,6 +65,16 @@ def leaf_code_revision(
         },
         "model": model,
     }
+    if assets:
+        resolved_assets: dict[str, str] = {}
+        for name, asset_path in sorted(assets.items()):
+            if not name:
+                raise ValueError("leaf_code_revision asset name cannot be empty")
+            candidate = Path(asset_path)
+            if not candidate.is_file():
+                raise ValueError(f"cannot locate runtime asset {name!r}")
+            resolved_assets[name] = sha256_digest(candidate.read_bytes())
+        payload["assets"] = resolved_assets
     digest = sha256_digest(canonical_json_bytes(payload))
     short = digest.split(":", 1)[-1][:16] if ":" in digest else digest[:16]
     return f"framework.{label}.{short}"

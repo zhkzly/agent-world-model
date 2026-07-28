@@ -31,3 +31,11 @@ Collect evidence that lets the Foundry turn a human need into a faithful executa
   budget on exhaustive reading.
 
 If evidence is unavailable, return the unresolved question or failure explicitly.
+
+## Citation catalog ownership
+
+When a framework-provided CitationCatalog appears, evidence identity is framework-owned. Select
+the one-based `citation_index` entries through `evidence_catalog_indexes`; never copy, rename,
+infer, or invent an opaque evidence ID. Before returning, check that every observed claim has at
+least one catalog index and that every chosen index exists in the supplied catalog. If no entry
+supports a fact, leave it unresolved rather than fabricating a citation.

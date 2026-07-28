@@ -106,6 +106,11 @@ provider。只有已通过真实 probe 证明某个兼容 gateway 会拒绝嵌�
 原始 Pydantic contract、确定性 compiler、Scheduler repair 和所有 Release Gate 验证；它不是
 模板、mock 或放宽输出/发布验收的开关。
 
+真实的长时单节点诊断可以显式把 `structured_turn_token_limit` 提高到
+`5_000_000`，并配套提高 `structured_invocation_timeout_seconds` 与该次诊断的总预算。它仍是
+可观测、可结算的有限 lease，目的在于避免把仍在推进的 Agent 误截断为短时失败；不能借此绕过
+Scheduler 的预算、终态和重试授权。
+
 ## 三种隔离 Agent Profile
 
 系统只物化三种 profile：

@@ -9,8 +9,6 @@ used by the configured Searxng/Jina/Bing production adapter.
 from __future__ import annotations
 
 import hashlib
-import json
-import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -123,14 +121,17 @@ class _PlanBackend:
 class _SynthesisBackend:
     """Protocol double for Scheduler wiring; never a production evidence claim."""
 
+    def __init__(self) -> None:
+        self.requests: list[InvocationRequest] = []
+
     @property
     def supported_executor_revision_ids(self) -> tuple[str, ...]:
         return ("framework.executor.v1",)
 
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
-        match = re.search(r"The exact allowed evidence_ids are: (\[[^\n]+\])", request.prompt)
-        assert match is not None
-        evidence_ids = json.loads(match.group(1))
+        self.requests.append(request)
+        assert "CitationCatalog:" in request.prompt
+        assert "evidence_id" not in request.prompt
         return InvocationResult(
             invocation_id=request.invocation_id,
             status=InvocationStatus.COMPLETED,
@@ -146,8 +147,8 @@ class _SynthesisBackend:
                             "Availability is checked before a reservation is confirmed."
                         ),
                         "confidence": 0.9,
-                        "evidence_ids": evidence_ids,
-                        "status": "supported",
+                        "evidence_catalog_indexes": [1],
+                        "claim_status": "supported",
                         "risk": "medium",
                     }
                 ],
@@ -508,10 +509,11 @@ async def test_acquisition_runs_one_real_toolchain_operation_and_exposes_evidenc
         workspace_root=tmp_path / "workspaces",
         kernel=SchedulerLeafExecutor(runtime=runtime),
     )
+    synthesis_backend = _SynthesisBackend()
     synthesis_leaf = EvidenceSynthesisLeaf(
         context_ref=context_ref,
         workspace_root=tmp_path / "workspaces",
-        backend=_SynthesisBackend(),
+        backend=synthesis_backend,
         profiles=profiles,
         kernel=SchedulerLeafExecutor(runtime=runtime),
     )
@@ -606,3 +608,5 @@ async def test_acquisition_runs_one_real_toolchain_operation_and_exposes_evidenc
     assert not bootstrap_manifest.releasable
     assert bootstrap_epoch.epoch_kind == "bootstrap"
     assert evidence_graph.claims[0].evidence_ids == (record.evidence[0].evidence_id,)
+    assert len(synthesis_backend.requests) == 1
+    assert record.evidence[0].evidence_id not in synthesis_backend.requests[0].prompt

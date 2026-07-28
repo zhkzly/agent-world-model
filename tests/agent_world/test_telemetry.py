@@ -11,7 +11,7 @@ import pytest
 
 from agent_world.contracts import ArtifactRef, sha256_digest
 from agent_world.control import MetricPoint, TelemetryError, TelemetryStore
-from agent_world.control.telemetry import _invocation_metrics
+from agent_world.control.telemetry import _invocation_metrics, classify_invocation_activity
 from agent_world.invocation import (
     InvocationRequest,
     InvocationResult,
@@ -242,9 +242,7 @@ def test_recovery_closes_orphaned_trace_spans_without_erasing_provider_metrics(
         assert inspected["summary"]["open_span_count"] == 0
         assert inspected["summary"]["metrics_sum"]["invocation.events.observed_delta"] == 1
         assert {row["status"] for row in inspected["spans"]} == {"error"}
-        assert {row["error_code"] for row in inspected["spans"]} == {
-            "owner_process_interrupted"
-        }
+        assert {row["error_code"] for row in inspected["spans"]} == {"owner_process_interrupted"}
 
 
 def test_semantic_transaction_costs_are_aggregated_without_prompt_content(
@@ -287,9 +285,9 @@ def test_semantic_transaction_costs_are_aggregated_without_prompt_content(
             ),
         )
 
-        transaction = store.inspect_trace("run:transactions")["summary"][
-            "semantic_transactions"
-        ]["design.world-architecture"]
+        transaction = store.inspect_trace("run:transactions")["summary"]["semantic_transactions"][
+            "design.world-architecture"
+        ]
         assert transaction["turns"] == 1
         assert transaction["tokens_total"] == 1200
         assert transaction["tokens_input"] == 900
@@ -372,9 +370,20 @@ def test_running_invocation_projects_throttled_safe_progress(tmp_path: Path) -> 
         )
 
         span = writer.start_invocation(request)
-        span.progress("item.started")
+        span.progress(
+            "item.started",
+            {"item": {"id": "reasoning-canary-must-not-persist", "type": "reasoning"}},
+        )
         for _ in range(128):
-            span.progress("tool.call.updated")
+            span.progress(
+                "item.updated",
+                {
+                    "item": {
+                        "id": "command-canary-must-not-persist",
+                        "type": "commandExecution",
+                    }
+                },
+            )
 
         inspected = reader.inspect_trace("run:progress")
         live = reader.active_work("run:progress")
@@ -383,8 +392,38 @@ def test_running_invocation_projects_throttled_safe_progress(tmp_path: Path) -> 
         assert inspected["spans"][0]["last_progress_at_ns"] is not None
         assert len(live) == 1
         assert live[0]["observed_event_count"] == 129
-        assert live[0]["observed_protocol_tool_event_count"] == 128
+        assert live[0]["activity_classification_available"] is True
+        assert live[0]["observed_activity_event_counts"] == {
+            "reasoning": 1,
+            "agent_message": 0,
+            "command": 128,
+            "file_change": 0,
+            "tool": 0,
+            "other": 0,
+            "unclassified": 0,
+        }
         assert live[0]["observed_token_count"] is None
         serialized = json.dumps({"trace": inspected, "active": live})
         assert request.prompt not in serialized
+        assert "reasoning-canary-must-not-persist" not in serialized
+        assert "command-canary-must-not-persist" not in serialized
         span.finish(status="passed")
+
+
+@pytest.mark.parametrize(
+    ("item_type", "expected"),
+    (
+        ("direct_stream_reasoning", "reasoning"),
+        ("direct_stream_output", "agent_message"),
+        ("direct_stream_unclassified", "unclassified"),
+        ("direct_stream_lifecycle", "other"),
+        ("direct_stream_completion", "other"),
+    ),
+)
+def test_direct_stream_activity_projection_preserves_safe_meaning(
+    item_type: str,
+    expected: str,
+) -> None:
+    """Direct stream sentinels stay content-free but remain debuggable live."""
+
+    assert classify_invocation_activity({"item": {"type": item_type}}) == expected

@@ -15,7 +15,12 @@ from pydantic import HttpUrl
 from v3_fixture import build_judge_candidate_graph
 
 from agent_world.agent_profiles import IsolatedAgentProfileProvider
-from agent_world.app import ApplicationConfigurationError, DirectRunReader, build_application
+from agent_world.app import (
+    ApplicationConfigurationError,
+    DirectRunReader,
+    build_application,
+    open_consumption,
+)
 from agent_world.artifact_store import ArtifactStore, ArtifactStoreError, UnsafeArtifactError
 from agent_world.builder import BuilderWorkspaceProgress, EnvironmentBuilder
 from agent_world.cli import (
@@ -24,7 +29,7 @@ from agent_world.cli import (
     _parse_suite_selection,
     build_parser,
 )
-from agent_world.config import AgentBackendConfig, FoundryConfig, ResearchConfig
+from agent_world.config import AgentBackendConfig, FoundryConfig, JudgeConfig, ResearchConfig
 from agent_world.contracts import (
     ArtifactRef,
     Budget,
@@ -346,6 +351,33 @@ def test_missing_base_url_environment_never_contains_credential_material(
 
     assert canary not in str(captured.value)
     assert "routing" in str(captured.value)
+
+
+def test_invalid_judge_cache_is_a_safe_application_configuration_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both clean-builder assembly paths preserve a useful, secret-safe cause."""
+
+    credential = "credential-that-must-not-appear-H38sL2"
+    routing_canary = "https://provider.example.test/v1"
+    missing_cache = tmp_path / "missing-uv-cache"
+    monkeypatch.setenv("OPENAI_API_KEY", credential)
+    monkeypatch.setenv("OPENAI_BASE_URL", routing_canary)
+    config = _filesystem_config(tmp_path).model_copy(
+        update={"judge": JudgeConfig(uv_cache_dir=missing_cache)}
+    )
+
+    for assemble in (build_application, open_consumption):
+        with pytest.raises(ApplicationConfigurationError) as captured:
+            assemble(config)
+
+        message = str(captured.value)
+        assert "judge clean-build configuration" in message
+        assert "judge.uv_cache_dir" in message
+        assert str(missing_cache) not in message
+        assert credential not in message
+        assert routing_canary not in message
 
 
 def test_application_accepts_short_opaque_api_key_and_still_seals_its_canary(
@@ -678,7 +710,16 @@ def test_direct_run_reader_exposes_live_progress_and_budget_without_content() ->
     telemetry_span = {
         "span_id": "span:live",
         "observed_event_count": 129,
-        "observed_protocol_tool_event_count": 8,
+        "activity_classification_available": True,
+        "observed_activity_event_counts": {
+            "reasoning": 4,
+            "agent_message": 1,
+            "command": 8,
+            "file_change": 2,
+            "tool": 0,
+            "other": 0,
+            "unclassified": 0,
+        },
         "observed_token_count": None,
     }
     reader = DirectRunReader(
@@ -696,6 +737,16 @@ def test_direct_run_reader_exposes_live_progress_and_budget_without_content() ->
     assert active["usage"]["unknown_upper_bound"]["llm_tokens"] == 0
     assert active["usage"]["conservative_committed"]["llm_tokens"] == 250
     assert active["usage"]["active_reserved_exposure"]["llm_tokens"] == 1500
+    assert active["usage"]["inflight_observed"]["activity_classification_available"] is True
+    assert active["usage"]["inflight_observed"]["activity_event_counts"] == {
+        "reasoning": 4,
+        "agent_message": 1,
+        "command": 8,
+        "file_change": 2,
+        "tool": 0,
+        "other": 0,
+        "unclassified": 0,
+    }
     assert active["usage"]["active_reserved_exposure"]["wall_seconds"] == 120
     assert active["usage"]["inflight_observed"]["llm_tokens"] is None
     assert "metadata-only" not in json.dumps(inspected)

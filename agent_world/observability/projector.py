@@ -4,12 +4,31 @@ from __future__ import annotations
 
 import json
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from typing import TypeGuard
 
 from agent_world.artifact_store import ArtifactStore, ArtifactWriter
-from agent_world.builder.models import BuildRecord
-from agent_world.contracts import EnvironmentCandidate, canonical_json_bytes, sha256_digest
-from agent_world.control.telemetry import TelemetryStore
-from agent_world.control.work import ValidationIssue, ValidationReport, WorkAttempt
+from agent_world.builder.models import BuilderWorkspaceProgress, BuildRecord
+from agent_world.builder.service import EnvironmentBuilder
+from agent_world.contracts import (
+    ArtifactRef,
+    Budget,
+    EnvironmentCandidate,
+    canonical_json_bytes,
+    sha256_digest,
+)
+from agent_world.control.telemetry import (
+    INVOCATION_ACTIVITY_CLASSES,
+    TelemetryStore,
+    invocation_activity_metric_name,
+)
+from agent_world.control.work import (
+    OperationRun,
+    ProposalExecution,
+    ValidationIssue,
+    ValidationReport,
+    WorkAttempt,
+)
 from agent_world.control.work_graph import WorkGraphManifest
 from agent_world.control.work_store import WorkControlHead, WorkControlStore
 
@@ -17,9 +36,15 @@ from .paths import ObservabilityError, ObservabilityRoot
 from .render import render_coordinate, render_scene
 from .scene import (
     MAX_WATERMARK_COORDINATES,
+    BudgetExhaustion,
+    CandidateWorkspaceLiveness,
+    InvocationLivenessPhase,
+    OperationPhase,
     PipelineStage,
     RepairAuthority,
     RunSceneIndex,
+    RuntimeAgentActivityCounts,
+    RuntimeAgentLiveness,
     Scene,
     SceneHead,
     SceneIssue,
@@ -101,20 +126,19 @@ class SceneProjector:
             )
         graph_digest = self._graph_digest(scope_id, heads)
         attempts = tuple(self.artifacts.get_json(head.attempt_ref, WorkAttempt) for head in heads)
+        observed_at = datetime.now(UTC)
         scene_heads = tuple(
             self._scene_head(
                 head,
                 attempt=attempt,
                 graph_digest=graph_digest,
                 run_id=run_id,
+                observed_at=observed_at,
             )
             for head, attempt in zip(heads, attempts, strict=True)
         )
         events = self._tier_b_events(
-            tuple(
-                attempt.telemetry_trace_id or run_id
-                for attempt in attempts
-            )
+            tuple(attempt.telemetry_trace_id or run_id for attempt in attempts)
         )
         scene = fold(scene_heads, events)
         self._materialize(scene)
@@ -155,8 +179,12 @@ class SceneProjector:
                         "status": status,
                         "attempt_ref_revision": attempt_ref_revision,
                     }
-                    for coordinate_key, revision, status, attempt_ref_revision
-                    in expected_coordinates
+                    for (
+                        coordinate_key,
+                        revision,
+                        status,
+                        attempt_ref_revision,
+                    ) in expected_coordinates
                 )
             )
         )
@@ -212,6 +240,7 @@ class SceneProjector:
         attempt: WorkAttempt | None = None,
         graph_digest: str,
         run_id: str | None,
+        observed_at: datetime,
     ) -> SceneHead:
         attempt = attempt or self.artifacts.get_json(head.attempt_ref, WorkAttempt)
         report = self._validation_report(attempt)
@@ -223,6 +252,27 @@ class SceneProjector:
             for issue in (report.issues if report is not None else ())
             if issue.severity == "blocker"
         )
+        (
+            last_completed_phase,
+            terminal_failure_phase,
+            terminal_failure_elapsed_ms,
+        ) = self._operation_timing(attempt)
+        runtime_agent_liveness = self._runtime_agent_liveness(attempt)
+        attempt_elapsed_ms, attempt_elapsed_estimated = _attempt_elapsed_ms(
+            attempt,
+            observed_at=observed_at,
+        )
+        first_progress_elapsed_ms = _elapsed_ms(
+            attempt.started_at,
+            attempt.first_progress_at,
+        )
+        if first_progress_elapsed_ms is None and runtime_agent_liveness is not None:
+            first_progress_elapsed_ms = runtime_agent_liveness.first_progress_elapsed_ms
+        candidate_workspace_liveness = self._candidate_workspace_liveness(
+            attempt,
+            source_run_id=source_run_id,
+        )
+        budget_exhaustion = self._budget_exhaustion(attempt, report)
         coordinate = head.coordinate
         return SceneHead(
             scope_id=self._safe(head.scope_id),
@@ -247,6 +297,254 @@ class SceneProjector:
             run_id=self._safe(source_run_id) if source_run_id is not None else None,
             graph_digest=graph_digest,
             updated_at=head.updated_at,
+            attempt_elapsed_ms=attempt_elapsed_ms,
+            attempt_elapsed_estimated=attempt_elapsed_estimated,
+            first_progress_elapsed_ms=first_progress_elapsed_ms,
+            last_completed_phase=last_completed_phase,
+            terminal_failure_phase=terminal_failure_phase,
+            terminal_failure_elapsed_ms=terminal_failure_elapsed_ms,
+            runtime_agent_liveness=runtime_agent_liveness,
+            candidate_workspace_liveness=candidate_workspace_liveness,
+            budget_exhaustion=budget_exhaustion,
+        )
+
+    def _operation_timing(
+        self,
+        attempt: WorkAttempt,
+    ) -> tuple[OperationPhase | None, OperationPhase | None, int | None]:
+        """Return only durable, bounded timing facts for the current attempt."""
+
+        completed: list[OperationRun] = []
+        for reference in attempt.operation_run_refs:
+            try:
+                operation = self.artifacts.get_json(reference, OperationRun)
+            except ValueError:
+                # Projection remains best-effort. A malformed historical
+                # operation cannot make the durable Work head disappear.
+                continue
+            if operation.status == "terminal" and operation.finished_at is not None:
+                completed.append(operation)
+        if not completed:
+            return None, None, None
+        last_completed = max(completed, key=_finished_at)
+        failures = tuple(operation for operation in completed if operation.error_code is not None)
+        if not failures:
+            return last_completed.kind, None, None
+        terminal_failure = max(failures, key=_finished_at)
+        return (
+            last_completed.kind,
+            terminal_failure.kind,
+            _elapsed_ms(terminal_failure.started_at, terminal_failure.finished_at),
+        )
+
+    def _runtime_agent_liveness(self, attempt: WorkAttempt) -> RuntimeAgentLiveness | None:
+        """Project only telemetry bound to this exact durable proposal invocation.
+
+        A trace can contain concurrent physical nodes, so trace membership is
+        insufficient.  The terminal ProposalExecution has the exact invocation
+        id; telemetry stores only its hash.  Matching those two durable facts
+        avoids attributing a sibling Agent's progress to this coordinate.
+        """
+
+        if self.telemetry is None or attempt.telemetry_trace_id is None:
+            return None
+        invocation_id = self._proposal_invocation_id(attempt)
+        if invocation_id is None:
+            return None
+        try:
+            trace = self.telemetry.inspect_trace(attempt.telemetry_trace_id)
+        except Exception:
+            return None
+        expected_invocation_hash = sha256_digest(invocation_id.encode("utf-8"))
+        matches: list[dict[str, object]] = []
+        for raw_span in trace.get("spans", ()):  # type: ignore[union-attr]
+            if not isinstance(raw_span, dict):
+                continue
+            if (
+                raw_span.get("component") != "invocation"
+                or raw_span.get("operation") != "agent.invoke"
+            ):
+                continue
+            try:
+                attributes = json.loads(str(raw_span.get("attributes_json", "{}")))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(attributes, dict):
+                continue
+            if attributes.get("invocation_id_hash") != expected_invocation_hash:
+                continue
+            matches.append(raw_span)
+        # An invocation id is a one-physical-turn identity.  A duplicate span
+        # would be an observability defect, not a license to fabricate a
+        # liveness summary from ambiguous evidence.
+        if len(matches) != 1:
+            return None
+        span = matches[0]
+        started_elapsed_ms = _elapsed_from_attempt_ns(attempt.started_at, span.get("started_at_ns"))
+        if started_elapsed_ms is None:
+            return None
+        span_id = span.get("span_id")
+        if not isinstance(span_id, str):
+            return None
+        event_count, activity = self._invocation_event_counts(
+            trace.get("metrics", ()),  # type: ignore[union-attr]
+            span_id=span_id,
+        )
+        return RuntimeAgentLiveness(
+            started_elapsed_ms=started_elapsed_ms,
+            first_progress_elapsed_ms=_elapsed_from_attempt_ns(
+                attempt.started_at,
+                span.get("first_progress_at_ns"),
+            ),
+            last_progress_elapsed_ms=_elapsed_from_attempt_ns(
+                attempt.started_at,
+                span.get("last_progress_at_ns"),
+            ),
+            last_local_heartbeat_elapsed_ms=_elapsed_from_attempt_ns(
+                attempt.started_at,
+                span.get("last_heartbeat_at_ns"),
+            ),
+            last_local_heartbeat_phase=_direct_liveness_phase(
+                span.get("last_heartbeat_phase")
+            ),
+            terminal_elapsed_ms=_elapsed_from_attempt_ns(
+                attempt.started_at,
+                span.get("ended_at_ns"),
+            ),
+            observed_event_count=event_count,
+            activity=activity,
+        )
+
+    def _proposal_invocation_id(self, attempt: WorkAttempt) -> str | None:
+        active: list[str] = []
+        candidates: list[tuple[datetime, str]] = []
+        for reference in attempt.operation_run_refs:
+            try:
+                operation = self.artifacts.get_json(reference, OperationRun)
+            except ValueError:
+                continue
+            if operation.kind != "proposal":
+                continue
+            if operation.status == "running" and operation.dispatch_id is not None:
+                active.append(operation.dispatch_id)
+                continue
+            if (
+                operation.status != "terminal"
+                or operation.execution_ref is None
+                or operation.finished_at is None
+            ):
+                continue
+            try:
+                execution = self.artifacts.get_json(operation.execution_ref, ProposalExecution)
+            except ValueError:
+                continue
+            if execution.invocation_id is not None:
+                candidates.append((operation.finished_at, execution.invocation_id))
+        # A running WorkAttempt has exactly one active OperationRun.  Keeping
+        # this explicit protects a scene from attributing a sibling invocation
+        # if malformed historical state ever contains more than one.
+        if len(active) == 1:
+            return active[0]
+        if active or not candidates:
+            return None
+        return max(candidates, key=lambda item: item[0])[1]
+
+    @staticmethod
+    def _invocation_event_counts(
+        metrics: object,
+        *,
+        span_id: str,
+    ) -> tuple[int, RuntimeAgentActivityCounts | None]:
+        if not isinstance(metrics, (list, tuple)):
+            return 0, None
+        event_metric = "invocation.events.observed_delta"
+        activity_metric_to_class = {
+            invocation_activity_metric_name(activity): activity
+            for activity in INVOCATION_ACTIVITY_CLASSES
+        }
+        event_count = 0
+        activity_counts = {activity: 0 for activity in INVOCATION_ACTIVITY_CLASSES}
+        activity_available = False
+        for metric in metrics:
+            if not isinstance(metric, dict) or metric.get("span_id") != span_id:
+                continue
+            name = metric.get("name")
+            if name != event_metric and name not in activity_metric_to_class:
+                continue
+            value = metric.get("value_integer")
+            if not _nonnegative_int(value):
+                continue
+            if name == event_metric:
+                event_count += value
+                continue
+            activity_available = True
+            activity_counts[activity_metric_to_class[name]] += value
+        if not activity_available:
+            return event_count, None
+        return event_count, RuntimeAgentActivityCounts(
+            reasoning_event_count=activity_counts["reasoning"],
+            agent_message_event_count=activity_counts["agent_message"],
+            command_event_count=activity_counts["command"],
+            file_change_event_count=activity_counts["file_change"],
+            tool_event_count=activity_counts["tool"],
+            other_event_count=activity_counts["other"],
+            unclassified_event_count=activity_counts["unclassified"],
+        )
+
+    def _candidate_workspace_liveness(
+        self,
+        attempt: WorkAttempt,
+        *,
+        source_run_id: str | None,
+    ) -> CandidateWorkspaceLiveness | None:
+        """Read the newest content-free Builder heartbeat for one attempt.
+
+        The first lookup uses the canonical run/attempt identity.  The fallback
+        covers a historical scene rebuilt after a controller changed its run-id
+        projection, while still requiring an exact durable attempt id.
+        """
+
+        references: tuple[ArtifactRef, ...] = ()
+        if source_run_id is not None:
+            artifact_id = EnvironmentBuilder.workspace_progress_artifact_id(
+                source_run_id,
+                attempt.attempt_id,
+            )
+            references = self.artifacts.list_revisions(artifact_id)
+        if not references:
+            references = tuple(
+                reference
+                for reference in self.artifacts.list_revisions()
+                if reference.artifact_type == "build.workspace_progress"
+                and reference.artifact_id.endswith(f":workspace-progress:{attempt.attempt_id}")
+            )
+        candidates: list[BuilderWorkspaceProgress] = []
+        for reference in references:
+            if reference.artifact_type != "build.workspace_progress":
+                continue
+            try:
+                progress = self.artifacts.get_json(reference, BuilderWorkspaceProgress)
+            except ValueError:
+                continue
+            if progress.attempt_id != attempt.attempt_id:
+                continue
+            if attempt.started_at is not None and progress.observed_at < attempt.started_at:
+                continue
+            candidates.append(progress)
+        if not candidates:
+            return None
+        progress = max(candidates, key=lambda item: item.observed_at)
+        observed_elapsed_ms = _elapsed_ms(attempt.started_at, progress.observed_at)
+        if observed_elapsed_ms is None:
+            return None
+        return CandidateWorkspaceLiveness(
+            status=progress.status,
+            observed_elapsed_ms=observed_elapsed_ms,
+            file_count=progress.file_count,
+            total_bytes=progress.total_bytes,
+            error_code=(
+                self._safe(progress.error_code) if progress.error_code is not None else None
+            ),
         )
 
     def _scene_issue(
@@ -266,6 +564,7 @@ class SceneProjector:
             path=tuple(self._safe(part) if isinstance(part, str) else part for part in issue.path),
             violated_condition=self._safe(issue.violated_condition),
             expected_category=self._safe(issue.expected_category),
+            remediation=(self._safe(issue.remediation) if issue.remediation is not None else None),
             severity=issue.severity,
             actionable=issue.actionable,
             gate_id=gate_id,
@@ -277,6 +576,59 @@ class SceneProjector:
         if attempt.validation_report_ref is None:
             return None
         return self.artifacts.get_json(attempt.validation_report_ref, ValidationReport)
+
+    def _budget_exhaustion(
+        self,
+        attempt: WorkAttempt,
+        report: ValidationReport | None,
+    ) -> BudgetExhaustion | None:
+        """Project only typed pre-admission facts from the terminal evidence.
+
+        A failed operation has its own durable ``OperationRun`` and must not be
+        summarized as though the model never ran.  This projection is therefore
+        available only for the Scheduler-owned terminal evidence and explicitly
+        reports whether *this attempt* had opened any operation at all.
+        """
+
+        if attempt.failure_code != "budget_exhausted" or report is None:
+            return None
+        evidence_refs = tuple(
+            ref
+            for ref in report.evidence_refs
+            if ref.artifact_type == "control.budget_exhaustion_evidence"
+        )
+        if len(evidence_refs) != 1:
+            return None
+        try:
+            evidence = self.artifacts.get_json(evidence_refs[0])
+        except ValueError:
+            return None
+        if not isinstance(evidence, dict):
+            return None
+        if (
+            evidence.get("attempt_id") != attempt.attempt_id
+            or evidence.get("failure_code") != "budget_exhausted"
+        ):
+            return None
+        dimensions = evidence.get("exhausted_dimensions")
+        allowed_dimensions = set(Budget.model_fields) - {"schema_version"}
+        if (
+            not isinstance(dimensions, list)
+            or not dimensions
+            or any(
+                not isinstance(dimension, str) or dimension not in allowed_dimensions
+                for dimension in dimensions
+            )
+        ):
+            return None
+        normalized_dimensions = tuple(sorted(set(dimensions)))
+        if tuple(dimensions) != normalized_dimensions:
+            return None
+        return BudgetExhaustion(
+            exhausted_dimensions=normalized_dimensions,
+            during_authorized_repair=attempt.repair_action_ref is not None,
+            operation_not_started=not attempt.operation_run_refs,
+        )
 
     def _previous_issue_ids(self, attempt: WorkAttempt) -> tuple[str, ...]:
         if attempt.parent_attempt_id is None:
@@ -417,9 +769,7 @@ class SceneProjector:
                 )
                 if isinstance(raw_coordinate_key, str) and raw_coordinate_key.startswith("sha256:"):
                     coordinate_key = raw_coordinate_key
-                events.append(
-                    SceneTierBEvent(event_type=event_type, coordinate_key=coordinate_key)
-                )
+                events.append(SceneTierBEvent(event_type=event_type, coordinate_key=coordinate_key))
         return tuple(events)
 
     def _record_projection_failure(self, attempt: WorkAttempt, exc: Exception) -> None:
@@ -476,6 +826,70 @@ class SceneProjector:
             value,
             known_secret_canaries=self.known_secret_canaries,
         )
+
+
+def _elapsed_ms(started_at: datetime | None, finished_at: datetime | None) -> int | None:
+    """Return a bounded projection fact, never a live clock calculation."""
+
+    if started_at is None or finished_at is None:
+        return None
+    return max(0, round((finished_at - started_at).total_seconds() * 1_000))
+
+
+def _attempt_elapsed_ms(
+    attempt: WorkAttempt,
+    *,
+    observed_at: datetime,
+) -> tuple[int | None, bool]:
+    """Return terminal elapsed time or one labelled running-time estimate.
+
+    The estimate deliberately uses the one rebuild checkpoint rather than an
+    invented scheduler snapshot.  It is presentation-only Tier A data and is
+    never reused for budget settlement, timeout enforcement, or release.
+    """
+
+    if attempt.started_at is None:
+        return None, False
+    if attempt.finished_at is not None:
+        return _elapsed_ms(attempt.started_at, attempt.finished_at), False
+    if attempt.status == "running":
+        return _elapsed_ms(attempt.started_at, observed_at), True
+    return None, False
+
+
+def _elapsed_from_attempt_ns(started_at: datetime | None, observed_at_ns: object) -> int | None:
+    """Project a telemetry wall-clock instant relative to one WorkAttempt."""
+
+    if started_at is None or not _nonnegative_int(observed_at_ns):
+        return None
+    started_at_ns = round(started_at.timestamp() * 1_000_000_000)
+    return max(0, round((observed_at_ns - started_at_ns) / 1_000_000))
+
+
+def _direct_liveness_phase(value: object) -> InvocationLivenessPhase | None:
+    """Keep only the closed local wait phases that are safe in a scene."""
+
+    if value == "direct_request_dispatched":
+        return "direct_request_dispatched"
+    if value == "direct_awaiting_response":
+        return "direct_awaiting_response"
+    if value == "direct_stream_opened":
+        return "direct_stream_opened"
+    if value == "direct_awaiting_stream_event":
+        return "direct_awaiting_stream_event"
+    return None
+
+
+def _nonnegative_int(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _finished_at(operation: OperationRun) -> datetime:
+    """Return the timestamp guaranteed by the terminal-operation filter."""
+
+    if operation.finished_at is None:
+        raise ValueError("terminal operation is missing finished_at")
+    return operation.finished_at
 
 
 def _gate_id(code: str) -> str | None:

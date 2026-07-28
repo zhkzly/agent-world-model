@@ -1,87 +1,104 @@
-# Agent/LLM Node Debugging Loop
+# Agent World Debugging and Execution Proof
 
-Use this process for every uncertain outcome from a real Agent/LLM invocation.
-It applies to Design, Builder, Judge, Research, and later nodes; it is not a
-WorldRules-only rule.
+Use the project-local agent-world-debugging Skill for every real Agent World
+failure. Use agent-world-llm-remediation only after a real scene makes the
+runtime Agent/LLM boundary a live hypothesis. Use
+agent-world-real-execution-proof to select the actual proof after a change.
 
-## 1. Read durable, safe evidence before changing anything
+The goal is to advance a trustworthy stage from natural-language need to a real
+programmatic environment, independent validation, and eventual Registry
+release—not to make a mocked test or one model sample pass.
 
-- Read the node's safe terminal status, `ValidationReport`, frontier, and
-  `observe scene` first.
-- Do not infer a cause from a model output snippet, a timeout label, a passing
-  unit test, or a repeated sample.
-- If the result lacks a stable code, source-facing path, violated condition,
-  and expected category, classify **feedback/observability** as defective and
-  repair that boundary before another semantic retry.
+## Keep the two Agent contexts distinct
 
-## 2. Make the four-way ownership decision
+The **project-execution Agent view** is for the Code Agent changing this
+repository: active task, compact scene, stable index, and absolute or
+repository-relative paths for on-demand reads. It is a project-navigation aid,
+not a runtime role-Agent input or permission system.
 
-Ask these four questions in order. Record the evidence for the selected owner.
+A **runtime role Agent** receives the product's effective runtime
+instruction/input (rendered Prompt plus runtime input projection), Runtime
+Skill, model profile, and authorized correction feedback. Do not repair one
+kind of context by changing the other.
 
-| Owner | Evidence | Correct next move |
-|---|---|---|
-| Prompt | The real node projection omits required frozen context, structural choice, or role instruction. | Fix that node's prompt projection; keep the compiler authoritative. |
-| Skill | The contract/prompt are sufficient but the owning role lacks durable, reusable guidance. | Update only that role Skill. |
-| Code / contract | A complete valid constructed input violates a framework-owned rule, or code asks the model to provide a mechanical/framework identity. | Refactor the deterministic ownership boundary and add a regression. |
-| Feedback / observability | A proposal failure is opaque, unsafe, generic, or cannot tell an Agent what field/category to repair. | Add safe typed diagnostics and scene/frontier projection first. |
+Keep durable logs, artifacts, traces, and state in the code-evidence layer.
+Keep the project top-level view small and replaceable: current question,
+known/unknown facts, and paths that answer the next questions. History belongs
+in evidence, not in an ever-growing index or hook payload.
 
-Never treat an `error` status alone as retry authority, and never turn a
-framework-owned mechanic into an Agent correction merely to obtain another
-turn.
+## Investigate before modifying
 
-## 3. Prove one real node boundary
+Read observe scene and the smallest related evidence. State what ran, what is
+known, unknown, and what the runner proves. If the evidence cannot support a
+useful hypothesis or a precise next read, feedback/observability is the first
+defect; improve and prove it locally before changing semantics or retrying.
 
-Construct a complete valid frozen input closure (or adapt a real committed
-closure), then execute the actual leaf/compiler/scheduler path for that node.
-Change or poison only the suspect condition.
+Explicitly mark these five surfaces as supported, weakened, or unknown:
 
-This is stronger than an interface-only unit test because it proves the real
-node's input projection, output parsing, compiler, validation, and settlement
-boundary. Ordinary pytest tests are still useful as regression guards, but are
-not evidence that an Agent/LLM node works with a real provider.
+1. project-execution Agent view;
+2. effective runtime instruction/input;
+3. Runtime Skill;
+4. code / execution boundary;
+5. feedback / observability.
 
-## Test output is also a feedback contract
+They are lenses, not exclusive buckets. Give evidence for one first repair
+target and only directly causal coupled changes. Route feedback by recipient:
+the project Agent gets a safe narrative and local paths; the control plane gets
+authority facts; a runtime role Agent gets a bounded correction story only when
+authorized.
 
-Every constructed-input or unit-level regression must emit enough safe context
-for an Agent to debug it without guessing:
+Code is not the default owner merely because it is editable. Before changing
+it, state what weakens or keeps live the project-view, runtime
+instruction/input, Runtime Skill, and feedback explanations. If several repair
+mechanisms remain credible, name the alternatives, choose the smallest coherent
+one, and record the observation that would make you switch.
 
-- exact test/node identity and owner boundary;
-- the valid fixture/committed-closure provenance and the one poisoned change;
-- stable code, source-facing path, violated condition, expected category, and
-  expected-versus-actual terminal state;
-- elapsed time plus the last completed phase/checkpoint.
+Every safe narrative states coordinate/phase, observed fact, known fact,
+unknown fact, and the next permitted read or action. This is a useful feedback
+shape, not a reason to add a global Schema for every error.
 
-A timeout or stall must additionally identify its timeout boundary and last
-safe heartbeat/operation. A bare assertion, an opaque exception string, or a
-test name that stops producing output is insufficient feedback: treat the
-test/harness observability boundary as a code defect before using that result
-to guide a semantic prompt, Skill, or contract repair.
+Treat a constructed boundary test as feedback too: state its node/owner,
+frozen-input provenance, one poison, expected versus actual stable diagnostic
+and terminal state, elapsed time, and last completed phase. A bare assertion,
+opaque exception, or unexplained stall is a test/harness observability defect,
+not evidence for a semantic retry.
 
-If one local result establishes a defect pattern, inventory every
-same-owner/same-boundary occurrence before returning to a live run. Do not fix
-one prompt branch, discover the next identical omission, and loop.
+When code / execution is live, name a concrete sub-lane: CLI/execution safety,
+verifier/gate weakness, replay/resume/state, Runtime/Judge isolation,
+legacy-command or ABI regression, or provider/transport. Do not collapse these
+different failures into a generic “code bug.”
 
-## 4. Make one causal change, then verify in layers
+## Select a repair from evidence
 
-1. Add a constructed input regression that fails for the original cause and
-   passes after the repair.
-2. Run focused deterministic tests, lint, and type checks as a supplement.
-3. Run exactly one isolated real `test-node` for the same frozen coordinate.
-4. Read its safe terminal scene before deciding the next action.
+Possible choices include better project view/feedback, runtime
+instruction/input or Runtime Skill changes followed by fresh generation, an
+authorized bounded model correction, model/profile/route/response-mode changes,
+deterministic mechanics repair, or an explicitly evidenced transient retry.
+Malformed JSON and missing fields do not prescribe one of these by themselves.
 
-The next real invocation is allowed only when the change is causally different
-(for example a corrected prompt/Skill, a new deterministic compiler boundary,
-or repaired feedback). Never rerun an unchanged coordinate hoping for a better
-sample.
+Before adding a contract, Hook gate, or fixed repair branch, ask what
+deterministic harm it prevents, whether textual Agent reasoning would suffice,
+what valid strategies it would forbid, whether the issue recurs, and which real
+execution would prove improvement.
 
-## 5. Interpret the live result without overclaiming
+## Prove one point before the chain
 
-- **Committed/passed:** this one node is proven; it does not prove downstream
-  Build/Judge/Registry or release.
-- **Typed semantic failure:** return to the four-way decision using its exact
-  diagnostic, then isolate that exact issue.
-- **Generic feedback:** repair feedback before retrying.
-- **Transport/interruption/infrastructure error:** use the recovery/transport
-  lane; do not mutate semantic prompts or WorldSpec without evidence.
-- **No progress or oscillation:** stop and record the causal blocker rather
-  than expanding retries.
+- For deterministic code, feedback, validator, scheduler, projection, verifier,
+  CLI, replay, resume, or isolation claims, first reproduce or extract one
+  failing true-boundary execution before editing. If only a durable real event
+  is available, record why it is sufficient and what post-change observation
+  would falsify the repair.
+- Run a constructed realistic input through the actual local boundary for
+  feedback, validator, scheduler, code, verifier, CLI, replay, resume, or
+  isolation claims.
+- Test a project-view change with a fresh project-Agent navigation exercise;
+  do not turn it into a runtime node test unless a runtime surface also changed.
+- Run one isolated real node for runtime instruction/input, Runtime Skill, or
+  model/profile claims.
+- Run the normal Scheduler for repair-loop claims.
+- Chain immediate integration and then E2E only after the changed single point
+  passes.
+
+pytest, lint, and typing are regression guards, not replacement evidence for a
+real boundary. Stop at the first new failure, read its scene, and begin a new
+attribution.

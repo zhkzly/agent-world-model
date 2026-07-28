@@ -15,6 +15,7 @@ from agent_world.agent_profiles import IsolatedAgentProfileProvider
 from agent_world.config import AgentBackendConfig
 from agent_world.contracts import PermissionScope
 from agent_world.control.telemetry import TelemetryStore
+from agent_world.designer.models import TrainingSemanticSourceDraft
 from agent_world.invocation import (
     DirectLlmBackend,
     InvocationExecutionMode,
@@ -24,19 +25,32 @@ from agent_world.invocation import (
     NodeCapabilityRequirement,
     RoutedInvocationBackend,
 )
+from agent_world.invocation.codex_sdk import _transport_output_schema
 
 
 class _FakeResponses:
-    def __init__(self, *, output_text: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        output_text: str | None = None,
+        status: str = "completed",
+        incomplete_reason: str | None = None,
+    ) -> None:
         self.requests: list[dict[str, object]] = []
+        self.status = status
+        self.incomplete_reason = incomplete_reason
         self.output_text = output_text or json.dumps(
             {"artifact_json": json.dumps({"title": "Hotel booking"})}
         )
 
-    async def create(self, **kwargs: object) -> object:
-        self.requests.append(kwargs)
+    def _response(self) -> SimpleNamespace:
         return SimpleNamespace(
-            status="completed",
+            status=self.status,
+            incomplete_details=(
+                SimpleNamespace(reason=self.incomplete_reason)
+                if self.incomplete_reason is not None
+                else None
+            ),
             output_text=self.output_text,
             usage=SimpleNamespace(
                 input_tokens=13,
@@ -47,14 +61,154 @@ class _FakeResponses:
             ),
         )
 
+    async def create(self, **kwargs: object) -> object:
+        self.requests.append(kwargs)
+        return _FakeResponseStream(self._response())
+
+
+class _FakeResponseStream:
+    """Small async stream that mirrors the Direct Responses terminal shape."""
+
+    def __init__(self, response: SimpleNamespace) -> None:
+        self._events = iter(
+            (
+                SimpleNamespace(type="response.created"),
+                SimpleNamespace(type="response.output_text.delta", delta=response.output_text),
+                SimpleNamespace(type=f"response.{response.status}", response=response),
+            )
+        )
+
+    def __aiter__(self) -> _FakeResponseStream:
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        try:
+            return next(self._events)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
 
 class _FakeClient:
-    def __init__(self, *, output_text: str | None = None) -> None:
-        self.responses = _FakeResponses(output_text=output_text)
+    def __init__(
+        self,
+        *,
+        output_text: str | None = None,
+        responses: _FakeResponses | None = None,
+    ) -> None:
+        self.responses = responses or _FakeResponses(output_text=output_text)
         self.closed = False
 
     async def close(self) -> None:
         self.closed = True
+
+
+class _BlockingResponses(_FakeResponses):
+    """Block after the adapter has dispatched one SDK request."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.request_dispatched = asyncio.Event()
+        self.release_response = asyncio.Event()
+
+    async def create(self, **kwargs: object) -> object:
+        self.requests.append(kwargs)
+        self.request_dispatched.set()
+        await self.release_response.wait()
+        return _FakeResponseStream(self._response())
+
+
+class _StallingResponseStream:
+    """Emit Provider lifecycle events, then wait without a terminal event."""
+
+    def __init__(self, response: SimpleNamespace) -> None:
+        self._events = iter(
+            (
+                SimpleNamespace(type="response.created"),
+                SimpleNamespace(type="response.in_progress"),
+            )
+        )
+        self.waiting_for_next_event = asyncio.Event()
+        self.release = asyncio.Event()
+        self._response = response
+
+    def __aiter__(self) -> _StallingResponseStream:
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        try:
+            return next(self._events)
+        except StopIteration:
+            self.waiting_for_next_event.set()
+            await self.release.wait()
+            raise StopAsyncIteration from None
+
+
+class _StallingStreamResponses(_FakeResponses):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream = _StallingResponseStream(self._response())
+
+    async def create(self, **kwargs: object) -> object:
+        self.requests.append(kwargs)
+        return self.stream
+
+
+class _FirstEventStallingResponseStream:
+    """Wait before the first Provider event, then complete normally."""
+
+    def __init__(self, response: SimpleNamespace) -> None:
+        self._events = iter(
+            (
+                SimpleNamespace(type="response.created"),
+                SimpleNamespace(type="response.output_text.delta", delta=response.output_text),
+                SimpleNamespace(type="response.completed", response=response),
+            )
+        )
+        self.waiting_for_first_event = asyncio.Event()
+        self.release = asyncio.Event()
+        self._first_event_pending = True
+
+    def __aiter__(self) -> _FirstEventStallingResponseStream:
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        if self._first_event_pending:
+            self._first_event_pending = False
+            self.waiting_for_first_event.set()
+            await self.release.wait()
+        try:
+            return next(self._events)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+
+class _FirstEventStallingStreamResponses(_FakeResponses):
+    def __init__(self) -> None:
+        super().__init__()
+        self.stream = _FirstEventStallingResponseStream(self._response())
+
+    async def create(self, **kwargs: object) -> object:
+        self.requests.append(kwargs)
+        return self.stream
+
+
+class _FakeDirectProviderError(Exception):
+    """Mimic the closed attributes exposed by an OpenAI status exception."""
+
+    def __init__(self, *, status_code: int, body: object) -> None:
+        super().__init__("provider request rejected")
+        self.status_code = status_code
+        self.body = body
+
+
+class _RejectingResponses(_FakeResponses):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
+    async def create(self, **kwargs: object) -> object:
+        self.requests.append(kwargs)
+        raise self.error
 
 
 class _RecordingBackend:
@@ -85,7 +239,11 @@ class _RecordingBackend:
         return self.name == "direct"
 
 
-def _request(tmp_path: Path) -> tuple[InvocationRequest, str, str]:
+def _request(
+    tmp_path: Path,
+    *,
+    transport: str = "json_envelope",
+) -> tuple[InvocationRequest, str, str]:
     # Values are generated at test runtime, never committed as fixture
     # material. The production contract exposes only their environment names.
     credential = uuid4().hex
@@ -95,7 +253,7 @@ def _request(tmp_path: Path) -> tuple[InvocationRequest, str, str]:
             model="direct-structured-test-model",
             api_key_environment="OPENAI_API_KEY",
             openai_base_url_environment="OPENAI_BASE_URL",
-            structured_output_transport="json_envelope",
+            structured_output_transport=transport,
         ),
         source_environment={
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -138,6 +296,26 @@ def _tree_contains(root: Path, value: str) -> bool:
         if path.is_file() and needle in path.read_bytes():
             return True
     return False
+
+
+def test_provider_schema_preserves_task_curriculum_required_rule_lists() -> None:
+    """A direct route can enforce the logical curriculum shape, not just an envelope."""
+
+    logical_schema = TrainingSemanticSourceDraft.model_json_schema(mode="validation")
+    provider_schema = _transport_output_schema(logical_schema, transport="provider_schema")
+
+    definitions = provider_schema["$defs"]
+    assert isinstance(definitions, dict)
+    task_schema = definitions["TaskRequirementSourceDraft"]
+    assert isinstance(task_schema, dict)
+    required = task_schema["required"]
+    assert isinstance(required, list)
+    assert {
+        "initial_state_constraints",
+        "success_conditions",
+        "failure_conditions",
+        "terminal_conditions",
+    }.issubset(required)
 
 
 @pytest.mark.asyncio
@@ -188,8 +366,18 @@ async def test_direct_backend_uses_responses_json_schema_without_subprocess(
     provider_request = client.responses.requests[0]
     assert provider_request["model"] == request.profile.model
     assert provider_request["input"] == request.prompt
+    instructions = provider_request["instructions"]
+    assert isinstance(instructions, str)
+    assert "Logical structured output contract" in instructions
+    assert "artifact_json" in instructions
+    logical_schema = instructions.split("<logical_output_schema_json>\n", 1)[1].split(
+        "\n</logical_output_schema_json>",
+        1,
+    )[0]
+    assert json.loads(logical_schema) == request.profile.output_schema
     assert provider_request["max_output_tokens"] == 333
     assert provider_request["store"] is False
+    assert provider_request["stream"] is True
     assert provider_request["reasoning"] == {
         "effort": request.profile.reasoning_effort.value,
     }
@@ -211,9 +399,43 @@ async def test_direct_backend_uses_responses_json_schema_without_subprocess(
         attributes_json = connection.execute(
             "SELECT attributes_json FROM spans WHERE operation = 'agent.invoke'"
         ).fetchone()[0]
+        metric_rows = connection.execute(
+            "SELECT name, SUM(value_integer) FROM metrics "
+            "WHERE name IN (?, ?, ?) GROUP BY name ORDER BY name",
+            (
+                "invocation.events.observed_delta",
+                "invocation.activity.agent_message_event_delta",
+                "invocation.activity.other_event_delta",
+            ),
+        ).fetchall()
     assert json.loads(attributes_json)["backend"] == "direct_llm"
+    assert metric_rows == [
+        ("invocation.activity.agent_message_event_delta", 1),
+        ("invocation.activity.other_event_delta", 2),
+        ("invocation.events.observed_delta", 3),
+    ]
     assert not _tree_contains(tmp_path, credential)
     assert not _tree_contains(tmp_path, base_url)
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_uses_direct_json_object_without_an_inner_envelope(
+    tmp_path: Path,
+) -> None:
+    """A compatible Direct route can remove fragile double serialization."""
+
+    request, _, _ = _request(tmp_path, transport="json_object")
+    client = _FakeClient(output_text=json.dumps({"title": "Hotel booking"}))
+
+    result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
+
+    assert result.status is InvocationStatus.COMPLETED
+    assert result.structured_output == {"title": "Hotel booking"}
+    assert client.responses.requests[0]["text"] == {"format": {"type": "json_object"}}
+    instructions = client.responses.requests[0]["instructions"]
+    assert isinstance(instructions, str)
+    assert "Return one direct JSON value satisfying the logical schema below." in instructions
+    assert "<logical_output_schema_json>" in instructions
 
 
 @pytest.mark.asyncio
@@ -241,16 +463,33 @@ async def test_direct_backend_reports_non_json_without_retaining_provider_text(
     tmp_path: Path,
 ) -> None:
     request, _, _ = _request(tmp_path)
-    client = _FakeClient(output_text="not-json")
-
-    result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
+    provider_output_canary = f"provider-output-{uuid4().hex}"
+    output_text = f"Gateway diagnostic: {provider_output_canary}"
+    client = _FakeClient(output_text=output_text)
+    telemetry = TelemetryStore(tmp_path / "telemetry")
+    try:
+        result = await DirectLlmBackend(
+            client_factory=lambda **_: client,
+            telemetry=telemetry,
+        ).invoke(request)
+    finally:
+        telemetry.close()
 
     assert result.status is InvocationStatus.FAILED
     assert result.error is not None
     assert result.error.code == "direct_structured_output_invalid_json"
+    assert result.error.retryable is False
+    assert result.error.details == {
+        "response_shape": "non_json",
+        "parse_failure": "syntax",
+        "parse_offset": 0,
+        "response_characters": len(output_text),
+    }
     assert result.final_text is None
     assert result.structured_output is None
     assert client.closed
+    assert provider_output_canary not in repr(result)
+    assert not _tree_contains(tmp_path, provider_output_canary)
 
 
 @pytest.mark.asyncio
@@ -258,16 +497,282 @@ async def test_direct_backend_reports_invalid_envelope_without_retaining_provide
     tmp_path: Path,
 ) -> None:
     request, _, _ = _request(tmp_path)
-    client = _FakeClient(output_text=json.dumps({"artifact_json": "not-json"}))
+    provider_output_canary = f"provider-output-{uuid4().hex}"
+    encoded = f"Gateway diagnostic: {provider_output_canary}"
+    client = _FakeClient(output_text=json.dumps({"artifact_json": encoded}))
 
     result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
 
     assert result.status is InvocationStatus.FAILED
     assert result.error is not None
     assert result.error.code == "direct_structured_output_transport_invalid"
+    assert result.error.retryable is False
+    assert result.error.details == {
+        "transport": "json_envelope",
+        "envelope_shape": "artifact_json_string",
+        "response_shape": "non_json",
+        "parse_failure": "syntax",
+        "parse_offset": 0,
+        "response_characters": len(encoded),
+    }
     assert result.final_text is None
     assert result.structured_output is None
     assert client.closed
+    assert provider_output_canary not in repr(result)
+    assert not _tree_contains(tmp_path, provider_output_canary)
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_projects_safe_rejected_schema_fingerprint(
+    tmp_path: Path,
+) -> None:
+    """A pre-model 400 must name its safe request component, never provider prose."""
+
+    request, _, _ = _request(tmp_path)
+    provider_message_canary = f"provider-message-{uuid4().hex}"
+    error = _FakeDirectProviderError(
+        status_code=400,
+        body={
+            "message": provider_message_canary,
+            "type": "invalid_request_error",
+            "code": "invalid_json_schema",
+            "param": "text.format.schema",
+        },
+    )
+    client = _FakeClient(responses=_RejectingResponses(error))
+
+    result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_invalid_request"
+    assert result.error.retryable is False
+    assert result.error.details == {
+        "http_status": 400,
+        "provider_error_shape": "object",
+        "provider_error_type": "invalid_request",
+        "provider_error_code": "structured_output_schema",
+        "provider_error_param": "structured_output_schema",
+    }
+    assert result.final_text is None
+    assert result.structured_output is None
+    assert client.closed
+    assert provider_message_canary not in repr(result)
+    assert not _tree_contains(tmp_path, provider_message_canary)
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_does_not_mark_dispatch_as_provider_progress(
+    tmp_path: Path,
+) -> None:
+    """Request dispatch alone is not evidence that the Provider is progressing."""
+
+    request, _, _ = _request(tmp_path)
+    responses = _BlockingResponses()
+    client = _FakeClient(responses=responses)
+    telemetry = TelemetryStore(tmp_path / "telemetry")
+    task = asyncio.create_task(
+        DirectLlmBackend(client_factory=lambda **_: client, telemetry=telemetry).invoke(request)
+    )
+    try:
+        await asyncio.wait_for(responses.request_dispatched.wait(), timeout=1)
+        with sqlite3.connect(tmp_path / "telemetry" / "telemetry.sqlite") as connection:
+            row = connection.execute(
+                "SELECT status, first_progress_at_ns, ended_at_ns, "
+                "last_heartbeat_at_ns, last_heartbeat_phase "
+                "FROM spans WHERE operation = 'agent.invoke'"
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "running"
+        assert row[1] is None
+        assert row[2] is None
+        assert row[3] is not None
+        assert row[4] == "direct_request_dispatched"
+    finally:
+        responses.release_response.set()
+        await task
+        telemetry.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_does_not_apply_idle_liveness_before_first_provider_event(
+    tmp_path: Path,
+) -> None:
+    """A started HTTP request still needs a real first Provider event before idle timing applies."""
+
+    request, _, _ = _request(tmp_path)
+    request = replace(
+        request,
+        profile=replace(
+            request.profile,
+            limits=replace(request.profile.limits, direct_stream_idle_timeout_seconds=0.02),
+        ),
+    )
+    responses = _FirstEventStallingStreamResponses()
+    client = _FakeClient(responses=responses)
+    telemetry = TelemetryStore(tmp_path / "telemetry")
+    task = asyncio.create_task(
+        DirectLlmBackend(
+            client_factory=lambda **_: client,
+            telemetry=telemetry,
+            liveness_heartbeat_seconds=0.005,
+        ).invoke(request)
+    )
+    try:
+        await asyncio.wait_for(responses.stream.waiting_for_first_event.wait(), timeout=1)
+        await asyncio.sleep(0.04)
+        assert not task.done()
+    finally:
+        responses.stream.release.set()
+        result = await asyncio.wait_for(task, timeout=1)
+        telemetry.close()
+
+    assert result.status is InvocationStatus.COMPLETED
+    assert result.error is None
+    assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_records_local_waiting_without_faking_provider_progress(
+    tmp_path: Path,
+) -> None:
+    """Exercise Direct adapter -> live telemetry while a stream stays open."""
+
+    request, _, _ = _request(tmp_path)
+    request = replace(
+        request,
+        profile=replace(
+            request.profile,
+            limits=replace(request.profile.limits, direct_stream_idle_timeout_seconds=None),
+        ),
+    )
+    responses = _StallingStreamResponses()
+    client = _FakeClient(responses=responses)
+    telemetry = TelemetryStore(tmp_path / "telemetry")
+    task = asyncio.create_task(
+        DirectLlmBackend(
+            client_factory=lambda **_: client,
+            telemetry=telemetry,
+            liveness_heartbeat_seconds=0.01,
+        ).invoke(request)
+    )
+    try:
+        await asyncio.wait_for(responses.stream.waiting_for_next_event.wait(), timeout=1)
+        await asyncio.sleep(0.03)
+        with sqlite3.connect(tmp_path / "telemetry" / "telemetry.sqlite") as connection:
+            row = connection.execute(
+                "SELECT status, first_progress_at_ns, last_progress_at_ns, "
+                "last_heartbeat_at_ns, last_heartbeat_phase "
+                "FROM spans WHERE operation = 'agent.invoke'"
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "running"
+        assert row[1] is not None
+        assert row[2] is not None
+        assert row[3] is not None
+        assert row[4] == "direct_awaiting_stream_event"
+    finally:
+        responses.stream.release.set()
+        result = await task
+        telemetry.close()
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_stream_terminal_missing"
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_terminalizes_a_started_silent_stream_with_safe_liveness_evidence(
+    tmp_path: Path,
+) -> None:
+    """A post-progress stream stall is a typed transport terminal, not a semantic timeout."""
+
+    request, _, _ = _request(tmp_path)
+    request = replace(
+        request,
+        profile=replace(
+            request.profile,
+            limits=replace(
+                request.profile.limits,
+                direct_stream_idle_timeout_seconds=0.02,
+            ),
+        ),
+    )
+    responses = _StallingStreamResponses()
+    client = _FakeClient(responses=responses)
+    telemetry = TelemetryStore(tmp_path / "telemetry")
+    try:
+        result = await asyncio.wait_for(
+            DirectLlmBackend(
+                client_factory=lambda **_: client,
+                telemetry=telemetry,
+                liveness_heartbeat_seconds=0.005,
+            ).invoke(request),
+            timeout=1,
+        )
+        with sqlite3.connect(tmp_path / "telemetry" / "telemetry.sqlite") as connection:
+            row = connection.execute(
+                "SELECT status, error_code, first_progress_at_ns, last_progress_at_ns, "
+                "last_heartbeat_at_ns, last_heartbeat_phase, ended_at_ns "
+                "FROM spans WHERE operation = 'agent.invoke'"
+            ).fetchone()
+    finally:
+        telemetry.close()
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_provider_stream_stalled"
+    assert result.error.retryable is True
+    assert result.error.details == {
+        "waiting_phase": "direct_awaiting_stream_event",
+        "idle_timeout_seconds": 0.02,
+        "observed_provider_event_count": 2,
+    }
+    assert client.closed
+    assert row is not None
+    assert row[0] == "failed"
+    assert row[1] == "direct_provider_stream_stalled"
+    assert row[2] is not None
+    assert row[3] is not None
+    assert row[4] is not None
+    assert row[5] == "direct_awaiting_stream_event"
+    assert row[6] is not None
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_reports_output_limit_without_retaining_provider_text(
+    tmp_path: Path,
+) -> None:
+    """A provider output ceiling is safe feedback, not a semantic sample."""
+
+    request, _, _ = _request(tmp_path)
+    provider_output_canary = f"provider-output-{uuid4().hex}"
+    client = _FakeClient(
+        responses=_FakeResponses(
+            output_text=provider_output_canary,
+            status="incomplete",
+            incomplete_reason="max_output_tokens",
+        )
+    )
+
+    result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_output_limit"
+    assert result.error.retryable is False
+    assert result.error.details == {
+        "terminal_status": "incomplete",
+        "terminal_reason": "max_output_tokens",
+        "configured_max_output_tokens": 333,
+    }
+    assert result.usage is not None and result.usage.turn is not None
+    assert result.usage.turn.total_tokens == 18
+    assert result.final_text is None
+    assert result.structured_output is None
+    assert client.closed
+    assert provider_output_canary not in repr(result)
+    assert not _tree_contains(tmp_path, provider_output_canary)
 
 
 @pytest.mark.asyncio

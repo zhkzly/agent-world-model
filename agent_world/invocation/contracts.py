@@ -68,6 +68,11 @@ class InvocationLimits:
     """Hard local limits enforced by the backend process supervisor."""
 
     timeout_seconds: float = 600.0
+    # This is deliberately not a second logical-turn or output-token ceiling.
+    # DirectLlmBackend applies it only after a Provider stream has already
+    # emitted an event and then goes silent.  ``None`` retains the full parent
+    # timeout for that stream as well.
+    direct_stream_idle_timeout_seconds: float | None = 300.0
     interrupt_grace_seconds: float = 5.0
     kill_grace_seconds: float = 2.0
     max_events: int = 20_000
@@ -82,6 +87,12 @@ class InvocationLimits:
         ):
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{label} must be finite and positive")
+        if self.direct_stream_idle_timeout_seconds is not None and (
+            not isinstance(self.direct_stream_idle_timeout_seconds, (int, float))
+            or not math.isfinite(self.direct_stream_idle_timeout_seconds)
+            or self.direct_stream_idle_timeout_seconds <= 0
+        ):
+            raise ValueError("direct_stream_idle_timeout_seconds must be finite and positive")
         if not isinstance(self.max_events, int) or self.max_events <= 0:
             raise ValueError("max_events must be positive")
         if not isinstance(self.max_protocol_bytes, int) or self.max_protocol_bytes < 128 * 1024:
@@ -208,7 +219,11 @@ class ResolvedAgentProfile:
             and self.openai_base_url_environment != "OPENAI_BASE_URL"
         ):
             raise ValueError("openai_base_url_environment must be OPENAI_BASE_URL")
-        if self.structured_output_transport not in {"provider_schema", "json_envelope"}:
+        if self.structured_output_transport not in {
+            "provider_schema",
+            "json_envelope",
+            "json_object",
+        }:
             raise ValueError("unsupported structured output transport")
         if self.rollout_token_limit is not None and self.rollout_token_limit <= 0:
             raise ValueError("rollout_token_limit must be positive when configured")
@@ -301,7 +316,14 @@ class ResolvedAgentProfile:
 
 @dataclass(frozen=True, slots=True)
 class InvocationSession:
-    """Durable continuation reference bound to one workspace lineage."""
+    """Continuation reference bound to one workspace lineage.
+
+    The reference itself may be retained in framework-private recovery state,
+    but a Codex thread id alone is not proof that a newly created adapter can
+    resume it. The adapter must also possess the matching private runtime
+    checkpoint; otherwise it returns a typed unavailable result and the
+    control plane may choose an explicit fresh-session repair, if authorized.
+    """
 
     thread_id: str
     lineage_id: str

@@ -79,6 +79,8 @@ from .leaf_executor import (
     LeafAssurance,
     LeafExecutionFailure,
     LeafProposal,
+    LeafSemanticRepairContinuation,
+    LeafSessionContinuation,
     LeafValidationFailure,
     SchedulerLeafExecutor,
 )
@@ -148,6 +150,7 @@ from .work import (
     WorkDefinition,
     WorkRepairLedgerEntry,
     classify_progress,
+    diagnostic_quality_for_issues,
 )
 from .work_epoch import WorkGraphEpochRuntime
 from .work_graph import (
@@ -163,8 +166,12 @@ from .work_graph import (
     WorkGraphNodeBinding,
     WorkGroupDefinition,
     compile_design_work_graph,
+    compile_world_work_graph,
     complete_generation_work_graph,
+    curriculum_plan_work_definition,
     derive_final_design_definitions,
+    derive_task_requirement_design_definitions,
+    derive_world_plan_definitions,
     deterministic_boundary_work_definition,
     research_acquisition_work_definition,
     research_plan_work_definition,
@@ -250,6 +257,8 @@ __all__ = [
     "GateEffect",
     "LeafAssurance",
     "LeafExecutionFailure",
+    "LeafSemanticRepairContinuation",
+    "LeafSessionContinuation",
     "LeafValidationFailure",
     "LeafProposal",
     "LeaseBudgetLedger",
@@ -367,8 +376,12 @@ __all__ = [
     "WorkGraphEpochRuntime",
     "WorkGroupDefinition",
     "compile_design_work_graph",
+    "compile_world_work_graph",
     "complete_generation_work_graph",
+    "curriculum_plan_work_definition",
     "derive_final_design_definitions",
+    "derive_task_requirement_design_definitions",
+    "derive_world_plan_definitions",
     "deterministic_boundary_work_definition",
     "research_acquisition_work_definition",
     "research_plan_work_definition",
@@ -383,5 +396,6 @@ __all__ = [
     "WorkMilestoneState",
     "tool_semantics_batch_definition",
     "classify_progress",
+    "diagnostic_quality_for_issues",
     "reduce_maturity",
 ]

@@ -53,6 +53,7 @@ type WorkHeadStatus = Literal[
     "interrupted",
 ]
 
+
 class WorkControlStoreError(RuntimeError):
     """Base error for WorkGraph mutable-head coordination."""
 
@@ -213,11 +214,7 @@ class WorkControlStore:
 
         if not scope_id:
             raise WorkControlStoreError("scope id cannot be empty")
-        return tuple(
-            head
-            for head in self._read_all_heads()
-            if head.scope_id == scope_id
-        )
+        return tuple(head for head in self._read_all_heads() if head.scope_id == scope_id)
 
     def latest_scope_id(self) -> str | None:
         """Return the most recently updated durable scope without scheduling it.
@@ -425,13 +422,7 @@ class WorkControlStore:
         """
 
         marker = self.root / TEST_NODE_DIAGNOSTIC_MARKER
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_CLOEXEC
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
         try:
             descriptor = os.open(marker, flags, 0o600)
         except FileExistsError:
@@ -475,13 +466,56 @@ class WorkControlStore:
         following ``begin_authorized_repair`` creates the new physical attempt.
         """
 
+        return self._authorize_terminal_repair(
+            lock,
+            expected_head=expected_head,
+            next_head=next_head,
+            allowed_statuses=frozenset({"committed", "failed", "needs_human", "interrupted"}),
+            conflict_prefix="causal repair",
+        )
+
+    def authorize_infrastructure_retry(
+        self,
+        lock: WorkControlLock,
+        *,
+        expected_head: WorkControlHead,
+        next_head: WorkControlHead,
+    ) -> WorkControlHead:
+        """Install one framework-authorized retry from a failed terminal head.
+
+        The caller must already have validated the exact retryable
+        ``ValidationReport`` and constructed a bound ``RepairAction`` / ledger
+        entry.  This store method owns only the otherwise-forbidden terminal
+        ``failed -> repair_authorized`` pointer transition; it never infers
+        retry authority from a status or error string.
+        """
+
+        return self._authorize_terminal_repair(
+            lock,
+            expected_head=expected_head,
+            next_head=next_head,
+            allowed_statuses=frozenset({"failed"}),
+            conflict_prefix="infrastructure retry",
+        )
+
+    def _authorize_terminal_repair(
+        self,
+        lock: WorkControlLock,
+        *,
+        expected_head: WorkControlHead,
+        next_head: WorkControlHead,
+        allowed_statuses: frozenset[WorkHeadStatus],
+        conflict_prefix: str,
+    ) -> WorkControlHead:
+        """Validate the one terminal-head exception used by repair authority."""
+
         next_head = WorkControlHead.model_validate(next_head.model_dump(mode="python"))
         self._validate_lock(lock, next_head.coordinate)
         current = self.read_head(next_head.coordinate)
         if current != expected_head:
-            raise WorkHeadConflictError("WorkGraph head changed before causal repair")
-        if current.status not in {"committed", "failed", "needs_human", "interrupted"}:
-            raise WorkHeadConflictError("causal repair target is not terminal")
+            raise WorkHeadConflictError(f"WorkGraph head changed before {conflict_prefix}")
+        if current.status not in allowed_statuses:
+            raise WorkHeadConflictError(f"{conflict_prefix} target is not terminal")
         if (
             next_head.scope_id != current.scope_id
             or next_head.coordinate != current.coordinate
@@ -498,7 +532,7 @@ class WorkControlStore:
             or next_head.commit_ref is not None
             or not next_head.invalidated_by_refs
         ):
-            raise WorkHeadConflictError("invalid causal repair authorization transition")
+            raise WorkHeadConflictError(f"invalid {conflict_prefix} authorization transition")
         self._atomic_write(
             self._head_path(next_head.scope_id, next_head.coordinate.coordinate_key),
             next_head.stable_json_bytes(),

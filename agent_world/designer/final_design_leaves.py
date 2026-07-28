@@ -35,14 +35,19 @@ from agent_world.invocation import InvocationBackend
 
 from .compact_rule_protocol import tool_semantics_batch_protocol
 from .final_design_compiler import (
+    compile_curriculum_plan_semantics,
     compile_shared_tool_semantics,
+    compile_task_requirement_semantics,
     compile_tool_semantics_batch,
     compile_training_semantics,
     compile_world_rules,
+    coverage_rule_catalog,
 )
 from .models import (
+    CurriculumPlanSourceDraft,
     SharedToolSemanticsContract,
     SharedToolSemanticsSourceDraft,
+    TaskRequirementSourceDraft,
     ToolCouplingPlan,
     ToolSemanticsBatchSourceDraft,
     ToolSemanticsDraft,
@@ -253,10 +258,12 @@ class ToolSemanticsBatchLeaf:
                     definition=definition,
                 ),
                 # A measured compatible gateway rejects the generated recursive
-                # RuleDraft schema when it is copied into the prompt.  This only
-                # replaces that prompt text for json_envelope transport; the
-                # original source model and compiler still accept the result.
-                json_envelope_protocol=tool_semantics_batch_protocol(),
+                # RuleDraft schema when it is copied into the prompt.  Supply
+                # the compatible protocol to every non-native-schema transport;
+                # the original source model and compiler still accept the result.
+                logical_output_protocol=tool_semantics_batch_protocol(
+                    target_tool_ids=tool_ids,
+                ),
             )
             compiled = compile_tool_semantics_batch(
                 turn.output,
@@ -400,6 +407,282 @@ class WorldRulesLeaf:
 
 
 @dataclass(slots=True)
+class CurriculumPlanLeaf:
+    """Author one small curriculum topology after the WorldModel is frozen.
+
+    This Agent turn intentionally has no task-family Rule IR in its output.
+    Its committed plan determines the physical sibling set for the following
+    graph epoch.
+    """
+
+    context_ref: ArtifactRef
+    workspace_root: Path
+    backend: InvocationBackend
+    profiles: StructuredProfileProvider
+    kernel: SchedulerLeafExecutor
+
+    async def execute(
+        self,
+        context: WorkExecutionContext,
+        *,
+        definition: WorkDefinition,
+    ) -> None:
+        async def proposal(
+            _context: WorkExecutionContext,
+            attempt: WorkAttempt,
+            dispatch_id: str,
+        ) -> LeafProposal:
+            inputs = _direct_inputs(self.context_ref, context, self.kernel)
+            _architecture_ref, _architecture, _skeleton, _plan, evidence_ref, evidence = (
+                _architecture_inputs(context, kernel=self.kernel)
+            )
+            world_ref = _one_parent(context, "design.world_model")
+            world = self.kernel.runtime.artifacts.get_json(world_ref, WorldModelDraft)
+
+            def validate(value: CurriculumPlanSourceDraft) -> None:
+                compile_curriculum_plan_semantics(
+                    value,
+                    world=world,
+                    evidence_graph=evidence,
+                )
+
+            turn = await invoke_structured_once(
+                backend=self.backend,
+                profiles=self.profiles,
+                definition=definition,
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+                lineage_id=f"{inputs.job.job_id}.curriculum-plan.{attempt.ordinal}",
+                workspace=self.workspace_root / "curriculum-plan" / attempt.attempt_id,
+                model=CurriculumPlanSourceDraft,
+                prompt=_curriculum_plan_prompt(inputs, world, evidence),
+                permissions=inputs.context.permissions,
+                semantic_validator=validate,
+                correction_brief=self.kernel.agent_correction_brief(
+                    context,
+                    definition=definition,
+                ),
+            )
+            compiled = compile_curriculum_plan_semantics(
+                turn.output,
+                world=world,
+                evidence_graph=evidence,
+            )
+            source_ref = self.kernel.runtime.artifacts.put_json(
+                artifact_id=f"{inputs.context.context_id}:curriculum-plan-source",
+                artifact_type="design.curriculum_plan_source",
+                value=compiled.canonical_source,
+                dependencies=_unique_refs(*_input_refs(context), evidence_ref, world_ref),
+            )
+            return LeafProposal(
+                output_refs=(source_ref,),
+                subject_refs=(source_ref,),
+                observed_actual=turn.observed_actual,
+                unknown_upper_bound=turn.unknown_upper_bound,
+                agent=turn.agent,
+            )
+
+        await self.kernel.execute(context, definition=definition, proposal_runner=proposal)
+
+
+@dataclass(slots=True)
+class TaskRequirementLeaf:
+    """Author exactly one plan-derived task family's Rule semantics."""
+
+    context_ref: ArtifactRef
+    workspace_root: Path
+    backend: InvocationBackend
+    profiles: StructuredProfileProvider
+    kernel: SchedulerLeafExecutor
+
+    async def execute(
+        self,
+        context: WorkExecutionContext,
+        *,
+        definition: WorkDefinition,
+    ) -> None:
+        async def proposal(
+            _context: WorkExecutionContext,
+            attempt: WorkAttempt,
+            dispatch_id: str,
+        ) -> LeafProposal:
+            inputs = _direct_inputs(self.context_ref, context, self.kernel)
+            _architecture_ref, _architecture, _skeleton, _plan, evidence_ref, evidence = (
+                _architecture_inputs(context, kernel=self.kernel)
+            )
+            task_type = definition.coordinate.shard_id
+            if task_type is None:
+                raise LeafExecutionFailure(
+                    code="preflight_task_requirement_coordinate_missing",
+                    category="TaskRequirement requires one frozen task_type shard coordinate",
+                    retryable=False,
+                    expected_category="one plan-derived task_type shard coordinate",
+                )
+            world_ref = _one_parent(context, "design.world_model")
+            plan_ref = _one_parent(context, "design.curriculum_plan_source")
+            world = self.kernel.runtime.artifacts.get_json(world_ref, WorldModelDraft)
+            curriculum_plan = self.kernel.runtime.artifacts.get_json(
+                plan_ref,
+                CurriculumPlanSourceDraft,
+            )
+            target = next(
+                (item for item in curriculum_plan.task_plans if item.task_type == task_type),
+                None,
+            )
+            if target is None:
+                raise LeafExecutionFailure(
+                    code="preflight_task_requirement_target_missing",
+                    category="TaskRequirement shard is absent from its committed CurriculumPlan",
+                    retryable=False,
+                    expected_category="a task_type present in the committed CurriculumPlan",
+                )
+
+            def validate(value: TaskRequirementSourceDraft) -> None:
+                compile_task_requirement_semantics(
+                    value,
+                    curriculum_plan=curriculum_plan,
+                    target_task_type=task_type,
+                    world=world,
+                    evidence_graph=evidence,
+                )
+
+            turn = await invoke_structured_once(
+                backend=self.backend,
+                profiles=self.profiles,
+                definition=definition,
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+                lineage_id=(f"{inputs.job.job_id}.task-requirement.{task_type}.{attempt.ordinal}"),
+                workspace=(
+                    self.workspace_root / "task-requirement" / task_type / attempt.attempt_id
+                ),
+                model=TaskRequirementSourceDraft,
+                prompt=_task_requirement_prompt(
+                    inputs,
+                    world,
+                    curriculum_plan,
+                    target.model_dump(mode="json"),
+                    evidence,
+                ),
+                permissions=inputs.context.permissions,
+                semantic_validator=validate,
+                correction_brief=self.kernel.agent_correction_brief(
+                    context,
+                    definition=definition,
+                ),
+            )
+            compiled = compile_task_requirement_semantics(
+                turn.output,
+                curriculum_plan=curriculum_plan,
+                target_task_type=task_type,
+                world=world,
+                evidence_graph=evidence,
+            )
+            source_ref = self.kernel.runtime.artifacts.put_json(
+                artifact_id=(f"{inputs.context.context_id}:task-requirement-source:{task_type}"),
+                artifact_type="design.task_requirement_source",
+                value=compiled.canonical_source,
+                dependencies=_unique_refs(
+                    *_input_refs(context),
+                    evidence_ref,
+                    world_ref,
+                    plan_ref,
+                ),
+            )
+            return LeafProposal(
+                output_refs=(source_ref,),
+                subject_refs=(source_ref,),
+                observed_actual=turn.observed_actual,
+                unknown_upper_bound=turn.unknown_upper_bound,
+                agent=turn.agent,
+            )
+
+        await self.kernel.execute(context, definition=definition, proposal_runner=proposal)
+
+
+@dataclass(slots=True)
+class TaskCurriculumJoinLeaf:
+    """Deterministically compose every committed task family into one source."""
+
+    context_ref: ArtifactRef
+    kernel: SchedulerLeafExecutor
+
+    async def execute(
+        self,
+        context: WorkExecutionContext,
+        *,
+        definition: WorkDefinition,
+    ) -> None:
+        async def proposal(
+            _context: WorkExecutionContext,
+            _attempt: WorkAttempt,
+            _dispatch_id: str,
+        ) -> LeafProposal:
+            inputs = _direct_inputs(self.context_ref, context, self.kernel)
+            _architecture_ref, _architecture, _skeleton, _plan, evidence_ref, evidence = (
+                _architecture_inputs(context, kernel=self.kernel)
+            )
+            world_source_ref = _one_parent(context, "design.world_semantic_source")
+            world_ref = _one_parent(context, "design.world_model")
+            plan_ref = _one_parent(context, "design.curriculum_plan_source")
+            world_source = self.kernel.runtime.artifacts.get_json(
+                world_source_ref,
+                WorldSemanticSourceIRDraft,
+            )
+            world = self.kernel.runtime.artifacts.get_json(world_ref, WorldModelDraft)
+            plan = self.kernel.runtime.artifacts.get_json(plan_ref, CurriculumPlanSourceDraft)
+            task_refs = _parents(context, "design.task_requirement_source")
+            task_sources = tuple(
+                self.kernel.runtime.artifacts.get_json(ref, TaskRequirementSourceDraft)
+                for ref in task_refs
+            )
+            expected_task_types = tuple(item.task_type for item in plan.task_plans)
+            sources_by_type = {item.task_type: item for item in task_sources}
+            if (
+                len(sources_by_type) != len(task_sources)
+                or set(sources_by_type) != set(expected_task_types)
+                or len(task_sources) != len(expected_task_types)
+            ):
+                raise LeafExecutionFailure(
+                    code="task_curriculum_join_task_family_closure_invalid",
+                    category=(
+                        "TaskCurriculum join lacks one exact committed task requirement for "
+                        "each CurriculumPlan entry"
+                    ),
+                    retryable=False,
+                    expected_category=(
+                        "one unique committed TaskRequirement source for every plan task_type"
+                    ),
+                )
+            source = TrainingSemanticSourceDraft(
+                curriculum_plan=plan,
+                task_requirements=tuple(sources_by_type[item] for item in expected_task_types),
+            )
+            compiled = compile_training_semantics(
+                source,
+                world_source=world_source,
+                world=world,
+                evidence_graph=evidence,
+            )
+            source_ref = self.kernel.runtime.artifacts.put_json(
+                artifact_id=f"{inputs.context.context_id}:task-curriculum-source",
+                artifact_type="design.task_curriculum_source",
+                value=compiled.canonical_source,
+                dependencies=_unique_refs(
+                    *_input_refs(context),
+                    evidence_ref,
+                    world_source_ref,
+                    world_ref,
+                    plan_ref,
+                    *task_refs,
+                ),
+            )
+            return LeafProposal(output_refs=(source_ref,), subject_refs=(source_ref,))
+
+        await self.kernel.execute(context, definition=definition, proposal_runner=proposal)
+
+
+@dataclass(slots=True)
 class TaskCurriculumLeaf:
     """Compile task meaning once against the committed executable WorldModel."""
 
@@ -458,9 +741,10 @@ class TaskCurriculumLeaf:
                 ),
             )
             # Compile during validation and again here by design: both calls are
-            # pure deterministic code. The second result is intentionally not
-            # persisted until ModelingBoundary owns the complete Design closure.
-            compile_training_semantics(
+            # pure deterministic code. ModelingBoundary still owns the complete
+            # Design closure, while this node persists the canonical semantic
+            # source with framework-owned Rule identities removed.
+            compiled = compile_training_semantics(
                 turn.output,
                 world_source=world_source,
                 world=world,
@@ -469,7 +753,7 @@ class TaskCurriculumLeaf:
             source_ref = self.kernel.runtime.artifacts.put_json(
                 artifact_id=f"{inputs.context.context_id}:task-curriculum-source",
                 artifact_type="design.task_curriculum_source",
-                value=turn.output,
+                value=compiled.canonical_source,
                 dependencies=_unique_refs(
                     *_input_refs(context),
                     evidence_ref,
@@ -671,10 +955,8 @@ class ModelingBoundaryLeaf:
                 value=baseline,
                 dependencies=(design_ref,),
             )
-            return LeafProposal(
-                output_refs=(coverage_ref, world_spec_ref, design_ref, gate_ref, baseline_ref),
-                subject_refs=(design_ref, gate_ref),
-            )
+            outputs = (coverage_ref, world_spec_ref, design_ref, gate_ref, baseline_ref)
+            return LeafProposal(output_refs=outputs, subject_refs=outputs)
 
         await self.kernel.execute(context, definition=definition, proposal_runner=proposal)
 
@@ -727,6 +1009,12 @@ def _one_parent(context: WorkExecutionContext, artifact_type: str) -> ArtifactRe
             category="Final Design leaf lacks one exact committed parent Artifact",
         )
     return matches[0]
+
+
+def _parents(context: WorkExecutionContext, artifact_type: str) -> tuple[ArtifactRef, ...]:
+    """Return every direct parent output of one declared multi-value type."""
+
+    return tuple(ref for ref in context.parent_output_refs if ref.artifact_type == artifact_type)
 
 
 def _input_refs(context: WorkExecutionContext) -> tuple[ArtifactRef, ...]:
@@ -860,7 +1148,9 @@ def _tool_batch_prompt(
         inputs,
         role="one physical tool-behavior batch",
         instruction=(
-            "Preserve the exact target tool order. Define only typed conditions, state transition, "
+            'The complete logical root is exactly {"tools":[...]}; never wrap the batch in '
+            "a `tool_semantics` field or any other object. Preserve the exact target tool order. "
+            "Define only typed conditions, state transition, "
             "error behavior, permission/observation and reliability. Do not add tools, tasks, "
             "runtime code, fixtures, answers or release decisions. Rule identifiers are framework "
             "owned: omit rule_id whenever the output schema permits it; code derives the stable "
@@ -884,7 +1174,13 @@ def _tool_batch_prompt(
             "top-level observation_schema fields. Framework derives redactions. Every reliability "
             "error reference must name an error declared by that "
             "tool, "
-            "and shared contracts are mandatory."
+            "and shared contracts are mandatory. Before returning, compare every target tool "
+            "with its matching shared contract: transaction.atomicity, concurrency.isolation, "
+            "and idempotency.mode must equal their frozen domains. For every "
+            "shared_contracts[*].source.error_policies entry that contains the tool id, declare "
+            "at least one error whose final error_code segment and retryable value exactly match "
+            "that policy. Include every matching frozen compensation edge in "
+            "rollback.compensation_tools."
             " The rule_context_catalog for each tool is the complete allowed Rule vocabulary "
             "for that tool's declared state footprint. lookup_binding_groups factor each lookup "
             "binding: source, collection_pointer and key_field apply to every value_bindings "
@@ -893,7 +1189,18 @@ def _tool_batch_prompt(
             "framework-proven same-terminal-field and same-type reference-key combinations, and "
             "each listed binding_id selects the whole combination. A missing binding or state "
             "root is forbidden rather than an "
-            "invitation to infer it."
+            "invitation to infer it. Before serializing, perform this independent JSON "
+            "representation audit for every target tool. Copy the enclosing tool_id exactly into "
+            "conditions.tool_id, state_transition.tool_id, errors.tool_id, "
+            "access_observation.tool_id, and reliability.tool_id; no nested id is implicit. "
+            "Every Rule description, error observation, denied observation, duplicate "
+            "observation, transaction commit point, rollback guarantee, conflict detection, and "
+            "ordering guarantee is one non-empty JSON string, never a list or object. Preserve "
+            "reliability primitive kinds: retry maximum_attempts is an integer >=1; retryable "
+            "and rollback code/tool fields are arrays; same-idempotency, partial-commit, and "
+            "rollback-supported fields are booleans; timeout seconds is positive; and conflict "
+            "error code is null or one identifier string. Do not turn scalars, booleans, or null "
+            "into explanatory prose."
         ),
         context={
             "world_boundary": {
@@ -1003,6 +1310,77 @@ def _world_rules_prompt(
     )
 
 
+def _curriculum_plan_prompt(
+    inputs: DirectGenerationInputs,
+    world: WorldModelDraft,
+    evidence: EvidenceGraph,
+) -> str:
+    return _prompt(
+        inputs,
+        role="bounded curriculum planning",
+        instruction=(
+            "Produce exactly one `CurriculumPlanSourceDraft`, not task Rule IR. This is a small "
+            "plan that will create one independent TaskRequirement call per `task_plans` entry, "
+            "so choose only the smallest semantically distinct end-to-end task families needed "
+            "for this frozen WorldModel. Do not enumerate task variants, trajectories, examples, "
+            "or task instances. `difficulty_dimensions` is one closed top-level catalog: emit "
+            "one `DifficultyDimension` for every `task_dimension_catalog` id, exactly once and "
+            "in its supplied order; do not rename, omit, add, or reorder ids. Each task plan may "
+            "select only applicable ids from that catalog. Each task plan must use only frozen "
+            "actors and tools and state a precise reachable objective. "
+            "Sampling Rules use family `sampling`, never read `task_goal`, and omit optional "
+            "`rule_id`; the framework derives `rule:sampling:<ordinal>`. Do not emit "
+            "TaskRequirement fields, success/failure/terminal Rules, schemas, evaluator bindings, "
+            "reward, verification policy, code, fixed replay tasks, solutions, or a release "
+            "decision. For `coverage_dimensions[*].rule_ids`, copy only literal IDs from "
+            "`coverage_rule_catalog`; leave the list empty when no frozen world Rule directly "
+            "supports that dimension. Keep Runtime and Verifier coverage absent at this stage."
+        ),
+        context={
+            "world": world.model_dump(mode="json"),
+            "task_dimension_catalog": world.task_dimensions,
+            "coverage_rule_catalog": coverage_rule_catalog(world),
+            "claims": _claim_catalog(evidence),
+        },
+    )
+
+
+def _task_requirement_prompt(
+    inputs: DirectGenerationInputs,
+    world: WorldModelDraft,
+    curriculum_plan: CurriculumPlanSourceDraft,
+    target_task_plan: dict[str, object],
+    evidence: EvidenceGraph,
+) -> str:
+    return _prompt(
+        inputs,
+        role="one independently repairable task-family contract",
+        instruction=(
+            "Produce exactly one `TaskRequirementSourceDraft` for `target_task_plan`; do not "
+            "add, remove, rename, or reorder task families. Preserve target_task_plan.task_type, "
+            "objective, allowed_actor_ids, required_tool_ids, difficulty_dimensions, and "
+            "minimum_tool_calls exactly. Author the smallest executable Rule set sufficient for "
+            "this one task family, rather than listing task instances or variants. Include all "
+            "four Rule-list fields: `initial_state_constraints` and `failure_conditions` may be "
+            "empty; `success_conditions` and `terminal_conditions` must be non-empty. Initial "
+            "Rules use family `initial_state` and never read `task_goal`; success, failure and "
+            "terminal Rules use `task_success`, `task_failure`, and `task_terminal`. At least one "
+            "success Rule and one terminal Rule must read scalar, non-root, non-overlapping "
+            "`task_goal` pointers. Evaluator Rules never read Runtime `terminated` or `truncated`. "
+            "Rule IDs are framework mechanics: omit optional `rule_id`; code derives "
+            "`rule:task:<task_type>:<section>:<ordinal>`. Do not emit sampling, coverage, schemas, "
+            "evaluator bindings, reward, verification policy, runtime code, examples, fixed "
+            "tasks, trajectories, answers, solutions, or a release decision."
+        ),
+        context={
+            "world": world.model_dump(mode="json"),
+            "curriculum_plan": curriculum_plan.model_dump(mode="json"),
+            "target_task_plan": target_task_plan,
+            "claims": _claim_catalog(evidence),
+        },
+    )
+
+
 def _curriculum_prompt(
     inputs: DirectGenerationInputs,
     world: WorldModelDraft,
@@ -1012,13 +1390,35 @@ def _curriculum_prompt(
         inputs,
         role="task curriculum semantics",
         instruction=(
-            "Define a small diverse task curriculum and exact task Rules against this frozen "
-            "WorldModel. "
-            "Do not modify the world, author schemas/evaluator bindings, code, fixed replay tasks, "
-            "solutions, expected answers or a release decision."
+            "Produce exactly one `TrainingSemanticSourceDraft`: a small diverse `curriculum_plan` "
+            "and exactly one ordered `task_requirements` entry for every plan entry against this "
+            "frozen WorldModel. Every task requirement must match its plan's task_type, objective, "
+            "actors, tools, difficulty dimensions and minimum calls exactly. Every task "
+            "requirement "
+            "must include all four Rule-list fields: `initial_state_constraints` (may be empty), "
+            "`success_conditions` (non-empty), `failure_conditions` (may be empty), and "
+            "`terminal_conditions` (non-empty). Never omit an empty-allowed field. Use only frozen "
+            "actors, tools, state paths, existing world Rule ids and evidence claim ids. For "
+            "`coverage_dimensions[*].rule_ids`, copy only literal `rule_id` values from "
+            "`coverage_rule_catalog`; it is the complete frozen world Rule closure. Do not "
+            "invent a Rule id or use task/sampling Rule ids, which do not exist yet. Leave "
+            "`rule_ids` empty when no existing world Rule directly supports that coverage "
+            "dimension. Task and sampling Rule identities are "
+            "framework mechanics: omit optional `rule_id`; code derives `rule:sampling:<ordinal>` "
+            "and `rule:task:<task_type>:<section>:<ordinal>`. Sampling Rules use family `sampling` "
+            "and never read `task_goal`. Per task, initial-state Rules use family `initial_state` "
+            "and never read `task_goal`; success Rules use `task_success`; failure Rules use "
+            "`task_failure`; terminal Rules use `task_terminal`. For every task requirement, at "
+            "least one success Rule and at least one terminal Rule must read scalar, non-root, "
+            "non-overlapping `task_goal` pointers; no "
+            "evaluator Rule may read Runtime `terminated` or `truncated`. Keep coverage at design "
+            "stage with Runtime and Verifier coverage absent. Do not modify the world, author "
+            "schemas/evaluator bindings, code, fixed replay tasks, solutions, expected answers or "
+            "a release decision."
         ),
         context={
             "world": world.model_dump(mode="json"),
+            "coverage_rule_catalog": coverage_rule_catalog(world),
             "claims": _claim_catalog(evidence),
         },
     )
@@ -1104,9 +1504,12 @@ def _stable_id(prefix: str, *parts: str) -> str:
 
 
 __all__ = [
+    "CurriculumPlanLeaf",
     "ModelingBoundaryLeaf",
     "SharedToolSemanticsLeaf",
+    "TaskCurriculumJoinLeaf",
     "TaskCurriculumLeaf",
+    "TaskRequirementLeaf",
     "ToolSemanticsBatchLeaf",
     "WorldRulesLeaf",
 ]

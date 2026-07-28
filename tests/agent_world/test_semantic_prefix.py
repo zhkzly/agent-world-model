@@ -345,6 +345,9 @@ async def test_direct_runner_semantic_prefix_never_enters_final_executors(
         workspace_root=tmp_path,
         structured_turn_token_limit=32_768,
         structured_turn_wall_seconds=30,
+        environment_codegen_session_token_limit=5_000_000,
+        environment_codegen_session_wall_seconds=28_800,
+        environment_codegen_physical_turn_token_limit=128_000,
     )
     monkeypatch.setattr(
         DirectWorkRunner,

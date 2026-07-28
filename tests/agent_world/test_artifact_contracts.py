@@ -6,7 +6,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
-from pydantic import JsonValue, ValidationError
+from pydantic import BaseModel, JsonValue, ValidationError
 
 from agent_world.artifact_store import (
     ArtifactIntegrityError,
@@ -74,6 +74,10 @@ def _diamond_artifact_refs(writer: ArtifactWriter) -> tuple[ArtifactRef, ...]:
         dependencies=(left, right),
     )
     return leaf, left, right, root
+
+
+class _ArtifactNode(BaseModel):
+    node: str
 
 
 def test_contract_json_and_hash_are_canonical_and_models_are_closed() -> None:
@@ -260,6 +264,76 @@ def test_artifact_store_verifies_each_shared_dag_revision_once_per_read(
     assert revision_read_counts == Counter(
         {ref.revision_id.removeprefix("sha256:"): 1 for ref in refs}
     )
+
+
+def test_artifact_store_reads_many_shared_revisions_with_one_dependency_audit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    writer = _test_writer(store)
+    leaf, left, right, _ = _diamond_artifact_refs(writer)
+    revision_read_counts: Counter[str] = Counter()
+    original_read_file = store._read_file
+
+    def counting_read_file(path: Path, *, missing_message: str) -> bytes:
+        relative = path.relative_to(store.root)
+        if relative.parts[:2] == ("revisions", "sha256"):
+            revision_read_counts[path.stem] += 1
+        return original_read_file(path, missing_message=missing_message)
+
+    monkeypatch.setattr(store, "_read_file", counting_read_file)
+
+    assert writer.get_json_many((left, right), _ArtifactNode) == (
+        _ArtifactNode(node="left"),
+        _ArtifactNode(node="right"),
+    )
+    assert revision_read_counts == Counter(
+        {
+            leaf.revision_id.removeprefix("sha256:"): 1,
+            left.revision_id.removeprefix("sha256:"): 1,
+            right.revision_id.removeprefix("sha256:"): 1,
+        }
+    )
+
+
+def test_artifact_writer_verified_closure_reuses_ancestor_audit_for_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    writer = _test_writer(store)
+    leaf = writer.put_json(
+        artifact_id="subject:verified-closure-leaf",
+        artifact_type="control.subject",
+        value={"node": "leaf"},
+    )
+    revision_read_counts: Counter[str] = Counter()
+    original_read_file = store._read_file
+
+    def counting_read_file(path: Path, *, missing_message: str) -> bytes:
+        relative = path.relative_to(store.root)
+        if relative.parts[:2] == ("revisions", "sha256"):
+            revision_read_counts[path.stem] += 1
+        return original_read_file(path, missing_message=missing_message)
+
+    monkeypatch.setattr(store, "_read_file", counting_read_file)
+
+    with writer.verified_closure():
+        writer.put_json(
+            artifact_id="subject:verified-closure-left",
+            artifact_type="control.subject",
+            value={"node": "left"},
+            dependencies=(leaf,),
+        )
+        writer.put_json(
+            artifact_id="subject:verified-closure-right",
+            artifact_type="control.subject",
+            value={"node": "right"},
+            dependencies=(leaf,),
+        )
+
+    assert revision_read_counts[leaf.revision_id.removeprefix("sha256:")] == 1
 
 
 @pytest.mark.parametrize("tamper_target", ["revision", "blob"])

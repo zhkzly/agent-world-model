@@ -14,15 +14,23 @@ from typing import NoReturn
 
 from pydantic import ValidationError
 
-from agent_world.contracts import ArtifactRef, EvidenceGraph
-from agent_world.control.validation import StructuredValidationError, ValidationDiagnostic
+from agent_world.contracts import ArtifactRef, EvidenceGraph, TaskRequirement
+from agent_world.control.validation import (
+    SafeValidationIssue,
+    StructuredValidationError,
+    ValidationDiagnostic,
+)
 
 from .models import (
+    CurriculumPlanDraft,
+    CurriculumPlanSourceDraft,
     EnvironmentDesignDraft,
     EnvironmentSemanticSourceDraft,
     RuleDraft,
     SharedToolSemanticsContract,
     SharedToolSemanticsSourceDraft,
+    TaskRequirementDraft,
+    TaskRequirementSourceDraft,
     ToolCouplingGroupPlan,
     ToolSemanticsBatchSourceDraft,
     ToolSemanticsDraft,
@@ -55,8 +63,183 @@ class CompiledWorldRules:
 class CompiledTrainingSemantics:
     """Exact whole-design semantic source and framework-composed Design draft."""
 
+    # Durable TaskCurriculum source retains only Agent-authored meaning.  Rule
+    # identities are deterministic framework IR mechanics and must never be
+    # persisted as values the Agent was asked to guess.
+    canonical_source: TrainingSemanticSourceDraft
     source: EnvironmentSemanticSourceDraft
     design: EnvironmentDesignDraft
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledCurriculumPlan:
+    """One canonical, world-bound curriculum topology.
+
+    This deliberately stops before any task-family Rule IR exists.  The
+    committed plan is the only authority that may determine the later physical
+    ``TaskRequirement`` WorkDefinitions.
+    """
+
+    canonical_source: CurriculumPlanSourceDraft
+    plan: CurriculumPlanDraft
+
+
+@dataclass(frozen=True, slots=True)
+class CompiledTaskRequirement:
+    """One canonical task-family source checked against its frozen plan entry."""
+
+    canonical_source: TaskRequirementSourceDraft
+    plan: CurriculumPlanDraft
+    target_task_type: str
+    source: TaskRequirementDraft
+    task: TaskRequirement
+
+
+def coverage_rule_catalog(world: WorldModelDraft) -> tuple[dict[str, str], ...]:
+    """Project the exact existing Rule identities usable by curriculum coverage.
+
+    The source schema cannot express a per-world enum, so the runtime Agent
+    receives this small frozen catalog alongside the full WorldModel.  It is a
+    navigation projection only: the existing compiler remains the authority
+    that validates every submitted reference.
+    """
+
+    return tuple(
+        {"rule_id": rule.rule_id, "family": rule.family}
+        for rule in EnvironmentDesigner._world_rule_sequence(world)
+    )
+
+
+def compile_curriculum_plan_semantics(
+    source: CurriculumPlanSourceDraft,
+    *,
+    world: WorldModelDraft,
+    evidence_graph: EvidenceGraph,
+) -> CompiledCurriculumPlan:
+    """Compile the bounded plan before any task-family Agent call exists.
+
+    A plan is semantic output, but Rule identities inside its sampling section
+    are framework mechanics.  Canonicalizing them here makes the committed
+    plan safe to use as the sole fan-out authority in a later graph epoch.
+    """
+
+    try:
+        canonical_source = _canonicalize_curriculum_plan_source(source)
+        plan = EnvironmentDesigner._compile_curriculum_plan_source(canonical_source)
+        EnvironmentDesigner._validate_curriculum_plan(
+            plan,
+            world=world,
+            evidence_graph=evidence_graph,
+        )
+    except (StructuredSemanticError, StructuredValidationError, ValidationError, ValueError) as exc:
+        _raise_compiler_diagnostic(exc, phase="curriculum_plan_preflight")
+    return CompiledCurriculumPlan(
+        canonical_source=canonical_source,
+        plan=plan,
+    )
+
+
+def compile_task_requirement_semantics(
+    source: TaskRequirementSourceDraft,
+    *,
+    curriculum_plan: CurriculumPlanSourceDraft,
+    target_task_type: str,
+    world: WorldModelDraft,
+    evidence_graph: EvidenceGraph,
+) -> CompiledTaskRequirement:
+    """Validate one independently executable task-family boundary.
+
+    The caller supplies the target from the committed plan-derived physical
+    coordinate.  This prevents an Agent from changing fan-out identity while
+    preserving its ownership of the task's business Rules.
+    """
+
+    try:
+        compiled_plan = compile_curriculum_plan_semantics(
+            curriculum_plan,
+            world=world,
+            evidence_graph=evidence_graph,
+        )
+        target = next(
+            (item for item in compiled_plan.plan.task_plans if item.task_type == target_task_type),
+            None,
+        )
+        if target is None:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="task_requirement_target",
+                    frontier_ordinal=40,
+                    issues=(
+                        SafeValidationIssue(
+                            "task_requirement_target_not_planned",
+                            ("task_type",),
+                            "This task requirement does not have a frozen curriculum-plan target.",
+                            retryable=False,
+                            violated_condition=(
+                                "every task requirement coordinate names one committed "
+                                "plan task_type"
+                            ),
+                            expected_category=(
+                                "a task_type present in the committed curriculum plan"
+                            ),
+                        ),
+                    ),
+                )
+            )
+        canonical_source = _canonicalize_task_requirement_source(source)
+        authored = EnvironmentDesigner._compile_task_requirement_source(
+            canonical_source,
+            framework_task_type=target.task_type,
+        )
+        try:
+            initial_config_schema = EnvironmentDesigner._compile_task_initial_config_schema(
+                world.state.root_state_schema
+            )
+        except ValueError as exc:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="task_initial_config_projection",
+                    frontier_ordinal=40,
+                    issues=(
+                        SafeValidationIssue(
+                            "task_initial_config_projection_invalid",
+                            ("world", "state", "root_state_schema"),
+                            "The frozen world state cannot be projected into the closed "
+                            "task reset schema.",
+                            retryable=False,
+                            violated_condition=(
+                                "the framework can derive a closed task initial-config schema "
+                                "from the frozen world state"
+                            ),
+                            expected_category="a framework-projectable closed world state schema",
+                        ),
+                    ),
+                )
+            ) from exc
+        task = EnvironmentDesigner._compile_task_requirement_shard(
+            authored,
+            target=target,
+            world=world,
+            initial_config_schema=initial_config_schema,
+        )
+        EnvironmentDesigner._validate_task_requirement_shard(
+            task,
+            target=target,
+            plan=compiled_plan.plan,
+            world=world,
+            evidence_graph=evidence_graph,
+        )
+    except (StructuredSemanticError, StructuredValidationError, ValidationError, ValueError) as exc:
+        _raise_compiler_diagnostic(exc, phase="task_requirement_preflight")
+    return CompiledTaskRequirement(
+        canonical_source=canonical_source,
+        plan=compiled_plan.plan,
+        target_task_type=target_task_type,
+        source=authored,
+        task=task,
+    )
 
 
 def compile_shared_tool_semantics(
@@ -182,18 +365,77 @@ def compile_training_semantics(
     """Compile tasks/reward/verification while preserving the frozen WorldModel."""
 
     try:
-        plan = EnvironmentDesigner._compile_curriculum_plan_source(source.curriculum_plan)
+        canonical_source = _canonicalize_training_semantics_source(source)
+        plan = EnvironmentDesigner._compile_curriculum_plan_source(canonical_source.curriculum_plan)
         EnvironmentDesigner._validate_curriculum_plan(
             plan,
             world=world,
             evidence_graph=evidence_graph,
         )
-        initial_config_schema = EnvironmentDesigner._compile_task_initial_config_schema(
-            world.state.root_state_schema
-        )
+        if len(canonical_source.task_requirements) != len(plan.task_plans):
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="task_curriculum_source_shape",
+                    frontier_ordinal=40,
+                    issues=(
+                        SafeValidationIssue(
+                            "task_requirement_count_mismatch",
+                            ("task_requirements",),
+                            (
+                                "Task requirements must contain exactly one entry "
+                                "for each curriculum plan."
+                            ),
+                            violated_condition=(
+                                "task_requirements length equals the frozen curriculum "
+                                "task-plan length"
+                            ),
+                            expected_category="one task requirement per curriculum task plan",
+                        ),
+                    ),
+                )
+            )
+        try:
+            initial_config_schema = EnvironmentDesigner._compile_task_initial_config_schema(
+                world.state.root_state_schema
+            )
+        except ValueError as exc:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="design",
+                    validation_phase="task_initial_config_projection",
+                    frontier_ordinal=40,
+                    issues=(
+                        SafeValidationIssue(
+                            "task_initial_config_projection_invalid",
+                            ("world", "state", "root_state_schema"),
+                            (
+                                "The frozen world state cannot be projected into "
+                                "the closed task reset schema."
+                            ),
+                            retryable=False,
+                            violated_condition=(
+                                "the framework can derive a closed task initial-config schema "
+                                "from the frozen world state"
+                            ),
+                            expected_category="a framework-projectable closed world state schema",
+                        ),
+                    ),
+                )
+            ) from exc
         authored_tasks = tuple(
-            EnvironmentDesigner._compile_task_requirement_source(item)
-            for item in source.task_requirements
+            EnvironmentDesigner._compile_task_requirement_source(
+                item,
+                framework_task_type=target.task_type,
+                path_prefix=("task_requirements", index),
+            )
+            for index, (target, item) in enumerate(
+                zip(
+                    plan.task_plans,
+                    canonical_source.task_requirements,
+                    strict=True,
+                )
+            )
         )
         tasks = tuple(
             EnvironmentDesigner._compile_task_requirement_shard(
@@ -201,16 +443,20 @@ def compile_training_semantics(
                 target=target,
                 world=world,
                 initial_config_schema=initial_config_schema,
+                path_prefix=("task_requirements", index),
             )
-            for target, authored in zip(plan.task_plans, authored_tasks, strict=True)
+            for index, (target, authored) in enumerate(
+                zip(plan.task_plans, authored_tasks, strict=True)
+            )
         )
-        for target, task in zip(plan.task_plans, tasks, strict=True):
+        for index, (target, task) in enumerate(zip(plan.task_plans, tasks, strict=True)):
             EnvironmentDesigner._validate_task_requirement_shard(
                 task,
                 target=target,
                 plan=plan,
                 world=world,
                 evidence_graph=evidence_graph,
+                path_prefix=("task_requirements", index),
             )
         curriculum = EnvironmentDesigner._compose_curriculum_contract(plan, tasks)
         training = EnvironmentDesigner._compile_training_contract(world, curriculum)
@@ -223,7 +469,55 @@ def compile_training_semantics(
         )
     except (StructuredSemanticError, StructuredValidationError, ValidationError, ValueError) as exc:
         _raise_compiler_diagnostic(exc, phase="task_curriculum_preflight")
-    return CompiledTrainingSemantics(source=semantic_source, design=design)
+    return CompiledTrainingSemantics(
+        canonical_source=canonical_source,
+        source=semantic_source,
+        design=design,
+    )
+
+
+def _without_rule_ids(rules: tuple[RuleDraft, ...]) -> tuple[RuleDraft, ...]:
+    return tuple(rule.model_copy(update={"rule_id": None}) for rule in rules)
+
+
+def _canonicalize_curriculum_plan_source(
+    source: CurriculumPlanSourceDraft,
+) -> CurriculumPlanSourceDraft:
+    """Remove Agent-authored sampling Rule identities before plan persistence."""
+
+    return source.model_copy(
+        update={"sampling_constraints": _without_rule_ids(source.sampling_constraints)}
+    )
+
+
+def _canonicalize_task_requirement_source(
+    source: TaskRequirementSourceDraft,
+) -> TaskRequirementSourceDraft:
+    """Remove Agent-authored task Rule identities before shard persistence."""
+
+    return source.model_copy(
+        update={
+            "initial_state_constraints": _without_rule_ids(source.initial_state_constraints),
+            "success_conditions": _without_rule_ids(source.success_conditions),
+            "failure_conditions": _without_rule_ids(source.failure_conditions),
+            "terminal_conditions": _without_rule_ids(source.terminal_conditions),
+        }
+    )
+
+
+def _canonicalize_training_semantics_source(
+    source: TrainingSemanticSourceDraft,
+) -> TrainingSemanticSourceDraft:
+    """Canonicalize the separately persisted plan and task-family sources."""
+
+    return source.model_copy(
+        update={
+            "curriculum_plan": _canonicalize_curriculum_plan_source(source.curriculum_plan),
+            "task_requirements": tuple(
+                _canonicalize_task_requirement_source(task) for task in source.task_requirements
+            ),
+        }
+    )
 
 
 def _raise_compiler_diagnostic(
@@ -233,7 +527,36 @@ def _raise_compiler_diagnostic(
 ) -> NoReturn:
     """Convert legacy compiler failures to the only repairable safe boundary."""
 
-    issues = EnvironmentDesigner._prefixed_validation_issues(exc, prefix=())
+    issues: tuple[SafeValidationIssue, ...]
+    if (
+        phase
+        in {
+            "curriculum_plan_preflight",
+            "task_requirement_preflight",
+            "task_curriculum_preflight",
+        }
+        and isinstance(exc, (ValidationError, ValueError))
+        and not isinstance(exc, (StructuredSemanticError, StructuredValidationError))
+    ):
+        boundary = {
+            "curriculum_plan_preflight": "CurriculumPlan",
+            "task_requirement_preflight": "TaskRequirement",
+            "task_curriculum_preflight": "TaskCurriculum",
+        }[phase]
+        issues = (
+            SafeValidationIssue(
+                f"{phase.removesuffix('_preflight')}_framework_protocol_invalid",
+                ("compiler",),
+                f"Framework-generated {boundary} protocol failed its closed contract.",
+                retryable=False,
+                violated_condition=(
+                    "the framework compiles the closed protocol after source validation"
+                ),
+                expected_category=f"a framework-valid {boundary} protocol",
+            ),
+        )
+    else:
+        issues = EnvironmentDesigner._prefixed_validation_issues(exc, prefix=())
     raise StructuredValidationError(
         ValidationDiagnostic(
             owner_component="design",
@@ -258,9 +581,14 @@ def _pure_compiler() -> EnvironmentDesigner:
 
 
 __all__ = [
+    "CompiledCurriculumPlan",
+    "CompiledTaskRequirement",
     "CompiledTrainingSemantics",
     "CompiledWorldRules",
+    "coverage_rule_catalog",
+    "compile_curriculum_plan_semantics",
     "compile_shared_tool_semantics",
+    "compile_task_requirement_semantics",
     "compile_tool_semantics_batch",
     "compile_training_semantics",
     "compile_world_rules",

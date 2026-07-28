@@ -13,6 +13,11 @@ REDACTED = "[REDACTED]"
 
 _BEARER = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}")
 _OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
+_TERMINAL_DIAGNOSTIC_URL = re.compile(r"(?i)\b(?:https?|wss?|file)://[^\s'\"<>]+")
+_TERMINAL_DIAGNOSTIC_ASSIGNMENT = re.compile(
+    r"(?i)\b(api[ _-]?key|authorization|token|secret|password)\b\s*[:=]\s*\S+"
+)
+_TERMINAL_DIAGNOSTIC_OPAQUE = re.compile(r"\b[A-Za-z0-9._~+/=-]{32,}\b")
 _CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 _SENSITIVE_NAMES = frozenset(
     {
@@ -73,6 +78,32 @@ class Redactor:
         if not isinstance(normalized, dict):
             raise TypeError("redacted object did not remain an object")
         return normalized
+
+
+def redacted_terminal_diagnostic_excerpt(
+    value: object,
+    *,
+    redactor: Redactor,
+    maximum_characters: int = 512,
+) -> str | None:
+    """Return one bounded local-only terminal excerpt after defensive redaction.
+
+    This is deliberately narrower than :meth:`Redactor.text`.  It is used
+    only by an explicitly opted-in diagnostic side channel, never ordinary
+    runtime feedback.  Provider terminal text can contain routes, credential
+    assignments, or opaque request material, so callers must receive a
+    compact, second-pass-scrubbed string even when a worker has already
+    redacted it.
+    """
+
+    if not isinstance(value, str) or maximum_characters <= 0:
+        return None
+    text = redactor.text(value)
+    text = _TERMINAL_DIAGNOSTIC_URL.sub("[REDACTED_URL]", text)
+    text = _TERMINAL_DIAGNOSTIC_ASSIGNMENT.sub(r"\1=[REDACTED]", text)
+    text = _TERMINAL_DIAGNOSTIC_OPAQUE.sub("[REDACTED_OPAQUE]", text)
+    compact = " ".join(text.split())
+    return compact[:maximum_characters] if compact else None
 
 
 def _sensitive_key(value: str) -> bool:

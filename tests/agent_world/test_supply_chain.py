@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from v3_fixture import build_judge_candidate_graph
 
 from agent_world.artifact_store import ArtifactStore
 from agent_world.builder import CandidateWorkspaceError, CandidateWorkspaceValidator
+from agent_world.builder.service import BuilderError, EnvironmentBuilder
 from agent_world.contracts import (
     ArtifactRef,
     EnvPackageMetadata,
@@ -60,6 +62,46 @@ def test_builder_accepts_only_the_virtual_non_installed_root_without_dependencie
     _validate(pyproject, lock)
 
 
+def test_builder_projects_virtual_root_name_mismatch_as_safe_repair_feedback() -> None:
+    """A real lock-policy rejection yields repairable, non-content feedback."""
+
+    pyproject, lock = _root_project()
+    packages = lock["package"]
+    assert isinstance(packages, list)
+    root = packages[0]
+    assert isinstance(root, dict)
+    root["name"] = "untrusted-virtual-root"
+
+    with pytest.raises(CandidateWorkspaceError) as captured:
+        _validate(pyproject, lock)
+
+    workspace_error = captured.value
+    assert workspace_error.safe_diagnostic is not None
+    assert workspace_error.safe_diagnostic.code == "dependency_virtual_root_name_mismatch"
+    try:
+        raise BuilderError("candidate.validation", str(workspace_error)) from workspace_error
+    except BuilderError as builder_error:
+        diagnostic = EnvironmentBuilder._validation_diagnostic(  # noqa: SLF001 - boundary under test
+            builder_error
+        )
+
+    issue = diagnostic.issues[0]
+    persisted = json.dumps(diagnostic.persistence_projection())
+    assert diagnostic.validation_phase == "dependency_contract"
+    assert issue.issue_code == "candidate_dependency_virtual_root_name_mismatch@candidate.uv.lock"
+    assert issue.violated_condition == (
+        "the virtual root package name in uv.lock does not equal [project].name"
+    )
+    assert issue.expected_category == (
+        'exactly one { virtual = "." } package named exactly [project].name'
+    )
+    assert issue.actionable_for_agent is True
+    assert "supply-chain-probe" not in diagnostic.feedback
+    assert "untrusted-virtual-root" not in diagnostic.feedback
+    assert "supply-chain-probe" not in persisted
+    assert "untrusted-virtual-root" not in persisted
+
+
 def test_builder_rejects_an_editable_root_project() -> None:
     pyproject, lock = _root_project()
     packages = lock["package"]
@@ -107,9 +149,7 @@ def test_builder_rejects_unapproved_dependency_and_build_sources(
     elif mutation == "direct-url":
         project["dependencies"] = ["evil @ https://evil.example/evil.whl"]
     elif mutation == "custom-index":
-        pyproject["tool"] = {
-            "uv": {"index-url": "https://packages.example/simple"}
-        }
+        pyproject["tool"] = {"uv": {"index-url": "https://packages.example/simple"}}
     else:
         project["dependencies"] = ["evil==1.0"]
         source = (
@@ -260,12 +300,7 @@ async def test_supply_gate_rejects_a_real_installed_component_absent_from_uv_loc
         site_packages = next((clean.root / ".venv").glob("lib/python*/site-packages"))
         rogue = site_packages / "rogue-1.0.dist-info"
         rogue.mkdir()
-        metadata = (
-            b"Metadata-Version: 2.4\n"
-            b"Name: rogue\n"
-            b"Version: 1.0\n"
-            b"License-Expression: MIT\n\n"
-        )
+        metadata = b"Metadata-Version: 2.4\nName: rogue\nVersion: 1.0\nLicense-Expression: MIT\n\n"
         (rogue / "METADATA").write_bytes(metadata)
         evidence = inspect_supply_chain(
             evidence_id="evidence:real-installed-lock-mismatch",
@@ -274,9 +309,7 @@ async def test_supply_gate_rejects_a_real_installed_component_absent_from_uv_loc
             manifest=graph.candidate_manifest,
             implementation_lineage_ref=graph.candidate_manifest.implementation_lineage_ref,
             implementation_lineage=graph.implementation_lineage,
-            installed_tree_hash=sha256_digest(
-                clean.installed_tree_hash.encode("utf-8") + metadata
-            ),
+            installed_tree_hash=sha256_digest(clean.installed_tree_hash.encode("utf-8") + metadata),
         )
 
     assert evidence.status == "fail"

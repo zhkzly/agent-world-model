@@ -144,12 +144,40 @@ class WorkRepairLedger:
         ordinal = len(executing) + 1
         if action.repair_attempt_ordinal != ordinal:
             raise WorkRepairDenied("repair_attempt_ordinal_mismatch")
-        if ordinal > policy.maximum_total_repair_attempts:
+        charged_ordinal = 1 + sum(
+            entry.decision != "session_continuation" and entry.outcome != "rejected"
+            for entry in prior
+        )
+        if (
+            action.decision != "session_continuation"
+            and charged_ordinal > policy.maximum_total_repair_attempts
+        ):
             raise WorkRepairDenied("repair_total_exhausted")
         if any(entry.outcome == "no_progress" for entry in prior):
             raise WorkRepairDenied("repair_no_progress_terminal")
 
-        if action.decision == "local_correction":
+        if action.decision == "session_continuation":
+            if (
+                definition.proposal_policy.executor != "agent"
+                or definition.proposal_policy.session_token_limit is None
+                or definition.proposal_policy.session_wall_seconds is None
+            ):
+                raise WorkRepairDenied("session_continuation_not_declared")
+            if report.status != "error" or tuple(issue.code for issue in report.issues) != (
+                "turn_failed_output_limit",
+            ):
+                raise WorkRepairDenied("session_continuation_requires_closed_output_limit")
+            if (
+                action.target_coordinate != definition.coordinate
+                or action.allowed_mutation_roots != definition.allowed_mutation_roots
+            ):
+                raise WorkRepairDenied("session_continuation_authority_mismatch")
+            continuation_count = sum(
+                entry.decision == "session_continuation" for entry in prior
+            )
+            if continuation_count >= policy.maximum_session_continuations:
+                raise WorkRepairDenied("session_continuation_exhausted")
+        elif action.decision == "local_correction":
             if not report.repair_actionable:
                 raise WorkRepairDenied("repair_diagnostic_not_actionable")
             if action.target_coordinate != definition.coordinate:
@@ -234,6 +262,7 @@ class WorkRepairLedger:
         observed_actual: BudgetUsage | None = None,
         unknown_upper_bound: BudgetUsage | None = None,
         force_no_progress: bool = False,
+        force_strict_progress: bool = False,
     ) -> WorkRepairLedgerEntry:
         report_before = ValidationReport.model_validate(report_before.model_dump(mode="python"))
         report_after = ValidationReport.model_validate(report_after.model_dump(mode="python"))
@@ -265,6 +294,13 @@ class WorkRepairLedger:
             # bonus merely because its original blockers are absent from a
             # transport report.
             progress = "unknown"
+        elif force_strict_progress:
+            # A second exact Provider output-ceiling terminal proves that the
+            # resumed physical turn consumed a real bounded slice of the same
+            # logical session.  It is not semantic progress, but it must not
+            # be classified as a no-op merely because both error reports share
+            # the same closed code.
+            progress = "strict_progress"
         outcome = (
             "resolved"
             if progress == "resolved"

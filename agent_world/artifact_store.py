@@ -19,7 +19,9 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TypeVar, overload
@@ -162,6 +164,42 @@ def _is_probable_credential(candidate: bytes) -> bool:
     )
 
 
+class ArtifactReadView:
+    """One operation-scoped, read-only verified Artifact closure view.
+
+    Public store reads deliberately re-audit their complete immutable ancestry:
+    a later public call must still detect a tampered ancestor.  A single
+    framework operation often needs several exact refs from the *same* frozen
+    closure, though.  This view shares only that operation's verified-revision
+    map, so it does not weaken the next public operation's integrity check.
+    """
+
+    __slots__ = ("_store", "_verified")
+
+    def __init__(self, store: ArtifactStore) -> None:
+        self._store = store
+        self._verified: dict[str, ArtifactRevision] = {}
+
+    @overload
+    def get_json(self, ref: ArtifactRef, model: type[TModel]) -> TModel: ...
+
+    @overload
+    def get_json(self, ref: ArtifactRef, model: None = None) -> Any: ...
+
+    def get_json(self, ref: ArtifactRef, model: type[TModel] | None = None) -> TModel | Any:
+        revision = self.get_revision(ref)
+        return self._store._decode_json_revision(revision, model)
+
+    def get_json_many(self, refs: Iterable[ArtifactRef], model: type[TModel]) -> tuple[TModel, ...]:
+        return tuple(self.get_json(ref, model) for ref in refs)
+
+    def get_revision(self, ref: ArtifactRef) -> ArtifactRevision:
+        return self._store._get_revision(ref, set(), self._verified)
+
+    def dependencies(self, ref: ArtifactRef) -> tuple[ArtifactRef, ...]:
+        return self.get_revision(ref).dependency_refs
+
+
 class ArtifactWriter:
     """Capability-limited read/write view over one ArtifactStore.
 
@@ -268,6 +306,19 @@ class ArtifactWriter:
     def get_json(self, ref: ArtifactRef, model: type[TModel] | None = None) -> TModel | Any:
         return self._store.get_json(ref, model)
 
+    def open_read_view(self) -> ArtifactReadView:
+        return self._store.open_read_view()
+
+    @contextmanager
+    def verified_closure(self) -> Iterator[None]:
+        """Share immutable dependency verification for one bounded operation."""
+
+        with self._store.verified_closure():
+            yield
+
+    def get_json_many(self, refs: Iterable[ArtifactRef], model: type[TModel]) -> tuple[TModel, ...]:
+        return self._store.get_json_many(refs, model)
+
     def get_blob(self, ref: ArtifactRef) -> bytes:
         return self._store.get_blob(ref)
 
@@ -342,6 +393,10 @@ class ArtifactStore:
         self._projection = self._open_projection()
         self._capability_issuance_sealed = False
         self._writer_authorizations: dict[str, set[object]] = {}
+        self._verified_closure: ContextVar[dict[str, ArtifactRevision] | None] = ContextVar(
+            "artifact-store-verified-closure",
+            default=None,
+        )
         # A Store instance is the single authenticated view used by one controller
         # process.  Building this index once avoids re-reading every immutable
         # revision manifest for each exact-artifact lookup during checkpoint resume.
@@ -651,7 +706,37 @@ class ArtifactStore:
     def get_json(self, ref: ArtifactRef, model: None = None) -> Any: ...
 
     def get_json(self, ref: ArtifactRef, model: type[TModel] | None = None) -> TModel | Any:
-        revision = self.get_revision(ref)
+        return self.open_read_view().get_json(ref, model)
+
+    def open_read_view(self) -> ArtifactReadView:
+        """Start one bounded immutable-closure audit for a framework operation."""
+
+        return ArtifactReadView(self)
+
+    @contextmanager
+    def verified_closure(self) -> Iterator[None]:
+        """Share verified immutable ancestors only for one caller-owned operation.
+
+        The cache is ContextVar-scoped, so concurrent async operations do not
+        share it.  Leaving this context discards every cached revision; the
+        next public read or write therefore performs its normal full audit.
+        """
+
+        if self._verified_closure.get() is not None:
+            yield
+            return
+        token = self._verified_closure.set({})
+        try:
+            yield
+        finally:
+            self._verified_closure.reset(token)
+
+    def _decode_json_revision(
+        self,
+        revision: ArtifactRevision,
+        model: type[TModel] | None,
+    ) -> TModel | Any:
+        ref = revision.ref
         if revision.ref.media_type != "application/json":
             raise ArtifactStoreError(f"artifact {ref.revision_id} is not JSON")
         raw = self._read_blob(revision.ref)
@@ -662,6 +747,15 @@ class ArtifactStore:
         if model is None:
             return value
         return model.model_validate_json(raw)
+
+    def get_json_many(
+        self,
+        refs: Iterable[ArtifactRef],
+        model: type[TModel],
+    ) -> tuple[TModel, ...]:
+        """Read a known immutable JSON set with one shared dependency audit."""
+
+        return self.open_read_view().get_json_many(refs, model)
 
     def get_blob(self, ref: ArtifactRef) -> bytes:
         revision = self.get_revision(ref)
@@ -698,7 +792,8 @@ class ArtifactStore:
             )
 
     def get_revision(self, ref: ArtifactRef) -> ArtifactRevision:
-        return self._get_revision(ref, set(), {})
+        verified = self._verified_closure.get()
+        return self._get_revision(ref, set(), {} if verified is None else verified)
 
     def _get_revision(
         self,
@@ -1130,7 +1225,9 @@ class ArtifactStore:
             raise ArtifactStoreError("dependency and related refs must be unique")
         if verify:
             stack: set[str] = set()
-            verified: dict[str, ArtifactRevision] = {}
+            verified = self._verified_closure.get()
+            if verified is None:
+                verified = {}
             for ref in result:
                 self._get_revision(ref, stack, verified)
         return result
@@ -1520,6 +1617,7 @@ __all__ = [
     "ArtifactEvent",
     "ArtifactIntegrityError",
     "ArtifactNotFoundError",
+    "ArtifactReadView",
     "ArtifactRef",
     "ArtifactRevision",
     "ArtifactStore",

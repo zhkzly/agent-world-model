@@ -199,7 +199,14 @@ class VerifierCaseIntent(V2Contract):
     actions: Annotated[tuple[RuntimeAction, ...], Field(min_length=1, max_length=32)]
     expectations: Annotated[
         tuple[PropertyExpectationIntent, ...],
-        Field(min_length=1, max_length=64),
+        Field(
+            min_length=1,
+            max_length=64,
+            description=(
+                "Required semantic expectation list for this case. Use this literal field name; "
+                "checks, assertions, and other aliases are not accepted."
+            ),
+        ),
     ]
 
     @property

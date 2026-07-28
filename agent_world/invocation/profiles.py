@@ -316,7 +316,11 @@ class AgentProfileSpec:
             normalized = json_compatible(self.output_schema)
             if not isinstance(normalized, dict):
                 raise TypeError("output_schema must be a JSON object")
-        if self.structured_output_transport not in {"provider_schema", "json_envelope"}:
+        if self.structured_output_transport not in {
+            "provider_schema",
+            "json_envelope",
+            "json_object",
+        }:
             raise ValueError("unsupported structured output transport")
         if self.rollout_token_limit is not None and self.rollout_token_limit <= 0:
             raise ValueError("rollout_token_limit must be positive when configured")
@@ -537,6 +541,9 @@ class ProfileResolver:
                 "tool_output_token_limit": spec.tool_output_token_limit,
                 "limits": {
                     "timeout_seconds": spec.limits.timeout_seconds,
+                    "direct_stream_idle_timeout_seconds": (
+                        spec.limits.direct_stream_idle_timeout_seconds
+                    ),
                     "interrupt_grace_seconds": spec.limits.interrupt_grace_seconds,
                     "kill_grace_seconds": spec.limits.kill_grace_seconds,
                     "max_events": spec.limits.max_events,

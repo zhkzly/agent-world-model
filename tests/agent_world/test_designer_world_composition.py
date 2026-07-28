@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Literal, cast
 
 import pytest
-from pydantic import JsonValue, ValidationError
+from pydantic import BaseModel, JsonValue, ValidationError
 from v3_fixture import portable_counter_contracts
 
 from agent_world.artifact_store import ArtifactStore
@@ -31,14 +31,26 @@ from agent_world.control.validation import (
     pydantic_validation_diagnostic,
 )
 from agent_world.designer.expansion_service import ExpansionDesigner
-from agent_world.designer.final_design_compiler import compile_world_rules
-from agent_world.designer.final_design_leaves import _world_rules_prompt
+from agent_world.designer.final_design_compiler import (
+    compile_curriculum_plan_semantics,
+    compile_task_requirement_semantics,
+    compile_training_semantics,
+    compile_world_rules,
+)
+from agent_world.designer.final_design_leaves import (
+    _curriculum_plan_prompt,
+    _curriculum_prompt,
+    _task_requirement_prompt,
+    _world_rules_prompt,
+)
 from agent_world.designer.models import (
     ActorAuthoritySourceDraft,
     AssumptionResolutionDraft,
     CompactFieldSemanticDraft,
     CurriculumPlanDraft,
+    CurriculumPlanSourceDraft,
     CurriculumTaskPlan,
+    CurriculumTaskPlanSourceDraft,
     EnvironmentDesignDraft,
     EnvironmentSemanticSourceDraft,
     EvidenceAssumptionClosureDraft,
@@ -48,6 +60,7 @@ from agent_world.designer.models import (
     RuleConstantDraft,
     RuleDraft,
     RuleGreaterOrEqualClauseDraft,
+    RuleLessThanClauseDraft,
     RuleReferenceDraft,
     SchemaArrayNodeDraft,
     SchemaIntegerNodeDraft,
@@ -64,6 +77,7 @@ from agent_world.designer.models import (
     StateFieldSourceDraft,
     TaskDistributionDeltaClaimDraft,
     TaskRequirementDraft,
+    TaskRequirementSourceDraft,
     TaskScopeDeltaClaimDraft,
     ToolAccessObservationDraft,
     ToolBehaviorDraft,
@@ -79,6 +93,7 @@ from agent_world.designer.models import (
     ToolSurfacePlan,
     ToolSurfaceSchemasDraft,
     ToolSurfaceSourceDraft,
+    TrainingSemanticSourceDraft,
     WorldArchitectureSourceDraft,
     WorldBoundaryDraft,
     WorldBoundarySourceDraft,
@@ -99,7 +114,6 @@ from agent_world.designer.service import (
     DIRECT_DESIGN_BASE_TURNS,
     DIRECT_DESIGN_MAX_TURNS,
     MAX_STATE_ENTITIES,
-    MAX_WORLD_CLOSURE_CONTEXT_BYTES,
     MAX_WORLD_TOOL_SURFACES,
     DesignBundle,
     EnvironmentDesigner,
@@ -413,6 +427,130 @@ def test_world_rule_prompts_keep_rule_id_ownership_in_framework() -> None:
     assert "omit optional `rule_id`" in legacy_world
     assert "optional `rule_id`" in legacy_initial
     assert "optional `rule_id`" in legacy_closure
+
+
+def test_task_curriculum_prompts_and_view_keep_semantics_bounded(tmp_path: Path) -> None:
+    """The Agent sees only frozen world/claims plus role guidance, not broad state."""
+
+    request = EnvironmentRequest(
+        request_id="request:task-curriculum-prompt",
+        need="Generate a bounded counter environment.",
+        release_profile=ReleaseProfile(profile_id="release:test"),
+    )
+    design = portable_counter_contracts(ArtifactStore(tmp_path / "task-curriculum-prompt")).design
+    world = WorldModelDraft(
+        boundary=design.world_spec.boundary,
+        state=design.world_spec.state,
+        tools=design.world_spec.tools,
+        invariants=design.world_spec.invariants,
+        task_dimensions=design.world_spec.task_dimensions,
+        fidelity=design.world_spec.fidelity,
+    )
+    active = _curriculum_prompt(
+        SimpleNamespace(request=SimpleNamespace(need=request.need)),
+        world,
+        EvidenceGraph(graph_id="evidence:task-curriculum-prompt", revision=1),
+    )
+    active_context = json.loads(active.rsplit("Frozen context:\n", maxsplit=1)[1])
+    task = design.curriculum.task_types[0]
+    dimension = design.curriculum.difficulty_dimensions[0]
+    plan_source = CurriculumPlanSourceDraft(
+        coverage_dimensions=(CoverageDimension(dimension="state_transitions"),),
+        task_plans=(
+            CurriculumTaskPlanSourceDraft(
+                task_type=task.task_type,
+                objective=task.objective,
+                allowed_actor_ids=task.allowed_actor_ids,
+                required_tool_ids=task.required_tool_ids,
+                difficulty_dimensions=(dimension.dimension,),
+                minimum_tool_calls=task.minimum_tool_calls,
+            ),
+        ),
+        difficulty_dimensions=(dimension,),
+        generation_seed_space=design.curriculum.generation_seed_space,
+    )
+    active_plan = _curriculum_plan_prompt(
+        SimpleNamespace(request=SimpleNamespace(need=request.need)),
+        world,
+        EvidenceGraph(graph_id="evidence:curriculum-plan-prompt", revision=1),
+    )
+    active_plan_context = json.loads(active_plan.rsplit("Frozen context:\n", maxsplit=1)[1])
+    active_task = _task_requirement_prompt(
+        SimpleNamespace(request=SimpleNamespace(need=request.need)),
+        world,
+        plan_source,
+        plan_source.task_plans[0].model_dump(mode="json"),
+        EvidenceGraph(graph_id="evidence:task-requirement-prompt", revision=1),
+    )
+    active_task_context = json.loads(active_task.rsplit("Frozen context:\n", maxsplit=1)[1])
+    legacy_training = EnvironmentDesigner._training_semantics_prompt(request)
+    legacy_plan = EnvironmentDesigner._curriculum_plan_prompt(request)
+    legacy_task = EnvironmentDesigner._task_requirement_prompt(
+        request,
+        task_type="increase_counter",
+    )
+
+    assert set(active_context) == {"claims", "coverage_rule_catalog", "world"}
+    assert set(active_plan_context) == {
+        "claims",
+        "coverage_rule_catalog",
+        "task_dimension_catalog",
+        "world",
+    }
+    assert tuple(active_plan_context["task_dimension_catalog"]) == world.task_dimensions
+    assert tuple(
+        (item["rule_id"], item["family"]) for item in active_context["coverage_rule_catalog"]
+    ) == tuple(
+        (rule.rule_id, rule.family)
+        for rule in EnvironmentDesigner._world_rule_sequence(world)  # noqa: SLF001
+    )
+    assert "omit optional `rule_id`" in active
+    assert "rule:sampling:<ordinal>" in active
+    assert "rule:task:<task_type>:<section>:<ordinal>" in active
+    assert "Sampling Rules use family `sampling`" in active
+    assert "initial-state Rules use family `initial_state`" in active
+    assert "success Rules use `task_success`" in active
+    assert "failure Rules use `task_failure`" in active
+    assert "terminal Rules use `task_terminal`" in active
+    assert "Every task requirement must include all four Rule-list fields" in active
+    assert "`terminal_conditions` (non-empty)" in active
+    assert (
+        "For every task requirement, at least one success Rule and at least one terminal Rule"
+        in (active)
+    )
+    assert "scalar, non-root, non-overlapping `task_goal` pointers" in active
+    assert "Runtime `terminated` or `truncated`" in active
+    assert "`coverage_dimensions[*].rule_ids`" in active
+    assert "`coverage_rule_catalog`" in active
+    assert "Leave `rule_ids` empty" in active
+    assert "closed top-level catalog" in active_plan
+    assert "every `task_dimension_catalog` id" in active_plan
+    assert "do not rename, omit, add, or reorder ids" in active_plan
+    assert "optional `rule_id` from sampling" in legacy_training
+    assert "terminal_conditions (non-empty)" in legacy_training
+    assert "`coverage_dimensions[*].rule_ids`" in legacy_training
+    assert "rule:sampling:<ordinal>" in legacy_plan
+    assert "`coverage_dimensions[*].rule_ids`" in legacy_plan
+    assert "optional `rule_id`" in legacy_task
+    assert legacy_task.count("use non-root, non-overlapping RFC 6901 pointers") == 1
+    assert "`terminal_conditions` must" in legacy_task
+    assert "Initial-state Rules may read reset_config/pre_state" in legacy_task
+
+    assert "Produce exactly one `CurriculumPlanSourceDraft`" in active_plan
+    assert "one independent TaskRequirement call" in active_plan
+    assert "Do not emit TaskRequirement fields" in active_plan
+    assert "success_conditions" not in active_plan_context
+    assert set(active_task_context) == {
+        "claims",
+        "curriculum_plan",
+        "target_task_plan",
+        "world",
+    }
+    assert active_task_context["target_task_plan"]["task_type"] == task.task_type
+    assert "Produce exactly one `TaskRequirementSourceDraft`" in active_task
+    assert "Preserve target_task_plan.task_type" in active_task
+    assert "Include all four Rule-list fields" in active_task
+    assert "Do not emit sampling, coverage, schemas" in active_task
 
 
 def test_tool_access_observation_reports_all_missing_fields_by_actor(
@@ -983,7 +1121,20 @@ def test_world_closure_context_excludes_unrelated_operational_payload(
     assert "observation_schema" not in encoded
     assert "clause_id" not in encoded
     assert "schema_version" not in encoded.split('"evidence_claims"', 1)[0]
-    assert len(encoded.encode("utf-8")) < MAX_WORLD_CLOSURE_CONTEXT_BYTES
+    assert len(encoded.encode("utf-8")) > 0
+
+
+def test_tool_free_frozen_input_projection_does_not_enforce_a_fixed_byte_ceiling() -> None:
+    class LargeFrozenInput(BaseModel):
+        payload: str
+
+    prompt = EnvironmentDesigner._with_frozen_inputs(
+        "Return the requested typed artifact.",
+        input=LargeFrozenInput(payload="x" * (1024 * 1024 + 1)),
+    )
+
+    assert len(prompt.encode("utf-8")) > 1024 * 1024
+    assert prompt.endswith("END_FROZEN_JSON name=input\n")
 
 
 def test_world_closure_context_deduplicates_identical_executable_clauses(
@@ -1115,6 +1266,18 @@ def test_training_contract_reward_and_verification_are_framework_compiled(
         target=plan.task_plans[0],
         world=world,
     )
+    with pytest.raises(StructuredValidationError) as captured:
+        EnvironmentDesigner._compile_task_requirement_shard(
+            draft.model_copy(update={"objective": "Drift from the frozen task plan."}),
+            target=plan.task_plans[0],
+            world=world,
+            path_prefix=("task_requirements", 0),
+        )
+    drift_issue = captured.value.diagnostic.issues[0]
+    assert drift_issue.code == "task_requirement_plan_field_drift"
+    assert drift_issue.location == ("task_requirements", 0, "objective")
+    assert drift_issue.violated_condition
+    assert drift_issue.expected_category
     authored = EnvironmentDesigner._compose_curriculum_contract(
         plan,
         (compiled_task,),
@@ -1187,6 +1350,20 @@ def test_curriculum_plan_reports_exact_unknown_world_rule_reference(tmp_path: Pa
         minimum_distinct_initial_states=design.curriculum.minimum_distinct_initial_states,
         minimum_distinct_tasks_per_type=design.curriculum.minimum_distinct_tasks_per_type,
     )
+    valid_plan = plan.model_copy(
+        update={
+            "coverage_dimensions": (
+                plan.coverage_dimensions[0].model_copy(
+                    update={"rule_ids": (world.invariants[0].rule_id,)}
+                ),
+            )
+        }
+    )
+    EnvironmentDesigner._validate_curriculum_plan(  # noqa: SLF001
+        valid_plan,
+        world=world,
+        evidence_graph=EvidenceGraph(graph_id="evidence:empty", revision=1),
+    )
 
     with pytest.raises(StructuredValidationError) as captured:
         EnvironmentDesigner._validate_curriculum_plan(  # noqa: SLF001
@@ -1200,6 +1377,66 @@ def test_curriculum_plan_reports_exact_unknown_world_rule_reference(tmp_path: Pa
     assert diagnostic.issue_codes == (
         "curriculum_coverage_rule_unknown@coverage_dimensions.0.rule_ids.0",
     )
+    issue = diagnostic.issues[0]
+    assert issue.violated_condition == (
+        "coverage rule_ids reference only frozen world Rule identifiers"
+    )
+    assert issue.expected_category == "an exact frozen coverage Rule identifier"
+
+
+def test_curriculum_plan_reports_closed_ordered_difficulty_catalog(tmp_path: Path) -> None:
+    """A multi-item catalog must not collapse into generic Agent-invented axes."""
+
+    design = portable_counter_contracts(ArtifactStore(tmp_path / "artifacts")).design
+    world = WorldModelDraft(
+        boundary=design.world_spec.boundary,
+        state=design.world_spec.state,
+        tools=design.world_spec.tools,
+        invariants=design.world_spec.invariants,
+        task_dimensions=("create_task", "complete_task", "delete_task", "list_tasks"),
+        fidelity=design.world_spec.fidelity,
+    )
+    task = design.curriculum.task_types[0]
+    catalog = tuple(
+        DifficultyDimension(
+            dimension=dimension,
+            description=f"Frozen dimension {index}.",
+            levels=("low", "high"),
+        )
+        for index, dimension in enumerate(world.task_dimensions)
+    )
+    plan = CurriculumPlanDraft(
+        coverage_dimensions=(CoverageDimension(dimension="state_transitions"),),
+        task_plans=(
+            CurriculumTaskPlan(
+                task_type=task.task_type,
+                objective=task.objective,
+                allowed_actor_ids=task.allowed_actor_ids,
+                required_tool_ids=task.required_tool_ids,
+                difficulty_dimensions=(world.task_dimensions[0],),
+                minimum_tool_calls=task.minimum_tool_calls,
+            ),
+        ),
+        difficulty_dimensions=tuple(reversed(catalog)),
+        generation_seed_space=design.curriculum.generation_seed_space,
+    )
+
+    with pytest.raises(StructuredValidationError) as captured:
+        EnvironmentDesigner._validate_curriculum_plan(  # noqa: SLF001
+            plan,
+            world=world,
+            evidence_graph=EvidenceGraph(graph_id="evidence:empty", revision=1),
+        )
+
+    issue = captured.value.diagnostic.issues[0]
+    assert issue.code == "curriculum_difficulty_catalog_drift"
+    assert issue.location == ("difficulty_dimensions",)
+    assert issue.message == (
+        "Build the top-level DifficultyDimension catalog by copying every frozen WorldModel "
+        "task_dimensions id exactly once and in order; task plans may then select an applicable "
+        "subset."
+    )
+    assert issue.expected_category == "the full exact ordered WorldModel task_dimensions catalog"
 
 
 def test_world_model_reports_unknown_evidence_claim_as_actionable_field(
@@ -2151,38 +2388,21 @@ def test_state_entity_schema_ir_rejects_structural_nullable_union_before_fanout(
         EnvironmentDesigner._validate_state_entity_schema_ir_draft(draft, plan=plan)
 
 
-def test_semantic_source_canonically_compiles_task_reward_and_verification(
-    tmp_path: Path,
-) -> None:
-    design = portable_counter_contracts(ArtifactStore(tmp_path / "semantic-source")).design
-    base_world, skeleton, graph, tool_semantics, closure = _inputs(tmp_path / "semantic-source-ir")
-    task = design.curriculum.task_types[0]
-    task_type = task.task_type
-    task_draft = TaskRequirementDraft(
-        task_type=task_type,
-        objective=task.objective,
-        allowed_actor_ids=task.allowed_actor_ids,
-        required_tool_ids=task.required_tool_ids,
-        initial_state_constraints=task.initial_state_constraints,
-        success_conditions=tuple(
-            rule.model_copy(update={"rule_id": f"rule:task:{task_type}:success:{index}"})
-            for index, rule in enumerate(task.success_conditions)
-        ),
-        failure_conditions=tuple(
-            rule.model_copy(update={"rule_id": f"rule:task:{task_type}:failure:{index}"})
-            for index, rule in enumerate(task.failure_conditions)
-        ),
-        terminal_conditions=tuple(
-            rule.model_copy(update={"rule_id": f"rule:task:{task_type}:terminal:{index}"})
-            for index, rule in enumerate(task.terminal_conditions)
-        ),
-        difficulty_dimensions=("target",),
-    )
+def _counter_world_semantic_source(
+    base_world: WorldSpec,
+    skeleton: WorldSkeletonDraft,
+    tool_semantics: ToolSemanticsDraft,
+    closure: WorldClosureDraft,
+    *,
+    task_dimension: str = "target",
+) -> WorldSemanticSourceIRDraft:
+    """Build the complete frozen WorldRules closure used by TaskCurriculum tests."""
+
     tool = base_world.tools[0]
-    world_source = WorldSemanticSourceIRDraft(
+    return WorldSemanticSourceIRDraft(
         boundary=WorldBoundaryDraft(
             boundary=skeleton.boundary,
-            task_dimensions=("target",),
+            task_dimensions=(task_dimension,),
             fidelity=skeleton.fidelity,
         ),
         state_inventory=StateEntityInventoryDraft(
@@ -2314,6 +2534,41 @@ def test_semantic_source_canonically_compiles_task_reward_and_verification(
         tool_semantics=(tool_semantics,),
         closure=closure,
     )
+
+
+def test_semantic_source_canonically_compiles_task_reward_and_verification(
+    tmp_path: Path,
+) -> None:
+    design = portable_counter_contracts(ArtifactStore(tmp_path / "semantic-source")).design
+    base_world, skeleton, graph, tool_semantics, closure = _inputs(tmp_path / "semantic-source-ir")
+    task = design.curriculum.task_types[0]
+    task_type = task.task_type
+    task_draft = TaskRequirementDraft(
+        task_type=task_type,
+        objective=task.objective,
+        allowed_actor_ids=task.allowed_actor_ids,
+        required_tool_ids=task.required_tool_ids,
+        initial_state_constraints=task.initial_state_constraints,
+        success_conditions=tuple(
+            rule.model_copy(update={"rule_id": f"rule:task:{task_type}:success:{index}"})
+            for index, rule in enumerate(task.success_conditions)
+        ),
+        failure_conditions=tuple(
+            rule.model_copy(update={"rule_id": f"rule:task:{task_type}:failure:{index}"})
+            for index, rule in enumerate(task.failure_conditions)
+        ),
+        terminal_conditions=tuple(
+            rule.model_copy(update={"rule_id": f"rule:task:{task_type}:terminal:{index}"})
+            for index, rule in enumerate(task.terminal_conditions)
+        ),
+        difficulty_dimensions=("target",),
+    )
+    world_source = _counter_world_semantic_source(
+        base_world,
+        skeleton,
+        tool_semantics,
+        closure,
+    )
     plan = CurriculumPlanDraft(
         coverage_dimensions=(
             CoverageDimension(
@@ -2410,6 +2665,261 @@ def test_semantic_source_canonically_compiles_task_reward_and_verification(
                 "unresolved_questions": ("Manufacture a new release blocker.",),
             }
         )
+
+
+def test_task_curriculum_compiler_derives_ids_and_reports_source_rule_family(
+    tmp_path: Path,
+) -> None:
+    """Execute the real TaskCurriculum compiler on a complete frozen WorldRules closure.
+
+    Provenance: a portable counter WorldRules closure.  The only poisoned value
+    below is ``success_conditions[0].family``; the assertion records the exact
+    safe Agent-facing diagnostic rather than a generic compiler exception.
+    """
+
+    design = portable_counter_contracts(ArtifactStore(tmp_path / "task-curriculum")).design
+    base_world, skeleton, graph, tool_semantics, closure = _inputs(
+        tmp_path / "task-curriculum-world-rules"
+    )
+    world = WorldModelDraft(
+        boundary=base_world.boundary,
+        state=base_world.state,
+        tools=base_world.tools,
+        invariants=base_world.invariants,
+        task_dimensions=base_world.task_dimensions,
+        fidelity=base_world.fidelity,
+    )
+    task_dimension = world.task_dimensions[0]
+    world_source = _counter_world_semantic_source(
+        base_world,
+        skeleton,
+        tool_semantics,
+        closure,
+        task_dimension=task_dimension,
+    )
+    task = design.curriculum.task_types[0]
+    task_type = task.task_type
+
+    pre_counter = RuleReferenceDraft(
+        kind="reference",
+        source="pre_state",
+        pointer="/counter/value",
+        value_type="number",
+    )
+    post_counter = RuleReferenceDraft(
+        kind="reference",
+        source="post_state",
+        pointer="/counter/value",
+        value_type="number",
+    )
+    task_goal = RuleReferenceDraft(
+        kind="reference",
+        source="task_goal",
+        pointer="/target",
+        value_type="number",
+    )
+    zero = RuleConstantDraft(kind="constant", value_type="number", value=0)
+
+    def task_goal_rule(
+        rule_id: str,
+        family: Literal["task_success", "task_terminal"],
+        description: str,
+    ) -> RuleDraft:
+        return RuleDraft(
+            rule_id=rule_id,
+            family=family,
+            description=description,
+            boolean_operator="all",
+            clauses=(
+                RuleGreaterOrEqualClauseDraft(
+                    clause_id=f"{rule_id}-target",
+                    operator="greater_or_equal",
+                    ordering="number",
+                    left=post_counter,
+                    right=task_goal,
+                ),
+            ),
+            case_sensitivity="positive_only",
+        )
+
+    initial_rule = RuleDraft(
+        rule_id="agent-initial-rule",
+        family="initial_state",
+        description="Counter state starts at or above zero.",
+        boolean_operator="all",
+        clauses=(
+            RuleGreaterOrEqualClauseDraft(
+                clause_id="initial-counter-nonnegative",
+                operator="greater_or_equal",
+                ordering="number",
+                left=pre_counter,
+                right=zero,
+            ),
+        ),
+        case_sensitivity="positive_only",
+    )
+    failure_rule = RuleDraft(
+        rule_id="agent-failure-rule",
+        family="task_failure",
+        description="Counter remains below the requested target.",
+        boolean_operator="all",
+        clauses=(
+            RuleLessThanClauseDraft(
+                clause_id="counter-below-target",
+                operator="less_than",
+                ordering="number",
+                left=post_counter,
+                right=task_goal,
+            ),
+        ),
+        case_sensitivity="positive_only",
+    )
+    sampling_rule = RuleDraft(
+        rule_id="agent-sampling-rule",
+        family="sampling",
+        description="Sample only nonnegative counter starting states.",
+        boolean_operator="all",
+        clauses=(
+            RuleGreaterOrEqualClauseDraft(
+                clause_id="sample-counter-nonnegative",
+                operator="greater_or_equal",
+                ordering="number",
+                left=pre_counter,
+                right=zero,
+            ),
+        ),
+        case_sensitivity="positive_only",
+    )
+    source = TrainingSemanticSourceDraft(
+        curriculum_plan=CurriculumPlanSourceDraft(
+            coverage_dimensions=(
+                CoverageDimension(
+                    dimension="state_transitions",
+                    evidence_discovered="complete",
+                    world_modelled="complete",
+                ),
+            ),
+            task_plans=(
+                CurriculumTaskPlanSourceDraft(
+                    task_type=task_type,
+                    objective=task.objective,
+                    allowed_actor_ids=task.allowed_actor_ids,
+                    required_tool_ids=task.required_tool_ids,
+                    difficulty_dimensions=(task_dimension,),
+                    minimum_tool_calls=task.minimum_tool_calls,
+                ),
+            ),
+            difficulty_dimensions=(
+                DifficultyDimension(
+                    dimension=task_dimension,
+                    description="Size of the requested counter target.",
+                    levels=("small", "large"),
+                ),
+            ),
+            generation_seed_space="all uint64 seeds",
+            sampling_constraints=(sampling_rule,),
+        ),
+        task_requirements=(
+            TaskRequirementSourceDraft(
+                task_type=task_type,
+                objective=task.objective,
+                allowed_actor_ids=task.allowed_actor_ids,
+                required_tool_ids=task.required_tool_ids,
+                initial_state_constraints=(initial_rule,),
+                success_conditions=(
+                    task_goal_rule(
+                        "agent-success-rule",
+                        "task_success",
+                        "Counter reaches the requested target.",
+                    ),
+                ),
+                failure_conditions=(failure_rule,),
+                terminal_conditions=(
+                    task_goal_rule(
+                        "agent-terminal-rule",
+                        "task_terminal",
+                        "Counter target terminates the task.",
+                    ),
+                ),
+                difficulty_dimensions=(task_dimension,),
+                minimum_tool_calls=task.minimum_tool_calls,
+            ),
+        ),
+    )
+
+    compiled_plan = compile_curriculum_plan_semantics(
+        source.curriculum_plan,
+        world=world,
+        evidence_graph=graph,
+    )
+    compiled_requirement = compile_task_requirement_semantics(
+        source.task_requirements[0],
+        curriculum_plan=compiled_plan.canonical_source,
+        target_task_type=task_type,
+        world=world,
+        evidence_graph=graph,
+    )
+    assert compiled_plan.plan.task_plans[0].task_type == task_type
+    assert compiled_plan.canonical_source.sampling_constraints[0].rule_id is None
+    assert compiled_requirement.task.task_type == task_type
+    assert tuple(rule.rule_id for rule in compiled_requirement.task.success_conditions) == (
+        f"rule:task:{task_type}:success:0",
+    )
+
+    compiled = compile_training_semantics(
+        source,
+        world_source=world_source,
+        world=world,
+        evidence_graph=graph,
+    )
+
+    canonical_task = compiled.canonical_source.task_requirements[0]
+    assert compiled.canonical_source.curriculum_plan.sampling_constraints[0].rule_id is None
+    assert canonical_task.initial_state_constraints[0].rule_id is None
+    assert canonical_task.success_conditions[0].rule_id is None
+    assert canonical_task.failure_conditions[0].rule_id is None
+    assert canonical_task.terminal_conditions[0].rule_id is None
+    compiled_task = compiled.design.curriculum.task_types[0]
+    assert tuple(rule.rule_id for rule in compiled.design.curriculum.sampling_constraints) == (
+        "rule:sampling:0",
+    )
+    assert tuple(rule.rule_id for rule in compiled_task.initial_state_constraints) == (
+        f"rule:task:{task_type}:initial_state:0",
+    )
+    assert tuple(rule.rule_id for rule in compiled_task.success_conditions) == (
+        f"rule:task:{task_type}:success:0",
+    )
+    assert tuple(rule.rule_id for rule in compiled_task.failure_conditions) == (
+        f"rule:task:{task_type}:failure:0",
+    )
+    assert tuple(rule.rule_id for rule in compiled_task.terminal_conditions) == (
+        f"rule:task:{task_type}:terminal:0",
+    )
+
+    poisoned_task = source.task_requirements[0].model_copy(
+        update={
+            "success_conditions": (
+                source.task_requirements[0]
+                .success_conditions[0]
+                .model_copy(update={"family": "task_failure"}),
+            )
+        }
+    )
+    poisoned = source.model_copy(update={"task_requirements": (poisoned_task,)})
+    with pytest.raises(StructuredValidationError) as captured:
+        compile_training_semantics(
+            poisoned,
+            world_source=world_source,
+            world=world,
+            evidence_graph=graph,
+        )
+    issue = captured.value.diagnostic.issues[0]
+    assert issue.code == "task_success_rule_family"
+    assert issue.location == ("task_requirements", 0, "success_conditions", 0, "family")
+    assert issue.violated_condition
+    assert issue.expected_category
+    assert issue.actionable_for_agent
+    assert issue.code != "framework_diagnostic_incomplete"
 
 
 def test_expansion_delta_claim_cannot_supply_framework_owned_task_after(

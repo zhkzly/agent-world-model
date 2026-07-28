@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent World Real Execution Proof"
+  short_description: "Select the smallest real proof for a change"
+  default_prompt: "Use $agent-world-real-execution-proof to validate this Agent World change before E2E."

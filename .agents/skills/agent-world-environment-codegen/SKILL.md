@@ -15,10 +15,12 @@ packaging, Registry publication, and training-suite selection.
 
 Read all immutable files that exist under `inputs/`, especially:
 
-- `environment-design.json`
 - `world-spec.json`
+- `curriculum.json`
 - `implementation-contract.json`
 - `task-materializer-output.schema.json`
+- `implementation-plan.md` when the preceding read-only planning node committed it; it is
+  advisory only and cannot override the frozen JSON contracts
 - the current `repair-disclosure-*.json` on repair turns
 
 Treat `inputs/` as build-time information only. A restored `candidate/` tree must install, import,
@@ -38,6 +40,10 @@ Create or repair only `candidate/` as a Python 3.12 uv virtual project:
 - Task Materializer v3 callable and entry module
 - runnable public self-check
 - real standalone public tests
+
+Keep the two uv files coupled: the one `uv.lock` package with
+`source = { virtual = "." }` must have exactly the same name as
+`[project].name`; every other lock package must be a registry dependency.
 
 Do not include `.venv`, caches, bytecode, build output, symlinks, undeclared files, credentials,
 host paths, or generated release/Judge claims.

@@ -212,17 +212,20 @@ EnvironmentRequest
 
 这是 readiness DAG，不是固定直线阶段。多个 EvidenceGraph、WorldSpec、Task、Verifier 或 Candidate revision 可以并存；current 只是 projection。任一 Gate 可以推翻上游 Artifact，rework 创建新 revision，不覆盖旧内容。
 
-#### 3.5.1 拓扑 epoch 与发布因果顺序（2026-07-21 更正）
+#### 3.5.1 拓扑 epoch 与发布因果顺序（2026-07-26 更正）
 
-WorldBehavior 的物理 shard 只有在 Architecture 已被真实证据约束后才能确定；Verifier 的真实
-Challenger batch 数又只能在 TaskCurriculum/Modeling 已冻结 exact `EnvironmentDesign` 后确定。
-因此同一 `EnvironmentJob` 允许三个有因果链接的 `WorkGraphEpoch`，每次只为一个新发现的、有界
-物理成员集冻结拓扑：不可发布的 `bootstrap` 完成 Intake、Research 与 Architecture；不可发布的
-`design` 保留 bootstrap commits 并完成 Behavior、Rules、Curriculum、Modeling 与 framework-owned
-`VerifierPlan`；唯一可发布的 `final` 保留前两者的精确 active commits，再从已提交 VerifierPlan
-派生每个实际 Challenger batch，并追加 Build、Integration、ReleaseAssurance、Observability、Package
-和 RegistryPublication。它们不是三条流水线，仍由同一个 Scheduler、预算和 repair ledger 执行；
-任何隐藏 fan-out、或只到 ModelingBoundary 的 graph 都必须 fail closed。
+WorldBehavior 的物理 shard 只有在 Architecture 已被真实证据约束后才能确定；`TaskRequirement`
+的物理 shard 又只能在一个已提交的 `CurriculumPlan` 给出精确 task-family 集合后才能确定；Verifier
+的真实 Challenger batch 数最后才在 Modeling 已冻结 exact `EnvironmentDesign` 后确定。因此同一
+`EnvironmentJob` 允许四个有因果链接的 `WorkGraphEpoch`，每次只为一个新发现的、有界物理成员集
+冻结拓扑：不可发布的 `bootstrap` 完成 Intake、Research 与 Architecture；不可发布的 `world` 保留
+bootstrap commits 并完成 Behavior、WorldRules 和小型 CurriculumPlan；不可发布的 `design` 保留 world
+commits，按 plan 顺序逐个执行 TaskRequirement，再由 code 确定性合并 TaskCurriculum、执行 Modeling
+与 framework-owned `VerifierPlan`；唯一可发布的 `final` 保留前三者的精确 active commits，再从已提交
+VerifierPlan 派生每个实际 Challenger batch，并追加 Build、Integration、ReleaseAssurance、Observability、
+Package 和 RegistryPublication。它们不是四条流水线，仍由同一个 Scheduler、预算和 repair ledger
+执行；任何隐藏 fan-out、把所有任务族塞进一次模型调用、或只到 ModelingBoundary 的 graph 都必须
+fail closed。
 
 发布证据不得产生自引用环。预打包 `ReleaseDossier` 只绑定 final graph manifest 与已经完成的
 Design/Candidate/Verifier/Integration/Assurance/Telemetry commit closure，**不能**引用 package、
@@ -406,11 +409,12 @@ conservative usage，active lease 显示保留暴露；不得等整轮 Direct sn
 零。每个 Scheduler WorkAttempt span 还必须以 Direct root span 为 parent；缺失 parent、尚未取得 provider
 usage 或尚未结算的 lease 都是明确的 `unknown/provisional`，不能用 0 或孤立 span 代替。
 
-一个 `WorkDefinition` 也不得掩盖可变数量的真实模型或工具调用。若 Verifier、ToolSemantics 或
-Research 的物理工作量在 Architecture 之后才由 task/tool 数确定，framework 必须在 final epoch
-冻结明确的 shard coordinates；每个 shard 各有自己的 Proposal/Validation/Feedback/WorkCommit，
-随后只由 code aggregate 绑定精确 child commit set。把 N 个真实 invocation 塞进单个
-`ProposalExecution` 会破坏 token、重试、恢复和因果失效的测量，属于 fail-closed 的拓扑错误。
+一个 `WorkDefinition` 也不得掩盖可变数量的真实模型或工具调用。若 ToolSemantics 的物理工作量在
+Architecture 后确定、TaskRequirement 的物理工作量在 CurriculumPlan 后确定、或 Verifier 的物理工作量
+在 Modeling 后确定，framework 必须在紧接该发现边界的下一 epoch 冻结明确 shard coordinates；每个
+shard 各有自己的 Proposal/Validation/Feedback/WorkCommit，随后只由 code aggregate 绑定精确 child
+commit set。把 N 个真实 invocation 塞进单个 `ProposalExecution` 会破坏 token、重试、恢复和因果失效的
+测量，属于 fail-closed 的拓扑错误。
 
 Generic root schema error、没有 exact path 的机械错误、相同 validator frontier + issue set 的
 重复错误不得继续消耗 LLM correction。它们必须被判为 output-contract/framework defect。
@@ -449,6 +453,13 @@ pointer、collection、primary key、item field 与 value type，并编译原有
 “哪条业务关系应成立、选择哪个已有字段、常量/比较/错误语义/evidence”的语义判断；代码负责绑定表、ID
 语法、唯一性、路径、类型与命名空间。该 binding 边界先限于 ToolSemantics；WorldRules/Curriculum 中
 尚未冻结的 task-local 语义不得被伪装成机械 binding。
+
+同样，`EvidenceSynthesis` 中“哪一份冻结证据支持这个 Claim”是 Researcher 的语义选择，但
+`evidence_id` 是 framework 的不透明持久身份。运行时输入必须给 Researcher 一个从 1 开始的
+`CitationCatalog`（含可读摘要/正文片段），SourceDraft 只返回 `evidence_catalog_indexes`；framework
+随后按同一冻结顺序映射为真实 `evidence_id` 并验证闭包。不得要求模型逐字抄写、猜测或修复这种内部
+ID；越界 catalog 位置必须以安全的 path/condition/category 反馈，而非把原始 ID 或 provider 文本塞回
+下一轮提示。
 
 ## 4. 五个组件的具体职责
 
@@ -561,16 +572,16 @@ Hook 使用 framework 定义的 backend-neutral lifecycle contract，并映射�
 1. **Intake**：Controller 将 canonical Request、permission、release profile 和预算绑定到 durable job fingerprint；同 id 不同 fingerprint 冲突。
 2. **Budget reservation**：为 Direct 前台工作预留容量；Discovery 使用独立低优先级 lease，不能借走首包预算。
 3. **Research**：Researcher 反复执行 plan、真实 search/fetch/extract、冲突核对和 gap 更新；停止由 coverage/risk/budget Gate 决定，不由 Agent 自称完成。
-4. **World modeling**：同一个隔离 Engineer profile 执行少量、有界的语义事务，而不是把每个实体、schema role 和工具语义字段变成独立模型调用。`WorldArchitecture` 一次冻结 identity、authority、实体及紧凑字段语义、生命周期、关系、工具边界与嵌入所属工具的紧凑接口语义；framework 从它确定性编译 Entity/Tool Schema、ID、引用、required、closed shape 和 root assembly。framework 随后从 namespace 与共享状态生成不可由模型修改的 `ToolCouplingPlan`。含五至八个耦合工具的 group 先由一次短 `SharedToolSemantics` 事务冻结 atomicity、concurrency、idempotency、ordering、compensation 与共享 error policy；每个最多四工具的 `ToolSemanticsBatch` 必须实现这份共享合同。所有 batch 完成后，代码生成 `ToolSemanticGroupClosure` 并在 WorldRules 前拒绝跨批冲突。随后单独的 `WorldRules` 事务只表达初态规则和跨实体/工具 invariant；framework 将其编译并与 Schema/Tool contracts 做闭包校验。`TaskCurriculumSemantics` 在完整 WorldModel 编译成功后一次产生 task family、objective、actor/tool scope、difficulty 与 success/failure/terminal RuleDraft；framework 再编译 TaskRequirement、task protocol、Reward 和 VerificationRequirements。
+4. **World modeling**：同一个隔离 Engineer profile 执行少量、有界的语义事务，而不是把每个实体、schema role 和工具语义字段变成独立模型调用。`WorldArchitecture` 一次冻结 identity、authority、实体及紧凑字段语义、生命周期、关系、工具边界与嵌入所属工具的紧凑接口语义；framework 从它确定性编译 Entity/Tool Schema、ID、引用、required、closed shape 和 root assembly。framework 随后从 namespace 与共享状态生成不可由模型修改的 `ToolCouplingPlan`。含五至八个耦合工具的 group 先由一次短 `SharedToolSemantics` 事务冻结 atomicity、concurrency、idempotency、ordering、compensation 与共享 error policy；每个最多四工具的 `ToolSemanticsBatch` 必须实现这份共享合同。所有 batch 完成后，代码生成 `ToolSemanticGroupClosure` 并在 WorldRules 前拒绝跨批冲突。随后单独的 `WorldRules` 事务只表达初态规则和跨实体/工具 invariant；framework 将其编译并与 Schema/Tool contracts 做闭包校验。完整 WorldModel 成功后，`CurriculumPlan` 只产生最小、按顺序的 task family、objective、actor/tool scope、difficulty、sampling 与 design-stage coverage，不能产生 task Rule。framework 冻结一个 `TaskRequirement` coordinate/Agent turn 给 plan 的每个 task type；循环每次只要求该 task family 的 initial/success/failure/terminal `RuleDraft`，失败只停在该 item，若有精确 feedback 和 repair 授权也只修该 item。全部 item commit 后，code 按 plan 顺序确定性合并 `TaskCurriculum`，再编译 TaskRequirement、task protocol、Reward 和 VerificationRequirements。
 
    模型只拥有业务字段意义和 `RuleDraft`/typed source IR，不拥有 `properties/required/additionalProperties/items/anyOf`、case id、seed、public/sealed partition、reward、Gate 或发布字段。工具批次的 Rule ID 则由 framework 的 frozen `tool_id + section + ordinal` 组合，模型可省略该机械字段。对 `SharedToolSemantics`，prompt 必须把冻结 `ordered_tool_ids` 明示为构造约束：atomicity、concurrency、idempotency 三类 domain 各自精确分割该全集；没有证据要求更细分时一个覆盖全集的 domain 是保守合法构造；error policy 至少覆盖全集。这个提示只减少机械遗漏，不替代或放宽 compiler 对实际分组/语义的验证。framework 确定性编译 Draft 2020-12 schema、核心 Rule IR、projection、task binding 和全局闭包。一个批次中的所有安全问题在同一 validation frontier 聚合；机械问题由代码直接拒绝或规范化，只有仍需业务判断的缺口才允许对整个最小语义批次做一次 correction。工具批次具有独立 commit/repair identity；当前调度器按稳定顺序执行，后续只有在 backend 容量、预算 lease 与提交确定性均得到证明后才可并发，失败批次不得失效已提交 sibling。
 
-   首次真实 Build 前，Direct Designer 的最坏基础 Agent turn 为 8：Research plan、检索后 synthesis、World Architecture、最多一次 multi-batch Shared Tool Contract、1–2 个 Tool Semantics batch、一次 WorldRules 和一次 Task/Curriculum；加上全 run 最多两次按需 Semantic Repair，硬预留为 10。没有 multi-batch group 时共享事务为零，典型调用仍更少。调用数不得随实体数量线性增长。若 192 KiB 输入投影或单 turn output cap 要求更小批次，Controller 必须在调用前拒绝超过总 turn 上限的 scope，而不是提交巨型 prompt 后靠 retry 消耗预算。
+   首次真实 Build 前，Direct Designer 的基础 Agent turn 为 `7–8 + K`：Research plan、检索后 synthesis、World Architecture、最多一次 multi-batch Shared Tool Contract、1–2 个 Tool Semantics batch、一次 WorldRules、一次 CurriculumPlan，以及已冻结 plan 中 `K` 个 TaskRequirement（`1 ≤ K ≤ 8`）。plan commit 后 Controller 才能计算精确 K、为每个 item 单独预留 turn/repair budget，并在总预算不足时 fail closed；不得把 K 个 item 假装成一次 Task/Curriculum 调用，也不得因某一 item 失败而启动后续 sibling。没有 multi-batch group 时共享事务为零，典型调用仍更少。框架不得以固定输入字节数、隐藏的单 turn token ceiling，或任意短的 first-progress/first-write deadline 预先拒绝、截断或迫使语义分片；first-progress/first-write 是观测事实，不是把尚未收到 Provider 事件的真实 Agent 调用自动判死的独立预算。真实 Provider/transport 的物理终态必须以安全可观测事实记录，再决定 profile、transport、workspace input 或拓扑调整。
 
-   WorldClosure 不复制完整 ToolContract JSON。framework 把已验证 Rule 确定性投影为去除重复 metadata 的 typed RulePath，并按执行语义对 clause 去重为 ConstraintCatalog；RulePath 只引用 constraint id，`schema_valid` 的 schema 正文由 framework 留存并标记为 elided。投影必须保留 reference source/pointer/type、constant、bounded arithmetic、operator、boolean composition、error state effect 与 evidence 绑定，并受固定 192 KiB 输入上限约束。超过上限必须在调用模型前明确失败并要求进一步分片，不能把超大上下文交给 provider 后以空响应或重试耗尽收场。
+   WorldClosure 不复制完整 ToolContract JSON。framework 把已验证 Rule 确定性投影为去除重复 metadata 的 typed RulePath，并按执行语义对 clause 去重为 ConstraintCatalog；RulePath 只引用 constraint id，`schema_valid` 的 schema 正文由 framework 留存并标记为 elided。投影必须保留 reference source/pointer/type、constant、bounded arithmetic、operator、boolean composition、error state effect 与 evidence 绑定。框架记录输入大小和 provenance 以供观测，但不设置固定字节上限来拒绝调用或改变语义；Provider 无法承载时必须给出可归因的安全终态，不能被框架预先伪装成“输入过大”。
 5. **Baseline**：首次 Modeling PASS 固化 DesignBaselineCheckpoint；当前原子 Designer 下，全部并发 Discovery clue 先进入 provisional Inbox，hard correction 形成 Finding 与隔离建议；deferred lane 由独立 resume job 继续，不阻塞或重开 Direct。
-6. **Modeling Gate 与并行编译**：完整 EnvironmentDesign 必须已经包含 framework 编译的 TaskRequirement、Reward 和 VerificationRequirements，随后通过 Modeling Gate。Builder 需要这份完整合同来一次生成最终 Runtime 与 Task Materializer；因此 Task/Curriculum 不能后移到 Builder 之后。通过后 Builder 与 Challenger VerifierIntent 分支并行。
-7. **Real build 与早期 Integration**：Engineer 通过 Codex backend 在隔离 workspace 一次生成最终候选；framework 重新检查源码闭包、协议、锁文件和完成条件。Builder 一提交，现有 Integration lane 立即对同一最终 source digest 执行 clean install、handshake、未知 seed reset/invoke、task materialization、restart/concurrency smoke，无需等待 Verifier。Verifier 缺失或失败只 `block_release`，不能取消或抹掉已完成的 Build/Integration。现阶段不引入第二个 Diagnostic Builder 或 tainted candidate；只有至少十个收敛后的 live run 证明 Runtime-core failure 比例和 staged-build 成本满足明确阈值，才考虑同一 Builder lineage 的两阶段 source checkpoint。
+6. **Modeling Gate、只读实现规划与并行编译**：完整 EnvironmentDesign 必须已经包含 framework 编译的 TaskRequirement、Reward 和 VerificationRequirements，随后通过 Modeling Gate。Builder 先在一个独立、只读的 `BuildImplementationPlan` Agent 边界中读取最小实现投影（WorldSpec、Curriculum、ImplementationContract 与 Task Materializer schema），产出可审计但非权威的文本实现计划；该计划不得写 `candidate/`、改变语义或充当 source checkpoint。之后 CandidateBuild 才消费完整合同和该 advisory plan 一次生成最终 Runtime 与 Task Materializer；因此 Task/Curriculum 不能后移到 Builder 之后。通过 Modeling Gate 后，`BuildImplementationPlan` 与 Challenger VerifierIntent 分支并行；CandidateBuild 只在自己的 plan commit 后开始。
+7. **Real build 与早期 Integration**：Engineer 通过 Codex backend 在隔离 workspace 一次生成最终候选；framework 重新检查源码闭包、协议、锁文件和完成条件。Builder 一提交，现有 Integration lane 立即对同一最终 source digest 执行 clean install、handshake、未知 seed reset/invoke、task materialization、restart/concurrency smoke，无需等待 Verifier。Verifier 缺失或失败只 `block_release`，不能取消或抹掉已完成的 Build/Integration。`BuildImplementationPlan` 不是第二个 Builder、partial candidate 或 tainted source；现阶段仍不引入第二个 Diagnostic Builder 或 source checkpoint。只有至少十个收敛后的 live run 证明 Runtime-core failure 比例和 staged-build 成本满足明确阈值，才考虑同一 Builder lineage 的两阶段 source checkpoint。
 8. **Independent Judge**：候选作为不可信子进程运行；Judge 执行 Task Materialization、reachability、conformance、property、sealed 和 clean deployment Gate。
 9. **Directed rework**：失败回到 owning Artifact，创建新 revision并传递失效；没有进展或预算耗尽时拒绝或请求人，而不是无限重试。
 10. **Atomic release**：Release Kernel 只读取有效 evidence；Registry 复验签名、owner、digest、reservation 和 package 物理内容后发布 envpkg v3。

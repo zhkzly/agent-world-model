@@ -6,6 +6,8 @@ from pydantic import ValidationError
 from agent_world.contracts import (
     ArtifactRef,
     Budget,
+    CoverageDimension,
+    DifficultyDimension,
     GenerationContext,
     PermissionScope,
     ReleaseProfile,
@@ -19,15 +21,25 @@ from agent_world.control.work_graph import (
     WorkGraphError,
     WorkGroupDefinition,
     compile_design_work_graph,
+    compile_world_work_graph,
     complete_generation_work_graph,
+    current_runtime_revisions_for_definition,
     derive_final_design_definitions,
+    derive_task_requirement_design_definitions,
+    derive_world_plan_definitions,
     deterministic_boundary_work_definition,
     research_acquisition_work_definition,
+    research_synthesis_work_definition,
     structured_agent_work_definition,
     tool_semantics_batch_definition,
     verifier_plan_work_definition,
 )
-from agent_world.designer.models import ToolCouplingGroupPlan, ToolCouplingPlan
+from agent_world.designer.models import (
+    CurriculumPlanSourceDraft,
+    CurriculumTaskPlanSourceDraft,
+    ToolCouplingGroupPlan,
+    ToolCouplingPlan,
+)
 
 
 def _artifact_ref(artifact_id: str, artifact_type: str) -> ArtifactRef:
@@ -65,6 +77,97 @@ def _definition(slot: str, dependencies: tuple[WorkCoordinate, ...] = ()):
             "coordinate": _coordinate(slot),
             "dependency_coordinates": dependencies,
         }
+    )
+
+
+def test_evidence_synthesis_definition_binds_current_prompt_skill_and_compiler_revisions() -> None:
+    parent = WorkCoordinate(
+        scope_id="job:hotel",
+        component="research",
+        stage="evidence_acquisition",
+        artifact_slot="research_acquisition",
+    )
+    definition = research_synthesis_work_definition(
+        scope_id="job:hotel",
+        dependency_coordinate=parent,
+        agent_wall_seconds=120,
+        agent_token_limit=10_000,
+    )
+
+    revisions = current_runtime_revisions_for_definition(definition)
+
+    assert revisions == (
+        definition.proposal_policy.implementation_revision_id,
+        definition.validation_policy.validator_revision_id,
+    )
+    assert definition.proposal_policy.implementation_revision_id.startswith(
+        "framework.research-evidence-synthesis."
+    )
+    assert definition.validation_policy.validator_revision_id.startswith(
+        "framework.validator-evidence-synthesis."
+    )
+
+
+def test_tool_semantics_batch_definition_binds_current_revisions() -> None:
+    definition = tool_semantics_batch_definition(
+        job_id="job:hotel",
+        group_id="coupling:booking",
+        batch_id="batch:1",
+        dependency_coordinates=(),
+        agent_wall_seconds=120,
+        agent_token_limit=10_000,
+    )
+
+    revisions = current_runtime_revisions_for_definition(definition)
+
+    assert revisions == (
+        definition.proposal_policy.implementation_revision_id,
+        definition.validation_policy.validator_revision_id,
+    )
+    assert definition.proposal_policy.implementation_revision_id.startswith(
+        "framework.design-tool-semantics-batch."
+    )
+    assert definition.validation_policy.validator_revision_id.startswith(
+        "framework.validator-tool-semantics-batch."
+    )
+
+
+def test_builder_agent_definitions_bind_current_prompt_skill_and_validator_revisions() -> None:
+    """Every Builder Agent boundary supports a causal implementation refresh."""
+
+    design_definitions, modeling = _complete_design_closure()
+    graph = complete_generation_work_graph(
+        scope_id="job:hotel",
+        design_graph=_design_graph(design_definitions, modeling),
+        verifier_batch_count=1,
+    )
+    definitions = {
+        item.coordinate.stage: item
+        for item in graph.definitions
+        if item.coordinate.component == "build"
+    }
+
+    implementation_plan = definitions["implementation_plan"]
+    candidate_build = definitions["candidate_build"]
+    assert current_runtime_revisions_for_definition(implementation_plan) == (
+        implementation_plan.proposal_policy.implementation_revision_id,
+        implementation_plan.validation_policy.validator_revision_id,
+    )
+    assert current_runtime_revisions_for_definition(candidate_build) == (
+        candidate_build.proposal_policy.implementation_revision_id,
+        candidate_build.validation_policy.validator_revision_id,
+    )
+    assert implementation_plan.proposal_policy.implementation_revision_id.startswith(
+        "framework.build-implementation-plan."
+    )
+    assert implementation_plan.validation_policy.validator_revision_id.startswith(
+        "framework.validator-build-implementation-plan."
+    )
+    assert candidate_build.proposal_policy.implementation_revision_id.startswith(
+        "framework.build-candidate."
+    )
+    assert candidate_build.validation_policy.validator_revision_id.startswith(
+        "framework.validator-build-candidate."
     )
 
 
@@ -326,10 +429,31 @@ def _complete_design_closure() -> tuple[tuple[WorkDefinition, ...], WorkDefiniti
         stage="world_rules",
         dependencies=(behavior.coordinate,),
     )
+    curriculum_plan = _stage_definition(
+        component="design",
+        stage="curriculum_plan",
+        dependencies=(rules.coordinate,),
+    )
+    task_requirement = _stage_definition(
+        component="design",
+        stage="task_requirement",
+        dependencies=(rules.coordinate, curriculum_plan.coordinate),
+    ).model_copy(
+        update={
+            "coordinate": WorkCoordinate(
+                scope_id="job:hotel",
+                component="design",
+                stage="task_requirement",
+                artifact_slot="task_requirement_source",
+                group_id="task-requirements",
+                shard_id="counter-increment",
+            )
+        }
+    )
     curriculum = _stage_definition(
         component="design",
         stage="task_curriculum",
-        dependencies=(rules.coordinate,),
+        dependencies=(rules.coordinate, curriculum_plan.coordinate, task_requirement.coordinate),
     )
     modeling = _stage_definition(
         component="design",
@@ -345,7 +469,17 @@ def _complete_design_closure() -> tuple[tuple[WorkDefinition, ...], WorkDefiniti
             )
         }
     )
-    return (plan, acquisition, synthesis, architecture, behavior, rules, curriculum), modeling
+    return (
+        plan,
+        acquisition,
+        synthesis,
+        architecture,
+        behavior,
+        rules,
+        curriculum_plan,
+        task_requirement,
+        curriculum,
+    ), modeling
 
 
 def _design_graph(
@@ -375,6 +509,7 @@ def test_complete_generation_graph_cannot_stop_at_modeling_boundary() -> None:
     stages = {item.coordinate.stage for item in graph.definitions}
     assert {
         "modeling_boundary",
+        "implementation_plan",
         "candidate_build",
         "verifier_plan",
         "verifier_intent_batch",
@@ -392,12 +527,121 @@ def test_complete_generation_graph_cannot_stop_at_modeling_boundary() -> None:
         "release_candidate",
         "released",
     }
+    implementation_plan = next(
+        item for item in graph.definitions if item.coordinate.stage == "implementation_plan"
+    )
     build = next(item for item in graph.definitions if item.coordinate.stage == "candidate_build")
+    assert implementation_plan.dependency_coordinates == (modeling.coordinate,)
+    assert implementation_plan.proposal_policy.budget.build_seconds == 0
+    assert implementation_plan.proposal_policy.budget.first_progress_seconds is None
+    assert implementation_plan.proposal_policy.budget.first_write_seconds is None
+    assert implementation_plan.proposal_policy.budget.llm_tokens == 16_384
+    assert build.proposal_policy.budget.build_seconds == 1_200
+    assert build.proposal_policy.budget.first_progress_seconds is None
+    assert build.proposal_policy.budget.first_write_seconds is None
+    assert implementation_plan.coordinate in build.dependency_coordinates
+    assert {
+        artifact_type for slot in build.input_slots for artifact_type in slot.artifact_types
+    } >= {
+        "build.implementation_contract",
+        "build.implementation_plan",
+    }
     release_assurance = next(
         item for item in graph.definitions if item.coordinate.stage == "release_assurance"
     )
     assert build.coordinate in release_assurance.dependency_coordinates
     assert build.coordinate in release_assurance.repair_target_coordinates
+
+
+def test_agent_work_definitions_do_not_add_short_progress_or_write_deadlines() -> None:
+    """LLM work inherits its declared logical envelope without a hidden liveness cap."""
+
+    design_definitions, modeling = _complete_design_closure()
+    graph = complete_generation_work_graph(
+        scope_id="job:hotel",
+        design_graph=_design_graph(design_definitions, modeling),
+        verifier_batch_count=1,
+    )
+
+    agent_definitions = [
+        definition
+        for definition in graph.definitions
+        if definition.proposal_policy.executor == "agent"
+    ]
+    assert agent_definitions
+    assert all(
+        definition.proposal_policy.budget.first_progress_seconds is None
+        and definition.proposal_policy.budget.first_write_seconds is None
+        for definition in agent_definitions
+    )
+
+
+def test_implementation_plan_splits_a_5m_logical_session_into_observable_provider_turns() -> None:
+    design_definitions, modeling = _complete_design_closure()
+
+    graph = complete_generation_work_graph(
+        scope_id="job:hotel",
+        design_graph=_design_graph(design_definitions, modeling),
+        implementation_plan_token_limit=128_000,
+        implementation_plan_wall_seconds=28_800,
+        implementation_plan_session_token_limit=5_000_000,
+        implementation_plan_session_wall_seconds=28_800,
+        verifier_batch_count=1,
+    )
+
+    implementation_plan = next(
+        item for item in graph.definitions if item.coordinate.stage == "implementation_plan"
+    )
+    assert implementation_plan.proposal_policy.budget.llm_tokens == 125_000
+    assert implementation_plan.proposal_policy.budget.wall_seconds == 720
+    assert implementation_plan.proposal_policy.session_token_limit == 5_000_000
+    assert implementation_plan.proposal_policy.session_wall_seconds == 28_800
+    assert implementation_plan.repair_policy.maximum_session_continuations == 39
+
+
+def test_candidate_build_splits_a_5m_logical_session_into_observable_provider_turns() -> None:
+    design_definitions, modeling = _complete_design_closure()
+
+    graph = complete_generation_work_graph(
+        scope_id="job:hotel",
+        design_graph=_design_graph(design_definitions, modeling),
+        builder_token_limit=128_000,
+        builder_wall_seconds=28_800,
+        builder_session_token_limit=5_000_000,
+        builder_session_wall_seconds=28_800,
+        verifier_batch_count=1,
+    )
+
+    build = next(item for item in graph.definitions if item.coordinate.stage == "candidate_build")
+    assert build.proposal_policy.budget.llm_tokens == 125_000
+    assert build.proposal_policy.budget.wall_seconds == 720
+    assert build.proposal_policy.session_token_limit == 5_000_000
+    assert build.proposal_policy.session_wall_seconds == 28_800
+    assert build.repair_policy.maximum_session_continuations == 39
+
+
+def test_candidate_build_rejects_a_partial_logical_session_envelope() -> None:
+    design_definitions, modeling = _complete_design_closure()
+
+    with pytest.raises(WorkGraphError, match="must be declared together"):
+        complete_generation_work_graph(
+            scope_id="job:hotel",
+            design_graph=_design_graph(design_definitions, modeling),
+            builder_session_token_limit=5_000_000,
+            verifier_batch_count=1,
+        )
+
+
+def test_implementation_plan_rejects_a_partial_logical_session_envelope() -> None:
+    design_definitions, modeling = _complete_design_closure()
+
+    with pytest.raises(WorkGraphError, match="must be declared together"):
+        complete_generation_work_graph(
+            scope_id="job:hotel",
+            design_graph=_design_graph(design_definitions, modeling),
+            implementation_plan_session_token_limit=5_000_000,
+            verifier_batch_count=1,
+        )
 
 
 def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() -> None:
@@ -449,7 +693,7 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
         ),
     )
 
-    definitions, modeling = derive_final_design_definitions(
+    world_definitions, modeling_template = derive_world_plan_definitions(
         scope_id="job:hotel",
         bootstrap_definitions=(plan, acquisition, synthesis, architecture),
         architecture_source_ref=coupling.architecture_ref,
@@ -457,10 +701,14 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
         agent_wall_seconds=120,
         agent_token_limit=10_000,
     )
-    shared = tuple(item for item in definitions if item.coordinate.stage == "shared_tool_semantics")
-    batches = tuple(item for item in definitions if item.coordinate.stage == "world_behavior")
-    rules = next(item for item in definitions if item.coordinate.stage == "world_rules")
-    curriculum = next(item for item in definitions if item.coordinate.stage == "task_curriculum")
+    shared = tuple(
+        item for item in world_definitions if item.coordinate.stage == "shared_tool_semantics"
+    )
+    batches = tuple(item for item in world_definitions if item.coordinate.stage == "world_behavior")
+    rules = next(item for item in world_definitions if item.coordinate.stage == "world_rules")
+    curriculum_plan = next(
+        item for item in world_definitions if item.coordinate.stage == "curriculum_plan"
+    )
 
     assert len(shared) == 1
     assert shared[0].coordinate.group_id == "group:booking"
@@ -477,20 +725,14 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
     )
     assert rules.proposal_policy.acceptance_transform_id == "framework.world-rules-compiler.v4"
     assert rules.validation_policy.validator_revision_id == "framework.validator.world-rules.v4"
-    assert curriculum.dependency_coordinates == (
+    assert curriculum_plan.dependency_coordinates == (
         synthesis.coordinate,
         architecture.coordinate,
         rules.coordinate,
-    )
-    assert modeling.dependency_coordinates == (
-        synthesis.coordinate,
-        architecture.coordinate,
-        rules.coordinate,
-        curriculum.coordinate,
     )
     assert all(
         item.proposal_policy.budget.agent_turns == 1
-        for item in (*shared, *batches, rules, curriculum)
+        for item in (*shared, *batches, rules, curriculum_plan)
     )
     assert all(
         (
@@ -503,7 +745,76 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
         for item in batches
     )
     assert all(
-        item.input_slots and item.output_slots for item in (*shared, *batches, rules, curriculum)
+        item.input_slots and item.output_slots
+        for item in (*shared, *batches, rules, curriculum_plan)
+    )
+
+    world_graph = compile_world_work_graph(
+        scope_id="job:hotel",
+        world_definitions=world_definitions,
+    )
+    assert world_graph.required_terminal_coordinates == (curriculum_plan.coordinate,)
+
+    plan_source = CurriculumPlanSourceDraft(
+        coverage_dimensions=(CoverageDimension(dimension="counter"),),
+        task_plans=(
+            CurriculumTaskPlanSourceDraft(
+                task_type="counter-increment",
+                objective="Increase the counter to the requested target.",
+                allowed_actor_ids=("user",),
+                required_tool_ids=("hotel.search",),
+                difficulty_dimensions=("target-size",),
+            ),
+            CurriculumTaskPlanSourceDraft(
+                task_type="counter-inspect",
+                objective="Inspect the current counter value.",
+                allowed_actor_ids=("user",),
+                required_tool_ids=("hotel.hold",),
+                difficulty_dimensions=("target-size",),
+            ),
+        ),
+        difficulty_dimensions=(
+            DifficultyDimension(
+                dimension="target-size",
+                description="Requested target magnitude.",
+                levels=("small", "large"),
+            ),
+        ),
+        generation_seed_space="all uint64 seeds",
+    )
+    definitions, modeling = derive_task_requirement_design_definitions(
+        scope_id="job:hotel",
+        world_definitions=world_definitions,
+        curriculum_plan_ref=_artifact_ref(
+            "curriculum-plan:hotel",
+            "design.curriculum_plan_source",
+        ),
+        curriculum_plan=plan_source,
+        modeling_template=modeling_template,
+        agent_wall_seconds=120,
+        agent_token_limit=10_000,
+    )
+    requirements = tuple(
+        item for item in definitions if item.coordinate.stage == "task_requirement"
+    )
+    curriculum = next(item for item in definitions if item.coordinate.stage == "task_curriculum")
+    assert tuple(item.coordinate.shard_id for item in requirements) == (
+        "counter-increment",
+        "counter-inspect",
+    )
+    assert all(item.coordinate.group_id == "task-requirements" for item in requirements)
+    assert curriculum.dependency_coordinates == (
+        synthesis.coordinate,
+        architecture.coordinate,
+        rules.coordinate,
+        curriculum_plan.coordinate,
+        *(item.coordinate for item in requirements),
+    )
+    assert modeling.dependency_coordinates == (
+        synthesis.coordinate,
+        architecture.coordinate,
+        rules.coordinate,
+        curriculum.coordinate,
     )
 
     graph = complete_generation_work_graph(
@@ -633,6 +944,26 @@ def test_complete_generation_graph_freezes_every_verifier_agent_batch_as_physica
     assert all(item.coordinate.group_id == "verifier-intent-batches" for item in batches)
     assert all(item.proposal_policy.executor == "agent" for item in batches)
     assert all(item.proposal_policy.budget.agent_turns == 1 for item in batches)
+    assert all(
+        item.proposal_policy.implementation_revision_id.startswith(
+            "framework.verifier-intent-batch."
+        )
+        for item in batches
+    )
+    assert all(
+        item.validation_policy.validator_revision_id.startswith(
+            "framework.validator-verifier-intent-batch."
+        )
+        for item in batches
+    )
+    assert all(
+        current_runtime_revisions_for_definition(item)
+        == (
+            item.proposal_policy.implementation_revision_id,
+            item.validation_policy.validator_revision_id,
+        )
+        for item in batches
+    )
     verifier_plan = next(
         definition
         for definition in graph.definitions
@@ -748,19 +1079,19 @@ def test_work_group_freezes_members_and_requires_exact_aggregate_join() -> None:
         )
 
 
-def test_tool_semantics_policy_has_one_base_correction_progress_bonus_and_infra_retry() -> None:
+def test_tool_semantics_policy_keeps_the_configured_token_budget() -> None:
     definition = tool_semantics_batch_definition(
         job_id="job:hotel",
         group_id="coupling:booking",
         batch_id="batch:1",
         dependency_coordinates=(_coordinate("architecture"),),
         agent_wall_seconds=300,
-        agent_token_limit=65_536,
+        agent_token_limit=5_000_000,
     )
 
     assert definition.coordinate.artifact_slot == "tool_semantics_batch"
     assert definition.proposal_policy.budget.agent_turns == 1
-    assert definition.proposal_policy.budget.llm_tokens == 32_768
+    assert definition.proposal_policy.budget.llm_tokens == 5_000_000
     assert definition.proposal_policy.budget.monetary_cost == 0
     assert definition.repair_policy.maximum_local_corrections == 1
     assert definition.repair_policy.strict_progress_bonus_corrections == 1

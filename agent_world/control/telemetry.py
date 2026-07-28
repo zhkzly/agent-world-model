@@ -59,6 +59,21 @@ type UsageProvenance = Literal[
     "unknown",
 ]
 type InvocationExecutionBackend = Literal["codex_sdk", "direct_llm"]
+type InvocationActivityClass = Literal[
+    "reasoning",
+    "agent_message",
+    "command",
+    "file_change",
+    "tool",
+    "other",
+    "unclassified",
+]
+type InvocationLivenessPhase = Literal[
+    "direct_request_dispatched",
+    "direct_awaiting_response",
+    "direct_stream_opened",
+    "direct_awaiting_stream_event",
+]
 
 _SCHEMA_VERSION = 1
 _CURRENT_TRACE: ContextVar[tuple[str, str, str | None, str | None, str | None] | None] = ContextVar(
@@ -78,6 +93,80 @@ _SENSITIVE_KEY_PARTS = (
     "secret",
     "token_value",
 )
+INVOCATION_ACTIVITY_CLASSES: tuple[InvocationActivityClass, ...] = (
+    "reasoning",
+    "agent_message",
+    "command",
+    "file_change",
+    "tool",
+    "other",
+    "unclassified",
+)
+
+
+def invocation_activity_metric_name(activity: InvocationActivityClass) -> str:
+    """Return the fixed, content-free metric name for one SDK item class."""
+
+    return f"invocation.activity.{activity}_event_delta"
+
+
+INVOCATION_ACTIVITY_METRIC_NAMES: tuple[str, ...] = tuple(
+    invocation_activity_metric_name(activity) for activity in INVOCATION_ACTIVITY_CLASSES
+)
+INVOCATION_LIVENESS_PHASES: frozenset[InvocationLivenessPhase] = frozenset(
+    {
+        "direct_request_dispatched",
+        "direct_awaiting_response",
+        "direct_stream_opened",
+        "direct_awaiting_stream_event",
+    }
+)
+
+
+def classify_invocation_activity(
+    event_payload: Mapping[str, Any] | None,
+) -> InvocationActivityClass:
+    """Classify only the compact SDK ``item.type`` into a closed safe bucket.
+
+    This is intentionally a notification classification, not a claim about an
+    exact command, file, tool argument, or successful side effect.  The raw
+    item type and every other payload field are discarded before telemetry is
+    persisted.  Missing type metadata remains ``unclassified`` rather than
+    being guessed from a free-form notification method.
+    """
+
+    if not isinstance(event_payload, Mapping):
+        return "unclassified"
+    item = event_payload.get("item")
+    if not isinstance(item, Mapping):
+        return "unclassified"
+    raw_type = item.get("type")
+    if not isinstance(raw_type, str) or not raw_type:
+        return "unclassified"
+    normalized = "".join(character for character in raw_type.casefold() if character.isalnum())
+    # DirectLlmBackend first projects Provider stream events into these
+    # content-free sentinel item types.  Recognize the projection explicitly
+    # instead of treating it as an arbitrary SDK item name: a visible output
+    # delta is useful liveness evidence, while an unknown Provider event must
+    # stay visibly unknown.  Lifecycle/completion remain ``other`` because
+    # neither proves Agent reasoning or emitted artifact content.
+    if normalized == "directstreamreasoning":
+        return "reasoning"
+    if normalized == "directstreamoutput":
+        return "agent_message"
+    if normalized == "directstreamunclassified":
+        return "unclassified"
+    if "reasoning" in normalized:
+        return "reasoning"
+    if "command" in normalized or "shell" in normalized or "terminal" in normalized:
+        return "command"
+    if "file" in normalized or "patch" in normalized:
+        return "file_change"
+    if "tool" in normalized or "mcp" in normalized or "function" in normalized:
+        return "tool"
+    if "message" in normalized:
+        return "agent_message"
+    return "other"
 
 
 class TelemetryError(RuntimeError):
@@ -111,7 +200,7 @@ class WorkSpan:
     first_progress_recorded: bool = False
     last_progress_perf_ns: int = 0
     pending_event_count: int = 0
-    pending_tool_event_count: int = 0
+    pending_activity_event_counts: dict[InvocationActivityClass, int] = field(default_factory=dict)
     closed: bool = False
 
     def first_progress(self) -> None:
@@ -121,14 +210,27 @@ class WorkSpan:
         self.first_progress_recorded = True
         self.last_progress_perf_ns = time.perf_counter_ns()
 
-    def progress(self, method: str) -> None:
-        """Record bounded provider liveness without persisting event payloads."""
+    def progress(
+        self,
+        method: str,
+        event_payload: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record bounded provider liveness with content-free activity counts.
+
+        ``method`` still identifies a protocol notification for the generic
+        liveness counter.  Activity uses only the already-compacted item type;
+        it never persists the payload itself or infers a tool call from a
+        method-name substring.
+        """
 
         if self.closed:
             return
+        del method  # Activity is intentionally not inferred from method text.
         self.pending_event_count += 1
-        if "tool" in method.casefold():
-            self.pending_tool_event_count += 1
+        activity = classify_invocation_activity(event_payload)
+        self.pending_activity_event_counts[activity] = (
+            self.pending_activity_event_counts.get(activity, 0) + 1
+        )
         now = time.perf_counter_ns()
         should_flush = (
             not self.first_progress_recorded
@@ -137,6 +239,18 @@ class WorkSpan:
         )
         if should_flush:
             self._flush_progress(now)
+
+    def heartbeat(self, phase: str) -> None:
+        """Record local wait liveness without claiming Provider progress.
+
+        A stream can remain open while the adapter is alive but no new Provider
+        event arrives. This updates a separate heartbeat field: first/last
+        progress remain evidence from actual Provider notifications only.
+        """
+
+        if self.closed:
+            return
+        self.store.mark_heartbeat(self.span_id, phase=phase)
 
     def _flush_progress(self, now_perf_ns: int | None = None) -> None:
         if not self.pending_event_count:
@@ -149,11 +263,14 @@ class WorkSpan:
                 "sdk",
             )
         ]
-        if self.pending_tool_event_count:
+        for activity in INVOCATION_ACTIVITY_CLASSES:
+            observed = self.pending_activity_event_counts.get(activity, 0)
+            if not observed:
+                continue
             points.append(
                 MetricPoint(
-                    "invocation.protocol_tool_events.observed_delta",
-                    self.pending_tool_event_count,
+                    invocation_activity_metric_name(activity),
+                    observed,
                     "events",
                     "sdk",
                 )
@@ -165,7 +282,7 @@ class WorkSpan:
         )
         self.first_progress_recorded = True
         self.pending_event_count = 0
-        self.pending_tool_event_count = 0
+        self.pending_activity_event_counts.clear()
         self.last_progress_perf_ns = now_perf_ns or time.perf_counter_ns()
 
     def metric(self, point: MetricPoint) -> None:
@@ -384,6 +501,27 @@ class TelemetryStore:
             self._touch(1 + len(metrics))
         # Provider progress is a live-operability signal. Flush only the
         # WorkSpan-throttled samples, never every raw SDK event.
+        self.flush()
+
+    def mark_heartbeat(self, span_id: str, *, phase: str) -> None:
+        """Persist one content-free local adapter heartbeat for a live span."""
+
+        if phase not in INVOCATION_LIVENESS_PHASES:
+            raise TelemetryError("unsupported invocation liveness phase")
+        with self._lock:
+            cursor = self._connection.execute(
+                """
+                UPDATE spans
+                SET last_heartbeat_at_ns = ?, last_heartbeat_phase = ?
+                WHERE span_id = ? AND status = 'running'
+                """,
+                (time.time_ns(), phase, span_id),
+            )
+            if cursor.rowcount != 1:
+                raise TelemetryError("cannot mark a heartbeat for a missing or closed WorkSpan")
+            self._touch()
+        # A heartbeat is useful to a separate observing process, so persist it
+        # immediately. It is not an execution deadline or retry.
         self.flush()
 
     def finish_span(
@@ -707,6 +845,12 @@ class TelemetryStore:
         usage remains unknown until a terminal provider result is available.
         """
 
+        metric_names = frozenset(
+            (
+                "invocation.events.observed_delta",
+                *INVOCATION_ACTIVITY_METRIC_NAMES,
+            )
+        )
         with self._lock:
             self.flush()
             rows = [
@@ -715,7 +859,8 @@ class TelemetryStore:
                     """
                     SELECT span_id, parent_span_id, component, node, operation,
                            attempt, started_at_ns, first_progress_at_ns,
-                           last_progress_at_ns
+                           last_progress_at_ns, last_heartbeat_at_ns,
+                           last_heartbeat_phase
                     FROM spans
                     WHERE trace_id = ? AND status = 'running'
                     ORDER BY started_at_ns, span_id
@@ -729,9 +874,9 @@ class TelemetryStore:
                        SUM(COALESCE(value_integer, value_real)) AS observed
                 FROM metrics
                 WHERE trace_id = ?
-                  AND name IN (
-                      'invocation.events.observed_delta',
-                      'invocation.protocol_tool_events.observed_delta'
+                  AND (
+                      name = 'invocation.events.observed_delta'
+                      OR name GLOB 'invocation.activity.*_event_delta'
                   )
                 GROUP BY span_id, name
                 """,
@@ -741,9 +886,24 @@ class TelemetryStore:
         for metric in metric_rows:
             if metric["span_id"] is None or metric["observed"] is None:
                 continue
+            if str(metric["name"]) not in metric_names:
+                continue
             observed_by_span.setdefault(str(metric["span_id"]), {})[str(metric["name"])] = metric[
                 "observed"
             ]
+        activity_by_span: dict[str, dict[InvocationActivityClass, int]] = {}
+        metric_to_activity = {
+            invocation_activity_metric_name(activity): activity
+            for activity in INVOCATION_ACTIVITY_CLASSES
+        }
+        for span_id, observed in observed_by_span.items():
+            activity_counts: dict[InvocationActivityClass, int] = {}
+            for metric_name, activity in metric_to_activity.items():
+                value = observed.get(metric_name)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                    activity_counts[activity] = int(value)
+            if activity_counts:
+                activity_by_span[span_id] = activity_counts
         now_ns = time.time_ns()
         return tuple(
             {
@@ -752,9 +912,11 @@ class TelemetryStore:
                 "observed_event_count": observed_by_span.get(row["span_id"], {}).get(
                     "invocation.events.observed_delta", 0
                 ),
-                "observed_protocol_tool_event_count": observed_by_span.get(row["span_id"], {}).get(
-                    "invocation.protocol_tool_events.observed_delta", 0
-                ),
+                "activity_classification_available": row["span_id"] in activity_by_span,
+                "observed_activity_event_counts": {
+                    activity: activity_by_span.get(row["span_id"], {}).get(activity, 0)
+                    for activity in INVOCATION_ACTIVITY_CLASSES
+                },
                 "observed_token_count": None,
             }
             for row in rows
@@ -1073,6 +1235,8 @@ class TelemetryStore:
                 started_at_ns INTEGER NOT NULL,
                 first_progress_at_ns INTEGER,
                 last_progress_at_ns INTEGER,
+                last_heartbeat_at_ns INTEGER,
+                last_heartbeat_phase TEXT,
                 ended_at_ns INTEGER,
                 duration_ns INTEGER,
                 error_code TEXT,
@@ -1131,6 +1295,10 @@ class TelemetryStore:
         }
         if "last_progress_at_ns" not in span_columns:
             self._connection.execute("ALTER TABLE spans ADD COLUMN last_progress_at_ns INTEGER")
+        if "last_heartbeat_at_ns" not in span_columns:
+            self._connection.execute("ALTER TABLE spans ADD COLUMN last_heartbeat_at_ns INTEGER")
+        if "last_heartbeat_phase" not in span_columns:
+            self._connection.execute("ALTER TABLE spans ADD COLUMN last_heartbeat_phase TEXT")
         row = self._connection.execute("SELECT schema_version FROM telemetry_meta").fetchone()
         if row is None:
             self._connection.execute(

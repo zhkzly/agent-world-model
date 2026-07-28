@@ -12,7 +12,7 @@ import asyncio
 import importlib.metadata
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -27,17 +27,35 @@ from .contracts import (
     InvocationResult,
     InvocationStatus,
     InvocationUsage,
+    JsonObject,
     TokenBreakdown,
     json_compatible,
 )
 from .profiles import ProfileResolutionError, verify_resolved_profile
 from .redaction import Redactor
+from .structured_diagnostics import (
+    direct_invalid_json_details,
+    direct_output_limit_details,
+    direct_provider_exception_details,
+    direct_provider_stream_stalled_details,
+    direct_transport_decode_details,
+)
 
 _DIRECT_EVENT_METHOD = "direct.response.completed"
+_DIRECT_STREAM_EVENT_METHOD = "direct.response.stream.event"
 _DIRECT_SCHEMA_NAME = "agent_world_structured_output"
+_DIRECT_LIVENESS_HEARTBEAT_SECONDS = 30.0
 # Scheduler/RepairLedger owns retry admission and accounting.  The HTTP SDK
 # must not make invisible transport retries beneath InvocationBackend.
 _DIRECT_SDK_MAX_RETRIES = 0
+
+
+class _DirectStreamIdleTimeout(TimeoutError):
+    """One started Direct stream stopped yielding Provider events."""
+
+    def __init__(self, *, idle_timeout_seconds: float) -> None:
+        self.idle_timeout_seconds = idle_timeout_seconds
+        super().__init__("Direct Provider stream stopped yielding events")
 
 
 class DirectLlmBackend:
@@ -56,9 +74,12 @@ class DirectLlmBackend:
         max_concurrent_invocations: int = 1,
         telemetry: TelemetryStore | None = None,
         client_factory: Callable[..., Any] | None = None,
+        liveness_heartbeat_seconds: float = _DIRECT_LIVENESS_HEARTBEAT_SECONDS,
     ) -> None:
         if not 1 <= max_concurrent_invocations <= 32:
             raise ValueError("max_concurrent_invocations must be between 1 and 32")
+        if liveness_heartbeat_seconds <= 0:
+            raise ValueError("liveness_heartbeat_seconds must be positive")
         self._capacity = asyncio.Semaphore(max_concurrent_invocations)
         self._lock = asyncio.Lock()
         self._active: dict[str, asyncio.Task[Any]] = {}
@@ -66,6 +87,7 @@ class DirectLlmBackend:
         self._telemetry_failures = 0
         self._client_close_failures = 0
         self._client_factory = client_factory or _default_client_factory
+        self._liveness_heartbeat_seconds = liveness_heartbeat_seconds
 
     @property
     def telemetry_failures(self) -> int:
@@ -93,12 +115,25 @@ class DirectLlmBackend:
             except Exception:
                 self._telemetry_failures += 1
 
-        def mark_provider_progress(_: str) -> None:
+        def mark_provider_progress(
+            method: str,
+            event_payload: Mapping[str, Any] | None = None,
+        ) -> None:
             nonlocal progress_disabled
             if telemetry_span is None or progress_disabled:
                 return
             try:
-                telemetry_span.progress(_DIRECT_EVENT_METHOD)
+                telemetry_span.progress(method, event_payload)
+            except Exception:
+                self._telemetry_failures += 1
+                progress_disabled = True
+
+        def mark_local_liveness(phase: str) -> None:
+            nonlocal progress_disabled
+            if telemetry_span is None or progress_disabled:
+                return
+            try:
+                telemetry_span.heartbeat(phase)
             except Exception:
                 self._telemetry_failures += 1
                 progress_disabled = True
@@ -132,6 +167,7 @@ class DirectLlmBackend:
                         result = await self._invoke_once(
                             request,
                             on_first_progress=mark_provider_progress,
+                            on_liveness=mark_local_liveness,
                         )
         except asyncio.CancelledError:
             if telemetry_span is not None:
@@ -179,7 +215,8 @@ class DirectLlmBackend:
         self,
         request: InvocationRequest,
         *,
-        on_first_progress: Callable[[str], None] | None,
+        on_first_progress: Callable[[str, Mapping[str, Any] | None], None] | None,
+        on_liveness: Callable[[str], None] | None,
     ) -> InvocationResult:
         started = time.monotonic()
         profile = request.profile
@@ -253,15 +290,10 @@ class DirectLlmBackend:
             )
 
         try:
-            text_format = {
-                "type": "json_schema",
-                "name": _DIRECT_SCHEMA_NAME,
-                "strict": True,
-                "schema": _transport_output_schema(
-                    profile.output_schema,
-                    transport=profile.structured_output_transport,
-                ),
-            }
+            text_format = _direct_text_format(
+                profile.output_schema,
+                transport=profile.structured_output_transport,
+            )
         except (TypeError, ValueError):
             return _local_failure(
                 request,
@@ -271,6 +303,8 @@ class DirectLlmBackend:
             )
 
         client = None
+        response: Any | None = None
+        observed_provider_event_count = 0
         try:
             client = self._client_factory(
                 api_key=api_key,
@@ -279,24 +313,96 @@ class DirectLlmBackend:
                 max_retries=_DIRECT_SDK_MAX_RETRIES,
             )
             async with asyncio.timeout(profile.limits.timeout_seconds):
-                response = await client.responses.create(
-                    model=profile.model,
-                    input=request.prompt,
-                    instructions=_combined_instructions(
-                        profile.base_instructions,
-                        profile.developer_instructions,
+                if on_liveness is not None:
+                    on_liveness("direct_request_dispatched")
+                stream = await _await_with_liveness_heartbeats(
+                    client.responses.create(
+                        model=profile.model,
+                        input=request.prompt,
+                        instructions=_combined_instructions(
+                            profile.base_instructions,
+                            profile.developer_instructions,
+                        ),
+                        max_output_tokens=profile.rollout_token_limit,
+                        reasoning={"effort": profile.reasoning_effort.value},
+                        store=False,
+                        stream=True,
+                        text={"format": text_format},
                     ),
-                    max_output_tokens=profile.rollout_token_limit,
-                    reasoning={"effort": profile.reasoning_effort.value},
-                    store=False,
-                    text={"format": text_format},
+                    heartbeat_seconds=self._liveness_heartbeat_seconds,
+                    on_liveness=on_liveness,
+                    waiting_phase="direct_awaiting_response",
                 )
+                if on_liveness is not None:
+                    on_liveness("direct_stream_opened")
+                iterator = aiter(stream)
+                while True:
+                    try:
+                        event = await _await_with_liveness_heartbeats(
+                            anext(iterator),
+                            heartbeat_seconds=self._liveness_heartbeat_seconds,
+                            on_liveness=on_liveness,
+                            waiting_phase="direct_awaiting_stream_event",
+                            # Do not create a first-progress death clock.  A
+                            # stream becomes eligible only after the Provider
+                            # has already emitted one real event and then goes
+                            # silent for the profile-owned liveness interval.
+                            idle_timeout_seconds=(
+                                profile.limits.direct_stream_idle_timeout_seconds
+                                if observed_provider_event_count > 0
+                                else None
+                            ),
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except _DirectStreamIdleTimeout as exc:
+                        return _local_failure(
+                            request,
+                            status=InvocationStatus.FAILED,
+                            code="direct_provider_stream_stalled",
+                            started=started,
+                            retryable=True,
+                            details=direct_provider_stream_stalled_details(
+                                idle_timeout_seconds=exc.idle_timeout_seconds,
+                                observed_provider_event_count=observed_provider_event_count,
+                            ),
+                        )
+                    event_type = _direct_stream_event_type(event)
+                    observed_provider_event_count += 1
+                    if on_first_progress is not None:
+                        on_first_progress(
+                            _DIRECT_STREAM_EVENT_METHOD,
+                            _direct_stream_activity_payload(event_type),
+                        )
+                    if event_type == "error":
+                        return _local_failure(
+                            request,
+                            status=InvocationStatus.FAILED,
+                            code="direct_stream_error",
+                            started=started,
+                        )
+                    if event_type in {
+                        "response.completed",
+                        "response.failed",
+                        "response.incomplete",
+                    }:
+                        candidate = getattr(event, "response", None)
+                        if candidate is not None:
+                            response = candidate
+                if response is None:
+                    return _local_failure(
+                        request,
+                        status=InvocationStatus.FAILED,
+                        code="direct_stream_terminal_missing",
+                        started=started,
+                    )
         except TimeoutError:
             return _local_failure(
                 request,
                 status=InvocationStatus.TIMED_OUT,
                 code="direct_timeout",
                 started=started,
+                retryable=True,
             )
         except asyncio.CancelledError:
             raise
@@ -308,6 +414,7 @@ class DirectLlmBackend:
                 code=code,
                 started=started,
                 retryable=retryable,
+                details=direct_provider_exception_details(exc),
             )
         finally:
             if client is not None:
@@ -323,7 +430,21 @@ class DirectLlmBackend:
         response_status = _response_status(response)
         if response_status != "completed":
             status, code = _response_terminal_status(response_status, response)
-            return _local_failure(request, status=status, code=code, started=started)
+            details = (
+                direct_output_limit_details(
+                    configured_max_output_tokens=profile.rollout_token_limit,
+                )
+                if code == "direct_output_limit"
+                else None
+            )
+            return _local_failure(
+                request,
+                status=status,
+                code=code,
+                started=started,
+                details=details,
+                usage=_response_usage(response),
+            )
         output_text = getattr(response, "output_text", None)
         if not isinstance(output_text, str) or not output_text:
             return _local_failure(
@@ -344,7 +465,7 @@ class DirectLlmBackend:
             )
         try:
             decoded_output = json.loads(output_text, parse_constant=_reject_json_constant)
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
             # Keep this boundary precise without retaining provider text.  A
             # completed compatible-gateway response that is not JSON is a
             # transport failure, not an invitation to coerce prose into a
@@ -354,23 +475,27 @@ class DirectLlmBackend:
                 status=InvocationStatus.FAILED,
                 code="direct_structured_output_invalid_json",
                 started=started,
+                details=direct_invalid_json_details(output_text, exc),
             )
         try:
             raw_output = json_compatible(decoded_output)
-            if profile.structured_output_transport == "provider_schema":
+            if profile.structured_output_transport in {"provider_schema", "json_object"}:
                 structured_output = _decode_provider_json_ir(raw_output)
             else:
                 structured_output = _decode_json_envelope(raw_output)
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
             return _local_failure(
                 request,
                 status=InvocationStatus.FAILED,
                 code="direct_structured_output_transport_invalid",
                 started=started,
+                details=direct_transport_decode_details(
+                    raw_output,
+                    transport=profile.structured_output_transport,
+                    exc=exc,
+                ),
             )
 
-        if on_first_progress is not None:
-            on_first_progress(_DIRECT_EVENT_METHOD)
         return InvocationResult(
             invocation_id=request.invocation_id,
             status=InvocationStatus.COMPLETED,
@@ -411,8 +536,109 @@ def _default_client_factory(
     )
 
 
+async def _await_with_liveness_heartbeats(
+    operation: Any,
+    *,
+    heartbeat_seconds: float,
+    on_liveness: Callable[[str], None] | None,
+    waiting_phase: str,
+    idle_timeout_seconds: float | None = None,
+) -> Any:
+    """Await one SDK boundary while truthfully reporting local waiting.
+
+    Heartbeats are separate from Provider events. They neither reset a timeout
+    nor consume retry authority; they only prove that this adapter task remains
+    alive awaiting the next SDK result.
+    """
+
+    if on_liveness is None and idle_timeout_seconds is None:
+        return await operation
+    task = asyncio.ensure_future(operation)
+    started = time.monotonic()
+    try:
+        while True:
+            wait_seconds: float | None = heartbeat_seconds if on_liveness is not None else None
+            if idle_timeout_seconds is not None:
+                remaining = idle_timeout_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise _DirectStreamIdleTimeout(
+                        idle_timeout_seconds=idle_timeout_seconds,
+                    )
+                wait_seconds = remaining if wait_seconds is None else min(wait_seconds, remaining)
+            done, _ = await asyncio.wait((task,), timeout=wait_seconds)
+            if done:
+                return task.result()
+            if (
+                idle_timeout_seconds is not None
+                and time.monotonic() - started >= idle_timeout_seconds
+            ):
+                raise _DirectStreamIdleTimeout(idle_timeout_seconds=idle_timeout_seconds)
+            if on_liveness is not None:
+                on_liveness(waiting_phase)
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 def _combined_instructions(base: str, developer: str | None) -> str:
     return "\n\n".join(part for part in (base, developer) if part)
+
+
+def _direct_text_format(schema: JsonObject, *, transport: str) -> JsonObject:
+    """Return the smallest provider-format contract for one Direct proposal.
+
+    ``json_object`` is intentionally not a weakened acceptance path: it only
+    removes the outer ``artifact_json`` string which otherwise makes a model
+    double-escape a large logical artifact.  The original local schema and
+    semantic compiler still run after the transport decode.
+    """
+
+    if transport == "json_object":
+        return {"type": "json_object"}
+    return {
+        "type": "json_schema",
+        "name": _DIRECT_SCHEMA_NAME,
+        "strict": True,
+        "schema": _transport_output_schema(schema, transport=transport),
+    }
+
+
+def _direct_stream_event_type(event: object) -> str:
+    """Return a closed safe event label without retaining Provider content."""
+
+    event_type = getattr(event, "type", None)
+    if not isinstance(event_type, str):
+        return "unknown"
+    return event_type
+
+
+def _direct_stream_activity_payload(event_type: str) -> Mapping[str, Mapping[str, str]]:
+    """Project a streamed protocol event to one content-free activity class."""
+
+    if event_type.startswith("response.reasoning"):
+        activity = "reasoning"
+    elif event_type in {
+        "response.created",
+        "response.queued",
+        "response.in_progress",
+    }:
+        activity = "lifecycle"
+    elif event_type in {
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+        "error",
+    }:
+        # ``terminal`` would be classified as a shell/command activity by the
+        # generic Codex-event classifier. A Direct response completion is only
+        # a provider lifecycle fact, never evidence of a command.
+        activity = "completion"
+    elif event_type == "response.output_text.delta":
+        activity = "output"
+    else:
+        activity = "unclassified"
+    return {"item": {"type": f"direct_stream_{activity}"}}
 
 
 def _direct_ineligibility_code(request: InvocationRequest) -> str | None:
@@ -509,6 +735,8 @@ def _local_failure(
     code: str,
     started: float,
     retryable: bool = False,
+    details: JsonObject | None = None,
+    usage: InvocationUsage | None = None,
 ) -> InvocationResult:
     return InvocationResult(
         invocation_id=request.invocation_id,
@@ -517,9 +745,14 @@ def _local_failure(
         turn_id=None,
         final_text=None,
         structured_output=None,
-        usage=None,
+        usage=usage,
         events=(),
-        error=InvocationError(code=code, message=code, retryable=retryable),
+        error=InvocationError(
+            code=code,
+            message=code,
+            retryable=retryable,
+            details=details or {},
+        ),
         duration_ms=max(0, int((time.monotonic() - started) * 1000)),
         backend_version=_openai_sdk_version(),
     )

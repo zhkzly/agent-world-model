@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import shutil
 import uuid
@@ -36,6 +37,53 @@ from agent_world.invocation.profiles import API_KEY_RUNTIME_PROVIDER, ProfileRes
 _ROLES = frozenset({"researcher", "environment-engineer", "challenger"})
 _SOLVER_NODE_ID = "challenger.reachability-solver"
 _SOLVER_RUNTIME_DIRECTORY = ".agent-solver-runtimes"
+
+
+def _logical_output_schema_instructions(
+    output_schema: JsonObject | None,
+    *,
+    transport: str,
+) -> str | None:
+    """Render the logical contract when a Direct transport cannot carry it.
+
+    ``json_envelope`` deliberately asks the Provider to enforce only a small
+    outer object.  The model still needs the complete inner artifact contract;
+    otherwise it can produce a syntactically valid envelope whose payload uses
+    plausible but wrong field names.  ``json_object`` has the same need because
+    its compatible-gateway response mode carries no JSON Schema at all.
+    """
+
+    if output_schema is None or transport == "provider_schema":
+        return None
+    schema_json = json.dumps(
+        output_schema,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    if transport == "json_envelope":
+        transport_instruction = (
+            "Return only the outer JSON object with the one field artifact_json. "
+            "Its string value must decode to one JSON value that satisfies the "
+            "logical schema below; the small outer envelope is not the artifact schema."
+        )
+    elif transport == "json_object":
+        transport_instruction = (
+            "Return one direct JSON value satisfying the logical schema below."
+        )
+    else:
+        raise ValueError(f"unsupported structured output transport: {transport}")
+    return "\n".join(
+        (
+            "## Logical structured output contract",
+            transport_instruction,
+            "Use the literal property names and closed-object rules in this schema. "
+            "Do not substitute aliases, add prose, Markdown fences, or extra fields.",
+            "<logical_output_schema_json>",
+            schema_json,
+            "</logical_output_schema_json>",
+        )
+    )
 
 
 class IsolatedAgentProfileProvider:
@@ -166,9 +214,7 @@ class IsolatedAgentProfileProvider:
         from inheriting another episode's Codex state or history.
         """
 
-        if isinstance(rollout_token_limit, bool) or not isinstance(
-            rollout_token_limit, int
-        ):
+        if isinstance(rollout_token_limit, bool) or not isinstance(rollout_token_limit, int):
             raise TypeError("rollout_token_limit must be an integer")
         if rollout_token_limit <= 0:
             raise ValueError("rollout_token_limit must be positive")
@@ -287,11 +333,60 @@ class IsolatedAgentProfileProvider:
                 "or deciding release. Produce only the requested typed verifier proposal."
             ),
         }
-        skill_source = self.assets_root / skill_names[role]
+        skill_name = skill_names[role]
+        instruction = instructions[role]
+        if role == "environment-engineer":
+            engineer_node_modes = {
+                "environment-engineer.implementation-plan": (
+                    "engineer-build-planning",
+                    (
+                        "Read the frozen implementation inputs and produce one compact advisory "
+                        "implementation map, not an exhaustive rule transcription. Do not write "
+                        "candidate source."
+                    ),
+                ),
+                "environment-engineer.runtime-build": (
+                    "engineer-environment-codegen",
+                    (
+                        "Implement one complete executable Candidate in the isolated workspace. "
+                        "Frozen WorldSpec and the implementation contract own semantics; never "
+                        "invent sealed evaluation data."
+                    ),
+                ),
+            }
+            selected = engineer_node_modes.get(capability_plan.node_id)
+            if selected is not None:
+                skill_name, instruction = selected
+        skill_source = self.assets_root / skill_name
         tool_free = not capability_plan.intrinsic_builtin_tools
-        role_timeout = (
-            self.config.environment_codegen_invocation_timeout_seconds
-            if role == "environment-engineer"
+        structured_output_transport = self.config.structured_output_transport
+        if structured_output_transport == "json_object" and not tool_free:
+            # ``json_object`` is deliberately a DirectLlmBackend transport:
+            # it eliminates a fragile double-serialization task for one-shot
+            # Designer proposals.  A workspace Agent turn continues to use
+            # the Codex SDK's native schema channel, while its logical Builder
+            # budget and continuation policy remain unchanged.
+            structured_output_transport = "provider_schema"
+        developer_instruction_parts: list[str] = []
+        if tool_free:
+            developer_instruction_parts.append(
+                skill_source.joinpath("SKILL.md").read_text(encoding="utf-8")
+            )
+        logical_output_schema_instructions = _logical_output_schema_instructions(
+            output_schema,
+            transport=structured_output_transport,
+        )
+        if logical_output_schema_instructions is not None:
+            developer_instruction_parts.append(logical_output_schema_instructions)
+        # Role is a capability boundary, not a timeout class.  Environment
+        # Engineer serves both structured Designer transactions and Builder
+        # codegen: the latter already passes its own immutable per-turn budget
+        # from ``EnvironmentBuilder``.  Capping every Engineer call here by
+        # the codegen setting would silently truncate a structured node even
+        # when its Scheduler policy and configured structured limit allow it.
+        operation_timeout = (
+            invocation_timeout_seconds
+            if invocation_timeout_seconds is not None
             else self.config.structured_invocation_timeout_seconds
         )
         default_limits = InvocationLimits()
@@ -302,7 +397,7 @@ class IsolatedAgentProfileProvider:
         )
         return AgentProfileSpec(
             profile_id=role,
-            profile_version="3",
+            profile_version="5",
             model=self.config.model,
             model_provider=API_KEY_RUNTIME_PROVIDER,
             openai_base_url_environment=self.config.openai_base_url_environment,
@@ -310,13 +405,9 @@ class IsolatedAgentProfileProvider:
             base_instructions=(
                 "Agent World Foundry turns a short human need into a real executable environment "
                 "whose program code owns state transitions and whose release is decided by "
-                "framework gates. " + instructions[role]
+                "framework gates. " + instruction
             ),
-            developer_instructions=(
-                skill_source.joinpath("SKILL.md").read_text(encoding="utf-8")
-                if tool_free
-                else None
-            ),
+            developer_instructions=("\n\n".join(developer_instruction_parts) or None),
             authentication_handle="model-auth",
             effective_capability_plan=capability_plan,
             codex_bin=self.codex_bin,
@@ -328,7 +419,7 @@ class IsolatedAgentProfileProvider:
             if tool_free
             else (
                 SkillBundleSpec(
-                    name=skill_names[role],
+                    name=skill_name,
                     source=skill_source,
                 ),
             ),
@@ -339,17 +430,15 @@ class IsolatedAgentProfileProvider:
                 *capability_plan.external.credential_handles,
             ),
             output_schema=output_schema,
-            structured_output_transport=self.config.structured_output_transport,
+            structured_output_transport=structured_output_transport,
             rollout_token_limit=rollout_token_limit,
             tool_output_token_limit=self.config.tool_output_token_limit,
             limits=InvocationLimits(
                 timeout_seconds=min(
                     self.config.invocation_timeout_seconds,
-                    role_timeout,
-                    invocation_timeout_seconds
-                    if invocation_timeout_seconds is not None
-                    else self.config.invocation_timeout_seconds,
+                    operation_timeout,
                 ),
+                direct_stream_idle_timeout_seconds=self.config.direct_stream_idle_timeout_seconds,
                 max_events=structured_event_limit,
             ),
         )
@@ -390,7 +479,16 @@ class IsolatedAgentProfileProvider:
             mcp_servers=(),
             credential_handles=("model-auth",),
             output_schema=output_schema,
-            structured_output_transport=self.config.structured_output_transport,
+            # The reachability solver has no tools, but it is not a Direct
+            # one-shot proposal: its interactive loop is an Agentic Codex
+            # session and resumes that session for later public actions.
+            # ``json_object`` is only implemented by DirectLlmBackend, so
+            # retain Codex's native schema transport for this profile.
+            structured_output_transport=(
+                "provider_schema"
+                if self.config.structured_output_transport == "json_object"
+                else self.config.structured_output_transport
+            ),
             rollout_token_limit=rollout_token_limit,
             tool_output_token_limit=self.config.tool_output_token_limit,
             limits=InvocationLimits(timeout_seconds=self.config.invocation_timeout_seconds),
@@ -404,9 +502,7 @@ class IsolatedAgentProfileProvider:
         return RoleCapabilityMaximum(
             role=role,
             policy_version="1",
-            maximum_sandbox=(
-                SandboxMode.WORKSPACE_WRITE if write else SandboxMode.READ_ONLY
-            ),
+            maximum_sandbox=(SandboxMode.WORKSPACE_WRITE if write else SandboxMode.READ_ONLY),
             intrinsic_builtin_tools=("shell", "workspace_edit") if write else ("shell",),
             external=ExternalCapabilitySet(network_domains=network_domains),
         )
@@ -496,13 +592,9 @@ def _validate_closed_output_envelope(schema: Mapping[str, Any]) -> None:
         if reference is not None and (
             not isinstance(reference, str) or not reference.startswith("#/")
         ):
-            raise ValueError(
-                f"solver output_schema contains a non-local $ref at {location}"
-            )
+            raise ValueError(f"solver output_schema contains a non-local $ref at {location}")
         if "$dynamicRef" in node:
-            raise ValueError(
-                f"solver output_schema contains unsupported $dynamicRef at {location}"
-            )
+            raise ValueError(f"solver output_schema contains unsupported $dynamicRef at {location}")
         declared_type = node.get("type")
         declares_object = declared_type == "object" or (
             isinstance(declared_type, list) and "object" in declared_type

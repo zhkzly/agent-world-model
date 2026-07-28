@@ -113,9 +113,7 @@ class ScheduledWork(V2Contract):
             raise ValueError("committed scheduling state requires one WorkCommit")
         if (self.state == "blocked") != bool(self.blocking_evaluation_refs):
             raise ValueError("blocked scheduling state requires boundary evaluations")
-        if len(set(self.blocking_evaluation_refs)) != len(
-            self.blocking_evaluation_refs
-        ):
+        if len(set(self.blocking_evaluation_refs)) != len(self.blocking_evaluation_refs):
             raise ValueError("blocking evaluation refs must be unique")
         if self.state == "waiting" and not self.waiting_on:
             raise ValueError("waiting scheduling state requires unmet dependencies")
@@ -159,9 +157,7 @@ class WorkScheduler:
         allow_diagnostic_ancestors: bool = False,
     ) -> None:
         self.graph = graph
-        self.manifest = WorkGraphManifest.model_validate(
-            manifest.model_dump(mode="python")
-        )
+        self.manifest = WorkGraphManifest.model_validate(manifest.model_dump(mode="python"))
         self.manifest_ref = manifest_ref
         self.heads = heads
         self.artifacts = artifacts
@@ -171,9 +167,7 @@ class WorkScheduler:
             or not runtime.diagnostic_only
             or not has_test_node_diagnostic_marker(heads.root)
         ):
-            raise WorkRuntimeError(
-                "diagnostic ancestor reuse requires a marked diagnostic runtime"
-            )
+            raise WorkRuntimeError("diagnostic ancestor reuse requires a marked diagnostic runtime")
         self.allow_diagnostic_ancestors = allow_diagnostic_ancestors
         self.artifacts.require_exact_json(
             manifest_ref,
@@ -226,9 +220,7 @@ class WorkScheduler:
         for definition in self.graph.topological_definitions():
             key = definition.coordinate.coordinate_key
             head = self.heads.read_head(definition.coordinate)
-            parent_keys = tuple(
-                item.coordinate_key for item in definition.dependency_coordinates
-            )
+            parent_keys = tuple(item.coordinate_key for item in definition.dependency_coordinates)
             parents_available = all(item in active for item in parent_keys)
             # Commit reuse must derive the *same* input closure as a future
             # dispatch.  A causal parent WorkCommit invalidates the child, but
@@ -285,6 +277,20 @@ class WorkScheduler:
                 )
                 continue
             if head is not None and head.status == "repair_authorized":
+                # Repair authority is bound to the exact immutable definition
+                # and input closure that produced it.  A new definition (for
+                # example, an explicitly frozen diagnostic-feedback variant)
+                # must not inherit that old authority.  Reconcile it as stale
+                # so ``dispatch_one`` opens a fresh WorkAttempt instead.
+                if head.definition_digest != definition.definition_digest or (
+                    expected_inputs is not None
+                    and head.input_fingerprint != self.heads.input_fingerprint(expected_inputs)
+                ):
+                    scheduled[key] = ScheduledWork(
+                        coordinate=definition.coordinate,
+                        state="stale",
+                    )
+                    continue
                 scheduled[key] = ScheduledWork(
                     coordinate=definition.coordinate,
                     state="repair_ready",
@@ -297,16 +303,16 @@ class WorkScheduler:
                 )
                 continue
             if head is not None and head.status in {"failed", "needs_human", "interrupted"}:
-                # Terminal failure is a boundary only for the exact immutable
-                # input closure it evaluated.  Once a causally repaired parent
-                # commits different consumer refs, retaining that old failure
-                # would permanently block the new candidate.  Treat it as
-                # stale; dispatch will create a new attempt under the changed
-                # input fingerprint, never silently reuse the old verdict.
-                if (
+                # A terminal failure is a boundary only for the exact immutable
+                # definition *and* input closure it evaluated.  A causally
+                # repaired parent may change consumer refs, and a feedback-only
+                # test-node run may freeze a new definition with the same
+                # inputs.  Either change invalidates the old terminal verdict;
+                # dispatch will create a new attempt rather than silently reuse
+                # it or leave the replacement definition permanently blocked.
+                if head.definition_digest != definition.definition_digest or (
                     expected_inputs is not None
-                    and head.input_fingerprint
-                    != self.heads.input_fingerprint(expected_inputs)
+                    and head.input_fingerprint != self.heads.input_fingerprint(expected_inputs)
                 ):
                     scheduled[key] = ScheduledWork(
                         coordinate=definition.coordinate,
@@ -344,9 +350,7 @@ class WorkScheduler:
                     scheduled[key] = ScheduledWork(
                         coordinate=definition.coordinate,
                         state="blocked",
-                        blocking_evaluation_refs=(
-                            group_state.blocking_evaluation_refs
-                        ),
+                        blocking_evaluation_refs=(group_state.blocking_evaluation_refs),
                     )
                 else:
                     waiting = tuple(
@@ -569,10 +573,7 @@ class WorkScheduler:
             wave = tuple(ready[:remaining])
             completed = await asyncio.gather(*(dispatch(item) for item in wave))
             results.extend(completed)
-        if any(
-            item.state in {"ready", "repair_ready", "stale"}
-            for item in self.snapshot().work
-        ):
+        if any(item.state in {"ready", "repair_ready", "stale"} for item in self.snapshot().work):
             raise WorkRuntimeError("scheduler dispatch limit exhausted before convergence")
         return tuple(results)
 
@@ -606,15 +607,9 @@ class WorkScheduler:
         payload = {
             "graph_digest": self.manifest.graph_digest,
             "coordinate": coordinate.model_dump(mode="json"),
-            "external_input_refs": tuple(
-                ref.model_dump(mode="json") for ref in external
-            ),
-            "parent_commit_refs": tuple(
-                ref.model_dump(mode="json") for ref in parent_commit_refs
-            ),
-            "parent_output_refs": tuple(
-                ref.model_dump(mode="json") for ref in parent_output_refs
-            ),
+            "external_input_refs": tuple(ref.model_dump(mode="json") for ref in external),
+            "parent_commit_refs": tuple(ref.model_dump(mode="json") for ref in parent_commit_refs),
+            "parent_output_refs": tuple(ref.model_dump(mode="json") for ref in parent_output_refs),
         }
         return ResolvedWorkInputs(
             graph_digest=self.manifest.graph_digest,
@@ -730,8 +725,7 @@ class WorkScheduler:
             route.source_coordinate != definition.coordinate
             or route.source_attempt_id != source_attempt.attempt_id
             or route.source_definition_digest != definition.definition_digest
-            or tuple(item.normalized_identity for item in report.issues)
-            != route.issue_identities
+            or tuple(item.normalized_identity for item in report.issues) != route.issue_identities
             or report.status != "failed"
             or not report.repair_actionable
         ):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -223,7 +224,7 @@ def test_implementation_revision_is_acceptance_critical_and_gates_reuse() -> Non
     assert base.acceptance_digest != edited.acceptance_digest
 
 
-def test_leaf_code_revision_changes_with_source_and_model() -> None:
+def test_leaf_code_revision_changes_with_source_model_and_runtime_asset(tmp_path: Path) -> None:
     from agent_world.control.code_revision import leaf_code_revision
 
     this_module = "tests.agent_world.test_work_control_contracts"
@@ -231,11 +232,24 @@ def test_leaf_code_revision_changes_with_source_and_model() -> None:
     b = leaf_code_revision(this_module)
     with_model = leaf_code_revision(this_module, model="claude-opus-4-8")
     other_model = leaf_code_revision(this_module, model="claude-sonnet-5")
+    skill = tmp_path / "runtime-skill.md"
+    skill.write_text("cite the supplied catalog", encoding="utf-8")
+    with_skill = leaf_code_revision(
+        this_module,
+        assets={"runtime-skill:test": skill},
+    )
+    skill.write_text("cite the supplied numbered catalog", encoding="utf-8")
+    changed_skill = leaf_code_revision(
+        this_module,
+        assets={"runtime-skill:test": skill},
+    )
 
     assert a == b  # stable across calls for identical source
     assert a.startswith("framework.impl.")
     assert with_model != a  # model identity participates
     assert with_model != other_model  # different model → different revision
+    assert with_skill != a  # mounted Runtime Skill participates
+    assert changed_skill != with_skill  # edited Runtime Skill breaks stale reuse
     with pytest.raises(ValueError):
         leaf_code_revision()  # at least one module required
     with pytest.raises(ValueError):

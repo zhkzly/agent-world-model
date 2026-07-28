@@ -46,11 +46,18 @@ from agent_world.control.semantic_prefix import (
     SemanticPrefixRunner,
 )
 from agent_world.control.test_node import (
+    DiagnosticDescendantNodeRunner,
+    DiagnosticFinalNodeRunner,
+    DiagnosticPlanDerivedDesignNodeRunner,
     DiagnosticSuccessorNodeRunner,
+    DiagnosticTaskCurriculumJoinRunner,
+    DiagnosticTaskRequirementNodeRunner,
+    DiagnosticWorldPlanNodeRunner,
     TestNodeError,
     TestNodeRunner,
 )
 from agent_world.doctor import run_doctor
+from agent_world.invocation.audit import INVOCATION_AUDIT_LANE_IDS, run_invocation_audit
 from agent_world.observability import ObservabilityError
 from agent_world.registry import RegistryError
 
@@ -94,6 +101,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="run both live probes; only this can report production_ready=true",
     )
 
+    invocation_audit = commands.add_parser(
+        "invocation-audit",
+        help=(
+            "exercise each distinct real Direct/Codex invocation mechanism without semantic output"
+        ),
+    )
+    invocation_audit.add_argument(
+        "--lane",
+        action="append",
+        choices=INVOCATION_AUDIT_LANE_IDS,
+        help="run one named invocation lane (repeatable; default runs every lane sequentially)",
+    )
+    invocation_audit.add_argument(
+        "--structured-output-transport",
+        choices=("provider_schema", "json_envelope", "json_object"),
+        help=(
+            "diagnostic-only override for resolved structured profiles; workspace Agent lanes "
+            "retain their native provider-schema transport"
+        ),
+    )
+
     test_node = commands.add_parser(
         "test-node",
         help="copy one captured scope and genuinely rerun exactly one frozen WorkGraph node",
@@ -101,14 +129,64 @@ def build_parser() -> argparse.ArgumentParser:
     test_node.add_argument("scope_id", help="captured WorkGraph scope id")
     test_node.add_argument(
         "target_coordinate",
-        help="exact coordinate key, coordinate JSON, or framework coordinate label",
+        help=(
+            "exact coordinate key/JSON, component|stage|artifact_slot|group_id|shard_id, "
+            "or the component.stage.artifact_slot label shown by observe"
+        ),
     )
     test_node.add_argument(
         "--source-state-root",
         metavar="PATH",
         help="captured state root to copy; defaults to the configured state root",
     )
-
+    test_node.add_argument(
+        "--proposal-llm-tokens",
+        metavar="TOKENS",
+        type=int,
+        help=(
+            "freeze one new diagnostic graph with this larger finite Agent proposal "
+            "output-token budget before rerunning the captured target"
+        ),
+    )
+    test_node.add_argument(
+        "--proposal-wall-seconds",
+        metavar="SECONDS",
+        type=float,
+        help=(
+            "freeze the same new diagnostic graph with this larger finite Agent wall "
+            "budget, including coupled Builder time leases when applicable"
+        ),
+    )
+    test_node.add_argument(
+        "--refresh-current-implementation",
+        action="store_true",
+        help=(
+            "freeze one new diagnostic definition that records the selected node's current "
+            "Prompt/Runtime-Skill/leaf/compiler revision while retaining its frozen input "
+            "closure and proposal budget"
+        ),
+    )
+    test_node.add_argument(
+        "--diagnostic-structured-output-transport",
+        choices=("provider_schema", "json_envelope", "json_object"),
+        help=(
+            "freeze one profile-only diagnostic definition and run the copied node under this "
+            "different structured-output transport; cannot combine with another diagnostic change"
+        ),
+    )
+    test_node.add_argument(
+        "--diagnostic-model",
+        metavar="MODEL",
+        help=(
+            "freeze one model-only diagnostic profile definition; requires "
+            "--diagnostic-source-model and cannot combine with another diagnostic change"
+        ),
+    )
+    test_node.add_argument(
+        "--diagnostic-source-model",
+        metavar="MODEL",
+        help="explicit source model for one --diagnostic-model experiment",
+    )
     test_successor_node = commands.add_parser(
         "test-successor-node",
         help=(
@@ -119,13 +197,255 @@ def build_parser() -> argparse.ArgumentParser:
     test_successor_node.add_argument("scope_id", help="captured WorkGraph scope id")
     test_successor_node.add_argument(
         "target_coordinate",
-        help="exact newly derived shared-tool or ToolSemantics batch coordinate",
+        help=(
+            "exact new shared-tool or ToolSemantics coordinate; accepts exact key/JSON, "
+            "pipe label, or the label shown by observe"
+        ),
     )
     test_successor_node.add_argument(
         "--diagnostic-state-root",
         metavar="PATH",
         required=True,
         help="one marked .agent-world-live/test-node-* copy produced by test-node",
+    )
+
+    test_descendant_node = commands.add_parser(
+        "test-descendant-node",
+        help=(
+            "dispatch one already-frozen unheaded descendant below a marked diagnostic "
+            "commit using the real Scheduler"
+        ),
+    )
+    test_descendant_node.add_argument("scope_id", help="captured WorkGraph scope id")
+    test_descendant_node.add_argument(
+        "target_coordinate",
+        help=(
+            "exact unheaded frozen successor coordinate; accepts exact key/JSON, pipe label, "
+            "or the component.stage.artifact_slot label shown by observe"
+        ),
+    )
+    test_descendant_node.add_argument(
+        "--diagnostic-state-root",
+        metavar="PATH",
+        required=True,
+        help="one marked .agent-world-live/test-node-* copy with a committed direct parent",
+    )
+    test_descendant_node.add_argument(
+        "--manifest-revision",
+        metavar="SHA256",
+        help=(
+            "select one exact frozen WorkGraph manifest revision when the coordinate appears "
+            "in more than one retained diagnostic topology"
+        ),
+    )
+    test_descendant_node.add_argument(
+        "--proposal-llm-tokens",
+        metavar="TOKENS",
+        type=int,
+        help=(
+            "create one new diagnostic graph with this larger finite Agent proposal "
+            "output-token budget; the frozen source manifest is never edited"
+        ),
+    )
+    test_descendant_node.add_argument(
+        "--proposal-wall-seconds",
+        metavar="SECONDS",
+        type=float,
+        help=(
+            "create the same new diagnostic graph with this larger finite Agent wall "
+            "budget, including coupled Builder time leases when applicable"
+        ),
+    )
+    test_descendant_node.add_argument(
+        "--infrastructure-retry",
+        action="store_true",
+        help=(
+            "after a same-route liveness check, authorize exactly one fresh physical attempt "
+            "for the exact failed retryable diagnostic definition; no prompt, input, Skill, "
+            "or proposal-envelope change is allowed"
+        ),
+    )
+    test_descendant_node.add_argument(
+        "--diagnostic-terminal-feedback",
+        action="store_true",
+        help=(
+            "make one feedback-only diagnostic definition with the same frozen Agent input, "
+            "Prompt, Skill, and envelope; write any redacted terminal excerpt locally"
+        ),
+    )
+    test_descendant_node.add_argument(
+        "--refresh-current-implementation",
+        action="store_true",
+        help=(
+            "freeze one new diagnostic definition that records the selected descendant's "
+            "current Prompt/Runtime-Skill/leaf/compiler revision while retaining its frozen "
+            "input closure and proposal budget"
+        ),
+    )
+    test_descendant_node.add_argument(
+        "--diagnostic-structured-output-transport",
+        choices=("provider_schema", "json_envelope", "json_object"),
+        help=(
+            "freeze one profile-only diagnostic definition and run the descendant under this "
+            "different structured-output transport; cannot combine with another diagnostic change"
+        ),
+    )
+    test_descendant_node.add_argument(
+        "--diagnostic-model",
+        metavar="MODEL",
+        help=(
+            "freeze one model-only diagnostic profile definition; requires "
+            "--diagnostic-source-model and cannot combine with another diagnostic change"
+        ),
+    )
+    test_descendant_node.add_argument(
+        "--diagnostic-source-model",
+        metavar="MODEL",
+        help="explicit source model for one --diagnostic-model experiment",
+    )
+
+    test_world_plan_node = commands.add_parser(
+        "test-world-plan-node",
+        help=(
+            "migrate one marked legacy WorldRules diagnostic closure to the compact "
+            "CurriculumPlan topology and genuinely dispatch only that new plan node"
+        ),
+    )
+    test_world_plan_node.add_argument("scope_id", help="captured WorkGraph scope id")
+    test_world_plan_node.add_argument(
+        "--diagnostic-state-root",
+        metavar="PATH",
+        required=True,
+        help=(
+            "one marked .agent-world-live/test-node-* copy with committed legacy WorldRules "
+            "and an unheaded historical TaskCurriculum tail"
+        ),
+    )
+    test_world_plan_node.add_argument(
+        "--manifest-revision",
+        metavar="SHA256",
+        help=(
+            "select one exact frozen legacy WorkGraph manifest when retained diagnostic "
+            "topologies reuse the historical TaskCurriculum coordinate"
+        ),
+    )
+
+    test_task_requirement_node = commands.add_parser(
+        "test-task-requirement-node",
+        help=(
+            "derive the frozen plan-owned TaskRequirement fan-out and genuinely dispatch "
+            "exactly one selected task-family node"
+        ),
+    )
+    test_task_requirement_node.add_argument("scope_id", help="captured WorkGraph scope id")
+    test_task_requirement_node.add_argument(
+        "task_type",
+        help="one exact task type declared by the committed CurriculumPlan",
+    )
+    test_task_requirement_node.add_argument(
+        "--diagnostic-state-root",
+        metavar="PATH",
+        required=True,
+        help=(
+            "one marked .agent-world-live/test-node-* copy with a committed CurriculumPlan "
+            "World epoch"
+        ),
+    )
+
+    test_task_curriculum_join = commands.add_parser(
+        "test-task-curriculum-join",
+        help=(
+            "dispatch the exact deterministic TaskCurriculum join below a committed "
+            "Plan-derived TaskRequirement closure"
+        ),
+    )
+    test_task_curriculum_join.add_argument("scope_id", help="captured WorkGraph scope id")
+    test_task_curriculum_join.add_argument(
+        "--diagnostic-state-root",
+        metavar="PATH",
+        required=True,
+        help=(
+            "one marked .agent-world-live/test-node-* copy with committed CurriculumPlan "
+            "and every plan-derived TaskRequirement"
+        ),
+    )
+
+    test_plan_derived_design_node = commands.add_parser(
+        "test-plan-derived-design-node",
+        help=(
+            "dispatch one exact deterministic TaskCurriculum, ModelingBoundary, or "
+            "VerifierPlan node from the committed Plan-derived Design epoch"
+        ),
+    )
+    test_plan_derived_design_node.add_argument("scope_id", help="captured WorkGraph scope id")
+    test_plan_derived_design_node.add_argument(
+        "target_stage",
+        choices=("task_curriculum", "modeling_boundary", "verifier_plan"),
+        help=(
+            "one closed deterministic tail stage; the framework selects the exact "
+            "Plan-derived manifest rather than accepting a caller-supplied revision"
+        ),
+    )
+    test_plan_derived_design_node.add_argument(
+        "--diagnostic-state-root",
+        metavar="PATH",
+        required=True,
+        help=(
+            "one marked .agent-world-live/test-node-* copy with the committed parents "
+            "of the requested Plan-derived tail node"
+        ),
+    )
+
+    test_final_node = commands.add_parser(
+        "test-final-node",
+        help=(
+            "freeze the exact final graph from a committed diagnostic Design and VerifierPlan "
+            "closure, then genuinely dispatch one independent initial implementation-plan or "
+            "Challenger node"
+        ),
+    )
+    test_final_node.add_argument("scope_id", help="captured WorkGraph scope id")
+    test_final_node.add_argument(
+        "target_stage",
+        choices=("implementation_plan", "verifier_intent_batch"),
+        help=(
+            "one initial final-graph boundary; batch selection is derived from the persisted "
+            "VerifierPlan"
+        ),
+    )
+    test_final_node.add_argument(
+        "--batch-index",
+        metavar="INDEX",
+        type=int,
+        help="1-based frozen VerifierPlan batch index; required only for verifier_intent_batch",
+    )
+    test_final_node.add_argument(
+        "--diagnostic-state-root",
+        metavar="PATH",
+        required=True,
+        help=(
+            "one marked .agent-world-live/test-node-* copy with committed plan-derived "
+            "ModelingBoundary and VerifierPlan"
+        ),
+    )
+    test_final_node.add_argument(
+        "--proposal-llm-tokens",
+        metavar="TOKENS",
+        type=int,
+        help=(
+            "compile a new diagnostic-only final WorkDefinition for the selected Agent node "
+            "with this larger finite rollout-token budget; it is not a retry of the source "
+            "definition"
+        ),
+    )
+    test_final_node.add_argument(
+        "--proposal-wall-seconds",
+        metavar="SECONDS",
+        type=float,
+        help=(
+            "compile the same new diagnostic-only final WorkDefinition with this larger finite "
+            "wall budget, up to the configured Direct-generation budget"
+        ),
     )
 
     semantic_prefix = commands.add_parser(
@@ -504,13 +824,21 @@ def main(argv: Sequence[str] | None = None) -> int:
 async def _dispatch(args: argparse.Namespace) -> int:
     config = load_foundry_config(args.config)
     if args.command == "doctor":
-        report = await run_doctor(
+        doctor_report = await run_doctor(
             config,
             live_agent=args.live_agent or args.production,
             live_research=args.live_research or args.production,
         )
-        _write_json(report)
-        return EXIT_OK if report.ok else EXIT_OPERATION_FAILED
+        _write_json(doctor_report)
+        return EXIT_OK if doctor_report.ok else EXIT_OPERATION_FAILED
+    if args.command == "invocation-audit":
+        audit_report = await run_invocation_audit(
+            config,
+            lane_ids=tuple(args.lane or ()),
+            structured_output_transport=args.structured_output_transport,
+        )
+        _write_json(audit_report)
+        return EXIT_OK if audit_report.status == "passed" else EXIT_OPERATION_FAILED
     if args.command == "test-node":
         test_node_result = await TestNodeRunner(
             config=config,
@@ -520,6 +848,12 @@ async def _dispatch(args: argparse.Namespace) -> int:
         ).run(
             scope_id=args.scope_id,
             target_coordinate=args.target_coordinate,
+            proposal_llm_tokens=args.proposal_llm_tokens,
+            proposal_wall_seconds=args.proposal_wall_seconds,
+            refresh_current_implementation=args.refresh_current_implementation,
+            diagnostic_structured_output_transport=args.diagnostic_structured_output_transport,
+            diagnostic_model=args.diagnostic_model,
+            diagnostic_source_model=args.diagnostic_source_model,
         )
         _write_json(test_node_result)
         return EXIT_OK
@@ -532,6 +866,75 @@ async def _dispatch(args: argparse.Namespace) -> int:
             target_coordinate=args.target_coordinate,
         )
         _write_json(successor_result)
+        return EXIT_OK
+    if args.command == "test-descendant-node":
+        descendant_result = await DiagnosticDescendantNodeRunner(
+            config=config,
+            diagnostic_state_root=Path(args.diagnostic_state_root),
+        ).run(
+            scope_id=args.scope_id,
+            target_coordinate=args.target_coordinate,
+            proposal_llm_tokens=args.proposal_llm_tokens,
+            proposal_wall_seconds=args.proposal_wall_seconds,
+            required_manifest_revision=args.manifest_revision,
+            infrastructure_retry=args.infrastructure_retry,
+            diagnostic_terminal_feedback=args.diagnostic_terminal_feedback,
+            refresh_current_implementation=args.refresh_current_implementation,
+            diagnostic_structured_output_transport=args.diagnostic_structured_output_transport,
+            diagnostic_model=args.diagnostic_model,
+            diagnostic_source_model=args.diagnostic_source_model,
+        )
+        _write_json(descendant_result)
+        return EXIT_OK
+    if args.command == "test-world-plan-node":
+        plan_result = await DiagnosticWorldPlanNodeRunner(
+            config=config,
+            diagnostic_state_root=Path(args.diagnostic_state_root),
+        ).run(
+            scope_id=args.scope_id,
+            required_manifest_revision=args.manifest_revision,
+        )
+        _write_json(plan_result)
+        return EXIT_OK
+    if args.command == "test-task-requirement-node":
+        task_requirement_result = await DiagnosticTaskRequirementNodeRunner(
+            config=config,
+            diagnostic_state_root=Path(args.diagnostic_state_root),
+        ).run(
+            scope_id=args.scope_id,
+            task_type=args.task_type,
+        )
+        _write_json(task_requirement_result)
+        return EXIT_OK
+    if args.command == "test-task-curriculum-join":
+        task_curriculum_join_result = await DiagnosticTaskCurriculumJoinRunner(
+            config=config,
+            diagnostic_state_root=Path(args.diagnostic_state_root),
+        ).run(scope_id=args.scope_id)
+        _write_json(task_curriculum_join_result)
+        return EXIT_OK
+    if args.command == "test-plan-derived-design-node":
+        plan_derived_design_result = await DiagnosticPlanDerivedDesignNodeRunner(
+            config=config,
+            diagnostic_state_root=Path(args.diagnostic_state_root),
+        ).run(
+            scope_id=args.scope_id,
+            target_stage=args.target_stage,
+        )
+        _write_json(plan_derived_design_result)
+        return EXIT_OK
+    if args.command == "test-final-node":
+        final_node_result = await DiagnosticFinalNodeRunner(
+            config=config,
+            diagnostic_state_root=Path(args.diagnostic_state_root),
+        ).run(
+            scope_id=args.scope_id,
+            target_stage=args.target_stage,
+            batch_index=args.batch_index,
+            proposal_llm_tokens=args.proposal_llm_tokens,
+            proposal_wall_seconds=args.proposal_wall_seconds,
+        )
+        _write_json(final_node_result)
         return EXIT_OK
     if args.command == "semantic-prefix":
         prefix_result = await SemanticPrefixRunner(config=config).run(

@@ -47,6 +47,7 @@ def test_production_defaults_reserve_full_v3_judge_capacity(tmp_path: Path) -> N
 
     assert config.agent.structured_turn_token_limit == 65_536
     assert config.agent.structured_output_transport == "provider_schema"
+    assert config.agent.environment_codegen_physical_turn_token_limit == 128_000
 
     assert direct.llm_tokens == 10_000_000
     assert candidate.llm_tokens == 1_200_000
@@ -55,6 +56,7 @@ def test_production_defaults_reserve_full_v3_judge_capacity(tmp_path: Path) -> N
     assert direct.evaluation_episodes == candidate.evaluation_episodes == 128
     assert direct.container_seconds == candidate.container_seconds == 3_600
     assert direct.wall_seconds == 28_800
+    assert direct.build_seconds == 28_800
     assert candidate.wall_seconds == 7_200
     assert direct.repair_attempts == 15
     direct_designer = derive_designer_invocation_budget(
@@ -63,9 +65,7 @@ def test_production_defaults_reserve_full_v3_judge_capacity(tmp_path: Path) -> N
         maximum_corrections=min(DIRECT_DESIGN_MAX_CORRECTIONS, direct.repair_attempts),
         rollout_token_limit=config.agent.structured_turn_token_limit,
     )
-    assert direct_designer.agent_turns == (
-        DIRECT_DESIGN_MAX_TURNS
-    )
+    assert direct_designer.agent_turns == (DIRECT_DESIGN_MAX_TURNS)
     assert direct_designer.llm_tokens <= direct.llm_tokens
 
     for dimension in (
@@ -145,6 +145,38 @@ def test_json_envelope_transport_is_explicitly_configured() -> None:
     )
 
     assert config.structured_output_transport == "json_envelope"
+
+
+def test_direct_json_object_transport_is_explicitly_configured() -> None:
+    config = AgentBackendConfig(
+        model="gpt-5.4-mini",
+        api_key_environment="COMPATIBLE_API_KEY",
+        structured_output_transport="json_object",
+    )
+
+    assert config.structured_output_transport == "json_object"
+
+
+def test_environment_codegen_limit_allows_one_full_live_diagnostic_session() -> None:
+    config = AgentBackendConfig(
+        model="gpt-5.4-mini",
+        api_key_environment="COMPATIBLE_API_KEY",
+        environment_codegen_turn_token_limit=5_000_000,
+        environment_codegen_physical_turn_token_limit=5_000_000,
+    )
+
+    assert config.environment_codegen_turn_token_limit == 5_000_000
+    assert config.environment_codegen_physical_turn_token_limit == 5_000_000
+
+
+def test_structured_limit_allows_one_full_live_diagnostic_session() -> None:
+    config = AgentBackendConfig(
+        model="gpt-5.4-mini",
+        api_key_environment="COMPATIBLE_API_KEY",
+        structured_turn_token_limit=5_000_000,
+    )
+
+    assert config.structured_turn_token_limit == 5_000_000
 
 
 def test_expansion_config_reserves_source_intake_and_one_real_candidate() -> None:

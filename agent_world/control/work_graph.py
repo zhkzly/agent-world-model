@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
+from math import ceil
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
 
 from pydantic import Field, model_validator
@@ -18,6 +20,7 @@ from agent_world.contracts import (
     sha256_digest,
 )
 
+from .code_revision import leaf_code_revision
 from .work import (
     ArtifactSlotContract,
     AssurancePolicy,
@@ -30,7 +33,7 @@ from .work import (
 )
 
 if TYPE_CHECKING:
-    from agent_world.designer.models import ToolCouplingPlan
+    from agent_world.designer.models import CurriculumPlanSourceDraft, ToolCouplingPlan
 
 
 class WorkGraphError(RuntimeError):
@@ -44,8 +47,11 @@ _REQUIRED_PRODUCTION_STAGES = frozenset(
         ("research", "evidence_synthesis"),
         ("design", "world_architecture"),
         ("design", "world_rules"),
+        ("design", "curriculum_plan"),
+        ("design", "task_requirement"),
         ("design", "task_curriculum"),
         ("design", "modeling_boundary"),
+        ("build", "implementation_plan"),
         ("build", "candidate_build"),
         ("verifier", "verifier_intent"),
         ("integration", "runtime_integration"),
@@ -55,10 +61,276 @@ _REQUIRED_PRODUCTION_STAGES = frozenset(
         ("registry", "publication"),
     }
 )
-_BEHAVIOR_STAGES = frozenset({"shared_tool_semantics", "tool_semantics_batch"})
-# BC-17: a four-tool physical batch exhausted a 65,536-token provider turn.
-# Two-tool batches get a hard framework-owned ceiling instead of more retries.
-TOOL_SEMANTICS_BATCH_TOKEN_CEILING = 32_768
+_BEHAVIOR_STAGES = frozenset({"shared_tool_semantics", "world_behavior", "tool_semantics_batch"})
+
+
+_EVIDENCE_SYNTHESIS_IMPLEMENTATION_MODULES = (
+    "agent_world.designer.evidence_synthesis_leaf",
+    "agent_world.designer.evidence_synthesis_compiler",
+    "agent_world.designer.models",
+)
+_EVIDENCE_SYNTHESIS_VALIDATOR_MODULES = (
+    "agent_world.designer.evidence_synthesis_compiler",
+    "agent_world.designer.models",
+    "agent_world.designer.validators",
+)
+_EVIDENCE_SYNTHESIS_SKILL = (
+    Path(__file__).resolve().parents[1]
+    / "agent_assets"
+    / "skills"
+    / "research-world-evidence"
+    / "SKILL.md"
+)
+_TOOL_SEMANTICS_BATCH_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.designer.compact_rule_protocol",
+    "agent_world.designer.final_design_leaves",
+    "agent_world.designer.models",
+    "agent_world.designer.one_shot",
+    "agent_world.designer.rule_context",
+)
+_TOOL_SEMANTICS_BATCH_VALIDATOR_MODULES = (
+    "agent_world.designer.final_design_compiler",
+    "agent_world.designer.models",
+    "agent_world.designer.rule_context",
+    "agent_world.designer.validation",
+)
+_TOOL_SEMANTICS_BATCH_SKILL = (
+    Path(__file__).resolve().parents[1]
+    / "agent_assets"
+    / "skills"
+    / "engineer-agent-world"
+    / "SKILL.md"
+)
+_VERIFIER_INTENT_BATCH_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.invocation.codex_sdk",
+    "agent_world.invocation.direct_llm",
+    "agent_world.judge.compiler",
+    "agent_world.judge.models",
+)
+_VERIFIER_INTENT_BATCH_VALIDATOR_MODULES = (
+    "agent_world.judge.compiler",
+    "agent_world.judge.leaf",
+    "agent_world.judge.models",
+)
+_VERIFIER_INTENT_BATCH_SKILL = (
+    Path(__file__).resolve().parents[1]
+    / "agent_assets"
+    / "skills"
+    / "challenge-agent-world"
+    / "SKILL.md"
+)
+_IMPLEMENTATION_PLAN_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.builder.leaf",
+    "agent_world.builder.models",
+    "agent_world.builder.service",
+    "agent_world.designer.one_shot",
+)
+_IMPLEMENTATION_PLAN_VALIDATOR_MODULES = (
+    "agent_world.builder.leaf",
+    "agent_world.builder.models",
+    "agent_world.control.leaf_executor",
+    "agent_world.designer.one_shot",
+)
+_IMPLEMENTATION_PLAN_SKILL = (
+    Path(__file__).resolve().parents[1]
+    / "agent_assets"
+    / "skills"
+    / "engineer-build-planning"
+    / "SKILL.md"
+)
+_CANDIDATE_BUILD_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.builder.leaf",
+    "agent_world.builder.models",
+    "agent_world.builder.service",
+    "agent_world.invocation.codex_sdk",
+)
+_CANDIDATE_BUILD_VALIDATOR_MODULES = (
+    "agent_world.builder.leaf",
+    "agent_world.builder.models",
+    "agent_world.builder.service",
+    "agent_world.builder.workspace",
+    "agent_world.control.leaf_executor",
+    "agent_world.control.validation",
+)
+_CANDIDATE_BUILD_SKILL = (
+    Path(__file__).resolve().parents[1]
+    / "agent_assets"
+    / "skills"
+    / "engineer-environment-codegen"
+    / "SKILL.md"
+)
+
+
+def evidence_synthesis_implementation_revision() -> Identifier:
+    """Hash the exact runtime authoring surface for EvidenceSynthesis.
+
+    The compiled WorkDefinition must change when either the leaf Prompt/schema
+    path or its mounted research Runtime Skill changes.  This is provenance for
+    a fresh semantic generation, not a request to make framework identities or
+    business claims model-authored.
+    """
+
+    return leaf_code_revision(
+        *_EVIDENCE_SYNTHESIS_IMPLEMENTATION_MODULES,
+        assets={"runtime-skill:research-world-evidence": _EVIDENCE_SYNTHESIS_SKILL},
+        label="research-evidence-synthesis",
+    )
+
+
+def evidence_synthesis_validator_revision() -> Identifier:
+    """Hash the deterministic source-to-canonical EvidenceGraph boundary."""
+
+    return leaf_code_revision(
+        *_EVIDENCE_SYNTHESIS_VALIDATOR_MODULES,
+        label="validator-evidence-synthesis",
+    )
+
+
+def tool_semantics_batch_implementation_revision() -> Identifier:
+    """Hash the full prompt/profile/Skill surface for one ToolSemantics batch."""
+
+    return leaf_code_revision(
+        *_TOOL_SEMANTICS_BATCH_IMPLEMENTATION_MODULES,
+        assets={"runtime-skill:engineer-agent-world": _TOOL_SEMANTICS_BATCH_SKILL},
+        label="design-tool-semantics-batch",
+    )
+
+
+def tool_semantics_batch_validator_revision() -> Identifier:
+    """Hash the deterministic ToolSemantics source compiler boundary."""
+
+    return leaf_code_revision(
+        *_TOOL_SEMANTICS_BATCH_VALIDATOR_MODULES,
+        label="validator-tool-semantics-batch",
+    )
+
+
+def verifier_intent_batch_implementation_revision() -> Identifier:
+    """Hash the Challenger's complete prompt/profile/Skill authoring surface."""
+
+    return leaf_code_revision(
+        *_VERIFIER_INTENT_BATCH_IMPLEMENTATION_MODULES,
+        assets={"runtime-skill:challenge-agent-world": _VERIFIER_INTENT_BATCH_SKILL},
+        label="verifier-intent-batch",
+    )
+
+
+def verifier_intent_batch_validator_revision() -> Identifier:
+    """Hash the deterministic verifier-intent validation and binding boundary."""
+
+    return leaf_code_revision(
+        *_VERIFIER_INTENT_BATCH_VALIDATOR_MODULES,
+        label="validator-verifier-intent-batch",
+    )
+
+
+def implementation_plan_implementation_revision() -> Identifier:
+    """Hash the complete Agent authoring surface for BuildImplementationPlan."""
+
+    return leaf_code_revision(
+        *_IMPLEMENTATION_PLAN_IMPLEMENTATION_MODULES,
+        assets={"runtime-skill:engineer-build-planning": _IMPLEMENTATION_PLAN_SKILL},
+        label="build-implementation-plan",
+    )
+
+
+def implementation_plan_validator_revision() -> Identifier:
+    """Hash the deterministic planning-output validation and Scheduler route."""
+
+    return leaf_code_revision(
+        *_IMPLEMENTATION_PLAN_VALIDATOR_MODULES,
+        label="validator-build-implementation-plan",
+    )
+
+
+def candidate_build_implementation_revision() -> Identifier:
+    """Hash the complete Agent authoring surface for CandidateBuild."""
+
+    return leaf_code_revision(
+        *_CANDIDATE_BUILD_IMPLEMENTATION_MODULES,
+        assets={"runtime-skill:engineer-environment-codegen": _CANDIDATE_BUILD_SKILL},
+        label="build-candidate",
+    )
+
+
+def candidate_build_validator_revision() -> Identifier:
+    """Hash Candidate workspace validation plus its safe feedback route."""
+
+    return leaf_code_revision(
+        *_CANDIDATE_BUILD_VALIDATOR_MODULES,
+        label="validator-build-candidate",
+    )
+
+
+def current_runtime_revisions_for_definition(
+    definition: WorkDefinition,
+) -> tuple[Identifier, Identifier] | None:
+    """Return current executable revisions for one known refreshable leaf.
+
+    A frozen diagnostic graph is intentionally historical.  ``test-node`` may
+    therefore refresh only an explicitly registered current implementation
+    identity; it cannot invent a new topology, input closure, prompt payload,
+    Skill, or acceptance rule.  New leaf kinds must opt in here with their own
+    complete authoring/validation revision sources.
+    """
+
+    coordinate = definition.coordinate
+    if (
+        coordinate.component == "research"
+        and coordinate.stage == "evidence_synthesis"
+        and coordinate.artifact_slot == "evidence_synthesis"
+        and definition.proposal_policy.output_contract_id == "contract:evidence-synthesis"
+    ):
+        return (
+            evidence_synthesis_implementation_revision(),
+            evidence_synthesis_validator_revision(),
+        )
+    if (
+        coordinate.component == "design"
+        and coordinate.stage == "world_behavior"
+        and coordinate.artifact_slot == "tool_semantics_batch"
+        and definition.proposal_policy.output_contract_id
+        == "contract:tool-semantics-batch-source.v7"
+    ):
+        return (
+            tool_semantics_batch_implementation_revision(),
+            tool_semantics_batch_validator_revision(),
+        )
+    if (
+        coordinate.component == "verifier"
+        and coordinate.stage == "verifier_intent_batch"
+        and coordinate.artifact_slot == "verifier_intent_checkpoint"
+        and definition.proposal_policy.output_contract_id == "contract:verifier-intent-batch.v3"
+    ):
+        return (
+            verifier_intent_batch_implementation_revision(),
+            verifier_intent_batch_validator_revision(),
+        )
+    if (
+        coordinate.component == "build"
+        and coordinate.stage == "implementation_plan"
+        and coordinate.artifact_slot == "implementation_plan"
+        and definition.proposal_policy.output_contract_id == "contract:implementation-plan.v1"
+    ):
+        return (
+            implementation_plan_implementation_revision(),
+            implementation_plan_validator_revision(),
+        )
+    if (
+        coordinate.component == "build"
+        and coordinate.stage == "candidate_build"
+        and coordinate.artifact_slot == "environment_candidate"
+        and definition.proposal_policy.output_contract_id == "contract:environment-candidate.v3"
+    ):
+        return (
+            candidate_build_implementation_revision(),
+            candidate_build_validator_revision(),
+        )
+    return None
 
 
 def _has_complete_production_topology(
@@ -258,18 +530,20 @@ class WorkGraphManifest(V2Contract):
 class WorkGraphEpoch(V2Contract):
     """One immutable topology freeze for a single GenerationContext.
 
-    Dynamic behavior/verifier groups are materialized only after grounded
-    Architecture and the compiled curriculum reveal two different bounded
-    physical member sets.  ``bootstrap`` therefore freezes Research through
-    Architecture, ``design`` freezes behavior through the deterministic
-    VerifierPlan, and only ``final`` retains both closures before it appends
-    Build through Registry.  These are graph-freezing boundaries within one
-    Job and one budget ledger, never separate pipelines or authorities.
+    Dynamic behavior, task-family, and verifier groups are materialized only
+    after grounded Architecture, a committed CurriculumPlan, and the compiled
+    curriculum reveal three different bounded physical member sets.
+    ``bootstrap`` therefore freezes Research through Architecture, ``world``
+    freezes behavior, WorldRules and the small CurriculumPlan, ``design``
+    freezes the plan-derived TaskRequirement children through deterministic
+    VerifierPlan, and only ``final`` retains all prior closures before it
+    appends Build through Registry.  These are graph-freezing boundaries within
+    one Job and one budget ledger, never separate pipelines or authorities.
     """
 
     epoch_id: Identifier
     scope_id: Identifier
-    epoch_kind: Literal["bootstrap", "design", "final"]
+    epoch_kind: Literal["bootstrap", "world", "design", "final"]
     context_ref: ArtifactRef
     manifest_ref: ArtifactRef
     predecessor_epoch_ref: ArtifactRef | None = None
@@ -833,19 +1107,19 @@ def tool_semantics_batch_definition(
             operation="design.tool_semantics_batch",
             budget=OperationBudget(
                 wall_seconds=agent_wall_seconds,
-                first_progress_seconds=min(60.0, agent_wall_seconds),
-                llm_tokens=min(agent_token_limit, TOOL_SEMANTICS_BATCH_TOKEN_CEILING),
+                llm_tokens=agent_token_limit,
                 agent_turns=1,
                 monetary_cost=agent_monetary_limit,
             ),
             agent_role="environment_engineer",
             capability_profile_id="profile:environment-engineer",
             output_contract_id="contract:tool-semantics-batch-source.v7",
+            implementation_revision_id=tool_semantics_batch_implementation_revision(),
         ),
         validation_policy=ValidationPolicy(
             policy_id=f"validation:tool-semantics:{digest}",
             validator_id="validator:tool-semantics-batch",
-            validator_revision_id="framework.validator.tool-semantics-batch.v5",
+            validator_revision_id=tool_semantics_batch_validator_revision(),
             validation_phase="tool_semantics",
             frontier_ordinal=20,
             claim_id=claim_id,
@@ -886,12 +1160,15 @@ def structured_agent_work_definition(
     allowed_mutation_roots: tuple[str, ...],
     agent_wall_seconds: float,
     agent_token_limit: int,
+    session_token_limit: int | None = None,
+    session_wall_seconds: float | None = None,
     replay_mode: Literal[
         "deterministic", "idempotent_with_key", "queryable", "non_replayable"
     ] = "non_replayable",
     maximum_local_corrections: int = 1,
     strict_progress_bonus_corrections: int = 1,
     maximum_infrastructure_retries: int = 1,
+    maximum_session_continuations: int = 0,
     maximum_process_recoveries: int = 2,
     maximum_automatic_backjump: int = 0,
     maximum_total_repair_attempts: int = 3,
@@ -929,10 +1206,11 @@ def structured_agent_work_definition(
             replay_mode=replay_mode,
             budget=OperationBudget(
                 wall_seconds=agent_wall_seconds,
-                first_progress_seconds=min(60.0, agent_wall_seconds),
                 llm_tokens=agent_token_limit,
                 agent_turns=1,
             ),
+            session_token_limit=session_token_limit,
+            session_wall_seconds=session_wall_seconds,
             agent_role=agent_role,
             capability_profile_id=f"profile:{agent_role.replace('_', '-')}",
             output_contract_id=output_contract_id,
@@ -954,6 +1232,7 @@ def structured_agent_work_definition(
             maximum_local_corrections=maximum_local_corrections,
             strict_progress_bonus_corrections=strict_progress_bonus_corrections,
             maximum_infrastructure_retries=maximum_infrastructure_retries,
+            maximum_session_continuations=maximum_session_continuations,
             maximum_process_recoveries=maximum_process_recoveries,
             maximum_automatic_backjump=maximum_automatic_backjump,
             maximum_total_repair_attempts=maximum_total_repair_attempts,
@@ -1039,7 +1318,8 @@ def research_synthesis_work_definition(
         timing_reason="World architecture may consume only one grounded EvidenceGraph.",
         output_contract_id="contract:evidence-synthesis",
         acceptance_transform_id="framework.direct-structured-output.v3",
-        validator_revision_id="framework.validator.evidence-synthesis.v3",
+        implementation_revision_id=evidence_synthesis_implementation_revision(),
+        validator_revision_id=evidence_synthesis_validator_revision(),
         agent_role="researcher",
         allowed_mutation_roots=("/",),
         agent_wall_seconds=agent_wall_seconds,
@@ -1388,6 +1668,62 @@ def research_acquisition_work_definition(
     )
 
 
+def compile_world_work_graph(
+    *,
+    scope_id: Identifier,
+    world_definitions: Iterable[WorkDefinition],
+    strict_input_contracts: bool = False,
+) -> GenerationWorkGraph:
+    """Freeze behavior, WorldRules, and one small CurriculumPlan.
+
+    ``CurriculumPlan`` is the task-family cardinality discovery boundary.  It
+    is deliberately terminal here: no TaskRequirement coordinate can exist
+    until the Agent has committed the ordered plan it will be bound to.
+    """
+
+    definitions = tuple(world_definitions)
+    if any(item.coordinate.scope_id != scope_id for item in definitions):
+        raise WorkGraphError("World definitions cannot mix generation scopes")
+    stages = {(item.coordinate.component, item.coordinate.stage) for item in definitions}
+    required = {
+        ("research", "research_plan"),
+        ("research", "evidence_acquisition"),
+        ("research", "evidence_synthesis"),
+        ("design", "world_architecture"),
+        ("design", "world_rules"),
+        ("design", "curriculum_plan"),
+    }
+    if not required <= stages or not any(
+        item.coordinate.component == "design" and item.coordinate.stage in _BEHAVIOR_STAGES
+        for item in definitions
+    ):
+        raise WorkGraphError(
+            "world graph requires Research, behavior, WorldRules, and CurriculumPlan"
+        )
+    planners = tuple(
+        item
+        for item in definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("design", "curriculum_plan")
+    )
+    world_rules = tuple(
+        item
+        for item in definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("design", "world_rules")
+    )
+    if (
+        len(planners) != 1
+        or len(world_rules) != 1
+        or world_rules[0].coordinate not in planners[0].dependency_coordinates
+    ):
+        raise WorkGraphError("world graph requires one CurriculumPlan directly bound to WorldRules")
+    return GenerationWorkGraph.compile(
+        definitions,
+        mode="diagnostic",
+        strict_input_contracts=strict_input_contracts,
+        required_terminal_coordinates=(planners[0].coordinate,),
+    )
+
+
 def compile_design_work_graph(
     *,
     scope_id: Identifier,
@@ -1445,6 +1781,43 @@ def compile_design_work_graph(
             "design graph requires Research and full semantic Design closure "
             "before ModelingBoundary"
         )
+    modern_task_fanout = {
+        ("design", "curriculum_plan"),
+        ("design", "task_requirement"),
+    }
+    present_fanout_stages = modern_task_fanout & upstream_stage_pairs
+    if present_fanout_stages and present_fanout_stages != modern_task_fanout:
+        raise WorkGraphError(
+            "design graph must retain both CurriculumPlan and TaskRequirement fan-out stages"
+        )
+    if present_fanout_stages:
+        planners = tuple(
+            item
+            for item in upstream
+            if (item.coordinate.component, item.coordinate.stage) == ("design", "curriculum_plan")
+        )
+        requirements = tuple(
+            item
+            for item in upstream
+            if (item.coordinate.component, item.coordinate.stage) == ("design", "task_requirement")
+        )
+        curriculum = tuple(
+            item
+            for item in upstream
+            if (item.coordinate.component, item.coordinate.stage) == ("design", "task_curriculum")
+        )
+        if (
+            len(planners) != 1
+            or not requirements
+            or len(curriculum) != 1
+            or planners[0].coordinate not in curriculum[0].dependency_coordinates
+            or any(
+                item.coordinate not in curriculum[0].dependency_coordinates for item in requirements
+            )
+        ):
+            raise WorkGraphError(
+                "TaskCurriculum join must retain the exact plan-derived TaskRequirement set"
+            )
     return GenerationWorkGraph.compile(
         (*upstream, modeling_definition, verifier_plan_definition),
         mode="diagnostic",
@@ -1454,12 +1827,66 @@ def compile_design_work_graph(
     )
 
 
+def _physical_session_envelope(
+    *,
+    node_name: str,
+    physical_turn_token_limit: int,
+    physical_turn_wall_seconds: float,
+    session_token_limit: int | None,
+    session_wall_seconds: float | None,
+) -> tuple[int, float, int]:
+    """Compile a logical Agent session into visible physical-turn reservations.
+
+    A configured Provider output ceiling is not a smaller user budget.  When a
+    logical session is declared, it selects the number of durable physical
+    turns and each turn receives an equal token/wall reservation.  The
+    Scheduler can then resume only after an observed closed output-ceiling
+    terminal, rather than treating a short Provider response as completion or
+    silently looping inside a node.
+    """
+
+    if (session_token_limit is None) != (session_wall_seconds is None):
+        raise WorkGraphError(
+            f"{node_name} logical session token and wall limits must be declared together"
+        )
+    if session_token_limit is None:
+        return physical_turn_token_limit, physical_turn_wall_seconds, 0
+
+    if (
+        isinstance(physical_turn_token_limit, bool)
+        or physical_turn_token_limit <= 0
+        or physical_turn_wall_seconds <= 0
+        or session_wall_seconds is None
+    ):
+        raise WorkGraphError(f"{node_name} physical and logical session limits must be positive")
+    if (
+        session_token_limit < physical_turn_token_limit
+        or session_wall_seconds < physical_turn_wall_seconds
+    ):
+        raise WorkGraphError(
+            f"{node_name} logical session envelope cannot be smaller than one physical turn"
+        )
+
+    physical_turn_count = ceil(session_token_limit / physical_turn_token_limit)
+    return (
+        ceil(session_token_limit / physical_turn_count),
+        session_wall_seconds / physical_turn_count,
+        physical_turn_count - 1,
+    )
+
+
 def complete_generation_work_graph(
     *,
     scope_id: Identifier,
     design_graph: GenerationWorkGraph,
+    implementation_plan_wall_seconds: float = 300.0,
+    implementation_plan_token_limit: int = 16_384,
+    implementation_plan_session_token_limit: int | None = None,
+    implementation_plan_session_wall_seconds: float | None = None,
     builder_wall_seconds: float = 1_200.0,
     builder_token_limit: int = 64_000,
+    builder_session_token_limit: int | None = None,
+    builder_session_wall_seconds: float | None = None,
     verifier_wall_seconds: float = 900.0,
     verifier_token_limit: int = 48_000,
     verifier_batch_count: int,
@@ -1502,25 +1929,94 @@ def complete_generation_work_graph(
     if not 1 <= verifier_batch_count <= 8:
         raise WorkGraphError("Verifier batch count must be within the fixed 1..8 capacity")
 
+    (
+        physical_implementation_plan_token_limit,
+        physical_implementation_plan_wall_seconds,
+        maximum_implementation_plan_session_continuations,
+    ) = _physical_session_envelope(
+        node_name="BuildImplementationPlan",
+        physical_turn_token_limit=implementation_plan_token_limit,
+        physical_turn_wall_seconds=implementation_plan_wall_seconds,
+        session_token_limit=implementation_plan_session_token_limit,
+        session_wall_seconds=implementation_plan_session_wall_seconds,
+    )
+    (
+        physical_builder_token_limit,
+        physical_builder_wall_seconds,
+        maximum_builder_session_continuations,
+    ) = _physical_session_envelope(
+        node_name="CandidateBuild",
+        physical_turn_token_limit=builder_token_limit,
+        physical_turn_wall_seconds=builder_wall_seconds,
+        session_token_limit=builder_session_token_limit,
+        session_wall_seconds=builder_session_wall_seconds,
+    )
+
+    implementation_plan = _agent_component_definition(
+        scope_id=scope_id,
+        component="build",
+        stage="implementation_plan",
+        artifact_slot="implementation_plan",
+        dependencies=(modeling_definition.coordinate,),
+        claim_id="build.implementation.plan.ready",
+        claim=(
+            "Exact frozen Design bytes are translated into an advisory implementation plan "
+            "for one later CandidateBuild turn."
+        ),
+        timing_reason=(
+            "CandidateBuild receives a focused, read-only Agent planning boundary before it "
+            "writes one complete source closure."
+        ),
+        role="environment_engineer",
+        operation="build.implementation_plan",
+        output_contract_id="contract:implementation-plan.v1",
+        implementation_revision_id=implementation_plan_implementation_revision(),
+        validator_revision_id=implementation_plan_validator_revision(),
+        validation_effect="block_integration",
+        success_maturity="implementation_planned",
+        wall_seconds=physical_implementation_plan_wall_seconds,
+        token_limit=physical_implementation_plan_token_limit,
+        session_token_limit=implementation_plan_session_token_limit,
+        session_wall_seconds=implementation_plan_session_wall_seconds,
+        maximum_session_continuations=maximum_implementation_plan_session_continuations,
+        # This names advisory Artifact replacement, not a filesystem grant.
+        # The actual profile is read-only and has no Candidate mutation root.
+        allowed_mutation_roots=("/implementation-plan",),
+        output_types=("build.implementation_contract", "build.implementation_plan"),
+        input_slots=(
+            ArtifactSlotContract(
+                slot_id="input:environment-design",
+                direction="input",
+                artifact_types=("design.environment_design",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="design",
+            ),
+        ),
+    )
     build = _agent_component_definition(
         scope_id=scope_id,
         component="build",
         stage="candidate_build",
         artifact_slot="environment_candidate",
-        dependencies=(modeling_definition.coordinate,),
+        dependencies=(modeling_definition.coordinate, implementation_plan.coordinate),
         claim_id="build.candidate.valid",
         claim="Exact frozen Design bytes are implemented as a closed executable Candidate.",
         timing_reason="Integration can execute only a committed Candidate source closure.",
         role="environment_engineer",
         operation="build.environment_candidate",
         output_contract_id="contract:environment-candidate.v3",
+        implementation_revision_id=candidate_build_implementation_revision(),
+        validator_revision_id=candidate_build_validator_revision(),
         validation_effect="block_integration",
         success_maturity="candidate_built",
-        wall_seconds=builder_wall_seconds,
-        token_limit=builder_token_limit,
+        wall_seconds=physical_builder_wall_seconds,
+        token_limit=physical_builder_token_limit,
+        session_token_limit=builder_session_token_limit,
+        session_wall_seconds=builder_session_wall_seconds,
+        maximum_session_continuations=maximum_builder_session_continuations,
         allowed_mutation_roots=("/source", "/dependencies", "/runtime", "/materializer"),
         output_types=(
-            "build.implementation_contract",
             "build.source_workspace_snapshot",
             "build.implementation_lineage",
             "build.candidate_manifest",
@@ -1535,6 +2031,22 @@ def complete_generation_work_graph(
                 minimum_count=1,
                 maximum_count=1,
                 producer_component="design",
+            ),
+            ArtifactSlotContract(
+                slot_id="input:implementation-contract",
+                direction="input",
+                artifact_types=("build.implementation_contract",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="build",
+            ),
+            ArtifactSlotContract(
+                slot_id="input:implementation-plan",
+                direction="input",
+                artifact_types=("build.implementation_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="build",
             ),
         ),
     )
@@ -1812,6 +2324,7 @@ def complete_generation_work_graph(
     return GenerationWorkGraph.compile(
         (
             *upstream,
+            implementation_plan,
             build,
             *verifier_batches,
             verifier,
@@ -2297,6 +2810,299 @@ def derive_final_design_definitions(
     )
 
 
+def curriculum_plan_work_definition(
+    *,
+    scope_id: Identifier,
+    task_curriculum_template: WorkDefinition,
+    agent_wall_seconds: float,
+    agent_token_limit: int,
+) -> WorkDefinition:
+    """Replace one historical whole-curriculum turn with a compact plan turn.
+
+    The replacement deliberately retains the historical node's exact input
+    closure.  In normal Direct execution that template is freshly derived from
+    the frozen Architecture.  A marked diagnostic migration can also supply an
+    immutable historical template, preserving every already-committed parent
+    definition rather than re-deriving it under newer implementation code.
+    """
+
+    template = task_curriculum_template
+    if template.coordinate.scope_id != scope_id:
+        raise WorkGraphError("CurriculumPlan template scope differs from generation scope")
+    if (template.coordinate.component, template.coordinate.stage) != (
+        "design",
+        "task_curriculum",
+    ):
+        raise WorkGraphError("CurriculumPlan requires one historical TaskCurriculum template")
+    if template.proposal_policy.executor != "agent":
+        raise WorkGraphError("CurriculumPlan template must be an Agent proposal boundary")
+    if agent_wall_seconds <= 0 or agent_token_limit <= 0:
+        raise WorkGraphError("CurriculumPlan Agent budgets must be positive")
+    return structured_agent_work_definition(
+        scope_id=scope_id,
+        component="design",
+        stage="curriculum_plan",
+        artifact_slot="curriculum_plan",
+        dependency_coordinates=template.dependency_coordinates,
+        claim_id="design.curriculum_plan.compiles",
+        claim=(
+            "One compact curriculum plan fixes the exact ordered task-family topology before "
+            "any task Rule semantics are authored."
+        ),
+        timing_reason=(
+            "The framework must freeze real TaskRequirement coordinates from a committed plan, "
+            "not conceal variable Agent calls in one curriculum transaction."
+        ),
+        output_contract_id="contract:curriculum-plan-source.v1",
+        acceptance_transform_id="framework.curriculum-plan-compiler.v1",
+        validator_revision_id="framework.validator.curriculum-plan.v1",
+        agent_role="environment_engineer",
+        allowed_mutation_roots=(
+            "/coverage_dimensions",
+            "/task_plans",
+            "/difficulty_dimensions",
+            "/generation_seed_space",
+            "/minimum_distinct_initial_states",
+            "/minimum_distinct_tasks_per_type",
+            "/sampling_constraints",
+            "/unresolved_questions",
+        ),
+        agent_wall_seconds=agent_wall_seconds,
+        agent_token_limit=agent_token_limit,
+        input_slots=template.input_slots,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:curriculum-plan-source",
+                direction="output",
+                artifact_types=("design.curriculum_plan_source",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="design",
+            ),
+        ),
+        success_maturity="curriculum_plan_compiled",
+    )
+
+
+def derive_world_plan_definitions(
+    *,
+    scope_id: Identifier,
+    bootstrap_definitions: tuple[WorkDefinition, ...],
+    architecture_source_ref: ArtifactRef,
+    coupling_plan: ToolCouplingPlan,
+    agent_wall_seconds: float,
+    agent_token_limit: int,
+) -> tuple[tuple[WorkDefinition, ...], WorkDefinition]:
+    """Derive the world-plus-plan epoch without creating task-family calls.
+
+    The existing coupling-plan compiler remains the one authority for physical
+    behavior shards.  This wrapper replaces only its historical monolithic
+    curriculum Agent definition with a compact CurriculumPlan definition and
+    returns the deterministic Modeling template for the later plan-derived
+    graph.  The returned graph never contains the old whole-curriculum node.
+    """
+
+    legacy_definitions, modeling_template = derive_final_design_definitions(
+        scope_id=scope_id,
+        bootstrap_definitions=bootstrap_definitions,
+        architecture_source_ref=architecture_source_ref,
+        coupling_plan=coupling_plan,
+        agent_wall_seconds=agent_wall_seconds,
+        agent_token_limit=agent_token_limit,
+    )
+    legacy_curriculum = tuple(
+        item
+        for item in legacy_definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("design", "task_curriculum")
+    )
+    if len(legacy_curriculum) != 1:
+        raise WorkGraphError("world-plan derivation requires one historical curriculum template")
+    template = legacy_curriculum[0]
+    curriculum_plan = curriculum_plan_work_definition(
+        scope_id=scope_id,
+        task_curriculum_template=template,
+        agent_wall_seconds=agent_wall_seconds,
+        agent_token_limit=agent_token_limit,
+    )
+    return (
+        tuple(item for item in legacy_definitions if item != template) + (curriculum_plan,),
+        modeling_template,
+    )
+
+
+def derive_task_requirement_design_definitions(
+    *,
+    scope_id: Identifier,
+    world_definitions: tuple[WorkDefinition, ...],
+    curriculum_plan_ref: ArtifactRef,
+    curriculum_plan: CurriculumPlanSourceDraft,
+    modeling_template: WorkDefinition,
+    agent_wall_seconds: float,
+    agent_token_limit: int,
+) -> tuple[tuple[WorkDefinition, ...], WorkDefinition]:
+    """Freeze one TaskRequirement WorkDefinition per committed plan entry.
+
+    The plan source is already a committed, compiler-validated artifact.  Its
+    ordered ``task_plans`` are the only fan-out input; code does not invent a
+    task type, output, or hidden iteration.  The returned TaskCurriculum node
+    is deterministic and retains the old downstream artifact boundary.
+    """
+
+    if agent_wall_seconds <= 0 or agent_token_limit <= 0:
+        raise WorkGraphError("task requirement Agent budgets must be positive")
+    if curriculum_plan_ref.artifact_type != "design.curriculum_plan_source":
+        raise WorkGraphError(
+            "task requirement derivation requires a CurriculumPlan source Artifact"
+        )
+    if not world_definitions:
+        raise WorkGraphError("task requirement derivation requires a committed world graph")
+    if any(item.coordinate.scope_id != scope_id for item in world_definitions):
+        raise WorkGraphError("world definitions mix a different generation scope")
+    if modeling_template.coordinate.scope_id != scope_id:
+        raise WorkGraphError("Modeling template scope differs from generation scope")
+    planners = tuple(
+        item
+        for item in world_definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("design", "curriculum_plan")
+    )
+    world_rules = tuple(
+        item
+        for item in world_definitions
+        if (item.coordinate.component, item.coordinate.stage) == ("design", "world_rules")
+    )
+    if len(planners) != 1 or len(world_rules) != 1:
+        raise WorkGraphError(
+            "task requirement derivation requires one WorldRules and CurriculumPlan"
+        )
+    planner = planners[0]
+    task_types = tuple(item.task_type for item in curriculum_plan.task_plans)
+    if not task_types or len(set(task_types)) != len(task_types):
+        raise WorkGraphError("committed CurriculumPlan does not have unique non-empty task types")
+    required_dependencies = (*planner.dependency_coordinates, planner.coordinate)
+    plan_input = ArtifactSlotContract(
+        slot_id="input:curriculum-plan-source",
+        direction="input",
+        artifact_types=("design.curriculum_plan_source",),
+        minimum_count=1,
+        maximum_count=1,
+        producer_component="design",
+    )
+    task_definitions = tuple(
+        structured_agent_work_definition(
+            scope_id=scope_id,
+            component="design",
+            stage="task_requirement",
+            artifact_slot="task_requirement_source",
+            group_id="task-requirements",
+            shard_id=task_type,
+            dependency_coordinates=required_dependencies,
+            claim_id="design.task_requirement.compiles",
+            claim=(
+                "One plan-derived task family compiles executable initial, success, failure and "
+                "terminal Rule semantics against the exact frozen world."
+            ),
+            timing_reason=(
+                "Each task family needs independent provenance, feedback, repair and budget "
+                "accounting before deterministic curriculum closure."
+            ),
+            output_contract_id="contract:task-requirement-source.v1",
+            acceptance_transform_id="framework.task-requirement-compiler.v1",
+            validator_revision_id="framework.validator.task-requirement.v1",
+            agent_role="environment_engineer",
+            allowed_mutation_roots=(
+                "/task_type",
+                "/objective",
+                "/allowed_actor_ids",
+                "/required_tool_ids",
+                "/initial_state_constraints",
+                "/success_conditions",
+                "/failure_conditions",
+                "/terminal_conditions",
+                "/difficulty_dimensions",
+                "/minimum_tool_calls",
+            ),
+            agent_wall_seconds=agent_wall_seconds,
+            agent_token_limit=agent_token_limit,
+            input_slots=(*planner.input_slots, plan_input),
+            output_slots=(
+                ArtifactSlotContract(
+                    slot_id="output:task-requirement-source",
+                    direction="output",
+                    artifact_types=("design.task_requirement_source",),
+                    minimum_count=1,
+                    maximum_count=1,
+                    producer_component="design",
+                ),
+            ),
+            success_maturity="task_requirement_compiled",
+        )
+        for task_type in task_types
+    )
+    curriculum = deterministic_boundary_work_definition(
+        scope_id=scope_id,
+        component="design",
+        stage="task_curriculum",
+        artifact_slot="task_curriculum",
+        dependency_coordinates=(
+            *required_dependencies,
+            *(item.coordinate for item in task_definitions),
+        ),
+        claim_id="design.curriculum.compiles",
+        claim=(
+            "The exact committed CurriculumPlan and every ordered TaskRequirement source compile "
+            "into one complete task curriculum."
+        ),
+        timing_reason="Builder and Verifier require one closed curriculum and task protocol.",
+        effect="block_compile",
+        success_maturity="curriculum_compiled",
+        wall_seconds=60.0,
+    ).model_copy(
+        update={
+            "input_slots": (
+                *planner.input_slots,
+                plan_input,
+                ArtifactSlotContract(
+                    slot_id="input:task-requirement-source",
+                    direction="input",
+                    artifact_types=("design.task_requirement_source",),
+                    minimum_count=len(task_definitions),
+                    maximum_count=len(task_definitions),
+                    producer_component="design",
+                ),
+            ),
+            "output_slots": (
+                ArtifactSlotContract(
+                    slot_id="output:task-curriculum-source",
+                    direction="output",
+                    artifact_types=("design.task_curriculum_source",),
+                    minimum_count=1,
+                    maximum_count=1,
+                    producer_component="design",
+                ),
+            ),
+        }
+    )
+    template_curriculum = tuple(
+        item
+        for item in modeling_template.dependency_coordinates
+        if item.component == "design" and item.stage == "task_curriculum"
+    )
+    if len(template_curriculum) != 1:
+        raise WorkGraphError("Modeling template must retain one TaskCurriculum boundary")
+    expected_template_dependencies = (
+        *planner.dependency_coordinates,
+        template_curriculum[0],
+    )
+    if modeling_template.dependency_coordinates != expected_template_dependencies:
+        raise WorkGraphError("Modeling template does not retain the expected curriculum boundary")
+    modeling = modeling_template.model_copy(
+        update={
+            "dependency_coordinates": (*planner.dependency_coordinates, curriculum.coordinate),
+        }
+    )
+    return (*world_definitions, *task_definitions, curriculum), modeling
+
+
 def _verifier_intent_group(
     *,
     scope_id: Identifier,
@@ -2378,18 +3184,18 @@ def _verifier_intent_group(
                     operation="verifier.compile_intent_batch",
                     budget=OperationBudget(
                         wall_seconds=per_batch_wall,
-                        first_progress_seconds=min(120.0, per_batch_wall),
                         llm_tokens=per_batch_tokens,
                         agent_turns=1,
                     ),
                     agent_role="challenger",
                     capability_profile_id="profile:challenger",
                     output_contract_id="contract:verifier-intent-batch.v3",
+                    implementation_revision_id=verifier_intent_batch_implementation_revision(),
                 ),
                 validation_policy=ValidationPolicy(
                     policy_id=f"validation:verifier-intent-batch:{digest}",
                     validator_id="validator:verifier-intent-batch",
-                    validator_revision_id="framework.validator.verifier-intent-batch.v3",
+                    validator_revision_id=verifier_intent_batch_validator_revision(),
                     validation_phase="verifier_intent_batch",
                     frontier_ordinal=100,
                     claim_id="verifier.intent.batch.valid",
@@ -2541,6 +3347,8 @@ def _agent_component_definition(
     role: Literal["environment_engineer", "challenger"],
     operation: Identifier,
     output_contract_id: Identifier,
+    implementation_revision_id: Identifier = "framework.impl.unversioned.v0",
+    validator_revision_id: Identifier | None = None,
     validation_effect: Literal["block_integration", "block_release"],
     success_maturity: Identifier,
     wall_seconds: float,
@@ -2549,6 +3357,9 @@ def _agent_component_definition(
     output_types: tuple[Identifier, ...],
     input_slots: tuple[ArtifactSlotContract, ...] = (),
     assurance: AssurancePolicy | None = None,
+    session_token_limit: int | None = None,
+    session_wall_seconds: float | None = None,
+    maximum_session_continuations: int = 0,
 ) -> WorkDefinition:
     coordinate = WorkCoordinate(
         scope_id=scope_id,
@@ -2557,6 +3368,7 @@ def _agent_component_definition(
         artifact_slot=artifact_slot,
     )
     digest = _stable_work_identity_digest(coordinate)
+    is_candidate_build = component == "build" and stage == "candidate_build"
     return WorkDefinition(
         work_id=f"work:{stage}:{digest}",
         coordinate=coordinate,
@@ -2578,14 +3390,20 @@ def _agent_component_definition(
         proposal_policy=ProposalPolicy(
             policy_id=f"proposal:{stage}:{digest}",
             executor="agent",
+            implementation_revision_id=implementation_revision_id,
             operation=operation,
             budget=OperationBudget(
                 wall_seconds=wall_seconds,
-                first_progress_seconds=min(120.0, wall_seconds),
-                first_write_seconds=(min(300.0, wall_seconds) if component == "build" else None),
+                # EnvironmentBuilder owns a real candidate workspace and
+                # explicitly refuses a zero build-time lease. The read-only
+                # implementation-plan boundary and Challenger batches do not
+                # consume that dimension.
+                build_seconds=(wall_seconds if is_candidate_build else 0),
                 llm_tokens=token_limit,
                 agent_turns=1,
             ),
+            session_token_limit=session_token_limit,
+            session_wall_seconds=session_wall_seconds,
             agent_role=role,
             capability_profile_id=f"profile:{role.replace('_', '-')}",
             output_contract_id=output_contract_id,
@@ -2593,7 +3411,7 @@ def _agent_component_definition(
         validation_policy=ValidationPolicy(
             policy_id=f"validation:{stage}:{digest}",
             validator_id=f"validator:{stage}",
-            validator_revision_id=f"framework.validator.{stage}.v1",
+            validator_revision_id=(validator_revision_id or f"framework.validator.{stage}.v1"),
             validation_phase=stage,
             frontier_ordinal=100,
             claim_id=claim_id,
@@ -2607,6 +3425,7 @@ def _agent_component_definition(
             maximum_local_corrections=1,
             strict_progress_bonus_corrections=1,
             maximum_infrastructure_retries=1,
+            maximum_session_continuations=maximum_session_continuations,
             maximum_process_recoveries=1,
             maximum_total_repair_attempts=3,
         ),
@@ -2767,8 +3586,12 @@ __all__ = [
     "WorkGraphEpoch",
     "WorkGroupDefinition",
     "compile_design_work_graph",
+    "compile_world_work_graph",
     "complete_generation_work_graph",
+    "curriculum_plan_work_definition",
     "derive_final_design_definitions",
+    "derive_task_requirement_design_definitions",
+    "derive_world_plan_definitions",
     "deterministic_boundary_work_definition",
     "research_acquisition_work_definition",
     "research_plan_work_definition",

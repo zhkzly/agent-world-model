@@ -641,6 +641,15 @@ class FoundryController:
                 workspace_root=self.workspace_root / "scheduler-direct",
                 structured_turn_token_limit=config.agent.structured_turn_token_limit,
                 structured_turn_wall_seconds=config.agent.structured_invocation_timeout_seconds,
+                environment_codegen_session_token_limit=(
+                    config.agent.environment_codegen_turn_token_limit
+                ),
+                environment_codegen_session_wall_seconds=(
+                    config.agent.environment_codegen_invocation_timeout_seconds
+                ),
+                environment_codegen_physical_turn_token_limit=(
+                    config.agent.environment_codegen_physical_turn_token_limit
+                ),
                 projector=self.scene_projector,
             )
             if self.telemetry is not None
@@ -816,6 +825,7 @@ class FoundryController:
                 for ref in (
                     context_ref,
                     outcome.bootstrap_epoch_ref,
+                    outcome.world_epoch_ref,
                     outcome.design_epoch_ref,
                     outcome.modeling_commit_ref,
                     outcome.verifier_plan_commit_ref,
@@ -978,7 +988,7 @@ class FoundryController:
         prior_head: DirectJobHead | None,
     ) -> GenerateResult:
         # Direct Generation has one executable success path: the durable
-        # three-epoch WorkGraph runner.  DirectJobStore is only its idempotent
+        # four-epoch WorkGraph runner.  DirectJobStore is only its idempotent
         # result index; it no longer owns component-local orchestration.
         return await self._execute_scheduler_direct_locked(
             request=request,
@@ -10177,7 +10187,7 @@ class FoundryController:
                 summary=f"Verifier and Builder require {minimum_turns} reserved Agent turns.",
             )
         verifier_turn_cap = self.config.agent.structured_turn_token_limit
-        builder_tokens = self.config.agent.environment_codegen_turn_token_limit
+        builder_tokens = self.config.agent.environment_codegen_physical_turn_token_limit
         reserved_builder_tokens = builder_tokens * builder_turns
         minimum_tokens = verifier_turn_cap * verifier_base_turns + reserved_builder_tokens
         if remaining.llm_tokens < minimum_tokens:

@@ -132,7 +132,45 @@ class ResearchAcquisition(V2Contract):
         return self
 
 
-class EvidenceSynthesis(AgentOutput):
+class EvidenceClaimSourceDraft(AgentOutput):
+    """Agent-authored claim meaning with framework-bound evidence selection.
+
+    Evidence identifiers are durable framework mechanics, not research meaning.
+    The Researcher therefore selects a one-based entry from the frozen citation
+    catalog; the compiler later restores the exact immutable evidence id.
+    """
+
+    claim_id: Identifier
+    kind: Literal["observed", "inference", "product_decision", "bounded_assumption"]
+    statement: Annotated[str, Field(min_length=1)]
+    confidence: Annotated[float, Field(ge=0, le=1)]
+    evidence_catalog_indexes: tuple[Annotated[int, Field(ge=1)], ...] = ()
+    supports_claim_ids: tuple[Identifier, ...] = ()
+    contradicts_claim_ids: tuple[Identifier, ...] = ()
+    claim_status: Literal["supported", "contested", "unresolved", "superseded"] = "unresolved"
+    risk: Literal["low", "medium", "high", "critical"] = "medium"
+
+
+class EvidenceConflictSourceDraft(AgentOutput):
+    """Agent-authored conflict meaning over Agent-owned claim identifiers."""
+
+    conflict_id: Identifier
+    claim_ids: Annotated[tuple[Identifier, ...], Field(min_length=2)]
+    description: Annotated[str, Field(min_length=1)]
+    resolution: Annotated[str, Field(min_length=1)] | None = None
+
+
+class EvidenceSynthesisSourceDraft(AgentOutput):
+    """One Researcher proposal before framework evidence-id compilation."""
+
+    claims: tuple[EvidenceClaimSourceDraft, ...]
+    conflicts: tuple[EvidenceConflictSourceDraft, ...] = ()
+    unresolved_questions: tuple[Annotated[str, Field(min_length=1)], ...] = ()
+
+
+class EvidenceSynthesis(V2Contract):
+    """Canonical synthesis after citation positions map to frozen evidence ids."""
+
     claims: tuple[Claim, ...]
     conflicts: tuple[EvidenceConflict, ...] = ()
     unresolved_questions: tuple[str, ...] = ()
@@ -768,9 +806,10 @@ class RuleDraft(AgentOutput):
     """Agent-facing Rule ADT deterministically compiled into the core Rule IR."""
 
     # A rule id names a framework IR object; it is not business semantics.
-    # ToolSemanticsBatch and WorldRules derive it from their frozen section and
-    # ordinal before a proposal is persisted or compiled.  Other legacy source
-    # boundaries may still require an identity during their own compilation.
+    # ToolSemanticsBatch, WorldRules, and TaskCurriculum derive it from their
+    # frozen section and ordinal before a proposal is persisted or compiled.
+    # A later compiled semantic source may carry that framework-derived ID, but
+    # an Agent-facing source draft must never need to guess one.
     rule_id: Identifier | None = None
     family: RuleFamily
     description: Annotated[str, Field(min_length=1)]
@@ -2174,7 +2213,7 @@ for _agent_output_root in (
     DiscoverySynthesis,
     EnvironmentSemanticSourceDraft,
     EvidenceAssumptionClosureDraft,
-    EvidenceSynthesis,
+    EvidenceSynthesisSourceDraft,
     ExpansionDesignDraft,
     ExpansionSourcePlan,
     ExpansionSourceSynthesis,
@@ -2237,7 +2276,10 @@ __all__ = [
     "EnvironmentDesignDraft",
     "EnvironmentSemanticSourceDraft",
     "EvidenceAssumptionClosureDraft",
+    "EvidenceClaimSourceDraft",
+    "EvidenceConflictSourceDraft",
     "EvidenceSynthesis",
+    "EvidenceSynthesisSourceDraft",
     "ExpansionDesignDraft",
     "ExpansionSourceClueDraft",
     "ExpansionSourceHypothesisDraft",

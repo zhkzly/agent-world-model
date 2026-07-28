@@ -54,15 +54,48 @@ class AgentBackendConfig(ConfigModel):
     engineer_dependency_network_domains: tuple[str, ...] = ()
     invocation_timeout_seconds: float = Field(default=2_700, gt=0)
     structured_invocation_timeout_seconds: float = Field(default=2_700, gt=0)
+    # A Provider stream that has started but stops yielding events is a
+    # transport-liveness condition, not an output-token cap.  Direct calls
+    # retain their declared logical timeout until the stream has made real
+    # progress; set this to ``None`` only when an external supervisor owns
+    # that post-progress liveness decision.
+    direct_stream_idle_timeout_seconds: float | None = Field(default=300, gt=0)
+    # These two values are the logical Environment Builder session envelope.
+    # A provider can still stop one SDK turn at its own smaller output ceiling;
+    # the WorkGraph turns that ceiling into explicit resumable physical turns.
     environment_codegen_invocation_timeout_seconds: float = Field(default=2_700, gt=0)
     max_concurrent_invocations: int = Field(default=1, ge=1, le=32)
-    structured_output_transport: Literal["provider_schema", "json_envelope"] = "provider_schema"
+    # ``json_object`` is the Direct, tool-free structured-node transport.  It
+    # asks the provider for one JSON object without making the model manually
+    # serialize a second JSON document into a string.  Local Pydantic and
+    # semantic validation remain the acceptance path.  Agentic Builder turns
+    # retain their provider-schema protocol and their resumable logical
+    # session envelope.
+    structured_output_transport: Literal[
+        "provider_schema", "json_envelope", "json_object"
+    ] = "provider_schema"
     tool_output_token_limit: int = Field(default=2_048, ge=512, le=32_768)
-    structured_turn_token_limit: int = Field(default=65_536, ge=16_384, le=1_048_576)
+    # A real isolated structured-node diagnostic can need the same long
+    # observation envelope as CandidateBuild.  Keep this finite so leases,
+    # recovery, and aggregate budgets remain accountable, but do not silently
+    # reintroduce a short one-million-token ceiling below an explicitly
+    # authorized five-million-token proof.
+    structured_turn_token_limit: int = Field(default=65_536, ge=16_384, le=5_000_000)
     environment_codegen_turn_token_limit: int = Field(
         default=262_144,
         ge=32_768,
-        le=2_097_152,
+        # Logical session ceiling.  This is intentionally not represented as
+        # a promise that one Provider response can emit this many tokens.
+        le=10_000_000,
+    )
+    environment_codegen_physical_turn_token_limit: int = Field(
+        default=128_000,
+        ge=32_768,
+        # A diagnostic proof may deliberately use the full logical session as
+        # one live Agent turn.  Keep the physical field wide enough to express
+        # that real 5M-token observation instead of silently reinstating a
+        # smaller test-only ceiling.
+        le=10_000_000,
     )
 
     @model_validator(mode="after")
@@ -74,13 +107,11 @@ class AgentBackendConfig(ConfigModel):
             and self.openai_base_url_environment != OPENAI_BASE_URL_ENVIRONMENT
         ):
             raise ValueError("openai_base_url_environment must be OPENAI_BASE_URL")
-        if (
-            self.openai_base_url_environment is not None
-            and self.model_provider not in {None, API_KEY_RUNTIME_PROVIDER}
-        ):
-            raise ValueError(
-                "API-key profiles use the framework-owned runtime model provider"
-            )
+        if self.openai_base_url_environment is not None and self.model_provider not in {
+            None,
+            API_KEY_RUNTIME_PROVIDER,
+        }:
+            raise ValueError("API-key profiles use the framework-owned runtime model provider")
         if len(self.engineer_network_domain_ceiling) != len(
             set(self.engineer_network_domain_ceiling)
         ):
@@ -365,7 +396,9 @@ def _generation_budget() -> Budget:
         agent_turns=128,
         search_calls=6,
         tool_calls=512,
-        build_seconds=900,
+        # The Direct Builder session is permitted to consume the configured
+        # outer eight-hour wall envelope through explicit physical turns.
+        build_seconds=28_800,
         evaluation_episodes=128,
         container_seconds=3_600,
         repair_attempts=15,
@@ -484,13 +517,11 @@ def _reject_file_backed_agent_credentials(value: dict[str, object]) -> None:
         return
     if "openai_base_url" in agent:
         raise ConfigError(
-            'agent.openai_base_url is forbidden; use '
+            "agent.openai_base_url is forbidden; use "
             'agent.openai_base_url_environment = "OPENAI_BASE_URL"'
         )
     if "chatgpt_auth_file" in agent:
-        raise ConfigError(
-            "agent.chatgpt_auth_file is forbidden; use an API-key environment handle"
-        )
+        raise ConfigError("agent.chatgpt_auth_file is forbidden; use an API-key environment handle")
 
 
 def _resolve_config_path(path: Path, base: Path) -> Path:

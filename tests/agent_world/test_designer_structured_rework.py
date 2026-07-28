@@ -32,6 +32,7 @@ from agent_world.control.validation import (
 from agent_world.designer.budget import DesignerInvocationBudget
 from agent_world.designer.models import (
     EvidenceSynthesis,
+    EvidenceSynthesisSourceDraft,
     ObservationSemanticsSourceDraft,
     PermissionRuleSourceDraft,
     RuleArithmeticDraft,
@@ -1791,7 +1792,7 @@ def test_semantic_feedback_marks_prompt_overflow_but_keeps_all_safe_issue_codes(
     feedback = EnvironmentDesigner._structured_repair_feedback(error)  # noqa: SLF001
     diagnostic = EnvironmentDesigner._validation_diagnostic(  # noqa: SLF001
         error,
-        model=EvidenceSynthesis,
+        model=EvidenceSynthesisSourceDraft,
         validation_stage="semantic",
     )
 
@@ -1800,7 +1801,7 @@ def test_semantic_feedback_marks_prompt_overflow_but_keeps_all_safe_issue_codes(
     assert "diagnostics_overflow" in feedback
     assert "3 additional safe issues" in feedback
     assert diagnostic is not None
-    assert diagnostic.validation_phase == "evidencesynthesis_semantic"
+    assert diagnostic.validation_phase == "evidencesynthesissourcedraft_semantic"
     assert diagnostic.frontier_ordinal == 20
     assert diagnostic.issue_codes == issue_codes
 

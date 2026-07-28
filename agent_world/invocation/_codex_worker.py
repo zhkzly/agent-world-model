@@ -26,7 +26,10 @@ if __package__ in {None, ""}:
     # into the Codex/app-server environment.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from agent_world.invocation.redaction import Redactor  # noqa: E402
+from agent_world.invocation.redaction import (  # noqa: E402
+    Redactor,
+    redacted_terminal_diagnostic_excerpt,
+)
 from agent_world.invocation.runtime_provider import (  # noqa: E402
     API_KEY_RUNTIME_PROVIDER as _API_KEY_RUNTIME_PROVIDER,
 )
@@ -42,6 +45,15 @@ SUPPORTED_SDK_VERSION = "0.144.4"
 SUPPORTED_RUNTIME_VERSION = "0.144.4"
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESULT_RESERVE_BYTES = 64 * 1024
+_SDK_EXECUTION_PHASES = frozenset(
+    {
+        "sdk_session_open",
+        "thread_start",
+        "thread_resume",
+        "turn_start",
+        "turn_stream",
+    }
+)
 
 
 class ProtocolBudgetExceeded(RuntimeError):
@@ -195,15 +207,46 @@ def _completed_turn_payload(
 def _terminal_turn_failure_code(error: object) -> str:
     """Return a safe, actionable class for a terminal provider failure.
 
-    Provider error payloads can contain the request, endpoint, or credential
-    hints.  They must not cross the worker boundary verbatim, but collapsing
-    every terminal failure to ``turn_failed`` makes a real production probe
-    impossible to diagnose.  Keep only a small, fixed taxonomy inferred from
-    the provider's declared code/type and message.
+    Provider error payloads can contain the request, endpoint, credential
+    hints, or arbitrary prose.  They must not cross the worker boundary, and
+    neither may their wording become a false causal claim in a safe scene.
+    Classify only the Codex app-server's closed ``codexErrorInfo`` protocol;
+    an absent or unknown discriminator is explicitly unclassified.
     """
 
+    return _terminal_turn_failure(error)[0]
+
+
+def _terminal_turn_failure(
+    error: object,
+    *,
+    diagnostic_capture_terminal_excerpt: bool = False,
+    redactor: Redactor | None = None,
+) -> tuple[str, dict[str, Any]]:
+    """Classify a terminal turn and retain only its closed protocol facts.
+
+    The SDK's ``codexErrorInfo`` union is a bounded, generated protocol.  A
+    stream connection event without an HTTP response is materially different
+    from a provider rejecting a request: it is an availability interruption
+    and can be considered for the Scheduler's bounded infrastructure policy.
+    Preserve that distinction without retaining an endpoint, request, provider
+    message, or ``additionalDetails``.
+    """
+
+    details = _terminal_turn_failure_details(error)
     if not isinstance(error, Mapping):
-        return "turn_failed_provider_rejected"
+        return "turn_failed_unclassified_codex_error", details
+
+    # This text is never part of ordinary InvocationError feedback: the
+    # Builder's normal projection strips it through ``safe_terminal_details``.
+    # An explicitly opted-in local diagnostic needs the same bounded, double
+    # redacted excerpt for a known closed enum as for an unknown one; otherwise
+    # ``internalservererror`` misleadingly looks as though the Provider gave
+    # no diagnosable terminal information at all.
+    if diagnostic_capture_terminal_excerpt and redactor is not None:
+        excerpt = _redacted_terminal_message_excerpt(error.get("message"), redactor)
+        if excerpt is not None:
+            details["diagnostic_error_excerpt"] = excerpt
 
     # The app-server's declared ``codexErrorInfo`` is a closed protocol enum
     # (with a few closed HTTP-status wrappers).  Prefer it over provider
@@ -216,42 +259,233 @@ def _terminal_turn_failure_code(error: object) -> str:
         codex_error_info = error.get("codex_error_info")
     structured_code = _codex_error_info_failure_code(codex_error_info)
     if structured_code is not None:
-        return structured_code
-    declared_fragments = [
-        value.lower()
-        for key in ("code", "type")
-        if isinstance(value := error.get(key), str)
-    ]
+        return structured_code, details
+    if _is_explicit_output_limit_terminal(error):
+        # Some OpenAI-compatible Codex routes surface the provider's physical
+        # turn-output ceiling only through the standard terminal message while
+        # keeping ``codexErrorInfo`` at its closed ``other`` value.  The exact
+        # pair below is a terminal-status signature, not a loose keyword
+        # heuristic: retain only its two fixed facts and never persist the
+        # provider message.  This changes investigation routing, not retry
+        # authority; the Scheduler still needs an explicit continuation or
+        # split-node policy before another real Agent turn can run.
+        details.update(
+            {
+                "terminal_status": "incomplete",
+                "terminal_reason": "max_output_tokens",
+            }
+        )
+        return "turn_failed_output_limit", details
+    # The generated protocol supplied no recognized closed kind.  Do not use
+    # ``code``, ``type``, ``message`` or ``additionalDetails`` as a routing
+    # proxy: provider-controlled prose cannot authorize a retry. It can,
+    # however, be reduced in this private worker into bounded *advisory*
+    # signals for the project-execution Agent. The signals never change the
+    # terminal code and never retain a character of provider text.
+    _add_advisory_terminal_text_signals(details, error)
+    return "turn_failed_unclassified_codex_error", details
+
+
+def _is_explicit_output_limit_terminal(error: Mapping[str, Any]) -> bool:
+    """Recognize Codex's exact safe output-ceiling terminal signature.
+
+    A generic mention of "tokens" or "output" in a Provider-controlled error
+    body is not enough to classify an error.  The current Codex app-server
+    emits this pair when it has received a terminal incomplete response whose
+    sole declared reason is ``max_output_tokens``.  The raw body is inspected
+    only inside this worker and is never sent to the parent process.
+    """
+
     message = error.get("message")
-    message_fragment = message.lower() if isinstance(message, str) else ""
-    categories = (
-        ("authentication", ("unauthorized", "forbidden", "authentication", "api key")),
-        ("model_unavailable", ("model_not_found", "model not found", "unsupported model")),
-        ("rate_limited", ("rate_limit", "rate limit", "too many requests")),
-        ("quota_exhausted", ("insufficient_quota", "quota exceeded", "billing")),
+    if not isinstance(message, str):
+        return False
+    text = message[:16_384].casefold()
+    return "incomplete response returned" in text and "reason: max_output_tokens" in text
+
+
+def _terminal_turn_failure_details(error: object) -> dict[str, Any]:
+    """Project a terminal SDK error into a small, safe feedback vocabulary."""
+
+    if error is None:
+        return {"terminal_error_shape": "missing"}
+    if not isinstance(error, Mapping):
+        return {"terminal_error_shape": "non_object"}
+
+    details: dict[str, Any] = {"terminal_error_shape": "object"}
+    codex_error_info = error.get("codexErrorInfo")
+    if codex_error_info is None:
+        codex_error_info = error.get("codex_error_info")
+    if codex_error_info is None:
+        details["codex_error_info"] = "absent"
+        return details
+    if isinstance(codex_error_info, str):
+        normalized = codex_error_info.replace("_", "").replace("-", "").lower()
+        safe_values = {
+            "contextwindowexceeded",
+            "sessionbudgetexceeded",
+            "usagelimitexceeded",
+            "serveroverloaded",
+            "internalservererror",
+            "unauthorized",
+            "badrequest",
+            "cyberpolicy",
+            "sandboxerror",
+            "threadrollbackfailed",
+            "other",
+        }
+        details["codex_error_info"] = (
+            f"enum:{normalized}" if normalized in safe_values else "enum:other"
+        )
+        return details
+    if not isinstance(codex_error_info, Mapping):
+        details["codex_error_info"] = "non_object"
+        return details
+
+    for field, safe_name in (
+        ("httpConnectionFailed", "http_connection_failed"),
+        ("responseStreamConnectionFailed", "response_stream_connection_failed"),
+        ("responseStreamDisconnected", "response_stream_disconnected"),
+        ("responseTooManyFailedAttempts", "response_too_many_failed_attempts"),
+    ):
+        payload = codex_error_info.get(field)
+        if not isinstance(payload, Mapping):
+            continue
+        details["codex_error_info"] = f"transport:{safe_name}"
+        status = payload.get("httpStatusCode")
+        if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+            details["http_status"] = status
+        return details
+    if isinstance(codex_error_info.get("activeTurnNotSteerable"), Mapping):
+        details["codex_error_info"] = "active_turn_not_steerable"
+        return details
+    details["codex_error_info"] = "object:other"
+    return details
+
+
+def _add_advisory_terminal_text_signals(
+    details: dict[str, Any],
+    error: Mapping[str, Any],
+) -> None:
+    """Project ambiguous provider prose into non-routing, content-free clues.
+
+    A custom OpenAI-compatible provider can legitimately return the declared
+    Codex ``other`` enum with its only useful explanation in ``message``.
+    ``additionalDetails`` is intentionally not even inspected because it is
+    frequently a raw provider transcript. Keeping either prose would risk persisting routing,
+    credential, prompt, or provider transcript material. These bounded
+    signals retain only investigation hypotheses for a Code Agent; Scheduler
+    must still treat the result as unclassified and must not use a signal to
+    authorize a retry or mutation.
+    """
+
+    message = error.get("message")
+    if not isinstance(message, str):
+        return
+    # Bound local inspection too: raw provider text never crosses the worker,
+    # and an unbounded error body should not consume diagnostic CPU.
+    text = message[:16_384].casefold()
+    signals: list[str] = []
+    for signal, markers in (
         (
-            "context_window",
-            ("context window", "context length", "maximum context", "too many tokens"),
+            "authentication_or_authorization",
+            (
+                "unauthorized",
+                "forbidden",
+                "authentication",
+                "api key",
+                "credential",
+                "permission denied",
+                "access denied",
+            ),
         ),
         (
-            "output_limit",
-            ("output token", "max output", "completion token", "maximum output"),
+            "model_or_route_availability",
+            (
+                "model not found",
+                "model unavailable",
+                "unknown model",
+                "unsupported model",
+                "deployment not found",
+                "no such model",
+            ),
         ),
         (
-            "output_schema",
-            ("response format", "output schema", "json schema", "invalid schema"),
+            "context_or_token_limit",
+            (
+                "context window",
+                "context length",
+                "maximum context",
+                "too many tokens",
+                "token limit",
+                "input too long",
+                "max tokens",
+            ),
         ),
-        ("content_filtered", ("content filter", "safety filter", "policy violation")),
-        ("invalid_request", ("invalid_request", "invalid request", "bad request")),
-        ("provider_timeout", ("timeout", "timed out", "deadline exceeded")),
-        ("provider_unavailable", ("internal server", "service unavailable", "server_error")),
-    )
-    for fragments in (declared_fragments, (message_fragment,)):
-        summary = " ".join(fragments)
-        for category, markers in categories:
-            if any(marker in summary for marker in markers):
-                return f"turn_failed_{category}"
-    return "turn_failed_provider_rejected"
+        (
+            "request_or_schema_compatibility",
+            (
+                "json schema",
+                "response format",
+                "response_format",
+                "output schema",
+                "structured output",
+                "unsupported parameter",
+                "invalid parameter",
+                "unknown parameter",
+                "invalid request",
+                "unsupported request",
+            ),
+        ),
+        (
+            "capacity_or_rate_limit",
+            (
+                "rate limit",
+                "too many requests",
+                "quota",
+                "usage limit",
+                "capacity",
+                "overloaded",
+            ),
+        ),
+        (
+            "transport_or_connection",
+            (
+                "connection refused",
+                "connection reset",
+                "connection failed",
+                "stream disconnected",
+                "network error",
+                "socket error",
+                "dns",
+            ),
+        ),
+        ("timeout_or_deadline", ("timed out", "timeout", "deadline exceeded")),
+        (
+            "policy_or_content_filter",
+            ("content filter", "safety policy", "policy violation", "blocked by policy"),
+        ),
+        (
+            "provider_internal_error",
+            ("internal server error", "internal error", "server error", "http 5"),
+        ),
+    ):
+        if any(marker in text for marker in markers):
+            signals.append(signal)
+    if signals:
+        details["advisory_text_signals"] = signals
+
+
+def _redacted_terminal_message_excerpt(value: object, redactor: Redactor) -> str | None:
+    """Return one strictly local, bounded excerpt for an opted-in Doctor probe.
+
+    This escape hatch exists only for a fixed-prompt provider readiness probe
+    whose closed terminal envelope was too weak to diagnose. It is never
+    copied into telemetry, artifacts, manifests, releases, or Scheduler
+    feedback. Known runtime secrets, URLs, credential assignments, and long
+    opaque tokens are removed before the parent can receive the text.
+    """
+
+    return redacted_terminal_diagnostic_excerpt(value, redactor=redactor)
 
 
 def _codex_error_info_failure_code(value: object) -> str | None:
@@ -266,14 +500,20 @@ def _codex_error_info_failure_code(value: object) -> str | None:
     if isinstance(value, str):
         return {
             "contextwindowexceeded": "turn_failed_context_window",
-            "sessionbudgetexceeded": "turn_failed_quota_exhausted",
-            "usagelimitexceeded": "turn_failed_quota_exhausted",
+            # These are materially different recovery routes.  A session
+            # rollout-budget terminal can be tested again under a newly
+            # declared envelope, whereas a Provider usage-limit terminal
+            # cannot.  Keep the worker's closed classification precise so
+            # the safe scene does not conflate them as generic "quota".
+            "sessionbudgetexceeded": "turn_failed_session_budget_exhausted",
+            "usagelimitexceeded": "turn_failed_usage_limit_exceeded",
             "serveroverloaded": "turn_failed_provider_unavailable",
             "internalservererror": "turn_failed_provider_unavailable",
             "unauthorized": "turn_failed_authentication",
             "badrequest": "turn_failed_invalid_request",
             "cyberpolicy": "turn_failed_content_filtered",
-            "sandboxerror": "turn_failed_provider_rejected",
+            "sandboxerror": "turn_failed_sandbox_error",
+            "threadrollbackfailed": "turn_failed_thread_rollback",
         }.get(value.replace("_", "").replace("-", "").lower())
     if not isinstance(value, Mapping):
         return None
@@ -288,7 +528,13 @@ def _codex_error_info_failure_code(value: object) -> str | None:
         if not isinstance(transport_error, Mapping):
             continue
         status = transport_error.get("httpStatusCode")
-        return _provider_http_status_failure_code(status)
+        if isinstance(status, int) and not isinstance(status, bool):
+            return _provider_http_status_failure_code(status)
+        # The generated Codex protocol uses these variants only for an
+        # interrupted connection/response stream.  Without an HTTP response,
+        # this is a transient Provider availability event, not a request
+        # incompatibility that the model should be asked to repair.
+        return "turn_failed_provider_unavailable"
     return None
 
 
@@ -378,16 +624,33 @@ def _status_result(
     code: str | None = None,
     message: str | None = None,
     retryable: bool = False,
+    error_details: Mapping[str, Any] | None = None,
     **extra: Any,
 ) -> dict[str, Any]:
     error = None
     if code is not None:
         error = {"code": code, "message": message or code, "retryable": retryable}
+        if error_details:
+            error["details"] = dict(error_details)
     return {
         "status": status,
         "duration_ms": int((time.monotonic() - started) * 1000),
         "error": error,
         **extra,
+    }
+
+
+def _sdk_execution_error_details(phase: str) -> dict[str, str]:
+    """Return the one safe phase fact for an otherwise opaque SDK exception.
+
+    The outer exception can include a Provider body, runtime route, or local
+    filesystem detail.  The phase is framework-owned control flow, so it is
+    enough to distinguish a failed continuation restore from a failure after a
+    model turn began without retaining exception prose.
+    """
+
+    return {
+        "worker_phase": phase if phase in _SDK_EXECUTION_PHASES else "unknown",
     }
 
 
@@ -481,9 +744,7 @@ def _redactor_for_payload(payload: object) -> Redactor:
                 for value in raw_names
                 if isinstance(value, str) and _ENVIRONMENT_NAME.fullmatch(value)
             )
-    return Redactor.from_values(
-        value for name in names if (value := os.environ.get(name))
-    )
+    return Redactor.from_values(value for name in names if (value := os.environ.get(name)))
 
 
 async def _run(payload: dict[str, Any]) -> None:
@@ -533,9 +794,7 @@ async def _run(payload: dict[str, Any]) -> None:
             )
         )
         return
-    base_url_environment = _require_string(
-        raw_base_url_environment, "openai_base_url_environment"
-    )
+    base_url_environment = _require_string(raw_base_url_environment, "openai_base_url_environment")
     if base_url_environment != _OPENAI_BASE_URL_ENVIRONMENT:
         raise ValueError("openai_base_url_environment must be OPENAI_BASE_URL")
     base_url = os.environ.get(base_url_environment)
@@ -689,6 +948,9 @@ async def _run(payload: dict[str, Any]) -> None:
     hooks_enabled = payload.get("hooks_enabled", False)
     if not isinstance(hooks_enabled, bool):
         raise ValueError("hooks_enabled must be a boolean")
+    diagnostic_capture_terminal_excerpt = payload.get("diagnostic_capture_terminal_excerpt", False)
+    if not isinstance(diagnostic_capture_terminal_excerpt, bool):
+        raise ValueError("diagnostic_capture_terminal_excerpt must be a boolean")
     deadline = started + timeout_seconds
     thread_id: str | None = None
     turn_id: str | None = None
@@ -696,6 +958,7 @@ async def _run(payload: dict[str, Any]) -> None:
     unknown_phase_text: str | None = None
     usage: dict[str, Any] | None = None
     completed_turn: dict[str, Any] | None = None
+    worker_phase = "sdk_session_open"
 
     try:
         app_server_environment = _app_server_environment(os.environ, runtime_path)
@@ -722,21 +985,24 @@ async def _run(payload: dict[str, Any]) -> None:
             thread_config = _thread_config_for_api_key_provider(base_url)
             requested_thread_id = payload.get("thread_id")
             if requested_thread_id is None:
+                worker_phase = "thread_start"
                 thread = await codex.thread_start(
                     approval_mode=ApprovalMode.deny_all,
                     base_instructions=base_instructions,
                     config=thread_config,
                     cwd=str(workspace),
                     developer_instructions=developer_instructions,
-                    # The SDK's official ephemeral mode prevents Codex from
-                    # persisting session rollout material locally.  Any later
-                    # resume must use the explicit framework-owned thread id
-                    # and otherwise fails closed.
-                    ephemeral=True,
+                    # The parent binds this persisted Codex thread to a
+                    # mode-0700 SQLite home below /dev/shm for the lifetime of
+                    # its private framework session.  A new physical worker
+                    # can then resume the same thread without putting rollout
+                    # state into Artifacts, telemetry, or the Agent workspace.
+                    ephemeral=False,
                     model=model,
                     model_provider=model_provider,
                 )
             else:
+                worker_phase = "thread_resume"
                 thread = await codex.thread_resume(
                     _require_string(requested_thread_id, "thread_id"),
                     approval_mode=ApprovalMode.deny_all,
@@ -751,6 +1017,7 @@ async def _run(payload: dict[str, Any]) -> None:
             if requested_thread_id is not None and thread_id != requested_thread_id:
                 raise RuntimeError("Codex resumed a different thread id")
 
+            worker_phase = "turn_start"
             turn = await thread.turn(
                 _require_string(payload.get("prompt"), "prompt"),
                 approval_mode=ApprovalMode.deny_all,
@@ -777,6 +1044,7 @@ async def _run(payload: dict[str, Any]) -> None:
                 return
 
             try:
+                worker_phase = "turn_stream"
                 async with asyncio.timeout(remaining):
                     async for notification in turn.stream():
                         event_payload = _notification_payload(notification.payload)
@@ -873,6 +1141,7 @@ async def _run(payload: dict[str, Any]) -> None:
                 code="authentication_failed" if authentication_error else "sdk_execution_failed",
                 message=message or type(exc).__name__,
                 retryable=not authentication_error,
+                error_details=_sdk_execution_error_details(worker_phase),
                 thread_id=thread_id,
                 turn_id=turn_id,
                 usage=usage,
@@ -901,10 +1170,14 @@ async def _run(payload: dict[str, Any]) -> None:
     turn_status = completed_turn.get("status")
     if turn_status != "completed":
         error = completed_turn.get("error")
-        terminal_code = (
-            _terminal_turn_failure_code(error)
+        terminal_code, terminal_details = (
+            _terminal_turn_failure(
+                error,
+                diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+                redactor=redactor,
+            )
             if turn_status == "failed"
-            else f"turn_{turn_status or 'unknown'}"
+            else (f"turn_{turn_status or 'unknown'}", {})
         )
         emitter.result(
             _status_result(
@@ -912,11 +1185,12 @@ async def _run(payload: dict[str, Any]) -> None:
                 started=started,
                 code=terminal_code,
                 # A provider's terminal ``message`` and ``additionalDetails``
-                # are opaque response text.  Persist only the fixed code so
-                # endpoint, credential, request, and provider transcript
-                # fragments can never cross the worker boundary.
+                # are opaque response text. Persist only the fixed code and
+                # closed details; the explicitly opted-in Doctor probe may
+                # additionally receive its separately redacted local excerpt.
                 message=terminal_code,
                 retryable=turn_status == "failed",
+                error_details=terminal_details,
                 thread_id=thread_id,
                 turn_id=turn_id,
                 final_text=final_text,

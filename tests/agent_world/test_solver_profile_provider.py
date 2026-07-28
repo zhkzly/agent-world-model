@@ -7,15 +7,24 @@ import pytest
 
 from agent_world.agent_profiles import IsolatedAgentProfileProvider
 from agent_world.config import AgentBackendConfig
-from agent_world.invocation import SandboxMode, verify_resolved_profile
+from agent_world.contracts import PermissionScope
+from agent_world.invocation import (
+    NodeCapabilityRequirement,
+    SandboxMode,
+    verify_resolved_profile,
+)
 from agent_world.judge.reachability import InteractiveSolveDecision, SolverProfileProvider
 
 
-def _provider() -> IsolatedAgentProfileProvider:
+def _provider(
+    *,
+    structured_output_transport: str = "provider_schema",
+) -> IsolatedAgentProfileProvider:
     return IsolatedAgentProfileProvider(
         AgentBackendConfig(
             model="configured-real-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+            structured_output_transport=structured_output_transport,  # type: ignore[arg-type]
         ),
         source_environment={
             "PATH": "/usr/bin:/bin",
@@ -50,9 +59,7 @@ def test_solver_profile_is_fresh_source_blind_and_capability_empty(tmp_path: Pat
     )
     ambient_codex = framework_workspace / ".codex"
     ambient_codex.mkdir()
-    (ambient_codex / "config.toml").write_text(
-        'web_search = "live"\n', encoding="utf-8"
-    )
+    (ambient_codex / "config.toml").write_text('web_search = "live"\n', encoding="utf-8")
 
     provider = _provider()
     _requires_solver_provider(provider)
@@ -202,6 +209,32 @@ def test_solver_profile_defensively_copies_output_schema(tmp_path: Path) -> None
 
     assert profile.output_schema == _solver_schema()
     verify_resolved_profile(profile)
+
+
+def test_solver_keeps_codex_transport_when_direct_json_object_is_configured(tmp_path: Path) -> None:
+    provider = _provider(structured_output_transport="json_object")
+
+    direct = provider.resolve(
+        role="challenger",
+        lineage_id="direct-json-object",
+        workspace=tmp_path / "direct",
+        output_schema=_solver_schema(),
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.structured_output(
+            node_id="challenger.direct-json-object",
+            role="challenger",
+        ),
+        rollout_token_limit=2_048,
+    )
+    solver = provider.resolve_solver(
+        lineage_id="solver-json-object",
+        workspace=tmp_path / "solver",
+        output_schema=_solver_schema(),
+        rollout_token_limit=2_048,
+    )
+
+    assert direct.structured_output_transport == "json_object"
+    assert solver.structured_output_transport == "provider_schema"
 
 
 def test_single_token_solver_budget_has_no_invalid_reminder_threshold(

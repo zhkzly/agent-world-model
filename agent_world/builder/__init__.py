@@ -1,6 +1,6 @@
 """Environment Builder: frozen design to real, untrusted candidate project."""
 
-from .leaf import BuilderLeaf
+from .leaf import BuilderLeaf, BuildPlanningLeaf
 from .models import (
     BuilderWorkspaceProgress,
     BuildRecord,
@@ -10,6 +10,8 @@ from .models import (
     CandidateRuntimeDeclaration,
     CandidateTaskMaterializerDeclaration,
     ImplementationContract,
+    ImplementationPlan,
+    ImplementationPlanDraft,
     RepairDisclosure,
     normalize_candidate_completion_output,
 )
@@ -32,6 +34,7 @@ __all__ = [
     "AgentProfileProvider",
     "BuildBundle",
     "BuildInvocationSummary",
+    "BuildPlanningLeaf",
     "BuildRecord",
     "BuilderWorkspaceProgress",
     "BuilderError",
@@ -46,6 +49,8 @@ __all__ = [
     "CandidateWorkspaceValidator",
     "EnvironmentBuilder",
     "ImplementationContract",
+    "ImplementationPlan",
+    "ImplementationPlanDraft",
     "RepairDisclosure",
     "ValidatedCandidateFile",
     "ValidatedCandidateWorkspace",

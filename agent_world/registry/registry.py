@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
-from agent_world.artifact_store import ArtifactStore
+from agent_world.artifact_store import ArtifactReadView, ArtifactStore
 from agent_world.contracts import (
     FRAMEWORK_PACKAGE_LAYOUT,
     ArtifactRef,
@@ -1047,25 +1047,41 @@ class EnvironmentRegistry:
             raise ReleaseRejectedError(
                 f"JudgeReport artifact_type must be {JUDGE_REPORT_ARTIFACT_TYPE}"
             )
-        self._assert_produced_by(manifest_ref, self._framework_producers, "framework")
-        self._assert_produced_by(judge_report_ref, self._judge_producers, "Judge")
-        manifest = self._artifact_store.get_json(manifest_ref, EnvironmentPackageManifest)
-        report = self._artifact_store.get_json(judge_report_ref, JudgeReport)
+        read_view = self._artifact_store.open_read_view()
+        self._assert_produced_by(
+            manifest_ref,
+            self._framework_producers,
+            "framework",
+            read_view=read_view,
+        )
+        self._assert_produced_by(
+            judge_report_ref,
+            self._judge_producers,
+            "Judge",
+            read_view=read_view,
+        )
+        manifest = read_view.get_json(manifest_ref, EnvironmentPackageManifest)
+        report = read_view.get_json(judge_report_ref, JudgeReport)
         dossier_ref = manifest.release_dossier_ref
         if dossier_ref.artifact_type != RELEASE_DOSSIER_ARTIFACT_TYPE:
             raise ReleaseRejectedError("manifest ReleaseDossier has the wrong artifact type")
-        self._assert_produced_by(dossier_ref, self._framework_producers, "framework")
-        dossier = self._artifact_store.get_json(dossier_ref, ReleaseDossier)
-        integration = self._artifact_store.get_json(
+        self._assert_produced_by(
+            dossier_ref,
+            self._framework_producers,
+            "framework",
+            read_view=read_view,
+        )
+        dossier = read_view.get_json(dossier_ref, ReleaseDossier)
+        integration = read_view.get_json(
             manifest.integration_report_ref,
             IntegrationReport,
         )
-        telemetry = self._artifact_store.get_json(
+        telemetry = read_view.get_json(
             manifest.telemetry_summary_ref,
             TelemetryReleaseSummary,
         )
-        epoch = self._artifact_store.get_json(dossier.final_epoch_ref, WorkGraphEpoch)
-        graph_manifest = self._artifact_store.get_json(
+        epoch = read_view.get_json(dossier.final_epoch_ref, WorkGraphEpoch)
+        graph_manifest = read_view.get_json(
             dossier.final_manifest_ref,
             WorkGraphManifest,
         )
@@ -1101,17 +1117,17 @@ class EnvironmentRegistry:
         # They must never be collapsed to one reference.  What publication
         # needs is proof that the exact JudgeReport consumed the IR named by the
         # dossier; the manifest separately binds its public self-check.
-        if dossier.verifier_ref not in self._artifact_store.dependencies(judge_report_ref):
+        if dossier.verifier_ref not in read_view.dependencies(judge_report_ref):
             raise ReleaseRejectedError("JudgeReport does not bind the ReleaseDossier Verifier IR")
         if not dossier.prepackage_commit_refs:
             raise ReleaseRejectedError("ReleaseDossier has no pre-package WorkCommit closure")
         for commit_ref in dossier.prepackage_commit_refs:
-            commit = self._artifact_store.get_json(commit_ref, WorkCommit)
+            commit = read_view.get_json(commit_ref, WorkCommit)
             if commit.diagnostic_only or not commit.releasable:
                 raise ReleaseRejectedError(
                     "diagnostic WorkCommit cannot establish release evidence"
                 )
-        dossier_dependencies = set(self._artifact_store.dependencies(dossier_ref))
+        dossier_dependencies = set(read_view.dependencies(dossier_ref))
         required_dossier_dependencies = {
             dossier.context_ref,
             dossier.final_epoch_ref,
@@ -1133,6 +1149,7 @@ class EnvironmentRegistry:
             graph_manifest=graph_manifest,
             dossier=dossier,
             manifest_ref=manifest_ref,
+            read_view=read_view,
         )
         if (
             report.candidate_ref != manifest.candidate_ref
@@ -1164,7 +1181,7 @@ class EnvironmentRegistry:
         ):
             raise ReleaseRejectedError("required hard gate did not pass")
         self._validate_reachability_release_evidence(report, gates)
-        manifest_dependencies = set(self._artifact_store.dependencies(manifest_ref))
+        manifest_dependencies = set(read_view.dependencies(manifest_ref))
         required_manifest_dependencies = {
             manifest.design_ref,
             manifest.world_spec_ref,
@@ -1182,9 +1199,9 @@ class EnvironmentRegistry:
         }
         if not required_manifest_dependencies <= manifest_dependencies:
             raise ReleaseRejectedError("package manifest dependency closure is incomplete")
-        if reservation_owner_ref not in self._artifact_store.dependencies(dossier.context_ref):
+        if reservation_owner_ref not in read_view.dependencies(dossier.context_ref):
             # The context itself binds its Job; accept an exact Job root only.
-            context = self._artifact_store.get_json(dossier.context_ref, GenerationContext)
+            context = read_view.get_json(dossier.context_ref, GenerationContext)
             if context.job_ref != reservation_owner_ref:
                 raise ReleaseRejectedError(
                     "ReleaseDossier context does not bind the reservation owner"
@@ -1197,6 +1214,7 @@ class EnvironmentRegistry:
         graph_manifest: WorkGraphManifest,
         dossier: ReleaseDossier,
         manifest_ref: ArtifactRef,
+        read_view: ArtifactReadView,
     ) -> None:
         """Prove dossier evidence is live Scheduler authority, not a hand-built DAG.
 
@@ -1231,8 +1249,13 @@ class EnvironmentRegistry:
         }
         commit_by_coordinate: dict[tuple[str, str], ArtifactRef] = {}
         for commit_ref in dossier.prepackage_commit_refs:
-            self._assert_produced_by(commit_ref, self._framework_producers, "framework")
-            commit = self._artifact_store.get_json(commit_ref, WorkCommit)
+            self._assert_produced_by(
+                commit_ref,
+                self._framework_producers,
+                "framework",
+                read_view=read_view,
+            )
+            commit = read_view.get_json(commit_ref, WorkCommit)
             commit_key = (commit.coordinate.component, commit.coordinate.stage)
             if commit_key in commit_by_coordinate:
                 raise ReleaseRejectedError("ReleaseDossier repeats a WorkCommit coordinate")
@@ -1245,7 +1268,7 @@ class EnvironmentRegistry:
             if binding is None:
                 raise ReleaseRejectedError("final WorkGraph omits a required release coordinate")
             commit_ref = commit_by_coordinate[key]
-            commit = self._artifact_store.get_json(commit_ref, WorkCommit)
+            commit = read_view.get_json(commit_ref, WorkCommit)
             if (
                 commit.coordinate != binding.coordinate
                 or commit.work_id != binding.work_id
@@ -1257,7 +1280,12 @@ class EnvironmentRegistry:
                 raise ReleaseRejectedError(
                     "ReleaseDossier WorkCommit does not prove its frozen final-graph output"
                 )
-            self._require_active_head_commit(binding, commit, commit_ref)
+            self._require_active_head_commit(
+                binding,
+                commit,
+                commit_ref,
+                read_view=read_view,
+            )
 
         package_binding = bindings.get(("release", "package"))
         if package_binding is None:
@@ -1269,7 +1297,7 @@ class EnvironmentRegistry:
             or package_head.commit_ref is None
         ):
             raise ReleaseRejectedError("Package has not committed before Registry publication")
-        package_commit = self._artifact_store.get_json(package_head.commit_ref, WorkCommit)
+        package_commit = read_view.get_json(package_head.commit_ref, WorkCommit)
         if (
             package_commit.coordinate != package_binding.coordinate
             or package_commit.work_id != package_binding.work_id
@@ -1283,6 +1311,7 @@ class EnvironmentRegistry:
             package_binding,
             package_commit,
             package_head.commit_ref,
+            read_view=read_view,
         )
 
     def _require_active_head_commit(
@@ -1290,6 +1319,8 @@ class EnvironmentRegistry:
         binding: WorkGraphNodeBinding,
         commit: WorkCommit,
         commit_ref: ArtifactRef,
+        *,
+        read_view: ArtifactReadView,
     ) -> None:
         """Check one frozen binding against the Scheduler's current durable head."""
 
@@ -1303,7 +1334,7 @@ class EnvironmentRegistry:
             or head.evaluation_ref != commit.feedback_evaluation_ref
         ):
             raise ReleaseRejectedError("ReleaseDossier WorkCommit is not active in WorkControl")
-        attempt = self._artifact_store.get_json(head.attempt_ref, WorkAttempt)
+        attempt = read_view.get_json(head.attempt_ref, WorkAttempt)
         if (
             attempt.attempt_id != commit.attempt_id
             or attempt.work_id != binding.work_id
@@ -1859,8 +1890,11 @@ class EnvironmentRegistry:
         ref: ArtifactRef,
         allowed_producers: frozenset[str],
         authority: str,
+        *,
+        read_view: ArtifactReadView | None = None,
     ) -> None:
-        revision = self._artifact_store.get_revision(ref)
+        reader = self._artifact_store if read_view is None else read_view
+        revision = reader.get_revision(ref)
         if revision.producer not in allowed_producers:
             raise ReleaseRejectedError(
                 f"artifact lacks signed {authority} producer provenance: {ref.artifact_id}"

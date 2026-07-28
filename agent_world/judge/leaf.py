@@ -31,6 +31,13 @@ from agent_world.control.leaf_executor import (
 from agent_world.control.work import ValidationIssue, WorkAttempt, WorkDefinition
 from agent_world.control.work_scheduler import WorkExecutionContext
 from agent_world.invocation import InvocationResult, ResolvedAgentProfile
+from agent_world.invocation.structured_diagnostics import (
+    safe_terminal_code,
+    safe_terminal_condition,
+    safe_terminal_expected_category,
+    safe_terminal_remediation,
+    terminal_failure_retryable,
+)
 
 from .compiler import VerifierCompilationError, VerifierCompiler
 from .models import VerifierBatchDraft, VerifierBatchPlan, VerifierIntent
@@ -132,16 +139,20 @@ class VerifierBatchLeaf:
             usage, unknown = self._usage(result.invocation, budget=self._budget(definition))
             if not result.invocation.succeeded:
                 backend_code = (
-                    result.invocation.error.code
+                    safe_terminal_code(result.invocation.error)
+                    or result.invocation.error.code
                     if result.invocation.error is not None
                     else result.invocation.status.value
                 )
                 raise LeafExecutionFailure(
                     code=self._safe_code(f"verifier_backend_{backend_code}"),
-                    category="VerifierBackendTerminal",
+                    category=safe_terminal_condition(result.invocation.error),
                     observed_actual=usage,
                     unknown_upper_bound=unknown,
                     agent=provenance,
+                    retryable=terminal_failure_retryable(result.invocation.error),
+                    expected_category=safe_terminal_expected_category(result.invocation.error),
+                    remediation=safe_terminal_remediation(result.invocation.error),
                 )
             if result.validation_diagnostic is not None:
                 raise LeafValidationFailure(
@@ -278,8 +289,7 @@ class VerifierBatchLeaf:
     @staticmethod
     def _safe_code(value: str) -> str:
         safe = "".join(
-            character if character.isalnum() or character in "._:-" else "_"
-            for character in value
+            character if character.isalnum() or character in "._:-" else "_" for character in value
         ).strip("._:-")
         return (safe or "verifier_failed")[:120]
 
@@ -345,9 +355,7 @@ class VerifierAggregateLeaf:
                     solve_recipes=merged.solve_recipes,
                 )
                 verifier_ref = self.compiler.artifacts.put_json(
-                    artifact_id=(
-                        f"{definition.coordinate.scope_id}:verifier-ir-projection"
-                    ),
+                    artifact_id=(f"{definition.coordinate.scope_id}:verifier-ir-projection"),
                     artifact_type="judge.verifier_ir_projection",
                     value=verifier.persistence_projection(),
                     dependencies=(

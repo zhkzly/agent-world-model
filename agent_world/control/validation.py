@@ -8,7 +8,9 @@ before asking the global RepairLedger for another real Agent turn.
 
 from __future__ import annotations
 
+import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
@@ -32,7 +34,10 @@ ValidationOwner = Literal[
 
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 _SAFE_LOCATION_PART = re.compile(r"[^A-Za-z0-9_-]")
+_PYDANTIC_INPUT_MISSING = object()
+_SAFE_LENGTH_LIMIT = 1_000_000
 _SAFE_PYDANTIC_MESSAGES = {
+    "missing": "Include the named required field; it cannot be omitted from the structured output.",
     # Designer semantic contracts (agent_world/designer/models.py).  Each entry
     # keeps a typed validator's identity repairable: the stable code alone would
     # already be non-generic, but an Agent also needs the safe instruction and
@@ -176,7 +181,7 @@ _GENERIC_NON_ACTIONABLE_CODES = frozenset(
     }
 )
 _SAFE_EXPECTED_CATEGORIES = {
-    "missing": "a required field matching the closed output schema",
+    "missing": "the named required field with a value satisfying its closed output schema",
     "string_type": "a string value",
     "int_type": "an integer value",
     "float_type": "a numeric value",
@@ -510,6 +515,7 @@ _SAFE_EXPECTED_CATEGORIES.update(
     {code: expected for code, (_condition, expected) in _DESIGNER_SEMANTIC_CONTRACTS.items()}
 )
 _SAFE_VIOLATED_CONDITIONS = {
+    "missing": "the named field is required by the closed output schema",
     **{code: condition for code, (condition, _expected) in _DESIGNER_SEMANTIC_CONTRACTS.items()},
     "compact_field_string_constraints": (
         "string_format and enum_values are valid only for string fields"
@@ -695,10 +701,17 @@ def pydantic_validation_diagnostic(
     validation_phase: str,
     frontier_ordinal: int,
 ) -> ValidationDiagnostic:
-    """Translate Pydantic errors without copying rejected inputs or messages."""
+    """Translate Pydantic errors without copying rejected inputs or messages.
+
+    Pydantic can provide the rejected input and error context.  Neither may be
+    persisted verbatim: an Agent response can contain secrets or untrusted
+    prose.  We use them only transiently to derive a small safe structural
+    fact (JSON kind or bounded length), which lets a correction distinguish an
+    empty array from a wrong scalar without exposing its contents.
+    """
 
     issues: list[SafeValidationIssue] = []
-    for item in exc.errors(include_url=False, include_context=False, include_input=False)[:64]:
+    for item in exc.errors(include_url=False, include_context=True, include_input=True)[:64]:
         raw_error_type = str(item.get("type", "invalid"))
         error_type = re.sub(r"[^A-Za-z0-9._:-]", "-", raw_error_type)
         location = tuple(
@@ -726,19 +739,27 @@ def pydantic_validation_diagnostic(
             raw_error_type,
             "a value satisfying the named closed-schema constraint",
         )
+        shape_details = _safe_pydantic_numeric_bound_details(raw_error_type, item)
+        if shape_details is None:
+            shape_details = _safe_pydantic_shape_details(raw_error_type, item)
+        if shape_details is None:
+            message = _SAFE_PYDANTIC_MESSAGES.get(
+                raw_error_type,
+                "Value does not satisfy the closed structured-output schema at this field.",
+            )
+            violated_condition = _SAFE_VIOLATED_CONDITIONS.get(
+                raw_error_type,
+                f"closed schema constraint {raw_error_type}",
+            )
+        else:
+            message, violated_condition, expected = shape_details
         issue_code = error_type if raw_error_type.startswith("rule_") else f"schema_{error_type}"
         issues.append(
             SafeValidationIssue(
                 code=issue_code[:160],
                 location=location,
-                message=_SAFE_PYDANTIC_MESSAGES.get(
-                    raw_error_type,
-                    "Value does not satisfy the closed structured-output schema at this field.",
-                ),
-                violated_condition=_SAFE_VIOLATED_CONDITIONS.get(
-                    raw_error_type,
-                    f"closed schema constraint {raw_error_type}",
-                ),
+                message=message,
+                violated_condition=violated_condition,
                 expected_category=expected,
             )
         )
@@ -762,6 +783,174 @@ def pydantic_validation_diagnostic(
         frontier_ordinal=frontier_ordinal,
         issues=tuple(issues),
     )
+
+
+def _safe_pydantic_shape_details(
+    raw_error_type: str,
+    item: Mapping[str, object],
+) -> tuple[str, str, str] | None:
+    """Return content-free shape feedback for common Pydantic wire failures."""
+
+    rejected_input = item.get("input", _PYDANTIC_INPUT_MISSING)
+    input_kind = _safe_json_kind(rejected_input)
+    if raw_error_type in {
+        "string_type",
+        "int_type",
+        "float_type",
+        "bool_type",
+        "list_type",
+        "tuple_type",
+        "dict_type",
+    } and input_kind is not None:
+        expected = _SAFE_EXPECTED_CATEGORIES[raw_error_type]
+        return (
+            f"Return {expected}; the rejected value has safe JSON type `{input_kind}`.",
+            f"closed schema constraint {raw_error_type}; received JSON type `{input_kind}`",
+            expected,
+        )
+
+    minimum = _safe_pydantic_context_length(item, "min_length")
+    maximum = _safe_pydantic_context_length(item, "max_length")
+    raw_length = _safe_input_length(rejected_input)
+    validated_length = _safe_pydantic_context_length(item, "actual_length")
+    unit = _safe_length_unit(input_kind)
+    if raw_error_type.endswith("too_short") and minimum is not None:
+        expected = f"at least {minimum} {unit}"
+        if (
+            input_kind is not None
+            and raw_length is not None
+            and validated_length is not None
+            and raw_length != validated_length
+        ):
+            return (
+                f"Return {expected}; the response has {raw_length} {unit}, but only "
+                f"{validated_length} passed nested item validation. Fix the item errors at "
+                "their reported paths.",
+                f"closed schema minimum length {minimum}; response length {raw_length}, "
+                f"validated length {validated_length}",
+                expected,
+            )
+        actual_length = validated_length if validated_length is not None else raw_length
+        actual = (
+            f"; the rejected {input_kind} has {actual_length} {unit}"
+            if input_kind is not None and actual_length is not None
+            else ""
+        )
+        condition = (
+            f"closed schema minimum length {minimum}"
+            + (f"; received length {actual_length}" if actual_length is not None else "")
+        )
+        return (f"Return {expected}{actual}.", condition, expected)
+    if raw_error_type.endswith("too_long") and maximum is not None:
+        expected = f"at most {maximum} {unit}"
+        actual_length = validated_length if validated_length is not None else raw_length
+        actual = (
+            f"; the rejected {input_kind} has {actual_length} {unit}"
+            if input_kind is not None and actual_length is not None
+            else ""
+        )
+        condition = (
+            f"closed schema maximum length {maximum}"
+            + (
+                f"; received length {actual_length}"
+                if actual_length is not None
+                else ""
+            )
+        )
+        return (f"Return {expected}{actual}.", condition, expected)
+    return None
+
+
+def _safe_pydantic_numeric_bound_details(
+    raw_error_type: str,
+    item: Mapping[str, object],
+) -> tuple[str, str, str] | None:
+    """Expose one schema-authored numeric bound without retaining model input.
+
+    A generic ``greater_than_equal`` label is technically field-addressable but
+    leaves an Agent unable to select a compliant value.  Pydantic supplies the
+    authoritative bound in its structured context, which is framework schema
+    metadata rather than rejected model content.  Keep the projection bounded
+    and finite so an arbitrary validator context cannot become a feedback
+    side-channel.
+    """
+
+    details = {
+        "greater_than_equal": ("ge", "greater than or equal to", "lower", "inclusive"),
+        "greater_than": ("gt", "greater than", "lower", "exclusive"),
+        "less_than_equal": ("le", "less than or equal to", "upper", "inclusive"),
+        "less_than": ("lt", "less than", "upper", "exclusive"),
+    }.get(raw_error_type)
+    if details is None:
+        return None
+    context_key, relation, direction, inclusion = details
+    context = item.get("ctx")
+    if not isinstance(context, Mapping):
+        return None
+    bound = context.get(context_key)
+    if (
+        isinstance(bound, bool)
+        or not isinstance(bound, (int, float))
+        or not math.isfinite(float(bound))
+        or abs(float(bound)) > _SAFE_LENGTH_LIMIT
+    ):
+        return None
+    rendered = format(bound, "g")
+    expected = f"a numeric value {relation} {rendered}"
+    return (
+        f"Return {expected}.",
+        f"closed schema {direction} bound {rendered} ({inclusion})",
+        expected,
+    )
+
+
+def _safe_json_kind(value: object) -> str | None:
+    """Classify one rejected value without retaining it or traversing it."""
+
+    if value is _PYDANTIC_INPUT_MISSING:
+        return None
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, (list, tuple)):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "non_json"
+
+
+def _safe_input_length(value: object) -> int | None:
+    """Expose only a bounded collection/string length from rejected input."""
+
+    if not isinstance(value, (str, list, tuple, dict)):
+        return None
+    length = len(value)
+    return length if 0 <= length <= _SAFE_LENGTH_LIMIT else None
+
+
+def _safe_pydantic_context_length(item: Mapping[str, object], key: str) -> int | None:
+    """Read a Pydantic numeric length bound without retaining arbitrary context."""
+
+    context = item.get("ctx")
+    if not isinstance(context, Mapping):
+        return None
+    value = context.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _SAFE_LENGTH_LIMIT:
+        return value
+    return None
+
+
+def _safe_length_unit(input_kind: str | None) -> str:
+    if input_kind == "string":
+        return "characters"
+    if input_kind == "object":
+        return "properties"
+    return "items"
 
 
 __all__ = [

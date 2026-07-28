@@ -9,13 +9,14 @@ frozen Tool Rule bindings, and deterministic compilers remain authoritative.
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 
-# V7 is the provider-compatible prompt form.  The separate descriptive schema
+# V8 is the provider-compatible prompt form.  The separate descriptive schema
 # below is retained for deterministic contract tests only: a real v2 probe
 # established that this gateway rejects JSON-Schema syntax even when it is
 # acyclic, so it must never be interpolated into the provider prompt.
-COMPACT_RULE_PROTOCOL_VERSION = "rule-output-protocol.v7"
+COMPACT_RULE_PROTOCOL_VERSION = "rule-output-protocol.v8"
 
 
 _TOOL_RULE_DRAFT = """\
@@ -55,6 +56,28 @@ with one lookup alias and a literal key. Never emit key_binding_id.
 Never emit reference, lookup_by_key, bound_lookup_by_key, source,
 pointer, collection_pointer, key_field, value_pointer, raw value_type for a
 binding, or free-form expression text.
+"""
+
+
+_TOOL_SEMANTICS_REPRESENTATION_AUDIT = """\
+Pre-serialization representation audit (run it independently for every TOOL):
+1. Copy the enclosing TOOL tool_id exactly into conditions.tool_id,
+   state_transition.tool_id, errors.tool_id, access_observation.tool_id, and
+   reliability.tool_id. No nested tool_id is implied by its parent or may be omitted.
+2. These are each one non-empty JSON string, never an array or object:
+   every RULE.description, ERROR.observation, permission.denied_observation,
+   idempotency.duplicate_observation, transaction.commit_point,
+   rollback.guarantees, concurrency.conflict_detection, and
+   concurrency.ordering_guarantee.
+3. In reliability, preserve primitive kinds: retry.maximum_attempts is an integer >= 1;
+   retry.retryable_error_codes, rollback.rollback_trigger_codes, and
+   rollback.compensation_tools are arrays; retry.requires_same_idempotency_key,
+   transaction.partial_commit_observable, and rollback.supported are booleans;
+   timeout.operation_timeout_seconds is a positive number; and
+   concurrency.conflict_error_code is either null or one identifier string.
+4. Do the same final kind check for optional numbers: idempotency_key.retention_seconds is
+   null or a positive number, and observation.staleness_bound_seconds is null or a
+   non-negative number. Do not turn a scalar, boolean, or null into explanatory prose.
 """
 
 
@@ -107,6 +130,8 @@ concurrency is {{"isolation", "conflict_detection", "conflict_error_code",
 serial|serializable|snapshot|read_committed|optimistic|last_write_wins.
 
 {_TOOL_RULE_DRAFT}
+
+{_TOOL_SEMANTICS_REPRESENTATION_AUDIT}
 """
 
 
@@ -544,26 +569,63 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
 
 
 def tool_semantics_batch_protocol_schema() -> dict[str, object]:
-    """Return an isolated descriptive schema for the compact v6 prompt form."""
+    """Return an isolated descriptive schema for the compact v8 prompt form."""
 
     return deepcopy(_TOOL_SEMANTICS_BATCH_SHAPE)
 
 
-def tool_semantics_batch_protocol() -> str:
-    """Return the compact v6 form for one frozen ToolSemantics batch.
+def tool_semantics_representation_audit() -> str:
+    """Return the shared final JSON-kind checklist for a ToolSemantics batch."""
+
+    return _TOOL_SEMANTICS_REPRESENTATION_AUDIT
+
+
+def tool_semantics_batch_protocol(
+    *,
+    target_tool_ids: tuple[str, ...] | None = None,
+) -> str:
+    """Return the compact v8 form for one frozen ToolSemantics batch.
 
     The reusable Rule section is intentionally separated above so WorldRules
     and Curriculum can adopt a future context-appropriate protocol without
     reintroducing recursive Pydantic schema text or changing their source ABI.
     The acyclic descriptive schema remains a test-only characterization rather
     than provider prompt text because the configured gateway rejects it.
+
+    A live physical batch may additionally bind its exact one- or two-tool
+    target near the end of the provider-visible protocol.  The generic compact
+    form deliberately cannot name that data, but leaving it only in the much
+    earlier frozen-context JSON caused models to substitute a plausible whole
+    inventory.  This is a Prompt projection, not a new semantic contract:
+    the compiler still owns identity/order acceptance.
     """
 
-    return _TOOL_SEMANTICS_BATCH
+    if target_tool_ids is None:
+        return _TOOL_SEMANTICS_BATCH
+    if (
+        not 1 <= len(target_tool_ids) <= 2
+        or len(set(target_tool_ids)) != len(target_tool_ids)
+        or any(not tool_id or tool_id != tool_id.strip() for tool_id in target_tool_ids)
+    ):
+        raise ValueError("ToolSemantics protocol requires one exact unique target-tool batch")
+    rendered_ids = json.dumps(target_tool_ids, ensure_ascii=False, separators=(",", ":"))
+    return f"""{_TOOL_SEMANTICS_BATCH}
+
+Invocation-specific final completion gate:
+Exact target tools: {rendered_ids}.
+Return exactly {len(target_tool_ids)} tools in this order; do not add, omit, rename, or reorder.
+Before serializing, verify every TOOL has all five required roots: conditions, state_transition,
+errors, access_observation, and reliability, then run the representation audit above for every
+target. In particular, reliability.tool_id is required and rollback.guarantees is one non-empty
+JSON string, never an array or object. In reliability.retry, maximum_attempts is an integer greater
+than or equal to 1. A tool with no retry after its initial call still uses maximum_attempts=1 and an
+empty retryable_error_codes list.
+"""
 
 
 __all__ = [
     "COMPACT_RULE_PROTOCOL_VERSION",
     "tool_semantics_batch_protocol",
     "tool_semantics_batch_protocol_schema",
+    "tool_semantics_representation_audit",
 ]

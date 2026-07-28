@@ -51,7 +51,18 @@ def _provider() -> IsolatedAgentProfileProvider:
 
 
 def test_resolved_profile_clamps_timeout_to_node_budget(tmp_path: Path) -> None:
-    profile = _provider().resolve(
+    provider = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="configured-real-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+            direct_stream_idle_timeout_seconds=321,
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-model-credential",
+        },
+    )
+    profile = provider.resolve(
         role="challenger",
         lineage_id="timeout-clamp",
         workspace=tmp_path / "challenger",
@@ -66,8 +77,55 @@ def test_resolved_profile_clamps_timeout_to_node_budget(tmp_path: Path) -> None:
     )
 
     assert profile.limits.timeout_seconds == 900
+    assert profile.limits.direct_stream_idle_timeout_seconds == 321
     assert profile.limits.max_events == 65_536
     assert profile.allowed_builtin_tools == ()
+
+
+def test_environment_engineer_timeout_uses_explicit_operation_budget(
+    tmp_path: Path,
+) -> None:
+    """Structured design must not inherit the unrelated Builder codegen cap."""
+
+    provider = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="configured-real-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+            invocation_timeout_seconds=2_700,
+            structured_invocation_timeout_seconds=900,
+            environment_codegen_invocation_timeout_seconds=120,
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-model-credential",
+        },
+    )
+    structured = provider.resolve(
+        role="environment-engineer",
+        lineage_id="task-curriculum-structured-timeout",
+        workspace=tmp_path / "task-curriculum",
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.structured_output(
+            node_id="environment-engineer.task-curriculum",
+            role="environment-engineer",
+        ),
+        invocation_timeout_seconds=900,
+    )
+    codegen = provider.resolve(
+        role="environment-engineer",
+        lineage_id="runtime-build-codegen-timeout",
+        workspace=tmp_path / "runtime-build",
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.isolated_build(
+            node_id="environment-engineer.runtime-build"
+        ),
+        invocation_timeout_seconds=120,
+    )
+
+    assert structured.limits.timeout_seconds == 900
+    assert codegen.limits.timeout_seconds == 120
 
 
 def test_structured_environment_engineer_event_budget_tracks_token_budget(
@@ -179,6 +237,40 @@ def test_engineer_profile_keeps_intrinsic_build_tools_but_gets_no_implicit_netwo
     assert 'web_search = "disabled"' in (profile.codex_home / "config.toml").read_text()
 
 
+def test_engineer_runtime_skills_are_selected_by_exact_build_node(tmp_path: Path) -> None:
+    """Planning stays read-only while CandidateBuild receives only codegen guidance."""
+
+    provider = _provider()
+    planning = provider.resolve(
+        role="environment-engineer",
+        lineage_id="implementation-plan-skill",
+        workspace=tmp_path / "planning",
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.structured_read(
+            node_id="environment-engineer.implementation-plan",
+            role="environment-engineer",
+        ),
+    )
+    codegen = provider.resolve(
+        role="environment-engineer",
+        lineage_id="candidate-build-skill",
+        workspace=tmp_path / "codegen",
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.isolated_build(
+            node_id="environment-engineer.runtime-build"
+        ),
+    )
+
+    assert planning.sandbox is SandboxMode.READ_ONLY
+    assert planning.allowed_builtin_tools == ("shell",)
+    assert tuple(bundle.name for bundle in planning.skills) == ("engineer-build-planning",)
+    assert codegen.sandbox is SandboxMode.WORKSPACE_WRITE
+    assert codegen.allowed_builtin_tools == ("shell", "workspace_edit")
+    assert tuple(bundle.name for bundle in codegen.skills) == ("engineer-environment-codegen",)
+
+
 def test_profile_provider_binds_typed_framework_lineage_to_stable_safe_identity(
     tmp_path: Path,
 ) -> None:
@@ -222,6 +314,8 @@ def test_tool_free_structured_profile_injects_role_skill_without_shell(
     assert profile.skills == ()
     assert profile.developer_instructions is not None
     assert "Research World Evidence" in profile.developer_instructions
+    assert "Citation catalog ownership" in profile.developer_instructions
+    assert "`evidence_catalog_indexes`" in profile.developer_instructions
     config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
     assert "shell_tool = false" in config_text
 
@@ -251,6 +345,10 @@ def test_tool_free_engineer_profile_requires_closed_evidence_claim_catalog(
     assert "Tool-semantics scalar observations" in profile.developer_instructions
     assert "errors.errors[*].observation" in profile.developer_instructions
     assert "one concrete user-visible sentence" in profile.developer_instructions
+    assert "Tool-semantics representation audit" in profile.developer_instructions
+    assert "`reliability.rollback.guarantees`" in profile.developer_instructions
+    assert "never a list or object" in profile.developer_instructions
+    assert "`reliability.tool_id`" in profile.developer_instructions
     assert "Tool-semantics Rule clause closure" in profile.developer_instructions
     assert "they **must omit** `ordering`" in profile.developer_instructions
     assert "Lookup keys use one flat, closed variant" in profile.developer_instructions
@@ -260,6 +358,54 @@ def test_tool_free_engineer_profile_requires_closed_evidence_claim_catalog(
     assert "WorldRules even if it appears in the output schema" in profile.developer_instructions
     assert "rule:state:<ordinal>" in profile.developer_instructions
     assert "rule:world:<ordinal>" in profile.developer_instructions
+    assert "CurriculumPlan semantic ownership" in profile.developer_instructions
+    assert "`difficulty_dimensions` is also a closed top-level catalog" in (
+        profile.developer_instructions
+    )
+    assert "`task_dimension_catalog`" in profile.developer_instructions
+    assert "do not add, remove, rename," in profile.developer_instructions
+    assert "or reorder any id" in profile.developer_instructions
+    assert "rule:sampling:<ordinal>" in profile.developer_instructions
+    assert "rule:task:<task_type>:<section>:<ordinal>" in profile.developer_instructions
+    assert "`terminal_conditions` (non-empty)" in profile.developer_instructions
+    assert "Every task has at least one success Rule and at least one terminal Rule" in (
+        profile.developer_instructions
+    )
+    assert "Evaluator Rules never read Runtime-reported `terminated` or `truncated`" in (
+        profile.developer_instructions
+    )
+
+
+def test_task_curriculum_agent_view_remains_tool_free_and_deny_by_default(
+    tmp_path: Path,
+) -> None:
+    """TaskCurriculum receives its frozen facts in the prompt, not broad workspace access."""
+
+    profile = _provider().resolve(
+        role="environment-engineer",
+        lineage_id="tool-free-task-curriculum-view",
+        workspace=tmp_path / "task-curriculum",
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(
+            network_domains=("pypi.org",),
+            tool_allowlist=("unused.external-tool",),
+        ),
+        requirement=NodeCapabilityRequirement.structured_output(
+            node_id="environment-engineer.task-curriculum",
+            role="environment-engineer",
+        ),
+    )
+
+    assert profile.allowed_builtin_tools == ()
+    assert profile.skills == ()
+    assert profile.effective_capability_plan.intrinsic_builtin_tools == ()
+    assert profile.effective_capability_plan.external == ExternalCapabilitySet()
+    assert profile.developer_instructions is not None
+    instructions = " ".join(profile.developer_instructions.split())
+    assert "TaskRequirement semantic ownership" in instructions
+    assert "`coverage_dimensions[*].rule_ids`" in instructions
+    assert "`coverage_rule_catalog`" in instructions
+    assert "Do not mint an ID or use a task/sampling Rule ID" in instructions
 
 
 def test_profile_identity_binds_even_unused_job_permission_scope(tmp_path: Path) -> None:

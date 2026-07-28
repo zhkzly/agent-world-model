@@ -87,11 +87,26 @@ type SceneStatus = Literal[
 type NextActionHint = Literal[
     "inspect_subprocess",
     "inspect_infrastructure",
+    "adjust_budget",
     "repair_candidate_code",
     "revise_proposal",
     "review_design_worldspec",
     "request_human_review",
     "wait_for_running_work",
+]
+type OperationPhase = Literal["proposal", "validation", "assurance"]
+type WorkspaceHeartbeatStatus = Literal[
+    "turn_started",
+    "changed",
+    "steady",
+    "turn_terminal",
+    "unavailable",
+]
+type InvocationLivenessPhase = Literal[
+    "direct_request_dispatched",
+    "direct_awaiting_response",
+    "direct_stream_opened",
+    "direct_awaiting_stream_event",
 ]
 
 
@@ -102,6 +117,7 @@ class TopIssue(V2Contract):
     path: Annotated[tuple[str | int, ...], Field(min_length=1, max_length=16)]
     violated_condition: Annotated[NonEmptyStr, Field(max_length=512)]
     expected_category: Annotated[NonEmptyStr, Field(max_length=512)]
+    remediation: Annotated[NonEmptyStr, Field(max_length=512)] | None = None
     severity: Literal["warning", "blocker"]
 
     @model_validator(mode="after")
@@ -111,6 +127,125 @@ class TopIssue(V2Contract):
                 raise ValueError("scene issue path strings must contain 1..160 characters")
             if isinstance(part, int) and part < 0:
                 raise ValueError("scene issue path indices cannot be negative")
+        return self
+
+
+class RuntimeAgentActivityCounts(V2Contract):
+    """Content-free counts of compact SDK item-type notifications.
+
+    Each count is a notification observation, not a claim that a command,
+    write, tool call, or message completed successfully.  ``None`` on the
+    enclosing liveness record means a historical trace predates this safe
+    classification, rather than that every activity count was zero.
+    """
+
+    reasoning_event_count: Annotated[int, Field(ge=0)] = 0
+    agent_message_event_count: Annotated[int, Field(ge=0)] = 0
+    command_event_count: Annotated[int, Field(ge=0)] = 0
+    file_change_event_count: Annotated[int, Field(ge=0)] = 0
+    tool_event_count: Annotated[int, Field(ge=0)] = 0
+    other_event_count: Annotated[int, Field(ge=0)] = 0
+    unclassified_event_count: Annotated[int, Field(ge=0)] = 0
+
+    @property
+    def total_event_count(self) -> int:
+        return sum(
+            (
+                self.reasoning_event_count,
+                self.agent_message_event_count,
+                self.command_event_count,
+                self.file_change_event_count,
+                self.tool_event_count,
+                self.other_event_count,
+                self.unclassified_event_count,
+            )
+        )
+
+
+class RuntimeAgentLiveness(V2Contract):
+    """Safe child-invocation timing bound to this exact Scheduler proposal.
+
+    Times are measured from the durable WorkAttempt start rather than from a
+    provider clock.  The projection deliberately contains no model output,
+    prompt, endpoint, transcript, tool arguments, or workspace path.
+    """
+
+    started_elapsed_ms: Annotated[int, Field(ge=0)]
+    first_progress_elapsed_ms: Annotated[int, Field(ge=0)] | None = None
+    last_progress_elapsed_ms: Annotated[int, Field(ge=0)] | None = None
+    last_local_heartbeat_elapsed_ms: Annotated[int, Field(ge=0)] | None = None
+    last_local_heartbeat_phase: InvocationLivenessPhase | None = None
+    terminal_elapsed_ms: Annotated[int, Field(ge=0)] | None = None
+    observed_event_count: Annotated[int, Field(ge=0)] = 0
+    activity: RuntimeAgentActivityCounts | None = None
+
+    @model_validator(mode="after")
+    def validate_order(self) -> RuntimeAgentLiveness:
+        for value in (
+            self.first_progress_elapsed_ms,
+            self.last_progress_elapsed_ms,
+            self.last_local_heartbeat_elapsed_ms,
+            self.terminal_elapsed_ms,
+        ):
+            if value is not None and value < self.started_elapsed_ms:
+                raise ValueError("Runtime Agent liveness cannot precede invocation start")
+        if (
+            self.first_progress_elapsed_ms is not None
+            and self.last_progress_elapsed_ms is not None
+            and self.last_progress_elapsed_ms < self.first_progress_elapsed_ms
+        ):
+            raise ValueError("Runtime Agent last progress cannot precede first progress")
+        if (
+            self.last_local_heartbeat_phase is not None
+            and self.last_local_heartbeat_elapsed_ms is None
+        ):
+            raise ValueError("Runtime Agent heartbeat phase requires a heartbeat time")
+        if (
+            self.activity is not None
+            and self.activity.total_event_count > self.observed_event_count
+        ):
+            raise ValueError("Runtime Agent activity cannot exceed all observed events")
+        return self
+
+
+class CandidateWorkspaceLiveness(V2Contract):
+    """Content-free Builder workspace heartbeat for this exact attempt."""
+
+    status: WorkspaceHeartbeatStatus
+    observed_elapsed_ms: Annotated[int, Field(ge=0)]
+    file_count: Annotated[int, Field(ge=0)]
+    total_bytes: Annotated[int, Field(ge=0)]
+    error_code: Annotated[NonEmptyStr, Field(max_length=160)] | None = None
+
+    @model_validator(mode="after")
+    def validate_heartbeat_shape(self) -> CandidateWorkspaceLiveness:
+        if self.status == "unavailable" and self.error_code is None:
+            raise ValueError("unavailable workspace heartbeat requires an error code")
+        if self.status != "unavailable" and self.error_code is not None:
+            raise ValueError("available workspace heartbeat cannot expose an error code")
+        return self
+
+
+class BudgetExhaustion(V2Contract):
+    """Safe admission facts for an attempt the Scheduler never dispatched.
+
+    This is a read-side projection of the framework-owned
+    ``control.budget_exhaustion_evidence`` artifact.  It deliberately carries
+    no provider, prompt, cost, or repair-policy details: a project-execution
+    Agent only needs to know which finite ledger dimension rejected admission
+    and whether a fresh operation actually began.
+    """
+
+    exhausted_dimensions: Annotated[
+        tuple[NonEmptyStr, ...], Field(min_length=1, max_length=16)
+    ]
+    during_authorized_repair: bool
+    operation_not_started: bool
+
+    @model_validator(mode="after")
+    def validate_dimensions(self) -> BudgetExhaustion:
+        if len(set(self.exhausted_dimensions)) != len(self.exhausted_dimensions):
+            raise ValueError("budget exhaustion dimensions must be unique")
         return self
 
 
@@ -195,6 +330,19 @@ class CoordinateScene(V2Contract):
     subprocess_pointer: Annotated[NonEmptyStr, Field(max_length=512)] | None = None
     input_fingerprint: ContentHash
     attempt_ref_id: Annotated[NonEmptyStr, Field(max_length=512)]
+    # Terminal timing is derived from durable WorkAttempt / OperationRun
+    # timestamps.  A still-running attempt additionally exposes one current
+    # wall-clock checkpoint, explicitly marked as an estimate, so an Agent does
+    # not mistake minutes of active waiting for missing telemetry.
+    attempt_elapsed_ms: Annotated[int, Field(ge=0)] | None = None
+    attempt_elapsed_estimated: bool = False
+    first_progress_elapsed_ms: Annotated[int, Field(ge=0)] | None = None
+    last_completed_phase: OperationPhase | None = None
+    terminal_failure_phase: OperationPhase | None = None
+    terminal_failure_elapsed_ms: Annotated[int, Field(ge=0)] | None = None
+    runtime_agent_liveness: RuntimeAgentLiveness | None = None
+    candidate_workspace_liveness: CandidateWorkspaceLiveness | None = None
+    budget_exhaustion: BudgetExhaustion | None = None
 
     @model_validator(mode="after")
     def validate_scene_bounds(self) -> CoordinateScene:
@@ -204,6 +352,12 @@ class CoordinateScene(V2Contract):
             raise ValueError("committed coordinate scenes cannot advertise a repair target")
         if self.repair_target == "generated_candidate_code" and self.candidate_file is None:
             raise ValueError("candidate-code repair target requires a concrete candidate file")
+        if self.budget_exhaustion is not None and self.failure_code != "budget_exhausted":
+            raise ValueError("budget exhaustion scene facts require budget_exhausted failure")
+        if self.attempt_elapsed_estimated and (
+            self.head_status != "running" or self.attempt_elapsed_ms is None
+        ):
+            raise ValueError("only a running scene may carry an elapsed-time estimate")
         return self
 
 
@@ -288,11 +442,12 @@ class SceneIssue:
     gate_id: str | None = None
     candidate_file: str | None = None
     multi_file_gate: bool = False
+    remediation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class SceneHead:
-    """Cold durable facts for one coordinate; no live scheduler snapshots enter here."""
+    """Durable coordinate facts plus an explicitly provisional running-time projection."""
 
     scope_id: str
     coordinate_key: str
@@ -323,6 +478,15 @@ class SceneHead:
     # proposal WITHOUT such a route is repairable where it was produced, so it
     # must not be presented as a frozen-design defect.
     routes_repair_to_parent: bool = False
+    attempt_elapsed_ms: int | None = None
+    attempt_elapsed_estimated: bool = False
+    first_progress_elapsed_ms: int | None = None
+    last_completed_phase: OperationPhase | None = None
+    terminal_failure_phase: OperationPhase | None = None
+    terminal_failure_elapsed_ms: int | None = None
+    runtime_agent_liveness: RuntimeAgentLiveness | None = None
+    candidate_workspace_liveness: CandidateWorkspaceLiveness | None = None
+    budget_exhaustion: BudgetExhaustion | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,6 +640,7 @@ def _coordinate_scene(head: SceneHead, *, subprocess_available: bool) -> Coordin
             path=item.path,
             violated_condition=item.violated_condition,
             expected_category=item.expected_category,
+            remediation=item.remediation,
             severity=item.severity,
         )
         for item in visible_issues
@@ -532,6 +697,15 @@ def _coordinate_scene(head: SceneHead, *, subprocess_available: bool) -> Coordin
         ),
         input_fingerprint=head.input_fingerprint,
         attempt_ref_id=head.attempt_ref_id,
+        attempt_elapsed_ms=head.attempt_elapsed_ms,
+        attempt_elapsed_estimated=head.attempt_elapsed_estimated,
+        first_progress_elapsed_ms=head.first_progress_elapsed_ms,
+        last_completed_phase=head.last_completed_phase,
+        terminal_failure_phase=head.terminal_failure_phase,
+        terminal_failure_elapsed_ms=head.terminal_failure_elapsed_ms,
+        runtime_agent_liveness=head.runtime_agent_liveness,
+        candidate_workspace_liveness=head.candidate_workspace_liveness,
+        budget_exhaustion=head.budget_exhaustion,
     )
 
 
@@ -661,6 +835,8 @@ def _next_action(scene: CoordinateScene) -> NextActionHint | None:
     reason = _stuck_reason(scene)
     if reason == "subprocess_crash":
         return "inspect_subprocess"
+    if scene.budget_exhaustion is not None:
+        return "adjust_budget"
     # A transport/infra terminal must be inspected as infrastructure even when
     # the attempt count would otherwise read as thrashing: the loop is caused by
     # mis-routing, not by an unrepairable design.  This precedes the thrashing
@@ -685,6 +861,8 @@ def _next_action(scene: CoordinateScene) -> NextActionHint | None:
 
 
 __all__ = [
+    "CandidateWorkspaceLiveness",
+    "BudgetExhaustion",
     "CoordinatePointer",
     "CoordinateScene",
     "CoordinateWatermark",
@@ -700,6 +878,8 @@ __all__ = [
     "ObservabilityIndex",
     "PipelineStage",
     "RunSceneIndex",
+    "RuntimeAgentActivityCounts",
+    "RuntimeAgentLiveness",
     "Scene",
     "SceneHead",
     "SceneIssue",

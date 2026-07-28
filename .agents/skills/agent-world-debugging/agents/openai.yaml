@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent World Debugging"
+  short_description: "Investigate real failures before repair or retry"
+  default_prompt: "Use $agent-world-debugging to investigate this real Agent World failure before changing it."

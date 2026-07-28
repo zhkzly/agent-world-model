@@ -9,6 +9,8 @@ import os
 import shutil
 import sys
 import tempfile
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
@@ -17,6 +19,7 @@ from pydantic import BaseModel, ConfigDict
 from agent_world.agent_profiles import IsolatedAgentProfileProvider
 from agent_world.config import FoundryConfig
 from agent_world.contracts import PermissionScope
+from agent_world.control import TelemetryStore
 from agent_world.invocation import (
     CodexSdkBackend,
     InvocationRequest,
@@ -24,6 +27,8 @@ from agent_world.invocation import (
     InvocationStatus,
     NodeCapabilityRequirement,
 )
+from agent_world.invocation.contracts import JsonObject
+from agent_world.invocation.structured_diagnostics import safe_terminal_details
 from agent_world.judge import (
     CandidateSandboxRunner,
     CleanCandidateBuilder,
@@ -47,6 +52,8 @@ _RUNTIME_PYTHON_PROBE = (
     "print(json.dumps({'major':sys.version_info.major,'minor':sys.version_info.minor},"
     "sort_keys=True,separators=(',',':')))"
 )
+_LIVE_AGENT_STATUS_FILENAME = "doctor-live-agent.json"
+_LIVE_AGENT_DEBUG_FILENAME = "doctor-live-agent-debug.json"
 
 
 class DoctorCheck(BaseModel):
@@ -235,12 +242,8 @@ async def run_doctor(
     live_agent_verified = live_agent_check.status == "pass"
     live_research_check = next(item for item in checks if item.check == "live_research")
     live_research_verified = live_research_check.status == "pass"
-    production_ready = (
-        configuration_ready and live_agent_verified and live_research_verified
-    )
-    requested_level: Literal[
-        "configured", "live-agent", "live-research", "production"
-    ]
+    production_ready = configuration_ready and live_agent_verified and live_research_verified
+    requested_level: Literal["configured", "live-agent", "live-research", "production"]
     if live_agent and live_research:
         requested_level = "production"
     elif live_agent:
@@ -250,8 +253,7 @@ async def run_doctor(
     else:
         requested_level = "configured"
     requested_checks_pass = configuration_ready and (
-        (not live_agent or live_agent_verified)
-        and (not live_research or live_research_verified)
+        (not live_agent or live_agent_verified) and (not live_research or live_research_verified)
     )
     return DoctorReport(
         requested_level=requested_level,
@@ -266,9 +268,35 @@ async def run_doctor(
 
 
 async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
-    """Spend one real backend turn without persisting prompt, response, or credentials."""
+    """Spend one observable real backend turn without persisting private content.
 
+    ``doctor --live-agent`` is a provider control, not a miniature node test.
+    It deliberately receives the largest configured real-Agent token envelope;
+    a small requested result must not silently create a smaller SDK budget.  A
+    compact current-status file and the ordinary telemetry trace make a long
+    control observable from a second process while it is still running.
+    """
+
+    trace_id = f"doctor-live-agent:{uuid.uuid4().hex}"
+    started_at = datetime.now(UTC).isoformat()
+    rollout_token_limit = _live_agent_probe_rollout_token_limit(config)
+    terminal_status: Literal["running", "passed", "failed", "interrupted"] = "running"
+    failure_code: str | None = None
+    terminal_details: JsonObject = {}
+    debug_feedback_path: Path | None = None
+    telemetry: TelemetryStore | None = None
     try:
+        _write_live_agent_status(
+            config,
+            trace_id=trace_id,
+            started_at=started_at,
+            status=terminal_status,
+            rollout_token_limit=rollout_token_limit,
+            failure_code=None,
+            terminal_details=terminal_details,
+            debug_feedback_path=None,
+        )
+        telemetry = TelemetryStore(config.state_root / "telemetry")
         with tempfile.TemporaryDirectory(
             prefix="doctor-live-agent-",
             dir=config.state_root,
@@ -289,12 +317,9 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                     node_id="researcher.doctor-live-agent",
                     role="researcher",
                 ),
-                # A real Codex turn carries several thousand non-cached input
-                # tokens before this tiny probe prompt is added.  The budget
-                # feature accounts both non-cached input and sampled output.
-                rollout_token_limit=16_384,
+                rollout_token_limit=rollout_token_limit,
             )
-            result = await CodexSdkBackend().invoke(
+            result = await CodexSdkBackend(telemetry=telemetry).invoke(
                 InvocationRequest(
                     invocation_id="doctor-live-agent-round-trip",
                     prompt=(
@@ -303,26 +328,174 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                         '{"status":"ok"}.'
                     ),
                     profile=profile,
+                    metadata={
+                        "trace_id": trace_id,
+                        "run_id": trace_id,
+                        "role": "researcher",
+                        "semantic_transaction": "doctor_live_agent_probe",
+                        "diagnostic_capture_terminal_excerpt": True,
+                    },
                 )
             )
         failure_code = _live_agent_failure_code(result)
         if failure_code is not None:
+            terminal_status = "failed"
+            terminal_details = safe_terminal_details(result.error)
+            excerpt = _live_agent_diagnostic_excerpt(result)
+            if excerpt is not None:
+                debug_feedback_path = _write_live_agent_debug_feedback(
+                    config,
+                    trace_id=trace_id,
+                    failure_code=failure_code,
+                    excerpt=excerpt,
+                )
             return DoctorCheck(
                 check="live_agent",
                 status="fail",
                 summary=f"real Codex SDK turn failed ({failure_code})",
             )
+        terminal_status = "passed"
         return DoctorCheck(
             check="live_agent",
             status="pass",
             summary="real Codex SDK structured-output turn completed",
         )
+    except asyncio.CancelledError:
+        terminal_status = "interrupted"
+        failure_code = "interrupted"
+        raise
     except Exception as exc:
+        terminal_status = "failed"
+        failure_code = "doctor_exception"
         return DoctorCheck(
             check="live_agent",
             status="fail",
             summary=f"real Codex SDK turn failed ({type(exc).__name__})",
         )
+    finally:
+        if telemetry is not None:
+            telemetry.close()
+        _write_live_agent_status(
+            config,
+            trace_id=trace_id,
+            started_at=started_at,
+            status=terminal_status,
+            rollout_token_limit=rollout_token_limit,
+            failure_code=failure_code,
+            terminal_details=terminal_details,
+            debug_feedback_path=debug_feedback_path,
+        )
+
+
+def _write_live_agent_status(
+    config: FoundryConfig,
+    *,
+    trace_id: str,
+    started_at: str,
+    status: Literal["running", "passed", "failed", "interrupted"],
+    rollout_token_limit: int,
+    failure_code: str | None,
+    terminal_details: JsonObject,
+    debug_feedback_path: Path | None,
+) -> None:
+    """Publish only durable, credential-free liveness facts for one Doctor turn."""
+
+    payload: dict[str, object] = {
+        "diagnostic_only": True,
+        "kind": "doctor_live_agent",
+        "rollout_token_limit": rollout_token_limit,
+        "started_at": started_at,
+        "status": status,
+        "telemetry_root": str(config.state_root / "telemetry"),
+        "trace_id": trace_id,
+        "updated_at": datetime.now(UTC).isoformat(),
+        "wall_timeout_seconds": config.agent.structured_invocation_timeout_seconds,
+    }
+    if failure_code is not None:
+        payload["failure_code"] = failure_code
+    if terminal_details:
+        payload["terminal_details"] = terminal_details
+    if debug_feedback_path is not None:
+        payload["debug_feedback_path"] = str(debug_feedback_path)
+    _write_live_agent_json(config.state_root / _LIVE_AGENT_STATUS_FILENAME, payload)
+
+
+def _live_agent_diagnostic_excerpt(result: InvocationResult) -> str | None:
+    """Read an explicitly opted-in, worker-redacted local Doctor excerpt."""
+
+    if result.error is None:
+        return None
+    excerpt = result.error.details.get("diagnostic_error_excerpt")
+    if not isinstance(excerpt, str) or not excerpt or len(excerpt) > 512:
+        return None
+    return excerpt
+
+
+def _write_live_agent_debug_feedback(
+    config: FoundryConfig,
+    *,
+    trace_id: str,
+    failure_code: str,
+    excerpt: str,
+) -> Path:
+    """Write an on-demand local Code-Agent debug sidecar, never runtime feedback."""
+
+    target = config.state_root / _LIVE_AGENT_DEBUG_FILENAME
+    _write_live_agent_json(
+        target,
+        {
+            "diagnostic_only": True,
+            "failure_code": failure_code,
+            "kind": "doctor_live_agent_debug",
+            "terminal_error_excerpt": excerpt,
+            "trace_id": trace_id,
+            "updated_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return target
+
+
+def _write_live_agent_json(target: Path, payload: dict[str, object]) -> None:
+    """Atomically write a private, local Doctor view below one safe state root."""
+
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if target.parent.is_symlink() or not target.parent.is_dir():
+        raise OSError("Doctor live-Agent state root must be a real directory")
+    if target.exists() and target.is_symlink():
+        raise OSError("Doctor live-Agent status path cannot be a symlink")
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", closefd=True) as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _live_agent_probe_rollout_token_limit(config: FoundryConfig) -> int:
+    """Use the configured real-Agent envelope for a live provider control.
+
+    A readiness probe has a tiny requested output, but its SDK turn still
+    materializes the actual Codex profile and may consume non-cached context
+    before it can emit the small structured response.  It must not introduce
+    an unrelated 16K cutoff that contradicts a deliberately enlarged
+    diagnostic envelope.  Selecting the larger configured structured/codegen
+    limit keeps this control capable of proving the route used by either real
+    Agent lane; actual usage remains metered by InvocationBackend.
+    """
+
+    return max(
+        config.agent.structured_turn_token_limit,
+        config.agent.environment_codegen_turn_token_limit,
+    )
 
 
 def _live_agent_failure_code(result: InvocationResult) -> str | None:
@@ -399,9 +572,7 @@ async def _codex_runtime_check(config: FoundryConfig) -> DoctorCheck:
             sdk_version = importlib.metadata.version("openai-codex")
             runtime_version = importlib.metadata.version("openai-codex-cli-bin")
             if sdk_version != runtime_version:
-                raise OSError(
-                    "SDK-bundled Codex runtime version does not match openai-codex"
-                )
+                raise OSError("SDK-bundled Codex runtime version does not match openai-codex")
             binary = bundled_codex_path()
             runtime_source = "SDK-bundled"
         except (ImportError, importlib.metadata.PackageNotFoundError, OSError) as exc:
@@ -473,9 +644,7 @@ async def _codex_runtime_check(config: FoundryConfig) -> DoctorCheck:
         return DoctorCheck(
             check="codex_runtime",
             status="pass",
-            summary=(
-                f"{runtime_source} {version} executable and rollout-budget schema ready"
-            ),
+            summary=(f"{runtime_source} {version} executable and rollout-budget schema ready"),
         )
     except (OSError, TimeoutError) as exc:
         return DoctorCheck(check="codex_runtime", status="fail", summary=str(exc))
