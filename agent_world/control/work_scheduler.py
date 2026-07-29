@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime
 from typing import Literal
 
 from pydantic import model_validator
@@ -424,6 +425,7 @@ class WorkScheduler:
         resolved = self.resolve_inputs(coordinate)
         repair_action_ref: ArtifactRef | None = None
         if scheduled.state == "repair_ready":
+            action: RepairAction
             with self.heads.exclusive(coordinate) as lock:
                 head = self.heads.read_head(coordinate)
                 if head is None or head.status != "repair_authorized":
@@ -432,11 +434,47 @@ class WorkScheduler:
                 if repair_action_ref is None:
                     raise WorkRuntimeError("repair-ready Work lacks RepairAction")
                 action = self.artifacts.get_json(repair_action_ref, RepairAction)
+            if action.route_liveness_required:
+                await self._await_retry_backoff(action)
+            with self.heads.exclusive(coordinate) as lock:
+                head = self.heads.read_head(coordinate)
+                if (
+                    head is None
+                    or head.status != "repair_authorized"
+                    or head.repair_action_ref != repair_action_ref
+                ):
+                    raise WorkRuntimeError("repair-ready Work changed during retry admission")
+                action = self.artifacts.get_json(repair_action_ref, RepairAction)
                 if action.target_coordinate != coordinate:
                     raise WorkRuntimeError(
                         "parent repair must be scheduled at its causal target coordinate"
                     )
-                self.runtime.begin_authorized_repair(lock, definition=definition)
+                route_liveness_evidence_ref: ArtifactRef | None = None
+                if action.route_liveness_required:
+                    check, route_liveness_evidence_ref = (
+                        self.runtime.check_authorized_route_liveness(
+                            lock,
+                            definition=definition,
+                        )
+                    )
+                    if check.status == "rejected":
+                        failed = self.runtime.reject_authorized_route_liveness(
+                            lock,
+                            definition=definition,
+                            evidence_ref=route_liveness_evidence_ref,
+                        )
+                        return WorkDispatchResult(
+                            coordinate=coordinate,
+                            before_state="repair_ready",
+                            after_state="blocked",
+                            attempt_ref=failed.attempt_ref,
+                            evaluation_ref=failed.evaluation_ref,
+                        )
+                self.runtime.begin_authorized_repair(
+                    lock,
+                    definition=definition,
+                    route_liveness_evidence_ref=route_liveness_evidence_ref,
+                )
         elif scheduled.state == "stale":
             with self.heads.exclusive(coordinate) as lock:
                 head = self.heads.read_head(coordinate)
@@ -479,6 +517,15 @@ class WorkScheduler:
             repair_action_ref=repair_action_ref,
         )
         try:
+            # Do not pay for a real model/tool proposal when the complete
+            # success path already cannot reserve its declared deterministic
+            # validation or assurance boundary. This is only an early
+            # observation; individual operations still acquire durable leases
+            # immediately before execution.
+            self.runtime.assert_attempt_operation_envelope_admissible(
+                definition=definition,
+                elapsed_wall_seconds=0,
+            )
             await executor(context)
         except BudgetExceeded as exc:
             # An operation lease is acquired inside a leaf only after the
@@ -494,6 +541,22 @@ class WorkScheduler:
                     definition=definition,
                     dimensions=exc.dimensions,
                 )
+        except KeyboardInterrupt:
+            # A terminal SIGINT can surface as ``KeyboardInterrupt`` rather
+            # than task cancellation.  Settle the durable Work boundary
+            # before letting the CLI preserve its conventional exit-130
+            # behavior; otherwise a dead owner can strand a running head.
+            self._settle_cancelled_dispatch(definition)
+            raise
+        except asyncio.CancelledError:
+            # A cooperative Scheduler leaf normally performs this same
+            # settlement before re-raising.  Keep the command/scheduler
+            # boundary as a second, idempotent owner-recovery fence for a
+            # signal that lands between the durable dispatch CAS and a leaf's
+            # own cancellation translation.  Cancellation never admits an
+            # infrastructure retry here.
+            self._settle_cancelled_dispatch(definition)
+            raise
         self._route_parent_repair_if_requested(definition)
         head = self.heads.read_head(coordinate)
         if head is None or head.active_operation_ref is not None:
@@ -517,6 +580,40 @@ class WorkScheduler:
             commit_ref=head.commit_ref,
             evaluation_ref=head.evaluation_ref,
         )
+
+    @staticmethod
+    async def _await_retry_backoff(action: RepairAction) -> None:
+        """Wait outside the Work lock until the policy-recorded retry instant."""
+
+        if not action.route_liveness_required:
+            return
+        if action.retry_not_before is None:
+            raise WorkRuntimeError("route-gated retry lacks a retry backoff timestamp")
+        remaining = (action.retry_not_before - datetime.now(UTC)).total_seconds()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+    def _settle_cancelled_dispatch(self, definition: WorkDefinition) -> None:
+        """Converge an active operation after external owner interruption.
+
+        This method deliberately delegates to the normal WorkRuntime terminal
+        chain, so budget accounting and Evaluation evidence stay identical to
+        ordinary recovery.  It is idempotent because a leaf may already have
+        settled the active operation while handling the same cancellation.
+        """
+
+        if self.runtime is None:
+            return
+        with self.heads.exclusive(definition.coordinate) as lock:
+            head = self.heads.read_head(definition.coordinate)
+            if head is None or head.status != "running" or head.active_operation_ref is None:
+                return
+            self.runtime.reconcile_abandoned_operation(
+                lock,
+                definition=definition,
+                interrupted_dispatch_code="process_interrupted_cancelled",
+                allow_infrastructure_retry=False,
+            )
 
     async def run_until_stalled(
         self,
@@ -584,15 +681,32 @@ class WorkScheduler:
         for parent_coordinate in definition.dependency_coordinates:
             parent = self.graph.require(parent_coordinate)
             head = self.heads.read_head(parent.coordinate)
-            if head is None or head.status != "committed":
-                raise WorkResumeError("cannot resolve inputs before every parent commits")
+            parent_label = ".".join(
+                (
+                    parent.coordinate.component,
+                    parent.coordinate.stage,
+                    parent.coordinate.artifact_slot,
+                )
+            )
+            if head is None:
+                raise WorkResumeError(
+                    f"cannot resolve inputs: parent {parent_label} has no Work head"
+                )
+            if head.status != "committed":
+                raise WorkResumeError(
+                    f"cannot resolve inputs: parent {parent_label} is {head.status}, "
+                    "required committed"
+                )
             attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
             active = self._require_usable_commit(
                 definition=parent,
                 input_refs=attempt.input_refs,
             )
             if active is None:
-                raise WorkResumeError("parent WorkCommit is no longer active")
+                raise WorkResumeError(
+                    f"cannot resolve inputs: parent {parent_label} WorkCommit is no longer "
+                    "active for its exact frozen definition/input closure"
+                )
             commit, commit_ref = active
             parent_commit_refs.append(commit_ref)
             parent_commits.append(commit)

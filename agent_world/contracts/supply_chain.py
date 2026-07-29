@@ -15,6 +15,17 @@ from .base import ArtifactRef, ContentHash, Identifier, NonEmptyStr, V2Contract
 MAX_PUBLIC_TESTS = 32
 
 
+class StaticDiagnosticLocation(V2Contract):
+    """One safe source coordinate for a framework-owned static-policy finding."""
+
+    line: Annotated[int, Field(ge=1)]
+    category: Literal[
+        "framework_private_identifier",
+        "fixture_registry",
+        "test_double",
+    ]
+
+
 class StaticFileEvidence(V2Contract):
     path: NonEmptyStr
     role: Identifier
@@ -27,6 +38,7 @@ class StaticFileEvidence(V2Contract):
     parse_valid: bool | None = None
     scan_passed: bool
     failure_codes: tuple[Identifier, ...] = ()
+    diagnostic_locations: tuple[StaticDiagnosticLocation, ...] = ()
 
     @model_validator(mode="after")
     def success_has_no_failure_codes(self) -> StaticFileEvidence:
@@ -39,6 +51,8 @@ class StaticFileEvidence(V2Contract):
         )
         if self.failure_codes and all(item is not False for item in checks):
             raise ValueError("static file failure codes require a failed check")
+        if self.diagnostic_locations and "static_forbidden_pattern" not in self.failure_codes:
+            raise ValueError("static diagnostic locations require a forbidden-pattern failure")
         return self
 
 
@@ -214,6 +228,7 @@ __all__ = [
     "MAX_PUBLIC_TESTS",
     "PublicTestExecution",
     "StaticAssuranceEvidence",
+    "StaticDiagnosticLocation",
     "StaticFileEvidence",
     "SupplyChainEvidence",
 ]

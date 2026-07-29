@@ -31,6 +31,8 @@ from .contracts import (
     ReasoningEffort,
     ResolvedAgentProfile,
     ResolvedBundle,
+    ResolvedRuntimeInterpreter,
+    ResolvedRuntimeTool,
     SandboxMode,
     json_compatible,
 )
@@ -55,6 +57,7 @@ _SUPPORTED_BUILTIN_TOOLS = frozenset({"shell", "workspace_edit", "web_search", "
 _CONTROL_PATHS = (".codex", ".agents", "AGENTS.md")
 _PROJECT_ROOT_MARKER = ".agent-world-project-root"
 _PERMISSIONS_PROFILE = "agent_world_isolated"
+_WORKSPACE_TOOLCHAIN_DIRECTORY = ".agent-world-tools"
 
 
 class ProfileResolutionError(RuntimeError):
@@ -223,6 +226,10 @@ class AgentProfileSpec:
     rollout_token_limit: int | None = None
     tool_output_token_limit: int = 2_048
     limits: InvocationLimits = field(default_factory=InvocationLimits)
+    # Framework-owned build executables are not ambient shell capabilities.
+    # They are resolved from the explicit source environment, copied below the
+    # private profile root, and mounted only from that isolated location.
+    required_runtime_tools: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_name("profile_id", self.profile_id)
@@ -326,6 +333,9 @@ class AgentProfileSpec:
             raise ValueError("rollout_token_limit must be positive when configured")
         if self.tool_output_token_limit <= 0:
             raise ValueError("tool_output_token_limit must be positive")
+        _ensure_unique("required runtime tool", self.required_runtime_tools)
+        for name in self.required_runtime_tools:
+            _validate_name("required runtime tool", name)
 
 
 class ProfileResolver:
@@ -449,6 +459,14 @@ class ProfileResolver:
                 )
             )
 
+        runtime_tool_sources, missing_runtime_tools = self._resolve_runtime_tool_sources(
+            spec.required_runtime_tools,
+            source_environment,
+        )
+        runtime_interpreter = (
+            self._resolve_runtime_interpreter() if spec.required_runtime_tools else None
+        )
+
         bindings = {handle: self._bindings[handle] for handle in spec.credential_handles}
         auth_binding = bindings[spec.authentication_handle]
         if (
@@ -530,6 +548,16 @@ class ProfileResolver:
                     {"kind": kind, "name": name, "sha256": digest}
                     for kind, name, _source, digest, _config in source_bundles
                 ],
+                "runtime_tools": [
+                    {"name": name, "sha256": digest}
+                    for name, _source, digest in runtime_tool_sources
+                ],
+                "missing_runtime_tools": list(missing_runtime_tools),
+                "runtime_interpreter": (
+                    runtime_interpreter.to_safe_dict()
+                    if runtime_interpreter is not None
+                    else None
+                ),
                 "mcp_servers": [_mcp_public_dict(server) for server in spec.mcp_servers],
                 "credential_handles": list(spec.credential_handles),
                 "authentication_handle": spec.authentication_handle,
@@ -597,6 +625,19 @@ class ProfileResolver:
                 )
                 resolved_hooks.append(resolved)
 
+        runtime_tools = (
+            self._materialize_runtime_tools(root, runtime_tool_sources)
+            if spec.required_runtime_tools
+            else ()
+        )
+        if runtime_tools:
+            assert runtime_interpreter is not None
+            self._materialize_workspace_tool_facades(
+                resolved_workspace,
+                runtime_tools=runtime_tools,
+                interpreter=runtime_interpreter,
+            )
+
         hooks_json = _merge_hook_fragments(hook_fragments)
         hooks_path = codex_home / "hooks.json"
         hooks_config_hash: str | None = None
@@ -607,6 +648,9 @@ class ProfileResolver:
             raise ProfileResolutionError("unexpected hooks.json exists for a hook-free profile")
 
         shell_environment = self._base_environment(source_environment)
+        if spec.required_runtime_tools:
+            assert runtime_interpreter is not None
+            shell_environment["PATH"] = self._isolated_tool_path(root, runtime_interpreter)
         shell_environment.update(
             {
                 "HOME": str(resolved_workspace / ".agent-world-tmp" / "home"),
@@ -615,7 +659,16 @@ class ProfileResolver:
                 "XDG_CACHE_HOME": str(resolved_workspace / ".agent-world-tmp" / "cache"),
             }
         )
-        runtime_read_roots = [Path(sys.prefix).resolve()]
+        runtime_read_roots = (
+            [runtime_interpreter.root]
+            if runtime_interpreter is not None
+            else [Path(sys.prefix).resolve()]
+        )
+        if spec.required_runtime_tools:
+            # This directory contains only the declared, copied executables.
+            # Mounting it permits shell PATH lookup without granting the Agent
+            # its ambient host bin directory.
+            runtime_read_roots.append(root / "toolchain" / "bin")
         if spec.codex_bin is not None:
             # The Codex app-server re-executes its own runtime inside the Linux
             # sandbox when it services shell/workspace tools.  A custom binary
@@ -643,6 +696,9 @@ class ProfileResolver:
         config_hash = hashlib.sha256(config_text.encode("utf-8")).hexdigest()
 
         base_environment = self._base_environment(source_environment)
+        if spec.required_runtime_tools:
+            assert runtime_interpreter is not None
+            base_environment["PATH"] = self._isolated_tool_path(root, runtime_interpreter)
         base_environment["TMPDIR"] = str(resolved_workspace / ".agent-world-tmp")
         descriptors = tuple(
             CredentialDescriptor(
@@ -676,6 +732,9 @@ class ProfileResolver:
             allowed_network_domains=tuple(spec.allowed_network_domains),
             skills=tuple(resolved_skills),
             hooks=tuple(resolved_hooks),
+            runtime_tools=runtime_tools,
+            missing_runtime_tools=missing_runtime_tools,
+            runtime_interpreter=runtime_interpreter,
             credential_descriptors=descriptors,
             authentication_kind="api_key",
             authentication_environment=auth_binding.target_environment,
@@ -710,6 +769,213 @@ class ProfileResolver:
             for name in self._base_environment_names
             if name in source and source[name]
         }
+
+    @staticmethod
+    def _isolated_tool_path(
+        root: Path,
+        interpreter: ResolvedRuntimeInterpreter,
+    ) -> str:
+        """Return the small truthful PATH for a provisioned shell profile."""
+
+        candidates = (
+            root / "toolchain" / "bin",
+            interpreter.executable.parent,
+            Path("/usr/bin"),
+            Path("/bin"),
+        )
+        entries: list[str] = []
+        for candidate in candidates:
+            text = str(candidate)
+            if text not in entries:
+                entries.append(text)
+        return os.pathsep.join(entries)
+
+    @staticmethod
+    def _resolve_runtime_interpreter() -> ResolvedRuntimeInterpreter:
+        """Pin the framework Python used by offline ``uv`` Candidate builds.
+
+        The old profile exposed ``sys.prefix`` (normally a virtual environment
+        whose Python entries are symlinks outside the sandbox).  That makes a
+        readable but non-executable interpreter appear to the Agent.  Resolve
+        the real interpreter and mount its actual prefix instead.
+        """
+
+        try:
+            executable = Path(sys.executable).resolve(strict=True)
+        except OSError as exc:
+            raise ProfileResolutionError("framework Python runtime is unavailable") from exc
+        if (
+            not executable.is_file()
+            or executable.is_symlink()
+            or not os.access(executable, os.X_OK)
+        ):
+            raise ProfileResolutionError("framework Python runtime is not executable")
+        version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        if version != "3.12":
+            raise ProfileResolutionError(
+                "isolated Candidate toolchains require the framework to run under Python 3.12"
+            )
+        root = executable.parent.parent
+        if not (root / "bin").is_dir() or not executable.is_relative_to(root):
+            raise ProfileResolutionError("framework Python runtime root is invalid")
+        return ResolvedRuntimeInterpreter(
+            version=version,
+            executable=executable,
+            root=root,
+            sha256=_hash_file(executable),
+        )
+
+    def _materialize_workspace_tool_facades(
+        self,
+        workspace: Path,
+        *,
+        runtime_tools: tuple[ResolvedRuntimeTool, ...],
+        interpreter: ResolvedRuntimeInterpreter,
+    ) -> None:
+        """Expose declared build tools through stable workspace-relative commands.
+
+        Current Codex app-server sandboxes can ignore a configured shell PATH
+        even though the tool directory is mounted.  The Agent must not have to
+        discover a private absolute profile path, so provide explicit relative
+        executable copies under the framework-owned workspace root.  They are
+        direct executables rather than shell wrappers, removing an additional
+        wrapper-interpreter dependency; the later real audit still proves
+        whether their runtime can start in the active sandbox.  The copies are
+        not Candidate output and are never trusted by a later framework gate.
+        """
+
+        tool_root = workspace / _WORKSPACE_TOOLCHAIN_DIRECTORY
+        self._make_private_directory(tool_root)
+        by_name = {tool.name: tool for tool in runtime_tools}
+        for tool in runtime_tools:
+            self._copy_workspace_tool_executable(
+                source=tool.path,
+                destination=tool_root / tool.name,
+                digest=tool.sha256,
+                description=f"runtime tool {tool.name!r}",
+            )
+        if "uv" in by_name and "python3.12" not in by_name:
+            self._copy_workspace_tool_executable(
+                source=interpreter.executable,
+                destination=tool_root / "python3.12",
+                digest=interpreter.sha256,
+                description="Python 3.12 interpreter",
+            )
+
+    @staticmethod
+    def _copy_workspace_tool_executable(
+        source: Path,
+        destination: Path,
+        *,
+        digest: str,
+        description: str,
+    ) -> None:
+        """Materialize one hash-pinned, directly executable workspace tool."""
+
+        if (
+            source.is_symlink()
+            or not source.is_file()
+            or not os.access(source, os.X_OK)
+            or _hash_file(source) != digest
+        ):
+            raise ProfileResolutionError(f"pinned {description} is unavailable")
+        if destination.exists() or destination.is_symlink():
+            if (
+                destination.is_symlink()
+                or not destination.is_file()
+                or not os.access(destination, os.X_OK)
+                or _hash_file(destination) != digest
+            ):
+                raise ProfileResolutionError(
+                    f"workspace copy of {description} was modified"
+                )
+            return
+
+        temporary = destination.with_name(f".{destination.name}.copying")
+        if temporary.exists() or temporary.is_symlink():
+            if temporary.is_dir() and not temporary.is_symlink():
+                raise ProfileResolutionError(
+                    f"workspace copy staging path is unexpectedly a directory: {temporary}"
+                )
+            temporary.unlink()
+        shutil.copyfile(source, temporary)
+        temporary.chmod(0o500)
+        if _hash_file(temporary) != digest:
+            temporary.unlink()
+            raise ProfileResolutionError(f"{description} changed while materializing workspace")
+        temporary.replace(destination)
+
+    @staticmethod
+    def _resolve_runtime_tool_sources(
+        names: tuple[str, ...],
+        source_environment: Mapping[str, str],
+    ) -> tuple[list[tuple[str, Path, str]], tuple[str, ...]]:
+        """Pin declared tool binaries without exposing ambient PATH at runtime."""
+
+        path_value = source_environment.get("PATH", "")
+        search_roots = tuple(
+            Path(item).expanduser()
+            for item in path_value.split(os.pathsep)
+            if item and Path(item).is_absolute()
+        )
+        resolved: list[tuple[str, Path, str]] = []
+        missing: list[str] = []
+        for name in names:
+            executable: Path | None = None
+            for directory in search_roots:
+                candidate = directory / name
+                try:
+                    target = candidate.resolve(strict=True)
+                except OSError:
+                    continue
+                if not target.is_file() or target.is_symlink() or not os.access(target, os.X_OK):
+                    continue
+                executable = target
+                break
+            if executable is None:
+                missing.append(name)
+                continue
+            resolved.append((name, executable, _hash_file(executable)))
+        return resolved, tuple(missing)
+
+    def _materialize_runtime_tools(
+        self,
+        root: Path,
+        sources: list[tuple[str, Path, str]],
+    ) -> tuple[ResolvedRuntimeTool, ...]:
+        """Copy each pinned executable into the profile-owned toolchain."""
+
+        toolchain = root / "toolchain"
+        tool_bin = toolchain / "bin"
+        self._make_private_directory(toolchain)
+        self._make_private_directory(tool_bin)
+        resolved: list[ResolvedRuntimeTool] = []
+        for name, source, digest in sources:
+            destination = tool_bin / name
+            if destination.exists():
+                if (
+                    destination.is_symlink()
+                    or not destination.is_file()
+                    or not os.access(destination, os.X_OK)
+                    or _hash_file(destination) != digest
+                ):
+                    raise ProfileResolutionError(
+                        f"materialized runtime tool {name!r} was modified"
+                    )
+            else:
+                temporary = tool_bin / f".{name}.copying"
+                if temporary.exists():
+                    temporary.unlink()
+                shutil.copyfile(source, temporary)
+                temporary.chmod(0o500)
+                if _hash_file(temporary) != digest:
+                    temporary.unlink()
+                    raise ProfileResolutionError(
+                        f"runtime tool {name!r} changed while materializing"
+                    )
+                temporary.replace(destination)
+            resolved.append(ResolvedRuntimeTool(name=name, path=destination, sha256=digest))
+        return tuple(resolved)
 
     def _reject_ambient_configuration(self, root: Path) -> None:
         # The custom marker written into the workspace terminates Codex project
@@ -1250,6 +1516,68 @@ def verify_resolved_profile(profile: ResolvedAgentProfile) -> None:
             raise ProfileResolutionError("configured Codex binary is not executable")
         if _hash_file(profile.codex_bin) != profile.codex_bin_sha256:
             raise ProfileResolutionError("configured Codex binary changed after resolution")
+
+    tool_bin = profile.materialization_root / "toolchain" / "bin"
+    expected_tools = {tool.name: tool for tool in profile.runtime_tools}
+    if profile.runtime_tools or profile.missing_runtime_tools:
+        if not tool_bin.is_dir() or tool_bin.is_symlink():
+            raise ProfileResolutionError("isolated runtime toolchain is unavailable")
+        actual_names = {path.name for path in tool_bin.iterdir()}
+        if actual_names != set(expected_tools):
+            raise ProfileResolutionError("isolated runtime toolchain contents changed")
+    for name, tool in expected_tools.items():
+        if tool.path != tool_bin / name:
+            raise ProfileResolutionError("resolved runtime tool escaped its isolated toolchain")
+        if tool.path.is_symlink() or not tool.path.is_file() or not os.access(tool.path, os.X_OK):
+            raise ProfileResolutionError("resolved runtime tool is unavailable")
+        if _hash_file(tool.path) != tool.sha256:
+            raise ProfileResolutionError("resolved runtime tool changed after resolution")
+
+    interpreter = profile.runtime_interpreter
+    if interpreter is not None:
+        if (
+            interpreter.executable.is_symlink()
+            or not interpreter.executable.is_file()
+            or not os.access(interpreter.executable, os.X_OK)
+            or not interpreter.executable.is_relative_to(interpreter.root)
+            or _hash_file(interpreter.executable) != interpreter.sha256
+        ):
+            raise ProfileResolutionError("resolved runtime interpreter changed after resolution")
+    if expected_tools:
+        assert interpreter is not None
+        facade_root = profile.workspace / _WORKSPACE_TOOLCHAIN_DIRECTORY
+        if not facade_root.is_dir() or facade_root.is_symlink():
+            raise ProfileResolutionError("workspace runtime tool facades are unavailable")
+        expected_facades = set(expected_tools)
+        if "uv" in expected_tools and "python3.12" not in expected_tools:
+            expected_facades.add("python3.12")
+        if {path.name for path in facade_root.iterdir()} != expected_facades:
+            raise ProfileResolutionError("workspace runtime tool facades changed")
+        for name, tool in expected_tools.items():
+            facade = facade_root / name
+            if (
+                facade.is_symlink()
+                or not facade.is_file()
+                or not os.access(facade, os.X_OK)
+                or _hash_file(facade) != tool.sha256
+            ):
+                raise ProfileResolutionError("workspace runtime tool facade changed")
+        python_facade = facade_root / "python3.12"
+        expected_python_facade_digest = (
+            expected_tools["python3.12"].sha256
+            if "python3.12" in expected_tools
+            else interpreter.sha256
+        )
+        if (
+            "python3.12" in expected_facades
+            and (
+                python_facade.is_symlink()
+                or not python_facade.is_file()
+                or not os.access(python_facade, os.X_OK)
+                or _hash_file(python_facade) != expected_python_facade_digest
+            )
+        ):
+            raise ProfileResolutionError("workspace Python tool facade changed")
 
     marker = _read_json_object(root / "resolved-profile.json")
     expected_marker = {

@@ -23,6 +23,7 @@ from typing import Any, Literal, Protocol, TypeVar, cast, overload
 from jsonschema import Draft202012Validator, SchemaError  # type: ignore[import-untyped]
 from pydantic import BaseModel, JsonValue, ValidationError
 
+from agent_world.agent_profiles import logical_workspace_for_isolated_agent_workspace
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.contracts import (
     ActorBoundary,
@@ -103,6 +104,7 @@ from agent_world.invocation import (
     CapabilityResolutionError,
     NodeCapabilityRequirement,
     assert_agent_output_advisory,
+    standalone_component_ownership,
 )
 from agent_world.invocation.contracts import (
     InvocationBackend,
@@ -296,6 +298,7 @@ class AgentProfileProvider(Protocol):
         requirement: NodeCapabilityRequirement,
         rollout_token_limit: int | None = None,
         invocation_timeout_seconds: float | None = None,
+        model_override: str | None = None,
     ) -> ResolvedAgentProfile: ...
 
 
@@ -4881,6 +4884,7 @@ class EnvironmentDesigner:
                 "structured source dependencies must equal immutable Work inputs"
             )
         workspace.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
+        frozen_input_workspace = workspace.expanduser().resolve()  # noqa: ASYNC240
         assert_agent_output_advisory(
             model,
             authority=AgentOutputAuthority.SEMANTIC_ADVISORY,
@@ -4925,6 +4929,45 @@ class EnvironmentDesigner:
                 + diagnostics
             )
 
+        def resolve_profile_for_attempt(
+            profile_workspace: Path,
+            *,
+            model_override: str | None,
+        ) -> ResolvedAgentProfile:
+            """Materialize the route selected by the durable WorkAttempt.
+
+            ``RepairAction.model_override`` is intentionally present only on a
+            fallback action.  ``WorkControlRuntime`` carries that selected
+            route onto every same-node successor, so this service must resolve
+            from the active attempt rather than retain the profile materialized
+            before repair admission.  Otherwise a Spark fallback's retry could
+            call the default Grok profile while the durable attempt said Spark.
+            """
+
+            try:
+                return self.profiles.resolve(
+                    role=role,
+                    lineage_id=lineage_id,
+                    workspace=profile_workspace,
+                    output_schema=schema,
+                    permissions=permissions,
+                    requirement=requirement,
+                    rollout_token_limit=definition.proposal_policy.budget.llm_tokens,
+                    # This WorkDefinition reserves one physical proposal
+                    # envelope.  The production Invocation Control Plane must
+                    # own that exact wall rather than inherit a broader role
+                    # default and race a service-local timeout.
+                    invocation_timeout_seconds=definition.proposal_policy.budget.wall_seconds,
+                    model_override=model_override,
+                )
+            except CapabilityResolutionError as exc:
+                raise DesignerError(
+                    "agent.permissions",
+                    str(exc),
+                    requires_permission=True,
+                    lineage_id=lineage_id,
+                ) from exc
+
         with runtime.heads.exclusive(definition.coordinate) as lock:
             active = runtime.heads.require_active_commit(
                 definition=definition,
@@ -4949,35 +4992,82 @@ class EnvironmentDesigner:
                 output_ref = output_refs[0]
                 return self.artifacts.get_json(output_ref, model), output_ref, ()
 
-            try:
-                supported_revisions = tuple(
-                    getattr(
-                        self.backend,
-                        "supported_executor_revision_ids",
-                        ("framework.executor.v1",),
-                    )
+            supported_revisions = tuple(
+                getattr(
+                    self.backend,
+                    "supported_executor_revision_ids",
+                    ("framework.executor.v1",),
                 )
-                if definition.proposal_policy.executor_revision_id not in supported_revisions:
-                    raise WorkRuntimeError(
-                        "InvocationBackend does not prove support for executor revision "
-                        f"{definition.proposal_policy.executor_revision_id}"
-                    )
-                profile = self.profiles.resolve(
-                    role=role,
-                    lineage_id=lineage_id,
-                    workspace=workspace,
-                    output_schema=schema,
-                    permissions=permissions,
-                    requirement=requirement,
-                    rollout_token_limit=definition.proposal_policy.budget.llm_tokens,
+            )
+            if definition.proposal_policy.executor_revision_id not in supported_revisions:
+                raise WorkRuntimeError(
+                    "InvocationBackend does not prove support for executor revision "
+                    f"{definition.proposal_policy.executor_revision_id}"
                 )
-            except CapabilityResolutionError as exc:
-                raise DesignerError(
-                    "agent.permissions",
-                    str(exc),
-                    requires_permission=True,
-                    lineage_id=lineage_id,
-                ) from exc
+            profile_workspace = workspace
+            profile = resolve_profile_for_attempt(profile_workspace, model_override=None)
+
+            async def begin_repair_with_route_liveness() -> WorkControlHead:
+                """Admit one already-authorized repair through the shared gate.
+
+                ``execute_structured_work`` is a legacy orchestration surface,
+                but it still reaches real Agent calls for compatibility.  It
+                must therefore use the same recorded backoff and route-
+                liveness admission as ``WorkScheduler`` before opening a
+                same-model retry.  In particular, a missing/failed check is a
+                terminal control-plane fact, never permission for this local
+                loop to dispatch another physical turn.
+                """
+
+                repair_head = runtime.heads.read_head(definition.coordinate)
+                if (
+                    repair_head is None
+                    or repair_head.status != "repair_authorized"
+                    or repair_head.repair_action_ref is None
+                ):
+                    raise WorkRuntimeError("structured repair lost its authorized head")
+                action = runtime.artifacts.get_json(
+                    repair_head.repair_action_ref,
+                    RepairAction,
+                )
+                route_liveness_evidence_ref: ArtifactRef | None = None
+                if action.route_liveness_required:
+                    if action.retry_not_before is None:
+                        raise WorkRuntimeError("route-gated repair lacks retry backoff")
+                    remaining_backoff = (
+                        action.retry_not_before - datetime.now(UTC)
+                    ).total_seconds()
+                    if remaining_backoff > 0:
+                        # This is an explicitly authorized retry pacing
+                        # interval, not a model-output or liveness timeout.
+                        await asyncio.sleep(remaining_backoff)
+                    check, route_liveness_evidence_ref = runtime.check_authorized_route_liveness(
+                        lock,
+                        definition=definition,
+                    )
+                    if check.status == "rejected":
+                        runtime.reject_authorized_route_liveness(
+                            lock,
+                            definition=definition,
+                            evidence_ref=route_liveness_evidence_ref,
+                        )
+                        raise DesignerError(
+                            f"agent.{role}.route_liveness",
+                            (
+                                "the previously failed model route did not pass its safe "
+                                "liveness check"
+                            ),
+                            last_result,
+                            results=tuple(invocation_results),
+                            validation_issues=(check.code,),
+                            infrastructure_error=True,
+                            lineage_id=lineage_id,
+                        )
+                return runtime.begin_authorized_repair(
+                    lock,
+                    definition=definition,
+                    route_liveness_evidence_ref=route_liveness_evidence_ref,
+                )
 
             head = runtime.heads.read_head(definition.coordinate)
             recovering_running = head is not None and head.status == "running"
@@ -5051,32 +5141,24 @@ class EnvironmentDesigner:
                                 definition=definition,
                                 record=record,
                             )
-                    if record is not None and Path(record.workspace) != profile.workspace:
+                    if record is not None:
                         continuation_workspace = Path(record.workspace)
-                        if (
-                            continuation_workspace.name != "workspace"
-                            or continuation_workspace.parent.name != ".agent-runtime"
-                        ):
+                        try:
+                            profile_workspace = logical_workspace_for_isolated_agent_workspace(
+                                continuation_workspace
+                            )
+                        except (OSError, ValueError) as exc:
                             raise WorkRuntimeError(
                                 "continuation workspace does not match the isolated profile layout"
-                            )
-                        try:
-                            profile = self.profiles.resolve(
-                                role=role,
-                                lineage_id=lineage_id,
-                                workspace=continuation_workspace.parent.parent,
-                                output_schema=schema,
-                                permissions=permissions,
-                                requirement=requirement,
-                                rollout_token_limit=(definition.proposal_policy.budget.llm_tokens),
-                            )
-                        except CapabilityResolutionError as exc:
-                            raise DesignerError(
-                                "agent.permissions",
-                                str(exc),
-                                requires_permission=True,
-                                lineage_id=lineage_id,
                             ) from exc
+                        if profile_workspace != frozen_input_workspace:
+                            raise WorkRuntimeError(
+                                "continuation workspace does not bind this frozen input root"
+                            )
+                        profile = resolve_profile_for_attempt(
+                            profile_workspace,
+                            model_override=prior_attempt.model_override,
+                        )
                     if (
                         record is None
                         or record.work_id != definition.work_id
@@ -5114,7 +5196,7 @@ class EnvironmentDesigner:
                     if session is not None
                     else f"{immutable_prompt}\n\n{correction_prompt}"
                 )
-                head = runtime.begin_authorized_repair(lock, definition=definition)
+                head = await begin_repair_with_route_liveness()
             elif head.status != "running":
                 raise DesignerError(
                     f"agent.{role}.work_terminal",
@@ -5359,32 +5441,22 @@ class EnvironmentDesigner:
                         )
                         if record is not None and Path(record.workspace) != profile.workspace:
                             continuation_workspace = Path(record.workspace)
-                            if (
-                                continuation_workspace.name != "workspace"
-                                or continuation_workspace.parent.name != ".agent-runtime"
-                            ):
+                            try:
+                                profile_workspace = logical_workspace_for_isolated_agent_workspace(
+                                    continuation_workspace
+                                )
+                            except (OSError, ValueError) as exc:
                                 raise WorkRuntimeError(
                                     "continuation workspace does not match isolated layout"
-                                )
-                            try:
-                                profile = self.profiles.resolve(
-                                    role=role,
-                                    lineage_id=lineage_id,
-                                    workspace=continuation_workspace.parent.parent,
-                                    output_schema=schema,
-                                    permissions=permissions,
-                                    requirement=requirement,
-                                    rollout_token_limit=(
-                                        definition.proposal_policy.budget.llm_tokens
-                                    ),
-                                )
-                            except CapabilityResolutionError as exc:
-                                raise DesignerError(
-                                    "agent.permissions",
-                                    str(exc),
-                                    requires_permission=True,
-                                    lineage_id=lineage_id,
                                 ) from exc
+                            if profile_workspace != frozen_input_workspace:
+                                raise WorkRuntimeError(
+                                    "continuation workspace does not bind this frozen input root"
+                                )
+                            profile = resolve_profile_for_attempt(
+                                profile_workspace,
+                                model_override=interrupted_attempt.model_override,
+                            )
                         if (
                             record is None
                             or record.work_id != definition.work_id
@@ -5510,7 +5582,7 @@ class EnvironmentDesigner:
                         recovery_report,
                         pending_repair_roots,
                     )
-                    head = runtime.begin_authorized_repair(lock, definition=definition)
+                    head = await begin_repair_with_route_liveness()
 
             while True:
                 invocation_id = f"inv-{uuid.uuid4().hex}"
@@ -5538,29 +5610,43 @@ class EnvironmentDesigner:
                         "proposal dispatch must be recovered before another invocation"
                     )
                 attempt = runtime.artifacts.get_json(head.attempt_ref, WorkAttempt)
+                if (
+                    attempt.model_override is not None
+                    and profile.model != attempt.model_override
+                ):
+                    profile = resolve_profile_for_attempt(
+                        profile_workspace,
+                        model_override=attempt.model_override,
+                    )
                 started_at = datetime.now(UTC)
                 try:
                     budget.authorize_turn(correction=attempt.ordinal > 1)
-                    async with asyncio.timeout(definition.proposal_policy.budget.wall_seconds):
-                        result = await self.backend.invoke(
-                            InvocationRequest(
-                                invocation_id=invocation_id,
-                                prompt=current_prompt,
-                                profile=profile,
-                                session=session,
-                                metadata={
-                                    "role": role,
-                                    "lineage_id": lineage_id,
-                                    "semantic_transaction": (
-                                        semantic_transaction or definition.proposal_policy.operation
-                                    ),
-                                    "work_id": definition.work_id,
-                                    "attempt_id": attempt.attempt_id,
-                                    "attempt": attempt.ordinal,
-                                    "repair_mode": repair_mode,
-                                },
-                            )
-                        )
+                    result = await self._invoke_backend_under_declared_wall(
+                        InvocationRequest(
+                            invocation_id=invocation_id,
+                            prompt=current_prompt,
+                            profile=profile,
+                            session=session,
+                            ownership=runtime.invocation_ownership_for_active_proposal_locked(
+                                lock,
+                                definition=definition,
+                                attempt=attempt,
+                                dispatch_id=invocation_id,
+                            ),
+                            metadata={
+                                "role": role,
+                                "lineage_id": lineage_id,
+                                "semantic_transaction": (
+                                    semantic_transaction or definition.proposal_policy.operation
+                                ),
+                                "work_id": definition.work_id,
+                                "attempt_id": attempt.attempt_id,
+                                "attempt": attempt.ordinal,
+                                "repair_mode": repair_mode,
+                            },
+                        ),
+                        declared_wall_seconds=definition.proposal_policy.budget.wall_seconds,
+                    )
                 except (DesignerBudgetExhausted, TimeoutError) as exc:
                     finished_at = datetime.now(UTC)
                     crossed_backend = not isinstance(exc, DesignerBudgetExhausted)
@@ -5657,7 +5743,7 @@ class EnvironmentDesigner:
                     session = None
                     current_prompt = immutable_prompt
                     repair_mode = "backend_retry"
-                    head = runtime.begin_authorized_repair(lock, definition=definition)
+                    head = await begin_repair_with_route_liveness()
                     continue
 
                 finished_at = datetime.now(UTC)
@@ -5783,7 +5869,7 @@ class EnvironmentDesigner:
                     session = None
                     current_prompt = immutable_prompt
                     repair_mode = "backend_retry"
-                    head = runtime.begin_authorized_repair(lock, definition=definition)
+                    head = await begin_repair_with_route_liveness()
                     continue
 
                 head = runtime.checkpoint_proposal(
@@ -5942,7 +6028,7 @@ class EnvironmentDesigner:
                             definition=definition,
                             record=record,
                         )
-                    head = runtime.begin_authorized_repair(lock, definition=definition)
+                    head = await begin_repair_with_route_liveness()
                     continue
 
                 output_ref = self.artifacts.put_json(
@@ -6069,6 +6155,27 @@ class EnvironmentDesigner:
                     f"repair projection path {projected} exceeds WorkDefinition authority"
                 )
 
+    async def _invoke_backend_under_declared_wall(
+        self,
+        request: InvocationRequest,
+        *,
+        declared_wall_seconds: float,
+    ) -> InvocationResult:
+        """Cross one physical invocation boundary with one production owner.
+
+        Application composition always injects ``InvocationControlPlane``;
+        there it owns the declared physical wall and produces the durable
+        terminal fact.  The narrowly retained wrapper exists only for an
+        explicitly standalone adapter/test double, where there is no parent
+        control plane to enforce the caller's declared envelope.  It is not a
+        second production timeout or retry policy.
+        """
+
+        if getattr(self.backend, "owns_declared_lifecycle", False):
+            return await self.backend.invoke(request)
+        async with asyncio.timeout(declared_wall_seconds):
+            return await self.backend.invoke(request)
+
     async def run_structured_agent(
         self,
         *,
@@ -6110,6 +6217,12 @@ class EnvironmentDesigner:
                 permissions=permissions,
                 requirement=requirement,
                 rollout_token_limit=budget.rollout_token_limit,
+                # Legacy multi-turn transactions retain one immutable profile
+                # for an authorized same-session semantic correction.  The
+                # profile therefore carries the declared transaction envelope;
+                # the budget meter remains the logical aggregate guard across
+                # individual turns below.
+                invocation_timeout_seconds=budget.reserved.wall_seconds,
             )
         except CapabilityResolutionError as exc:
             self._record_feedback_terminal(
@@ -6285,24 +6398,38 @@ class EnvironmentDesigner:
         for attempt in range(self.maximum_structured_reworks + 1):
             try:
                 budget.authorize_turn(correction=attempt > 0)
-                async with asyncio.timeout(budget.remaining_wall_seconds):
-                    result = await self.backend.invoke(
-                        InvocationRequest(
-                            invocation_id=f"inv-{uuid.uuid4().hex}",
-                            prompt=current_prompt,
-                            profile=profile,
-                            session=session,
-                            metadata={
-                                "role": role,
-                                "lineage_id": lineage_id,
-                                "semantic_transaction": (
-                                    semantic_transaction or f"{role}.structured-output"
-                                ),
-                                "attempt": attempt,
-                                "repair_mode": repair_mode,
-                            },
-                        )
-                    )
+                invocation_id = f"inv-{uuid.uuid4().hex}"
+                result = await self._invoke_backend_under_declared_wall(
+                    InvocationRequest(
+                        invocation_id=invocation_id,
+                        prompt=current_prompt,
+                        profile=profile,
+                        session=session,
+                        # This legacy transaction has no WorkDefinition from
+                        # which to claim a committed parent closure. It still
+                        # records explicit per-turn component ownership so
+                        # production ICP never relies on metadata inference or
+                        # a private session id.
+                        ownership=standalone_component_ownership(
+                            invocation_id=invocation_id,
+                            component="designer",
+                            coordinate="designer:legacy_structured",
+                        ),
+                        metadata={
+                            "role": role,
+                            "lineage_id": lineage_id,
+                            "semantic_transaction": (
+                                semantic_transaction or f"{role}.structured-output"
+                            ),
+                            "attempt": attempt,
+                            "repair_mode": repair_mode,
+                        },
+                    ),
+                    # ICP owns the declared physical wall in production. This
+                    # value is only for an isolated compatibility adapter or
+                    # focused test double with no parent control plane.
+                    declared_wall_seconds=budget.remaining_wall_seconds,
+                )
                 budget.record_result(result)
                 invocation_results.append(result)
             except (DesignerBudgetExhausted, TimeoutError) as exc:
@@ -6358,6 +6485,11 @@ class EnvironmentDesigner:
                     result.error is not None
                     and result.error.retryable
                     and attempt < self.maximum_structured_reworks
+                    # A production Invocation Control Plane has already
+                    # normalized and durably classified this physical terminal.
+                    # Scheduler/WorkRuntime—not this legacy helper—owns any
+                    # fresh-session retry or model fallback.
+                    and not getattr(self.backend, "owns_declared_lifecycle", False)
                 ):
                     # A transport/provider failure is not a semantic correction.
                     # Preserve the failed InvocationResult for audit, but retry the

@@ -32,6 +32,7 @@ from agent_world.control.work import (
     WorkDefinition,
 )
 from agent_world.control.work_store import WorkControlHead, WorkControlStore
+from agent_world.invocation import InvocationControlStore
 
 from .paths import ObservabilityError, ObservabilityRoot
 from .projector import SceneProjector
@@ -79,6 +80,7 @@ class ObservabilityReader:
         artifacts: ArtifactStore | ArtifactWriter,
         heads: WorkControlStore,
         telemetry: TelemetryStore,
+        invocation_control: InvocationControlStore | None = None,
         known_secret_canaries: Sequence[str | bytes] = (),
         tier_a_keep_last_scopes: int = 64,
     ) -> None:
@@ -88,6 +90,7 @@ class ObservabilityReader:
         self.artifacts = artifacts
         self.heads = heads
         self.telemetry = telemetry
+        self.invocation_control = invocation_control
         self.known_secret_canaries = tuple(known_secret_canaries)
         self.tier_a_keep_last_scopes = tier_a_keep_last_scopes
         self._projector = SceneProjector(
@@ -95,6 +98,7 @@ class ObservabilityReader:
             artifacts=artifacts,
             heads=heads,
             telemetry=telemetry,
+            invocation_control=invocation_control,
             known_secret_canaries=known_secret_canaries,
         )
 
@@ -216,11 +220,7 @@ class ObservabilityReader:
         rebuilt = self._rebuild_scene(scope_id)
         return SceneRead(
             scene=rebuilt.index,
-            cache_status=(
-                "rebuilt_after_stale_watermark"
-                if cached is not None
-                else "rebuilt"
-            ),
+            cache_status=("rebuilt_after_stale_watermark" if cached is not None else "rebuilt"),
         )
 
     def _coordinate(self, scope_id: str, coordinate: str) -> CoordinateScene:
@@ -260,9 +260,8 @@ class ObservabilityReader:
                 "frontier diff requires both --from and --to together",
                 code="observability_frontier_selector_invalid",
             )
-        if (
-            from_attempt_ordinal is not None
-            and (from_attempt_ordinal < 1 or to_attempt_ordinal is None or to_attempt_ordinal < 1)
+        if from_attempt_ordinal is not None and (
+            from_attempt_ordinal < 1 or to_attempt_ordinal is None or to_attempt_ordinal < 1
         ):
             raise ObservabilityError(
                 "frontier attempt ordinals must be positive",
@@ -320,9 +319,7 @@ class ObservabilityReader:
                 "removed": self._bounded_issue_ids(removed),
                 "retained": self._bounded_issue_ids(retained),
             },
-            "frontier_ordinal_delta": (
-                to_record.frontier_ordinal - from_record.frontier_ordinal
-            ),
+            "frontier_ordinal_delta": (to_record.frontier_ordinal - from_record.frontier_ordinal),
         }
 
     def _compare(
@@ -367,10 +364,7 @@ class ObservabilityReader:
         head = self._head_for_coordinate(scope_id, coordinate)
         current = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
         attempts, trace_ids = self._attempt_lineage(current)
-        by_hash = {
-            sha256_digest(item.attempt_id.encode("utf-8")): item
-            for item in attempts
-        }
+        by_hash = {sha256_digest(item.attempt_id.encode("utf-8")): item for item in attempts}
         rows: list[tuple[int, int, dict[str, object]]] = []
         seen: set[str] = set()
         for trace_id in trace_ids:
@@ -548,18 +542,14 @@ class ObservabilityReader:
             "do_not_modify": ["world_spec", "gate"],
             "world_spec_tool_surface": tools,
             "verifier_expectation": {
-                "required_rule_ids": [
-                    self._safe(item) for item in verification.required_rule_ids
-                ],
+                "required_rule_ids": [self._safe(item) for item in verification.required_rule_ids],
                 "required_property_families": [
                     self._safe(item) for item in verification.required_property_families
                 ],
                 "required_metamorphic_relations": [
                     self._safe(item) for item in verification.required_metamorphic_relations
                 ],
-                "deployment_checks": [
-                    self._safe(item) for item in verification.deployment_checks
-                ],
+                "deployment_checks": [self._safe(item) for item in verification.deployment_checks],
                 "minimum_unknown_seed_episodes": verification.minimum_unknown_seed_episodes,
             },
         }
@@ -877,9 +867,7 @@ class ObservabilityReader:
         attempt: WorkAttempt,
     ) -> tuple[ArtifactRef, EnvironmentCandidate]:
         refs = tuple(
-            ref
-            for ref in attempt.input_refs
-            if ref.artifact_type == "build.environment_candidate"
+            ref for ref in attempt.input_refs if ref.artifact_type == "build.environment_candidate"
         )
         if len(refs) != 1:
             raise ObservabilityError(

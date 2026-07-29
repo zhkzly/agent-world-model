@@ -567,6 +567,9 @@ class SafeValidationIssue:
     retryable: bool = True
     violated_condition: str | None = None
     expected_category: str | None = None
+    # A framework-authored next edit for an authorized correction.  It must
+    # remain independent of the rejected candidate value, just like ``message``.
+    remediation: str | None = None
 
     def __post_init__(self) -> None:
         # Direct semantic compilers and Pydantic conversion share the same
@@ -596,6 +599,7 @@ class SafeValidationIssue:
         for field_name, value in (
             ("violated_condition", self.violated_condition),
             ("expected_category", self.expected_category),
+            ("remediation", self.remediation),
         ):
             if value is not None and (not value or len(value) > 512):
                 raise ValueError(f"{field_name} must contain at most 512 characters")
@@ -613,6 +617,8 @@ class SafeValidationIssue:
             detail += f" Violated condition: {self.violated_condition}."
         if self.expected_category is not None:
             detail += f" Expected: {self.expected_category}."
+        if self.remediation is not None:
+            detail += f" Remediation: {self.remediation}."
         return detail
 
     @property
@@ -637,6 +643,8 @@ class SafeValidationIssue:
             value["violated_condition"] = self.violated_condition
         if self.expected_category is not None:
             value["expected_category"] = self.expected_category
+        if self.remediation is not None:
+            value["remediation"] = self.remediation
         return value
 
 
@@ -742,6 +750,12 @@ def pydantic_validation_diagnostic(
         shape_details = _safe_pydantic_numeric_bound_details(raw_error_type, item)
         if shape_details is None:
             shape_details = _safe_pydantic_shape_details(raw_error_type, item)
+        remediation = (
+            "Set schema_version to exactly `v2`; do not copy a version label from an input or "
+            "context document."
+            if _is_safe_v2_schema_version_literal_error(raw_error_type, item)
+            else None
+        )
         if shape_details is None:
             message = _SAFE_PYDANTIC_MESSAGES.get(
                 raw_error_type,
@@ -761,6 +775,7 @@ def pydantic_validation_diagnostic(
                 message=message,
                 violated_condition=violated_condition,
                 expected_category=expected,
+                remediation=remediation,
             )
         )
     if not issues:
@@ -793,15 +808,27 @@ def _safe_pydantic_shape_details(
 
     rejected_input = item.get("input", _PYDANTIC_INPUT_MISSING)
     input_kind = _safe_json_kind(rejected_input)
-    if raw_error_type in {
-        "string_type",
-        "int_type",
-        "float_type",
-        "bool_type",
-        "list_type",
-        "tuple_type",
-        "dict_type",
-    } and input_kind is not None:
+    if _is_safe_v2_schema_version_literal_error(raw_error_type, item):
+        expected = "the literal string `v2`"
+        return (
+            "Use the literal schema_version `v2`; never copy a version label from an input or "
+            "context document.",
+            "closed schema literal schema_version=v2",
+            expected,
+        )
+    if (
+        raw_error_type
+        in {
+            "string_type",
+            "int_type",
+            "float_type",
+            "bool_type",
+            "list_type",
+            "tuple_type",
+            "dict_type",
+        }
+        and input_kind is not None
+    ):
         expected = _SAFE_EXPECTED_CATEGORIES[raw_error_type]
         return (
             f"Return {expected}; the rejected value has safe JSON type `{input_kind}`.",
@@ -836,9 +863,8 @@ def _safe_pydantic_shape_details(
             if input_kind is not None and actual_length is not None
             else ""
         )
-        condition = (
-            f"closed schema minimum length {minimum}"
-            + (f"; received length {actual_length}" if actual_length is not None else "")
+        condition = f"closed schema minimum length {minimum}" + (
+            f"; received length {actual_length}" if actual_length is not None else ""
         )
         return (f"Return {expected}{actual}.", condition, expected)
     if raw_error_type.endswith("too_long") and maximum is not None:
@@ -849,16 +875,32 @@ def _safe_pydantic_shape_details(
             if input_kind is not None and actual_length is not None
             else ""
         )
-        condition = (
-            f"closed schema maximum length {maximum}"
-            + (
-                f"; received length {actual_length}"
-                if actual_length is not None
-                else ""
-            )
+        condition = f"closed schema maximum length {maximum}" + (
+            f"; received length {actual_length}" if actual_length is not None else ""
         )
         return (f"Return {expected}{actual}.", condition, expected)
     return None
+
+
+def _is_safe_v2_schema_version_literal_error(
+    raw_error_type: str,
+    item: Mapping[str, object],
+) -> bool:
+    """Recognize the framework-wide V2 version mismatch without retaining model text.
+
+    The expected literal is fixed framework schema metadata.  We deliberately
+    do not expose arbitrary literal alternatives or the rejected value: a
+    model response can contain untrusted prose, while this one small V2 fact
+    gives an authorized correction everything it needs.
+    """
+
+    if raw_error_type != "literal_error":
+        return False
+    location = item.get("loc")
+    if not isinstance(location, (tuple, list)) or not location or location[-1] != "schema_version":
+        return False
+    context = item.get("ctx")
+    return isinstance(context, Mapping) and context.get("expected") == "'v2'"
 
 
 def _safe_pydantic_numeric_bound_details(

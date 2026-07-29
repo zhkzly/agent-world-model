@@ -34,6 +34,12 @@ class ConfigModel(BaseModel):
 
 class AgentBackendConfig(ConfigModel):
     model: str = Field(min_length=1)
+    # Explicit candidates for a *new* same-node diagnostic definition after a
+    # classified transient has exhausted its one fresh-session retry.  This is
+    # deliberately configuration rather than a leaf-local fallback: route
+    # selection remains visible, profile-hashed, and subject to the Work
+    # control-plane's immutable parent closure.
+    fallback_models: tuple[str, ...] = ()
     model_provider: str | None = None
     # The actual routing value is intentionally never admitted into TOML,
     # resolved-profile metadata, or generated Codex configuration.  The
@@ -65,6 +71,10 @@ class AgentBackendConfig(ConfigModel):
     # the WorkGraph turns that ceiling into explicit resumable physical turns.
     environment_codegen_invocation_timeout_seconds: float = Field(default=2_700, gt=0)
     max_concurrent_invocations: int = Field(default=1, ge=1, le=32)
+    # This is retry pacing, not a Provider-progress timeout or an output cap.
+    # Scheduler records the resulting absolute retry instant and checks the
+    # prior ICP record before it opens the fresh node-local session.
+    infrastructure_retry_backoff_seconds: float = Field(default=5.0, ge=0)
     # ``json_object`` is the Direct, tool-free structured-node transport.  It
     # asks the provider for one JSON object without making the model manually
     # serialize a second JSON document into a string.  Local Pydantic and
@@ -112,6 +122,18 @@ class AgentBackendConfig(ConfigModel):
             API_KEY_RUNTIME_PROVIDER,
         }:
             raise ValueError("API-key profiles use the framework-owned runtime model provider")
+        if any(
+            not model
+            or model != model.strip()
+            or len(model) > 128
+            or any(character.isspace() for character in model)
+            for model in self.fallback_models
+        ):
+            raise ValueError("fallback_models must contain canonical non-secret model names")
+        if self.model in self.fallback_models or len(set(self.fallback_models)) != len(
+            self.fallback_models
+        ):
+            raise ValueError("fallback_models must be unique and exclude the primary model")
         if len(self.engineer_network_domain_ceiling) != len(
             set(self.engineer_network_domain_ceiling)
         ):
@@ -127,6 +149,12 @@ class AgentBackendConfig(ConfigModel):
                 "engineer_dependency_network_domains must be contained by the role ceiling"
             )
         return self
+
+    @property
+    def model_routes(self) -> tuple[str, ...]:
+        """Return the only configured models eligible for explicit fallback."""
+
+        return (self.model, *self.fallback_models)
 
 
 class ResearchConfig(ConfigModel):
@@ -219,6 +247,7 @@ def _expansion_campaign_budget() -> Budget:
         agent_turns=640,
         search_calls=30,
         tool_calls=2_560,
+        process_calls=2_560,
         build_seconds=4_500,
         evaluation_episodes=640,
         container_seconds=18_000,
@@ -233,6 +262,7 @@ def _expansion_candidate_budget() -> Budget:
         agent_turns=128,
         search_calls=6,
         tool_calls=512,
+        process_calls=512,
         build_seconds=900,
         evaluation_episodes=128,
         container_seconds=3_600,
@@ -396,6 +426,11 @@ def _generation_budget() -> Budget:
         agent_turns=128,
         search_calls=6,
         tool_calls=512,
+        # Process work is an independent capacity dimension. Keep its default
+        # aligned with the existing real-tool capacity so deterministic
+        # validation and clean-runtime probes cannot be admitted only after an
+        # expensive Agent proposal has completed.
+        process_calls=512,
         # The Direct Builder session is permitted to consume the configured
         # outer eight-hour wall envelope through explicit physical turns.
         build_seconds=28_800,

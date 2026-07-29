@@ -20,6 +20,27 @@ Rules:
 - Keep live model/network tests opt-in.
 - Run `uv run pytest tests/agent_world` before claiming this slice still works.
 
+## Local execution state roots and live observability
+
+For a normal `generate` or E2E run, configure `state_root` outside the
+reserved `.agent-world-live/` tree; this repository uses
+`.agent-world-staged/<run>/state` for durable, gitignored normal-run evidence.
+`ObservabilityRoot` deliberately rejects ordinary state beneath
+`.agent-world-live/`, so that location is not a valid way to make a normal
+E2E private.
+
+`.agent-world-live/` is only for private live diagnostics such as doctor state
+and marked `test-node` clones. A test-node clone has its own explicit marker;
+do not infer that a normal Generate run may use the same path.
+
+Read on demand:
+
+- `docs/configuration.zh.md` — safe normal configuration shape and state-root
+  choice.
+- `agent_world/app.py` — application-level reserved-live guard.
+- `agent_world/observability/paths.py` — scene-cache path guard and its exact
+  failure meaning.
+
 ## Artifact DAG verification
 
 ### 1. Scope / Trigger

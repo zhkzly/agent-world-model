@@ -335,6 +335,135 @@ def test_worker_compacts_repeated_text_delta_without_losing_progress_metadata() 
     assert len(str(compact)) < 512
 
 
+def test_worker_projects_expected_command_completion_without_command_text() -> None:
+    command = "./.agent-world-tools/uv --version > candidate/invocation-audit-marker.txt"
+    output_canary = "tool-output-must-not-persist"
+    compact = _compact_notification_payload(
+        "item/completed",
+        {
+            "item": {
+                "id": "private-command-item",
+                "type": "commandExecution",
+                "command": command,
+                "status": "completed",
+                "exitCode": 0,
+                "aggregatedOutput": output_canary,
+                "cwd": "/private/workspace",
+            }
+        },
+        diagnostic_command_expectations=(
+            ("uv_version", "./.agent-world-tools/uv --version"),
+        ),
+    )
+
+    assert compact == {
+        "item": {
+            "id": "private-command-item",
+            "type": "commandExecution",
+            "status": "completed",
+        },
+        "diagnosticCommandProof": [
+            {"label": "uv_version", "outcome": "succeeded", "exitCode": 0}
+        ],
+        "sourceMethod": "item/completed",
+    }
+    serialized = str(compact)
+    assert command not in serialized
+    assert output_canary not in serialized
+    assert "/private/workspace" not in serialized
+
+
+def test_worker_correlates_private_command_start_and_completion_by_item_id() -> None:
+    matches: dict[str, tuple[str, ...]] = {}
+    expectations = (("python312_version", "./.agent-world-tools/python3.12 --version"),)
+
+    started = _compact_notification_payload(
+        "item/started",
+        {
+            "item": {
+                "id": "private-command-item",
+                "type": "commandExecution",
+                "command": "./.agent-world-tools/python3.12 --version",
+                "status": "inProgress",
+            }
+        },
+        diagnostic_command_expectations=expectations,
+        diagnostic_command_matches=matches,
+    )
+    completed = _compact_notification_payload(
+        "item/completed",
+        {
+            "item": {
+                "id": "private-command-item",
+                "type": "commandExecution",
+                "status": "completed",
+                "exitCode": 0,
+            }
+        },
+        diagnostic_command_expectations=expectations,
+        diagnostic_command_matches=matches,
+    )
+
+    assert "diagnosticCommandProof" not in started
+    assert completed["diagnosticCommandProof"] == [
+        {"label": "python312_version", "outcome": "succeeded", "exitCode": 0}
+    ]
+    assert matches == {}
+
+
+def test_worker_projects_safe_command_not_found_category() -> None:
+    compact = _compact_notification_payload(
+        "item/completed",
+        {
+            "item": {
+                "id": "private-command-item",
+                "type": "commandExecution",
+                "command": "./.agent-world-tools/uv --version",
+                "status": "failed",
+                "exitCode": 127,
+            }
+        },
+        diagnostic_command_expectations=(
+            ("uv_version", "./.agent-world-tools/uv --version"),
+        ),
+    )
+
+    assert compact["diagnosticCommandProof"] == [
+        {"label": "uv_version", "outcome": "not_found", "exitCode": 127}
+    ]
+
+
+def test_worker_scrubs_expected_command_failure_excerpt() -> None:
+    redaction_canary = "command-diagnostic-secret"
+    compact = _compact_notification_payload(
+        "item/completed",
+        {
+            "item": {
+                "id": "private-command-item",
+                "type": "commandExecution",
+                "command": "./.agent-world-tools/uv --version",
+                "status": "failed",
+                "exitCode": 1,
+                "aggregatedOutput": (
+                    f"failure in /private/profile/bin/uv at https://provider.example.test/v1 "
+                    f"token={redaction_canary}"
+                ),
+            }
+        },
+        diagnostic_command_expectations=(
+            ("uv_version", "./.agent-world-tools/uv --version"),
+        ),
+        diagnostic_command_redactor=Redactor.from_values((redaction_canary,)),
+    )
+
+    proof = compact["diagnosticCommandProof"][0]
+    assert proof["exitCode"] == 1
+    assert redaction_canary not in str(proof)
+    assert "provider.example.test" not in str(proof)
+    assert "/private/profile/bin/uv" not in str(proof)
+    assert "[REDACTED_PATH]" in str(proof)
+
+
 def test_worker_keeps_custom_provider_routing_off_argv() -> None:
     routing_canary = "https://provider.example.test/v1"
 

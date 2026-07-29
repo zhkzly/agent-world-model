@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import json
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
-from v3_fixture import portable_counter_contracts
+from v3_fixture import candidate_files, portable_counter_contracts, write_candidate_project
 
+import agent_world.builder.leaf as builder_leaf_module
 from agent_world.artifact_store import ArtifactStore
 from agent_world.builder import (
     BuilderError,
@@ -26,14 +28,22 @@ from agent_world.builder import (
     ImplementationPlan,
     normalize_candidate_completion_output,
 )
-from agent_world.builder.models import TaskMaterializerContract, ToolBindingRequirement
+from agent_world.builder.models import (
+    RepairDisclosure,
+    TaskMaterializerContract,
+    ToolBindingRequirement,
+)
 from agent_world.contracts import (
     Budget,
+    EnvironmentCandidate,
     EnvironmentJob,
     EnvironmentRequest,
     GenerationContext,
     PermissionScope,
+    PublicSelfCheckDescriptor,
     ReleaseProfile,
+    RuntimeLaunch,
+    TaskMaterializerDescriptor,
     sha256_digest,
 )
 from agent_world.control import (
@@ -114,6 +124,161 @@ def test_builder_repair_prompt_preserves_unrelated_regression_obligations() -> N
     assert "unrelated to the disclosed Finding as regression obligations" in normalized
     assert "do not delete, relax, invert, or replace" in normalized
     assert "Add or strengthen a focused regression test" in normalized
+
+
+def test_runtime_contract_uses_declared_schema_and_repair_feedback_allows_domain_task_id() -> None:
+    runtime_contract = EnvironmentBuilder._runtime_wire_contract()  # noqa: SLF001
+
+    rendered_contract = runtime_contract.model_dump_json()
+    assert "evaluator_goal" not in rendered_contract
+    assert "sealed_case" not in rendered_contract
+    assert "verifier_ir" not in rendered_contract
+    handshake = next(item for item in runtime_contract.operations if item.operation == "handshake")
+    assert "JSON string array" in " ".join(handshake.result_requirements)
+    assert '"handshake","reset","invoke","snapshot","close"' in " ".join(
+        handshake.result_requirements
+    )
+    reset = next(item for item in runtime_contract.operations if item.operation == "reset")
+    assert "only the reset payload fields declared" in " ".join(reset.result_requirements)
+    digest_requirement = (
+        "state_digest must be exactly `sha256:` followed by 64 lowercase hexadecimal characters"
+    )
+    for operation in ("reset", "invoke", "snapshot"):
+        runtime_operation = next(
+            item for item in runtime_contract.operations if item.operation == operation
+        )
+        assert digest_requirement in " ".join(runtime_operation.result_requirements)
+
+    initial_prompt = EnvironmentBuilder._initial_prompt(  # noqa: SLF001
+        SimpleNamespace(design_id="design:wire-format", revision=1),
+        has_implementation_plan=True,
+    )
+    assert (
+        "literal `sha256:` prefix followed by 64 lowercase hexadecimal characters" in initial_prompt
+    )
+    skill = Path("agent_world/agent_assets/skills/engineer-environment-codegen/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    assert "`state_digest` must be exactly `sha256:` followed by 64 lowercase hexadecimal" in skill
+
+    disclosure = RepairDisclosure(
+        disclosure_id="repair-disclosure:domain-task-id",
+        category="runtime_protocol",
+        severity="high",
+        disclosure="repair",
+        summary="WorldSpec tool schema requires the domain task_id property.",
+        suggested_repair="Keep the domain task_id tool argument intact.",
+    )
+    assert "task_id" in disclosure.summary
+
+    with pytest.raises(ValidationError, match="private evaluation vocabulary"):
+        RepairDisclosure(
+            disclosure_id="repair-disclosure:sealed-case",
+            category="runtime_protocol",
+            severity="high",
+            disclosure="repair",
+            summary="The sealed_case must not cross the Runtime boundary.",
+        )
+
+    with pytest.raises(ValidationError, match="private evaluation vocabulary"):
+        RepairDisclosure(
+            disclosure_id="repair-disclosure:evaluation-binding",
+            category="runtime_protocol",
+            severity="high",
+            disclosure="repair",
+            summary="The evaluator goal must not cross the Runtime boundary.",
+        )
+
+
+def test_builder_surfaces_retired_contract_projection_as_safe_preflight(tmp_path: Path) -> None:
+    """An old frozen Builder projection must settle, not escape Scheduler dispatch.
+
+    The raw artifact intentionally models a prior framework projection.  The
+    real Artifact reader rejects it before any model invocation; Builder must
+    turn that into one safe preflight diagnosis rather than silently normalizing
+    the immutable payload or exposing the retired field name in feedback.
+    """
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    control_artifacts = store.issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("design.",),
+    )
+    builder_artifacts = store.issue_writer(
+        producer="environment-builder",
+        allowed_artifact_type_prefixes=("build.",),
+    )
+    design = portable_counter_contracts(store).design
+    design_ref = control_artifacts.put_json(
+        artifact_id="design:retired-builder-projection",
+        artifact_type="design.environment_design",
+        value=design,
+    )
+    current_contract = ImplementationContract(
+        contract_id="implementation-contract:retired-builder-projection",
+        design_ref=design_ref,
+        world_spec_hash=design.world_spec.content_digest(),
+        state_schema_hash=design.world_spec.state.content_digest(),
+        curriculum_hash=design.curriculum.content_digest(),
+        runtime=EnvironmentBuilder._runtime_wire_contract(),  # noqa: SLF001 - frozen projection
+        tools=tuple(
+            ToolBindingRequirement(
+                tool_id=tool.surface.tool_id,
+                tool_contract_hash=tool.content_digest(),
+            )
+            for tool in design.world_spec.tools
+        ),
+        task_materializer=TaskMaterializerContract(
+            task_types=tuple(item.task_type for item in design.curriculum.task_types),
+            minimum_distinct_initial_states=design.curriculum.minimum_distinct_initial_states,
+            minimum_distinct_tasks_per_type=design.curriculum.minimum_distinct_tasks_per_type,
+        ),
+    )
+    retired_payload = current_contract.model_dump(mode="json")
+    retired_payload["runtime"]["retired_framework_projection"] = ("old",)
+    retired_contract_ref = builder_artifacts.put_json(
+        artifact_id=current_contract.contract_id,
+        artifact_type="build.implementation_contract",
+        value=retired_payload,
+        dependencies=(design_ref,),
+    )
+    plan = ImplementationPlan(
+        plan_id="implementation-plan:retired-builder-projection",
+        design_ref=design_ref,
+        implementation_contract_ref=retired_contract_ref,
+        world_spec_hash=design.world_spec.content_digest(),
+        curriculum_hash=design.curriculum.content_digest(),
+        implementation_strategy="Use the frozen framework-owned codegen projection.",
+    )
+    plan_ref = builder_artifacts.put_json(
+        artifact_id=plan.plan_id,
+        artifact_type="build.implementation_plan",
+        value=plan,
+        dependencies=(design_ref, retired_contract_ref),
+    )
+    builder = EnvironmentBuilder(
+        artifact_store=builder_artifacts,
+        invocation_backend=SimpleNamespace(),
+        profile_provider=SimpleNamespace(),
+    )
+
+    with pytest.raises(BuilderError) as raised:
+        builder._implementation_contract_for_build(  # noqa: SLF001 - real frozen input boundary
+            design=design,
+            design_ref=design_ref,
+            implementation_plan=plan,
+            implementation_plan_ref=plan_ref,
+        )
+
+    assert raised.value.stage == "implementation_contract"
+    assert "regenerate BuildImplementationPlan" in str(raised.value)
+    assert "retired_framework_projection" not in str(raised.value)
+    assert BuilderLeaf._preflight_expected_category(  # noqa: SLF001 - feedback contract
+        raised.value.stage
+    ) == (
+        "a current framework-owned ImplementationContract compiled by "
+        "BuildImplementationPlan from the exact frozen EnvironmentDesign"
+    )
 
 
 def test_builder_leaf_projects_safe_source_phase_through_framework_diagnostic() -> None:
@@ -877,6 +1042,10 @@ async def test_builder_leaf_resumes_only_the_private_output_limited_session(tmp_
         input_refs=all_inputs,
         repair_action_ref=action_ref,
         continuation_commitment=record.record_commitment,
+        # The prior fallback route remains effective across an authorized
+        # output-ceiling continuation; the continuation action itself does
+        # not name a second model change.
+        model_override="gpt-5.3-codex-spark",
         scheduled_at=attempt_time,
         started_at=attempt_time,
     )
@@ -966,6 +1135,828 @@ async def test_builder_leaf_resumes_only_the_private_output_limited_session(tmp_
     assert builder.resume_kwargs["session_token_limit"] == 250_000
     assert builder.resume_kwargs["session_wall_seconds"] == 1_440
     assert builder.resume_kwargs["attempt_ordinal"] == 2
+    assert builder.resume_kwargs["model_override"] == "gpt-5.3-codex-spark"
+    assert proposal.output_refs == output_refs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decision", "model_override"),
+    (
+        ("infrastructure_retry", None),
+        ("model_fallback", "gpt-5.3-codex-spark"),
+    ),
+)
+async def test_builder_leaf_uses_fresh_session_for_authorized_transport_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    decision: str,
+    model_override: str | None,
+) -> None:
+    """Transport recovery must start a fresh Builder turn, never a correction.
+
+    ``RepairAction`` owns authorization and route choice.  CandidateBuild owns
+    only the new physical session, so an infrastructure retry or model fallback
+    must call ``build_once`` with the frozen input closure and no prior-session
+    or correction material.
+    """
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    artifacts = store.issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.", "design."),
+    )
+    build_artifacts = store.issue_writer(
+        producer="environment-builder",
+        allowed_artifact_type_prefixes=("build.",),
+    )
+    budget = Budget(
+        llm_tokens=1_000,
+        agent_turns=1,
+        build_seconds=60,
+        repair_attempts=1,
+        wall_seconds=120,
+    )
+    definition = deterministic_boundary_work_definition(
+        scope_id=f"job:builder-{decision}",
+        component="build",
+        stage="candidate_build",
+        artifact_slot="environment_candidate",
+        dependency_coordinates=(),
+        claim_id="build.candidate.valid",
+        claim="One frozen Candidate may recover one classified transport route.",
+        timing_reason="A retry must retain only immutable inputs.",
+        effect="block_integration",
+        success_maturity="candidate_built",
+    )
+    context_ref = artifacts.put_json(
+        artifact_id=f"context:builder-{decision}",
+        artifact_type="control.generation_context",
+        value={"case": decision},
+    )
+    design = portable_counter_contracts(store).design
+    design_ref = artifacts.put_json(
+        artifact_id=f"design:builder-{decision}",
+        artifact_type="design.environment_design",
+        value=design,
+        dependencies=(context_ref,),
+    )
+    implementation_plan_ref = build_artifacts.put_json(
+        artifact_id=f"implementation-plan:builder-{decision}",
+        artifact_type="build.implementation_plan",
+        value={"case": decision},
+        dependencies=(design_ref,),
+    )
+    report_ref = artifacts.put_json(
+        artifact_id=f"validation-report:builder-{decision}",
+        artifact_type="control.validation_report",
+        value={"case": decision},
+        dependencies=(context_ref,),
+    )
+    evaluation_ref = artifacts.put_json(
+        artifact_id=f"evaluation:builder-{decision}",
+        artifact_type="control.feedback_evaluation",
+        value={"case": decision},
+        dependencies=(report_ref,),
+    )
+    input_refs = (context_ref,)
+    action = RepairAction(
+        action_id=f"repair-action:builder-{decision}",
+        repair_policy_id=definition.repair_policy.policy_id,
+        repair_epoch_digest=sha256_digest(f"builder-{decision}".encode()),
+        definition_digest=definition.definition_digest,
+        input_fingerprint=work_input_fingerprint(input_refs),
+        source_evaluation_ref=evaluation_ref,
+        current_coordinate=definition.coordinate,
+        target_coordinate=definition.coordinate,
+        decision=decision,  # type: ignore[arg-type] - parametrized closed recovery decisions
+        jump_distance=0,
+        repair_attempt_ordinal=1,
+        immutable_input_refs=input_refs,
+        allowed_mutation_roots=(),
+        causal_evidence_refs=(report_ref, evaluation_ref),
+        reason_code="retryable_infrastructure_failure",
+        repair_attempt_charge=1,
+        authorized_at=datetime.now(UTC),
+        route_model="gpt-5.4-mini",
+        model_override=model_override,
+    )
+    action_ref = artifacts.put_json(
+        artifact_id=action.action_id,
+        artifact_type="control.repair_action",
+        value=action,
+        dependencies=(*input_refs, report_ref, evaluation_ref),
+    )
+    definition_ref = artifacts.put_json(
+        artifact_id=f"work-definition:builder-{decision}",
+        artifact_type="control.work_definition",
+        value=definition,
+        dependencies=(context_ref,),
+    )
+    now = datetime.now(UTC)
+    attempt = WorkAttempt(
+        attempt_id=f"attempt:builder-{decision}",
+        work_id=definition.work_id,
+        coordinate=definition.coordinate,
+        ordinal=2,
+        parent_attempt_id="attempt:builder-prior",
+        status="running",
+        definition_digest=definition.definition_digest,
+        proposal_policy_digest=definition.proposal_policy.content_digest(),
+        validation_policy_digest=definition.validation_policy.content_digest(),
+        repair_policy_digest=definition.repair_policy.content_digest(),
+        input_refs=input_refs,
+        repair_action_ref=action_ref,
+        repair_attempt_charge=1,
+        model_override=model_override,
+        scheduled_at=now,
+        started_at=now,
+    )
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=WorkControlStore(tmp_path / "work-control"),
+        budget=LeaseBudgetLedger(budget),
+    )
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+    output_refs = tuple(
+        build_artifacts.put_json(
+            artifact_id=f"builder-{decision}-output:{index}",
+            artifact_type=artifact_type,
+            value={"case": decision, "artifact_type": artifact_type},
+            dependencies=(implementation_plan_ref,),
+        )
+        for index, artifact_type in enumerate(
+            (
+                "build.source_workspace_snapshot",
+                "build.implementation_lineage",
+                "build.candidate_manifest",
+                "build.record",
+                "build.environment_candidate",
+            )
+        )
+    )
+
+    class FreshSessionBuilder:
+        calls: list[dict[str, object]] = []
+
+        async def build_once(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            profile = SimpleNamespace(
+                model_provider="openai",
+                model=(model_override or "gpt-5.4-mini"),
+                profile_hash="a" * 64,
+            )
+            return SimpleNamespace(
+                state=SimpleNamespace(profile=profile, invocation_session=None),
+                source_snapshot_ref=output_refs[0],
+                implementation_lineage_ref=output_refs[1],
+                candidate_manifest_ref=output_refs[2],
+                build_artifact_ref=output_refs[3],
+                candidate_ref=output_refs[4],
+                invocation=BuildInvocationSummary(
+                    invocation_id="dispatch:builder-transport-recovery",
+                    status=InvocationStatus.COMPLETED,
+                    duration_ms=12,
+                    usage=None,
+                    backend_version="constructed-boundary",
+                    total_tokens=100,
+                ),
+            )
+
+    builder = FreshSessionBuilder()
+    leaf = BuilderLeaf(
+        builder=builder,  # type: ignore[arg-type] - constructed fresh-session boundary
+        workspace_root=tmp_path / "builder-workspace",
+        run_id=f"run:builder-{decision}",
+        kernel=kernel,
+    )
+    context = WorkExecutionContext(
+        definition_ref=definition_ref,
+        coordinate=definition.coordinate,
+        graph_digest=sha256_digest(f"builder-{decision}".encode()),
+        external_input_refs=input_refs,
+        parent_output_refs=(),
+        repair_action_ref=action_ref,
+    )
+    monkeypatch.setattr(
+        builder_leaf_module,
+        "_modeling_design_from_context",
+        lambda _context, _kernel: (design_ref, design),
+    )
+    monkeypatch.setattr(
+        builder_leaf_module,
+        "_implementation_plan_from_context",
+        lambda _context, _kernel, **_kwargs: (implementation_plan_ref, SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        builder_leaf_module,
+        "_generation_permissions",
+        lambda _context, _kernel: PermissionScope(),
+    )
+
+    proposal = await leaf._proposal(  # noqa: SLF001 - recovery action boundary
+        context,
+        attempt,
+        "dispatch:builder-transport-recovery",
+        definition=definition,
+    )
+
+    assert len(builder.calls) == 1
+    call = builder.calls[0]
+    assert call["workspace"] == (tmp_path / "builder-workspace" / attempt.attempt_id)
+    assert call["model_override"] == model_override
+    assert call["parent_workspace_refs"] == ()
+    assert "correction_feedback" not in call
+    assert "session" not in call
+    assert proposal.output_refs == output_refs
+
+
+@pytest.mark.asyncio
+async def test_builder_leaf_uses_private_draft_in_a_fresh_workspace_recovery_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CandidateBuild never turns a transiently interrupted draft into output.
+
+    The Scheduler proof owns authorization and private-record binding.  This
+    adapter proof verifies the next boundary: Builder receives the exact
+    private workspace plus binding facts, starts no old Provider session, and
+    must return an ordinary complete bundle before the leaf can expose output.
+    """
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    artifacts = store.issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.", "design."),
+    )
+    build_artifacts = store.issue_writer(
+        producer="environment-builder",
+        allowed_artifact_type_prefixes=("build.",),
+    )
+    budget = Budget(
+        llm_tokens=1_000,
+        agent_turns=1,
+        build_seconds=60,
+        repair_attempts=1,
+        wall_seconds=120,
+    )
+    base_definition = deterministic_boundary_work_definition(
+        scope_id="job:builder-workspace-recovery",
+        component="build",  # type: ignore[arg-type]
+        stage="candidate_build",
+        artifact_slot="environment_candidate",
+        dependency_coordinates=(),
+        claim_id="build.candidate.valid",
+        claim="One private draft may be completed by one fresh Builder session.",
+        timing_reason="A Provider terminal cannot adopt an uncommitted candidate.",
+        effect="block_integration",
+        success_maturity="candidate_built",
+    )
+    definition = base_definition.model_copy(
+        update={
+            "repair_policy": RepairPolicy(
+                policy_id="repair:builder-workspace-recovery",
+                maximum_local_corrections=1,
+                strict_progress_bonus_corrections=0,
+                maximum_infrastructure_retries=1,
+                maximum_session_continuations=0,
+                maximum_process_recoveries=0,
+                maximum_total_repair_attempts=2,
+            ),
+            "allowed_mutation_roots": ("/candidate",),
+        }
+    )
+    context_ref = artifacts.put_json(
+        artifact_id="context:builder-workspace-recovery",
+        artifact_type="control.generation_context",
+        value={"case": "workspace-recovery"},
+    )
+    design = portable_counter_contracts(store).design
+    design_ref = artifacts.put_json(
+        artifact_id="design:builder-workspace-recovery",
+        artifact_type="design.environment_design",
+        value=design,
+        dependencies=(context_ref,),
+    )
+    implementation_plan_ref = build_artifacts.put_json(
+        artifact_id="implementation-plan:builder-workspace-recovery",
+        artifact_type="build.implementation_plan",
+        value={"case": "workspace-recovery"},
+        dependencies=(design_ref,),
+    )
+    report_ref = artifacts.put_json(
+        artifact_id="validation-report:builder-workspace-recovery",
+        artifact_type="control.validation_report",
+        value={"case": "workspace-recovery"},
+        dependencies=(context_ref,),
+    )
+    evaluation_ref = artifacts.put_json(
+        artifact_id="evaluation:builder-workspace-recovery",
+        artifact_type="control.feedback_evaluation",
+        value={"case": "workspace-recovery"},
+        dependencies=(report_ref,),
+    )
+    execution_ref = artifacts.put_json(
+        artifact_id="proposal-execution:builder-workspace-recovery",
+        artifact_type="control.proposal_execution",
+        value={"case": "workspace-recovery"},
+        dependencies=(report_ref,),
+    )
+    input_refs = (context_ref,)
+    model = "grok-4.5"
+    action = RepairAction(
+        action_id="repair-action:builder-workspace-recovery",
+        repair_policy_id=definition.repair_policy.policy_id,
+        repair_epoch_digest=sha256_digest(b"builder-workspace-recovery"),
+        definition_digest=definition.definition_digest,
+        input_fingerprint=work_input_fingerprint(input_refs),
+        source_evaluation_ref=evaluation_ref,
+        current_coordinate=definition.coordinate,
+        target_coordinate=definition.coordinate,
+        decision="infrastructure_retry",
+        jump_distance=0,
+        repair_attempt_ordinal=1,
+        immutable_input_refs=input_refs,
+        allowed_mutation_roots=definition.allowed_mutation_roots,
+        causal_evidence_refs=(report_ref, evaluation_ref),
+        reason_code="private_workspace_recovery",
+        repair_attempt_charge=1,
+        route_model=model,
+        workspace_recovery=True,
+        authorized_at=datetime.now(UTC),
+    )
+    action_ref = artifacts.put_json(
+        artifact_id=action.action_id,
+        artifact_type="control.repair_action",
+        value=action,
+        dependencies=(*input_refs, report_ref, evaluation_ref),
+    )
+    continuation_workspace_root = tmp_path / "continuation-workspaces"
+    workspace = (
+        continuation_workspace_root / "builder" / "attempt-initial" / ".agent-runtime" / "workspace"
+    )
+    (workspace / "candidate").mkdir(parents=True)
+    (workspace / "candidate" / "runtime.py").write_text(
+        "def generated_before_terminal():\n    return 'draft'\n",
+        encoding="utf-8",
+    )
+    profile_digest = f"sha256:{'a' * 64}"
+    config_digest = f"sha256:{'b' * 64}"
+    record = NodeContinuationRecord.capture_workspace_recovery(
+        work_id=definition.work_id,
+        attempt_id="attempt:builder-workspace-prior",
+        lineage_id=f"implementation:{design_ref.revision_id}",
+        workspace=workspace,
+        profile_digest=profile_digest,
+        codex_config_digest=config_digest,
+        model=model,
+        output_schema_digest=BuilderLeaf._candidate_schema_digest(),  # noqa: SLF001
+        definition_digest=definition.definition_digest,
+        proposal_policy_digest=definition.proposal_policy.content_digest(),
+        input_fingerprint=work_input_fingerprint(input_refs),
+        allowed_mutation_roots=definition.allowed_mutation_roots,
+        source_report_ref=report_ref,
+        source_evaluation_ref=evaluation_ref,
+        repair_action_ref=action_ref,
+        previous_execution_ref=execution_ref,
+    )
+    continuations = NodeContinuationStore(tmp_path / "continuations")
+    continuations.save(record)
+    definition_ref = artifacts.put_json(
+        artifact_id="work-definition:builder-workspace-recovery",
+        artifact_type="control.work_definition",
+        value=definition,
+        dependencies=(context_ref,),
+    )
+    now = datetime.now(UTC)
+    attempt = WorkAttempt(
+        attempt_id="attempt:builder-workspace-recovery",
+        work_id=definition.work_id,
+        coordinate=definition.coordinate,
+        ordinal=2,
+        parent_attempt_id=record.attempt_id,
+        status="running",
+        definition_digest=definition.definition_digest,
+        proposal_policy_digest=definition.proposal_policy.content_digest(),
+        validation_policy_digest=definition.validation_policy.content_digest(),
+        repair_policy_digest=definition.repair_policy.content_digest(),
+        input_refs=input_refs,
+        repair_action_ref=action_ref,
+        repair_attempt_charge=1,
+        continuation_commitment=record.record_commitment,
+        scheduled_at=now,
+        started_at=now,
+    )
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=WorkControlStore(tmp_path / "work-control"),
+        budget=LeaseBudgetLedger(budget),
+        continuations=continuations,
+        continuation_workspace_root=continuation_workspace_root,
+    )
+    output_refs = tuple(
+        build_artifacts.put_json(
+            artifact_id=f"builder-workspace-recovery-output:{index}",
+            artifact_type=artifact_type,
+            value={"case": "workspace-recovery", "artifact_type": artifact_type},
+            dependencies=(implementation_plan_ref,),
+        )
+        for index, artifact_type in enumerate(
+            (
+                "build.source_workspace_snapshot",
+                "build.implementation_lineage",
+                "build.candidate_manifest",
+                "build.record",
+                "build.environment_candidate",
+            )
+        )
+    )
+
+    class WorkspaceRecoveryBuilder:
+        normal_calls = 0
+        recovery_calls: list[dict[str, object]] = []
+
+        async def build_once(self, **_kwargs):
+            self.normal_calls += 1
+            raise AssertionError("a private workspace recovery must not start an empty build")
+
+        async def resume_interrupted_workspace_build(self, **kwargs):
+            self.recovery_calls.append(dict(kwargs))
+            profile = SimpleNamespace(
+                model_provider="openai-compatible",
+                model=model,
+                profile_hash="a" * 64,
+            )
+            return SimpleNamespace(
+                state=SimpleNamespace(profile=profile, invocation_session=None),
+                source_snapshot_ref=output_refs[0],
+                implementation_lineage_ref=output_refs[1],
+                candidate_manifest_ref=output_refs[2],
+                build_artifact_ref=output_refs[3],
+                candidate_ref=output_refs[4],
+                invocation=BuildInvocationSummary(
+                    invocation_id=kwargs["proposal_invocation_id"],
+                    status=InvocationStatus.COMPLETED,
+                    duration_ms=12,
+                    usage=None,
+                    backend_version="constructed-boundary",
+                    total_tokens=100,
+                ),
+            )
+
+    builder = WorkspaceRecoveryBuilder()
+    leaf = BuilderLeaf(
+        builder=builder,  # type: ignore[arg-type]
+        workspace_root=tmp_path / "empty-builder-workspace",
+        run_id="run:builder-workspace-recovery",
+        kernel=SchedulerLeafExecutor(runtime=runtime),
+    )
+    context = WorkExecutionContext(
+        definition_ref=definition_ref,
+        coordinate=definition.coordinate,
+        graph_digest=sha256_digest(b"builder-workspace-recovery"),
+        external_input_refs=input_refs,
+        parent_output_refs=(),
+        repair_action_ref=action_ref,
+    )
+    monkeypatch.setattr(
+        builder_leaf_module,
+        "_modeling_design_from_context",
+        lambda _context, _kernel: (design_ref, design),
+    )
+    monkeypatch.setattr(
+        builder_leaf_module,
+        "_implementation_plan_from_context",
+        lambda _context, _kernel, **_kwargs: (implementation_plan_ref, SimpleNamespace()),
+    )
+    monkeypatch.setattr(
+        builder_leaf_module,
+        "_generation_permissions",
+        lambda _context, _kernel: PermissionScope(),
+    )
+
+    proposal = await leaf._proposal(  # noqa: SLF001 - adapter recovery boundary
+        context,
+        attempt,
+        "dispatch:builder-workspace-recovery",
+        definition=definition,
+    )
+
+    assert builder.normal_calls == 0
+    assert len(builder.recovery_calls) == 1
+    call = builder.recovery_calls[0]
+    assert call["workspace"] == workspace.resolve()
+    assert call["recovery_lineage_id"] == record.lineage_id
+    assert call["recovery_profile_digest"] == profile_digest
+    assert call["recovery_codex_config_digest"] == config_digest
+    assert call["recovery_model"] == model
+    assert call["model_override"] is None
+    assert "session" not in call
+    assert proposal.output_refs == output_refs
+
+
+@pytest.mark.asyncio
+async def test_builder_leaf_repairs_committed_seed_in_a_fresh_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A downstream repair restores the immutable Candidate, not a lost thread."""
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    control_artifacts = store.issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.",),
+    )
+    build_artifacts = store.issue_writer(
+        producer="environment-builder",
+        allowed_artifact_type_prefixes=("build.",),
+    )
+    input_ref = control_artifacts.put_json(
+        artifact_id="context:builder-snapshot-repair",
+        artifact_type="control.generation_context",
+        value={"context": "builder-snapshot-repair"},
+    )
+    definition = deterministic_boundary_work_definition(
+        scope_id="job:builder-snapshot-repair",
+        component="build",
+        stage="candidate_build",
+        artifact_slot="environment_candidate",
+        dependency_coordinates=(),
+        claim_id="build.candidate.valid",
+        claim="One committed Candidate may receive one focused downstream correction.",
+        timing_reason="Integration must repair only the exact committed Candidate closure.",
+        effect="block_integration",
+        success_maturity="candidate_built",
+    ).model_copy(
+        update={
+            "repair_policy": RepairPolicy(
+                policy_id="repair:builder-snapshot-repair",
+                maximum_local_corrections=1,
+                strict_progress_bonus_corrections=0,
+                maximum_infrastructure_retries=0,
+                maximum_session_continuations=0,
+                maximum_process_recoveries=0,
+                maximum_total_repair_attempts=1,
+            ),
+            "allowed_mutation_roots": ("/source", "/runtime"),
+        }
+    )
+    task_schema_ref = build_artifacts.put_json(
+        artifact_id="snapshot-repair:task-schema",
+        artifact_type="build.task_materialization_schema",
+        value={"schema": "task"},
+    )
+    curriculum_ref = build_artifacts.put_json(
+        artifact_id="snapshot-repair:curriculum",
+        artifact_type="build.curriculum",
+        value={"curriculum": "frozen"},
+    )
+    manifest_ref = build_artifacts.put_json(
+        artifact_id="snapshot-repair:manifest",
+        artifact_type="build.candidate_manifest",
+        value={"manifest": "frozen"},
+    )
+    lineage_ref = build_artifacts.put_json(
+        artifact_id="snapshot-repair:lineage",
+        artifact_type="build.implementation_lineage",
+        value={"lineage": "frozen"},
+    )
+    build_record_ref = build_artifacts.put_json(
+        artifact_id="snapshot-repair:record",
+        artifact_type="build.record",
+        value={"record": "frozen"},
+    )
+    snapshot_ref = build_artifacts.put_json(
+        artifact_id="snapshot-repair:source",
+        artifact_type="build.source_workspace_snapshot",
+        value={"snapshot": "frozen"},
+    )
+    verifier_ref = build_artifacts.put_json(
+        artifact_id="snapshot-repair:verifier",
+        artifact_type="build.public_verifier",
+        value={"verifier": "public"},
+    )
+    contract_ref = build_artifacts.put_json(
+        artifact_id="snapshot-repair:contract",
+        artifact_type="build.implementation_contract",
+        value={"contract": "frozen"},
+    )
+    candidate = EnvironmentCandidate(
+        candidate_id="candidate:snapshot-repair",
+        revision=1,
+        design_ref=input_ref,
+        implementation_contract_ref=contract_ref,
+        source_workspace_snapshot_ref=snapshot_ref,
+        build_artifact_ref=build_record_ref,
+        runtime=RuntimeLaunch(argv=(".venv/bin/python", "-m", "environment.runtime")),
+        task_materializer=TaskMaterializerDescriptor(
+            entrypoint="environment.tasks:materialize",
+            entry_path="src/environment/tasks.py",
+            output_schema_ref=task_schema_ref,
+            curriculum_ref=curriculum_ref,
+        ),
+        public_self_check=PublicSelfCheckDescriptor(
+            argv=(".venv/bin/python", "-m", "environment.public_check"),
+            entry_path="src/environment/public_check.py",
+        ),
+        public_verifier_ref=verifier_ref,
+        candidate_manifest_ref=manifest_ref,
+        implementation_lineage_ref=lineage_ref,
+    )
+    candidate_ref = build_artifacts.put_json(
+        artifact_id="snapshot-repair:candidate",
+        artifact_type="build.environment_candidate",
+        value=candidate,
+        dependencies=(snapshot_ref, contract_ref, manifest_ref, lineage_ref, build_record_ref),
+    )
+    operation_ref = control_artifacts.put_json(
+        artifact_id="operation:snapshot-repair:initial",
+        artifact_type="control.operation_run",
+        value={"operation": "initial"},
+    )
+    evaluation_ref = control_artifacts.put_json(
+        artifact_id="evaluation:snapshot-repair",
+        artifact_type="control.feedback_evaluation",
+        value={"evaluation": "initial"},
+    )
+    output_refs = (
+        snapshot_ref,
+        lineage_ref,
+        manifest_ref,
+        build_record_ref,
+        candidate_ref,
+    )
+    now = datetime.now(UTC)
+    source_attempt = WorkAttempt(
+        attempt_id="attempt:builder-snapshot-repair:1",
+        work_id=definition.work_id,
+        coordinate=definition.coordinate,
+        ordinal=1,
+        status="succeeded",
+        definition_digest=definition.definition_digest,
+        proposal_policy_digest=definition.proposal_policy.content_digest(),
+        validation_policy_digest=definition.validation_policy.content_digest(),
+        repair_policy_digest=definition.repair_policy.content_digest(),
+        input_refs=(input_ref,),
+        output_refs=output_refs,
+        operation_run_refs=(operation_ref,),
+        feedback_evaluation_ref=evaluation_ref,
+        scheduled_at=now,
+        started_at=now,
+        finished_at=now,
+    )
+    source_attempt_ref = control_artifacts.put_json(
+        artifact_id=source_attempt.attempt_id,
+        artifact_type="control.work_attempt",
+        value=source_attempt,
+        dependencies=(input_ref, *output_refs, operation_ref, evaluation_ref),
+    )
+    action = RepairAction(
+        action_id="repair-action:builder-snapshot-repair",
+        repair_policy_id=definition.repair_policy.policy_id,
+        repair_epoch_digest=sha256_digest(b"builder-snapshot-repair"),
+        definition_digest=definition.definition_digest,
+        input_fingerprint=work_input_fingerprint((input_ref,)),
+        source_evaluation_ref=evaluation_ref,
+        current_coordinate=definition.coordinate,
+        target_coordinate=definition.coordinate,
+        decision="local_correction",
+        jump_distance=0,
+        repair_attempt_ordinal=1,
+        immutable_input_refs=(input_ref,),
+        repair_seed_attempt_ref=source_attempt_ref,
+        repair_seed_output_refs=output_refs,
+        allowed_mutation_roots=definition.allowed_mutation_roots,
+        causal_evidence_refs=(evaluation_ref,),
+        reason_code="causal_downstream_failure",
+        repair_attempt_charge=1,
+        authorized_at=now,
+    )
+    action_ref = control_artifacts.put_json(
+        artifact_id=action.action_id,
+        artifact_type="control.repair_action",
+        value=action,
+        dependencies=(source_attempt_ref, evaluation_ref, *output_refs, input_ref),
+    )
+    repair_attempt = WorkAttempt(
+        attempt_id="attempt:builder-snapshot-repair:2",
+        work_id=definition.work_id,
+        coordinate=definition.coordinate,
+        ordinal=2,
+        parent_attempt_id=source_attempt.attempt_id,
+        status="running",
+        definition_digest=definition.definition_digest,
+        proposal_policy_digest=definition.proposal_policy.content_digest(),
+        validation_policy_digest=definition.validation_policy.content_digest(),
+        repair_policy_digest=definition.repair_policy.content_digest(),
+        input_refs=(input_ref,),
+        repair_action_ref=action_ref,
+        repair_attempt_charge=1,
+        scheduled_at=now,
+        started_at=now,
+    )
+    runtime = WorkControlRuntime(
+        artifacts=control_artifacts,
+        heads=WorkControlStore(tmp_path / "work-control"),
+        budget=LeaseBudgetLedger(Budget(llm_tokens=1_000, agent_turns=1, repair_attempts=1)),
+    )
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+    monkeypatch.setattr(
+        SchedulerLeafExecutor,
+        "agent_correction_brief",
+        lambda _self, _context, *, definition: SimpleNamespace(
+            prompt_projection=lambda: {
+                "total_blocking_issues": 1,
+                "clusters": ({"code": "handshake", "remediation": "Return string operations."},),
+            }
+        ),
+    )
+    design = SimpleNamespace(design_id="design:snapshot-repair")
+    plan = SimpleNamespace(implementation_strategy="repair exactly the restored source")
+    monkeypatch.setattr(
+        builder_leaf_module,
+        "_modeling_design_from_context",
+        lambda *_args: (input_ref, design),
+    )
+    monkeypatch.setattr(
+        builder_leaf_module,
+        "_implementation_plan_from_context",
+        lambda *_args, **_kwargs: (contract_ref, plan),
+    )
+    monkeypatch.setattr(
+        builder_leaf_module,
+        "_generation_permissions",
+        lambda *_args: PermissionScope(),
+    )
+    fresh_session = InvocationSession(
+        thread_id="fresh-builder-thread",
+        lineage_id="implementation:snapshot-repair",
+        workspace=(tmp_path / "fresh-workspace").resolve(),
+        profile_hash="a" * 64,
+        codex_config_sha256="b" * 64,
+    )
+    success_state = SimpleNamespace(
+        profile=SimpleNamespace(
+            model_provider="openai",
+            model="gpt-5.3-codex-spark",
+            profile_hash="a" * 64,
+        ),
+        invocation_session=fresh_session,
+    )
+
+    class SnapshotRepairBuilder:
+        repair_kwargs: dict[str, object] | None = None
+
+        async def repair_from_snapshot(self, **kwargs):
+            self.repair_kwargs = dict(kwargs)
+            return SimpleNamespace(
+                state=success_state,
+                source_snapshot_ref=snapshot_ref,
+                implementation_lineage_ref=lineage_ref,
+                candidate_manifest_ref=manifest_ref,
+                build_artifact_ref=build_record_ref,
+                candidate_ref=candidate_ref,
+                invocation=BuildInvocationSummary(
+                    invocation_id=kwargs["proposal_invocation_id"],
+                    status=InvocationStatus.COMPLETED,
+                    duration_ms=11,
+                    usage=None,
+                    backend_version="constructed-snapshot-repair",
+                    total_tokens=11,
+                ),
+            )
+
+    builder = SnapshotRepairBuilder()
+    leaf = BuilderLeaf(
+        builder=builder,  # type: ignore[arg-type] - constructed adapter boundary
+        workspace_root=tmp_path / "workspaces",
+        run_id="run:builder-snapshot-repair",
+        kernel=kernel,
+    )
+    definition_ref = control_artifacts.put_json(
+        artifact_id="work-definition:builder-snapshot-repair",
+        artifact_type="control.work_definition",
+        value=definition,
+    )
+    context = WorkExecutionContext(
+        definition_ref=definition_ref,
+        coordinate=definition.coordinate,
+        graph_digest=sha256_digest(b"builder-snapshot-repair-graph"),
+        external_input_refs=(input_ref,),
+        repair_action_ref=action_ref,
+    )
+
+    proposal = await leaf._proposal(  # noqa: SLF001 - adapter boundary under test
+        context,
+        repair_attempt,
+        "dispatch:builder-snapshot-repair",
+        definition=definition,
+    )
+
+    assert builder.repair_kwargs is not None
+    assert builder.repair_kwargs["candidate_ref"] == candidate_ref
+    assert builder.repair_kwargs["workspace"] == tmp_path / "workspaces" / repair_attempt.attempt_id
+    assert b"Return string operations." in builder.repair_kwargs["correction_feedback"]
     assert proposal.output_refs == output_refs
 
 
@@ -1130,6 +2121,125 @@ def test_workspace_manifest_gap_becomes_safe_actionable_repair_feedback(tmp_path
     assert missing_path not in persisted
 
 
+def test_workspace_python_range_mismatch_becomes_safe_actionable_repair_feedback(
+    tmp_path: Path,
+) -> None:
+    """A real candidate tree exposes the frozen Python-range failure precisely."""
+
+    project, _uv_path, _uv_cache = write_candidate_project(tmp_path)
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'requires-python = ">=3.12,<3.13"',
+            'requires-python = ">=3.12"',
+        ),
+        encoding="utf-8",
+    )
+    (project / "uv.lock").write_text(
+        """version = 1
+revision = 3
+requires-python = ">=3.12"
+
+[[package]]
+name = "counter-runtime-v3"
+version = "0.1.0"
+source = { virtual = "." }
+""",
+        encoding="utf-8",
+    )
+    completion = CandidateCompletion(
+        status="completed",
+        project_root="candidate",
+        root_project_mode="virtual-read-only-source-tree",
+        dependency_install_mode="offline-wheel-only",
+        runtime=CandidateRuntimeDeclaration(
+            argv=(".venv/bin/python", "-m", "runtime"),
+            entry_path="runtime.py",
+        ),
+        task_materializer=CandidateTaskMaterializerDeclaration(
+            entrypoint="task_materializer:materialize",
+            entry_path="task_materializer.py",
+        ),
+        public_self_check=CandidatePublicSelfCheckDeclaration(
+            argv=(".venv/bin/python", "-m", "public_check"),
+            entry_path="public_check.py",
+        ),
+        public_test_paths=("public_test.py",),
+        files=tuple(
+            CandidateFileDeclaration(path=item.path, role=item.role)  # type: ignore[arg-type]
+            for item in candidate_files(project)
+        ),
+    )
+
+    with pytest.raises(CandidateWorkspaceError) as captured:
+        CandidateWorkspaceValidator().validate(project, completion)
+
+    workspace_error = captured.value
+    assert workspace_error.safe_diagnostic is not None
+    assert workspace_error.safe_diagnostic.code == "python_requires_contract_mismatch"
+    try:
+        raise BuilderError("candidate.validation", str(workspace_error)) from workspace_error
+    except BuilderError as builder_error:
+        diagnostic = EnvironmentBuilder._validation_diagnostic(  # noqa: SLF001 - boundary under test
+            builder_error
+        )
+
+    issue = diagnostic.issues[0]
+    assert diagnostic.validation_phase == "project_contract"
+    assert issue.issue_code == (
+        "candidate_python_requires_contract_mismatch@candidate.pyproject.toml.uv.lock"
+    )
+    assert issue.violated_condition == (
+        "candidate Python ranges do not exactly represent the frozen implementation contract"
+    )
+    assert issue.expected_category == (
+        "the exact frozen python_requires value in pyproject and either that value or "
+        "uv's canonical Python 3.12 range in uv.lock"
+    )
+    assert "inputs/implementation-contract.json" in diagnostic.feedback
+    assert ">=3.12" in diagnostic.feedback
+
+
+def test_workspace_derives_executable_mode_from_physical_tree(tmp_path: Path) -> None:
+    """A model no longer owns redundant mode metadata for Candidate files."""
+
+    project, _uv_path, _uv_cache = write_candidate_project(tmp_path)
+    runtime_path = project / "runtime.py"
+    runtime_path.chmod(runtime_path.stat().st_mode | stat.S_IXUSR)
+    completion = CandidateCompletion(
+        status="completed",
+        project_root="candidate",
+        root_project_mode="virtual-read-only-source-tree",
+        dependency_install_mode="offline-wheel-only",
+        runtime=CandidateRuntimeDeclaration(
+            argv=(".venv/bin/python", "-m", "runtime"),
+            entry_path="runtime.py",
+        ),
+        task_materializer=CandidateTaskMaterializerDeclaration(
+            entrypoint="task_materializer:materialize",
+            entry_path="task_materializer.py",
+        ),
+        public_self_check=CandidatePublicSelfCheckDeclaration(
+            argv=(".venv/bin/python", "-m", "public_check"),
+            entry_path="public_check.py",
+        ),
+        public_test_paths=("public_test.py",),
+        files=tuple(
+            CandidateFileDeclaration(path=item.path, role=item.role)  # type: ignore[arg-type]
+            for item in candidate_files(project)
+        ),
+    )
+
+    validated = CandidateWorkspaceValidator().validate(project, completion)
+
+    runtime = next(item for item in validated.files if item.path == "runtime.py")
+    assert runtime.executable is True
+    assert (
+        "executable"
+        not in CandidateFileDeclaration.model_json_schema(mode="validation")["properties"]
+    )
+
+
 @pytest.mark.parametrize("field", ("root_project_mode", "dependency_install_mode"))
 def test_completed_candidate_cannot_omit_supply_chain_contract(field: str) -> None:
     values = _completed_values()
@@ -1286,6 +2396,21 @@ def test_framework_normalizes_one_witnessed_outer_candidate_namespace() -> None:
     assert completion.runtime.argv[-1] == "candidate.runtime"
     assert completion.task_materializer is not None
     assert completion.task_materializer.entrypoint == "candidate.materializer:materialize"
+
+
+def test_framework_drops_legacy_agent_executable_declarations() -> None:
+    raw = _outer_prefixed_completion_output()
+    files = raw["files"]
+    assert isinstance(files, list)
+    for item in files:
+        assert isinstance(item, dict)
+        item["executable"] = True
+
+    normalized = normalize_candidate_completion_output(raw)
+
+    normalized_files = normalized["files"]  # type: ignore[index]
+    assert all("executable" not in item for item in normalized_files)
+    assert _parse_json_completion(normalized).status == "completed"
 
 
 def test_framework_preserves_legitimate_nested_candidate_package() -> None:

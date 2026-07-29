@@ -65,6 +65,26 @@ agent-world-agent-view-stewardship sets the acceptance criteria for a project
 view. This Skill owns the test selection and execution; do not bury node tests
 inside the view-design Skill.
 
+## Observe live calls actively
+
+For every real Provider, Agent, or LLM node, record its dispatch identity and
+start observation. If five minutes pass without a terminal result **or
+meaningful progress**, pause the execution chain and perform a read-only
+liveness check: safe scene/telemetry, active operation and invocation-control
+state, owner process state, last Provider event/first progress/first write,
+and any safe route or network terminal fact. Process existence alone is not
+meaningful progress.
+
+This is an inspection cadence, not a new five-minute runtime death clock. Do
+not shorten the node's declared logical envelope merely to make a test finish.
+If the evidence shows real bounded progress, leave the call running and repeat
+the read-only check at an interval no longer than five minutes. If it shows an
+absent owner, no event/liveness evidence, a terminal error, or an
+uninterpretable gap, stop chaining, read the scene, and return to
+agent-world-debugging. Do not wait one or two hours without new evidence, and
+do not retry or change Prompt/Skill semantics until the stalled boundary has an
+owner hypothesis.
+
 ## Run one boundary at a time
 
 1. Preserve or construct the smallest credible input closure, including the

@@ -49,6 +49,7 @@ _SANDBOX_PYTHON = f"{_SANDBOX_PYTHON_ROOT}/bin/{_PRODUCTION_PYTHON.name}"
 _SANDBOX_UV_CACHE_SOURCE = "/opt/agent-world/uv-cache"
 _APPROVED_INTERPRETERS = frozenset({".venv/bin/python", ".venv/bin/python3", "python", "python3"})
 _TASK_MATERIALIZER_RUNNER_DESTINATION = "/opt/agent-world/bin/task-materializer-runner.py"
+_PUBLIC_TEST_RUNNER_DESTINATION = "/opt/agent-world/bin/public-test-runner.py"
 
 
 @functools.lru_cache(maxsize=1)
@@ -187,6 +188,49 @@ except BaseException as exc:
 sys.stdout.write(encoded + "\n")
 sys.stdout.flush()
 """
+
+
+_PUBLIC_TEST_RUNNER_SOURCE = r"""from __future__ import annotations
+
+import os
+import runpy
+import sys
+from pathlib import PurePosixPath
+
+
+def fail(message: str, exit_code: int = 70) -> None:
+    sys.stderr.write(message + "\n")
+    raise SystemExit(exit_code)
+
+
+if len(sys.argv) != 2:
+    fail("framework public-test runner requires exactly one candidate-relative test path")
+
+relative = PurePosixPath(sys.argv[1])
+if (
+    relative.is_absolute()
+    or not relative.parts
+    or ".." in relative.parts
+    or "\\" in sys.argv[1]
+):
+    fail("framework public-test runner received an invalid candidate-relative test path")
+
+workspace = os.environ.get("AGENT_WORLD_WORKSPACE", "/workspace")
+test_path = os.path.join(workspace, *relative.parts)
+if not os.path.isfile(test_path):
+    fail("framework public-test runner could not find the declared test file")
+
+# The virtual project is deliberately not installed.  Public tests nevertheless
+# exercise the exact candidate tree, including conventional root and src layouts.
+# This is framework-owned launch setup, not a candidate-controlled PYTHONPATH.
+for import_root in (os.path.join(workspace, "src"), workspace):
+    if import_root not in sys.path:
+        sys.path.insert(0, import_root)
+
+sys.argv = [relative.as_posix()]
+runpy.run_path(test_path, run_name="__main__")
+"""
+
 
 class JudgeInfrastructureError(RuntimeError):
     def __init__(
@@ -801,9 +845,7 @@ class CleanCandidateBuilder:
                     if self.uv_cache_dir is not None
                     else None
                 ),
-                extra_writable_directory_binds={
-                    dependency_environment: "/workspace/.venv"
-                },
+                extra_writable_directory_binds={dependency_environment: "/workspace/.venv"},
                 process_limit=self.resource_limits.processes,
             )
             started = time.monotonic()
@@ -1086,6 +1128,63 @@ class CandidateSandboxRunner:
                 stdin_bytes=stdin_bytes,
                 extra_read_only_binds={runner_path: _TASK_MATERIALIZER_RUNNER_DESTINATION},
                 failure_prefix="task_materializer",
+            )
+
+    async def run_public_test(
+        self,
+        project_root: Path,
+        *,
+        test_path: str,
+        visible_workspace_paths: Sequence[str],
+        timeout_seconds: float | None = None,
+        max_output_bytes: int | None = None,
+    ) -> SandboxProcessResult:
+        """Run one declared public test with the virtual candidate import roots.
+
+        Candidate projects are intentionally installed with ``--no-install-project``.
+        A direct ``python tests/test_x.py`` therefore loses the project root from
+        ``sys.path`` before the test has a chance to exercise candidate code.  The
+        framework-owned runner restores only the read-only candidate root and
+        optional ``src/`` layout inside the existing sandbox; it does not expose a
+        host path or let the candidate override ``PYTHONPATH``.
+        """
+
+        if (
+            not isinstance(test_path, str)
+            or not test_path
+            or chr(0) in test_path
+            or "\\" in test_path
+        ):
+            raise JudgeInfrastructureError(
+                "invalid_public_test_path",
+                "public test path must be a non-empty candidate-relative POSIX path",
+            )
+        path = PurePosixPath(test_path)
+        if path.is_absolute() or not path.parts or ".." in path.parts:
+            raise JudgeInfrastructureError(
+                "invalid_public_test_path",
+                "public test path must stay inside the candidate root",
+            )
+
+        with tempfile.TemporaryDirectory(
+            prefix="agent-world-public-test-",
+            dir=_trusted_temp_root(),
+        ) as runner_text:
+            runner_path = Path(runner_text) / "public-test-runner.py"
+            runner_path.write_text(_PUBLIC_TEST_RUNNER_SOURCE, encoding="utf-8")
+            runner_path.chmod(0o400)
+            return await self.run(
+                project_root,
+                argv=(
+                    ".venv/bin/python",
+                    _PUBLIC_TEST_RUNNER_DESTINATION,
+                    path.as_posix(),
+                ),
+                visible_workspace_paths=visible_workspace_paths,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=max_output_bytes,
+                extra_read_only_binds={runner_path: _PUBLIC_TEST_RUNNER_DESTINATION},
+                failure_prefix="public_test",
             )
 
 
@@ -1923,11 +2022,7 @@ def _validate_declared_source_tree(
                 "candidate_source_file_missing",
                 f"manifest-declared source file is missing: {declared.path}",
             ) from exc
-        if (
-            path.is_symlink()
-            or not stat.S_ISREG(observed.st_mode)
-            or observed.st_nlink != 1
-        ):
+        if path.is_symlink() or not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
             raise CandidateBuildError(
                 "candidate_source_file_unsafe",
                 f"manifest-declared source is not an independent regular file: {declared.path}",

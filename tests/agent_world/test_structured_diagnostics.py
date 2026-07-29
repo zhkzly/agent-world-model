@@ -112,7 +112,37 @@ def test_direct_provider_unavailable_keeps_a_safe_liveness_fingerprint() -> None
     }
     assert "http_status=503" in safe_terminal_condition(error)
     assert "Provider liveness/route check" in (safe_terminal_expected_category(error) or "")
-    assert "safe HTTP status" in (safe_terminal_remediation(error) or "")
+    assert "safe Provider fingerprint" in (safe_terminal_remediation(error) or "")
+    assert terminal_failure_retryable(error) is True
+
+
+def test_direct_streamed_provider_unavailable_keeps_a_safe_retry_route() -> None:
+    provider_message_canary = "DIRECT_PROVIDER_STREAM_SECRET_MESSAGE"
+    error = InvocationError(
+        code="direct_provider_unavailable",
+        message=provider_message_canary,
+        retryable=True,
+        details={
+            "provider_error_shape": "object",
+            "provider_error_type": "absent",
+            "provider_error_code": "provider_unavailable",
+            "provider_error_param": "other",
+            "message": provider_message_canary,
+        },
+    )
+
+    assert safe_terminal_details(error) == {
+        "provider_error_shape": "object",
+        "provider_error_type": "absent",
+        "provider_error_code": "provider_unavailable",
+        "provider_error_param": "other",
+    }
+    assert "code=provider_unavailable" in safe_terminal_condition(error)
+    assert "safe Provider fingerprint" in (safe_terminal_expected_category(error) or "")
+    assert "safe Provider fingerprint" in (safe_terminal_remediation(error) or "")
+    assert provider_message_canary not in safe_terminal_condition(error)
+    assert provider_message_canary not in (safe_terminal_expected_category(error) or "")
+    assert provider_message_canary not in (safe_terminal_remediation(error) or "")
     assert terminal_failure_retryable(error) is True
 
 

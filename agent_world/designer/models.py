@@ -957,18 +957,37 @@ class ToolRuleDraft(AgentOutput):
     complete reference and collection-binding catalog for one tool.
     """
 
+    # In ToolSemantics this is a structural label fixed by the enclosing
+    # section, not Agent-authored semantics.  Keep it in the materialized IR
+    # for the shared Rule compiler, but make the wire field optional and let
+    # ToolSemanticSourceDraft derive it after parsing.
     family: Literal[
         "precondition",
         "transition",
         "postcondition",
         "error_condition",
         "permission",
-    ]
+    ] = "precondition"
     description: Annotated[str, Field(min_length=1)]
     boolean_operator: Literal["all", "any"]
     clauses: Annotated[tuple[ToolRuleClauseDraft, ...], Field(min_length=1, max_length=64)]
     case_sensitivity: Literal["positive_only", "positive_and_negative"]
     evidence_claim_ids: tuple[Identifier, ...] = ()
+
+
+def _with_tool_rule_family(
+    rule: ToolRuleDraft,
+    family: Literal[
+        "precondition",
+        "transition",
+        "postcondition",
+        "error_condition",
+        "permission",
+    ],
+) -> ToolRuleDraft:
+    """Return one ToolSemantics Rule with its framework-owned section label."""
+
+    return rule.model_copy(update={"family": family})
 
 
 class ToolErrorSourceDraft(AgentOutput):
@@ -1925,6 +1944,71 @@ class ToolSemanticSourceDraft(AgentOutput):
     errors: ToolRuleErrorsSourceDraft
     access_observation: ToolRuleAccessObservationSourceDraft
     reliability: ToolReliabilitySourceDraft
+
+    @model_validator(mode="after")
+    def derive_rule_families(self) -> ToolSemanticSourceDraft:
+        """Own section-derived Rule families in framework code.
+
+        A rule's family is already determined by its one closed containment
+        path in this ToolSemantics wire object. Asking the Agent to repeat it
+        caused format-only semantic failures such as a postcondition label in
+        ``state_transition.transition``. Normalize both omission and an
+        incorrect redundant label before the general Rule compiler sees the
+        draft; the compiler still validates all Agent-authored rule content.
+        """
+
+        conditions = self.conditions.model_copy(
+            update={
+                "preconditions": tuple(
+                    _with_tool_rule_family(rule, "precondition")
+                    for rule in self.conditions.preconditions
+                ),
+                "postconditions": tuple(
+                    _with_tool_rule_family(rule, "postcondition")
+                    for rule in self.conditions.postconditions
+                ),
+            }
+        )
+        state_transition = self.state_transition.model_copy(
+            update={
+                "transition": tuple(
+                    _with_tool_rule_family(rule, "transition")
+                    for rule in self.state_transition.transition
+                )
+            }
+        )
+        errors = self.errors.model_copy(
+            update={
+                "errors": tuple(
+                    error.model_copy(
+                        update={"when": _with_tool_rule_family(error.when, "error_condition")}
+                    )
+                    for error in self.errors.errors
+                )
+            }
+        )
+        permission = self.access_observation.permission
+        access_observation = self.access_observation.model_copy(
+            update={
+                "permission": permission.model_copy(
+                    update={
+                        "condition": (
+                            _with_tool_rule_family(permission.condition, "permission")
+                            if permission.condition is not None
+                            else None
+                        )
+                    }
+                )
+            }
+        )
+        return self.model_copy(
+            update={
+                "conditions": conditions,
+                "state_transition": state_transition,
+                "errors": errors,
+                "access_observation": access_observation,
+            }
+        )
 
 
 class ToolSemanticsBatchSourceDraft(AgentOutput):

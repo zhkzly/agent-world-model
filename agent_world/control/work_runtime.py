@@ -9,7 +9,8 @@ or create the resumable WorkCommit.
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -21,9 +22,32 @@ from agent_world.contracts import (
     canonical_json_bytes,
     sha256_digest,
 )
+from agent_world.invocation.contracts import (
+    InvocationOwnerKind,
+    InvocationOwnership,
+    JsonObject,
+    JsonValue,
+)
+from agent_world.invocation.recovery import (
+    InvocationFailureClass,
+    InvocationRecoveryDecision,
+    InvocationRecoveryEvidence,
+    InvocationRecoveryPolicy,
+    InvocationRecoveryRoute,
+    RouteLivenessCheck,
+    RouteLivenessChecker,
+)
 
 from .budget import DurableLeaseBudgetCoordinator, LeaseBudgetLedger
-from .continuation_store import NodeContinuationRecord, NodeContinuationStore
+from .continuation_store import (
+    DiagnosticSemanticRepairSeedRecord,
+    DiagnosticWorkspaceRecoveryRecord,
+    DiagnosticWorkspaceRecoveryStore,
+    NodeContinuationRecord,
+    NodeContinuationStore,
+    SemanticRepairSeedRecord,
+    SemanticRepairSeedStore,
+)
 from .models import BudgetLease
 from .telemetry import ComponentName, MetricPoint, TelemetryStore
 from .work import (
@@ -127,6 +151,10 @@ class WorkControlRuntime:
         trace_id: str | None = None,
         run_id: str | None = None,
         diagnostic_only: bool = False,
+        model_routes: tuple[str, ...] = (),
+        route_liveness_checker: RouteLivenessChecker | None = None,
+        require_route_liveness_gate: bool = False,
+        infrastructure_retry_backoff_seconds: float = 0.0,
     ) -> None:
         self.artifacts = artifacts
         self.heads = heads
@@ -140,6 +168,20 @@ class WorkControlRuntime:
             else WorkRepairLedger()
         )
         self.continuations = continuations
+        # Stateless semantic seeds are not Provider sessions and do not need a
+        # workspace authority. Keep them in a separate private store so Direct
+        # structured repair never accidentally inherits Codex continuation
+        # semantics.
+        self.semantic_repair_seeds = SemanticRepairSeedStore(
+            self.heads.root / "semantic-repair-seeds"
+        )
+        # A diagnostic CandidateBuild settles before an operator explicitly
+        # authorizes its one transient retry.  Keep the untrusted workspace
+        # offer private and separate from both parsed semantic seeds and the
+        # later action-bound continuation record.
+        self.diagnostic_workspace_recoveries = DiagnosticWorkspaceRecoveryStore(
+            self.heads.root / "diagnostic-workspace-recoveries"
+        )
         self.telemetry = telemetry
         self.projector = projector
         self.trace_id = trace_id
@@ -149,6 +191,21 @@ class WorkControlRuntime:
         # Keep this at the runtime boundary so every terminal control artifact
         # receives the same non-releasable classification.
         self.diagnostic_only = diagnostic_only
+        if len(set(model_routes)) != len(model_routes) or any(
+            not item or item != item.strip() for item in model_routes
+        ):
+            raise WorkRuntimeError("model routes must be unique canonical model names")
+        # This is the complete configured route order, including the primary
+        # model.  Naming it ``model_routes`` rather than ``fallback_models``
+        # matters: recovery may only choose a *later* route, never infer a
+        # primary model or cycle back to an earlier one.
+        self.model_routes = model_routes
+        self.recovery_policy = InvocationRecoveryPolicy()
+        self.route_liveness_checker = route_liveness_checker
+        self.require_route_liveness_gate = require_route_liveness_gate
+        if infrastructure_retry_backoff_seconds < 0:
+            raise WorkRuntimeError("infrastructure retry backoff cannot be negative")
+        self.infrastructure_retry_backoff_seconds = infrastructure_retry_backoff_seconds
         if telemetry is not None and trace_id is None:
             raise WorkRuntimeError("Work telemetry requires one exact trace id")
         if continuations is not None and continuation_workspace_root is None:
@@ -276,7 +333,7 @@ class WorkControlRuntime:
         definition: WorkDefinition,
         record: NodeContinuationRecord,
     ) -> WorkControlHead:
-        """Bind private same-session state to an already-authorized repair."""
+        """Bind private continuation or draft-recovery state to an authorized repair."""
 
         if self.continuations is None:
             raise WorkRuntimeError("repair continuation store is not configured")
@@ -310,6 +367,14 @@ class WorkControlRuntime:
             or record.previous_execution_ref not in proposal_execution_refs
         ):
             raise WorkRuntimeError("continuation does not bind the exact repair authority")
+        action = self.artifacts.get_json(head.repair_action_ref, RepairAction)
+        if record.continuation_kind == "workspace_recovery":
+            if action.decision != "infrastructure_retry" or not action.workspace_recovery:
+                raise WorkRuntimeError(
+                    "private workspace recovery does not bind its infrastructure retry action"
+                )
+        elif action.workspace_recovery:
+            raise WorkRuntimeError("workspace recovery action cannot bind a Provider session")
         self.continuations.save(record)
         bound = attempt.model_copy(update={"continuation_commitment": record.record_commitment})
         bound_ref = self._persist_attempt(
@@ -330,6 +395,466 @@ class WorkControlRuntime:
             }
         )
         return self.heads.compare_and_swap(lock, expected_head=head, next_head=next_head)
+
+    def bind_semantic_repair_seed(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        record: SemanticRepairSeedRecord,
+    ) -> WorkControlHead:
+        """Bind a private parsed candidate to one authorized local correction."""
+
+        head = self.heads.read_head(definition.coordinate)
+        if (
+            head is None
+            or head.status != "repair_authorized"
+            or head.evaluation_ref is None
+            or head.repair_action_ref is None
+        ):
+            raise WorkRuntimeError("semantic repair seed requires an authorized repair head")
+        action = self.artifacts.get_json(head.repair_action_ref, RepairAction)
+        if action.decision != "local_correction":
+            raise WorkRuntimeError("semantic repair seed requires local correction authority")
+        attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        proposal_execution_refs = tuple(
+            operation.execution_ref
+            for operation in (
+                self.artifacts.get_json(ref, OperationRun) for ref in attempt.operation_run_refs
+            )
+            if operation.kind == "proposal"
+            and operation.status == "terminal"
+            and operation.execution_ref is not None
+        )
+        if (
+            record.work_id != definition.work_id
+            or record.attempt_id != attempt.attempt_id
+            or record.definition_digest != definition.definition_digest
+            or record.proposal_policy_digest != definition.proposal_policy.content_digest()
+            or record.input_fingerprint != self.heads.input_fingerprint(attempt.input_refs)
+            or record.allowed_mutation_roots != action.allowed_mutation_roots
+            or record.source_report_ref != attempt.validation_report_ref
+            or record.source_evaluation_ref != head.evaluation_ref
+            or record.repair_action_ref != head.repair_action_ref
+            or record.previous_execution_ref not in proposal_execution_refs
+        ):
+            raise WorkRuntimeError("semantic repair seed does not bind exact repair authority")
+        self.semantic_repair_seeds.save(record)
+        bound = attempt.model_copy(
+            update={"semantic_repair_seed_commitment": record.record_commitment}
+        )
+        bound_ref = self._persist_attempt(
+            bound,
+            dependencies=(
+                head.attempt_ref,
+                head.evaluation_ref,
+                head.repair_action_ref,
+                record.source_report_ref,
+                record.previous_execution_ref,
+            ),
+        )
+        next_head = head.model_copy(
+            update={
+                "revision": head.revision + 1,
+                "attempt_ref": bound_ref,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        return self.heads.compare_and_swap(lock, expected_head=head, next_head=next_head)
+
+    def capture_diagnostic_semantic_repair_seed(
+        self,
+        _lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        model: str,
+        profile_digest: str,
+        output_schema_digest: str,
+        previous_candidate: JsonValue,
+        source_output_commitment: str,
+    ) -> DiagnosticSemanticRepairSeedRecord:
+        """Privately retain one parsed Direct candidate from a failed diagnostic node.
+
+        Diagnostic node runners intentionally settle their first proposal before
+        an explicit repair command may create a ``RepairAction``.  Preserve the
+        parsed candidate in the private seed store now, then bind it to that
+        exact action only if the user asks to exercise the repair path.  No
+        candidate bytes enter an Artifact, scene, telemetry payload, or normal
+        feedback at this stage.
+        """
+
+        if not self.diagnostic_only:
+            raise WorkRuntimeError("diagnostic semantic seed requires diagnostic runtime")
+        if definition.proposal_policy.executor != "agent":
+            raise WorkRuntimeError("diagnostic semantic seed requires an Agent proposal")
+        head = self.heads.read_head(definition.coordinate)
+        if (
+            head is None
+            or head.status != "failed"
+            or head.evaluation_ref is None
+            or head.repair_action_ref is not None
+        ):
+            raise WorkRuntimeError("diagnostic semantic seed requires one un-repaired failure")
+        attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        if (
+            not attempt.diagnostic_only
+            or attempt.releasable
+            or attempt.validation_report_ref is None
+            or attempt.status != "failed"
+        ):
+            raise WorkRuntimeError("diagnostic semantic seed has invalid terminal attempt state")
+        matching_executions = tuple(
+            (
+                ref,
+                self.artifacts.get_json(ref, ProposalExecution),
+            )
+            for ref in self.proposal_execution_refs(attempt)
+        )
+        matching_executions = tuple(
+            (ref, execution)
+            for ref, execution in matching_executions
+            if execution.output_commitment == source_output_commitment
+        )
+        if len(matching_executions) != 1:
+            raise WorkRuntimeError(
+                "diagnostic semantic seed requires one matching completed proposal execution"
+            )
+        execution_ref, execution = matching_executions[0]
+        if (
+            execution.executor != "agent"
+            or execution.status != "completed"
+            or execution.attempt_id != attempt.attempt_id
+            or execution.model != model
+            or execution.profile_digest != profile_digest
+            or execution.output_schema_digest != output_schema_digest
+        ):
+            raise WorkRuntimeError("diagnostic semantic seed does not bind Agent provenance")
+        record = DiagnosticSemanticRepairSeedRecord.capture(
+            work_id=definition.work_id,
+            attempt_id=attempt.attempt_id,
+            model=model,
+            profile_digest=profile_digest,
+            output_schema_digest=output_schema_digest,
+            definition_digest=definition.definition_digest,
+            proposal_policy_digest=definition.proposal_policy.content_digest(),
+            input_fingerprint=self.heads.input_fingerprint(attempt.input_refs),
+            previous_candidate=previous_candidate,
+            source_output_commitment=source_output_commitment,
+            previous_execution_ref=execution_ref,
+        )
+        return self.semantic_repair_seeds.save_diagnostic_pending(record)
+
+    def bind_diagnostic_semantic_repair_seed(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+    ) -> WorkControlHead:
+        """Promote an exact private diagnostic candidate after repair authorization.
+
+        Missing pending state is allowed: some typed semantic leaves have no
+        parsed Direct candidate and can still receive the safe correction brief
+        as a complete regeneration.  A present record must bind every source
+        fact or the authorization fails closed instead of silently discarding
+        the candidate and pretending this is a targeted repair.
+        """
+
+        head = self.heads.read_head(definition.coordinate)
+        if (
+            head is None
+            or head.status != "repair_authorized"
+            or head.evaluation_ref is None
+            or head.repair_action_ref is None
+        ):
+            raise WorkRuntimeError("diagnostic semantic seed requires an authorized repair head")
+        action = self.artifacts.get_json(head.repair_action_ref, RepairAction)
+        if action.decision != "local_correction":
+            raise WorkRuntimeError("diagnostic semantic seed requires local correction authority")
+        attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        if attempt.validation_report_ref is None:
+            raise WorkRuntimeError("diagnostic semantic seed lacks its terminal report")
+        matches: list[DiagnosticSemanticRepairSeedRecord] = []
+        for execution_ref in self.proposal_execution_refs(attempt):
+            pending_record = self.semantic_repair_seeds.find_diagnostic_pending(
+                work_id=definition.work_id,
+                attempt_id=attempt.attempt_id,
+                definition_digest=definition.definition_digest,
+                proposal_policy_digest=definition.proposal_policy.content_digest(),
+                input_fingerprint=self.heads.input_fingerprint(attempt.input_refs),
+                previous_execution_ref=execution_ref,
+            )
+            if pending_record is not None:
+                matches.append(pending_record)
+        if len(matches) > 1:
+            raise WorkRuntimeError("diagnostic repair authority binds multiple parsed candidates")
+        if not matches:
+            return head
+        pending = matches[0]
+        execution = self.artifacts.get_json(pending.previous_execution_ref, ProposalExecution)
+        if (
+            execution.executor != "agent"
+            or execution.status != "completed"
+            or execution.attempt_id != attempt.attempt_id
+            or execution.output_commitment != pending.source_output_commitment
+            or execution.model != pending.model
+            or execution.profile_digest != pending.profile_digest
+            or execution.output_schema_digest != pending.output_schema_digest
+        ):
+            raise WorkRuntimeError("diagnostic semantic seed no longer matches its proposal")
+        seed_record = SemanticRepairSeedRecord.capture(
+            work_id=definition.work_id,
+            attempt_id=attempt.attempt_id,
+            model=pending.model,
+            profile_digest=pending.profile_digest,
+            output_schema_digest=pending.output_schema_digest,
+            definition_digest=definition.definition_digest,
+            proposal_policy_digest=definition.proposal_policy.content_digest(),
+            input_fingerprint=self.heads.input_fingerprint(attempt.input_refs),
+            previous_candidate=pending.previous_candidate,
+            allowed_mutation_roots=action.allowed_mutation_roots,
+            source_report_ref=attempt.validation_report_ref,
+            source_evaluation_ref=head.evaluation_ref,
+            repair_action_ref=head.repair_action_ref,
+            previous_execution_ref=pending.previous_execution_ref,
+        )
+        return self.bind_semantic_repair_seed(lock, definition=definition, record=seed_record)
+
+    def capture_diagnostic_workspace_recovery(
+        self,
+        _lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        workspace: Path,
+        lineage_id: str,
+        profile_digest: str,
+        codex_config_digest: str,
+        model: str,
+        output_schema_digest: str,
+        invocation_id: str,
+    ) -> DiagnosticWorkspaceRecoveryRecord:
+        """Privately retain one verified CandidateBuild draft after terminal failure.
+
+        A diagnostic leaf may observe regular files in its isolated Builder
+        workspace before the Provider closes with a classified transient.  At
+        this point there is deliberately no RepairAction, so binding a normal
+        continuation would be authority forgery.  Retain only an exact private
+        offer; ``bind_diagnostic_workspace_recovery`` promotes it after the
+        explicit infrastructure-retry action exists.
+        """
+
+        if not self.diagnostic_only:
+            raise WorkRuntimeError("diagnostic workspace recovery requires diagnostic runtime")
+        if self.continuations is None or self.continuation_workspace_root is None:
+            raise WorkRuntimeError("diagnostic workspace recovery lacks private authority")
+        if (
+            definition.proposal_policy.executor != "agent"
+            or definition.coordinate.component != "build"
+            or definition.coordinate.stage != "candidate_build"
+        ):
+            raise WorkRuntimeError("diagnostic workspace recovery is CandidateBuild-only")
+        head = self.heads.read_head(definition.coordinate)
+        if (
+            head is None
+            or head.status != "failed"
+            or head.evaluation_ref is None
+            or head.repair_action_ref is not None
+        ):
+            raise WorkRuntimeError("diagnostic workspace recovery requires one un-repaired failure")
+        attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        if (
+            not attempt.diagnostic_only
+            or attempt.releasable
+            or attempt.status != "failed"
+            or attempt.validation_report_ref is None
+        ):
+            raise WorkRuntimeError("diagnostic workspace recovery has invalid terminal attempt")
+        report = self.artifacts.get_json(attempt.validation_report_ref, ValidationReport)
+        evaluation = self.artifacts.get_json(head.evaluation_ref, FeedbackEvaluation)
+        if (
+            report.status != "error"
+            or not report.infrastructure_retryable
+            or evaluation.status != "error"
+            or not evaluation.diagnostic_only
+            or evaluation.releasable
+        ):
+            raise WorkRuntimeError(
+                "diagnostic workspace recovery requires retryable terminal facts"
+            )
+        root = self.continuation_workspace_root
+        try:
+            resolved_workspace = workspace.expanduser().resolve(strict=True)
+            resolved_workspace.relative_to(root)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise WorkRuntimeError(
+                "diagnostic workspace recovery lies outside its private authority"
+            ) from exc
+        if workspace.is_symlink() or not resolved_workspace.is_dir():
+            raise WorkRuntimeError("diagnostic workspace recovery is not a safe directory")
+        matching = tuple(
+            (ref, self.artifacts.get_json(ref, ProposalExecution))
+            for ref in self.proposal_execution_refs(attempt)
+        )
+        matching = tuple(
+            (ref, execution)
+            for ref, execution in matching
+            if (
+                execution.executor == "agent"
+                and execution.status == "failed"
+                and execution.attempt_id == attempt.attempt_id
+                and execution.invocation_id == invocation_id
+                and execution.model == model
+                and execution.profile_digest == profile_digest
+                and execution.output_schema_digest == output_schema_digest
+            )
+        )
+        if len(matching) != 1:
+            raise WorkRuntimeError(
+                "diagnostic workspace recovery requires one matching failed Agent execution"
+            )
+        execution_ref, _execution = matching[0]
+        record = DiagnosticWorkspaceRecoveryRecord.capture(
+            work_id=definition.work_id,
+            attempt_id=attempt.attempt_id,
+            lineage_id=lineage_id,
+            workspace=resolved_workspace,
+            profile_digest=profile_digest,
+            codex_config_digest=codex_config_digest,
+            model=model,
+            output_schema_digest=output_schema_digest,
+            definition_digest=definition.definition_digest,
+            proposal_policy_digest=definition.proposal_policy.content_digest(),
+            input_fingerprint=self.heads.input_fingerprint(attempt.input_refs),
+            previous_execution_ref=execution_ref,
+        )
+        return self.diagnostic_workspace_recoveries.save(record)
+
+    def _diagnostic_workspace_recovery_pending(
+        self,
+        *,
+        definition: WorkDefinition,
+        attempt: WorkAttempt,
+    ) -> DiagnosticWorkspaceRecoveryRecord | None:
+        """Return the one private draft offer tied to an exact terminal attempt."""
+
+        matches: list[DiagnosticWorkspaceRecoveryRecord] = []
+        for execution_ref in self.proposal_execution_refs(attempt):
+            pending = self.diagnostic_workspace_recoveries.find_diagnostic_pending(
+                work_id=definition.work_id,
+                attempt_id=attempt.attempt_id,
+                definition_digest=definition.definition_digest,
+                proposal_policy_digest=definition.proposal_policy.content_digest(),
+                input_fingerprint=self.heads.input_fingerprint(attempt.input_refs),
+                previous_execution_ref=execution_ref,
+            )
+            if pending is not None:
+                matches.append(pending)
+        if len(matches) > 1:
+            raise WorkRuntimeError("diagnostic failure binds multiple workspace recovery offers")
+        return matches[0] if matches else None
+
+    def bind_diagnostic_workspace_recovery(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+    ) -> WorkControlHead:
+        """Promote one pending private draft only after exact retry authorization."""
+
+        if self.continuations is None or self.continuation_workspace_root is None:
+            raise WorkRuntimeError("diagnostic workspace recovery lacks private authority")
+        head = self.heads.read_head(definition.coordinate)
+        if (
+            head is None
+            or head.status != "repair_authorized"
+            or head.evaluation_ref is None
+            or head.repair_action_ref is None
+        ):
+            raise WorkRuntimeError("diagnostic workspace recovery requires an authorized retry")
+        action = self.artifacts.get_json(head.repair_action_ref, RepairAction)
+        if action.decision != "infrastructure_retry" or not action.workspace_recovery:
+            raise WorkRuntimeError("diagnostic workspace recovery requires its exact retry action")
+        attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        if attempt.validation_report_ref is None:
+            raise WorkRuntimeError("diagnostic workspace recovery lacks its terminal report")
+        pending = self._diagnostic_workspace_recovery_pending(
+            definition=definition,
+            attempt=attempt,
+        )
+        if pending is None:
+            raise WorkRuntimeError("diagnostic workspace recovery offer is missing")
+        execution = self.artifacts.get_json(pending.previous_execution_ref, ProposalExecution)
+        if (
+            execution.executor != "agent"
+            or execution.status != "failed"
+            or execution.attempt_id != attempt.attempt_id
+            or execution.model != pending.model
+            or execution.profile_digest != pending.profile_digest
+            or execution.output_schema_digest != pending.output_schema_digest
+        ):
+            raise WorkRuntimeError("diagnostic workspace recovery no longer matches its proposal")
+        record = NodeContinuationRecord.capture_workspace_recovery(
+            work_id=definition.work_id,
+            attempt_id=attempt.attempt_id,
+            lineage_id=pending.lineage_id,
+            workspace=Path(pending.workspace),
+            profile_digest=pending.profile_digest,
+            codex_config_digest=pending.codex_config_digest,
+            model=pending.model,
+            output_schema_digest=pending.output_schema_digest,
+            definition_digest=definition.definition_digest,
+            proposal_policy_digest=definition.proposal_policy.content_digest(),
+            input_fingerprint=self.heads.input_fingerprint(attempt.input_refs),
+            allowed_mutation_roots=action.allowed_mutation_roots,
+            source_report_ref=attempt.validation_report_ref,
+            source_evaluation_ref=head.evaluation_ref,
+            repair_action_ref=head.repair_action_ref,
+            previous_execution_ref=pending.previous_execution_ref,
+        )
+        return self.bind_repair_continuation(lock, definition=definition, record=record)
+
+    def load_semantic_repair_seed(
+        self,
+        *,
+        definition: WorkDefinition,
+        attempt: WorkAttempt,
+        repair_action_ref: ArtifactRef | None,
+    ) -> SemanticRepairSeedRecord | None:
+        """Load one private seed only when the successor binds its authority."""
+
+        commitment = attempt.semantic_repair_seed_commitment
+        if commitment is None:
+            return None
+        if repair_action_ref is None or attempt.parent_attempt_id is None:
+            raise WorkRuntimeError("semantic repair seed successor lacks repair authority")
+        action = self.artifacts.get_json(repair_action_ref, RepairAction)
+        if (
+            action.decision != "local_correction"
+            or action.definition_digest != definition.definition_digest
+            or action.target_coordinate != definition.coordinate
+            or action.input_fingerprint != self.heads.input_fingerprint(attempt.input_refs)
+            or action.immutable_input_refs != attempt.input_refs
+            or action.allowed_mutation_roots != definition.allowed_mutation_roots
+        ):
+            raise WorkRuntimeError("semantic repair seed action binding is invalid")
+        try:
+            record = self.semantic_repair_seeds.load_commitment(commitment)
+        except Exception as exc:
+            raise WorkRuntimeError("semantic repair seed state is invalid") from exc
+        if record is None:
+            raise WorkRuntimeError("semantic repair seed state is missing")
+        if (
+            record.work_id != definition.work_id
+            or record.attempt_id != attempt.parent_attempt_id
+            or record.definition_digest != definition.definition_digest
+            or record.proposal_policy_digest != definition.proposal_policy.content_digest()
+            or record.input_fingerprint != self.heads.input_fingerprint(attempt.input_refs)
+            or record.allowed_mutation_roots != action.allowed_mutation_roots
+            or record.source_evaluation_ref != action.source_evaluation_ref
+            or record.repair_action_ref != repair_action_ref
+            or record.source_report_ref not in action.causal_evidence_refs
+        ):
+            raise WorkRuntimeError("semantic repair seed does not bind the successor")
+        return record
 
     def recover_pending_validation(
         self,
@@ -416,6 +941,7 @@ class WorkControlRuntime:
         # scheduled operation first gets a tiny framework recovery dispatch;
         # the original scheduled revision remains immutable evidence that no
         # external executor had started before cancellation.
+        settlement_already_recorded = False
         if was_scheduled:
             head = self.start_operation(
                 lock,
@@ -425,16 +951,50 @@ class WorkControlRuntime:
             if head.active_operation_ref is None:
                 raise WorkRuntimeError("recovery dispatch did not retain its active operation")
             operation = self.artifacts.get_json(head.active_operation_ref, OperationRun)
+            observed = BudgetUsage()
             unknown = BudgetUsage()
         else:
             lease = self.artifacts.get_json(operation.budget_lease_ref, BudgetLease)
-            unknown = BudgetUsage.model_validate(
-                {
-                    field_name: getattr(lease.reserved, field_name)
-                    for field_name in BudgetUsage.model_fields
-                    if field_name != "schema_version"
-                }
+            try:
+                budget_snapshot = self.budget_coordinator.snapshot(
+                    scope_id=definition.coordinate.scope_id
+                )
+            except ValueError as exc:
+                raise WorkRuntimeError("recovery operation budget scope is unavailable") from exc
+            durable_lease = next(
+                (
+                    item
+                    for item in budget_snapshot.leases
+                    if item.lease_id == operation.budget_lease_ref.artifact_id
+                ),
+                None,
             )
+            if (
+                durable_lease is None
+                or durable_lease.owner_id != operation.operation_run_id
+                or durable_lease.reserved != lease.reserved
+            ):
+                raise WorkRuntimeError("recovery operation budget lease is not exact")
+            if durable_lease.status == "settled":
+                # A process can settle the durable budget ledger before it
+                # persists the terminal OperationRun. That ledger decision is
+                # the charge authority, including any historical accounting
+                # convention, so recovery must mirror it rather than derive a
+                # second unknown upper bound.
+                observed = durable_lease.observed_actual
+                unknown = durable_lease.unknown_upper_bound
+                settlement_already_recorded = True
+            elif durable_lease.status == "active":
+                observed = BudgetUsage()
+                unknown = BudgetUsage.model_validate(
+                    {
+                        field_name: getattr(lease.reserved, field_name)
+                        for field_name in BudgetUsage.model_fields
+                        if field_name != "schema_version"
+                    }
+                )
+            else:
+                raise WorkRuntimeError("recovery operation budget lease is not settleable")
 
         now = datetime.now(UTC)
         allow_infrastructure_retry = allow_infrastructure_retry and (
@@ -453,10 +1013,21 @@ class WorkControlRuntime:
                 executor_revision_id=definition.proposal_policy.executor_revision_id,
                 operation=definition.proposal_policy.operation,
                 status="interrupted" if dispatched else "cancelled",
+                # A running *Agent* OperationRun has crossed the Scheduler
+                # dispatch fence, so its id is exact framework-owned identity
+                # for the physical InvocationRequest.  Preserve only that
+                # link on recovery; code and real-tool operations must never
+                # masquerade as Agent invocations, and the lost owner has
+                # supplied no provider/profile/model/schema provenance.
+                invocation_id=(
+                    operation.dispatch_id
+                    if dispatched and definition.proposal_policy.executor == "agent"
+                    else None
+                ),
                 error_code=execution_code,
-                observed_actual=BudgetUsage(),
+                observed_actual=observed,
                 unknown_upper_bound=unknown,
-                conservative_committed=unknown,
+                conservative_committed=_add_usage(observed, unknown),
                 started_at=operation.started_at or now,
                 finished_at=now,
                 duration_ms=max(
@@ -464,7 +1035,12 @@ class WorkControlRuntime:
                     int((now - (operation.started_at or now)).total_seconds() * 1000),
                 ),
             )
-            head = self.checkpoint_proposal(lock, definition=definition, execution=execution)
+            head = self.checkpoint_proposal(
+                lock,
+                definition=definition,
+                execution=execution,
+                settlement_already_recorded=settlement_already_recorded,
+            )
             return self._complete_recovered_validation(
                 lock,
                 definition=definition,
@@ -934,6 +1510,55 @@ class WorkControlRuntime:
             next_head=next_head,
         )
 
+    def assert_attempt_operation_envelope_admissible(
+        self,
+        *,
+        definition: WorkDefinition,
+        elapsed_wall_seconds: float,
+    ) -> None:
+        """Reject an impossible complete attempt before its expensive proposal.
+
+        A Scheduler leaf normally reserves each operation immediately before it
+        runs. That remains the authoritative, durable admission boundary. This
+        non-mutating preflight is deliberately earlier: an Agent proposal
+        should not spend a real Provider turn when the same fresh WorkAttempt
+        can already prove that its declared deterministic validation or real
+        assurance operation has no capacity.
+
+        The check aggregates only non-wall dimensions. Scope wall is elapsed
+        time rather than a sum of serial operation ceilings, so adding proposal,
+        validation and assurance walls here would manufacture a false
+        rejection. The normal per-operation lease still enforces physical wall
+        and remains authoritative if another coordinate reserves capacity after
+        this observation.
+        """
+
+        head = self._require_running(definition)
+        if head.active_operation_ref is not None:
+            raise WorkRuntimeError("attempt-envelope admission requires no active operation")
+        attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        if attempt.operation_run_refs:
+            raise WorkRuntimeError(
+                "attempt-envelope admission is valid only before its first operation"
+            )
+        envelope = self._attempt_operation_envelope(definition, attempt=attempt)
+        self.budget_coordinator.initialize(
+            scope_id=definition.coordinate.scope_id,
+            reserved=self.budget.reserved,
+            leases=self.budget.leases,
+        )
+        snapshot = self.budget_coordinator.snapshot(scope_id=definition.coordinate.scope_id)
+        # Use an ephemeral ledger so this proof neither consumes nor exposes a
+        # lease. A later real ``schedule_operation`` still performs the only
+        # durable reservation.
+        probe = LeaseBudgetLedger(snapshot.reserved, leases=snapshot.leases)
+        probe.reserve(
+            lease_id=self._id("attempt-envelope-preflight", attempt.attempt_id),
+            owner_id=attempt.attempt_id,
+            requested=envelope,
+            elapsed_wall_seconds=elapsed_wall_seconds,
+        )
+
     def start_operation(
         self,
         lock: WorkControlLock,
@@ -989,6 +1614,66 @@ class WorkControlRuntime:
             next_head=next_head,
         )
 
+    def invocation_ownership_for_active_proposal(
+        self,
+        *,
+        definition: WorkDefinition,
+        attempt: WorkAttempt,
+        dispatch_id: str,
+    ) -> InvocationOwnership:
+        """Bind one physical Agent turn to its active proposal OperationRun.
+
+        Every Work-backed caller needs the same ownership proof before it
+        crosses an ``InvocationBackend``: the running operation, the exact
+        attempt, the dispatch fence, and the immutable input closure must all
+        agree.  Keeping that proof in ``WorkControlRuntime`` prevents service
+        or leaf-specific copies from quietly drifting into different recovery
+        behavior.
+        """
+
+        with self.heads.exclusive(definition.coordinate) as lock:
+            return self.invocation_ownership_for_active_proposal_locked(
+                lock,
+                definition=definition,
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+            )
+
+    def invocation_ownership_for_active_proposal_locked(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        attempt: WorkAttempt,
+        dispatch_id: str,
+    ) -> InvocationOwnership:
+        """Return proposal ownership while the caller already holds its lock."""
+
+        coordinate = definition.coordinate
+        if lock.scope_id != coordinate.scope_id or lock.coordinate_key != coordinate.coordinate_key:
+            raise WorkRuntimeError("proposal ownership lock does not bind this WorkDefinition")
+        head = self.heads.read_head(coordinate)
+        if head is None or head.active_operation_ref is None:
+            raise WorkRuntimeError("Agent invocation has no active OperationRun")
+        operation = self.artifacts.get_json(head.active_operation_ref, OperationRun)
+        if (
+            operation.kind != "proposal"
+            or operation.status != "running"
+            or operation.attempt_id != attempt.attempt_id
+            or operation.coordinate != coordinate
+            or operation.dispatch_id != dispatch_id
+        ):
+            raise WorkRuntimeError("Agent invocation ownership does not bind its active proposal")
+        return InvocationOwnership(
+            owner_kind=InvocationOwnerKind.WORK_OPERATION,
+            owner_id=operation.operation_run_id,
+            scope_id=coordinate.scope_id,
+            coordinate=coordinate.coordinate_key,
+            immutable_input_closure_digest=work_input_fingerprint(
+                operation.input_refs
+            ).removeprefix("sha256:"),
+        )
+
     def finish_operation(
         self,
         lock: WorkControlLock,
@@ -996,6 +1681,7 @@ class WorkControlRuntime:
         definition: WorkDefinition,
         execution: ProposalExecution | ValidationExecution | AssuranceExecution,
         output_refs: tuple[ArtifactRef, ...] = (),
+        settlement_already_recorded: bool = False,
     ) -> WorkControlHead:
         """Settle and adopt one real result without permitting stale runners."""
 
@@ -1046,7 +1732,11 @@ class WorkControlRuntime:
             dependencies=(head.active_operation_ref, *output_refs),
         )
         observed = execution.observed_actual
-        if operation.kind == "proposal" and attempt.repair_attempt_charge:
+        if (
+            operation.kind == "proposal"
+            and attempt.repair_attempt_charge
+            and not settlement_already_recorded
+        ):
             observed = observed.model_copy(update={"repair_attempts": observed.repair_attempts + 1})
         settled = self.budget_coordinator.settle(
             scope_id=definition.coordinate.scope_id,
@@ -1311,6 +2001,7 @@ class WorkControlRuntime:
         definition: WorkDefinition,
         execution: ProposalExecution,
         output_refs: tuple[ArtifactRef, ...] = (),
+        settlement_already_recorded: bool = False,
     ) -> WorkControlHead:
         """Adopt a Proposal result only for the currently dispatched operation."""
 
@@ -1320,6 +2011,7 @@ class WorkControlRuntime:
             definition=definition,
             execution=execution,
             output_refs=output_refs,
+            settlement_already_recorded=settlement_already_recorded,
         )
         checkpointed = self.artifacts.get_json(
             committed_head.attempt_ref,
@@ -1418,6 +2110,306 @@ class WorkControlRuntime:
             next_head=next_head,
         )
 
+    def _terminal_code(self, report: ValidationReport) -> str | None:
+        """Return one closed invocation terminal code, never an inferred summary."""
+
+        if report.status != "error" or len(report.issues) != 1:
+            return None
+        return report.issues[0].code
+
+    def _terminal_details(self, report: ValidationReport) -> JsonObject:
+        """Read only scalar values from the leaf's already-redacted evidence."""
+
+        for ref in report.evidence_refs:
+            if ref.artifact_type != "control.leaf_failure_evidence":
+                continue
+            raw = self.artifacts.get_json(ref)
+            if not isinstance(raw, Mapping):
+                continue
+            details = raw.get("terminal_details")
+            if not isinstance(details, Mapping):
+                continue
+            projection: JsonObject = {}
+            for key, value in details.items():
+                if not isinstance(key, str):
+                    continue
+                if value is None or isinstance(value, (str, int, float, bool)):
+                    projection[key] = value
+            return projection
+        return {}
+
+    def _compatible_fallback_models(self, current_model: str | None) -> tuple[str, ...]:
+        """Return only later configured routes, so fallback can never loop backward."""
+
+        if current_model is None:
+            return ()
+        try:
+            current_index = self.model_routes.index(current_model)
+        except ValueError:
+            return ()
+        return self.model_routes[current_index + 1 :]
+
+    def _proposal_model(self, attempt: WorkAttempt) -> str | None:
+        """Read the actual model provenance for this terminal proposal.
+
+        A fallback is selected from the model that really produced the closed
+        terminal fact, not an ambient config default or a previous RepairAction.
+        The attempt override is only a conservative fallback for a terminal
+        record that lost proposal provenance before an adapter could return it.
+        """
+
+        for execution_ref in reversed(self.proposal_execution_refs(attempt)):
+            execution = self.artifacts.get_json(execution_ref, ProposalExecution)
+            if execution.model is not None:
+                return execution.model
+        return attempt.model_override
+
+    def _prior_same_class_retry_count(
+        self,
+        *,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+        failure_class: InvocationFailureClass,
+        current_model: str | None,
+    ) -> int:
+        """Count only prior same-model retry actions with the same closed class."""
+
+        if current_model is None:
+            return 0
+        count = 0
+        for entry in self.repairs.entries_for(definition, input_refs=input_refs):
+            if entry.decision != "infrastructure_retry" or entry.route_model != current_model:
+                continue
+            report = self.artifacts.get_json(entry.report_before_ref, ValidationReport)
+            classification = self.recovery_policy.classify(
+                InvocationRecoveryEvidence(
+                    terminal_code=self._terminal_code(report),
+                    retryable=report.infrastructure_retryable,
+                    terminal_details=self._terminal_details(report),
+                )
+            )
+            if classification is failure_class:
+                count += 1
+        return count
+
+    def _invocation_recovery_decision(
+        self,
+        *,
+        definition: WorkDefinition,
+        attempt: WorkAttempt,
+        report: ValidationReport,
+        current_model: str | None,
+        private_continuation_available: bool,
+        private_workspace_recovery_available: bool,
+    ) -> tuple[InvocationRecoveryDecision, InvocationRecoveryEvidence]:
+        """Select a route from the closed terminal fact, not a leaf exception label."""
+
+        terminal_code = self._terminal_code(report)
+        terminal_details = self._terminal_details(report)
+        provisional = InvocationRecoveryEvidence(
+            terminal_code=terminal_code,
+            retryable=report.infrastructure_retryable,
+            terminal_details=terminal_details,
+            private_continuation_available=private_continuation_available,
+            private_workspace_recovery_available=private_workspace_recovery_available,
+            current_model=current_model,
+            compatible_fallback_models=self._compatible_fallback_models(current_model),
+        )
+        failure_class = self.recovery_policy.classify(provisional)
+        evidence = InvocationRecoveryEvidence(
+            terminal_code=terminal_code,
+            retryable=report.infrastructure_retryable,
+            terminal_details=terminal_details,
+            private_continuation_available=private_continuation_available,
+            private_workspace_recovery_available=private_workspace_recovery_available,
+            prior_same_class_retry_count=self._prior_same_class_retry_count(
+                definition=definition,
+                input_refs=attempt.input_refs,
+                failure_class=failure_class,
+                current_model=current_model,
+            ),
+            current_model=current_model,
+            compatible_fallback_models=self._compatible_fallback_models(current_model),
+        )
+        return self.recovery_policy.decide(evidence), evidence
+
+    def _persist_invocation_recovery_decision(
+        self,
+        *,
+        definition: WorkDefinition,
+        attempt: WorkAttempt,
+        report: ValidationReport,
+        report_ref: ArtifactRef,
+        evaluation_ref: ArtifactRef,
+        decision: InvocationRecoveryDecision,
+        evidence: InvocationRecoveryEvidence,
+    ) -> ArtifactRef:
+        """Persist the safe policy route that explains a retry, fallback, or stop."""
+
+        return self.artifacts.put_json(
+            artifact_id=self._id("invocation-recovery", attempt.attempt_id),
+            artifact_type="control.invocation_recovery_decision",
+            value={
+                "attempt_id": attempt.attempt_id,
+                "coordinate": definition.coordinate.model_dump(mode="json"),
+                "terminal_code": evidence.terminal_code,
+                "retryable": evidence.retryable,
+                "private_workspace_recovery_available": (
+                    evidence.private_workspace_recovery_available
+                ),
+                "failure_class": decision.failure_class.value,
+                "route": decision.route.value,
+                "prior_same_class_retry_count": evidence.prior_same_class_retry_count,
+                "current_model": evidence.current_model,
+                "compatible_fallback_models": evidence.compatible_fallback_models,
+                "target_model": decision.target_model,
+                "requires_fresh_node_session": decision.requires_fresh_node_session,
+                "requires_route_liveness_gate": decision.requires_route_liveness_gate,
+                "assessments": tuple(
+                    {"lens": item.lens.value, "support": item.support.value}
+                    for item in decision.assessments
+                ),
+            },
+            dependencies=(report_ref, evaluation_ref, *report.evidence_refs),
+        )
+
+    def check_authorized_route_liveness(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+    ) -> tuple[RouteLivenessCheck, ArtifactRef]:
+        """Record the pre-dispatch gate for one authorized same-model retry.
+
+        The Scheduler calls this only after the durable ``retry_not_before``
+        timestamp. It does not open another operation, mutate a Prompt, or
+        pretend that an unrelated provider ping proves the frozen node route.
+        """
+
+        head = self.heads.read_head(definition.coordinate)
+        if head is None or head.status != "repair_authorized" or head.repair_action_ref is None:
+            raise WorkRuntimeError("route liveness requires an authorized repair head")
+        action = self.artifacts.get_json(head.repair_action_ref, RepairAction)
+        if not action.route_liveness_required:
+            raise WorkRuntimeError("repair action does not require route liveness")
+        if action.retry_not_before is None:
+            raise WorkRuntimeError("route-gated repair lacks a retry backoff timestamp")
+        if datetime.now(UTC) < action.retry_not_before:
+            raise WorkRuntimeError("Scheduler attempted a retry before its recorded backoff")
+        attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        proposal_refs = self.proposal_execution_refs(attempt)
+        proposal = (
+            self.artifacts.get_json(proposal_refs[-1], ProposalExecution) if proposal_refs else None
+        )
+        if self.route_liveness_checker is None:
+            check = RouteLivenessCheck(
+                status=("rejected" if self.require_route_liveness_gate else "not_enforced"),
+                source="constructed_runtime",
+                code=(
+                    "route_liveness_checker_missing"
+                    if self.require_route_liveness_gate
+                    else "route_liveness_constructed_boundary"
+                ),
+            )
+        else:
+            check = self.route_liveness_checker.assess(
+                invocation_id=(proposal.invocation_id if proposal is not None else None),
+                expected_model=(proposal.model if proposal is not None else None),
+                expected_scope_id=definition.coordinate.scope_id,
+                expected_coordinate=definition.coordinate.coordinate_key,
+                expected_input_closure_digest=work_input_fingerprint(
+                    attempt.input_refs
+                ).removeprefix("sha256:"),
+            )
+        evidence_ref = self.artifacts.put_json(
+            artifact_id=self._id("route-liveness", action.action_id),
+            artifact_type="control.invocation_route_liveness_check",
+            value={
+                "action_id": action.action_id,
+                "attempt_id": attempt.attempt_id,
+                "coordinate": definition.coordinate.model_dump(mode="json"),
+                "retry_not_before": action.retry_not_before.isoformat(),
+                "status": check.status,
+                "source": check.source,
+                "code": check.code,
+                "route": check.route,
+                "provider_progress_count": check.provider_progress_count,
+                "last_local_phase": check.last_local_phase,
+            },
+            dependencies=tuple(
+                item
+                for item in (
+                    head.attempt_ref,
+                    head.repair_action_ref,
+                    *(proposal_refs[-1:] if proposal_refs else ()),
+                )
+                if item is not None
+            ),
+        )
+        return check, evidence_ref
+
+    def reject_authorized_route_liveness(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        evidence_ref: ArtifactRef,
+    ) -> WorkControlHead:
+        """Close a pending retry when its post-backoff gate fails closed.
+
+        The preceding WorkAttempt already has a complete terminal report and
+        evaluation. The gate adds control-plane evidence and exhausts the
+        authorized action *before* any second proposal operation can start.
+        """
+
+        if evidence_ref.artifact_type != "control.invocation_route_liveness_check":
+            raise WorkRuntimeError("route-liveness rejection has the wrong evidence Artifact")
+        head = self.heads.read_head(definition.coordinate)
+        if head is None or head.status != "repair_authorized" or head.repair_action_ref is None:
+            raise WorkRuntimeError("route-liveness rejection requires an authorized repair head")
+        action = self.artifacts.get_json(head.repair_action_ref, RepairAction)
+        if not action.route_liveness_required:
+            raise WorkRuntimeError("only a route-gated retry may be rejected by this gate")
+        prior = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        entry = next(
+            (
+                item
+                for item in self.repairs.entries_for(definition, input_refs=prior.input_refs)
+                if item.repair_action_ref == head.repair_action_ref
+            ),
+            None,
+        )
+        if entry is None or entry.outcome != "authorized":
+            raise WorkRuntimeError("route-liveness rejection lacks an active repair ledger entry")
+        exhausted = self.repairs.exhaust_pre_dispatch(entry.entry_id)
+        prior_ledger_refs = self.artifacts.list_revisions(exhausted.entry_id)
+        exhausted_ref = self.artifacts.put_json(
+            artifact_id=exhausted.entry_id,
+            artifact_type="control.work_repair_ledger_entry",
+            value=exhausted,
+            dependencies=tuple(
+                dict.fromkeys(
+                    (
+                        exhausted.repair_action_ref,
+                        evidence_ref,
+                        *(prior_ledger_refs[-1:] if prior_ledger_refs else ()),
+                    )
+                )
+            ),
+        )
+        next_head = head.model_copy(
+            update={
+                "revision": head.revision + 1,
+                "status": "failed",
+                "repair_action_ref": None,
+                "invalidated_by_refs": tuple(
+                    dict.fromkeys((*head.invalidated_by_refs, evidence_ref, exhausted_ref))
+                ),
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        return self.heads.compare_and_swap(lock, expected_head=head, next_head=next_head)
+
     def evaluate(
         self,
         lock: WorkControlLock,
@@ -1430,6 +2422,7 @@ class WorkControlRuntime:
         repair_mutation_roots: tuple[str, ...] | None = None,
         allow_infrastructure_retry: bool = True,
         allow_session_continuation: bool = False,
+        allow_workspace_recovery: bool = False,
     ) -> WorkControlHead:
         # Callers build reports before handing them to the runtime.  In a
         # diagnostic run the persisted report is deliberately reclassified at
@@ -1631,6 +2624,31 @@ class WorkControlRuntime:
             ),
         )
         self._complete_previous_repair(definition, attempt, report, report_ref)
+        reconciled_process_interruption = (
+            report.status == "error"
+            and bool(report.issues)
+            and all(issue.code.startswith("process_interrupted") for issue in report.issues)
+        )
+        recovery_decision: InvocationRecoveryDecision | None = None
+        recovery_evidence_ref: ArtifactRef | None = None
+        if report.status == "error" and not reconciled_process_interruption:
+            recovery_decision, recovery_evidence = self._invocation_recovery_decision(
+                definition=definition,
+                attempt=attempt,
+                report=report,
+                current_model=self._proposal_model(attempt),
+                private_continuation_available=allow_session_continuation,
+                private_workspace_recovery_available=allow_workspace_recovery,
+            )
+            recovery_evidence_ref = self._persist_invocation_recovery_decision(
+                definition=definition,
+                attempt=attempt,
+                report=report,
+                report_ref=report_ref,
+                evaluation_ref=evaluation_ref,
+                decision=recovery_decision,
+                evidence=recovery_evidence,
+            )
         terminal_status = "succeeded" if report.status == "passed" else "failed"
         terminal = attempt.model_copy(
             update={
@@ -1741,15 +2759,45 @@ class WorkControlRuntime:
                 error_code=terminal.failure_code,
             )
             return failed_head
+        recovery_route = recovery_decision.route if recovery_decision is not None else None
         session_continuation_eligible = self._session_continuation_eligible(
             definition=definition,
             report=report,
-            allowed=allow_session_continuation,
+            allowed=recovery_route is InvocationRecoveryRoute.SESSION_CONTINUATION,
         )
-        if (
-            report.status == "error"
-            and not allow_infrastructure_retry
-            and not session_continuation_eligible
+        workspace_recovery_eligible = self._workspace_recovery_eligible(
+            definition=definition,
+            report=report,
+            allowed=recovery_route is InvocationRecoveryRoute.WORKSPACE_RECOVERY,
+        )
+        if report.status == "error" and (
+            recovery_route is None
+            and not (reconciled_process_interruption and allow_infrastructure_retry)
+            or recovery_route is not None
+            and recovery_route
+            not in {
+                InvocationRecoveryRoute.SAME_MODEL_FRESH_RETRY,
+                InvocationRecoveryRoute.WORKSPACE_RECOVERY,
+                InvocationRecoveryRoute.MODEL_FALLBACK,
+                InvocationRecoveryRoute.SESSION_CONTINUATION,
+            }
+            or (
+                recovery_route
+                in {
+                    InvocationRecoveryRoute.SAME_MODEL_FRESH_RETRY,
+                    InvocationRecoveryRoute.WORKSPACE_RECOVERY,
+                    InvocationRecoveryRoute.MODEL_FALLBACK,
+                }
+                and not allow_infrastructure_retry
+            )
+            or (
+                recovery_route is InvocationRecoveryRoute.SESSION_CONTINUATION
+                and not session_continuation_eligible
+            )
+            or (
+                recovery_route is InvocationRecoveryRoute.WORKSPACE_RECOVERY
+                and not workspace_recovery_eligible
+            )
         ):
             failed_head = self._fail_head(
                 lock,
@@ -1775,6 +2823,9 @@ class WorkControlRuntime:
             elapsed_wall_seconds=elapsed_wall_seconds,
             repair_mutation_roots=repair_mutation_roots,
             allow_session_continuation=session_continuation_eligible,
+            allow_workspace_recovery=workspace_recovery_eligible,
+            recovery_decision=recovery_decision,
+            recovery_evidence_ref=recovery_evidence_ref,
         )
         self._finish_attempt_span(
             terminal,
@@ -2067,6 +3118,7 @@ class WorkControlRuntime:
         lock: WorkControlLock,
         *,
         definition: WorkDefinition,
+        route_liveness_evidence_ref: ArtifactRef | None = None,
     ) -> WorkControlHead:
         head = self.heads.read_head(definition.coordinate)
         if head is None or head.status != "repair_authorized" or head.repair_action_ref is None:
@@ -2087,6 +3139,32 @@ class WorkControlRuntime:
             raise WorkRuntimeError("repair action lacks an active WorkRepairLedger entry")
         now = datetime.now(UTC)
         action = self.artifacts.get_json(head.repair_action_ref, RepairAction)
+        if action.decision == "model_fallback":
+            if action.model_override is None or action.model_override not in self.model_routes:
+                raise WorkRuntimeError("model fallback action has no configured target route")
+        elif action.model_override is not None:
+            raise WorkRuntimeError("only a model fallback may override the Agent route")
+        if action.route_liveness_required:
+            if (
+                route_liveness_evidence_ref is None
+                or route_liveness_evidence_ref.artifact_type
+                != "control.invocation_route_liveness_check"
+            ):
+                raise WorkRuntimeError(
+                    "same-model infrastructure retry lacks route-liveness evidence"
+                )
+        elif route_liveness_evidence_ref is not None:
+            raise WorkRuntimeError("only a route-gated retry may bind liveness evidence")
+        # ``RepairAction.model_override`` is a route *change*, not the full
+        # effective route of every successor.  Once a fallback selected (say)
+        # Spark, the next same-model infrastructure retry, semantic correction,
+        # or output-ceiling continuation must remain on Spark.  Replacing the
+        # prior attempt's override with ``None`` here silently sent those
+        # successors back to the configured primary route.  Only an explicit
+        # model-fallback action may change that inherited route.
+        effective_model_override = (
+            action.model_override if action.decision == "model_fallback" else prior.model_override
+        )
         telemetry_trace_id, telemetry_span_id = self._start_attempt_span(
             definition,
             ordinal=prior.ordinal + 1,
@@ -2106,11 +3184,36 @@ class WorkControlRuntime:
                 "feedback_evaluation_ref": None,
                 "repair_action_ref": head.repair_action_ref,
                 "repair_attempt_charge": action.repair_attempt_charge,
+                "model_override": effective_model_override,
+                "route_liveness_evidence_ref": route_liveness_evidence_ref,
                 "telemetry_trace_id": telemetry_trace_id,
                 "telemetry_span_id": telemetry_span_id,
                 "recovery_ordinal": 0,
                 "recovery_reason_code": None,
-                "continuation_commitment": prior.continuation_commitment,
+                # A model fallback and ordinary fresh infrastructure retry
+                # must never reuse the failed node-local session. A semantic
+                # correction may retain a session only because its completed
+                # prior turn has an exact, authorized correction brief. The
+                # one explicit exception is Builder workspace recovery: it
+                # carries a private *workspace-only* record into a fresh
+                # Provider thread, never an old thread id or adopted output.
+                "continuation_commitment": (
+                    prior.continuation_commitment
+                    if (
+                        (
+                            action.decision
+                            in {"session_continuation", "local_correction", "parent_correction"}
+                            and action.repair_seed_attempt_ref is None
+                        )
+                        or action.workspace_recovery
+                    )
+                    else None
+                ),
+                "semantic_repair_seed_commitment": (
+                    prior.semantic_repair_seed_commitment
+                    if action.decision == "local_correction"
+                    else None
+                ),
                 "observed_actual": BudgetUsage(),
                 "unknown_upper_bound": BudgetUsage(),
                 "conservative_committed": BudgetUsage(),
@@ -2124,7 +3227,15 @@ class WorkControlRuntime:
         )
         attempt_ref = self._persist_attempt(
             attempt,
-            dependencies=(head.attempt_ref, head.repair_action_ref),
+            dependencies=tuple(
+                item
+                for item in (
+                    head.attempt_ref,
+                    head.repair_action_ref,
+                    route_liveness_evidence_ref,
+                )
+                if item is not None
+            ),
         )
         next_head = head.model_copy(
             update={
@@ -2215,16 +3326,21 @@ class WorkControlRuntime:
                     "causal_feedback",
                     route.source_coordinate.component,
                     route.source_coordinate.stage,
-                    index,
+                    *source_issue.path,
                 ),
-                violated_condition=(
-                    "A validated downstream execution exposed a defect attributable to "
-                    "this mutable artifact."
-                ),
-                expected_category=("a repair confined to the target WorkDefinition mutation roots"),
-                retryable=True,
+                # ValidationIssue is already the framework's safe, field-addressable
+                # diagnostic contract.  Replacing its condition with a generic
+                # sentence made a Scheduler-authorized Agent repair indistinguishable
+                # from a blind retry: the target knew a descendant failed but not
+                # which source condition to correct.  Preserve the safe condition,
+                # expectation, remediation and severity while namespacing provenance.
+                violated_condition=source_issue.violated_condition,
+                expected_category=source_issue.expected_category,
+                remediation=source_issue.remediation,
+                severity=source_issue.severity,
+                retryable=source_issue.retryable,
             )
-            for index, source_issue in enumerate(source_report.issues)
+            for source_issue in source_report.issues
         )
         proxy_report = ValidationReport(
             report_id=self._id("causal-repair-report", target_attempt.attempt_id, route.route_id),
@@ -2283,6 +3399,8 @@ class WorkControlRuntime:
             jump_distance=0,
             repair_attempt_ordinal=ordinal,
             immutable_input_refs=input_refs,
+            repair_seed_attempt_ref=(head.attempt_ref if target_attempt.output_refs else None),
+            repair_seed_output_refs=target_attempt.output_refs,
             allowed_mutation_roots=definition.allowed_mutation_roots,
             causal_evidence_refs=(source_evaluation_ref, source_report_ref, route_ref),
             reason_code="causal_downstream_failure",
@@ -2299,6 +3417,8 @@ class WorkControlRuntime:
                 source_evaluation_ref,
                 source_report_ref,
                 route_ref,
+                head.attempt_ref,
+                *target_attempt.output_refs,
                 *input_refs,
             ),
         )
@@ -2412,7 +3532,62 @@ class WorkControlRuntime:
             raise WorkRuntimeError(
                 "diagnostic infrastructure retry requires one safe retryable terminal report"
             )
-        return self._authorize_next_or_fail(
+        # The diagnostic command is an explicit request to continue a
+        # classified transient route, not permission to bypass the shared
+        # recovery policy.  Recompute from the durable terminal report using
+        # the current configured route set: a historical test-node may have
+        # been produced before the control-plane wiring was fixed.
+        current_model = self._proposal_model(attempt)
+        if current_model is None:
+            # A constructed deterministic boundary has no Provider
+            # provenance.  Preserve its narrow test-only retry exercise, but
+            # do not manufacture a liveness gate or model fallback from it.
+            return self._authorize_next_or_fail(
+                lock,
+                head=head,
+                terminal_attempt=attempt,
+                terminal_ref=head.attempt_ref,
+                definition=definition,
+                report=report,
+                report_ref=report_ref,
+                evaluation_ref=head.evaluation_ref,
+                elapsed_wall_seconds=0,
+                repair_mutation_roots=None,
+                terminal_infrastructure_retry=True,
+            )
+        private_workspace_recovery_available = (
+            self._diagnostic_workspace_recovery_pending(
+                definition=definition,
+                attempt=attempt,
+            )
+            is not None
+        )
+        recovery_decision, recovery_evidence = self._invocation_recovery_decision(
+            definition=definition,
+            attempt=attempt,
+            report=report,
+            current_model=current_model,
+            private_continuation_available=False,
+            private_workspace_recovery_available=private_workspace_recovery_available,
+        )
+        recovery_evidence_ref = self._persist_invocation_recovery_decision(
+            definition=definition,
+            attempt=attempt,
+            report=report,
+            report_ref=report_ref,
+            evaluation_ref=head.evaluation_ref,
+            decision=recovery_decision,
+            evidence=recovery_evidence,
+        )
+        if recovery_decision.route not in {
+            InvocationRecoveryRoute.SAME_MODEL_FRESH_RETRY,
+            InvocationRecoveryRoute.WORKSPACE_RECOVERY,
+            InvocationRecoveryRoute.MODEL_FALLBACK,
+        }:
+            raise WorkRuntimeError(
+                "diagnostic transient recovery is not authorized by the closed policy route"
+            )
+        authorized = self._authorize_next_or_fail(
             lock,
             head=head,
             terminal_attempt=attempt,
@@ -2423,8 +3598,108 @@ class WorkControlRuntime:
             evaluation_ref=head.evaluation_ref,
             elapsed_wall_seconds=0,
             repair_mutation_roots=None,
-            terminal_infrastructure_retry=True,
+            terminal_infrastructure_retry=(
+                recovery_decision.route
+                in {
+                    InvocationRecoveryRoute.SAME_MODEL_FRESH_RETRY,
+                    InvocationRecoveryRoute.WORKSPACE_RECOVERY,
+                }
+            ),
+            recovery_decision=recovery_decision,
+            recovery_evidence_ref=recovery_evidence_ref,
+            allow_workspace_recovery=private_workspace_recovery_available,
         )
+        if recovery_decision.route is InvocationRecoveryRoute.WORKSPACE_RECOVERY:
+            return self.bind_diagnostic_workspace_recovery(lock, definition=definition)
+        return authorized
+
+    def authorize_diagnostic_semantic_repair(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+    ) -> WorkControlHead:
+        """Record one exact, feedback-bound semantic repair for a diagnostic node.
+
+        A normal Scheduler creates this authority after a parsed actionable
+        semantic failure.  Diagnostic runners intentionally stop at their
+        first physical dispatch, so this opt-in method is the only way to
+        prove the normal repair route without re-running an unchanged failed
+        generation.  It merely creates the ordinary ``RepairAction`` and
+        ledger evidence; a second explicit diagnostic command must execute it.
+
+        Provider/adapter errors, stale definitions, opaque feedback, and
+        already-authorized heads are rejected.  No model call occurs here.
+        """
+
+        if not self.diagnostic_only:
+            raise WorkRuntimeError("diagnostic semantic repair requires diagnostic runtime")
+        try:
+            self.heads.require_test_node_diagnostic_clone()
+        except Exception as exc:
+            raise WorkRuntimeError(
+                "diagnostic semantic repair requires an isolated marked state root"
+            ) from exc
+        definition = self.register_definition(definition)
+        head = self.heads.read_head(definition.coordinate)
+        if head is None or head.status != "failed" or head.repair_action_ref is not None:
+            raise WorkRuntimeError(
+                "diagnostic semantic repair requires one un-repaired failed terminal head"
+            )
+        if (
+            head.work_id != definition.work_id
+            or head.definition_digest != definition.definition_digest
+            or head.acceptance_digest != definition.acceptance_digest
+            or head.input_fingerprint != self.heads.input_fingerprint(input_refs)
+        ):
+            raise WorkRuntimeError(
+                "diagnostic semantic repair must bind the exact terminal definition and inputs"
+            )
+        attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
+        if (
+            attempt.input_refs != input_refs
+            or not attempt.diagnostic_only
+            or attempt.releasable
+            or attempt.validation_report_ref is None
+            or head.evaluation_ref is None
+        ):
+            raise WorkRuntimeError(
+                "diagnostic semantic repair lacks one exact terminal evidence closure"
+            )
+        report_ref = attempt.validation_report_ref
+        report = self.artifacts.get_json(report_ref, ValidationReport)
+        evaluation = self.artifacts.get_json(head.evaluation_ref, FeedbackEvaluation)
+        if (
+            report.attempt_id != attempt.attempt_id
+            or report.coordinate != definition.coordinate
+            or not report.repair_actionable
+            or report.infrastructure_retryable
+            or evaluation.attempt_id != attempt.attempt_id
+            or evaluation.work_id != definition.work_id
+            or evaluation.coordinate != definition.coordinate
+            or evaluation.validation_report_ref != report_ref
+            or evaluation.status != "failed"
+            or not evaluation.diagnostic_only
+            or evaluation.releasable
+        ):
+            raise WorkRuntimeError(
+                "diagnostic semantic repair requires one safe actionable semantic report"
+            )
+        self._authorize_next_or_fail(
+            lock,
+            head=head,
+            terminal_attempt=attempt,
+            terminal_ref=head.attempt_ref,
+            definition=definition,
+            report=report,
+            report_ref=report_ref,
+            evaluation_ref=head.evaluation_ref,
+            elapsed_wall_seconds=0,
+            repair_mutation_roots=None,
+            terminal_diagnostic_semantic_repair=True,
+        )
+        return self.bind_diagnostic_semantic_repair_seed(lock, definition=definition)
 
     def restart_interrupted_repair(
         self,
@@ -2686,17 +3961,46 @@ class WorkControlRuntime:
         elapsed_wall_seconds: float,
         repair_mutation_roots: tuple[str, ...] | None,
         terminal_infrastructure_retry: bool = False,
+        terminal_diagnostic_semantic_repair: bool = False,
         allow_session_continuation: bool = False,
+        allow_workspace_recovery: bool = False,
+        recovery_decision: InvocationRecoveryDecision | None = None,
+        recovery_evidence_ref: ArtifactRef | None = None,
     ) -> WorkControlHead:
+        if terminal_infrastructure_retry and terminal_diagnostic_semantic_repair:
+            raise WorkRuntimeError(
+                "a diagnostic repair route cannot be both semantic and infrastructure"
+            )
         decision: Literal[
-            "infrastructure_retry", "local_correction", "session_continuation"
-        ] = (
-            "session_continuation"
-            if allow_session_continuation
-            else "infrastructure_retry"
-            if report.status == "error"
-            else "local_correction"
-        )
+            "infrastructure_retry",
+            "local_correction",
+            "model_fallback",
+            "session_continuation",
+        ]
+        model_override: str | None = None
+        workspace_recovery = False
+        if recovery_decision is None:
+            decision = (
+                "session_continuation"
+                if allow_session_continuation
+                else "infrastructure_retry"
+                if report.status == "error"
+                else "local_correction"
+            )
+        elif recovery_decision.route is InvocationRecoveryRoute.SAME_MODEL_FRESH_RETRY:
+            decision = "infrastructure_retry"
+        elif recovery_decision.route is InvocationRecoveryRoute.WORKSPACE_RECOVERY:
+            decision = "infrastructure_retry"
+            workspace_recovery = True
+        elif recovery_decision.route is InvocationRecoveryRoute.MODEL_FALLBACK:
+            decision = "model_fallback"
+            model_override = recovery_decision.target_model
+        elif recovery_decision.route is InvocationRecoveryRoute.SESSION_CONTINUATION:
+            decision = "session_continuation"
+        else:
+            raise WorkRuntimeError("recovery route cannot authorize a Work repair action")
+        if recovery_decision is not None and recovery_evidence_ref is None:
+            raise WorkRuntimeError("recovery route requires one durable decision record")
         process_interrupted = (
             report.status == "error"
             and bool(report.issues)
@@ -2711,6 +4015,19 @@ class WorkControlRuntime:
             definition.repair_policy.maximum_infrastructure_retries == 0
             or not report.infrastructure_retryable
         )
+        no_workspace_recovery_authority = workspace_recovery and (
+            not allow_workspace_recovery
+            or self.continuations is None
+            or self.continuation_workspace_root is None
+            or definition.proposal_policy.executor != "agent"
+            or not definition.allowed_mutation_roots
+        )
+        no_model_fallback_authority = decision == "model_fallback" and (
+            model_override is None
+            or model_override not in self.model_routes
+            or definition.repair_policy.maximum_model_fallbacks == 0
+            or not report.infrastructure_retryable
+        )
         no_session_continuation_authority = decision == "session_continuation" and (
             definition.repair_policy.maximum_session_continuations == 0
             or self.continuations is None
@@ -2719,12 +4036,18 @@ class WorkControlRuntime:
         if (
             no_local_repair_authority
             or no_infrastructure_retry_authority
+            or no_workspace_recovery_authority
+            or no_model_fallback_authority
             or no_session_continuation_authority
         ):
             if terminal_infrastructure_retry:
                 raise WorkRuntimeError(
                     "diagnostic infrastructure retry is not authorized by the terminal "
                     "report/policy"
+                )
+            if terminal_diagnostic_semantic_repair:
+                raise WorkRuntimeError(
+                    "diagnostic semantic repair is not authorized by the terminal report/policy"
                 )
             # A FeedbackEvaluation records the failed Claim regardless, but an
             # actionable diagnostic cannot manufacture repair authority.  In
@@ -2747,6 +4070,24 @@ class WorkControlRuntime:
             + 1
         )
         authorized_at = datetime.now(UTC)
+        route_liveness_required = bool(
+            recovery_decision is not None
+            and recovery_decision.route
+            in {
+                InvocationRecoveryRoute.SAME_MODEL_FRESH_RETRY,
+                InvocationRecoveryRoute.WORKSPACE_RECOVERY,
+            }
+        )
+        retry_not_before = (
+            authorized_at + timedelta(seconds=self.infrastructure_retry_backoff_seconds)
+            if route_liveness_required
+            else None
+        )
+        transient_route_model = (
+            self._proposal_model(terminal_attempt)
+            if decision in {"infrastructure_retry", "model_fallback"}
+            else None
+        )
         action = RepairAction(
             action_id=self._id("repair-action", terminal_attempt.attempt_id, str(ordinal)),
             repair_policy_id=definition.repair_policy.policy_id,
@@ -2769,20 +4110,33 @@ class WorkControlRuntime:
                     if repair_mutation_roots is not None
                     else definition.allowed_mutation_roots
                 )
-                if decision in {"local_correction", "session_continuation"}
+                if decision in {"local_correction", "session_continuation"} or workspace_recovery
                 else ()
             ),
-            causal_evidence_refs=(report_ref, evaluation_ref),
+            causal_evidence_refs=tuple(
+                item
+                for item in (report_ref, evaluation_ref, recovery_evidence_ref)
+                if item is not None
+            ),
             reason_code=(
                 "actionable_validation_failure"
                 if decision == "local_correction"
                 else "provider_output_ceiling"
                 if decision == "session_continuation"
+                else "classified_transient_model_fallback"
+                if decision == "model_fallback"
                 else "process_interrupted"
                 if process_interrupted
+                else "private_workspace_recovery"
+                if workspace_recovery
                 else "retryable_infrastructure_failure"
             ),
             repair_attempt_charge=(0 if decision == "session_continuation" else 1),
+            model_override=model_override,
+            route_model=transient_route_model,
+            retry_not_before=retry_not_before,
+            route_liveness_required=route_liveness_required,
+            workspace_recovery=workspace_recovery,
             authorized_at=authorized_at,
         )
         action_ref = self.artifacts.put_json(
@@ -2847,6 +4201,28 @@ class WorkControlRuntime:
                     "terminal diagnostic repair may authorize infrastructure retry only"
                 )
             return self.heads.authorize_infrastructure_retry(
+                lock,
+                expected_head=head,
+                next_head=next_head,
+            )
+        if terminal_diagnostic_semantic_repair:
+            if decision != "local_correction":
+                raise WorkRuntimeError(
+                    "terminal diagnostic repair may authorize semantic correction only"
+                )
+            return self.heads.authorize_diagnostic_semantic_repair(
+                lock,
+                expected_head=head,
+                next_head=next_head,
+            )
+        if decision == "model_fallback" and head.status == "failed":
+            # Normal Scheduler evaluation authorizes the fallback while the
+            # head is still ``running`` and can use its ordinary transition.
+            # A diagnostic clone deliberately settles its first attempt before
+            # an explicit recovery command re-enters here, so the same
+            # policy-authorized fallback needs the narrow terminal transition
+            # owned by WorkControlStore.
+            return self.heads.authorize_model_fallback(
                 lock,
                 expected_head=head,
                 next_head=next_head,
@@ -2941,6 +4317,43 @@ class WorkControlRuntime:
             and self._has_exact_output_limit(report)
         )
 
+    def _workspace_recovery_eligible(
+        self,
+        *,
+        definition: WorkDefinition,
+        report: ValidationReport,
+        allowed: bool,
+    ) -> bool:
+        """Return whether one Builder draft may use the normal transient retry.
+
+        The private record is supplied by the leaf only after it has observed
+        real workspace activity. This runtime check deliberately does not
+        infer activity from Provider prose or create extra retry authority; it
+        verifies the capability/store/policy prerequisites for the route the
+        central policy already selected.
+        """
+
+        failure_class = self.recovery_policy.classify(
+            InvocationRecoveryEvidence(
+                terminal_code=self._terminal_code(report),
+                retryable=report.infrastructure_retryable,
+                terminal_details=self._terminal_details(report),
+            )
+        )
+        return bool(
+            allowed
+            and self.continuations is not None
+            and self.continuation_workspace_root is not None
+            and definition.proposal_policy.executor == "agent"
+            and definition.repair_policy.maximum_infrastructure_retries > 0
+            and definition.allowed_mutation_roots
+            and failure_class
+            in {
+                InvocationFailureClass.TRANSIENT_CAPACITY,
+                InvocationFailureClass.TRANSIENT_TRANSPORT,
+            }
+        )
+
     @staticmethod
     def _has_exact_output_limit(report: ValidationReport) -> bool:
         return report.status == "error" and tuple(issue.code for issue in report.issues) == (
@@ -3017,6 +4430,38 @@ class WorkControlRuntime:
             repair_attempts=1 if repair else 0,
             wall_seconds=operation.wall_seconds,
             monetary_cost=operation.monetary_cost,
+        )
+
+    def _attempt_operation_envelope(
+        self,
+        definition: WorkDefinition,
+        *,
+        attempt: WorkAttempt,
+    ) -> Budget:
+        """Return non-wall capacity needed for one successful fresh attempt."""
+
+        operation_budgets = (
+            self._budget_from_operation(
+                definition.proposal_policy.budget,
+                repair=bool(attempt.repair_attempt_charge),
+            ),
+            self._budget_from_operation(definition.validation_policy.budget, repair=False),
+            *(
+                (self._budget_from_operation(definition.assurance_policy.budget, repair=False),)
+                if definition.assurance_policy is not None
+                else ()
+            ),
+        )
+        return Budget.model_validate(
+            {
+                field_name: (
+                    0.0
+                    if field_name == "wall_seconds"
+                    else sum(getattr(item, field_name) for item in operation_budgets)
+                )
+                for field_name in Budget.model_fields
+                if field_name != "schema_version"
+            }
         )
 
     def _persist_operation(

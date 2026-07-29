@@ -122,6 +122,12 @@ access_observation, and reliability. Do not add a sibling tool merely to explain
 code derives the stable tool/section/ordinal namespace after validation. Never infer or satisfy an
 ID-prefix convention in model output.
 
+`ToolRuleDraft.family` is also framework-owned in ToolSemantics. Omit it: framework code derives
+the closed location mapping `conditions.preconditions => precondition`,
+`conditions.postconditions => postcondition`, `state_transition.transition => transition`,
+`errors.errors[*].when => error_condition`, and `permission.condition => permission`. Do not
+repeat or guess this structural label; spend the output budget on the Rule's actual clauses.
+
 ## Tool-semantics representation audit
 
 Before returning a `ToolSemanticsBatchSourceDraft`, run a separate JSON-shape pass for **every**
@@ -205,8 +211,12 @@ Lookup keys use one flat, closed variant. For a reference key, use
 `bound_lookup_by_reference` with the single composite `binding_id` listed in
 `lookup_reference_binding_groups`; never combine a lookup alias with a separate reference alias.
 For a literal key, use `bound_lookup_by_constant` with one lookup `binding_id`, `key_value_type`,
-and `key_value`. Never emit `key_binding_id`, a nested `key`, arithmetic as a key, another lookup
-as a key, or raw reference/pointer fields.
+and `key_value`. First locate that alias in exactly one `lookup_binding_groups` entry: copy its
+group-level `key_value_type` byte-for-byte, then make `key_value` a JSON value of that type. The
+selected `value_bindings[*].value_type` describes the value returned by the lookup, **not** its
+key; never substitute it or use a literal as a stand-in for the retrieved value. Never emit
+`key_binding_id`, a nested `key`, arithmetic as a key, another lookup as a key, or raw
+reference/pointer fields.
 
 ## Tool-semantics reliability closure
 

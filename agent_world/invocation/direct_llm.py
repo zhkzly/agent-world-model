@@ -23,6 +23,8 @@ from .contracts import (
     InvocationError,
     InvocationEvent,
     InvocationExecutionMode,
+    InvocationLifecyclePhase,
+    InvocationLifecycleSupervision,
     InvocationRequest,
     InvocationResult,
     InvocationStatus,
@@ -37,6 +39,7 @@ from .structured_diagnostics import (
     direct_invalid_json_details,
     direct_output_limit_details,
     direct_provider_exception_details,
+    direct_provider_response_error_details,
     direct_provider_stream_stalled_details,
     direct_transport_decode_details,
 )
@@ -102,6 +105,7 @@ class DirectLlmBackend:
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
         """Run one direct response, retaining no transcript or provider payload."""
 
+        _emit_lifecycle(request, InvocationLifecyclePhase.QUEUED)
         telemetry_span: WorkSpan | None = None
         progress_disabled = False
         queue_started = time.perf_counter_ns()
@@ -119,6 +123,7 @@ class DirectLlmBackend:
             method: str,
             event_payload: Mapping[str, Any] | None = None,
         ) -> None:
+            _emit_provider_progress(request, "direct_provider_event")
             nonlocal progress_disabled
             if telemetry_span is None or progress_disabled:
                 return
@@ -129,6 +134,7 @@ class DirectLlmBackend:
                 progress_disabled = True
 
         def mark_local_liveness(phase: str) -> None:
+            _emit_lifecycle(request, _direct_lifecycle_phase(phase))
             nonlocal progress_disabled
             if telemetry_span is None or progress_disabled:
                 return
@@ -163,6 +169,7 @@ class DirectLlmBackend:
                     )
                 else:
                     async with self._capacity:
+                        _emit_lifecycle(request, InvocationLifecyclePhase.ADMITTED)
                         queue_duration_ms = (time.perf_counter_ns() - queue_started) / 1_000_000
                         result = await self._invoke_once(
                             request,
@@ -221,6 +228,7 @@ class DirectLlmBackend:
         started = time.monotonic()
         profile = request.profile
         redactor = Redactor.from_values(profile.secret_values)
+        _emit_lifecycle(request, InvocationLifecyclePhase.PROFILE_VERIFYING)
         try:
             verify_resolved_profile(profile)
         except ProfileResolutionError:
@@ -238,6 +246,7 @@ class DirectLlmBackend:
                 started=started,
                 retryable=True,
             )
+        _emit_lifecycle(request, InvocationLifecyclePhase.PROFILE_VERIFIED)
 
         ineligible = _direct_ineligibility_code(request)
         if ineligible is not None:
@@ -312,7 +321,16 @@ class DirectLlmBackend:
                 timeout=profile.limits.timeout_seconds,
                 max_retries=_DIRECT_SDK_MAX_RETRIES,
             )
-            async with asyncio.timeout(profile.limits.timeout_seconds):
+            # A request inside the Invocation Control Plane has exactly one
+            # parent-side wall supervisor.  Keep this adapter-local wall only
+            # for intentionally standalone adapter use; the client transport
+            # still has the profile's declared timeout for its own I/O.
+            adapter_timeout = (
+                None
+                if request.lifecycle_supervision is InvocationLifecycleSupervision.CONTROL_PLANE
+                else profile.limits.timeout_seconds
+            )
+            async with asyncio.timeout(adapter_timeout):
                 if on_liveness is not None:
                     on_liveness("direct_request_dispatched")
                 stream = await _await_with_liveness_heartbeats(
@@ -375,11 +393,16 @@ class DirectLlmBackend:
                             _direct_stream_activity_payload(event_type),
                         )
                     if event_type == "error":
+                        status, code, retryable, stream_error_details = (
+                            _direct_response_error_terminal(event)
+                        )
                         return _local_failure(
                             request,
-                            status=InvocationStatus.FAILED,
-                            code="direct_stream_error",
+                            status=status,
+                            code=code,
                             started=started,
+                            retryable=retryable,
+                            details=stream_error_details,
                         )
                     if event_type in {
                         "response.completed",
@@ -418,6 +441,7 @@ class DirectLlmBackend:
             )
         finally:
             if client is not None:
+                _emit_lifecycle(request, InvocationLifecyclePhase.CLEANUP_RUNNING)
                 try:
                     await client.close()
                 except asyncio.CancelledError:
@@ -426,23 +450,26 @@ class DirectLlmBackend:
                     # The HTTP request already has a terminal result. A close
                     # failure must not replace it with an opaque client error.
                     self._client_close_failures += 1
+                finally:
+                    _emit_lifecycle(request, InvocationLifecyclePhase.CLEANUP_FINISHED)
 
         response_status = _response_status(response)
         if response_status != "completed":
-            status, code = _response_terminal_status(response_status, response)
-            details = (
-                direct_output_limit_details(
+            status, code, retryable, terminal_details = _response_terminal_status(
+                response_status,
+                response,
+            )
+            if code == "direct_output_limit":
+                terminal_details = direct_output_limit_details(
                     configured_max_output_tokens=profile.rollout_token_limit,
                 )
-                if code == "direct_output_limit"
-                else None
-            )
             return _local_failure(
                 request,
                 status=status,
                 code=code,
                 started=started,
-                details=details,
+                retryable=retryable,
+                details=terminal_details,
                 usage=_response_usage(response),
             )
         output_text = getattr(response, "output_text", None)
@@ -641,6 +668,41 @@ def _direct_stream_activity_payload(event_type: str) -> Mapping[str, Mapping[str
     return {"item": {"type": f"direct_stream_{activity}"}}
 
 
+def _direct_lifecycle_phase(phase: str) -> InvocationLifecyclePhase:
+    """Map local Direct adapter facts onto the shared closed lifecycle vocabulary."""
+
+    return {
+        "direct_request_dispatched": InvocationLifecyclePhase.DIRECT_DISPATCHED,
+        "direct_awaiting_response": InvocationLifecyclePhase.DIRECT_AWAITING_RESPONSE,
+        "direct_stream_opened": InvocationLifecyclePhase.DIRECT_STREAM_OPENED,
+        "direct_awaiting_stream_event": InvocationLifecyclePhase.DIRECT_AWAITING_STREAM_EVENT,
+    }.get(phase, InvocationLifecyclePhase.DIRECT_AWAITING_STREAM_EVENT)
+
+
+def _emit_lifecycle(request: InvocationRequest, phase: InvocationLifecyclePhase) -> None:
+    """Keep optional control observation from changing the real adapter outcome."""
+
+    sink = request.lifecycle_sink
+    if sink is None:
+        return
+    try:
+        sink.local(phase)
+    except Exception:
+        return
+
+
+def _emit_provider_progress(request: InvocationRequest, activity: str) -> None:
+    """Record only that a Provider event occurred, never its contents."""
+
+    sink = request.lifecycle_sink
+    if sink is None:
+        return
+    try:
+        sink.provider_progress(activity)
+    except Exception:
+        return
+
+
 def _direct_ineligibility_code(request: InvocationRequest) -> str | None:
     if request.execution_mode is not InvocationExecutionMode.SINGLE_SHOT_STRUCTURED:
         return "direct_execution_mode_ineligible"
@@ -658,15 +720,38 @@ def _response_status(response: Any) -> str:
     return status if isinstance(status, str) else "unknown"
 
 
-def _response_terminal_status(status: str, response: Any) -> tuple[InvocationStatus, str]:
+def _response_terminal_status(
+    status: str,
+    response: Any,
+) -> tuple[InvocationStatus, str, bool, JsonObject | None]:
     if status == "cancelled":
-        return InvocationStatus.CANCELLED, "direct_response_cancelled"
+        return InvocationStatus.CANCELLED, "direct_response_cancelled", False, None
     reason = getattr(getattr(response, "incomplete_details", None), "reason", None)
     if reason == "max_output_tokens":
-        return InvocationStatus.FAILED, "direct_output_limit"
+        return InvocationStatus.FAILED, "direct_output_limit", False, None
     if reason == "content_filter":
-        return InvocationStatus.FAILED, "direct_content_filtered"
-    return InvocationStatus.FAILED, "direct_response_not_completed"
+        return InvocationStatus.FAILED, "direct_content_filtered", False, None
+    if status == "failed":
+        return _direct_response_error_terminal(getattr(response, "error", None))
+    return InvocationStatus.FAILED, "direct_response_not_completed", False, None
+
+
+def _direct_response_error_terminal(
+    error: object | None,
+) -> tuple[InvocationStatus, str, bool, JsonObject]:
+    """Classify both Responses streamed error surfaces through one safe path."""
+
+    details = direct_provider_response_error_details(error)
+    provider_code = details.get("provider_error_code")
+    if provider_code == "provider_unavailable":
+        return InvocationStatus.FAILED, "direct_provider_unavailable", True, details
+    if provider_code == "rate_limited":
+        return InvocationStatus.FAILED, "direct_rate_limited", True, details
+    if provider_code in {"structured_output_schema", "request_parameter", "context_window"}:
+        return InvocationStatus.FAILED, "direct_invalid_request", False, details
+    if provider_code == "model_route":
+        return InvocationStatus.FAILED, "direct_model_unavailable", False, details
+    return InvocationStatus.FAILED, "direct_provider_rejected", False, details
 
 
 def _direct_exception_status(exc: Exception) -> tuple[InvocationStatus, str, bool]:

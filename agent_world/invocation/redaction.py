@@ -18,6 +18,7 @@ _TERMINAL_DIAGNOSTIC_ASSIGNMENT = re.compile(
     r"(?i)\b(api[ _-]?key|authorization|token|secret|password)\b\s*[:=]\s*\S+"
 )
 _TERMINAL_DIAGNOSTIC_OPAQUE = re.compile(r"\b[A-Za-z0-9._~+/=-]{32,}\b")
+_TERMINAL_DIAGNOSTIC_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9._-])/(?:[^\s'\"<>]+)")
 _CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 _SENSITIVE_NAMES = frozenset(
     {
@@ -104,6 +105,30 @@ def redacted_terminal_diagnostic_excerpt(
     text = _TERMINAL_DIAGNOSTIC_OPAQUE.sub("[REDACTED_OPAQUE]", text)
     compact = " ".join(text.split())
     return compact[:maximum_characters] if compact else None
+
+
+def redacted_command_diagnostic_excerpt(
+    value: object,
+    *,
+    redactor: Redactor,
+    maximum_characters: int = 256,
+) -> str | None:
+    """Return a local-only shell failure excerpt without path or secret detail.
+
+    A constructed command audit needs the concrete shell failure rather than
+    merely a nonzero result. Unlike a Provider terminal, command output can
+    also echo private absolute sandbox/profile paths, so remove those after
+    the existing credential/URL/opaque-token scrub.
+    """
+
+    excerpt = redacted_terminal_diagnostic_excerpt(
+        value,
+        redactor=redactor,
+        maximum_characters=maximum_characters,
+    )
+    if excerpt is None:
+        return None
+    return _TERMINAL_DIAGNOSTIC_ABSOLUTE_PATH.sub("[REDACTED_PATH]", excerpt)
 
 
 def _sensitive_key(value: str) -> bool:

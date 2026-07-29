@@ -63,6 +63,16 @@ _REQUIRED_PRODUCTION_STAGES = frozenset(
 )
 _BEHAVIOR_STAGES = frozenset({"shared_tool_semantics", "world_behavior", "tool_semantics_batch"})
 
+# Every refreshable leaf is executed and repaired through this shared Scheduler
+# boundary.  Its source must participate in each validation revision: otherwise
+# a feedback/repair-route change could silently reuse a frozen leaf as though
+# the current control-plane behavior were unchanged.
+_SHARED_SCHEDULER_FEEDBACK_MODULES = (
+    "agent_world.control.leaf_executor",
+    "agent_world.control.work_repair",
+    "agent_world.control.work_runtime",
+    "agent_world.control.work_scheduler",
+)
 
 _EVIDENCE_SYNTHESIS_IMPLEMENTATION_MODULES = (
     "agent_world.designer.evidence_synthesis_leaf",
@@ -73,6 +83,7 @@ _EVIDENCE_SYNTHESIS_VALIDATOR_MODULES = (
     "agent_world.designer.evidence_synthesis_compiler",
     "agent_world.designer.models",
     "agent_world.designer.validators",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _EVIDENCE_SYNTHESIS_SKILL = (
     Path(__file__).resolve().parents[1]
@@ -94,6 +105,7 @@ _TOOL_SEMANTICS_BATCH_VALIDATOR_MODULES = (
     "agent_world.designer.models",
     "agent_world.designer.rule_context",
     "agent_world.designer.validation",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _TOOL_SEMANTICS_BATCH_SKILL = (
     Path(__file__).resolve().parents[1]
@@ -113,6 +125,7 @@ _VERIFIER_INTENT_BATCH_VALIDATOR_MODULES = (
     "agent_world.judge.compiler",
     "agent_world.judge.leaf",
     "agent_world.judge.models",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _VERIFIER_INTENT_BATCH_SKILL = (
     Path(__file__).resolve().parents[1]
@@ -120,6 +133,17 @@ _VERIFIER_INTENT_BATCH_SKILL = (
     / "skills"
     / "challenge-agent-world"
     / "SKILL.md"
+)
+_VERIFIER_PLAN_IMPLEMENTATION_MODULES = (
+    "agent_world.judge.compiler",
+    "agent_world.judge.leaf",
+    "agent_world.judge.models",
+)
+_VERIFIER_PLAN_VALIDATOR_MODULES = (
+    "agent_world.judge.compiler",
+    "agent_world.judge.leaf",
+    "agent_world.judge.models",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _IMPLEMENTATION_PLAN_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -133,6 +157,7 @@ _IMPLEMENTATION_PLAN_VALIDATOR_MODULES = (
     "agent_world.builder.models",
     "agent_world.control.leaf_executor",
     "agent_world.designer.one_shot",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _IMPLEMENTATION_PLAN_SKILL = (
     Path(__file__).resolve().parents[1]
@@ -146,7 +171,9 @@ _CANDIDATE_BUILD_IMPLEMENTATION_MODULES = (
     "agent_world.builder.leaf",
     "agent_world.builder.models",
     "agent_world.builder.service",
+    "agent_world.invocation.contracts",
     "agent_world.invocation.codex_sdk",
+    "agent_world.invocation.profiles",
 )
 _CANDIDATE_BUILD_VALIDATOR_MODULES = (
     "agent_world.builder.leaf",
@@ -155,6 +182,7 @@ _CANDIDATE_BUILD_VALIDATOR_MODULES = (
     "agent_world.builder.workspace",
     "agent_world.control.leaf_executor",
     "agent_world.control.validation",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _CANDIDATE_BUILD_SKILL = (
     Path(__file__).resolve().parents[1]
@@ -162,6 +190,42 @@ _CANDIDATE_BUILD_SKILL = (
     / "skills"
     / "engineer-environment-codegen"
     / "SKILL.md"
+)
+_RUNTIME_INTEGRATION_IMPLEMENTATION_MODULES = (
+    "agent_world.control.direct_runner",
+    "agent_world.control.leaf_executor",
+    "agent_world.judge.assurance",
+    "agent_world.judge.leaf",
+    "agent_world.judge.service",
+    "agent_world.judge.supervisor",
+    "agent_world.judge.visibility",
+)
+_RUNTIME_INTEGRATION_VALIDATOR_MODULES = (
+    "agent_world.control.leaf_executor",
+    "agent_world.control.validation",
+    "agent_world.judge.assurance",
+    "agent_world.judge.leaf",
+    "agent_world.judge.service",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
+)
+_RELEASE_ASSURANCE_IMPLEMENTATION_MODULES = (
+    "agent_world.control.direct_runner",
+    "agent_world.control.leaf_executor",
+    "agent_world.judge.assurance",
+    "agent_world.judge.compiler",
+    "agent_world.judge.leaf",
+    "agent_world.judge.reachability",
+    "agent_world.judge.service",
+    "agent_world.judge.supervisor",
+    "agent_world.judge.visibility",
+)
+_RELEASE_ASSURANCE_VALIDATOR_MODULES = (
+    "agent_world.control.leaf_executor",
+    "agent_world.control.validation",
+    "agent_world.judge.compiler",
+    "agent_world.judge.leaf",
+    "agent_world.judge.service",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 
 
@@ -228,6 +292,29 @@ def verifier_intent_batch_validator_revision() -> Identifier:
     )
 
 
+def verifier_plan_implementation_revision() -> Identifier:
+    """Hash the code-owned VerifierPlan context and partition compiler.
+
+    ``VerifierBatchPlan.context_hash`` binds the exact Challenger context that
+    follows.  A compiler change is therefore also a change to this deterministic
+    parent, not merely to the later Agent leaf.
+    """
+
+    return leaf_code_revision(
+        *_VERIFIER_PLAN_IMPLEMENTATION_MODULES,
+        label="verifier-plan",
+    )
+
+
+def verifier_plan_validator_revision() -> Identifier:
+    """Hash deterministic VerifierPlan admission and its feedback boundary."""
+
+    return leaf_code_revision(
+        *_VERIFIER_PLAN_VALIDATOR_MODULES,
+        label="validator-verifier-plan",
+    )
+
+
 def implementation_plan_implementation_revision() -> Identifier:
     """Hash the complete Agent authoring surface for BuildImplementationPlan."""
 
@@ -263,6 +350,42 @@ def candidate_build_validator_revision() -> Identifier:
     return leaf_code_revision(
         *_CANDIDATE_BUILD_VALIDATOR_MODULES,
         label="validator-build-candidate",
+    )
+
+
+def runtime_integration_implementation_revision() -> Identifier:
+    """Hash the complete isolated Integration execution path."""
+
+    return leaf_code_revision(
+        *_RUNTIME_INTEGRATION_IMPLEMENTATION_MODULES,
+        label="integration-runtime",
+    )
+
+
+def runtime_integration_validator_revision() -> Identifier:
+    """Hash Integration report-to-safe-feedback validation and routing."""
+
+    return leaf_code_revision(
+        *_RUNTIME_INTEGRATION_VALIDATOR_MODULES,
+        label="validator-runtime-integration",
+    )
+
+
+def release_assurance_implementation_revision() -> Identifier:
+    """Hash the complete isolated ReleaseAssurance execution path."""
+
+    return leaf_code_revision(
+        *_RELEASE_ASSURANCE_IMPLEMENTATION_MODULES,
+        label="judge-release-assurance",
+    )
+
+
+def release_assurance_validator_revision() -> Identifier:
+    """Hash ReleaseAssurance report-to-safe-feedback validation and routing."""
+
+    return leaf_code_revision(
+        *_RELEASE_ASSURANCE_VALIDATOR_MODULES,
+        label="validator-release-assurance",
     )
 
 
@@ -302,6 +425,18 @@ def current_runtime_revisions_for_definition(
         )
     if (
         coordinate.component == "verifier"
+        and coordinate.stage == "verifier_plan"
+        and coordinate.artifact_slot == "verifier_batch_plan"
+        and definition.proposal_policy.executor == "code"
+        and definition.proposal_policy.operation == "verifier.verifier_plan"
+        and definition.validation_policy.validator_id == "validator:verifier_plan"
+    ):
+        return (
+            verifier_plan_implementation_revision(),
+            verifier_plan_validator_revision(),
+        )
+    if (
+        coordinate.component == "verifier"
         and coordinate.stage == "verifier_intent_batch"
         and coordinate.artifact_slot == "verifier_intent_checkpoint"
         and definition.proposal_policy.output_contract_id == "contract:verifier-intent-batch.v3"
@@ -329,6 +464,30 @@ def current_runtime_revisions_for_definition(
         return (
             candidate_build_implementation_revision(),
             candidate_build_validator_revision(),
+        )
+    if (
+        coordinate.component == "integration"
+        and coordinate.stage == "runtime_integration"
+        and coordinate.artifact_slot == "integration_report"
+        and definition.proposal_policy.executor == "code"
+        and definition.proposal_policy.operation == "integration.runtime_integration.execute"
+        and definition.validation_policy.validator_id == "validator:runtime_integration"
+    ):
+        return (
+            runtime_integration_implementation_revision(),
+            runtime_integration_validator_revision(),
+        )
+    if (
+        coordinate.component == "judge"
+        and coordinate.stage == "release_assurance"
+        and coordinate.artifact_slot == "judge_report"
+        and definition.proposal_policy.executor == "code"
+        and definition.proposal_policy.operation == "judge.release_assurance.execute"
+        and definition.validation_policy.validator_id == "validator:release_assurance"
+    ):
+        return (
+            release_assurance_implementation_revision(),
+            release_assurance_validator_revision(),
         )
     return None
 
@@ -1132,6 +1291,7 @@ def tool_semantics_batch_definition(
             maximum_local_corrections=1,
             strict_progress_bonus_corrections=1,
             maximum_infrastructure_retries=1,
+            maximum_model_fallbacks=1,
             maximum_automatic_backjump=0,
             maximum_total_repair_attempts=3,
         ),
@@ -1144,7 +1304,7 @@ def tool_semantics_batch_definition(
 def structured_agent_work_definition(
     *,
     scope_id: Identifier,
-    component: Literal["research", "design"] = "design",
+    component: Literal["research", "design", "build"] = "design",
     stage: Identifier,
     artifact_slot: Identifier,
     dependency_coordinates: tuple[WorkCoordinate, ...],
@@ -1168,6 +1328,7 @@ def structured_agent_work_definition(
     maximum_local_corrections: int = 1,
     strict_progress_bonus_corrections: int = 1,
     maximum_infrastructure_retries: int = 1,
+    maximum_model_fallbacks: int = 1,
     maximum_session_continuations: int = 0,
     maximum_process_recoveries: int = 2,
     maximum_automatic_backjump: int = 0,
@@ -1232,6 +1393,7 @@ def structured_agent_work_definition(
             maximum_local_corrections=maximum_local_corrections,
             strict_progress_bonus_corrections=strict_progress_bonus_corrections,
             maximum_infrastructure_retries=maximum_infrastructure_retries,
+            maximum_model_fallbacks=maximum_model_fallbacks,
             maximum_session_continuations=maximum_session_continuations,
             maximum_process_recoveries=maximum_process_recoveries,
             maximum_automatic_backjump=maximum_automatic_backjump,
@@ -1531,6 +1693,7 @@ def deterministic_boundary_work_definition(
             maximum_local_corrections=0,
             strict_progress_bonus_corrections=0,
             maximum_infrastructure_retries=0,
+            maximum_model_fallbacks=0,
             maximum_automatic_backjump=0,
             maximum_total_repair_attempts=0,
         ),
@@ -1660,6 +1823,7 @@ def research_acquisition_work_definition(
             maximum_local_corrections=0,
             strict_progress_bonus_corrections=0,
             maximum_infrastructure_retries=1,
+            maximum_model_fallbacks=0,
             maximum_process_recoveries=1,
             maximum_total_repair_attempts=1,
         ),
@@ -2079,6 +2243,8 @@ def complete_generation_work_graph(
         ),
         output_types=("judge.integration_report",),
         allowed_mutation_roots=("/source", "/dependencies", "/runtime", "/materializer"),
+        implementation_revision_id=runtime_integration_implementation_revision(),
+        validator_revision_id=runtime_integration_validator_revision(),
         input_slots=(
             ArtifactSlotContract(
                 slot_id="input:environment-candidate",
@@ -2116,6 +2282,8 @@ def complete_generation_work_graph(
         ),
         output_types=("judge_report",),
         allowed_mutation_roots=("/verifier", "/source", "/runtime"),
+        implementation_revision_id=release_assurance_implementation_revision(),
+        validator_revision_id=release_assurance_validator_revision(),
         input_slots=(
             ArtifactSlotContract(
                 slot_id="input:release-candidate",
@@ -3208,6 +3376,7 @@ def _verifier_intent_group(
                     maximum_local_corrections=1,
                     strict_progress_bonus_corrections=1,
                     maximum_infrastructure_retries=1,
+                    maximum_model_fallbacks=1,
                     maximum_process_recoveries=1,
                     maximum_total_repair_attempts=3,
                 ),
@@ -3281,7 +3450,7 @@ def verifier_plan_work_definition(
     batch Agents may read it but cannot redefine it.
     """
 
-    return _code_component_definition(
+    definition = _code_component_definition(
         scope_id=scope_id,
         component="verifier",
         stage="verifier_plan",
@@ -3299,8 +3468,15 @@ def verifier_plan_work_definition(
         effect="block_release",
         success_maturity="verifier_plan_frozen",
         output_types=("judge.verifier_batch_plan",),
-    ).model_copy(
+    )
+    return definition.model_copy(
         update={
+            "proposal_policy": definition.proposal_policy.model_copy(
+                update={"implementation_revision_id": verifier_plan_implementation_revision()}
+            ),
+            "validation_policy": definition.validation_policy.model_copy(
+                update={"validator_revision_id": verifier_plan_validator_revision()}
+            ),
             "input_slots": (
                 ArtifactSlotContract(
                     slot_id="input:environment-design",
@@ -3425,6 +3601,7 @@ def _agent_component_definition(
             maximum_local_corrections=1,
             strict_progress_bonus_corrections=1,
             maximum_infrastructure_retries=1,
+            maximum_model_fallbacks=1,
             maximum_session_continuations=maximum_session_continuations,
             maximum_process_recoveries=1,
             maximum_total_repair_attempts=3,
@@ -3452,6 +3629,8 @@ def _assured_code_definition(
     probe_ids: tuple[Identifier, ...],
     output_types: tuple[Identifier, ...],
     allowed_mutation_roots: tuple[str, ...],
+    implementation_revision_id: Identifier,
+    validator_revision_id: Identifier,
     input_slots: tuple[ArtifactSlotContract, ...] = (),
 ) -> WorkDefinition:
     coordinate = WorkCoordinate(
@@ -3488,6 +3667,7 @@ def _assured_code_definition(
             # the same probe under a second control operation.  Validation
             # only maps that immutable report to the declared Claim.
             operation=f"{component}.{stage}.execute",
+            implementation_revision_id=implementation_revision_id,
             budget=OperationBudget(
                 wall_seconds=wall_seconds,
                 tool_calls=max(16, len(probe_ids) * 8),
@@ -3500,7 +3680,7 @@ def _assured_code_definition(
         validation_policy=ValidationPolicy(
             policy_id=f"validation:{stage}:{digest}",
             validator_id=f"validator:{stage}",
-            validator_revision_id=f"framework.validator.{stage}.v1",
+            validator_revision_id=validator_revision_id,
             validation_phase=stage,
             frontier_ordinal=100,
             claim_id=claim_id,
@@ -3517,6 +3697,7 @@ def _assured_code_definition(
             maximum_local_corrections=0,
             strict_progress_bonus_corrections=0,
             maximum_infrastructure_retries=1,
+            maximum_model_fallbacks=0,
             maximum_process_recoveries=1,
             maximum_automatic_backjump=1,
             maximum_total_repair_attempts=2,

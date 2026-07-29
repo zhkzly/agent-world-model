@@ -15,6 +15,15 @@ from agent_world.contracts import (
 )
 from agent_world.control.work import ArtifactSlotContract, WorkCoordinate, WorkDefinition
 from agent_world.control.work_graph import (
+    _CANDIDATE_BUILD_VALIDATOR_MODULES,
+    _EVIDENCE_SYNTHESIS_VALIDATOR_MODULES,
+    _IMPLEMENTATION_PLAN_VALIDATOR_MODULES,
+    _RELEASE_ASSURANCE_VALIDATOR_MODULES,
+    _RUNTIME_INTEGRATION_VALIDATOR_MODULES,
+    _SHARED_SCHEDULER_FEEDBACK_MODULES,
+    _TOOL_SEMANTICS_BATCH_VALIDATOR_MODULES,
+    _VERIFIER_INTENT_BATCH_VALIDATOR_MODULES,
+    _VERIFIER_PLAN_VALIDATOR_MODULES,
     GenerationWorkGraph,
     JoinPolicy,
     WorkGraphEpoch,
@@ -108,6 +117,22 @@ def test_evidence_synthesis_definition_binds_current_prompt_skill_and_compiler_r
     )
 
 
+def test_refreshable_validator_revisions_bind_shared_scheduler_feedback_route() -> None:
+    """Feedback/control changes invalidate every registered refreshable leaf."""
+
+    for modules in (
+        _EVIDENCE_SYNTHESIS_VALIDATOR_MODULES,
+        _TOOL_SEMANTICS_BATCH_VALIDATOR_MODULES,
+        _VERIFIER_INTENT_BATCH_VALIDATOR_MODULES,
+        _VERIFIER_PLAN_VALIDATOR_MODULES,
+        _IMPLEMENTATION_PLAN_VALIDATOR_MODULES,
+        _CANDIDATE_BUILD_VALIDATOR_MODULES,
+        _RUNTIME_INTEGRATION_VALIDATOR_MODULES,
+        _RELEASE_ASSURANCE_VALIDATOR_MODULES,
+    ):
+        assert set(_SHARED_SCHEDULER_FEEDBACK_MODULES).issubset(modules)
+
+
 def test_tool_semantics_batch_definition_binds_current_revisions() -> None:
     definition = tool_semantics_batch_definition(
         job_id="job:hotel",
@@ -169,6 +194,43 @@ def test_builder_agent_definitions_bind_current_prompt_skill_and_validator_revis
     assert candidate_build.validation_policy.validator_revision_id.startswith(
         "framework.validator-build-candidate."
     )
+
+
+def test_assured_code_definitions_bind_current_execution_and_feedback_revisions() -> None:
+    """Judge code leaves must be refreshable after an execution/feedback fix."""
+
+    design_definitions, modeling = _complete_design_closure()
+    graph = complete_generation_work_graph(
+        scope_id="job:hotel",
+        design_graph=_design_graph(design_definitions, modeling),
+        verifier_batch_count=1,
+    )
+    definitions = {
+        (item.coordinate.component, item.coordinate.stage): item for item in graph.definitions
+    }
+
+    integration = definitions[("integration", "runtime_integration")]
+    release_assurance = definitions[("judge", "release_assurance")]
+    for definition, implementation_prefix, validator_prefix in (
+        (
+            integration,
+            "framework.integration-runtime.",
+            "framework.validator-runtime-integration.",
+        ),
+        (
+            release_assurance,
+            "framework.judge-release-assurance.",
+            "framework.validator-release-assurance.",
+        ),
+    ):
+        assert current_runtime_revisions_for_definition(definition) == (
+            definition.proposal_policy.implementation_revision_id,
+            definition.validation_policy.validator_revision_id,
+        )
+        assert definition.proposal_policy.implementation_revision_id.startswith(
+            implementation_prefix
+        )
+        assert definition.validation_policy.validator_revision_id.startswith(validator_prefix)
 
 
 def test_graph_derives_descendant_invalidation_and_exact_parent_repair() -> None:
@@ -974,6 +1036,16 @@ def test_complete_generation_graph_freezes_every_verifier_agent_batch_as_physica
     )
     assert verifier_plan.dependency_coordinates == (modeling.coordinate,)
     assert verifier_plan.proposal_policy.executor == "code"
+    assert current_runtime_revisions_for_definition(verifier_plan) == (
+        verifier_plan.proposal_policy.implementation_revision_id,
+        verifier_plan.validation_policy.validator_revision_id,
+    )
+    assert verifier_plan.proposal_policy.implementation_revision_id.startswith(
+        "framework.verifier-plan."
+    )
+    assert verifier_plan.validation_policy.validator_revision_id.startswith(
+        "framework.validator-verifier-plan."
+    )
     assert all(item.dependency_coordinates == (verifier_plan.coordinate,) for item in batches)
     assert all(
         item.input_slots[0].artifact_types == ("judge.verifier_batch_plan",) for item in batches

@@ -56,6 +56,8 @@ from agent_world.invocation import (
     CodexSdkBackend,
     DirectLlmBackend,
     InvocationBackend,
+    InvocationControlPlane,
+    InvocationControlStore,
     RoutedInvocationBackend,
 )
 from agent_world.judge import (
@@ -89,6 +91,7 @@ class FoundryApplication:
     registry: EnvironmentRegistry
     profiles: IsolatedAgentProfileProvider
     backend: InvocationBackend
+    invocation_control: InvocationControlStore
     telemetry: TelemetryStore
     research: ResearchToolchain
     designer: EnvironmentDesigner
@@ -515,10 +518,24 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         max_concurrent_invocations=config.agent.max_concurrent_invocations,
         telemetry=telemetry,
     )
-    backend: InvocationBackend = RoutedInvocationBackend(
+    routed_backend = RoutedInvocationBackend(
         codex_backend=codex_backend,
         direct_backend=direct_backend,
         max_concurrent_invocations=config.agent.max_concurrent_invocations,
+    )
+    invocation_control = InvocationControlStore(config.state_root / "invocation-control")
+    # This scan only records an owner-loss terminal fact. It never authorizes
+    # a retry, changes a Work head, or releases a Scheduler lease.
+    invocation_control.reconcile_owner_loss()
+    backend: InvocationBackend = InvocationControlPlane(
+        routed_backend,
+        invocation_control,
+        # Every production caller has a typed owner: a Work-backed call binds
+        # its active OperationRun, while an audit or retained standalone
+        # component turn declares its own safe owner.  Refuse metadata-based
+        # inference here so a future raw adapter path cannot quietly bypass
+        # lifecycle settlement and recovery attribution.
+        require_explicit_ownership=True,
     )
     research = build_research_toolchain(
         config.research,
@@ -598,6 +615,7 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         judge=judge,
         registry=registry,
         telemetry=telemetry,
+        invocation_control=invocation_control,
         known_secret_canaries=canaries,
     )
     return FoundryApplication(
@@ -606,6 +624,7 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         registry=registry,
         profiles=profiles,
         backend=backend,
+        invocation_control=invocation_control,
         telemetry=telemetry,
         research=research,
         designer=designer,
@@ -718,6 +737,15 @@ def open_observability(config: FoundryConfig) -> ObservabilityReader:
         known_secret_canaries=canaries,
     )
     artifacts.seal_capability_issuance()
+    control_root = config.state_root / "invocation-control"
+    # The observe plane has no need to manufacture a control directory.  When
+    # one exists, it contributes only redacted lifecycle facts to the scene;
+    # absence remains an honest historical-observability gap.
+    invocation_control = (
+        InvocationControlStore(control_root)
+        if control_root.is_dir() and not control_root.is_symlink()
+        else None
+    )
     return ObservabilityReader(
         root=ObservabilityRoot(config.state_root),
         artifacts=artifacts,
@@ -726,6 +754,7 @@ def open_observability(config: FoundryConfig) -> ObservabilityReader:
             config.state_root / "telemetry",
             commit_batch_size=config.observability.commit_batch_size,
         ),
+        invocation_control=invocation_control,
         known_secret_canaries=canaries,
         tier_a_keep_last_scopes=config.observability.tier_a_keep_last_scopes,
     )

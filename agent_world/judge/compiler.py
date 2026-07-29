@@ -6,7 +6,7 @@ import asyncio
 import json
 import uuid
 from collections import Counter
-from collections.abc import Callable, Coroutine, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +41,11 @@ from agent_world.contracts.reachability import (
 )
 from agent_world.control.decision import StructuredRepairMode
 from agent_world.control.feedback import RepairTargetRef
+from agent_world.control.leaf_executor import (
+    AgentCorrectionBrief,
+    LeafSemanticRepairSeed,
+    append_authorized_semantic_repair_context,
+)
 from agent_world.control.repair import StructuredRepairAuthority, StructuredRepairDenied
 from agent_world.control.validation import (
     SafeValidationIssue,
@@ -53,11 +58,13 @@ from agent_world.invocation import (
     CapabilityResolutionError,
     InvocationBackend,
     InvocationExecutionMode,
+    InvocationOwnership,
     InvocationRequest,
     InvocationResult,
     NodeCapabilityRequirement,
     ResolvedAgentProfile,
     assert_agent_output_advisory,
+    standalone_component_ownership,
 )
 
 from .models import (
@@ -91,6 +98,76 @@ _AUXILIARY_PROPERTY_RULE_FAMILIES = {
     "metamorphic": set(_CANONICAL_PROPERTY_KIND),
 }
 
+type _CoverageRequirementKey = tuple[str, str, str, tuple[str, ...], bool]
+
+
+def _coverage_requirement_key(
+    *,
+    task_type: str | None,
+    property_kind: str,
+    tool_ids: Iterable[str],
+    positive_and_negative: bool,
+) -> _CoverageRequirementKey:
+    """Return the public tuple that identifies one Challenger coverage group."""
+
+    return (
+        "task" if task_type is not None else "world_shared",
+        task_type or "",
+        property_kind,
+        tuple(sorted(tool_ids)),
+        positive_and_negative,
+    )
+
+
+def _coverage_requirement_id(key: _CoverageRequirementKey) -> str:
+    """Derive a stable model-visible id without revealing framework Rule ids."""
+
+    scope, task_type, property_kind, tool_ids, positive_and_negative = key
+    digest = sha256_digest(
+        canonical_json_bytes(
+            {
+                "scope": scope,
+                "task_type": task_type or None,
+                "property_kind": property_kind,
+                "tool_ids": list(tool_ids),
+                "positive_and_negative": positive_and_negative,
+            }
+        )
+    ).removeprefix("sha256:")
+    return f"coverage:{digest[:24]}"
+
+
+def _coverage_requirement_projection(
+    key: _CoverageRequirementKey,
+    *,
+    rule_count: int,
+) -> dict[str, JsonValue]:
+    """Render one public coverage ledger entry for the Challenger prompt."""
+
+    scope, task_type, property_kind, tool_ids, positive_and_negative = key
+    return {
+        "coverage_id": _coverage_requirement_id(key),
+        "scope": scope,
+        "task_type": task_type or None,
+        "property_kind": property_kind,
+        "tool_ids": list(tool_ids),
+        "positive_and_negative": positive_and_negative,
+        "rule_count": rule_count,
+    }
+
+
+def _coverage_requirement_summary(key: _CoverageRequirementKey) -> str:
+    """Describe only fields that already appear in the Challenger context."""
+
+    scope, task_type, property_kind, tool_ids, positive_and_negative = key
+    task_label = task_type if scope == "task" else "world_shared"
+    tools_label = ", ".join(tool_ids) if tool_ids else "any compatible task tool"
+    polarity_label = "positive_and_negative" if positive_and_negative else "positive_only"
+    return (
+        f"scope={scope}, task_type={task_label}, property_kind={property_kind}, "
+        f"tool_ids=[{tools_label}], polarity={polarity_label}"
+    )
+
 
 class ChallengerProfileProvider(Protocol):
     def resolve(
@@ -104,6 +181,7 @@ class ChallengerProfileProvider(Protocol):
         requirement: NodeCapabilityRequirement,
         rollout_token_limit: int | None = None,
         invocation_timeout_seconds: float | None = None,
+        model_override: str | None = None,
     ) -> ResolvedAgentProfile: ...
 
 
@@ -199,6 +277,11 @@ class VerifierCompilationError(RuntimeError):
         unknown_token_upper_bounds: Sequence[int] = (),
         checkpoint_refs: Sequence[ArtifactRef] = (),
         profile: ResolvedAgentProfile | None = None,
+        safe_code: str = "verifier_compilation_error",
+        safe_category: str = "VerifierCompilationError",
+        retryable: bool = True,
+        expected_category: str | None = None,
+        remediation: str | None = None,
     ) -> None:
         super().__init__(message)
         self.result = result
@@ -210,6 +293,11 @@ class VerifierCompilationError(RuntimeError):
         self.unknown_token_upper_bounds = tuple(unknown_token_upper_bounds)
         self.checkpoint_refs = tuple(checkpoint_refs)
         self.profile = profile
+        self.safe_code = safe_code
+        self.safe_category = safe_category
+        self.retryable = retryable
+        self.expected_category = expected_category
+        self.remediation = remediation
 
 
 @dataclass(frozen=True, slots=True)
@@ -239,6 +327,9 @@ class CompiledVerifierBatch:
     checkpoint_ref: ArtifactRef | None = None
     draft_ref: ArtifactRef | None = None
     validation_diagnostic: ValidationDiagnostic | None = None
+    # A parsed-but-rejected intent is private repair input only. It is never
+    # persisted as a Judge Artifact unless the full semantic compilation passes.
+    intent: VerifierIntent | None = None
 
     @property
     def succeeded(self) -> bool:
@@ -412,6 +503,10 @@ class VerifierCompiler:
         budget: Budget,
         permissions: PermissionScope,
         invocation_id: str,
+        invocation_ownership: InvocationOwnership | None = None,
+        model_override: str | None = None,
+        correction_brief: AgentCorrectionBrief | None = None,
+        semantic_repair_seed: LeafSemanticRepairSeed | None = None,
     ) -> CompiledVerifierBatch:
         """Run exactly one planned Challenger turn; never authorize an internal retry.
 
@@ -455,38 +550,83 @@ class VerifierCompiler:
         )
         context["semantic_case_limit"] = batch.semantic_case_limit
         if sha256_digest(canonical_json_bytes(context)) != batch.context_hash:
-            raise VerifierCompilationError("Verifier batch plan context commitment mismatch")
+            raise VerifierCompilationError(
+                "Verifier batch plan context commitment mismatch",
+                safe_code="verifier_batch_plan_context_commitment_mismatch",
+                safe_category=(
+                    "current Verifier compiler context differs from the frozen deterministic "
+                    "VerifierPlan"
+                ),
+                retryable=False,
+                expected_category=(
+                    "a VerifierBatchPlan regenerated from the same frozen EnvironmentDesign "
+                    "under the current compiler revision"
+                ),
+                remediation=(
+                    "refresh the deterministic VerifierPlan before dispatching this Verifier batch"
+                ),
+            )
         self._write_json(workspace / "verifier-context.json", context)
         try:
             assert_agent_output_advisory(
                 VerifierIntent,
                 authority=AgentOutputAuthority.SEMANTIC_ADVISORY,
             )
-            profile = self.profiles.resolve(
-                role="challenger",
-                lineage_id=f"{lineage_id}.batch.{batch_index}",
-                workspace=workspace,
-                output_schema=VerifierIntent.model_json_schema(mode="validation"),
-                permissions=permissions,
-                requirement=NodeCapabilityRequirement.structured_output(
-                    node_id="challenger.verifier-compile-batch",
+            if model_override is None:
+                profile = self.profiles.resolve(
                     role="challenger",
-                ),
-                rollout_token_limit=budget.llm_tokens,
-                invocation_timeout_seconds=budget.wall_seconds,
-            )
+                    lineage_id=f"{lineage_id}.batch.{batch_index}",
+                    workspace=workspace,
+                    output_schema=VerifierIntent.model_json_schema(mode="validation"),
+                    permissions=permissions,
+                    requirement=NodeCapabilityRequirement.structured_output(
+                        node_id="challenger.verifier-compile-batch",
+                        role="challenger",
+                    ),
+                    rollout_token_limit=budget.llm_tokens,
+                    invocation_timeout_seconds=budget.wall_seconds,
+                )
+            else:
+                profile = self.profiles.resolve(
+                    role="challenger",
+                    lineage_id=f"{lineage_id}.batch.{batch_index}",
+                    workspace=workspace,
+                    output_schema=VerifierIntent.model_json_schema(mode="validation"),
+                    permissions=permissions,
+                    requirement=NodeCapabilityRequirement.structured_output(
+                        node_id="challenger.verifier-compile-batch",
+                        role="challenger",
+                    ),
+                    rollout_token_limit=budget.llm_tokens,
+                    invocation_timeout_seconds=budget.wall_seconds,
+                    model_override=model_override,
+                )
         except CapabilityResolutionError as exc:
             raise VerifierCompilationError(
                 str(exc),
                 permission_denied=True,
             ) from exc
+        ownership = invocation_ownership or standalone_component_ownership(
+            invocation_id=invocation_id,
+            component="judge",
+            coordinate="judge:verifier_batch",
+        )
+        self._assert_semantic_repair_seed_binding(
+            semantic_repair_seed,
+            profile=profile,
+        )
         try:
             invocation = await self.backend.invoke(
                 InvocationRequest(
                     invocation_id=invocation_id,
-                    prompt=self._prompt(context),
+                    prompt=append_authorized_semantic_repair_context(
+                        self._prompt(context),
+                        correction_brief=correction_brief,
+                        semantic_repair_seed=semantic_repair_seed,
+                    ),
                     profile=profile,
                     session=None,
+                    ownership=ownership,
                     metadata={
                         "role": "challenger",
                         "lineage_id": lineage_id,
@@ -519,6 +659,7 @@ class VerifierCompiler:
         )
         if not invocation.succeeded:
             return outcome
+        intent: VerifierIntent | None = None
         try:
             if invocation.structured_output is None:
                 raise ValueError("Challenger returned no structured output")
@@ -534,6 +675,7 @@ class VerifierCompiler:
                 profile=profile,
                 invocation=invocation,
                 validation_diagnostic=self._validation_diagnostic(exc),
+                intent=intent,
             )
         try:
             checkpoint_ref = self._persist_intent_checkpoint(
@@ -591,7 +733,28 @@ class VerifierCompiler:
             draft=draft,
             checkpoint_ref=checkpoint_ref,
             draft_ref=draft_ref,
+            intent=intent,
         )
+
+    @staticmethod
+    def _assert_semantic_repair_seed_binding(
+        seed: LeafSemanticRepairSeed | None,
+        *,
+        profile: ResolvedAgentProfile,
+    ) -> None:
+        if seed is None:
+            return
+        schema_digest = sha256_digest(
+            canonical_json_bytes(VerifierIntent.model_json_schema(mode="validation"))
+        )
+        if (
+            seed.model != profile.model
+            or seed.profile_digest != f"sha256:{profile.profile_hash}"
+            or seed.output_schema_digest != schema_digest
+        ):
+            raise VerifierCompilationError(
+                "Verifier semantic repair seed does not bind the resolved Challenger profile"
+            )
 
     @staticmethod
     def _validate_planned_intent(
@@ -1270,6 +1433,11 @@ class VerifierCompiler:
                             prompt=current_prompt,
                             profile=profile,
                             session=session,
+                            ownership=standalone_component_ownership(
+                                invocation_id=invocation_id,
+                                component="judge",
+                                coordinate="judge:legacy_verifier",
+                            ),
                             metadata={
                                 "role": "challenger",
                                 "lineage_id": lineage_id,
@@ -1313,6 +1481,12 @@ class VerifierCompiler:
                     and result.error.retryable
                     and attempt < self.maximum_structured_reworks
                     and attempt + 1 < budget.agent_turns
+                    # In production the Invocation Control Plane has already
+                    # classified and durably settled this physical terminal.
+                    # A fresh-session transport retry or model fallback must
+                    # be authorized by Scheduler/WorkRuntime, rather than
+                    # being silently consumed inside this legacy compiler.
+                    and not getattr(self.backend, "owns_declared_lifecycle", False)
                 ):
                     # Provider/transport failures are code-routed local retries, not
                     # semantic corrections. Restart from the immutable batch prompt in
@@ -1695,6 +1869,13 @@ class VerifierCompiler:
     ) -> tuple[SafeValidationIssue, ...]:
         """Return field-addressable schema errors without echoing rejected values."""
 
+        raw_properties = schema.get("properties")
+        declared_fields = (
+            tuple(str(field) for field in raw_properties)
+            if isinstance(raw_properties, dict)
+            else ()
+        )
+        declared_fields_text = ", ".join(declared_fields)[:320] or "(no fields)"
         issues: list[SafeValidationIssue] = []
         errors = sorted(
             Draft202012Validator(schema).iter_errors(value),
@@ -1706,6 +1887,9 @@ class VerifierCompiler:
         for error in errors[:64]:
             keyword = str(error.validator or "invalid")
             issue_location = (*location, *tuple(error.absolute_path))
+            violated_condition: str | None = None
+            expected_category: str | None = None
+            remediation: str | None = None
             if keyword == "type":
                 expected = error.validator_value
                 expected_label = (
@@ -1729,7 +1913,19 @@ class VerifierCompiler:
                 )
             elif keyword == "additionalProperties":
                 message = (
-                    f"Remove fields not declared by the frozen closed {value_label} schema here."
+                    f"Remove fields not declared by the frozen closed {value_label} schema here. "
+                    f"Its declared fields are: {declared_fields_text}."
+                )
+                violated_condition = (
+                    f"this {value_label} is a closed object and permits only fields declared "
+                    "by its frozen schema"
+                )
+                expected_category = (
+                    f"a closed {value_label} object using only declared fields: "
+                    f"{declared_fields_text}"
+                )
+                remediation = (
+                    f"Remove undeclared {value_label} fields and use only: {declared_fields_text}"
                 )
             elif keyword == "enum":
                 message = f"Use a value allowed by the frozen {value_label} schema here."
@@ -1756,6 +1952,9 @@ class VerifierCompiler:
                     code=code,
                     location=issue_location,
                     message=message,
+                    violated_condition=violated_condition,
+                    expected_category=expected_category,
+                    remediation=remediation,
                 )
             )
         return tuple(issues)
@@ -1802,21 +2001,38 @@ class VerifierCompiler:
             if semantics.permission.condition is not None:
                 rule_tools[semantics.permission.condition.rule_id].add(tool.surface.tool_id)
 
+        def coverage_key_for(rule_id: str) -> _CoverageRequirementKey:
+            rule = rules[rule_id]
+            return _coverage_requirement_key(
+                task_type=task_rule_owners.get(rule_id),
+                property_kind=str(_CANONICAL_PROPERTY_KIND[rule.family]),
+                tool_ids=rule_tools[rule_id],
+                positive_and_negative=(rule.case_sensitivity == "positive_and_negative"),
+            )
+
         case_assertions: dict[str, list[VerifierAssertion]] = {
             item.case_id: [] for item in bound_cases
         }
         property_cases: dict[str, set[str]] = {rule_id: set() for rule_id in required}
         binding_issues: list[SafeValidationIssue] = []
-        for rule_index, rule_id in enumerate(required):
+        for rule_id in required:
             rule = rules[rule_id]
             canonical_kind = _CANONICAL_PROPERTY_KIND[rule.family]
             owner = task_rule_owners.get(rule_id)
+            coverage_key = coverage_key_for(rule_id)
+            coverage_id = _coverage_requirement_id(coverage_key)
+            coverage_summary = _coverage_requirement_summary(coverage_key)
             if owner is not None and owner not in allowed_tasks:
                 binding_issues.append(
                     SafeValidationIssue(
                         "rule_outside_task_batch",
-                        ("required_rules", rule_index),
-                        "A required Rule belongs to a task outside this capacity batch.",
+                        ("coverage_requirements", coverage_id),
+                        (
+                            f"Framework batch assignment is inconsistent for coverage requirement "
+                            f"{coverage_id} ({coverage_summary}); do not retry the Challenger "
+                            "until the frozen batch plan is repaired."
+                        ),
+                        retryable=False,
                     )
                 )
                 continue
@@ -1836,9 +2052,21 @@ class VerifierCompiler:
                 binding_issues.append(
                     SafeValidationIssue(
                         "rule_positive_partition_coverage",
-                        ("required_rules", rule_index),
-                        "Bind this Rule to positive obligations in both sealed and "
-                        "public-or-repair trajectories.",
+                        ("coverage_requirements", coverage_id),
+                        (
+                            f"Coverage requirement {coverage_id} ({coverage_summary}) needs a "
+                            "positive expectation in a compatible semantic trajectory. The "
+                            "framework will pair that trajectory into sealed and public "
+                            "obligations."
+                        ),
+                        expected_category=(
+                            "an expectations entry with the row property_kind, expected=true, "
+                            "and after_action_ordinal pointing to a compatible row tool"
+                        ),
+                        remediation=(
+                            "Add a compatible expectation with expected=true; when this row "
+                            "lists tool_ids, point its ordinal at one of those tool actions."
+                        ),
                     )
                 )
             if rule.case_sensitivity == "positive_and_negative" and not any(
@@ -1847,8 +2075,20 @@ class VerifierCompiler:
                 binding_issues.append(
                     SafeValidationIssue(
                         "rule_negative_obligation_missing",
-                        ("required_rules", rule_index),
-                        "Bind this positive-and-negative Rule to at least one negative obligation.",
+                        ("coverage_requirements", coverage_id),
+                        (
+                            f"Coverage requirement {coverage_id} ({coverage_summary}) also "
+                            "needs at least one compatible negative expectation."
+                        ),
+                        expected_category=(
+                            "an expectations entry with the row property_kind, expected=false, "
+                            "and after_action_ordinal pointing to a compatible row tool"
+                        ),
+                        remediation=(
+                            "Add a separate compatible expectation with expected=false; when "
+                            "this row lists tool_ids, point its ordinal at one of those tool "
+                            "actions."
+                        ),
                     )
                 )
             for ordinal, (case, action_index, expected) in enumerate(matches):
@@ -2330,14 +2570,34 @@ Produce exactly one compact VerifierIntent structured output. You propose only d
 configs, tool-action trajectories, and family-level expectations such as "transition after action
 N should be true". Never enumerate Rule ids or properties: framework code expands each family
 expectation to the complete frozen Rule closure and rejects uncovered rules deterministically.
+The verifier context and requested output are different schemas. The context's `schema_version`
+is context data only: never copy it into VerifierIntent. The top-level VerifierIntent v2
+`schema_version` may be omitted when the output schema permits its default; if emitted, it must be
+the literal `"v2"`.
 Each item in `cases` must use the literal `expectations` field, never aliases such as `checks`,
 `assertions`, or `properties`. Its expectation items describe `kind`, one-based
 `after_action_ordinal`, and boolean `expected` according to the supplied logical output schema;
 do not add unrecognized case fields.
-For every coverage requirement provide a positive semantic expectation; when
-positive_and_negative is true, also provide a negative expectation. Framework code pairs every
-semantic trajectory into public and sealed cases and assigns both case ids and independent uint64
-seeds. You must not propose or infer disclosure partitions, ids, or seeds.
+Before answering, perform a two-pass coverage audit over every
+`coverage_requirements[].coverage_id`.
+`coverage_id` is a stable planning label, not an output field: use its visible scope, task_type,
+property_kind, tool_ids, and polarity to choose compatible trajectories and expectations, but never
+emit the id itself. One compatible semantic trajectory may satisfy several coverage entries. For
+each coverage requirement provide a positive semantic expectation; when positive_and_negative is
+true, also provide a negative expectation. Framework code pairs every semantic trajectory into
+public and sealed cases and assigns both case ids and independent uint64 seeds. You must not
+propose or infer disclosure partitions, ids, or seeds.
+In pass one, choose a concrete `(kind, expected, after_action_ordinal, action tool_id)` mapping for
+each row before composing the final cases. `rule_count` counts the framework's private Rules in a
+row; it never removes that row's own expectation obligation. In pass two, scan the completed
+`cases` against every row again. For this ledger, positive means an `expectations` item with
+`expected=true`; negative means a separate compatible item with `expected=false`. Its `kind` must
+equal the row's property_kind. If a row lists tool_ids, the expectation's after_action_ordinal must
+point to an action whose tool_id is one of those values: merely including that tool elsewhere in the
+same trajectory does not cover the row. This applies equally to `positive_only` error_semantics
+rows. For a row with positive_and_negative=true, check that both boolean expectation entries exist
+before returning. For a row with no tool_ids, use a compatible action in the selected task. Do not
+return while any ledger row lacks its mapped expectation.
 Coverage requirements with `scope="world_shared"` and `task_type=null` apply across the assigned
 real tasks; `world_shared` is never a case task_type. Choose case task_type only from `tasks`.
 Use meaningful multi-action trajectories, error paths, idempotency, permissions, rollback, and
@@ -2355,6 +2615,13 @@ Each case must declare a real task_type and evaluator_goal satisfying that task'
 evaluator_goal_schema, plus one actor from that task's allowed_actor_ids. Actor is bound once by
 reset and cannot appear in an action's arguments. Never include evaluator_goal in reset_config or
 action arguments.
+
+Action-input schema audit is mandatory before returning: for every
+`cases[].actions[]`, find its selected `tool_id` in `tools` and make `arguments` validate against
+that exact tool's `input_schema`. Include every field named by `required`; when that schema has
+`additionalProperties=false`, emit no other argument fields; and satisfy its declared value types,
+enums, formats, and bounds. This is a per-action check: do not reuse arguments from a different
+tool merely because the domain meaning sounds similar.
 
 `after_action_ordinal` is one-based: the first action is 1, the second is 2, and a case containing
 one action permits only ordinal 1. Never use zero and never use an ordinal larger than the number
@@ -2392,8 +2659,8 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
 
         The full EnvironmentDesign repeats the root reset schema once per task and contains
         evidence/Rule expression material the Challenger is neither allowed nor required to
-        reinterpret.  This projection deduplicates reset schemas and exposes only legitimate
-        domain inputs plus framework-owned Rule identities and coverage metadata.
+        reinterpret. This projection deduplicates reset schemas and exposes only legitimate
+        domain inputs plus model-visible coverage metadata; framework Rule ids stay Judge-side.
         """
 
         rules = design_rule_index(design)
@@ -2455,17 +2722,16 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
         for rule_id in sorted(selected_rule_ids):
             rule = rules[rule_id]
             task_owner = task_rule_owners.get(rule_id)
-            key = (
-                "task" if task_owner is not None else "world_shared",
-                task_owner or "",
-                str(_CANONICAL_PROPERTY_KIND[rule.family]),
-                tuple(sorted(rule_tools[rule_id])),
-                rule.case_sensitivity == "positive_and_negative",
+            key = _coverage_requirement_key(
+                task_type=task_owner,
+                property_kind=str(_CANONICAL_PROPERTY_KIND[rule.family]),
+                tool_ids=rule_tools[rule_id],
+                positive_and_negative=(rule.case_sensitivity == "positive_and_negative"),
             )
             coverage_groups[key] = coverage_groups.get(key, 0) + 1
 
         return {
-            "schema_version": "agent-world.challenger-context.v3",
+            "schema_version": "agent-world.challenger-context.v4",
             "reset_config_schemas": [
                 {"schema_id": schema_id, "schema": schema}
                 for schema_id, schema in sorted(reset_schemas.items())
@@ -2490,29 +2756,12 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
                     "evaluator_goal_schema": task.evaluator_goal_schema,
                     "required_tool_ids": list(task.required_tool_ids),
                     "minimum_tool_calls": task.minimum_tool_calls,
-                    "initial_rule_ids": [rule.rule_id for rule in task.initial_state_constraints],
-                    "success_rule_ids": [rule.rule_id for rule in task.success_conditions],
-                    "failure_rule_ids": [rule.rule_id for rule in task.failure_conditions],
-                    "terminal_rule_ids": [rule.rule_id for rule in task.terminal_conditions],
                 }
                 for task in selected_tasks
             ],
             "coverage_requirements": [
-                {
-                    "scope": scope,
-                    "task_type": task_type or None,
-                    "property_kind": property_kind,
-                    "tool_ids": list(tool_ids),
-                    "positive_and_negative": positive_and_negative,
-                    "rule_count": count,
-                }
-                for (
-                    scope,
-                    task_type,
-                    property_kind,
-                    tool_ids,
-                    positive_and_negative,
-                ), count in sorted(coverage_groups.items())
+                _coverage_requirement_projection(key, rule_count=count)
+                for key, count in sorted(coverage_groups.items())
             ],
             "required_property_families": list(
                 design.verification.required_property_families

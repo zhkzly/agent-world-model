@@ -9,7 +9,9 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel
 
+from agent_world.agent_profiles import IsolatedAgentProfileProvider
 from agent_world.artifact_store import ArtifactStore, ArtifactWriter
+from agent_world.config import AgentBackendConfig
 from agent_world.contracts import (
     ArtifactRef,
     Budget,
@@ -22,7 +24,14 @@ from agent_world.contracts import (
     PermissionScope,
     sha256_digest,
 )
-from agent_world.control import StructuredRepairMode
+from agent_world.control import (
+    ArtifactSlotContract,
+    LeaseBudgetLedger,
+    StructuredRepairMode,
+    WorkControlRuntime,
+    WorkControlStore,
+    structured_agent_work_definition,
+)
 from agent_world.control.feedback import RepairTargetRef
 from agent_world.control.validation import (
     SafeValidationIssue,
@@ -59,6 +68,7 @@ from agent_world.designer.service import (
     DesignerError,
     EnvironmentDesigner,
     RootSectionRepairProjection,
+    StructuredWorkSpec,
     ToolSemanticsRepairProjection,
     _gather_independent,
 )
@@ -437,6 +447,58 @@ class _RetryableBackend:
             status=InvocationStatus.COMPLETED,
             session=None,
             turn_id="turn-retry-completed",
+            final_text=None,
+            structured_output={"value": "valid"},
+            usage=InvocationUsage(turn=TokenBreakdown(total_tokens=10)),
+            events=(),
+            error=None,
+            duration_ms=1,
+        )
+
+    async def cancel(self, invocation_id: str) -> bool:
+        return False
+
+
+class _ControlPlaneOwnedRetryableBackend(_RetryableBackend):
+    """Expose a closed transient through the production lifecycle boundary."""
+
+    owns_declared_lifecycle = True
+
+
+class _TransientThenFallbackBackend:
+    """Protocol-boundary double for one legacy-service route migration proof."""
+
+    def __init__(self) -> None:
+        self.requests: list[InvocationRequest] = []
+
+    @property
+    def supported_executor_revision_ids(self) -> tuple[str, ...]:
+        return ("framework.executor.v1",)
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        self.requests.append(request)
+        if len(self.requests) < 3:
+            return InvocationResult(
+                invocation_id=request.invocation_id,
+                status=InvocationStatus.FAILED,
+                session=None,
+                turn_id=f"turn:transient:{len(self.requests)}",
+                final_text=None,
+                structured_output=None,
+                usage=InvocationUsage(turn=TokenBreakdown(total_tokens=10)),
+                events=(),
+                error=InvocationError(
+                    code="turn_failed_provider_unavailable",
+                    message="safe test-only transient provider failure",
+                    retryable=True,
+                ),
+                duration_ms=1,
+            )
+        return InvocationResult(
+            invocation_id=request.invocation_id,
+            status=InvocationStatus.COMPLETED,
+            session=None,
+            turn_id="turn:fallback-success",
             final_text=None,
             structured_output={"value": "valid"},
             usage=InvocationUsage(turn=TokenBreakdown(total_tokens=10)),
@@ -1407,6 +1469,183 @@ async def test_retryable_backend_failure_replays_immutable_node_in_fresh_session
     assert backend.requests[1].session is None
     assert backend.requests[1].prompt == backend.requests[0].prompt
     assert backend.requests[1].metadata["repair_mode"] == "backend_retry"
+
+
+@pytest.mark.asyncio
+async def test_legacy_structured_agent_does_not_spend_a_hidden_icp_retry(
+    tmp_path: Path,
+) -> None:
+    """An ICP-classified transient leaves retry authority above the legacy helper."""
+
+    backend = _ControlPlaneOwnedRetryableBackend()
+    designer = EnvironmentDesigner(
+        artifact_store=cast(ArtifactWriter, object()),
+        research_artifact_store=cast(ArtifactWriter, object()),
+        invocation_backend=cast(InvocationBackend, backend),
+        profile_provider=cast(AgentProfileProvider, _ProfileProvider()),
+        research_toolchain=cast(ResearchToolchain, object()),
+        maximum_structured_reworks=1,
+    )
+
+    with pytest.raises(DesignerError) as captured:
+        await designer.run_structured_agent(
+            role="environment-engineer",
+            lineage_id="lineage:icp-owned-transient",
+            workspace=tmp_path,
+            model=_Output,
+            prompt="Create the artifact from immutable node inputs.",
+            permissions=PermissionScope(),
+            budget=DesignerInvocationBudget(
+                Budget(llm_tokens=1_000, agent_turns=2, repair_attempts=1, wall_seconds=30)
+            ),
+        )
+
+    assert captured.value.stage == "agent.environment-engineer"
+    assert len(backend.requests) == 1
+    assert backend.requests[0].metadata["repair_mode"] == "initial"
+
+
+@pytest.mark.asyncio
+async def test_legacy_structured_work_records_retry_gate_and_applies_fallback_route(
+    tmp_path: Path,
+) -> None:
+    """Legacy Designer work uses the shared retry gate before a new turn.
+
+    This is a constructed local boundary, not a claim about a live Provider:
+    it runs the actual legacy ``execute_structured_work`` control flow through
+    durable WorkRuntime state, profile resolution, and InvocationRequest
+    dispatch.  Two closed transient terminals consume Grok's one fresh retry;
+    the next physical request must carry the persisted Spark fallback profile.
+    """
+
+    writer = ArtifactStore(tmp_path / "artifacts").issue_writer(
+        producer="legacy-designer-route-migration-test",
+        allowed_artifact_type_prefixes=("control.", "design."),
+    )
+    input_ref = writer.put_json(
+        artifact_id="input:legacy-route-migration",
+        artifact_type="control.test_input",
+        value={"frozen": True},
+    )
+    definition = structured_agent_work_definition(
+        scope_id="job:legacy-route-migration",
+        component="design",
+        stage="legacy_route_migration",
+        artifact_slot="test_output",
+        dependency_coordinates=(),
+        claim_id="design.legacy_route_migration.valid",
+        claim="One isolated Designer turn returns the declared test output.",
+        timing_reason="The migration proof needs one exact output closure.",
+        output_contract_id="contract:legacy-route-migration",
+        agent_role="environment_engineer",
+        allowed_mutation_roots=(),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=0,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_model_fallbacks=1,
+        maximum_total_repair_attempts=2,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:test-output",
+                direction="output",
+                artifact_types=("design.test_output",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="design",
+            ),
+        ),
+    )
+    heads = WorkControlStore(tmp_path / "work-control")
+    runtime = WorkControlRuntime(
+        artifacts=writer,
+        heads=heads,
+        budget=LeaseBudgetLedger(
+            Budget(
+                llm_tokens=3_000,
+                agent_turns=3,
+                repair_attempts=2,
+                wall_seconds=300,
+            )
+        ),
+        model_routes=("grok-4.5", "gpt-5.3-codex-spark"),
+        # This proof has no real ICP record to query. The important assertion
+        # is that legacy work records the same safe gate artifact and carries
+        # it into the retry attempt; the live mechanism proof remains separate.
+        require_route_liveness_gate=False,
+        infrastructure_retry_backoff_seconds=0,
+    )
+    backend = _TransientThenFallbackBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="grok-4.5",
+            fallback_models=("gpt-5.3-codex-spark",),
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+    designer = EnvironmentDesigner(
+        artifact_store=writer,
+        research_artifact_store=writer,
+        invocation_backend=cast(InvocationBackend, backend),
+        profile_provider=profiles,
+        research_toolchain=cast(ResearchToolchain, object()),
+    )
+
+    output, output_ref, results = await designer.execute_structured_work(
+        runtime=runtime,
+        work=StructuredWorkSpec(
+            definition=definition,
+            input_refs=(input_ref,),
+            artifact_id="output:legacy-route-migration",
+            artifact_type="design.test_output",
+            dependencies=(input_ref,),
+        ),
+        role="environment-engineer",
+        lineage_id="lineage:legacy-route-migration",
+        workspace=tmp_path / "workspace",
+        model=_Output,
+        prompt="Return the declared test output.",
+        permissions=PermissionScope(),
+        budget=DesignerInvocationBudget(
+            Budget(
+                llm_tokens=3_000,
+                agent_turns=3,
+                repair_attempts=2,
+                wall_seconds=300,
+            )
+        ),
+    )
+
+    assert output == _Output(value="valid")
+    assert output_ref.artifact_type == "design.test_output"
+    assert [result.status for result in results] == [
+        InvocationStatus.FAILED,
+        InvocationStatus.FAILED,
+        InvocationStatus.COMPLETED,
+    ]
+    assert [request.profile.model for request in backend.requests] == [
+        "grok-4.5",
+        "grok-4.5",
+        "gpt-5.3-codex-spark",
+    ]
+    assert backend.requests[1].metadata["repair_mode"] == "backend_retry"
+    assert backend.requests[2].metadata["repair_mode"] == "backend_retry"
+    route_checks = tuple(
+        ref
+        for ref in writer.list_revisions()
+        if ref.artifact_type == "control.invocation_route_liveness_check"
+    )
+    assert len(route_checks) == 1
+    route_check = writer.get_json(route_checks[0])
+    assert route_check["status"] == "not_enforced"
+    assert route_check["code"] == "route_liveness_constructed_boundary"
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "committed"
 
 
 def test_resumable_node_uses_latest_committed_valid_revision(tmp_path: Path) -> None:

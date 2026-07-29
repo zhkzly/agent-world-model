@@ -68,6 +68,11 @@ require_package_relative_paths = true
 allow_unresolved_assumptions = false
 ```
 
+正常 `generate` / E2E 的 `state_root` 必须在 `.agent-world-live/` 之外；若使用本仓库
+内的 gitignored 本机目录，推荐 `.agent-world-staged/<run>/state`。`.agent-world-live/`
+保留给私有 doctor 状态和带显式诊断标记的 `test-node` clone；普通应用会拒绝在该目录下建立
+可观测视图，以避免把私有 live 状态误作通用 Agent 观测输入。
+
 配置 loader 会把 TOML array 显式转换为严格 `ReleaseProfile` tuple。省略
 `required_hard_gates` 时使用与上面相同的封闭十门默认；显式覆盖意味着有意定义一套 release
 policy，不能用它跳过 framework 始终强制的安全检查，也不能让 Agent、Policy 或 LLM score 覆盖
@@ -230,6 +235,7 @@ llm_tokens = 10000000
 agent_turns = 128
 search_calls = 6
 tool_calls = 512
+process_calls = 512
 build_seconds = 900
 evaluation_episodes = 128
 container_seconds = 3600
@@ -244,7 +250,9 @@ tool_calls = 12
 wall_seconds = 900
 ```
 
-未列出的维度为零，不会自动从 token、时间或金额等其他维度“借预算”。Discovery 使用独立
+未列出的维度为零，不会自动从 token、时间或金额等其他维度“借预算”。其中 `process_calls`
+覆盖 framework 启动的确定性 validator、clean-runtime 与 probe 进程；它不是 LLM token
+或 wall time 的替代品。Discovery 使用独立
 小预算，即使失败或超时也不能占用 Direct Generation 的首包预算。
 
 这里的生产默认值刻意覆盖 Task Materialization v3 与真实 task reachability 的最坏情况
@@ -289,6 +297,7 @@ llm_tokens = 6000000
 agent_turns = 640
 search_calls = 30
 tool_calls = 2560
+process_calls = 2560
 build_seconds = 4500
 evaluation_episodes = 640
 container_seconds = 18000
@@ -300,6 +309,7 @@ llm_tokens = 1200000
 agent_turns = 128
 search_calls = 6
 tool_calls = 512
+process_calls = 512
 build_seconds = 900
 evaluation_episodes = 128
 container_seconds = 3600

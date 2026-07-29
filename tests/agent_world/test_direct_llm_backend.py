@@ -88,6 +88,32 @@ class _FakeResponseStream:
             raise StopAsyncIteration from exc
 
 
+class _TerminalEventStream:
+    """A Direct stream with an explicit Provider terminal event."""
+
+    def __init__(self, *events: SimpleNamespace) -> None:
+        self._events = iter(events)
+
+    def __aiter__(self) -> _TerminalEventStream:
+        return self
+
+    async def __anext__(self) -> SimpleNamespace:
+        try:
+            return next(self._events)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+
+class _TerminalEventResponses(_FakeResponses):
+    def __init__(self, *events: SimpleNamespace) -> None:
+        super().__init__()
+        self._events = events
+
+    async def create(self, **kwargs: object) -> object:
+        self.requests.append(kwargs)
+        return _TerminalEventStream(*self._events)
+
+
 class _FakeClient:
     def __init__(
         self,
@@ -553,6 +579,85 @@ async def test_direct_backend_projects_safe_rejected_schema_fingerprint(
         "provider_error_type": "invalid_request",
         "provider_error_code": "structured_output_schema",
         "provider_error_param": "structured_output_schema",
+    }
+    assert result.final_text is None
+    assert result.structured_output is None
+    assert client.closed
+    assert provider_message_canary not in repr(result)
+    assert not _tree_contains(tmp_path, provider_message_canary)
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_projects_safe_stream_error_as_retryable_unavailable(
+    tmp_path: Path,
+) -> None:
+    """A top-level streamed error retains its closed retry category, never prose."""
+
+    request, _, _ = _request(tmp_path)
+    provider_message_canary = f"provider-message-{uuid4().hex}"
+    provider_param_canary = f"provider-param-{uuid4().hex}"
+    responses = _TerminalEventResponses(
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="error",
+            code="server_error",
+            param=provider_param_canary,
+            message=provider_message_canary,
+        ),
+    )
+    client = _FakeClient(responses=responses)
+
+    result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_provider_unavailable"
+    assert result.error.retryable is True
+    assert result.error.details == {
+        "provider_error_shape": "object",
+        "provider_error_type": "absent",
+        "provider_error_code": "provider_unavailable",
+        "provider_error_param": "other",
+    }
+    assert result.final_text is None
+    assert result.structured_output is None
+    assert client.closed
+    assert provider_message_canary not in repr(result)
+    assert provider_param_canary not in repr(result)
+    assert not _tree_contains(tmp_path, provider_message_canary)
+    assert not _tree_contains(tmp_path, provider_param_canary)
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_projects_safe_response_failed_error_as_rate_limited(
+    tmp_path: Path,
+) -> None:
+    """A response.failed error follows the exact same terminal classifier."""
+
+    request, _, _ = _request(tmp_path)
+    provider_message_canary = f"provider-message-{uuid4().hex}"
+    response = _FakeResponses(status="failed")._response()
+    response.error = SimpleNamespace(
+        code="rate_limit_exceeded",
+        message=provider_message_canary,
+    )
+    responses = _TerminalEventResponses(
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(type="response.failed", response=response),
+    )
+    client = _FakeClient(responses=responses)
+
+    result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_rate_limited"
+    assert result.error.retryable is True
+    assert result.error.details == {
+        "provider_error_shape": "object",
+        "provider_error_type": "absent",
+        "provider_error_code": "rate_limited",
+        "provider_error_param": "absent",
     }
     assert result.final_text is None
     assert result.structured_output is None

@@ -81,10 +81,14 @@ class _ProjectionBatch(BaseModel):
     tools: tuple[_ProjectionTool, ...]
 
 
-def test_tool_batch_derives_rule_identity_before_source_artifact_can_be_written() -> None:
-    """Rule namespace is absent from the Agent wire and remains framework mechanics."""
+def test_tool_batch_derives_rule_identity_and_family_before_source_artifact_can_be_written() -> (
+    None
+):
+    """Rule namespace and section family are absent from the Agent wire."""
 
-    assert "rule_id" not in ToolRuleDraft.model_json_schema()["properties"]
+    schema = ToolRuleDraft.model_json_schema()
+    assert "rule_id" not in schema["properties"]
+    assert "family" not in schema.get("required", ())
 
 
 def test_retired_world_skeleton_resume_is_not_a_public_success_path() -> None:
@@ -379,6 +383,7 @@ def test_tool_batch_prompt_discloses_only_the_target_tool_state_footprint() -> N
 
     assert 'The complete logical root is exactly {"tools":[...]}' in prompt
     assert "independent JSON representation audit for every target tool" in prompt
+    assert "The selected value_bindings entry's value_type is the value returned" in prompt
     assert "reliability.tool_id" in prompt
     assert "rollback guarantee" in prompt
     assert "architecture" not in frozen
@@ -555,7 +560,6 @@ def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
         if ordering is not None:
             clause["ordering"] = ordering
         return {
-            "family": family,
             "description": f"A {family} rule for the frozen counter tool.",
             "boolean_operator": "all",
             "clauses": [clause],
@@ -695,6 +699,10 @@ def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
     assert "not emit allowed_actors; framework code derives" in protocol
     assert "they MUST omit `ordering`" in protocol
     assert "never emit a nested `key` object" in protocol
+    assert "group's key_value_type byte-for-byte" in protocol
+    assert "not the key type; never substitute it" in protocol
+    assert "Omit rule_id and family" in protocol
+    assert "state_transition.transition => transition" in protocol
     assert "Never emit key_binding_id" in protocol
     assert "Never emit reference, lookup_by_key" in protocol
     assert "Pre-serialization representation audit" in protocol
@@ -709,6 +717,17 @@ def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
     assert not tuple(protocol_validator.iter_errors(source_document))
 
     source = ToolSemanticsBatchSourceDraft.model_validate_json(json.dumps(source_document))
+    assert source.tools[0].conditions.preconditions[0].family == "precondition"
+    assert source.tools[0].state_transition.transition[0].family == "transition"
+    assert source.tools[0].errors.errors[0].when.family == "error_condition"
+    redundant_family_document = json.loads(json.dumps(source_document))
+    redundant_family_document["tools"][0]["state_transition"]["transition"][0]["family"] = (
+        "postcondition"
+    )
+    redundant_family = ToolSemanticsBatchSourceDraft.model_validate_json(
+        json.dumps(redundant_family_document)
+    )
+    assert redundant_family.tools[0].state_transition.transition[0].family == "transition"
     compiled = compile_tool_semantics_batch(
         source,
         expected_tool_ids=(tool.surface.tool_id,),
@@ -756,9 +775,7 @@ def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
     assert any(code.startswith("schema_too_short@") for code in lookup_diagnostic.issue_codes)
 
     invalid_split_lookup = json.loads(json.dumps(source_document))
-    invalid_split_lookup["tools"][0]["state_transition"]["transition"][0]["clauses"][0][
-        "right"
-    ] = {
+    invalid_split_lookup["tools"][0]["state_transition"]["transition"][0]["clauses"][0]["right"] = {
         "kind": "bound_lookup_by_reference",
         "binding_id": "lookup-ref-1",
         "key_binding_id": "ref-1",
@@ -948,9 +965,7 @@ def test_shared_policy_failures_are_visible_before_rule_compilation() -> None:
                 concurrency=SimpleNamespace(
                     isolation="serializable" if include_timeout else "read_committed"
                 ),
-                idempotency=SimpleNamespace(
-                    mode="natural" if include_timeout else "not_supported"
-                ),
+                idempotency=SimpleNamespace(mode="natural" if include_timeout else "not_supported"),
                 rollback=SimpleNamespace(compensation_tools=()),
             ),
         )
@@ -990,9 +1005,7 @@ def test_shared_policy_failures_are_visible_before_rule_compilation() -> None:
     assert issues["shared_isolation_mismatch"].expected_category == (
         "concurrency.isolation=`serializable`"
     )
-    assert issues["shared_idempotency_mismatch"].expected_category == (
-        "idempotency.mode=`natural`"
-    )
+    assert issues["shared_idempotency_mismatch"].expected_category == ("idempotency.mode=`natural`")
     assert "error-policy:timeout" in issues["shared_error_policy_mismatch"].message
     assert "`timeout`" in issues["shared_error_policy_mismatch"].expected_category
     assert issues["shared_compensation_mismatch"].expected_category == (

@@ -4,6 +4,10 @@ state_root = "/home/me/.local/state/agent-world"
 
 [agent]
 model = "YOUR_CODEX_MODEL"
+# Explicit only: these are eligible after one closed same-model transient retry,
+# never a silent replacement for a failed semantic proposal.  Order encodes the
+# user-approved preference among routes compatible with this deployment.
+fallback_models = ["grok-4.5", "gpt-5.3-codex-spark", "gpt-5.4-mini"]
 codex_bin = "/absolute/path/to/a/current/codex"
 # Names only. The values must be injected into the Foundry process environment.
 api_key_environment = "OPENAI_API_KEY"
@@ -114,6 +118,7 @@ llm_tokens = 6000000
 agent_turns = 640
 search_calls = 30
 tool_calls = 2560
+process_calls = 2560
 build_seconds = 4500
 evaluation_episodes = 640
 container_seconds = 18000
@@ -125,6 +130,7 @@ llm_tokens = 1200000
 agent_turns = 128
 search_calls = 6
 tool_calls = 512
+process_calls = 512
 build_seconds = 900
 evaluation_episodes = 128
 container_seconds = 3600
@@ -136,6 +142,7 @@ llm_tokens = 10000000
 agent_turns = 128
 search_calls = 6
 tool_calls = 512
+process_calls = 512
 build_seconds = 900
 evaluation_episodes = 128
 container_seconds = 3600

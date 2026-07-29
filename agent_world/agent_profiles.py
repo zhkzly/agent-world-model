@@ -31,12 +31,49 @@ from agent_world.invocation import (
     SkillBundleSpec,
     compile_effective_capability_plan,
 )
+from agent_world.invocation.codex_runtime import CodexRuntimeUnavailable, resolve_codex_runtime
 from agent_world.invocation.contracts import JsonObject
 from agent_world.invocation.profiles import API_KEY_RUNTIME_PROVIDER, ProfileResolver
 
 _ROLES = frozenset({"researcher", "environment-engineer", "challenger"})
 _SOLVER_NODE_ID = "challenger.reachability-solver"
 _SOLVER_RUNTIME_DIRECTORY = ".agent-solver-runtimes"
+_FALLBACK_ROUTE_DIRECTORY_PREFIX = "route-"
+_FALLBACK_ROUTE_DIGEST_LENGTH = 64
+
+
+def logical_workspace_for_isolated_agent_workspace(workspace: Path) -> Path:
+    """Recover the frozen input root from one isolated profile workspace.
+
+    Primary profiles live directly below ``.agent-runtime``.  A selected
+    fallback model uses a child route root so it cannot overwrite the primary
+    profile marker/configuration.  Continuation callers receive only the
+    private Agent workspace, so this shared parser keeps Builder and legacy
+    Designer resumption aligned with the materialization policy.
+    """
+
+    requested = workspace.expanduser()
+    if requested.is_symlink():
+        raise ValueError("isolated Agent workspace must not be a symlink")
+    resolved = requested.resolve(strict=True)
+    if not resolved.is_dir() or resolved.name != "workspace":
+        raise ValueError("isolated Agent workspace has an invalid layout")
+    materialization_root = resolved.parent
+    runtime_root = materialization_root
+    if materialization_root.name != ".agent-runtime":
+        route_name = materialization_root.name
+        route_digest = route_name.removeprefix(_FALLBACK_ROUTE_DIRECTORY_PREFIX)
+        if (
+            not route_name.startswith(_FALLBACK_ROUTE_DIRECTORY_PREFIX)
+            or len(route_digest) != _FALLBACK_ROUTE_DIGEST_LENGTH
+            or any(character not in "0123456789abcdef" for character in route_digest)
+            or materialization_root.parent.name != ".agent-runtime"
+        ):
+            raise ValueError("isolated Agent fallback workspace has an invalid layout")
+        runtime_root = materialization_root.parent
+    if runtime_root.is_symlink() or runtime_root.parent.is_symlink():
+        raise ValueError("isolated Agent runtime layout must not contain symlinks")
+    return runtime_root.parent
 
 
 def _logical_output_schema_instructions(
@@ -68,9 +105,7 @@ def _logical_output_schema_instructions(
             "logical schema below; the small outer envelope is not the artifact schema."
         )
     elif transport == "json_object":
-        transport_instruction = (
-            "Return one direct JSON value satisfying the logical schema below."
-        )
+        transport_instruction = "Return one direct JSON value satisfying the logical schema below."
     else:
         raise ValueError(f"unsupported structured output transport: {transport}")
     return "\n".join(
@@ -79,6 +114,10 @@ def _logical_output_schema_instructions(
             transport_instruction,
             "Use the literal property names and closed-object rules in this schema. "
             "Do not substitute aliases, add prose, Markdown fences, or extra fields.",
+            "Input/context documents may have their own schema_version or similarly named "
+            "fields; they are data for the task, not fields to copy into this output. When this "
+            "logical schema declares a const value, emit exactly that value if you include the "
+            "field; otherwise omit a defaulted field only when this schema permits omission.",
             "<logical_output_schema_json>",
             schema_json,
             "</logical_output_schema_json>",
@@ -103,16 +142,16 @@ class IsolatedAgentProfileProvider:
         self.source_environment = dict(
             os.environ if source_environment is None else source_environment
         )
-        self.codex_bin = config.codex_bin
-        self.codex_bin_sha256: str | None = None
-        if self.codex_bin is not None:
-            if (
-                self.codex_bin.is_symlink()
-                or not self.codex_bin.is_file()
-                or not os.access(self.codex_bin, os.X_OK)
-            ):
-                raise ValueError("configured codex_bin must be a real executable file")
-            self.codex_bin_sha256 = _sha256(self.codex_bin)
+        try:
+            codex_runtime = resolve_codex_runtime(config.codex_bin)
+        except CodexRuntimeUnavailable as exc:
+            raise ValueError(str(exc)) from exc
+        # The outer worker and its inner bwrap command sandbox must use this
+        # same pinned executable.  Materializing it on every profile prevents
+        # the worker's bundled-runtime fallback from becoming an invisible
+        # unmounted dependency at command execution time.
+        self.codex_bin = codex_runtime.path
+        self.codex_bin_sha256 = codex_runtime.sha256
         handle = "model-auth"
         binding = CredentialBinding(
             handle=handle,
@@ -136,6 +175,7 @@ class IsolatedAgentProfileProvider:
         requirement: NodeCapabilityRequirement,
         rollout_token_limit: int | None = None,
         invocation_timeout_seconds: float | None = None,
+        model_override: str | None = None,
     ) -> ResolvedAgentProfile:
         return self._resolve(
             role=role,
@@ -146,6 +186,7 @@ class IsolatedAgentProfileProvider:
             requirement=requirement,
             rollout_token_limit=rollout_token_limit,
             invocation_timeout_seconds=invocation_timeout_seconds,
+            model_override=model_override,
         )
 
     def _resolve(
@@ -159,6 +200,7 @@ class IsolatedAgentProfileProvider:
         requirement: NodeCapabilityRequirement,
         rollout_token_limit: int | None,
         invocation_timeout_seconds: float | None,
+        model_override: str | None,
     ) -> ResolvedAgentProfile:
         if role not in _ROLES:
             raise ValueError(f"unsupported Agent role: {role}")
@@ -172,6 +214,18 @@ class IsolatedAgentProfileProvider:
         logical_workspace = workspace.expanduser().resolve()
         logical_workspace.mkdir(parents=True, exist_ok=True)
         materialization_root = logical_workspace / ".agent-runtime"
+        resolved_model = self._configured_model(model_override)
+        if resolved_model != self.config.model:
+            # A selected fallback is a new physical node session.  It must not
+            # overwrite the primary profile marker/configuration in the same
+            # logical frozen-input root, while it must still stage that exact
+            # root's immutable inputs.  The directory uses only a digest of a
+            # configured non-secret model name; no Provider/session identity
+            # reaches the filesystem layout.
+            route_digest = hashlib.sha256(resolved_model.encode("utf-8")).hexdigest()
+            materialization_root = materialization_root / (
+                f"{_FALLBACK_ROUTE_DIRECTORY_PREFIX}{route_digest}"
+            )
         agent_workspace = materialization_root / "workspace"
         resolved = self.resolver.resolve(
             self._spec(
@@ -180,6 +234,7 @@ class IsolatedAgentProfileProvider:
                 capability_plan=capability_plan,
                 rollout_token_limit=rollout_token_limit,
                 invocation_timeout_seconds=invocation_timeout_seconds,
+                model_override=model_override,
             ),
             # Framework artifact/job ids intentionally use typed ``:``
             # separators, while ProfileResolver requires an identity that is
@@ -203,6 +258,7 @@ class IsolatedAgentProfileProvider:
         workspace: Path,
         output_schema: dict[str, object],
         rollout_token_limit: int,
+        model_override: str | None = None,
     ) -> ResolvedAgentProfile:
         """Materialize Challenger's tool-free interactive reachability mode.
 
@@ -255,6 +311,7 @@ class IsolatedAgentProfileProvider:
                 cast(JsonObject, solver_schema),
                 capability_plan=capability_plan,
                 rollout_token_limit=rollout_token_limit,
+                model_override=model_override,
             ),
             # Judge lineage ids intentionally carry typed ':' separators, while
             # ProfileResolver accepts filesystem-safe identities only.  Bind the
@@ -308,6 +365,7 @@ class IsolatedAgentProfileProvider:
         capability_plan: EffectiveCapabilityPlan,
         rollout_token_limit: int | None = None,
         invocation_timeout_seconds: float | None = None,
+        model_override: str | None = None,
     ) -> AgentProfileSpec:
         skill_names = {
             "researcher": "research-world-evidence",
@@ -326,7 +384,7 @@ class IsolatedAgentProfileProvider:
             ),
             "environment-engineer": (
                 "Design or implement the complete executable programmatic world in the isolated "
-                "workspace. WorldSpec owns semantics; never invent sealed evaluation data."
+                "workspace. WorldSpec owns semantics; implement only declared Candidate surfaces."
             ),
             "challenger": (
                 "Challenge evidence, design and black-box behavior without editing candidate code "
@@ -349,8 +407,8 @@ class IsolatedAgentProfileProvider:
                     "engineer-environment-codegen",
                     (
                         "Implement one complete executable Candidate in the isolated workspace. "
-                        "Frozen WorldSpec and the implementation contract own semantics; never "
-                        "invent sealed evaluation data."
+                        "Frozen WorldSpec and the implementation contract own semantics; use only "
+                        "declared Candidate interfaces."
                     ),
                 ),
             }
@@ -359,6 +417,15 @@ class IsolatedAgentProfileProvider:
                 skill_name, instruction = selected
         skill_source = self.assets_root / skill_name
         tool_free = not capability_plan.intrinsic_builtin_tools
+        workspace_toolchain = (
+            role == "environment-engineer"
+            and capability_plan.sandbox is SandboxMode.WORKSPACE_WRITE
+            and "shell" in capability_plan.intrinsic_builtin_tools
+        )
+        runtime_build = (
+            role == "environment-engineer"
+            and capability_plan.node_id == "environment-engineer.runtime-build"
+        )
         structured_output_transport = self.config.structured_output_transport
         if structured_output_transport == "json_object" and not tool_free:
             # ``json_object`` is deliberately a DirectLlmBackend transport:
@@ -368,9 +435,33 @@ class IsolatedAgentProfileProvider:
             # budget and continuation policy remain unchanged.
             structured_output_transport = "provider_schema"
         developer_instruction_parts: list[str] = []
-        if tool_free:
+        if tool_free or runtime_build:
             developer_instruction_parts.append(
                 skill_source.joinpath("SKILL.md").read_text(encoding="utf-8")
+            )
+        if runtime_build:
+            developer_instruction_parts.append(
+                "\n".join(
+                    (
+                        "## Isolated CandidateBuild working context",
+                        "You are already at the isolated workspace root. Use relative paths such "
+                        "as `inputs/...` and `candidate/...`; never reconstruct or search for "
+                        "host, Codex, or profile absolute paths.",
+                        "Use `./.agent-world-tools/uv` for every uv operation and "
+                        "`./.agent-world-tools/python3.12` for compact JSON inspection. Bare "
+                        "`uv`, bare `python`, and a generation-workspace `.venv` are not "
+                        "provisioned interfaces. For uv commands that select or create a Python "
+                        "runtime, pass `--python ./.agent-world-tools/python3.12` explicitly; "
+                        "do not rely on PATH or `UV_PYTHON`.",
+                        "Read every frozen input through focused fields rather than dumping full "
+                        "JSON into tool output. After the initial concise pass, create the "
+                        "`candidate/` project skeleton before any further deep schema lookup, "
+                        "then validate incrementally.",
+                        "If one shell command fails, first run `pwd` and retry the intended "
+                        "relative command. Do not spend the turn scanning parent directories or "
+                        "guessing an alternate host toolchain.",
+                    )
+                )
             )
         logical_output_schema_instructions = _logical_output_schema_instructions(
             output_schema,
@@ -397,8 +488,8 @@ class IsolatedAgentProfileProvider:
         )
         return AgentProfileSpec(
             profile_id=role,
-            profile_version="5",
-            model=self.config.model,
+            profile_version="7",
+            model=self._configured_model(model_override),
             model_provider=API_KEY_RUNTIME_PROVIDER,
             openai_base_url_environment=self.config.openai_base_url_environment,
             reasoning_effort=ReasoningEffort(reasoning[role]),
@@ -433,6 +524,7 @@ class IsolatedAgentProfileProvider:
             structured_output_transport=structured_output_transport,
             rollout_token_limit=rollout_token_limit,
             tool_output_token_limit=self.config.tool_output_token_limit,
+            required_runtime_tools=("uv",) if workspace_toolchain else (),
             limits=InvocationLimits(
                 timeout_seconds=min(
                     self.config.invocation_timeout_seconds,
@@ -449,11 +541,12 @@ class IsolatedAgentProfileProvider:
         *,
         capability_plan: EffectiveCapabilityPlan,
         rollout_token_limit: int,
+        model_override: str | None = None,
     ) -> AgentProfileSpec:
         return AgentProfileSpec(
             profile_id="challenger",
             profile_version="reachability-solver-1",
-            model=self.config.model,
+            model=self._configured_model(model_override),
             model_provider=API_KEY_RUNTIME_PROVIDER,
             openai_base_url_environment=self.config.openai_base_url_environment,
             reasoning_effort=ReasoningEffort(self.config.reasoning_challenger),
@@ -506,6 +599,21 @@ class IsolatedAgentProfileProvider:
             intrinsic_builtin_tools=("shell", "workspace_edit") if write else ("shell",),
             external=ExternalCapabilitySet(network_domains=network_domains),
         )
+
+    @property
+    def model_routes(self) -> tuple[str, ...]:
+        """The non-secret configured route order, including the primary model."""
+
+        return self.config.model_routes
+
+    def _configured_model(self, model_override: str | None) -> str:
+        """Reject an undeclared route before materializing a private profile."""
+
+        if model_override is None:
+            return self.config.model
+        if model_override not in self.config.model_routes:
+            raise ValueError("model_override is not an explicitly configured fallback route")
+        return model_override
 
     @staticmethod
     def _copy_framework_inputs(source: Path, destination: Path) -> None:

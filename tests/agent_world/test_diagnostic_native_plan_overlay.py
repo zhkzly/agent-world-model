@@ -18,6 +18,7 @@ from agent_world.contracts import (
     GenerationContext,
     PermissionScope,
     ReleaseProfile,
+    sha256_digest,
 )
 from agent_world.control import (
     ArtifactSlotContract,
@@ -38,6 +39,7 @@ from agent_world.control.test_node import (
     DiagnosticTaskRequirementNodeRunner,
 )
 from agent_world.designer.models import CurriculumPlanSourceDraft, CurriculumTaskPlanSourceDraft
+from agent_world.judge.models import VerifierBatchPlan, VerifierBatchPlanItem
 
 
 def _config(tmp_path: Path) -> FoundryConfig:
@@ -420,4 +422,88 @@ def test_task_requirement_loader_accepts_native_plan_overlay(
     )
     assert selected_join.design_epoch_ref == overlay_design_epoch_ref
     assert selected_join.curriculum_plan_definition == overlay_plan
+
+    # A current VerifierPlan implementation refresh is a different diagnostic
+    # shape: upstream CurriculumPlan remains the original normal commit, while
+    # only the deterministic VerifierPlan becomes diagnostic.  The final-node
+    # harness must select this exact Design epoch by VerifierPlan, rather than
+    # incorrectly requiring an unrelated diagnostic CurriculumPlan.
+    runtime.execute_deterministic_boundary(
+        definition=base_plan,
+        input_refs=(context_ref,),
+        subject_ref=base_plan_ref,
+        output_refs=(base_plan_ref,),
+    )
+    refreshed_verifier_plan = verifier_plan.model_copy(
+        update={
+            "proposal_policy": verifier_plan.proposal_policy.model_copy(
+                update={
+                    "implementation_revision_id": "framework.fixture.verifier-plan-refresh.v1"
+                }
+            )
+        }
+    )
+    refreshed_design_graph = compile_design_work_graph(
+        scope_id=scope_id,
+        design_definitions=(*base_world_definitions, task_requirement, task_curriculum),
+        modeling_definition=modeling,
+        verifier_plan_definition=refreshed_verifier_plan,
+    )
+    _, _, _, refreshed_design_epoch_ref = epochs.freeze_design_from_world(
+        context_ref=context_ref,
+        world_epoch_ref=base_world_epoch_ref,
+        graph=refreshed_design_graph,
+        topology_id="topology:native-overlay-verifier-plan-refresh",
+        allow_diagnostic_predecessors=True,
+    )
+    refreshed_design_ref = artifacts.put_json(
+        artifact_id="fixture-output:refreshed-verifier-plan-design",
+        artifact_type="design.environment_design",
+        value={"fixture": "refreshed-verifier-plan-design"},
+        dependencies=(context_ref,),
+    )
+    refreshed_world_spec_ref = artifacts.put_json(
+        artifact_id="fixture-output:refreshed-verifier-plan-world-spec",
+        artifact_type="design.world_spec",
+        value={"fixture": "refreshed-verifier-plan-world-spec"},
+        dependencies=(refreshed_design_ref,),
+    )
+    refreshed_plan = VerifierBatchPlan(
+        plan_id="verifier-plan:fixture:refreshed",
+        design_ref=refreshed_design_ref,
+        world_spec_ref=refreshed_world_spec_ref,
+        maximum_tasks_per_batch=1,
+        batches=(
+            VerifierBatchPlanItem(
+                batch_id="verifier-batch:fixture:refreshed",
+                batch_index=0,
+                task_types=("todo-list",),
+                required_rule_ids=(),
+                required_property_families=(),
+                semantic_case_limit=2,
+                context_hash=sha256_digest(b"fixture-verifier-plan-refresh"),
+            ),
+        ),
+    )
+    refreshed_plan_ref = app.verifier_compiler.artifacts.put_json(
+        artifact_id=refreshed_plan.plan_id,
+        artifact_type="judge.verifier_batch_plan",
+        value=refreshed_plan,
+        dependencies=(refreshed_design_ref, refreshed_world_spec_ref),
+    )
+    diagnostic_runtime.execute_deterministic_boundary(
+        definition=refreshed_verifier_plan,
+        input_refs=(refreshed_design_ref, refreshed_world_spec_ref),
+        subject_ref=refreshed_plan_ref,
+        output_refs=(refreshed_plan_ref,),
+    )
+    selected_final = DiagnosticTaskCurriculumJoinRunner._load_plan_derived_join(  # noqa: SLF001
+        app=app,
+        scope_id=scope_id,
+        require_unheaded_join=False,
+        diagnostic_anchor="verifier_plan",
+    )
+    assert selected_final.design_epoch_ref == refreshed_design_epoch_ref
+    assert selected_final.curriculum_plan_definition == base_plan
+    assert selected_final.verifier_plan_definition == refreshed_verifier_plan
     app.telemetry.close()

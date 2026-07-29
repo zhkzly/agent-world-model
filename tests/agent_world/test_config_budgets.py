@@ -53,6 +53,7 @@ def test_production_defaults_reserve_full_v3_judge_capacity(tmp_path: Path) -> N
     assert candidate.llm_tokens == 1_200_000
     assert direct.agent_turns == candidate.agent_turns == 128
     assert direct.tool_calls == candidate.tool_calls == 512
+    assert direct.process_calls == candidate.process_calls == 512
     assert direct.evaluation_episodes == candidate.evaluation_episodes == 128
     assert direct.container_seconds == candidate.container_seconds == 3_600
     assert direct.wall_seconds == 28_800
@@ -73,6 +74,7 @@ def test_production_defaults_reserve_full_v3_judge_capacity(tmp_path: Path) -> N
         "agent_turns",
         "search_calls",
         "tool_calls",
+        "process_calls",
         "build_seconds",
         "evaluation_episodes",
         "container_seconds",

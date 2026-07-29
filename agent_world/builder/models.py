@@ -189,7 +189,6 @@ class RuntimeWireContract(V2Contract):
     )
     response_optional_keys: tuple[Identifier, ...] = ("result", "error")
     operations: Annotated[tuple[RuntimeOperationContract, ...], Field(min_length=5)]
-    forbidden_runtime_key_names: Annotated[tuple[Identifier, ...], Field(min_length=1)]
     one_request_one_response: bool = True
     stdout_is_protocol_only: bool = True
 
@@ -244,12 +243,7 @@ class TaskMaterializerContract(V2Contract):
         "initial_config",
     )
     framework_renders_public_instruction: Literal[True] = True
-    framework_projects_evaluator_goal: Literal[True] = True
-    candidate_evaluator_authority_prohibited: Literal[True] = True
-    candidate_solution_witness_prohibited: Literal[True] = True
     same_seed_difficulty_contrast_required: Literal[True] = True
-    evaluator_goal_must_not_enter_runtime: Literal[True] = True
-    trusted_evaluator_owns_reward_and_termination: Literal[True] = True
 
     @model_validator(mode="after")
     def validate_fixed_boundary(self) -> TaskMaterializerContract:
@@ -298,19 +292,6 @@ class ImplementationContract(V2Contract):
         Literal["task_materializer", "public_verifier", "public_tests"],
         ...,
     ] = ("task_materializer", "public_verifier", "public_tests")
-    prohibited_implementation_patterns: tuple[Identifier, ...] = (
-        "fixed_task_replay",
-        "fixture_registry",
-        "environment_id_branch",
-        "generated_verify_authority",
-        "expected_value_input",
-        "sealed_case_input",
-        "mock_fake_stub",
-        "template_fallback",
-        "candidate_authored_instruction",
-        "candidate_authored_evaluator_goal",
-        "candidate_authored_solution_witness",
-    )
 
     @model_validator(mode="after")
     def validate_contract(self) -> ImplementationContract:
@@ -364,11 +345,10 @@ register_agent_output_contract(
 
 
 class CandidateFileDeclaration(V2Contract):
-    """Agent declaration of one relative file; hashes are framework-owned."""
+    """Agent declaration of one relative file; hashes and modes are framework-owned."""
 
     path: NonEmptyStr
     role: CandidateFileRole
-    executable: bool = False
 
     @field_validator("path")
     @classmethod
@@ -456,6 +436,12 @@ def normalize_candidate_completion_output(value: JsonValue) -> JsonValue:
     inspect or mutate the filesystem here.  Physical closure remains the independent
     responsibility of :class:`CandidateWorkspaceValidator`.
 
+    File executable mode is likewise a physical property of the final
+    workspace, which the framework derives while it validates and packages the
+    candidate. Drop a legacy Agent-supplied ``files[*].executable`` spelling:
+    it cannot alter the resulting manifest and must not become a second source
+    of truth for a file mode.
+
     The callable name ``materialize`` is fixed by the implementation contract.
     Its module is uniquely derived from one lexically importable ``entry_path``;
     normalize any ``*:materialize`` spelling to that canonical representation
@@ -472,6 +458,13 @@ def normalize_candidate_completion_output(value: JsonValue) -> JsonValue:
         return proposal
 
     files = proposal.get("files")
+    if isinstance(files, list):
+        for declaration in files:
+            if isinstance(declaration, dict):
+                # Mode belongs to the physical regular file, not an Agent
+                # declaration. This exact legacy field is safe to discard
+                # before strict structured-output validation.
+                declaration.pop("executable", None)
     if isinstance(files, list) and files:
         declarations = tuple(item for item in files if isinstance(item, dict))
         raw_paths = tuple(item.get("path") for item in declarations)
@@ -793,19 +786,20 @@ class RepairDisclosure(V2Contract):
     def reject_private_evaluation_details(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        normalized = unicodedata.normalize("NFKC", value).casefold().replace("-", "_")
+        normalized = re.sub(r"[\s-]+", "_", unicodedata.normalize("NFKC", value).casefold())
         forbidden = (
             "case_id",
             "case_label",
+            "evaluator_goal",
             "expected_answer",
             "expected_output",
             "expected_path",
             "expected_state",
+            "evaluation_witness",
             "oracle",
             "private_goal",
             "sealed_case",
             "sealed_data",
-            "task_id",
             "verifier_ir",
         )
         if any(term in normalized for term in forbidden):

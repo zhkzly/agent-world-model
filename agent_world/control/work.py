@@ -8,9 +8,15 @@ the old FeedbackContract and component-local retry limits are not inputs.
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import (
+    AwareDatetime,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from agent_world.contracts import (
     ArtifactRef,
@@ -67,9 +73,17 @@ type RepairDecision = Literal[
     "local_correction",
     "parent_correction",
     "infrastructure_retry",
+    "model_fallback",
     "session_continuation",
     "request_human",
     "reject",
+]
+type ExecutingRepairDecision = Literal[
+    "local_correction",
+    "parent_correction",
+    "infrastructure_retry",
+    "model_fallback",
+    "session_continuation",
 ]
 type ProposalExecutionStatus = Literal[
     "completed",
@@ -361,7 +375,9 @@ class ProposalPolicy(V2Contract):
             if self.budget.agent_turns < 1 or self.budget.llm_tokens < 1:
                 raise ValueError("Agent proposal requires numeric turn and token limits")
             if (self.session_token_limit is None) != (self.session_wall_seconds is None):
-                raise ValueError("Agent logical session token and wall limits must be declared together")
+                raise ValueError(
+                    "Agent logical session token and wall limits must be declared together"
+                )
             if self.session_token_limit is not None and (
                 self.session_token_limit < self.budget.llm_tokens
                 or self.session_wall_seconds is None
@@ -450,6 +466,17 @@ class RepairPolicy(V2Contract):
     maximum_local_corrections: Annotated[int, Field(ge=0, le=1)] = 1
     strict_progress_bonus_corrections: Annotated[int, Field(ge=0, le=1)] = 1
     maximum_infrastructure_retries: Annotated[int, Field(ge=0)] = 1
+    # A fallback is a new physical attempt after the same route has already
+    # consumed its fresh-session retry. It shares the global charged-repair
+    # ceiling with semantic and infrastructure attempts, but has its own
+    # category cap so a route list cannot become a blind model loop.
+    #
+    # This was added after persisted v2 WorkDefinitions already existed.
+    # Absence therefore means *no newly granted fallback authority*, rather
+    # than silently changing the behavior of an old immutable definition.
+    # All current graph factories pass this field explicitly and consequently
+    # bind the chosen authority into their digest.
+    maximum_model_fallbacks: Annotated[int, Field(ge=0)] = 0
     # Provider output ceilings are neither semantic corrections nor transient
     # infrastructure retries.  This count is derived from the declared logical
     # session envelope and the physical-turn reservation; it is separately
@@ -462,6 +489,26 @@ class RepairPolicy(V2Contract):
     insufficient_diagnostic_action: Literal["terminal"] = "terminal"
     no_progress_action: Literal["terminal"] = "terminal"
     oscillation_action: Literal["terminal"] = "terminal"
+
+    @model_serializer(mode="wrap")
+    def serialize_backward_compatible(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ) -> dict[str, Any]:
+        """Keep a pre-fallback persisted policy byte-identical when reloaded.
+
+        ``model_fields_set`` records whether an old artifact actually carried
+        the field. Pydantic otherwise materializes the current default while
+        parsing, which would make a historical WorkDefinition fail its own
+        immutable digest comparison. Deliberately omitting the field remains
+        a closed, zero-authority legacy policy; new graph factories always
+        declare it and therefore serialize it normally.
+        """
+
+        serialized: dict[str, Any] = handler(self)
+        if "maximum_model_fallbacks" not in self.model_fields_set:
+            serialized.pop("maximum_model_fallbacks", None)
+        return serialized
 
     @model_validator(mode="after")
     def validate_single_limit(self) -> RepairPolicy:
@@ -550,7 +597,8 @@ class WorkDefinition(V2Contract):
         )
         if bool(mutation_repair) != bool(self.allowed_mutation_roots):
             raise ValueError(
-                "mutable repair/continuation policy and allowed mutation roots must be declared together"
+                "mutable repair/continuation policy and allowed mutation roots "
+                "must be declared together"
             )
         if bool(self.repair_target_coordinates) != bool(
             self.repair_policy.maximum_automatic_backjump
@@ -698,17 +746,21 @@ class ProposalExecution(V2Contract):
             and self.error_code.startswith("preflight_")
         )
         # A process can disappear after the dispatch fence but before the SDK
-        # returns invocation/profile provenance.  Preserve it as an explicit
-        # interrupted unknown rather than fabricating a provider/session id.
-        agent_interrupted_before_provenance = (
+        # returns provider/profile provenance.  The durable OperationRun
+        # dispatch id is already framework-owned evidence of *which physical
+        # call* was interrupted, so it may survive.  Do not manufacture any
+        # provider/model/profile/schema fact that the adapter never returned.
+        agent_interrupted_after_dispatch = (
             self.executor == "agent"
             and self.status == "interrupted"
             and self.error_code is not None
             and self.error_code.startswith("process_interrupted")
         )
         if self.executor == "agent" and any(value is None for value in agent_fields):
-            if not (agent_preflight_failure or agent_interrupted_before_provenance) or any(
-                value is not None for value in agent_fields
+            missing_provider_provenance = any(value is not None for value in agent_fields[1:])
+            if not (
+                (agent_preflight_failure and all(value is None for value in agent_fields))
+                or (agent_interrupted_after_dispatch and not missing_provider_provenance)
             ):
                 raise ValueError(
                     "Agent execution requires invocation/profile/model/schema evidence "
@@ -1152,9 +1204,23 @@ class WorkAttempt(V2Contract):
     feedback_evaluation_ref: ArtifactRef | None = None
     repair_action_ref: ArtifactRef | None = None
     repair_attempt_charge: Annotated[int, Field(ge=0, le=1)] = 0
+    # A fallback is a fresh physical node attempt with the same immutable
+    # closure, not a change to the frozen WorkDefinition.  The selected model
+    # remains visible on that attempt and every same-node successor; the
+    # originating model change is bound by its RepairAction.
+    model_override: NonEmptyStr | None = None
+    # A same-model transient retry may start only after Scheduler has recorded
+    # a pre-dispatch route-liveness check. This pointer is control-plane
+    # evidence, never runtime-Agent feedback or a provider/session handle.
+    route_liveness_evidence_ref: ArtifactRef | None = None
     recovery_ordinal: Annotated[int, Field(ge=0, le=2)] = 0
     recovery_reason_code: Identifier | None = None
     continuation_commitment: ContentHash | None = None
+    # A fresh-session semantic correction may retain one parsed candidate in
+    # private storage. This is deliberately separate from a Provider session
+    # continuation: the public attempt holds only a commitment, never the
+    # candidate bytes or any worker/thread/workspace identity.
+    semantic_repair_seed_commitment: ContentHash | None = None
     observed_actual: BudgetUsage = Field(default_factory=BudgetUsage)
     unknown_upper_bound: BudgetUsage = Field(default_factory=BudgetUsage)
     conservative_committed: BudgetUsage = Field(default_factory=BudgetUsage)
@@ -1206,6 +1272,20 @@ class WorkAttempt(V2Contract):
             raise ValueError("work attempt repair action ref has the wrong Artifact type")
         if self.repair_attempt_charge and self.repair_action_ref is None:
             raise ValueError("repair charge requires an exact RepairAction")
+        if self.model_override is not None and self.repair_action_ref is None:
+            raise ValueError("model override requires an exact RepairAction")
+        if (
+            self.model_override is not None
+            and self.repair_attempt_charge == 0
+            and self.continuation_commitment is None
+        ):
+            raise ValueError("an uncharged model override requires an exact continuation binding")
+        if (
+            self.route_liveness_evidence_ref is not None
+            and self.route_liveness_evidence_ref.artifact_type
+            != "control.invocation_route_liveness_check"
+        ):
+            raise ValueError("work attempt route-liveness evidence has the wrong Artifact type")
         recovering = self.recovery_ordinal > 0
         if recovering != (self.recovery_reason_code is not None):
             raise ValueError("physical recovery requires ordinal and reason together")
@@ -1348,13 +1428,13 @@ class WorkRepairLedgerEntry(V2Contract):
     input_fingerprint: ContentHash | None = None
     repair_policy_digest: ContentHash
     repair_action_ref: ArtifactRef
-    decision: Literal[
-        "local_correction",
-        "parent_correction",
-        "infrastructure_retry",
-        "session_continuation",
-    ]
+    decision: ExecutingRepairDecision
     reason_code: Identifier = "legacy_unspecified"
+    # The source route for a transient retry/fallback.  It is a configured
+    # model identifier, never a provider session or response value.  Keeping
+    # it on the durable ledger lets policy prove one fresh retry per current
+    # model instead of accidentally spending Grok's retry on a later route.
+    route_model: NonEmptyStr | None = None
     source_evaluation_ref: ArtifactRef
     report_before_ref: ArtifactRef
     report_after_ref: ArtifactRef | None = None
@@ -1380,6 +1460,11 @@ class WorkRepairLedgerEntry(V2Contract):
             value is None for value in epoch_fields
         ):
             raise ValueError("repair epoch identity must be complete or read-only legacy")
+        if self.route_model is not None and self.decision not in {
+            "infrastructure_retry",
+            "model_fallback",
+        }:
+            raise ValueError("only transient recovery entries may declare a route model")
         expected_types = {
             "repair_action_ref": (self.repair_action_ref, "control.repair_action"),
             "source_evaluation_ref": (
@@ -1445,10 +1530,33 @@ class RepairAction(V2Contract):
     jump_distance: Annotated[int, Field(ge=0, le=2)]
     repair_attempt_ordinal: Annotated[int, Field(ge=0)]
     immutable_input_refs: tuple[ArtifactRef, ...] = ()
+    # A semantic correction may need to begin in a fresh node-local Agent
+    # session.  In that case the framework binds the exact already-committed
+    # output closure that is safe to restore before the new turn.  This is
+    # provenance/control data, never a prompt field and never a private
+    # provider session handle.
+    repair_seed_attempt_ref: ArtifactRef | None = None
+    repair_seed_output_refs: tuple[ArtifactRef, ...] = ()
     allowed_mutation_roots: tuple[NonEmptyStr, ...] = ()
     causal_evidence_refs: tuple[ArtifactRef, ...] = ()
     reason_code: Identifier
     repair_attempt_charge: Annotated[int, Field(ge=0, le=1)]
+    model_override: NonEmptyStr | None = None
+    # ``route_model`` names the model that produced the classified transient
+    # terminal.  For an infrastructure retry it is the model being retried;
+    # for a fallback it is the source route, while ``model_override`` names
+    # the next route.  It must never carry a thread/session/provider handle.
+    route_model: NonEmptyStr | None = None
+    # ``retry_not_before`` records backoff without keeping a Scheduler lock or
+    # a node-local session alive. It is only meaningful for the one
+    # policy-selected same-model infrastructure retry.
+    retry_not_before: AwareDatetime | None = None
+    route_liveness_required: bool = False
+    # A Builder-only same-model infrastructure retry may start a new Agent
+    # thread over a private, uncommitted workspace draft.  This is control
+    # authorization only: the draft never becomes an Artifact and the normal
+    # Candidate validator/commit boundary remains the sole adoption path.
+    workspace_recovery: bool = False
     authorized_at: AwareDatetime
 
     @model_validator(mode="after")
@@ -1457,26 +1565,40 @@ class RepairAction(V2Contract):
             raise ValueError("repair source must be a FeedbackEvaluation Artifact")
         for values in (
             self.immutable_input_refs,
+            self.repair_seed_output_refs,
             self.allowed_mutation_roots,
             self.causal_evidence_refs,
         ):
             if _duplicates(values):
                 raise ValueError("repair inputs, mutation roots, and evidence must be unique")
+        if (self.repair_seed_attempt_ref is None) != (not self.repair_seed_output_refs):
+            raise ValueError(
+                "repair seed must bind both one prior WorkAttempt and its exact output closure"
+            )
+        if (
+            self.repair_seed_attempt_ref is not None
+            and self.repair_seed_attempt_ref.artifact_type != "control.work_attempt"
+        ):
+            raise ValueError("repair seed attempt must be a WorkAttempt Artifact")
         physical_attempt = self.decision in {
             "local_correction",
             "parent_correction",
             "infrastructure_retry",
+            "model_fallback",
             "session_continuation",
         }
         charged_repair = self.decision in {
             "local_correction",
             "parent_correction",
             "infrastructure_retry",
+            "model_fallback",
         }
         if charged_repair != (self.repair_attempt_charge == 1):
             raise ValueError("only an executing repair action consumes one repair attempt")
         if physical_attempt != (self.repair_attempt_ordinal >= 1):
-            raise ValueError("only a physical continuation or repair has a positive attempt ordinal")
+            raise ValueError(
+                "only a physical continuation or repair has a positive attempt ordinal"
+            )
         if self.jump_distance >= 2 and self.decision != "request_human":
             raise ValueError("distance-two repair requires human authority")
         if self.decision == "local_correction":
@@ -1489,6 +1611,38 @@ class RepairAction(V2Contract):
                 raise ValueError("parent correction must target a distinct coordinate")
         if self.decision == "infrastructure_retry" and self.jump_distance != 0:
             raise ValueError("infrastructure retry cannot backjump")
+        if self.workspace_recovery and (
+            self.decision != "infrastructure_retry"
+            or not self.immutable_input_refs
+            or not self.allowed_mutation_roots
+        ):
+            raise ValueError(
+                "workspace recovery requires one local infrastructure retry with exact inputs "
+                "and mutation roots"
+            )
+        if self.route_liveness_required:
+            if self.decision != "infrastructure_retry" or self.retry_not_before is None:
+                raise ValueError(
+                    "route liveness gate requires one same-model infrastructure retry and backoff"
+                )
+        elif self.retry_not_before is not None:
+            raise ValueError("only a route-liveness-gated retry may carry a retry backoff")
+        if self.decision == "model_fallback":
+            if self.jump_distance != 0 or self.target_coordinate != self.current_coordinate:
+                raise ValueError("model fallback must target the current coordinate")
+            if self.model_override is None:
+                raise ValueError("model fallback requires one explicit target model")
+            if self.route_model is None:
+                raise ValueError("model fallback requires the exact failed source route")
+            if self.route_model == self.model_override:
+                raise ValueError("model fallback target must differ from its failed source route")
+        elif self.model_override is not None:
+            raise ValueError("only a model fallback may declare a target model")
+        if self.route_model is not None and self.decision not in {
+            "infrastructure_retry",
+            "model_fallback",
+        }:
+            raise ValueError("only transient recovery may declare a route model")
         if self.decision == "session_continuation":
             if self.jump_distance != 0 or self.target_coordinate != self.current_coordinate:
                 raise ValueError("session continuation must target the current coordinate")
@@ -1500,6 +1654,11 @@ class RepairAction(V2Contract):
             self.immutable_input_refs and self.allowed_mutation_roots
         ):
             raise ValueError("semantic correction requires immutable inputs and mutation roots")
+        if self.repair_seed_attempt_ref is not None and self.decision not in {
+            "local_correction",
+            "parent_correction",
+        }:
+            raise ValueError("only a semantic correction may restore a committed repair seed")
         if not physical_attempt and self.allowed_mutation_roots:
             raise ValueError("non-executing decision cannot grant mutation authority")
         return self
@@ -1616,6 +1775,7 @@ __all__ = [
     "AssuranceReport",
     "BoundaryExecutionStatus",
     "DiagnosticQuality",
+    "ExecutingRepairDecision",
     "EvaluationStatus",
     "FeedbackEvaluation",
     "OperationBudget",

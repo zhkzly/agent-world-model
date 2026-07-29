@@ -76,6 +76,11 @@ class WorldArchitectureLeaf:
                 definition=definition,
                 attempt=attempt,
                 dispatch_id=dispatch_id,
+                ownership=self.kernel.invocation_ownership(
+                    definition=definition,
+                    attempt=attempt,
+                    dispatch_id=dispatch_id,
+                ),
                 lineage_id=f"{inputs.job.job_id}.world-architecture.{attempt.ordinal}",
                 workspace=self.workspace_root / "world-architecture" / attempt.attempt_id,
                 model=WorldArchitectureSourceDraft,
@@ -85,6 +90,11 @@ class WorldArchitectureLeaf:
                 correction_brief=self.kernel.agent_correction_brief(
                     context,
                     definition=definition,
+                ),
+                semantic_repair_seed=self.kernel.agent_semantic_repair_seed(
+                    context,
+                    definition=definition,
+                    attempt=attempt,
                 ),
             )
             source_ref = self.kernel.runtime.artifacts.put_json(

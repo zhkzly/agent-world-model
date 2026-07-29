@@ -152,6 +152,54 @@ def test_static_assurance_rejects_runtime_import_of_isolated_materializer(
     )
     runtime_evidence = next(item for item in inspection.files if item.path.endswith("runtime.py"))
     assert "static_component_import_boundary_violation" in runtime_evidence.failure_codes
+    assert not runtime_evidence.scan_passed
+    summary = EnvironmentJudge._static_assurance_failure_summary(  # noqa: SLF001
+        inspection,
+        failed_public_tests=(),
+    )
+    assert len(summary) <= 512
+    assert "runtime.py (runtime)" in summary
+    assert "Executable sources may not import `configuration`" in summary
+    assert "Visibility: runtime->runtime" in summary
+
+
+def test_static_assurance_reports_safe_locations_for_framework_private_identifiers(
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "candidate"
+    package.mkdir()
+    (package / "runtime.py").write_text(
+        "FRAMEWORK_DENYLIST = {'evaluator_goal'}\n",
+        encoding="utf-8",
+    )
+
+    data = (package / "runtime.py").read_bytes()
+    manifest = SimpleNamespace(
+        files=(
+            PackageFile(
+                path="candidate/runtime.py",
+                role="runtime",
+                content_hash=sha256_digest(data),
+                size_bytes=len(data),
+                executable=False,
+            ),
+        )
+    )
+
+    inspection = inspect_static_sources(tmp_path, manifest)  # type: ignore[arg-type]
+    evidence = inspection.files[0]
+    summary = EnvironmentJudge._static_assurance_failure_summary(  # noqa: SLF001
+        inspection,
+        failed_public_tests=(),
+    )
+
+    assert evidence.failure_codes == ("static_forbidden_pattern",)
+    assert [(item.line, item.category) for item in evidence.diagnostic_locations] == [
+        (1, "framework_private_identifier"),
+    ]
+    assert "runtime.py:1 (framework private identifier)" in summary
+    assert "declared schema fields" in summary
+    assert "evaluator_goal" not in summary
 
 
 def test_runtime_contract_diff_reports_all_repair_coordinates(tmp_path: Path) -> None:
@@ -310,11 +358,8 @@ async def test_integration_runs_before_verifier_and_cannot_authorize_release(
     )
 
     assert integrated.report.status == "ready", [
-        (item.gate_id, item.status, item.summary)
-        for item in integrated.report.gate_results
-    ] + [
-        (item.category, item.suggested_repair) for item in integrated.report.findings
-    ]
+        (item.gate_id, item.status, item.summary) for item in integrated.report.gate_results
+    ] + [(item.category, item.suggested_repair) for item in integrated.report.findings]
     assert integrated.report_ref.artifact_type == "judge.integration_report"
     assert {item.gate_id for item in integrated.report.gate_results} == {
         "schema",
@@ -533,6 +578,61 @@ async def test_clean_build_and_runtime_supervisor_execute_complete_abi_v2(
         different_seed = await reset_in_fresh_process(11_000_002)
         assert replay_first == replay_second
         assert replay_first["state_digest"] != different_seed["state_digest"]
+
+
+@pytest.mark.asyncio
+async def test_public_test_runner_imports_virtual_project_from_nested_test_path(
+    tmp_path: Path,
+) -> None:
+    """A nested public test must exercise a virtual, non-installed project."""
+
+    source, uv_path, uv_cache = write_candidate_project(tmp_path)
+    nested_tests = source / "tests"
+    nested_tests.mkdir()
+    nested_test_path = nested_tests / "test_imports.py"
+    nested_test_path.write_text(
+        "from task_materializer import materialize\n"
+        "assert callable(materialize)\n"
+        "print('nested public import passed')\n",
+        encoding="utf-8",
+    )
+    visible_paths = (
+        "LICENSE",
+        "public_check.py",
+        "public_test.py",
+        "pyproject.toml",
+        "runtime.py",
+        "task_materializer.py",
+        "tests/test_imports.py",
+        "uv.lock",
+    )
+    builder = CleanCandidateBuilder(
+        build_isolation=await _require_real_isolation("build"),
+        uv_path=uv_path,
+        uv_cache_dir=uv_cache,
+        timeout_seconds=60,
+    )
+
+    async with builder.materialize(source) as candidate:
+        runner = CandidateSandboxRunner(isolation=await _require_real_isolation())
+        direct = await runner.run(
+            candidate.root,
+            argv=(".venv/bin/python", "tests/test_imports.py"),
+            visible_workspace_paths=visible_paths,
+            failure_prefix="public_test",
+        )
+        assert direct.exit_code == 1
+        assert "ModuleNotFoundError" in direct.stderr
+
+        through_framework_runner = await runner.run_public_test(
+            candidate.root,
+            test_path="tests/test_imports.py",
+            visible_workspace_paths=visible_paths,
+        )
+
+    assert through_framework_runner.succeeded
+    assert through_framework_runner.stdout == "nested public import passed\n"
+    assert through_framework_runner.argv[-1] == "tests/test_imports.py"
 
 
 @pytest.mark.asyncio
@@ -1006,7 +1106,7 @@ async def test_real_public_test_failure_blocks_release_with_typed_static_evidenc
     graph = build_judge_candidate_graph(
         state_root,
         store,
-        public_test_source="raise SystemExit(7)\n",
+        public_test_source="raise AssertionError('intentional-public-test-diagnostic')\n",
     )
 
     report = await _evaluate_real_judge_graph(
@@ -1021,6 +1121,7 @@ async def test_real_public_test_failure_blocks_release_with_typed_static_evidenc
     assert gates["supply_chain"].status == "pass"
     assert gates["static_assurance"].status == "fail"
     assert "public_test.py" in gates["static_assurance"].summary
+    assert "AssertionError: intentional-public-test-diagnostic" in gates["static_assurance"].summary
     evidence_ref = next(
         ref
         for ref in gates["static_assurance"].evidence_refs
@@ -1030,7 +1131,7 @@ async def test_real_public_test_failure_blocks_release_with_typed_static_evidenc
     assert evidence.status == "fail"
     assert evidence.failure_codes == ("static_public_test_failed",)
     assert len(evidence.public_tests) == 1
-    assert evidence.public_tests[0].exit_code == 7
+    assert evidence.public_tests[0].exit_code == 1
     assert not evidence.public_tests[0].passed
 
 
@@ -1108,6 +1209,87 @@ def test_protocol_allows_domain_fields_that_only_share_generic_words() -> None:
     }
 
 
+def test_protocol_allows_world_spec_domain_task_id_in_schema_and_arguments() -> None:
+    handshake_request = make_request("handshake")
+    handshake_wire = {
+        "abi_version": "agent-world.runtime.v2",
+        "request_id": handshake_request.request_id,
+        "operation": "handshake",
+        "ok": True,
+        "result": {
+            "runtime_id": "todo-runtime",
+            "operations": ["handshake", "reset", "invoke", "snapshot", "close"],
+            "tools": [
+                {
+                    "tool_id": "todo.localstorage.mark_task_done",
+                    "namespace": "todo.localstorage",
+                    "name": "mark_task_done",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"task_id": {"type": "string"}},
+                        "required": ["task_id"],
+                        "additionalProperties": False,
+                    },
+                    "output_schema": {"type": "object"},
+                    "observation_schema": {"type": "object"},
+                }
+            ],
+        },
+    }
+
+    handshake = decode_response(
+        (json.dumps(handshake_wire, separators=(",", ":")) + "\n").encode(),
+        expected_request=handshake_request,
+    )
+    assert handshake.result is not None
+    tools = handshake.result["tools"]
+    assert isinstance(tools, list)
+    tool = tools[0]
+    assert isinstance(tool, dict)
+    input_schema = tool["input_schema"]
+    assert isinstance(input_schema, dict)
+    properties = input_schema["properties"]
+    assert isinstance(properties, dict)
+    assert properties["task_id"] == {"type": "string"}
+
+    invoke_request = make_request(
+        "invoke",
+        {
+            "tool": "todo.localstorage.mark_task_done",
+            "args": {"task_id": "task-42"},
+            "idempotency_key": "mark-task-42",
+        },
+    )
+    assert invoke_request.payload["args"] == {"task_id": "task-42"}
+
+
+def test_protocol_handshake_feedback_names_the_exact_operations_array() -> None:
+    request = make_request("handshake")
+    wire = {
+        "abi_version": "agent-world.runtime.v2",
+        "request_id": request.request_id,
+        "operation": "handshake",
+        "ok": True,
+        "result": {
+            "runtime_id": "todo-runtime",
+            "operations": [{"operation": "handshake", "schema_version": "v2"}],
+            "tools": [],
+        },
+    }
+
+    with pytest.raises(ProtocolViolation) as error:
+        decode_response(
+            (json.dumps(wire, separators=(",", ":")) + "\n").encode(),
+            expected_request=request,
+        )
+
+    assert error.value.code == "invalid_handshake"
+    assert str(error.value) == (
+        "response.result[handshake].operations must be the JSON string array "
+        '["handshake","reset","invoke","snapshot","close"], not operation objects'
+    )
+
+
 def test_invoke_cannot_override_the_actor_bound_by_reset() -> None:
     with pytest.raises(ProtocolViolation) as error:
         make_request(
@@ -1120,6 +1302,33 @@ def test_invoke_cannot_override_the_actor_bound_by_reset() -> None:
             },
         )
     assert error.value.code == "schema_mismatch"
+
+
+def test_protocol_state_digest_feedback_names_exact_wire_format() -> None:
+    request = make_request("reset", {"seed": 1, "actor": "user", "config": {}})
+    wire = {
+        "abi_version": "agent-world.runtime.v2",
+        "request_id": request.request_id,
+        "operation": "reset",
+        "ok": True,
+        "result": {
+            "observation": {},
+            "state_digest": "0" * 64,
+            "terminated": False,
+            "info": {},
+        },
+    }
+
+    with pytest.raises(ProtocolViolation) as error:
+        decode_response(
+            (json.dumps(wire, separators=(",", ":")) + "\n").encode(),
+            expected_request=request,
+        )
+
+    assert error.value.code == "invalid_state_digest"
+    assert str(error.value) == (
+        "state_digest must match sha256:<64 lowercase hexadecimal characters>"
+    )
 
 
 @pytest.mark.parametrize(

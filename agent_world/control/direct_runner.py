@@ -42,6 +42,7 @@ from agent_world.designer.final_design_leaves import (
     WorldRulesLeaf,
 )
 from agent_world.designer.models import CurriculumPlanSourceDraft, ToolCouplingPlan
+from agent_world.invocation import RouteLivenessChecker
 from agent_world.judge import (
     EnvironmentJudge,
     IntegrationLeaf,
@@ -200,6 +201,13 @@ class DirectWorkRunner:
     environment_codegen_session_token_limit: int
     environment_codegen_session_wall_seconds: float
     environment_codegen_physical_turn_token_limit: int
+    # Complete, explicitly configured order including the primary model.
+    # WorkRuntime alone may choose a later route after a classified transient;
+    # leaves never mutate their profile route themselves.
+    model_routes: tuple[str, ...] = ()
+    route_liveness_checker: RouteLivenessChecker | None = None
+    require_route_liveness_gate: bool = False
+    infrastructure_retry_backoff_seconds: float = 0.0
     maximum_concurrency: int = 4
     projector: SceneProjector | None = None
 
@@ -493,6 +501,10 @@ class DirectWorkRunner:
             projector=self.projector,
             trace_id=trace_id,
             run_id=run_id,
+            model_routes=self.model_routes,
+            route_liveness_checker=self.route_liveness_checker,
+            require_route_liveness_gate=self.require_route_liveness_gate,
+            infrastructure_retry_backoff_seconds=self.infrastructure_retry_backoff_seconds,
         )
         kernel = SchedulerLeafExecutor(runtime=runtime)
         epochs = WorkGraphEpochRuntime(artifacts=self.artifacts, heads=self.heads)
@@ -1004,7 +1016,18 @@ class DirectWorkRunner:
                 head = runtime.heads.read_head(definition.coordinate)
                 if head is None or head.status != "running" or head.active_operation_ref is None:
                     continue
-                runtime.reconcile_abandoned_operation(lock, definition=definition)
+                recovery_definition = (
+                    definition
+                    if (
+                        head.work_id == definition.work_id
+                        and head.definition_digest == definition.definition_digest
+                    )
+                    else runtime.heads.require_running_definition(
+                        head=head,
+                        artifacts=runtime.artifacts,
+                    )
+                )
+                runtime.reconcile_abandoned_operation(lock, definition=recovery_definition)
 
     @staticmethod
     def _leaf_executor(leaf: object, definition: WorkDefinition):

@@ -23,14 +23,17 @@ from agent_world.control.telemetry import (
     invocation_activity_metric_name,
 )
 from agent_world.control.work import (
+    FeedbackEvaluation,
     OperationRun,
     ProposalExecution,
     ValidationIssue,
     ValidationReport,
     WorkAttempt,
+    work_input_fingerprint,
 )
 from agent_world.control.work_graph import WorkGraphManifest
 from agent_world.control.work_store import WorkControlHead, WorkControlStore
+from agent_world.invocation import InvocationControlStore
 
 from .paths import ObservabilityError, ObservabilityRoot
 from .render import render_coordinate, render_scene
@@ -85,12 +88,14 @@ class SceneProjector:
         artifacts: ArtifactStore | ArtifactWriter,
         heads: WorkControlStore,
         telemetry: TelemetryStore | None = None,
+        invocation_control: InvocationControlStore | None = None,
         known_secret_canaries: Sequence[str | bytes] = (),
     ) -> None:
         self.root = root
         self.artifacts = artifacts
         self.heads = heads
         self.telemetry = telemetry
+        self.invocation_control = invocation_control
         self.known_secret_canaries = tuple(known_secret_canaries)
 
     def project_attempt(self, *, attempt: WorkAttempt, run_id: str | None = None) -> None:
@@ -243,7 +248,13 @@ class SceneProjector:
         observed_at: datetime,
     ) -> SceneHead:
         attempt = attempt or self.artifacts.get_json(head.attempt_ref, WorkAttempt)
-        report = self._validation_report(attempt)
+        # A causal parent repair keeps the original committed attempt as the
+        # head's physical lineage, while ``evaluation_ref`` names the new
+        # target-local proxy report that actually authorized the next turn.
+        # Showing the old passing report made the project-execution Agent see
+        # ``repair_authorized`` with no issues and incorrectly focus on the
+        # failed descendant instead of the permitted Builder repair.
+        report = self._repair_authorization_report(head) or self._validation_report(attempt)
         candidate_files = self.candidate_files_for_attempt(attempt)
         prior_issue_ids = self._previous_issue_ids(attempt)
         source_run_id = run_id or attempt.telemetry_trace_id
@@ -338,18 +349,34 @@ class SceneProjector:
         )
 
     def _runtime_agent_liveness(self, attempt: WorkAttempt) -> RuntimeAgentLiveness | None:
-        """Project only telemetry bound to this exact durable proposal invocation.
+        """Project safe liveness bound to this exact durable proposal invocation.
 
-        A trace can contain concurrent physical nodes, so trace membership is
-        insufficient.  The terminal ProposalExecution has the exact invocation
-        id; telemetry stores only its hash.  Matching those two durable facts
-        avoids attributing a sibling Agent's progress to this coordinate.
+        Telemetry remains the richer primary source when it contains one exact
+        span.  A durable invocation-control record is the fallback when a
+        worker exited or a parent recovered before telemetry could materialize
+        a usable terminal span.  Neither path exposes prompt, response,
+        endpoint, private session, or workspace data.
         """
 
-        if self.telemetry is None or attempt.telemetry_trace_id is None:
-            return None
         invocation_id = self._proposal_invocation_id(attempt)
         if invocation_id is None:
+            return None
+        telemetry_liveness = self._telemetry_runtime_agent_liveness(attempt, invocation_id)
+        control_liveness = self._control_runtime_agent_liveness(attempt, invocation_id)
+        if telemetry_liveness is None:
+            return control_liveness
+        if control_liveness is None:
+            return telemetry_liveness
+        return _merge_runtime_agent_liveness(telemetry_liveness, control_liveness)
+
+    def _telemetry_runtime_agent_liveness(
+        self,
+        attempt: WorkAttempt,
+        invocation_id: str,
+    ) -> RuntimeAgentLiveness | None:
+        """Return the richer trace projection when its exact span is available."""
+
+        if self.telemetry is None or attempt.telemetry_trace_id is None:
             return None
         try:
             trace = self.telemetry.inspect_trace(attempt.telemetry_trace_id)
@@ -404,15 +431,101 @@ class SceneProjector:
                 attempt.started_at,
                 span.get("last_heartbeat_at_ns"),
             ),
-            last_local_heartbeat_phase=_direct_liveness_phase(
-                span.get("last_heartbeat_phase")
-            ),
+            last_local_heartbeat_phase=_direct_liveness_phase(span.get("last_heartbeat_phase")),
             terminal_elapsed_ms=_elapsed_from_attempt_ns(
                 attempt.started_at,
                 span.get("ended_at_ns"),
             ),
             observed_event_count=event_count,
             activity=activity,
+        )
+
+    def _control_runtime_agent_liveness(
+        self,
+        attempt: WorkAttempt,
+        invocation_id: str,
+    ) -> RuntimeAgentLiveness | None:
+        """Project redacted durable control facts after exact Work ownership checks."""
+
+        if self.invocation_control is None:
+            return None
+        try:
+            record = self.invocation_control.read(invocation_id)
+        except Exception:
+            return None
+        if record is None or not self._control_record_belongs_to_attempt(
+            record.owner.owner_kind.value,
+            record.owner.owner_id,
+            record.owner.scope_id,
+            record.owner.coordinate,
+            record.owner.immutable_input_closure_digest,
+            attempt,
+            invocation_id,
+        ):
+            return None
+        started_elapsed_ms = _elapsed_ms(attempt.started_at, record.started_at)
+        if started_elapsed_ms is None:
+            return None
+        return RuntimeAgentLiveness(
+            started_elapsed_ms=started_elapsed_ms,
+            first_progress_elapsed_ms=_elapsed_ms(
+                attempt.started_at,
+                record.first_provider_progress_at,
+            ),
+            last_progress_elapsed_ms=_elapsed_ms(
+                attempt.started_at,
+                record.last_provider_progress_at,
+            ),
+            last_local_heartbeat_elapsed_ms=_elapsed_ms(
+                attempt.started_at,
+                record.last_local_activity_at,
+            ),
+            last_local_heartbeat_phase=(
+                _control_liveness_phase(record.last_local_phase.value)
+                if record.last_local_activity_at is not None
+                else None
+            ),
+            terminal_elapsed_ms=(
+                _elapsed_ms(attempt.started_at, record.updated_at) if record.settled else None
+            ),
+            observed_event_count=record.provider_progress_count,
+        )
+
+    def _control_record_belongs_to_attempt(
+        self,
+        owner_kind: str,
+        owner_id: str,
+        owner_scope_id: str,
+        owner_coordinate: str | None,
+        owner_input_closure_digest: str | None,
+        attempt: WorkAttempt,
+        invocation_id: str,
+    ) -> bool:
+        """Require the control record to match one exact proposal operation."""
+
+        if (
+            owner_kind != "work_operation"
+            or owner_scope_id != attempt.coordinate.scope_id
+            or owner_coordinate != attempt.coordinate.coordinate_key
+            or owner_input_closure_digest is None
+        ):
+            return False
+        matches: list[OperationRun] = []
+        for reference in attempt.operation_run_refs:
+            try:
+                operation = self.artifacts.get_json(reference, OperationRun)
+            except ValueError:
+                continue
+            if operation.kind != "proposal" or operation.dispatch_id != invocation_id:
+                continue
+            matches.append(operation)
+        if len(matches) != 1:
+            return False
+        operation = matches[0]
+        return (
+            owner_id == operation.operation_run_id
+            and owner_input_closure_digest
+            == work_input_fingerprint(operation.input_refs).removeprefix("sha256:")
         )
 
     def _proposal_invocation_id(self, attempt: WorkAttempt) -> str | None:
@@ -438,8 +551,22 @@ class SceneProjector:
                 execution = self.artifacts.get_json(operation.execution_ref, ProposalExecution)
             except ValueError:
                 continue
-            if execution.invocation_id is not None:
-                candidates.append((operation.finished_at, execution.invocation_id))
+            invocation_id = execution.invocation_id
+            if (
+                invocation_id is None
+                and execution.executor == "agent"
+                and execution.status == "interrupted"
+                and execution.error_code is not None
+                and execution.error_code.startswith("process_interrupted")
+            ):
+                # Pre-v2 recovery records could lose the invocation field even
+                # though the terminal OperationRun retained the immutable
+                # Scheduler dispatch fence.  An Agent leaf uses that exact
+                # dispatch id for its physical InvocationRequest, so this is
+                # evidence recovery—not a guessed provider/session identity.
+                invocation_id = operation.dispatch_id
+            if invocation_id is not None:
+                candidates.append((operation.finished_at, invocation_id))
         # A running WorkAttempt has exactly one active OperationRun.  Keeping
         # this explicit protects a scene from attributing a sibling invocation
         # if malformed historical state ever contains more than one.
@@ -537,9 +664,19 @@ class SceneProjector:
         observed_elapsed_ms = _elapsed_ms(attempt.started_at, progress.observed_at)
         if observed_elapsed_ms is None:
             return None
+        changed = max(
+            (item for item in candidates if item.status == "changed"),
+            key=lambda item: item.observed_at,
+            default=None,
+        )
         return CandidateWorkspaceLiveness(
             status=progress.status,
             observed_elapsed_ms=observed_elapsed_ms,
+            last_changed_elapsed_ms=(
+                _elapsed_ms(attempt.started_at, changed.observed_at)
+                if changed is not None
+                else None
+            ),
             file_count=progress.file_count,
             total_bytes=progress.total_bytes,
             error_code=(
@@ -576,6 +713,31 @@ class SceneProjector:
         if attempt.validation_report_ref is None:
             return None
         return self.artifacts.get_json(attempt.validation_report_ref, ValidationReport)
+
+    def _repair_authorization_report(
+        self,
+        head: WorkControlHead,
+    ) -> ValidationReport | None:
+        """Return the exact target-local report behind an authorized repair.
+
+        This is a read-only projection aid, never repair authority.  The
+        Runtime has already bound ``head.evaluation_ref`` to the RepairAction;
+        we merely surface its safe blocker diagnostics in the project Agent's
+        compact scene.
+        """
+
+        if head.status != "repair_authorized" or head.evaluation_ref is None:
+            return None
+        evaluation = self.artifacts.get_json(head.evaluation_ref, FeedbackEvaluation)
+        if evaluation.coordinate != head.coordinate or evaluation.validation_report_ref is None:
+            return None
+        report = self.artifacts.get_json(
+            evaluation.validation_report_ref,
+            ValidationReport,
+        )
+        if report.coordinate != head.coordinate or report.attempt_id != evaluation.attempt_id:
+            return None
+        return report
 
     def _budget_exhaustion(
         self,
@@ -866,18 +1028,96 @@ def _elapsed_from_attempt_ns(started_at: datetime | None, observed_at_ns: object
     return max(0, round((observed_at_ns - started_at_ns) / 1_000_000))
 
 
+def _merge_runtime_agent_liveness(
+    telemetry: RuntimeAgentLiveness,
+    control: RuntimeAgentLiveness,
+) -> RuntimeAgentLiveness:
+    """Combine two exact, redacted views without treating a heartbeat as progress."""
+
+    telemetry_heartbeat = (
+        telemetry.last_local_heartbeat_elapsed_ms,
+        telemetry.last_local_heartbeat_phase,
+    )
+    control_heartbeat = (
+        control.last_local_heartbeat_elapsed_ms,
+        control.last_local_heartbeat_phase,
+    )
+    latest_heartbeat = max(
+        (telemetry_heartbeat, control_heartbeat),
+        key=lambda item: item[0] if item[0] is not None else -1,
+    )
+    return RuntimeAgentLiveness(
+        started_elapsed_ms=min(telemetry.started_elapsed_ms, control.started_elapsed_ms),
+        first_progress_elapsed_ms=_earliest_elapsed(
+            telemetry.first_progress_elapsed_ms,
+            control.first_progress_elapsed_ms,
+        ),
+        last_progress_elapsed_ms=_latest_elapsed(
+            telemetry.last_progress_elapsed_ms,
+            control.last_progress_elapsed_ms,
+        ),
+        last_local_heartbeat_elapsed_ms=latest_heartbeat[0],
+        last_local_heartbeat_phase=latest_heartbeat[1],
+        terminal_elapsed_ms=_latest_elapsed(
+            telemetry.terminal_elapsed_ms,
+            control.terminal_elapsed_ms,
+        ),
+        observed_event_count=max(
+            telemetry.observed_event_count,
+            control.observed_event_count,
+        ),
+        activity=telemetry.activity,
+    )
+
+
+def _earliest_elapsed(*values: int | None) -> int | None:
+    observed = tuple(value for value in values if value is not None)
+    return min(observed) if observed else None
+
+
+def _latest_elapsed(*values: int | None) -> int | None:
+    observed = tuple(value for value in values if value is not None)
+    return max(observed) if observed else None
+
+
+_CONTROL_LIVENESS_PHASE_BY_VALUE: dict[str, InvocationLivenessPhase] = {
+    "queued": "queued",
+    "admitted": "admitted",
+    "profile_verifying": "profile_verifying",
+    "profile_verified": "profile_verified",
+    "worker_spawned": "worker_spawned",
+    "payload_dispatched": "payload_dispatched",
+    "sdk_session_open": "sdk_session_open",
+    "thread_start": "thread_start",
+    "thread_resume": "thread_resume",
+    "turn_start": "turn_start",
+    "turn_stream": "turn_stream",
+    "parent_waiting": "parent_waiting",
+    "worker_exited": "worker_exited",
+    "direct_request_dispatched": "direct_request_dispatched",
+    "direct_dispatched": "direct_dispatched",
+    "direct_awaiting_response": "direct_awaiting_response",
+    "direct_stream_opened": "direct_stream_opened",
+    "direct_awaiting_stream_event": "direct_awaiting_stream_event",
+    "cancel_requested": "cancel_requested",
+    "declared_wall_expired": "declared_wall_expired",
+    "cleanup_running": "cleanup_running",
+    "cleanup_finished": "cleanup_finished",
+    "terminal_received": "terminal_received",
+    "owner_lost": "owner_lost",
+}
+
+
+def _control_liveness_phase(value: object) -> InvocationLivenessPhase | None:
+    """Keep only closed framework lifecycle labels in the project Agent view."""
+
+    return _CONTROL_LIVENESS_PHASE_BY_VALUE.get(value) if isinstance(value, str) else None
+
+
 def _direct_liveness_phase(value: object) -> InvocationLivenessPhase | None:
     """Keep only the closed local wait phases that are safe in a scene."""
 
-    if value == "direct_request_dispatched":
-        return "direct_request_dispatched"
-    if value == "direct_awaiting_response":
-        return "direct_awaiting_response"
-    if value == "direct_stream_opened":
-        return "direct_stream_opened"
-    if value == "direct_awaiting_stream_event":
-        return "direct_awaiting_stream_event"
-    return None
+    return _control_liveness_phase(value)
 
 
 def _nonnegative_int(value: object) -> TypeGuard[int]:

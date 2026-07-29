@@ -12,21 +12,22 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 
-# V8 is the provider-compatible prompt form.  The separate descriptive schema
+# V10 is the provider-compatible prompt form.  The separate descriptive schema
 # below is retained for deterministic contract tests only: a real v2 probe
 # established that this gateway rejects JSON-Schema syntax even when it is
 # acyclic, so it must never be interpolated into the provider prompt.
-COMPACT_RULE_PROTOCOL_VERSION = "rule-output-protocol.v8"
+COMPACT_RULE_PROTOCOL_VERSION = "rule-output-protocol.v10"
 
 
 _TOOL_RULE_DRAFT = """\
-A RULE has only these fields:
-{"family": RULE_FAMILY, "description": non-empty string,
- "boolean_operator": "all"|"any", "clauses": [CLAUSE, ...],
+A RULE has only these Agent-authored fields:
+{"description": non-empty string, "boolean_operator": "all"|"any", "clauses": [CLAUSE, ...],
  "case_sensitivity": "positive_only"|"positive_and_negative",
  "evidence_claim_ids": [claim id, ...]}
-Omit rule_id: framework code derives it. RULE_FAMILY must match the containing
-section: precondition, postcondition, transition, error_condition, or permission.
+Omit rule_id and family: framework code derives both from the closed containment
+path. In order: conditions.preconditions => precondition,
+conditions.postconditions => postcondition, state_transition.transition => transition,
+errors.errors[*].when => error_condition, and permission.condition => permission.
 
 A CLAUSE is closed by its operator. equal, not_equal, contains, and not_contains
 have exactly clause_id, operator, left, right, and optional negate; they MUST omit `ordering`.
@@ -52,10 +53,16 @@ For this ToolSemantics protocol, a TERM is exactly one of:
 Lookup keys are flat and closed: never emit a nested `key` object. Choose one
 bound_lookup_by_reference alias from lookup_reference_binding_groups when the
 framework has frozen a compatible reference key, or bound_lookup_by_constant
-with one lookup alias and a literal key. Never emit key_binding_id.
+with one lookup alias and a literal key. For bound_lookup_by_constant, first
+locate its binding_id in exactly one lookup_binding_groups entry: copy that
+group's key_value_type byte-for-byte into key_value_type, and make key_value a
+JSON value of that type. The value_bindings[*].value_type is the type retrieved
+from the lookup, not the key type; never substitute it or use a literal as a
+stand-in for the retrieved value. Never emit key_binding_id.
 Never emit reference, lookup_by_key, bound_lookup_by_key, source,
 pointer, collection_pointer, key_field, value_pointer, raw value_type for a
-binding, or free-form expression text.
+binding, or free-form expression text. key_value_type is the required
+bound_lookup_by_constant exception, not a raw binding annotation.
 """
 
 
@@ -260,7 +267,6 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
         "rule": {
             "type": "object",
             "required": [
-                "family",
                 "description",
                 "boolean_operator",
                 "clauses",
@@ -269,15 +275,6 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
             ],
             "additionalProperties": False,
             "properties": {
-                "family": {
-                    "enum": [
-                        "precondition",
-                        "postcondition",
-                        "transition",
-                        "error_condition",
-                        "permission",
-                    ]
-                },
                 "description": {"type": "string", "minLength": 1},
                 "boolean_operator": {"enum": ["all", "any"]},
                 "clauses": {
@@ -569,7 +566,7 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
 
 
 def tool_semantics_batch_protocol_schema() -> dict[str, object]:
-    """Return an isolated descriptive schema for the compact v8 prompt form."""
+    """Return an isolated descriptive schema for the compact v10 prompt form."""
 
     return deepcopy(_TOOL_SEMANTICS_BATCH_SHAPE)
 
@@ -584,7 +581,7 @@ def tool_semantics_batch_protocol(
     *,
     target_tool_ids: tuple[str, ...] | None = None,
 ) -> str:
-    """Return the compact v8 form for one frozen ToolSemantics batch.
+    """Return the compact v10 form for one frozen ToolSemantics batch.
 
     The reusable Rule section is intentionally separated above so WorldRules
     and Curriculum can adopt a future context-appropriate protocol without

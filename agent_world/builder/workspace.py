@@ -329,14 +329,6 @@ class CandidateWorkspaceValidator:
             self._scan_sensitive_data(relative, data, forbidden_bytes, path_bytes)
             declaration = declarations[relative]
             executable = bool(file_stat.st_mode & 0o111)
-            if executable != declaration.executable:
-                raise CandidateWorkspaceError(
-                    f"executable mode contradicts declaration: {relative}",
-                    safe_diagnostic=CandidateWorkspaceDiagnostic(
-                        "manifest_executable_mode",
-                        1,
-                    ),
-                )
             files.append(
                 ValidatedCandidateFile(
                     path=relative,
@@ -494,7 +486,10 @@ class CandidateWorkspaceValidator:
         }:
             raise CandidateWorkspaceError(
                 "pyproject requires-python and uv's canonical lock range must exactly represent "
-                f"the implementation contract ({python_requires})"
+                f"the implementation contract ({python_requires})",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "python_requires_contract_mismatch"
+                ),
             )
         if not isinstance(lock.get("version"), int):
             raise CandidateWorkspaceError("uv.lock does not contain a uv lock format version")

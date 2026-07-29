@@ -34,6 +34,12 @@ from agent_world.control.work_graph import (
 )
 from agent_world.control.work_runtime import WorkControlRuntime
 from agent_world.control.work_store import WorkControlStore
+from agent_world.invocation import (
+    InvocationControlStore,
+    InvocationLifecyclePhase,
+    InvocationStatus,
+    InvocationTerminalFact,
+)
 from agent_world.invocation.contracts import InvocationError
 from agent_world.invocation.structured_diagnostics import (
     safe_terminal_condition,
@@ -868,6 +874,24 @@ def test_projector_binds_safe_runtime_activity_and_workspace_heartbeat(
                     attempt_id=attempt.attempt_id,
                     lineage_id="lineage:scene-runtime-activity",
                     observed_at=datetime.now(UTC),
+                    status="changed",
+                    file_count=1,
+                    total_bytes=128,
+                    metadata_digest=sha256_digest(b"scene workspace change"),
+                ),
+                dependencies=(input_ref,),
+            )
+            artifacts.put_json(
+                artifact_id=EnvironmentBuilder.workspace_progress_artifact_id(
+                    runtime.run_id,
+                    attempt.attempt_id,
+                ),
+                artifact_type="build.workspace_progress",
+                value=BuilderWorkspaceProgress(
+                    run_id=runtime.run_id,
+                    attempt_id=attempt.attempt_id,
+                    lineage_id="lineage:scene-runtime-activity",
+                    observed_at=datetime.now(UTC),
                     status="turn_terminal",
                     file_count=0,
                     total_bytes=0,
@@ -934,6 +958,7 @@ def test_projector_binds_safe_runtime_activity_and_workspace_heartbeat(
     assert coordinate.candidate_workspace_liveness is not None
     assert coordinate.candidate_workspace_liveness.status == "turn_terminal"
     assert coordinate.candidate_workspace_liveness.file_count == 0
+    assert coordinate.candidate_workspace_liveness.last_changed_elapsed_ms is not None
     markdown = root.coordinate_markdown_path(
         scene_scope_id,
         coordinate.coordinate_key,
@@ -943,6 +968,7 @@ def test_projector_binds_safe_runtime_activity_and_workspace_heartbeat(
     assert "command-events=1" in markdown
     assert "file-change-events=1" in markdown
     assert "Candidate workspace heartbeat: turn_terminal" in markdown
+    assert "last file change +" in markdown
     assert activity_canary not in markdown
     assert (
         activity_canary
@@ -1042,6 +1068,213 @@ def test_projector_projects_running_invocation_liveness_as_an_estimate(
     assert "Runtime Agent liveness:" in markdown
     assert "local heartbeat" in markdown
     assert "not Provider progress" in markdown
+
+
+def test_projector_recovers_control_liveness_after_an_interrupted_agent_dispatch(
+    tmp_path: Path,
+) -> None:
+    """Exercise Work recovery -> durable control -> scene without an LLM fixture.
+
+    This is the actual boundary that matters after an operator stops a stalled
+    physical turn: the Work runtime must retain the Scheduler dispatch id,
+    and the project-execution Agent view must recover only safe timing/count
+    facts from the matching invocation-control record.  It intentionally does
+    not hand-write a Scene or claim that a local cleanup heartbeat was Provider
+    progress.
+    """
+
+    artifacts, heads, runtime, definition, input_ref, candidate_ref, root, _canary = _harness(
+        tmp_path
+    )
+    control = InvocationControlStore(tmp_path / "invocation-control")
+    invocation_id = "dispatch:scene:interrupted-control"
+
+    with heads.exclusive(definition.coordinate) as lock:
+        head = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(input_ref, candidate_ref),
+            elapsed_wall_seconds=0,
+        )
+        runtime.schedule_operation(
+            lock,
+            definition=definition,
+            kind="proposal",
+            replay_mode="non_replayable",
+            elapsed_wall_seconds=0,
+        )
+        head = runtime.start_operation(
+            lock,
+            definition=definition,
+            dispatch_id=invocation_id,
+        )
+        attempt = _attempt(artifacts, head)
+        ownership = runtime.invocation_ownership_for_active_proposal_locked(
+            lock,
+            definition=definition,
+            attempt=attempt,
+            dispatch_id=invocation_id,
+        )
+        control.begin(
+            invocation_id=invocation_id,
+            owner=ownership,
+            route="codex_sdk",
+            model="gpt-5.4-mini",
+            profile_digest="profile:scene-control",
+            envelope_digest="a" * 64,
+            declared_wall_seconds=120,
+        )
+        control.record_local(invocation_id, InvocationLifecyclePhase.WORKER_SPAWNED)
+        control.record_provider_progress(invocation_id, activity="codex_provider_event")
+        control.record_local(invocation_id, InvocationLifecyclePhase.PARENT_WAITING)
+        control.settle(
+            invocation_id,
+            terminal=InvocationTerminalFact(
+                status=InvocationStatus.CANCELLED,
+                code="owner_cancelled",
+                retryable=False,
+            ),
+            final_phase=InvocationLifecyclePhase.CLEANUP_FINISHED,
+        )
+        recovered = runtime.reconcile_abandoned_operation(
+            lock,
+            definition=definition,
+            interrupted_dispatch_code="process_interrupted_cancelled",
+            allow_infrastructure_retry=False,
+        )
+
+    assert recovered.status == "failed"
+    recovered_attempt = _attempt(artifacts, recovered)
+    proposal_run = next(
+        artifacts.get_json(reference, OperationRun)
+        for reference in recovered_attempt.operation_run_refs
+        if artifacts.get_json(reference, OperationRun).kind == "proposal"
+    )
+    assert proposal_run.execution_ref is not None
+    execution = artifacts.get_json(proposal_run.execution_ref, ProposalExecution)
+    assert execution.status == "interrupted"
+    assert execution.invocation_id == invocation_id
+    assert execution.provider is None
+    assert execution.model is None
+
+    scene = SceneProjector(
+        root=root,
+        artifacts=artifacts,
+        heads=heads,
+        invocation_control=control,
+    ).rebuild(definition.coordinate.scope_id)
+    coordinate = next(
+        item
+        for item in scene.coordinates
+        if item.coordinate_key == definition.coordinate.coordinate_key
+    )
+    assert coordinate.runtime_agent_liveness is not None
+    assert coordinate.runtime_agent_liveness.first_progress_elapsed_ms is not None
+    assert coordinate.runtime_agent_liveness.last_progress_elapsed_ms is not None
+    assert coordinate.runtime_agent_liveness.last_local_heartbeat_elapsed_ms is not None
+    assert coordinate.runtime_agent_liveness.last_local_heartbeat_phase == "cleanup_finished"
+    assert coordinate.runtime_agent_liveness.terminal_elapsed_ms is not None
+    assert coordinate.runtime_agent_liveness.observed_event_count == 1
+    # The scene may explain liveness, but it must not reveal the raw physical
+    # invocation id that connects the private adapter/control plane.
+    assert invocation_id not in str(coordinate.model_dump(mode="json"))
+
+
+def test_projector_reads_a_legacy_interrupted_dispatch_without_provider_provenance(
+    tmp_path: Path,
+) -> None:
+    """A v1-style interrupted execution still has its exact dispatch fence."""
+
+    artifacts, heads, runtime, definition, input_ref, candidate_ref, root, _canary = _harness(
+        tmp_path
+    )
+    control = InvocationControlStore(tmp_path / "invocation-control")
+    invocation_id = "dispatch:scene:legacy-interrupted-control"
+
+    with heads.exclusive(definition.coordinate) as lock:
+        head = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(input_ref, candidate_ref),
+            elapsed_wall_seconds=0,
+        )
+        runtime.schedule_operation(
+            lock,
+            definition=definition,
+            kind="proposal",
+            replay_mode="non_replayable",
+            elapsed_wall_seconds=0,
+        )
+        head = runtime.start_operation(
+            lock,
+            definition=definition,
+            dispatch_id=invocation_id,
+        )
+        attempt = _attempt(artifacts, head)
+        operation = artifacts.get_json(head.active_operation_ref, OperationRun)
+        assert operation.started_at is not None
+        ownership = runtime.invocation_ownership_for_active_proposal_locked(
+            lock,
+            definition=definition,
+            attempt=attempt,
+            dispatch_id=invocation_id,
+        )
+        control.begin(
+            invocation_id=invocation_id,
+            owner=ownership,
+            route="codex_sdk",
+            model="gpt-5.4-mini",
+            profile_digest="profile:scene-legacy-control",
+            envelope_digest="b" * 64,
+            declared_wall_seconds=120,
+        )
+        control.record_provider_progress(invocation_id, activity="codex_provider_event")
+        control.settle(
+            invocation_id,
+            terminal=InvocationTerminalFact(
+                status=InvocationStatus.CANCELLED,
+                code="owner_cancelled",
+                retryable=False,
+            ),
+            final_phase=InvocationLifecyclePhase.CLEANUP_FINISHED,
+        )
+        # This is the historical shape written before recovery retained the
+        # dispatch id in ProposalExecution.  The OperationRun still has the
+        # exact fence, while all Provider provenance remains absent.
+        runtime.checkpoint_proposal(
+            lock,
+            definition=definition,
+            execution=ProposalExecution(
+                execution_id="execution:scene:legacy-interrupted-control",
+                attempt_id=attempt.attempt_id,
+                executor="agent",
+                operation=definition.proposal_policy.operation,
+                status="interrupted",
+                error_code="process_interrupted_legacy_owner_loss",
+                observed_actual=BudgetUsage(),
+                unknown_upper_bound=BudgetUsage(),
+                conservative_committed=BudgetUsage(),
+                started_at=operation.started_at,
+                finished_at=operation.started_at + timedelta(milliseconds=1),
+                duration_ms=1,
+            ),
+        )
+
+    scene = SceneProjector(
+        root=root,
+        artifacts=artifacts,
+        heads=heads,
+        invocation_control=control,
+    ).rebuild(definition.coordinate.scope_id)
+    coordinate = next(
+        item
+        for item in scene.coordinates
+        if item.coordinate_key == definition.coordinate.coordinate_key
+    )
+    assert coordinate.runtime_agent_liveness is not None
+    assert coordinate.runtime_agent_liveness.observed_event_count == 1
+    assert coordinate.runtime_agent_liveness.first_progress_elapsed_ms is not None
+    assert coordinate.runtime_agent_liveness.terminal_elapsed_ms is not None
 
 
 def test_observe_phase_four_queries_and_tier_a_retention(tmp_path: Path) -> None:
@@ -1478,3 +1711,166 @@ def test_fold_routes_self_inconsistent_proposal_to_the_proposal_lane() -> None:
     assert coordinate.repair_target != "design_worldspec"
     assert scene.index.next_action_hint == "revise_proposal"
     assert scene.index.next_action_hint != "review_design_worldspec"
+
+
+def test_fold_prioritizes_authorized_multifile_candidate_repair() -> None:
+    """A parent repair is the next action, not an unrelated human-review hint.
+
+    The causal Integration coordinate remains failed evidence.  Once its
+    target Builder coordinate holds Scheduler authority, the compact project
+    Agent view must surface that target and retain the multi-file scope rather
+    than guessing one source path.
+    """
+
+    now = datetime.now(UTC)
+    graph_digest = sha256_digest(b"causal-repair-scene")
+    source_issue = SceneIssue(
+        normalized_identity=sha256_digest(b"source-static-assurance"),
+        code="integration_gate_static_assurance_fail",
+        path=("integration", "gate", 0),
+        violated_condition="Static assurance failed in generated Candidate sources.",
+        expected_category="the exact independent execution gate to pass",
+        severity="blocker",
+        actionable=True,
+        gate_id="static_assurance",
+        candidate_file=None,
+        multi_file_gate=True,
+    )
+    repair_issue = SceneIssue(
+        normalized_identity=sha256_digest(b"repair-static-assurance"),
+        code="causal_integration_gate_static_assurance_fail",
+        path=("causal_feedback", "integration", "runtime_integration", "integration", "gate", 0),
+        violated_condition="Move shared executable helpers out of configuration.",
+        expected_category="the exact independent execution gate to pass",
+        severity="blocker",
+        actionable=True,
+        gate_id="static_assurance",
+        candidate_file=None,
+        multi_file_gate=True,
+    )
+    source = SceneHead(
+        scope_id="job:causal-repair-scene",
+        coordinate_key=sha256_digest(b"causal-source"),
+        coordinate_label="integration.runtime_integration.integration_report",
+        head_status="failed",
+        revision=3,
+        attempt_ref_revision=sha256_digest(b"causal-source-attempt"),
+        attempt_ref_id="attempt:causal-source",
+        attempt_ordinal=1,
+        failure_code="validation_failed",
+        frontier_ordinal=100,
+        pipeline_stage="Integration",
+        repair_authority="none",
+        input_fingerprint=sha256_digest(b"causal-source-input"),
+        issues=(source_issue,),
+        previous_issue_ids=(),
+        run_id=None,
+        graph_digest=graph_digest,
+        updated_at=now,
+        validation_status="failed",
+    )
+    target = SceneHead(
+        scope_id="job:causal-repair-scene",
+        coordinate_key=sha256_digest(b"causal-target"),
+        coordinate_label="build.candidate_build.environment_candidate",
+        head_status="repair_authorized",
+        revision=4,
+        attempt_ref_revision=sha256_digest(b"causal-target-attempt"),
+        attempt_ref_id="attempt:causal-target",
+        attempt_ordinal=2,
+        failure_code=None,
+        frontier_ordinal=100,
+        pipeline_stage="Builder",
+        repair_authority="authorized",
+        input_fingerprint=sha256_digest(b"causal-target-input"),
+        issues=(repair_issue,),
+        previous_issue_ids=(),
+        run_id=None,
+        graph_digest=graph_digest,
+        updated_at=now,
+        validation_status="failed",
+    )
+
+    scene = fold((source, target), ())
+    selected = next(
+        item for item in scene.coordinates if item.coordinate_key == target.coordinate_key
+    )
+
+    assert scene.index.stuck_coordinate is not None
+    assert scene.index.stuck_coordinate.coordinate_key == target.coordinate_key
+    assert scene.index.stuck_reason == "authorized_repair"
+    assert selected.repair_target == "generated_candidate_code"
+    assert selected.candidate_file is None
+    assert scene.index.next_action_hint == "repair_candidate_code"
+
+
+def test_fold_prefers_the_latest_equally_blocked_coordinate_for_current_view() -> None:
+    """A current Candidate failure must not be hidden by stale Integration state.
+
+    This is the compact project-execution Agent view boundary, not a retry or
+    semantic-routing rule.  Both nodes remain durable failed evidence with no
+    repair authority; when their urgency is otherwise equal, the recent node
+    is the one that can answer the current debugging question.
+    """
+
+    now = datetime.now(UTC)
+    graph_digest = sha256_digest(b"current-view-freshness")
+    issue = SceneIssue(
+        normalized_identity=sha256_digest(b"current-view-issue"),
+        code="process_interrupted_cancelled",
+        path=("operation", "proposal"),
+        violated_condition="The prior owner stopped after dispatch.",
+        expected_category="manual recovery or a new generation request",
+        severity="blocker",
+        actionable=True,
+        gate_id=None,
+        candidate_file=None,
+    )
+    stale_integration = SceneHead(
+        scope_id="job:current-view-freshness",
+        coordinate_key=sha256_digest(b"a-stale-integration"),
+        coordinate_label="integration.runtime_integration.integration_report",
+        head_status="failed",
+        revision=3,
+        attempt_ref_revision=sha256_digest(b"stale-integration-attempt"),
+        attempt_ref_id="attempt:stale-integration",
+        attempt_ordinal=1,
+        failure_code="validation_error",
+        frontier_ordinal=100,
+        pipeline_stage="Integration",
+        repair_authority="none",
+        input_fingerprint=sha256_digest(b"stale-integration-input"),
+        issues=(issue,),
+        previous_issue_ids=(),
+        run_id=None,
+        graph_digest=graph_digest,
+        updated_at=now,
+        validation_status="error",
+    )
+    current_candidate = SceneHead(
+        scope_id="job:current-view-freshness",
+        coordinate_key=sha256_digest(b"z-current-candidate"),
+        coordinate_label="build.candidate_build.environment_candidate",
+        head_status="failed",
+        revision=7,
+        attempt_ref_revision=sha256_digest(b"current-candidate-attempt"),
+        attempt_ref_id="attempt:current-candidate",
+        attempt_ordinal=7,
+        failure_code="validation_error",
+        frontier_ordinal=100,
+        pipeline_stage="Builder",
+        repair_authority="none",
+        input_fingerprint=sha256_digest(b"current-candidate-input"),
+        issues=(issue,),
+        previous_issue_ids=(),
+        run_id=None,
+        graph_digest=graph_digest,
+        updated_at=now + timedelta(seconds=1),
+        validation_status="error",
+    )
+
+    scene = fold((stale_integration, current_candidate), ())
+
+    assert scene.index.stuck_coordinate is not None
+    assert scene.index.stuck_coordinate.coordinate_key == current_candidate.coordinate_key
+    assert scene.index.next_action_hint == "inspect_infrastructure"

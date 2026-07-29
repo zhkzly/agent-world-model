@@ -266,6 +266,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     test_descendant_node.add_argument(
+        "--execute-authorized-repair",
+        action="store_true",
+        help=(
+            "execute exactly one already-authorized semantic RepairAction through the normal "
+            "Scheduler; retains its frozen definition, feedback, Prompt, Runtime Skill, "
+            "profile, and envelope"
+        ),
+    )
+    test_descendant_node.add_argument(
+        "--authorize-semantic-repair",
+        action="store_true",
+        help=(
+            "record exactly one feedback-bound semantic RepairAction for an actionable failed "
+            "diagnostic node; makes no model call and must be followed by the separate "
+            "--execute-authorized-repair command"
+        ),
+    )
+    test_descendant_node.add_argument(
         "--diagnostic-terminal-feedback",
         action="store_true",
         help=(
@@ -878,6 +896,8 @@ async def _dispatch(args: argparse.Namespace) -> int:
             proposal_wall_seconds=args.proposal_wall_seconds,
             required_manifest_revision=args.manifest_revision,
             infrastructure_retry=args.infrastructure_retry,
+            execute_authorized_repair=args.execute_authorized_repair,
+            authorize_semantic_repair=args.authorize_semantic_repair,
             diagnostic_terminal_feedback=args.diagnostic_terminal_feedback,
             refresh_current_implementation=args.refresh_current_implementation,
             diagnostic_structured_output_transport=args.diagnostic_structured_output_transport,

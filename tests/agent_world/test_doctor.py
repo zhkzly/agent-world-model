@@ -27,6 +27,7 @@ from agent_world.doctor import (
     run_doctor,
 )
 from agent_world.invocation import (
+    InvocationControlStore,
     InvocationError,
     InvocationRequest,
     InvocationResult,
@@ -287,6 +288,74 @@ async def test_live_agent_probe_publishes_live_safe_trace_and_terminal_status(
     serialized = json.dumps(terminal, sort_keys=True)
     assert "production InvocationBackend readiness probe" not in serialized
     assert "test-key" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_live_agent_probe_mints_a_new_physical_invocation_for_each_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repeated readiness probe must not collide with a settled control record."""
+
+    environment_name = "AGENT_WORLD_TEST_REPEAT_DOCTOR_KEY"
+    monkeypatch.setenv(environment_name, "test-key")
+    config = FoundryConfig(
+        state_root=tmp_path / "state",
+        agent=AgentBackendConfig(
+            model="doctor-readiness-probe",
+            api_key_environment=environment_name,
+        ),
+        research=ResearchConfig(
+            provider="searxng",
+            searxng_base_url=HttpUrl("http://127.0.0.1:18080"),
+            searxng_allow_private_endpoint=True,
+            use_jina_reader_fallback=False,
+        ),
+        judge=JudgeConfig(),
+    )
+    invocation_ids: list[str] = []
+
+    class CompletingBackend:
+        def __init__(self, *, telemetry: TelemetryStore) -> None:
+            self.telemetry = telemetry
+
+        async def invoke(self, request: InvocationRequest) -> InvocationResult:
+            invocation_ids.append(request.invocation_id)
+            span = self.telemetry.start_invocation(request)
+            span.first_progress()
+            span.finish(status="passed")
+            return InvocationResult(
+                invocation_id=request.invocation_id,
+                status=InvocationStatus.COMPLETED,
+                session=InvocationSession(
+                    thread_id=f"doctor-thread:{len(invocation_ids)}",
+                    lineage_id=request.profile.lineage_id,
+                    workspace=request.profile.workspace,
+                    profile_hash=request.profile.profile_hash,
+                    codex_config_sha256=request.profile.codex_config_sha256,
+                ),
+                turn_id=f"doctor-turn:{len(invocation_ids)}",
+                final_text=None,
+                structured_output={"status": "ok"},
+                usage=None,
+                events=(),
+                error=None,
+                duration_ms=1,
+                backend_version="test-backend",
+            )
+
+    monkeypatch.setattr(doctor_module, "CodexSdkBackend", CompletingBackend)
+
+    first = await _live_agent_check(config)
+    second = await _live_agent_check(config)
+
+    assert first.status == "pass"
+    assert second.status == "pass"
+    assert len(invocation_ids) == 2
+    assert invocation_ids[0] != invocation_ids[1]
+    records = InvocationControlStore(config.state_root / "invocation-control").list_records()
+    assert {record.invocation_id for record in records} == set(invocation_ids)
+    assert all(record.settled for record in records)
 
 
 @pytest.mark.asyncio

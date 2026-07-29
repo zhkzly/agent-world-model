@@ -111,15 +111,14 @@ _ACTOR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$")
 _ERROR_CODE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 
-# These *exact* names belong to framework-private evaluation contracts.  They
+# These *exact* names belong to framework-private evaluation contracts. They
 # are rejected recursively, including inside reset config and tool arguments.
-# Do not use prefix matching here: ordinary domains legitimately contain names
-# such as ``expected_delivery_date`` and ``release_date``.  The actual trust
-# boundary is the typed task/verifier projection; this list is only a final
-# defence against serialising a framework-private object wholesale.
+# A name is not private merely because it looks like an identifier: ordinary
+# WorldSpec schemas may legitimately use ``task_id`` for a domain object. The
+# actual trust boundary is the typed task/verifier projection; this list is
+# only a final defence against serialising a framework-private object wholesale.
 _PRIVATE_RUNTIME_KEYS = frozenset(
     {
-        "task_id",
         "case",
         "case_id",
         "case_label",
@@ -508,7 +507,11 @@ def _validate_handshake_result(result: Mapping[str, JsonValue], *, request_id: s
     if not isinstance(operations, list) or not all(isinstance(item, str) for item in operations):
         raise ProtocolViolation(
             "invalid_handshake",
-            "handshake operations must be a list of strings",
+            (
+                "response.result[handshake].operations must be the JSON string array "
+                '["handshake","reset","invoke","snapshot","close"], '
+                "not operation objects"
+            ),
             request_id=request_id,
         )
     if set(operations) != {operation.value for operation in RuntimeOperation} or len(
@@ -516,7 +519,10 @@ def _validate_handshake_result(result: Mapping[str, JsonValue], *, request_id: s
     ) != len(RuntimeOperation):
         raise ProtocolViolation(
             "incomplete_handshake",
-            "handshake must declare every ABI v2 operation exactly once",
+            (
+                "response.result[handshake].operations must contain each ABI v2 string exactly "
+                'once: ["handshake","reset","invoke","snapshot","close"]'
+            ),
             request_id=request_id,
         )
     tools = result["tools"]
@@ -709,7 +715,7 @@ def _require_digest(value: JsonValue, request_id: str) -> None:
     if not isinstance(value, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
         raise ProtocolViolation(
             "invalid_state_digest",
-            "state_digest must be a sha256 content digest",
+            "state_digest must match sha256:<64 lowercase hexadecimal characters>",
             request_id=request_id,
         )
 

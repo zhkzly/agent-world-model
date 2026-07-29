@@ -35,8 +35,13 @@ from .campaign_store import (
 )
 from .continuation_store import (
     ContinuationStoreError,
+    DiagnosticSemanticRepairSeedRecord,
+    DiagnosticWorkspaceRecoveryRecord,
+    DiagnosticWorkspaceRecoveryStore,
     NodeContinuationRecord,
     NodeContinuationStore,
+    SemanticRepairSeedRecord,
+    SemanticRepairSeedStore,
 )
 from .decision import (
     AdvisoryWorkOrder,
@@ -80,9 +85,12 @@ from .leaf_executor import (
     LeafExecutionFailure,
     LeafProposal,
     LeafSemanticRepairContinuation,
+    LeafSemanticRepairSeed,
     LeafSessionContinuation,
     LeafValidationFailure,
+    LeafWorkspaceRecovery,
     SchedulerLeafExecutor,
+    append_authorized_semantic_repair_context,
 )
 from .models import (
     BudgetLease,
@@ -258,9 +266,12 @@ __all__ = [
     "LeafAssurance",
     "LeafExecutionFailure",
     "LeafSemanticRepairContinuation",
+    "LeafSemanticRepairSeed",
     "LeafSessionContinuation",
+    "LeafWorkspaceRecovery",
     "LeafValidationFailure",
     "LeafProposal",
+    "append_authorized_semantic_repair_context",
     "LeaseBudgetLedger",
     "DurableLeaseBudgetCoordinator",
     "ScopeBudgetSnapshot",
@@ -269,6 +280,11 @@ __all__ = [
     "NodeAttempt",
     "NodeContinuationRecord",
     "NodeContinuationStore",
+    "DiagnosticSemanticRepairSeedRecord",
+    "DiagnosticWorkspaceRecoveryRecord",
+    "DiagnosticWorkspaceRecoveryStore",
+    "SemanticRepairSeedRecord",
+    "SemanticRepairSeedStore",
     "NodeKind",
     "NodeCommit",
     "RepairDirective",

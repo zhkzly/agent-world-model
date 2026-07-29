@@ -406,6 +406,11 @@ def test_one_repair_policy_is_the_total_semantic_and_infrastructure_ceiling() ->
     policy = RepairPolicy(policy_id="repair:default")
 
     assert policy.maximum_total_repair_attempts == 3
+    # A missing field is a legacy-compatible closed policy. New WorkGraph
+    # factories must name a fallback allowance explicitly so that it binds the
+    # immutable definition identity instead of changing historic behavior.
+    assert policy.maximum_model_fallbacks == 0
+    assert "maximum_model_fallbacks" not in policy.model_dump(mode="json")
     with pytest.raises(ValidationError, match="allowances exceed total"):
         RepairPolicy(
             policy_id="repair:incoherent",
@@ -642,6 +647,32 @@ def test_repair_action_enforces_local_one_hop_and_human_boundaries() -> None:
         authorized_at=now,
     )
     assert local.repair_attempt_charge == 1
+
+    seed_attempt_ref = _ref("repair-seed-attempt", "control.work_attempt")
+    seed_output_ref = _ref("repair-seed-output", "build.environment_candidate")
+    seeded = RepairAction.model_validate(
+        {
+            **local.model_dump(mode="python"),
+            "repair_seed_attempt_ref": seed_attempt_ref,
+            "repair_seed_output_refs": (seed_output_ref,),
+        }
+    )
+    assert seeded.repair_seed_attempt_ref == seed_attempt_ref
+    with pytest.raises(ValidationError, match="repair seed must bind"):
+        RepairAction.model_validate(
+            {
+                **local.model_dump(mode="python"),
+                "repair_seed_attempt_ref": seed_attempt_ref,
+            }
+        )
+    with pytest.raises(ValidationError, match="repair seed attempt"):
+        RepairAction.model_validate(
+            {
+                **local.model_dump(mode="python"),
+                "repair_seed_attempt_ref": input_ref,
+                "repair_seed_output_refs": (seed_output_ref,),
+            }
+        )
 
     parent_action = RepairAction.model_validate(
         {

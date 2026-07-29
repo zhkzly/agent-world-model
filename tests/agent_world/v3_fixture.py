@@ -1610,7 +1610,6 @@ def build_judge_candidate_graph(
         CandidateFileDeclaration(
             path=item.path,
             role=item.role,  # type: ignore[arg-type]
-            executable=item.executable,
         )
         for item in candidate_files(workspace)
     )
@@ -2250,7 +2249,6 @@ def build_release_graph(
             CandidateFileDeclaration(
                 path=item.path,
                 role=item.role,  # type: ignore[arg-type]
-                executable=item.executable,
             )
             for item in candidate_files(workspace)
         ),

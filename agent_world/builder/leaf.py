@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent_world.agent_profiles import logical_workspace_for_isolated_agent_workspace
+from agent_world.artifact_store import ArtifactStoreError
 from agent_world.contracts import (
     ArtifactRef,
     Budget,
     BudgetUsage,
+    EnvironmentCandidate,
     EnvironmentDesign,
     GenerationContext,
     canonical_json_bytes,
@@ -22,6 +27,7 @@ from agent_world.control.leaf_executor import (
     LeafSemanticRepairContinuation,
     LeafSessionContinuation,
     LeafValidationFailure,
+    LeafWorkspaceRecovery,
     SchedulerLeafExecutor,
 )
 from agent_world.control.validation import ValidationDiagnostic
@@ -52,6 +58,15 @@ from .service import (
     BuildInvocationSummary,
     EnvironmentBuilder,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotRepairSeed:
+    """One verified committed Candidate closure for a fresh repair session."""
+
+    candidate_ref: ArtifactRef
+    candidate: EnvironmentCandidate
+    correction_feedback: bytes
 
 
 @dataclass(slots=True)
@@ -121,11 +136,10 @@ class BuildPlanningLeaf:
             prompt = self._prompt(design_id=design.design_id)
         else:
             session = continuation.restore_session()
-            # The profile resolver receives its materialization root, while
-            # the private record stores the exact Agent workspace.  Reusing
-            # the root lets profile resolution verify the same immutable
-            # bundles and workspace rather than constructing a fresh one.
-            workspace = session.workspace.parent.parent
+            # The private record stores the exact Agent workspace. Recover the
+            # logical frozen-input root so profile resolution can reproduce
+            # its primary or selected-fallback materialization layout.
+            workspace = logical_workspace_for_isolated_agent_workspace(session.workspace)
             lineage_id = session.lineage_id
             prompt = self._continuation_prompt()
         self.builder.materialize_implementation_inputs(
@@ -145,6 +159,11 @@ class BuildPlanningLeaf:
             definition=definition,
             attempt=attempt,
             dispatch_id=dispatch_id,
+            ownership=self.kernel.invocation_ownership(
+                definition=definition,
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+            ),
             lineage_id=lineage_id,
             workspace=workspace,
             model=ImplementationPlanDraft,
@@ -298,6 +317,10 @@ errors to code; the Task Materializer v3 mapping; the runtime JSONL/ABI boundary
 self-check/public-test strategy; validation order; and genuine risks or unresolved details with
 their authoritative frozen input.
 
+Where a Runtime ABI field has an exact wire-format literal, preserve that literal in the plan and
+its public-test strategy rather than reducing it to a generic type label. In particular, do not
+summarize a content-digest format as merely "a digest".
+
 Do not exhaustively restate every JSON field, Rule, transition, or schema clause. Group repeated
 patterns and cite a concrete tool/rule/input only where it changes implementation behavior or
 prevents ambiguity. CandidateBuild will read the complete frozen inputs itself; this plan is an
@@ -383,13 +406,84 @@ class BuilderLeaf:
             attempt=attempt,
             definition=definition,
         )
+        workspace_recovery = self._load_interrupted_workspace_recovery(
+            context=context,
+            attempt=attempt,
+            definition=definition,
+        )
         semantic_repair = self._load_semantic_repair_continuation(
             context=context,
             attempt=attempt,
             definition=definition,
         )
+        snapshot_repair = self._load_snapshot_repair_seed(
+            context=context,
+            attempt=attempt,
+            definition=definition,
+        )
+        invocation_ownership = self.kernel.invocation_ownership_if_dispatched(
+            definition=definition,
+            attempt=attempt,
+            dispatch_id=dispatch_id,
+        )
+
+        async def fresh_build() -> BuildBundle:
+            """Start one new Builder session for an initial or transport retry.
+
+            A classified infrastructure retry and a model fallback preserve the
+            immutable Work input closure, but deliberately do *not* preserve a
+            failed provider session, workspace, or correction brief.  The
+            Scheduler has already validated and charged their RepairAction;
+            this leaf owns only the corresponding fresh physical turn.
+            """
+
+            return await self.builder.build_once(
+                design=design,
+                design_ref=design_ref,
+                workspace=self.workspace_root / attempt.attempt_id,
+                budget=self._budget(definition),
+                permissions=permissions,
+                parent_workspace_refs=(),
+                run_id=self.run_id,
+                attempt_id=attempt.attempt_id,
+                proposal_invocation_id=dispatch_id,
+                session_token_limit=session_token_limit,
+                session_wall_seconds=session_wall_seconds,
+                implementation_plan=implementation_plan,
+                implementation_plan_ref=implementation_plan_ref,
+                diagnostic_capture_terminal_excerpt=(
+                    self.kernel.local_terminal_diagnostics_enabled
+                ),
+                invocation_ownership=invocation_ownership,
+                model_override=attempt.model_override,
+            )
+
         try:
-            if semantic_repair is not None:
+            if snapshot_repair is not None:
+                bundle = await self.builder.repair_from_snapshot(
+                    design=design,
+                    design_ref=design_ref,
+                    candidate=snapshot_repair.candidate,
+                    candidate_ref=snapshot_repair.candidate_ref,
+                    workspace=self.workspace_root / attempt.attempt_id,
+                    budget=self._budget(definition),
+                    permissions=permissions,
+                    run_id=self.run_id,
+                    attempt_id=attempt.attempt_id,
+                    attempt_ordinal=attempt.ordinal,
+                    proposal_invocation_id=dispatch_id,
+                    correction_feedback=snapshot_repair.correction_feedback,
+                    session_token_limit=session_token_limit,
+                    session_wall_seconds=session_wall_seconds,
+                    implementation_plan=implementation_plan,
+                    implementation_plan_ref=implementation_plan_ref,
+                    diagnostic_capture_terminal_excerpt=(
+                        self.kernel.local_terminal_diagnostics_enabled
+                    ),
+                    invocation_ownership=invocation_ownership,
+                    model_override=attempt.model_override,
+                )
+            elif semantic_repair is not None:
                 if session_token_limit is None or session_wall_seconds is None:
                     raise LeafExecutionFailure(
                         code="preflight_builder_repair_session_policy_missing",
@@ -419,18 +513,24 @@ class BuilderLeaf:
                     diagnostic_capture_terminal_excerpt=(
                         self.kernel.local_terminal_diagnostics_enabled
                     ),
+                    invocation_ownership=invocation_ownership,
+                    model_override=attempt.model_override,
                 )
-            elif continuation is None:
-                bundle = await self.builder.build_once(
+            elif workspace_recovery is not None:
+                bundle = await self.builder.resume_interrupted_workspace_build(
                     design=design,
                     design_ref=design_ref,
-                    workspace=self.workspace_root / attempt.attempt_id,
+                    workspace=workspace_recovery.workspace_for_recovery(),
                     budget=self._budget(definition),
                     permissions=permissions,
-                    parent_workspace_refs=(),
                     run_id=self.run_id,
                     attempt_id=attempt.attempt_id,
+                    attempt_ordinal=attempt.ordinal,
                     proposal_invocation_id=dispatch_id,
+                    recovery_lineage_id=workspace_recovery.lineage_id,
+                    recovery_profile_digest=workspace_recovery.profile_digest,
+                    recovery_codex_config_digest=workspace_recovery.codex_config_digest,
+                    recovery_model=workspace_recovery.model,
                     session_token_limit=session_token_limit,
                     session_wall_seconds=session_wall_seconds,
                     implementation_plan=implementation_plan,
@@ -438,7 +538,65 @@ class BuilderLeaf:
                     diagnostic_capture_terminal_excerpt=(
                         self.kernel.local_terminal_diagnostics_enabled
                     ),
+                    invocation_ownership=invocation_ownership,
+                    model_override=attempt.model_override,
                 )
+            elif context.repair_action_ref is not None:
+                action = self.kernel.runtime.artifacts.get_json(
+                    context.repair_action_ref,
+                    RepairAction,
+                )
+                if action.decision in {"infrastructure_retry", "model_fallback"}:
+                    # These actions are authorization for one fresh node-local
+                    # session.  They are neither semantic correction feedback
+                    # nor a private output-limit continuation, so the model
+                    # must receive no prior candidate/session state.
+                    bundle = await fresh_build()
+                elif action.decision == "local_correction":
+                    raise self._semantic_repair_preflight_failure(
+                        "preflight_builder_repair_seed_missing"
+                    )
+                elif action.decision != "session_continuation" or continuation is None:
+                    raise LeafExecutionFailure(
+                        code="preflight_builder_repair_action_unsupported",
+                        category=(
+                            "CandidateBuild received RepairAction that is not a supported "
+                            "continuation or semantic correction"
+                        ),
+                        retryable=False,
+                    )
+                elif session_token_limit is None or session_wall_seconds is None:
+                    raise LeafExecutionFailure(
+                        code="preflight_builder_continuation_session_policy_missing",
+                        category=(
+                            "CandidateBuild continuation lacks a declared logical session envelope"
+                        ),
+                    )
+                else:
+                    resumed_session = continuation.restore_session()
+                    bundle = await self.builder.resume_output_limited_build(
+                        design=design,
+                        design_ref=design_ref,
+                        workspace=resumed_session.workspace,
+                        session=resumed_session,
+                        budget=self._budget(definition),
+                        permissions=permissions,
+                        run_id=self.run_id,
+                        attempt_id=attempt.attempt_id,
+                        attempt_ordinal=attempt.ordinal,
+                        proposal_invocation_id=dispatch_id,
+                        session_token_limit=session_token_limit,
+                        session_wall_seconds=session_wall_seconds,
+                        implementation_plan=implementation_plan,
+                        implementation_plan_ref=implementation_plan_ref,
+                        diagnostic_capture_terminal_excerpt=(
+                            self.kernel.local_terminal_diagnostics_enabled
+                        ),
+                        invocation_ownership=invocation_ownership,
+                        model_override=attempt.model_override,
+                    )
+            elif continuation is None:
+                bundle = await fresh_build()
             else:
                 if session_token_limit is None or session_wall_seconds is None:
                     raise LeafExecutionFailure(
@@ -466,6 +624,8 @@ class BuilderLeaf:
                     diagnostic_capture_terminal_excerpt=(
                         self.kernel.local_terminal_diagnostics_enabled
                     ),
+                    invocation_ownership=invocation_ownership,
+                    model_override=attempt.model_override,
                 )
         except BuilderError as exc:
             preflight = exc.invocation is None
@@ -546,6 +706,12 @@ class BuilderLeaf:
                     else None
                 ),
                 session_continuation=self._session_continuation_from_error(
+                    code=code,
+                    state=exc.state,
+                    provenance=provenance,
+                    definition=definition,
+                ),
+                workspace_recovery=self._workspace_recovery_from_error(
                     code=code,
                     state=exc.state,
                     provenance=provenance,
@@ -646,6 +812,83 @@ class BuilderLeaf:
             )
         return record
 
+    def _load_interrupted_workspace_recovery(
+        self,
+        *,
+        context: WorkExecutionContext,
+        attempt: WorkAttempt,
+        definition: WorkDefinition,
+    ) -> NodeContinuationRecord | None:
+        """Load one fresh-session Builder draft recovery, never a Provider thread.
+
+        The public successor holds only a private-record commitment.  This
+        loader proves that the record is for the exact immediately preceding
+        attempt and the exact `infrastructure_retry` action; it does not scan
+        history or accept a bare workspace path.
+        """
+
+        repair_action_ref = context.repair_action_ref
+        if repair_action_ref is None:
+            return None
+        action = self.kernel.runtime.artifacts.get_json(repair_action_ref, RepairAction)
+        if action.decision != "infrastructure_retry" or not action.workspace_recovery:
+            return None
+        if (
+            attempt.continuation_commitment is None
+            or attempt.parent_attempt_id is None
+            or self.kernel.runtime.continuations is None
+            or self.kernel.runtime.continuation_workspace_root is None
+        ):
+            raise self._workspace_recovery_preflight_failure(
+                "preflight_builder_workspace_recovery_state_missing"
+            )
+        try:
+            record = self.kernel.runtime.continuations.load_commitment(
+                attempt.continuation_commitment,
+                workspace_root=self.kernel.runtime.continuation_workspace_root,
+            )
+        except ContinuationStoreError as exc:
+            raise self._workspace_recovery_preflight_failure(
+                "preflight_builder_workspace_recovery_state_invalid"
+            ) from exc
+        if record is None:
+            raise self._workspace_recovery_preflight_failure(
+                "preflight_builder_workspace_recovery_state_missing"
+            )
+
+        input_fingerprint = work_input_fingerprint(attempt.input_refs)
+        expected_schema_digest = self._candidate_schema_digest()
+        if (
+            record.continuation_kind != "workspace_recovery"
+            or record.thread_id is not None
+            or record.work_id != definition.work_id
+            or record.attempt_id != attempt.parent_attempt_id
+            or record.definition_digest != definition.definition_digest
+            or record.proposal_policy_digest != definition.proposal_policy.content_digest()
+            or record.input_fingerprint != input_fingerprint
+            or record.output_schema_digest != expected_schema_digest
+            or record.repair_action_ref != repair_action_ref
+            or record.source_evaluation_ref != action.source_evaluation_ref
+            or record.source_report_ref not in action.causal_evidence_refs
+            or record.allowed_mutation_roots != action.allowed_mutation_roots
+            or record.allowed_mutation_roots != definition.allowed_mutation_roots
+            or action.definition_digest != definition.definition_digest
+            or action.input_fingerprint != input_fingerprint
+            or action.immutable_input_refs != attempt.input_refs
+            or action.allowed_mutation_roots != definition.allowed_mutation_roots
+            or action.route_model != record.model
+        ):
+            raise self._workspace_recovery_preflight_failure(
+                "preflight_builder_workspace_recovery_binding_invalid"
+            )
+        try:
+            record.workspace_for_recovery()
+        except ContinuationStoreError as exc:
+            raise self._workspace_recovery_preflight_failure(
+                "preflight_builder_workspace_recovery_binding_invalid"
+            ) from exc
+        return record
+
     def _load_semantic_repair_continuation(
         self,
         *,
@@ -668,13 +911,20 @@ class BuilderLeaf:
         action = self.kernel.runtime.artifacts.get_json(repair_action_ref, RepairAction)
         if action.decision != "local_correction":
             return None
+        # A completed Candidate may be repaired from its immutable output
+        # snapshot in a fresh node-local session.  Absence of a private
+        # continuation is therefore not itself a failure; the seed resolver
+        # below decides whether a durable snapshot is available.  If a
+        # commitment *is* present, however, it remains strict evidence and
+        # must never be silently ignored when corrupt or misbound.
+        if attempt.continuation_commitment is None:
+            return None
         if (
-            attempt.continuation_commitment is None
-            or attempt.parent_attempt_id is None
+            attempt.parent_attempt_id is None
             or self.kernel.runtime.continuations is None
             or self.kernel.runtime.continuation_workspace_root is None
         ):
-            raise self._semantic_repair_preflight_failure("preflight_builder_repair_state_missing")
+            raise self._semantic_repair_preflight_failure("preflight_builder_repair_state_invalid")
         try:
             record = self.kernel.runtime.continuations.load_commitment(
                 attempt.continuation_commitment,
@@ -716,6 +966,99 @@ class BuilderLeaf:
             )
         return record, canonical_json_bytes(brief.prompt_projection())
 
+    def _load_snapshot_repair_seed(
+        self,
+        *,
+        context: WorkExecutionContext,
+        attempt: WorkAttempt,
+        definition: WorkDefinition,
+    ) -> _SnapshotRepairSeed | None:
+        """Bind a fresh Builder repair to one committed Candidate source closure.
+
+        The Scheduler action carries only immutable artifact references.  This
+        leaf verifies the whole relationship before materializing anything:
+        current successor -> exact prior WorkAttempt -> exact output closure
+        -> one Candidate.  It deliberately does not scan history, revive a
+        provider thread, or choose a "latest" candidate.
+        """
+
+        repair_action_ref = context.repair_action_ref
+        if repair_action_ref is None:
+            return None
+        action = self.kernel.runtime.artifacts.get_json(repair_action_ref, RepairAction)
+        if action.decision != "local_correction" or action.repair_seed_attempt_ref is None:
+            return None
+        if attempt.parent_attempt_id is None:
+            raise self._semantic_repair_preflight_failure(
+                "preflight_builder_repair_seed_parent_missing"
+            )
+        input_fingerprint = work_input_fingerprint(attempt.input_refs)
+        if (
+            action.definition_digest != definition.definition_digest
+            or action.input_fingerprint != input_fingerprint
+            or action.immutable_input_refs != attempt.input_refs
+            or action.allowed_mutation_roots != definition.allowed_mutation_roots
+        ):
+            raise self._semantic_repair_preflight_failure(
+                "preflight_builder_repair_seed_binding_invalid"
+            )
+        try:
+            seed_attempt = self.kernel.runtime.artifacts.get_json(
+                action.repair_seed_attempt_ref,
+                WorkAttempt,
+            )
+        except (ArtifactStoreError, ValueError, TypeError) as exc:
+            raise self._semantic_repair_preflight_failure(
+                "preflight_builder_repair_seed_invalid"
+            ) from exc
+        if (
+            seed_attempt.attempt_id != attempt.parent_attempt_id
+            or seed_attempt.work_id != definition.work_id
+            or seed_attempt.coordinate != definition.coordinate
+            or seed_attempt.status != "succeeded"
+            or seed_attempt.definition_digest != definition.definition_digest
+            or seed_attempt.proposal_policy_digest != definition.proposal_policy.content_digest()
+            or seed_attempt.validation_policy_digest
+            != definition.validation_policy.content_digest()
+            or seed_attempt.repair_policy_digest != definition.repair_policy.content_digest()
+            or seed_attempt.input_refs != attempt.input_refs
+            or seed_attempt.output_refs != action.repair_seed_output_refs
+        ):
+            raise self._semantic_repair_preflight_failure(
+                "preflight_builder_repair_seed_binding_invalid"
+            )
+        candidate_refs = tuple(
+            ref
+            for ref in action.repair_seed_output_refs
+            if ref.artifact_type == "build.environment_candidate"
+        )
+        if len(candidate_refs) != 1:
+            raise self._semantic_repair_preflight_failure(
+                "preflight_builder_repair_seed_candidate_missing"
+            )
+        candidate_ref = candidate_refs[0]
+        try:
+            candidate = self.kernel.runtime.artifacts.get_json(candidate_ref, EnvironmentCandidate)
+            self.kernel.runtime.artifacts.require_exact_json(
+                candidate_ref,
+                candidate,
+                artifact_types=("build.environment_candidate",),
+            )
+        except (ArtifactStoreError, ValueError, TypeError) as exc:
+            raise self._semantic_repair_preflight_failure(
+                "preflight_builder_repair_seed_candidate_invalid"
+            ) from exc
+        brief = self.kernel.agent_correction_brief(context, definition=definition)
+        if brief is None:
+            raise self._semantic_repair_preflight_failure(
+                "preflight_builder_repair_feedback_missing"
+            )
+        return _SnapshotRepairSeed(
+            candidate_ref=candidate_ref,
+            candidate=candidate,
+            correction_feedback=canonical_json_bytes(brief.prompt_projection()),
+        )
+
     @staticmethod
     def _continuation_preflight_failure(code: str) -> LeafExecutionFailure:
         return LeafExecutionFailure(
@@ -728,12 +1071,23 @@ class BuilderLeaf:
         )
 
     @staticmethod
+    def _workspace_recovery_preflight_failure(code: str) -> LeafExecutionFailure:
+        return LeafExecutionFailure(
+            code=code,
+            category=(
+                "CandidateBuild private workspace recovery is unavailable or does not bind "
+                "this authorized fresh-session infrastructure retry"
+            ),
+            retryable=False,
+        )
+
+    @staticmethod
     def _semantic_repair_preflight_failure(code: str) -> LeafExecutionFailure:
         return LeafExecutionFailure(
             code=code,
             category=(
-                "CandidateBuild semantic repair private state or safe feedback is unavailable "
-                "for this authorized physical attempt"
+                "CandidateBuild semantic repair lacks a verified private continuation, "
+                "committed snapshot seed, or safe feedback for this authorized physical attempt"
             ),
             retryable=False,
         )
@@ -874,6 +1228,92 @@ class BuilderLeaf:
             output_schema_digest=provenance.output_schema_digest,
         )
 
+    @classmethod
+    def _workspace_recovery_from_error(
+        cls,
+        *,
+        code: str,
+        state: BuilderSessionState | None,
+        provenance: AgentExecutionProvenance | None,
+        definition: WorkDefinition,
+    ) -> LeafWorkspaceRecovery | None:
+        """Offer one untrusted draft only after closed transient file activity.
+
+        A `BuilderError` without a complete CandidateCompletion cannot itself
+        become a candidate.  This merely records that a fresh same-model
+        session may inspect the isolated draft under the existing retry action.
+        Any semantic or filesystem acceptance still happens later in
+        `EnvironmentBuilder._validate_and_commit`.
+        """
+
+        normalized = code.removeprefix("agent_backend_").removeprefix("verifier_backend_")
+        if (
+            normalized
+            not in {
+                "turn_failed_provider_unavailable",
+                "direct_provider_unavailable",
+                "direct_provider_timeout",
+                "transport_failed",
+            }
+            or state is None
+            or provenance is None
+            or definition.repair_policy.maximum_infrastructure_retries < 1
+            or provenance.model != state.profile.model
+            or provenance.profile_digest != f"sha256:{state.profile.profile_hash}"
+            or provenance.output_schema_digest != cls._candidate_schema_digest()
+            or not cls._has_regular_candidate_draft(state.workspace)
+        ):
+            return None
+        return LeafWorkspaceRecovery(
+            workspace=state.workspace.resolve(),
+            lineage_id=state.lineage_id,
+            profile_digest=provenance.profile_digest,
+            codex_config_digest=f"sha256:{state.profile.codex_config_sha256}",
+            model=provenance.model,
+            output_schema_digest=provenance.output_schema_digest,
+        )
+
+    @staticmethod
+    def _has_regular_candidate_draft(workspace: Path) -> bool:
+        """Return whether the private candidate root has safe normal file activity.
+
+        This is deliberately an eligibility observation, not a partial
+        Candidate validator.  It rejects links and special files so the
+        control plane never binds an unsafe draft; the complete final-tree
+        validator still owns all acceptance decisions after the fresh Agent
+        returns a CandidateCompletion.
+        """
+
+        try:
+            root = workspace.resolve(strict=True)
+            if workspace.is_symlink():
+                return False
+            candidate_root = root / "candidate"
+            if candidate_root.is_symlink() or not candidate_root.is_dir():
+                return False
+            for _directory, directory_names, file_names, directory_fd in os.fwalk(
+                candidate_root,
+                topdown=True,
+                follow_symlinks=False,
+            ):
+                for name in directory_names:
+                    observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+                        return False
+                for name in file_names:
+                    observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if (
+                        stat.S_ISLNK(observed.st_mode)
+                        or not stat.S_ISREG(observed.st_mode)
+                        or observed.st_nlink != 1
+                    ):
+                        return False
+                    if observed.st_size > 0:
+                        return True
+        except OSError:
+            return False
+        return False
+
     @staticmethod
     def _budget(definition: WorkDefinition) -> Budget:
         policy = definition.proposal_policy.budget
@@ -987,6 +1427,11 @@ class BuilderLeaf:
             return "a capability profile that authorizes the declared Builder operation"
         if stage == "workspace":
             return "one fresh empty Builder workspace for this attempt"
+        if stage == "implementation_contract":
+            return (
+                "a current framework-owned ImplementationContract compiled by "
+                "BuildImplementationPlan from the exact frozen EnvironmentDesign"
+            )
         return "a corrected Builder preflight configuration outside this attempt"
 
     @classmethod

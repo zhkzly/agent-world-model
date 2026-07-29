@@ -31,11 +31,18 @@ def render_scene(scene: RunSceneIndex, coordinates: tuple[CoordinateScene, ...])
         if stuck.top_issues:
             lines.append(_why_line(stuck, stuck.top_issues[0]))
         _append_timing(lines, stuck)
-        if stuck.repair_target == "generated_candidate_code" and stuck.candidate_file is not None:
-            lines.append(
-                "Repair target: generated Candidate code. "
-                "WorldSpec and the gate are frozen; do not change either (DRIFT)."
-            )
+        if stuck.repair_target == "generated_candidate_code":
+            if stuck.candidate_file is not None:
+                lines.append(
+                    "Repair target: generated Candidate code. "
+                    "WorldSpec and the gate are frozen; do not change either (DRIFT)."
+                )
+            else:
+                lines.append(
+                    "Repair target: the authorized generated Candidate source closure. "
+                    "Several files may need one coherent repair; WorldSpec and the gate are "
+                    "frozen (DRIFT)."
+                )
         elif stuck.repair_target == "proposal_semantics":
             lines.append(
                 "Repair target: the rejected proposal this coordinate just produced. "
@@ -84,11 +91,17 @@ def render_coordinate(scene: CoordinateScene) -> str:
         lines.append(f"Failure code: {_text(scene.failure_code)}")
     if scene.candidate_file is not None:
         lines.append(f"Candidate file: {_text(scene.candidate_file)}")
-    if scene.repair_target == "generated_candidate_code" and scene.candidate_file is not None:
-        lines.append(
-            f"Why: {_text(scene.candidate_file)} is the repair subject; "
-            "the frozen WorldSpec and gate are not editable (DRIFT)."
-        )
+    if scene.repair_target == "generated_candidate_code":
+        if scene.candidate_file is not None:
+            lines.append(
+                f"Why: {_text(scene.candidate_file)} is the repair subject; "
+                "the frozen WorldSpec and gate are not editable (DRIFT)."
+            )
+        else:
+            lines.append(
+                "Why: this Scheduler-authorized correction spans generated Candidate source; "
+                "inspect the listed safe issues, not the frozen WorldSpec or gate (DRIFT)."
+            )
     elif scene.repair_target == "proposal_semantics":
         lines.append("Repair target: proposal_semantics")
         lines.append(
@@ -152,9 +165,7 @@ def _append_timing(lines: list[str], scene: CoordinateScene) -> None:
         lines.append(f"Last completed phase: {scene.last_completed_phase}")
     budget_exhaustion = scene.budget_exhaustion
     if budget_exhaustion is not None:
-        details = [
-            "Budget exhaustion: " + ", ".join(budget_exhaustion.exhausted_dimensions)
-        ]
+        details = ["Budget exhaustion: " + ", ".join(budget_exhaustion.exhausted_dimensions)]
         if budget_exhaustion.during_authorized_repair:
             details.append("before a Scheduler-authorized repair")
         if budget_exhaustion.operation_not_started:
@@ -173,10 +184,7 @@ def _append_timing(lines: list[str], scene: CoordinateScene) -> None:
         if runtime_agent.last_progress_elapsed_ms is not None:
             details.append(f"last progress +{runtime_agent.last_progress_elapsed_ms} ms")
         if runtime_agent.last_local_heartbeat_elapsed_ms is not None:
-            heartbeat = (
-                "local heartbeat "
-                f"+{runtime_agent.last_local_heartbeat_elapsed_ms} ms"
-            )
+            heartbeat = f"local heartbeat +{runtime_agent.last_local_heartbeat_elapsed_ms} ms"
             if runtime_agent.last_local_heartbeat_phase is not None:
                 heartbeat += f" phase={runtime_agent.last_local_heartbeat_phase}"
             details.append(heartbeat + " (not Provider progress)")
@@ -210,6 +218,8 @@ def _append_timing(lines: list[str], scene: CoordinateScene) -> None:
             f"observed +{workspace.observed_elapsed_ms} ms; files={workspace.file_count}; "
             f"bytes={workspace.total_bytes}"
         )
+        if workspace.last_changed_elapsed_ms is not None:
+            heartbeat += f"; last file change +{workspace.last_changed_elapsed_ms} ms"
         if workspace.error_code is not None:
             heartbeat += f"; error={_text(workspace.error_code)}"
         lines.append(heartbeat)

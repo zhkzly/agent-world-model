@@ -120,6 +120,11 @@ class SharedToolSemanticsLeaf:
                 definition=definition,
                 attempt=attempt,
                 dispatch_id=dispatch_id,
+                ownership=self.kernel.invocation_ownership(
+                    definition=definition,
+                    attempt=attempt,
+                    dispatch_id=dispatch_id,
+                ),
                 lineage_id=(
                     f"{inputs.job.job_id}.shared-tool-semantics.{group_id}.{attempt.ordinal}"
                 ),
@@ -138,6 +143,11 @@ class SharedToolSemanticsLeaf:
                 correction_brief=self.kernel.agent_correction_brief(
                     context,
                     definition=definition,
+                ),
+                semantic_repair_seed=self.kernel.agent_semantic_repair_seed(
+                    context,
+                    definition=definition,
+                    attempt=attempt,
                 ),
             )
             contract = compile_shared_tool_semantics(
@@ -231,6 +241,11 @@ class ToolSemanticsBatchLeaf:
                 definition=definition,
                 attempt=attempt,
                 dispatch_id=dispatch_id,
+                ownership=self.kernel.invocation_ownership(
+                    definition=definition,
+                    attempt=attempt,
+                    dispatch_id=dispatch_id,
+                ),
                 lineage_id=(
                     f"{inputs.job.job_id}.tool-semantics."
                     f"{definition.coordinate.shard_id}.{attempt.ordinal}"
@@ -256,6 +271,11 @@ class ToolSemanticsBatchLeaf:
                 correction_brief=self.kernel.agent_correction_brief(
                     context,
                     definition=definition,
+                ),
+                semantic_repair_seed=self.kernel.agent_semantic_repair_seed(
+                    context,
+                    definition=definition,
+                    attempt=attempt,
                 ),
                 # A measured compatible gateway rejects the generated recursive
                 # RuleDraft schema when it is copied into the prompt.  Supply
@@ -358,6 +378,11 @@ class WorldRulesLeaf:
                 definition=definition,
                 attempt=attempt,
                 dispatch_id=dispatch_id,
+                ownership=self.kernel.invocation_ownership(
+                    definition=definition,
+                    attempt=attempt,
+                    dispatch_id=dispatch_id,
+                ),
                 lineage_id=f"{inputs.job.job_id}.world-rules.{attempt.ordinal}",
                 workspace=self.workspace_root / "world-rules" / attempt.attempt_id,
                 model=WorldRuleSemanticsSourceDraft,
@@ -367,6 +392,11 @@ class WorldRulesLeaf:
                 correction_brief=self.kernel.agent_correction_brief(
                     context,
                     definition=definition,
+                ),
+                semantic_repair_seed=self.kernel.agent_semantic_repair_seed(
+                    context,
+                    definition=definition,
+                    attempt=attempt,
                 ),
             )
             compiled = compile_world_rules(
@@ -452,6 +482,11 @@ class CurriculumPlanLeaf:
                 definition=definition,
                 attempt=attempt,
                 dispatch_id=dispatch_id,
+                ownership=self.kernel.invocation_ownership(
+                    definition=definition,
+                    attempt=attempt,
+                    dispatch_id=dispatch_id,
+                ),
                 lineage_id=f"{inputs.job.job_id}.curriculum-plan.{attempt.ordinal}",
                 workspace=self.workspace_root / "curriculum-plan" / attempt.attempt_id,
                 model=CurriculumPlanSourceDraft,
@@ -461,6 +496,11 @@ class CurriculumPlanLeaf:
                 correction_brief=self.kernel.agent_correction_brief(
                     context,
                     definition=definition,
+                ),
+                semantic_repair_seed=self.kernel.agent_semantic_repair_seed(
+                    context,
+                    definition=definition,
+                    attempt=attempt,
                 ),
             )
             compiled = compile_curriculum_plan_semantics(
@@ -552,6 +592,11 @@ class TaskRequirementLeaf:
                 definition=definition,
                 attempt=attempt,
                 dispatch_id=dispatch_id,
+                ownership=self.kernel.invocation_ownership(
+                    definition=definition,
+                    attempt=attempt,
+                    dispatch_id=dispatch_id,
+                ),
                 lineage_id=(f"{inputs.job.job_id}.task-requirement.{task_type}.{attempt.ordinal}"),
                 workspace=(
                     self.workspace_root / "task-requirement" / task_type / attempt.attempt_id
@@ -569,6 +614,11 @@ class TaskRequirementLeaf:
                 correction_brief=self.kernel.agent_correction_brief(
                     context,
                     definition=definition,
+                ),
+                semantic_repair_seed=self.kernel.agent_semantic_repair_seed(
+                    context,
+                    definition=definition,
+                    attempt=attempt,
                 ),
             )
             compiled = compile_task_requirement_semantics(
@@ -729,6 +779,11 @@ class TaskCurriculumLeaf:
                 definition=definition,
                 attempt=attempt,
                 dispatch_id=dispatch_id,
+                ownership=self.kernel.invocation_ownership(
+                    definition=definition,
+                    attempt=attempt,
+                    dispatch_id=dispatch_id,
+                ),
                 lineage_id=f"{inputs.job.job_id}.task-curriculum.{attempt.ordinal}",
                 workspace=self.workspace_root / "task-curriculum" / attempt.attempt_id,
                 model=TrainingSemanticSourceDraft,
@@ -738,6 +793,11 @@ class TaskCurriculumLeaf:
                 correction_brief=self.kernel.agent_correction_brief(
                     context,
                     definition=definition,
+                ),
+                semantic_repair_seed=self.kernel.agent_semantic_repair_seed(
+                    context,
+                    definition=definition,
+                    attempt=attempt,
                 ),
             )
             # Compile during validation and again here by design: both calls are
@@ -1152,19 +1212,26 @@ def _tool_batch_prompt(
             "a `tool_semantics` field or any other object. Preserve the exact target tool order. "
             "Define only typed conditions, state transition, "
             "error behavior, permission/observation and reliability. Do not add tools, tasks, "
-            "runtime code, fixtures, answers or release decisions. Rule identifiers are framework "
-            "owned: omit rule_id whenever the output schema permits it; code derives the stable "
-            "tool/section/ordinal namespace. For every Rule value use only bound_reference, "
+            "runtime code, fixtures, answers or release decisions. Rule identifiers and families "
+            "are framework owned: omit rule_id and family; code derives the stable "
+            "tool/section/ordinal namespace and the family from each closed containing section. "
+            "For every Rule value use only bound_reference, "
             "bound_lookup_by_reference, or bound_lookup_by_constant and select each binding id "
             "from this tool's rule_context_catalog. "
             "Those binding_id values are compact frozen aliases; never invent one or substitute "
             "a long digest from another context. "
-            "Never emit raw source, pointer, value_type, collection_pointer, key_field, or "
-            "value_pointer fields: framework code expands the selected binding against the frozen "
-            "WorldSpec. A reference-key lookup selects one composite alias from "
+            "Never emit raw source, pointer, binding value_type, collection_pointer, key_field, "
+            "or value_pointer fields: framework code expands the selected binding against the "
+            "frozen WorldSpec. key_value_type is the required exception only for a constant-key "
+            "lookup. A reference-key lookup selects one composite alias from "
             "lookup_reference_binding_groups; it never combines a lookup alias with a separate "
             "key alias. A constant-key lookup selects one lookup alias and uses key_value_type "
-            "plus key_value. Neither form contains a nested key object or key_binding_id. This "
+            "plus key_value. First find that alias in exactly one lookup_binding_groups entry: "
+            "copy the enclosing group's key_value_type exactly, and make key_value a JSON value "
+            "of that type. The selected value_bindings entry's value_type is the value returned "
+            "by the lookup, never the lookup-key type; do not use it or a sentinel literal as a "
+            "stand-in for the retrieved value. Neither form contains a nested key object or "
+            "key_binding_id. This "
             "prevents "
             "fake '/bookings/status' paths, fixed array indexes, and mismatched collection/key/"
             "field combinations. Every ordered clause declares a compatible ordering. "

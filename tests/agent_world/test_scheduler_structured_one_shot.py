@@ -13,7 +13,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
@@ -35,6 +35,7 @@ from agent_world.contracts import (
 )
 from agent_world.control import (
     GenerationWorkGraph,
+    LeafProposal,
     LeaseBudgetLedger,
     SchedulerLeafExecutor,
     ValidationReport,
@@ -158,6 +159,24 @@ class _StaticOutputBackend(_MalformedOutputBackend):
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
         result = await super().invoke(request)
         return replace(result, structured_output=self.output)
+
+
+class _SequenceOutputBackend(_MalformedOutputBackend):
+    """Return each parsed candidate through the normal Direct boundary once."""
+
+    def __init__(self, outputs: list[dict[str, JsonValue]]) -> None:
+        super().__init__()
+        self._outputs = list(outputs)
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        if not self._outputs:
+            raise AssertionError("test backend received an unexpected extra model invocation")
+        result = await super().invoke(request)
+        return replace(
+            result,
+            turn_id=f"turn:sequence:{len(self.requests)}",
+            structured_output=self._outputs.pop(0),
+        )
 
 
 class _HangingOutputBackend(_MalformedOutputBackend):
@@ -492,6 +511,62 @@ async def test_structured_read_uses_one_real_agentic_turn(tmp_path: Path) -> Non
     assert backend.requests[0].profile.allowed_builtin_tools == ("shell",)
 
 
+@pytest.mark.asyncio
+async def test_one_shot_resolves_the_durable_fallback_route_for_its_physical_turn(
+    tmp_path: Path,
+) -> None:
+    """A Scheduler-authorized fallback reaches the actual backend profile.
+
+    The preceding Scheduler/RepairLedger boundary proves that a fallback
+    ``WorkAttempt`` is durably authorized.  This narrower boundary proves the
+    next necessary link: the persisted selected route, rather than the ambient
+    primary model, is what reaches ``InvocationBackend`` for that new physical
+    proposal.
+    """
+
+    definition = _definition()
+    attempt = WorkAttempt.model_validate(
+        {
+            **_attempt(definition).model_dump(mode="python"),
+            "attempt_id": "attempt:one-shot:fallback",
+            "ordinal": 2,
+            "repair_action_ref": _repair_action_ref(),
+            "repair_attempt_charge": 1,
+            "model_override": "gpt-5.3-codex-spark",
+        }
+    )
+    backend = _SemanticOutputBackend()
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="grok-4.5",
+            fallback_models=("gpt-5.3-codex-spark", "gpt-5.4-mini"),
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+
+    result = await invoke_structured_once(
+        backend=backend,
+        profiles=profiles,
+        definition=definition,
+        attempt=attempt,
+        dispatch_id="dispatch:one-shot:fallback",
+        lineage_id="lineage:one-shot:fallback",
+        workspace=tmp_path / "fallback",
+        model=_StrictOneShotOutput,
+        prompt="Produce the requested title object.",
+        permissions=PermissionScope(),
+    )
+
+    assert result.output.title == "Hotel booking"
+    assert len(backend.requests) == 1
+    assert backend.requests[0].profile.model == "gpt-5.3-codex-spark"
+    assert backend.requests[0].metadata["repair_mode"] == "authorized_repair"
+
+
 def test_missing_pydantic_field_has_an_explicit_safe_repair_condition() -> None:
     """A correction brief can distinguish an omitted field from an opaque schema failure."""
 
@@ -516,6 +591,40 @@ def test_missing_pydantic_field_has_an_explicit_safe_repair_condition() -> None:
         "the named required field with a value satisfying its closed output schema"
     )
     assert issue.actionable_for_agent is True
+
+
+def test_pydantic_v2_schema_version_feedback_is_safe_and_actionable() -> None:
+    """A common input/output-version mix-up must be repairable without echoing model text."""
+
+    class VersionProbe(BaseModel):
+        model_config = ConfigDict(strict=True)
+
+        schema_version: Literal["v2"] = "v2"
+
+    with pytest.raises(ValidationError) as captured:
+        VersionProbe.model_validate({"schema_version": "agent-world.challenger-context.v4"})
+
+    diagnostic = pydantic_validation_diagnostic(
+        captured.value,
+        owner_component="verifier",
+        validation_phase="intent_schema",
+        frontier_ordinal=10,
+    )
+
+    issue = diagnostic.issues[0]
+    assert issue.code == "schema_literal_error"
+    assert issue.location == ("schema_version",)
+    assert issue.message == (
+        "Use the literal schema_version `v2`; never copy a version label from an input or "
+        "context document."
+    )
+    assert issue.violated_condition == "closed schema literal schema_version=v2"
+    assert issue.expected_category == "the literal string `v2`"
+    assert issue.remediation == (
+        "Set schema_version to exactly `v2`; do not copy a version label from an input or "
+        "context document."
+    )
+    assert "agent-world.challenger-context.v4" not in diagnostic.feedback
 
 
 def test_pydantic_shape_feedback_discloses_safe_kind_and_length_not_raw_input() -> None:
@@ -1092,6 +1201,167 @@ async def test_bc44_provider_rejection_cannot_authorize_a_scheduler_retry(
     assert report.status == "error"
     assert report.infrastructure_retryable is False
     assert report.issues[0].code == "agent_backend_turn_failed_provider_rejected"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_passes_a_parsed_direct_candidate_only_to_its_authorized_repair(
+    tmp_path: Path,
+) -> None:
+    """A stateless repair gets data plus feedback, never a fake Provider session.
+
+    This crosses the real Scheduler -> leaf -> structured invocation boundary
+    twice.  The first Direct response is shape-valid but semantically rejected;
+    the second physical Direct request must carry only the parsed prior object
+    and the safe correction brief that the Scheduler authorized in between.
+    """
+
+    definition = structured_agent_work_definition(
+        scope_id="job:direct-semantic-repair-seed",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One stateless Researcher response satisfies the repairable plan contract.",
+        timing_reason="A correction needs the rejected parsed plan and its exact finding.",
+        output_contract_id="contract:research-plan",
+        agent_role="researcher",
+        allowed_mutation_roots=("/",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=0,
+        maximum_model_fallbacks=0,
+        maximum_total_repair_attempts=1,
+    )
+    graph = GenerationWorkGraph.compile((definition,), mode="diagnostic")
+    artifacts = ArtifactStore(tmp_path / "artifacts").issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.", "design."),
+    )
+    context_ref = artifacts.put_json(
+        artifact_id="context:direct-semantic-repair-seed",
+        artifact_type="control.generation_context",
+        value={"case": "stateless semantic repair seed"},
+    )
+    manifest = graph.manifest(
+        topology_id="topology:direct-semantic-repair-seed",
+        external_root_refs=(context_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(context_ref,),
+    )
+    heads = WorkControlStore(tmp_path / "work-control")
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(
+            Budget(
+                llm_tokens=2_000,
+                agent_turns=2,
+                repair_attempts=1,
+                wall_seconds=300,
+            )
+        ),
+    )
+    scheduler = WorkScheduler(
+        graph=graph,
+        manifest=manifest,
+        manifest_ref=manifest_ref,
+        heads=heads,
+        artifacts=artifacts,
+        runtime=runtime,
+    )
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+    backend = _SequenceOutputBackend(
+        [{"title": "prior-invalid-title"}, {"title": "repaired-title"}]
+    )
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+    received_seeds = []
+
+    def semantic_validator(value: _StrictOneShotOutput) -> None:
+        if value.title == "prior-invalid-title":
+            raise StructuredSemanticError(
+                (
+                    StructuredSemanticIssue(
+                        code="research_plan_title_requires_repair",
+                        location=("title",),
+                        message="The title must name the repaired research plan.",
+                        violated_condition="the title still names the rejected plan",
+                        expected_category="a title for the repaired research plan",
+                    ),
+                )
+            )
+
+    async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        seed = kernel.agent_semantic_repair_seed(
+            context,
+            definition=definition,
+            attempt=attempt,
+        )
+        received_seeds.append(seed)
+        turn = await invoke_structured_once(
+            backend=backend,
+            profiles=profiles,
+            definition=definition,
+            attempt=attempt,
+            dispatch_id=dispatch_id,
+            lineage_id="lineage:direct-semantic-repair-seed",
+            workspace=tmp_path / "direct-semantic-repair" / attempt.attempt_id,
+            model=_StrictOneShotOutput,
+            prompt="Produce one research plan title.",
+            permissions=PermissionScope(),
+            semantic_validator=semantic_validator,
+            correction_brief=kernel.agent_correction_brief(context, definition=definition),
+            semantic_repair_seed=seed,
+        )
+        output_ref = artifacts.put_json(
+            artifact_id=f"research-plan:{attempt.ordinal}",
+            artifact_type="design.research_plan",
+            value=turn.output,
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            observed_actual=turn.observed_actual,
+            unknown_upper_bound=turn.unknown_upper_bound,
+            agent=turn.agent,
+        )
+
+    async def execute(context) -> None:
+        await kernel.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == ["repair_ready", "committed"]
+    assert len(backend.requests) == 2
+    assert received_seeds[0] is None
+    assert received_seeds[1] is not None
+    assert received_seeds[1].previous_candidate == {"title": "prior-invalid-title"}
+    assert backend.requests[0].session is None
+    assert backend.requests[1].session is None
+    assert "<prior_candidate_json>" not in backend.requests[0].prompt
+    prior_candidate_marker = '<prior_candidate_json>\n{"title":"prior-invalid-title"}'
+    assert prior_candidate_marker in backend.requests[1].prompt
+    assert "the title still names the rejected plan" in backend.requests[1].prompt
+    assert "repair_action_ref" not in backend.requests[1].prompt
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "committed"
+    assert runtime.repairs.entries[0].outcome == "resolved"
 
 
 @pytest.mark.asyncio

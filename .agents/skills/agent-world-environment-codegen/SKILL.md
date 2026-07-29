@@ -53,8 +53,12 @@ host paths, or generated release/Judge claims.
 Implement `agent-world.runtime.v2` exactly from `implementation-contract.json`. Implement every
 WorldSpec tool and code-owned transition for unseen uint64 seeds. Bind the reset actor for the
 episode; project reset/invoke observations to the declared actor visibility; keep snapshot as the
-full Judge-only state. Do not accept task ids, expected answers, evaluator goals, verifier IR,
-oracle data, sealed data, or release metadata.
+full Judge-only state. Do not accept framework-private task-instance identity, expected answers,
+evaluator goals, verifier IR, oracle data, sealed data, or release metadata. A WorldSpec-defined
+domain identifier such as a tool `task_id` argument remains valid and must be implemented exactly.
+For the Runtime handshake, return `operations` as exactly the JSON string array
+`["handshake","reset","invoke","snapshot","close"]` in that order, never as operation
+objects or metadata; make a standalone public Runtime test assert that shape.
 
 Expose exactly:
 

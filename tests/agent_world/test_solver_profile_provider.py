@@ -19,10 +19,12 @@ from agent_world.judge.reachability import InteractiveSolveDecision, SolverProfi
 def _provider(
     *,
     structured_output_transport: str = "provider_schema",
+    fallback_models: tuple[str, ...] = (),
 ) -> IsolatedAgentProfileProvider:
     return IsolatedAgentProfileProvider(
         AgentBackendConfig(
             model="configured-real-model",
+            fallback_models=fallback_models,
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
             structured_output_transport=structured_output_transport,  # type: ignore[arg-type]
         ),
@@ -150,6 +152,41 @@ def test_solver_profile_is_fresh_source_blind_and_capability_empty(tmp_path: Pat
     assert "rollout_budget.reminder_interval_tokens" not in config_text
     verify_resolved_profile(first)
     verify_resolved_profile(second)
+
+
+def test_solver_profile_model_override_is_explicit_and_profile_hashed(tmp_path: Path) -> None:
+    provider = _provider(fallback_models=("grok-4.5", "gpt-5.3-codex-spark"))
+
+    primary = provider.resolve_solver(
+        lineage_id="judge-run:primary",
+        workspace=tmp_path / "primary",
+        output_schema=_solver_schema(),
+        rollout_token_limit=4_096,
+    )
+    fallback = provider.resolve_solver(
+        lineage_id="judge-run:fallback",
+        workspace=tmp_path / "fallback",
+        output_schema=_solver_schema(),
+        rollout_token_limit=4_096,
+        model_override="grok-4.5",
+    )
+
+    assert provider.model_routes == (
+        "configured-real-model",
+        "grok-4.5",
+        "gpt-5.3-codex-spark",
+    )
+    assert primary.model == "configured-real-model"
+    assert fallback.model == "grok-4.5"
+    assert fallback.profile_hash != primary.profile_hash
+    with pytest.raises(ValueError, match="explicitly configured fallback route"):
+        provider.resolve_solver(
+            lineage_id="judge-run:undeclared",
+            workspace=tmp_path / "undeclared",
+            output_schema=_solver_schema(),
+            rollout_token_limit=4_096,
+            model_override="undeclared-model",
+        )
 
 
 @pytest.mark.parametrize("token_limit", [0, -1, True, 1.5])

@@ -14,34 +14,78 @@ import json
 import os
 import tempfile
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Literal, TypedDict, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agent_world.agent_profiles import IsolatedAgentProfileProvider
 from agent_world.builder.models import CandidateCompletion
 from agent_world.config import FoundryConfig
-from agent_world.contracts import PermissionScope
+from agent_world.contracts import PermissionScope, canonical_json_bytes
 from agent_world.control import TelemetryStore
 
 from .capabilities import NodeCapabilityRequirement
 from .codex_sdk import CodexSdkBackend
 from .contracts import (
+    DiagnosticCommandExpectation,
+    InvocationBackend,
     InvocationExecutionMode,
+    InvocationOwnerKind,
+    InvocationOwnership,
     InvocationRequest,
     InvocationResult,
     ResolvedAgentProfile,
 )
+from .control_plane import InvocationControlPlane
+from .control_store import InvocationControlStore
 from .direct_llm import DirectLlmBackend
+from .redaction import (
+    Redactor,
+    redacted_command_diagnostic_excerpt,
+    redacted_terminal_diagnostic_excerpt,
+)
 from .routing import RoutedInvocationBackend
 from .structured_diagnostics import safe_terminal_details
 
-type AuditStatus = Literal["running", "passed", "failed"]
+type AuditStatus = Literal["running", "passed", "failed", "interrupted"]
 type AuditBackend = Literal["direct_llm", "codex_sdk"]
 type AuditOutputContract = Literal["status", "candidate_completion_blocked"]
+type AuditStructuredOutputKind = Literal[
+    "not_evaluated",
+    "exact_match",
+    "missing",
+    "non_object",
+    "status_mismatch",
+    "candidate_completion_invalid",
+    "candidate_completion_unexpected_completed",
+    "candidate_completion_blocking_reason_mismatch",
+]
+type AuditStructuredOutputIssueCode = Literal[
+    "completion_blocking_reason_missing",
+    "completion_blocked_claims_outputs",
+    "completion_completed_has_blocker",
+    "completion_missing_declarations",
+    "completion_public_tests_missing",
+    "completion_files_missing",
+    "completion_file_declarations_duplicate",
+    "completion_required_role_missing",
+    "completion_public_test_role_invalid",
+    "schema_value",
+]
+type AuditStructuredOutputValidationCategory = Literal[
+    "candidate_rule",
+    "missing_required_field",
+    "unexpected_field",
+    "literal_mismatch",
+    "container_shape_mismatch",
+    "scalar_type_mismatch",
+    "value_constraint",
+    "other_schema_validation",
+]
 
 
 class _SafeProfileDetails(TypedDict):
@@ -63,7 +107,49 @@ _CANDIDATE_COMPLETION_BLOCKED_VALUE: dict[str, object] = {
 }
 _STATUS_FILENAME = "invocation-audit.json"
 _RUN_RECORDS_DIRECTORY = "invocation-audit-runs"
+_DEBUG_DIRECTORY = "invocation-audit-debug"
 _RUN_ID_PREFIX = "invocation-audit:"
+_CANDIDATE_COMPLETION_SAFE_ISSUE_CODES = frozenset(
+    {
+        "completion_blocking_reason_missing",
+        "completion_blocked_claims_outputs",
+        "completion_completed_has_blocker",
+        "completion_missing_declarations",
+        "completion_public_tests_missing",
+        "completion_files_missing",
+        "completion_file_declarations_duplicate",
+        "completion_required_role_missing",
+        "completion_public_test_role_invalid",
+    }
+)
+_WORKSPACE_TOOLCHAIN_EXPECTATIONS: tuple[DiagnosticCommandExpectation, ...] = (
+    # This is deliberately an observation, not an additional Candidate or
+    # runtime contract. It separates a missing/wrong workspace view from a
+    # visible executable whose ELF runtime cannot start in bwrap.
+    DiagnosticCommandExpectation(
+        label="workspace_toolchain_visible",
+        command_fragment=(
+            "test -x ./.agent-world-tools/uv && test -x ./.agent-world-tools/python3.12"
+        ),
+    ),
+    DiagnosticCommandExpectation(
+        label="uv_version",
+        command_fragment="./.agent-world-tools/uv --version",
+    ),
+    DiagnosticCommandExpectation(
+        label="python312_version",
+        command_fragment="./.agent-world-tools/python3.12 --version",
+    ),
+)
+_WORKSPACE_TOOLCHAIN_EXECUTION_LABELS = ("uv_version", "python312_version")
+type AuditCommandProofState = Literal[
+    "unobserved",
+    "unknown",
+    "not_found",
+    "not_executable",
+    "failed",
+    "succeeded",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +161,16 @@ class _AuditLane:
     execution_mode: InvocationExecutionMode
     expected_backend: AuditBackend
     workspace_write: bool = False
+    # A workspace-write marker alone proves neither that the isolated build
+    # toolchain is executable nor that the runtime Agent used the stable
+    # workspace-relative entrypoints.  Keep this audit-only proof explicit so
+    # a future CandidateBuild stall has one narrow, truthful prerequisite.
+    workspace_toolchain: bool = False
     require_session_resume: bool = False
     output_contract: AuditOutputContract = "status"
+    # A terminal excerpt is an opt-in local diagnostic aid only. It is never
+    # normal Agent feedback, an Artifact field, or part of the compact report.
+    diagnostic_terminal_excerpt: bool = False
 
 
 _AUDIT_LANES: tuple[_AuditLane, ...] = (
@@ -133,6 +227,18 @@ _AUDIT_LANES: tuple[_AuditLane, ...] = (
         require_session_resume=True,
     ),
     _AuditLane(
+        # This is deliberately separate from workspace-write proof: a failed
+        # file redirect must not be mistaken for an unavailable tool facade.
+        lane_id="codex_engineer_workspace_toolchain",
+        node_id="environment-engineer.runtime-build",
+        role="environment-engineer",
+        capability="isolated_build",
+        execution_mode=InvocationExecutionMode.AGENTIC,
+        expected_backend="codex_sdk",
+        workspace_toolchain=True,
+        require_session_resume=True,
+    ),
+    _AuditLane(
         lane_id="codex_engineer_candidate_completion",
         node_id="environment-engineer.runtime-build",
         role="environment-engineer",
@@ -141,6 +247,7 @@ _AUDIT_LANES: tuple[_AuditLane, ...] = (
         expected_backend="codex_sdk",
         workspace_write=True,
         output_contract="candidate_completion_blocked",
+        diagnostic_terminal_excerpt=True,
     ),
     _AuditLane(
         lane_id="codex_challenger_solver",
@@ -186,6 +293,39 @@ class InvocationAuditLaneResult(BaseModel):
     provider_event_count: int | None = None
     activity_event_counts: dict[str, int] = Field(default_factory=dict)
     workspace_write_verified: bool | None = None
+    workspace_toolchain_verified: bool | None = None
+    workspace_toolchain_command_proofs: dict[str, AuditCommandProofState] = Field(
+        default_factory=dict
+    )
+    # This exists only in the diagnostic audit report/run record. Normal
+    # telemetry strips it before persistence; it is a bounded, re-scrubbed
+    # shell failure clue rather than model feedback or an Artifact field.
+    workspace_toolchain_command_diagnostics: dict[str, str] = Field(default_factory=dict)
+    # A local, explicitly opted-in terminal excerpt may be available at this
+    # path. The ordinary report retains only the path and closed terminal
+    # facts; the text itself remains in a bounded, re-scrubbed sidecar.
+    diagnostic_terminal_feedback_path: str | None = None
+    # A closed, text-free explanation of why the audit response did not match
+    # its own requested output.  This lets a project-execution Agent distinguish
+    # Prompt/Skill, transport/parser, and feedback hypotheses without retaining
+    # an arbitrary model response in the durable audit record.
+    structured_output_observations: tuple[InvocationAuditStructuredOutputObservation, ...] = ()
+
+
+class InvocationAuditStructuredOutputObservation(BaseModel):
+    """One redaction-safe structured-output check for an audit physical turn."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: AuditStructuredOutputKind
+    validation_issue_codes: tuple[AuditStructuredOutputIssueCode, ...] = Field(
+        default_factory=tuple,
+        max_length=3,
+    )
+    validation_issue_categories: tuple[AuditStructuredOutputValidationCategory, ...] = Field(
+        default_factory=tuple,
+        max_length=3,
+    )
 
 
 class InvocationAuditPhysicalTurn(BaseModel):
@@ -258,10 +398,17 @@ async def run_invocation_audit(
     telemetry = TelemetryStore(state_root / "telemetry")
     try:
         provider = IsolatedAgentProfileProvider(audit_config.agent)
-        backend = RoutedInvocationBackend(
+        routed_backend = RoutedInvocationBackend(
             codex_backend=CodexSdkBackend(telemetry=telemetry),
             direct_backend=DirectLlmBackend(telemetry=telemetry),
             max_concurrent_invocations=audit_config.agent.max_concurrent_invocations,
+        )
+        control_store = InvocationControlStore(state_root / "invocation-control")
+        control_store.reconcile_owner_loss()
+        backend: InvocationBackend = InvocationControlPlane(
+            routed_backend,
+            control_store,
+            require_explicit_ownership=True,
         )
         for index, lane in enumerate(selected):
             records[index] = records[index].model_copy(
@@ -298,6 +445,20 @@ async def run_invocation_audit(
                     records=records,
                 ),
             )
+    except asyncio.CancelledError:
+        records = [_interrupted_record(record) for record in records]
+        _write_report(
+            state_root,
+            _report(
+                run_id=run_id,
+                status="interrupted",
+                started_at=started_at,
+                source_transport=source_transport,
+                transport=audit_config.agent.structured_output_transport,
+                records=records,
+            ),
+        )
+        raise
     finally:
         telemetry.close()
 
@@ -318,7 +479,7 @@ async def _run_lane(
     lane: _AuditLane,
     *,
     provider: IsolatedAgentProfileProvider,
-    backend: RoutedInvocationBackend,
+    backend: InvocationBackend,
     telemetry: TelemetryStore,
     state_root: Path,
     run_id: str,
@@ -329,6 +490,7 @@ async def _run_lane(
     marker_expected = lane.workspace_write
     profile: ResolvedAgentProfile | None = None
     workspace_write_verified: bool | None = None
+    workspace_toolchain_marker_verified: bool | None = None
     try:
         with tempfile.TemporaryDirectory(
             prefix=f"invocation-audit-{lane.lane_id}-",
@@ -352,25 +514,41 @@ async def _run_lane(
                     phase="profile_resolution",
                     profile=None,
                     workspace_write_verified=None,
+                    workspace_toolchain_marker_verified=None,
                 )
             marker = profile.workspace / "candidate" / "invocation-audit-marker.txt"
             try:
+                invocation_id = f"{lane.lane_id}-{uuid.uuid4().hex}"
                 result = await backend.invoke(
                     InvocationRequest(
-                        invocation_id=f"{lane.lane_id}-{uuid.uuid4().hex}",
+                        invocation_id=invocation_id,
                         prompt=_prompt_for_lane(lane, profile.structured_output_transport),
                         profile=profile,
+                        ownership=_audit_ownership(
+                            run_id=run_id,
+                            lane=lane,
+                            invocation_id=invocation_id,
+                        ),
                         metadata={
                             "trace_id": trace_id,
                             "run_id": run_id,
                             "role": lane.role,
                             "semantic_transaction": f"invocation_audit.{lane.lane_id}",
+                            "diagnostic_capture_terminal_excerpt": (
+                                lane.diagnostic_terminal_excerpt
+                            ),
                         },
                         execution_mode=lane.execution_mode,
+                        diagnostic_command_expectations=(
+                            _WORKSPACE_TOOLCHAIN_EXPECTATIONS if lane.workspace_toolchain else ()
+                        ),
                     )
                 )
             except Exception:
-                workspace_write_verified = marker.is_file() if marker_expected else None
+                workspace_write_verified = _marker_exists(marker) if marker_expected else None
+                workspace_toolchain_marker_verified = (
+                    _toolchain_marker_verified(marker) if lane.workspace_toolchain else None
+                )
                 return _exception_record(
                     lane,
                     started_at=started_at,
@@ -379,31 +557,44 @@ async def _run_lane(
                     phase="backend_invoke",
                     profile=profile,
                     workspace_write_verified=workspace_write_verified,
+                    workspace_toolchain_marker_verified=workspace_toolchain_marker_verified,
                 )
             resumed_result: InvocationResult | None = None
             if lane.require_session_resume and result.succeeded and result.session is not None:
                 try:
+                    resumed_invocation_id = f"{lane.lane_id}-resume-{uuid.uuid4().hex}"
                     resumed_result = await backend.invoke(
                         InvocationRequest(
-                            invocation_id=f"{lane.lane_id}-resume-{uuid.uuid4().hex}",
+                            invocation_id=resumed_invocation_id,
                             prompt=_resume_prompt_for_lane(
                                 lane,
                                 profile.structured_output_transport,
                             ),
                             profile=profile,
                             session=result.session,
+                            ownership=_audit_ownership(
+                                run_id=run_id,
+                                lane=lane,
+                                invocation_id=resumed_invocation_id,
+                            ),
                             metadata={
                                 "trace_id": trace_id,
                                 "run_id": run_id,
                                 "role": lane.role,
                                 "semantic_transaction": f"invocation_audit.{lane.lane_id}",
                                 "physical_turn": 2,
+                                "diagnostic_capture_terminal_excerpt": (
+                                    lane.diagnostic_terminal_excerpt
+                                ),
                             },
                             execution_mode=lane.execution_mode,
                         )
                     )
                 except Exception:
-                    workspace_write_verified = marker.is_file() if marker_expected else None
+                    workspace_write_verified = _marker_exists(marker) if marker_expected else None
+                    workspace_toolchain_marker_verified = (
+                        _toolchain_marker_verified(marker) if lane.workspace_toolchain else None
+                    )
                     return _exception_record(
                         lane,
                         started_at=started_at,
@@ -412,9 +603,19 @@ async def _run_lane(
                         phase="session_resume",
                         profile=profile,
                         workspace_write_verified=workspace_write_verified,
+                        workspace_toolchain_marker_verified=workspace_toolchain_marker_verified,
                         prior_results=(result,),
                     )
-            workspace_write_verified = marker.is_file() if marker_expected else None
+            workspace_write_verified = _marker_exists(marker) if marker_expected else None
+            workspace_toolchain_marker_verified = (
+                _toolchain_marker_verified(marker) if lane.workspace_toolchain else None
+            )
+            diagnostic_terminal_feedback_path = _write_diagnostic_terminal_feedback(
+                state_root=state_root,
+                run_id=run_id,
+                lane=lane,
+                results=(result,) if resumed_result is None else (result, resumed_result),
+            )
             return _result_record(
                 lane,
                 result=result,
@@ -424,6 +625,8 @@ async def _run_lane(
                 telemetry=telemetry,
                 trace_id=trace_id,
                 workspace_write_verified=workspace_write_verified,
+                workspace_toolchain_marker_verified=workspace_toolchain_marker_verified,
+                diagnostic_terminal_feedback_path=diagnostic_terminal_feedback_path,
             )
     except asyncio.CancelledError:
         raise
@@ -436,7 +639,24 @@ async def _run_lane(
             phase="audit_setup",
             profile=profile,
             workspace_write_verified=workspace_write_verified,
+            workspace_toolchain_marker_verified=workspace_toolchain_marker_verified,
         )
+
+
+def _audit_ownership(
+    *,
+    run_id: str,
+    lane: _AuditLane,
+    invocation_id: str,
+) -> InvocationOwnership:
+    """Bind each audit physical turn without exposing its private session."""
+
+    return InvocationOwnership(
+        owner_kind=InvocationOwnerKind.DIAGNOSTIC_AUDIT,
+        owner_id=invocation_id,
+        scope_id=run_id,
+        coordinate=f"invocation_audit.{lane.lane_id}",
+    )
 
 
 def _exception_record(
@@ -448,6 +668,7 @@ def _exception_record(
     phase: Literal["profile_resolution", "backend_invoke", "session_resume", "audit_setup"],
     profile: ResolvedAgentProfile | None,
     workspace_write_verified: bool | None,
+    workspace_toolchain_marker_verified: bool | None,
     prior_results: tuple[InvocationResult, ...] = (),
 ) -> InvocationAuditLaneResult:
     """Persist a safe, recipient-actionable failure without raw Provider text."""
@@ -457,6 +678,8 @@ def _exception_record(
     if profile is not None:
         terminal_details["structured_output_transport"] = profile.structured_output_transport
     profile_details = _safe_profile_details(profile)
+    command_proofs = _command_proofs_for_results(lane, prior_results)
+    command_diagnostics = _command_diagnostics_for_results(lane, prior_results)
     return InvocationAuditLaneResult(
         lane_id=lane.lane_id,
         node_id=lane.node_id,
@@ -486,6 +709,13 @@ def _exception_record(
         provider_event_count=observed,
         activity_event_counts=activity,
         workspace_write_verified=workspace_write_verified,
+        workspace_toolchain_verified=_toolchain_verified(
+            lane,
+            marker_verified=workspace_toolchain_marker_verified,
+            command_proofs=command_proofs,
+        ),
+        workspace_toolchain_command_proofs=command_proofs,
+        workspace_toolchain_command_diagnostics=command_diagnostics,
     )
 
 
@@ -553,6 +783,18 @@ def _prompt_for_lane(lane: _AuditLane, transport: str) -> str:
             "CandidateCompletion with blocking_reason `invocation-audit-complete`; do not claim "
             "candidate outputs, files, or declarations."
         )
+    elif lane.workspace_toolchain:
+        base = (
+            "This is an isolated production InvocationBackend audit of the Environment Engineer "
+            "workspace toolchain. It is not an environment build. Do not read inputs or create "
+            "files. Run exactly these shell commands, in order, and wait for each to complete:\n"
+            "test -x ./.agent-world-tools/uv && test -x ./.agent-world-tools/python3.12\n"
+            "./.agent-world-tools/uv --version\n"
+            "./.agent-world-tools/python3.12 --version\n"
+            "Do not substitute bare `uv`, bare `python`, a `.venv`, or a host path. Do not read "
+            "unrelated files or run network commands. Then return the required structured "
+            "status object."
+        )
     elif lane.workspace_write:
         base = (
             "This is an isolated production InvocationBackend audit. Create exactly one file "
@@ -565,6 +807,126 @@ def _prompt_for_lane(lane: _AuditLane, transport: str) -> str:
             "unrelated files. Return the required structured status object."
         )
     return _transport_prompt(base, transport, _expected_output_for_lane(lane))
+
+
+def _marker_exists(marker: Path) -> bool:
+    """Accept only a regular audit marker, never a workspace symlink."""
+
+    return marker.is_file() and not marker.is_symlink()
+
+
+def _toolchain_marker_verified(marker: Path) -> bool:
+    """Validate the bounded evidence written by the two required facades.
+
+    This is an audit-only executable-boundary check, not a Candidate business
+    contract.  The detailed command transcript remains private to the active
+    Agent runtime; the durable report retains only this boolean.
+    """
+
+    if not _marker_exists(marker):
+        return False
+    try:
+        lines = marker.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    return len(lines) == 2 and lines[0].startswith("uv ") and lines[1].startswith("Python 3.12.")
+
+
+def _command_proofs_for_results(
+    lane: _AuditLane,
+    results: tuple[InvocationResult, ...],
+) -> dict[str, AuditCommandProofState]:
+    """Collapse private event facts into an actionable, transcript-free view."""
+
+    if not lane.workspace_toolchain:
+        return {}
+    proofs: dict[str, AuditCommandProofState] = {
+        item.label: "unobserved" for item in _WORKSPACE_TOOLCHAIN_EXPECTATIONS
+    }
+    for result in results:
+        for event in result.events:
+            values = event.payload.get("diagnosticCommandProof")
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if not isinstance(value, dict):
+                    continue
+                label = value.get("label")
+                outcome = value.get("outcome")
+                if (
+                    not isinstance(label, str)
+                    or label not in proofs
+                    or outcome
+                    not in {"unknown", "not_found", "not_executable", "failed", "succeeded"}
+                ):
+                    continue
+                checked_outcome = cast(AuditCommandProofState, outcome)
+                current = proofs[label]
+                if checked_outcome == "succeeded" or current != "succeeded":
+                    proofs[label] = checked_outcome
+    return proofs
+
+
+def _toolchain_verified(
+    lane: _AuditLane,
+    *,
+    marker_verified: bool | None,
+    command_proofs: dict[str, AuditCommandProofState],
+) -> bool | None:
+    """Combine the workspace evidence with the SDK's closed command facts."""
+
+    if not lane.workspace_toolchain:
+        return None
+    marker_ok = marker_verified is True if lane.workspace_write else True
+    return marker_ok and all(
+        command_proofs.get(label) == "succeeded" for label in _WORKSPACE_TOOLCHAIN_EXECUTION_LABELS
+    )
+
+
+def _command_diagnostics_for_results(
+    lane: _AuditLane,
+    results: tuple[InvocationResult, ...],
+) -> dict[str, str]:
+    """Retain a small, twice-scrubbed command clue only in audit output."""
+
+    if not lane.workspace_toolchain:
+        return {}
+    diagnostics: dict[str, str] = {}
+    labels = {item.label for item in _WORKSPACE_TOOLCHAIN_EXPECTATIONS}
+    for result in results:
+        for event in result.events:
+            values = event.payload.get("diagnosticCommandProof")
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if not isinstance(value, dict):
+                    continue
+                label = value.get("label")
+                outcome = value.get("outcome")
+                if (
+                    not isinstance(label, str)
+                    or label not in labels
+                    or outcome not in {"unknown", "not_found", "not_executable", "failed"}
+                ):
+                    if isinstance(label, str) and label in labels and outcome == "succeeded":
+                        diagnostics.pop(label, None)
+                    continue
+                parts: list[str] = []
+                exit_code = value.get("exitCode")
+                if (
+                    isinstance(exit_code, int)
+                    and not isinstance(exit_code, bool)
+                    and 0 <= exit_code <= 255
+                ):
+                    parts.append(f"exit={exit_code}")
+                excerpt = redacted_command_diagnostic_excerpt(
+                    value.get("diagnosticExcerpt"),
+                    redactor=Redactor.from_values(()),
+                )
+                if excerpt is not None:
+                    parts.append(excerpt)
+                diagnostics[label] = "; ".join(parts) if parts else "command failed"
+    return diagnostics
 
 
 def _transport_prompt(base: str, transport: str, expected: dict[str, object]) -> str:
@@ -609,14 +971,24 @@ def _result_record(
     telemetry: TelemetryStore,
     trace_id: str,
     workspace_write_verified: bool | None,
+    workspace_toolchain_marker_verified: bool | None,
+    diagnostic_terminal_feedback_path: str | None,
 ) -> InvocationAuditLaneResult:
     results = (result,) if resumed_result is None else (result, resumed_result)
+    command_proofs = _command_proofs_for_results(lane, results)
+    command_diagnostics = _command_diagnostics_for_results(lane, results)
+    toolchain_verified = _toolchain_verified(
+        lane,
+        marker_verified=workspace_toolchain_marker_verified,
+        command_proofs=command_proofs,
+    )
     physical_turns = tuple(
         _physical_turn_record(index + 1, item) for index, item in enumerate(results)
     )
-    valid_output = all(
-        item.succeeded and _output_matches_lane(lane, item.structured_output) for item in results
+    structured_output_observations = tuple(
+        _structured_output_observation(lane, item) for item in results
     )
+    valid_output = all(item.kind == "exact_match" for item in structured_output_observations)
     requires_session = lane.execution_mode is InvocationExecutionMode.AGENTIC
     initial_session_ok = not requires_session or result.session is not None
     resume_ok = not lane.require_session_resume or (
@@ -626,7 +998,8 @@ def _result_record(
     )
     session_ok = initial_session_ok and resume_ok
     write_ok = workspace_write_verified is not False
-    passed = valid_output and session_ok and write_ok
+    toolchain_ok = toolchain_verified is not False
+    passed = valid_output and session_ok and write_ok and toolchain_ok
     if passed:
         failure_code = None
         retryable = None
@@ -649,6 +1022,10 @@ def _result_record(
         failure_code = "invocation_audit_workspace_write_missing"
         retryable = False
         terminal_details = {}
+    elif not toolchain_ok:
+        failure_code = "invocation_audit_workspace_toolchain_unverified"
+        retryable = False
+        terminal_details = {}
     else:
         failure_code = "invocation_audit_structured_output_mismatch"
         retryable = False
@@ -659,7 +1036,7 @@ def _result_record(
         failure_phase = "session_resume"
     elif not session_ok:
         failure_phase = "session_resume" if lane.require_session_resume else "initial"
-    elif not write_ok or not valid_output:
+    elif not write_ok or not toolchain_ok or not valid_output:
         failure_phase = "initial"
     else:
         failure_phase = None
@@ -692,20 +1069,174 @@ def _result_record(
         provider_event_count=observed,
         activity_event_counts=activity,
         workspace_write_verified=workspace_write_verified,
+        workspace_toolchain_verified=toolchain_verified,
+        workspace_toolchain_command_proofs=command_proofs,
+        workspace_toolchain_command_diagnostics=command_diagnostics,
+        diagnostic_terminal_feedback_path=diagnostic_terminal_feedback_path,
+        structured_output_observations=structured_output_observations,
     )
 
 
-def _output_matches_lane(lane: _AuditLane, output: object) -> bool:
+def _write_diagnostic_terminal_feedback(
+    *,
+    state_root: Path,
+    run_id: str,
+    lane: _AuditLane,
+    results: tuple[InvocationResult, ...],
+) -> str | None:
+    """Persist one bounded terminal excerpt for an explicitly diagnostic lane.
+
+    This is deliberately narrower than ordinary audit reporting. The Worker
+    already redacts the Provider terminal text, and this sidecar performs the
+    same defensive second scrub used by Doctor before a local Code-Agent view
+    is written. No raw request, response, workspace path, or session material
+    crosses this boundary.
+    """
+
+    if not lane.diagnostic_terminal_excerpt:
+        return None
+    for result in results:
+        if result.error is None:
+            continue
+        excerpt = redacted_terminal_diagnostic_excerpt(
+            result.error.details.get("diagnostic_error_excerpt"),
+            redactor=Redactor.from_values(()),
+        )
+        if excerpt is None:
+            continue
+        root = state_root / _DEBUG_DIRECTORY
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if root.is_symlink() or not root.is_dir():
+            raise OSError("invocation audit debug directory must be a real directory")
+        target = root / f"{_audit_run_token(run_id)}-{lane.lane_id}.json"
+        payload = {
+            "diagnostic_only": True,
+            "failure_code": result.error.code,
+            "kind": "invocation_audit_terminal_debug",
+            "lane_id": lane.lane_id,
+            "run_id": run_id,
+            "terminal_error_excerpt": excerpt,
+            "updated_at": _now(),
+        }
+        _write_private_report(
+            target,
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        )
+        return str(target)
+    return None
+
+
+def _structured_output_observation(
+    lane: _AuditLane,
+    result: InvocationResult,
+) -> InvocationAuditStructuredOutputObservation:
+    """Reduce one audit response to a bounded mismatch category.
+
+    The audit prompt and expected response are non-semantic fixtures, but a
+    raw model response still must not enter the durable run record.  Preserve
+    only the closed distinction needed to choose the next diagnostic surface.
+    """
+
+    if not result.succeeded:
+        return InvocationAuditStructuredOutputObservation(kind="not_evaluated")
+    output = result.structured_output
+    if output is None:
+        return InvocationAuditStructuredOutputObservation(kind="missing")
+    if not isinstance(output, Mapping):
+        return InvocationAuditStructuredOutputObservation(kind="non_object")
     if lane.output_contract == "status":
-        return output == _STATUS_VALUE
+        return InvocationAuditStructuredOutputObservation(
+            kind="exact_match" if output == _STATUS_VALUE else "status_mismatch"
+        )
     try:
-        completion = CandidateCompletion.model_validate(output)
-    except ValueError:
-        return False
-    return (
-        completion.status == "blocked"
-        and completion.blocking_reason == _CANDIDATE_COMPLETION_BLOCKED_VALUE["blocking_reason"]
-    )
+        # The real Builder validates a Provider JSON result through JSON mode.
+        # Keep this audit on that exact acceptance boundary: a decoded empty
+        # JSON array is a valid representation of a tuple field, while strict
+        # Python-mode validation would incorrectly call it a shape failure.
+        completion = CandidateCompletion.model_validate_json(canonical_json_bytes(output))
+    except ValidationError as exc:
+        return InvocationAuditStructuredOutputObservation(
+            kind="candidate_completion_invalid",
+            validation_issue_codes=_safe_candidate_completion_issue_codes(exc),
+            validation_issue_categories=_safe_candidate_completion_validation_categories(exc),
+        )
+    if completion.status == "completed":
+        return InvocationAuditStructuredOutputObservation(
+            kind="candidate_completion_unexpected_completed"
+        )
+    if completion.blocking_reason != _CANDIDATE_COMPLETION_BLOCKED_VALUE["blocking_reason"]:
+        return InvocationAuditStructuredOutputObservation(
+            kind="candidate_completion_blocking_reason_mismatch"
+        )
+    return InvocationAuditStructuredOutputObservation(kind="exact_match")
+
+
+def _safe_candidate_completion_issue_codes(
+    exc: ValidationError,
+) -> tuple[AuditStructuredOutputIssueCode, ...]:
+    """Keep only built-in CandidateCompletion rule identifiers, never values."""
+
+    codes: list[AuditStructuredOutputIssueCode] = []
+    for item in exc.errors():
+        observed = item.get("type")
+        code: AuditStructuredOutputIssueCode = (
+            cast(AuditStructuredOutputIssueCode, observed)
+            if observed in _CANDIDATE_COMPLETION_SAFE_ISSUE_CODES
+            else "schema_value"
+        )
+        if code not in codes:
+            codes.append(code)
+        if len(codes) == 3:
+            break
+    return tuple(codes or ("schema_value",))
+
+
+def _safe_candidate_completion_validation_categories(
+    exc: ValidationError,
+) -> tuple[AuditStructuredOutputValidationCategory, ...]:
+    """Map Pydantic's evolving error names into a closed diagnostic vocabulary."""
+
+    categories: list[AuditStructuredOutputValidationCategory] = []
+    for item in exc.errors():
+        observed = item.get("type")
+        category = _candidate_completion_validation_category(observed)
+        if category not in categories:
+            categories.append(category)
+        if len(categories) == 3:
+            break
+    return tuple(categories or ("other_schema_validation",))
+
+
+def _candidate_completion_validation_category(
+    observed: object,
+) -> AuditStructuredOutputValidationCategory:
+    """Classify error *kind* only; values, locations and prose stay private."""
+
+    if observed in _CANDIDATE_COMPLETION_SAFE_ISSUE_CODES:
+        return "candidate_rule"
+    if observed == "missing":
+        return "missing_required_field"
+    if observed == "extra_forbidden":
+        return "unexpected_field"
+    if observed in {"literal_error", "enum"}:
+        return "literal_mismatch"
+    if observed in {"dict_type", "list_type", "tuple_type", "model_type"}:
+        return "container_shape_mismatch"
+    if isinstance(observed, str) and observed.endswith("_type"):
+        return "scalar_type_mismatch"
+    if observed in {
+        "greater_than",
+        "greater_than_equal",
+        "less_than",
+        "less_than_equal",
+        "string_too_short",
+        "string_too_long",
+        "too_short",
+        "too_long",
+        "value_error",
+    }:
+        return "value_constraint"
+    return "other_schema_validation"
 
 
 def _safe_activity_counts(
@@ -810,6 +1341,23 @@ def _pending_record(lane: _AuditLane, started_at: str) -> InvocationAuditLaneRes
     )
 
 
+def _interrupted_record(record: InvocationAuditLaneResult) -> InvocationAuditLaneResult:
+    """Turn a transient audit view into a safe terminal owner-interruption fact."""
+
+    if record.status != "running":
+        return record
+    return record.model_copy(
+        update={
+            "status": "interrupted",
+            "updated_at": _now(),
+            "failure_phase": "audit_owner_interrupted",
+            "failure_code": "owner_process_interrupted",
+            "retryable": False,
+            "terminal_details": {"phase": "audit_owner_interrupted"},
+        }
+    )
+
+
 def _report(
     *,
     run_id: str,
@@ -881,6 +1429,12 @@ def _write_report(state_root: Path, report: InvocationAuditReport) -> None:
 
 
 def _run_record_filename(run_id: str) -> str:
+    return f"{_audit_run_token(run_id)}.json"
+
+
+def _audit_run_token(run_id: str) -> str:
+    """Return the validated opaque token used by all local audit sidecars."""
+
     run_token = run_id.removeprefix(_RUN_ID_PREFIX)
     if (
         run_token == run_id
@@ -888,7 +1442,7 @@ def _run_record_filename(run_id: str) -> str:
         or any(character not in "0123456789abcdef" for character in run_token)
     ):
         raise ValueError("invocation audit run id must use the framework UUID format")
-    return f"{run_token}.json"
+    return run_token
 
 
 def _serialized_report(report: InvocationAuditReport) -> str:

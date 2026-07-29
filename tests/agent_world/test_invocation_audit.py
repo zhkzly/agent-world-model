@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -8,11 +10,14 @@ from typing import cast
 import pytest
 
 import agent_world.invocation.audit as audit
+from agent_world.builder.models import CandidateCompletion
 from agent_world.config import AgentBackendConfig, FoundryConfig, ResearchConfig
 from agent_world.invocation.capabilities import NodeCapabilityRequirement
 from agent_world.invocation.contracts import (
     InvocationError,
+    InvocationEvent,
     InvocationExecutionMode,
+    InvocationLimits,
     InvocationRequest,
     InvocationResult,
     InvocationSession,
@@ -66,8 +71,11 @@ class _FakeProfileProvider:
                 ),
                 workspace=agent_workspace,
                 lineage_id=lineage_id,
+                model="audit-model",
                 profile_hash="a" * 64,
                 codex_config_sha256="b" * 64,
+                limits=InvocationLimits(),
+                rollout_token_limit=None,
             ),
         )
 
@@ -97,10 +105,17 @@ class _FakeRoutedBackend:
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
         profile = request.profile
         execution_mode = request.execution_mode
-        if "workspace_edit" in profile.allowed_builtin_tools:
+        if "workspace_edit" in profile.allowed_builtin_tools and request.session is None:
             marker = profile.workspace / "candidate" / "invocation-audit-marker.txt"
             marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text("ok", encoding="utf-8")
+            marker.write_text(
+                (
+                    "uv 0.0.0\nPython 3.12.0\n"
+                    if "./.agent-world-tools/uv --version" in request.prompt
+                    else "ok"
+                ),
+                encoding="utf-8",
+            )
         session = None
         if execution_mode is InvocationExecutionMode.AGENTIC:
             session = InvocationSession(
@@ -119,15 +134,27 @@ class _FakeRoutedBackend:
             turn_id=None,
             final_text=None,
             structured_output=(
-                {
-                    "status": "blocked",
-                    "blocking_reason": "invocation-audit-complete",
-                }
+                dict(audit._CANDIDATE_COMPLETION_BLOCKED_VALUE)
                 if candidate_completion
                 else {"status": "ok"}
             ),
             usage=None,
-            events=(),
+            events=(
+                (
+                    InvocationEvent(
+                        sequence=0,
+                        method="item/completed",
+                        payload={
+                            "diagnosticCommandProof": [
+                                {"label": item.label, "outcome": "succeeded"}
+                                for item in request.diagnostic_command_expectations
+                            ]
+                        },
+                    ),
+                )
+                if request.diagnostic_command_expectations
+                else ()
+            ),
             error=None,
             duration_ms=1,
             backend_version="fake-audit",
@@ -165,6 +192,71 @@ class _ResumeFailingRoutedBackend(_FakeRoutedBackend):
         )
 
 
+class _CandidateCompletionMismatchBackend(_FakeRoutedBackend):
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        result = await super().invoke(request)
+        properties = request.profile.output_schema.get("properties", {})
+        if isinstance(properties, dict) and "blocking_reason" in properties:
+            return replace(
+                result,
+                structured_output={
+                    **audit._CANDIDATE_COMPLETION_BLOCKED_VALUE,
+                    "blocking_reason": "untrusted-model-text-must-not-persist",
+                },
+            )
+        return result
+
+
+class _CandidateCompletionTerminalExcerptBackend(_FakeRoutedBackend):
+    requests: list[InvocationRequest] = []
+
+    async def invoke(self, request: InvocationRequest) -> InvocationResult:
+        type(self).requests.append(request)
+        result = await super().invoke(request)
+        properties = request.profile.output_schema.get("properties", {})
+        if not isinstance(properties, dict) or "blocking_reason" not in properties:
+            return result
+        opaque = "a" * 40
+        return replace(
+            result,
+            status=InvocationStatus.FAILED,
+            structured_output=None,
+            error=InvocationError(
+                code="turn_failed_unclassified_codex_error",
+                message="provider terminal failed",
+                retryable=True,
+                details={
+                    "terminal_error_shape": "object",
+                    "codex_error_info": "enum:other",
+                    "diagnostic_error_excerpt": (
+                        "unsupported response format at "
+                        "https://provider.example.test/v1?api_key=must-not-persist "
+                        f"token={opaque}"
+                    ),
+                },
+            ),
+        )
+
+
+class _BlockingRoutedBackend:
+    instances: list[_BlockingRoutedBackend] = []
+    created: asyncio.Event | None = None
+
+    def __init__(self, **_: object) -> None:
+        self.started = asyncio.Event()
+        type(self).instances.append(self)
+        if type(self).created is not None:
+            type(self).created.set()
+
+    async def invoke(self, _: InvocationRequest) -> InvocationResult:
+        self.started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("the blocking audit backend unexpectedly resumed")
+
+    async def cancel(self, _: str) -> bool:
+        return True
+
+
 def _config(tmp_path: Path) -> FoundryConfig:
     return FoundryConfig(
         state_root=tmp_path / "state",
@@ -197,6 +289,16 @@ async def test_invocation_audit_covers_all_distinct_real_mechanisms_safely(
         item for item in report.lanes if item.lane_id == "codex_engineer_workspace_write"
     )
     assert workspace.workspace_write_verified is True
+    assert workspace.workspace_toolchain_verified is None
+    toolchain = next(
+        item for item in report.lanes if item.lane_id == "codex_engineer_workspace_toolchain"
+    )
+    assert toolchain.workspace_toolchain_verified is True
+    assert toolchain.workspace_toolchain_command_proofs == {
+        "workspace_toolchain_visible": "succeeded",
+        "uv_version": "succeeded",
+        "python312_version": "succeeded",
+    }
     assert workspace.node_id == "environment-engineer.runtime-build"
     plan = next(
         item for item in report.lanes if item.lane_id == "codex_engineer_implementation_plan_read"
@@ -230,6 +332,15 @@ async def test_invocation_audit_covers_all_distinct_real_mechanisms_safely(
     records = tuple((tmp_path / "state" / "invocation-audit-runs").glob("*.json"))
     assert len(records) == 1
     assert json.loads(records[0].read_text(encoding="utf-8"))["run_id"] == report.run_id
+    attempts = tuple(
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (tmp_path / "state" / "invocation-control" / "attempts").glob("*.json")
+    )
+    assert attempts
+    assert all(item["owner"]["owner_kind"] == "diagnostic_audit" for item in attempts)
+    assert all(item["owner"]["scope_id"] == report.run_id for item in attempts)
+    assert all(item["owner"]["coordinate"].startswith("invocation_audit.") for item in attempts)
+    assert all(item["owner"]["owner_id"] == item["invocation_id"] for item in attempts)
 
 
 def test_invocation_audit_rejects_unknown_lane_before_a_provider_call() -> None:
@@ -247,8 +358,70 @@ def test_invocation_audit_uses_the_real_special_engineer_profile_coordinates() -
         "environment-engineer.implementation-plan"
     )
     assert lanes["codex_engineer_workspace_write"].node_id == ("environment-engineer.runtime-build")
+    toolchain_prompt = audit._prompt_for_lane(
+        lanes["codex_engineer_workspace_toolchain"],
+        "json_envelope",
+    )
+    assert (
+        "test -x ./.agent-world-tools/uv && test -x ./.agent-world-tools/python3.12"
+        in toolchain_prompt
+    )
+    assert "./.agent-world-tools/uv --version" in toolchain_prompt
+    assert "./.agent-world-tools/python3.12 --version" in toolchain_prompt
     assert lanes["codex_engineer_candidate_completion"].output_contract == (
         "candidate_completion_blocked"
+    )
+
+
+def test_candidate_completion_audit_uses_json_mode_like_the_builder() -> None:
+    lane = next(
+        item for item in audit._AUDIT_LANES if item.lane_id == "codex_engineer_candidate_completion"
+    )
+    result = InvocationResult(
+        invocation_id="audit-candidate-json-mode",
+        status=InvocationStatus.COMPLETED,
+        session=None,
+        turn_id=None,
+        final_text=None,
+        structured_output=CandidateCompletion(
+            status="blocked",
+            blocking_reason="invocation-audit-complete",
+        ).model_dump(mode="json"),
+        usage=None,
+        events=(),
+        error=None,
+        duration_ms=1,
+    )
+
+    observation = audit._structured_output_observation(lane, result)
+
+    assert observation.kind == "exact_match"
+
+
+def test_candidate_completion_audit_observation_keeps_only_closed_schema_categories() -> None:
+    lane = next(
+        item for item in audit._AUDIT_LANES if item.lane_id == "codex_engineer_candidate_completion"
+    )
+    result = InvocationResult(
+        invocation_id="audit-candidate-invalid",
+        status=InvocationStatus.COMPLETED,
+        session=None,
+        turn_id=None,
+        final_text=None,
+        structured_output={"untrusted_field": "untrusted-value"},
+        usage=None,
+        events=(),
+        error=None,
+        duration_ms=1,
+    )
+
+    observation = audit._structured_output_observation(lane, result)
+
+    assert observation.kind == "candidate_completion_invalid"
+    assert observation.validation_issue_codes == ("schema_value",)
+    assert observation.validation_issue_categories == (
+        "missing_required_field",
+        "unexpected_field",
     )
 
 
@@ -308,6 +481,76 @@ async def test_invocation_audit_reports_the_exact_failed_physical_turn_safely(
 
 
 @pytest.mark.asyncio
+async def test_invocation_audit_reports_a_closed_candidate_completion_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(audit, "TelemetryStore", _FakeTelemetry)
+    monkeypatch.setattr(audit, "IsolatedAgentProfileProvider", _FakeProfileProvider)
+    monkeypatch.setattr(audit, "CodexSdkBackend", lambda **_: object())
+    monkeypatch.setattr(audit, "DirectLlmBackend", lambda **_: object())
+    monkeypatch.setattr(audit, "RoutedInvocationBackend", _CandidateCompletionMismatchBackend)
+
+    report = await audit.run_invocation_audit(
+        _config(tmp_path),
+        lane_ids=("codex_engineer_candidate_completion",),
+    )
+
+    lane = report.lanes[0]
+    assert report.status == "failed"
+    assert lane.failure_code == "invocation_audit_structured_output_mismatch"
+    assert [item.kind for item in lane.structured_output_observations] == [
+        "candidate_completion_blocking_reason_mismatch"
+    ]
+    assert lane.structured_output_observations[0].validation_issue_codes == ()
+    serialized = (tmp_path / "state" / "invocation-audit.json").read_text(encoding="utf-8")
+    assert "untrusted-model-text-must-not-persist" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_candidate_completion_audit_writes_only_a_redacted_opted_in_terminal_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _CandidateCompletionTerminalExcerptBackend.requests.clear()
+    monkeypatch.setattr(audit, "TelemetryStore", _FakeTelemetry)
+    monkeypatch.setattr(audit, "IsolatedAgentProfileProvider", _FakeProfileProvider)
+    monkeypatch.setattr(audit, "CodexSdkBackend", lambda **_: object())
+    monkeypatch.setattr(audit, "DirectLlmBackend", lambda **_: object())
+    monkeypatch.setattr(
+        audit,
+        "RoutedInvocationBackend",
+        _CandidateCompletionTerminalExcerptBackend,
+    )
+
+    report = await audit.run_invocation_audit(
+        _config(tmp_path),
+        lane_ids=("codex_engineer_candidate_completion",),
+    )
+
+    lane = report.lanes[0]
+    assert report.status == "failed"
+    assert lane.failure_code == "turn_failed_unclassified_codex_error"
+    assert lane.diagnostic_terminal_feedback_path is not None
+    assert (
+        _CandidateCompletionTerminalExcerptBackend.requests[0].metadata[
+            "diagnostic_capture_terminal_excerpt"
+        ]
+        is True
+    )
+    debug_path = Path(lane.diagnostic_terminal_feedback_path)
+    debug = json.loads(await asyncio.to_thread(debug_path.read_text, encoding="utf-8"))
+    assert debug["kind"] == "invocation_audit_terminal_debug"
+    assert debug["failure_code"] == "turn_failed_unclassified_codex_error"
+    assert debug["terminal_error_excerpt"].startswith("unsupported response format")
+    assert "provider.example.test" not in debug["terminal_error_excerpt"]
+    assert "a" * 40 not in debug["terminal_error_excerpt"]
+    serialized = (tmp_path / "state" / "invocation-audit.json").read_text(encoding="utf-8")
+    assert "unsupported response format" not in serialized
+    assert "provider.example.test" not in serialized
+
+
+@pytest.mark.asyncio
 async def test_invocation_audit_keeps_prior_run_record_when_a_subset_runs_later(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -337,3 +580,46 @@ async def test_invocation_audit_keeps_prior_run_record_when_a_subset_runs_later(
     assert set(records) == {first.run_id, second.run_id}
     assert records[first.run_id]["lanes"][0]["lane_id"] == "direct_researcher_structured"
     assert current["run_id"] == second.run_id
+
+
+@pytest.mark.asyncio
+async def test_invocation_audit_cancellation_writes_non_running_report_and_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation is an owner terminal, never an indefinitely running audit."""
+
+    _BlockingRoutedBackend.instances.clear()
+    _BlockingRoutedBackend.created = asyncio.Event()
+    monkeypatch.setattr(audit, "TelemetryStore", _FakeTelemetry)
+    monkeypatch.setattr(audit, "IsolatedAgentProfileProvider", _FakeProfileProvider)
+    monkeypatch.setattr(audit, "CodexSdkBackend", lambda **_: object())
+    monkeypatch.setattr(audit, "DirectLlmBackend", lambda **_: object())
+    monkeypatch.setattr(audit, "RoutedInvocationBackend", _BlockingRoutedBackend)
+
+    task = asyncio.create_task(
+        audit.run_invocation_audit(
+            _config(tmp_path),
+            lane_ids=("codex_challenger_solver",),
+        )
+    )
+    await _BlockingRoutedBackend.created.wait()
+    await _BlockingRoutedBackend.instances[0].started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    report = json.loads((tmp_path / "state" / "invocation-audit.json").read_text(encoding="utf-8"))
+    assert report["status"] == "interrupted"
+    lane = report["lanes"][0]
+    assert lane["status"] == "interrupted"
+    assert lane["failure_code"] == "owner_process_interrupted"
+    records = tuple((tmp_path / "state" / "invocation-control" / "attempts").glob("*.json"))
+    assert len(records) == 1
+    attempt = json.loads(records[0].read_text(encoding="utf-8"))
+    assert attempt["status"] == "settled"
+    assert attempt["terminal"] == {
+        "status": "cancelled",
+        "code": "owner_cancelled",
+        "retryable": False,
+    }

@@ -20,6 +20,7 @@ from typing import Literal, Protocol
 
 from pydantic import JsonValue, ValidationError
 
+from agent_world.agent_profiles import logical_workspace_for_isolated_agent_workspace
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.contracts import (
     ArtifactRef,
@@ -51,6 +52,7 @@ from agent_world.invocation import (
     InvocationBackend,
     InvocationError,
     InvocationLimits,
+    InvocationOwnership,
     InvocationRequest,
     InvocationSession,
     InvocationStatus,
@@ -58,6 +60,7 @@ from agent_world.invocation import (
     NodeCapabilityRequirement,
     ResolvedAgentProfile,
     assert_agent_output_advisory,
+    standalone_component_ownership,
 )
 from agent_world.invocation.redaction import Redactor, redacted_terminal_diagnostic_excerpt
 from agent_world.invocation.structured_diagnostics import (
@@ -90,26 +93,6 @@ from .workspace import (
     ValidatedCandidateWorkspace,
 )
 
-_FORBIDDEN_RUNTIME_KEYS = (
-    "task_id",
-    "case_id",
-    "case_label",
-    "framework_private",
-    "expected_answer",
-    "expected_state",
-    "expected_output",
-    "evaluator_goal",
-    "private_goal",
-    "oracle",
-    "oracle_data",
-    "sealed_case",
-    "sealed_data",
-    "verifier_ir",
-    "verifier_spec",
-    "release_decision",
-    "release_label",
-    "release_threshold",
-)
 _BUILD_VALIDATIONS = (
     "declared_file_closure",
     "regular_file_only",
@@ -143,6 +126,7 @@ class AgentProfileProvider(Protocol):
         requirement: NodeCapabilityRequirement,
         rollout_token_limit: int | None = None,
         invocation_timeout_seconds: float | None = None,
+        model_override: str | None = None,
     ) -> ResolvedAgentProfile: ...
 
 
@@ -366,7 +350,25 @@ class EnvironmentBuilder:
                 "advisory plan does not bind the exact frozen EnvironmentDesign closure",
             )
         contract_ref = implementation_plan.implementation_contract_ref
-        contract = self.artifacts.get_json(contract_ref, ImplementationContract)
+        try:
+            contract = self.artifacts.get_json(contract_ref, ImplementationContract)
+        except ValidationError as exc:
+            # ``ImplementationContract`` is a framework-owned compilation of
+            # the frozen Design, not Agent-authored business semantics.  Do
+            # not silently discard retired fields here: that would change the
+            # canonical Artifact payload behind its exact ref and conceal a
+            # stale input projection.  Surface one safe preflight fact so the
+            # Scheduler can settle this attempt and the diagnostic runner can
+            # select the only coherent next step (regenerate the parent
+            # BuildImplementationPlan from the same frozen Design).
+            raise BuilderError(
+                "implementation_contract",
+                (
+                    "frozen ImplementationContract uses an older Builder projection; "
+                    "regenerate BuildImplementationPlan from the exact frozen "
+                    "EnvironmentDesign before CandidateBuild"
+                ),
+            ) from exc
         self.artifacts.require_exact_json(
             contract_ref,
             contract,
@@ -718,6 +720,8 @@ class EnvironmentBuilder:
         implementation_plan: ImplementationPlan | None = None,
         implementation_plan_ref: ArtifactRef | None = None,
         diagnostic_capture_terminal_excerpt: bool = False,
+        invocation_ownership: InvocationOwnership | None = None,
+        model_override: str | None = None,
     ) -> BuildBundle:
         """Execute exactly one real Engineer proposal for a scheduler WorkAttempt.
 
@@ -745,6 +749,8 @@ class EnvironmentBuilder:
             implementation_plan=implementation_plan,
             implementation_plan_ref=implementation_plan_ref,
             diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+            invocation_ownership=invocation_ownership,
+            model_override=model_override,
         )
 
     async def resume_output_limited_build(
@@ -765,6 +771,8 @@ class EnvironmentBuilder:
         implementation_plan: ImplementationPlan | None = None,
         implementation_plan_ref: ArtifactRef | None = None,
         diagnostic_capture_terminal_excerpt: bool = False,
+        invocation_ownership: InvocationOwnership | None = None,
+        model_override: str | None = None,
     ) -> BuildBundle:
         """Resume one exact Builder session after a closed physical output ceiling.
 
@@ -791,17 +799,14 @@ class EnvironmentBuilder:
                 "continuation",
                 "output-limit continuation requires a successor physical attempt",
             )
-        workspace = workspace.expanduser().resolve()  # noqa: ASYNC240 - bounded setup I/O
-        if (
-            workspace.name != "workspace"
-            or workspace.parent.name != ".agent-runtime"
-            or not workspace.is_dir()
-        ):
+        try:
+            logical_workspace = logical_workspace_for_isolated_agent_workspace(workspace)
+        except (OSError, ValueError) as exc:
             raise BuilderError(
                 "continuation",
                 "continuation workspace does not match the isolated profile layout",
-            )
-        materialization_root = workspace.parent.parent
+            ) from exc
+        workspace = workspace.expanduser().resolve()  # noqa: ASYNC240 - bounded setup I/O
         contract, contract_ref = self._implementation_contract_for_build(
             design=design,
             design_ref=design_ref,
@@ -828,7 +833,7 @@ class EnvironmentBuilder:
             profile = self.profiles.resolve(
                 role="environment-engineer",
                 lineage_id=lineage_id,
-                workspace=materialization_root,
+                workspace=logical_workspace,
                 output_schema=CandidateCompletion.model_json_schema(mode="validation"),
                 permissions=permissions,
                 requirement=NodeCapabilityRequirement.isolated_build(
@@ -837,6 +842,7 @@ class EnvironmentBuilder:
                 ),
                 rollout_token_limit=logical_session_token_limit,
                 invocation_timeout_seconds=per_turn_timeout_seconds,
+                model_override=model_override,
             )
         except CapabilityResolutionError as exc:
             raise BuilderError(
@@ -891,6 +897,195 @@ class EnvironmentBuilder:
             error_state=state,
             invocation_id=proposal_invocation_id,
             diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+            invocation_ownership=invocation_ownership,
+        )
+        next_state = replace(state, invocation_session=next_session)
+        return self._validate_and_commit(
+            completion=completion,
+            state=next_state,
+            invocation=invocation,
+        )
+
+    async def resume_interrupted_workspace_build(
+        self,
+        *,
+        design: EnvironmentDesign,
+        design_ref: ArtifactRef,
+        workspace: Path,
+        budget: Budget,
+        permissions: PermissionScope,
+        run_id: str,
+        attempt_id: str,
+        attempt_ordinal: int,
+        proposal_invocation_id: str,
+        recovery_lineage_id: str,
+        recovery_profile_digest: str,
+        recovery_codex_config_digest: str,
+        recovery_model: str,
+        session_token_limit: int | None = None,
+        session_wall_seconds: float | None = None,
+        implementation_plan: ImplementationPlan | None = None,
+        implementation_plan_ref: ArtifactRef | None = None,
+        diagnostic_capture_terminal_excerpt: bool = False,
+        invocation_ownership: InvocationOwnership | None = None,
+        model_override: str | None = None,
+    ) -> BuildBundle:
+        """Finish a private Builder draft in a new Agent session.
+
+        The caller has already received an authorized same-model
+        infrastructure-retry action and privately bound this workspace to it.
+        This method intentionally does *not* receive an ``InvocationSession``:
+        the old Provider thread may be incomplete or unavailable.  The draft
+        is only a local starting point for a fresh Agent to inspect and test;
+        it has no Artifact or Candidate authority until the ordinary final
+        validator and commit below succeed.
+        """
+
+        self.artifacts.require_exact_json(
+            design_ref,
+            design,
+            artifact_types=("design.environment_design", "expansion.environment_design"),
+        )
+        self._validate_budget(budget, repair=False)
+        if not isinstance(diagnostic_capture_terminal_excerpt, bool):
+            raise BuilderError(
+                "diagnostic",
+                "Builder diagnostic terminal-excerpt control must be boolean",
+            )
+        if attempt_ordinal < 2:
+            raise BuilderError(
+                "workspace_recovery",
+                "interrupted workspace recovery requires a successor physical attempt",
+            )
+        if not all(
+            value and value == value.strip()
+            for value in (
+                recovery_lineage_id,
+                recovery_profile_digest,
+                recovery_codex_config_digest,
+                recovery_model,
+            )
+        ):
+            raise BuilderError("workspace_recovery", "private recovery binding is incomplete")
+        try:
+            logical_workspace = logical_workspace_for_isolated_agent_workspace(workspace)
+            resolved_workspace = workspace.expanduser().resolve(  # noqa: ASYNC240 - bounded private-path verification
+                strict=True
+            )
+        except (OSError, ValueError) as exc:
+            raise BuilderError(
+                "workspace_recovery",
+                "private workspace does not match the isolated profile layout",
+            ) from exc
+        contract, contract_ref = self._implementation_contract_for_build(
+            design=design,
+            design_ref=design_ref,
+            implementation_plan=implementation_plan,
+            implementation_plan_ref=implementation_plan_ref,
+        )
+        per_turn_token_limit, per_turn_timeout_seconds = self._initial_turn_envelope(
+            budget,
+            turn_limit=1,
+        )
+        logical_session_token_limit, _logical_session_wall_seconds = self._logical_session_envelope(
+            session_token_limit=session_token_limit,
+            session_wall_seconds=session_wall_seconds,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+        )
+        lineage_id = self._stable_id("implementation", design_ref.revision_id)
+        candidate_id = self._stable_id("candidate", lineage_id)
+        try:
+            assert_agent_output_advisory(
+                CandidateCompletion,
+                authority=AgentOutputAuthority.WORKSPACE_PROPOSAL,
+            )
+            profile = self.profiles.resolve(
+                role="environment-engineer",
+                lineage_id=lineage_id,
+                workspace=logical_workspace,
+                output_schema=CandidateCompletion.model_json_schema(mode="validation"),
+                permissions=permissions,
+                requirement=NodeCapabilityRequirement.isolated_build(
+                    node_id="environment-engineer.runtime-build",
+                    external=self.dependency_capabilities,
+                ),
+                rollout_token_limit=logical_session_token_limit,
+                invocation_timeout_seconds=per_turn_timeout_seconds,
+                model_override=model_override,
+            )
+        except CapabilityResolutionError as exc:
+            raise BuilderError(
+                "permissions",
+                str(exc),
+                permission_denied=True,
+            ) from exc
+        if profile.workspace != resolved_workspace:
+            raise BuilderError(
+                "workspace_recovery",
+                "resolved Engineer profile does not preserve the private recovery workspace",
+            )
+        if (
+            lineage_id != recovery_lineage_id
+            or profile.model != recovery_model
+            or f"sha256:{profile.profile_hash}" != recovery_profile_digest
+            or f"sha256:{profile.codex_config_sha256}" != recovery_codex_config_digest
+        ):
+            raise BuilderError(
+                "workspace_recovery",
+                "resolved Engineer profile does not match the private recovery binding",
+            )
+        self._validate_profile_budget(
+            profile,
+            budget,
+            authorized_turns=1,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+        )
+        input_hashes = self.materialize_implementation_inputs(
+            workspace=profile.workspace,
+            design=design,
+            contract=contract,
+            implementation_plan=implementation_plan,
+        )
+        self._verify_private_workspace_draft(profile.workspace)
+        state = BuilderSessionState(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            lineage_id=lineage_id,
+            candidate_id=candidate_id,
+            workspace=profile.workspace,
+            profile=profile,
+            invocation_session=None,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+            design=design,
+            design_ref=design_ref,
+            implementation_contract=contract,
+            implementation_contract_ref=contract_ref,
+            input_hashes=input_hashes,
+            parent_workspace_refs=(),
+            implementation_plan_ref=implementation_plan_ref,
+            repair_count=attempt_ordinal - 1,
+        )
+        self._verify_framework_inputs(state)
+        completion, next_session, invocation = await self._invoke_engineer(
+            profile=profile,
+            session=None,
+            prompt=(
+                self._initial_prompt(
+                    design,
+                    has_implementation_plan=implementation_plan is not None,
+                )
+                + "\n\n"
+                + self._interrupted_workspace_recovery_prompt(attempt_ordinal)
+            ),
+            lineage_id=lineage_id,
+            attempt=attempt_ordinal,
+            error_state=state,
+            invocation_id=proposal_invocation_id,
+            diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+            invocation_ownership=invocation_ownership,
         )
         next_state = replace(state, invocation_session=next_session)
         return self._validate_and_commit(
@@ -918,6 +1113,8 @@ class EnvironmentBuilder:
         implementation_plan: ImplementationPlan | None = None,
         implementation_plan_ref: ArtifactRef | None = None,
         diagnostic_capture_terminal_excerpt: bool = False,
+        invocation_ownership: InvocationOwnership | None = None,
+        model_override: str | None = None,
     ) -> BuildBundle:
         """Run one Scheduler-authorized semantic repair in the same workspace.
 
@@ -950,17 +1147,14 @@ class EnvironmentBuilder:
                 "repair",
                 "semantic Builder repair requires a successor physical attempt",
             )
-        workspace = workspace.expanduser().resolve()  # noqa: ASYNC240 - bounded setup I/O
-        if (
-            workspace.name != "workspace"
-            or workspace.parent.name != ".agent-runtime"
-            or not workspace.is_dir()
-        ):
+        try:
+            logical_workspace = logical_workspace_for_isolated_agent_workspace(workspace)
+        except (OSError, ValueError) as exc:
             raise BuilderError(
                 "repair",
                 "semantic repair workspace does not match the isolated profile layout",
-            )
-        materialization_root = workspace.parent.parent
+            ) from exc
+        workspace = workspace.expanduser().resolve()  # noqa: ASYNC240 - bounded setup I/O
         contract, contract_ref = self._implementation_contract_for_build(
             design=design,
             design_ref=design_ref,
@@ -987,7 +1181,7 @@ class EnvironmentBuilder:
             profile = self.profiles.resolve(
                 role="environment-engineer",
                 lineage_id=lineage_id,
-                workspace=materialization_root,
+                workspace=logical_workspace,
                 output_schema=CandidateCompletion.model_json_schema(mode="validation"),
                 permissions=permissions,
                 requirement=NodeCapabilityRequirement.isolated_build(
@@ -996,6 +1190,7 @@ class EnvironmentBuilder:
                 ),
                 rollout_token_limit=logical_session_token_limit,
                 invocation_timeout_seconds=per_turn_timeout_seconds,
+                model_override=model_override,
             )
         except CapabilityResolutionError as exc:
             raise BuilderError(
@@ -1066,11 +1261,196 @@ class EnvironmentBuilder:
             error_state=state,
             invocation_id=proposal_invocation_id,
             diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+            invocation_ownership=invocation_ownership,
         )
         next_state = replace(state, invocation_session=next_session)
         return self._validate_and_commit(
             completion=completion,
             state=next_state,
+            invocation=invocation,
+        )
+
+    async def repair_from_snapshot(
+        self,
+        *,
+        design: EnvironmentDesign,
+        design_ref: ArtifactRef,
+        candidate: EnvironmentCandidate,
+        candidate_ref: ArtifactRef,
+        workspace: Path,
+        budget: Budget,
+        permissions: PermissionScope,
+        run_id: str,
+        attempt_id: str,
+        attempt_ordinal: int,
+        proposal_invocation_id: str,
+        correction_feedback: bytes,
+        session_token_limit: int | None = None,
+        session_wall_seconds: float | None = None,
+        implementation_plan: ImplementationPlan | None = None,
+        implementation_plan_ref: ArtifactRef | None = None,
+        diagnostic_capture_terminal_excerpt: bool = False,
+        invocation_ownership: InvocationOwnership | None = None,
+        model_override: str | None = None,
+    ) -> BuildBundle:
+        """Repair one committed Candidate from its immutable source snapshot.
+
+        A downstream Integration/Judge finding is evidence about a Candidate
+        that *already committed*.  Its durable source snapshot, not the
+        private provider thread from the original Builder turn, is therefore
+        the only recoverable continuity boundary.  This method restores that
+        exact closure into a fresh isolated Agent workspace, stages one safe
+        Scheduler correction brief, and spends exactly one new Agent turn.
+        """
+
+        self.artifacts.require_exact_json(
+            design_ref,
+            design,
+            artifact_types=("design.environment_design", "expansion.environment_design"),
+        )
+        self.artifacts.require_exact_json(
+            candidate_ref,
+            candidate,
+            artifact_types=("build.environment_candidate",),
+        )
+        self._validate_budget(budget, repair=False)
+        if not correction_feedback:
+            raise BuilderError(
+                "repair",
+                "snapshot Builder repair requires non-empty safe feedback",
+            )
+        if not isinstance(diagnostic_capture_terminal_excerpt, bool):
+            raise BuilderError(
+                "diagnostic",
+                "Builder diagnostic terminal-excerpt control must be boolean",
+            )
+        if attempt_ordinal < 2:
+            raise BuilderError(
+                "repair",
+                "snapshot Builder repair requires a successor physical attempt",
+            )
+        workspace = workspace.expanduser().resolve()  # noqa: ASYNC240 - bounded setup I/O
+        workspace.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
+        contract, contract_ref = self._implementation_contract_for_build(
+            design=design,
+            design_ref=design_ref,
+            implementation_plan=implementation_plan,
+            implementation_plan_ref=implementation_plan_ref,
+        )
+        lineage_id = self._stable_id("implementation", design_ref.revision_id)
+        candidate_id = self._stable_id("candidate", lineage_id)
+        if (
+            candidate.design_ref != design_ref
+            or candidate.implementation_contract_ref != contract_ref
+            or candidate.candidate_id != candidate_id
+        ):
+            raise BuilderError(
+                "repair",
+                "committed repair seed does not bind this frozen CandidateBuild closure",
+            )
+        per_turn_token_limit, per_turn_timeout_seconds = self._initial_turn_envelope(
+            budget,
+            turn_limit=1,
+        )
+        logical_session_token_limit, _logical_session_wall_seconds = self._logical_session_envelope(
+            session_token_limit=session_token_limit,
+            session_wall_seconds=session_wall_seconds,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+        )
+        try:
+            assert_agent_output_advisory(
+                CandidateCompletion,
+                authority=AgentOutputAuthority.WORKSPACE_PROPOSAL,
+            )
+            profile = self.profiles.resolve(
+                role="environment-engineer",
+                lineage_id=lineage_id,
+                workspace=workspace,
+                output_schema=CandidateCompletion.model_json_schema(mode="validation"),
+                permissions=permissions,
+                requirement=NodeCapabilityRequirement.isolated_build(
+                    node_id="environment-engineer.runtime-build",
+                    external=self.dependency_capabilities,
+                ),
+                rollout_token_limit=logical_session_token_limit,
+                invocation_timeout_seconds=per_turn_timeout_seconds,
+                model_override=model_override,
+            )
+        except CapabilityResolutionError as exc:
+            raise BuilderError(
+                "permissions",
+                str(exc),
+                permission_denied=True,
+            ) from exc
+        self._validate_profile_budget(
+            profile,
+            budget,
+            authorized_turns=1,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+        )
+        input_hashes = self.materialize_implementation_inputs(
+            workspace=profile.workspace,
+            design=design,
+            contract=contract,
+            implementation_plan=implementation_plan,
+        )
+        self.materialize_exact_candidate(
+            candidate=candidate,
+            candidate_ref=candidate_ref,
+            workspace=profile.workspace,
+        )
+        disclosure_name = f"scheduler-snapshot-repair-{attempt_ordinal}.json"
+        disclosure_path = profile.workspace / "inputs" / disclosure_name
+        self._assert_no_secret_values(correction_feedback, profile.secret_values)
+        self._write_immutable(disclosure_path, correction_feedback)
+        input_hashes = tuple(
+            sorted(
+                (
+                    *input_hashes,
+                    (
+                        disclosure_path.relative_to(profile.workspace).as_posix(),
+                        sha256_digest(correction_feedback),
+                    ),
+                )
+            )
+        )
+        state = BuilderSessionState(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            lineage_id=lineage_id,
+            candidate_id=candidate_id,
+            workspace=profile.workspace,
+            profile=profile,
+            invocation_session=None,
+            physical_turn_token_limit=per_turn_token_limit,
+            physical_turn_timeout_seconds=per_turn_timeout_seconds,
+            design=design,
+            design_ref=design_ref,
+            implementation_contract=contract,
+            implementation_contract_ref=contract_ref,
+            input_hashes=input_hashes,
+            parent_workspace_refs=(),
+            implementation_plan_ref=implementation_plan_ref,
+            prior_snapshot_refs=(candidate.source_workspace_snapshot_ref,),
+            repair_count=attempt_ordinal - 1,
+        )
+        self._verify_framework_inputs(state)
+        completion, session, invocation = await self._invoke_engineer(
+            profile=profile,
+            session=None,
+            prompt=self._scheduler_snapshot_repair_prompt(attempt_ordinal, disclosure_name),
+            lineage_id=lineage_id,
+            attempt=attempt_ordinal,
+            error_state=state,
+            invocation_id=proposal_invocation_id,
+            diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+            invocation_ownership=invocation_ownership,
+        )
+        return self._validate_and_commit(
+            completion=completion,
+            state=replace(state, invocation_session=session),
             invocation=invocation,
         )
 
@@ -1114,6 +1494,8 @@ class EnvironmentBuilder:
             implementation_plan=implementation_plan,
             implementation_plan_ref=implementation_plan_ref,
             diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+            invocation_ownership=None,
+            model_override=None,
         )
 
     async def _build(
@@ -1135,6 +1517,8 @@ class EnvironmentBuilder:
         implementation_plan: ImplementationPlan | None,
         implementation_plan_ref: ArtifactRef | None,
         diagnostic_capture_terminal_excerpt: bool,
+        invocation_ownership: InvocationOwnership | None,
+        model_override: str | None,
     ) -> BuildBundle:
         """Run an Engineer proposal, optionally through the legacy correction loop."""
 
@@ -1192,19 +1576,35 @@ class EnvironmentBuilder:
                 CandidateCompletion,
                 authority=AgentOutputAuthority.WORKSPACE_PROPOSAL,
             )
-            profile = self.profiles.resolve(
-                role="environment-engineer",
-                lineage_id=lineage_id,
-                workspace=workspace,
-                output_schema=CandidateCompletion.model_json_schema(mode="validation"),
-                permissions=permissions,
-                requirement=NodeCapabilityRequirement.isolated_build(
-                    node_id="environment-engineer.runtime-build",
-                    external=self.dependency_capabilities,
-                ),
-                rollout_token_limit=logical_session_token_limit,
-                invocation_timeout_seconds=per_turn_timeout_seconds,
-            )
+            if model_override is None:
+                profile = self.profiles.resolve(
+                    role="environment-engineer",
+                    lineage_id=lineage_id,
+                    workspace=workspace,
+                    output_schema=CandidateCompletion.model_json_schema(mode="validation"),
+                    permissions=permissions,
+                    requirement=NodeCapabilityRequirement.isolated_build(
+                        node_id="environment-engineer.runtime-build",
+                        external=self.dependency_capabilities,
+                    ),
+                    rollout_token_limit=logical_session_token_limit,
+                    invocation_timeout_seconds=per_turn_timeout_seconds,
+                )
+            else:
+                profile = self.profiles.resolve(
+                    role="environment-engineer",
+                    lineage_id=lineage_id,
+                    workspace=workspace,
+                    output_schema=CandidateCompletion.model_json_schema(mode="validation"),
+                    permissions=permissions,
+                    requirement=NodeCapabilityRequirement.isolated_build(
+                        node_id="environment-engineer.runtime-build",
+                        external=self.dependency_capabilities,
+                    ),
+                    rollout_token_limit=logical_session_token_limit,
+                    invocation_timeout_seconds=per_turn_timeout_seconds,
+                    model_override=model_override,
+                )
         except CapabilityResolutionError as exc:
             raise BuilderError(
                 "permissions",
@@ -1343,6 +1743,7 @@ class EnvironmentBuilder:
                     error_state=state,
                     invocation_id=(proposal_invocation_id if turn_index == 0 else None),
                     diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+                    invocation_ownership=invocation_ownership,
                 )
             except BuilderError as exc:
                 if exc.invocation is not None:
@@ -1700,12 +2101,11 @@ class EnvironmentBuilder:
                         "declarations are not unique",
                         "project is empty",
                         "file-count limit",
-                        "executable mode contradicts",
                     ),
                     "manifest_closure",
                     30,
                     "candidate_manifest_closure",
-                    "Make file declarations exactly match the final regular files and modes.",
+                    "Make file declarations exactly match the final regular files and roles.",
                 ),
                 (
                     (
@@ -1806,6 +2206,32 @@ class EnvironmentBuilder:
 
         count = diagnostic.count
         plural = "path" if count == 1 else "paths"
+        if diagnostic.code == "python_requires_contract_mismatch":
+            return ValidationDiagnostic(
+                owner_component="build",
+                validation_phase="project_contract",
+                frontier_ordinal=50,
+                issues=(
+                    SafeValidationIssue(
+                        "candidate_python_requires_contract_mismatch",
+                        ("candidate", "pyproject.toml", "uv.lock"),
+                        (
+                            "Read inputs/implementation-contract.json and copy its "
+                            "python_requires field exactly into [project].requires-python; "
+                            "make uv.lock use that same range or uv's canonical ==3.12.* "
+                            "range. Do not widen it to >=3.12."
+                        ),
+                        violated_condition=(
+                            "candidate Python ranges do not exactly represent the frozen "
+                            "implementation contract"
+                        ),
+                        expected_category=(
+                            "the exact frozen python_requires value in pyproject and either "
+                            "that value or uv's canonical Python 3.12 range in uv.lock"
+                        ),
+                    ),
+                ),
+            )
         dependency_details: dict[str, tuple[str, str, str]] = {
             "dependency_virtual_root_source_invalid": (
                 "candidate_dependency_virtual_root_source_invalid",
@@ -1884,14 +2310,6 @@ class EnvironmentBuilder:
                 ),
                 "a bounded final regular candidate file inventory",
             ),
-            "manifest_executable_mode": (
-                "candidate_manifest_executable_mode",
-                (
-                    "a final candidate file executable bit disagrees with its "
-                    "CandidateCompletion declaration"
-                ),
-                "an executable declaration matching every final regular file mode",
-            ),
         }
         mapped = details.get(diagnostic.code)
         if mapped is None:
@@ -1920,8 +2338,8 @@ class EnvironmentBuilder:
                     ("candidate", "files"),
                     (
                         "Inspect the final candidate/ inventory after cleanup, then return one "
-                        "complete CandidateCompletion whose files list and executable flags match "
-                        "that inventory exactly."
+                        "complete CandidateCompletion whose files list and roles match that "
+                        "inventory exactly."
                     ),
                     violated_condition=condition,
                     expected_category=expected,
@@ -2061,6 +2479,7 @@ class EnvironmentBuilder:
         error_state: BuilderSessionState,
         invocation_id: str | None = None,
         diagnostic_capture_terminal_excerpt: bool = False,
+        invocation_ownership: InvocationOwnership | None = None,
     ) -> tuple[CandidateCompletion, InvocationSession, BuildInvocationSummary]:
         invocation_id = invocation_id or f"build-{hashlib.sha256(os.urandom(32)).hexdigest()[:24]}"
         invocation_started = time.monotonic()
@@ -2082,12 +2501,18 @@ class EnvironmentBuilder:
                     # opts in. The backend returns a worker-redacted excerpt
                     # which is deliberately kept out of normal feedback.
                     metadata["diagnostic_capture_terminal_excerpt"] = True
+                ownership = invocation_ownership or standalone_component_ownership(
+                    invocation_id=invocation_id,
+                    component="builder",
+                    coordinate="builder:candidate",
+                )
                 result = await self.backend.invoke(
                     InvocationRequest(
                         invocation_id=invocation_id,
                         prompt=prompt,
                         profile=profile,
                         session=session,
+                        ownership=ownership,
                         metadata=metadata,
                     )
                 )
@@ -2711,6 +3136,62 @@ class EnvironmentBuilder:
                 )
 
     @staticmethod
+    def _verify_private_workspace_draft(workspace: Path) -> None:
+        """Check only that a recovery draft is safe to re-open privately.
+
+        This deliberately does not validate a Candidate manifest, file roles,
+        dependency closure, or semantics: no CandidateCompletion exists yet.
+        The fresh Engineer may remove derived debris and complete the project;
+        `_validate_and_commit` remains the only acceptance boundary. Links,
+        special files, and empty roots are rejected before a new Agent session
+        can inspect the draft.
+        """
+
+        candidate_root = workspace / "candidate"
+        if candidate_root.is_symlink() or not candidate_root.is_dir():
+            raise BuilderError(
+                "workspace_recovery",
+                "private Candidate draft root is missing or unsafe",
+            )
+        observed_regular_file = False
+        try:
+            for _directory, directory_names, file_names, directory_fd in os.fwalk(
+                candidate_root,
+                topdown=True,
+                follow_symlinks=False,
+            ):
+                for name in directory_names:
+                    observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+                        raise BuilderError(
+                            "workspace_recovery",
+                            "private Candidate draft contains an unsafe directory entry",
+                        )
+                for name in file_names:
+                    observed = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if (
+                        stat.S_ISLNK(observed.st_mode)
+                        or not stat.S_ISREG(observed.st_mode)
+                        or observed.st_nlink != 1
+                    ):
+                        raise BuilderError(
+                            "workspace_recovery",
+                            "private Candidate draft contains an unsafe file entry",
+                        )
+                    if observed.st_size > 0:
+                        observed_regular_file = True
+        except OSError as exc:
+            raise BuilderError(
+                "workspace_recovery",
+                "private Candidate draft could not be inspected safely",
+            ) from exc
+        if not observed_regular_file:
+            raise BuilderError(
+                "workspace_recovery",
+                "private Candidate draft has no regular file activity",
+            )
+
+    @staticmethod
     def _assert_no_secret_values(content: bytes, secret_values: tuple[str, ...]) -> None:
         for value in secret_values:
             encoded = value.encode("utf-8")
@@ -2900,6 +3381,10 @@ class EnvironmentBuilder:
 
     @staticmethod
     def _runtime_wire_contract() -> RuntimeWireContract:
+        state_digest_requirement = (
+            "state_digest must be exactly `sha256:` followed by 64 lowercase hexadecimal "
+            "characters; a bare hexadecimal digest is invalid."
+        )
         return RuntimeWireContract(
             operations=(
                 RuntimeOperationContract(
@@ -2907,7 +3392,11 @@ class EnvironmentBuilder:
                     request_payload={},
                     result_requirements=(
                         "Return exactly runtime_id, operations, tools, and optional metadata.",
-                        "operations contains handshake/reset/invoke/snapshot/close exactly once.",
+                        (
+                            "operations is exactly the JSON string array "
+                            '["handshake","reset","invoke","snapshot","close"] '
+                            "in that order; do not emit operation objects or metadata there."
+                        ),
                         (
                             "Each tools entry contains exactly tool_id, namespace, name, "
                             "input_schema, output_schema, observation_schema, and optional "
@@ -2929,10 +3418,16 @@ class EnvironmentBuilder:
                             "Return only ActorBoundary.visibility fields in observation."
                         ),
                         (
-                            "Return exactly observation, sha256 state_digest, terminated, and "
-                            "an empty info object."
+                            "Return exactly observation, state_digest, terminated, and an empty "
+                            "info object."
                         ),
-                        "Do not accept private goal, expected value, task id, or case metadata.",
+                        state_digest_requirement,
+                        (
+                            "Accept only the reset payload fields declared by this contract and "
+                            "the frozen WorldSpec schemas. Framework-only metadata is unavailable "
+                            "to Candidate code. A WorldSpec-defined domain identifier such as a "
+                            "tool task_id argument remains ordinary domain semantics."
+                        ),
                     ),
                 ),
                 RuntimeOperationContract(
@@ -2945,9 +3440,10 @@ class EnvironmentBuilder:
                     result_requirements=(
                         "Execute the WorldSpec transition in program code.",
                         (
-                            "Return exactly tool_result, observation, events, sha256 "
-                            "state_digest, reward, terminated, truncated, and info."
+                            "Return exactly tool_result, observation, events, state_digest, "
+                            "reward, terminated, truncated, and info."
                         ),
+                        state_digest_requirement,
                         (
                             "Return only ObservationSemantics.visible_fields_by_actor for the "
                             "episode actor; events and info are empty. Error details are empty."
@@ -2963,15 +3459,18 @@ class EnvironmentBuilder:
                         ),
                         (
                             "Treat reward and terminated as diagnostic-only Runtime fields; the "
-                            "framework trusted evaluator recomputes authoritative task reward and "
-                            "termination from evaluator_goal plus the WorldSpec Rule IR."
+                            "framework independently computes authoritative task outcomes from the "
+                            "frozen design."
                         ),
                     ),
                 ),
                 RuntimeOperationContract(
                     operation="snapshot",
                     request_payload={},
-                    result_requirements=("Return exactly observation and sha256 state_digest.",),
+                    result_requirements=(
+                        "Return exactly observation and state_digest.",
+                        state_digest_requirement,
+                    ),
                 ),
                 RuntimeOperationContract(
                     operation="close",
@@ -2979,7 +3478,6 @@ class EnvironmentBuilder:
                     result_requirements=("Close resources and return an empty JSON object.",),
                 ),
             ),
-            forbidden_runtime_key_names=_FORBIDDEN_RUNTIME_KEYS,
         )
 
     @staticmethod
@@ -2997,12 +3495,24 @@ class EnvironmentBuilder:
                 "order from the frozen JSON inputs."
             )
         )
-        return f"""You are the isolated Environment Engineer for the Agent World Foundry.
+        prompt = """You are the isolated Environment Engineer for the Agent World Foundry.
 
 Project purpose: turn a human need into a real executable programmatic environment whose state
 transitions are owned by code and can later be independently evaluated or used for Agent training.
 Your Builder role is narrower: compile the frozen EnvironmentDesign/WorldSpec into a candidate.
-Do not change semantics, decide release, or search for sealed/private evaluation material.
+Do not change semantics or decide release. Treat framework-only evaluation machinery as unavailable
+and build only the declared Candidate interfaces.
+
+You are already at the isolated workspace root. Work only with relative `inputs/...` and
+`candidate/...` paths. Use `./.agent-world-tools/uv` for every uv operation and
+`./.agent-world-tools/python3.12` for compact JSON inspection. Bare `uv`, bare `python`, and a
+generation-workspace `.venv` are not provisioned interfaces. For uv commands that select or
+create a Python runtime, pass `--python ./.agent-world-tools/python3.12` explicitly; do not rely
+on PATH or `UV_PYTHON`. Read each immutable input through focused fields rather than dumping full
+JSON into tool output. After the initial concise pass,
+create the `candidate/` project skeleton before any further deep schema lookup. If a shell command
+fails, use `pwd` and correct the relative command; do not reconstruct host/profile paths or scan
+parent directories for alternate tools.
 
 Read these immutable framework inputs before editing:
 - inputs/world-spec.json
@@ -3024,9 +3534,16 @@ declared with file role `license`. The `[project]` table must contain an explici
 license expression or a license-file declaration bound to that file. Implement stdio JSONL
 agent-world.runtime.v2 exactly as the implementation contract states. Runtime state must use the
 writable `AGENT_WORLD_STATE_DIR`; the installed source tree is read-only under Judge isolation.
+For every reset, invoke, and snapshot result, state_digest is a wire value: emit exactly the
+literal `sha256:` prefix followed by 64 lowercase hexadecimal characters. A bare
+`hashlib.sha256(...).hexdigest()` value is invalid. Assert this exact format in a standalone
+public Runtime test.
+Copy `inputs/implementation-contract.json` field `python_requires` verbatim into
+`[project].requires-python`; `uv.lock` must use that same range or uv's canonical `==3.12.*`
+range. Never replace the frozen range with a broad `>=3.12` shorthand.
 The root project is a virtual, non-installed uv root executed directly from that read-only source
 tree: set `[tool.uv] package = false`, do not declare a build-system, and ensure `uv.lock` records
-exactly one root package named exactly `[project].name` with `{{ virtual = "." }}`. Dependencies
+exactly one root package named exactly `[project].name` with `{ virtual = "." }`. Dependencies
 may only be ordinary named requirements resolved to hash-pinned wheels from the fixed HTTPS PyPI
 registry. Do not use editable/workspace, path, Git,
 direct URL, custom index, find-links, build-setting, source-build, or sdist-only install paths.
@@ -3036,8 +3553,10 @@ supply-chain contract.
 
 Implement unseen seeded episodes, every WorldSpec tool and transition, the Task Materializer v3
 callable, a runnable public self-check, and real standalone public-test scripts. Declare the
-self-check as a `.venv/bin/python -m package.module` command. Every declared public test must run
-directly as `.venv/bin/python relative/test_path.py` without network or a writable source tree; it
+self-check as a `.venv/bin/python -m package.module` command. The framework invokes every declared
+public test as a standalone script under the candidate-only read-only sandbox, with the project root
+and an optional `src/` layout importable. Write ordinary imports from declared candidate modules;
+do not mutate `sys.path`, depend on `PYTHONPATH`, network, or a writable source tree. Public tests
 may diagnose the candidate but cannot claim release authority. Use uv to lock and run the tests.
 Remove `.venv`, caches, build output, bytecode, links, and undeclared files before completion.
 
@@ -3061,20 +3580,32 @@ candidate-relative `.py` path, whereas runtime and self-check `argv` must use th
 dot-separated module after `-m`. For example, `candidate/runtime.py` pairs with
 `[.venv/bin/python, -m, candidate.runtime]`. Before returning, inspect the final regular-file
 inventory and declare every final path exactly once with its fixed role.
+The framework derives hashes and executable modes from the physical final tree; do not include
+executable metadata in CandidateCompletion file declarations.
 If the materializer file is directly at the project root as `candidate/task_materializer.py`,
 declare `entry_path=task_materializer.py` and `entrypoint=task_materializer:materialize`; only
 use a `candidate.` module prefix when `candidate/` is an actual package directory inside the
 project root.
-Never author `public_instruction`, evaluator goal, answer, expected output, solution trace, or
-evaluation witness. Framework code renders the instruction from the frozen objective and public
-goal, projects the evaluator goal through typed identity bindings, and independently proves task
-reachability. For every difficulty dimension, changing only that dimension at the same seed and
-actor must change `public_goal` or `initial_config`, not merely echo another label.
+
+Candidate file roles are real isolated source views, not labels for organization only. A
+`runtime` module may import only `runtime` files; a `task_materializer` module may import
+`runtime` or `task_materializer`; a `public_verifier` module may import `runtime`,
+`task_materializer`, or `public_verifier`. Do not declare shared executable helpers as
+configuration/documentation/test files. If Runtime and another component need a helper, declare
+that helper `runtime` or make the components self-contained. Before completion, compare all
+Python imports with the final declared roles and verify each component can import only its visible
+source closure.
+The Task Materializer owns only its declared closed output fields. Framework code independently
+renders user-facing instructions, binds evaluation, and proves task reachability. Do not add
+undeclared output fields, framework-only constants, or a generic private-name blacklist to
+Candidate source. For every difficulty dimension, changing only that dimension at the same seed
+and actor must change `public_goal` or `initial_config`, not merely echo another label.
 
 Runtime reset receives only `seed`, `actor`, and `initial_config`, and binds actor for the episode;
-invoke has no actor field and must not infer one from tool arguments. Runtime cannot truthfully
-compute evaluator-owned task reward or success, so its reward/termination fields are diagnostic
-only; do not smuggle evaluator goals or solver traces into Runtime state or inputs.
+invoke has no actor field and must not infer one from tool arguments. Authoritative task outcomes
+are computed outside Candidate code, so its reward/termination fields are diagnostic only. Keep
+Runtime state and inputs limited to their declared schemas; do not add generic private-data fields
+or names.
 Project reset
 observation to ActorBoundary.visibility and each invoke observation to
 ObservationSemantics.visible_fields_by_actor for the bound actor. Snapshot remains full-state and
@@ -3082,8 +3613,10 @@ Judge-only. Keep reset/invoke info, invoke events, and error details empty becau
 have no typed WorldSpec semantics.
 
 Never implement fixed task replay, fixture registries, environment-id branches, generated verify()
-release authority, mocks/fakes/stubs, or template fallback. Runtime inputs must never contain task
-ids, case labels, expected values, oracle data, verifier IR, sealed data, or release metadata.
+release authority, mocks/fakes/stubs, or template fallback. Candidate code and Runtime inputs must
+use only fields declared by WorldSpec and the frozen schemas. Do not introduce a generic blacklist
+of framework-only names or embed framework-owned metadata in source. This does not prohibit a
+WorldSpec-defined domain identifier such as a tool `task_id` argument.
 Do not write an envpkg, candidate, Judge, or release manifest: framework code creates those after
 it independently inspects every declared project file. Do not generate or claim an SBOM,
 supply-chain verdict, license-completeness verdict, Judge result, or Gate result; those are derived
@@ -3091,13 +3624,18 @@ from the physical lock, clean installation, metadata, and isolated executions by
 
 Return only the requested CandidateCompletion JSON. A completed declaration must explicitly echo
 `root_project_mode=virtual-read-only-source-tree` and
-`dependency_install_mode=offline-wheel-only`, plus relative paths, file roles, executable bits,
-entrypoints and launch argv. It must not invent hashes, ArtifactRefs, Judge results, or release
+`dependency_install_mode=offline-wheel-only`, plus relative paths, file roles, entrypoints and
+launch argv. It must not invent hashes, file modes, ArtifactRefs, Judge results, or release
 claims. If a real dependency/tool/permission prevents completion, return status=blocked with the
 honest blocker and no claimed files.
 
-Frozen design id: {design.design_id}, revision: {design.revision}.
+Frozen design id: {design_id}, revision: {design_revision}.
 """
+        return (
+            prompt.replace("{plan_instruction}", plan_instruction)
+            .replace("{design_id}", design.design_id)
+            .replace("{design_revision}", str(design.revision))
+        )
 
     @staticmethod
     def _output_limit_continuation_prompt() -> str:
@@ -3120,6 +3658,31 @@ interruption. When the candidate is complete, return the full requested Candidat
 only; it must declare the final complete workspace rather than a patch or partial file list."""
 
     @staticmethod
+    def _interrupted_workspace_recovery_prompt(attempt: int) -> str:
+        """Start a fresh thread over an untrusted private Candidate draft."""
+
+        return f"""You are in a fresh isolated Environment Engineer session after a previous
+physical Provider turn was interrupted before it returned CandidateCompletion.
+
+`candidate/` is an uncommitted, untrusted working draft. It is not a prior answer, an Artifact,
+or a release candidate. Do not search for, restore, or refer to an earlier Agent thread. First
+read the frozen `inputs/` documents, inspect the existing candidate files, and run focused public
+checks. Preserve correct work when it satisfies the frozen contracts, but freely correct, replace,
+or complete the draft when it does not. Do not treat the missing previous response as a semantic
+failure and do not copy any framework input into Candidate source. The initial instruction to
+create a candidate skeleton means inspect and complete this existing skeleton; it does not require
+deleting correct draft files merely because this thread is fresh.
+
+The normal Builder validator will independently inspect the final tree. Before returning, clean
+only derived debris, inspect the complete regular-file inventory under `candidate/`, and make one
+complete CandidateCompletion declaration that exactly matches it. The declaration must be a full
+replacement, never a patch or a partial list. Do not claim Candidate, Judge, Gate, or release
+success. If frozen inputs or a real dependency/tool constraint prevents completion, return the
+honest blocked completion instead.
+
+Return only CandidateCompletion JSON. This is fresh-session workspace recovery attempt {attempt}."""
+
+    @staticmethod
     def _repair_prompt(attempt: int, disclosure_filename: str) -> str:
         return f"""Continue the same Environment Engineer thread and modify the existing
 `candidate/` project in the same workspace.
@@ -3129,16 +3692,21 @@ transitions for later independent evaluation/training. Builder repair only fixes
 against the frozen design; it must not weaken WorldSpec, infer hidden cases, or decide release.
 
 Read `inputs/{disclosure_filename}`. It is the complete authorized disclosure for repair attempt
-{attempt}. Do not search for evidence refs, expected outputs, evaluator goals, sealed cases, or
-Judge internals. Framework inputs are build-time only: the candidate must run when restored alone,
+{attempt}. Do not search for undisclosed framework-owned material or Judge internals. Framework
+inputs are build-time only: the candidate must run when restored alone,
 and no candidate component or test may read `../inputs` or another workspace file. Treat existing
 candidate behavior and public-test assertions unrelated to the disclosed Finding as regression
 obligations: do not delete, relax, invert, or replace them merely to make the current repair pass.
+Keep the repair within declared Candidate interfaces; do not introduce a generic private-name
+blacklist to work around a gate.
 Add or strengthen a focused regression test for the root cause, inspect the final diff for
-unrelated changes, rerun real uv/public checks from an isolated candidate-only copy, clean build
-debris, and return only the requested CandidateCompletion relative-path/launch declaration. If a
-pre-existing assertion truly conflicts with the frozen design, report the blocker instead of
-silently weakening it. If blocked, report it honestly.
+unrelated changes, and, when touching `pyproject.toml` or `uv.lock`, reread
+`inputs/implementation-contract.json`: `[project].requires-python` must copy `python_requires`
+verbatim and the lock range must be that value or canonical `==3.12.*`, never a broad `>=3.12`.
+Rerun real uv/public checks from an isolated candidate-only copy, clean build debris, and return
+only the requested CandidateCompletion relative-path/launch declaration. If a pre-existing
+assertion truly conflicts with the frozen design, report the blocker instead of silently weakening
+it. If blocked, report it honestly.
 """
 
     @staticmethod
@@ -3156,13 +3724,46 @@ and unrelated public-test behavior.
 
 Before returning, remove only derived debris, inspect the final regular-file inventory under
 `candidate/`, and reconcile it with the full CandidateCompletion you return: every final regular
-file is declared exactly once with the correct role and executable flag, and nothing absent from
-the final tree remains declared. If the correction touches implementation behavior, strengthen a
-focused public regression without weakening unrelated assertions. Do not read or copy `inputs/`
-into the candidate, do not change WorldSpec/Curriculum semantics, and do not claim Judge, Gate, or
-release results.
+file is declared exactly once with the correct role, and nothing absent from the final tree remains
+declared. The framework derives executable modes from the physical files; do not include mode
+metadata in the declaration. If the correction touches `pyproject.toml` or `uv.lock`, reread
+`inputs/implementation-contract.json`: `[project].requires-python` must copy `python_requires`
+verbatim, and the lock range must be that value or canonical `==3.12.*`, never a broad `>=3.12`.
+If the correction touches implementation behavior, strengthen a focused public regression without
+weakening unrelated assertions. Do not read or copy `inputs/` into the candidate, do not change
+WorldSpec/Curriculum semantics, and do not claim Judge, Gate, or release results.
 
 Return one complete corrected CandidateCompletion JSON only, never a patch or an explanation.
+This is correction attempt {attempt}."""
+
+    @staticmethod
+    def _scheduler_snapshot_repair_prompt(attempt: int, disclosure_filename: str) -> str:
+        """Render a fresh-session correction over one restored Candidate snapshot."""
+
+        return f"""You are in a fresh isolated Environment Engineer session.
+
+The framework has restored one exact, previously committed Candidate source tree under
+`candidate/`. Do not regenerate it from a template and do not search for an earlier Agent thread:
+the restored files are the complete continuity boundary for this one correction. Make only the
+disclosed correction in place, preserving every unrelated working behavior and public-test
+assertion.
+
+Read only `inputs/{disclosure_filename}` for the safe rejected conditions. It contains no hidden
+evaluator data, no release decision, and no authority to change the frozen WorldSpec or
+Curriculum. Framework inputs are build-time only: the candidate must run when restored alone, and
+no candidate component or test may read `../inputs` or another workspace file. If a disclosed
+condition cannot be reconciled with the frozen inputs, report the blocker honestly rather than
+weakening source, tests, or contracts.
+
+Before returning, run the focused public regression and the candidate's real public checks. Remove
+only derived debris, inspect the final regular-file inventory under `candidate/`, and reconcile it
+with the full CandidateCompletion you return: every final regular file is declared exactly once
+with the correct role, and no absent file remains declared. If the correction touches
+`pyproject.toml` or `uv.lock`, reread `inputs/implementation-contract.json`:
+`[project].requires-python` must copy `python_requires` verbatim and the lock range must be that
+value or canonical `==3.12.*`, never a broad `>=3.12`.
+
+Return one complete corrected CandidateCompletion JSON only, never a patch or explanation.
 This is correction attempt {attempt}."""
 
     @staticmethod

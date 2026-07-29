@@ -15,6 +15,8 @@ from agent_world.contracts.reachability import (
     RecipePointer,
 )
 from agent_world.invocation import (
+    InvocationOwnerKind,
+    InvocationOwnership,
     InvocationRequest,
     InvocationResult,
     InvocationSession,
@@ -373,3 +375,50 @@ async def test_interactive_solver_hard_caps_each_turn_without_breaking_session(
     assert backend.requests[0].session is None
     assert backend.requests[1].session is not None
     assert backend.requests[1].session.profile_hash == backend.requests[1].profile.profile_hash
+
+
+@pytest.mark.asyncio
+async def test_interactive_solver_binds_each_turn_to_the_same_explicit_operation(
+    tmp_path: Path,
+) -> None:
+    """The solver's session is private; durable recovery owns the operation."""
+
+    profiles = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="configured-model",
+            api_key_environment="OPENAI_API_KEY",
+            openai_base_url_environment="OPENAI_BASE_URL",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "OPENAI_API_KEY": "ownership-probe-credential",
+            "OPENAI_BASE_URL": "https://provider.example.test/v1",
+        },
+    )
+    backend = _BudgetProbeBackend()
+    strategy = InteractiveChallengerStrategy(
+        invocation_backend=backend,
+        profile_provider=profiles,
+    )
+    ownership = InvocationOwnership(
+        owner_kind=InvocationOwnerKind.WORK_OPERATION,
+        owner_id="operation:release-assurance",
+        scope_id="scope:reachability",
+        coordinate="judge:release_assurance",
+        immutable_input_closure_digest="b" * 64,
+    )
+
+    outcome = await strategy.solve(
+        driver=_TwoStepEpisode(),
+        lineage_id="reachability-ownership-probe",
+        workspace=tmp_path / "solver-workspace",
+        budget=Budget(llm_tokens=10, agent_turns=2, tool_calls=2),
+        required_tool_ids=("counter.increment",),
+        minimum_tool_calls=2,
+        maximum_agent_turns=2,
+        maximum_steps=2,
+        invocation_ownership=ownership,
+    )
+
+    assert outcome.certified
+    assert [request.ownership for request in backend.requests] == [ownership, ownership]

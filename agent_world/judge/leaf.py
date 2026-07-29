@@ -12,6 +12,7 @@ from agent_world.contracts import (
     BudgetUsage,
     EnvironmentCandidate,
     EnvironmentDesign,
+    Finding,
     GenerationContext,
     IntegrationReport,
     JudgeReport,
@@ -25,6 +26,7 @@ from agent_world.control.leaf_executor import (
     AgentExecutionProvenance,
     LeafExecutionFailure,
     LeafProposal,
+    LeafSemanticRepairSeed,
     LeafValidationFailure,
     SchedulerLeafExecutor,
 )
@@ -115,6 +117,21 @@ class VerifierBatchLeaf:
                     budget=self._budget(definition),
                     permissions=_generation_permissions(current_context, self.compiler),
                     invocation_id=dispatch_id,
+                    invocation_ownership=self.kernel.invocation_ownership(
+                        definition=definition,
+                        attempt=attempt,
+                        dispatch_id=dispatch_id,
+                    ),
+                    model_override=attempt.model_override,
+                    correction_brief=self.kernel.agent_correction_brief(
+                        current_context,
+                        definition=definition,
+                    ),
+                    semantic_repair_seed=self.kernel.agent_semantic_repair_seed(
+                        current_context,
+                        definition=definition,
+                        attempt=attempt,
+                    ),
                 )
             except VerifierCompilationError as exc:
                 provenance = (
@@ -124,23 +141,25 @@ class VerifierBatchLeaf:
                     exc.result,
                     budget=self._budget(definition),
                 )
-                code = self._safe_code("verifier_compilation_error")
+                code = self._safe_code(exc.safe_code)
                 if provenance is None:
                     code = f"preflight_{code}"
                 raise LeafExecutionFailure(
                     code=code,
-                    category="VerifierCompilationError",
+                    category=exc.safe_category,
                     observed_actual=usage,
                     unknown_upper_bound=unknown,
                     agent=provenance,
+                    retryable=exc.retryable,
+                    expected_category=exc.expected_category,
+                    remediation=exc.remediation,
                 ) from exc
 
             provenance = self._provenance(result.profile, dispatch_id)
             usage, unknown = self._usage(result.invocation, budget=self._budget(definition))
             if not result.invocation.succeeded:
                 backend_code = (
-                    safe_terminal_code(result.invocation.error)
-                    or result.invocation.error.code
+                    safe_terminal_code(result.invocation.error) or result.invocation.error.code
                     if result.invocation.error is not None
                     else result.invocation.status.value
                 )
@@ -165,6 +184,7 @@ class VerifierBatchLeaf:
                                 issue.expected_category
                                 or "the frozen verifier intent contract at this path"
                             ),
+                            remediation=issue.remediation,
                             retryable=issue.retryable,
                         )
                         for issue in result.validation_diagnostic.issues
@@ -174,6 +194,16 @@ class VerifierBatchLeaf:
                     observed_actual=usage,
                     unknown_upper_bound=unknown,
                     agent=provenance,
+                    semantic_repair_seed=(
+                        LeafSemanticRepairSeed(
+                            model=provenance.model,
+                            profile_digest=provenance.profile_digest,
+                            output_schema_digest=provenance.output_schema_digest,
+                            previous_candidate=result.intent.model_dump(mode="json"),
+                        )
+                        if result.intent is not None
+                        else None
+                    ),
                 )
             if not result.succeeded or result.checkpoint_ref is None or result.draft_ref is None:
                 raise RuntimeError("one-shot Verifier result omitted its required Artifact closure")
@@ -502,24 +532,23 @@ class IntegrationLeaf:
                     parent_repair_target=self._unique_build_target(definition),
                 ) from exc
             budget = self._budget(definition)
-            try:
-                bundle = await self.judge.evaluate_integration(
-                    candidate=candidate,
-                    candidate_ref=candidate_ref,
-                    source_dir=source_dir,
-                    world_spec=world_spec,
-                    world_spec_ref=world_spec_ref,
-                    release_profile=self.release_profile,
-                    budget=budget,
-                    run_id=f"{self.run_id}:integration:{attempt.attempt_id}",
-                    telemetry_trace_id=attempt.telemetry_trace_id,
-                    coordinate_key=definition.coordinate.coordinate_key,
-                )
-            except Exception as exc:
-                raise LeafExecutionFailure(
-                    code="integration_execution_error",
-                    category=type(exc).__name__,
-                ) from exc
+            # Do not flatten a framework ValidationError into an opaque
+            # execution category.  SchedulerLeafExecutor owns the common
+            # Pydantic-to-safe-ValidationIssue bridge for code leaves, which
+            # preserves field locations and prevents a deterministic schema
+            # failure from being misrouted as transport retry work.
+            bundle = await self.judge.evaluate_integration(
+                candidate=candidate,
+                candidate_ref=candidate_ref,
+                source_dir=source_dir,
+                world_spec=world_spec,
+                world_spec_ref=world_spec_ref,
+                release_profile=self.release_profile,
+                budget=budget,
+                run_id=f"{self.run_id}:integration:{attempt.attempt_id}",
+                telemetry_trace_id=attempt.telemetry_trace_id,
+                coordinate_key=definition.coordinate.coordinate_key,
+            )
             return self._integration_proposal(bundle, definition=definition)
 
         await self.kernel.execute(context, definition=definition, proposal_runner=proposal)
@@ -596,18 +625,105 @@ class IntegrationLeaf:
                 category="independent integration infrastructure failed",
                 observed_actual=usage,
             )
+        repair_issues, route_build_repair = self._integration_repair_feedback(report)
         raise LeafValidationFailure(
-            issues=self._report_issues(report, stage="integration"),
+            issues=repair_issues,
             output_commitment=bundle.report_ref.content_hash,
             category="independent_integration_failed",
             observed_actual=usage,
             evidence_refs=(bundle.report_ref,),
             parent_repair_target=(
-                self._unique_build_target(definition)
-                if self._all_blocking_findings_owned_by(report, owner="build")
-                else None
+                self._unique_build_target(definition) if route_build_repair else None
             ),
         )
+
+    @staticmethod
+    def _integration_repair_feedback(
+        report: IntegrationReport,
+    ) -> tuple[tuple[ValidationIssue, ...], bool]:
+        """Project only root, build-owned failures into a Builder repair brief.
+
+        Integration records every attempted gate so an observer can understand
+        the whole run.  That is intentionally broader than an Agent repair
+        brief: gates skipped after an earlier failure are usually
+        ``inconclusive`` and say nothing new about the source change required.
+        Feeding those consequences back to the Builder creates a noisy,
+        circular repair turn.  Keep the full report as evidence while routing
+        only concrete failed gates with a matching build-owned disclosure.
+        """
+
+        gates = {gate.gate_id: gate for gate in report.gate_results}
+        failed_gates = tuple(gate for gate in report.gate_results if gate.status == "fail")
+        blocking = tuple(item for item in report.findings if item.blocks_release)
+        by_category: dict[str, tuple[Finding, ...]] = {
+            gate.gate_id: tuple(
+                finding
+                for finding in blocking
+                if finding.category == gate.gate_id and finding.owner == "build"
+            )
+            for gate in failed_gates
+        }
+        issues: list[ValidationIssue] = []
+        routeable = bool(failed_gates)
+        for index, gate in enumerate(failed_gates):
+            findings = by_category[gate.gate_id]
+            if not findings:
+                routeable = False
+                remediation = None
+            else:
+                remediation = IntegrationLeaf._safe_repair_remediation(findings[0])
+            issues.append(
+                ValidationIssue(
+                    code=f"integration_gate_{gate.gate_id}_fail"[:120],
+                    path=("integration", "gate", index),
+                    violated_condition=gate.summary[:512],
+                    expected_category="the exact independent execution gate to pass",
+                    remediation=remediation,
+                )
+            )
+
+        # A blocking Finding that is not tied to a concrete failed gate is a
+        # separate root cause; an inconclusive gate, by contrast, is a
+        # consequence of an earlier failure and stays in the report/scene but
+        # not in the model correction brief.  Any error/non-build root removes
+        # automatic Builder authority rather than asking the model to guess.
+        for finding in blocking:
+            related_gate = gates.get(finding.category)
+            if related_gate is None or related_gate.status in {"pass", "error"}:
+                routeable = False
+            elif related_gate.status == "fail" and finding.owner != "build":
+                routeable = False
+
+        if issues:
+            return tuple(issues), routeable
+        return (
+            (
+                ValidationIssue(
+                    code="integration_report_root_cause_insufficient",
+                    path=("integration", "report"),
+                    violated_condition=(
+                        "The independent Integration report did not identify one concrete "
+                        "failed build gate with a safe repair disclosure."
+                    ),
+                    expected_category=(
+                        "a report with one observable root cause before another Builder turn"
+                    ),
+                    retryable=False,
+                ),
+            ),
+            False,
+        )
+
+    @staticmethod
+    def _safe_repair_remediation(finding: Finding) -> str | None:
+        remediation = (
+            " ".join(finding.suggested_repair.split())
+            if finding.disclosure == "repair" and finding.suggested_repair is not None
+            else None
+        )
+        # A repair Agent needs an intact, concise disclosure, never an
+        # arbitrary prefix of sealed or oversized text.
+        return remediation if remediation is None or len(remediation) <= 512 else None
 
     @staticmethod
     def _all_blocking_findings_owned_by(
@@ -636,12 +752,14 @@ class IntegrationLeaf:
                 )
             )
         for index, finding in enumerate(item for item in report.findings if item.blocks_release):
+            remediation = IntegrationLeaf._safe_repair_remediation(finding)
             issues.append(
                 ValidationIssue(
                     code=f"{stage}_finding_{finding.category}"[:120],
                     path=(stage, "finding", index),
                     violated_condition=finding.summary[:512],
                     expected_category="a Candidate and verifier closure satisfying this finding",
+                    remediation=remediation,
                     retryable=finding.owner not in {"permissions", "release_policy"},
                 )
             )
@@ -702,13 +820,11 @@ class ReleaseAssuranceLeaf(IntegrationLeaf):
         async def proposal(
             current_context: WorkExecutionContext,
             attempt: WorkAttempt,
-            _dispatch_id: str,
+            dispatch_id: str,
         ) -> LeafProposal:
-            if self.judge.interactive_challenger is not None:
-                raise LeafExecutionFailure(
-                    code="preflight_release_hidden_agent_rollout",
-                    category="release Judge must not hide Challenger Agent turns",
-                )
+            # Interactive Challenger turns are no longer hidden inside the
+            # Judge: each one receives this active Scheduler operation's
+            # explicit ownership before it crosses InvocationBackend.
             candidate_ref, candidate = self._candidate_from_context(current_context)
             _design, world_spec_ref, world_spec = self._design_world(candidate, candidate_ref)
             verifier_ref, verifier = self._verifier_from_context(current_context)
@@ -756,29 +872,30 @@ class ReleaseAssuranceLeaf(IntegrationLeaf):
                     category="candidate_snapshot_recovery",
                     parent_repair_target=self._unique_build_target(definition),
                 ) from exc
-            try:
-                bundle = await self.judge.evaluate(
-                    candidate=candidate,
-                    candidate_ref=candidate_ref,
-                    source_dir=source_dir,
-                    world_spec=world_spec,
-                    world_spec_ref=world_spec_ref,
-                    verifier=verifier,
-                    verifier_ref=verifier_ref,
-                    release_profile=self.release_profile,
-                    budget=self._budget(definition),
-                    reachability_workspace=(
-                        self.workspace_root / f"{attempt.attempt_id}-reachability"
-                    ),
-                    run_id=f"{self.run_id}:release:{attempt.attempt_id}",
-                    telemetry_trace_id=attempt.telemetry_trace_id,
-                    coordinate_key=definition.coordinate.coordinate_key,
-                )
-            except Exception as exc:
-                raise LeafExecutionFailure(
-                    code="release_assurance_execution_error",
-                    category=type(exc).__name__,
-                ) from exc
+            # Match IntegrationLeaf: unhandled framework validation must reach
+            # SchedulerLeafExecutor's safe structured diagnostic bridge rather
+            # than becoming a generic release execution error.
+            bundle = await self.judge.evaluate(
+                candidate=candidate,
+                candidate_ref=candidate_ref,
+                source_dir=source_dir,
+                world_spec=world_spec,
+                world_spec_ref=world_spec_ref,
+                verifier=verifier,
+                verifier_ref=verifier_ref,
+                release_profile=self.release_profile,
+                budget=self._budget(definition),
+                reachability_workspace=(self.workspace_root / f"{attempt.attempt_id}-reachability"),
+                run_id=f"{self.run_id}:release:{attempt.attempt_id}",
+                telemetry_trace_id=attempt.telemetry_trace_id,
+                coordinate_key=definition.coordinate.coordinate_key,
+                invocation_ownership=self.kernel.invocation_ownership(
+                    definition=definition,
+                    attempt=attempt,
+                    dispatch_id=dispatch_id,
+                ),
+                model_override=attempt.model_override,
+            )
             return self._judge_proposal(bundle, definition=definition)
 
         await self.kernel.execute(context, definition=definition, proposal_runner=proposal)

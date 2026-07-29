@@ -5,12 +5,15 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from typing import cast
 
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.contracts import ArtifactRef, BudgetUsage
 
 from .work import (
+    ExecutingRepairDecision,
     RepairAction,
+    RepairPolicy,
     ValidationReport,
     WorkDefinition,
     WorkRepairLedgerEntry,
@@ -153,8 +156,27 @@ class WorkRepairLedger:
             and charged_ordinal > policy.maximum_total_repair_attempts
         ):
             raise WorkRepairDenied("repair_total_exhausted")
-        if any(entry.outcome == "no_progress" for entry in prior):
+        # ``no_progress`` is a comparison of validation reports, not a
+        # universal "never dispatch again" signal.  Only a completed semantic
+        # correction can establish that its actionable content made no
+        # progress.  An infrastructure retry that reaches the same closed
+        # transient terminal has no comparable semantic proposal; the
+        # recovery policy may instead authorize its explicit next-model route.
+        # Treating that transport recurrence as semantic no-progress used to
+        # block the policy-selected fallback before it could start.
+        if any(
+            entry.outcome == "no_progress"
+            and entry.decision in {"local_correction", "parent_correction"}
+            for entry in prior
+        ):
             raise WorkRepairDenied("repair_no_progress_terminal")
+
+        if action.workspace_recovery and (
+            action.decision != "infrastructure_retry"
+            or action.target_coordinate != definition.coordinate
+            or action.allowed_mutation_roots != definition.allowed_mutation_roots
+        ):
+            raise WorkRepairDenied("workspace_recovery_authority_mismatch")
 
         if action.decision == "session_continuation":
             if (
@@ -172,9 +194,7 @@ class WorkRepairLedger:
                 or action.allowed_mutation_roots != definition.allowed_mutation_roots
             ):
                 raise WorkRepairDenied("session_continuation_authority_mismatch")
-            continuation_count = sum(
-                entry.decision == "session_continuation" for entry in prior
-            )
+            continuation_count = sum(entry.decision == "session_continuation" for entry in prior)
             if continuation_count >= policy.maximum_session_continuations:
                 raise WorkRepairDenied("session_continuation_exhausted")
         elif action.decision == "local_correction":
@@ -199,9 +219,37 @@ class WorkRepairLedger:
                 not local_prior or local_prior[-1].outcome != "progressed"
             ):
                 raise WorkRepairDenied("repair_progress_bonus_denied")
-        elif action.decision == "infrastructure_retry":
+        elif action.decision in {"infrastructure_retry", "model_fallback"}:
             if report.status != "error":
-                raise WorkRepairDenied("infrastructure_retry_requires_error_report")
+                raise WorkRepairDenied("transport_recovery_requires_error_report")
+            if action.decision == "model_fallback":
+                if action.model_override is None:
+                    raise WorkRepairDenied("model_fallback_requires_target_model")
+                if action.route_model is None:
+                    raise WorkRepairDenied("model_fallback_requires_source_route")
+                fallback_count = sum(entry.decision == "model_fallback" for entry in prior)
+                if fallback_count >= policy.maximum_model_fallbacks:
+                    raise WorkRepairDenied("repair_model_fallback_exhausted")
+                # A fallback is only admissible after the exact same current
+                # node has consumed its one fresh-session infrastructure
+                # retry. The typed recovery policy selected it; the ledger
+                # still proves that no upstream Work was reopened.
+                if not any(
+                    entry.decision == "infrastructure_retry"
+                    and entry.route_model == action.route_model
+                    for entry in prior
+                ):
+                    raise WorkRepairDenied("model_fallback_requires_prior_infrastructure_retry")
+                return self._append_authorized(
+                    definition=definition,
+                    policy=policy,
+                    action=action,
+                    action_ref=action_ref,
+                    evaluation_ref=evaluation_ref,
+                    report_ref=report_ref,
+                    epoch=epoch,
+                    ordinal=ordinal,
+                )
             process_recovery = action.reason_code == "process_interrupted"
             if process_recovery:
                 process_count = sum(
@@ -212,11 +260,22 @@ class WorkRepairLedger:
                 if process_count >= policy.maximum_process_recoveries:
                     raise WorkRepairDenied("repair_process_recovery_exhausted")
             else:
-                infrastructure_count = sum(
-                    entry.decision == "infrastructure_retry"
-                    and entry.reason_code != "process_interrupted"
-                    for entry in prior
-                )
+                if action.route_model is None:
+                    # Old or generic recovery records remain auditable, but
+                    # do not gain the newer per-route allowance.  New
+                    # classified model-route retries always declare it.
+                    infrastructure_count = sum(
+                        entry.decision == "infrastructure_retry"
+                        and entry.reason_code != "process_interrupted"
+                        for entry in prior
+                    )
+                else:
+                    infrastructure_count = sum(
+                        entry.decision == "infrastructure_retry"
+                        and entry.reason_code != "process_interrupted"
+                        and entry.route_model == action.route_model
+                        for entry in prior
+                    )
                 if infrastructure_count >= policy.maximum_infrastructure_retries:
                     raise WorkRepairDenied("repair_infrastructure_exhausted")
         elif action.decision == "parent_correction":
@@ -229,6 +288,29 @@ class WorkRepairLedger:
         else:
             raise WorkRepairDenied("non_executing_action_has_no_ledger_authority")
 
+        return self._append_authorized(
+            definition=definition,
+            policy=policy,
+            action=action,
+            action_ref=action_ref,
+            evaluation_ref=evaluation_ref,
+            report_ref=report_ref,
+            epoch=epoch,
+            ordinal=ordinal,
+        )
+
+    def _append_authorized(
+        self,
+        *,
+        definition: WorkDefinition,
+        policy: RepairPolicy,
+        action: RepairAction,
+        action_ref: ArtifactRef,
+        evaluation_ref: ArtifactRef,
+        report_ref: ArtifactRef,
+        epoch: str,
+        ordinal: int,
+    ) -> WorkRepairLedgerEntry:
         digest = hashlib.sha256(
             f"{action_ref.revision_id}\0{definition.work_id}\0{ordinal}".encode()
         ).hexdigest()[:24]
@@ -241,8 +323,9 @@ class WorkRepairLedger:
             input_fingerprint=work_input_fingerprint(action.immutable_input_refs),
             repair_policy_digest=policy.content_digest(),
             repair_action_ref=action_ref,
-            decision=action.decision,
+            decision=cast(ExecutingRepairDecision, action.decision),
             reason_code=action.reason_code,
+            route_model=action.route_model,
             source_evaluation_ref=evaluation_ref,
             report_before_ref=report_ref,
             repair_attempt_ordinal=ordinal,
@@ -410,6 +493,35 @@ class WorkRepairLedger:
         current = self._entries[index]
         if current.outcome != "authorized":
             raise WorkRepairDenied("repair_budget_exhaustion_not_authorized")
+        updated = WorkRepairLedgerEntry.model_validate(
+            {
+                **current.model_dump(mode="python"),
+                "outcome": "exhausted",
+                "finished_at": datetime.now(UTC),
+            }
+        )
+        self._entries[index] = updated
+        return updated
+
+    def exhaust_pre_dispatch(self, entry_id: str) -> WorkRepairLedgerEntry:
+        """Close an authorized repair before a new physical operation starts.
+
+        A failed route-liveness gate differs from a budget denial and from an
+        interrupted operation: it has not opened the successor WorkAttempt at
+        all. The shared terminal ``exhausted`` outcome prevents its durable
+        RepairAction from being redispatched after restart without inventing a
+        semantic progress report.
+        """
+
+        index = next(
+            (index for index, entry in enumerate(self._entries) if entry.entry_id == entry_id),
+            None,
+        )
+        if index is None:
+            raise ValueError("unknown WorkRepairLedger entry")
+        current = self._entries[index]
+        if current.outcome != "authorized":
+            raise WorkRepairDenied("repair_pre_dispatch_exhaustion_not_authorized")
         updated = WorkRepairLedgerEntry.model_validate(
             {
                 **current.model_dump(mode="python"),

@@ -176,6 +176,7 @@ from .supply_chain import (
     LockedWheelEvidence,
     PublicTestExecution,
     StaticAssuranceEvidence,
+    StaticDiagnosticLocation,
     StaticFileEvidence,
     SupplyChainEvidence,
 )
@@ -392,6 +393,7 @@ __all__ = [
     "TaskDistribution",
     "TaskDistributionDelta",
     "StaticAssuranceEvidence",
+    "StaticDiagnosticLocation",
     "StaticFileEvidence",
     "StrictModel",
     "SupplyChainEvidence",

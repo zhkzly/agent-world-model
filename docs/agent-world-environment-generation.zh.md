@@ -657,7 +657,7 @@ Trusted Judge   <- EvaluatorGoal + WorldSpec Rule IR + trusted state/events
 
 `public_instruction` 是 framework 的确定性渲染结果，不由候选编写。EvaluatorGoal 的每个 required leaf 必须由一个严格 RFC 6901 pointer 等值绑定到 required `public_goal` leaf，且恰好覆盖一次；不提供表达式、代码或隐式转换语言。Rule IR 读取的 task-goal pointer 必须落在已绑定 required leaf 上。
 
-候选永远不提供求解见证或标准答案。Runtime 也不接收 task id、EvaluatorGoal、case label、Verifier IR 或 release metadata。训练 Agent 能看到完整 PublicTask，但不能通过 observation、event、error details 或 package mount 旁路读取 evaluator-only 状态。
+候选永远不提供求解见证或标准答案。Runtime 也不接收 framework-private 的 materialized task instance identity、EvaluatorGoal、case label、Verifier IR 或 release metadata；这不禁止 WorldSpec 定义业务对象标识，例如工具参数 `task_id`。训练 Agent 能看到完整 PublicTask，但不能通过 observation、event、error details 或 package mount 旁路读取 evaluator-only 状态。
 
 ### 7.3 `task_materialization` 硬门
 
@@ -695,6 +695,9 @@ invoke(tool_id, arguments, idempotency_key)
 snapshot
 close
 ```
+
+handshake 响应中的 `operations` 必须是严格的 JSON 字符串数组
+`["handshake","reset","invoke","snapshot","close"]`，不能改为含 `operation` 或 metadata 的对象列表。
 
 reset seed 必须可复现，每个 RuntimeSupervisor 实例只拥有一个隔离 episode，重复 idempotency key 不得重复副作用。Actor 在 reset 时绑定整个 episode；invoke 不能逐调用伪造身份。Agent-visible observation 只能包含 WorldSpec 声明的 visibility/observation projection；`snapshot` 只供 framework/Judge/可信 Consumer 内部校验，绝不通过训练 RPC 暴露。
 

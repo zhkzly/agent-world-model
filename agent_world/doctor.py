@@ -22,11 +22,16 @@ from agent_world.contracts import PermissionScope
 from agent_world.control import TelemetryStore
 from agent_world.invocation import (
     CodexSdkBackend,
+    InvocationControlPlane,
+    InvocationControlStore,
+    InvocationOwnerKind,
+    InvocationOwnership,
     InvocationRequest,
     InvocationResult,
     InvocationStatus,
     NodeCapabilityRequirement,
 )
+from agent_world.invocation.codex_runtime import CodexRuntimeUnavailable, resolve_codex_runtime
 from agent_world.invocation.contracts import JsonObject
 from agent_world.invocation.structured_diagnostics import safe_terminal_details
 from agent_world.judge import (
@@ -278,6 +283,7 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
     """
 
     trace_id = f"doctor-live-agent:{uuid.uuid4().hex}"
+    invocation_id = f"doctor-live-agent-round-trip:{uuid.uuid4().hex}"
     started_at = datetime.now(UTC).isoformat()
     rollout_token_limit = _live_agent_probe_rollout_token_limit(config)
     terminal_status: Literal["running", "passed", "failed", "interrupted"] = "running"
@@ -297,6 +303,17 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
             debug_feedback_path=None,
         )
         telemetry = TelemetryStore(config.state_root / "telemetry")
+        control_store = InvocationControlStore(config.state_root / "invocation-control")
+        # A doctor probe has no Work head to reconcile, but it must still not
+        # leave a prior crashed physical turn looking live in the shared
+        # invocation view.  This scan only writes a terminal owner-loss fact;
+        # it never performs a provider retry.
+        control_store.reconcile_owner_loss()
+        backend = InvocationControlPlane(
+            CodexSdkBackend(telemetry=telemetry),
+            control_store,
+            require_explicit_ownership=True,
+        )
         with tempfile.TemporaryDirectory(
             prefix="doctor-live-agent-",
             dir=config.state_root,
@@ -319,9 +336,9 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                 ),
                 rollout_token_limit=rollout_token_limit,
             )
-            result = await CodexSdkBackend(telemetry=telemetry).invoke(
+            result = await backend.invoke(
                 InvocationRequest(
-                    invocation_id="doctor-live-agent-round-trip",
+                    invocation_id=invocation_id,
                     prompt=(
                         "This is a production InvocationBackend readiness probe. "
                         "Do not call tools. Return exactly the structured object "
@@ -335,6 +352,12 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                         "semantic_transaction": "doctor_live_agent_probe",
                         "diagnostic_capture_terminal_excerpt": True,
                     },
+                    ownership=InvocationOwnership(
+                        owner_kind=InvocationOwnerKind.DIAGNOSTIC_AUDIT,
+                        owner_id=invocation_id,
+                        scope_id=trace_id,
+                        coordinate="doctor:live_agent",
+                    ),
                 )
             )
         failure_code = _live_agent_failure_code(result)
@@ -563,24 +586,16 @@ def _executable_check(name: str, executable: str | None) -> DoctorCheck:
 
 
 async def _codex_runtime_check(config: FoundryConfig) -> DoctorCheck:
-    binary = config.agent.codex_bin
-    runtime_source = "explicit"
-    if binary is None:
-        try:
-            from codex_cli_bin import bundled_codex_path  # type: ignore[import-untyped]
-
-            sdk_version = importlib.metadata.version("openai-codex")
-            runtime_version = importlib.metadata.version("openai-codex-cli-bin")
-            if sdk_version != runtime_version:
-                raise OSError("SDK-bundled Codex runtime version does not match openai-codex")
-            binary = bundled_codex_path()
-            runtime_source = "SDK-bundled"
-        except (ImportError, importlib.metadata.PackageNotFoundError, OSError) as exc:
-            return DoctorCheck(
-                check="codex_runtime",
-                status="fail",
-                summary=f"SDK-bundled Codex runtime unavailable: {exc}",
-            )
+    try:
+        runtime = resolve_codex_runtime(config.agent.codex_bin)
+    except CodexRuntimeUnavailable as exc:
+        return DoctorCheck(
+            check="codex_runtime",
+            status="fail",
+            summary=f"SDK-bundled Codex runtime unavailable: {exc}",
+        )
+    binary = runtime.path
+    runtime_source = "explicit" if runtime.source == "configured" else "SDK-bundled"
     try:
         if binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
             raise OSError("configured Codex runtime is not a real executable file")

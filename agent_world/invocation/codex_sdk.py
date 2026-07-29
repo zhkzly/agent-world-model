@@ -26,6 +26,8 @@ from ._codex_worker import PROTOCOL_VERSION
 from .contracts import (
     InvocationError,
     InvocationEvent,
+    InvocationLifecyclePhase,
+    InvocationLifecycleSupervision,
     InvocationRequest,
     InvocationResult,
     InvocationSession,
@@ -73,6 +75,44 @@ def _consume_task_result(task: asyncio.Task[object]) -> None:
         task.result()
     except BaseException:
         return
+
+
+def _emit_lifecycle(request: InvocationRequest, phase: InvocationLifecyclePhase) -> None:
+    """Keep optional control observation from changing a real worker outcome."""
+
+    sink = request.lifecycle_sink
+    if sink is None:
+        return
+    try:
+        sink.local(phase)
+    except Exception:
+        return
+
+
+def _emit_provider_progress(request: InvocationRequest, activity: str) -> None:
+    """Record a Provider event without forwarding its payload outside telemetry."""
+
+    sink = request.lifecycle_sink
+    if sink is None:
+        return
+    try:
+        sink.provider_progress(activity)
+    except Exception:
+        return
+
+
+def _telemetry_event_payload(payload: JsonObject) -> JsonObject:
+    """Keep local diagnostic sidecars out of normal telemetry.
+
+    A diagnostic-audit command proof may carry one bounded, redacted shell
+    failure excerpt for the audit report. It is useful to the project Agent,
+    but it is not normal invocation telemetry and must not flow into scenes,
+    Artifact-linked trace views, or a future scheduler feedback route.
+    """
+
+    if "diagnosticCommandProof" not in payload:
+        return payload
+    return {key: value for key, value in payload.items() if key != "diagnosticCommandProof"}
 
 
 def _reject_json_constant(value: str) -> None:
@@ -176,6 +216,7 @@ class CodexSdkBackend:
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
         # Queueing is controller/backend scheduling, not model execution.  Acquire
         # capacity before starting either the per-turn clock or the worker watchdog.
+        _emit_lifecycle(request, InvocationLifecyclePhase.QUEUED)
         telemetry_span: WorkSpan | None = None
         telemetry_progress_disabled = False
         queue_started = time.perf_counter_ns()
@@ -186,12 +227,14 @@ class CodexSdkBackend:
                 self._telemetry_failures += 1
         try:
             async with self._capacity:
+                _emit_lifecycle(request, InvocationLifecyclePhase.ADMITTED)
                 queue_duration_ms = (time.perf_counter_ns() - queue_started) / 1_000_000
 
                 def mark_provider_progress(
                     method: str,
                     event_payload: Mapping[str, Any] | None = None,
                 ) -> None:
+                    _emit_provider_progress(request, "codex_provider_event")
                     nonlocal telemetry_progress_disabled
                     if telemetry_span is None or telemetry_progress_disabled:
                         return
@@ -242,6 +285,16 @@ class CodexSdkBackend:
     ) -> InvocationResult:
         """Bound the complete parent-side worker lifecycle and account its elapsed time."""
 
+        if request.lifecycle_supervision is InvocationLifecycleSupervision.CONTROL_PLANE:
+            # The control plane has already admitted this exact physical turn
+            # and owns the declared wall, cancellation record and terminal
+            # projection.  A second adapter watchdog can race it and turn one
+            # expiry into two incompatible terminal facts.
+            return await self._invoke_with_capacity(
+                request,
+                on_first_progress=on_first_progress,
+            )
+
         started = time.monotonic()
         limits = request.profile.limits
         normal_lifecycle_ceiling = limits.timeout_seconds + limits.interrupt_grace_seconds + 0.5
@@ -258,8 +311,9 @@ class CodexSdkBackend:
                 timeout=normal_lifecycle_ceiling,
             )
         except TimeoutError:
+            _emit_lifecycle(request, InvocationLifecyclePhase.DECLARED_WALL_EXPIRED)
             await self._bounded_worker_cleanup(
-                request.invocation_id,
+                request,
                 invocation_task,
                 kill_grace_seconds=limits.kill_grace_seconds,
             )
@@ -272,7 +326,7 @@ class CodexSdkBackend:
             )
         except asyncio.CancelledError:
             await self._bounded_worker_cleanup(
-                request.invocation_id,
+                request,
                 invocation_task,
                 kill_grace_seconds=limits.kill_grace_seconds,
             )
@@ -282,16 +336,17 @@ class CodexSdkBackend:
 
     async def _bounded_worker_cleanup(
         self,
-        invocation_id: str,
+        request: InvocationRequest,
         invocation_task: asyncio.Task[InvocationResult],
         *,
         kill_grace_seconds: float,
     ) -> None:
         """Spend only the reserved two kill-grace windows on worker cleanup."""
 
+        _emit_lifecycle(request, InvocationLifecyclePhase.CLEANUP_RUNNING)
         cancel_task = asyncio.create_task(
-            self.cancel(invocation_id),
-            name=f"cancel-codex-worker-{invocation_id}",
+            self.cancel(request.invocation_id),
+            name=f"cancel-codex-worker-{request.invocation_id}",
         )
         invocation_task.cancel()
         try:
@@ -302,6 +357,8 @@ class CodexSdkBackend:
             invocation_task.cancel()
             for task in (cancel_task, invocation_task):
                 task.add_done_callback(_consume_task_result)
+        finally:
+            _emit_lifecycle(request, InvocationLifecyclePhase.CLEANUP_FINISHED)
 
     async def _invoke_with_capacity(
         self,
@@ -311,6 +368,7 @@ class CodexSdkBackend:
     ) -> InvocationResult:
         started = time.monotonic()
         redactor = Redactor.from_values(request.profile.secret_values)
+        _emit_lifecycle(request, InvocationLifecyclePhase.PROFILE_VERIFYING)
         try:
             verify_resolved_profile(request.profile)
         except ProfileResolutionError as exc:
@@ -329,6 +387,18 @@ class CodexSdkBackend:
                 message=redactor.text(str(exc) or type(exc).__name__),
                 started=started,
                 retryable=True,
+            )
+        _emit_lifecycle(request, InvocationLifecyclePhase.PROFILE_VERIFIED)
+        if request.profile.missing_runtime_tools:
+            return _local_failure(
+                request,
+                status=InvocationStatus.FAILED,
+                code="runtime_toolchain_unavailable",
+                message=(
+                    "required isolated runtime toolchain is unavailable: "
+                    + ", ".join(request.profile.missing_runtime_tools)
+                ),
+                started=started,
             )
 
         payload = self._worker_payload(request)
@@ -463,6 +533,7 @@ class CodexSdkBackend:
                     started=started,
                     retryable=True,
                 )
+            _emit_lifecycle(request, InvocationLifecyclePhase.WORKER_SPAWNED)
             self._active[request.invocation_id] = _ActiveWorker(
                 process=process,
                 kill_grace_seconds=request.profile.limits.kill_grace_seconds,
@@ -489,13 +560,18 @@ class CodexSdkBackend:
             process.stdin.write(encoded_payload)
             await process.stdin.drain()
             process.stdin.close()
-            hard_timeout = (
-                request.profile.limits.timeout_seconds
-                + request.profile.limits.interrupt_grace_seconds
-                + 0.5
-            )
+            _emit_lifecycle(request, InvocationLifecyclePhase.PAYLOAD_DISPATCHED)
             try:
-                await asyncio.wait_for(process.wait(), timeout=hard_timeout)
+                _emit_lifecycle(request, InvocationLifecyclePhase.PARENT_WAITING)
+                if request.lifecycle_supervision is InvocationLifecycleSupervision.CONTROL_PLANE:
+                    await process.wait()
+                else:
+                    hard_timeout = (
+                        request.profile.limits.timeout_seconds
+                        + request.profile.limits.interrupt_grace_seconds
+                        + 0.5
+                    )
+                    await asyncio.wait_for(process.wait(), timeout=hard_timeout)
             except TimeoutError:
                 hard_timed_out = True
                 await _terminate_process_tree(
@@ -529,6 +605,8 @@ class CodexSdkBackend:
         finally:
             async with self._lock:
                 self._active.pop(request.invocation_id, None)
+
+        _emit_lifecycle(request, InvocationLifecyclePhase.WORKER_EXITED)
 
         stdout_capture = await _finish_stdout_capture(stdout_capture_task)
         stderr_text = await _finish_stderr_capture(stderr_capture_task)
@@ -662,6 +740,12 @@ class CodexSdkBackend:
             "diagnostic_capture_terminal_excerpt": (
                 request.metadata.get("diagnostic_capture_terminal_excerpt") is True
             ),
+            # The worker compares these framework-owned audit fragments only
+            # in memory. Its compact event contains labels/outcomes, never
+            # the command strings or their output.
+            "diagnostic_command_expectations": [
+                item.to_worker_payload() for item in request.diagnostic_command_expectations
+            ],
             "limits": {
                 "timeout_seconds": limits.timeout_seconds,
                 "interrupt_grace_seconds": limits.interrupt_grace_seconds,
@@ -1002,7 +1086,7 @@ async def _capture_stdout(
                 continue
             safe_payload = redactor.object(payload)
             if on_first_progress is not None:
-                on_first_progress(method, safe_payload)
+                on_first_progress(method, _telemetry_event_payload(safe_payload))
             expected_sequence += 1
             if len(events) >= request.profile.limits.max_events:
                 overflowed = True
@@ -1014,6 +1098,17 @@ async def _capture_stdout(
                     payload=safe_payload,
                 )
             )
+        elif record_type == "lifecycle":
+            raw_phase = record.get("phase")
+            if not isinstance(raw_phase, str):
+                errors.append("worker lifecycle phase is invalid")
+                continue
+            try:
+                phase = InvocationLifecyclePhase(raw_phase)
+            except ValueError:
+                errors.append("worker lifecycle phase is unknown")
+                continue
+            _emit_lifecycle(request, phase)
         elif record_type == "result":
             raw_result = record.get("result")
             if not isinstance(raw_result, dict):

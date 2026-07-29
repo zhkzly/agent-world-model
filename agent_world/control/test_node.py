@@ -35,9 +35,11 @@ from agent_world.contracts import (
 )
 from agent_world.designer.models import CurriculumPlanSourceDraft
 from agent_world.diagnostic_state import is_marked_test_node_diagnostic_state_root
+from agent_world.invocation.control_store import InvocationControlStore, InvocationControlStoreError
 from agent_world.judge.models import VerifierBatchPlan
 
 from .budget import LeaseBudgetLedger
+from .continuation_store import NodeContinuationStore
 from .leaf_executor import LocalTerminalDiagnostic, SchedulerLeafExecutor
 from .work import (
     OperationBudget,
@@ -91,6 +93,7 @@ _NON_DURABLE_STATE_DIRECTORIES = frozenset(
         "campaigns",
         "direct-jobs",
         "expansion-source-runs",
+        "invocation-control",
         "observability",
         "registry",
         "runs",
@@ -106,6 +109,96 @@ type DiagnosticStructuredOutputTransport = Literal[
 _DIAGNOSTIC_STRUCTURED_OUTPUT_TRANSPORTS = frozenset(
     {"provider_schema", "json_envelope", "json_object"}
 )
+
+
+def _diagnostic_work_runtime(
+    *,
+    app: FoundryApplication,
+    heads: WorkControlStore,
+    budget: Budget,
+    trace_id: str | None = None,
+    run_id: str | None = None,
+    repair_scope_id: str | None = None,
+    continuation_workspace_root: Path | None = None,
+) -> WorkControlRuntime:
+    """Build every diagnostic runtime with the production recovery controls.
+
+    A marked test-node clone changes release authority and state ownership, not
+    configured model routing, liveness policy, or retry pacing.  Keeping this
+    composition in one helper prevents a diagnostic command from silently
+    proving a different recovery policy than ``DirectWorkRunner``.
+    """
+
+    observed = trace_id is not None
+    if continuation_workspace_root is not None:
+        try:
+            continuation_workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            continuation_workspace_root.chmod(0o700)
+        except OSError as exc:
+            raise TestNodeError(
+                "test_node_private_workspace_root_unavailable",
+                "diagnostic private workspace root is unavailable",
+            ) from exc
+    return WorkControlRuntime(
+        artifacts=app.controller.artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(budget),
+        telemetry=app.telemetry if observed else None,
+        projector=app.controller.scene_projector if observed else None,
+        trace_id=trace_id,
+        run_id=run_id,
+        diagnostic_only=True,
+        repair_scope_id=repair_scope_id,
+        continuations=(
+            NodeContinuationStore(heads.root / "continuations")
+            if continuation_workspace_root is not None
+            else None
+        ),
+        continuation_workspace_root=continuation_workspace_root,
+        model_routes=app.config.agent.model_routes,
+        route_liveness_checker=app.controller.route_liveness_checker,
+        require_route_liveness_gate=app.controller.route_liveness_checker is not None,
+        infrastructure_retry_backoff_seconds=app.config.agent.infrastructure_retry_backoff_seconds,
+    )
+
+
+def _mirror_settled_retry_control_record(
+    *,
+    source_state_root: Path,
+    app: FoundryApplication,
+    retry_head: WorkControlHead,
+) -> None:
+    """Mirror only the prior settled invocation fact needed by one retry gate.
+
+    Full ``invocation-control`` directories stay outside a diagnostic clone:
+    they are execution state, not frozen WorkGraph input.  The one exception
+    is a settled record tied by the prior ``ProposalExecution`` to the exact
+    retry target.  It is already redacted by ``InvocationControlStore`` and
+    allows the clone's normal liveness checker to verify the same route without
+    reading or mutating the source state.
+    """
+
+    attempt = app.controller.artifacts.get_json(retry_head.attempt_ref, WorkAttempt)
+    proposals = TestNodeRunner._proposal_executions(app.controller.artifacts, attempt)
+    invocation_id = proposals[-1].invocation_id if proposals else None
+    if invocation_id is None:
+        # Constructed deterministic boundaries have no Provider provenance.
+        # Their explicit test-only retry path remains observable without
+        # inventing an Invocation Control record.
+        return
+    source_control_root = source_state_root / "invocation-control"
+    if not source_control_root.exists():
+        return
+    try:
+        source_store = InvocationControlStore(source_control_root)
+        record = source_store.read_settled_snapshot(invocation_id)
+        if record is not None:
+            app.invocation_control.import_settled_snapshot(record)
+    except InvocationControlStoreError as exc:
+        raise TestNodeError(
+            "test_descendant_route_liveness_snapshot_invalid",
+            "the prior diagnostic invocation-control record cannot be safely mirrored",
+        ) from exc
 
 
 def _settle_cancelled_diagnostic_dispatch(
@@ -588,18 +681,13 @@ class TestNodeRunner:
             run_id=run_id,
             parent_span_id=root_span.span_id,
         )
-        runtime = WorkControlRuntime(
-            artifacts=app.controller.artifacts,
+        runtime = _diagnostic_work_runtime(
+            app=app,
             heads=heads,
-            budget=LeaseBudgetLedger(budget),
-            # A test-node run intentionally has no authority to continue an
-            # old RepairLedger entry.  ``diagnostic_only`` causes every
-            # non-passing result to terminate after this one dispatch.
-            telemetry=app.telemetry,
-            projector=app.controller.scene_projector,
+            budget=budget,
             trace_id=trace_id,
             run_id=run_id,
-            diagnostic_only=True,
+            continuation_workspace_root=diagnostic_root / "runs",
         )
         workspace_root = diagnostic_root / "runs" / "test-node" / run_token
         workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -630,6 +718,31 @@ class TestNodeRunner:
                 target,
                 executors={frozen.definition.work_id: executor},
             )
+        except KeyboardInterrupt:
+            interrupted_head = _settle_cancelled_diagnostic_dispatch(
+                runtime=runtime,
+                definition=frozen.definition,
+            )
+            if (
+                interrupted_head is None
+                or interrupted_head.status not in _TERMINAL_WORK_HEAD_STATUSES
+            ):
+                root_span.finish(status="cancelled", error_code="test_node_dispatch_interrupted")
+            else:
+                root_span.finish(
+                    status="cancelled",
+                    output_refs=tuple(
+                        ref
+                        for ref in (
+                            interrupted_head.commit_ref,
+                            interrupted_head.evaluation_ref,
+                        )
+                        if ref is not None
+                    ),
+                )
+            app.telemetry.flush()
+            # Do not turn a terminal signal into a successful CLI result.
+            raise
         except asyncio.CancelledError:
             interrupted_head = _settle_cancelled_diagnostic_dispatch(
                 runtime=runtime,
@@ -967,11 +1080,10 @@ class TestNodeRunner:
             except ValueError:
                 continue
             diagnostic_runtime = (
-                WorkControlRuntime(
-                    artifacts=app.controller.artifacts,
+                _diagnostic_work_runtime(
+                    app=app,
                     heads=heads,
-                    budget=LeaseBudgetLedger(self._single_attempt_budget(definition)),
-                    diagnostic_only=True,
+                    budget=self._single_attempt_budget(definition),
                 )
                 if allow_diagnostic_ancestor_closure
                 else None
@@ -1417,8 +1529,12 @@ class DiagnosticDescendantNodeResult(V2Contract):
 
     The ordinary form targets one unheaded frozen definition.  The explicitly
     requested infrastructure-retry form instead consumes one exact failed,
-    retryable diagnostic terminal through a new ``RepairAction``.  Both forms
-    retain their diagnostic parents and remain non-releasable.
+    retryable diagnostic terminal through a new ``RepairAction``.  An already
+    authorized semantic correction may likewise be executed once through the
+    normal Scheduler, without changing its definition, prompt, Skill, or
+    feedback.  A current runtime implementation refresh instead supersedes
+    that authority and regenerates from the same immutable parent closure.
+    All forms retain their diagnostic parents and remain non-releasable.
     """
 
     source_scope_id: str
@@ -1439,13 +1555,15 @@ class DiagnosticDescendantNodeResult(V2Contract):
     runtime_profile_override_ref: ArtifactRef | None = None
     superseded_stale_attempt_ref: ArtifactRef | None = None
     superseded_stale_definition_digest: str | None = None
+    superseded_authorized_repair_action_ref: ArtifactRef | None = None
     infrastructure_retry_action_ref: ArtifactRef | None = None
+    authorized_repair_action_ref: ArtifactRef | None = None
     predecessor_attempt_refs: tuple[ArtifactRef, ...]
     predecessor_commit_refs: tuple[ArtifactRef, ...]
     target_attempt_ref: ArtifactRef
     target_evaluation_ref: ArtifactRef
     target_commit_ref: ArtifactRef | None = None
-    status: Literal["committed", "failed", "needs_human", "interrupted"]
+    status: Literal["committed", "failed", "needs_human", "interrupted", "repair_authorized"]
     validation_report: ValidationReport
     proposal_executions: tuple[ProposalExecution, ...] = ()
     actual_usage: BudgetUsage
@@ -1471,6 +1589,27 @@ class _FrozenDiagnosticDescendant:
     predecessor_commit_refs: tuple[ArtifactRef, ...]
     stale_head: WorkControlHead | None = None
     infrastructure_retry_head: WorkControlHead | None = None
+    authorized_repair_head: WorkControlHead | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FinalEpochDiagnosticAnchor:
+    """The narrowly scoped diagnostic ancestry proof for one final-graph root.
+
+    ``BuildImplementationPlan`` deliberately consumes the ModelingBoundary,
+    rather than VerifierPlan.  A diagnostic final epoch can nevertheless be
+    causally anchored by its exact diagnostic VerifierPlan commit.  This
+    private record carries the immutable epoch facts needed to prove that
+    relationship without adding a false production dependency or weakening
+    ordinary descendant checks.
+    """
+
+    final_epoch_ref: ArtifactRef
+    final_manifest_ref: ArtifactRef
+    design_epoch_ref: ArtifactRef
+    verifier_plan_coordinate: WorkCoordinate
+    verifier_plan_definition_digest: str
+    verifier_plan_commit_ref: ArtifactRef
 
 
 class DiagnosticProposalBudgetOverride(V2Contract):
@@ -1572,19 +1711,28 @@ class DiagnosticDescendantNodeRunner:
 
     * source state must already be a marked test-node diagnostic copy;
     * target must be one unheaded definition, a stale terminal head under a
-      different immutable definition, or an explicitly requested retryable
-      infrastructure terminal with the *same* immutable definition;
+      different immutable definition, an already-authorized repair explicitly
+      executed once or superseded by a current-runtime refresh, or an
+      explicitly requested retryable infrastructure terminal with the *same*
+      immutable definition;
     * all direct parents must be committed and at least one must be a real
-      diagnostic commit; and
+      diagnostic commit, except for the two initial final-graph boundaries
+      where one exact final epoch retains a diagnostic VerifierPlan anchor;
     * execution happens only in one fresh marked child copy with the ordinary
       Scheduler and a diagnostic-only runtime.
 
-    It does not repair, publish, adopt a diagnostic commit in normal state, or
-    derive new topology. ``DiagnosticSuccessorNodeRunner`` remains responsible
-    for the special Architecture-to-new-Design-graph case.
+    It does not publish, adopt a diagnostic commit in normal state, or derive
+    new topology.  A same-definition semantic repair is permitted only with
+    explicit ``execute_authorized_repair`` and goes through the ordinary
+    Scheduler; a current-runtime refresh is instead a fresh regeneration that
+    never inherits old repair authority or private continuation state.
+    ``DiagnosticSuccessorNodeRunner`` remains responsible for the special
+    Architecture-to-new-Design-graph case.
     """
 
-    _TERMINAL_STATUSES = frozenset({"committed", "failed", "needs_human", "interrupted"})
+    _SETTLED_HEAD_STATUSES = frozenset(
+        {"committed", "failed", "needs_human", "interrupted", "repair_authorized"}
+    )
     _TERMINAL_FEEDBACK_IMPLEMENTATION_SUFFIX = ".diagnostic-terminal-feedback.v1"
 
     def __init__(
@@ -1610,11 +1758,14 @@ class DiagnosticDescendantNodeRunner:
         required_manifest_ref: ArtifactRef | None = None,
         required_manifest_revision: str | None = None,
         infrastructure_retry: bool = False,
+        execute_authorized_repair: bool = False,
+        authorize_semantic_repair: bool = False,
         diagnostic_terminal_feedback: bool = False,
         refresh_current_implementation: bool = False,
         diagnostic_structured_output_transport: DiagnosticStructuredOutputTransport | None = None,
         diagnostic_model: str | None = None,
         diagnostic_source_model: str | None = None,
+        final_epoch_diagnostic_anchor: _FinalEpochDiagnosticAnchor | None = None,
     ) -> DiagnosticDescendantNodeResult:
         profile_change = _diagnostic_runtime_profile_change(
             self.config,
@@ -1626,6 +1777,30 @@ class DiagnosticDescendantNodeRunner:
             raise TestNodeError(
                 "test_descendant_terminal_feedback_retry_conflict",
                 "local terminal-feedback capture is a new diagnostic definition, not a retry",
+            )
+        if execute_authorized_repair and authorize_semantic_repair:
+            raise TestNodeError(
+                "test_descendant_semantic_repair_phase_conflict",
+                (
+                    "authorize one exact semantic RepairAction first, then execute it in a "
+                    "separate diagnostic command"
+                ),
+            )
+        if (execute_authorized_repair or authorize_semantic_repair) and (
+            infrastructure_retry
+            or diagnostic_terminal_feedback
+            or refresh_current_implementation
+            or proposal_llm_tokens is not None
+            or proposal_wall_seconds is not None
+            or profile_change.requested
+        ):
+            raise TestNodeError(
+                "test_descendant_authorized_repair_overlay_conflict",
+                (
+                    "a semantic repair authorization or execution must retain its exact frozen "
+                    "definition, "
+                    "input closure, feedback, Prompt, Runtime Skill, profile, and envelope"
+                ),
             )
         if diagnostic_terminal_feedback and (
             proposal_llm_tokens is not None or proposal_wall_seconds is not None
@@ -1712,7 +1887,16 @@ class DiagnosticDescendantNodeRunner:
             required_manifest_ref=required_manifest_ref,
             infrastructure_retry=infrastructure_retry,
             diagnostic_terminal_feedback=diagnostic_terminal_feedback,
+            allow_authorized_repair_regeneration=refresh_current_implementation,
+            allow_authorized_repair_execution=execute_authorized_repair,
+            final_epoch_diagnostic_anchor=final_epoch_diagnostic_anchor,
         )
+        if infrastructure_retry and frozen.infrastructure_retry_head is not None:
+            _mirror_settled_retry_control_record(
+                source_state_root=source_diagnostic_root,
+                app=app,
+                retry_head=frozen.infrastructure_retry_head,
+            )
         source_manifest_ref = frozen.manifest_ref
         source_proposal_llm_tokens = frozen.definition.proposal_policy.budget.llm_tokens
         source_proposal_wall_seconds = frozen.definition.proposal_policy.budget.wall_seconds
@@ -1782,7 +1966,7 @@ class DiagnosticDescendantNodeRunner:
             )
             runtime_profile_override_ref = overlay.override_ref
         budget = TestNodeRunner._single_attempt_budget(frozen.definition)
-        if infrastructure_retry:
+        if infrastructure_retry or execute_authorized_repair:
             # The frozen operation envelope remains unchanged, but the
             # Scheduler must be able to charge the one already-authorized
             # physical repair attempt.  This is not a second semantic budget
@@ -1792,16 +1976,26 @@ class DiagnosticDescendantNodeRunner:
         run_token = uuid.uuid4().hex
         run_id = f"test-descendant-node:{run_token}"
         trace_id = run_id
-        runtime = WorkControlRuntime(
-            artifacts=app.controller.artifacts,
+        source_workspace_root = source_diagnostic_root / "runs"
+        continuation_workspace_root = (
+            source_workspace_root
+            if infrastructure_retry
+            and source_workspace_root.is_dir()
+            and not source_workspace_root.is_symlink()
+            else diagnostic_root / "runs"
+        )
+        runtime = _diagnostic_work_runtime(
+            app=app,
             heads=app.controller.work_control,
-            budget=LeaseBudgetLedger(budget),
-            telemetry=app.telemetry,
-            projector=app.controller.scene_projector,
+            budget=budget,
             trace_id=trace_id,
             run_id=run_id,
-            diagnostic_only=True,
             repair_scope_id=scope_id,
+            # A retry's child clone must not copy private agent homes or
+            # drafts.  It may receive one explicit record that points back to
+            # the immediately preceding marked diagnostic workspace; a fresh
+            # first attempt instead captures only its own private root.
+            continuation_workspace_root=continuation_workspace_root,
         )
         terminal_feedback = _diagnostic_terminal_feedback_collector(
             config=app.config,
@@ -1822,7 +2016,7 @@ class DiagnosticDescendantNodeRunner:
         except WorkResumeError as exc:
             raise TestNodeError(
                 "test_descendant_ancestor_closure_missing",
-                "the frozen descendant lacks one exact committed diagnostic ancestor",
+                f"the frozen descendant lacks one exact committed diagnostic ancestor: {exc}",
             ) from exc
         scheduled_target = next(
             (
@@ -1833,7 +2027,8 @@ class DiagnosticDescendantNodeRunner:
             None,
         )
         if (
-            frozen.stale_head is not None
+            not authorize_semantic_repair
+            and frozen.stale_head is not None
             and frozen.stale_head.definition_digest == frozen.definition.definition_digest
             and scheduled_target is not None
             and scheduled_target.state not in {"ready", "repair_ready", "stale"}
@@ -1845,8 +2040,23 @@ class DiagnosticDescendantNodeRunner:
                     "its resolved input closure"
                 ),
             )
+        if execute_authorized_repair and (
+            frozen.authorized_repair_head is None
+            or frozen.authorized_repair_head.repair_action_ref is None
+            or scheduled_target is None
+            or scheduled_target.state != "repair_ready"
+        ):
+            raise TestNodeError(
+                "test_descendant_authorized_repair_not_ready",
+                (
+                    "the copied diagnostic target no longer has the exact Scheduler-authorized "
+                    "semantic repair ready for one normal dispatch"
+                ),
+            )
 
         infrastructure_retry_action_ref: ArtifactRef | None = None
+        authorized_semantic_repair_action_ref: ArtifactRef | None = None
+        authorized_semantic_repair_evaluation_ref: ArtifactRef | None = None
         if infrastructure_retry:
             try:
                 with app.controller.work_control.exclusive(frozen.definition.coordinate) as lock:
@@ -1869,11 +2079,41 @@ class DiagnosticDescendantNodeRunner:
                     "test_descendant_infrastructure_retry_authorization_invalid",
                     "the diagnostic infrastructure retry did not create one exact RepairAction",
                 )
+        if authorize_semantic_repair:
+            try:
+                with app.controller.work_control.exclusive(frozen.definition.coordinate) as lock:
+                    authorized = runtime.authorize_diagnostic_semantic_repair(
+                        lock,
+                        definition=frozen.definition,
+                        input_refs=resolved.all_input_refs,
+                    )
+            except Exception as exc:
+                raise TestNodeError(
+                    "test_descendant_semantic_repair_authorization_denied",
+                    (
+                        "the exact diagnostic target does not retain one policy-authorized "
+                        "actionable semantic repair"
+                    ),
+                ) from exc
+            authorized_semantic_repair_action_ref = authorized.repair_action_ref
+            if (
+                authorized.status != "repair_authorized"
+                or authorized_semantic_repair_action_ref is None
+            ):
+                raise TestNodeError(
+                    "test_descendant_semantic_repair_authorization_invalid",
+                    "the diagnostic semantic repair did not create one exact RepairAction",
+                )
+            authorized_semantic_repair_evaluation_ref = authorized.evaluation_ref
 
         root_span = app.telemetry.start_span(
             trace_id=trace_id,
             component="controller",
-            operation="test_descendant_node.dispatch",
+            operation=(
+                "test_descendant_node.authorize_semantic_repair"
+                if authorize_semantic_repair
+                else "test_descendant_node.dispatch"
+            ),
             run_id=run_id,
             node=frozen.definition.work_id,
             input_refs=resolved.all_input_refs,
@@ -1881,6 +2121,8 @@ class DiagnosticDescendantNodeRunner:
                 "diagnostic_only": True,
                 "releasable": False,
                 "infrastructure_retry": infrastructure_retry,
+                "authorized_repair_execution": execute_authorized_repair,
+                "semantic_repair_prepare": authorize_semantic_repair,
                 "diagnostic_terminal_feedback": diagnostic_terminal_feedback,
                 "runtime_implementation_override": refresh_current_implementation,
                 "runtime_profile_override": diagnostic_structured_output_transport is not None,
@@ -1891,69 +2133,104 @@ class DiagnosticDescendantNodeRunner:
             run_id=run_id,
             parent_span_id=root_span.span_id,
         )
-        workspace_root = diagnostic_root / "runs" / "test-descendant-node" / run_token
-        workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        execution = TestNodeExecution(
-            app=app,
-            graph=frozen.graph,
-            manifest=frozen.manifest,
-            manifest_ref=frozen.manifest_ref,
-            definition=frozen.definition,
-            context=frozen.context,
-            context_ref=frozen.context_ref,
-            runtime=runtime,
-            workspace_root=workspace_root,
-            run_id=run_id,
-            trace_id=trace_id,
-            terminal_feedback=terminal_feedback,
-        )
-        executor = (
-            self.executor_factory(execution)
-            if self.executor_factory is not None
-            else TestNodeRunner(config=self.config)._production_executor(execution)
-        )
-        try:
-            dispatch = await scheduler.dispatch_one(
-                frozen.definition.coordinate,
-                executors={frozen.definition.work_id: executor},
-            )
-        except asyncio.CancelledError:
-            head = _settle_cancelled_diagnostic_dispatch(
-                runtime=runtime,
-                definition=frozen.definition,
-            )
-            if head is None or head.status not in self._TERMINAL_STATUSES:
-                root_span.finish(
-                    status="cancelled",
-                    error_code="test_descendant_node_dispatch_cancelled",
-                )
-                app.telemetry.flush()
-                raise
-            dispatch = None
+        dispatch = None
+        if authorize_semantic_repair:
             root_span.finish(
-                status="cancelled",
+                status="passed",
                 output_refs=tuple(
-                    ref for ref in (head.commit_ref, head.evaluation_ref) if ref is not None
+                    ref
+                    for ref in (
+                        authorized_semantic_repair_action_ref,
+                        authorized_semantic_repair_evaluation_ref,
+                    )
+                    if ref is not None
                 ),
             )
             app.telemetry.flush()
-        except Exception as exc:
-            root_span.finish(
-                status="error",
-                error_code="test_descendant_node_dispatch_error",
-            )
-            app.telemetry.flush()
-            nonterminal = _nonterminal_diagnostic_dispatch_error(
+        else:
+            workspace_root = diagnostic_root / "runs" / "test-descendant-node" / run_token
+            workspace_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            execution = TestNodeExecution(
                 app=app,
+                graph=frozen.graph,
+                manifest=frozen.manifest,
+                manifest_ref=frozen.manifest_ref,
                 definition=frozen.definition,
-                scope_id=scope_id,
+                context=frozen.context,
+                context_ref=frozen.context_ref,
+                runtime=runtime,
+                workspace_root=workspace_root,
                 run_id=run_id,
-                error_code="test_descendant_nonterminal_dispatch_failure",
-                exc=exc,
+                trace_id=trace_id,
+                terminal_feedback=terminal_feedback,
             )
-            if nonterminal is not None:
-                raise nonterminal from exc
-            raise
+            executor = (
+                self.executor_factory(execution)
+                if self.executor_factory is not None
+                else TestNodeRunner(config=self.config)._production_executor(execution)
+            )
+            try:
+                dispatch = await scheduler.dispatch_one(
+                    frozen.definition.coordinate,
+                    executors={frozen.definition.work_id: executor},
+                )
+            except KeyboardInterrupt:
+                head = _settle_cancelled_diagnostic_dispatch(
+                    runtime=runtime,
+                    definition=frozen.definition,
+                )
+                if head is None or head.status not in self._SETTLED_HEAD_STATUSES:
+                    root_span.finish(
+                        status="cancelled",
+                        error_code="test_descendant_node_dispatch_interrupted",
+                    )
+                else:
+                    root_span.finish(
+                        status="cancelled",
+                        output_refs=tuple(
+                            ref for ref in (head.commit_ref, head.evaluation_ref) if ref is not None
+                        ),
+                    )
+                app.telemetry.flush()
+                # The top-level CLI must still report the caller's SIGINT.
+                raise
+            except asyncio.CancelledError:
+                head = _settle_cancelled_diagnostic_dispatch(
+                    runtime=runtime,
+                    definition=frozen.definition,
+                )
+                if head is None or head.status not in self._SETTLED_HEAD_STATUSES:
+                    root_span.finish(
+                        status="cancelled",
+                        error_code="test_descendant_node_dispatch_cancelled",
+                    )
+                    app.telemetry.flush()
+                    raise
+                dispatch = None
+                root_span.finish(
+                    status="cancelled",
+                    output_refs=tuple(
+                        ref for ref in (head.commit_ref, head.evaluation_ref) if ref is not None
+                    ),
+                )
+                app.telemetry.flush()
+            except Exception as exc:
+                root_span.finish(
+                    status="error",
+                    error_code="test_descendant_node_dispatch_error",
+                )
+                app.telemetry.flush()
+                nonterminal = _nonterminal_diagnostic_dispatch_error(
+                    app=app,
+                    definition=frozen.definition,
+                    scope_id=scope_id,
+                    run_id=run_id,
+                    error_code="test_descendant_nonterminal_dispatch_failure",
+                    exc=exc,
+                )
+                if nonterminal is not None:
+                    raise nonterminal from exc
+                raise
         if dispatch is not None:
             root_span.finish(
                 status="passed" if dispatch.after_state == "committed" else "failed",
@@ -1964,7 +2241,7 @@ class DiagnosticDescendantNodeRunner:
             app.telemetry.flush()
 
         head = app.controller.work_control.read_head(frozen.definition.coordinate)
-        if head is None or head.status not in self._TERMINAL_STATUSES:
+        if head is None or head.status not in self._SETTLED_HEAD_STATUSES:
             raise TestNodeError(
                 "test_descendant_no_terminal_result",
                 "the fresh diagnostic descendant did not produce one terminal Work head",
@@ -2023,14 +2300,33 @@ class DiagnosticDescendantNodeRunner:
             superseded_stale_definition_digest=(
                 frozen.stale_head.definition_digest if frozen.stale_head is not None else None
             ),
+            superseded_authorized_repair_action_ref=(
+                frozen.stale_head.repair_action_ref
+                if frozen.stale_head is not None and frozen.stale_head.status == "repair_authorized"
+                else None
+            ),
             infrastructure_retry_action_ref=infrastructure_retry_action_ref,
+            authorized_repair_action_ref=(
+                authorized_semantic_repair_action_ref
+                or (
+                    frozen.authorized_repair_head.repair_action_ref
+                    if frozen.authorized_repair_head is not None
+                    else None
+                )
+            ),
             predecessor_attempt_refs=frozen.predecessor_attempt_refs,
             predecessor_commit_refs=frozen.predecessor_commit_refs,
             target_attempt_ref=head.attempt_ref,
             target_evaluation_ref=head.evaluation_ref,
             target_commit_ref=head.commit_ref,
             status=cast(
-                Literal["committed", "failed", "needs_human", "interrupted"],
+                Literal[
+                    "committed",
+                    "failed",
+                    "needs_human",
+                    "interrupted",
+                    "repair_authorized",
+                ],
                 head.status,
             ),
             validation_report=report,
@@ -2221,6 +2517,92 @@ class DiagnosticDescendantNodeRunner:
             )
         return manifest_ref
 
+    @staticmethod
+    def _require_final_epoch_diagnostic_anchor(
+        *,
+        app: FoundryApplication,
+        manifest: WorkGraphManifest,
+        manifest_ref: ArtifactRef,
+        definition: WorkDefinition,
+        predecessor_commit_refs: tuple[ArtifactRef, ...],
+        anchor: _FinalEpochDiagnosticAnchor,
+    ) -> None:
+        """Prove the one non-direct diagnostic lineage allowed for final roots.
+
+        A final graph has two independent initial Agent boundaries.  Its
+        implementation planner consumes ModelingBoundary rather than
+        VerifierPlan, even though the final epoch itself was frozen from the
+        exact diagnostic VerifierPlan closure.  Requiring a direct diagnostic
+        parent here would make that legitimate final-boundary proof
+        unreachable; accepting an arbitrary ancestor would make the normal
+        descendant guard meaningless.  This method permits only the exact
+        final-epoch relation that ``DiagnosticFinalNodeRunner`` has just
+        frozen in the same marked copy.
+        """
+
+        if (
+            manifest_ref != anchor.final_manifest_ref
+            or manifest.mode != "production"
+            or not manifest.releasable
+            or (
+                definition.coordinate.component,
+                definition.coordinate.stage,
+            )
+            not in {
+                ("build", "implementation_plan"),
+                ("verifier", "verifier_intent_batch"),
+            }
+        ):
+            raise TestNodeError(
+                "test_final_node_diagnostic_anchor_invalid",
+                "final-epoch diagnostic ancestry may authorize only one exact initial final node",
+            )
+        try:
+            final_epoch = app.artifacts.get_json(anchor.final_epoch_ref, WorkGraphEpoch)
+            design_epoch = app.artifacts.get_json(anchor.design_epoch_ref, WorkGraphEpoch)
+            verifier_commit = app.artifacts.get_json(
+                anchor.verifier_plan_commit_ref,
+                WorkCommit,
+            )
+        except ValueError as exc:
+            raise TestNodeError(
+                "test_final_node_diagnostic_anchor_invalid",
+                (
+                    "final-epoch diagnostic ancestry is missing one durable epoch or "
+                    "VerifierPlan commit"
+                ),
+            ) from exc
+        if (
+            final_epoch.epoch_kind != "final"
+            or final_epoch.scope_id != definition.coordinate.scope_id
+            or final_epoch.manifest_ref != manifest_ref
+            or final_epoch.predecessor_epoch_ref != anchor.design_epoch_ref
+            or design_epoch.epoch_kind != "design"
+            or design_epoch.scope_id != definition.coordinate.scope_id
+            or design_epoch.context_ref != final_epoch.context_ref
+            or anchor.verifier_plan_commit_ref not in final_epoch.retained_commit_refs
+            or not set(predecessor_commit_refs).issubset(final_epoch.retained_commit_refs)
+            or verifier_commit.coordinate != anchor.verifier_plan_coordinate
+            or verifier_commit.definition_digest != anchor.verifier_plan_definition_digest
+            or not verifier_commit.diagnostic_only
+            or verifier_commit.releasable
+        ):
+            raise TestNodeError(
+                "test_final_node_diagnostic_anchor_invalid",
+                "final-epoch ancestry does not retain the exact diagnostic VerifierPlan closure",
+            )
+        verifier_head = app.controller.work_control.read_head(anchor.verifier_plan_coordinate)
+        if (
+            verifier_head is None
+            or verifier_head.status != "committed"
+            or verifier_head.commit_ref != anchor.verifier_plan_commit_ref
+            or verifier_head.definition_digest != anchor.verifier_plan_definition_digest
+        ):
+            raise TestNodeError(
+                "test_final_node_diagnostic_anchor_invalid",
+                "the diagnostic VerifierPlan commit is no longer the active final-epoch anchor",
+            )
+
     @classmethod
     def _load_frozen_descendant(
         cls,
@@ -2231,6 +2613,9 @@ class DiagnosticDescendantNodeRunner:
         required_manifest_ref: ArtifactRef | None = None,
         infrastructure_retry: bool = False,
         diagnostic_terminal_feedback: bool = False,
+        allow_authorized_repair_regeneration: bool = False,
+        allow_authorized_repair_execution: bool = False,
+        final_epoch_diagnostic_anchor: _FinalEpochDiagnosticAnchor | None = None,
     ) -> _FrozenDiagnosticDescendant:
         expected = cls._parse_coordinate(supplied)
         if (
@@ -2250,9 +2635,11 @@ class DiagnosticDescendantNodeRunner:
         saw_terminal_feedback_missing_source = False
         saw_terminal_feedback_definition_mismatch = False
         saw_terminal_feedback_nonfailed = False
+        saw_authorized_repair_requires_refresh = False
         saw_conflicting_live_head = False
         saw_conflicting_work_identity = False
         saw_missing_ancestor = False
+        missing_ancestor_details: set[str] = set()
         saw_without_diagnostic_parent = False
         manifest_refs = (
             (required_manifest_ref,)
@@ -2294,6 +2681,7 @@ class DiagnosticDescendantNodeRunner:
             existing_head = heads.read_head(definition.coordinate)
             stale_head: WorkControlHead | None = None
             infrastructure_retry_head: WorkControlHead | None = None
+            authorized_repair_head: WorkControlHead | None = None
             if infrastructure_retry:
                 # A retry is deliberately stricter than a fresh descendant.
                 # It may consume only the exact immutable definition that
@@ -2334,11 +2722,26 @@ class DiagnosticDescendantNodeRunner:
                     continue
                 stale_head = existing_head
             elif existing_head is not None:
-                if existing_head.definition_digest == definition.definition_digest:
+                if existing_head.status == "repair_authorized":
                     if existing_head.work_id != definition.work_id:
                         saw_conflicting_work_identity = True
                         continue
-                    if existing_head.status not in cls._TERMINAL_STATUSES:
+                    if allow_authorized_repair_execution:
+                        authorized_repair_head = existing_head
+                    elif not allow_authorized_repair_regeneration:
+                        saw_authorized_repair_requires_refresh = True
+                        continue
+                    else:
+                        # The caller will freeze a changed current implementation
+                        # below.  Scheduler then observes this old authority as
+                        # stale and opens a fresh regeneration; it must never bind
+                        # the old repair action or private continuation.
+                        stale_head = existing_head
+                elif existing_head.definition_digest == definition.definition_digest:
+                    if existing_head.work_id != definition.work_id:
+                        saw_conflicting_work_identity = True
+                        continue
+                    if existing_head.status not in cls._SETTLED_HEAD_STATUSES:
                         saw_conflicting_live_head = True
                         continue
                     # A child definition can be byte-identical while a newly
@@ -2350,7 +2753,7 @@ class DiagnosticDescendantNodeRunner:
                 elif existing_head.work_id != definition.work_id:
                     saw_conflicting_work_identity = True
                     continue
-                elif existing_head.status not in cls._TERMINAL_STATUSES:
+                elif existing_head.status not in cls._SETTLED_HEAD_STATUSES:
                     saw_conflicting_live_head = True
                     continue
                 else:
@@ -2375,10 +2778,30 @@ class DiagnosticDescendantNodeRunner:
             predecessor_heads = tuple(
                 heads.read_head(coordinate) for coordinate in definition.dependency_coordinates
             )
-            if len(predecessor_heads) != len(definition.dependency_coordinates) or any(
-                head is None or head.status != "committed" or head.commit_ref is None
-                for head in predecessor_heads
-            ):
+            unresolved_parents = tuple(
+                (
+                    TestNodeRunner._coordinate_scene_label(parent_coordinate),
+                    "missing"
+                    if parent_head is None
+                    else (
+                        parent_head.status
+                        if parent_head.commit_ref is not None
+                        else f"{parent_head.status}:missing_commit"
+                    ),
+                )
+                for parent_coordinate, parent_head in zip(
+                    definition.dependency_coordinates,
+                    predecessor_heads,
+                    strict=True,
+                )
+                if parent_head is None
+                or parent_head.status != "committed"
+                or parent_head.commit_ref is None
+            )
+            if unresolved_parents:
+                missing_ancestor_details.add(
+                    ", ".join(f"{label}={state}" for label, state in unresolved_parents)
+                )
                 saw_missing_ancestor = True
                 continue
             resolved_heads = cast(tuple[WorkControlHead, ...], predecessor_heads)
@@ -2387,11 +2810,24 @@ class DiagnosticDescendantNodeRunner:
                 for head in resolved_heads
                 if head.commit_ref is not None
             )
-            if not any(
+            has_direct_diagnostic_parent = any(
                 commit.diagnostic_only and not commit.releasable for commit in predecessor_commits
-            ):
-                saw_without_diagnostic_parent = True
-                continue
+            )
+            predecessor_commit_refs = tuple(
+                cast(ArtifactRef, head.commit_ref) for head in resolved_heads
+            )
+            if not has_direct_diagnostic_parent:
+                if final_epoch_diagnostic_anchor is None:
+                    saw_without_diagnostic_parent = True
+                    continue
+                cls._require_final_epoch_diagnostic_anchor(
+                    app=app,
+                    manifest=manifest,
+                    manifest_ref=manifest_ref,
+                    definition=definition,
+                    predecessor_commit_refs=predecessor_commit_refs,
+                    anchor=final_epoch_diagnostic_anchor,
+                )
             # Input resolution must use the same marked diagnostic runtime as
             # the eventual dispatch.  Constructing an opt-in Scheduler here
             # without that runtime is deliberately rejected by its authority
@@ -2406,11 +2842,10 @@ class DiagnosticDescendantNodeRunner:
                     context=context,
                     context_ref=context_ref,
                     predecessor_attempt_refs=tuple(head.attempt_ref for head in resolved_heads),
-                    predecessor_commit_refs=tuple(
-                        cast(ArtifactRef, head.commit_ref) for head in resolved_heads
-                    ),
+                    predecessor_commit_refs=predecessor_commit_refs,
                     stale_head=stale_head,
                     infrastructure_retry_head=infrastructure_retry_head,
+                    authorized_repair_head=authorized_repair_head,
                 )
             )
         if len(candidates) == 1:
@@ -2475,6 +2910,16 @@ class DiagnosticDescendantNodeRunner:
                 "test_descendant_terminal_feedback_source_not_failed",
                 "local terminal feedback may be collected only from one failed target head",
             )
+        if saw_authorized_repair_requires_refresh:
+            raise TestNodeError(
+                "test_descendant_authorized_repair_requires_runtime_refresh",
+                (
+                    "the exact target has Scheduler-authorized semantic repair for its "
+                    "current frozen definition; use the normal repair path, or freeze one "
+                    "--refresh-current-implementation regeneration after a causal runtime "
+                    "Prompt, Runtime Skill, leaf, or validator change"
+                ),
+            )
         if saw_conflicting_live_head:
             raise TestNodeError(
                 "test_descendant_stale_head_running",
@@ -2486,9 +2931,13 @@ class DiagnosticDescendantNodeRunner:
                 "a conflicting head reuses the coordinate with a different work identity",
             )
         if saw_missing_ancestor:
+            details = "; ".join(sorted(missing_ancestor_details))
             raise TestNodeError(
                 "test_descendant_ancestor_closure_missing",
-                "the frozen descendant lacks one exact committed parent closure",
+                (
+                    "the frozen descendant lacks one exact committed parent closure"
+                    + (f": {details}" if details else "")
+                ),
             )
         if saw_without_diagnostic_parent:
             raise TestNodeError(
@@ -2728,6 +3177,13 @@ def _freeze_diagnostic_overlay_epoch(
                     f"{label} has an unsupported graph epoch kind",
                 )
     except (WorkGraphError, WorkResumeError, WorkControlStoreError) as exc:
+        remediation = _final_epoch_rederivation_required(
+            source_epoch_kind=source_epoch.epoch_kind,
+            error=exc,
+            label=label,
+        )
+        if remediation is not None:
+            raise remediation from exc
         raise TestNodeError(
             invalid_epoch_code,
             f"{label} could not freeze one retained graph epoch",
@@ -2738,6 +3194,43 @@ def _freeze_diagnostic_overlay_epoch(
             f"{label} changed the frozen external input root",
         )
     return manifest, manifest_ref
+
+
+def _final_epoch_rederivation_required(
+    *,
+    source_epoch_kind: str,
+    error: Exception,
+    label: str,
+) -> TestNodeError | None:
+    """Route a stale final graph to the only truthful diagnostic successor.
+
+    ``test-descendant-node`` can dispatch an unheaded node from a graph that
+    is already frozen.  It cannot silently rebuild final topology after a
+    diagnostic Design predecessor (notably ``VerifierPlan``) has changed.
+    The normal epoch check correctly rejects that stale closure; this helper
+    keeps the safe coordinate and routes the project-execution Agent to the
+    dedicated final-epoch harness instead of leaving an opaque epoch error.
+    """
+
+    prefix = "predecessor WorkCommit is not active for the next graph: "
+    if (
+        source_epoch_kind != "final"
+        or not isinstance(error, WorkResumeError)
+        or not str(error).startswith(prefix)
+    ):
+        return None
+    predecessor = str(error).removeprefix(prefix)
+    return TestNodeError(
+        "test_node_final_epoch_rederivation_required",
+        (
+            f"{label} cannot retain the frozen final graph because its committed "
+            f"diagnostic predecessor {predecessor} no longer matches that graph's "
+            "definition, acceptance, or input closure. No model invocation was started. "
+            "Freeze a new diagnostic final graph from the committed Design and "
+            "VerifierPlan closure with test-final-node, then dispatch the selected "
+            "initial final node."
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -4091,6 +4584,7 @@ _PlanDerivedDesignTailStage = Literal[
     "modeling_boundary",
     "verifier_plan",
 ]
+_PlanDerivedDiagnosticAnchor = Literal["curriculum_plan", "verifier_plan"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -4220,7 +4714,49 @@ class DiagnosticTaskCurriculumJoinRunner:
         app: FoundryApplication,
         scope_id: str,
         require_unheaded_join: bool = True,
+        diagnostic_anchor: _PlanDerivedDiagnosticAnchor = "curriculum_plan",
     ) -> _PlanDerivedDiagnosticJoin:
+        """Select one exact Plan-derived Design closure by its changed boundary.
+
+        ``TaskCurriculum`` continuation is anchored to a diagnostic
+        ``CurriculumPlan`` because that is the changed fan-out parent.  A
+        final-graph derivation is different: it may preserve a normal committed
+        CurriculumPlan while refreshing only the deterministic ``VerifierPlan``.
+        In that case the exact diagnostic VerifierPlan commit is the only safe
+        selector.  Both routes retain the same structural Design checks; this
+        switch changes neither production scheduling nor release authority.
+        """
+
+        if diagnostic_anchor == "curriculum_plan":
+            anchor_label = "CurriculumPlan"
+            missing_code = "test_task_curriculum_join_design_missing"
+            ambiguous_code = "test_task_curriculum_join_design_ambiguous"
+            not_diagnostic_code = "test_task_curriculum_join_plan_not_diagnostic"
+            missing_message = (
+                "diagnostic state requires one Plan-derived TaskCurriculum Design epoch"
+            )
+            ambiguous_message = (
+                "diagnostic state has more than one Plan-derived TaskCurriculum Design epoch"
+            )
+        elif diagnostic_anchor == "verifier_plan":
+            anchor_label = "VerifierPlan"
+            missing_code = "test_final_node_design_missing"
+            ambiguous_code = "test_final_node_design_ambiguous"
+            not_diagnostic_code = "test_final_node_verifier_plan_not_diagnostic"
+            missing_message = (
+                "diagnostic state requires one Plan-derived Design epoch whose "
+                "VerifierPlan has an exact diagnostic commit"
+            )
+            ambiguous_message = (
+                "diagnostic state has more than one Plan-derived Design epoch whose "
+                "VerifierPlan has an exact diagnostic commit"
+            )
+        else:  # pragma: no cover - Literal callers are checked statically
+            raise TestNodeError(
+                "test_plan_derived_design_anchor_invalid",
+                "diagnostic anchor must be curriculum_plan or verifier_plan",
+            )
+
         candidates: list[_PlanDerivedDiagnosticJoin] = []
         for design_epoch_ref in app.artifacts.list_revisions():
             if design_epoch_ref.artifact_type != "control.work_graph_epoch":
@@ -4323,18 +4859,23 @@ class DiagnosticTaskCurriculumJoinRunner:
                     or verifier_plan.dependency_coordinates != (modeling.coordinate,)
                 ):
                     continue
-                # A normal native Design epoch and the diagnostic Plan-derived
-                # epoch intentionally retain the same public coordinates.  The
-                # only safe selector is the exact digest-bound diagnostic Plan
-                # commit, not the first structurally compatible manifest.
-                plan_head = app.controller.work_control.read_head(plans[0].coordinate)
-                if plan_head is None or plan_head.status != "committed":
+                # A normal native Design epoch and a diagnostic epoch
+                # intentionally retain public coordinates.  Select the exact
+                # digest-bound diagnostic boundary, never the first
+                # structurally compatible manifest.  TaskCurriculum continues
+                # below a diagnostic Plan; final derivation may instead follow
+                # a normal Plan and one diagnostic VerifierPlan refresh.
+                anchor_definition = (
+                    plans[0] if diagnostic_anchor == "curriculum_plan" else verifier_plan
+                )
+                anchor_head = app.controller.work_control.read_head(anchor_definition.coordinate)
+                if anchor_head is None or anchor_head.status != "committed":
                     continue
-                plan_attempt = app.artifacts.get_json(plan_head.attempt_ref, WorkAttempt)
+                anchor_attempt = app.artifacts.get_json(anchor_head.attempt_ref, WorkAttempt)
                 if (
                     app.controller.work_control.require_diagnostic_commit(
-                        definition=plans[0],
-                        input_refs=plan_attempt.input_refs,
+                        definition=anchor_definition,
+                        input_refs=anchor_attempt.input_refs,
                         artifacts=app.controller.artifacts,
                     )
                     is None
@@ -4355,13 +4896,13 @@ class DiagnosticTaskCurriculumJoinRunner:
             )
         if len(candidates) > 1:
             raise TestNodeError(
-                "test_task_curriculum_join_design_ambiguous",
-                "diagnostic state has more than one Plan-derived TaskCurriculum Design epoch",
+                ambiguous_code,
+                ambiguous_message,
             )
         if not candidates:
             raise TestNodeError(
-                "test_task_curriculum_join_design_missing",
-                "diagnostic state requires one Plan-derived TaskCurriculum Design epoch",
+                missing_code,
+                missing_message,
             )
 
         candidate = candidates[0]
@@ -4388,22 +4929,27 @@ class DiagnosticTaskCurriculumJoinRunner:
                     "test_task_curriculum_join_parent_closure_missing",
                     "the Plan-derived TaskCurriculum join lacks one committed parent closure",
                 )
-        plan_head = heads.read_head(candidate.curriculum_plan_definition.coordinate)
-        assert plan_head is not None  # established by the complete parent closure above
-        plan_attempt = app.artifacts.get_json(plan_head.attempt_ref, WorkAttempt)
+        anchor_definition = (
+            candidate.curriculum_plan_definition
+            if diagnostic_anchor == "curriculum_plan"
+            else candidate.verifier_plan_definition
+        )
+        anchor_head = heads.read_head(anchor_definition.coordinate)
+        assert anchor_head is not None  # established by the exact candidate selector above
+        anchor_attempt = app.artifacts.get_json(anchor_head.attempt_ref, WorkAttempt)
         if (
             app.controller.work_control.require_diagnostic_commit(
-                definition=candidate.curriculum_plan_definition,
-                input_refs=plan_attempt.input_refs,
+                definition=anchor_definition,
+                input_refs=anchor_attempt.input_refs,
                 artifacts=app.controller.artifacts,
             )
             is None
         ):
             raise TestNodeError(
-                "test_task_curriculum_join_plan_not_diagnostic",
+                not_diagnostic_code,
                 (
-                    "the Plan-derived TaskCurriculum join requires one diagnostic "
-                    "CurriculumPlan commit"
+                    "the selected Plan-derived Design epoch requires one exact diagnostic "
+                    f"{anchor_label} commit"
                 ),
             )
         return candidate
@@ -4613,6 +5159,7 @@ class DiagnosticFinalNodeRunner:
             app=app,
             scope_id=scope_id,
             require_unheaded_join=False,
+            diagnostic_anchor="verifier_plan",
         )
         try:
             design_epoch = app.artifacts.get_json(frozen.design_epoch_ref, WorkGraphEpoch)
@@ -4648,7 +5195,7 @@ class DiagnosticFinalNodeRunner:
             )
             if diagnostic_verifier is None:
                 raise WorkResumeError("VerifierPlan has no active diagnostic commit")
-            verifier_commit, _verifier_commit_ref = diagnostic_verifier
+            verifier_commit, verifier_commit_ref = diagnostic_verifier
             verifier_plan_ref = self._one_consumer_ref(
                 verifier_commit,
                 artifact_type="judge.verifier_batch_plan",
@@ -4735,6 +5282,14 @@ class DiagnosticFinalNodeRunner:
                     allow_diagnostic_predecessors=True,
                 )
             )
+            final_epoch_diagnostic_anchor = _FinalEpochDiagnosticAnchor(
+                final_epoch_ref=final_epoch_ref,
+                final_manifest_ref=final_manifest_ref,
+                design_epoch_ref=frozen.design_epoch_ref,
+                verifier_plan_coordinate=frozen.verifier_plan_definition.coordinate,
+                verifier_plan_definition_digest=(frozen.verifier_plan_definition.definition_digest),
+                verifier_plan_commit_ref=verifier_commit_ref,
+            )
         except (ValueError, WorkGraphError, WorkResumeError, WorkControlStoreError) as exc:
             raise TestNodeError(
                 "test_final_node_topology_derivation_failed",
@@ -4753,6 +5308,7 @@ class DiagnosticFinalNodeRunner:
             scope_id=scope_id,
             target_coordinate=target.coordinate_key,
             required_manifest_ref=final_manifest_ref,
+            final_epoch_diagnostic_anchor=final_epoch_diagnostic_anchor,
         )
         return DiagnosticFinalNodeResult(
             source_scope_id=scope_id,
@@ -5186,15 +5742,13 @@ class DiagnosticSuccessorNodeRunner:
         run_token = uuid.uuid4().hex
         run_id = f"test-successor-node:{run_token}"
         trace_id = run_id
-        runtime = WorkControlRuntime(
-            artifacts=app.controller.artifacts,
+        runtime = _diagnostic_work_runtime(
+            app=app,
             heads=heads,
-            budget=LeaseBudgetLedger(budget),
-            telemetry=app.telemetry,
-            projector=app.controller.scene_projector,
+            budget=budget,
             trace_id=trace_id,
             run_id=run_id,
-            diagnostic_only=True,
+            continuation_workspace_root=diagnostic_root / "runs",
         )
         scheduler = WorkScheduler(
             graph=design_graph,
@@ -5252,6 +5806,26 @@ class DiagnosticSuccessorNodeRunner:
                 target,
                 executors={definition.work_id: executor},
             )
+        except KeyboardInterrupt:
+            head = _settle_cancelled_diagnostic_dispatch(
+                runtime=runtime,
+                definition=definition,
+            )
+            if head is None or head.status not in _TERMINAL_WORK_HEAD_STATUSES:
+                root_span.finish(
+                    status="cancelled",
+                    error_code="test_successor_node_dispatch_interrupted",
+                )
+            else:
+                root_span.finish(
+                    status="cancelled",
+                    output_refs=tuple(
+                        ref for ref in (head.commit_ref, head.evaluation_ref) if ref is not None
+                    ),
+                )
+            app.telemetry.flush()
+            # Preserve the real external-interrupt signal after durability.
+            raise
         except asyncio.CancelledError:
             head = _settle_cancelled_diagnostic_dispatch(
                 runtime=runtime,
@@ -5422,13 +5996,25 @@ class DiagnosticSuccessorNodeRunner:
             )
         )
         if len(matches) != 1:
+            candidates = tuple(
+                sorted(
+                    TestNodeRunner._coordinate_label(definition.coordinate)
+                    for definition in graph.definitions
+                    if (
+                        definition.coordinate.component == "design"
+                        and definition.coordinate.stage in cls._ALLOWED_STAGES
+                    )
+                )
+            )
+            available = ", ".join(candidates) if candidates else "none"
             raise TestNodeError(
                 "test_successor_coordinate_not_fresh_semantic",
                 (
                     "target must be one newly derived shared or physical ToolSemantics coordinate; "
                     "use its exact hash, coordinate JSON, "
                     "component|stage|artifact_slot|group_id|shard_id, or the "
-                    "component.stage.artifact_slot label shown by observe"
+                    "component.stage.artifact_slot label shown by observe; "
+                    f"available diagnostic successor coordinates: {available}"
                 ),
             )
         return matches[0]

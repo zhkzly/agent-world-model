@@ -209,6 +209,74 @@ def test_work_head_cas_is_single_writer_and_terminal_commit_is_immutable(
             )
 
 
+def test_model_fallback_authorizes_one_failed_terminal_head(
+    tmp_path: Path,
+) -> None:
+    """A classified fallback has the same narrow terminal transition as retry."""
+
+    definition = _definition()
+    writer = _writer(tmp_path)
+    work_store = WorkControlStore(tmp_path / "work-control")
+    input_ref = writer.put_json(
+        artifact_id="hotel:model-fallback-input",
+        artifact_type="design.world_skeleton",
+        value={"kind": "hotel"},
+    )
+    attempt_ref = writer.put_json(
+        artifact_id="hotel:model-fallback-attempt",
+        artifact_type="control.work_attempt",
+        value={"attempt_id": "attempt:model-fallback"},
+        dependencies=(input_ref,),
+    )
+    evaluation_ref = writer.put_json(
+        artifact_id="hotel:model-fallback-evaluation",
+        artifact_type="control.feedback_evaluation",
+        value={"kind": "closed-transient-terminal"},
+        dependencies=(attempt_ref,),
+    )
+    action_ref = writer.put_json(
+        artifact_id="hotel:model-fallback-action",
+        artifact_type="control.repair_action",
+        value={"decision": "model_fallback"},
+        dependencies=(attempt_ref, evaluation_ref),
+    )
+    initial = WorkControlStore.new_head(
+        definition=definition,
+        input_refs=(input_ref,),
+        attempt_ref=attempt_ref,
+    )
+    failed = initial.model_copy(
+        update={
+            "revision": 2,
+            "status": "failed",
+            "evaluation_ref": evaluation_ref,
+            "updated_at": datetime.now(UTC),
+        }
+    )
+    fallback = failed.model_copy(
+        update={
+            "revision": 3,
+            "status": "repair_authorized",
+            "evaluation_ref": evaluation_ref,
+            "repair_action_ref": action_ref,
+            "invalidated_by_refs": (attempt_ref, action_ref),
+            "updated_at": datetime.now(UTC),
+        }
+    )
+
+    with work_store.exclusive(definition.coordinate) as lock:
+        work_store.compare_and_swap(lock, expected_head=None, next_head=initial)
+        work_store.compare_and_swap(lock, expected_head=initial, next_head=failed)
+        authorized = work_store.authorize_model_fallback(
+            lock,
+            expected_head=failed,
+            next_head=fallback,
+        )
+
+    assert authorized == fallback
+    assert work_store.read_head(definition.coordinate) == fallback
+
+
 def test_resume_rejects_commit_with_fake_attempt_even_when_evaluation_looks_passed(
     tmp_path: Path,
 ) -> None:

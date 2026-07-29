@@ -33,6 +33,7 @@ from agent_world.contracts.supply_chain import (
     LicenseMetadataEvidence,
     LockedComponentEvidence,
     LockedWheelEvidence,
+    StaticDiagnosticLocation,
     StaticFileEvidence,
     SupplyChainEvidence,
 )
@@ -43,12 +44,21 @@ _TEXT_SUFFIXES = frozenset(
     {".cfg", ".ini", ".json", ".md", ".py", ".rst", ".toml", ".txt", ".yaml", ".yml"}
 )
 _TEXT_NAMES = frozenset({"LICENSE", "LICENSE-APACHE", "LICENSE-MIT", "NOTICE", "README"})
-_FORBIDDEN_PATTERNS = (
-    re.compile(rb"\bunittest\.mock\b", re.IGNORECASE),
-    re.compile(rb"\bMagicMock\b"),
-    re.compile(rb"\bfixture[_ -]?registry\b", re.IGNORECASE),
-    re.compile(rb"\bmock[_ -]?(?:backend|runtime|environment)\b", re.IGNORECASE),
-    re.compile(rb"\b(?:evaluator_goal|sealed_case|verifier_ir)\b", re.IGNORECASE),
+type StaticDiagnosticCategory = Literal[
+    "framework_private_identifier",
+    "fixture_registry",
+    "test_double",
+]
+
+_FORBIDDEN_PATTERNS: tuple[tuple[StaticDiagnosticCategory, re.Pattern[bytes]], ...] = (
+    ("test_double", re.compile(rb"\bunittest\.mock\b", re.IGNORECASE)),
+    ("test_double", re.compile(rb"\bMagicMock\b")),
+    ("fixture_registry", re.compile(rb"\bfixture[_ -]?registry\b", re.IGNORECASE)),
+    ("test_double", re.compile(rb"\bmock[_ -]?(?:backend|runtime|environment)\b", re.IGNORECASE)),
+    (
+        "framework_private_identifier",
+        re.compile(rb"\b(?:evaluator_goal|sealed_case|verifier_ir)\b", re.IGNORECASE),
+    ),
 )
 _SECRET_PATTERNS = (
     re.compile(rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -68,6 +78,20 @@ type LicenseMetadataSource = Literal[
     "core-metadata-license-field",
     "missing",
 ]
+
+
+def _forbidden_diagnostic_locations(data: bytes) -> tuple[StaticDiagnosticLocation, ...]:
+    """Classify forbidden-byte matches without retaining their matched text."""
+
+    locations = {
+        (data.count(b"\n", 0, match.start()) + 1, category)
+        for category, pattern in _FORBIDDEN_PATTERNS
+        for match in pattern.finditer(data)
+    }
+    return tuple(
+        StaticDiagnosticLocation(line=line, category=category)
+        for line, category in sorted(locations)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +140,7 @@ def inspect_static_sources(root: Path, manifest: CandidateManifest) -> StaticSou
         parse_valid: bool | None = None
         scan_passed = True
         item_failures: set[str] = set()
+        diagnostic_locations: tuple[StaticDiagnosticLocation, ...] = ()
 
         text: str | None = None
         if is_text:
@@ -127,7 +152,8 @@ def inspect_static_sources(root: Path, manifest: CandidateManifest) -> StaticSou
                 item_failures.add("static_utf8_invalid")
                 failures.add("static_utf8_invalid")
 
-            if any(pattern.search(data) is not None for pattern in _FORBIDDEN_PATTERNS):
+            diagnostic_locations = _forbidden_diagnostic_locations(data)
+            if diagnostic_locations:
                 forbidden_ok = False
                 scan_passed = False
                 item_failures.add("static_forbidden_pattern")
@@ -187,6 +213,7 @@ def inspect_static_sources(root: Path, manifest: CandidateManifest) -> StaticSou
                 parse_valid=parse_valid,
                 scan_passed=scan_passed,
                 failure_codes=tuple(sorted(item_failures)),
+                diagnostic_locations=diagnostic_locations,
             )
         )
 
@@ -197,14 +224,18 @@ def inspect_static_sources(root: Path, manifest: CandidateManifest) -> StaticSou
     if violations_by_source:
         failures.add("static_component_import_boundary_violation")
         component_import_violations.update(
-            violation
-            for violations in violations_by_source.values()
-            for violation in violations
+            violation for violations in violations_by_source.values() for violation in violations
         )
         file_evidence = [
             (
                 evidence.model_copy(
                     update={
+                        # A declared cross-role import is a failed static
+                        # inspection of this source file.  Keep the per-file
+                        # evidence internally coherent: StaticFileEvidence
+                        # intentionally rejects a failure code when every
+                        # recorded check still says it passed.
+                        "scan_passed": False,
                         "failure_codes": tuple(
                             sorted(
                                 {
@@ -212,7 +243,7 @@ def inspect_static_sources(root: Path, manifest: CandidateManifest) -> StaticSou
                                     "static_component_import_boundary_violation",
                                 }
                             )
-                        )
+                        ),
                     }
                 )
                 if evidence.path in violations_by_source
@@ -247,9 +278,7 @@ def _component_import_violations(
     """Reject declared cross-role imports that cannot exist in the isolated file view."""
 
     module_paths = {
-        module: path
-        for path in python_trees
-        if (module := _module_name_for_path(path)) is not None
+        module: path for path in python_trees if (module := _module_name_for_path(path)) is not None
     }
     violations: dict[str, tuple[str, ...]] = {}
     for source_path, tree in python_trees.items():

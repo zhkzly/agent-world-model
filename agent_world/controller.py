@@ -153,6 +153,8 @@ from agent_world.expansion_runner import (
     ExpansionCampaignRunner,
 )
 from agent_world.invocation import (
+    InvocationControlRouteLivenessChecker,
+    InvocationControlStore,
     InvocationResult,
     InvocationStatus,
     InvocationUsage,
@@ -598,6 +600,7 @@ class FoundryController:
         judge: EnvironmentJudge,
         registry: EnvironmentRegistry,
         telemetry: TelemetryStore | None = None,
+        invocation_control: InvocationControlStore | None = None,
         error_audit_policy: ErrorAuditPolicy | None = None,
         known_secret_canaries: Sequence[str | bytes] = (),
     ) -> None:
@@ -614,6 +617,12 @@ class FoundryController:
         self.judge = judge
         self.registry = registry
         self.telemetry = telemetry
+        self.invocation_control = invocation_control
+        self.route_liveness_checker = (
+            InvocationControlRouteLivenessChecker(invocation_control)
+            if invocation_control is not None
+            else None
+        )
         self.error_audit_policy = error_audit_policy or ErrorAuditPolicy()
         self.code_router = CodeRouter()
         self.quarantine_review_policy = QuarantineReviewPolicy(artifact_store=self.artifacts)
@@ -626,6 +635,7 @@ class FoundryController:
             artifacts=self.artifacts,
             heads=self.work_control,
             telemetry=self.telemetry,
+            invocation_control=self.invocation_control,
             known_secret_canaries=known_secret_canaries,
         )
         self.direct_work_runner = (
@@ -649,6 +659,12 @@ class FoundryController:
                 ),
                 environment_codegen_physical_turn_token_limit=(
                     config.agent.environment_codegen_physical_turn_token_limit
+                ),
+                model_routes=config.agent.model_routes,
+                route_liveness_checker=self.route_liveness_checker,
+                require_route_liveness_gate=self.route_liveness_checker is not None,
+                infrastructure_retry_backoff_seconds=(
+                    config.agent.infrastructure_retry_backoff_seconds
                 ),
                 projector=self.scene_projector,
             )
@@ -1196,7 +1212,14 @@ class FoundryController:
             summary = str(error)
         else:
             failure_code = "scheduler_direct_execution_error"
-            summary = f"Scheduler Direct execution stopped ({type(error).__name__})."
+            diagnostic_ref = self._record_scheduler_execution_diagnostic(
+                run=run,
+                error=error,
+            )
+            safe_type = self._safe_identifier(type(error).__name__)
+            summary = f"Scheduler Direct execution stopped ({safe_type})."
+            if diagnostic_ref is not None:
+                summary += f" Read safe diagnostic: {diagnostic_ref.artifact_id}."
         final_snapshot_ref = await self._persist_snapshot(
             run,
             status="failed",
@@ -1214,6 +1237,78 @@ class FoundryController:
         )
         self._complete_direct_result(run, result)
         return result
+
+    def _record_scheduler_execution_diagnostic(
+        self,
+        *,
+        run: _RunState,
+        error: Exception,
+    ) -> ArtifactRef | None:
+        """Persist one text-free failure location for project-execution debugging.
+
+        The outer Direct runner is the last framework boundary before a
+        ``GenerateResult``.  Flattening an exception to its class made a real
+        failed run impossible to attribute: the project Agent could not tell
+        whether to inspect a Scheduler invariant, an adapter, or the model
+        prompt.  This compact Artifact deliberately keeps only framework
+        source locations, exception classes, and a one-way message fingerprint.
+        It is observation only: it grants no retry, repair, or semantic
+        authority, and never retains an exception message, provider payload,
+        workspace path, or session data.
+        """
+
+        try:
+            frames: list[dict[str, JsonValue]] = []
+            frame_sites: list[str] = []
+            for frame in traceback.extract_tb(error.__traceback__):
+                normalized = frame.filename.replace("\\", "/")
+                marker = "/agent_world/"
+                if marker not in normalized:
+                    continue
+                source_path = "agent_world/" + normalized.split(marker, 1)[1]
+                frame_sites.append(f"{source_path}:{frame.lineno}")
+                frames.append(
+                    {
+                        "source_path": source_path,
+                        "function": self._safe_identifier(frame.name),
+                        "line": frame.lineno,
+                    }
+                )
+            # Four frames are enough to distinguish the caller, Scheduler,
+            # adapter, and root invariant without turning this local view into
+            # an accumulating traceback transcript.
+            frames = frames[-4:]
+            cause_types: list[str] = []
+            cause: BaseException | None = error.__cause__ or error.__context__
+            while cause is not None and len(cause_types) < 4:
+                cause_types.append(self._safe_identifier(type(cause).__name__))
+                cause = cause.__cause__ or cause.__context__
+            safe_type = self._safe_identifier(type(error).__name__)
+            evidence: dict[str, JsonValue] = {
+                "diagnostic_kind": "scheduler_direct_execution_exception",
+                "error_type": safe_type,
+                "error_site": (frame_sites[-1] if frame_sites else "external_boundary"),
+                "frames": cast(JsonValue, frames),
+                "cause_types": cast(JsonValue, cause_types),
+                "message_fingerprint": sha256_digest(str(error).encode("utf-8", errors="replace")),
+            }
+            ref = self.artifacts.put_json(
+                artifact_id=self._stable_id(
+                    "scheduler-direct-diagnostic",
+                    run.run_id,
+                    safe_type,
+                    str(run.snapshot_revision),
+                ),
+                artifact_type="control.scheduler_execution_diagnostic",
+                value=evidence,
+                dependencies=(run.job_ref,),
+            )
+        except Exception:
+            # A diagnostic write may not mask the already-closed control-plane
+            # error or prevent the DirectJob from receiving a terminal result.
+            return None
+        run.remember(ref)
+        return ref
 
     async def _project_scheduler_outcome(
         self,
@@ -4326,6 +4421,12 @@ class FoundryController:
                 continuation_workspace_root=self.config.state_root / "runs",
                 projector=self.scene_projector,
                 run_id=run.run_id,
+                model_routes=self.config.agent.model_routes,
+                route_liveness_checker=self.route_liveness_checker,
+                require_route_liveness_gate=self.route_liveness_checker is not None,
+                infrastructure_retry_backoff_seconds=(
+                    self.config.agent.infrastructure_retry_backoff_seconds
+                ),
             )
             bundle = await self.designer.generate(
                 job=job,

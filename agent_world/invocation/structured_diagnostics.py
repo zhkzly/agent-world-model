@@ -186,6 +186,8 @@ _DIRECT_PROVIDER_ERROR_CODES = frozenset(
         "request_parameter",
         "context_window",
         "model_route",
+        "provider_unavailable",
+        "rate_limited",
         "other",
     }
 )
@@ -322,6 +324,37 @@ def direct_provider_exception_details(exc: Exception) -> JsonObject:
     return details
 
 
+def direct_provider_response_error_details(error: object | None) -> JsonObject:
+    """Project a streamed Direct terminal error into a closed fingerprint.
+
+    The Responses API can expose the same provider terminal through either a
+    top-level ``error`` stream event or ``response.failed.response.error``.
+    Both objects carry potentially sensitive human-readable ``message`` text.
+    Keep only the small, shared code/parameter projection so scheduler
+    feedback can distinguish retryable capacity from a request incompatibility
+    without turning the raw provider payload into durable Agent context.
+    """
+
+    if error is None:
+        return {"provider_error_shape": "missing"}
+    if isinstance(error, Mapping):
+        code = error.get("code")
+        param = error.get("param")
+    elif hasattr(error, "code") or hasattr(error, "param"):
+        code = getattr(error, "code", None)
+        param = getattr(error, "param", None)
+    else:
+        return {"provider_error_shape": "non_object"}
+    return {
+        "provider_error_shape": "object",
+        # ``event.type == \"error\"`` is a stream-protocol label, not a
+        # Provider error type. Do not invent one for either terminal surface.
+        "provider_error_type": "absent",
+        "provider_error_code": _direct_provider_error_code(code),
+        "provider_error_param": _direct_provider_error_param(param),
+    }
+
+
 def _direct_provider_error_body(body: Mapping[object, object]) -> Mapping[object, object]:
     """Use a nested ``error`` object when the compatible gateway provides one."""
 
@@ -361,6 +394,10 @@ def _direct_provider_error_code(value: object) -> str:
         return "context_window"
     if normalized in {"model_not_found", "model_not_available", "unsupported_model"}:
         return "model_route"
+    if normalized in {"server_error", "internal_server_error", "service_unavailable"}:
+        return "provider_unavailable"
+    if normalized in {"rate_limit_exceeded", "rate_limited"}:
+        return "rate_limited"
     return "other"
 
 
@@ -580,12 +617,13 @@ def safe_terminal_expected_category(error: InvocationError | None) -> str | None
         return _direct_invalid_request_expected_category(safe_terminal_details(error))
     if code == "direct_provider_unavailable":
         return (
-            "a Direct Provider liveness/route check using the safe HTTP fingerprint, then at "
+            "a Direct Provider liveness/route check using the safe Provider fingerprint, then at "
             "most one policy-authorized fresh physical execution; do not issue a model correction"
         )
     if code == "direct_rate_limited":
         return (
-            "restored Direct Provider capacity followed by at most one policy-authorized fresh "
+            "restored Direct Provider capacity using the safe Provider fingerprint, followed by "
+            "at most one policy-authorized fresh "
             "physical execution; do not issue a model correction"
         )
     if code in {"direct_authentication_failed", "direct_model_unavailable"}:
@@ -595,7 +633,7 @@ def safe_terminal_expected_category(error: InvocationError | None) -> str | None
         )
     if code in {"direct_provider_timeout", "direct_provider_rejected"}:
         return (
-            "a Direct adapter/provider route investigation using the safe HTTP fingerprint; "
+            "a Direct adapter/provider route investigation using the safe Provider fingerprint; "
             "make one explicit causal decision before another real execution"
         )
     return None
@@ -660,19 +698,19 @@ def safe_terminal_remediation(error: InvocationError | None) -> str | None:
         )
     if code == "direct_provider_unavailable":
         return (
-            "Inspect the retained Direct safe HTTP status and provider shape, verify current "
+            "Inspect the retained Direct safe Provider fingerprint, verify current "
             "route liveness, then spend at most the declared infrastructure retry."
         )
     if code == "direct_rate_limited":
         return (
-            "Inspect the retained Direct HTTP status and safe provider shape, wait for restored "
+            "Inspect the retained Direct safe Provider fingerprint, wait for restored "
             "capacity, then spend at most the declared infrastructure retry."
         )
     if code in {"direct_authentication_failed", "direct_model_unavailable"}:
         return "Inspect Direct credential/model routing outside the Agent Prompt and Runtime Skill."
     if code in {"direct_provider_timeout", "direct_provider_rejected"}:
         return (
-            "Inspect the retained Direct HTTP status and safe provider shape before selecting a "
+            "Inspect the retained Direct safe Provider fingerprint before selecting a "
             "new route, budget, or one authorized retry."
         )
     routes = {
@@ -1034,7 +1072,7 @@ def _direct_invalid_request_condition(details: JsonObject) -> str:
 
 
 def _direct_provider_exception_condition(code: str, details: JsonObject) -> str:
-    """Describe an HTTP-side Direct terminal without retaining provider prose."""
+    """Describe a Direct Provider terminal without retaining provider prose."""
 
     conditions = {
         "direct_authentication_failed": "the Direct Provider rejected the configured credential",
@@ -1256,11 +1294,7 @@ def _bounded_nonnegative_int(value: object) -> TypeGuard[int]:
 
 
 def _safe_http_status(value: object) -> TypeGuard[int]:
-    return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
-        and 100 <= value <= 599
-    )
+    return isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599
 
 
 def _response_shape(output_text: str) -> str:
@@ -1314,6 +1348,7 @@ def _envelope_shape(value: JsonValue) -> str:
 __all__ = [
     "direct_invalid_json_details",
     "direct_output_limit_details",
+    "direct_provider_response_error_details",
     "direct_provider_stream_stalled_details",
     "direct_provider_exception_details",
     "direct_transport_decode_details",

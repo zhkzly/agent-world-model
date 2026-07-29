@@ -449,6 +449,11 @@ class WorkControlStore:
                 "diagnostic head archive requires an isolated test-node state root"
             )
 
+    def require_test_node_diagnostic_clone(self) -> None:
+        """Prove this store belongs to an isolated marked diagnostic copy."""
+
+        self._require_diagnostic_archive_marker()
+
     def authorize_causal_repair(
         self,
         lock: WorkControlLock,
@@ -496,6 +501,57 @@ class WorkControlStore:
             next_head=next_head,
             allowed_statuses=frozenset({"failed"}),
             conflict_prefix="infrastructure retry",
+        )
+
+    def authorize_model_fallback(
+        self,
+        lock: WorkControlLock,
+        *,
+        expected_head: WorkControlHead,
+        next_head: WorkControlHead,
+    ) -> WorkControlHead:
+        """Install one explicit fallback after a failed transient route.
+
+        The recovery policy and repair ledger have already proved the failed
+        model route, the compatible replacement, and the immutable input
+        closure.  This method owns the otherwise-forbidden terminal
+        ``failed -> repair_authorized`` pointer transition for that distinct
+        recovery decision; it does not select a model or infer retry
+        authority from an error string.
+        """
+
+        return self._authorize_terminal_repair(
+            lock,
+            expected_head=expected_head,
+            next_head=next_head,
+            allowed_statuses=frozenset({"failed"}),
+            conflict_prefix="model fallback",
+        )
+
+    def authorize_diagnostic_semantic_repair(
+        self,
+        lock: WorkControlLock,
+        *,
+        expected_head: WorkControlHead,
+        next_head: WorkControlHead,
+    ) -> WorkControlHead:
+        """Install one semantic repair only inside a marked diagnostic clone.
+
+        A production failed head remains terminal unless its ordinary Scheduler
+        authorizes the repair before settlement.  A diagnostic node deliberately
+        stops after that first settled failure, so proving a feedback-bound
+        correction requires this explicit opt-in transition in an isolated
+        state root.  The caller still has to bind a normal RepairAction and
+        repair ledger before this store changes the head.
+        """
+
+        self.require_test_node_diagnostic_clone()
+        return self._authorize_terminal_repair(
+            lock,
+            expected_head=expected_head,
+            next_head=next_head,
+            allowed_statuses=frozenset({"failed"}),
+            conflict_prefix="diagnostic semantic repair",
         )
 
     def _authorize_terminal_repair(
@@ -1069,6 +1125,66 @@ class WorkControlStore:
                 if field_name != "schema_version"
             }
         )
+
+    @staticmethod
+    def require_running_definition(
+        *,
+        head: WorkControlHead,
+        artifacts: ArtifactWriter,
+    ) -> WorkDefinition:
+        """Recover the immutable definition that owns one running operation.
+
+        A restart can derive a newer graph while an earlier process still owns
+        an operation under its frozen definition.  The historical definition is
+        authority only to settle that operation; callers must still project the
+        resulting terminal head against their current graph before dispatching
+        anything new.
+        """
+
+        if head.status != "running" or head.active_operation_ref is None:
+            raise WorkResumeError("running definition recovery requires one active Work operation")
+        try:
+            attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+        except ValidationError as exc:
+            raise WorkResumeError("running Work head lacks its exact WorkAttempt") from exc
+        if (
+            attempt.work_id != head.work_id
+            or attempt.coordinate != head.coordinate
+            or attempt.definition_digest != head.definition_digest
+            or WorkControlStore.input_fingerprint(attempt.input_refs) != head.input_fingerprint
+        ):
+            raise WorkResumeError("running Work head does not bind its exact WorkAttempt")
+
+        candidates: list[WorkDefinition] = []
+        for ref in artifacts.list_revisions():
+            if (
+                ref.artifact_type != "control.work_definition"
+                or ref.content_hash != head.definition_digest
+            ):
+                continue
+            try:
+                candidate = artifacts.get_json(ref, WorkDefinition)
+            except ValidationError:
+                continue
+            if (
+                candidate.work_id == head.work_id
+                and candidate.coordinate == head.coordinate
+                and candidate.definition_digest == head.definition_digest
+                and candidate.acceptance_digest == head.acceptance_digest
+                and candidate.proposal_policy.content_digest() == attempt.proposal_policy_digest
+                and candidate.validation_policy.content_digest() == attempt.validation_policy_digest
+                and (
+                    None
+                    if candidate.assurance_policy is None
+                    else candidate.assurance_policy.content_digest()
+                )
+                == attempt.assurance_policy_digest
+                and candidate.repair_policy.content_digest() == attempt.repair_policy_digest
+            ):
+                candidates.append(candidate)
+        if not candidates or any(candidate != candidates[0] for candidate in candidates[1:]):
+            raise WorkResumeError("running Work head lacks one exact originating WorkDefinition")
+        return candidates[0]
 
     @staticmethod
     def _require_commit_definition(

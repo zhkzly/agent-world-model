@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 
@@ -132,6 +134,7 @@ def test_profile_resolver_materializes_private_capabilities_without_ambient_inhe
     assert "sqlite_home =" not in config_text
     assert "log_dir =" not in config_text
     assert 'web_search = "disabled"' in config_text
+    assert 'default_permissions = "agent_world_isolated"' in config_text
     assert 'inherit = "none"' in config_text
     assert f'"{profile.codex_home}" = "deny"' in config_text
     assert f'"{profile.skills[0].path}" = "read"' in config_text
@@ -196,6 +199,132 @@ def test_profile_resolver_mounts_only_the_pinned_custom_codex_runtime(
     config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
     assert f'"{codex_bin.resolve()}" = "read"' in config_text
     assert f'"{codex_bin.parent.resolve()}" = "read"' not in config_text
+    verify_resolved_profile(profile)
+
+
+def test_profile_resolver_materializes_a_pinned_isolated_runtime_tool(
+    tmp_path: Path,
+) -> None:
+    host_bin = tmp_path / "host-bin"
+    host_bin.mkdir()
+    source_uv = host_bin / "uv"
+    # The workspace command is a direct content-pinned executable copy, not a
+    # wrapper whose interpreter would become an extra runtime dependency.
+    source_uv.write_bytes(Path(sys.executable).resolve(strict=True).read_bytes())
+    source_uv.chmod(0o500)
+    resolver = ProfileResolver(
+        credential_bindings={
+            "model-auth": CredentialBinding(
+                handle="model-auth",
+                source_environment="MODEL_API_KEY",
+                target_environment="OPENAI_API_KEY",
+                purpose="model_api_key",
+            )
+        },
+        allowed_credential_handles=("model-auth",),
+    )
+
+    profile = resolver.resolve(
+        replace(_profile_spec(), required_runtime_tools=("uv",)),
+        lineage_id="research-runtime-toolchain",
+        materialization_root=tmp_path / "research-runtime-toolchain",
+        source_environment={
+            "PATH": f"{host_bin}:/usr/bin:/bin",
+            "MODEL_API_KEY": "test-placeholder-not-a-real-key",
+            "OPENAI_BASE_URL": "https://provider.example.test/v1",
+        },
+    )
+
+    assert profile.missing_runtime_tools == ()
+    assert tuple(tool.name for tool in profile.runtime_tools) == ("uv",)
+    assert profile.runtime_interpreter is not None
+    assert profile.runtime_interpreter.version == "3.12"
+    resolved_uv = profile.runtime_tools[0]
+    assert resolved_uv.path == profile.materialization_root / "toolchain" / "bin" / "uv"
+    assert resolved_uv.path.read_bytes() == source_uv.read_bytes()
+    assert profile.worker_environment()["PATH"].split(os.pathsep)[0] == str(
+        resolved_uv.path.parent
+    )
+    config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
+    assert str(resolved_uv.path.parent) in config_text
+    assert str(source_uv) not in config_text
+    public_profile = json.dumps(profile.to_public_dict(), sort_keys=True)
+    assert str(source_uv) not in public_profile
+    assert {"name": "uv", "sha256": resolved_uv.sha256} in profile.to_public_dict()[
+        "runtime_tools"
+    ]
+    assert profile.runtime_interpreter.to_safe_dict() == profile.to_public_dict()[
+        "runtime_interpreter"
+    ]
+    assert str(profile.runtime_interpreter.executable) not in public_profile
+    assert str(profile.runtime_interpreter.root) not in public_profile
+    facade_root = profile.workspace / ".agent-world-tools"
+    facade_uv = facade_root / "uv"
+    facade_python = facade_root / "python3.12"
+    assert facade_uv.is_file() and facade_python.is_file()
+    assert facade_uv.read_bytes() == resolved_uv.path.read_bytes()
+    assert facade_python.read_bytes() == profile.runtime_interpreter.executable.read_bytes()
+    assert not facade_uv.read_bytes().startswith(b"#!")
+    assert not facade_python.read_bytes().startswith(b"#!")
+    assert subprocess.run(  # noqa: S603 -- resolver-created facade is the test subject.
+        [str(facade_uv), "--version"],
+        cwd=profile.workspace,
+        check=False,
+    ).returncode == 0
+    python_version = subprocess.run(  # noqa: S603 -- resolver-created facade is the test subject.
+        [str(facade_python), "--version"],
+        cwd=profile.workspace,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert python_version.stdout.startswith("Python 3.12.")
+    assert f'"{profile.runtime_interpreter.root}" = "read"' in config_text
+    assert f'"{Path(sys.prefix).resolve()}" = "read"' not in config_text
+    verify_resolved_profile(profile)
+
+    facade_uv.chmod(0o700)
+    facade_uv.write_bytes(b"tampered")
+    with pytest.raises(ProfileResolutionError, match="workspace runtime tool facade changed"):
+        verify_resolved_profile(profile)
+    facade_uv.write_bytes(resolved_uv.path.read_bytes())
+    facade_uv.chmod(0o500)
+
+    resolved_uv.path.chmod(0o700)
+    resolved_uv.path.write_text("tampered", encoding="utf-8")
+    with pytest.raises(ProfileResolutionError, match="runtime tool changed"):
+        verify_resolved_profile(profile)
+
+
+def test_profile_resolver_records_a_missing_declared_runtime_tool_without_host_fallback(
+    tmp_path: Path,
+) -> None:
+    resolver = ProfileResolver(
+        credential_bindings={
+            "model-auth": CredentialBinding(
+                handle="model-auth",
+                source_environment="MODEL_API_KEY",
+                target_environment="OPENAI_API_KEY",
+                purpose="model_api_key",
+            )
+        },
+        allowed_credential_handles=("model-auth",),
+    )
+    missing_name = "agent-world-test-missing-tool"
+    profile = resolver.resolve(
+        replace(_profile_spec(), required_runtime_tools=(missing_name,)),
+        lineage_id="research-missing-runtime-tool",
+        materialization_root=tmp_path / "research-missing-runtime-tool",
+        source_environment={
+            "PATH": str(tmp_path / "empty-bin"),
+            "MODEL_API_KEY": "test-placeholder-not-a-real-key",
+            "OPENAI_BASE_URL": "https://provider.example.test/v1",
+        },
+    )
+
+    assert profile.runtime_tools == ()
+    assert profile.missing_runtime_tools == (missing_name,)
+    assert missing_name in profile.to_public_dict()["missing_runtime_tools"]
     verify_resolved_profile(profile)
 
 

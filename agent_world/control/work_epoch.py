@@ -874,7 +874,11 @@ class WorkGraphEpochRuntime:
                 )
             )
             if active is None:
-                raise WorkResumeError("predecessor WorkCommit is not active for the next graph")
+                coordinate = binding.coordinate
+                raise WorkResumeError(
+                    "predecessor WorkCommit is not active for the next graph: "
+                    f"{coordinate.component}.{coordinate.stage}.{coordinate.artifact_slot}"
+                )
             commit, commit_ref = active
             if commit.coordinate != binding.coordinate:
                 raise WorkResumeError("predecessor WorkCommit coordinate changed unexpectedly")

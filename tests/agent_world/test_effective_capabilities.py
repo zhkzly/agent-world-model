@@ -269,6 +269,18 @@ def test_engineer_runtime_skills_are_selected_by_exact_build_node(tmp_path: Path
     assert codegen.sandbox is SandboxMode.WORKSPACE_WRITE
     assert codegen.allowed_builtin_tools == ("shell", "workspace_edit")
     assert tuple(bundle.name for bundle in codegen.skills) == ("engineer-environment-codegen",)
+    assert codegen.developer_instructions is not None
+    assert "Engineer Environment Codegen" in codegen.developer_instructions
+    assert "Isolated CandidateBuild working context" in codegen.developer_instructions
+    assert "Use relative paths such as `inputs/...` and `candidate/...`" in (
+        codegen.developer_instructions
+    )
+    assert "./.agent-world-tools/uv" in codegen.developer_instructions
+    assert "./.agent-world-tools/python3.12" in codegen.developer_instructions
+    assert "--python ./.agent-world-tools/python3.12" in codegen.developer_instructions
+    instructions = " ".join(codegen.developer_instructions.split())
+    assert "Component source visibility" in instructions
+    assert "A `runtime` source may import only files declared `runtime`" in instructions
 
 
 def test_profile_provider_binds_typed_framework_lineage_to_stable_safe_identity(
@@ -318,6 +330,51 @@ def test_tool_free_structured_profile_injects_role_skill_without_shell(
     assert "`evidence_catalog_indexes`" in profile.developer_instructions
     config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
     assert "shell_tool = false" in config_text
+
+
+def test_tool_free_challenger_profile_loads_action_input_schema_audit(
+    tmp_path: Path,
+) -> None:
+    profile = IsolatedAgentProfileProvider(
+        AgentBackendConfig(
+            model="configured-real-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+            structured_output_transport="json_envelope",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-model-credential",
+        },
+    ).resolve(
+        role="challenger",
+        lineage_id="tool-free-challenger-action-schema-audit",
+        workspace=tmp_path / "tool-free-challenger",
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.structured_output(
+            node_id="challenger.verifier-compile-batch",
+            role="challenger",
+        ),
+    )
+
+    assert profile.allowed_builtin_tools == ()
+    assert profile.developer_instructions is not None
+    assert "Action-input schema audit" in profile.developer_instructions
+    assert "additionalProperties` is `false`" in profile.developer_instructions
+    assert "Positive means one `expectations` item" in profile.developer_instructions
+    assert "`expected=true`" in profile.developer_instructions
+    assert "two-pass internal" in profile.developer_instructions
+    assert "coverage audit" in profile.developer_instructions
+    assert "positive_only` `error_semantics` row" in profile.developer_instructions
+    assert "merely including the tool elsewhere" in profile.developer_instructions
+    assert (
+        "Input/context documents may have their own schema_version"
+        in profile.developer_instructions
+    )
+    assert "The Challenger context and the requested `VerifierIntent` are different documents" in (
+        profile.developer_instructions
+    )
+    assert 'literal `"v2"`' in profile.developer_instructions
 
 
 def test_tool_free_engineer_profile_requires_closed_evidence_claim_catalog(

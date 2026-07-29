@@ -14,14 +14,18 @@ from agent_world.contracts import Budget, BudgetUsage, canonical_json_bytes, sha
 from agent_world.control import (
     AgentExecutionProvenance,
     ArtifactSlotContract,
+    ContinuationStoreError,
     GenerationWorkGraph,
     LeafExecutionFailure,
     LeafProposal,
     LeafSemanticRepairContinuation,
+    LeafSemanticRepairSeed,
     LeafSessionContinuation,
     LeafValidationFailure,
+    LeafWorkspaceRecovery,
     LeaseBudgetLedger,
     NodeContinuationStore,
+    OperationBudget,
     OperationRun,
     ProposalExecution,
     RepairAction,
@@ -38,6 +42,12 @@ from agent_world.control import (
 )
 from agent_world.control.direct_runner import DirectWorkRunner
 from agent_world.control.leaf_executor import record_agent_proposal_outcome
+from agent_world.invocation import (
+    InvocationControlRouteLivenessChecker,
+    InvocationControlStore,
+    InvocationStatus,
+    InvocationTerminalFact,
+)
 from agent_world.invocation.contracts import InvocationSession
 from agent_world.observability import CoordinateScene, ObservabilityRoot, SceneProjector
 
@@ -48,6 +58,11 @@ def _setup(
     definition=None,
     budget: Budget | None = None,
     session_continuations: bool = False,
+    model_routes: tuple[str, ...] = (),
+    route_liveness_checker=None,
+    require_route_liveness_gate: bool = False,
+    infrastructure_retry_backoff_seconds: float = 0.0,
+    diagnostic_only: bool = False,
 ):
     scope_id = "job:leaf-kernel"
     if definition is None:
@@ -84,6 +99,8 @@ def _setup(
         dependencies=(root_ref,),
     )
     heads = WorkControlStore(tmp_path / "work-control")
+    if diagnostic_only:
+        heads.mark_test_node_diagnostic_clone()
     continuation_workspace_root = tmp_path / "continuation-workspaces"
     if session_continuations:
         continuation_workspace_root.mkdir()
@@ -97,6 +114,11 @@ def _setup(
         continuation_workspace_root=(
             continuation_workspace_root if session_continuations else None
         ),
+        model_routes=model_routes,
+        route_liveness_checker=route_liveness_checker,
+        require_route_liveness_gate=require_route_liveness_gate,
+        infrastructure_retry_backoff_seconds=infrastructure_retry_backoff_seconds,
+        diagnostic_only=diagnostic_only,
     )
     scheduler = WorkScheduler(
         graph=graph,
@@ -107,6 +129,311 @@ def _setup(
         runtime=runtime,
     )
     return artifacts, definition, heads, runtime, scheduler
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_parsed_candidate_binds_after_explicit_semantic_repair_authorization(
+    tmp_path: Path,
+) -> None:
+    """A test-node repair keeps parsed JSON privately until explicit authorization.
+
+    The first pass is a true Scheduler proposal/validation/evaluation boundary
+    in diagnostic mode.  It must settle failed before authorization, retain no
+    public candidate Artifact, and then promote the exact private candidate to
+    the ordinary repair seed only after the explicit RepairAction exists.
+    """
+
+    definition = structured_agent_work_definition(
+        scope_id="job:diagnostic-semantic-seed",
+        component="design",
+        stage="diagnostic_semantic_seed",
+        artifact_slot="diagnostic_semantic_seed",
+        dependency_coordinates=(),
+        claim_id="design.diagnostic_seed.repairs",
+        claim="One parsed diagnostic candidate can receive a feedback-bound repair.",
+        timing_reason="A real semantic rejection needs its exact parsed baseline.",
+        output_contract_id="contract:diagnostic-semantic-seed.v1",
+        allowed_mutation_roots=("/",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=0,
+        maximum_total_repair_attempts=1,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:diagnostic-semantic-seed",
+                direction="output",
+                artifact_types=("design.diagnostic_semantic_seed",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="design",
+            ),
+        ),
+    )
+    artifacts, definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(llm_tokens=2_000, agent_turns=2, repair_attempts=1, wall_seconds=300),
+        diagnostic_only=True,
+    )
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+    candidate = {"cases": [{"expectations": [{"expected": True}]}]}
+    received_seeds: list[LeafSemanticRepairSeed | None] = []
+
+    def provenance(dispatch_id: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="test-provider",
+            model="test-direct-model",
+            profile_digest=sha256_digest(canonical_json_bytes({"profile": "diagnostic"})),
+            output_schema_digest=sha256_digest(
+                canonical_json_bytes({"schema": "diagnostic-semantic-seed"})
+            ),
+        )
+
+    async def rejected(context) -> None:
+        async def proposal(_context, _attempt, dispatch_id: str) -> LeafProposal:
+            agent = provenance(dispatch_id)
+            raise LeafValidationFailure(
+                issues=(
+                    ValidationIssue(
+                        code="semantic_negative_expectation_missing",
+                        path=("cases", 0, "expectations"),
+                        violated_condition="the parsed candidate omits the negative expectation",
+                        expected_category="a separate compatible expectation with expected=false",
+                        remediation="Preserve valid expectations and add the missing negative one.",
+                    ),
+                ),
+                output_commitment=sha256_digest(
+                    canonical_json_bytes(
+                        {
+                            "invocation_id": dispatch_id,
+                            "structured_output": candidate,
+                        }
+                    )
+                ),
+                category="semantic_coverage",
+                agent=agent,
+                semantic_repair_seed=LeafSemanticRepairSeed(
+                    model=agent.model,
+                    profile_digest=agent.profile_digest,
+                    output_schema_digest=agent.output_schema_digest,
+                    previous_candidate=candidate,
+                ),
+            )
+
+        await kernel.execute(context, definition=definition, proposal_runner=proposal)
+
+    first = await scheduler.run_until_stalled(executors={definition.work_id: rejected})
+    # The graph reports its terminal dependency state as blocked; the exact
+    # diagnostic Work head below remains the failed node that can be explicitly
+    # authorized for one repair.
+    assert [result.after_state for result in first] == ["blocked"]
+    failed_head = heads.read_head(definition.coordinate)
+    assert failed_head is not None and failed_head.status == "failed"
+    failed_attempt = artifacts.get_json(failed_head.attempt_ref, WorkAttempt)
+    assert failed_attempt.semantic_repair_seed_commitment is None
+
+    with heads.exclusive(definition.coordinate) as lock:
+        authorized_head = runtime.authorize_diagnostic_semantic_repair(
+            lock,
+            definition=definition,
+            input_refs=failed_attempt.input_refs,
+        )
+
+    assert authorized_head.status == "repair_authorized"
+    authorized_attempt = artifacts.get_json(authorized_head.attempt_ref, WorkAttempt)
+    assert authorized_attempt.semantic_repair_seed_commitment is not None
+    stored = runtime.semantic_repair_seeds.load_commitment(
+        authorized_attempt.semantic_repair_seed_commitment
+    )
+    assert stored is not None
+    assert stored.previous_candidate == candidate
+    assert stored.repair_action_ref == authorized_head.repair_action_ref
+
+    async def repaired(context) -> None:
+        async def proposal(current_context, attempt, dispatch_id: str) -> LeafProposal:
+            seed = kernel.agent_semantic_repair_seed(
+                current_context,
+                definition=definition,
+                attempt=attempt,
+            )
+            received_seeds.append(seed)
+            assert seed is not None and seed.previous_candidate == candidate
+            output_ref = artifacts.put_json(
+                artifact_id="diagnostic-semantic-seed:repaired",
+                artifact_type="design.diagnostic_semantic_seed",
+                value={"repaired": True},
+                dependencies=current_context.external_input_refs,
+            )
+            return LeafProposal(
+                output_refs=(output_ref,),
+                subject_refs=(output_ref,),
+                agent=provenance(dispatch_id),
+            )
+
+        await kernel.execute(context, definition=definition, proposal_runner=proposal)
+
+    # This test proves one isolated diagnostic node, whose non-releasable
+    # commit is intentionally not a converged release graph.  Dispatch the
+    # explicitly authorized repair once instead of asking the diagnostic
+    # scheduler to re-schedule its deliberately non-active terminal commit.
+    repaired_result = await scheduler.dispatch_one(
+        definition.coordinate,
+        executors={definition.work_id: repaired},
+    )
+    assert repaired_result.after_state == "committed"
+    assert len(received_seeds) == 1
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_candidate_draft_binds_only_after_explicit_infrastructure_retry(
+    tmp_path: Path,
+) -> None:
+    """A diagnostic CandidateBuild keeps a private draft across one fresh session.
+
+    This exercises the actual Scheduler proposal -> validation -> evaluation ->
+    explicit RepairAction transition.  The first Agent turn writes an
+    untrusted draft and reaches a closed transient terminal; no draft becomes
+    an Artifact.  Only the later authorized retry receives an action-bound
+    private record, and it must use a fresh Provider session.
+    """
+
+    model = "gpt-5.3-codex-spark"
+    definition = structured_agent_work_definition(
+        scope_id="job:diagnostic-candidate-workspace",
+        component="build",
+        stage="candidate_build",
+        artifact_slot="candidate_build",
+        dependency_coordinates=(),
+        claim_id="builder.candidate.completes",
+        claim="A fresh Builder session may inspect one untrusted private draft.",
+        timing_reason="A closed Provider capacity terminal cannot adopt a draft.",
+        output_contract_id="contract:candidate-build.v1",
+        allowed_mutation_roots=("/candidate",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_model_fallbacks=0,
+        maximum_total_repair_attempts=2,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:candidate-build",
+                direction="output",
+                artifact_types=("design.candidate_build",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="build",
+            ),
+        ),
+    )
+    artifacts, definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(llm_tokens=2_000, agent_turns=2, repair_attempts=1, wall_seconds=300),
+        session_continuations=True,
+        model_routes=(model,),
+        diagnostic_only=True,
+    )
+    assert runtime.continuation_workspace_root is not None
+    workspace = runtime.continuation_workspace_root / "candidate-attempt"
+    (workspace / "candidate").mkdir(parents=True)
+    draft = workspace / "candidate" / "runtime.py"
+    draft.write_text("def draft(): return 'untrusted'\n", encoding="utf-8")
+    schema_digest = sha256_digest(canonical_json_bytes({"schema": "candidate-completion"}))
+    profile_digest = sha256_digest(canonical_json_bytes({"profile": "engineer"}))
+    config_digest = sha256_digest(canonical_json_bytes({"config": "engineer"}))
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+    seen_sessions: list[str | None] = []
+
+    def provenance(dispatch_id: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="test-provider",
+            model=model,
+            profile_digest=profile_digest,
+            output_schema_digest=schema_digest,
+        )
+
+    async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        if attempt.ordinal == 1:
+            raise LeafExecutionFailure(
+                code="agent_backend_turn_failed_provider_unavailable",
+                category="the Provider closed after regular private Candidate files were written",
+                retryable=True,
+                observed_actual=BudgetUsage(llm_tokens=1_000, agent_turns=1),
+                agent=provenance(dispatch_id),
+                workspace_recovery=LeafWorkspaceRecovery(
+                    workspace=workspace,
+                    lineage_id="implementation:diagnostic-candidate",
+                    profile_digest=profile_digest,
+                    codex_config_digest=config_digest,
+                    model=model,
+                    output_schema_digest=schema_digest,
+                ),
+            )
+        assert attempt.ordinal == 2
+        assert attempt.continuation_commitment is not None
+        assert runtime.continuations is not None
+        record = runtime.continuations.load_commitment(
+            attempt.continuation_commitment,
+            workspace_root=runtime.continuation_workspace_root,
+        )
+        assert record is not None
+        assert record.continuation_kind == "workspace_recovery"
+        assert record.thread_id is None
+        assert record.workspace_for_recovery() == workspace.resolve()
+        with pytest.raises(ContinuationStoreError, match="cannot resume a Provider thread"):
+            record.restore_session()
+        assert draft.read_text(encoding="utf-8").startswith("def draft")
+        seen_sessions.append(record.thread_id)
+        output = artifacts.put_json(
+            artifact_id="diagnostic-candidate:completed",
+            artifact_type="design.candidate_build",
+            value={"completed_after_fresh_workspace_inspection": True},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output,),
+            subject_refs=(output,),
+            observed_actual=BudgetUsage(llm_tokens=1_000, agent_turns=1),
+            agent=provenance(dispatch_id),
+        )
+
+    async def execute(context) -> None:
+        await kernel.execute(context, definition=definition, proposal_runner=proposal)
+
+    first = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+    assert [result.after_state for result in first] == ["blocked"]
+    failed = heads.read_head(definition.coordinate)
+    assert failed is not None and failed.status == "failed"
+    failed_attempt = artifacts.get_json(failed.attempt_ref, WorkAttempt)
+    assert failed_attempt.continuation_commitment is None
+    assert not any("candidate-attempt" in ref.artifact_id for ref in artifacts.list_revisions())
+
+    with heads.exclusive(definition.coordinate) as lock:
+        authorized = runtime.authorize_diagnostic_infrastructure_retry(
+            lock,
+            definition=definition,
+            input_refs=failed_attempt.input_refs,
+        )
+
+    assert authorized.status == "repair_authorized"
+    action = artifacts.get_json(authorized.repair_action_ref, RepairAction)
+    assert action.decision == "infrastructure_retry"
+    assert action.workspace_recovery is True
+    bound = artifacts.get_json(authorized.attempt_ref, WorkAttempt)
+    assert bound.continuation_commitment is not None
+
+    recovered = await scheduler.dispatch_one(
+        definition.coordinate,
+        executors={definition.work_id: execute},
+    )
+    assert recovered.after_state == "committed"
+    assert seen_sessions == [None]
 
 
 def test_direct_runner_binds_tool_batch_leaf_by_artifact_slot(tmp_path: Path) -> None:
@@ -477,6 +804,450 @@ async def test_agent_backend_error_with_no_candidate_output_still_reaches_termin
 
 
 @pytest.mark.asyncio
+async def test_scheduler_records_backoff_gate_then_falls_back_without_rerunning_parents(
+    tmp_path: Path,
+) -> None:
+    """One closed transient retry is gated, then only this node changes model.
+
+    This is a constructed **real Scheduler/WorkRuntime boundary**. It uses an
+    actual durable InvocationControlStore record for the first retry gate, but
+    it deliberately does not claim that a fake Provider failure proves live
+    model availability. The later live CandidateBuild mechanism remains the
+    required proof for the configured provider route.
+    """
+
+    definition = structured_agent_work_definition(
+        scope_id="job:model-fallback",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One isolated Researcher call produces a bounded research plan.",
+        timing_reason="Acquisition cannot begin without an exact plan.",
+        output_contract_id="contract:research-plan",
+        agent_role="researcher",
+        allowed_mutation_roots=(),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=0,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_model_fallbacks=1,
+        maximum_total_repair_attempts=2,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:research-plan",
+                direction="output",
+                artifact_types=("design.research_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="research",
+            ),
+        ),
+    )
+    store = InvocationControlStore(tmp_path / "invocation-control")
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(
+            llm_tokens=3_000,
+            agent_turns=3,
+            repair_attempts=2,
+            wall_seconds=300,
+        ),
+        model_routes=("grok-4.5", "gpt-5.3-codex-spark", "gpt-5.4-mini"),
+        route_liveness_checker=InvocationControlRouteLivenessChecker(store),
+        require_route_liveness_gate=True,
+    )
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+    attempts: list[WorkAttempt] = []
+
+    def provenance(dispatch_id: str, model: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="openai-compatible",
+            model=model,
+            profile_digest=sha256_digest(canonical_json_bytes({"profile": model})),
+            output_schema_digest=sha256_digest(canonical_json_bytes({"schema": "plan"})),
+        )
+
+    def record_closed_transient(
+        *,
+        attempt: WorkAttempt,
+        dispatch_id: str,
+    ) -> None:
+        ownership = leaf.invocation_ownership(
+            definition=definition,
+            attempt=attempt,
+            dispatch_id=dispatch_id,
+        )
+        store.begin(
+            invocation_id=dispatch_id,
+            owner=ownership,
+            route="codex_sdk",
+            model="grok-4.5",
+            profile_digest="sha256:" + "a" * 64,
+            envelope_digest="b" * 64,
+            declared_wall_seconds=30,
+        )
+        store.settle(
+            dispatch_id,
+            terminal=InvocationTerminalFact(
+                status=InvocationStatus.FAILED,
+                code="turn_failed_provider_unavailable",
+                retryable=True,
+            ),
+        )
+
+    async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        attempts.append(attempt)
+        if attempt.ordinal in {1, 2}:
+            assert attempt.model_override is None
+            assert attempt.continuation_commitment is None
+            record_closed_transient(attempt=attempt, dispatch_id=dispatch_id)
+            raise LeafExecutionFailure(
+                code="agent_backend_turn_failed_provider_unavailable",
+                category="the configured provider temporarily rejected the route",
+                retryable=True,
+                terminal_details={"codex_error_info": "enum:serveroverloaded"},
+                agent=provenance(dispatch_id, "grok-4.5"),
+            )
+        assert attempt.ordinal == 3
+        assert attempt.model_override == "gpt-5.3-codex-spark"
+        assert attempt.continuation_commitment is None
+        output_ref = artifacts.put_json(
+            artifact_id=f"research-plan:{attempt.attempt_id}",
+            artifact_type="design.research_plan",
+            value={"model": attempt.model_override},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            agent=provenance(dispatch_id, "gpt-5.3-codex-spark"),
+        )
+
+    async def execute(context) -> None:
+        await leaf.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == [
+        "repair_ready",
+        "repair_ready",
+        "committed",
+    ]
+    assert [attempt.model_override for attempt in attempts] == [
+        None,
+        None,
+        "gpt-5.3-codex-spark",
+    ]
+    assert len({attempt.input_refs for attempt in attempts}) == 1
+    assert attempts[1].route_liveness_evidence_ref is not None
+    gate = artifacts.get_json(attempts[1].route_liveness_evidence_ref)
+    assert gate["status"] == "verified"
+    assert gate["source"] == "invocation_control"
+    assert gate["code"] == "route_liveness_prior_terminal_verified"
+
+    actions = tuple(
+        artifacts.get_json(entry.repair_action_ref, RepairAction)
+        for entry in runtime.repairs.entries
+    )
+    # The repeated transport terminal has no semantic proposal to compare, so
+    # its ledger outcome may be ``no_progress`` without suppressing the
+    # independently authorized next-model route.
+    assert runtime.repairs.entries[0].outcome == "no_progress"
+    assert [action.decision for action in actions] == [
+        "infrastructure_retry",
+        "model_fallback",
+    ]
+    assert actions[0].route_liveness_required
+    assert actions[0].retry_not_before is not None
+    assert actions[1].model_override == "gpt-5.3-codex-spark"
+    recovery_ref = next(
+        ref
+        for ref in actions[1].causal_evidence_refs
+        if ref.artifact_type == "control.invocation_recovery_decision"
+    )
+    recovery = artifacts.get_json(recovery_ref)
+    assert recovery["route"] == "model_fallback"
+    assert recovery["target_model"] == "gpt-5.3-codex-spark"
+
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_retries_each_fallback_route_before_advancing_again(
+    tmp_path: Path,
+) -> None:
+    """A retry is scoped to the active model, never a prior fallback route.
+
+    This extends the durable Scheduler/WorkRuntime proof across three
+    configured models.  The first Grok retry and the first Spark retry both
+    require their own closed control-plane record and fresh node-local turn;
+    neither may be skipped because another model already consumed a retry.
+    """
+
+    routes = ("grok-4.5", "gpt-5.3-codex-spark", "gpt-5.4-mini")
+    definition = structured_agent_work_definition(
+        scope_id="job:per-route-model-retry",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One isolated Researcher call produces a bounded research plan.",
+        timing_reason="Acquisition cannot begin without an exact plan.",
+        output_contract_id="contract:research-plan",
+        agent_role="researcher",
+        allowed_mutation_roots=(),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=0,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_model_fallbacks=2,
+        maximum_total_repair_attempts=5,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:research-plan",
+                direction="output",
+                artifact_types=("design.research_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="research",
+            ),
+        ),
+    )
+    store = InvocationControlStore(tmp_path / "invocation-control")
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(
+            llm_tokens=5_000,
+            agent_turns=5,
+            repair_attempts=5,
+            wall_seconds=300,
+        ),
+        model_routes=routes,
+        route_liveness_checker=InvocationControlRouteLivenessChecker(store),
+        require_route_liveness_gate=True,
+    )
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+    attempts: list[WorkAttempt] = []
+
+    def provenance(dispatch_id: str, model: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="openai-compatible",
+            model=model,
+            profile_digest=sha256_digest(canonical_json_bytes({"profile": model})),
+            output_schema_digest=sha256_digest(canonical_json_bytes({"schema": "plan"})),
+        )
+
+    def record_closed_transient(
+        *,
+        attempt: WorkAttempt,
+        dispatch_id: str,
+        model: str,
+    ) -> None:
+        store.begin(
+            invocation_id=dispatch_id,
+            owner=leaf.invocation_ownership(
+                definition=definition,
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+            ),
+            route="codex_sdk",
+            model=model,
+            profile_digest="sha256:" + "a" * 64,
+            envelope_digest="b" * 64,
+            declared_wall_seconds=30,
+        )
+        store.settle(
+            dispatch_id,
+            terminal=InvocationTerminalFact(
+                status=InvocationStatus.FAILED,
+                code="turn_failed_provider_unavailable",
+                retryable=True,
+            ),
+        )
+
+    expected_models = (routes[0], routes[0], routes[1], routes[1], routes[2])
+
+    async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        attempts.append(attempt)
+        expected_model = expected_models[attempt.ordinal - 1]
+        actual_model = attempt.model_override or routes[0]
+        assert actual_model == expected_model
+        assert attempt.continuation_commitment is None
+        if attempt.ordinal < len(expected_models):
+            record_closed_transient(
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+                model=actual_model,
+            )
+            raise LeafExecutionFailure(
+                code="agent_backend_turn_failed_provider_unavailable",
+                category="the configured provider temporarily rejected the route",
+                retryable=True,
+                terminal_details={"codex_error_info": "enum:serveroverloaded"},
+                agent=provenance(dispatch_id, actual_model),
+            )
+        output_ref = artifacts.put_json(
+            artifact_id=f"research-plan:{attempt.attempt_id}",
+            artifact_type="design.research_plan",
+            value={"model": actual_model},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            agent=provenance(dispatch_id, actual_model),
+        )
+
+    async def execute(context) -> None:
+        await leaf.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == [
+        "repair_ready",
+        "repair_ready",
+        "repair_ready",
+        "repair_ready",
+        "committed",
+    ]
+    assert [attempt.model_override for attempt in attempts] == [
+        None,
+        None,
+        routes[1],
+        routes[1],
+        routes[2],
+    ]
+    assert len({attempt.input_refs for attempt in attempts}) == 1
+    assert attempts[1].route_liveness_evidence_ref is not None
+    assert attempts[3].route_liveness_evidence_ref is not None
+
+    actions = tuple(
+        artifacts.get_json(entry.repair_action_ref, RepairAction)
+        for entry in runtime.repairs.entries
+    )
+    assert [(action.decision, action.route_model, action.model_override) for action in actions] == [
+        ("infrastructure_retry", routes[0], None),
+        ("model_fallback", routes[0], routes[1]),
+        ("infrastructure_retry", routes[1], None),
+        ("model_fallback", routes[1], routes[2]),
+    ]
+    assert [entry.outcome for entry in runtime.repairs.entries] == [
+        "no_progress",
+        "no_progress",
+        "no_progress",
+        "resolved",
+    ]
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_rejects_missing_route_liveness_before_second_leaf_turn(
+    tmp_path: Path,
+) -> None:
+    """A missing durable prior record closes the retry before a second call.
+
+    This is the opposite branch of the same Scheduler/WorkRuntime boundary:
+    the first leaf reaches a closed retryable terminal, but no matching
+    InvocationControl record exists.  The gate must leave no second proposal
+    turn or hidden retry behind.
+    """
+
+    definition = structured_agent_work_definition(
+        scope_id="job:route-liveness-rejection",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One isolated Researcher call produces a bounded research plan.",
+        timing_reason="Acquisition cannot begin without an exact plan.",
+        output_contract_id="contract:research-plan",
+        agent_role="researcher",
+        allowed_mutation_roots=(),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=0,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_total_repair_attempts=2,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:research-plan",
+                direction="output",
+                artifact_types=("design.research_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="research",
+            ),
+        ),
+    )
+    store = InvocationControlStore(tmp_path / "invocation-control")
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(
+            llm_tokens=2_000,
+            agent_turns=2,
+            repair_attempts=1,
+            wall_seconds=300,
+        ),
+        model_routes=("grok-4.5", "gpt-5.3-codex-spark"),
+        route_liveness_checker=InvocationControlRouteLivenessChecker(store),
+        require_route_liveness_gate=True,
+    )
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+    calls: list[str] = []
+
+    async def proposal(_context, _attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        calls.append(dispatch_id)
+        raise LeafExecutionFailure(
+            code="agent_backend_turn_failed_provider_unavailable",
+            category="the configured provider temporarily rejected the route",
+            retryable=True,
+            terminal_details={"codex_error_info": "enum:serveroverloaded"},
+            agent=AgentExecutionProvenance(
+                invocation_id=dispatch_id,
+                provider="openai-compatible",
+                model="grok-4.5",
+                profile_digest=sha256_digest(canonical_json_bytes({"profile": "grok"})),
+                output_schema_digest=sha256_digest(canonical_json_bytes({"schema": "plan"})),
+            ),
+        )
+
+    async def execute(context) -> None:
+        await leaf.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == ["repair_ready", "blocked"]
+    assert len(calls) == 1
+    assert len(runtime.repairs.entries) == 1
+    assert runtime.repairs.entries[0].outcome == "exhausted"
+    gate_refs = tuple(
+        ref
+        for ref in artifacts.list_revisions()
+        if ref.artifact_type == "control.invocation_route_liveness_check"
+    )
+    assert len(gate_refs) == 1
+    gate = artifacts.get_json(gate_refs[0])
+    assert gate["status"] == "rejected"
+    assert gate["code"] == "route_liveness_prior_record_missing"
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "failed" and head.active_operation_ref is None
+
+
+@pytest.mark.asyncio
 async def test_closed_output_ceiling_creates_one_private_session_continuation_attempt(
     tmp_path: Path,
 ) -> None:
@@ -616,6 +1387,189 @@ async def test_closed_output_ceiling_creates_one_private_session_continuation_at
 
 
 @pytest.mark.asyncio
+async def test_closed_transient_private_draft_starts_fresh_workspace_recovery_attempt(
+    tmp_path: Path,
+) -> None:
+    """A written Builder draft is input to one new thread, never an adopted output.
+
+    This is a constructed real Scheduler/WorkRuntime boundary: the first
+    physical Agent attempt writes a regular private draft and reaches a
+    settled transient terminal.  The successor has a private draft record but
+    no Provider thread; it must still produce normal output that commits only
+    through the ordinary validation path.
+    """
+
+    definition = structured_agent_work_definition(
+        scope_id="job:candidate-workspace-recovery",
+        component="build",
+        stage="candidate_build",
+        artifact_slot="candidate_build",
+        dependency_coordinates=(),
+        claim_id="builder.candidate.completes",
+        claim="One fresh Builder session may inspect an interrupted private draft.",
+        timing_reason="A terminal Provider outage must not adopt an uncommitted candidate.",
+        output_contract_id="contract:candidate-build",
+        agent_role="environment_engineer",
+        allowed_mutation_roots=("/candidate",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        # CandidateBuild declares normal semantic repair roots as well; this
+        # test takes only the distinct infrastructure-recovery branch.
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_total_repair_attempts=2,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:candidate-build",
+                direction="output",
+                artifact_types=("design.candidate_build",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="build",
+            ),
+        ),
+    )
+    invocation_store = InvocationControlStore(tmp_path / "invocation-control")
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(
+            llm_tokens=2_000,
+            agent_turns=2,
+            repair_attempts=1,
+            wall_seconds=300,
+        ),
+        session_continuations=True,
+        route_liveness_checker=InvocationControlRouteLivenessChecker(invocation_store),
+        require_route_liveness_gate=True,
+    )
+    assert runtime.continuation_workspace_root is not None
+    workspace = (
+        runtime.continuation_workspace_root
+        / "builder"
+        / "attempt-initial"
+        / ".agent-runtime"
+        / "workspace"
+    )
+    (workspace / "candidate").mkdir(parents=True)
+    draft_path = workspace / "candidate" / "runtime.py"
+    draft_path.write_text("def draft_runtime():\n    return 'untrusted'\n", encoding="utf-8")
+
+    model = "grok-4.5"
+    profile_digest = f"sha256:{'a' * 64}"
+    config_digest = f"sha256:{'b' * 64}"
+    schema_digest = sha256_digest(canonical_json_bytes({"schema": "candidate-build"}))
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+    seen_attempts: list[WorkAttempt] = []
+
+    def provenance(dispatch_id: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="openai-compatible",
+            model=model,
+            profile_digest=profile_digest,
+            output_schema_digest=schema_digest,
+        )
+
+    def record_closed_transient(*, attempt: WorkAttempt, dispatch_id: str) -> None:
+        ownership = leaf.invocation_ownership(
+            definition=definition,
+            attempt=attempt,
+            dispatch_id=dispatch_id,
+        )
+        invocation_store.begin(
+            invocation_id=dispatch_id,
+            owner=ownership,
+            route="codex_sdk",
+            model=model,
+            profile_digest=profile_digest,
+            envelope_digest="c" * 64,
+            declared_wall_seconds=30,
+        )
+        invocation_store.settle(
+            dispatch_id,
+            terminal=InvocationTerminalFact(
+                status=InvocationStatus.FAILED,
+                code="turn_failed_provider_unavailable",
+                retryable=True,
+            ),
+        )
+
+    async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        seen_attempts.append(attempt)
+        if attempt.ordinal == 1:
+            record_closed_transient(attempt=attempt, dispatch_id=dispatch_id)
+            raise LeafExecutionFailure(
+                code="agent_backend_turn_failed_provider_unavailable",
+                category="the Provider became unavailable after a private candidate write",
+                retryable=True,
+                observed_actual=BudgetUsage(llm_tokens=1_000, agent_turns=1),
+                agent=provenance(dispatch_id),
+                workspace_recovery=LeafWorkspaceRecovery(
+                    workspace=workspace.resolve(),
+                    lineage_id="implementation:candidate-workspace-recovery",
+                    profile_digest=profile_digest,
+                    codex_config_digest=config_digest,
+                    model=model,
+                    output_schema_digest=schema_digest,
+                ),
+            )
+        assert attempt.ordinal == 2
+        assert attempt.continuation_commitment is not None
+        assert attempt.model_override is None
+        assert runtime.continuations is not None
+        record = runtime.continuations.load_commitment(
+            attempt.continuation_commitment,
+            workspace_root=runtime.continuation_workspace_root,
+        )
+        assert record is not None
+        assert record.continuation_kind == "workspace_recovery"
+        assert record.thread_id is None
+        assert record.workspace_for_recovery() == workspace.resolve()
+        with pytest.raises(ContinuationStoreError, match="cannot resume a Provider thread"):
+            record.restore_session()
+        assert draft_path.read_text(encoding="utf-8").startswith("def draft_runtime")
+        output_ref = artifacts.put_json(
+            artifact_id="candidate-build:completed-after-workspace-recovery",
+            artifact_type="design.candidate_build",
+            value={"accepted_only_after_fresh_completion": True},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            observed_actual=BudgetUsage(llm_tokens=1_000, agent_turns=1),
+            agent=provenance(dispatch_id),
+        )
+
+    async def execute(context) -> None:
+        await leaf.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == ["repair_ready", "committed"]
+    assert [attempt.ordinal for attempt in seen_attempts] == [1, 2]
+    repair = runtime.artifacts.get_json(seen_attempts[1].repair_action_ref, RepairAction)
+    assert repair.decision == "infrastructure_retry"
+    assert repair.workspace_recovery
+    assert repair.reason_code == "private_workspace_recovery"
+    assert repair.route_liveness_required
+    assert seen_attempts[1].route_liveness_evidence_ref is not None
+    route_gate = artifacts.get_json(seen_attempts[1].route_liveness_evidence_ref)
+    assert route_gate["status"] == "verified"
+    recovery_ref = next(
+        ref
+        for ref in repair.causal_evidence_refs
+        if ref.artifact_type == "control.invocation_recovery_decision"
+    )
+    assert artifacts.get_json(recovery_ref)["route"] == "workspace_recovery"
+    assert str(workspace) not in seen_attempts[1].model_dump_json()
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "committed"
+
+
+@pytest.mark.asyncio
 async def test_cancelled_agent_before_provenance_is_terminal_unknown_evidence(
     tmp_path: Path,
 ) -> None:
@@ -686,11 +1640,67 @@ async def test_cancelled_agent_before_provenance_is_terminal_unknown_evidence(
     assert proposal_run.execution_ref is not None
     execution = artifacts.get_json(proposal_run.execution_ref, ProposalExecution)
     assert execution.status == "interrupted"
-    assert execution.invocation_id is None
+    assert execution.invocation_id == proposal_run.dispatch_id
     assert execution.provider is None
     assert execution.model is None
     assert execution.profile_digest is None
     assert execution.output_schema_digest is None
+
+
+@pytest.mark.asyncio
+async def test_scheduler_boundary_settles_an_uncooperative_cancelled_executor(
+    tmp_path: Path,
+) -> None:
+    """The outer Scheduler owns the last cancellation fence, not one leaf type."""
+
+    artifacts, definition, heads, runtime, scheduler = _setup(tmp_path)
+    started = asyncio.Event()
+
+    async def uncooperative_executor(context) -> None:
+        input_refs = tuple(
+            dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+        )
+        with runtime.heads.exclusive(definition.coordinate) as lock:
+            runtime.schedule_operation(
+                lock,
+                definition=definition,
+                kind="proposal",
+                replay_mode="non_replayable",
+                elapsed_wall_seconds=0,
+                input_refs=input_refs,
+            )
+            runtime.start_operation(
+                lock,
+                definition=definition,
+                dispatch_id="dispatch:scheduler-boundary-cancellation",
+            )
+        started.set()
+        await asyncio.Event().wait()
+
+    dispatch = asyncio.create_task(
+        scheduler.dispatch_one(
+            definition.coordinate,
+            executors={definition.work_id: uncooperative_executor},
+        )
+    )
+    await started.wait()
+    dispatch.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch
+
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "failed" and head.active_operation_ref is None
+    attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+    proposal = next(
+        artifacts.get_json(ref, OperationRun)
+        for ref in attempt.operation_run_refs
+        if artifacts.get_json(ref, OperationRun).kind == "proposal"
+    )
+    assert proposal.status == "terminal"
+    assert proposal.error_code == "process_interrupted_cancelled"
+    assert proposal.execution_ref is not None
+    execution = artifacts.get_json(proposal.execution_ref, ProposalExecution)
+    assert execution.invocation_id is None
 
 
 @pytest.mark.asyncio
@@ -861,6 +1871,11 @@ async def test_interrupted_running_operation_is_charged_and_routed_by_replay_pol
     assert proposal_run.replay_mode == replay_mode
     assert proposal_run.unknown_upper_bound.llm_tokens == 1_000
     assert proposal_run.unknown_upper_bound.agent_turns == 1
+    assert proposal_run.execution_ref is not None
+    recovered_execution = artifacts.get_json(proposal_run.execution_ref, ProposalExecution)
+    assert recovered_execution.invocation_id == "dispatch:orphaned-real-agent-turn"
+    assert recovered_execution.provider is None
+    assert recovered_execution.model is None
     direct_usage = DirectWorkRunner._scope_budget_usage(  # noqa: SLF001
         runtime=runtime,
         scope_id=definition.coordinate.scope_id,
@@ -872,6 +1887,231 @@ async def test_interrupted_running_operation_is_charged_and_routed_by_replay_pol
         assert recovered.repair_action_ref is not None
     else:
         assert recovered.repair_action_ref is None
+
+
+def test_direct_runner_recovers_an_old_running_definition_before_current_graph_restarts(
+    tmp_path: Path,
+) -> None:
+    """An old orphan settles under its own definition; the new graph sees only stale state.
+
+    This is a true recovery boundary: no Agent executor is registered or
+    invoked.  It reproduces a process interruption after a frozen definition
+    was superseded by an implementation change, then exercises the production
+    Direct runner recovery hook and current scheduler projection.
+    """
+
+    historical_definition = structured_agent_work_definition(
+        scope_id="job:historical-running-definition",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One isolated Researcher call produces a bounded research plan.",
+        timing_reason="Acquisition cannot begin without an exact plan.",
+        output_contract_id="contract:research-plan",
+        implementation_revision_id="framework.impl.research-plan.v1",
+        agent_role="researcher",
+        allowed_mutation_roots=("/",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        replay_mode="non_replayable",
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:research-plan",
+                direction="output",
+                artifact_types=("design.research_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="research",
+            ),
+        ),
+    )
+    artifacts, _definition, heads, runtime, _scheduler = _setup(
+        tmp_path,
+        definition=historical_definition,
+        budget=Budget(
+            llm_tokens=2_000,
+            agent_turns=2,
+            repair_attempts=1,
+            wall_seconds=300,
+        ),
+    )
+    root_ref = next(
+        ref
+        for ref in artifacts.list_revisions("context")
+        if ref.artifact_type == "control.generation_context"
+    )
+    artifacts.put_json(
+        artifact_id=f"work-definition:{historical_definition.work_id}",
+        artifact_type="control.work_definition",
+        value=historical_definition,
+    )
+    with heads.exclusive(historical_definition.coordinate) as lock:
+        runtime.begin(
+            lock,
+            definition=historical_definition,
+            input_refs=(root_ref,),
+            elapsed_wall_seconds=0,
+        )
+        runtime.schedule_operation(
+            lock,
+            definition=historical_definition,
+            kind="proposal",
+            replay_mode=historical_definition.proposal_policy.replay_mode,
+            elapsed_wall_seconds=0,
+        )
+        runtime.start_operation(
+            lock,
+            definition=historical_definition,
+            dispatch_id="dispatch:historical-orphan",
+        )
+
+    current_definition = historical_definition.model_copy(
+        update={
+            "proposal_policy": historical_definition.proposal_policy.model_copy(
+                update={"implementation_revision_id": "framework.impl.research-plan.v2"}
+            )
+        }
+    )
+    current_graph = GenerationWorkGraph.compile((current_definition,), mode="diagnostic")
+
+    DirectWorkRunner._reconcile_abandoned_operations(  # noqa: SLF001
+        graph=current_graph,
+        runtime=runtime,
+    )
+
+    recovered = heads.read_head(historical_definition.coordinate)
+    assert recovered is not None
+    assert recovered.status == "failed"
+    assert recovered.active_operation_ref is None
+    assert recovered.definition_digest == historical_definition.definition_digest
+    attempt = artifacts.get_json(recovered.attempt_ref, WorkAttempt)
+    assert attempt.definition_digest == historical_definition.definition_digest
+    operation = next(
+        artifacts.get_json(ref, OperationRun)
+        for ref in attempt.operation_run_refs
+        if artifacts.get_json(ref, OperationRun).kind == "proposal"
+    )
+    assert operation.status == "terminal"
+    assert operation.error_code == "process_interrupted_after_dispatch"
+
+    current_manifest = current_graph.manifest(
+        topology_id="topology:current-definition-after-recovery",
+        external_root_refs=(root_ref,),
+    )
+    current_manifest_ref = artifacts.put_json(
+        artifact_id=current_manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=current_manifest,
+        dependencies=(root_ref,),
+    )
+    current_scheduler = WorkScheduler(
+        graph=current_graph,
+        manifest=current_manifest,
+        manifest_ref=current_manifest_ref,
+        heads=heads,
+        artifacts=artifacts,
+        runtime=runtime,
+    )
+    assert current_scheduler.snapshot().work[0].state == "stale"
+
+
+def test_recovery_reuses_a_lease_settled_before_the_operation_terminalizes(
+    tmp_path: Path,
+) -> None:
+    """A crash after durable budget settlement cannot try to overwrite that charge."""
+
+    definition = structured_agent_work_definition(
+        scope_id="job:settled-lease-recovery",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One isolated Researcher call produces a bounded research plan.",
+        timing_reason="Acquisition cannot begin without an exact plan.",
+        output_contract_id="contract:research-plan",
+        agent_role="researcher",
+        allowed_mutation_roots=("/",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        replay_mode="non_replayable",
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:research-plan",
+                direction="output",
+                artifact_types=("design.research_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="research",
+            ),
+        ),
+    )
+    artifacts, _definition, heads, runtime, _scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(
+            llm_tokens=2_000,
+            agent_turns=2,
+            repair_attempts=1,
+            wall_seconds=300,
+        ),
+    )
+    root_ref = next(
+        ref
+        for ref in artifacts.list_revisions("context")
+        if ref.artifact_type == "control.generation_context"
+    )
+    with heads.exclusive(definition.coordinate) as lock:
+        runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(root_ref,),
+            elapsed_wall_seconds=0,
+        )
+        runtime.schedule_operation(
+            lock,
+            definition=definition,
+            kind="proposal",
+            replay_mode=definition.proposal_policy.replay_mode,
+            elapsed_wall_seconds=0,
+        )
+        runtime.start_operation(
+            lock,
+            definition=definition,
+            dispatch_id="dispatch:settled-before-operation-terminal",
+        )
+
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.active_operation_ref is not None
+    operation = artifacts.get_json(head.active_operation_ref, OperationRun)
+    prior_unknown = BudgetUsage(llm_tokens=1_000, agent_turns=1)
+    runtime.budget_coordinator.settle(
+        scope_id=definition.coordinate.scope_id,
+        lease_id=operation.budget_lease_ref.artifact_id,
+        observed_actual=BudgetUsage(),
+        unknown_upper_bound=prior_unknown,
+    )
+
+    with heads.exclusive(definition.coordinate) as lock:
+        recovered = runtime.reconcile_abandoned_operation(lock, definition=definition)
+
+    assert recovered.status == "failed"
+    attempt = artifacts.get_json(recovered.attempt_ref, WorkAttempt)
+    proposal_operation = next(
+        artifacts.get_json(ref, OperationRun)
+        for ref in attempt.operation_run_refs
+        if artifacts.get_json(ref, OperationRun).kind == "proposal"
+    )
+    assert proposal_operation.status == "terminal"
+    assert proposal_operation.unknown_upper_bound == prior_unknown
+    settled = runtime.budget_coordinator.snapshot(scope_id=definition.coordinate.scope_id)
+    durable = next(
+        item for item in settled.leases if item.lease_id == operation.budget_lease_ref.artifact_id
+    )
+    assert durable.observed_actual == BudgetUsage()
+    assert durable.unknown_upper_bound == prior_unknown
 
 
 @pytest.mark.asyncio
@@ -980,6 +2220,84 @@ async def test_scheduler_closes_an_unaffordable_authorized_repair_without_a_seco
             definition.coordinate.coordinate_key,
         ).read_text()
     )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_rejects_an_impossible_validation_envelope_before_agent_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A missing process budget fails before the first expensive proposal.
+
+    This is the real Scheduler-to-leaf boundary behind the BuilderPlan bad
+    case: a future deterministic validation needs two process calls, while the
+    configured scope admits none. The proposal runner represents the actual
+    backend boundary and must not be reached.
+    """
+
+    base = structured_agent_work_definition(
+        scope_id="job:validation-envelope",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One isolated Researcher call produces a bounded research plan.",
+        timing_reason="Validation capacity must be admitted before the Agent proposal.",
+        output_contract_id="contract:research-plan",
+        agent_role="researcher",
+        allowed_mutation_roots=("/",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=1,
+        maximum_infrastructure_retries=0,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:research-plan",
+                direction="output",
+                artifact_types=("design.research_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="research",
+            ),
+        ),
+    )
+    definition = base.model_copy(
+        update={
+            "validation_policy": base.validation_policy.model_copy(
+                update={"budget": OperationBudget(wall_seconds=30, process_calls=2)}
+            )
+        }
+    )
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(llm_tokens=1_000, agent_turns=1, wall_seconds=300),
+    )
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+    dispatched: list[str] = []
+
+    async def proposal(_context, _attempt, _dispatch_id) -> LeafProposal:
+        dispatched.append("agent")
+        raise AssertionError("the preflight must reject before the Agent dispatch")
+
+    async def execute(context) -> None:
+        await kernel.execute(context, definition=definition, proposal_runner=proposal)
+
+    result = await scheduler.dispatch_one(
+        definition.coordinate,
+        executors={definition.work_id: execute},
+    )
+
+    assert result.after_state == "blocked"
+    assert dispatched == []
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "failed"
+    attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+    assert attempt.status == "budget_exhausted"
+    report = artifacts.get_json(attempt.validation_report_ref, ValidationReport)
+    evidence = artifacts.get_json(report.evidence_refs[0])
+    assert evidence["exhausted_dimensions"] == ["process_calls"]
 
 
 @pytest.mark.asyncio
@@ -1554,9 +2872,14 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
     kernel = SchedulerLeafExecutor(runtime=runtime)
     target_turns: list[int] = []
     source_turns: list[int] = []
+    repair_issues: list[tuple[ValidationIssue, ...]] = []
 
     async def target_proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
         target_turns.append(attempt.ordinal)
+        if attempt.ordinal == 2:
+            brief = kernel.agent_correction_brief(context, definition=target)
+            assert brief is not None
+            repair_issues.append(brief.issues)
         output_ref = artifacts.put_json(
             artifact_id=f"candidate-source:{attempt.ordinal}",
             artifact_type="design.world_architecture_source",
@@ -1585,6 +2908,7 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
                         path=("runtime", "handshake"),
                         violated_condition="The isolated runtime protocol rejected this candidate.",
                         expected_category="candidate source satisfying the runtime protocol",
+                        remediation="Repair the Candidate runtime handshake implementation.",
                     ),
                 ),
                 output_commitment=sha256_digest(b"failed-real-integration-evidence"),
@@ -1612,6 +2936,22 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
 
     assert target_turns == [1, 2]
     assert source_turns == [1, 2]
+    assert len(repair_issues) == 1
+    assert repair_issues[0] == (
+        ValidationIssue(
+            code="causal_runtime_protocol_rejects_candidate",
+            path=(
+                "causal_feedback",
+                "integration",
+                "runtime_integration",
+                "runtime",
+                "handshake",
+            ),
+            violated_condition="The isolated runtime protocol rejected this candidate.",
+            expected_category="candidate source satisfying the runtime protocol",
+            remediation="Repair the Candidate runtime handshake implementation.",
+        ),
+    )
     assert [item.before_state for item in results] == [
         "ready",
         "ready",
@@ -1634,4 +2974,8 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
     assert any(
         ref.artifact_type == "control.parent_repair_route" for ref in action.causal_evidence_refs
     )
+    assert action.repair_seed_attempt_ref is not None
+    seed_attempt = artifacts.get_json(action.repair_seed_attempt_ref, WorkAttempt)
+    assert seed_attempt.status == "succeeded"
+    assert action.repair_seed_output_refs == seed_attempt.output_refs
     assert runtime.repairs.entries[0].outcome == "resolved"

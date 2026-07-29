@@ -65,7 +65,7 @@ from agent_world.designer import (
     ExpansionDesigner,
     ExpansionSourceRouter,
 )
-from agent_world.invocation import CodexSdkBackend, DirectLlmBackend, RoutedInvocationBackend
+from agent_world.invocation import InvocationControlPlane, InvocationControlStore
 from agent_world.judge import (
     EnvironmentJudge,
     InteractiveChallengerStrategy,
@@ -297,9 +297,9 @@ def test_production_app_assembles_real_components_and_secret_canaries(
     app = build_application(_filesystem_config(tmp_path))
 
     assert isinstance(app.profiles, IsolatedAgentProfileProvider)
-    assert isinstance(app.backend, RoutedInvocationBackend)
-    assert isinstance(app.backend.codex_backend, CodexSdkBackend)
-    assert isinstance(app.backend.direct_backend, DirectLlmBackend)
+    assert isinstance(app.backend, InvocationControlPlane)
+    assert app.backend.require_explicit_ownership
+    assert isinstance(app.invocation_control, InvocationControlStore)
     assert isinstance(app.designer, EnvironmentDesigner)
     assert isinstance(app.expansion_source, ExpansionSourceRouter)
     assert isinstance(app.expansion_designer, ExpansionDesigner)

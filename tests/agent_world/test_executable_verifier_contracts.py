@@ -166,7 +166,11 @@ def _rule(
     )
 
 
-def _design(*, transition_sensitivity: str = "positive_only") -> EnvironmentDesign:
+def _design(
+    *,
+    transition_sensitivity: str = "positive_only",
+    error_sensitivity: str = "positive_and_negative",
+) -> EnvironmentDesign:
     artifact = _ref("evidence")
     transition = _rule(
         "rule:transition",
@@ -201,7 +205,7 @@ def _design(*, transition_sensitivity: str = "positive_only") -> EnvironmentDesi
         _ref_value("args", "/amount"),
         "less_or_equal",
         _constant(0),
-        sensitivity="positive_and_negative",
+        sensitivity=error_sensitivity,
     )
     invariant = _rule(
         "rule:invariant",
@@ -549,24 +553,42 @@ def test_challenger_context_is_deduplicated_and_omits_rule_expressions() -> None
     context = VerifierCompiler._challenger_context(design)
     serialized = json.dumps(context, sort_keys=True)
 
-    assert context["schema_version"] == "agent-world.challenger-context.v3"
+    assert context["schema_version"] == "agent-world.challenger-context.v4"
     reset_config_schemas = context["reset_config_schemas"]
     assert isinstance(reset_config_schemas, list)
     assert len(reset_config_schemas) == 1
     assert '"clauses"' not in serialized
     assert '"evidence_claim_ids"' not in serialized
     assert '"rule:transition"' not in serialized
+    assert '"initial_rule_ids"' not in serialized
+    assert '"success_rule_ids"' not in serialized
     assert '"property_kind": "transition"' in serialized
     assert '"rule_count"' in serialized
     coverage_requirements = context["coverage_requirements"]
     assert isinstance(coverage_requirements, list)
-    shared_requirements = [
-        item for item in coverage_requirements if item["scope"] == "world_shared"
-    ]
+    coverage_entries = [item for item in coverage_requirements if isinstance(item, dict)]
+    assert len(coverage_entries) == len(coverage_requirements)
+    coverage_ids: list[str] = []
+    for item in coverage_entries:
+        coverage_id = item.get("coverage_id")
+        assert isinstance(coverage_id, str)
+        coverage_ids.append(coverage_id)
+    assert all(item.startswith("coverage:") for item in coverage_ids)
+    assert len(coverage_ids) == len(set(coverage_ids))
+    shared_requirements = [item for item in coverage_entries if item.get("scope") == "world_shared"]
     assert shared_requirements
-    assert all(item["task_type"] is None for item in shared_requirements)
+    assert all(item.get("task_type") is None for item in shared_requirements)
     assert '"task_type": "shared"' not in serialized
-    assert "You have no tools" in VerifierCompiler._prompt(context)
+    prompt = VerifierCompiler._prompt(context)
+    assert "You have no tools" in prompt
+    assert "two-pass coverage audit" in prompt
+    assert "`rule_count` counts the framework's private Rules" in prompt
+    assert "`positive_only` error_semantics" in prompt
+    assert "positive means an `expectations` item" in prompt
+    assert "`expected=true`" in prompt
+    assert "merely including that tool elsewhere" in prompt
+    assert "Action-input schema audit is mandatory" in prompt
+    assert "additionalProperties=false" in prompt
 
 
 def test_compact_intent_expands_to_complete_rule_bound_verifier() -> None:
@@ -660,6 +682,102 @@ def test_verifier_rule_binding_reports_all_independent_missing_obligations() -> 
     assert diagnostic.validation_phase == "rule_binding"
     assert len(diagnostic.issue_codes) > 2
     assert all("rule:" not in issue for issue in diagnostic.issue_codes)
+    context = VerifierCompiler._challenger_context(design)
+    coverage_requirements = context["coverage_requirements"]
+    assert isinstance(coverage_requirements, list)
+    coverage_ids: set[str] = set()
+    for item in coverage_requirements:
+        if not isinstance(item, dict):
+            continue
+        coverage_id = item.get("coverage_id")
+        if isinstance(coverage_id, str):
+            coverage_ids.add(coverage_id)
+    assert all(issue.location[0] == "coverage_requirements" for issue in diagnostic.issues)
+    assert all(issue.location[1] in coverage_ids for issue in diagnostic.issues)
+    assert all("required_rules" not in issue.feedback for issue in diagnostic.issues)
+    assert all(issue.expected_category is not None for issue in diagnostic.issues)
+    assert all(issue.remediation is not None for issue in diagnostic.issues)
+    assert "expected=true" in diagnostic.feedback
+    assert "expected=false" in diagnostic.feedback
+
+
+def test_positive_only_error_coverage_has_one_safe_row_level_remediation() -> None:
+    """A single omitted positive error row stays actionable without exposing Rules.
+
+    This is the deterministic counterpart of the real Challenger failure: the
+    model-visible coverage row has a positive-only error obligation, but the
+    candidate omits the matching expectation.  The framework must retain the
+    gate and return enough safe information for a subsequent authorized repair
+    or causally changed regeneration.
+    """
+
+    design = _design(error_sensitivity="positive_only")
+    draft = _draft(design)
+    rules = design_rule_index(design)
+    cases = tuple(
+        VerifierCaseIntent(
+            task_type=case.task_type,
+            evaluator_goal=case.evaluator_goal,
+            actor=case.actor,
+            reset_config=case.reset_config,
+            actions=case.actions,
+            expectations=tuple(
+                PropertyExpectationIntent(
+                    kind={
+                        "error_condition": "error_semantics",
+                    }.get(rules[item.rule_id].family, rules[item.rule_id].family),  # type: ignore[arg-type]
+                    after_action_ordinal=item.action_index + 1,
+                    expected=item.expected,
+                )
+                for item in case.assertions
+                if rules[item.rule_id].family != "error_condition"
+            ),
+        )
+        for case in draft.cases
+    )
+    intent = VerifierIntent(cases=cases, solve_recipes=draft.solve_recipes)
+
+    with pytest.raises(StructuredValidationError) as captured:
+        VerifierCompiler._compile_intent(  # noqa: SLF001
+            intent,
+            design,
+            allowed_task_types=("increase",),
+            required_rule_ids=design.verification.required_rule_ids,
+            required_property_families=design.verification.required_property_families,
+            require_metamorphic=False,
+        )
+
+    context = VerifierCompiler._challenger_context(design)
+    rows = context["coverage_requirements"]
+    assert isinstance(rows, list)
+    error_rows = [
+        item
+        for item in rows
+        if isinstance(item, dict)
+        and item.get("property_kind") == "error_semantics"
+        and item.get("positive_and_negative") is False
+    ]
+    assert len(error_rows) == 1
+    coverage_id = error_rows[0]["coverage_id"]
+    assert isinstance(coverage_id, str)
+
+    diagnostic = captured.value.diagnostic
+    issue = next(
+        item
+        for item in diagnostic.issues
+        if item.code == "rule_positive_partition_coverage"
+        and item.location == ("coverage_requirements", coverage_id)
+    )
+    assert issue.expected_category == (
+        "an expectations entry with the row property_kind, expected=true, "
+        "and after_action_ordinal pointing to a compatible row tool"
+    )
+    assert issue.remediation == (
+        "Add a compatible expectation with expected=true; when this row lists tool_ids, "
+        "point its ordinal at one of those tool actions."
+    )
+    assert "counter.increment" in issue.feedback
+    assert "rule:error" not in issue.feedback
 
 
 def test_verifier_turn_budget_scales_by_capacity_batch_not_task() -> None:
@@ -817,6 +935,37 @@ def test_verifier_intent_schema_feedback_reports_exact_safe_field_paths() -> Non
     assert "minimum=-10" in diagnostic.feedback
 
 
+def test_verifier_action_schema_feedback_exposes_safe_allowed_fields_not_rejected_input() -> None:
+    issues = VerifierCompiler._json_schema_issues(  # noqa: SLF001 - feedback boundary under test
+        schema={
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+        value={"private-sentinel": "never disclose"},
+        location=("cases", 0, "actions", 0, "arguments"),
+        code="intent_action_input_schema_mismatch",
+        value_label="action input",
+    )
+
+    additional_properties = next(
+        issue for issue in issues if "declared fields are" in issue.message
+    )
+    assert "title" in additional_properties.message
+    assert "private-sentinel" not in additional_properties.feedback
+    assert "never disclose" not in additional_properties.feedback
+    assert additional_properties.expected_category == (
+        "a closed action input object using only declared fields: title"
+    )
+    assert additional_properties.remediation == (
+        "Remove undeclared action input fields and use only: title"
+    )
+    persisted = additional_properties.persistence_projection()
+    assert persisted["remediation"] == additional_properties.remediation
+    assert "private-sentinel" not in str(persisted)
+
+
 def test_verifier_intent_uses_one_based_ordinals_and_reports_all_bad_references() -> None:
     design = _design()
     draft = _draft(design)
@@ -861,6 +1010,8 @@ def test_verifier_intent_uses_one_based_ordinals_and_reports_all_bad_references(
     assert "fewest distinct trajectories" in prompt
     assert "`expectations`" in prompt
     assert "`checks`" in prompt
+    assert "The verifier context and requested output are different schemas" in prompt
+    assert 'literal `"v2"`' in prompt
     schema = VerifierIntent.model_json_schema(mode="validation")
     definitions = schema["$defs"]
     assert isinstance(definitions, dict)
@@ -939,6 +1090,77 @@ def test_verifier_batch_plan_is_deterministic_and_persisted_before_challenger_wo
         task.task_type for task in design.curriculum.task_types
     )
     assert store.get_json(plan_ref, VerifierBatchPlan) == first
+
+
+@pytest.mark.asyncio
+async def test_verifier_context_commitment_mismatch_requests_a_plan_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A compiler-context revision is a deterministic-parent change, not an Agent retry."""
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    design_writer = store.issue_writer(
+        producer="environment-designer",
+        allowed_artifact_type_prefixes=("design.",),
+    )
+    judge_writer = store.issue_writer(
+        producer="environment-judge",
+        allowed_artifact_type_prefixes=("judge.",),
+    )
+    design = _design()
+    design_ref = design_writer.put_json(
+        artifact_id="design:context-commitment",
+        artifact_type="design.environment_design",
+        value=design,
+    )
+    world_spec_ref = design_writer.put_json(
+        artifact_id="world:context-commitment",
+        artifact_type="design.world_spec",
+        value=design.world_spec,
+    )
+    compiler = VerifierCompiler(
+        artifact_store=judge_writer,
+        invocation_backend=object(),  # type: ignore[arg-type]
+        profile_provider=object(),  # type: ignore[arg-type]
+    )
+    plan = compiler.build_batch_plan(
+        design=design,
+        design_ref=design_ref,
+        world_spec_ref=world_spec_ref,
+    )
+    plan_ref = compiler.persist_batch_plan(plan)
+    original_context = compiler._challenger_context  # noqa: SLF001
+
+    def revised_context(*args: object, **kwargs: object) -> dict[str, object]:
+        context = original_context(*args, **kwargs)
+        context["protocol_version"] = "agent-world.challenger-context.test-revised"
+        return context
+
+    monkeypatch.setattr(compiler, "_challenger_context", revised_context)
+
+    with pytest.raises(VerifierCompilationError) as captured:
+        await compiler.compile_batch_once(
+            design=design,
+            design_ref=design_ref,
+            world_spec_ref=world_spec_ref,
+            plan=plan,
+            plan_ref=plan_ref,
+            batch_index=0,
+            workspace=tmp_path / "workspace",
+            lineage_id="lineage:context-commitment",
+            budget=Budget(llm_tokens=1_000, agent_turns=1, wall_seconds=30),
+            permissions=PermissionScope(),
+            invocation_id="dispatch:context-commitment",
+        )
+
+    error = captured.value
+    assert error.safe_code == "verifier_batch_plan_context_commitment_mismatch"
+    assert error.retryable is False
+    assert error.expected_category is not None
+    assert error.remediation == (
+        "refresh the deterministic VerifierPlan before dispatching this Verifier batch"
+    )
 
 
 @pytest.mark.asyncio
@@ -1062,10 +1284,10 @@ async def test_one_shot_verifier_batch_uses_the_scheduler_dispatch_and_never_ret
 
 
 @pytest.mark.asyncio
-async def test_scheduler_verifier_leaves_commit_plan_and_one_physical_batch(
+async def test_scheduler_verifier_leaf_repairs_a_parsed_direct_candidate_with_feedback(
     tmp_path: Path,
 ) -> None:
-    """Plan -> batch runs through the shared kernel without compiler-internal retries."""
+    """A Verifier batch repairs through Scheduler, not a compiler-local retry loop."""
 
     store = ArtifactStore(tmp_path / "artifacts")
     design_writer = store.issue_writer(
@@ -1101,7 +1323,12 @@ async def test_scheduler_verifier_leaves_commit_plan_and_one_physical_batch(
         kind="generate",
         request_ref=request_ref,
         permissions=PermissionScope(),
-        budget=Budget(llm_tokens=1_000, agent_turns=1, wall_seconds=300),
+        budget=Budget(
+            llm_tokens=2_000,
+            agent_turns=2,
+            repair_attempts=1,
+            wall_seconds=300,
+        ),
         release_profile=ReleaseProfile(profile_id="release:scheduler-verifier"),
     )
     job_ref = control_writer.put_json(
@@ -1377,6 +1604,24 @@ async def test_scheduler_verifier_leaves_commit_plan_and_one_physical_batch(
         ),
         solve_recipes=source_draft.solve_recipes,
     )
+    rejected_intent = intent.model_copy(
+        update={
+            "cases": tuple(
+                case.model_copy(
+                    update={
+                        "expectations": tuple(
+                            expectation.model_copy(update={"expected": True})
+                            if expectation.kind == "error_semantics"
+                            and expectation.expected is False
+                            else expectation
+                            for expectation in case.expectations
+                        )
+                    }
+                )
+                for case in intent.cases
+            )
+        }
+    )
 
     class Profile:
         allowed_builtin_tools: tuple[str, ...] = ()
@@ -1402,7 +1647,9 @@ async def test_scheduler_verifier_leaves_commit_plan_and_one_physical_batch(
                 session=None,
                 turn_id="turn:scheduler-verifier",
                 final_text="completed",
-                structured_output=intent.model_dump(mode="json"),
+                structured_output=(
+                    rejected_intent if len(self.requests) == 1 else intent
+                ).model_dump(mode="json"),
                 usage=None,
                 events=(),
                 error=None,
@@ -1419,7 +1666,14 @@ async def test_scheduler_verifier_leaves_commit_plan_and_one_physical_batch(
     runtime = WorkControlRuntime(
         artifacts=control_writer,
         heads=heads,
-        budget=LeaseBudgetLedger(Budget(llm_tokens=1_000, agent_turns=1, wall_seconds=300)),
+        budget=LeaseBudgetLedger(
+            Budget(
+                llm_tokens=2_000,
+                agent_turns=2,
+                repair_attempts=1,
+                wall_seconds=300,
+            )
+        ),
     )
     runtime.execute_deterministic_boundary(
         definition=modeling_definition,
@@ -1466,13 +1720,20 @@ async def test_scheduler_verifier_leaves_commit_plan_and_one_physical_batch(
 
     assert tuple(item.after_state for item in results) == (
         "committed",
+        "repair_ready",
         "committed",
         "committed",
     )
-    assert len(backend.requests) == 1
+    assert len(backend.requests) == 2
     assert (  # type: ignore[attr-defined]
         backend.requests[0].execution_mode is InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
     )
+    assert backend.requests[0].session is None  # type: ignore[attr-defined]
+    assert backend.requests[1].session is None  # type: ignore[attr-defined]
+    assert "<prior_candidate_json>" not in backend.requests[0].prompt  # type: ignore[attr-defined]
+    assert "<prior_candidate_json>" in backend.requests[1].prompt  # type: ignore[attr-defined]
+    assert "coverage:" in backend.requests[1].prompt  # type: ignore[attr-defined]
+    assert "repair_action_ref" not in backend.requests[1].prompt  # type: ignore[attr-defined]
     batch_head = heads.read_head(batch_coordinate)
     assert batch_head is not None and batch_head.commit_ref is not None
     batch_attempt = control_writer.get_json(batch_head.attempt_ref, WorkAttempt)
@@ -1484,7 +1745,7 @@ async def test_scheduler_verifier_leaves_commit_plan_and_one_physical_batch(
     )
     assert proposal_run.execution_ref is not None
     proposal = control_writer.get_json(proposal_run.execution_ref, ProposalExecution)
-    assert proposal.invocation_id == backend.requests[0].invocation_id  # type: ignore[attr-defined]
+    assert proposal.invocation_id == backend.requests[1].invocation_id  # type: ignore[attr-defined]
     aggregate_head = heads.read_head(aggregate_coordinate)
     assert aggregate_head is not None and aggregate_head.commit_ref is not None
     aggregate_commit = control_writer.get_json(aggregate_head.commit_ref, WorkCommit)
@@ -1585,6 +1846,66 @@ async def test_verifier_code_router_retries_retryable_backend_failure_fresh(
 
 
 @pytest.mark.asyncio
+async def test_legacy_verifier_does_not_spend_a_hidden_icp_retry(
+    tmp_path: Path,
+) -> None:
+    """An ICP terminal leaves provider retry authority above the legacy loop."""
+
+    class Profile:
+        rollout_token_limit = 100
+
+    class Profiles:
+        def resolve(self, **_kwargs: object) -> Profile:
+            return Profile()
+
+    class ControlPlaneRetryBackend:
+        owns_declared_lifecycle = True
+
+        def __init__(self) -> None:
+            self.requests: list[object] = []
+
+        async def invoke(self, request: object) -> InvocationResult:
+            self.requests.append(request)
+            return InvocationResult(
+                invocation_id=request.invocation_id,  # type: ignore[attr-defined]
+                status=InvocationStatus.FAILED,
+                session=None,
+                turn_id=None,
+                final_text=None,
+                structured_output=None,
+                usage=None,
+                events=(),
+                error=InvocationError(
+                    code="turn_failed_provider_unavailable",
+                    message="closed transient terminal",
+                    retryable=True,
+                ),
+                duration_ms=1,
+            )
+
+    backend = ControlPlaneRetryBackend()
+    compiler = VerifierCompiler(
+        artifact_store=object(),  # type: ignore[arg-type]
+        invocation_backend=backend,  # type: ignore[arg-type]
+        profile_provider=Profiles(),  # type: ignore[arg-type]
+        maximum_structured_reworks=1,
+    )
+
+    with pytest.raises(VerifierCompilationError):
+        await compiler._run_structured(  # noqa: SLF001
+            lineage_id="verifier-icp-owned-retry",
+            workspace=tmp_path / "verifier-icp-owned-retry",
+            model=VerifierIntent,
+            prompt="immutable verifier batch prompt",
+            semantic_validator=lambda _output: None,
+            budget=Budget(llm_tokens=200, agent_turns=2, wall_seconds=30),
+            permissions=PermissionScope(),
+        )
+
+    assert len(backend.requests) == 1
+
+
+@pytest.mark.asyncio
 async def test_verifier_supervisor_cancels_real_straggler_and_keeps_success_checkpoint(
     tmp_path: Path,
 ) -> None:
@@ -1632,6 +1953,7 @@ async def test_verifier_supervisor_cancels_real_straggler_and_keeps_success_chec
     )
     active: dict[int, set[str]] = {0: set(), 1: set(), 2: set()}
     checkpoint_refs: list[ArtifactRef] = []
+    straggler_started = asyncio.Event()
     design = _design()
 
     async def successful_job() -> tuple[VerifierDraft, tuple[object, ...], ArtifactRef]:
@@ -1647,6 +1969,10 @@ async def test_verifier_supervisor_cancels_real_straggler_and_keeps_success_chec
         return _draft(design), (), ref
 
     async def fatal_job() -> tuple[VerifierDraft, tuple[object, ...], ArtifactRef]:
+        # A production leaf records its invocation id before crossing the
+        # backend boundary.  Make this real-process test exercise that same
+        # state rather than racing a child process against its registration.
+        await straggler_started.wait()
         process = await asyncio.create_subprocess_exec(
             sys.executable,
             "-c",
@@ -1664,6 +1990,7 @@ async def test_verifier_supervisor_cancels_real_straggler_and_keeps_success_chec
         )
         backend.processes[invocation_id] = process
         active[2].add(invocation_id)
+        straggler_started.set()
         try:
             await process.wait()
         finally:

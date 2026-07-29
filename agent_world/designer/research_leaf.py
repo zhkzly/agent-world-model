@@ -106,6 +106,11 @@ class ResearchPlanLeaf:
                 definition=definition,
                 attempt=attempt,
                 dispatch_id=dispatch_id,
+                ownership=self.kernel.invocation_ownership(
+                    definition=definition,
+                    attempt=attempt,
+                    dispatch_id=dispatch_id,
+                ),
                 lineage_id=f"{inputs.job.job_id}.research-plan.{attempt.ordinal}",
                 workspace=self.workspace_root / "research-plan" / attempt.attempt_id,
                 model=ResearchPlan,
@@ -115,6 +120,11 @@ class ResearchPlanLeaf:
                 correction_brief=self.kernel.agent_correction_brief(
                     context,
                     definition=definition,
+                ),
+                semantic_repair_seed=self.kernel.agent_semantic_repair_seed(
+                    context,
+                    definition=definition,
+                    attempt=attempt,
                 ),
             )
             plan_ref = self.kernel.runtime.artifacts.put_json(

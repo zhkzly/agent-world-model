@@ -69,6 +69,7 @@ type RepairTarget = Literal[
     "needs_human",
 ]
 type StuckReason = Literal[
+    "authorized_repair",
     "thrashing",
     "no_repair_authority",
     "subprocess_crash",
@@ -103,10 +104,30 @@ type WorkspaceHeartbeatStatus = Literal[
     "unavailable",
 ]
 type InvocationLivenessPhase = Literal[
+    "queued",
+    "admitted",
+    "profile_verifying",
+    "profile_verified",
+    "worker_spawned",
+    "payload_dispatched",
+    "sdk_session_open",
+    "thread_start",
+    "thread_resume",
+    "turn_start",
+    "turn_stream",
+    "parent_waiting",
+    "worker_exited",
     "direct_request_dispatched",
+    "direct_dispatched",
     "direct_awaiting_response",
     "direct_stream_opened",
     "direct_awaiting_stream_event",
+    "cancel_requested",
+    "declared_wall_expired",
+    "cleanup_running",
+    "cleanup_finished",
+    "terminal_received",
+    "owner_lost",
 ]
 
 
@@ -213,6 +234,7 @@ class CandidateWorkspaceLiveness(V2Contract):
 
     status: WorkspaceHeartbeatStatus
     observed_elapsed_ms: Annotated[int, Field(ge=0)]
+    last_changed_elapsed_ms: Annotated[int, Field(ge=0)] | None = None
     file_count: Annotated[int, Field(ge=0)]
     total_bytes: Annotated[int, Field(ge=0)]
     error_code: Annotated[NonEmptyStr, Field(max_length=160)] | None = None
@@ -223,6 +245,11 @@ class CandidateWorkspaceLiveness(V2Contract):
             raise ValueError("unavailable workspace heartbeat requires an error code")
         if self.status != "unavailable" and self.error_code is not None:
             raise ValueError("available workspace heartbeat cannot expose an error code")
+        if (
+            self.last_changed_elapsed_ms is not None
+            and self.last_changed_elapsed_ms > self.observed_elapsed_ms
+        ):
+            raise ValueError("workspace change cannot follow its latest heartbeat")
         return self
 
 
@@ -236,9 +263,7 @@ class BudgetExhaustion(V2Contract):
     and whether a fresh operation actually began.
     """
 
-    exhausted_dimensions: Annotated[
-        tuple[NonEmptyStr, ...], Field(min_length=1, max_length=16)
-    ]
+    exhausted_dimensions: Annotated[tuple[NonEmptyStr, ...], Field(min_length=1, max_length=16)]
     during_authorized_repair: bool
     operation_not_started: bool
 
@@ -350,8 +375,14 @@ class CoordinateScene(V2Contract):
             raise ValueError("scene unresolved issue identities must be unique")
         if self.head_status == "committed" and self.repair_target is not None:
             raise ValueError("committed coordinate scenes cannot advertise a repair target")
-        if self.repair_target == "generated_candidate_code" and self.candidate_file is None:
-            raise ValueError("candidate-code repair target requires a concrete candidate file")
+        if (
+            self.repair_target == "generated_candidate_code"
+            and self.candidate_file is None
+            and self.repair_authority != "authorized"
+        ):
+            raise ValueError(
+                "candidate-code repair target without a concrete file requires Scheduler authority"
+            )
         if self.budget_exhaustion is not None and self.failure_code != "budget_exhausted":
             raise ValueError("budget exhaustion scene facts require budget_exhausted failure")
         if self.attempt_elapsed_estimated and (
@@ -538,6 +569,7 @@ def fold(heads: Sequence[SceneHead], tier_b_events: Sequence[SceneTierBEvent]) -
         )
         for head in ordered_heads
     )
+    updated_at_by_coordinate = {head.coordinate_key: head.updated_at for head in ordered_heads}
     records = tuple(
         FrontierRecord(
             coordinate_key=coordinate.coordinate_key,
@@ -558,7 +590,10 @@ def fold(heads: Sequence[SceneHead], tier_b_events: Sequence[SceneTierBEvent]) -
     stuck_scenes = tuple(
         sorted(
             (item for item in coordinates if item.head_status != "committed"),
-            key=_stuck_sort_key,
+            key=lambda item: _stuck_sort_key(
+                item,
+                updated_at=updated_at_by_coordinate[item.coordinate_key],
+            ),
         )
     )
     stuck = stuck_scenes[0] if stuck_scenes else None
@@ -717,6 +752,15 @@ def _repair_target(
 ) -> RepairTarget | None:
     if head.head_status == "committed":
         return None
+    # A causal Integration failure can authorize a Builder repair whose source
+    # closure spans several files.  ``multi_file_gate`` normally prevents the
+    # view from guessing one editable file, but an already-authorized
+    # CandidateBuild repair is stronger evidence: surface the exact permitted
+    # lane without inventing a single-file target.
+    if head.repair_authority == "authorized" and head.coordinate_label.startswith(
+        "build.candidate_build."
+    ):
+        return "generated_candidate_code"
     # An infrastructure/transport terminal (ValidationReport.status == "error")
     # is not evidence of a design defect: the leaf never produced a proposal to
     # judge.  It must never route to design_worldspec, or a transient bad-JSON
@@ -793,17 +837,28 @@ def _overall_status(coordinates: tuple[CoordinateScene, ...]) -> SceneStatus:
     return next(item for item in priorities if item in statuses)
 
 
-def _stuck_sort_key(scene: CoordinateScene) -> tuple[int, int, str]:
+def _stuck_sort_key(
+    scene: CoordinateScene,
+    *,
+    updated_at: datetime,
+) -> tuple[int, int, float, str]:
     reason = _stuck_reason(scene)
-    reason_priority = {
-        "thrashing": 0,
-        "subprocess_crash": 1,
-        "budget_exhausted": 2,
-        "needs_human": 3,
-        "no_repair_authority": 4,
-        "blocked_by_parent": 5,
-        None: 6,
-    }[reason]
+    # Prefer one already-authorized correction over a downstream failed
+    # coordinate with no local authority.  More urgent anomalies (crash,
+    # budget exhaustion, thrashing, explicit human decision) still win.
+    reason_priority = (
+        3
+        if scene.repair_authority == "authorized"
+        else {
+            "thrashing": 0,
+            "subprocess_crash": 1,
+            "budget_exhausted": 2,
+            "needs_human": 3,
+            "no_repair_authority": 4,
+            "blocked_by_parent": 5,
+            None: 6,
+        }[reason]
+    )
     status_priority = {
         "failed": 0,
         "needs_human": 1,
@@ -812,7 +867,15 @@ def _stuck_sort_key(scene: CoordinateScene) -> tuple[int, int, str]:
         "running": 4,
         "committed": 5,
     }[scene.head_status]
-    return (reason_priority, status_priority, scene.coordinate_key)
+    # A compact top-level scene is a *current* project-Agent orientation, not
+    # a durable error archive.  Once urgency and terminal status tie, surface
+    # the most recently changed unresolved coordinate.  Without this tie
+    # breaker, a stale downstream Integration failure can win merely because
+    # its opaque coordinate hash sorts before the just-failed Builder attempt
+    # that the Code Agent actually needs to investigate.  The per-coordinate
+    # files retain the full history; equal timestamps deliberately keep the
+    # coordinate key as a deterministic final tie breaker.
+    return (reason_priority, status_priority, -updated_at.timestamp(), scene.coordinate_key)
 
 
 def _stuck_reason(scene: CoordinateScene) -> StuckReason | None:
@@ -822,6 +885,11 @@ def _stuck_reason(scene: CoordinateScene) -> StuckReason | None:
         return "budget_exhausted"
     if scene.subprocess_pointer is not None:
         return "subprocess_crash"
+    # A new Scheduler-authorized correction may follow earlier unsuccessful
+    # attempts.  Its historical ordinal is not evidence that this newly
+    # authorized, recipient-specific repair has itself thrashed.
+    if scene.repair_authority == "authorized":
+        return "authorized_repair"
     if scene.frontier_progress == "no_progress" and scene.attempt_ordinal > 1:
         return "thrashing"
     if scene.failure_code is not None and scene.failure_code.startswith("causal_"):

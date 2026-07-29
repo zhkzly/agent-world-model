@@ -43,6 +43,7 @@ from agent_world.invocation import (
     AgentOutputAuthority,
     ExternalCapabilitySet,
     InvocationBackend,
+    InvocationOwnership,
     InvocationRequest,
     InvocationResult,
     InvocationSession,
@@ -50,6 +51,7 @@ from agent_world.invocation import (
     ResolvedAgentProfile,
     SandboxMode,
     assert_agent_output_advisory,
+    standalone_component_ownership,
 )
 
 type ReachabilityStatus = Literal[
@@ -169,6 +171,7 @@ class SolverProfileProvider(Protocol):
         workspace: Path,
         output_schema: dict[str, object],
         rollout_token_limit: int,
+        model_override: str | None = None,
     ) -> ResolvedAgentProfile: ...
 
 
@@ -461,6 +464,8 @@ class InteractiveChallengerStrategy:
         minimum_tool_calls: int,
         maximum_agent_turns: int,
         maximum_steps: int,
+        invocation_ownership: InvocationOwnership | None = None,
+        model_override: str | None = None,
     ) -> ReachabilityOutcome:
         actions: list[RuntimeAction] = []
         steps: list[EpisodeStepResult] = []
@@ -518,15 +523,27 @@ class InteractiveChallengerStrategy:
                 InteractiveSolveDecision,
                 authority=AgentOutputAuthority.EPISODE_ACTION_PROPOSAL,
             )
-            profile = self.profiles.resolve_solver(
-                lineage_id=lineage_id,
-                workspace=workspace,
-                output_schema=cast(
-                    dict[str, object],
-                    InteractiveSolveDecision.model_json_schema(mode="validation"),
-                ),
-                rollout_token_limit=per_turn_token_cap,
-            )
+            if model_override is None:
+                profile = self.profiles.resolve_solver(
+                    lineage_id=lineage_id,
+                    workspace=workspace,
+                    output_schema=cast(
+                        dict[str, object],
+                        InteractiveSolveDecision.model_json_schema(mode="validation"),
+                    ),
+                    rollout_token_limit=per_turn_token_cap,
+                )
+            else:
+                profile = self.profiles.resolve_solver(
+                    lineage_id=lineage_id,
+                    workspace=workspace,
+                    output_schema=cast(
+                        dict[str, object],
+                        InteractiveSolveDecision.model_json_schema(mode="validation"),
+                    ),
+                    rollout_token_limit=per_turn_token_cap,
+                    model_override=model_override,
+                )
             _validate_solver_profile(profile, per_turn_token_cap)
         except Exception as exc:  # profile materialization is framework infrastructure
             return _failed_outcome(
@@ -553,9 +570,15 @@ class InteractiveChallengerStrategy:
                     llm_tokens=consumed_tokens,
                 )
             try:
+                invocation_id = f"reachability-{uuid.uuid4().hex}"
+                ownership = invocation_ownership or standalone_component_ownership(
+                    invocation_id=invocation_id,
+                    component="judge",
+                    coordinate="judge:reachability",
+                )
                 result = await self.backend.invoke(
                     InvocationRequest(
-                        invocation_id=f"reachability-{uuid.uuid4().hex}",
+                        invocation_id=invocation_id,
                         prompt=prompt,
                         profile=profile,
                         session=session,
@@ -567,6 +590,12 @@ class InteractiveChallengerStrategy:
                             "turn_index": turn_index,
                             "executed_steps": len(actions),
                         },
+                        # Every physical Challenger turn belongs to the same
+                        # Scheduler OperationRun when this strategy is reached
+                        # through ReleaseAssuranceLeaf.  The session may span
+                        # turns, but the ownership is deliberately operation
+                        # identity rather than a private session/thread id.
+                        ownership=ownership,
                     )
                 )
             except Exception as exc:

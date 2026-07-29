@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import os
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,17 +20,25 @@ from agent_world.config import AgentBackendConfig, FoundryConfig, ResearchConfig
 from agent_world.contracts import (
     ArtifactRef,
     Budget,
+    BudgetUsage,
     EnvironmentJob,
     EnvironmentRequest,
     GenerationContext,
     PermissionScope,
     ReleaseProfile,
+    canonical_json_bytes,
+    sha256_digest,
 )
 from agent_world.control import (
     ArtifactSlotContract,
+    ContinuationStoreError,
+    FeedbackEvaluation,
     GenerationWorkGraph,
     LeaseBudgetLedger,
+    ParentRepairRoute,
     RepairAction,
+    ValidationIssue,
+    ValidationReport,
     WorkControlRuntime,
     WorkControlStore,
     WorkControlStoreError,
@@ -41,11 +50,15 @@ from agent_world.control import (
     research_acquisition_work_definition,
     research_plan_work_definition,
     research_synthesis_work_definition,
+    structured_agent_work_definition,
     world_architecture_work_definition,
 )
 from agent_world.control.leaf_executor import (
+    AgentExecutionProvenance,
     LeafExecutionFailure,
     LeafProposal,
+    LeafValidationFailure,
+    LeafWorkspaceRecovery,
     SchedulerLeafExecutor,
 )
 from agent_world.control.release_leaf import RegistryPublicationLeaf
@@ -60,6 +73,9 @@ from agent_world.control.test_node import (
     DiagnosticRuntimeProfileOverride,
 )
 from agent_world.control.test_node import (
+    DiagnosticSuccessorNodeRunner as SuccessorRunner,
+)
+from agent_world.control.test_node import (
     TestNodeError as NodeError,
 )
 from agent_world.control.test_node import (
@@ -70,6 +86,8 @@ from agent_world.control.test_node import (
 )
 from agent_world.control.work import OperationRun, WorkAttempt, WorkCommit
 from agent_world.control.work_scheduler import WorkScheduler
+from agent_world.control.work_store import WorkResumeError
+from agent_world.invocation import InvocationStatus, InvocationTerminalFact
 from agent_world.observability import ObservabilityError, ObservabilityRoot
 
 
@@ -364,6 +382,39 @@ def _assert_diagnostic_result_artifacts(
     assert evaluation["readiness_effect"] == "observes"
 
 
+def test_diagnostic_successor_coordinate_feedback_lists_copyable_candidates() -> None:
+    """A fresh derived graph must expose the coordinates a Code Agent can run."""
+
+    scope_id = "generate-job:successor-coordinate-feedback"
+    architecture = _definition(
+        scope_id=scope_id,
+        stage="world_architecture",
+        dependencies=(),
+    )
+    shared = _definition(
+        scope_id=scope_id,
+        stage="shared_tool_semantics",
+        dependencies=(architecture.coordinate,),
+    )
+    behavior = _definition(
+        scope_id=scope_id,
+        stage="world_behavior",
+        dependencies=(shared.coordinate,),
+    )
+    graph = SimpleNamespace(definitions=(architecture, shared, behavior))
+
+    with pytest.raises(NodeError) as raised:
+        SuccessorRunner._resolve_fresh_semantic_coordinate(  # noqa: SLF001 - feedback seam
+            graph,
+            "design.world_behavior.tool_semantics_batch",
+        )
+
+    assert raised.value.code == "test_successor_coordinate_not_fresh_semantic"
+    message = str(raised.value)
+    assert "design|shared_tool_semantics|shared_tool_semantics||" in message
+    assert "design|world_behavior|world_behavior||" in message
+
+
 @pytest.mark.asyncio
 async def test_test_node_reruns_only_target_with_real_scheduler_dispatch(
     tmp_path: Path,
@@ -567,6 +618,58 @@ def test_runtime_profile_overlay_freezes_one_changed_agent_provenance(
     )
     assert override.diagnostic_only is True
     assert override.releasable is False
+
+
+def test_test_node_reconstructs_legacy_definition_without_implicit_model_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newly added retry field must not invalidate frozen historical graphs."""
+
+    captured = _capture_scope(tmp_path, monkeypatch)
+    app = build_application(captured.config)
+    artifacts = app.controller.artifacts
+    manifest_ref = next(
+        ref
+        for ref in artifacts.list_revisions()
+        if ref.artifact_type == "control.work_graph_manifest"
+    )
+    source_manifest = artifacts.get_json(manifest_ref, WorkGraphManifest)
+
+    # Model the exact historic wire shape: the field did not exist, rather
+    # than representing an explicit zero in a current graph.
+    legacy_raw = captured.target_definition.model_dump(mode="python")
+    legacy_raw["repair_policy"].pop("maximum_model_fallbacks", None)
+    legacy_definition = WorkDefinition.model_validate(legacy_raw)
+    assert legacy_definition.repair_policy.maximum_model_fallbacks == 0
+    assert (
+        "maximum_model_fallbacks" not in legacy_definition.model_dump(mode="json")["repair_policy"]
+    )
+
+    legacy_ref = artifacts.put_json(
+        artifact_id="work-definition:legacy-no-model-fallback",
+        artifact_type="control.work_definition",
+        value=legacy_definition,
+    )
+    assert legacy_ref.content_hash == legacy_definition.definition_digest
+    manifest = source_manifest.model_copy(
+        update={
+            "node_bindings": tuple(
+                binding.model_copy(update={"definition_digest": legacy_ref.content_hash})
+                if binding.coordinate == captured.target_definition.coordinate
+                else binding
+                for binding in source_manifest.node_bindings
+            )
+        }
+    )
+
+    reconstructed = NodeRunner._reconstruct_graph(  # noqa: SLF001 - frozen closure proof
+        artifacts,
+        manifest,
+    )
+    recovered = reconstructed.require(captured.target_definition.coordinate)
+    assert recovered.definition_digest == legacy_ref.content_hash
+    assert recovered.repair_policy.maximum_model_fallbacks == 0
 
 
 def test_runtime_profile_overlay_freezes_one_model_only_change(
@@ -779,6 +882,369 @@ async def test_diagnostic_descendant_dispatches_one_unheaded_successor_from_diag
     assert successor_commit.diagnostic_only and not successor_commit.releasable
     assert successor_evaluation["diagnostic_only"] is True
     assert successor_evaluation["releasable"] is False
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_descendant_runtime_refresh_regenerates_without_reusing_authorized_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Prompt/Skill revision supersedes old repair state rather than borrowing it.
+
+    This is the true Scheduler boundary for a real bad-case shape: a candidate
+    already has precise semantic repair authority, but a causal runtime
+    implementation revision requires a fresh definition.  The regenerated
+    attempt must retain its immutable parent closure while receiving neither
+    the old RepairAction nor its private continuation binding.
+    """
+
+    captured = _capture_scope(tmp_path, monkeypatch)
+    diagnostic_parent = tmp_path / ".agent-world-live"
+
+    def parent_executor_factory(execution: NodeExecution):
+        async def execute(context) -> None:
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"repair-refresh-parent:{execution.run_id}",
+                artifact_type="design.test_node_target",
+                value={"source": "diagnostic-parent-for-runtime-refresh"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+            )
+
+        return execute
+
+    parent = await NodeRunner(
+        config=captured.config,
+        source_state_root=captured.state_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=parent_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+    )
+    parent_root = Path(parent.diagnostic_state_root)
+    parent_app = build_application(captured.config.model_copy(update={"state_root": parent_root}))
+    parent_artifacts = parent_app.controller.artifacts
+    source_manifest_ref = next(
+        ref
+        for ref in parent_artifacts.list_revisions()
+        if ref.artifact_type == "control.work_graph_manifest"
+    )
+    source_manifest = parent_artifacts.get_json(source_manifest_ref, WorkGraphManifest)
+    source_graph = NodeRunner._reconstruct_graph(  # noqa: SLF001 - frozen test closure setup
+        parent_artifacts,
+        source_manifest,
+    )
+    repair_successor = source_graph.require(captured.successor_definition.coordinate).model_copy(
+        update={
+            "repair_policy": captured.successor_definition.repair_policy.model_copy(
+                update={
+                    "maximum_local_corrections": 1,
+                    "strict_progress_bonus_corrections": 0,
+                    "maximum_infrastructure_retries": 0,
+                    "maximum_total_repair_attempts": 1,
+                }
+            ),
+            "allowed_mutation_roots": ("/candidate",),
+        }
+    )
+    repair_graph = GenerationWorkGraph.compile(
+        tuple(
+            repair_successor if definition.coordinate == repair_successor.coordinate else definition
+            for definition in source_graph.definitions
+        ),
+        mode="diagnostic",
+        strict_input_contracts=True,
+    )
+    context_ref = next(
+        ref
+        for ref in source_manifest.external_root_refs
+        if ref.artifact_type == "control.generation_context"
+    )
+    repair_manifest, repair_manifest_ref, _repair_epoch, _repair_epoch_ref = WorkGraphEpochRuntime(
+        artifacts=parent_artifacts,
+        heads=parent_app.controller.work_control,
+    ).freeze_bootstrap(
+        context_ref=context_ref,
+        graph=repair_graph,
+        topology_id="topology:test-node-runtime-refresh-from-repair",
+    )
+
+    def committed_executor_factory(execution: NodeExecution):
+        async def execute(context) -> None:
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"repair-refresh-committed:{execution.run_id}",
+                artifact_type="design.test_node_successor",
+                value={"source": "candidate-before-causal-repair"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+            )
+
+        return execute
+
+    committed = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=parent_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=committed_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=repair_successor.coordinate.coordinate_key,
+        required_manifest_ref=repair_manifest_ref,
+    )
+    assert committed.status == "committed"
+    committed_root = Path(committed.diagnostic_state_root)
+    committed_app = build_application(
+        captured.config.model_copy(update={"state_root": committed_root})
+    )
+    committed_artifacts = committed_app.controller.artifacts
+    committed_head = committed_app.controller.work_control.read_head(repair_successor.coordinate)
+    assert committed_head is not None and committed_head.status == "committed"
+    committed_attempt = committed_artifacts.get_json(committed_head.attempt_ref, WorkAttempt)
+
+    source_coordinate = WorkCoordinate(
+        scope_id=captured.scope_id,
+        component="integration",
+        stage="runtime_integration",
+        artifact_slot="integration_report",
+    )
+    source_issue = ValidationIssue(
+        code="test_runtime_refresh_role_visibility",
+        path=("candidate", "role_visibility"),
+        violated_condition="the source candidate violated one visible-role rule",
+        expected_category="one candidate satisfying the declared visible-role rule",
+        remediation="Regenerate after the recorded runtime guidance revision.",
+    )
+    source_report = ValidationReport(
+        report_id="validation-report:test-descendant-runtime-refresh-source",
+        attempt_id="attempt:test-descendant-runtime-refresh-source",
+        coordinate=source_coordinate,
+        policy_id="validation:test-descendant-runtime-refresh-source",
+        policy_digest=sha256_digest(b"test-descendant-runtime-refresh-source-policy"),
+        status="failed",
+        validation_phase="runtime_integration",
+        frontier_ordinal=100,
+        issues=(source_issue,),
+        diagnostic_quality="actionable",
+        diagnostic_only=True,
+        releasable=False,
+        evaluated_at=datetime.now(UTC),
+    )
+    source_report_ref = committed_artifacts.put_json(
+        artifact_id=source_report.report_id,
+        artifact_type="control.validation_report",
+        value=source_report,
+        dependencies=committed_attempt.input_refs,
+    )
+    source_evaluation = FeedbackEvaluation(
+        evaluation_id="evaluation:test-descendant-runtime-refresh-source",
+        attempt_id=source_report.attempt_id,
+        work_id="work:test-descendant-runtime-refresh-source",
+        coordinate=source_coordinate,
+        claim_id="test-descendant-runtime-refresh-source.claim",
+        acceptance_digest=sha256_digest(b"test-descendant-runtime-refresh-source-acceptance"),
+        policy_digest=source_report.policy_digest,
+        status="failed",
+        effect="block_release",
+        readiness_effect="observes",
+        validation_report_ref=source_report_ref,
+        diagnostic_only=True,
+        releasable=False,
+        evaluated_at=datetime.now(UTC),
+    )
+    source_evaluation_ref = committed_artifacts.put_json(
+        artifact_id=source_evaluation.evaluation_id,
+        artifact_type="control.feedback_evaluation",
+        value=source_evaluation,
+        dependencies=(source_report_ref,),
+    )
+    route = ParentRepairRoute(
+        route_id="parent-repair-route:test-descendant-runtime-refresh",
+        source_coordinate=source_coordinate,
+        source_attempt_id=source_report.attempt_id,
+        source_definition_digest=sha256_digest(
+            b"test-descendant-runtime-refresh-source-definition"
+        ),
+        target_coordinate=repair_successor.coordinate,
+        issue_identities=(source_issue.normalized_identity,),
+        routed_at=datetime.now(UTC),
+    )
+    route_ref = committed_artifacts.put_json(
+        artifact_id=route.route_id,
+        artifact_type="control.parent_repair_route",
+        value=route,
+        dependencies=(source_report_ref, source_evaluation_ref),
+    )
+    causal_runtime = WorkControlRuntime(
+        artifacts=committed_artifacts,
+        heads=committed_app.controller.work_control,
+        budget=LeaseBudgetLedger(committed.reserved_budget),
+        telemetry=committed_app.telemetry,
+        projector=committed_app.controller.scene_projector,
+        trace_id="test-descendant-runtime-refresh-causal-authority",
+        run_id="test-descendant-runtime-refresh-causal-authority",
+        diagnostic_only=True,
+        repair_scope_id=captured.scope_id,
+    )
+    with committed_app.controller.work_control.exclusive(repair_successor.coordinate) as lock:
+        authorized_head = causal_runtime.authorize_causal_repair(
+            lock,
+            definition=repair_successor,
+            input_refs=committed_attempt.input_refs,
+            source_evaluation_ref=source_evaluation_ref,
+            source_report_ref=source_report_ref,
+            route_ref=route_ref,
+        )
+    assert authorized_head.status == "repair_authorized"
+    assert authorized_head.repair_action_ref is not None
+    old_repair_action_ref = authorized_head.repair_action_ref
+
+    assert (
+        WorkControlStore(committed_root / "work-control").read_head(repair_successor.coordinate)
+        == authorized_head
+    )
+
+    with pytest.raises(NodeError) as exact_repair:
+        await DescendantRunner(
+            config=captured.config,
+            diagnostic_state_root=committed_root,
+            diagnostic_parent=diagnostic_parent,
+        ).run(
+            scope_id=captured.scope_id,
+            target_coordinate=repair_successor.coordinate.coordinate_key,
+            required_manifest_ref=repair_manifest_ref,
+        )
+    assert exact_repair.value.code == "test_descendant_authorized_repair_requires_runtime_refresh"
+
+    repair_actions_seen: list[ArtifactRef | None] = []
+
+    def authorized_repair_executor_factory(execution: NodeExecution):
+        async def execute(context) -> None:
+            repair_actions_seen.append(context.repair_action_ref)
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"repair-executed:{execution.run_id}",
+                artifact_type="design.test_node_successor",
+                value={"source": "one-authorized-scheduler-repair"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+            )
+
+        return execute
+
+    executed_repair = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=committed_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=authorized_repair_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=repair_successor.coordinate.coordinate_key,
+        required_manifest_ref=repair_manifest_ref,
+        execute_authorized_repair=True,
+    )
+
+    assert executed_repair.status == "committed"
+    assert executed_repair.authorized_repair_action_ref == old_repair_action_ref
+    assert repair_actions_seen == [old_repair_action_ref]
+    executed_artifacts = ArtifactStore(Path(executed_repair.diagnostic_state_root) / "artifacts")
+    executed_attempt = executed_artifacts.get_json(executed_repair.target_attempt_ref, WorkAttempt)
+    assert executed_attempt.parent_attempt_id == committed_attempt.attempt_id
+    assert executed_attempt.repair_action_ref == old_repair_action_ref
+    # The original diagnostic copy remains evidence with its own untouched
+    # authority, so a separate runtime-refresh experiment can still start from
+    # the same bad case rather than a mutated test fixture.
+    assert (
+        WorkControlStore(committed_root / "work-control").read_head(repair_successor.coordinate)
+        == authorized_head
+    )
+
+    updated_implementation = "framework.test-descendant-runtime-refresh.v1"
+    updated_validator = "framework.test-descendant-validator-refresh.v1"
+    monkeypatch.setattr(
+        test_node_module,
+        "current_runtime_revisions_for_definition",
+        lambda definition: (
+            (updated_implementation, updated_validator)
+            if definition.coordinate == repair_successor.coordinate
+            else None
+        ),
+    )
+    seen_repair_actions: list[ArtifactRef | None] = []
+
+    def regeneration_executor_factory(execution: NodeExecution):
+        async def execute(context) -> None:
+            seen_repair_actions.append(context.repair_action_ref)
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"repair-refresh-regenerated:{execution.run_id}",
+                artifact_type="design.test_node_successor",
+                value={"source": "fresh-runtime-revision-regeneration"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+            )
+
+        return execute
+
+    regenerated = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=committed_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=regeneration_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=repair_successor.coordinate.coordinate_key,
+        required_manifest_ref=repair_manifest_ref,
+        refresh_current_implementation=True,
+    )
+
+    assert regenerated.status == "committed"
+    assert regenerated.runtime_implementation_override_ref is not None
+    assert regenerated.superseded_stale_attempt_ref == authorized_head.attempt_ref
+    assert regenerated.superseded_stale_definition_digest == repair_successor.definition_digest
+    assert regenerated.superseded_authorized_repair_action_ref == old_repair_action_ref
+    assert seen_repair_actions == [None]
+    regenerated_artifacts = ArtifactStore(Path(regenerated.diagnostic_state_root) / "artifacts")
+    prior_attempt = committed_artifacts.get_json(
+        authorized_head.attempt_ref,
+        WorkAttempt,
+    )
+    regenerated_attempt = regenerated_artifacts.get_json(
+        regenerated.target_attempt_ref,
+        WorkAttempt,
+    )
+    assert regenerated_attempt.parent_attempt_id == prior_attempt.attempt_id
+    assert regenerated_attempt.repair_action_ref is None
 
 
 @pytest.mark.asyncio
@@ -1012,6 +1478,532 @@ async def test_diagnostic_descendant_allows_one_explicit_retryable_infrastructur
         )
     assert repeated_retry.value.code == "test_descendant_infrastructure_retry_not_failed"
     assert retry_calls == [retry_successor.coordinate]
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_descendant_recovers_one_private_candidate_draft_in_a_fresh_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copied diagnostic child may inspect, but never adopt, its parent's draft.
+
+    The first descendant executes a real Scheduler boundary and creates normal
+    files under its private ``runs/`` workspace before a classified Provider
+    terminal.  The next descendant receives neither that directory nor an old
+    Provider thread; its sole authority is the action-bound private recovery
+    record copied with the durable diagnostic control state.
+    """
+
+    captured = _capture_scope(tmp_path, monkeypatch)
+    diagnostic_parent = tmp_path / ".agent-world-live"
+
+    def parent_executor_factory(execution: NodeExecution):
+        async def execute(context) -> None:
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"workspace-recovery-parent:{execution.run_id}",
+                artifact_type="design.test_node_target",
+                value={"source": "diagnostic-parent-for-workspace-recovery"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+            )
+
+        return execute
+
+    parent = await NodeRunner(
+        config=captured.config,
+        source_state_root=captured.state_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=parent_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+    )
+    parent_root = Path(parent.diagnostic_state_root)
+    parent_app = build_application(captured.config.model_copy(update={"state_root": parent_root}))
+    artifacts = parent_app.controller.artifacts
+    source_manifest_ref = next(
+        ref
+        for ref in artifacts.list_revisions()
+        if ref.artifact_type == "control.work_graph_manifest"
+    )
+    source_manifest = artifacts.get_json(source_manifest_ref, WorkGraphManifest)
+    source_graph = NodeRunner._reconstruct_graph(  # noqa: SLF001 - frozen setup
+        artifacts,
+        source_manifest,
+    )
+    candidate = structured_agent_work_definition(
+        scope_id=captured.scope_id,
+        component="build",
+        stage="candidate_build",
+        artifact_slot="candidate_build",
+        dependency_coordinates=(captured.target_definition.coordinate,),
+        claim_id="builder.candidate.completes",
+        claim="A fresh Engineer session may inspect one untrusted private draft.",
+        timing_reason="A Provider capacity terminal cannot adopt an incomplete Candidate.",
+        output_contract_id="contract:diagnostic-candidate-build.v1",
+        allowed_mutation_roots=("/candidate",),
+        agent_wall_seconds=60,
+        agent_token_limit=1_000,
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_model_fallbacks=0,
+        maximum_total_repair_attempts=2,
+        input_slots=(
+            ArtifactSlotContract(
+                slot_id="input:diagnostic-target",
+                direction="input",
+                artifact_types=("design.test_node_target",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="design",
+            ),
+        ),
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:candidate-build",
+                direction="output",
+                artifact_types=("design.candidate_build",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="build",
+            ),
+        ),
+    )
+    graph = GenerationWorkGraph.compile(
+        (
+            source_graph.require(captured.parent_coordinate),
+            source_graph.require(captured.target_definition.coordinate),
+            candidate,
+        ),
+        mode="diagnostic",
+        strict_input_contracts=True,
+    )
+    for definition in graph.definitions:
+        artifacts.put_json(
+            artifact_id=f"work-definition:{definition.work_id}",
+            artifact_type="control.work_definition",
+            value=definition,
+            dependencies=source_manifest.external_root_refs,
+        )
+    manifest = graph.manifest(
+        topology_id="topology:test-node-private-candidate-workspace-recovery",
+        external_root_refs=source_manifest.external_root_refs,
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=source_manifest.external_root_refs,
+    )
+
+    model = captured.config.agent.model
+    profile_digest = sha256_digest(canonical_json_bytes({"profile": "diagnostic-engineer"}))
+    config_digest = sha256_digest(canonical_json_bytes({"config": "diagnostic-engineer"}))
+    schema_digest = sha256_digest(canonical_json_bytes({"schema": "candidate-completion"}))
+    written_workspace: Path | None = None
+
+    def provenance(dispatch_id: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="test-provider",
+            model=model,
+            profile_digest=profile_digest,
+            output_schema_digest=schema_digest,
+        )
+
+    def failing_executor_factory(execution: NodeExecution):
+        kernel = SchedulerLeafExecutor(runtime=execution.runtime)
+
+        async def proposal(_context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+            nonlocal written_workspace
+            workspace = execution.workspace_root
+            (workspace / "candidate").mkdir(parents=True)
+            (workspace / "candidate" / "runtime.py").write_text(
+                "def draft_runtime(): return 'untrusted'\n",
+                encoding="utf-8",
+            )
+            written_workspace = workspace.resolve()
+            # The real InvocationControlPlane always leaves one redacted
+            # terminal record for a dispatched Agent turn.  This realistic
+            # leaf boundary deliberately bypasses the adapter to poison the
+            # Scheduler failure path, so it must record that same settled
+            # physical fact; otherwise the descendant's liveness gate rightly
+            # rejects an unprovable retry before workspace recovery is reached.
+            ownership = kernel.invocation_ownership(
+                definition=execution.definition,
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+            )
+            execution.app.invocation_control.begin(
+                invocation_id=dispatch_id,
+                owner=ownership,
+                route="codex_sdk",
+                model=model,
+                profile_digest=profile_digest,
+                envelope_digest="d" * 64,
+                declared_wall_seconds=60,
+            )
+            execution.app.invocation_control.settle(
+                dispatch_id,
+                terminal=InvocationTerminalFact(
+                    status=InvocationStatus.FAILED,
+                    code="turn_failed_provider_unavailable",
+                    retryable=True,
+                ),
+            )
+            raise LeafExecutionFailure(
+                code="agent_backend_turn_failed_provider_unavailable",
+                category="the Provider closed after regular private Candidate files were written",
+                retryable=True,
+                observed_actual=BudgetUsage(llm_tokens=1_000, agent_turns=1),
+                agent=provenance(dispatch_id),
+                workspace_recovery=LeafWorkspaceRecovery(
+                    workspace=workspace.resolve(),
+                    lineage_id="implementation:diagnostic-private-draft",
+                    profile_digest=profile_digest,
+                    codex_config_digest=config_digest,
+                    model=model,
+                    output_schema_digest=schema_digest,
+                ),
+            )
+
+        async def execute(context) -> None:
+            await kernel.execute(context, definition=execution.definition, proposal_runner=proposal)
+
+        return execute
+
+    first = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=parent_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=failing_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=candidate.coordinate.coordinate_key,
+        required_manifest_ref=manifest_ref,
+    )
+    assert first.status == "failed"
+    assert written_workspace is not None
+    first_root = Path(first.diagnostic_state_root)
+    assert written_workspace.is_relative_to(first_root / "runs")
+
+    def recovered_executor_factory(execution: NodeExecution):
+        kernel = SchedulerLeafExecutor(runtime=execution.runtime)
+
+        async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+            assert attempt.continuation_commitment is not None
+            assert execution.runtime.continuations is not None
+            assert execution.runtime.continuation_workspace_root == first_root / "runs"
+            record = execution.runtime.continuations.load_commitment(
+                attempt.continuation_commitment,
+                workspace_root=execution.runtime.continuation_workspace_root,
+            )
+            assert record is not None
+            assert record.continuation_kind == "workspace_recovery"
+            assert record.thread_id is None
+            assert record.workspace_for_recovery() == written_workspace
+            with pytest.raises(ContinuationStoreError, match="cannot resume a Provider thread"):
+                record.restore_session()
+            assert (
+                (written_workspace / "candidate" / "runtime.py")
+                .read_text(encoding="utf-8")
+                .startswith("def draft_runtime")
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"candidate-workspace-recovered:{execution.run_id}",
+                artifact_type="design.candidate_build",
+                value={"complete_replacement_after_fresh_workspace_inspection": True},
+                dependencies=context.external_input_refs,
+            )
+            return LeafProposal(
+                output_refs=(output_ref,),
+                subject_refs=(output_ref,),
+                observed_actual=BudgetUsage(llm_tokens=1_000, agent_turns=1),
+                agent=provenance(dispatch_id),
+            )
+
+        async def execute(context) -> None:
+            await kernel.execute(context, definition=execution.definition, proposal_runner=proposal)
+
+        return execute
+
+    recovered = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=first_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=recovered_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=candidate.coordinate.coordinate_key,
+        required_manifest_ref=manifest_ref,
+        infrastructure_retry=True,
+    )
+    assert recovered.status == "committed"
+    assert recovered.infrastructure_retry_action_ref is not None
+    retry_artifacts = ArtifactStore(Path(recovered.diagnostic_state_root) / "artifacts")
+    action = retry_artifacts.get_json(recovered.infrastructure_retry_action_ref, RepairAction)
+    retry_attempt = retry_artifacts.get_json(recovered.target_attempt_ref, WorkAttempt)
+    assert action.workspace_recovery is True
+    # The recovery commitment existed only while the fresh Agent was inspecting
+    # the private draft (asserted inside ``recovered_executor_factory``).  A
+    # successful commit must clear it so no future attempt can reuse the draft.
+    assert retry_attempt.continuation_commitment is None
+    assert str(written_workspace) not in retry_attempt.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_descendant_authorizes_then_executes_one_actionable_semantic_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed diagnostic candidate gets one explicit feedback-bound repair.
+
+    The first constructed boundary is a real Scheduler/Validation/Feedback
+    failure, not a hand-mutated Work head.  The authorization command may only
+    record the existing normal RepairAction; it must not dispatch an executor.
+    A separate descendant run then consumes that exact action through the
+    ordinary Scheduler repair path.
+    """
+
+    captured = _capture_scope(tmp_path, monkeypatch)
+    diagnostic_parent = tmp_path / ".agent-world-live"
+
+    def parent_executor_factory(execution: NodeExecution):
+        async def execute(context) -> None:
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"semantic-repair-parent:{execution.run_id}",
+                artifact_type="design.test_node_target",
+                value={"source": "diagnostic-parent-for-semantic-repair"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+            )
+
+        return execute
+
+    parent = await NodeRunner(
+        config=captured.config,
+        source_state_root=captured.state_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=parent_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+    )
+    parent_root = Path(parent.diagnostic_state_root)
+    parent_app = build_application(captured.config.model_copy(update={"state_root": parent_root}))
+    parent_artifacts = parent_app.controller.artifacts
+    source_manifest_ref = next(
+        ref
+        for ref in parent_artifacts.list_revisions()
+        if ref.artifact_type == "control.work_graph_manifest"
+    )
+    source_manifest = parent_artifacts.get_json(source_manifest_ref, WorkGraphManifest)
+    source_graph = NodeRunner._reconstruct_graph(  # noqa: SLF001 - frozen test closure setup
+        parent_artifacts,
+        source_manifest,
+    )
+    repair_successor = source_graph.require(captured.successor_definition.coordinate).model_copy(
+        update={
+            "repair_policy": captured.successor_definition.repair_policy.model_copy(
+                update={
+                    "maximum_local_corrections": 1,
+                    "strict_progress_bonus_corrections": 0,
+                    "maximum_infrastructure_retries": 0,
+                    "maximum_total_repair_attempts": 1,
+                }
+            ),
+            "allowed_mutation_roots": ("/candidate",),
+        }
+    )
+    repair_graph = GenerationWorkGraph.compile(
+        (
+            source_graph.require(captured.parent_coordinate),
+            source_graph.require(captured.target_definition.coordinate),
+            repair_successor,
+        ),
+        mode="diagnostic",
+        strict_input_contracts=True,
+    )
+    for definition in repair_graph.definitions:
+        parent_artifacts.put_json(
+            artifact_id=f"work-definition:{definition.work_id}",
+            artifact_type="control.work_definition",
+            value=definition,
+            dependencies=source_manifest.external_root_refs,
+        )
+    repair_manifest = repair_graph.manifest(
+        topology_id="topology:test-node-semantic-repair",
+        external_root_refs=source_manifest.external_root_refs,
+    )
+    repair_manifest_ref = parent_artifacts.put_json(
+        artifact_id=repair_manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=repair_manifest,
+        dependencies=source_manifest.external_root_refs,
+    )
+
+    first_calls: list[str] = []
+
+    def failing_executor_factory(execution: NodeExecution):
+        kernel = SchedulerLeafExecutor(runtime=execution.runtime)
+
+        async def proposal(_context, _attempt, _dispatch_id) -> LeafProposal:
+            first_calls.append("rejected-candidate")
+            raise LeafValidationFailure(
+                issues=(
+                    ValidationIssue(
+                        code="test_semantic_coverage_missing_negative_case",
+                        path=("candidate", "coverage", 0),
+                        violated_condition=(
+                            "the candidate omits the negative semantic coverage row"
+                        ),
+                        expected_category=(
+                            "one candidate including the declared negative semantic coverage row"
+                        ),
+                        remediation=(
+                            "Preserve valid coverage and add the missing negative semantic row."
+                        ),
+                    ),
+                ),
+                output_commitment=sha256_digest(b"test-semantic-repair-rejected-candidate"),
+                category="deterministic_semantic_coverage",
+            )
+
+        async def execute(context) -> None:
+            await kernel.execute(
+                context,
+                definition=execution.definition,
+                proposal_runner=proposal,
+            )
+
+        return execute
+
+    first = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=parent_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=failing_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=repair_successor.coordinate.coordinate_key,
+        required_manifest_ref=repair_manifest_ref,
+    )
+
+    assert first_calls == ["rejected-candidate"]
+    assert first.status == "failed"
+    assert first.validation_report.status == "failed"
+    assert first.validation_report.repair_actionable is True
+    first_head = WorkControlStore(Path(first.diagnostic_state_root) / "work-control").read_head(
+        repair_successor.coordinate
+    )
+    assert first_head is not None
+    assert first_head.repair_action_ref is None
+
+    authorization_executor_calls: list[NodeExecution] = []
+
+    def forbidden_authorization_executor(execution: NodeExecution):
+        authorization_executor_calls.append(execution)
+        raise AssertionError("semantic repair authorization must not create an executor")
+
+    authorized = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=Path(first.diagnostic_state_root),
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=forbidden_authorization_executor,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=repair_successor.coordinate.coordinate_key,
+        required_manifest_ref=repair_manifest_ref,
+        authorize_semantic_repair=True,
+    )
+
+    assert authorization_executor_calls == []
+    assert authorized.status == "repair_authorized"
+    assert authorized.authorized_repair_action_ref is not None
+    assert authorized.target_evaluation_ref == first.target_evaluation_ref
+    assert authorized.reserved_budget.repair_attempts == 0
+    authorized_artifacts = ArtifactStore(Path(authorized.diagnostic_state_root) / "artifacts")
+    action = authorized_artifacts.get_json(
+        authorized.authorized_repair_action_ref,
+        RepairAction,
+    )
+    first_attempt = ArtifactStore(Path(first.diagnostic_state_root) / "artifacts").get_json(
+        first.target_attempt_ref,
+        WorkAttempt,
+    )
+    assert action.decision == "local_correction"
+    assert action.source_evaluation_ref == first.target_evaluation_ref
+    assert action.immutable_input_refs == first_attempt.input_refs
+    assert action.allowed_mutation_roots == ("/candidate",)
+
+    repair_actions_seen: list[ArtifactRef | None] = []
+    repair_briefs: list[tuple[ValidationIssue, ...]] = []
+
+    def repaired_executor_factory(execution: NodeExecution):
+        kernel = SchedulerLeafExecutor(runtime=execution.runtime)
+
+        async def execute(context) -> None:
+            repair_actions_seen.append(context.repair_action_ref)
+            brief = kernel.agent_correction_brief(context, definition=execution.definition)
+            assert brief is not None
+            repair_briefs.append(brief.issues)
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"semantic-repair-completed:{execution.run_id}",
+                artifact_type="design.test_node_successor",
+                value={"source": "one-authorized-semantic-repair"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+            )
+
+        return execute
+
+    repaired = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=Path(authorized.diagnostic_state_root),
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=repaired_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=repair_successor.coordinate.coordinate_key,
+        required_manifest_ref=repair_manifest_ref,
+        execute_authorized_repair=True,
+    )
+
+    assert repaired.status == "committed"
+    assert repaired.reserved_budget.repair_attempts == 1
+    assert repair_actions_seen == [authorized.authorized_repair_action_ref]
+    assert len(repair_briefs) == 1
+    assert repair_briefs[0][0].code == "test_semantic_coverage_missing_negative_case"
+    repaired_artifacts = ArtifactStore(Path(repaired.diagnostic_state_root) / "artifacts")
+    repaired_attempt = repaired_artifacts.get_json(repaired.target_attempt_ref, WorkAttempt)
+    assert repaired_attempt.parent_attempt_id == first_attempt.attempt_id
+    assert repaired_attempt.repair_action_ref == authorized.authorized_repair_action_ref
+    assert repaired_attempt.repair_attempt_charge == 1
 
 
 @pytest.mark.asyncio
@@ -1332,6 +2324,9 @@ async def test_test_node_cancellation_is_terminal_unknown_agent_evidence(
     assert operation.execution_ref is not None
     execution = artifacts.get_json(operation.execution_ref)
     assert execution["status"] == "interrupted"
+    # This diagnostic fixture executes a framework leaf rather than a real
+    # Agent-backed proposal, so its Scheduler dispatch must not be presented
+    # as an Agent invocation identity.
     assert execution["invocation_id"] is None
     assert execution["unknown_upper_bound"]["agent_turns"] == 0
 
@@ -1396,6 +2391,64 @@ async def test_test_node_external_cancellation_settles_started_operation(
 
 
 @pytest.mark.asyncio
+async def test_test_node_keyboard_interrupt_settles_started_operation_before_reraise(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real SIGINT shape must settle WorkControl before CLI exit 130."""
+
+    captured = _capture_scope(tmp_path, monkeypatch)
+    diagnostic_parent = tmp_path / "diagnostics"
+
+    def executor_factory(execution: NodeExecution):
+        async def execute(context) -> None:
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            with execution.runtime.heads.exclusive(execution.definition.coordinate) as lock:
+                execution.runtime.schedule_operation(
+                    lock,
+                    definition=execution.definition,
+                    kind="proposal",
+                    replay_mode="non_replayable",
+                    elapsed_wall_seconds=0,
+                    input_refs=input_refs,
+                )
+                execution.runtime.start_operation(
+                    lock,
+                    definition=execution.definition,
+                    dispatch_id="dispatch:test-node-keyboard-interrupt",
+                )
+            raise KeyboardInterrupt
+
+        return execute
+
+    with pytest.raises(KeyboardInterrupt):
+        await NodeRunner(
+            config=captured.config,
+            source_state_root=captured.state_root,
+            diagnostic_parent=diagnostic_parent,
+            executor_factory=executor_factory,
+        ).run(
+            scope_id=captured.scope_id,
+            target_coordinate=captured.target_definition.coordinate.coordinate_key,
+        )
+
+    diagnostic_roots = tuple(diagnostic_parent.iterdir())
+    assert len(diagnostic_roots) == 1
+    artifacts = ArtifactStore(diagnostic_roots[0] / "artifacts")
+    head = WorkControlStore(diagnostic_roots[0] / "work-control").read_head(
+        captured.target_definition.coordinate
+    )
+    assert head is not None and head.status == "failed" and head.active_operation_ref is None
+    attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+    assert attempt.finished_at is not None
+    assert attempt.validation_report_ref is not None
+    report = artifacts.get_json(attempt.validation_report_ref)
+    assert report["issues"][0]["code"] == "process_interrupted_cancelled"
+
+
+@pytest.mark.asyncio
 async def test_test_node_fails_closed_when_a_committed_ancestor_head_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1437,6 +2490,67 @@ async def test_test_node_fails_closed_when_a_committed_ancestor_head_is_missing(
     )
 
 
+@pytest.mark.asyncio
+async def test_descendant_preflight_names_the_noncommitted_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A diagnostic descendant tells the project Agent exactly what blocks it."""
+
+    captured = _capture_scope(tmp_path, monkeypatch)
+    diagnostic_parent = tmp_path / ".agent-world-live"
+
+    def target_executor_factory(execution: NodeExecution):
+        async def execute(context) -> None:
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"diagnostic-parent:{execution.run_id}",
+                artifact_type="design.test_node_target",
+                value={"source": "diagnostic-parent"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+            )
+
+        return execute
+
+    parent_result = await NodeRunner(
+        config=captured.config,
+        source_state_root=captured.state_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=target_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+    )
+    parent_root = Path(parent_result.diagnostic_state_root)
+    parent_head_key = hashlib.sha256(
+        f"{captured.scope_id}\0{captured.target_definition.coordinate.coordinate_key}".encode()
+    ).hexdigest()
+    (parent_root / "work-control" / "heads" / f"{parent_head_key}.json").replace(
+        parent_root / "withheld-descendant-parent-head.json"
+    )
+
+    with pytest.raises(NodeError) as raised:
+        await DescendantRunner(
+            config=captured.config,
+            diagnostic_state_root=parent_root,
+            diagnostic_parent=diagnostic_parent,
+        ).run(
+            scope_id=captured.scope_id,
+            target_coordinate=captured.successor_definition.coordinate.coordinate_key,
+        )
+
+    assert raised.value.code == "test_descendant_ancestor_closure_missing"
+    assert "design.captured_target.captured_target=missing" in str(raised.value)
+
+
 def test_test_node_archive_requires_a_marked_diagnostic_copy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1462,7 +2576,16 @@ def test_test_node_copy_excludes_non_durable_agent_workspaces(tmp_path: Path) ->
     (runtime_home / "tool-link").symlink_to(tmp_path / "outside-tool")
     source_runs = source_root / "expansion-source-runs" / "prior-agent"
     source_runs.mkdir(parents=True)
-    for directory in ("campaigns", "direct-jobs", "observability", "registry", "telemetry"):
+    invocation_record = source_root / "invocation-control" / "attempts" / "settled.json"
+    invocation_record.parent.mkdir(parents=True)
+    invocation_record.write_text('{"status":"settled"}', encoding="utf-8")
+    for directory in (
+        "campaigns",
+        "direct-jobs",
+        "observability",
+        "registry",
+        "telemetry",
+    ):
         (source_root / directory).mkdir()
 
     diagnostic_root = tmp_path / "diagnostic-state"
@@ -1471,7 +2594,14 @@ def test_test_node_copy_excludes_non_durable_agent_workspaces(tmp_path: Path) ->
     assert (diagnostic_root / "artifacts" / "durable.json").is_file()
     assert not (diagnostic_root / "runs").exists()
     assert not (diagnostic_root / "expansion-source-runs").exists()
-    for directory in ("campaigns", "direct-jobs", "observability", "registry", "telemetry"):
+    for directory in (
+        "campaigns",
+        "direct-jobs",
+        "invocation-control",
+        "observability",
+        "registry",
+        "telemetry",
+    ):
         assert not (diagnostic_root / directory).exists()
 
 
@@ -1657,6 +2787,45 @@ def test_descendant_node_cli_accepts_one_explicit_infrastructure_retry(
     assert parsed.infrastructure_retry is True
     assert parsed.proposal_llm_tokens == 5_000_000
     assert parsed.proposal_wall_seconds == 28_800.0
+
+
+def test_descendant_node_cli_accepts_one_authorized_semantic_repair(
+    tmp_path: Path,
+) -> None:
+    parsed = build_parser().parse_args(
+        [
+            "test-descendant-node",
+            "generate-job:test-node",
+            "build.candidate_build.environment_candidate",
+            "--diagnostic-state-root",
+            str(tmp_path / ".agent-world-live" / "test-node-source"),
+            "--execute-authorized-repair",
+        ]
+    )
+
+    assert parsed.execute_authorized_repair is True
+    assert parsed.infrastructure_retry is False
+    assert parsed.refresh_current_implementation is False
+
+
+def test_descendant_node_cli_accepts_one_semantic_repair_authorization(
+    tmp_path: Path,
+) -> None:
+    parsed = build_parser().parse_args(
+        [
+            "test-descendant-node",
+            "generate-job:test-node",
+            "build.candidate_build.environment_candidate",
+            "--diagnostic-state-root",
+            str(tmp_path / ".agent-world-live" / "test-node-source"),
+            "--authorize-semantic-repair",
+        ]
+    )
+
+    assert parsed.authorize_semantic_repair is True
+    assert parsed.execute_authorized_repair is False
+    assert parsed.infrastructure_retry is False
+    assert parsed.refresh_current_implementation is False
 
 
 def test_descendant_node_cli_accepts_one_feedback_only_diagnostic(
@@ -1986,6 +3155,34 @@ def test_final_node_target_selection_binds_one_physical_batch() -> None:
             target_stage="verifier_intent_batch",
             batch_index=3,
         )
+
+
+def test_final_epoch_overlay_feedback_routes_stale_design_predecessor_to_final_harness() -> None:
+    error = test_node_module._final_epoch_rederivation_required(  # noqa: SLF001
+        source_epoch_kind="final",
+        error=WorkResumeError(
+            "predecessor WorkCommit is not active for the next graph: "
+            "verifier.verifier_plan.verifier_batch_plan"
+        ),
+        label="current runtime implementation refresh",
+    )
+
+    assert error is not None
+    assert error.code == "test_node_final_epoch_rederivation_required"
+    assert "verifier.verifier_plan.verifier_batch_plan" in str(error)
+    assert "No model invocation was started" in str(error)
+    assert "test-final-node" in str(error)
+    assert (
+        test_node_module._final_epoch_rederivation_required(  # noqa: SLF001
+            source_epoch_kind="design",
+            error=WorkResumeError(
+                "predecessor WorkCommit is not active for the next graph: "
+                "verifier.verifier_plan.verifier_batch_plan"
+            ),
+            label="current runtime implementation refresh",
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

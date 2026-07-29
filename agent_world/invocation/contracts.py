@@ -9,6 +9,7 @@ auditable evidence about that execution.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -21,6 +22,9 @@ if TYPE_CHECKING:
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = dict[str, JsonValue]
+
+_SAFE_CONTROL_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
+_SAFE_DIAGNOSTIC_COMMAND_LABEL = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 
 class SandboxMode(StrEnum):
@@ -61,6 +65,145 @@ class InvocationExecutionMode(StrEnum):
 
     AGENTIC = "agentic"
     SINGLE_SHOT_STRUCTURED = "single_shot_structured"
+
+
+class InvocationLifecycleSupervision(StrEnum):
+    """Which trusted parent owns the declared physical lifecycle wall.
+
+    Adapters retain a self-supervised mode for direct, standalone use.  Once a
+    request is admitted by :class:`InvocationControlPlane`, however, that
+    control plane is the *only* parent-side lifecycle supervisor.  This is
+    private execution wiring, never runtime-Agent input or worker payload.
+    """
+
+    ADAPTER = "adapter"
+    CONTROL_PLANE = "control_plane"
+
+
+class InvocationOwnerKind(StrEnum):
+    """The durable authority that owns one physical invocation attempt.
+
+    This is deliberately about execution ownership, not Agent semantics.  It
+    lets the invocation layer leave a safe recovery fact without exposing a
+    Prompt, private session, workspace path, or provider response.
+    """
+
+    WORK_OPERATION = "work_operation"
+    DIAGNOSTIC_AUDIT = "diagnostic_audit"
+    STANDALONE_COMPONENT = "standalone_component"
+
+
+class InvocationLifecyclePhase(StrEnum):
+    """Closed local lifecycle facts emitted independently of Provider events."""
+
+    QUEUED = "queued"
+    ADMITTED = "admitted"
+    PROFILE_VERIFYING = "profile_verifying"
+    PROFILE_VERIFIED = "profile_verified"
+    WORKER_SPAWNED = "worker_spawned"
+    PAYLOAD_DISPATCHED = "payload_dispatched"
+    SDK_SESSION_OPEN = "sdk_session_open"
+    THREAD_START = "thread_start"
+    THREAD_RESUME = "thread_resume"
+    TURN_START = "turn_start"
+    TURN_STREAM = "turn_stream"
+    PARENT_WAITING = "parent_waiting"
+    WORKER_EXITED = "worker_exited"
+    DIRECT_DISPATCHED = "direct_dispatched"
+    DIRECT_AWAITING_RESPONSE = "direct_awaiting_response"
+    DIRECT_STREAM_OPENED = "direct_stream_opened"
+    DIRECT_AWAITING_STREAM_EVENT = "direct_awaiting_stream_event"
+    CANCEL_REQUESTED = "cancel_requested"
+    DECLARED_WALL_EXPIRED = "declared_wall_expired"
+    CLEANUP_RUNNING = "cleanup_running"
+    CLEANUP_FINISHED = "cleanup_finished"
+    TERMINAL_RECEIVED = "terminal_received"
+    OWNER_LOST = "owner_lost"
+
+
+@dataclass(frozen=True, slots=True)
+class InvocationOwnership:
+    """Safe identity of the controller-side owner of one physical turn.
+
+    ``owner_id`` and ``scope_id`` are framework identifiers, not user text or
+    provider/session identifiers.  The optional closure digest lets retry and
+    fallback policy later prove that a current node retained its committed
+    parent closure without putting those Artifacts into a provider request.
+    """
+
+    owner_kind: InvocationOwnerKind
+    owner_id: str
+    scope_id: str
+    coordinate: str | None = None
+    immutable_input_closure_digest: str | None = None
+
+    def __post_init__(self) -> None:
+        for label, value in (("owner_id", self.owner_id), ("scope_id", self.scope_id)):
+            if not _SAFE_CONTROL_IDENTIFIER.fullmatch(value):
+                raise ValueError(f"{label} must be a safe bounded framework identifier")
+        if self.coordinate is not None and not _SAFE_CONTROL_IDENTIFIER.fullmatch(self.coordinate):
+            raise ValueError("coordinate must be a safe bounded framework identifier when present")
+        digest = self.immutable_input_closure_digest
+        if digest is not None and (
+            len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("immutable_input_closure_digest must be a sha256 hex digest")
+
+    def to_safe_dict(self) -> JsonObject:
+        """Return only the durable ownership facts safe for a control record."""
+
+        return {
+            "owner_kind": self.owner_kind.value,
+            "owner_id": self.owner_id,
+            "scope_id": self.scope_id,
+            "coordinate": self.coordinate,
+            "immutable_input_closure_digest": self.immutable_input_closure_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosticCommandExpectation:
+    """One private, audit-only command fact expected from a real Agent turn.
+
+    The expectation is not a runtime-Agent contract or a durable transcript.
+    The worker compares it against SDK command items in memory and emits only
+    the safe label plus a closed completion state. This lets a constructed
+    boundary prove a provisioned tool actually ran without retaining command
+    text, output, cwd, or private session material.
+    """
+
+    label: str
+    command_fragment: str
+
+    def __post_init__(self) -> None:
+        if not _SAFE_DIAGNOSTIC_COMMAND_LABEL.fullmatch(self.label):
+            raise ValueError("diagnostic command label must be a safe bounded identifier")
+        if (
+            not self.command_fragment
+            or len(self.command_fragment) > 256
+            or "\n" in self.command_fragment
+            or "\r" in self.command_fragment
+        ):
+            raise ValueError("diagnostic command fragment must be one bounded line")
+
+    def to_worker_payload(self) -> JsonObject:
+        """Return the private worker comparison input, never a durable fact."""
+
+        return {
+            "label": self.label,
+            "command_fragment": self.command_fragment,
+        }
+
+
+@runtime_checkable
+class InvocationLifecycleSink(Protocol):
+    """Receive framework-local lifecycle facts without entering model input."""
+
+    def local(self, phase: InvocationLifecyclePhase) -> None:
+        """Record one closed local adapter/supervisor phase."""
+
+    def provider_progress(self, activity: str = "provider_event") -> None:
+        """Record a real Provider event without its payload or text."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,10 +248,7 @@ class InvocationLimits:
         """Worst-case worker wall time including bounded termination handshakes."""
 
         return (
-            self.timeout_seconds
-            + self.interrupt_grace_seconds
-            + 0.5
-            + 2 * self.kill_grace_seconds
+            self.timeout_seconds + self.interrupt_grace_seconds + 0.5 + 2 * self.kill_grace_seconds
         )
 
 
@@ -128,6 +268,67 @@ class ResolvedBundle:
             raise ValueError("bundle name must not be empty")
         if len(self.sha256) != 64:
             raise ValueError("bundle sha256 must contain 64 hexadecimal characters")
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedRuntimeTool:
+    """One framework-provisioned executable in an isolated Agent profile.
+
+    ``path`` is deliberately private profile state.  It is materialized below
+    the profile root, never copied into public profile evidence, and is
+    re-hashed before a worker starts.  A workspace-local facade gives the
+    runtime role Agent a stable relative command without exposing this path.
+    """
+
+    name: str
+    path: Path = field(repr=False)
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not _SAFE_CONTROL_IDENTIFIER.fullmatch(self.name):
+            raise ValueError("runtime tool name must be a safe bounded identifier")
+        if not self.path.is_absolute():
+            raise ValueError("runtime tool path must be absolute")
+        if len(self.sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.sha256
+        ):
+            raise ValueError("runtime tool sha256 must be lowercase sha256 hex")
+
+    def to_safe_dict(self) -> JsonObject:
+        """Return provenance without a host or private-profile path."""
+
+        return {"name": self.name, "sha256": self.sha256}
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedRuntimeInterpreter:
+    """Pinned Python runtime needed by an isolated build-tool facade.
+
+    ``executable`` and ``root`` are private profile implementation details.
+    The Agent invokes the workspace-local facade rather than either host path;
+    public profile evidence records only the interpreter version and binary
+    digest needed to distinguish one provisioned runtime from another.
+    """
+
+    version: str
+    executable: Path = field(repr=False)
+    root: Path = field(repr=False)
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[0-9]+\.[0-9]+", self.version):
+            raise ValueError("runtime interpreter version must be major.minor")
+        if not self.executable.is_absolute() or not self.root.is_absolute():
+            raise ValueError("runtime interpreter paths must be absolute")
+        if not self.executable.is_relative_to(self.root):
+            raise ValueError("runtime interpreter executable must remain below its root")
+        if len(self.sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in self.sha256
+        ):
+            raise ValueError("runtime interpreter sha256 must be lowercase sha256 hex")
+
+    def to_safe_dict(self) -> JsonObject:
+        return {"version": self.version, "sha256": self.sha256}
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +370,9 @@ class ResolvedAgentProfile:
     allowed_network_domains: tuple[str, ...]
     skills: tuple[ResolvedBundle, ...]
     hooks: tuple[ResolvedBundle, ...]
+    runtime_tools: tuple[ResolvedRuntimeTool, ...]
+    missing_runtime_tools: tuple[str, ...]
+    runtime_interpreter: ResolvedRuntimeInterpreter | None
     credential_descriptors: tuple[CredentialDescriptor, ...]
     authentication_kind: str
     authentication_environment: str | None
@@ -235,11 +439,20 @@ class ResolvedAgentProfile:
             raise ValueError("effective capability sandbox must match the resolved profile")
         if self.effective_capability_plan.intrinsic_builtin_tools != self.allowed_builtin_tools:
             raise ValueError("effective intrinsic tools must match the resolved profile")
-        if (
-            self.effective_capability_plan.external.network_domains
-            != self.allowed_network_domains
-        ):
+        if self.effective_capability_plan.external.network_domains != self.allowed_network_domains:
             raise ValueError("effective network domains must match the resolved profile")
+        runtime_tool_names = tuple(tool.name for tool in self.runtime_tools)
+        if len(set(runtime_tool_names)) != len(runtime_tool_names):
+            raise ValueError("resolved runtime tool names must be unique")
+        if len(set(self.missing_runtime_tools)) != len(self.missing_runtime_tools):
+            raise ValueError("missing runtime tool names must be unique")
+        if set(runtime_tool_names) & set(self.missing_runtime_tools):
+            raise ValueError("a runtime tool cannot be both resolved and missing")
+        if (self.runtime_tools or self.missing_runtime_tools) and self.runtime_interpreter is None:
+            raise ValueError("provisioned runtime tools require a pinned runtime interpreter")
+        for name in self.missing_runtime_tools:
+            if not _SAFE_CONTROL_IDENTIFIER.fullmatch(name):
+                raise ValueError("missing runtime tool name must be a safe bounded identifier")
         for root in (self.materialization_root, self.home, self.codex_home, self.workspace):
             if not root.is_absolute():
                 raise ValueError(f"resolved path must be absolute: {root}")
@@ -301,6 +514,13 @@ class ResolvedAgentProfile:
                 {"name": item.name, "path": str(item.path), "sha256": item.sha256}
                 for item in self.hooks
             ],
+            "runtime_tools": [item.to_safe_dict() for item in self.runtime_tools],
+            "missing_runtime_tools": list(self.missing_runtime_tools),
+            "runtime_interpreter": (
+                self.runtime_interpreter.to_safe_dict()
+                if self.runtime_interpreter is not None
+                else None
+            ),
             "credential_handles": [item.handle for item in self.credential_descriptors],
             "authentication_kind": self.authentication_kind,
             "codex_bin": str(self.codex_bin) if self.codex_bin is not None else None,
@@ -352,6 +572,27 @@ class InvocationRequest:
     session: InvocationSession | None = None
     metadata: JsonObject = field(default_factory=dict)
     execution_mode: InvocationExecutionMode = InvocationExecutionMode.AGENTIC
+    ownership: InvocationOwnership | None = None
+    # Only a constructed diagnostic may request a closed command-execution
+    # observation. It is private worker input and is projected back solely as
+    # safe labels/outcomes; no command text or tool output survives the turn.
+    diagnostic_command_expectations: tuple[DiagnosticCommandExpectation, ...] = field(
+        default_factory=tuple,
+        repr=False,
+        compare=False,
+    )
+    # This callback is private parent-side control-plane wiring.  It is not
+    # serialized into the worker payload and never becomes runtime Agent input.
+    lifecycle_sink: InvocationLifecycleSink | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    lifecycle_supervision: InvocationLifecycleSupervision = field(
+        default=InvocationLifecycleSupervision.ADAPTER,
+        repr=False,
+        compare=False,
+    )
 
     def __post_init__(self) -> None:
         if not self.invocation_id:
@@ -374,6 +615,17 @@ class InvocationRequest:
                 raise ValueError("continued session must use the same resolved profile")
             if self.session.codex_config_sha256 != self.profile.codex_config_sha256:
                 raise ValueError("continued session must use the exact same Codex configuration")
+        if self.diagnostic_command_expectations:
+            if (
+                self.ownership is None
+                or self.ownership.owner_kind is not InvocationOwnerKind.DIAGNOSTIC_AUDIT
+            ):
+                raise ValueError(
+                    "diagnostic command expectations require explicit diagnostic audit ownership"
+                )
+            labels = tuple(item.label for item in self.diagnostic_command_expectations)
+            if len(labels) != len(set(labels)):
+                raise ValueError("diagnostic command expectation labels must be unique")
 
 
 @dataclass(frozen=True, slots=True)

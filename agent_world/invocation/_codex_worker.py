@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib.metadata
 import json
 import os
 import re
@@ -28,6 +27,7 @@ if __package__ in {None, ""}:
 
 from agent_world.invocation.redaction import (  # noqa: E402
     Redactor,
+    redacted_command_diagnostic_excerpt,
     redacted_terminal_diagnostic_excerpt,
 )
 from agent_world.invocation.runtime_provider import (  # noqa: E402
@@ -42,8 +42,9 @@ from agent_world.invocation.runtime_provider import (  # noqa: E402
 
 PROTOCOL_VERSION = "agent-world.codex-worker.v1"
 SUPPORTED_SDK_VERSION = "0.144.4"
-SUPPORTED_RUNTIME_VERSION = "0.144.4"
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_DIAGNOSTIC_COMMAND_LABEL = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_DIAGNOSTIC_COMMAND_MAX_EXPECTATIONS = 8
 _RESULT_RESERVE_BYTES = 64 * 1024
 _SDK_EXECUTION_PHASES = frozenset(
     {
@@ -91,6 +92,24 @@ class Emitter:
         if self.protocol_bytes + len(encoded) > event_budget:
             raise ProtocolBudgetExceeded("SDK event bytes exceeded the resolved profile limit")
         self.event_count += 1
+        self.protocol_bytes += len(encoded)
+        _write_encoded(encoded)
+
+    def lifecycle(self, phase: str) -> None:
+        """Emit one bounded worker-local phase, distinct from SDK progress."""
+
+        if phase not in _SDK_EXECUTION_PHASES:
+            raise ValueError("unsupported worker lifecycle phase")
+        record = {
+            "type": "lifecycle",
+            "protocol_version": PROTOCOL_VERSION,
+            "phase": phase,
+        }
+        encoded = _encode_record(record)
+        if self.protocol_bytes + len(encoded) > self.max_protocol_bytes:
+            raise ProtocolBudgetExceeded(
+                "worker lifecycle bytes exceeded the resolved profile limit"
+            )
         self.protocol_bytes += len(encoded)
         _write_encoded(encoded)
 
@@ -189,6 +208,41 @@ def _optional_string(value: Any, label: str) -> str | None:
     if value is None:
         return None
     return _require_string(value, label)
+
+
+def _parse_diagnostic_command_expectations(value: object) -> tuple[tuple[str, str], ...]:
+    """Validate private audit probes before they can affect event projection.
+
+    The outer request type already restricts this to a diagnostic audit. The
+    worker revalidates it because it is a protocol boundary. The command
+    fragments never appear in compact events, telemetry, or the final result.
+    """
+
+    if value is None:
+        return ()
+    if not isinstance(value, list) or len(value) > _DIAGNOSTIC_COMMAND_MAX_EXPECTATIONS:
+        raise ValueError("diagnostic_command_expectations must be a bounded list")
+    parsed: list[tuple[str, str]] = []
+    labels: set[str] = set()
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {"label", "command_fragment"}:
+            raise ValueError("diagnostic command expectation has an invalid shape")
+        label = item.get("label")
+        fragment = item.get("command_fragment")
+        if (
+            not isinstance(label, str)
+            or not _DIAGNOSTIC_COMMAND_LABEL.fullmatch(label)
+            or label in labels
+            or not isinstance(fragment, str)
+            or not fragment
+            or len(fragment) > 256
+            or "\n" in fragment
+            or "\r" in fragment
+        ):
+            raise ValueError("diagnostic command expectation is invalid")
+        labels.add(label)
+        parsed.append((label, fragment))
+    return tuple(parsed)
 
 
 def _completed_turn_payload(
@@ -559,6 +613,10 @@ def _provider_http_status_failure_code(status: object) -> str:
 def _compact_notification_payload(
     method: str,
     event_payload: Mapping[str, Any],
+    *,
+    diagnostic_command_expectations: tuple[tuple[str, str], ...] = (),
+    diagnostic_command_matches: dict[str, tuple[str, ...]] | None = None,
+    diagnostic_command_redactor: Redactor | None = None,
 ) -> dict[str, Any]:
     """Project SDK notifications to bounded telemetry metadata.
 
@@ -586,6 +644,15 @@ def _compact_notification_payload(
         }
         if projected:
             compact[key] = projected
+        if key == "item" and value.get("type") == "commandExecution":
+            command_proofs = _compact_diagnostic_command_proofs(
+                value,
+                diagnostic_command_expectations,
+                diagnostic_command_matches,
+                diagnostic_command_redactor,
+            )
+            if command_proofs:
+                compact["diagnosticCommandProof"] = command_proofs
     token_usage = event_payload.get("tokenUsage")
     if isinstance(token_usage, dict):
         compact["tokenUsage"] = {
@@ -597,6 +664,73 @@ def _compact_notification_payload(
         }
     compact["sourceMethod"] = method
     return compact
+
+
+def _compact_diagnostic_command_proofs(
+    item: Mapping[str, Any],
+    expectations: tuple[tuple[str, str], ...],
+    matches_by_item_id: dict[str, tuple[str, ...]] | None,
+    redactor: Redactor | None,
+) -> list[dict[str, Any]]:
+    """Project expected-command completion states, never command detail.
+
+    Codex may emit a command text when an item starts and its exit code only
+    when that same item completes. Keep their private item id in worker memory
+    for this one turn so the safe projection does not falsely report an
+    expected command as unobserved merely because the SDK split its fields.
+    """
+
+    if not expectations:
+        return []
+    item_id = item.get("id")
+    command = item.get("command")
+    status = item.get("status")
+    exit_code = item.get("exitCode")
+    labels: tuple[str, ...] = ()
+    if isinstance(command, str):
+        labels = tuple(label for label, fragment in expectations if fragment in command)
+        if labels and isinstance(item_id, str) and matches_by_item_id is not None:
+            matches_by_item_id[item_id] = labels
+    if not labels and isinstance(item_id, str) and matches_by_item_id is not None:
+        labels = matches_by_item_id.get(item_id, ())
+    if not labels or not isinstance(status, str):
+        return []
+    if status == "completed" and exit_code == 0:
+        outcome = "succeeded"
+    elif exit_code == 127:
+        outcome = "not_found"
+    elif exit_code == 126:
+        outcome = "not_executable"
+    elif status == "failed" or isinstance(exit_code, int):
+        outcome = "failed"
+    elif status == "completed":
+        outcome = "unknown"
+    else:
+        return []
+    if isinstance(item_id, str) and matches_by_item_id is not None:
+        matches_by_item_id.pop(item_id, None)
+    safe_exit_code = (
+        exit_code
+        if isinstance(exit_code, int) and not isinstance(exit_code, bool) and 0 <= exit_code <= 255
+        else None
+    )
+    excerpt = (
+        redacted_command_diagnostic_excerpt(
+            item.get("aggregatedOutput"),
+            redactor=redactor,
+        )
+        if outcome != "succeeded" and redactor is not None
+        else None
+    )
+    proofs: list[dict[str, Any]] = []
+    for label in labels:
+        proof: dict[str, Any] = {"label": label, "outcome": outcome}
+        if safe_exit_code is not None:
+            proof["exitCode"] = safe_exit_code
+        if excerpt is not None:
+            proof["diagnosticExcerpt"] = excerpt
+        proofs.append(proof)
+    return proofs
 
 
 def _validated_codex_binary(path_text: str, expected_digest: str) -> Path:
@@ -851,63 +985,34 @@ async def _run(payload: dict[str, Any]) -> None:
     )
     if (configured_codex_bin is None) != (configured_codex_digest is None):
         raise ValueError("codex_bin and codex_bin_sha256 must be present together")
-    runtime_path: Path | None = None
-    if configured_codex_bin is not None:
-        assert configured_codex_digest is not None
-        try:
-            codex_binary = await asyncio.to_thread(
-                _validated_codex_binary,
-                configured_codex_bin,
-                configured_codex_digest,
+    if configured_codex_bin is None or configured_codex_digest is None:
+        emitter.result(
+            _status_result(
+                status="needs_human",
+                started=started,
+                code="profile_codex_runtime_missing",
+                message="the resolved profile does not declare a pinned Codex runtime",
+                backend_version=sdk_version,
             )
-        except OSError as exc:
-            emitter.result(
-                _status_result(
-                    status="needs_human",
-                    started=started,
-                    code="codex_runtime_unavailable",
-                    message=str(exc),
-                    backend_version=sdk_version,
-                )
+        )
+        return
+    try:
+        codex_binary = await asyncio.to_thread(
+            _validated_codex_binary,
+            configured_codex_bin,
+            configured_codex_digest,
+        )
+    except OSError as exc:
+        emitter.result(
+            _status_result(
+                status="needs_human",
+                started=started,
+                code="codex_runtime_unavailable",
+                message=str(exc),
+                backend_version=sdk_version,
             )
-            return
-    else:
-        try:
-            from codex_cli_bin import (  # type: ignore[import-untyped]
-                bundled_codex_path,
-                bundled_path_dir,
-            )
-        except (ImportError, ModuleNotFoundError):
-            emitter.result(
-                _status_result(
-                    status="needs_human",
-                    started=started,
-                    code="codex_runtime_unavailable",
-                    message="the runtime package pinned by openai-codex is not installed",
-                    backend_version=sdk_version,
-                )
-            )
-            return
-        try:
-            runtime_version = importlib.metadata.version("openai-codex-cli-bin")
-        except importlib.metadata.PackageNotFoundError:
-            runtime_version = None
-        if runtime_version != SUPPORTED_RUNTIME_VERSION:
-            emitter.result(
-                _status_result(
-                    status="needs_human",
-                    started=started,
-                    code="codex_runtime_version_unsupported",
-                    message=(
-                        f"openai-codex-cli-bin {runtime_version or 'missing'} is installed; "
-                        f"this adapter requires {SUPPORTED_RUNTIME_VERSION}"
-                    ),
-                    backend_version=sdk_version,
-                )
-            )
-            return
-        codex_binary = bundled_codex_path()
-        runtime_path = bundled_path_dir()
+        )
+        return
 
     workspace = Path(_require_string(payload.get("workspace"), "workspace")).resolve()  # noqa: ASYNC240
     if not workspace.is_dir():
@@ -951,6 +1056,10 @@ async def _run(payload: dict[str, Any]) -> None:
     diagnostic_capture_terminal_excerpt = payload.get("diagnostic_capture_terminal_excerpt", False)
     if not isinstance(diagnostic_capture_terminal_excerpt, bool):
         raise ValueError("diagnostic_capture_terminal_excerpt must be a boolean")
+    diagnostic_command_expectations = _parse_diagnostic_command_expectations(
+        payload.get("diagnostic_command_expectations", [])
+    )
+    diagnostic_command_matches: dict[str, tuple[str, ...]] = {}
     deadline = started + timeout_seconds
     thread_id: str | None = None
     turn_id: str | None = None
@@ -961,7 +1070,7 @@ async def _run(payload: dict[str, Any]) -> None:
     worker_phase = "sdk_session_open"
 
     try:
-        app_server_environment = _app_server_environment(os.environ, runtime_path)
+        app_server_environment = _app_server_environment(os.environ, runtime_path=None)
         launch_args = _app_server_launch_args(codex_binary, hooks_enabled=hooks_enabled)
         config = CodexConfig(
             cwd=str(workspace),
@@ -972,6 +1081,7 @@ async def _run(payload: dict[str, Any]) -> None:
             client_version=PROTOCOL_VERSION,
         )
         async with AsyncCodex(config) as codex:
+            emitter.lifecycle("sdk_session_open")
             base_instructions = _require_string(
                 payload.get("base_instructions"), "base_instructions"
             )
@@ -986,6 +1096,7 @@ async def _run(payload: dict[str, Any]) -> None:
             requested_thread_id = payload.get("thread_id")
             if requested_thread_id is None:
                 worker_phase = "thread_start"
+                emitter.lifecycle(worker_phase)
                 thread = await codex.thread_start(
                     approval_mode=ApprovalMode.deny_all,
                     base_instructions=base_instructions,
@@ -1003,6 +1114,7 @@ async def _run(payload: dict[str, Any]) -> None:
                 )
             else:
                 worker_phase = "thread_resume"
+                emitter.lifecycle(worker_phase)
                 thread = await codex.thread_resume(
                     _require_string(requested_thread_id, "thread_id"),
                     approval_mode=ApprovalMode.deny_all,
@@ -1018,6 +1130,7 @@ async def _run(payload: dict[str, Any]) -> None:
                 raise RuntimeError("Codex resumed a different thread id")
 
             worker_phase = "turn_start"
+            emitter.lifecycle(worker_phase)
             turn = await thread.turn(
                 _require_string(payload.get("prompt"), "prompt"),
                 approval_mode=ApprovalMode.deny_all,
@@ -1045,6 +1158,7 @@ async def _run(payload: dict[str, Any]) -> None:
 
             try:
                 worker_phase = "turn_stream"
+                emitter.lifecycle(worker_phase)
                 async with asyncio.timeout(remaining):
                     async for notification in turn.stream():
                         event_payload = _notification_payload(notification.payload)
@@ -1070,6 +1184,9 @@ async def _run(payload: dict[str, Any]) -> None:
                             _compact_notification_payload(
                                 notification.method,
                                 event_payload,
+                                diagnostic_command_expectations=diagnostic_command_expectations,
+                                diagnostic_command_matches=diagnostic_command_matches,
+                                diagnostic_command_redactor=redactor,
                             ),
                         )
                         if terminal_turn is not None:

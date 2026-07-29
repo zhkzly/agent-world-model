@@ -64,6 +64,7 @@ from agent_world.contracts.supply_chain import (
     StaticAssuranceEvidence,
     SupplyChainEvidence,
 )
+from agent_world.invocation import InvocationOwnership
 from agent_world.observability.subprocess_scene import (
     RuntimeSubprocessScene,
     runtime_subprocess_scene,
@@ -75,7 +76,12 @@ from agent_world.task_materialization import (
 )
 
 from .assertions import evaluate_assertion
-from .assurance import MAX_PUBLIC_TESTS, inspect_static_sources, inspect_supply_chain
+from .assurance import (
+    MAX_PUBLIC_TESTS,
+    StaticSourceInspection,
+    inspect_static_sources,
+    inspect_supply_chain,
+)
 from .models import CaseEvaluation, RuntimeActionObservation
 from .protocol import ProtocolViolation, RuntimeResponse
 from .reachability import (
@@ -135,6 +141,7 @@ def _is_content_hash(value: object) -> bool:
     """Keep telemetry coordinate correlation to an opaque, non-secret key."""
 
     return isinstance(value, str) and _CONTENT_HASH_PATTERN.fullmatch(value) is not None
+
 
 _CANONICAL_GATES = (
     "schema",
@@ -240,9 +247,7 @@ def _runtime_contract_mismatch_paths(
             "observation_schema": surface.observation_schema,
         }
         for key, expected_value in contract.items():
-            if canonical_json_bytes(entries[0].get(key)) != canonical_json_bytes(
-                expected_value
-            ):
+            if canonical_json_bytes(entries[0].get(key)) != canonical_json_bytes(expected_value):
                 mismatches.append(f"tools[{tool_id}].{key}")
     return tuple(mismatches)
 
@@ -339,6 +344,42 @@ def _python_missing_module(stderr: str) -> str | None:
     return matches[-1].group("module") if matches else None
 
 
+def _public_test_failure_feedback(
+    result: SandboxProcessResult,
+    *,
+    known_secret_canaries: Sequence[str | bytes] = (),
+) -> str | None:
+    """Return one bounded, safety-screened diagnostic for repair feedback.
+
+    Public-test stdout and stderr are candidate-controlled and must not become
+    durable raw evidence.  A concise, redacted terminal line is nevertheless
+    needed by the Builder to distinguish an import/setup problem from a test
+    assertion or a timeout.  It is advisory feedback only; it cannot affect
+    gate authority or retry policy.
+    """
+
+    if result.succeeded:
+        return None
+    missing_module = _python_missing_module(result.stderr)
+    if missing_module is not None:
+        return f"Python ModuleNotFoundError: module `{missing_module}` is not importable."
+
+    source = result.stderr if result.stderr.strip() else result.stdout
+    lines = tuple(line.strip() for line in source.splitlines() if line.strip())
+    if lines:
+        terminal_line = re.sub(r"[\x00-\x1f\x7f]+", " ", lines[-1]).strip()
+        safe_line = safe_dynamic_text(
+            terminal_line,
+            known_secret_canaries=known_secret_canaries,
+        )
+        if safe_line.startswith("sha256:"):
+            return "Public-test terminal detail was redacted by the safety screen."
+        return f"Public-test terminal: {safe_line[:280]}"
+    if result.failure_class:
+        return f"Public-test process failure class: {result.failure_class}."
+    return "Public test failed without stdout or stderr."
+
+
 def _schema_validation_coordinates(errors: Sequence[Any]) -> tuple[str, ...]:
     """Project jsonschema failures to value-free, deterministic repair coordinates."""
 
@@ -353,17 +394,14 @@ def _schema_validation_coordinates(errors: Sequence[Any]) -> tuple[str, ...]:
     )
     for error in ordered:
         path = "/" + "/".join(
-            str(part).replace("~", "~0").replace("/", "~1")
-            for part in error.absolute_path
+            str(part).replace("~", "~0").replace("/", "~1") for part in error.absolute_path
         )
         validator = str(error.validator)
         detail = validator
         if validator == "required" and isinstance(error.instance, Mapping):
             required = error.validator_value
             if isinstance(required, list):
-                missing = sorted(
-                    str(item) for item in required if str(item) not in error.instance
-                )
+                missing = sorted(str(item) for item in required if str(item) not in error.instance)
                 if missing:
                     detail += "_missing=" + "|".join(missing)
         elif validator == "additionalProperties" and isinstance(error.instance, Mapping):
@@ -1098,6 +1136,8 @@ class EnvironmentJudge:
         run_id: str | None = None,
         telemetry_trace_id: str | None = None,
         coordinate_key: str | None = None,
+        invocation_ownership: InvocationOwnership | None = None,
+        model_override: str | None = None,
     ) -> JudgeBundle:
         self.artifacts.require_exact_json(
             candidate_ref,
@@ -1394,6 +1434,8 @@ class EnvironmentJudge:
                         materialization.envelopes,
                         budget=budget,
                         reachability_workspace=reachability_workspace,
+                        invocation_ownership=invocation_ownership,
+                        model_override=model_override,
                     )
                 else:
                     reachability_ref = self._evidence(
@@ -1672,34 +1714,46 @@ class EnvironmentJudge:
         async def execute(
             path: str,
             ref: ArtifactRef,
-        ) -> PublicTestExecution:
-            argv = (".venv/bin/python", path)
-            result = await self.sandbox_runner.run(
+        ) -> tuple[PublicTestExecution, str | None]:
+            result = await self.sandbox_runner.run_public_test(
                 clean.root,
-                argv=argv,
+                test_path=path,
                 visible_workspace_paths=visible_paths,
                 timeout_seconds=min(30.0, self.sandbox_runner.timeout_seconds),
                 max_output_bytes=min(256 * 1024, self.sandbox_runner.max_output_bytes),
-                failure_prefix="public_test",
             )
             failure_class = result.failure_class or (
                 None if result.succeeded else "public_test_failed"
             )
-            return PublicTestExecution(
-                path=path,
-                public_test_ref=ref,
-                argv=argv,
-                exit_code=result.exit_code,
-                duration_ms=result.duration_ms,
-                stdout_hash=sha256_digest(result.stdout.encode("utf-8")),
-                stderr_hash=sha256_digest(result.stderr.encode("utf-8")),
-                stdout_truncated=result.stdout_truncated,
-                stderr_truncated=result.stderr_truncated,
-                passed=result.succeeded,
-                failure_class=failure_class,
+            return (
+                PublicTestExecution(
+                    path=path,
+                    public_test_ref=ref,
+                    argv=result.argv,
+                    exit_code=result.exit_code,
+                    duration_ms=result.duration_ms,
+                    stdout_hash=sha256_digest(result.stdout.encode("utf-8")),
+                    stderr_hash=sha256_digest(result.stderr.encode("utf-8")),
+                    stdout_truncated=result.stdout_truncated,
+                    stderr_truncated=result.stderr_truncated,
+                    passed=result.succeeded,
+                    failure_class=failure_class,
+                ),
+                _public_test_failure_feedback(
+                    result,
+                    known_secret_canaries=self._known_secret_canaries,
+                ),
             )
 
-        executions = tuple(await asyncio.gather(*(execute(path, ref) for path, ref in pairs)))
+        execution_outcomes = tuple(
+            await asyncio.gather(*(execute(path, ref) for path, ref in pairs))
+        )
+        executions = tuple(item[0] for item in execution_outcomes)
+        public_test_diagnostics = tuple(
+            (execution.path, diagnostic)
+            for execution, diagnostic in execution_outcomes
+            if diagnostic is not None
+        )
         if not executions:
             failures.add("static_public_tests_missing")
         if any(not item.passed for item in executions):
@@ -1739,16 +1793,12 @@ class EnvironmentJudge:
                 "passed."
             )
         else:
-            failed_public_tests = tuple(
-                item.path for item in evidence.public_tests if not item.passed
+            failed_public_tests = tuple(item for item in evidence.public_tests if not item.passed)
+            summary = self._static_assurance_failure_summary(
+                inspection,
+                failed_public_tests=failed_public_tests,
+                public_test_diagnostics=public_test_diagnostics,
             )
-            summary = "Static assurance failed: " + ", ".join(evidence.failure_codes)
-            if inspection.component_import_violations:
-                summary += "; component import violations: " + ", ".join(
-                    inspection.component_import_violations
-                )
-            if failed_public_tests:
-                summary += "; failed public tests: " + ", ".join(failed_public_tests)
         return _AssuranceGateResult(
             status=evidence.status,
             evidence_ref=evidence_ref,
@@ -1756,6 +1806,113 @@ class EnvironmentJudge:
             owner="build",
             tool_calls=len(executions),
         )
+
+    @staticmethod
+    def _static_assurance_failure_summary(
+        inspection: StaticSourceInspection,
+        *,
+        failed_public_tests: tuple[PublicTestExecution, ...],
+        public_test_diagnostics: tuple[tuple[str, str], ...] = (),
+    ) -> str:
+        """Return a safe, Builder-actionable static-assurance failure summary.
+
+        Evidence retains the complete per-file record.  Scheduler repair only
+        receives the gate summary, so retain source paths, declared roles and
+        framework failure codes here without disclosing the matched source
+        text or a private evaluator condition.
+        """
+
+        summary = "Static assurance failed: " + ", ".join(inspection.failure_codes) + "."
+        failed_sources = tuple(
+            f"{item.path.removeprefix('candidate/')} ({item.role})"
+            for item in inspection.files
+            if item.failure_codes
+        )
+        forbidden_locations = tuple(
+            (
+                f"{item.path.removeprefix('candidate/')}:{location.line}",
+                location.category,
+            )
+            for item in inspection.files
+            for location in item.diagnostic_locations
+        )
+        framework_private_locations = tuple(
+            path
+            for path, category in forbidden_locations
+            if category == "framework_private_identifier"
+        )
+        failed_public_test_paths = tuple(item.path for item in failed_public_tests)
+        diagnostics_by_path = dict(public_test_diagnostics)
+        if failed_sources:
+            summary += " Files: " + ", ".join(failed_sources) + "."
+        if inspection.component_import_violations:
+            summary += (
+                " Executable sources may not import `configuration`; move shared executable "
+                "helpers into `runtime`. Visibility: runtime->runtime; "
+                "task_materializer->runtime/task_materializer; "
+                "public_verifier->runtime/task_materializer/public_verifier."
+            )
+        if "static_forbidden_pattern" in inspection.failure_codes:
+            displayed_locations = forbidden_locations[:6]
+            if displayed_locations:
+                summary += " Static-policy locations: " + ", ".join(
+                    f"{path} ({category.replace('_', ' ')})"
+                    for path, category in displayed_locations
+                )
+                if len(forbidden_locations) > len(displayed_locations):
+                    summary += f", and {len(forbidden_locations) - len(displayed_locations)} more"
+                summary += "."
+            if framework_private_locations:
+                summary += (
+                    " Implement only declared schema fields and remove any generic private-name "
+                    "blacklist from Candidate source."
+                )
+            else:
+                summary += " Remove the disallowed static construct from affected source."
+        if failed_public_test_paths:
+            summary += " Failed public tests: " + ", ".join(failed_public_test_paths) + "."
+            first_failure = failed_public_tests[0]
+            diagnostic = diagnostics_by_path.get(first_failure.path)
+            if diagnostic is not None:
+                exit_code = (
+                    str(first_failure.exit_code)
+                    if first_failure.exit_code is not None
+                    else "unknown"
+                )
+                summary += (
+                    f" First public-test terminal ({first_failure.path}, exit {exit_code}): "
+                    f"{diagnostic}"
+                )
+        if len(summary) <= 512:
+            return summary
+
+        # ValidationIssue/TopIssue deliberately have a bounded text field.  Do
+        # not silently take a raw character prefix: that used to cut the exact
+        # component-isolation instruction from the Builder's feedback.  The
+        # complete typed evidence remains durable; this explicit fallback still
+        # tells the repair Agent what to inspect in its own candidate workspace.
+        fallback = (
+            "Static assurance failed with "
+            f"{len(inspection.failure_codes)} failure code(s), {len(failed_sources)} source "
+            f"file(s), {len(inspection.component_import_violations)} component-import "
+            f"violation(s), "
+            f"and {len(failed_public_test_paths)} failed public test(s). "
+            "Inspect every Candidate source/import. Executable sources may not import "
+            "`configuration`; move shared executable helpers into `runtime`. Visibility: "
+            "runtime->runtime; task_materializer->runtime/task_materializer; "
+            "public_verifier->runtime/task_materializer/public_verifier."
+        )
+        if framework_private_locations:
+            fallback += (
+                " Implement only declared schema fields; remove any generic private-name "
+                "blacklist from Candidate source."
+            )
+        if failed_public_tests:
+            first_failure = failed_public_tests[0]
+            diagnostic = diagnostics_by_path.get(first_failure.path)
+            if diagnostic is not None:
+                fallback += f" First public-test terminal: {diagnostic}"
+        return fallback[:512]
 
     def _bind_public_tests(
         self,
@@ -2262,8 +2419,14 @@ class EnvironmentJudge:
             }
             if isinstance(exc, _CandidateTaskFailure) and exc.details:
                 record["failure_details"] = exc.details
+            if isinstance(exc, ProtocolViolation):
+                record["protocol_code"] = exc.code
+                if exc.code == "invalid_state_digest":
+                    record["expected_state_digest_format"] = (
+                        "sha256:<64 lowercase hexadecimal characters>"
+                    )
             status = "fail"
-            summary = str(exc)
+            summary = _candidate_failure_summary(exc)
             owner = "build"
             envelopes = ()
         except JudgeInfrastructureError as exc:
@@ -2309,6 +2472,8 @@ class EnvironmentJudge:
         *,
         budget: Budget,
         reachability_workspace: Path,
+        invocation_ownership: InvocationOwnership | None = None,
+        model_override: str | None = None,
     ) -> _ReachabilityGateResult:
         recipes = self._recipe_index(verifier.solve_recipes)
         requirements = {item.task_type: item for item in design.curriculum.task_types}
@@ -2405,6 +2570,8 @@ class EnvironmentJudge:
                         requirement=requirement,
                         budget=self._solver_attempt_budget(policy, budget),
                         reachability_workspace=reachability_workspace,
+                        invocation_ownership=invocation_ownership,
+                        model_override=model_override,
                     )
                     episodes += int(interactive_episode_started)
                     usage = _add_usage(usage, interactive_outcome.usage)
@@ -2522,6 +2689,8 @@ class EnvironmentJudge:
         requirement: TaskRequirement,
         budget: Budget,
         reachability_workspace: Path,
+        invocation_ownership: InvocationOwnership | None = None,
+        model_override: str | None = None,
     ) -> tuple[ReachabilityOutcome, str | None, bool]:
         if self.interactive_challenger is None:
             return (
@@ -2564,6 +2733,8 @@ class EnvironmentJudge:
                         requirement.reachability_policy.maximum_agent_turns_per_attempt
                     ),
                     maximum_steps=(requirement.reachability_policy.maximum_steps_per_attempt),
+                    invocation_ownership=invocation_ownership,
+                    model_override=model_override,
                 )
             return outcome, driver.final_state_digest, True
         except TimeoutError:
@@ -3513,8 +3684,7 @@ class EnvironmentJudge:
         if errors:
             coordinates = _schema_validation_coordinates(errors)
             raise ValueError(
-                f"{label} violates actor-projected WorldSpec schema at: "
-                + ", ".join(coordinates)
+                f"{label} violates actor-projected WorldSpec schema at: " + ", ".join(coordinates)
             )
 
     @staticmethod
@@ -3527,8 +3697,7 @@ class EnvironmentJudge:
         if errors:
             coordinates = _schema_validation_coordinates(errors)
             raise ValueError(
-                "snapshot violates WorldSpec root state schema at: "
-                + ", ".join(coordinates)
+                "snapshot violates WorldSpec root state schema at: " + ", ".join(coordinates)
             )
 
     @staticmethod
@@ -4122,8 +4291,7 @@ def _sanitize_evidence(
         return sanitized
     if isinstance(value, (list, tuple)):
         return [
-            _sanitize_evidence(item, known_secret_canaries=known_secret_canaries)
-            for item in value
+            _sanitize_evidence(item, known_secret_canaries=known_secret_canaries) for item in value
         ]
     if isinstance(value, str):
         return safe_dynamic_text(value, known_secret_canaries=known_secret_canaries)
