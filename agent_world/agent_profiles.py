@@ -531,6 +531,7 @@ class IsolatedAgentProfileProvider:
                     operation_timeout,
                 ),
                 direct_stream_idle_timeout_seconds=self.config.direct_stream_idle_timeout_seconds,
+                direct_first_event_timeout_seconds=(self.config.direct_first_event_timeout_seconds),
                 max_events=structured_event_limit,
             ),
         )
@@ -588,15 +589,33 @@ class IsolatedAgentProfileProvider:
         )
 
     def _role_maximum(self, role: str) -> RoleCapabilityMaximum:
+        """Return the widest capability set a role may ever request.
+
+        A ceiling, not a grant: a node still has to request a capability and the
+        job permission still has to allow it.  Only the sandbox primitives are
+        enumerated -- the Codex runtime's own tools are not modelled here, so a
+        role cannot end up holding a tool the runtime withholds or vice versa.
+        """
+
         write = role == "environment-engineer"
-        network_domains = (
-            tuple(sorted(self.config.engineer_network_domain_ceiling)) if write else ()
+        # Egress is not per-role guesswork.  An Agent that can look things up but
+        # can only write its disposable workspace cannot affect anything the Judge
+        # evaluates, so every role shares the configured lookup ceiling and the
+        # Engineer adds its dependency-install ceiling on top.
+        lookup_domains = set(self.config.research_network_domain_ceiling)
+        network_domains = tuple(
+            sorted(
+                lookup_domains | set(self.config.engineer_network_domain_ceiling)
+                if write
+                else lookup_domains
+            )
         )
+        intrinsic: tuple[str, ...] = ("shell", "workspace_edit") if write else ("shell",)
         return RoleCapabilityMaximum(
             role=role,
-            policy_version="1",
+            policy_version="2",
             maximum_sandbox=(SandboxMode.WORKSPACE_WRITE if write else SandboxMode.READ_ONLY),
-            intrinsic_builtin_tools=("shell", "workspace_edit") if write else ("shell",),
+            intrinsic_builtin_tools=intrinsic,
             external=ExternalCapabilitySet(network_domains=network_domains),
         )
 

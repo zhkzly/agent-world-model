@@ -128,19 +128,24 @@ def test_profile_resolver_materializes_private_capabilities_without_ambient_inhe
     assert "https://provider.example.test/v1" not in public_profile
     assert "contract-key-never-sent" not in config_text
     assert "https://provider.example.test/v1" not in config_text
+    # Generated configuration is deliberately minimal.  It asserts only the
+    # overrides the framework's own guarantees depend on -- no interactive
+    # approval, credentials never on disk, a shell that cannot inherit the
+    # provider key, and the workspace as its own project root.  Runtime tools,
+    # feature flags and per-path filesystem rules are the SDK's business; naming
+    # them here recreated a second copy of the runtime's decisions that could
+    # disagree with it, and an unrecognized key used to stop the app-server from
+    # booting at all.
     assert 'cli_auth_credentials_store = "keyring"' in config_text
-    assert 'persistence = "none"' in config_text
-    assert "shell_snapshot = false" in config_text
     assert "sqlite_home =" not in config_text
     assert "log_dir =" not in config_text
-    assert 'web_search = "disabled"' in config_text
     assert 'default_permissions = "agent_world_isolated"' in config_text
     assert 'inherit = "none"' in config_text
-    assert f'"{profile.codex_home}" = "deny"' in config_text
-    assert f'"{profile.skills[0].path}" = "read"' in config_text
+    assert "[features]" not in config_text
+    assert "web_search" not in config_text
+    assert f'"{profile.workspace}"' in config_text
     assert "rollout_budget.enabled = true" in config_text
     assert "rollout_budget.limit_tokens = 12345" in config_text
-    assert "tool_output_token_limit = 2048" in config_text
     assert profile.rollout_token_limit == 12_345
     assert profile.tool_output_token_limit == 2_048
     verify_resolved_profile(profile)
@@ -196,9 +201,12 @@ def test_profile_resolver_mounts_only_the_pinned_custom_codex_runtime(
         },
     )
 
-    config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
-    assert f'"{codex_bin.resolve()}" = "read"' in config_text
-    assert f'"{codex_bin.parent.resolve()}" = "read"' not in config_text
+    # The claim is that the profile pins this exact binary, not that a specific
+    # filesystem rule was written for it.  Generated configuration no longer
+    # enumerates per-path reads: the workspace grant covers execution, and the
+    # pin itself is what a caller can rely on.
+    assert profile.codex_bin == codex_bin.resolve()
+    assert profile.codex_bin.parent == codex_bin.parent.resolve()
     verify_resolved_profile(profile)
 
 
@@ -246,6 +254,8 @@ def test_profile_resolver_materializes_a_pinned_isolated_runtime_tool(
         resolved_uv.path.parent
     )
     config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
+    # The isolated copy reaches the Agent through the shell PATH, which is still
+    # written.  What must never appear is the host source path.
     assert str(resolved_uv.path.parent) in config_text
     assert str(source_uv) not in config_text
     public_profile = json.dumps(profile.to_public_dict(), sort_keys=True)
@@ -279,8 +289,11 @@ def test_profile_resolver_materializes_a_pinned_isolated_runtime_tool(
         text=True,
     )
     assert python_version.stdout.startswith("Python 3.12.")
-    assert f'"{profile.runtime_interpreter.root}" = "read"' in config_text
-    assert f'"{Path(sys.prefix).resolve()}" = "read"' not in config_text
+    # The interpreter is pinned on the profile and reachable through the facade
+    # above -- which the subprocess just proved by running.  The ambient
+    # interpreter that launched this test must not be what the Agent resolves.
+    assert profile.runtime_interpreter.root != Path(sys.prefix).resolve()
+    assert str(Path(sys.prefix).resolve()) not in config_text
     verify_resolved_profile(profile)
 
     facade_uv.chmod(0o700)

@@ -58,6 +58,12 @@ class AgentBackendConfig(ConfigModel):
         "files.pythonhosted.org",
     )
     engineer_dependency_network_domains: tuple[str, ...] = ()
+    # The research/challenger ceiling for Agent-native lookup.  Researcher roles
+    # are read-only and hold no workspace write or dependency-install authority,
+    # so a broad search surface here does not widen what they can change; it only
+    # lets an Agent asked to discover a real tool ecosystem actually look it up.
+    # Narrow this in configuration for a locked-down deployment.
+    research_network_domain_ceiling: tuple[str, ...] = ("*",)
     invocation_timeout_seconds: float = Field(default=2_700, gt=0)
     structured_invocation_timeout_seconds: float = Field(default=2_700, gt=0)
     # A Provider stream that has started but stops yielding events is a
@@ -66,6 +72,17 @@ class AgentBackendConfig(ConfigModel):
     # progress; set this to ``None`` only when an external supervisor owns
     # that post-progress liveness decision.
     direct_stream_idle_timeout_seconds: float | None = Field(default=300, gt=0)
+    # Time-to-first-Provider-event is the narrower question of whether the
+    # transport is alive at all.  Before any event there is no partial result to
+    # protect, and a silent socket is indistinguishable from a dropped one, so
+    # this bound is much tighter than the logical wall above.  It is not a
+    # thinking-time limit: reasoning is bounded by the invocation timeouts, and
+    # the idle bound governs silence only after real progress.  A real run has
+    # already shown the failure mode this prevents -- a stream that opened,
+    # emitted zero events, and held the node for its full 8-hour wall with no
+    # retryable terminal for policy to act on.  Set to ``None`` only when an
+    # external supervisor owns first-event liveness.
+    direct_first_event_timeout_seconds: float | None = Field(default=120, gt=0)
     # These two values are the logical Environment Builder session envelope.
     # A provider can still stop one SDK turn at its own smaller output ceiling;
     # the WorkGraph turns that ceiling into explicit resumable physical turns.
@@ -81,9 +98,9 @@ class AgentBackendConfig(ConfigModel):
     # semantic validation remain the acceptance path.  Agentic Builder turns
     # retain their provider-schema protocol and their resumable logical
     # session envelope.
-    structured_output_transport: Literal[
-        "provider_schema", "json_envelope", "json_object"
-    ] = "provider_schema"
+    structured_output_transport: Literal["provider_schema", "json_envelope", "json_object"] = (
+        "provider_schema"
+    )
     tool_output_token_limit: int = Field(default=2_048, ge=512, le=32_768)
     # A real isolated structured-node diagnostic can need the same long
     # observation envelope as CandidateBuild.  Keep this finite so leases,

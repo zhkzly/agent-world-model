@@ -1254,13 +1254,32 @@ def _parse_capability_signal(value: str) -> CapabilityAggregateSignal:
 
 
 def _job_permissions(config: FoundryConfig) -> PermissionScope:
+    """Grant the job-level ceiling every Agent capability is then checked against.
+
+    A capability needs three independent yeses: the role ceiling, this job grant,
+    and the node's own request.  The grant previously carried network domains only
+    when dependency installs were configured, so on a default config it was empty
+    and every Agent lookup was denied at compile time -- while the role ceiling and
+    the generated runtime config each looked individually reasonable.  The union of
+    both configured ceilings is granted here instead; narrowing stays a
+    configuration decision, and the per-role ceiling plus per-node request still
+    decide what any single Agent actually receives.
+    """
+
     handles = (
         (config.research.jina_credential_handle,)
         if config.research.jina_api_key_environment is not None
         else ()
     )
-    dependency_domains = config.agent.engineer_dependency_network_domains
-    network_domains = tuple(sorted({"*", *dependency_domains})) if dependency_domains else ()
+    network_domains = tuple(
+        sorted(
+            {
+                *config.agent.engineer_network_domain_ceiling,
+                *config.agent.engineer_dependency_network_domains,
+                *config.agent.research_network_domain_ceiling,
+            }
+        )
+    )
     return PermissionScope(
         network_domains=network_domains,
         credential_handles=handles,

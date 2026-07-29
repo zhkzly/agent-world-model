@@ -2519,6 +2519,19 @@ def _builder_repair_scenario(tmp_path: Path, name: str) -> _BuilderRepairScenari
     repair_state = SimpleNamespace(
         profile=repair_profile,
         invocation_session=repair_session,
+        # ``repair_turn_requirements`` reads the immutable per-turn envelope off
+        # the session state.  Without these the helper raised AttributeError,
+        # which the controller's broad handler reported as an invalid repair
+        # profile -- so each of these tests halted before reaching the
+        # infrastructure-failure path it exists to verify.
+        physical_turn_token_limit=256,
+        # The reserved wall must cover the declared turn plus the supervisor's
+        # bounded interrupt/kill handshake, which is what these leases assert.
+        physical_turn_timeout_seconds=(
+            repair_profile.limits.supervisor_wall_ceiling_seconds
+            - repair_profile.limits.timeout_seconds
+            + 5.0
+        ),
     )
     build = BuildBundle(
         implementation_contract=store.get_json(

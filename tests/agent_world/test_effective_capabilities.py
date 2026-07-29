@@ -234,7 +234,11 @@ def test_engineer_profile_keeps_intrinsic_build_tools_but_gets_no_implicit_netwo
     assert profile.allowed_network_domains == ()
     assert profile.effective_capability_plan.external.network_domains == ()
     assert set(profile.to_public_dict()) >= {"effective_capability_plan", "profile_hash"}
-    assert 'web_search = "disabled"' in (profile.codex_home / "config.toml").read_text()
+    # Runtime tools are not enumerated in generated configuration at all.  The
+    # framework models only the sandbox primitives that decide whether an Agent
+    # can change something; which tools the Codex runtime offers is its own
+    # decision, and a second copy of it here could only disagree.
+    assert "web_search" not in (profile.codex_home / "config.toml").read_text()
 
 
 def test_engineer_runtime_skills_are_selected_by_exact_build_node(tmp_path: Path) -> None:
@@ -328,8 +332,11 @@ def test_tool_free_structured_profile_injects_role_skill_without_shell(
     assert "Research World Evidence" in profile.developer_instructions
     assert "Citation catalog ownership" in profile.developer_instructions
     assert "`evidence_catalog_indexes`" in profile.developer_instructions
+    # Tool-free is expressed by the resolved profile, asserted above, not by a
+    # feature flag in generated configuration.  This profile is routed to the
+    # Direct transport, which has no tool surface to disable in the first place.
     config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
-    assert "shell_tool = false" in config_text
+    assert "[features]" not in config_text
 
 
 def test_tool_free_challenger_profile_loads_action_input_schema_audit(

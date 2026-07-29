@@ -16,6 +16,14 @@ that id.  This over-invalidates (a safe direction — it re-runs work that would
 have produced an identical result) but can never under-invalidate (reuse a
 result the current code would not produce).  Granularity can be tightened to
 per-leaf later without changing the acceptance contract.
+
+Over-invalidation is safe only while it stays *semantic*.  The physical
+invocation control plane (``agent_world.invocation.*``) decides how one attempt
+is admitted, supervised, retried and settled — never what a correct answer is.
+Binding it into an acceptance digest made every transport or liveness repair
+invalidate already-committed semantic Artifacts, so no run could converge while
+the control plane was under repair.  ``leaf_code_revision`` therefore rejects
+those modules outright: an acceptance identity may not depend on them.
 """
 
 from __future__ import annotations
@@ -25,6 +33,11 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from agent_world.contracts import canonical_json_bytes, sha256_digest
+
+# The physical invocation control plane: adapters, worker lifecycle, liveness
+# supervision, retry/fallback routing, ownership, recovery and audit.  None of
+# it authors meaning, so none of it may enter an acceptance identity.
+_CONTROL_PLANE_MODULE_PREFIX = "agent_world.invocation."
 
 
 def _module_source_bytes(module_name: str) -> bytes:
@@ -53,15 +66,29 @@ def leaf_code_revision(
     a mounted Runtime Skill. ``model`` binds the Agent model identity when the
     leaf's output depends on it. The result is stable across processes for
     identical inputs and changes whenever a named module or asset changes.
+
+    Physical invocation-control modules are rejected: an acceptance identity may
+    depend on what a leaf asks for and what counts as correct, never on how one
+    attempt was transported, supervised or retried.
     """
 
     if not module_names:
         raise ValueError("leaf_code_revision requires at least one module name")
+    control_plane = sorted(
+        name for name in set(module_names) if name.startswith(_CONTROL_PLANE_MODULE_PREFIX)
+    )
+    if control_plane:
+        raise ValueError(
+            "leaf_code_revision cannot bind physical invocation-control modules "
+            f"into an acceptance identity: {', '.join(control_plane)}. "
+            "A transport, liveness, retry or ownership change must not make an "
+            "already-committed semantic Artifact stale; record it in the "
+            "Invocation Control Store instead."
+        )
     payload: dict[str, object] = {
         "protocol": "framework.leaf-code-revision.v1",
         "modules": {
-            name: sha256_digest(_module_source_bytes(name))
-            for name in sorted(set(module_names))
+            name: sha256_digest(_module_source_bytes(name)) for name in sorted(set(module_names))
         },
         "model": model,
     }

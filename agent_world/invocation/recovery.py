@@ -351,6 +351,12 @@ class InvocationRecoveryPolicy:
         if normalized in {
             "direct_provider_timeout",
             "direct_provider_stream_stalled",
+            # No Provider event ever arrived, so the transport -- not the model
+            # -- is the first credible owner.  Classifying it here is what gives
+            # policy an authorized fresh-session retry and then an explicit
+            # compatible-model fallback; left UNKNOWN it produced no route at
+            # all and the attempt sat until its full declared wall expired.
+            "direct_no_first_provider_event",
             # Older Scheduler leaves normalize a closed adapter transport
             # terminal under this framework-owned safe code. It is still not
             # a semantic model failure; retryability remains an independent

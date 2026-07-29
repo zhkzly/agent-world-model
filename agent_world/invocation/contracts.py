@@ -216,6 +216,16 @@ class InvocationLimits:
     # emitted an event and then goes silent.  ``None`` retains the full parent
     # timeout for that stream as well.
     direct_stream_idle_timeout_seconds: float | None = 300.0
+    # Time-to-first-Provider-event is a TRANSPORT liveness bound, not a limit on
+    # how long a model may think.  Before the first event nothing has been
+    # produced to wait for: a stream that opens and never speaks is
+    # indistinguishable from a dropped connection, and previously ran to the
+    # full logical wall (8h in real configurations) with no retryable terminal.
+    # Exceeding this bound yields a closed, retryable transport terminal that
+    # policy can route to a fresh-session retry or model fallback.  Reasoning
+    # time is bounded by ``timeout_seconds``; the idle bound above governs
+    # silence *after* real progress.  ``None`` restores the old behavior.
+    direct_first_event_timeout_seconds: float | None = 120.0
     interrupt_grace_seconds: float = 5.0
     kill_grace_seconds: float = 2.0
     max_events: int = 20_000
@@ -230,12 +240,16 @@ class InvocationLimits:
         ):
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{label} must be finite and positive")
-        if self.direct_stream_idle_timeout_seconds is not None and (
-            not isinstance(self.direct_stream_idle_timeout_seconds, (int, float))
-            or not math.isfinite(self.direct_stream_idle_timeout_seconds)
-            or self.direct_stream_idle_timeout_seconds <= 0
+        for optional_label, optional_value in (
+            ("direct_stream_idle_timeout_seconds", self.direct_stream_idle_timeout_seconds),
+            ("direct_first_event_timeout_seconds", self.direct_first_event_timeout_seconds),
         ):
-            raise ValueError("direct_stream_idle_timeout_seconds must be finite and positive")
+            if optional_value is not None and (
+                not isinstance(optional_value, (int, float))
+                or not math.isfinite(optional_value)
+                or optional_value <= 0
+            ):
+                raise ValueError(f"{optional_label} must be finite and positive")
         if not isinstance(self.max_events, int) or self.max_events <= 0:
             raise ValueError("max_events must be positive")
         if not isinstance(self.max_protocol_bytes, int) or self.max_protocol_bytes < 128 * 1024:

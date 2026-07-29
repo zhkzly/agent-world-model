@@ -42,12 +42,11 @@ _CONTROL_PLANE_VERSION = "invocation-control-plane.v1"
 class InvocationControlPlane:
     """Wrap one routed real backend with durable physical-attempt ownership."""
 
-    # Scheduler leaves use this explicit capability marker only while callers
-    # migrate away from their historical local timeout wrappers.  Production
-    # composition always supplies this control plane, so it has one physical
-    # lifecycle owner; test doubles and deliberately standalone adapters keep
-    # their own declared-envelope guard.
-    owns_declared_lifecycle = True
+    # There is no capability marker for "who owns the physical lifecycle".
+    # Callers used to probe one and keep a fallback wall/retry of their own,
+    # which meant two policies could settle one attempt differently.  This
+    # class is now the only backend any caller receives, so ownership is a
+    # structural fact rather than something to detect at runtime.
 
     def __init__(
         self,

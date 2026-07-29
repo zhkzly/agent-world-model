@@ -127,24 +127,21 @@ def test_solver_profile_is_fresh_source_blind_and_capability_empty(tmp_path: Pat
     assert "must-not-cross-solver-boundary" not in public_profile
 
     config_text = (first.codex_home / "config.toml").read_text(encoding="utf-8")
-    assert 'web_search = "disabled"' in config_text
-    assert "hooks = false" in config_text
-    assert "apps = false" in config_text
-    assert "plugins = false" in config_text
-    assert "remote_plugin = false" in config_text
-    assert "tool_suggest = false" in config_text
-    assert "workspace_dependencies = false" in config_text
-    assert "memories = false" in config_text
-    assert "goals = false" in config_text
-    assert "multi_agent = false" in config_text
-    assert "shell_tool = false" in config_text
-    assert "skill_mcp_dependency_install = false" in config_text
+    # The solver's isolation is a property of its resolved profile -- asserted
+    # above: no skills, no MCP, no credentials, no ambient environment.  It is not
+    # a list of disabled feature flags in generated configuration.  That list is
+    # gone: it duplicated the runtime's own decisions about which tools exist, and
+    # an unrecognized key in it used to stop the app-server from booting.
+    assert "[features]" not in config_text
+    assert "web_search" not in config_text
     assert 'inherit = "none"' in config_text
-    assert '":root" = "deny"' in config_text
-    assert "enabled = false" in config_text
     assert "[[skills.config]]" not in config_text
     assert "[mcp_servers." not in config_text
-    assert f'{json.dumps(str(framework_workspace))} = "read"' not in config_text
+    # Source-blind is about content, not path depth: the solver's runtime root
+    # lives under the framework workspace (asserted above), but none of that
+    # workspace's private files or ambient Codex config may be staged into it.
+    assert not (first.workspace / "AGENTS.md").exists()
+    assert not (first.workspace / ".codex").exists()
     assert "rollout_budget.limit_tokens = 4096" in config_text
     assert "rollout_budget.reminder_at_remaining_tokens = [409]" in config_text
     assert "rollout_budget.sampling_token_weight = 1.0" in config_text

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -703,14 +704,26 @@ async def test_direct_backend_does_not_mark_dispatch_as_provider_progress(
 async def test_direct_backend_does_not_apply_idle_liveness_before_first_provider_event(
     tmp_path: Path,
 ) -> None:
-    """A started HTTP request still needs a real first Provider event before idle timing applies."""
+    """The post-progress idle bound must not fire before any Provider event exists.
+
+    Boundary: DirectLlmBackend -> stream that withholds its first event.
+    The idle interval answers "did a live stream go quiet mid-response"; with
+    zero events there is no progress to have lost, so first-event liveness (a
+    separate, explicitly disabled bound here) is the only thing entitled to end
+    this wait.  Failing this test means an idle timeout is being charged for
+    latency it cannot observe.
+    """
 
     request, _, _ = _request(tmp_path)
     request = replace(
         request,
         profile=replace(
             request.profile,
-            limits=replace(request.profile.limits, direct_stream_idle_timeout_seconds=0.02),
+            limits=replace(
+                request.profile.limits,
+                direct_stream_idle_timeout_seconds=0.02,
+                direct_first_event_timeout_seconds=None,
+            ),
         ),
     )
     responses = _FirstEventStallingStreamResponses()
@@ -735,6 +748,168 @@ async def test_direct_backend_does_not_apply_idle_liveness_before_first_provider
     assert result.status is InvocationStatus.COMPLETED
     assert result.error is None
     assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_terminalizes_a_stream_that_never_emits_a_first_event(
+    tmp_path: Path,
+) -> None:
+    """An opened stream that never speaks must become a retryable terminal.
+
+    Boundary: DirectLlmBackend -> real stream object that yields nothing.
+    Frozen input: one resolved tool-free structured profile whose declared
+    logical wall is far larger than its first-event bound -- the exact shape of
+    the real run where a Direct attempt held a node for its full 8-hour wall
+    with ``provider_progress_count = 0`` and no terminal any policy could act
+    on.  The one poisoned condition is time-to-first-event.
+
+    Expected: FAILED / ``direct_no_first_provider_event`` / retryable, carrying
+    the safe waiting phase and a zero event count.  A ``direct_timeout`` here
+    would mean the declared wall was spent and would send attribution toward
+    model latency instead of transport liveness.
+    """
+
+    request, _, _ = _request(tmp_path)
+    request = replace(
+        request,
+        profile=replace(
+            request.profile,
+            limits=replace(
+                request.profile.limits,
+                timeout_seconds=30.0,
+                direct_stream_idle_timeout_seconds=300.0,
+                direct_first_event_timeout_seconds=0.05,
+            ),
+        ),
+    )
+    responses = _FirstEventStallingStreamResponses()
+    client = _FakeClient(responses=responses)
+    telemetry = TelemetryStore(tmp_path / "telemetry")
+    started = time.monotonic()
+    try:
+        result = await asyncio.wait_for(
+            DirectLlmBackend(
+                client_factory=lambda **_: client,
+                telemetry=telemetry,
+                liveness_heartbeat_seconds=0.01,
+            ).invoke(request),
+            timeout=5,
+        )
+    finally:
+        responses.stream.release.set()
+        telemetry.close()
+    elapsed = time.monotonic() - started
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_no_first_provider_event"
+    assert result.error.retryable is True
+    assert result.error.details == {
+        "waiting_phase": "direct_awaiting_stream_event",
+        "first_event_timeout_seconds": 0.05,
+        "observed_provider_event_count": 0,
+    }
+    # The bound, not the declared wall, ended this attempt.
+    assert elapsed < 5
+    assert client.closed
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_terminalizes_a_request_that_never_returns_a_stream(
+    tmp_path: Path,
+) -> None:
+    """The first-event bound also covers the wait for the stream itself.
+
+    Boundary: DirectLlmBackend -> ``responses.create`` that never returns.
+    The two waits before a first event (opening the stream, reading from it)
+    share one deadline, so a request that never gets a stream is bounded too --
+    and its safe waiting phase must say ``direct_awaiting_response`` so the next
+    read distinguishes "request never left" from "stream opened and stayed
+    silent".
+    """
+
+    request, _, _ = _request(tmp_path)
+    request = replace(
+        request,
+        profile=replace(
+            request.profile,
+            limits=replace(
+                request.profile.limits,
+                timeout_seconds=30.0,
+                direct_first_event_timeout_seconds=0.05,
+            ),
+        ),
+    )
+    responses = _BlockingResponses()
+    client = _FakeClient(responses=responses)
+    telemetry = TelemetryStore(tmp_path / "telemetry")
+    try:
+        result = await asyncio.wait_for(
+            DirectLlmBackend(
+                client_factory=lambda **_: client,
+                telemetry=telemetry,
+                liveness_heartbeat_seconds=0.01,
+            ).invoke(request),
+            timeout=5,
+        )
+    finally:
+        responses.release_response.set()
+        telemetry.close()
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_no_first_provider_event"
+    assert result.error.retryable is True
+    assert result.error.details["waiting_phase"] == "direct_awaiting_response"
+
+
+@pytest.mark.asyncio
+async def test_direct_first_event_bound_does_not_curtail_a_slow_but_live_stream(
+    tmp_path: Path,
+) -> None:
+    """One real Provider event must retire the first-event bound entirely.
+
+    Boundary: DirectLlmBackend -> stream that emits events, then stalls longer
+    than the first-event bound before completing.  This is the guard against
+    the bound degenerating into a short death clock on model reasoning: once the
+    transport has proven itself, only the (much larger) idle interval and the
+    declared wall may end the attempt.
+    """
+
+    request, _, _ = _request(tmp_path)
+    request = replace(
+        request,
+        profile=replace(
+            request.profile,
+            limits=replace(
+                request.profile.limits,
+                direct_stream_idle_timeout_seconds=None,
+                direct_first_event_timeout_seconds=0.02,
+            ),
+        ),
+    )
+    responses = _StallingStreamResponses()
+    client = _FakeClient(responses=responses)
+    telemetry = TelemetryStore(tmp_path / "telemetry")
+    task = asyncio.create_task(
+        DirectLlmBackend(
+            client_factory=lambda **_: client,
+            telemetry=telemetry,
+            liveness_heartbeat_seconds=0.005,
+        ).invoke(request)
+    )
+    try:
+        await asyncio.wait_for(responses.stream.waiting_for_next_event.wait(), timeout=1)
+        # Well past the first-event bound; real events already retired it.
+        await asyncio.sleep(0.08)
+        assert not task.done()
+    finally:
+        responses.stream.release.set()
+        result = await asyncio.wait_for(task, timeout=1)
+        telemetry.close()
+
+    assert result.error is not None
+    assert result.error.code != "direct_no_first_provider_event"
 
 
 @pytest.mark.asyncio

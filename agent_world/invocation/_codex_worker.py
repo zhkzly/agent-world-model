@@ -825,7 +825,13 @@ def _app_server_environment(
 def _app_server_launch_args(codex_binary: Path, *, hooks_enabled: bool) -> tuple[str, ...]:
     """Build a Codex app-server command without upstream routing material."""
 
-    launch_args = [str(codex_binary), "--strict-config"]
+    # No ``--strict-config``.  It makes the app-server refuse to start on any key
+    # it does not recognize, which turns a harmless or newly-renamed setting into
+    # an opaque ``sdk_session_open`` failure with no indication of which line was
+    # at fault.  Codex ignoring a setting it does not understand is the tolerant
+    # behavior we want; the settings that actually matter are asserted by the
+    # framework itself rather than by refusing to boot.
+    launch_args = [str(codex_binary)]
     if hooks_enabled:
         # Resolver-vetted hooks are copied into the otherwise empty
         # CODEX_HOME.  The SDK has no hook-trust API, so automation must use

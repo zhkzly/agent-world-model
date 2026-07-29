@@ -114,9 +114,8 @@ def test_worker_payload_passes_logical_schema_directly_to_codex_sdk(
     assert request.profile.codex_bin_sha256 is not None
     assert payload["codex_bin"] == str(request.profile.codex_bin)
     assert payload["codex_bin_sha256"] == request.profile.codex_bin_sha256
-    assert f'"{request.profile.codex_bin}" = "read"' in (
-        request.profile.codex_home / "config.toml"
-    ).read_text(encoding="utf-8")
+    # The worker payload carries the pinned binary and its digest, asserted just
+    # above.  Generated configuration no longer enumerates per-path reads for it.
     assert payload["openai_base_url_environment"] == "OPENAI_BASE_URL"
     assert payload["sensitive_environment_names"] == ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
     assert payload["diagnostic_capture_terminal_excerpt"] is False

@@ -74,6 +74,31 @@ _SHARED_SCHEDULER_FEEDBACK_MODULES = (
     "agent_world.control.work_scheduler",
 )
 
+# SEMANTIC IDENTITY vs CONTROL-PLANE VERSION.
+#
+# ``implementation_revision_id`` flows into ``acceptance_digest``, so any module
+# named by a leaf's implementation tuple invalidates every already-committed
+# output of that leaf when its source changes.  That is correct for surfaces
+# which author *meaning*: the rendered Prompt, the output schema, the mounted
+# Runtime Skill, and the model identity.  It is wrong for the physical
+# invocation control plane -- transport adapters, worker lifecycle, liveness
+# supervision, retry/fallback routing, ownership and recovery.  Those decide
+# only *how* one physical attempt is admitted, observed and settled; a fix
+# there cannot make an accepted semantic Artifact retroactively invalid.
+#
+# Binding them anyway produced a real, mechanical failure mode: every
+# invocation-layer repair marked committed upstream nodes stale and forced a
+# full regeneration, so no run could converge while the control plane was still
+# being fixed.  Invocation modules are therefore deliberately excluded from
+# every ``*_IMPLEMENTATION_MODULES`` tuple below.  They remain observable
+# through the durable Invocation Control Store and telemetry, which is where a
+# physical-attempt change belongs.
+#
+# The rule for adding a module here: include it only if changing it can change
+# what a correct model would be asked to produce, or what counts as a correct
+# answer.  Never include it merely because the leaf calls into it.
+# ``leaf_code_revision`` enforces this mechanically.
+
 _EVIDENCE_SYNTHESIS_IMPLEMENTATION_MODULES = (
     "agent_world.designer.evidence_synthesis_leaf",
     "agent_world.designer.evidence_synthesis_compiler",
@@ -116,8 +141,6 @@ _TOOL_SEMANTICS_BATCH_SKILL = (
 )
 _VERIFIER_INTENT_BATCH_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
-    "agent_world.invocation.codex_sdk",
-    "agent_world.invocation.direct_llm",
     "agent_world.judge.compiler",
     "agent_world.judge.models",
 )
@@ -171,9 +194,6 @@ _CANDIDATE_BUILD_IMPLEMENTATION_MODULES = (
     "agent_world.builder.leaf",
     "agent_world.builder.models",
     "agent_world.builder.service",
-    "agent_world.invocation.contracts",
-    "agent_world.invocation.codex_sdk",
-    "agent_world.invocation.profiles",
 )
 _CANDIDATE_BUILD_VALIDATOR_MODULES = (
     "agent_world.builder.leaf",

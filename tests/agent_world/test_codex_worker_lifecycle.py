@@ -472,7 +472,10 @@ def test_worker_keeps_custom_provider_routing_off_argv() -> None:
         hooks_enabled=False,
     )
 
-    assert launch_args == ("/opt/codex", "--strict-config", "app-server", "--listen", "stdio://")
+    # No ``--strict-config``: it made the app-server refuse to boot on any key it
+    # did not recognize, surfacing as an opaque ``sdk_session_open`` failure that
+    # named no line.  Tolerating unknown settings is the behavior we want.
+    assert launch_args == ("/opt/codex", "app-server", "--listen", "stdio://")
     assert "--config" not in launch_args
     assert routing_canary not in " ".join(launch_args)
     assert _thread_config_for_api_key_provider(routing_canary) == {

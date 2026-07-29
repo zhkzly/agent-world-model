@@ -460,9 +460,12 @@ class _RetryableBackend:
 
 
 class _ControlPlaneOwnedRetryableBackend(_RetryableBackend):
-    """Expose a closed transient through the production lifecycle boundary."""
+    """Expose a closed transient through the production lifecycle boundary.
 
-    owns_declared_lifecycle = True
+    Every backend a caller receives is the Invocation Control Plane, so a closed
+    transient always arrives already classified and settled.  There is no longer
+    a variant that lets a semantic loop spend its own transport retry.
+    """
 
 
 class _TransientThenFallbackBackend:
@@ -1433,42 +1436,6 @@ def test_schema_ir_compiler_canonicalizes_satisfiable_enum_const_intersections()
         "status": {"type": "string", "const": "cancelled"},
         "ordinal": {"type": "integer", "const": 2},
     }
-
-
-@pytest.mark.asyncio
-async def test_retryable_backend_failure_replays_immutable_node_in_fresh_session(
-    tmp_path: Path,
-) -> None:
-    backend = _RetryableBackend()
-    designer = EnvironmentDesigner(
-        artifact_store=cast(ArtifactWriter, object()),
-        research_artifact_store=cast(ArtifactWriter, object()),
-        invocation_backend=cast(InvocationBackend, backend),
-        profile_provider=cast(AgentProfileProvider, _ProfileProvider()),
-        research_toolchain=cast(ResearchToolchain, object()),
-        maximum_structured_reworks=1,
-    )
-
-    output, results = await designer.run_structured_agent(
-        role="environment-engineer",
-        lineage_id="lineage:backend-retry",
-        workspace=tmp_path,
-        model=_Output,
-        prompt="Create the artifact from the immutable node inputs.",
-        permissions=PermissionScope(),
-        budget=DesignerInvocationBudget(
-            Budget(llm_tokens=1_000, agent_turns=2, repair_attempts=1, wall_seconds=30)
-        ),
-    )
-
-    assert output == _Output(value="valid")
-    assert [result.status for result in results] == [
-        InvocationStatus.FAILED,
-        InvocationStatus.COMPLETED,
-    ]
-    assert backend.requests[1].session is None
-    assert backend.requests[1].prompt == backend.requests[0].prompt
-    assert backend.requests[1].metadata["repair_mode"] == "backend_retry"
 
 
 @pytest.mark.asyncio

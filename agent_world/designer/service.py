@@ -6161,20 +6161,18 @@ class EnvironmentDesigner:
         *,
         declared_wall_seconds: float,
     ) -> InvocationResult:
-        """Cross one physical invocation boundary with one production owner.
+        """Cross one physical invocation boundary with exactly one owner.
 
-        Application composition always injects ``InvocationControlPlane``;
-        there it owns the declared physical wall and produces the durable
-        terminal fact.  The narrowly retained wrapper exists only for an
-        explicitly standalone adapter/test double, where there is no parent
-        control plane to enforce the caller's declared envelope.  It is not a
-        second production timeout or retry policy.
+        The Invocation Control Plane is the only ``InvocationBackend`` any
+        caller receives, and it owns the declared physical wall, liveness
+        supervision and the durable terminal fact.  This helper therefore adds
+        no wall of its own: a second timeout here would race the control
+        plane's and produce two disagreeing terminals for one attempt.
+        ``declared_wall_seconds`` is retained as the caller's declared envelope
+        for feedback and budget prose only.
         """
 
-        if getattr(self.backend, "owns_declared_lifecycle", False):
-            return await self.backend.invoke(request)
-        async with asyncio.timeout(declared_wall_seconds):
-            return await self.backend.invoke(request)
+        return await self.backend.invoke(request)
 
     async def run_structured_agent(
         self,
@@ -6481,29 +6479,14 @@ class EnvironmentDesigner:
                     else f"backend_{result.status.value}"
                 )
                 await complete_active_repair((backend_issue,))
-                if (
-                    result.error is not None
-                    and result.error.retryable
-                    and attempt < self.maximum_structured_reworks
-                    # A production Invocation Control Plane has already
-                    # normalized and durably classified this physical terminal.
-                    # Scheduler/WorkRuntime—not this legacy helper—owns any
-                    # fresh-session retry or model fallback.
-                    and not getattr(self.backend, "owns_declared_lifecycle", False)
-                ):
-                    # A transport/provider failure is not a semantic correction.
-                    # Preserve the failed InvocationResult for audit, but retry the
-                    # immutable node input in a fresh session so partial provider
-                    # state cannot silently affect the artifact.
-                    session = None
-                    current_prompt = immutable_prompt
-                    repair_mode = StructuredRepairMode.BACKEND_RETRY.value
-                    await authorize_repair(
-                        StructuredRepairMode.BACKEND_RETRY,
-                        (backend_issue,),
-                        continued_session=False,
-                    )
-                    continue
+                # A physical transport/provider terminal is never retried here.
+                # The Invocation Control Plane has already classified and
+                # durably settled it; Scheduler/WorkRuntime owns the one
+                # authorized fresh-session retry and the explicit model
+                # fallback.  Consuming that authority inside this semantic loop
+                # is what previously produced two competing retry policies for
+                # one attempt.  This loop only spends turns on *semantic*
+                # corrections against a parsed candidate.
                 message = result.error.message if result.error else result.status.value
                 self._record_feedback_terminal(
                     contract_id=feedback_contract_id,

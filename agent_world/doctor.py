@@ -59,6 +59,11 @@ _RUNTIME_PYTHON_PROBE = (
 )
 _LIVE_AGENT_STATUS_FILENAME = "doctor-live-agent.json"
 _LIVE_AGENT_DEBUG_FILENAME = "doctor-live-agent-debug.json"
+# The probe's tool-dispatch evidence.  A fixed name and content keep the check
+# deterministic and make the file recognizable as framework-owned, so a leftover
+# marker can never be mistaken for Agent-authored candidate material.
+_LIVE_AGENT_PROBE_FILENAME = "agent-world-live-agent-probe.txt"
+_LIVE_AGENT_PROBE_CONTENT = "agent-world-live-agent-probe-ok"
 
 
 class DoctorCheck(BaseModel):
@@ -273,13 +278,26 @@ async def run_doctor(
 
 
 async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
-    """Spend one observable real backend turn without persisting private content.
+    """Spend one observable real Agent turn without persisting private content.
 
     ``doctor --live-agent`` is a provider control, not a miniature node test.
     It deliberately receives the largest configured real-Agent token envelope;
     a small requested result must not silently create a smaller SDK budget.  A
     compact current-status file and the ordinary telemetry trace make a long
     control observable from a second process while it is still running.
+
+    This probe asks the Agent to USE A TOOL -- write a file into its own isolated
+    workspace -- and then verifies that file on disk.  A prompt-only round trip
+    ("return this object, do not call tools") proves the transport and nothing
+    else: worker spawn, app-server startup, sandbox mounts and tool dispatch can
+    all be broken while it still passes.  Those are exactly the layers that fail
+    in practice, so the control has to cross them.  The structured answer alone is
+    not sufficient evidence: only the observed workspace file proves a tool ran.
+
+    The probe deliberately exercises one framework-owned primitive rather than
+    surveying the runtime's tool catalogue.  Which tools a Codex runtime offers is
+    its own business, and a readiness check that asserted a specific catalogue
+    would fail whenever that catalogue legitimately changed.
     """
 
     trace_id = f"doctor-live-agent:{uuid.uuid4().hex}"
@@ -319,36 +337,49 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
             dir=config.state_root,
         ) as temporary:
             provider = IsolatedAgentProfileProvider(config.agent)
+            # The Engineer role is the one with workspace-write authority, so it
+            # is the only role that can prove tool dispatch end to end.  Probing
+            # a read-only role would leave the write path -- the one CandidateBuild
+            # depends on -- untested.
             profile = provider.resolve(
-                role="researcher",
+                role="environment-engineer",
                 lineage_id="doctor.live-agent",
                 workspace=Path(temporary) / "logical",
                 output_schema={
                     "type": "object",
-                    "properties": {"status": {"type": "string", "enum": ["ok"]}},
-                    "required": ["status"],
+                    "properties": {
+                        "status": {"type": "string", "enum": ["ok"]},
+                        "wrote_file": {"type": "boolean"},
+                    },
+                    "required": ["status", "wrote_file"],
                     "additionalProperties": False,
                 },
-                permissions=PermissionScope(),
-                requirement=NodeCapabilityRequirement.structured_read(
-                    node_id="researcher.doctor-live-agent",
-                    role="researcher",
+                permissions=_live_agent_probe_permissions(config),
+                requirement=NodeCapabilityRequirement.isolated_build(
+                    node_id="engineer.doctor-live-agent",
                 ),
                 rollout_token_limit=rollout_token_limit,
             )
+            probe_marker = profile.workspace / _LIVE_AGENT_PROBE_FILENAME
             result = await backend.invoke(
                 InvocationRequest(
                     invocation_id=invocation_id,
                     prompt=(
-                        "This is a production InvocationBackend readiness probe. "
-                        "Do not call tools. Return exactly the structured object "
-                        '{"status":"ok"}.'
+                        "This is a production Agent readiness probe. Use your real "
+                        "tools; do not simulate their results.\n"
+                        f"1. Write a file named {_LIVE_AGENT_PROBE_FILENAME} in your "
+                        "current working directory. Its content must be exactly the "
+                        f"single line {_LIVE_AGENT_PROBE_CONTENT}\n"
+                        '2. Return the structured object with status "ok" and '
+                        "wrote_file set to whether the write actually succeeded. "
+                        "Report false if it failed; do not claim success you did "
+                        "not achieve."
                     ),
                     profile=profile,
                     metadata={
                         "trace_id": trace_id,
                         "run_id": trace_id,
-                        "role": "researcher",
+                        "role": "environment-engineer",
                         "semantic_transaction": "doctor_live_agent_probe",
                         "diagnostic_capture_terminal_excerpt": True,
                     },
@@ -360,6 +391,10 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                     ),
                 )
             )
+            # Observed while the isolated workspace still exists.  The Agent's own
+            # booleans are a self-report; this is the framework's independent
+            # evidence that a tool really ran, so the two are recorded separately.
+            tool_evidence = _live_agent_tool_evidence(result, probe_marker)
         failure_code = _live_agent_failure_code(result)
         if failure_code is not None:
             terminal_status = "failed"
@@ -377,11 +412,25 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                 status="fail",
                 summary=f"real Codex SDK turn failed ({failure_code})",
             )
+        if not tool_evidence.workspace_write_observed:
+            terminal_status = "failed"
+            failure_code = "agent_workspace_write_not_observed"
+            terminal_details = dict(tool_evidence.to_public_dict())
+            return DoctorCheck(
+                check="live_agent",
+                status="fail",
+                summary=(
+                    "the Codex turn completed but its workspace write was not "
+                    "observed on disk; tool dispatch or sandbox mounting is broken "
+                    "even though the transport works"
+                ),
+            )
         terminal_status = "passed"
+        terminal_details = dict(tool_evidence.to_public_dict())
         return DoctorCheck(
             check="live_agent",
             status="pass",
-            summary="real Codex SDK structured-output turn completed",
+            summary="real Codex Agent turn dispatched a tool and wrote its workspace file",
         )
     except asyncio.CancelledError:
         terminal_status = "interrupted"
@@ -521,12 +570,82 @@ def _live_agent_probe_rollout_token_limit(config: FoundryConfig) -> int:
     )
 
 
+def _live_agent_probe_permissions(config: FoundryConfig) -> PermissionScope:
+    """Grant the probe the same job-level ceiling a real Agent node receives.
+
+    A probe under a narrower grant than production would pass while the real
+    thing is denied, which is the failure this control exists to catch.
+    """
+
+    return PermissionScope(
+        network_domains=tuple(
+            sorted(
+                {
+                    *config.agent.engineer_network_domain_ceiling,
+                    *config.agent.engineer_dependency_network_domains,
+                    *config.agent.research_network_domain_ceiling,
+                }
+            )
+        ),
+    )
+
+
+class _LiveAgentToolEvidence(BaseModel):
+    """Framework-observed tool evidence, kept apart from the Agent's self-report."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workspace_write_observed: bool
+    workspace_content_matched: bool
+    workspace_write_self_reported: bool
+
+    def to_public_dict(self) -> JsonObject:
+        return {
+            "workspace_write_observed": self.workspace_write_observed,
+            "workspace_content_matched": self.workspace_content_matched,
+            "workspace_write_self_reported": self.workspace_write_self_reported,
+        }
+
+
+def _live_agent_tool_evidence(
+    result: InvocationResult,
+    probe_marker: Path,
+) -> _LiveAgentToolEvidence:
+    """Observe the workspace directly instead of trusting the structured answer.
+
+    ``workspace_write_observed`` is the only load-bearing field: a model can
+    report ``wrote_file: true`` without a tool ever running, so the file on disk
+    is what proves worker spawn, sandbox mounts and tool dispatch all work.  The
+    self-report is retained beside it because a disagreement between the two is
+    itself the useful diagnostic -- a real run reported false while the file was
+    present, which told us more than either fact alone.
+    """
+
+    observed = False
+    matched = False
+    try:
+        if probe_marker.is_file():
+            observed = True
+            matched = probe_marker.read_text(encoding="utf-8", errors="replace").strip() == (
+                _LIVE_AGENT_PROBE_CONTENT
+            )
+    except OSError:
+        observed = False
+    output = result.structured_output if isinstance(result.structured_output, dict) else {}
+    return _LiveAgentToolEvidence(
+        workspace_write_observed=observed,
+        workspace_content_matched=matched,
+        workspace_write_self_reported=output.get("wrote_file") is True,
+    )
+
+
 def _live_agent_failure_code(result: InvocationResult) -> str | None:
     """Classify a live probe result without disclosing provider diagnostics."""
 
     if result.status is not InvocationStatus.COMPLETED:
         return result.error.code if result.error is not None else result.status.value
-    if result.structured_output != {"status": "ok"}:
+    output = result.structured_output
+    if not isinstance(output, dict) or output.get("status") != "ok":
         return "structured_output_mismatch"
     if result.session is None:
         return "missing_session"

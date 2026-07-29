@@ -10,6 +10,10 @@ __pycache__/
 # are still local generated state rather than source.
 .agent-world-staged/
 
+# Same for run state written under this root: generated workspaces, telemetry,
+# control records and registries. Audit data, not source.
+.agent-world-runs/
+
 # Explicitly opt-in local diagnostics; never stage raw debug transcripts.
 observability/**/_debug/
 

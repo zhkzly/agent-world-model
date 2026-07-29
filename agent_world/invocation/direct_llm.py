@@ -37,6 +37,7 @@ from .profiles import ProfileResolutionError, verify_resolved_profile
 from .redaction import Redactor
 from .structured_diagnostics import (
     direct_invalid_json_details,
+    direct_no_first_provider_event_details,
     direct_output_limit_details,
     direct_provider_exception_details,
     direct_provider_response_error_details,
@@ -59,6 +60,22 @@ class _DirectStreamIdleTimeout(TimeoutError):
     def __init__(self, *, idle_timeout_seconds: float) -> None:
         self.idle_timeout_seconds = idle_timeout_seconds
         super().__init__("Direct Provider stream stopped yielding events")
+
+
+class _DirectFirstEventTimeout(TimeoutError):
+    """A Direct request never produced its first Provider event.
+
+    This is a transport-liveness fact, not a statement about model latency: no
+    Provider event has been observed at all, so nothing distinguishes a silent
+    socket from a dropped one.  Without it, a stream that opens and never speaks
+    consumed the entire declared logical wall and produced no retryable
+    terminal, so policy could neither retry nor fall back.
+    """
+
+    def __init__(self, *, first_event_timeout_seconds: float, phase: str) -> None:
+        self.first_event_timeout_seconds = first_event_timeout_seconds
+        self.phase = phase
+        super().__init__("Direct Provider produced no first event")
 
 
 class DirectLlmBackend:
@@ -330,6 +347,14 @@ class DirectLlmBackend:
                 if request.lifecycle_supervision is InvocationLifecycleSupervision.CONTROL_PLANE
                 else profile.limits.timeout_seconds
             )
+            # Time-to-first-Provider-event spans BOTH waits below: opening the
+            # stream and reading its first event.  A single shared deadline is
+            # what makes "the transport is alive" falsifiable; two independent
+            # ones would let a request idle twice as long, and none at all is the
+            # defect that let a silent stream consume an 8-hour logical wall.
+            first_event_budget = _FirstEventBudget(
+                profile.limits.direct_first_event_timeout_seconds
+            )
             async with asyncio.timeout(adapter_timeout):
                 if on_liveness is not None:
                     on_liveness("direct_request_dispatched")
@@ -350,6 +375,7 @@ class DirectLlmBackend:
                     heartbeat_seconds=self._liveness_heartbeat_seconds,
                     on_liveness=on_liveness,
                     waiting_phase="direct_awaiting_response",
+                    first_event_budget=first_event_budget,
                 )
                 if on_liveness is not None:
                     on_liveness("direct_stream_opened")
@@ -361,18 +387,35 @@ class DirectLlmBackend:
                             heartbeat_seconds=self._liveness_heartbeat_seconds,
                             on_liveness=on_liveness,
                             waiting_phase="direct_awaiting_stream_event",
-                            # Do not create a first-progress death clock.  A
-                            # stream becomes eligible only after the Provider
-                            # has already emitted one real event and then goes
-                            # silent for the profile-owned liveness interval.
+                            # Two different silences, two different bounds.
+                            # After real progress, the profile's idle interval
+                            # governs a stream that goes quiet mid-response.
+                            # Before any event, the shared first-event budget
+                            # bounds transport liveness instead -- neither is a
+                            # limit on how long the model may reason.
                             idle_timeout_seconds=(
                                 profile.limits.direct_stream_idle_timeout_seconds
                                 if observed_provider_event_count > 0
                                 else None
                             ),
+                            first_event_budget=(
+                                None if observed_provider_event_count > 0 else first_event_budget
+                            ),
                         )
                     except StopAsyncIteration:
                         break
+                    except _DirectFirstEventTimeout as exc:
+                        return _local_failure(
+                            request,
+                            status=InvocationStatus.FAILED,
+                            code="direct_no_first_provider_event",
+                            started=started,
+                            retryable=True,
+                            details=direct_no_first_provider_event_details(
+                                first_event_timeout_seconds=exc.first_event_timeout_seconds,
+                                last_local_phase=exc.phase,
+                            ),
+                        )
                     except _DirectStreamIdleTimeout as exc:
                         return _local_failure(
                             request,
@@ -419,6 +462,23 @@ class DirectLlmBackend:
                         code="direct_stream_terminal_missing",
                         started=started,
                     )
+        except _DirectFirstEventTimeout as exc:
+            # Raised while opening the stream, before the event loop above could
+            # classify it.  It must not collapse into the generic
+            # ``direct_timeout`` below: that code says the declared wall was
+            # spent, which would send policy looking at model latency instead of
+            # the transport that never spoke.
+            return _local_failure(
+                request,
+                status=InvocationStatus.FAILED,
+                code="direct_no_first_provider_event",
+                started=started,
+                retryable=True,
+                details=direct_no_first_provider_event_details(
+                    first_event_timeout_seconds=exc.first_event_timeout_seconds,
+                    last_local_phase=exc.phase,
+                ),
+            )
         except TimeoutError:
             return _local_failure(
                 request,
@@ -563,6 +623,39 @@ def _default_client_factory(
     )
 
 
+class _FirstEventBudget:
+    """One deadline shared by every wait that precedes the first Provider event.
+
+    Opening the stream and reading its first event are separate awaits but the
+    same question: is this transport alive at all?  Holding one monotonic
+    deadline across both keeps the answer bounded no matter how the SDK splits
+    the work.  ``None`` disables the bound and restores the pre-policy behavior.
+    """
+
+    __slots__ = ("_deadline", "timeout_seconds")
+
+    def __init__(self, timeout_seconds: float | None) -> None:
+        self.timeout_seconds = timeout_seconds
+        self._deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
+
+    @property
+    def enabled(self) -> bool:
+        return self._deadline is not None
+
+    def remaining(self) -> float | None:
+        if self._deadline is None:
+            return None
+        return self._deadline - time.monotonic()
+
+    def expired(self, phase: str) -> _DirectFirstEventTimeout:
+        # ``timeout_seconds`` is not None whenever a deadline exists.
+        assert self.timeout_seconds is not None
+        return _DirectFirstEventTimeout(
+            first_event_timeout_seconds=self.timeout_seconds,
+            phase=phase,
+        )
+
+
 async def _await_with_liveness_heartbeats(
     operation: Any,
     *,
@@ -570,36 +663,54 @@ async def _await_with_liveness_heartbeats(
     on_liveness: Callable[[str], None] | None,
     waiting_phase: str,
     idle_timeout_seconds: float | None = None,
+    first_event_budget: _FirstEventBudget | None = None,
 ) -> Any:
     """Await one SDK boundary while truthfully reporting local waiting.
 
     Heartbeats are separate from Provider events. They neither reset a timeout
     nor consume retry authority; they only prove that this adapter task remains
     alive awaiting the next SDK result.
+
+    At most one of ``idle_timeout_seconds`` (silence after real progress) and
+    ``first_event_budget`` (silence before any progress) applies to a given
+    wait; the caller selects which question this wait is answering.
     """
 
-    if on_liveness is None and idle_timeout_seconds is None:
+    bounded_first_event = first_event_budget is not None and first_event_budget.enabled
+    if on_liveness is None and idle_timeout_seconds is None and not bounded_first_event:
         return await operation
     task = asyncio.ensure_future(operation)
     started = time.monotonic()
+
+    def deadline_remaining() -> float | None:
+        """Return seconds left on whichever bound governs this wait."""
+
+        if idle_timeout_seconds is not None:
+            return idle_timeout_seconds - (time.monotonic() - started)
+        if first_event_budget is not None and first_event_budget.enabled:
+            return first_event_budget.remaining()
+        return None
+
+    def expired() -> TimeoutError:
+        if idle_timeout_seconds is not None:
+            return _DirectStreamIdleTimeout(idle_timeout_seconds=idle_timeout_seconds)
+        assert first_event_budget is not None
+        return first_event_budget.expired(waiting_phase)
+
     try:
         while True:
             wait_seconds: float | None = heartbeat_seconds if on_liveness is not None else None
-            if idle_timeout_seconds is not None:
-                remaining = idle_timeout_seconds - (time.monotonic() - started)
+            remaining = deadline_remaining()
+            if remaining is not None:
                 if remaining <= 0:
-                    raise _DirectStreamIdleTimeout(
-                        idle_timeout_seconds=idle_timeout_seconds,
-                    )
+                    raise expired()
                 wait_seconds = remaining if wait_seconds is None else min(wait_seconds, remaining)
             done, _ = await asyncio.wait((task,), timeout=wait_seconds)
             if done:
                 return task.result()
-            if (
-                idle_timeout_seconds is not None
-                and time.monotonic() - started >= idle_timeout_seconds
-            ):
-                raise _DirectStreamIdleTimeout(idle_timeout_seconds=idle_timeout_seconds)
+            remaining = deadline_remaining()
+            if remaining is not None and remaining <= 0:
+                raise expired()
             if on_liveness is not None:
                 on_liveness(waiting_phase)
     finally:

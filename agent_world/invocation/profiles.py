@@ -53,7 +53,7 @@ _SENSITIVE_HOOK_FIELD = re.compile(
 _SAFE_BASE_ENVIRONMENT_NAMES = frozenset(
     {"PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"}
 )
-_SUPPORTED_BUILTIN_TOOLS = frozenset({"shell", "workspace_edit", "web_search", "multi_agent"})
+_SUPPORTED_BUILTIN_TOOLS = frozenset({"shell", "workspace_edit"})
 _CONTROL_PATHS = (".codex", ".agents", "AGENTS.md")
 _PROJECT_ROOT_MARKER = ".agent-world-project-root"
 _PERMISSIONS_PROFILE = "agent_world_isolated"
@@ -270,18 +270,14 @@ class AgentProfileSpec:
             raise ValueError("workspace-write profiles must explicitly allow workspace_edit")
         if self.sandbox is not self.effective_capability_plan.sandbox:
             raise ValueError("sandbox must equal the effective capability plan")
-        if self.allowed_builtin_tools != (
-            self.effective_capability_plan.intrinsic_builtin_tools
-        ):
+        if self.allowed_builtin_tools != (self.effective_capability_plan.intrinsic_builtin_tools):
             raise ValueError("builtin tools must equal the effective intrinsic capability set")
         if self.allowed_network_domains != (
             self.effective_capability_plan.external.network_domains
         ):
             raise ValueError("network domains must equal the effective capability set")
         external_handles = set(self.credential_handles) - {self.authentication_handle}
-        if external_handles != set(
-            self.effective_capability_plan.external.credential_handles
-        ):
+        if external_handles != set(self.effective_capability_plan.external.credential_handles):
             raise ValueError("external credential handles must equal the effective capability set")
         if self.mcp_servers or self.effective_capability_plan.external.tool_allowlist:
             raise ValueError(
@@ -538,9 +534,7 @@ class ProfileResolver:
                 "reasoning_effort": spec.reasoning_effort.value,
                 "base_instructions": spec.base_instructions,
                 "developer_instructions": spec.developer_instructions,
-                "effective_capability_plan": (
-                    spec.effective_capability_plan.to_public_dict()
-                ),
+                "effective_capability_plan": (spec.effective_capability_plan.to_public_dict()),
                 "sandbox": spec.sandbox.value,
                 "allowed_builtin_tools": list(spec.allowed_builtin_tools),
                 "allowed_network_domains": list(spec.allowed_network_domains),
@@ -554,9 +548,7 @@ class ProfileResolver:
                 ],
                 "missing_runtime_tools": list(missing_runtime_tools),
                 "runtime_interpreter": (
-                    runtime_interpreter.to_safe_dict()
-                    if runtime_interpreter is not None
-                    else None
+                    runtime_interpreter.to_safe_dict() if runtime_interpreter is not None else None
                 ),
                 "mcp_servers": [_mcp_public_dict(server) for server in spec.mcp_servers],
                 "credential_handles": list(spec.credential_handles),
@@ -571,6 +563,9 @@ class ProfileResolver:
                     "timeout_seconds": spec.limits.timeout_seconds,
                     "direct_stream_idle_timeout_seconds": (
                         spec.limits.direct_stream_idle_timeout_seconds
+                    ),
+                    "direct_first_event_timeout_seconds": (
+                        spec.limits.direct_first_event_timeout_seconds
                     ),
                     "interrupt_grace_seconds": spec.limits.interrupt_grace_seconds,
                     "kill_grace_seconds": spec.limits.kill_grace_seconds,
@@ -886,9 +881,7 @@ class ProfileResolver:
                 or not os.access(destination, os.X_OK)
                 or _hash_file(destination) != digest
             ):
-                raise ProfileResolutionError(
-                    f"workspace copy of {description} was modified"
-                )
+                raise ProfileResolutionError(f"workspace copy of {description} was modified")
             return
 
         temporary = destination.with_name(f".{destination.name}.copying")
@@ -959,9 +952,7 @@ class ProfileResolver:
                     or not os.access(destination, os.X_OK)
                     or _hash_file(destination) != digest
                 ):
-                    raise ProfileResolutionError(
-                        f"materialized runtime tool {name!r} was modified"
-                    )
+                    raise ProfileResolutionError(f"materialized runtime tool {name!r} was modified")
             else:
                 temporary = tool_bin / f".{name}.copying"
                 if temporary.exists():
@@ -1073,7 +1064,25 @@ def _render_codex_config(
     bindings: Mapping[str, CredentialBinding],
     shell_environment: Mapping[str, str],
 ) -> str:
-    web_search_mode = "live" if "web_search" in spec.allowed_builtin_tools else "disabled"
+    # KEEP THIS FILE SMALL.  Codex ships working defaults for its tools, sandbox
+    # and permissions; every line written here overrides one of them, and each
+    # override is a place where a generated profile can disagree with the runtime
+    # that actually executes it.  A previous version emitted ~83 lines -- 21
+    # feature flags, a hand-rebuilt shell environment, and a domain allowlist --
+    # and the observable result was tools that existed but could not work
+    # tools that existed but could not work, which failed silently and had to be
+    # re-diagnosed per node.  Runtime tools are never named here at all: the Codex
+    # runtime owns which of its tools exist, and a second copy of that decision in
+    # generated config can only disagree with it.
+    #
+    # Only three things justify an override, because the framework's own
+    # guarantees depend on them:
+    #   1. no interactive approval -- there is no human at this terminal;
+    #   2. credentials never reach disk -- the provider key stays in the worker's
+    #      memory and must not be materialized into a Codex auth file;
+    #   3. writes stay inside the isolated workspace -- Judge and Registry
+    #      evidence is only meaningful if a candidate cannot write elsewhere.
+    # Everything else is the SDK's business.  Do not re-add flags defensively.
     lines = [
         'approval_policy = "never"',
         f"default_permissions = {_toml_string(_PERMISSIONS_PROFILE)}",
@@ -1081,67 +1090,17 @@ def _render_codex_config(
         # request config.  Disallow Codex's file credential store so an
         # accidental login path cannot materialize auth.json here.
         'cli_auth_credentials_store = "keyring"',
-        f"web_search = {_toml_string(web_search_mode)}",
-        'file_opener = "none"',
-        "hide_agent_reasoning = true",
-        "show_raw_agent_reasoning = false",
-        "project_doc_max_bytes = 0",
-        "project_doc_fallback_filenames = []",
-        f"tool_output_token_limit = {spec.tool_output_token_limit}",
+        # These two define where the workspace *is*.  Without them Codex walks up
+        # from cwd, finds the checkout that launched it, and treats that as the
+        # project -- it then reports the repository's .codex as untrusted project
+        # config and the session fails to open.  The marker names the disposable
+        # workspace as its own project root so nothing above it is in scope.
         f"project_root_markers = [{_toml_string(_PROJECT_ROOT_MARKER)}]",
+        "project_doc_max_bytes = 0",
     ]
-    lines.extend([
-        "",
-        "[history]",
-        # Codex's normal save-all history and explicit sqlite/log roots can
-        # retain the app-server launch environment.  Agent World has its own
-        # secret-screened invocation evidence and continuation identity, so
-        # the vendor-local history plane must stay off.
-        'persistence = "none"',
-        "",
-        "[analytics]",
-        "enabled = false",
-        "",
-        "[feedback]",
-        "enabled = false",
-        "",
-        "[features]",
-        # A generated role profile is a capability allowlist.  Stable Codex
-        # desktop integrations are otherwise enabled by default and can expose
-        # remote plugins, app tools or browser surfaces that were never granted
-        # by ``allowed_builtin_tools``.  Keep those surfaces off here; explicit
-        # MCP servers and the one bundled role Skill are materialized below.
-        "apps = false",
-        "auth_elicitation = false",
-        "browser_use = false",
-        "browser_use_external = false",
-        "computer_use = false",
-        "enable_mcp_apps = false",
-        f"hooks = {_toml_bool(bool(spec.hooks))}",
-        "image_generation = false",
-        "in_app_browser = false",
-        "memories = false",
-        "goals = false",
-        f"multi_agent = {_toml_bool('multi_agent' in spec.allowed_builtin_tools)}",
-        "plugin_sharing = false",
-        "plugins = false",
-        "remote_plugin = false",
-        # The official Codex shell-snapshot feature captures the app-server
-        # environment before ``shell_environment_policy`` applies.  That
-        # environment necessarily contains the provider's env_key, so disable
-        # the feature rather than relying on post-hoc redaction.
-        "shell_snapshot = false",
-        f"shell_tool = {_toml_bool('shell' in spec.allowed_builtin_tools)}",
-        "skill_mcp_dependency_install = false",
-        "tool_call_mcp_elicitation = false",
-        "tool_suggest = false",
-        "workspace_dependencies = false",
-    ])
     if spec.rollout_token_limit is not None:
         reminder_thresholds = (
-            []
-            if spec.rollout_token_limit == 1
-            else [max(1, spec.rollout_token_limit // 10)]
+            [] if spec.rollout_token_limit == 1 else [max(1, spec.rollout_token_limit // 10)]
         )
         lines.extend(
             [
@@ -1153,13 +1112,25 @@ def _render_codex_config(
                 "rollout_budget.prefill_token_weight = 1.0",
             ]
         )
+    # The Agent runs inside a disposable workspace with full authority over it:
+    # network on, filesystem write, no domain allowlist, no per-path rules.  The
+    # containment that matters is the workspace itself -- it is created per
+    # invocation, nothing outside it is an input to Judge or Registry, and a
+    # candidate becomes real only by passing validation and an immutable commit.
+    # Writing per-path filesystem rules here bought nothing and cost correctness:
+    # a tool could exist and still be unable to work, which fails silently and
+    # has to be re-diagnosed at every node.
+    #
+    # The shell keeps ``inherit = "none"`` for one non-negotiable reason: the
+    # parent environment holds the provider credential, which must never reach a
+    # subprocess or a snapshot.  The few values below are what a shell needs to
+    # function at all (its pinned toolchain and a writable temp/cache inside the
+    # workspace), not a policy.
     lines.extend(
         [
             "",
             "[shell_environment_policy]",
             'inherit = "none"',
-            "experimental_use_profile = false",
-            "ignore_default_excludes = false",
             "",
             "[shell_environment_policy.set]",
         ]
@@ -1171,46 +1142,23 @@ def _render_codex_config(
         [
             "",
             f"[permissions.{_toml_key(_PERMISSIONS_PROFILE)}]",
-            'description = "Agent World isolated invocation workspace"',
+            'description = "Agent World disposable invocation workspace"',
             "",
             f"[permissions.{_toml_key(_PERMISSIONS_PROFILE)}.filesystem]",
-            '":root" = "deny"',
-            '":minimal" = "read"',
-        ]
-    )
-    lines.extend(
-        [
-            f'{_toml_string(str(codex_home.parent / "home"))} = "deny"',
-            f'{_toml_string(str(codex_home))} = "deny"',
-        ]
-    )
-    for runtime_root in runtime_read_roots:
-        lines.append(f'{_toml_string(str(runtime_root))} = "read"')
-    for bundle in skills:
-        lines.append(f'{_toml_string(str(bundle.path))} = "read"')
-    for hook in hooks:
-        lines.append(f'{_toml_string(str(hook.path))} = "read"')
-    lines.extend(
-        [
-            "",
-            f'[permissions.{_toml_key(_PERMISSIONS_PROFILE)}.filesystem.":workspace_roots"]',
-            f'"." = {_toml_string("read" if spec.sandbox is SandboxMode.READ_ONLY else "write")}',
-            f'{_toml_string(_PROJECT_ROOT_MARKER)} = "read"',
+            # ``:root`` is Codex's own name for the whole tree.  ``:all`` is not a
+            # key it recognizes and made the app-server fail at session open --
+            # a reminder that inventing config vocabulary fails later and less
+            # legibly than using the runtime's.
+            '":root" = "write"',
             "",
             f"[permissions.{_toml_key(_PERMISSIONS_PROFILE)}.network]",
-            f"enabled = {_toml_bool(bool(spec.allowed_network_domains))}",
+            "enabled = true",
         ]
     )
-    if spec.allowed_network_domains:
-        lines.extend(
-            [
-                "",
-                f"[permissions.{_toml_key(_PERMISSIONS_PROFILE)}.network.domains]",
-            ]
-        )
-        for domain in spec.allowed_network_domains:
-            lines.append(f'{_toml_string(domain)} = "allow"')
 
+    # Declaring the workspace as a project keeps Codex from resolving a project
+    # above it.  ``untrusted`` refers to project-local config/hooks, not to the
+    # Agent's authority inside the workspace, which is full.
     lines.extend(
         [
             "",
@@ -1435,7 +1383,8 @@ def _validate_runtime_base_url(value: str) -> None:
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
-        or port is not None and not 0 < port < 65536
+        or port is not None
+        and not 0 < port < 65536
     ):
         raise CredentialResolutionError("configured API base URL has an unsafe shape")
 
@@ -1568,14 +1517,11 @@ def verify_resolved_profile(profile: ResolvedAgentProfile) -> None:
             if "python3.12" in expected_tools
             else interpreter.sha256
         )
-        if (
-            "python3.12" in expected_facades
-            and (
-                python_facade.is_symlink()
-                or not python_facade.is_file()
-                or not os.access(python_facade, os.X_OK)
-                or _hash_file(python_facade) != expected_python_facade_digest
-            )
+        if "python3.12" in expected_facades and (
+            python_facade.is_symlink()
+            or not python_facade.is_file()
+            or not os.access(python_facade, os.X_OK)
+            or _hash_file(python_facade) != expected_python_facade_digest
         ):
             raise ProfileResolutionError("workspace Python tool facade changed")
 

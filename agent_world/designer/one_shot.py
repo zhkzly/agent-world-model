@@ -16,7 +16,6 @@ interprets semantic progress.  Those are Scheduler responsibilities.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from collections.abc import Callable
@@ -329,15 +328,11 @@ async def invoke_structured_once[TOutput: BaseModel](
     uncertain_before_result = _reserved_invocation_usage(definition)
     output: TOutput | None = None
     try:
-        if getattr(backend, "owns_declared_lifecycle", False):
-            result = await backend.invoke(request)
-        else:
-            # Compatibility guard for a deliberately standalone adapter or a
-            # focused test double.  Production composition injects the
-            # Invocation Control Plane above, which is the sole parent-side
-            # physical-wall owner and returns its typed terminal fact instead.
-            async with asyncio.timeout(policy.budget.wall_seconds):
-                result = await backend.invoke(request)
+        # The Invocation Control Plane is the only backend a leaf receives, and
+        # it owns the declared physical wall, liveness supervision, cancellation
+        # and the durable terminal fact.  A second wall here would race it and
+        # produce two disagreeing terminals for one physical attempt.
+        result = await backend.invoke(request)
     except TimeoutError as exc:
         raise LeafExecutionFailure(
             code="agent_invocation_timeout",

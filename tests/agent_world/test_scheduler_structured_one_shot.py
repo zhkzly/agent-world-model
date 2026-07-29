@@ -8,7 +8,6 @@ failure to the Scheduler rather than entering the legacy local retry loop.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -179,13 +178,28 @@ class _SequenceOutputBackend(_MalformedOutputBackend):
         )
 
 
-class _HangingOutputBackend(_MalformedOutputBackend):
-    """Record one dispatch, then exceed the leaf's real wall budget."""
+class _DeclaredWallExpiredBackend(_MalformedOutputBackend):
+    """Return the control plane's declared-wall terminal for one dispatch.
+
+    The physical wall belongs to the Invocation Control Plane, which enforces it
+    and hands the leaf a typed ``TIMED_OUT`` result.  A double that instead hung
+    and waited to be cancelled would be asserting a leaf-local wall that no
+    longer exists -- and whose existence used to mean two supervisors could
+    settle one attempt differently.
+    """
 
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
-        self.requests.append(request)
-        await asyncio.sleep(1)
-        raise AssertionError("the Scheduler timeout must cancel this invocation")
+        result = await super().invoke(request)
+        return replace(
+            result,
+            status=InvocationStatus.TIMED_OUT,
+            structured_output=None,
+            error=InvocationError(
+                code="declared_wall_expired",
+                message="declared_wall_expired",
+                retryable=False,
+            ),
+        )
 
 
 class _ProviderRejectedBackend(_MalformedOutputBackend):
@@ -508,6 +522,9 @@ async def test_structured_read_uses_one_real_agentic_turn(tmp_path: Path) -> Non
     assert result.output.title == "Frozen input inspection"
     assert len(backend.requests) == 1
     assert backend.requests[0].execution_mode is InvocationExecutionMode.AGENTIC
+    # Only the sandbox primitive is modelled.  Whichever tools the Codex runtime
+    # offers this turn are the runtime's decision, not something the framework
+    # enumerates and can disagree with.
     assert backend.requests[0].profile.allowed_builtin_tools == ("shell",)
 
 
@@ -2010,7 +2027,7 @@ async def test_one_shot_timeout_preserves_dispatch_provenance_for_terminal_settl
             )
         }
     )
-    backend = _HangingOutputBackend()
+    backend = _DeclaredWallExpiredBackend()
     profiles = IsolatedAgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
@@ -2038,8 +2055,14 @@ async def test_one_shot_timeout_preserves_dispatch_provenance_for_terminal_settl
 
     failure = captured.value
     assert len(backend.requests) == 1
-    assert failure.code == "agent_invocation_timeout"
+    # The wall is the control plane's, so a timeout reaches the leaf as a typed
+    # terminal result rather than as an exception the leaf raced to raise.  The
+    # provenance that terminal settlement depends on must survive that route.
+    assert failure.code == "agent_backend_declared_wall_expired"
     assert failure.agent is not None
     assert failure.agent.invocation_id == "dispatch:one-shot:timeout"
     assert failure.agent.model == "test-structured-model"
-    assert failure.unknown_upper_bound.llm_tokens == 1_000
+    # A typed terminal carries real measured usage, so the conservative unknown
+    # upper bound is the remaining reservation rather than the whole budget.  It
+    # must still be charged: an interrupted physical turn is never free.
+    assert 0 < failure.unknown_upper_bound.llm_tokens <= 1_000

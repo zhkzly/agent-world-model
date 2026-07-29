@@ -20,6 +20,7 @@ _DIRECT_TRANSPORT_INVALID_CODE = "direct_structured_output_transport_invalid"
 _DIRECT_OUTPUT_LIMIT_CODE = "direct_output_limit"
 _DIRECT_INVALID_REQUEST_CODE = "direct_invalid_request"
 _DIRECT_PROVIDER_STREAM_STALLED_CODE = "direct_provider_stream_stalled"
+_DIRECT_NO_FIRST_EVENT_CODE = "direct_no_first_provider_event"
 _DIRECT_PROVIDER_EXCEPTION_CODES = frozenset(
     {
         "direct_authentication_failed",
@@ -53,6 +54,10 @@ _SDK_EXECUTION_FAILED_CODE = "sdk_execution_failed"
 _MAX_SAFE_OUTPUT_TOKEN_LIMIT = 10_000_000
 _MAX_SAFE_DIRECT_STREAM_IDLE_SECONDS = 31_536_000
 _MAX_SAFE_DIRECT_STREAM_EVENT_COUNT = 10_000_000
+# The only two waits that can precede a first Provider event.  Naming which one
+# expired is what separates "the request never left" from "the stream opened and
+# stayed silent" -- different first reads, so the phase must survive projection.
+_DIRECT_FIRST_EVENT_PHASES = frozenset({"direct_awaiting_response", "direct_awaiting_stream_event"})
 _NON_RETRYABLE_TERMINAL_CODES = frozenset(
     {
         _PROVIDER_REJECTED_CODE,
@@ -293,6 +298,33 @@ def direct_provider_stream_stalled_details(
     }
 
 
+def direct_no_first_provider_event_details(
+    *,
+    first_event_timeout_seconds: float,
+    last_local_phase: str,
+) -> JsonObject:
+    """Describe a Direct request that produced no Provider event at all.
+
+    This is strictly weaker evidence than a stalled stream: zero Provider events
+    were observed, so the Provider may never have accepted the request.  Keeping
+    it a distinct terminal is what lets policy route it to a transport/liveness
+    check and one authorized fresh execution instead of a semantic correction.
+    """
+
+    if (
+        isinstance(first_event_timeout_seconds, bool)
+        or not isinstance(first_event_timeout_seconds, (int, float))
+        or not 0 < first_event_timeout_seconds <= _MAX_SAFE_DIRECT_STREAM_IDLE_SECONDS
+        or last_local_phase not in _DIRECT_FIRST_EVENT_PHASES
+    ):
+        return {}
+    return {
+        "waiting_phase": last_local_phase,
+        "first_event_timeout_seconds": first_event_timeout_seconds,
+        "observed_provider_event_count": 0,
+    }
+
+
 def direct_provider_exception_details(exc: Exception) -> JsonObject:
     """Project a Direct HTTP exception into a closed, secret-safe fingerprint.
 
@@ -442,6 +474,8 @@ def safe_terminal_condition(error: InvocationError | None) -> str:
         return _output_limit_condition(error.details)
     if code == _DIRECT_PROVIDER_STREAM_STALLED_CODE:
         return _direct_provider_stream_stalled_condition(safe_terminal_details(error))
+    if code == _DIRECT_NO_FIRST_EVENT_CODE:
+        return _direct_no_first_provider_event_condition(safe_terminal_details(error))
     if code == _DIRECT_INVALID_REQUEST_CODE:
         return _direct_invalid_request_condition(safe_terminal_details(error))
     if code in _DIRECT_PROVIDER_EXCEPTION_CODES:
@@ -609,6 +643,13 @@ def safe_terminal_expected_category(error: InvocationError | None) -> str | None
             "stream/route boundary or one Scheduler-authorized fresh physical execution; do not "
             "change the Prompt or Runtime Skill without semantic output"
         )
+    if code == _DIRECT_NO_FIRST_EVENT_CODE:
+        return (
+            "a Direct transport/route liveness control at the same profile, then one "
+            "policy-authorized fresh physical execution or an explicit compatible-model "
+            "fallback; zero Provider events means no semantic candidate existed, so a Prompt, "
+            "Runtime Skill, or output-budget change has no supporting evidence"
+        )
     if code == _DIRECT_INVALID_JSON_CODE:
         return _direct_invalid_json_expected_category(safe_terminal_details(error))
     if code == _DIRECT_TRANSPORT_INVALID_CODE:
@@ -688,6 +729,14 @@ def safe_terminal_remediation(error: InvocationError | None) -> str | None:
             "run one profile-matched Direct control. If that control passes, treat this as one "
             "stalled stream and repair the Direct route/proxy/adapter boundary or use only an "
             "existing Scheduler-authorized retry."
+        )
+    if code == _DIRECT_NO_FIRST_EVENT_CODE:
+        return (
+            "Read the safe waiting phase to see whether the request never returned a stream or "
+            "the stream opened and stayed silent, then run one profile-matched Direct control on "
+            "the same route. If that control passes, this attempt lost its transport: use only "
+            "an existing Scheduler-authorized fresh execution or the explicit compatible-model "
+            "fallback. Do not read this as slow reasoning -- the declared wall was not spent."
         )
     if code == _SDK_EXECUTION_FAILED_CODE and (
         safe_terminal_details(error).get("worker_phase") == "thread_resume"
@@ -799,6 +848,8 @@ def safe_terminal_details(error: InvocationError | None) -> JsonObject:
         return _safe_direct_output_limit_details(error.details)
     if error.code == _DIRECT_PROVIDER_STREAM_STALLED_CODE:
         return _safe_direct_provider_stream_stalled_details(error.details)
+    if error.code == _DIRECT_NO_FIRST_EVENT_CODE:
+        return _safe_direct_no_first_provider_event_details(error.details)
     if error.code == _DIRECT_INVALID_REQUEST_CODE:
         return _safe_direct_invalid_request_details(error.details)
     if error.code in _DIRECT_PROVIDER_EXCEPTION_CODES:
@@ -933,6 +984,39 @@ def _safe_direct_provider_stream_stalled_details(details: JsonObject) -> JsonObj
         "idle_timeout_seconds": idle_timeout_seconds,
         "observed_provider_event_count": observed_provider_event_count,
     }
+
+
+def _safe_direct_no_first_provider_event_details(details: JsonObject) -> JsonObject:
+    waiting_phase = details.get("waiting_phase")
+    first_event_timeout_seconds = details.get("first_event_timeout_seconds")
+    if (
+        waiting_phase not in _DIRECT_FIRST_EVENT_PHASES
+        or isinstance(first_event_timeout_seconds, bool)
+        or not isinstance(first_event_timeout_seconds, (int, float))
+        or not 0 < first_event_timeout_seconds <= _MAX_SAFE_DIRECT_STREAM_IDLE_SECONDS
+    ):
+        return {}
+    return {
+        "waiting_phase": waiting_phase,
+        "first_event_timeout_seconds": first_event_timeout_seconds,
+        "observed_provider_event_count": 0,
+    }
+
+
+def _direct_no_first_provider_event_condition(details: JsonObject) -> str:
+    waiting_phase = details.get("waiting_phase")
+    first_event_timeout_seconds = details.get("first_event_timeout_seconds")
+    if isinstance(first_event_timeout_seconds, (int, float)) and not isinstance(
+        first_event_timeout_seconds, bool
+    ):
+        opened = waiting_phase == "direct_awaiting_stream_event"
+        stage = (
+            "the Direct Provider stream opened but emitted no first event"
+            if opened
+            else "the Direct Provider request never returned a stream"
+        )
+        return f"{stage} within {first_event_timeout_seconds:g} seconds"
+    return "the Direct Provider produced no first event before its liveness bound"
 
 
 def _direct_provider_stream_stalled_condition(details: JsonObject) -> str:
@@ -1347,6 +1431,7 @@ def _envelope_shape(value: JsonValue) -> str:
 
 __all__ = [
     "direct_invalid_json_details",
+    "direct_no_first_provider_event_details",
     "direct_output_limit_details",
     "direct_provider_response_error_details",
     "direct_provider_stream_stalled_details",

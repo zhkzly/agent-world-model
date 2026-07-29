@@ -1340,7 +1340,6 @@ class VerifierCompiler:
                 permission_denied=True,
             ) from exc
         session = None
-        immutable_prompt = prompt
         current_prompt = prompt
         results: list[InvocationResult] = []
         batch_accounting = accounting or _VerifierBatchAccounting()
@@ -1476,28 +1475,12 @@ class VerifierCompiler:
                 )
                 backend_issue = f"verifier_backend:{backend_code}"
                 await complete_repair((backend_issue,))
-                if (
-                    result.error is not None
-                    and result.error.retryable
-                    and attempt < self.maximum_structured_reworks
-                    and attempt + 1 < budget.agent_turns
-                    # In production the Invocation Control Plane has already
-                    # classified and durably settled this physical terminal.
-                    # A fresh-session transport retry or model fallback must
-                    # be authorized by Scheduler/WorkRuntime, rather than
-                    # being silently consumed inside this legacy compiler.
-                    and not getattr(self.backend, "owns_declared_lifecycle", False)
-                ):
-                    # Provider/transport failures are code-routed local retries, not
-                    # semantic corrections. Restart from the immutable batch prompt in
-                    # a fresh session so partial provider state cannot affect VerifierIR.
-                    await authorize_repair(
-                        (backend_issue,),
-                        repair_mode=StructuredRepairMode.BACKEND_RETRY,
-                    )
-                    session = None
-                    current_prompt = immutable_prompt
-                    continue
+                # A physical provider/transport terminal is not retried here.
+                # The Invocation Control Plane has already classified and
+                # durably settled it, and Scheduler/WorkRuntime owns the one
+                # authorized fresh-session retry plus the explicit model
+                # fallback.  This loop spends Agent turns only on semantic
+                # corrections against a parsed VerifierIR candidate.
                 message = result.error.message if result.error else result.status.value
                 raise VerifierCompilationError(
                     message,

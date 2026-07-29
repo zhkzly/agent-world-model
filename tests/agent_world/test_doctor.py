@@ -60,6 +60,20 @@ def _check(report_checks: tuple[DoctorCheck, ...], name: str) -> DoctorCheck:
     return matches[0]
 
 
+def _write_probe_marker(workspace: Path) -> None:
+    """Produce the tool-dispatch evidence the live-agent probe verifies on disk.
+
+    The probe deliberately does not trust the model's ``wrote_file`` claim, so a
+    backend double representing a successful Agent turn has to leave the same
+    real artifact a real turn would.
+    """
+
+    (workspace / doctor_module._LIVE_AGENT_PROBE_FILENAME).write_text(  # noqa: SLF001
+        doctor_module._LIVE_AGENT_PROBE_CONTENT,  # noqa: SLF001
+        encoding="utf-8",
+    )
+
+
 async def _require_real_isolation() -> None:
     if shutil.which("uv") is None:
         pytest.skip("real uv executable is unavailable")
@@ -241,6 +255,12 @@ async def test_live_agent_probe_publishes_live_safe_trace_and_terminal_status(
             entered.set()
             await release.wait()
             span.finish(status="passed")
+            # The probe verifies tool dispatch by observing this file on disk, so a
+            # double standing in for a real Agent turn has to actually write it.
+            # This test is about the live trace and terminal status, not about the
+            # write itself -- but the probe cannot pass without real evidence, which
+            # is the point of checking the filesystem rather than the model's claim.
+            _write_probe_marker(request.profile.workspace)
             return InvocationResult(
                 invocation_id=request.invocation_id,
                 status=InvocationStatus.COMPLETED,
@@ -253,7 +273,7 @@ async def test_live_agent_probe_publishes_live_safe_trace_and_terminal_status(
                 ),
                 turn_id="doctor-test-turn",
                 final_text=None,
-                structured_output={"status": "ok"},
+                structured_output={"status": "ok", "wrote_file": True},
                 usage=None,
                 events=(),
                 error=None,
@@ -324,6 +344,7 @@ async def test_live_agent_probe_mints_a_new_physical_invocation_for_each_run(
             span = self.telemetry.start_invocation(request)
             span.first_progress()
             span.finish(status="passed")
+            _write_probe_marker(request.profile.workspace)
             return InvocationResult(
                 invocation_id=request.invocation_id,
                 status=InvocationStatus.COMPLETED,
@@ -336,7 +357,7 @@ async def test_live_agent_probe_mints_a_new_physical_invocation_for_each_run(
                 ),
                 turn_id=f"doctor-turn:{len(invocation_ids)}",
                 final_text=None,
-                structured_output={"status": "ok"},
+                structured_output={"status": "ok", "wrote_file": True},
                 usage=None,
                 events=(),
                 error=None,

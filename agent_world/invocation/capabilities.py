@@ -19,9 +19,15 @@ from typing import Protocol
 from .contracts import JsonObject, SandboxMode
 
 _CAPABILITY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
-_DOMAIN = re.compile(
-    r"^(?:\*|(?:(?:\*|\*\*)\.)?[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)$"
-)
+# Intrinsic tools are the sandbox primitives the framework has to reason about,
+# because they decide whether an Agent can change anything: shell execution and
+# workspace edits.  The Codex runtime's own tools are not enumerated here and are
+# not written into generated configuration -- the runtime decides which of its
+# tools exist, and an Agent gets whatever its runtime provides.  Naming a runtime
+# tool here only creates a second, weaker copy of that decision which can
+# disagree with it.
+_INTRINSIC_BUILTIN_TOOLS = frozenset({"shell", "workspace_edit"})
+_DOMAIN = re.compile(r"^(?:\*|(?:(?:\*|\*\*)\.)?[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)$")
 
 
 class CapabilityResolutionError(RuntimeError):
@@ -154,7 +160,12 @@ class NodeCapabilityRequirement:
         node_id: str,
         role: str,
     ) -> NodeCapabilityRequirement:
-        """Read framework-staged files and return typed output; no external access."""
+        """Read framework-staged files and return typed output; no write authority.
+
+        Only the sandbox primitive is declared.  Whatever other tools the Codex
+        runtime offers this turn are the runtime's business, not something this
+        requirement enumerates.
+        """
 
         return cls(
             node_id=node_id,
@@ -186,7 +197,12 @@ class NodeCapabilityRequirement:
         node_id: str,
         external: ExternalCapabilitySet | None = None,
     ) -> NodeCapabilityRequirement:
-        """Edit/test the candidate workspace with only explicitly required externals."""
+        """Edit/test the candidate workspace with only explicitly required externals.
+
+        Declares the two sandbox primitives that let this node change something.
+        Other runtime tools are not enumerated: the Codex runtime provides what it
+        provides, and writes remain confined to the isolated candidate workspace.
+        """
 
         return cls(
             node_id=node_id,
@@ -274,9 +290,7 @@ def compile_effective_capability_plan(
         missing.append("role")
     if _sandbox_rank(requirement.sandbox) > _sandbox_rank(role_maximum.maximum_sandbox):
         missing.append("intrinsic.sandbox")
-    if not set(requirement.intrinsic_builtin_tools) <= set(
-        role_maximum.intrinsic_builtin_tools
-    ):
+    if not set(requirement.intrinsic_builtin_tools) <= set(role_maximum.intrinsic_builtin_tools):
         missing.append("intrinsic.builtin_tools")
 
     granted = ExternalCapabilitySet.from_permission_scope(job_permission)
@@ -351,7 +365,7 @@ def _domain_rule_matches(domain: str, rule: str) -> bool:
 def _validate_intrinsic_tools(values: tuple[str, ...]) -> None:
     if len(values) != len(set(values)):
         raise ValueError("intrinsic_builtin_tools must not contain duplicates")
-    if any(value not in {"shell", "workspace_edit"} for value in values):
+    if any(value not in _INTRINSIC_BUILTIN_TOOLS for value in values):
         raise ValueError("intrinsic_builtin_tools contains an external/unsupported tool")
     if "workspace_edit" in values and "shell" not in values:
         raise ValueError("workspace_edit requires the intrinsic shell capability")
