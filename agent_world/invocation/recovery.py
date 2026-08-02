@@ -154,6 +154,29 @@ class InvocationRecoveryDecision:
             raise ValueError("each attribution lens may appear at most once")
 
 
+def _codex_opaque_empty_envelope(evidence: InvocationRecoveryEvidence) -> bool:
+    """True when a Codex terminal is a pure opaque ``enum:other`` envelope.
+
+    ``_codex_worker`` reduces an unknown closed ``codexErrorInfo`` to
+    ``turn_failed_unclassified_codex_error`` with ``terminal_error_shape: object``
+    plus (when the provider message carried one) an advisory signal or HTTP
+    status.  A *pure opaque* envelope has none of those — the gateway collapsed
+    a transport disconnect or Provider 5xx into ``other`` with no observable
+    signal.  This is the Codex analog of the direct lane's empty
+    ``provider_error_shape in {missing, non_object}`` envelope; both should be
+    retryable transport, not a semantic design defect.
+    """
+
+    details = evidence.terminal_details
+    if details.get("terminal_error_shape") != "object":
+        return False
+    if details.get("advisory_text_signals"):
+        return False
+    if details.get("http_status") is not None:
+        return False
+    return True
+
+
 class InvocationRecoveryPolicy:
     """Classify safe terminal facts without choosing semantic content.
 
@@ -424,6 +447,22 @@ class InvocationRecoveryPolicy:
             # required fact below.
             "transport_failed",
         }:
+            return InvocationFailureClass.TRANSIENT_TRANSPORT
+        if (
+            normalized == "turn_failed_unclassified_codex_error"
+            and _codex_opaque_empty_envelope(evidence)
+        ):
+            # A closed ``enum:other`` envelope with NO advisory signal and NO
+            # HTTP status is the Codex-gateway analog of the direct-lane empty
+            # envelope (``provider_error_shape in {missing, non_object}``) that
+            # ``direct_llm`` already classifies as retryable transport.  The
+            # worker could not attribute a transport disconnect or Provider 5xx
+            # to any signal (they collapse into ``other``), so the conservative
+            # unclassified-fatal outcome mis-attributes a genuinely transient
+            # gateway outage as a semantic design defect.  Treating the pure
+            # opaque envelope as TRANSIENT_TRANSPORT keeps the failure honest
+            # (bounded infra retry) while never authorizing semantic repair —
+            # the worker still marks mixed-signal envelopes unclassified.
             return InvocationFailureClass.TRANSIENT_TRANSPORT
         if evidence.parsed_semantic_candidate:
             return InvocationFailureClass.SEMANTIC_VALIDATION

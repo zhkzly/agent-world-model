@@ -235,3 +235,39 @@ def test_unsettled_physical_attempt_requires_reconciliation_before_any_retry() -
 
     assert decision.route is InvocationRecoveryRoute.RECONCILE_OBSERVATION
     assert decision.failure_class is InvocationFailureClass.LIFECYCLE_UNSETTLED
+
+
+def test_codex_pure_opaque_other_envelope_routes_transient_transport() -> None:
+    """A closed enum:other with no signal/HTTP status is retryable transport.
+
+    The direct lane already treats an empty failed envelope
+    (provider_error_shape in {missing, non_object}) as retryable; the Codex
+    gateway collapses a transport disconnect or Provider 5xx into ``other``
+    with no observable signal, so the opaque envelope must route the same way
+    instead of being fatal.
+    """
+    decision = InvocationRecoveryPolicy().decide(
+        InvocationRecoveryEvidence(
+            terminal_code="agent_backend_turn_failed_unclassified_codex_error",
+            retryable=True,
+            terminal_details={"terminal_error_shape": "object", "codex_error_info": "other"},
+        )
+    )
+    assert decision.failure_class is InvocationFailureClass.TRANSIENT_TRANSPORT
+    assert decision.route is InvocationRecoveryRoute.SAME_MODEL_FRESH_RETRY
+
+
+def test_codex_opaque_envelope_with_signal_stays_unclassified() -> None:
+    """A mixed-signal or HTTP-bearing envelope must NOT become retryable."""
+    decision = InvocationRecoveryPolicy().decide(
+        InvocationRecoveryEvidence(
+            terminal_code="agent_backend_turn_failed_unclassified_codex_error",
+            retryable=True,
+            terminal_details={
+                "terminal_error_shape": "object",
+                "codex_error_info": "other",
+                "advisory_text_signals": ["some_semantic_signal"],
+            },
+        )
+    )
+    assert decision.failure_class is InvocationFailureClass.UNKNOWN
