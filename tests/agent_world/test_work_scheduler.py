@@ -1658,3 +1658,61 @@ def test_begin_after_head_reset_continues_at_first_free_ordinal(
     )
     assert attempt.attempt_id not in prior_ids
 
+
+
+def test_running_noop_head_with_stale_definition_is_classified_stale(
+    tmp_path: Path,
+) -> None:
+    """A running no-op head of an older definition must not be reused.
+
+    The ready classification reuses a running head with no active operation;
+    if that head carries an older definition digest (for example a previous
+    resume under a different config), the dispatch envelope preflight fails
+    its exact digest check and crashes the run.  The head must be classified
+    stale so supersede_stale re-derives it under the current definition.
+    """
+
+    (
+        scope_id,
+        coordinate,
+        _definition_a,
+        _graph,
+        _manifest,
+        _manifest_ref,
+        heads,
+        artifacts,
+        _runtime,
+        root_ref,
+    ) = _orphan_scope(tmp_path)
+
+    # A changed definition for the exact same coordinate (simulating config
+    # drift between resume waves).
+    definition_b = _definition(
+        scope_id=scope_id,
+        component="release",
+        stage="package",
+        coordinate=coordinate,
+        dependencies=(),
+    ).model_copy(update={"claim": "a changed boundary claim for the same coordinate"})
+    assert definition_b.definition_digest != _definition_a.definition_digest
+    graph_b = GenerationWorkGraph.compile((definition_b,), mode="diagnostic")
+    manifest_b = graph_b.manifest(
+        topology_id="topology:stale-running-test",
+        external_root_refs=(root_ref,),
+    )
+    manifest_ref_b = artifacts.put_json(
+        artifact_id=manifest_b.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest_b,
+        dependencies=(root_ref,),
+    )
+    scheduler_b = WorkScheduler(
+        graph=graph_b,
+        manifest=manifest_b,
+        manifest_ref=manifest_ref_b,
+        heads=heads,
+        artifacts=artifacts,
+    )
+    snapshot = scheduler_b.snapshot()
+    item = next(item for item in snapshot.work if item.coordinate == coordinate)
+    assert item.state == "stale"

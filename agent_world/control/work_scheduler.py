@@ -336,6 +336,22 @@ class WorkScheduler:
                 # ready branch already tolerates an existing running head with no
                 # active operation, so it re-runs the fresh attempt cleanly.
                 if head.active_operation_ref is None:
+                    if (
+                        head.definition_digest != definition.definition_digest
+                        or head.input_fingerprint
+                        != self.heads.input_fingerprint(expected_inputs)
+                    ):
+                        # A running no-op head left by an older definition or
+                        # input closure (for example a previous resume under a
+                        # different config) must be superseded, not reused: the
+                        # ready branch reuses the head as-is and the envelope
+                        # preflight then fails its exact digest check, crashing
+                        # the whole run instead of re-deriving.
+                        scheduled[key] = ScheduledWork(
+                            coordinate=definition.coordinate,
+                            state="stale",
+                        )
+                        continue
                     scheduled[key] = ScheduledWork(
                         coordinate=definition.coordinate,
                         state="ready",
