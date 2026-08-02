@@ -739,12 +739,34 @@ class SchedulerLeafExecutor:
                         retryable=False,
                     )
                     return
+                # outcome is None: the Agent never executed — the ValidationError
+                # came from loading a framework input (e.g. an old EnvironmentDesign
+                # that a new curriculum cap rejects). Classify it as a preflight_
+                # schema failure so the provenance gate in _finish_exception
+                # (which exempts preflight_ codes) lets the real field paths
+                # surface instead of flattening into the misleading
+                # "Agent leaf failures must bind real invocation/profile
+                # provenance". agent=None is correct: there is no real turn.
+                preflight_diagnostic = pydantic_validation_diagnostic(
+                    exc,
+                    owner_component=definition.coordinate.component,
+                    validation_phase=definition.validation_policy.validation_phase,
+                    frontier_ordinal=definition.validation_policy.frontier_ordinal,
+                )
+                field_summary = ", ".join(
+                    "/".join(str(part) for part in issue.location) if issue.location else issue.code
+                    for issue in preflight_diagnostic.issues[:8]
+                )
                 await self._finish_exception(
                     definition=definition,
                     input_refs=input_refs,
                     attempt=attempt,
-                    code="agent_leaf_untranslated_schema_error",
-                    category="Agent leaf failed to translate a schema error",
+                    code="preflight_agent_input_schema",
+                    category=(
+                        "Agent input schema validation failed before dispatch"
+                        + (f": {field_summary}" if field_summary else "")
+                    ),
+                    retryable=False,
                 )
                 return
             diagnostic = pydantic_validation_diagnostic(
@@ -1125,7 +1147,11 @@ class SchedulerLeafExecutor:
     ) -> None:
         """Persist an actionable failed validation without fabricating an output Artifact."""
 
-        if definition.proposal_policy.executor == "agent" and agent is None:
+        if (
+            definition.proposal_policy.executor == "agent"
+            and agent is None
+            and _ACTIVE_AGENT_PROPOSAL_OUTCOME.get() is not None
+        ):
             raise WorkRuntimeError("Agent validation failure lacks real invocation provenance")
         if definition.proposal_policy.executor != "agent" and agent is not None:
             raise WorkRuntimeError("non-Agent validation failure cannot claim Agent provenance")

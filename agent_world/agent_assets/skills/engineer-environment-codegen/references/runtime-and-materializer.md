@@ -18,6 +18,32 @@ handshake, reset, invoke, snapshot, and close.
   state transitions come from the frozen WorldSpec. Runtime reward and
   termination fields are diagnostic only; framework rules decide outcomes.
 
+### Invoke result shape (exact, required)
+
+The integration gate validates the `invoke` response with exact keys — a missing
+or extra key fails the run. Return an object with EXACTLY these eight keys, no
+more, no less:
+
+- `tool_result`: any JSON value — the tool's returned payload (an object, a
+  scalar, or null). This is the value the caller sees as the tool outcome.
+- `observation`: an object — the actor's visible observation after the action.
+  Build it from the same ActorBoundary.visibility rules as reset: include every
+  visible root-state field and make it satisfy the actor's projection of
+  `world-spec.state.root_state_schema` with every required field.
+- `events`: an empty JSON array `[]`. The closed agent-facing ABI requires
+  invoke `events` to be empty; do not populate it.
+- `state_digest`: exactly `sha256:` followed by 64 lowercase hex characters of
+  the post-action state.
+- `reward`: a finite JSON number (never a bool).
+- `terminated`: a JSON boolean.
+- `truncated`: a JSON boolean.
+- `info`: an empty JSON object `{}`. The closed ABI requires invoke `info` to be
+  empty.
+
+Do not return a partial result (e.g. only a `call_id`) — every invoke response
+must carry all eight keys. `snapshot` and `reset` have their own separate shapes;
+see below.
+
 ### Reset and snapshot state projections
 
 Read `only ActorBoundary.visibility fields` as an upper visibility boundary,

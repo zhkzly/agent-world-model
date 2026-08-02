@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import sys
+import traceback
 from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -855,6 +856,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         _write_error(exc.code, str(exc))
         return EXIT_OPERATION_FAILED
     except Exception as exc:  # fail closed without exposing backend/auth exception text
+        # Keep the JSON response concise (never leak backend/auth exception text),
+        # but surface the full traceback on stderr for local debugging — without
+        # it, a diagnostic runner failure reduces to a single misleading type name.
+        traceback.print_exc()
         _write_error("operation_failed", f"operation failed ({type(exc).__name__})")
         return EXIT_OPERATION_FAILED
 
