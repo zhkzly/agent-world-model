@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.config import FoundryConfig
@@ -78,7 +78,7 @@ from .work_graph import (
 )
 from .work_repair import WorkRepairDenied, WorkRepairLedger
 from .work_runtime import WorkControlRuntime, WorkRuntimeError
-from .work_scheduler import WorkExecutor, WorkScheduler
+from .work_scheduler import WorkDispatchResult, WorkExecutor, WorkScheduler
 from .work_store import (
     WorkControlHead,
     WorkControlStore,
@@ -543,6 +543,93 @@ def _nonterminal_diagnostic_dispatch_error(
     )
 
 
+async def _dispatch_diagnostic_target(
+    *,
+    scheduler: WorkScheduler,
+    coordinate: WorkCoordinate,
+    executor: WorkExecutor,
+    runtime: WorkControlRuntime,
+    definition: WorkDefinition,
+    app: FoundryApplication,
+    scope_id: str,
+    run_id: str,
+    span: Any,
+    dispatch_error_code: str,
+    interrupt_code: str,
+    cancel_code: str,
+    nonterminal_code: str,
+    settled_statuses: frozenset[str],
+) -> WorkDispatchResult | None:
+    """Dispatch one diagnostic target through the real scheduler, classifying errors.
+
+    The three dispatching runners (TestNode, Descendant, Successor) repeat the
+    same dispatch + KeyboardInterrupt/CancelledError/Exception classification
+    (using the module-level ``_settle_cancelled_diagnostic_dispatch`` and
+    ``_nonterminal_diagnostic_dispatch_error``).  Only the error-code strings,
+    the settled-status set (Descendant adds ``repair_authorized``) and the
+    ``span.finish`` calls differ.  This helper keeps that one dispatch path in
+    one place; the caller still owns executor construction and post-dispatch
+    span finish.
+    """
+
+    try:
+        return await scheduler.dispatch_one(
+            coordinate,
+            executors={definition.work_id: executor},
+        )
+    except KeyboardInterrupt:
+        interrupted_head = _settle_cancelled_diagnostic_dispatch(
+            runtime=runtime,
+            definition=definition,
+        )
+        if interrupted_head is None or interrupted_head.status not in settled_statuses:
+            span.finish(status="cancelled", error_code=interrupt_code)
+        else:
+            span.finish(
+                status="cancelled",
+                output_refs=tuple(
+                    ref
+                    for ref in (interrupted_head.commit_ref, interrupted_head.evaluation_ref)
+                    if ref is not None
+                ),
+            )
+        app.telemetry.flush()
+        raise
+    except asyncio.CancelledError:
+        interrupted_head = _settle_cancelled_diagnostic_dispatch(
+            runtime=runtime,
+            definition=definition,
+        )
+        if interrupted_head is None or interrupted_head.status not in settled_statuses:
+            span.finish(status="cancelled", error_code=cancel_code)
+            app.telemetry.flush()
+            raise
+        span.finish(
+            status="cancelled",
+            output_refs=tuple(
+                ref
+                for ref in (interrupted_head.commit_ref, interrupted_head.evaluation_ref)
+                if ref is not None
+            ),
+        )
+        app.telemetry.flush()
+        return None
+    except Exception as exc:
+        span.finish(status="error", error_code=dispatch_error_code)
+        app.telemetry.flush()
+        nonterminal = _nonterminal_diagnostic_dispatch_error(
+            app=app,
+            definition=definition,
+            scope_id=scope_id,
+            run_id=run_id,
+            error_code=nonterminal_code,
+            exc=exc,
+        )
+        if nonterminal is not None:
+            raise nonterminal from exc
+        raise
+
+
 class ProposalExecutionEnvelope(V2Contract):
     """Safe, explicit distinction between a physical turn and its session.
 
@@ -663,6 +750,123 @@ class _FrozenTarget:
 TestNodeExecutorFactory = Callable[[TestNodeExecution], WorkExecutor]
 
 
+def _resolve_marked_diagnostic_root(
+    diagnostic_state_root: Path,
+    *,
+    prefix: str,
+) -> Path:
+    """Resolve one marked diagnostic state root, with per-runner error codes.
+
+    Seven runners repeat the same marked-root resolution; only the error-code
+    prefix differs (``test_descendant`` / ``test_world_plan`` / ...).  Keeping
+    the prefix parameterized preserves each runner's CLI audit granularity.
+    """
+
+    candidate = diagnostic_state_root.expanduser()
+    if not is_marked_test_node_diagnostic_state_root(candidate):
+        raise TestNodeError(
+            f"{prefix}_state_not_marked",
+            f"diagnostic {prefix.replace('test_', '').replace('_', ' ')} requires one marked "
+            ".agent-world-live/test-node-* state root",
+        )
+    try:
+        return candidate.resolve(strict=True)
+    except OSError as exc:  # pragma: no cover - marker checks the same path first
+        raise TestNodeError(
+            f"{prefix}_state_missing",
+            f"diagnostic {prefix.replace('test_', '').replace('_', ' ')} state root is unavailable",
+        ) from exc
+
+
+def _prepare_diagnostic_clone(
+    *,
+    source_root: Path,
+    diagnostic_parent: Path | None = None,
+    marker_error_code: str,
+    marker_message: str,
+) -> Path:
+    """Create one marked, isolated diagnostic copy of a captured state root.
+
+    Shared by the six runners that copy+mark (TestNode, Descendant, WorldPlan,
+    TaskRequirement, Final, Successor).  The source archive is copied
+    byte-for-byte minus non-durable directories, then marked so diagnostic head
+    archiving and non-releasable commits are legal.  Scope separation stays at
+    the read boundary; this function never filters by scope (preserving the
+    byte-for-byte completeness the ancestor-closure assertions depend on).
+
+    ``marker_error_code`` / ``marker_message`` are the per-runner CLI error
+    codes (test_node_* / test_descendant_* / test_world_plan_* / ...) so the
+    unified helper preserves each runner's audit granularity.
+
+    ``diagnostic_parent`` may be None (most CLI constructions omit it); the
+    helper then mirrors ``TestNodeRunner._diagnostic_parent`` by preferring a
+    ``.agent-world-live`` ancestor of the source root, falling back to the
+    current working directory's ``.agent-world-live``.
+    """
+
+    parent = diagnostic_parent
+    if parent is None:
+        parent = next(
+            (
+                candidate
+                for candidate in source_root.parents
+                if candidate.name == ".agent-world-live"
+            ),
+            Path.cwd() / ".agent-world-live",
+        )
+    if parent.exists() and parent.is_symlink():
+        raise TestNodeError(
+            "test_node_diagnostic_parent_symlink",
+            "diagnostic parent cannot be a link",
+        )
+    try:
+        parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        parent.chmod(0o700)
+    except OSError as exc:
+        raise TestNodeError(
+            "test_node_diagnostic_parent_unavailable",
+            "diagnostic parent is unavailable",
+        ) from exc
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    diagnostic_root = parent / f"test-node-{timestamp}-{uuid.uuid4().hex[:12]}"
+
+    TestNodeRunner._assert_no_symlinks(source_root)
+
+    def _ignore(directory: str, names: list[str]) -> set[str]:
+        relative = Path(directory).resolve().relative_to(source_root)
+        ignored: set[str] = set()
+        if relative == Path("."):
+            ignored.update(
+                name for name in names if name in _NON_DURABLE_STATE_DIRECTORIES
+            )
+        if relative == Path("work-control"):
+            ignored.update(name for name in names if name in {"scope-budgets", "locks", "tmp"})
+        return ignored
+
+    try:
+        shutil.copytree(
+            source_root,
+            diagnostic_root,
+            copy_function=shutil.copy2,
+            ignore=_ignore,
+        )
+        diagnostic_root.chmod(0o700)
+    except OSError as exc:
+        raise TestNodeError(
+            "test_node_state_copy_failed",
+            "could not create an isolated diagnostic state copy",
+        ) from exc
+
+    try:
+        WorkControlStore(diagnostic_root / "work-control").mark_test_node_diagnostic_clone()
+    except WorkControlStoreError as exc:
+        raise TestNodeError(
+            marker_error_code,
+            marker_message,
+        ) from exc
+    return diagnostic_root
+
+
 class TestNodeRunner:
     """Copy one scope and dispatch exactly one target node in that copy."""
 
@@ -719,15 +923,12 @@ class TestNodeRunner:
             )
         diagnostic_config = profile_change.config
         source_root = self._resolve_source_root()
-        diagnostic_root = self._new_diagnostic_root(source_root)
-        self._copy_state_root(source_root, diagnostic_root)
-        try:
-            WorkControlStore(diagnostic_root / "work-control").mark_test_node_diagnostic_clone()
-        except WorkControlStoreError as exc:
-            raise TestNodeError(
-                "test_node_diagnostic_marker_failed",
-                "isolated diagnostic state could not be marked",
-            ) from exc
+        diagnostic_root = _prepare_diagnostic_clone(
+            source_root=source_root,
+            diagnostic_parent=self.diagnostic_parent or self._diagnostic_parent(source_root),
+            marker_error_code="test_node_diagnostic_marker_failed",
+            marker_message="isolated diagnostic state could not be marked",
+        )
 
         # Import here to keep the production composition root free of an
         # import cycle with ``agent_world.control``.
@@ -938,75 +1139,22 @@ class TestNodeRunner:
             artifacts=app.controller.artifacts,
             runtime=runtime,
         )
-        try:
-            dispatch = await diagnostic_scheduler.dispatch_one(
-                target,
-                executors={frozen.definition.work_id: executor},
-            )
-        except KeyboardInterrupt:
-            interrupted_head = _settle_cancelled_diagnostic_dispatch(
-                runtime=runtime,
-                definition=frozen.definition,
-            )
-            if (
-                interrupted_head is None
-                or interrupted_head.status not in _TERMINAL_WORK_HEAD_STATUSES
-            ):
-                root_span.finish(status="cancelled", error_code="test_node_dispatch_interrupted")
-            else:
-                root_span.finish(
-                    status="cancelled",
-                    output_refs=tuple(
-                        ref
-                        for ref in (
-                            interrupted_head.commit_ref,
-                            interrupted_head.evaluation_ref,
-                        )
-                        if ref is not None
-                    ),
-                )
-            app.telemetry.flush()
-            # Do not turn a terminal signal into a successful CLI result.
-            raise
-        except asyncio.CancelledError:
-            interrupted_head = _settle_cancelled_diagnostic_dispatch(
-                runtime=runtime,
-                definition=frozen.definition,
-            )
-            if (
-                interrupted_head is None
-                or interrupted_head.status not in _TERMINAL_WORK_HEAD_STATUSES
-            ):
-                root_span.finish(status="cancelled", error_code="test_node_dispatch_cancelled")
-                app.telemetry.flush()
-                raise
-            dispatch = None
-            root_span.finish(
-                status="cancelled",
-                output_refs=tuple(
-                    ref
-                    for ref in (
-                        interrupted_head.commit_ref,
-                        interrupted_head.evaluation_ref,
-                    )
-                    if ref is not None
-                ),
-            )
-            app.telemetry.flush()
-        except Exception as exc:
-            root_span.finish(status="error", error_code="test_node_dispatch_error")
-            app.telemetry.flush()
-            nonterminal = _nonterminal_diagnostic_dispatch_error(
-                app=app,
-                definition=frozen.definition,
-                scope_id=scope_id,
-                run_id=run_id,
-                error_code="test_node_nonterminal_dispatch_failure",
-                exc=exc,
-            )
-            if nonterminal is not None:
-                raise nonterminal from exc
-            raise
+        dispatch = await _dispatch_diagnostic_target(
+            scheduler=diagnostic_scheduler,
+            coordinate=target,
+            executor=executor,
+            runtime=runtime,
+            definition=frozen.definition,
+            app=app,
+            scope_id=scope_id,
+            run_id=run_id,
+            span=root_span,
+            dispatch_error_code="test_node_dispatch_error",
+            interrupt_code="test_node_dispatch_interrupted",
+            cancel_code="test_node_dispatch_cancelled",
+            nonterminal_code="test_node_nonterminal_dispatch_failure",
+            settled_statuses=_TERMINAL_WORK_HEAD_STATUSES,
+        )
         if dispatch is not None:
             root_span.finish(
                 status="passed" if dispatch.after_state == "committed" else "failed",
@@ -1104,64 +1252,6 @@ class TestNodeRunner:
             )
         return resolved
 
-    def _new_diagnostic_root(self, source_root: Path) -> Path:
-        parent = self.diagnostic_parent or self._diagnostic_parent(source_root)
-        if parent.exists() and parent.is_symlink():
-            raise TestNodeError(
-                "test_node_diagnostic_parent_symlink",
-                "diagnostic parent cannot be a link",
-            )
-        try:
-            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            parent.chmod(0o700)
-        except OSError as exc:
-            raise TestNodeError(
-                "test_node_diagnostic_parent_unavailable",
-                "diagnostic parent is unavailable",
-            ) from exc
-        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        return parent / f"test-node-{timestamp}-{uuid.uuid4().hex[:12]}"
-
-    def _diagnostic_parent(self, source_root: Path) -> Path:
-        for candidate in (*source_root.parents, *self.config.state_root.parents):
-            if candidate.name == ".agent-world-live":
-                return candidate
-        return Path.cwd() / ".agent-world-live"
-
-    @staticmethod
-    def _copy_state_root(source_root: Path, diagnostic_root: Path) -> None:
-        TestNodeRunner._assert_no_symlinks(source_root)
-
-        def ignore(directory: str, names: list[str]) -> set[str]:
-            relative = Path(directory).resolve().relative_to(source_root)
-            ignored: set[str] = set()
-            if relative == Path("."):
-                # ``runs`` is an execution workspace, not the frozen input
-                # closure.  Excluding it also prevents old agent runtime
-                # homes or their symlinks from entering diagnostic evidence.
-                ignored.update(name for name in names if name in _NON_DURABLE_STATE_DIRECTORIES)
-            if relative == Path("work-control"):
-                # Budget reservations and locks are mutable execution authority.
-                # The target receives a fresh, one-attempt diagnostic ledger;
-                # ancestor Artifact/commit/head closure remains byte-for-byte.
-                ignored.update(name for name in names if name in {"scope-budgets", "locks", "tmp"})
-            return ignored
-
-        try:
-            shutil.copytree(
-                source_root,
-                diagnostic_root,
-                copy_function=shutil.copy2,
-                ignore=ignore,
-            )
-            diagnostic_root.chmod(0o700)
-        except OSError as exc:
-            raise TestNodeError(
-                "test_node_state_copy_failed",
-                "could not create an isolated diagnostic state copy",
-            ) from exc
-
-    @staticmethod
     def _assert_no_symlinks(source_root: Path) -> None:
         for directory, directories, files in os.walk(source_root, followlinks=False):
             relative = Path(directory).resolve().relative_to(source_root)
@@ -2074,21 +2164,12 @@ class DiagnosticDescendantNodeRunner:
                 ),
             )
         source_diagnostic_root = self._resolve_diagnostic_root()
-        copy_helper = TestNodeRunner(
-            config=self.config,
+        diagnostic_root = _prepare_diagnostic_clone(
+            source_root=source_diagnostic_root,
             diagnostic_parent=self.diagnostic_parent,
+            marker_error_code="test_descendant_diagnostic_marker_failed",
+            marker_message="fresh diagnostic descendant state could not be marked",
         )
-        diagnostic_root = copy_helper._new_diagnostic_root(source_diagnostic_root)  # noqa: SLF001
-        try:
-            copy_helper._copy_state_root(source_diagnostic_root, diagnostic_root)  # noqa: SLF001
-            WorkControlStore(diagnostic_root / "work-control").mark_test_node_diagnostic_clone()
-        except TestNodeError:
-            raise
-        except WorkControlStoreError as exc:
-            raise TestNodeError(
-                "test_descendant_diagnostic_marker_failed",
-                "fresh diagnostic descendant state could not be marked",
-            ) from exc
 
         # Keep the production composition root at the same lazy import seam as
         # ``TestNodeRunner`` and ``DiagnosticSuccessorNodeRunner``.
@@ -2548,68 +2629,22 @@ class DiagnosticDescendantNodeRunner:
                 if self.executor_factory is not None
                 else TestNodeRunner(config=self.config)._production_executor(execution)
             )
-            try:
-                dispatch = await scheduler.dispatch_one(
-                    frozen.definition.coordinate,
-                    executors={frozen.definition.work_id: executor},
-                )
-            except KeyboardInterrupt:
-                head = _settle_cancelled_diagnostic_dispatch(
-                    runtime=runtime,
-                    definition=frozen.definition,
-                )
-                if head is None or head.status not in self._SETTLED_HEAD_STATUSES:
-                    root_span.finish(
-                        status="cancelled",
-                        error_code="test_descendant_node_dispatch_interrupted",
-                    )
-                else:
-                    root_span.finish(
-                        status="cancelled",
-                        output_refs=tuple(
-                            ref for ref in (head.commit_ref, head.evaluation_ref) if ref is not None
-                        ),
-                    )
-                app.telemetry.flush()
-                # The top-level CLI must still report the caller's SIGINT.
-                raise
-            except asyncio.CancelledError:
-                head = _settle_cancelled_diagnostic_dispatch(
-                    runtime=runtime,
-                    definition=frozen.definition,
-                )
-                if head is None or head.status not in self._SETTLED_HEAD_STATUSES:
-                    root_span.finish(
-                        status="cancelled",
-                        error_code="test_descendant_node_dispatch_cancelled",
-                    )
-                    app.telemetry.flush()
-                    raise
-                dispatch = None
-                root_span.finish(
-                    status="cancelled",
-                    output_refs=tuple(
-                        ref for ref in (head.commit_ref, head.evaluation_ref) if ref is not None
-                    ),
-                )
-                app.telemetry.flush()
-            except Exception as exc:
-                root_span.finish(
-                    status="error",
-                    error_code="test_descendant_node_dispatch_error",
-                )
-                app.telemetry.flush()
-                nonterminal = _nonterminal_diagnostic_dispatch_error(
-                    app=app,
-                    definition=frozen.definition,
-                    scope_id=scope_id,
-                    run_id=run_id,
-                    error_code="test_descendant_nonterminal_dispatch_failure",
-                    exc=exc,
-                )
-                if nonterminal is not None:
-                    raise nonterminal from exc
-                raise
+            dispatch = await _dispatch_diagnostic_target(
+                scheduler=scheduler,
+                coordinate=frozen.definition.coordinate,
+                executor=executor,
+                runtime=runtime,
+                definition=frozen.definition,
+                app=app,
+                scope_id=scope_id,
+                run_id=run_id,
+                span=root_span,
+                dispatch_error_code="test_descendant_node_dispatch_error",
+                interrupt_code="test_descendant_node_dispatch_interrupted",
+                cancel_code="test_descendant_node_dispatch_cancelled",
+                nonterminal_code="test_descendant_nonterminal_dispatch_failure",
+                settled_statuses=self._SETTLED_HEAD_STATUSES,
+            )
         if dispatch is not None:
             root_span.finish(
                 status="passed" if dispatch.after_state == "committed" else "failed",
@@ -2851,22 +2886,9 @@ class DiagnosticDescendantNodeRunner:
         )
 
     def _resolve_diagnostic_root(self) -> Path:
-        candidate = self.diagnostic_state_root.expanduser()
-        if not is_marked_test_node_diagnostic_state_root(candidate):
-            raise TestNodeError(
-                "test_descendant_state_not_marked",
-                (
-                    "diagnostic descendant requires one marked "
-                    ".agent-world-live/test-node-* state root"
-                ),
-            )
-        try:
-            return candidate.resolve(strict=True)
-        except OSError as exc:  # pragma: no cover - marker checks the same path first
-            raise TestNodeError(
-                "test_descendant_state_missing",
-                "diagnostic descendant state root is unavailable",
-            ) from exc
+        return _resolve_marked_diagnostic_root(
+            self.diagnostic_state_root, prefix="test_descendant"
+        )
 
     @staticmethod
     def _resolve_manifest_revision(
@@ -4928,21 +4950,12 @@ class DiagnosticWorldPlanNodeRunner:
         required_manifest_revision: str | None = None,
     ) -> DiagnosticWorldPlanNodeResult:
         source_diagnostic_root = self._resolve_diagnostic_root()
-        copy_helper = TestNodeRunner(
-            config=self.config,
+        prepared_root = _prepare_diagnostic_clone(
+            source_root=source_diagnostic_root,
             diagnostic_parent=self.diagnostic_parent,
+            marker_error_code="test_world_plan_diagnostic_marker_failed",
+            marker_message="fresh diagnostic World-plan state could not be marked",
         )
-        prepared_root = copy_helper._new_diagnostic_root(source_diagnostic_root)  # noqa: SLF001
-        try:
-            copy_helper._copy_state_root(source_diagnostic_root, prepared_root)  # noqa: SLF001
-            WorkControlStore(prepared_root / "work-control").mark_test_node_diagnostic_clone()
-        except TestNodeError:
-            raise
-        except WorkControlStoreError as exc:
-            raise TestNodeError(
-                "test_world_plan_diagnostic_marker_failed",
-                "fresh diagnostic World-plan state could not be marked",
-            ) from exc
 
         # Keep the production composition root at the same lazy-import seam as
         # the other test-node runners; this command does not create an
@@ -5057,22 +5070,9 @@ class DiagnosticWorldPlanNodeRunner:
         )
 
     def _resolve_diagnostic_root(self) -> Path:
-        candidate = self.diagnostic_state_root.expanduser()
-        if not is_marked_test_node_diagnostic_state_root(candidate):
-            raise TestNodeError(
-                "test_world_plan_state_not_marked",
-                (
-                    "World-plan diagnostic requires one marked "
-                    ".agent-world-live/test-node-* state root"
-                ),
-            )
-        try:
-            return candidate.resolve(strict=True)
-        except OSError as exc:  # pragma: no cover - marker checks the same path first
-            raise TestNodeError(
-                "test_world_plan_state_missing",
-                "World-plan diagnostic state root is unavailable",
-            ) from exc
+        return _resolve_marked_diagnostic_root(
+            self.diagnostic_state_root, prefix="test_world_plan"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -5140,21 +5140,12 @@ class DiagnosticTaskRequirementNodeRunner:
         task_type: str,
     ) -> DiagnosticTaskRequirementNodeResult:
         source_diagnostic_root = self._resolve_diagnostic_root()
-        copy_helper = TestNodeRunner(
-            config=self.config,
+        prepared_root = _prepare_diagnostic_clone(
+            source_root=source_diagnostic_root,
             diagnostic_parent=self.diagnostic_parent,
+            marker_error_code="test_task_requirement_diagnostic_marker_failed",
+            marker_message="fresh diagnostic TaskRequirement state could not be marked",
         )
-        prepared_root = copy_helper._new_diagnostic_root(source_diagnostic_root)  # noqa: SLF001
-        try:
-            copy_helper._copy_state_root(source_diagnostic_root, prepared_root)  # noqa: SLF001
-            WorkControlStore(prepared_root / "work-control").mark_test_node_diagnostic_clone()
-        except TestNodeError:
-            raise
-        except WorkControlStoreError as exc:
-            raise TestNodeError(
-                "test_task_requirement_diagnostic_marker_failed",
-                "fresh diagnostic TaskRequirement state could not be marked",
-            ) from exc
 
         from agent_world.app import build_application
 
@@ -5270,22 +5261,9 @@ class DiagnosticTaskRequirementNodeRunner:
         )
 
     def _resolve_diagnostic_root(self) -> Path:
-        candidate = self.diagnostic_state_root.expanduser()
-        if not is_marked_test_node_diagnostic_state_root(candidate):
-            raise TestNodeError(
-                "test_task_requirement_state_not_marked",
-                (
-                    "TaskRequirement diagnostic requires one marked "
-                    ".agent-world-live/test-node-* state root"
-                ),
-            )
-        try:
-            return candidate.resolve(strict=True)
-        except OSError as exc:  # pragma: no cover - marker checks the same path first
-            raise TestNodeError(
-                "test_task_requirement_state_missing",
-                "diagnostic TaskRequirement state root is unavailable",
-            ) from exc
+        return _resolve_marked_diagnostic_root(
+            self.diagnostic_state_root, prefix="test_task_requirement"
+        )
 
     @staticmethod
     def _task_requirement_coordinate(
@@ -5715,22 +5693,9 @@ class DiagnosticTaskCurriculumJoinRunner:
         )
 
     def _resolve_diagnostic_root(self) -> Path:
-        candidate = self.diagnostic_state_root.expanduser()
-        if not is_marked_test_node_diagnostic_state_root(candidate):
-            raise TestNodeError(
-                "test_task_curriculum_join_state_not_marked",
-                (
-                    "TaskCurriculum join diagnostic requires one marked "
-                    ".agent-world-live/test-node-* state root"
-                ),
-            )
-        try:
-            return candidate.resolve(strict=True)
-        except OSError as exc:  # pragma: no cover - marker checks the same path first
-            raise TestNodeError(
-                "test_task_curriculum_join_state_missing",
-                "diagnostic TaskCurriculum join state root is unavailable",
-            ) from exc
+        return _resolve_marked_diagnostic_root(
+            self.diagnostic_state_root, prefix="test_task_curriculum_join"
+        )
 
     @classmethod
     def _load_plan_derived_join(
@@ -6079,22 +6044,9 @@ class DiagnosticPlanDerivedDesignNodeRunner:
         )
 
     def _resolve_diagnostic_root(self) -> Path:
-        candidate = self.diagnostic_state_root.expanduser()
-        if not is_marked_test_node_diagnostic_state_root(candidate):
-            raise TestNodeError(
-                "test_plan_derived_design_state_not_marked",
-                (
-                    "Plan-derived Design diagnostic requires one marked "
-                    ".agent-world-live/test-node-* state root"
-                ),
-            )
-        try:
-            return candidate.resolve(strict=True)
-        except OSError as exc:  # pragma: no cover - marker checks the same path first
-            raise TestNodeError(
-                "test_plan_derived_design_state_missing",
-                "diagnostic Plan-derived Design state root is unavailable",
-            ) from exc
+        return _resolve_marked_diagnostic_root(
+            self.diagnostic_state_root, prefix="test_plan_derived_design"
+        )
 
 
 _DiagnosticFinalInitialStage = Literal[
@@ -6184,21 +6136,12 @@ class DiagnosticFinalNodeRunner:
                 ),
             )
         source_diagnostic_root = self._resolve_diagnostic_root()
-        copy_helper = TestNodeRunner(
-            config=self.config,
+        prepared_root = _prepare_diagnostic_clone(
+            source_root=source_diagnostic_root,
             diagnostic_parent=self.diagnostic_parent,
+            marker_error_code="test_final_node_diagnostic_marker_failed",
+            marker_message="fresh diagnostic final-node state could not be marked",
         )
-        prepared_root = copy_helper._new_diagnostic_root(source_diagnostic_root)  # noqa: SLF001
-        try:
-            copy_helper._copy_state_root(source_diagnostic_root, prepared_root)  # noqa: SLF001
-            WorkControlStore(prepared_root / "work-control").mark_test_node_diagnostic_clone()
-        except TestNodeError:
-            raise
-        except WorkControlStoreError as exc:
-            raise TestNodeError(
-                "test_final_node_diagnostic_marker_failed",
-                "fresh diagnostic final-node state could not be marked",
-            ) from exc
 
         from agent_world.app import build_application
 
@@ -6763,22 +6706,9 @@ class DiagnosticFinalNodeRunner:
         return policy.budget.llm_tokens, policy.budget.wall_seconds
 
     def _resolve_diagnostic_root(self) -> Path:
-        candidate = self.diagnostic_state_root.expanduser()
-        if not is_marked_test_node_diagnostic_state_root(candidate):
-            raise TestNodeError(
-                "test_final_node_state_not_marked",
-                (
-                    "final-node diagnostic requires one marked "
-                    ".agent-world-live/test-node-* state root"
-                ),
-            )
-        try:
-            return candidate.resolve(strict=True)
-        except OSError as exc:  # pragma: no cover - marker checks the same path first
-            raise TestNodeError(
-                "test_final_node_state_missing",
-                "diagnostic final-node state root is unavailable",
-            ) from exc
+        return _resolve_marked_diagnostic_root(
+            self.diagnostic_state_root, prefix="test_final_node"
+        )
 
     @staticmethod
     def _one_consumer_ref(commit: WorkCommit, *, artifact_type: str) -> ArtifactRef:
@@ -6915,18 +6845,12 @@ class DiagnosticSuccessorNodeRunner:
         target_coordinate: str,
     ) -> DiagnosticSuccessorNodeResult:
         source_diagnostic_root = self._resolve_diagnostic_root()
-        copy_helper = TestNodeRunner(config=self.config)
-        diagnostic_root = copy_helper._new_diagnostic_root(source_diagnostic_root)  # noqa: SLF001
-        try:
-            copy_helper._copy_state_root(source_diagnostic_root, diagnostic_root)  # noqa: SLF001
-            WorkControlStore(diagnostic_root / "work-control").mark_test_node_diagnostic_clone()
-        except TestNodeError:
-            raise
-        except WorkControlStoreError as exc:
-            raise TestNodeError(
-                "test_successor_diagnostic_marker_failed",
-                "fresh diagnostic successor state could not be marked",
-            ) from exc
+        diagnostic_root = _prepare_diagnostic_clone(
+            source_root=source_diagnostic_root,
+            diagnostic_parent=TestNodeRunner(config=self.config)._diagnostic_parent(source_diagnostic_root),
+            marker_error_code="test_successor_diagnostic_marker_failed",
+            marker_message="fresh diagnostic successor state could not be marked",
+        )
         # Import lazily for the same composition-root cycle boundary as
         # ``TestNodeRunner``.
         from agent_world.app import build_application
@@ -7097,68 +7021,22 @@ class DiagnosticSuccessorNodeRunner:
             if self.executor_factory is not None
             else TestNodeRunner(config=self.config)._production_executor(execution)
         )
-        try:
-            dispatch = await scheduler.dispatch_one(
-                target,
-                executors={definition.work_id: executor},
-            )
-        except KeyboardInterrupt:
-            head = _settle_cancelled_diagnostic_dispatch(
-                runtime=runtime,
-                definition=definition,
-            )
-            if head is None or head.status not in _TERMINAL_WORK_HEAD_STATUSES:
-                root_span.finish(
-                    status="cancelled",
-                    error_code="test_successor_node_dispatch_interrupted",
-                )
-            else:
-                root_span.finish(
-                    status="cancelled",
-                    output_refs=tuple(
-                        ref for ref in (head.commit_ref, head.evaluation_ref) if ref is not None
-                    ),
-                )
-            app.telemetry.flush()
-            # Preserve the real external-interrupt signal after durability.
-            raise
-        except asyncio.CancelledError:
-            head = _settle_cancelled_diagnostic_dispatch(
-                runtime=runtime,
-                definition=definition,
-            )
-            if head is None or head.status not in _TERMINAL_WORK_HEAD_STATUSES:
-                root_span.finish(
-                    status="cancelled",
-                    error_code="test_successor_node_dispatch_cancelled",
-                )
-                app.telemetry.flush()
-                raise
-            dispatch = None
-            root_span.finish(
-                status="cancelled",
-                output_refs=tuple(
-                    ref for ref in (head.commit_ref, head.evaluation_ref) if ref is not None
-                ),
-            )
-            app.telemetry.flush()
-        except Exception as exc:
-            root_span.finish(
-                status="error",
-                error_code="test_successor_node_dispatch_error",
-            )
-            app.telemetry.flush()
-            nonterminal = _nonterminal_diagnostic_dispatch_error(
-                app=app,
-                definition=definition,
-                scope_id=scope_id,
-                run_id=run_id,
-                error_code="test_successor_nonterminal_dispatch_failure",
-                exc=exc,
-            )
-            if nonterminal is not None:
-                raise nonterminal from exc
-            raise
+        dispatch = await _dispatch_diagnostic_target(
+            scheduler=scheduler,
+            coordinate=target,
+            executor=executor,
+            runtime=runtime,
+            definition=definition,
+            app=app,
+            scope_id=scope_id,
+            run_id=run_id,
+            span=root_span,
+            dispatch_error_code="test_successor_node_dispatch_error",
+            interrupt_code="test_successor_node_dispatch_interrupted",
+            cancel_code="test_successor_node_dispatch_cancelled",
+            nonterminal_code="test_successor_nonterminal_dispatch_failure",
+            settled_statuses=_TERMINAL_WORK_HEAD_STATUSES,
+        )
         if dispatch is not None:
             root_span.finish(
                 status="passed" if dispatch.after_state == "committed" else "failed",
@@ -7230,19 +7108,9 @@ class DiagnosticSuccessorNodeRunner:
         )
 
     def _resolve_diagnostic_root(self) -> Path:
-        candidate = self.diagnostic_state_root.expanduser()
-        if not is_marked_test_node_diagnostic_state_root(candidate):
-            raise TestNodeError(
-                "test_successor_state_not_marked",
-                "diagnostic successor requires one marked .agent-world-live/test-node-* state root",
-            )
-        try:
-            return candidate.resolve(strict=True)
-        except OSError as exc:  # pragma: no cover - marker checks the same path first
-            raise TestNodeError(
-                "test_successor_state_missing",
-                "diagnostic successor state root is unavailable",
-            ) from exc
+        return _resolve_marked_diagnostic_root(
+            self.diagnostic_state_root, prefix="test_successor"
+        )
 
     @staticmethod
     def _architecture_coordinate(heads: tuple[WorkControlHead, ...]) -> WorkCoordinate:

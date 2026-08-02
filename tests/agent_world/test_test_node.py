@@ -71,6 +71,7 @@ from agent_world.control.test_node import (
 from agent_world.control.test_node import (
     DiagnosticRuntimeImplementationOverride,
     DiagnosticRuntimeProfileOverride,
+    _prepare_diagnostic_clone,
 )
 from agent_world.control.test_node import (
     DiagnosticSuccessorNodeRunner as SuccessorRunner,
@@ -3470,9 +3471,14 @@ def test_test_node_copy_excludes_non_durable_agent_workspaces(tmp_path: Path) ->
         "telemetry",
     ):
         (source_root / directory).mkdir()
+    (source_root / "work-control").mkdir()
 
-    diagnostic_root = tmp_path / "diagnostic-state"
-    NodeRunner._copy_state_root(source_root, diagnostic_root)
+    diagnostic_root = _prepare_diagnostic_clone(
+        source_root=source_root,
+        diagnostic_parent=tmp_path,
+        marker_error_code="test_node_diagnostic_marker_failed",
+        marker_message="x",
+    )
 
     assert (diagnostic_root / "artifacts" / "durable.json").is_file()
     assert not (diagnostic_root / "runs").exists()

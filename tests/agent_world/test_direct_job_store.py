@@ -255,3 +255,42 @@ def test_failed_direct_head_requires_explicit_restart_and_preserves_prior_result
             next_head=resumed,
             allow_terminal_restart=True,
         ) == resumed
+
+
+def test_list_request_ids_for_scope_filters_by_scope_and_excludes_legacy(
+    tmp_path: Path,
+) -> None:
+    store = DirectJobStore(tmp_path / "direct-jobs")
+    scope_a = "generate-job:aaa"
+    scope_b = "generate-job:bbb"
+
+    def _put(request_id: str, scope_id: str | None) -> None:
+        request_ref = _ref(f"request-artifact:{request_id}", "control.environment_request")
+        job_ref = _ref(f"generate-job:{request_id}", "control.environment_job")
+        snapshot = _ref(f"run:{request_id}:state", "control.job_run_snapshot")
+        with store.exclusive(request_id) as lock:
+            head = new_direct_job_head(
+                request_id=request_id,
+                request_fingerprint=sha256_digest(request_id.encode("utf-8")),
+                request_ref=request_ref,
+                job_ref=job_ref,
+                run_id=f"run:{request_id}",
+                snapshot_ref=snapshot,
+                snapshot_revision=1,
+                status="running",
+                scope_id=scope_id,
+            )
+            store.compare_and_swap(lock, expected_head=None, next_head=head)
+
+    _put("request:in-a", scope_a)
+    _put("request:also-a", scope_a)
+    _put("request:in-b", scope_b)
+    _put("request:legacy", None)  # pre-R3 head without scope_id
+
+    assert store.list_request_ids_for_scope(scope_a) == (
+        "request:also-a",
+        "request:in-a",
+    )
+    assert store.list_request_ids_for_scope(scope_b) == ("request:in-b",)
+    # legacy head is excluded (fail-closed), not silently assigned to a scope
+    assert store.list_request_ids_for_scope("generate-job:nonexistent") == ()

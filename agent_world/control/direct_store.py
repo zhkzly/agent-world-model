@@ -144,6 +144,39 @@ class DirectJobStore:
             raise DirectJobStoreError("Direct job head identity mismatch")
         return head
 
+    def list_request_ids_for_scope(self, scope_id: str) -> tuple[str, ...]:
+        """Return the request ids whose Direct job head belongs to one scope.
+
+        Scope is the stable ``EnvironmentJob.job_id`` for the life of a run
+        (``DirectJobHead.scope_id``, R3).  Legacy heads written before the
+        field existed carry ``scope_id=None``; they are intentionally excluded
+        here (fail-closed) rather than silently guessed, because deriving their
+        scope would require a job deref this store cannot do without the
+        artifact store.  Callers that need legacy scopes should deref
+        ``job_ref`` themselves.
+        """
+
+        heads_dir = self.root / "heads"
+        try:
+            entries = tuple(heads_dir.iterdir())
+        except FileNotFoundError:
+            return ()
+        except OSError as exc:
+            raise DirectJobStoreError(
+                f"cannot scan Direct job heads for scope: {scope_id}"
+            ) from exc
+        matches: list[str] = []
+        for entry in entries:
+            if not entry.is_file() or entry.suffix != ".json":
+                continue
+            try:
+                head = DirectJobHead.model_validate_json(entry.read_bytes())
+            except Exception:  # noqa: S112 - a corrupt unrelated head must not abort the scan
+                continue
+            if head.scope_id == scope_id:
+                matches.append(head.request_id)
+        return tuple(sorted(matches))
+
     def compare_and_swap(
         self,
         lock: DirectJobLock,
