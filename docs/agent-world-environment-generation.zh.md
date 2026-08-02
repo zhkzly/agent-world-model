@@ -108,7 +108,9 @@ flowchart TB
 
 输入一个 `EnvironmentRequest`，输出一个 released `EnvironmentPackage`，或结构化的 `rejected`、`needs_human`、`budget_exhausted`。成功不依赖 EnvironmentPool、Evolve、Suite、rollout 或训练反馈。
 
-Designer 对外只暴露经过 framework typed validation 的 `evidence_graph` `DesignPhaseCheckpoint`，它绑定同一 `EnvironmentJob`、`EnvironmentRequest` 与完整证据 DAG。恢复时复用该 EvidenceGraph，且本次恢复的 search/fetch/Researcher 调用为零。其后的 WorldArchitecture、SharedToolSemantics、ToolSemanticsBatch、WorldRules 和 TaskCurriculum 不暴露为可任意采用的 phase checkpoint；每个事务只能在 Source/derived Artifacts、当前 compiler 的 `ValidationReport`、唯一 terminal `FeedbackEvaluation` 全部完成后写一个 framework-owned `WorkCommit`。跨进程恢复必须同时验证 coordinate、精确 immutable dependencies、当前 `acceptance_digest` 和未失效 WorkCommit；`acceptance_digest` 绑定 Claim、依赖拓扑、输出契约、acceptance transform、显式 validator executable revision、assurance 要求和 success maturity。完整 `definition_digest` 仍绑定新 Attempt 的执行预算与权限，`repair_epoch_digest` 仍绑定失败/返工授权，但这些未来执行策略的变化不得追溯性地使已经通过且 acceptance 不变的成功失效。单独 Source、审计事件、未完成模型输出或旧控制对象均无恢复资格。需求语义变化、跨 request 复用、证据过期或来源失效不得隐式采用旧证据，必须进入显式 freshness/adoption policy。
+Designer 对外只暴露经过 framework typed validation 的 `evidence_graph` `DesignPhaseCheckpoint`，它绑定同一 `EnvironmentJob`、`EnvironmentRequest` 与完整证据 DAG。恢复时复用该 EvidenceGraph，且本次恢复的 search/fetch/Researcher 调用为零。其后的 WorldArchitecture、SharedToolSemantics、ToolSemanticsBatch、WorldRules 和 TaskCurriculum 不暴露为可任意采用的 phase checkpoint；每个事务只能在 Source/derived Artifacts、当前 compiler 的 `ValidationReport`、唯一 terminal `FeedbackEvaluation` 全部完成后写一个 framework-owned `WorkCommit`。跨进程恢复必须同时验证 coordinate、精确 immutable dependencies、当前 `acceptance_digest` 和未失效 WorkCommit；`acceptance_digest` 绑定 Claim、依赖拓扑、输出契约、acceptance transform、显式 validator executable revision、assurance 要求和 success maturity。对 Agent 语义节点，`implementation_revision_id` 还必须哈希实际生效的 Prompt/input 投影、输出模型、Runtime Skill 与会改变这些内容的 profile-materialization 代码；它们一变就必须生成新节点，不能把旧提交伪装为当前语义。相反，纯物理 invocation transport、worker lifecycle、重试/回退与观测修复不改变“什么答案正确”，不得仅因这类变更使上游语义 Artifact 失效。完整 `definition_digest` 仍绑定新 Attempt 的执行预算与权限，`repair_epoch_digest` 仍绑定失败/返工授权，但这些未来执行策略的变化不得追溯性地使已经通过且 acceptance 不变的成功失效。单独 Source、审计事件、未完成模型输出或旧控制对象均无恢复资格。需求语义变化、跨 request 复用、证据过期或来源失效不得隐式采用旧证据，必须进入显式 freshness/adoption policy。
+
+这里的 Runtime Skill 仅指 tool-enabled Codex Agent 的实际 mounted bundle；Direct LLM 的同一身份只绑定其实际生效的 Prompt/input、输出模型和 profile-materialization，绝不能把不存在的 Skill 资产哈希进 Direct semantic identity。
 
 首次通过 Modeling Gate 时，Controller 仍固化 `DesignBaselineCheckpoint`。Controller 不会为了制造“基线前接入”而等待 Discovery，也不会伪称 late evidence 已进入当前 Design：完成的 clue 先确定性写入 provisional Expansion Inbox，再由独立 admission 细化；未完成 work 写成 deferred state，可由 `agent-world discovery resume DISCOVERY_RUN_ID` 在新独立预算下恢复。任何时刻证明 hard claim、工具语义、安全规则或 fidelity 声明错误的新证据仍必须形成 Finding 与 `quarantine_recommended` 信号；真正 quarantine 由框架独立证据政策决定，不能由 LLM admission 单独执行。
 
@@ -234,7 +236,7 @@ reservation 或 `WorkReadinessSnapshot`。Package bytes 和其 WorkCommit 成功
 Registry staging 后生成的物理发布回执另称 `PublicationDossier`。旧 `ClaimVector` 不能再作为
 package/Registry 的平行成功权威，迁移完成后删除。
 
-恢复同样按 readiness DAG，而不是按“整条流水线重跑”。任一节点通过后，Controller 必须在启动下一个长耗时 consumer 前立即结算 lease、关闭 `WorkAttempt`、写唯一 `WorkCommit` 和不可变快照；Builder 与 Verifier 并发时，Builder 一完成就必须提交 ImplementationContract、source tar、lineage、CandidateManifest、BuildRecord 与 Candidate，并立即进入 Integration，慢 Verifier 不得推迟或抹掉已经成功的 Build。恢复只采用同一 request/job、同一最终 Design revision、当前 Modeling Gate 仍通过且 Artifact dependency closure 完整的 WorkCommit。Build 恢复还必须逐文件复验 link-free source tar 的 path、mode、size、content hash 和完整 manifest closure，再物化到新的隔离 workspace，并从精确 Design/ImplementationContract 重新生成候选只读的 `inputs/`（不能把它遗漏或塞入 source tar）。Agent continuation 只能从 framework 私有 checkpoint 恢复，并重新验证 workspace、lineage、profile/config/schema、immutable inputs、RepairAction 和 budget lease；不存在这些绑定时显式启动新的真实 Builder，不能伪造 session 或把旧候选假装修好。
+恢复同样按 readiness DAG，而不是按“整条流水线重跑”。任一节点通过后，Controller 必须在启动下一个长耗时 consumer 前立即结算 lease、关闭 `WorkAttempt`、写唯一 `WorkCommit` 和不可变快照；Builder 与 Verifier 并发时，Builder 一完成就必须提交 ImplementationContract、source tar、lineage、CandidateManifest、BuildRecord 与 Candidate，并立即进入 Integration，慢 Verifier 不得推迟或抹掉已经成功的 Build。恢复只采用同一 request/job、同一最终 Design revision、当前 Modeling Gate 仍通过且 Artifact dependency closure 完整的 WorkCommit。Build 恢复还必须逐文件复验 link-free source tar 的 path、mode、size、content hash 和完整 manifest closure，再物化到新的隔离 workspace，并从精确 Design/ImplementationContract 重新生成候选只读的 `inputs/`（不能把它遗漏或塞入 source tar）。已建立 Codex thread 的 retryable Provider terminal 若仍有 framework 私有的 runtime checkpoint，优先在同一 backend、同一 workspace、同一 profile/config/schema 和同一 immutable inputs 下启动一个新的物理 turn 续接该 session；它仍消耗显式 infrastructure retry、经过 liveness/backoff，并保留失败 attempt。Agent continuation 只能从这类 framework 私有 checkpoint 恢复，并重新验证 workspace、lineage、profile/config/schema、immutable inputs、RepairAction 和 budget lease；不存在这些绑定、backend 已重启或续接终端不再可用时，才显式启动新的真实 Builder，不能伪造 session 或把旧候选假装修好。
 
 ### 3.6 决策权限：Code Router 执行，LLM 只作语义裁判
 
@@ -499,7 +501,16 @@ Verifier 编译不得按 task 数量复制完整 Challenger invocation。Framewo
 
 ### 5.4 ResolvedAgentProfile 与 EffectiveCapabilityPlan
 
-每个 Agent invocation 前，framework 必须物化 hermetic `ResolvedAgentProfile`：独立 HOME/CODEX_HOME、workspace、只读 Skill bundle、只读 Hook bundle、Tool/MCP allowlist、network policy、credential handles、输出目录和 sealed namespace。不得自动继承开发者全局 Skills、Hooks、MCP、凭证或 ambient filesystem。
+每次模型调用先由 framework 区分两个不兼容的执行形态，不能把同一套语义上下文隐式复制给二者：
+
+| 形态 | 模型实际收到的语义输入 | 不得出现的隐式上下文 |
+| --- | --- | --- |
+| Direct LLM structured node | `model + rendered Prompt/input + 已授权 correction feedback`；输出 transport/schema、凭证、路由和 liveness 仅是调用机械配置 | Runtime Skill、runtime Hook、工具、workspace 指令、profile-owned instruction、Provider `instructions` |
+| tool-enabled Codex Agent node | 通用 Codex + 当前节点的唯一专有只读 Skill + rendered Prompt/input + 已授权 correction feedback；SDK 以真实工作目录和 full access 执行 | ambient Skills/runtime Hooks/MCP、别的节点的语义 Skill |
+
+两种形态共用 `ResolvedAgentProfile` 的路由、凭证句柄和可验证身份，但不是同一套模型上下文。Direct profile 只保留不可见的最小 provenance marker，必须没有 `skills`、builtin tools、运行时工具、外部能力和任何 profile-owned instruction 字段；Direct Provider request 只发送模型、渲染后的 Prompt 和必要 response transport 字段。Codex Agent profile 才物化私有 `CODEX_HOME`、当前工作目录和唯一只读 Skill bundle；SDK 直接以 `full-access` 在主机工作目录执行，不创建 bwrap/unshare、虚拟路径、工具门面或项目自定义权限表。runtime profile 不支持 Hook bundle；不得自动继承开发者全局 Skills、runtime Hooks、MCP 或凭证文件。
+
+语义文本不得双写：Direct 节点的渲染 Prompt 是其唯一的完整工作说明（含输出协议）；真实 Codex Agent 的专用 Skill 负责可复用的工作方法与工具纪律，节点 Prompt 只说明本次 Artifact、冻结输入与获授权的反馈。不能把 Skill 正文复制到 Agent 的 Prompt 或其他隐藏注入面；runtime profile 没有 base/developer instruction 字段，也不挂载 Hook。
 
 有效能力由不可变交集编译：
 
@@ -520,31 +531,25 @@ flowchart TB
 
     subgraph RP["Researcher hermetic profile"]
         RSK["只读 Research Skill bundle"]
-        RHK["该 profile 的只读 Hooks"]
         RTL["Search / Fetch / Reader<br/>显式 network + credential handles"]
         RWS["独立 HOME / CODEX_HOME<br/>只读 staged evidence workspace"]
         RSK --> RWS
-        RHK --> RWS
         RTL --> RWS
     end
 
     subgraph EP["Environment Engineer hermetic profile"]
         ESK["WorldSpec / Task / Codegen Skills"]
-        EHK["该 profile 的只读 Hooks"]
         ETL["受控 shell / uv / build<br/>显式 dependency domains"]
         EWS["稳定但隔离的可写 workspace<br/>同 lineage 定向 repair"]
         ESK --> EWS
-        EHK --> EWS
         ETL --> EWS
     end
 
     subgraph CP["Challenger hermetic profile"]
         CSK["Review / Verifier proposal Skills"]
-        CHK["该 profile 的只读 Hooks"]
         CTL["只读设计与 public episode tools"]
         CWS["独立 session / workspace<br/>data-only proposal / recipe"]
         CSK --> CWS
-        CHK --> CWS
         CTL --> CWS
     end
 
@@ -556,27 +561,48 @@ flowchart TB
     CWS --> IB
 
     SEALED["sealed cases / EvaluatorGoal / Rule IR<br/>Release Kernel namespace"] --> JUDGE["Framework Judge only"]
-    DENY["不挂载给任何 Agent<br/>无 ambient Skills / Hooks / MCP / credentials"] -.-> SEALED
+    DENY["不挂载给任何 Agent<br/>无 ambient Skills / runtime Hooks / MCP / credentials"] -.-> SEALED
 ```
 
-Skill 与 Hook bundle 必须逐份内容哈希并只读物化；Tool/MCP 通过 typed allowlist、transport、domain 与 credential handle 描述，未声明能力不出现。不同角色不能共享 HOME、CODEX_HOME、workspace、session、可变 Hook 状态或隐藏工具。ProfileResolver 和 adapter 都要复验物理 bundle、Codex binary、workspace 和 capability manifest；无法证明隔离时在调用模型前失败，而不是带着宿主机的默认配置继续运行。
+Codex Agent 的唯一 Skill bundle 必须内容哈希并只读物化到隔离
+`CODEX_HOME/skills/<skill-name>/SKILL.md` 的真实 Codex 发现根；仅在
+`skills.config` 中记录外部 bundle 路径不能证明模型实际看见了 Skill。真实验收必须检查该 turn
+初始 `Available skills` 目录，而不能只相信 profile 的计划 skill count。Direct LLM 不得有 bundle
+可哈希或可挂载，runtime profile 也不支持 Hook bundle。不同 Codex Agent 调用不共享私有
+`CODEX_HOME`、session 或隐藏配置。ProfileResolver 和 adapter 都要复验实际 profile 的 bundle、
+Codex binary、workspace 与可公开的 profile marker；无法证明这些调用身份时在调用模型前失败，
+而不是继承未知的项目外配置。
 
-缺少任一必需授权时必须在调用模型前 fail closed，进入 `needs_human` 或结构化失败，不能退化为更宽 profile。隔离 shell、staged input read 和 Builder workspace edit 是节点声明的 intrinsic sandbox capability；外部网络、工具、MCP、credentials 和 side effects 是单独授权的 external capability。
+这里的“唯一 Skill bundle”是一个渐进加载的完整目录，而不是只允许一份长 Markdown：
+`SKILL.md` 只保留触发条件、核心方法和按需导航；详细协议、领域约束与案例放一层
+`references/`；重复且需要确定性可靠性的机械检查才放 `scripts/`；只有会被产物直接复用的模板
+或媒体才放 `assets/`。一个节点不能为了把同一职责拆成章节而并列挂载多个始终生效的 Skills；
+例如 CandidateBuild 的 Python 项目交付是其 Codegen Skill 的 reference，而不是第二个角色
+Skill。profile hash、Agent 语义 implementation revision 与真实物化必须绑定整个 bundle 闭包，
+使 reference 或 script 的改变与 `SKILL.md` 改变一样令旧语义结果失效。Direct LLM 既不加载
+`SKILL.md`，也不获得其 references/scripts。
 
-所有模型调用都经过真实 `InvocationBackend` adapter。Codex SDK 的 session continuation、workspace 和 sandbox 逻辑只存在于 backend adapter，pipeline core 不散落 SDK 调用。关闭或缺少真实 backend 时诚实失败；不存在模板、固定环境、通用 shell 生成器或伪 Agent 成功路径。
+缺少模型或研究所需凭证时必须在调用前 fail closed，进入 `needs_human` 或结构化失败；不得把
+凭证写入 profile、Artifact 或日志。节点 profile 仍记录 Direct-vs-Agent、Skill、预算和外部调用
+需求以便调度与审计，但不把 shell、workspace edit、网络或主机路径编译成 project-owned sandbox
+capability。Code Agent 的主机访问由 SDK `full-access` 和其真实工作目录决定。
 
-Hook 使用 framework 定义的 backend-neutral lifecycle contract，并映射到 SDK 原生 hook。Hook 不得扩大 ToolBroker 能力、跨 profile 保存隐藏可变状态或绕过 Artifact writer。
+所有模型调用都经过真实 `InvocationBackend` adapter。Codex SDK 的 session continuation、workspace
+和 full-access 选择只存在于 backend adapter，pipeline core 不散落 SDK 调用。关闭或缺少真实
+backend 时诚实失败；不存在模板、固定环境、通用 shell 生成器或伪 Agent 成功路径。
+
+项目执行 Agent 的 session-start/index hook 只负责导航视图，绝不物化到 runtime profile、Codex SDK payload 或模型 Prompt；它不能扩大 ToolBroker 能力、跨 profile 保存隐藏可变状态或绕过 Artifact writer。
 
 ## 6. Direct Generation 详细流程
 
 1. **Intake**：Controller 将 canonical Request、permission、release profile 和预算绑定到 durable job fingerprint；同 id 不同 fingerprint 冲突。
 2. **Budget reservation**：为 Direct 前台工作预留容量；Discovery 使用独立低优先级 lease，不能借走首包预算。
 3. **Research**：Researcher 反复执行 plan、真实 search/fetch/extract、冲突核对和 gap 更新；停止由 coverage/risk/budget Gate 决定，不由 Agent 自称完成。
-4. **World modeling**：同一个隔离 Engineer profile 执行少量、有界的语义事务，而不是把每个实体、schema role 和工具语义字段变成独立模型调用。`WorldArchitecture` 一次冻结 identity、authority、实体及紧凑字段语义、生命周期、关系、工具边界与嵌入所属工具的紧凑接口语义；framework 从它确定性编译 Entity/Tool Schema、ID、引用、required、closed shape 和 root assembly。framework 随后从 namespace 与共享状态生成不可由模型修改的 `ToolCouplingPlan`。含五至八个耦合工具的 group 先由一次短 `SharedToolSemantics` 事务冻结 atomicity、concurrency、idempotency、ordering、compensation 与共享 error policy；每个最多四工具的 `ToolSemanticsBatch` 必须实现这份共享合同。所有 batch 完成后，代码生成 `ToolSemanticGroupClosure` 并在 WorldRules 前拒绝跨批冲突。随后单独的 `WorldRules` 事务只表达初态规则和跨实体/工具 invariant；framework 将其编译并与 Schema/Tool contracts 做闭包校验。完整 WorldModel 成功后，`CurriculumPlan` 只产生最小、按顺序的 task family、objective、actor/tool scope、difficulty、sampling 与 design-stage coverage，不能产生 task Rule。framework 冻结一个 `TaskRequirement` coordinate/Agent turn 给 plan 的每个 task type；循环每次只要求该 task family 的 initial/success/failure/terminal `RuleDraft`，失败只停在该 item，若有精确 feedback 和 repair 授权也只修该 item。全部 item commit 后，code 按 plan 顺序确定性合并 `TaskCurriculum`，再编译 TaskRequirement、task protocol、Reward 和 VerificationRequirements。
+4. **World modeling**：Direct LLM Engineer 节点以少量、有界且相互独立的 Prompt-only 语义事务执行，而不是把每个实体、schema role 和工具语义字段变成独立模型调用。`WorldArchitecture` 一次冻结 identity、authority、实体及紧凑字段语义、生命周期、关系、工具边界与嵌入所属工具的紧凑接口语义；framework 从它确定性编译 Entity/Tool Schema、ID、引用、required、closed shape 和 root assembly。framework 随后从 namespace 与共享状态生成不可由模型修改的 `ToolCouplingPlan`。每个含多个耦合工具的 group 先由一次短 `SharedToolSemantics` 事务冻结 atomicity、concurrency、idempotency、ordering、compensation 与共享 error policy；该合同 commit 后，每个 `ToolSemantics` 物理 shard **恰好只实现一个工具**，并必须实现所属共享合同。这样不会把每个 precondition/postcondition 字段拆成模型调用，却避免把多工具的完整结构化行为压入同一 Provider 输出 envelope。相互独立的 singleton shard 可在已配置的 backend 容量、预算 lease 与确定性提交条件下并行；同组 sibling 不互相依赖，只共同依赖已提交的 SharedToolSemantics。所有 shard 完成后，代码生成 `ToolSemanticGroupClosure` 并在 WorldRules 前拒绝跨工具冲突。随后单独的 `WorldRules` 事务只表达初态规则和仍未由工具局部规则覆盖、且能被封闭 Rule ADT 真实表达的跨实体/工具 invariant；没有这种额外全局关系时 `invariants` 必须允许为空，不能用恒真式、集合存在性或 Schema 重述凑数。framework 将其编译并与 Schema/Tool contracts 做闭包校验。完整 WorldModel 成功后，`CurriculumPlan` 只产生最小、按顺序的 task family、objective、actor/tool scope、difficulty、sampling 与 design-stage coverage，不能产生 task Rule。framework 冻结一个 `TaskRequirement` coordinate/Direct LLM turn 给 plan 的每个 task type；循环每次只要求该 task family 的 initial/success/failure/terminal `RuleDraft`，失败只停在该 item，若有精确 feedback 和 repair 授权也只修该 item。全部 item commit 后，code 按 plan 顺序确定性合并 `TaskCurriculum`，再编译 TaskRequirement、task protocol、Reward 和 VerificationRequirements。
 
-   模型只拥有业务字段意义和 `RuleDraft`/typed source IR，不拥有 `properties/required/additionalProperties/items/anyOf`、case id、seed、public/sealed partition、reward、Gate 或发布字段。工具批次的 Rule ID 则由 framework 的 frozen `tool_id + section + ordinal` 组合，模型可省略该机械字段。对 `SharedToolSemantics`，prompt 必须把冻结 `ordered_tool_ids` 明示为构造约束：atomicity、concurrency、idempotency 三类 domain 各自精确分割该全集；没有证据要求更细分时一个覆盖全集的 domain 是保守合法构造；error policy 至少覆盖全集。这个提示只减少机械遗漏，不替代或放宽 compiler 对实际分组/语义的验证。framework 确定性编译 Draft 2020-12 schema、核心 Rule IR、projection、task binding 和全局闭包。一个批次中的所有安全问题在同一 validation frontier 聚合；机械问题由代码直接拒绝或规范化，只有仍需业务判断的缺口才允许对整个最小语义批次做一次 correction。工具批次具有独立 commit/repair identity；当前调度器按稳定顺序执行，后续只有在 backend 容量、预算 lease 与提交确定性均得到证明后才可并发，失败批次不得失效已提交 sibling。
+   模型只拥有业务字段意义和 `RuleDraft`/typed source IR，不拥有 `properties/required/additionalProperties/items/anyOf`、case id、seed、public/sealed partition、reward、Gate 或发布字段。工具 shard 的 Rule ID 则由 framework 的 frozen `tool_id + section + ordinal` 组合，模型可省略该机械字段。对 `SharedToolSemantics`，Prompt 必须把冻结 `ordered_tool_ids` 明示为构造约束：atomicity、concurrency、idempotency 三类 domain 各自精确分割该全集；没有证据要求更细分时一个覆盖全集的 domain 是保守合法构造；error policy 至少覆盖全集。这个提示只减少机械遗漏，不替代或放宽 compiler 对实际分组/语义的验证。单工具 Direct LLM Prompt（含其唯一的紧凑输出协议）必须独自要求“最小充分的完整行为”：不叙述推理、不重复等价 Rule、不枚举样例/轨迹/替代方案，也不因求短而漏掉必要行为；不得再由 Runtime Skill 复制这些内容。framework 确定性编译 Draft 2020-12 schema、核心 Rule IR、projection、task binding 和全局闭包。一个 shard 中的所有安全问题在同一 validation frontier 聚合；机械问题由代码直接拒绝或规范化，只有仍需业务判断的缺口才允许对该最小语义 shard 做一次 correction。工具 shard 具有独立 commit/repair identity；Scheduler 以稳定 coordinate 决定 wave，在 `max_concurrent_invocations` 的同一全局 admission capacity 内并行 dispatch 真正 ready 的 sibling，失败 shard 不得失效已提交 sibling。
 
-   首次真实 Build 前，Direct Designer 的基础 Agent turn 为 `7–8 + K`：Research plan、检索后 synthesis、World Architecture、最多一次 multi-batch Shared Tool Contract、1–2 个 Tool Semantics batch、一次 WorldRules、一次 CurriculumPlan，以及已冻结 plan 中 `K` 个 TaskRequirement（`1 ≤ K ≤ 8`）。plan commit 后 Controller 才能计算精确 K、为每个 item 单独预留 turn/repair budget，并在总预算不足时 fail closed；不得把 K 个 item 假装成一次 Task/Curriculum 调用，也不得因某一 item 失败而启动后续 sibling。没有 multi-batch group 时共享事务为零，典型调用仍更少。框架不得以固定输入字节数、隐藏的单 turn token ceiling，或任意短的 first-progress/first-write deadline 预先拒绝、截断或迫使语义分片；first-progress/first-write 是观测事实，不是把尚未收到 Provider 事件的真实 Agent 调用自动判死的独立预算。真实 Provider/transport 的物理终态必须以安全可观测事实记录，再决定 profile、transport、workspace input 或拓扑调整。
+   首次真实 Build 前，Direct Designer 的基础模型 turn 为 `6 + G + T`：Research plan、真实 evidence acquisition、检索后 synthesis、World Architecture、`G` 个 multi-tool Shared Tool Contract、`T` 个单工具 ToolSemantics shard、一次 WorldRules、一次 CurriculumPlan；其中 `0 ≤ G ≤ 4`、`1 ≤ T ≤ 8`。随后已冻结 plan 中每个 `K` 个 TaskRequirement（`1 ≤ K ≤ 8`）各占一个 turn。Architecture commit 后 Controller 才能计算精确 G/T/K、为每个 item 单独预留 turn/repair budget，并在总预算不足时 fail closed；不得把 T 个工具或 K 个 task item 假装成一次巨型 Agent 调用，也不得因某一 item 失败而启动其依赖节点。没有 multi-tool group 时 G 为零。框架不得以固定输入字节数、隐藏的单 turn token ceiling，或任意短的 first-progress/first-write deadline 预先拒绝、截断或迫使语义分片；first-progress/first-write 是观测事实，不是把尚未收到 Provider 事件的真实 Agent 调用自动判死的独立预算。真实 Provider/transport 的物理终态必须以安全可观测事实记录，再决定 profile、transport、workspace input 或拓扑调整。
 
    WorldClosure 不复制完整 ToolContract JSON。framework 把已验证 Rule 确定性投影为去除重复 metadata 的 typed RulePath，并按执行语义对 clause 去重为 ConstraintCatalog；RulePath 只引用 constraint id，`schema_valid` 的 schema 正文由 framework 留存并标记为 elided。投影必须保留 reference source/pointer/type、constant、bounded arithmetic、operator、boolean composition、error state effect 与 evidence 绑定。框架记录输入大小和 provenance 以供观测，但不设置固定字节上限来拒绝调用或改变语义；Provider 无法承载时必须给出可归因的安全终态，不能被框架预先伪装成“输入过大”。
 5. **Baseline**：首次 Modeling PASS 固化 DesignBaselineCheckpoint；当前原子 Designer 下，全部并发 Discovery clue 先进入 provisional Inbox，hard correction 形成 Finding 与隔离建议；deferred lane 由独立 resume job 继续，不阻塞或重开 Direct。
@@ -707,10 +733,10 @@ reset seed 必须可复现，每个 RuntimeSupervisor 实例只拥有一个隔�
 
 Builder 输出完整 `PackageFile` closure 和 `candidate_source_tree_digest`。Judge 在安装前后按 CandidateManifest 复验路径、角色、mode、size、content hash 和 tree digest；同一 digest 必须贯穿 JudgeReport、envpkg v3 manifest 和 Registry 物理复制。
 
-发布 build 在 bubblewrap 隔离中执行：
+发布 build 直接在主机进程中执行；framework 负责复制干净 Candidate 树、选择 cwd、临时状态目录、资源限制、超时、输出采集和安装前后完整性复验，不再创建 bwrap/unshare、mount 或虚拟路径：
 
-- 候选源码逐文件只读挂载，运行时直接从只读 workspace 导入；
-- `.venv` 在物理独立可写目录中由 framework 创建，再复制到 clean materialization；
+- Candidate 源码复制到干净目录；安装前后均按 manifest/tree digest 复验，依赖安装不得改变源码；
+- `.venv` 在物理独立目录中由 framework 创建，再复制到 clean materialization；
 - 使用 uv 的 frozen、offline、no-build、no-root-install 模式；
 - 只接受受信只读 uv cache 中带 hash/size 的固定 wheel；
 - 拒绝候选 build backend、自定义 index、Git/URL/path/editable dependency 和仅源码分发依赖；
@@ -726,8 +752,8 @@ Builder 输出完整 `PackageFile` closure 和 `candidate_source_tree_digest`。
 flowchart TD
     C["EnvironmentCandidate + exact Design refs"] --> P["Provenance / source digest / supply-chain Gate"]
     P --> S["Static、schema、type、lint、secret、license"]
-    S --> B["bubblewrap + uv offline clean build"]
-    B --> H["Runtime handshake / lifecycle / isolation"]
+    S --> B["host process + uv offline clean build"]
+    B --> H["Runtime handshake / lifecycle / host execution"]
     H --> TM["Hard Gate: task_materialization"]
     TM --> RR["Parameterized solve recipes<br/>Challenger accelerator"]
     RR -->|"未取得 trusted success"| IC["Interactive Challenger fallback<br/>public episode view only"]
@@ -984,7 +1010,7 @@ Package 不携带任何候选控制的消费代码。Framework 从 manifest 和�
 
 1. 复验 SuiteSnapshot、Registry record、envpkg hash 和 manifest；
 2. clean materialize dependency/runtime；
-3. 在隔离进程启动 Task Materializer 与 Runtime；
+3. 在 framework-owned 主机子进程启动 Task Materializer 与 Runtime；
 4. framework 编译 PublicTask、EvaluatorGoal 和 Rule IR evaluator；
 5. 只通过最小 RPC 暴露 `start -> step/result -> close`；
 6. 可信 evaluator 根据真实状态和规则计算 reward/termination/trace。
@@ -1048,11 +1074,11 @@ CLI 必须支持对 run/campaign 的实时/事后 metrics inspect、JSON/Parquet
 
 | 区域 | 当前状态 | 仍需达到的验收 |
 |---|---|---|
-| 真实调用与研究 | 已有真实 Codex InvocationBackend、Search/Fetch/Extract 适配和无伪成功 fallback。历史隔离 run 已实际提交 `ResearchPlan -> EvidenceAcquisition -> EvidenceSynthesis -> WorldArchitecture`，后续到达 `SharedToolSemantics` 并被 bounded no-progress policy 诚实阻断。2026-07-22 的一个 `grok-4.5` run 以真实 Search/Fetch/Extract、6 次真实 Agent 调用到达 `SharedToolSemantics`：安全 correction brief 使错误从分区遗漏变为 error-policy 覆盖遗漏，第三稿又复现已解决分区错误，故 framework 按 A→B→A 振荡停止；所有 leases/operations 都已终态化。随后新鲜 `grok-4.5` run 完成 4 次真实 Agent 调用、6 次 search 并首次提交 SharedToolSemantics，却暴露后继物理 batch 的 executor 拓扑缺陷；同样无活动 lease/operation。此前另一个 WorldArchitecture timeout 的 pre-dispatch provenance 缺陷也已由 deterministic regression 修复。它们都不是静态证据、模板或手工 Artifact 成功 | 在 executor completeness 修复后，仍须从新 request 真实运行到 Registry；不得把任何 Research/Design 前缀、deterministic regression 或失败 run 当作 live Generate 成功 |
-| 控制面 | `DirectWorkRunner` 已是 Controller 的 Direct 执行路径，使用三 epoch `bootstrap -> design -> final`、完整 leaf registry 和 `WorkScheduler` 驱动 Research 至 Registry。依赖边现为“dependency = 因果失效；input slot = 最小披露”，snapshot 与 dispatch 调用同一输入闭包；Package 只从显式输入闭包组装。每个 Agent 造成的 semantic issue 必须保留 source-facing path、违反条件和期望类别；裸 `ValueError` 只能表示 framework/output-contract 缺陷，不得消耗 Agent 修复额度。实时 inspect 直接投影 Scheduler durable scope lease ledger，WorkAttempt span 继承 Direct root。leaf registry 现按稳定 physical `artifact_slot` 绑定，ready/repair-ready Work 缺 executor 会作为精确 typed infrastructure failure，而非无坐标 semantic block。确定性回归实际驱动 Package→Registry 闭包、真实 Registry 文件系统原子发布与发布前 observability closure；它们只证明框架执行闭环，不代替真实 Agent 生成证据。所有 Agent role 仍只在唯一 SDK 边界映射到隔离 profile，Skills/Hooks/Tools 权限不随 parent Artifact 扩张 | 运行一次真实从 Request 到 Registry 的完整新路径，并逐段确认 Design、Build、Integration、Release、Package、Registry 的实际 Artifact/Span/预算。旧控制对象不得重新取得成功或发布权威；在完整实证前绝不宣称端到端完成 |
-| 能力隔离 | 已有 EffectiveCapabilityPlan、角色 profile 和 workspace/network/credential 边界 | 持续用隔离验收证明 Skills/Hooks/Tools 不发生 ambient 继承 |
+| 真实调用与研究 | 已有真实 Codex InvocationBackend、Search/Fetch/Extract 适配和无伪成功 fallback。历史 live run 已实际提交 `ResearchPlan -> EvidenceAcquisition -> EvidenceSynthesis -> WorldArchitecture`，后续到达 `SharedToolSemantics` 并被 bounded no-progress policy 诚实阻断。2026-07-22 的一个 `grok-4.5` run 以真实 Search/Fetch/Extract、6 次真实 Agent 调用到达 `SharedToolSemantics`：安全 correction brief 使错误从分区遗漏变为 error-policy 覆盖遗漏，第三稿又复现已解决分区错误，故 framework 按 A→B→A 振荡停止；所有 leases/operations 都已终态化。随后新鲜 `grok-4.5` run 完成 4 次真实 Agent 调用、6 次 search 并首次提交 SharedToolSemantics，却暴露后继物理 batch 的 executor 拓扑缺陷；同样无活动 lease/operation。此前另一个 WorldArchitecture timeout 的 pre-dispatch provenance 缺陷也已由 deterministic regression 修复。它们都不是静态证据、模板或手工 Artifact 成功 | 在 executor completeness 修复后，仍须从新 request 真实运行到 Registry；不得把任何 Research/Design 前缀、deterministic regression 或失败 run 当作 live Generate 成功 |
+| 控制面 | `DirectWorkRunner` 已是 Controller 的 Direct 执行路径，使用三 epoch `bootstrap -> design -> final`、完整 leaf registry 和 `WorkScheduler` 驱动 Research 至 Registry。依赖边现为“dependency = 因果失效；input slot = 最小披露”，snapshot 与 dispatch 调用同一输入闭包；Package 只从显式输入闭包组装。每个模型节点造成的 semantic issue 必须保留 source-facing path、违反条件和期望类别；裸 `ValueError` 只能表示 framework/output-contract 缺陷，不得消耗模型修复额度。实时 inspect 直接投影 Scheduler durable scope lease ledger，WorkAttempt span 继承 Direct root。leaf registry 现按稳定 physical `artifact_slot` 绑定，ready/repair-ready Work 缺 executor 会作为精确 typed infrastructure failure，而非无坐标 semantic block。确定性回归实际驱动 Package→Registry 闭包、真实 Registry 文件系统原子发布与发布前 observability closure；它们只证明框架执行闭环，不代替真实模型生成证据。tool-enabled Codex Agent 在唯一 SDK 边界使用私有 Skill 状态、真实工作目录和 full access，Direct LLM 在唯一 Direct adapter 调用；runtime Hook 已不支持，且 Direct 不挂载 Skill 或工具 | 运行一次真实从 Request 到 Registry 的完整新路径，并逐段确认 Design、Build、Integration、Release、Package、Registry 的实际 Artifact/Span/预算。旧控制对象不得重新取得成功或发布权威；在完整实证前绝不宣称端到端完成 |
+| Agent runtime surface | 已有角色 profile、私有 SDK 状态和显式 Runtime Skill 选择；它们不构成 OS/namespace 权限隔离 | 持续验证 Direct 不意外挂载 Skill、Codex 不继承环境外的 Skill/Hook，且 SDK 保持真实 host full access |
 | Evolve Source/Policy | 已有配置化 Source catalog/default selection、真实 two-turn Researcher/Search、冻结 clue context、可替换 ask/tell Policy 与 tool-first Operator | 用 live providers 对多种 Source/policy 做恢复、空 clue、needs-human、纵向与横向 Campaign 验收 |
-| Runtime/Judge | 已有 out-of-process Runtime、Unix RPC、bubblewrap/uv offline supply-chain、Task v3、recipe/interactive reachability 和独立 hard Gates | 用真实 Agent 生成的未知环境持续扩大 property、并发、资源限制与 adversarial sealed 验收 |
+| Runtime/Judge | 已有 out-of-process Runtime、Unix RPC、主机进程 + uv offline supply-chain、Task v3、recipe/interactive reachability 和独立 hard Gates | 用真实 Agent 生成的未知环境持续扩大 property、并发、资源限制与 adversarial sealed 验收 |
 | Task v3 | Builder、Judge、package 与 Consumer 已使用 framework-owned materialization/evaluator 合同 | 用未固定 seed/task 的真实生成 package 证明 materialization 多样性与 reachability，不把预构造合同样本当作生产证明 |
 | envpkg v3/Consumer | 已有 canonical metadata/provenance/assurance/fidelity/SBOM、Registry 物理重解析、SuiteSnapshot 与 framework-owned RPC consumer | 对真实 Agent 输出和含第三方 wheel 的 package 做冷目录、跨 cwd、restart/concurrency 端到端验收 |
 | 可选 Feedback | 已有 Suite digest 绑定的封闭 aggregate CapabilityFeedback recorder、CLI 与 Source 最小投影；feedback 不进入 evidence | 从真实 rollout 聚合信号并证明有/无 feedback 的 Campaign 都保持相同 release Gate |
@@ -1097,7 +1123,7 @@ Discovery 失败、权限拒绝或耗尽预算不改变 Direct verdict；普通 
 
 - schema/type/lint/secret/license/SBOM；
 - Artifact producer/provenance/source digest；
-- real process protocol/lifecycle/isolation；
+- real host-process protocol/lifecycle；
 - task materialization/reachability；
 - Rule IR conformance/property/metamorphic/sealed；
 - clean offline build/deployment；

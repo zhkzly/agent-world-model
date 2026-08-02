@@ -74,4 +74,4 @@ uv run agent-world doctor --config /absolute/path/to/config.toml --live-agent
 | `model credential environment is unavailable` | 由 secret manager 向同一启动进程注入 `OPENAI_API_KEY`。 |
 | `model routing value environment is unavailable` | 由 secret manager 向同一启动进程注入 `OPENAI_BASE_URL`。 |
 | `routing_environment_invalid` | 修正环境中的 URL 形状；不要把它写回 TOML。 |
-| `IsolationUnavailable` | 恢复本机 user namespace 前提，不得跳过 Judge。 |
+| `HostExecutionUnavailable` | 检查本机 Python/子进程启动链；不得跳过 Judge，也不要添加 bwrap/user namespace 回退。 |

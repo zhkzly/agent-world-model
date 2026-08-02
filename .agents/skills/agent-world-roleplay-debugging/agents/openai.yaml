@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent World Roleplay Debugging"
+  short_description: "Role-play evidence before changing a failure"
+  default_prompt: "Use $agent-world-roleplay-debugging to test whether each real participant has enough context to act."

@@ -86,8 +86,10 @@ def _configured_state_root() -> Path | None:
         else Path.home() / ".config" / "agent-world" / "config.toml"
     )
     config_path = Path(os.path.abspath(config_path))
-    if ".agent-world-live" in config_path.parts:
-        return None
+    # NOTE: the config file may legitimately live under a ".agent-world-live"
+    # directory (e.g. a gitignored E2E config). Only the resolved *state_root*
+    # is guarded against ".agent-world-live" (in _failed_direct_scope_id), so
+    # nothing is filtered here — the state_root guard is authoritative.
     config = _read_toml_object(config_path)
     if config is None:
         return None

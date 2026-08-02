@@ -5,10 +5,11 @@ Read `docs/agent-world-environment-generation.zh.md` first.
 Rules:
 
 - Keep success paths artifact-driven.
-- Keep all model/agent execution behind `InvocationBackend`; production uses the isolated
+- Keep all model/agent execution behind `InvocationBackend`; production uses the direct-host
   `CodexSdkBackend` adapter and pipeline core never calls provider SDKs directly.
-- Give Researcher, Environment Engineer, and Challenger separate capability profiles;
-  skills, hooks, tools, credentials, source views, and sealed evidence are deny-by-default.
+- Give Researcher, Environment Engineer, and Challenger explicit node profiles for model route,
+  Direct-vs-Agent mode, Runtime Skill selection, credentials, source views, and sealed evidence.
+  These profiles do not create an OS/namespace sandbox or virtual tool/path layer.
 - Direct Generation is independent. Discovery is non-blocking and Evolve is optional;
   neither may bypass `WorldSpec -> Builder -> Judge -> Registry`.
 - Treat tool surface, tool semantics, state/transition constraints, and task scope as
@@ -91,47 +92,183 @@ Read on demand:
 
 ### 2. Signatures
 
-- `AgentBackendConfig.openai_base_url: HttpUrl | None`
+- `AgentBackendConfig.openai_base_url_environment: str | None`
+- `AgentBackendConfig.maximum_same_model_infrastructure_retries: int`
+- `AgentBackendConfig.infrastructure_retry_backoff_seconds: float`
+- `AgentBackendConfig.provider_first_event_timeout_seconds: float | None`
+- `InvocationLimits.provider_first_event_timeout_seconds: float | None`
 - `InvocationError.retryable: bool`
-- `EnvironmentDesigner.run_structured_agent(...) -> (typed_output, InvocationResult...)`
+- `InvocationRecoveryEvidence.same_route_retry_limit: int`
+- `bind_model_route_recovery_policy(..., maximum_same_model_infrastructure_retries: int)`
 
 ### 3. Contracts
 
-- `openai_base_url` is non-secret, API-key-only, credential-free, hashed profile input and is
-  materialized into the isolated `$CODEX_HOME/config.toml`; never inherit it ambiently.
+- The actual base URL and API key remain private process environment values addressed by named
+  handles; neither value is materialized into `$CODEX_HOME/config.toml` or public artifacts.
 - A retryable failed result remains in lineage. Retry the exact immutable prompt in a fresh
-  session, within the existing turn/repair lease; do not treat it as semantic correction.
+  session, within the definition-bound retry allowance; do not treat it as semantic correction.
+- Same-model retry count is frozen into each eligible `WorkDefinition`; it is not a hidden
+  `InvocationBackend` loop. Retry backoff scales with the retry ordinal before explicit fallback
+  or terminal exhaustion.
 - Controller failure evidence records backend code, retryable flag and attempt count without raw
   provider messages.
+- A Direct exception with no Provider body must retain a closed
+  `transport_exception_kind` (`connection` or `timeout`) when the official SDK class or its
+  immediate HTTP cause proves one. Do not persist exception message, class name, route, proxy,
+  request, or credential. `provider_error_shape=missing` alone is insufficient feedback for a
+  project-execution Agent to select a liveness investigation.
+- `provider_first_event_timeout_seconds` is one shared transport-liveness policy for Direct and
+  Codex. It starts when the real transport is dispatched and retires permanently after the first
+  validated Provider event; it is neither an input/output cap nor a post-progress reasoning limit.
+  Direct returns `direct_no_first_provider_event`; Codex returns
+  `codex_no_first_provider_event` after parent-side process-group cleanup. Both are safe,
+  retryable transport facts with a zero Provider-event count.
 
 ### 4. Validation & Error Matrix
 
 - `openai_base_url` + ChatGPT login -> configuration error.
 - `openai_base_url` + non-OpenAI custom provider id -> configuration error.
 - URL credentials/query/fragment -> configuration error.
-- retryable backend failure + remaining lease -> fresh-session node retry.
-- non-retryable failure or exhausted retry lease -> `DesignerError` and release-blocking Finding.
+- typed retryable terminal + private same-session checkpoint + remaining same-route allowance ->
+  one backoff-gated physical turn on that exact session; it still consumes the explicit
+  infrastructure-retry allowance and retains the failed attempt.
+- typed retryable terminal without an eligible private same-session checkpoint + remaining
+  same-route allowance -> fresh-session same-model retry.
+- typed retryable terminal + exhausted same-route allowance + authorized configured route ->
+  explicit model fallback.
+- Codex worker/app-server local lifecycle frames but zero validated Provider events ->
+  `codex_no_first_provider_event`, retryable; Prompt/input and Runtime Skill remain unproven.
+- Direct `provider_error_shape=missing` plus `transport_exception_kind=connection` -> investigate
+  the actual process network boundary/route before changing a Direct Prompt, input, or any
+  Runtime Skill. `timeout` follows the same route investigation but distinguishes a reached,
+  deadline-bound transport from an explicit connection failure.
+- non-retryable failure, missing terminal evidence, or exhausted routes -> terminal
+  infrastructure failure and release-blocking Finding.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: transient TLS/provider failure, failed result retained, second real turn succeeds.
+- Good: a closed transient Codex terminal retains a framework-private thread/runtime binding, and
+  one definition-authorized backoff-gated turn resumes that same session; if the binding is absent,
+  a fresh same-model turn may instead succeed.
+- Good: a Codex worker starts, emits local `sdk_session_open`, then never emits a Provider event;
+  the parent reaps it at the shared first-event bound and the Invocation Control record settles.
+- Good: a profile-matched minimal Direct SDK control fails with a body-less connection exception;
+  its durable scene says `transport=connection` without exposing its exception text, then the
+  same host-network boundary is inspected before consuming a retry.
 - Base: first real turn succeeds; no retry is scheduled.
-- Bad: reuse a partially failed session, silently change prompt/model/provider, loop without a hard
-  lease, or reclassify infrastructure failure as a WorldSpec defect.
+- Bad: reuse a partially failed session without its private runtime binding, silently change
+  prompt/model/provider, retry before a typed terminal, hide retries inside the SDK adapter, loop
+  without a hard lease, or reclassify infrastructure failure as a WorldSpec defect.
 
 ### 6. Tests Required
 
-- Assert retry uses `session is None`, identical prompt, `repair_mode=backend_retry`, and returns
-  both failed and successful results.
-- Assert compatible base URL is in materialized config/public profile but API key is absent.
+- Assert the Scheduler selects an eligible same-session continuation before a fresh same-model
+  retry, preserves its private binding, retains every failed attempt, and scales backoff by ordinal.
+- Assert fallback is considered only after the same-model allowance is exhausted and only when the
+  node has explicit fallback authority.
+- Assert base URL and API key values are absent from generated config, public profile, artifacts,
+  and safe feedback.
+- Use a real parent/child Codex worker fixture that emits only a local startup phase; assert its
+  process is reaped, the durable record is settled, and `provider_progress_count == 0`.
 - Live acceptance must still run the real configured model; unit doubles do not prove production.
 
 ### 7. Wrong vs Correct
 
-- Wrong: abort the whole GenerateJob on every `turn_failed`, or read `OPENAI_BASE_URL` from ambient
-  worker environment.
-- Correct: adapter marks only retryable terminal failures; Designer schedules a bounded fresh turn;
-  Profile Resolver explicitly materializes and hashes the configured base URL.
+- Wrong: abort the whole GenerateJob on every `turn_failed`, or let each backend invent its own
+  opaque retry loop.
+- Wrong: treat `sdk_session_open` or a live PID as Provider progress, let that worker consume the
+  entire logical wall, or edit Prompt/Skill before a Provider event proves they were delivered.
+- Correct: adapter settles a typed terminal; Scheduler reads definition-bound route policy and,
+  only when the framework retains an exact private session/runtime binding, authorizes a new
+  physical turn on that same session after observable backoff. Otherwise it authorizes a fresh
+  physical attempt, while preserving immutable semantic inputs and complete lineage.
+- Correct: use one profile-owned first-event bound for each transport, preserve local lifecycle as
+  local evidence only, and route a zero-event Codex terminal through the ordinary liveness/retry
+  policy.
+- Correct: preserve only a closed body-less Direct transport class. A testing Agent running inside
+  a network-restricted process must not label that as a Provider outage; rerun the same minimal
+  control from the actual invocation host before changing model-facing context.
+
+## Candidate snapshot repair across physical transport recovery
+
+### 1. Scope / Trigger
+
+- Applies when a committed Candidate fails a semantic Integration gate, a bounded
+  `local_correction` is authorized, and that correction then has a typed retryable
+  Provider/transport terminal before it commits.
+
+### 2. Signatures
+
+- `WorkExecutionContext.repair_action_ref: ArtifactRef | None`
+- `WorkExecutionContext.semantic_repair_context_ref: ArtifactRef | None`
+- `RepairAction.semantic_repair_context_ref: ArtifactRef | None`
+- `WorkControlRuntime._is_committed_candidate_snapshot_repair(...) -> bool`
+- `BuilderLeaf._load_snapshot_repair_seed(...) -> _SnapshotRepairSeed | None`
+
+### 3. Contracts
+
+- The physical `infrastructure_retry` or `model_fallback` action is a fresh Provider
+  session.  Its `semantic_repair_context_ref` may name one earlier authorized
+  `local_correction`; it is never a Provider thread, response, or private workspace.
+- Builder resolves source Candidate and bounded safe feedback from that semantic action,
+  then verifies that both actions bind the exact definition digest, coordinate, immutable
+  inputs, input fingerprint, and allowed mutation roots before materializing the repair.
+- A structured Direct correction proves its repair starting point with a private parsed-seed
+  commitment.  CandidateBuild has a different safe starting point: one prior committed output
+  closure containing exactly one `build.environment_candidate`.  Control-plane recovery must
+  recognize either form, but only for `build.candidate_build.environment_candidate`; Builder
+  remains responsible for the deeper source-attempt/Candidate-object validation.
+- The fresh Agent receives the committed Candidate snapshot plus safe Integration feedback.
+  It must emit a complete replacement through normal Candidate validation and commit.  It
+  may not silently become a fresh initial build, adopt uncommitted files, or resume the
+  failed Provider thread.
+
+### 4. Validation & Error Matrix
+
+- Missing/foreign semantic repair ref or a mismatch in definition, inputs, target, or
+  mutation roots -> `preflight_builder_repair_transport_context_invalid`; no model call.
+- Bound semantic action is not `local_correction` or lacks its repair seed -> no snapshot
+  repair; ordinary policy decides the next leaf path.
+- A transport recovery with neither a private parsed seed nor the narrow committed Candidate
+  snapshot shape -> it must not carry `semantic_repair_context_ref`; ordinary no-progress policy
+  remains fail-closed.
+- Valid bound action and committed Candidate seed -> fresh physical Agent session receives
+  that exact source and bounded feedback.
+
+### 5. Good/Base/Bad Cases
+
+- Good: Integration reports runtime protocol mismatches; the ensuing Candidate correction is
+  interrupted by a typed Provider terminal; its retry fixes the same committed Candidate from
+  the same safe feedback.
+- Base: semantic correction succeeds on its first physical session.
+- Bad: a retry reads only `repair_action_ref`, mistakes transport recovery for a new build,
+  and drops the Integration diagnostic that selected the correction.
+
+### 6. Tests Required
+
+- Construct a semantic correction and a bound `infrastructure_retry`; assert the Builder
+  loader returns the original Candidate reference and the correction brief.
+- Exercise Scheduler recovery through a cross-class transient failure; assert it retains
+  `semantic_repair_context_ref` on the fresh attempt.
+- Exercise the actual Scheduler chain `Candidate commit -> Integration finding -> Candidate
+  correction -> retryable Provider terminal -> fresh Candidate retry`; assert the retry keeps
+  the original correction brief while its `semantic_repair_seed_commitment` remains absent.
+- Live proof remains required: after a Candidate snapshot repair commits, rerun the actual
+  Integration gate before claiming downstream completion.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: transport recovery overwrites the semantic reason for this Candidate revision.
+action = load(context.repair_action_ref)
+return fresh_initial_build()
+
+# Correct: new physical session; exact prior semantic repair stays safely bound.
+physical = load(context.repair_action_ref)
+semantic = load(context.semantic_repair_context_ref or context.repair_action_ref)
+verify_recovery_binding(physical, semantic, definition)
+return repair_committed_candidate(seed=semantic.repair_seed, feedback=semantic.feedback)
+```
 
 ## Designer phase checkpoint recovery
 
@@ -305,18 +442,24 @@ telemetry observation, or a new design plan.
 
 ### 2. Signatures
 
-- Agent transactions: up to two `ToolSemanticsBatchSourceDraft` values (at most four coupled tools
-  each), then one `WorldRuleSemanticsSourceDraft` for initial-state and global invariants.
+- Agent transactions: one `ToolSemanticsBatchSourceDraft` per frozen tool (at most eight tools),
+  preceded by one `SharedToolSemantics` transaction for each multi-tool coupling group, then one
+  `WorldRuleSemanticsSourceDraft` for initial-state and global invariants.
 - Framework output: closed ToolContracts and WorldModel Rule IR.
 
 ### 3. Contracts
 
 - Partition tools by shared state and transaction coupling, not by environment id.
-- Tool batches have exact RepairTarget identity and stable order. Current scheduler is sequential;
-  concurrency is allowed only after backend capacity, lease accounting and deterministic commit
-  behavior are proven.
+- Tool shards have exact RepairTarget identity and stable order. A multi-tool coupling group first
+  commits its shared contract; its singleton tool shards are then independent and may run in the
+  same stable Scheduler wave only within the same configured global invocation capacity, lease
+  accounting, and deterministic commit behavior.
 - WorldRules owns business initial-state/invariant meaning only. Framework validates every path and
   compiles Rule IR; it never asks the model to repair framework-generated ids or schema syntax.
+- WorldRules emits only global Rules that remain beyond frozen tool-local
+  semantics and are genuinely expressible in the closed Rule ADT. Empty
+  `invariants` is valid; constant-only, collection-existence, tautological,
+  placeholder, and Schema-restatement Rules are not acceptable substitutes.
 - `WorldRuleSemanticsSourceDraft.RuleDraft.rule_id` is optional input mechanics, never business
   meaning. Before persistence or core compilation, framework code canonicalizes it away and derives
   `rule:state:<ordinal>` for `initial_state_rules.initial_state_constraints` and
@@ -325,11 +468,11 @@ telemetry observation, or a new design plan.
   second uses `invariant`. A wrong family is a safe actionable diagnostic; an identity prefix or
   duplicate failure is a non-retryable framework invariant and must not enter an
   `AgentCorrectionBrief`.
-- The full pre-Build Direct proposal graph has at most eight base turns: two research,
-  architecture, an optional multi-batch shared contract, one or two tool batches, world rules and
-  curriculum. A global WorkGraph budget currently reserves at most two semantic corrections, so
-  the hard envelope is ten turns. No component-local counter may grant work beyond that envelope;
-  a second correction for one logical Artifact requires code-proven strict progress.
+- Before task-family turns, the Direct proposal graph has `6 + G + T` base turns: three research
+  boundaries, architecture, `G` shared contracts, `T` singleton tool shards, WorldRules, and
+  CurriculumPlan (`0 ≤ G ≤ 4`, `1 ≤ T ≤ 8`). Budget admission must derive that exact topology after
+  Architecture commits; no component-local counter may grant extra work, and a second correction
+  for one logical Artifact requires code-proven strict progress.
 
 ### 4. Validation & Error Matrix
 
@@ -347,19 +490,24 @@ telemetry observation, or a new design plan.
 
 ### 5. Good/Base/Bad Cases
 
-- Good: reserve/cancel tools that share booking state are one batch; global inventory non-negativity
-  is expressed once in WorldRules and compiled by code.
+- Good: reserve/cancel tools that share booking state first commit one shared contract, then each
+  has its own singleton semantic shard; global inventory non-negativity is expressed once in
+  WorldRules and compiled by code.
 - Base: one small tool produces one tool batch and one WorldRules transaction.
 - Bad: invoke one Agent per precondition/postcondition field or merge rules into a giant architecture
   prompt that spends ten minutes before producing its first artifact.
 
 ### 6. Tests Required
 
-- Assert eight tools form at most two stable batches and nested tool identity drift fails locally.
+- Assert eight tools form eight stable singleton shards, each dependent on its committed shared
+  contract where one exists; prove capacity-bounded sibling dispatch and reject a historical
+  multi-tool physical batch before invocation.
 - Assert WorldRules compile only after all tool batches and preserve source evidence bindings.
 - Assert arbitrary WorldRules `rule_id` values are absent from the persisted canonical source and
   compile to the two framework namespaces; assert a wrong section family remains the only
   corresponding actionable source diagnostic.
+- Assert a WorldRules source with empty `invariants` compiles through
+  `WorldModelDraft` and `WorldSpec` without manufacturing a placeholder Rule.
 - Measure every real semantic transaction's wall time, tokens, repair mode and projection size.
 
 ### 7. Wrong vs Correct
@@ -425,8 +573,11 @@ telemetry observation, or a new design plan.
   deadlines, validation, repair routing, mutation authority, and topology.
 - `acceptance_digest` alone decides whether an immutable passing `WorkCommit` remains reusable.
   It binds exact inputs separately plus coordinate, Claim, dependency topology, output contract,
-  acceptance transform, explicit validator executable revision, assurance requirements, and
-  success maturity.
+  acceptance transform, the explicit implementation revision for an Agent-facing Prompt/input,
+  Runtime Skill, output model, or profile-materialization surface, explicit validator executable
+  revision, assurance requirements, and success maturity. Invocation transport, worker lifecycle,
+  retry/fallback, and observation modules remain outside that semantic identity unless they change
+  what the Agent is asked to produce or what is accepted.
 - `repair_epoch_digest` binds full definition, exact inputs, validation policy, and repair policy;
   progress, retry ordinals, and no-progress decisions never cross epochs.
 - Changing token/time limits, timing prose, or repair/recovery caps must not invalidate an already
@@ -438,6 +589,120 @@ telemetry observation, or a new design plan.
 - Bad case: adding one process-recovery field changes every full WorkDefinition digest and reruns
   ResearchPlan/Evidence despite unchanged acceptance. Required regression tests must distinguish
   policy-only changes from validator/schema changes and verify no orphaned lease remains.
+
+## Direct LLM Prompt-only versus Codex Agent Skill boundary
+
+### 1. Scope / Trigger
+
+- Applies whenever a structured semantic node, profile recipe, adapter, Prompt,
+  Runtime Skill, or request-shape observation changes.
+- Triggered by a real failure in which a Direct LLM received a copied role
+  Skill or profile-owned instruction, an Agent received duplicated node
+  semantics, or a Codex app-server rejected an explicit empty instruction
+  field before the model saw the Prompt.
+
+### 2. Signatures
+
+- `IsolatedAgentProfileProvider.resolve(..., requirement: NodeCapabilityRequirement) -> ResolvedAgentProfile`
+- `invoke_structured_once(..., prompt: str, logical_output_protocol: str | None) -> StructuredTurnResult`
+- `DirectLlmBackend.invoke(InvocationRequest) -> InvocationResult`
+- `CodexSdkBackend._worker_payload(InvocationRequest) -> JsonObject`
+
+### 3. Contracts
+
+- `NodeCapabilityRequirement.structured_output(...)` is a Direct LLM route:
+  the effective semantic request is exactly `model + rendered Prompt/input +
+  authorized correction feedback`. Its profile must have `skills == ()`,
+  no runtime/external tools, `allowed_builtin_tools == ()`, no runtime Hook
+  support, and no profile-owned base/developer instruction fields at all.
+- The Direct adapter sends no `instructions` field when that contract holds.
+  The node Prompt owns its output protocol; a ToolSemantics compact protocol is
+  appended to that Prompt rather than copied from a Skill.
+- A tool-enabled Codex Agent route mounts one node-specific Skill, receives the
+  rendered Prompt and granted tools, and has no profile-owned bootstrap text.
+  The worker payload omits Codex `base_instructions` and
+  `developer_instructions` keys entirely; it never sends `""` and never
+  invents generic replacement prose.
+- Materialize every pinned Agent Runtime Skill as a real read-only directory at
+  the isolated `CODEX_HOME/skills/<skill-name>/SKILL.md` discovery root.
+  `skills.config` is an enable/disable override for a Skill Codex already
+  discovered; an external bundle directory mentioned there is not proof that
+  the turn's actual `Available skills` catalog contains it.
+- Treat one Runtime Skill as a progressively loaded bundle: keep trigger and
+  core method in `SKILL.md`, detailed protocols/domain guidance in one-level
+  `references/`, deterministic repeated checks in `scripts/`, and output
+  templates only in `assets/`. Do not mount a second always-active Skill merely
+  to split one node's method into chapters. Hash and materialize the complete
+  bundle so a reference or script edit invalidates the same Agent semantic
+  identity as a `SKILL.md` edit.
+- For CandidateBuild and BuildImplementationPlan, the mounted specialized Skill
+  owns reusable workspace, ABI, validation, and completion mechanics. Their
+  node Prompt names only the current frozen Artifact/input and any authorized
+  repair context; it must not duplicate the Skill as a second long instruction.
+- Direct profile resolution may retain credential, model-route, timeout, and
+  response-transport mechanics, but those fields must not become an additional
+  semantic instruction source.
+- Direct leaf implementation revisions bind Prompt/input, output model, and
+  profile-materialization code, but not a Runtime Skill asset. Agent leaf
+  revisions additionally bind their actually mounted Skill asset.
+
+### 4. Validation & Error Matrix
+
+- Direct profile has a Skill -> `direct_runtime_bundles_ineligible`;
+  do not silently send the bundle as provider instructions.
+- Profile/worker payload contains base/developer instruction material ->
+  construction or adapter defect; remove that surface rather than treating it
+  as model formatting behavior.
+- `sdk_session_open` with zero Provider events -> model never saw Prompt or
+  Skill; classify provider/profile/adapter and feedback first. If phase alone
+  is insufficient, use an explicitly diagnostic bounded redacted local excerpt,
+  not normal feedback or a semantic repair turn.
+- Direct response lacks/violates the requested artifact shape -> inspect the
+  rendered Prompt, compact protocol, provider route, and safe feedback before
+  deciding between fresh generation and an authorized correction.
+- Codex Agent has no mounted node Skill or an ungranted tool -> fail profile
+  materialization before dispatch; do not borrow a Direct Prompt-only setup.
+
+### 5. Good/Base/Bad Cases
+
+- Good: a ToolSemantics Direct request carries one frozen tool Prompt plus its
+  compact protocol, has `runtime_skill_count == 0`, and the Provider request
+  contains no `instructions` field.
+- Base: a CandidateBuild Codex Agent mounts only
+  `engineer-environment-codegen`, reads it from its private SDK bundle, and uses
+  its real host workspace; its worker payload has neither instruction key.
+- Bad: inject a generic Engineer Skill into every Direct design node,
+  then try to repair a provider output limit as if it were a business defect.
+
+### 6. Tests Required
+
+- Resolve Direct profiles for Researcher, Engineer, and Challenger structured
+  outputs and assert no Skills, runtime Hook surface, tools, or profile
+  instruction fields.
+- Exercise `DirectLlmBackend` with a fake Provider and assert the request has
+  the rendered Prompt but no `instructions` field; assert bundle/capability
+  variants are rejected before transport.
+- Resolve BuildImplementationPlan and CandidateBuild, assert exactly their
+  single mounted Skill names, assert Candidate references/scripts are present
+  under that bundle, and assert no hidden instruction attributes exist.
+- Run a real Candidate-profile Codex audit after changing Skill
+  materialization and inspect the turn's actual initial Skill catalog; a
+  profile `runtime_skill_count` or resolved bundle list alone is insufficient
+  evidence that the model could discover the Skill.
+- Build a real Codex worker payload and assert both SDK instruction keys are
+  absent; run a real direct-host Codex Agent turn after changing that boundary.
+- Run a real Direct ToolSemantics node after any change to this
+  boundary, inspect its safe request shape, then chain only after it passes.
+
+### 7. Wrong vs Correct
+
+- Wrong: make Direct LLM behavior reliable by adding a generic role Skill,
+  retaining empty/generic profile instructions for either route, or turning
+  every format problem into a deterministic business contract.
+- Correct: put Direct node semantics and its one required output protocol in
+  the rendered Prompt; reserve specialized Skills and tools for real Codex
+  Agent work, and choose regeneration/correction/profile/adapter changes from
+  the observed failure.
 
 ## Judge Finding groups and executable RepairAction accounting
 
@@ -1119,6 +1384,85 @@ parent_output_refs.extend(
 )
 ```
 
+## Scheduler causal readiness during recovery
+
+### 1. Scope / Trigger
+
+- Applies when `WorkScheduler.snapshot()` reconstructs a graph containing any
+  existing committed, terminal, or `repair_authorized` child whose causal
+  parent has no active exact `WorkCommit`.
+
+### 2. Signatures
+
+- `WorkScheduler.snapshot() -> WorkScheduleSnapshot`
+- `WorkScheduler.resolve_inputs(coordinate) -> ResolvedWorkInputs`
+- `ScheduledWork(state="waiting", waiting_on=(...))`
+- `WorkDependencyUnavailableError.{child,parent,parent_status,reason_code}`
+
+### 3. Contracts
+
+- A child may be `repair_ready`, `blocked`, or reusable only after every direct
+  parent resolves to an active commit under the current frozen definition and
+  input closure.
+- While that closure is unknowable, an existing committed result, authorized
+  repair, or terminal verdict is `waiting` on the unavailable parents. Old
+  output/repair authority remains durable but cannot be dispatched against
+  guessed inputs.
+- Snapshot and dispatch must agree: no coordinate projected as dispatchable may
+  fail `resolve_inputs()` solely because snapshot already knew a parent was
+  unavailable.
+- If parent readiness changes after projection, safe Scheduler diagnostics name
+  child/parent coordinate keys, parent status, and a stable reason code; they do
+  not retain raw exception text.
+
+### 4. Validation & Error Matrix
+
+- All parents have active commits and repair binding matches -> `repair_ready`.
+- Parent definition/input changed and has not recommitted -> child `waiting`
+  with exact `waiting_on` coordinates.
+- Parent recommits with a changed disclosed input closure -> child becomes
+  `stale`; its old repair/terminal binding is not inherited.
+- A dispatchable child still encounters an unavailable parent -> framework
+  recovery defect with typed safe dependency evidence, never Agent feedback or
+  semantic retry authority.
+
+### 5. Good / Base / Bad Cases
+
+- Good: Architecture is stale, so an old authorized WorldRules repair waits;
+  after Architecture commits, Scheduler re-evaluates the exact child binding.
+- Good: a committed ResearchPlan becomes stale, so committed
+  EvidenceAcquisition/Synthesis descendants wait instead of all reopening in
+  one wave.
+- Base: a root repair has no causal parents and may remain `repair_ready`.
+- Bad: mark the child `repair_ready`, then let `dispatch_one()` raise
+  `WorkResumeError` because its parent is `repair_authorized` or failed.
+
+### 6. Tests Required
+
+- Persist a committed parent and failed child, authorize the child repair, then
+  change the parent definition. Assert parent `stale`, child `waiting`, exact
+  `waiting_on`, zero child executor calls, and unchanged repair head.
+- Persist a fully committed parent/child chain, change only the parent
+  definition, and assert the child waits until the new parent closure exists.
+- Project a constructed dependency race and assert the safe diagnostic exposes
+  only coordinate keys, parent status, and reason code.
+- Preserve existing exact-input tests proving that a recommitted parent can
+  make the child repair ready or stale according to its new closure.
+
+### 7. Wrong vs Correct
+
+```python
+# Wrong: absence of expected inputs skips the binding comparison and grants readiness.
+if expected_inputs is None or head.input_fingerprint == fingerprint(expected_inputs):
+    state = "repair_ready"
+
+# Correct: missing causal authority is a waiting state, not dispatch authority.
+if expected_inputs is None:
+    state = "waiting"
+else:
+    state = "repair_ready" if binding_matches(head, expected_inputs) else "stale"
+```
+
 ## Shared-tool semantic transaction completion
 
 ### 1. Scope / Trigger
@@ -1466,30 +1810,28 @@ raise PydanticCustomError(
 - A raw `/bookings/status` Tool reference must fail with `tool_rule_binding_required` before core
   Rule compilation.
 
-## Recursive structured-output transport compatibility
+## Native structured output and compact node protocol
 
 ### 1. Scope / Trigger
 
-- Applies when a real configured provider accepts the shallow `json_envelope` schema but rejects a
-  prompt carrying a recursive logical Pydantic schema, especially `RuleDraft`-bearing output.
-- This is established only by a real profile-matched probe with safe status/token observations;
-  a unit double cannot classify a provider limit.
+- Applies when a real configured Direct provider rejects a native schema or a recursive
+  rule-bearing Prompt/input, especially `RuleDraft`-bearing output.
+- Establish the boundary only with a real profile-matched probe carrying safe status/token
+  observations; a unit double cannot classify a provider limit.
 
 ### 2. Contracts
 
-- Provider request transport may constrain only the shallow `{"artifact_json": string}` schema.
-  Decode either its JSON-string document or a compatibility gateway's object-valued
-  `artifact_json` document, then require the exact same original Pydantic source model, frozen
-  RuleContext materialization and deterministic compiler. Scalars, arrays and malformed JSON are
-  transport-invalid. Do not create a permissive transport success path.
-- A rule-bearing leaf may substitute a versioned compact **Agent-facing protocol** for the generated
-  recursive JSON Schema text only after a real rejection. The protocol describes a strict existing
-  source-model subset; it does not introduce a DSL, raw expression text, raw pointers, unsupported
-  rule variants, fixture data or a special environment branch.
+- Every Direct and Agent turn uses the provider's native strict JSON Schema. The resulting object
+  must still pass the exact original Pydantic source model, frozen RuleContext materialization, and
+  deterministic compiler. Never add a second JSON-string wrapper or a permissive decoder.
+- A rule-bearing Direct leaf may append a versioned compact node protocol to its Prompt only after
+  a real rejection. It describes a strict existing source-model subset; it does not introduce a
+  DSL, raw expression text, raw pointers, unsupported rule variants, fixture data, or a special
+  environment branch. It is Prompt text, not a Runtime Skill.
 - Every compact Rule clause must state its exact operator-owned field closure. In particular,
   `equal`/`not_equal`/`contains`/`not_contains` must omit `ordering`, while comparison operators
-  require it. The environment-engineer skill may repeat this exact mechanical check, but no prompt
-  wording may relax the closed source schema.
+  require it. Keep those mechanics in the rule-bearing Direct Prompt that needs them; do not
+  duplicate them into an unrelated Agent-only Skill or relax the closed source schema.
 - A compact `bound_lookup_by_key.key` is likewise a closed sub-ADT: only a constant or frozen
   `bound_reference` alias is permitted. Arithmetic, nested lookup, raw reference/pointer, bare
   identifier, and scalar shortcut forms must remain rejected by the unchanged source model.
@@ -1499,15 +1841,15 @@ raise PydanticCustomError(
 
 ### 3. Tests Required
 
-- Exact-envelope JSON-string and object-valued decode, plus Pydantic/model/compiler acceptance of
-  a compact-protocol-shaped document; scalar/array payloads remain rejected.
+- Native-schema object decoding plus Pydantic/model/compiler acceptance of a
+  compact-protocol-shaped document; malformed or non-object payloads remain rejected.
 - Rejection of missing roots, raw Tool references/selectors and unsupported compact forms at the
   same existing local validation boundary.
 - Construct an equality clause carrying `ordering`; assert the compact schema and the unchanged
   Pydantic source model both reject it before compiler acceptance.
 - Construct a lookup whose `key` carries arithmetic; assert the compact schema and source model
   reject it before frozen binding materialization.
-- A real profile-matched transport probe that stores only safe result category and measured usage;
+- A real profile-matched native-schema probe that stores only safe result category and measured usage;
   the subsequent full Direct E2E is still mandatory.
 
 ### 4. Validation & Error Matrix
@@ -1515,9 +1857,9 @@ raise PydanticCustomError(
 - Provider rejects the outer request before a result -> safe backend terminal such as
   `turn_failed_provider_rejected`; preserve measured/unknown usage and do not classify a model
   proposal.
-- Provider completes the shallow envelope but the decoded document raises a typed
+- Provider completes the native-schema turn but the decoded document raises a typed
   `schema_*`/semantic compiler issue -> `LeafValidationFailure` with safe code and path. This is
-  a failed compact-protocol probe, not transport success.
+  a failed compact-protocol probe, not semantic success.
 - Provider completes, the unchanged source model parses, frozen bindings materialize, and the
   deterministic compiler accepts -> compact-protocol probe passes. It is still non-release
   evidence and does not establish Design, Builder, Judge, Package, or Registry success.
@@ -1527,10 +1869,10 @@ raise PydanticCustomError(
 
 ### 5. Good / Base / Bad Cases
 
-- Good: a real configured Engineer profile returns one compact ToolSemantics document whose exact
-  inner JSON passes `ToolSemanticsBatchSourceDraft`, `RuleContextCatalog` materialization, and
+- Good: a real configured Direct Engineer profile returns one compact ToolSemantics document whose
+  exact object passes `ToolSemanticsBatchSourceDraft`, `RuleContextCatalog` materialization, and
   `compile_tool_semantics_batch`.
-- Base: a shallow-envelope small-schema control completes. It proves the endpoint can run an
+- Base: a native-schema small control completes. It proves the endpoint can run one
   InvocationBackend turn, not that a recursive Rule-bearing proposal is compatible.
 - Bad: provider output reaches Pydantic but supplies a scalar where a frozen actor array is
   required, an unsupported transaction literal, a non-string concurrency description, or no valid
@@ -1539,8 +1881,8 @@ raise PydanticCustomError(
 
 ### 6. Tests Required
 
-- The one-shot transport test must prove that an explicit compact protocol replaces generated
-  recursive-schema prompt text while the original output model still parses the returned object.
+- The one-shot Direct test must prove that an explicit compact protocol augments the node Prompt
+  while the original output model still parses the returned object.
 - A ToolSemantics regression must construct a compact-protocol-shaped JSON document, pass it
   through JSON-mode Pydantic parsing and the real batch compiler, then prove a raw reference fails
   as `tool_rule_binding_required` at the existing materializer boundary.
@@ -1550,9 +1892,9 @@ raise PydanticCustomError(
 ### 7. Wrong vs Correct
 
 ```python
-# Wrong: a gateway completed, so skip the typed ToolSemantics boundary.
+# Wrong: a provider completed, so skip the typed ToolSemantics boundary.
 if invocation.succeeded:
-    mark_compact_transport_compatible()
+    mark_compact_protocol_compatible()
 
 # Correct: completion must traverse the existing inner acceptance chain.
 source = ToolSemanticsBatchSourceDraft.model_validate_json(inner_json)

@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/guides/agent-llm-node-debugging.md", "reason": "检查节点级真实执行、反馈归因和 E2E 声明边界。"}
+{"file": ".trellis/spec/agent_world/backend/index.md", "reason": "检查 Candidate、Invocation、Integration 与 release 相关合同。"}
