@@ -98,6 +98,12 @@ class InvocationRecoveryEvidence:
     # and untrusted; policy may authorize a *new* session to inspect it only
     # within the existing same-model infrastructure-retry budget.
     private_workspace_recovery_available: bool = False
+    # The repair ledger proved that prior semantic corrections of this exact
+    # (definition, input) closure made no progress.  A further same-model
+    # correction would be blind repetition; the policy may instead route the
+    # next compatible model on a fresh session carrying the same repair
+    # context (``semantic_context_recovery``).
+    semantic_no_progress: bool = False
     # A same-model fresh session is one route-local recovery sequence, not a
     # separate allowance for every transient terminal subclass. The limit is
     # frozen in the WorkDefinition and shared with the RepairLedger.
@@ -279,6 +285,27 @@ class InvocationRecoveryPolicy:
             )
 
         if failure_class is InvocationFailureClass.SEMANTIC_VALIDATION:
+            # A node whose prior semantic corrections made no progress is
+            # stuck on this model; the only bounded escape is the next
+            # compatible model on a fresh session with the same repair
+            # context.  Without this the node blocks permanently
+            # (repair_no_progress_terminal) despite a fallback model that
+            # could produce a different candidate.
+            if evidence.semantic_no_progress:
+                target = _next_fallback_model(evidence)
+                if target is not None:
+                    return self._decision(
+                        InvocationRecoveryRoute.MODEL_FALLBACK,
+                        failure_class,
+                        (
+                            (InvocationAttributionLens.PROMPT_INPUT, AttributionSupport.WEAKENED),
+                            (InvocationAttributionLens.RUNTIME_SKILL, AttributionSupport.WEAKENED),
+                            (InvocationAttributionLens.FEEDBACK_OBSERVABILITY, AttributionSupport.SUPPORTED),
+                            (InvocationAttributionLens.CODE_PROVIDER_PROFILE, AttributionSupport.SUPPORTED),
+                        ),
+                        requires_fresh_node_session=True,
+                        target_model=target,
+                    )
             route = (
                 InvocationRecoveryRoute.SEMANTIC_REPAIR
                 if evidence.parsed_semantic_candidate and evidence.precise_semantic_feedback

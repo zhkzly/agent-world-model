@@ -328,13 +328,21 @@ class WorkRepairLedger:
                 # A fallback is only admissible after the exact same current
                 # node has consumed its one fresh-session infrastructure
                 # retry. The typed recovery policy selected it; the ledger
-                # still proves that no upstream Work was reopened.
-                if not direct_output_ceiling_fallback and not any(
-                    entry.decision in {"infrastructure_retry", "session_continuation"}
-                    and entry.reason_code != "provider_output_ceiling"
-                    and entry.route_model == action.route_model
-                    and entry.semantic_repair_context_ref == action.semantic_repair_context_ref
-                    for entry in prior
+                # still proves that no upstream Work was reopened.  The two
+                # exceptions are closed terminals whose only escape is the
+                # fallback itself: the output ceiling, and a semantic repair
+                # chain that made no progress on this model.
+                if (
+                    not direct_output_ceiling_fallback
+                    and action.reason_code != "semantic_no_progress_model_fallback"
+                    and not any(
+                        entry.decision in {"infrastructure_retry", "session_continuation"}
+                        and entry.reason_code != "provider_output_ceiling"
+                        and entry.route_model == action.route_model
+                        and entry.semantic_repair_context_ref
+                        == action.semantic_repair_context_ref
+                        for entry in prior
+                    )
                 ):
                     raise WorkRepairDenied("model_fallback_requires_prior_infrastructure_retry")
                 return self._append_authorized(

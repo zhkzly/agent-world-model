@@ -2607,6 +2607,11 @@ class WorkControlRuntime:
             terminal_details=terminal_details,
             private_continuation_available=private_continuation_available,
             private_workspace_recovery_available=private_workspace_recovery_available,
+            semantic_no_progress=any(
+                entry.outcome == "no_progress"
+                and entry.decision in {"local_correction", "parent_correction"}
+                for entry in self.repairs.entries_for(definition, input_refs=attempt.input_refs)
+            ),
             prior_same_route_retry_count=self._prior_same_route_retry_count(
                 definition=definition,
                 input_refs=attempt.input_refs,
@@ -4435,11 +4440,23 @@ class WorkControlRuntime:
             and recovery_decision is not None
             and recovery_decision.failure_class is InvocationFailureClass.OUTPUT_CEILING
         )
+        # A validation report is deliberately not infrastructure-retryable, but
+        # the semantic-no-progress fallback is the only escape for a node whose
+        # corrections made no progress on this model.
+        semantic_no_progress_fallback = (
+            decision == "model_fallback"
+            and recovery_decision is not None
+            and recovery_decision.failure_class is InvocationFailureClass.SEMANTIC_VALIDATION
+        )
         no_model_fallback_authority = decision == "model_fallback" and (
             model_override is None
             or model_override not in self.model_routes
             or definition.repair_policy.maximum_model_fallbacks == 0
-            or (not report.infrastructure_retryable and not output_ceiling_fallback)
+            or (
+                not report.infrastructure_retryable
+                and not output_ceiling_fallback
+                and not semantic_no_progress_fallback
+            )
         )
         no_session_continuation_authority = decision == "session_continuation" and (
             definition.repair_policy.maximum_session_continuations == 0
@@ -4567,6 +4584,8 @@ class WorkControlRuntime:
                 if decision == "session_continuation"
                 else "direct_output_ceiling_model_fallback"
                 if output_ceiling_fallback
+                else "semantic_no_progress_model_fallback"
+                if semantic_no_progress_fallback
                 else "classified_transient_model_fallback"
                 if decision == "model_fallback"
                 else "process_interrupted"

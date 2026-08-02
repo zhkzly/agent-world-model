@@ -271,3 +271,30 @@ def test_codex_opaque_envelope_with_signal_stays_unclassified() -> None:
         )
     )
     assert decision.failure_class is InvocationFailureClass.UNKNOWN
+
+
+def test_semantic_no_progress_routes_model_fallback():
+    """A validation-stuck node (prior corrections made no progress) falls back."""
+
+    policy = InvocationRecoveryPolicy()
+    evidence = InvocationRecoveryEvidence(
+        terminal_code="agent_backend_validation_failed",
+        retryable=False,
+        terminal_details={},
+        precise_semantic_feedback=True,
+        parsed_semantic_candidate=True,
+        semantic_no_progress=True,
+        current_model="grok-4.5",
+        compatible_fallback_models=("gpt-5.3-codex-spark", "gpt-5.6-luna"),
+    )
+    decision = policy.decide(evidence)
+    assert decision.route is InvocationRecoveryRoute.MODEL_FALLBACK
+    assert decision.target_model == "gpt-5.3-codex-spark"
+    assert decision.requires_fresh_node_session
+
+    # Without the no-progress flag the same facts stay a semantic repair.
+    import dataclasses
+    evidence_ok = dataclasses.replace(evidence, semantic_no_progress=False)
+    assert (
+        policy.decide(evidence_ok).route is InvocationRecoveryRoute.SEMANTIC_REPAIR
+    )
