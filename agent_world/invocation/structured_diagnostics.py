@@ -910,13 +910,33 @@ def safe_terminal_expected_category(error: InvocationError | None) -> str | None
 
 
 def terminal_failure_retryable(error: InvocationError | None) -> bool:
-    """Use explicit backend retryability while rejecting known incompatibilities."""
+    """Use explicit backend retryability while rejecting known incompatibilities.
 
-    return bool(
-        error is not None
-        and error.retryable
-        and safe_terminal_code(error) not in _NON_RETRYABLE_TERMINAL_CODES
-    )
+    A Codex ``enum:other`` envelope with NO advisory signal and NO HTTP status
+    is a pure opaque gateway degradation (a transport disconnect or Provider
+    5xx collapsed into ``other``).  ``InvocationRecoveryPolicy.classify``
+    already treats it as TRANSIENT_TRANSPORT, so it must be retryable here too
+    or the bounded infrastructure retry would never be granted (the opaque
+    envelope would fall through to fatal).  Mixed-signal ``enum:other``
+    envelopes remain non-retryable (never semantic repair).
+    """
+
+    if error is None or not error.retryable:
+        return False
+    code = safe_terminal_code(error)
+    if code == _PROVIDER_UNCLASSIFIED_CODE:
+        # Inspect the raw worker details, NOT safe_terminal_details: advisory
+        # signals are intentionally stripped from the safe projection (they
+        # "never alter retry routing"), so the pure-vs-mixed distinction must
+        # be made on the worker's original record.  A pure opaque envelope
+        # (enum:other with no advisory signal and no HTTP status) is the
+        # Codex analog of the direct lane's empty failed envelope and is
+        # retryable; a mixed-signal envelope stays non-retryable.
+        raw = error.details
+        if not raw.get("advisory_text_signals") and raw.get("http_status") is None:
+            return True
+        return False
+    return code not in _NON_RETRYABLE_TERMINAL_CODES
 
 
 def safe_terminal_code(error: InvocationError | None) -> str | None:

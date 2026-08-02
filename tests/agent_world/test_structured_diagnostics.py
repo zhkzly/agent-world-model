@@ -368,3 +368,34 @@ def test_direct_malformed_json_has_prompt_schema_and_adapter_feedback() -> None:
     assert "Runtime Skill" not in (safe_terminal_expected_category(error) or "")
     assert "native schema" in (safe_terminal_remediation(error) or "")
     assert terminal_failure_retryable(error) is False
+
+
+def test_pure_opaque_codex_other_envelope_is_retryable() -> None:
+    """A pure enum:other envelope (no signal/HTTP status) must be retryable.
+
+    The recovery policy classifies it TRANSIENT_TRANSPORT; terminal_failure_retryable
+    must agree or the bounded infrastructure retry is never granted and the
+    opaque gateway degradation becomes fatal.
+    """
+    error = InvocationError(
+        code="turn_failed_unclassified_codex_error",
+        message="turn_failed_unclassified_codex_error",
+        retryable=True,
+        details={"terminal_error_shape": "object", "codex_error_info": "enum:other"},
+    )
+    assert terminal_failure_retryable(error) is True
+
+
+def test_signal_bearing_codex_other_envelope_stays_non_retryable() -> None:
+    """A mixed-signal enum:other envelope must NOT become retryable."""
+    error = InvocationError(
+        code="turn_failed_unclassified_codex_error",
+        message="turn_failed_unclassified_codex_error",
+        retryable=True,
+        details={
+            "terminal_error_shape": "object",
+            "codex_error_info": "enum:other",
+            "advisory_text_signals": ["some_semantic_signal"],
+        },
+    )
+    assert terminal_failure_retryable(error) is False
