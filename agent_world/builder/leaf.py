@@ -1259,7 +1259,25 @@ class BuilderLeaf:
             unknown_upper_bound=unknown_upper_bound,
             agent=agent,
             semantic_repair_continuation=semantic_repair_continuation,
+            # A completion failure means the built Candidate is not acceptable:
+            # the Builder has no mutation root of its own, so the only repair
+            # is a causal rework of the frozen EnvironmentDesign parent.
+            parent_repair_target=self._unique_design_repair_target(definition),
         )
+
+    @staticmethod
+    def _unique_design_repair_target(definition: WorkDefinition):
+        targets = tuple(
+            coordinate
+            for coordinate in definition.repair_target_coordinates
+            if coordinate.component == "design"
+        )
+        if len(targets) != 1:
+            raise LeafExecutionFailure(
+                code="preflight_candidate_design_route_ambiguous",
+                category="candidate build definition lacks one Design causal target",
+            )
+        return targets[0]
 
     @classmethod
     def _resumable_session_from_error(

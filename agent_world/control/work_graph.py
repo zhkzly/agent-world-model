@@ -2578,6 +2578,10 @@ def complete_generation_work_graph(
         session_token_limit=builder_session_token_limit,
         session_wall_seconds=builder_session_wall_seconds,
         maximum_session_continuations=maximum_builder_session_continuations,
+        # A completion/build failure is a design-quality verdict: the builder
+        # has no mutation root of its own, so the only repair is a causal
+        # rework of the frozen EnvironmentDesign parent.
+        repair_targets=(modeling_definition.coordinate,),
         allowed_mutation_roots=("/source", "/dependencies", "/runtime", "/materializer"),
         output_types=(
             "build.source_workspace_snapshot",
@@ -3957,6 +3961,7 @@ def _agent_component_definition(
     session_token_limit: int | None = None,
     session_wall_seconds: float | None = None,
     maximum_session_continuations: int = 0,
+    repair_targets: tuple[WorkCoordinate, ...] = (),
 ) -> WorkDefinition:
     coordinate = WorkCoordinate(
         scope_id=scope_id,
@@ -3972,6 +3977,7 @@ def _agent_component_definition(
         claim=claim,
         timing_reason=timing_reason,
         dependency_coordinates=dependencies,
+        repair_target_coordinates=repair_targets,
         input_slots=input_slots,
         output_slots=tuple(
             ArtifactSlotContract(
