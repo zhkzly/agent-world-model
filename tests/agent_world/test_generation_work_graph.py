@@ -1351,7 +1351,10 @@ def test_complete_generation_graph_freezes_every_verifier_agent_batch_as_physica
         if definition.coordinate.stage == "release_assurance"
     )
     assert aggregate.coordinate in release_assurance.dependency_coordinates
-    assert not {item.coordinate for item in batches} & set(release_assurance.dependency_coordinates)
+    # release_assurance rebuilds the full VerifierIR (with sealed cases) from
+    # the per-batch verifier drafts, so it must depend on every batch
+    # coordinate (parent_output_refs only projects direct parents).
+    assert {item.coordinate for item in batches} <= set(release_assurance.dependency_coordinates)
 
 
 def test_work_group_freezes_members_and_requires_exact_aggregate_join() -> None:

@@ -2661,7 +2661,12 @@ def complete_generation_work_graph(
         # and one-hop repair edge, not an implicit two-hop ancestor hidden behind
         # Integration.  Exact Integration evidence is still consumed to avoid
         # rerunning its matching checks under another name.
-        dependencies=(build.coordinate, integration.coordinate, verifier.coordinate),
+        dependencies=(
+            build.coordinate,
+            integration.coordinate,
+            verifier.coordinate,
+            *(item.coordinate for item in verifier_batches),
+        ),
         repair_targets=(build.coordinate,),
         claim_id="release.assurance.passed",
         claim="Exact Candidate and Verifier bytes satisfy every required hard release claim.",
@@ -2704,6 +2709,15 @@ def complete_generation_work_graph(
                 artifact_types=("judge.verifier_ir_projection",),
                 minimum_count=1,
                 maximum_count=1,
+                producer_component="verifier",
+                confidentiality="sealed",
+            ),
+            ArtifactSlotContract(
+                slot_id="input:verifier-batch-draft",
+                direction="input",
+                artifact_types=("judge.verifier_batch_draft",),
+                minimum_count=verifier_batch_count,
+                maximum_count=verifier_batch_count,
                 producer_component="verifier",
                 confidentiality="sealed",
             ),

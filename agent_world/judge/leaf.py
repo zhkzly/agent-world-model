@@ -897,7 +897,9 @@ class ReleaseAssuranceLeaf(IntegrationLeaf):
             # explicit ownership before it crosses InvocationBackend.
             candidate_ref, candidate = self._candidate_from_context(current_context)
             _design, world_spec_ref, world_spec = self._design_world(candidate, candidate_ref)
-            verifier_ref, verifier = self._verifier_from_context(current_context)
+            verifier_ref, verifier = self._verifier_from_context(
+                current_context, design=_design
+            )
             integration_ref, integration = self._integration_from_context(current_context)
             if (
                 integration.status != "ready"
@@ -978,18 +980,63 @@ class ReleaseAssuranceLeaf(IntegrationLeaf):
     def _verifier_from_context(
         self,
         context: WorkExecutionContext,
+        *,
+        design: EnvironmentDesign,
     ) -> tuple[ArtifactRef, VerifierIR]:
-        refs = tuple(
+        # The FULL VerifierIR (with sealed case bodies release must EXECUTE) is
+        # rebuilt from the persisted verifier_batch_drafts — the same merge the
+        # verifier aggregate performs.  Sealed material is never stored as a
+        # standalone artifact (candidate runs unsandboxed); the drafts carry it
+        # under confidentiality="sealed" and release re-derives the complete IR
+        # deterministically.  The projection stays the audit-only ref passed to
+        # judge.evaluate (service byte-compares it against the rebuilt IR).
+        draft_refs = tuple(
+            ref
+            for ref in context.parent_output_refs
+            if ref.artifact_type == "judge.verifier_batch_draft"
+        )
+        if not draft_refs:
+            raise LeafExecutionFailure(
+                code="preflight_release_verifier_missing",
+                category="missing exact framework Verifier batch drafts",
+            )
+        batch_drafts = tuple(
+            self.judge.artifacts.get_json(ref, VerifierBatchDraft) for ref in draft_refs
+        )
+        plan_refs = {item.plan_ref for item in batch_drafts}
+        if len(plan_refs) != 1:
+            raise LeafExecutionFailure(
+                code="preflight_release_verifier_missing",
+                category="verifier batch drafts must share one batch plan",
+            )
+        plan = self.judge.artifacts.get_json(next(iter(plan_refs)), VerifierBatchPlan)
+        by_batch_id = {item.batch_id: item for item in batch_drafts}
+        if {item.batch_id for item in batch_drafts} != {item.batch_id for item in plan.batches}:
+            raise LeafExecutionFailure(
+                code="preflight_release_verifier_missing",
+                category="verifier batch drafts must match the exact planned batch set",
+            )
+        drafts = tuple(by_batch_id[item.batch_id].draft for item in plan.batches)
+        merged = VerifierCompiler._merge_batch_drafts(drafts)
+        VerifierCompiler._validate_draft(merged, design)
+        verifier = VerifierIR(
+            verifier_ir_id=f"verifier:{context.coordinate.scope_id}",
+            revision=1,
+            world_spec_ref=plan.world_spec_ref,
+            design_ref=plan.design_ref,
+            properties=merged.properties,
+            cases=merged.cases,
+            solve_recipes=merged.solve_recipes,
+        )
+        # The projection ref stays the audit ref (registry/dossier bind it);
+        # judge.evaluate byte-checks it against the rebuilt IR.
+        projection_refs = tuple(
             ref
             for ref in context.parent_output_refs
             if ref.artifact_type == "judge.verifier_ir_projection"
         )
-        if len(refs) != 1:
-            raise LeafExecutionFailure(
-                code="preflight_release_verifier_missing",
-                category="missing exact framework Verifier IR",
-            )
-        return refs[0], self.judge.artifacts.get_json(refs[0], VerifierIR)
+        audit_ref = projection_refs[0] if projection_refs else draft_refs[0]
+        return audit_ref, verifier
 
     def _integration_from_context(
         self,
