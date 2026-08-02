@@ -867,9 +867,19 @@ class WorkControlRuntime:
             raise WorkRuntimeError("semantic repair seed state is invalid") from exc
         if record is None:
             raise WorkRuntimeError("semantic repair seed state is missing")
+        # The seed binds the ORIGINAL semantic failure attempt (the action's
+        # source evaluation), not the immediately preceding attempt: the
+        # commitment is inherited across a transient-recovery chain (semantic
+        # repair -> same-model fresh retry -> model fallback), so the direct
+        # parent of the replay attempt is a recovery attempt, not the attempt
+        # whose turn produced the seed.
+        source_evaluation = self.artifacts.get_json(
+            action.source_evaluation_ref,
+            FeedbackEvaluation,
+        )
         if (
             record.work_id != definition.work_id
-            or record.attempt_id != attempt.parent_attempt_id
+            or record.attempt_id != source_evaluation.attempt_id
             or record.definition_digest != definition.definition_digest
             or record.proposal_policy_digest != definition.proposal_policy.content_digest()
             or record.input_fingerprint != self.heads.input_fingerprint(attempt.input_refs)
@@ -2501,38 +2511,54 @@ class WorkControlRuntime:
                 return execution.model
         return attempt.model_override
 
+    def _attempt_semantic_repair_context(self, attempt: WorkAttempt) -> ArtifactRef | None:
+        """Resolve an attempt's repair chain to its original semantic action.
+
+        Mirrors ``_authorize_next_or_fail``: a direct semantic correction is
+        its own context; a transient recovery names its earlier semantic
+        action.  Requires the artifacts store, so it is a bound method.
+        """
+
+        if attempt.repair_action_ref is None:
+            return None
+        action = self.artifacts.get_json(attempt.repair_action_ref, RepairAction)
+        if action.decision in {"local_correction", "parent_correction"}:
+            return attempt.repair_action_ref
+        return action.semantic_repair_context_ref
+
     def _prior_same_route_retry_count(
         self,
         *,
         definition: WorkDefinition,
         input_refs: tuple[ArtifactRef, ...],
-        failure_class: InvocationFailureClass,
         current_model: str | None,
+        semantic_repair_context_ref: ArtifactRef | None,
     ) -> int:
-        """Count only prior same-model retry actions with the same closed class.
+        """Count prior same-route retries exactly as the RepairLedger will.
 
-        A route is one (model, failure-class) recovery sequence, so the count
-        the policy gates on (``prior_same_route_retry_count``) is exactly the
-        number of prior infrastructure retries that reused ``current_model`` and
-        resolved to the same closed ``failure_class``.
+        The ledger authorizes one same-model fresh retry per (route model,
+        semantic repair context) pair and denies the next one
+        (``repair_infrastructure_exhausted``).  The recovery policy must count
+        the same set or it keeps offering ``SAME_MODEL_FRESH_RETRY`` routes the
+        ledger then denies, stranding the node instead of falling back to the
+        next compatible model.  A route is therefore not (model,
+        failure-class): a cross-class transient on the same model has already
+        consumed the one same-route retry and must be routed to
+        ``MODEL_FALLBACK``.
         """
 
         if current_model is None:
             return 0
         count = 0
         for entry in self.repairs.entries_for(definition, input_refs=input_refs):
-            if entry.decision != "infrastructure_retry" or entry.route_model != current_model:
+            if (
+                entry.decision != "infrastructure_retry"
+                or entry.reason_code == "process_interrupted"
+                or entry.route_model != current_model
+                or entry.semantic_repair_context_ref != semantic_repair_context_ref
+            ):
                 continue
-            report = self.artifacts.get_json(entry.report_before_ref, ValidationReport)
-            classification = self.recovery_policy.classify(
-                InvocationRecoveryEvidence(
-                    terminal_code=self._terminal_code(report),
-                    retryable=report.infrastructure_retryable,
-                    terminal_details=self._terminal_details(report),
-                )
-            )
-            if classification is failure_class:
-                count += 1
+            count += 1
         return count
 
     def _invocation_recovery_decision(
@@ -2559,6 +2585,11 @@ class WorkControlRuntime:
             compatible_fallback_models=self._compatible_fallback_models(current_model),
         )
         failure_class = self.recovery_policy.classify(provisional)
+        # The semantic context of the failed attempt's own repair chain: a
+        # same-route retry of an attempt dispatched under a semantic repair
+        # must be counted against the same (route, context) pair the ledger
+        # will check, or the ledger denies the offered retry.
+        semantic_repair_context_ref = self._attempt_semantic_repair_context(attempt)
         evidence = InvocationRecoveryEvidence(
             terminal_code=terminal_code,
             retryable=report.infrastructure_retryable,
@@ -2568,8 +2599,8 @@ class WorkControlRuntime:
             prior_same_route_retry_count=self._prior_same_route_retry_count(
                 definition=definition,
                 input_refs=attempt.input_refs,
-                failure_class=failure_class,
                 current_model=current_model,
+                semantic_repair_context_ref=semantic_repair_context_ref,
             ),
             current_model=current_model,
             compatible_fallback_models=self._compatible_fallback_models(current_model),
@@ -2794,14 +2825,28 @@ class WorkControlRuntime:
         if report.status == "error" and attempt.repair_action_ref is not None:
             action = self.artifacts.get_json(attempt.repair_action_ref, RepairAction)
             if action.decision in {"local_correction", "parent_correction"}:
-                # A transport/infrastructure error during an already-authorized
-                # semantic repair cannot establish semantic progress and must
-                # not mint a second, independent infrastructure retry.  It
-                # still has to pass through normal terminal settlement: that
-                # closes the active repair ledger entry and prevents the
-                # WorkHead from being stranded in ``running`` after its
-                # Proposal/Validation operations were both settled.
-                allow_infrastructure_retry = False
+                # A transport-liveness error during an already-authorized
+                # semantic repair produced zero Provider events: the repair
+                # guidance was never exercised, so a fresh-session retry that
+                # replays that same repair context (``semantic_context_recovery``)
+                # is the only way that correction can ever be tested.  Any
+                # other transport/infrastructure error cannot establish
+                # semantic progress and must not mint a second, independent
+                # infrastructure retry.  Either way the failure still has to
+                # pass through normal terminal settlement: that closes the
+                # active repair ledger entry and prevents the WorkHead from
+                # being stranded in ``running`` after its Proposal/Validation
+                # operations were both settled.
+                terminal_blocker = next(
+                    (
+                        issue.code
+                        for issue in report.issues
+                        if issue.severity == "blocker"
+                    ),
+                    None,
+                )
+                if not _is_transport_liveness_timeout(terminal_blocker):
+                    allow_infrastructure_retry = False
         if report.attempt_id != attempt.attempt_id:
             raise WorkRuntimeError("ValidationReport belongs to another WorkAttempt")
         if report.coordinate != definition.coordinate:
@@ -3555,6 +3600,10 @@ class WorkControlRuntime:
                 "semantic_repair_seed_commitment": (
                     prior.semantic_repair_seed_commitment
                     if action.decision == "local_correction"
+                    or (
+                        action.decision in {"infrastructure_retry", "model_fallback"}
+                        and action.semantic_repair_context_ref is not None
+                    )
                     else None
                 ),
                 "observed_actual": BudgetUsage(),
@@ -4431,6 +4480,34 @@ class WorkControlRuntime:
             if decision in {"infrastructure_retry", "model_fallback"}
             else None
         )
+        # A transient recovery of an attempt that was itself dispatched under
+        # an already-authorized semantic repair replays that repair's context
+        # (``semantic_context_recovery``): same correction brief, same seed,
+        # fresh Provider session.  The RepairAction schema requires the
+        # original mutation authority to be carried along with that context.
+        semantic_repair_context_ref: ArtifactRef | None = None
+        recovery_mutation_roots: tuple[NonEmptyStr, ...] = ()
+        if (
+            decision in {"infrastructure_retry", "model_fallback"}
+            and terminal_attempt.repair_action_ref is not None
+        ):
+            source_repair_action = self.artifacts.get_json(
+                terminal_attempt.repair_action_ref,
+                RepairAction,
+            )
+            if source_repair_action.decision in {"local_correction", "parent_correction"}:
+                semantic_repair_context_ref = terminal_attempt.repair_action_ref
+                recovery_mutation_roots = source_repair_action.allowed_mutation_roots
+            elif source_repair_action.semantic_repair_context_ref is not None:
+                # The failed attempt was itself a transient recovery replaying
+                # an earlier semantic repair: keep naming that original
+                # semantic action so its seed and correction brief stay stable.
+                semantic_repair_context_ref = source_repair_action.semantic_repair_context_ref
+                semantic_source = self.artifacts.get_json(
+                    source_repair_action.semantic_repair_context_ref,
+                    RepairAction,
+                )
+                recovery_mutation_roots = semantic_source.allowed_mutation_roots
         action = RepairAction(
             action_id=self._id("repair-action", terminal_attempt.attempt_id, str(ordinal)),
             repair_policy_id=definition.repair_policy.policy_id,
@@ -4447,6 +4524,7 @@ class WorkControlRuntime:
             jump_distance=0,
             repair_attempt_ordinal=ordinal,
             immutable_input_refs=terminal_attempt.input_refs,
+            semantic_repair_context_ref=semantic_repair_context_ref,
             allowed_mutation_roots=(
                 (
                     repair_mutation_roots
@@ -4454,7 +4532,7 @@ class WorkControlRuntime:
                     else definition.allowed_mutation_roots
                 )
                 if decision in {"local_correction", "session_continuation"} or workspace_recovery
-                else ()
+                else recovery_mutation_roots
             ),
             causal_evidence_refs=tuple(
                 item
