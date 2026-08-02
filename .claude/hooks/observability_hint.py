@@ -27,23 +27,36 @@ _FRAMEWORK_JOB_ID_PATTERN = re.compile(r"^(?:generate|expand)-job:[0-9a-f]{24}$"
 _TERMINAL_FAILURE_STATUSES = frozenset({"failed", "needs_human", "budget_exhausted"})
 
 
-def failed_direct_observability_hint() -> str | None:
-    """Return one safe scene command for the newest unsuccessful Direct job.
+_ACTIVE_STATUSES = frozenset({"running", "failed", "needs_human", "budget_exhausted"})
 
-    A missing, malformed, symlinked, or reserved-live state is intentionally a
-    silent no-op: hook discovery is advisory and must never affect a session.
+
+def direct_observability_hint() -> str | None:
+    """Return one safe scene command for the newest active Direct job.
+
+    Unlike the earlier failed-only hint, this also surfaces a *running* Direct
+    job so the session sees progress during a long generation (the user asked
+    for process readability).  A failed / needs_human / budget_exhausted job is
+    still prioritized over a merely running one.  Missing, malformed,
+    symlinked, or reserved-live state is intentionally a silent no-op: hook
+    discovery is advisory and must never affect a session.
     """
 
-    scope_id = _failed_direct_scope_id()
+    scope_id = _active_direct_scope_id()
     if scope_id is None:
         return None
     return (
-        "Failed Direct job detected. Before acting, run "
+        "Active Direct job detected. Before acting, run "
         f"`uv run agent-world observe scene {scope_id}`; 先读 scene.md。"
     )
 
 
-def _failed_direct_scope_id() -> str | None:
+def failed_direct_observability_hint() -> str | None:
+    """Backward-compatible wrapper returning only the failed-job hint."""
+
+    return direct_observability_hint()
+
+
+def _active_direct_scope_id() -> str | None:
     state_root = _configured_state_root()
     if state_root is None or ".agent-world-live" in state_root.parts:
         return None
@@ -52,7 +65,7 @@ def _failed_direct_scope_id() -> str | None:
     if not _is_real_directory(heads_dir):
         return None
 
-    candidates: list[tuple[int, str, dict[str, object]]] = []
+    candidates: list[tuple[int, str, dict[str, object], bool]] = []
     try:
         entries = tuple(heads_dir.iterdir())
     except OSError:
@@ -67,11 +80,18 @@ def _failed_direct_scope_id() -> str | None:
         if not stat.S_ISREG(metadata.st_mode):
             continue
         head = _read_json_object(entry, limit=_DIRECT_HEAD_MAX_BYTES)
-        if head is None or head.get("status") not in _TERMINAL_FAILURE_STATUSES:
+        if head is None:
             continue
-        candidates.append((metadata.st_mtime_ns, entry.name, head))
+        status = head.get("status")
+        if status not in _ACTIVE_STATUSES:
+            continue
+        is_terminal = status in _TERMINAL_FAILURE_STATUSES
+        candidates.append((metadata.st_mtime_ns, entry.name, head, is_terminal))
 
-    for _mtime_ns, _name, head in sorted(candidates, reverse=True):
+    # Terminal (failed/needs_human/budget_exhausted) first, then running; within
+    # each class newest first.
+    ordered = sorted(candidates, key=lambda item: (not item[3], -item[0]))
+    for _mtime_ns, _name, head, _is_terminal in ordered:
         scope_id = _scope_id_from_job_blob(state_root, head)
         if scope_id is not None:
             return scope_id
