@@ -1588,7 +1588,7 @@ def tool_semantics_batch_definition(
             # The post-fix repair chain is local correction + strict-progress
             # bonus + one same-model infrastructure retry + one model fallback
             # (4 charged attempts); 3 structurally excluded the fallback.
-            maximum_total_repair_attempts=5,
+            maximum_total_repair_attempts=8,
         ),
         required_claim_id=claim_id,
         allowed_mutation_roots=("/tools",),
@@ -1629,7 +1629,7 @@ def structured_agent_work_definition(
     maximum_automatic_backjump: int = 0,
     # Sized for the full post-fix chain (local + bonus + infra + fallback) plus
     # one quality-loop margin; 3 made the model fallback structurally impossible.
-    maximum_total_repair_attempts: int = 5,
+    maximum_total_repair_attempts: int = 8,
     group_id: Identifier | None = None,
     shard_id: Identifier | None = None,
     success_maturity: Identifier = "semantic_compiled",
@@ -3803,7 +3803,7 @@ def _verifier_intent_group(
                     maximum_infrastructure_retries=1,
                     maximum_model_fallbacks=1,
                     maximum_process_recoveries=1,
-                    maximum_total_repair_attempts=5,
+                    maximum_total_repair_attempts=8,
                 ),
                 required_claim_id="verifier.intent.batch.valid",
                 allowed_mutation_roots=("/cases", "/properties", "/coverage"),
@@ -4041,7 +4041,7 @@ def _agent_component_definition(
             # no mutation root of its own, so an actionable build failure
             # routes one causal rework of the frozen Design parent.
             maximum_automatic_backjump=1 if repair_targets else 0,
-            maximum_total_repair_attempts=5,
+            maximum_total_repair_attempts=8,
         ),
         required_claim_id=claim_id,
         allowed_mutation_roots=allowed_mutation_roots,
