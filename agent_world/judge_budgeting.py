@@ -10,7 +10,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from agent_world.contracts import CurriculumRequirements, EnvironmentDesign
+from agent_world.contracts import (
+    MAX_ACTORS_PER_TASK,
+    MAX_DIFFICULTY_DIMENSIONS,
+    MAX_DISTINCT_CURRICULUM_SAMPLES,
+    CurriculumRequirements,
+    EnvironmentDesign,
+)
 from agent_world.contracts.supply_chain import MAX_PUBLIC_TESTS
 
 if TYPE_CHECKING:
@@ -35,17 +41,24 @@ def task_materializer_call_counts(
 ) -> dict[str, int]:
     """Compile each task type's finite stratified materialization sample."""
 
+    # Hard clamp even if a model bypassed the schema caps (defense-in-depth):
+    # the budget engine must never amplify evaluation cost beyond framework
+    # bounds.  actor/dimension counts and the distinctness floor are all
+    # clamped so a malformed-but-valid-typed curriculum stays within budget.
     return {
         requirement.task_type: (
-            len(requirement.allowed_actor_ids)
+            min(len(requirement.allowed_actor_ids), MAX_ACTORS_PER_TASK)
             * (
-                max(
-                    2,
-                    curriculum.minimum_distinct_initial_states,
-                    curriculum.minimum_distinct_tasks_per_type,
-                    requirement.reachability_policy.samples_per_task_actor,
+                min(
+                    max(
+                        2,
+                        curriculum.minimum_distinct_initial_states,
+                        curriculum.minimum_distinct_tasks_per_type,
+                        requirement.reachability_policy.samples_per_task_actor,
+                    ),
+                    MAX_DISTINCT_CURRICULUM_SAMPLES,
                 )
-                + 2 * len(requirement.difficulty_dimensions)
+                + 2 * min(len(requirement.difficulty_dimensions), MAX_DIFFICULTY_DIMENSIONS)
             )
             + requirement.reachability_policy.random_tail_samples
         )

@@ -2856,11 +2856,12 @@ empty list, or rely on public/sealed case pairing as a solve recipe.
 
 Solve-recipe binding audit is mandatory before returning. A matching field name is not proof that a
 pointer is valid: a `number` source cannot fill an `integer` tool argument. For each required
-recipe argument, consult `solve_recipe_binding_guide`; it lists type-compatible `public_goal`
-pointers already derivable from this context. The guide is not a value source and is not exhaustive:
-you may use another source only after checking its exact resolved schema. If the guide has no
-compatible public-goal pointer, use a schema-valid `{"kind":"literal","value":...}` or an
-earlier compatible public tool result/observation. Never cast, round, parse, or otherwise transform
+recipe argument, consult `solve_recipe_binding_guide`; it lists the CLOSED enumeration of every
+legal `public_goal` pointer already derivable from this context, including deep pointers. The guide
+is not a value source and is exhaustive for public_goal: use a pointer only if it appears in the
+guide. If the guide lists no compatible pointer for an argument, use a schema-valid
+`{"kind":"literal","value":...}` or an earlier compatible public tool result/observation. Never
+cast, round, parse, or otherwise transform
 a pointer value inside a recipe. A literal must also satisfy the selected field's enum, format, and
 bounds. Every RFC 6901 pointer segment must descend through a structured source node: each object
 key must select an object property and each index must select an array item. A pointer may stop at a
@@ -3588,28 +3589,93 @@ def _schema_type_label(schema: Mapping[str, JsonValue]) -> str:
     return "schema-defined value"
 
 
+def _enumerate_legal_pointers(
+    schema: Mapping[str, JsonValue],
+    *,
+    visible_fields: set[str] | None = None,
+) -> list[tuple[str, Mapping[str, JsonValue]]]:
+    """Enumerate every legal RFC 6901 pointer derivable from a JSON schema.
+
+    Mirrors ``_schema_at_pointer`` branch logic exactly: an object node emits
+    one pointer per declared ``properties`` key (segment 0 respects the
+    actor-visibility filter) and recurses; an array node emits ``/0`` (the
+    canonical representative index) and recurses into ``items``; a scalar or
+    type-less node stops (never descends through a scalar).  The emitted set is
+    therefore a *superset* of what the pointer validator accepts for structured
+    values and a precise subset for the scalar-traversal trap, so a model
+    picking from this closed set can never trigger ``recipe_pointer_traverses_scalar``.
+    Returns ``(pointer, node_schema)`` pairs in breadth-first order.
+    """
+
+    results: list[tuple[str, Mapping[str, JsonValue]]] = []
+
+    def _visit(
+        current: Mapping[str, JsonValue],
+        *,
+        tokens: list[str],
+        depth: int,
+    ) -> None:
+        if depth > 32:  # _MAX_POINTER_SEGMENTS alignment (contracts/reachability.py)
+            return
+        schema_type = current.get("type")
+        if schema_type == "object":
+            properties = current.get("properties")
+            if not isinstance(properties, dict):
+                return
+            for key in properties:
+                child = properties[key]
+                if not isinstance(child, dict):
+                    continue
+                if depth == 0 and visible_fields is not None and key not in visible_fields:
+                    continue  # actor-visibility gate (segment 0)
+                next_tokens = [*tokens, key]
+                pointer = "/" + "/".join(
+                    tok.replace("~", "~0").replace("/", "~1") for tok in next_tokens
+                )
+                results.append((pointer, child))
+                _visit(child, tokens=next_tokens, depth=depth + 1)
+        elif schema_type == "array":
+            items = current.get("items")
+            if not isinstance(items, dict):
+                return
+            next_tokens = [*tokens, "0"]
+            pointer = "/" + "/".join(
+                tok.replace("~", "~0").replace("/", "~1") for tok in next_tokens
+            )
+            results.append((pointer, items))
+            _visit(items, tokens=next_tokens, depth=depth + 1)
+        # scalar or missing type: stop, do not descend.
+
+    _visit(schema, tokens=[], depth=0)
+    return results
+
+
 def _solve_recipe_binding_guide(
     tasks: Sequence[TaskRequirement],
     tools: Sequence[ToolContract],
 ) -> list[JsonValue]:
     """Project type-compatible public-goal bindings into the Direct Agent view.
 
-    This is an advisory reading aid, not a new runtime contract or a generated
-    answer: it summarizes only schemas already visible in the Challenger
-    context.  In particular, an empty pointer list deliberately leaves the
-    model to choose a schema-valid literal or a later public result.
+    The guide is now a CLOSED enumeration of every legal pointer derivable from
+    the frozen ``public_goal`` schema (including deep pointers), per tool
+    argument, across every frozen tool a task may use.  A model picking a
+    pointer only from this set can never hit ``recipe_pointer_traverses_scalar``:
+    the enumerator mirrors ``_schema_at_pointer`` exactly, so every emitted
+    pointer passes the pointer validator.  An empty candidate list means the
+    argument must be a schema-valid literal (or an earlier public result).
     """
 
     tools_by_id = {tool.surface.tool_id: tool for tool in tools}
     guide: list[JsonValue] = []
     for task in tasks:
-        goal_properties = task.public_goal_schema.get("properties")
-        if not isinstance(goal_properties, dict):
-            continue
-        for tool_id in task.required_tool_ids:
-            tool = tools_by_id.get(tool_id)
-            if tool is None:
-                continue
+        # Enumerate the closed legal-pointer set for this task's public_goal
+        # once; every tool argument filters this set by type compatibility.
+        goal_pointers = _enumerate_legal_pointers(task.public_goal_schema)
+        # Enumerate ALL frozen tools a task may bind, not just required ones:
+        # the validator checks every step for every tool the Challenger uses,
+        # so a guide that omits a tool leaves that argument with no candidates.
+        for tool_id in sorted(tools_by_id):
+            tool = tools_by_id[tool_id]
             input_schema = tool.surface.input_schema
             input_properties = input_schema.get("properties")
             required = input_schema.get("required")
@@ -3620,16 +3686,14 @@ def _solve_recipe_binding_guide(
                 target_schema = input_properties.get(argument_name)
                 if not isinstance(target_schema, dict):
                     continue
-                pointers: list[JsonValue] = []
-                for source_name, source_schema in sorted(goal_properties.items()):
-                    if not isinstance(source_schema, dict):
-                        continue
+                candidates: list[JsonValue] = []
+                for pointer, source_schema in goal_pointers:
                     if not _schemas_compatible(source_schema, target_schema):
                         continue
-                    pointers.append(
+                    candidates.append(
                         {
-                            "pointer": "/"
-                            + source_name.replace("~", "~0").replace("/", "~1"),
+                            "source": "public_goal",
+                            "pointer": pointer,
                             "value_type": _schema_type_label(source_schema),
                         }
                     )
@@ -3637,7 +3701,7 @@ def _solve_recipe_binding_guide(
                     {
                         "argument": argument_name,
                         "target_type": _schema_type_label(target_schema),
-                        "type_compatible_public_goal_pointers": pointers,
+                        "candidates": candidates,
                     }
                 )
             guide.append(

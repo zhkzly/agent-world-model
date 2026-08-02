@@ -13,6 +13,9 @@ from agent_world.agent_output_authority import (
     register_agent_output_contract,
 )
 from agent_world.contracts import (
+    MAX_ACTORS_PER_TASK,
+    MAX_DIFFICULTY_DIMENSIONS,
+    MAX_DISTINCT_CURRICULUM_SAMPLES,
     ArtifactRef,
     BudgetUsage,
     Claim,
@@ -1368,9 +1371,15 @@ class CurriculumTaskPlan(AgentOutput):
 
     task_type: Identifier
     objective: Annotated[str, Field(min_length=1)]
-    allowed_actor_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    allowed_actor_ids: Annotated[
+        tuple[Identifier, ...],
+        Field(min_length=1, max_length=MAX_ACTORS_PER_TASK),
+    ]
     required_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
-    difficulty_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    difficulty_dimensions: Annotated[
+        tuple[Identifier, ...],
+        Field(min_length=1, max_length=MAX_DIFFICULTY_DIMENSIONS),
+    ]
     minimum_tool_calls: Annotated[int, Field(ge=1, le=32)] = 1
 
     @model_validator(mode="after")
@@ -1402,8 +1411,12 @@ class CurriculumPlanDraft(AgentOutput):
         tuple[DifficultyDimension, ...], Field(min_length=1, max_length=32)
     ]
     generation_seed_space: Annotated[str, Field(min_length=1)]
-    minimum_distinct_initial_states: Annotated[int, Field(ge=2)] = 2
-    minimum_distinct_tasks_per_type: Annotated[int, Field(ge=2)] = 2
+    minimum_distinct_initial_states: Annotated[
+        int, Field(ge=2, le=MAX_DISTINCT_CURRICULUM_SAMPLES)
+    ] = 2
+    minimum_distinct_tasks_per_type: Annotated[
+        int, Field(ge=2, le=MAX_DISTINCT_CURRICULUM_SAMPLES)
+    ] = 2
     sampling_constraints: Annotated[tuple[Rule, ...], Field(max_length=128)] = ()
     unresolved_questions: tuple[str, ...] = ()
 
@@ -1440,9 +1453,15 @@ class CurriculumPlanDraft(AgentOutput):
 class CurriculumTaskPlanSourceDraft(AgentOutput):
     task_type: Identifier
     objective: Annotated[str, Field(min_length=1)]
-    allowed_actor_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    allowed_actor_ids: Annotated[
+        tuple[Identifier, ...],
+        Field(min_length=1, max_length=MAX_ACTORS_PER_TASK),
+    ]
     required_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
-    difficulty_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    difficulty_dimensions: Annotated[
+        tuple[Identifier, ...],
+        Field(min_length=1, max_length=MAX_DIFFICULTY_DIMENSIONS),
+    ]
     minimum_tool_calls: Annotated[int, Field(ge=1, le=32)] = 1
 
 
@@ -1459,8 +1478,12 @@ class CurriculumPlanSourceDraft(AgentOutput):
         tuple[DifficultyDimension, ...], Field(min_length=1, max_length=32)
     ]
     generation_seed_space: Annotated[str, Field(min_length=1)]
-    minimum_distinct_initial_states: Annotated[int, Field(ge=2)] = 2
-    minimum_distinct_tasks_per_type: Annotated[int, Field(ge=2)] = 2
+    minimum_distinct_initial_states: Annotated[
+        int, Field(ge=2, le=MAX_DISTINCT_CURRICULUM_SAMPLES)
+    ] = 2
+    minimum_distinct_tasks_per_type: Annotated[
+        int, Field(ge=2, le=MAX_DISTINCT_CURRICULUM_SAMPLES)
+    ] = 2
     sampling_constraints: Annotated[tuple[RuleDraft, ...], Field(max_length=128)] = ()
     unresolved_questions: tuple[str, ...] = ()
 

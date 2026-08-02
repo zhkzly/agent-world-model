@@ -28,6 +28,15 @@ _RULE_PROPERTY_FAMILY = {
 
 _MAX_POINTER_LENGTH = 4096
 _MAX_POINTER_SEGMENTS = 32
+# Budget-determining curriculum bounds.  These cap the model-authored knobs that
+# directly multiply the Judge evaluation-episode budget via
+# ``task_materializer_call_counts`` (judge_budgeting.py).  A model writing a huge
+# ``minimum_distinct_initial_states`` (e.g. 12025) or a long actor/dimension
+# list would otherwise inflate integration/release evaluation cost unboundedly.
+MAX_DISTINCT_CURRICULUM_SAMPLES = 16
+MAX_ACTORS_PER_TASK = 4
+MAX_DIFFICULTY_DIMENSIONS = 4
+MAX_LEVELS_PER_DIM = 16
 _SAMPLING_UNAVAILABLE_RULE_SOURCES = frozenset(
     {"args", "tool_result", "error", "events", "terminated", "truncated"}
 )
@@ -83,7 +92,10 @@ def _term_goal_pointers(term: RuleTerm | None) -> frozenset[str]:
 class DifficultyDimension(V2Contract):
     dimension: Identifier
     description: NonEmptyStr
-    levels: Annotated[tuple[Identifier, ...], Field(min_length=2)]
+    levels: Annotated[
+        tuple[Identifier, ...],
+        Field(min_length=2, max_length=MAX_LEVELS_PER_DIM),
+    ]
 
 
 class EvaluatorGoalBinding(V2Contract):
@@ -107,7 +119,10 @@ class EvaluatorGoalBinding(V2Contract):
 class TaskRequirement(V2Contract):
     task_type: Identifier
     objective: NonEmptyStr
-    allowed_actor_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    allowed_actor_ids: Annotated[
+        tuple[Identifier, ...],
+        Field(min_length=1, max_length=MAX_ACTORS_PER_TASK),
+    ]
     required_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
     initial_state_constraints: tuple[Rule, ...] = ()
     success_conditions: Annotated[tuple[Rule, ...], Field(min_length=1, max_length=64)]
@@ -119,7 +134,10 @@ class TaskRequirement(V2Contract):
     evaluator_goal_bindings: Annotated[
         tuple[EvaluatorGoalBinding, ...], Field(min_length=1, max_length=64)
     ]
-    difficulty_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    difficulty_dimensions: Annotated[
+        tuple[Identifier, ...],
+        Field(min_length=1, max_length=MAX_DIFFICULTY_DIMENSIONS),
+    ]
     minimum_tool_calls: Annotated[int, Field(ge=1, le=32)] = 1
     reachability_policy: ReachabilityPolicy = Field(default_factory=ReachabilityPolicy)
 
@@ -385,8 +403,12 @@ class CurriculumRequirements(V2Contract):
     task_types: Annotated[tuple[TaskRequirement, ...], Field(min_length=1)]
     difficulty_dimensions: Annotated[tuple[DifficultyDimension, ...], Field(min_length=1)]
     generation_seed_space: NonEmptyStr
-    minimum_distinct_initial_states: Annotated[int, Field(ge=2)] = 2
-    minimum_distinct_tasks_per_type: Annotated[int, Field(ge=2)] = 2
+    minimum_distinct_initial_states: Annotated[
+        int, Field(ge=2, le=MAX_DISTINCT_CURRICULUM_SAMPLES)
+    ] = 2
+    minimum_distinct_tasks_per_type: Annotated[
+        int, Field(ge=2, le=MAX_DISTINCT_CURRICULUM_SAMPLES)
+    ] = 2
     sampling_constraints: Annotated[tuple[Rule, ...], Field(max_length=128)] = ()
 
     @model_validator(mode="after")

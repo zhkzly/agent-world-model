@@ -14,6 +14,10 @@ from .base import (
     sha256_digest,
 )
 from .design import (
+    MAX_ACTORS_PER_TASK,
+    MAX_DIFFICULTY_DIMENSIONS,
+    MAX_DISTINCT_CURRICULUM_SAMPLES,
+    MAX_LEVELS_PER_DIM,
     CurriculumRequirements,
     DifficultyDimension,
     EnvironmentDesign,
@@ -262,6 +266,10 @@ __all__ = [
     "ContentHash",
     "CURRICULUM_PACKAGE_PATH",
     "CoverageDimension",
+    "MAX_ACTORS_PER_TASK",
+    "MAX_DIFFICULTY_DIMENSIONS",
+    "MAX_DISTINCT_CURRICULUM_SAMPLES",
+    "MAX_LEVELS_PER_DIM",
     "CoverageGain",
     "CoverageLevel",
     "CoverageMap",

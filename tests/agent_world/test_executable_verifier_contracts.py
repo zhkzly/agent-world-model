@@ -871,7 +871,7 @@ def test_solve_recipe_type_feedback_and_agent_view_expose_compatible_bindings() 
                 {
                     "argument": "amount",
                     "target_type": "integer",
-                    "type_compatible_public_goal_pointers": [],
+                    "candidates": [],
                 }
             ],
         }
