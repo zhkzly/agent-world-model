@@ -4425,11 +4425,21 @@ class WorkControlRuntime:
             or definition.proposal_policy.executor != "agent"
             or not definition.allowed_mutation_roots
         )
+        # An output-ceiling fallback is the *only* recovery for a closed
+        # ``direct_output_limit`` terminal: the same model and envelope already
+        # exhausted its structured output budget, so the report is deliberately
+        # NOT infrastructure-retryable.  Gate the non-retryable requirement on
+        # the non-ceiling case or the fallback is denied before it starts.
+        output_ceiling_fallback = (
+            decision == "model_fallback"
+            and recovery_decision is not None
+            and recovery_decision.failure_class is InvocationFailureClass.OUTPUT_CEILING
+        )
         no_model_fallback_authority = decision == "model_fallback" and (
             model_override is None
             or model_override not in self.model_routes
             or definition.repair_policy.maximum_model_fallbacks == 0
-            or not report.infrastructure_retryable
+            or (not report.infrastructure_retryable and not output_ceiling_fallback)
         )
         no_session_continuation_authority = decision == "session_continuation" and (
             definition.repair_policy.maximum_session_continuations == 0
@@ -4555,6 +4565,8 @@ class WorkControlRuntime:
                 if decision == "local_correction"
                 else "provider_output_ceiling"
                 if decision == "session_continuation"
+                else "direct_output_ceiling_model_fallback"
+                if output_ceiling_fallback
                 else "classified_transient_model_fallback"
                 if decision == "model_fallback"
                 else "process_interrupted"
@@ -5247,6 +5259,8 @@ class WorkControlRuntime:
 
     def _require_running(self, definition: WorkDefinition) -> WorkControlHead:
         head = self.heads.read_head(definition.coordinate)
+        if __import__("os").environ.get("PROBE_REQ") and (head is None or head.status != "running" or head.definition_digest != definition.definition_digest):
+            print(f"  [probe] _require_running FAIL: coord={definition.coordinate.component}.{definition.coordinate.stage}.{definition.coordinate.artifact_slot} head={'None' if head is None else head.status} head_def={head.definition_digest if head else '?'} want_def={definition.definition_digest} head_work={head.work_id if head else '?'} want_work={definition.work_id}", flush=True)
         if (
             head is None
             or head.status != "running"
