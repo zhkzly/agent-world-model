@@ -1576,3 +1576,85 @@ async def test_orphaned_running_head_recovers_and_reaches_committed(
 
     assert tuple(item.after_state for item in results) == ("committed",)
     assert scheduler.snapshot().work[-1].state == "committed"
+
+
+def test_begin_after_head_reset_continues_at_first_free_ordinal(
+    tmp_path: Path,
+) -> None:
+    """A re-begun coordinate must not reuse the original attempt identity.
+
+    ``_id`` is deterministic, so re-beginning at ordinal 1 after a diagnostic
+    head reset would recreate the original attempt id and collide with its
+    settled budget leases (ValueError: lease id is already bound to different
+    or terminal work).  begin() must continue at the first free ordinal.
+    """
+
+    scope_id = "job:begin-ordinal"
+    coordinate = WorkCoordinate(
+        scope_id=scope_id,
+        component="release",
+        stage="package",
+        artifact_slot="package",
+    )
+    definition = _definition(
+        scope_id=scope_id,
+        component="release",
+        stage="package",
+        coordinate=coordinate,
+        dependencies=(),
+    )
+    graph = GenerationWorkGraph.compile((definition,), mode="diagnostic")
+    artifacts = ArtifactStore(tmp_path / "artifacts").issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.", "release."),
+    )
+    heads = WorkControlStore(tmp_path / "heads")
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(Budget(wall_seconds=1_000, process_calls=20)),
+    )
+    root_ref = artifacts.put_json(
+        artifact_id="context:begin-ordinal",
+        artifact_type="control.generation_context",
+        value={"request": "hotel"},
+    )
+    manifest = graph.manifest(
+        topology_id="topology:begin-ordinal-test",
+        external_root_refs=(root_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(root_ref,),
+    )
+
+    # Simulate a coordinate that already carries attempt history (a previous
+    # run's attempts remain in the artifact store after a diagnostic head
+    # reset removed the durable head).
+    prior_ids = [
+        WorkControlRuntime._id("attempt", definition.work_id, str(ordinal))
+        for ordinal in (1, 2)
+    ]
+    for attempt_id in prior_ids:
+        artifacts.put_json(
+            artifact_id=attempt_id,
+            artifact_type="control.work_attempt",
+            value={"attempt_id": attempt_id, "work_id": definition.work_id},
+        )
+
+    with heads.exclusive(coordinate) as lock:
+        begun = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(root_ref,),
+            elapsed_wall_seconds=0,
+        )
+    attempt = artifacts.get_json(begun.attempt_ref, WorkAttempt)
+    assert attempt.ordinal == 3
+    assert attempt.attempt_id == WorkControlRuntime._id(
+        "attempt", definition.work_id, "3"
+    )
+    assert attempt.attempt_id not in prior_ids
+

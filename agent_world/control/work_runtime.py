@@ -2058,17 +2058,28 @@ class WorkControlRuntime:
             leases=self.budget.leases,
         )
         now = datetime.now(UTC)
+        # A re-open of a coordinate with prior attempt history (for example a
+        # diagnostic head reset after a framework-corrected terminal verdict)
+        # must continue at the first free ordinal: ``_id`` is deterministic,
+        # so re-beginning at ordinal 1 would reuse the original attempt's
+        # identity and collide with its settled budget leases ("lease id is
+        # already bound to different or terminal work").
+        ordinal = 1
+        while self.artifacts.list_revisions(
+            self._id("attempt", definition.work_id, str(ordinal))
+        ):
+            ordinal += 1
         telemetry_trace_id, telemetry_span_id = self._start_attempt_span(
             definition,
-            ordinal=1,
+            ordinal=ordinal,
             input_refs=input_refs,
             repair_mode="initial",
         )
         attempt = WorkAttempt(
-            attempt_id=self._id("attempt", definition.work_id, "1"),
+            attempt_id=self._id("attempt", definition.work_id, str(ordinal)),
             work_id=definition.work_id,
             coordinate=definition.coordinate,
-            ordinal=1,
+            ordinal=ordinal,
             status="running",
             definition_digest=definition.definition_digest,
             proposal_policy_digest=definition.proposal_policy.content_digest(),
