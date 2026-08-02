@@ -1585,7 +1585,10 @@ def tool_semantics_batch_definition(
             maximum_infrastructure_retries=1,
             maximum_model_fallbacks=1,
             maximum_automatic_backjump=0,
-            maximum_total_repair_attempts=3,
+            # The post-fix repair chain is local correction + strict-progress
+            # bonus + one same-model infrastructure retry + one model fallback
+            # (4 charged attempts); 3 structurally excluded the fallback.
+            maximum_total_repair_attempts=5,
         ),
         required_claim_id=claim_id,
         allowed_mutation_roots=("/tools",),
@@ -1624,7 +1627,9 @@ def structured_agent_work_definition(
     maximum_session_continuations: int = 0,
     maximum_process_recoveries: int = 2,
     maximum_automatic_backjump: int = 0,
-    maximum_total_repair_attempts: int = 3,
+    # Sized for the full post-fix chain (local + bonus + infra + fallback) plus
+    # one quality-loop margin; 3 made the model fallback structurally impossible.
+    maximum_total_repair_attempts: int = 5,
     group_id: Identifier | None = None,
     shard_id: Identifier | None = None,
     success_maturity: Identifier = "semantic_compiled",
@@ -3794,7 +3799,7 @@ def _verifier_intent_group(
                     maximum_infrastructure_retries=1,
                     maximum_model_fallbacks=1,
                     maximum_process_recoveries=1,
-                    maximum_total_repair_attempts=3,
+                    maximum_total_repair_attempts=5,
                 ),
                 required_claim_id="verifier.intent.batch.valid",
                 allowed_mutation_roots=("/cases", "/properties", "/coverage"),
@@ -4026,7 +4031,7 @@ def _agent_component_definition(
             maximum_model_fallbacks=1,
             maximum_session_continuations=maximum_session_continuations,
             maximum_process_recoveries=1,
-            maximum_total_repair_attempts=3,
+            maximum_total_repair_attempts=5,
         ),
         required_claim_id=claim_id,
         allowed_mutation_roots=allowed_mutation_roots,
