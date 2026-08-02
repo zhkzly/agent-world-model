@@ -120,6 +120,7 @@ from agent_world.control import (
     verifier_plan_work_definition,
 )
 from agent_world.judge import VerifierBatchPlan, VerifierBatchPlanItem
+from agent_world.judge.models import VerifierBatchDraft, VerifierDraft
 from agent_world.task_materialization import compile_task_materializer_output_schema
 
 RUNTIME_SOURCE = r"""from __future__ import annotations
@@ -904,10 +905,86 @@ def _commit_prepackage_fixture_closure(
         value={"fixture": "checkpoint"},
         dependencies=(verifier_plan_ref,),
     )
+    # The release_assurance leaf rebuilds the full VerifierIR (with sealed
+    # cases) from the persisted per-batch drafts, so the fixture must persist a
+    # REAL VerifierBatchDraft (not a placeholder).  Mirror the minimal complete
+    # IR from build_judge_candidate_graph: one public + one sealed case, one
+    # property, one recipe.
+    _plan = store.get_json(verifier_plan_ref, VerifierBatchPlan)
+    _draft_cases = (
+        VerifierCase(
+            case_id=f"case:fixture-{scope_suffix}:public",
+            partition="public",
+            task_type="fixture-booking",
+            evaluator_goal={"target": 5},
+            seed=1,
+            actor="user",
+            reset_config={"initial": 0},
+            actions=(RuntimeAction(tool_id="booking.book", arguments={"room": 1}),),
+            assertions=(
+                VerifierAssertion(
+                    assertion_id=f"assertion:fixture-{scope_suffix}:public",
+                    rule_id="rule:fixture-invariant",
+                    action_index=0,
+                    expected=True,
+                ),
+            ),
+        ),
+        VerifierCase(
+            case_id=f"case:fixture-{scope_suffix}:sealed",
+            partition="sealed",
+            task_type="fixture-booking",
+            evaluator_goal={"target": 99},
+            seed=99,
+            actor="user",
+            reset_config={"initial": 0},
+            actions=(RuntimeAction(tool_id="booking.book", arguments={"room": 9}),),
+            assertions=(
+                VerifierAssertion(
+                    assertion_id=f"assertion:fixture-{scope_suffix}:sealed",
+                    rule_id="rule:fixture-invariant",
+                    action_index=0,
+                    expected=True,
+                ),
+            ),
+        ),
+    )
+    _draft = VerifierDraft(
+        properties=(
+            VerifierProperty(
+                property_id=f"property:fixture-{scope_suffix}",
+                kind="invariant",
+                rule_ids=("rule:fixture-invariant",),
+                case_ids=tuple(case.case_id for case in _draft_cases),
+                description="Fixture invariant holds in public and sealed cases.",
+            ),
+        ),
+        cases=_draft_cases,
+        solve_recipes=(
+            ParameterizedSolveRecipe(
+                recipe_id=f"recipe:fixture-{scope_suffix}",
+                task_type="fixture-booking",
+                preferred=True,
+                steps=(
+                    ParameterizedSolveStep(
+                        step_id=f"step:fixture-{scope_suffix}",
+                        tool_id="booking.book",
+                        arguments={"room": RecipeLiteral(value=1)},
+                    ),
+                ),
+            ),
+        ),
+    )
     verifier_draft_ref = fixture_judge_writer.put_json(
         artifact_id=f"fixture-output:{scope_suffix}:verifier-draft",
         artifact_type="judge.verifier_batch_draft",
-        value={"fixture": "draft"},
+        value=VerifierBatchDraft(
+            draft_id=f"fixture-output:{scope_suffix}:verifier-draft",
+            plan_ref=verifier_plan_ref,
+            batch_id=_plan.batches[0].batch_id,
+            checkpoint_ref=verifier_checkpoint_ref,
+            draft=_draft,
+        ),
         dependencies=(verifier_plan_ref,),
     )
     # A physical Challenger batch is a real final-epoch member.  Recording
@@ -944,6 +1021,7 @@ def _commit_prepackage_fixture_closure(
             candidate_ref,
             integration_report_ref,
             verifier_ref,
+            verifier_draft_ref,
         ),
         subject_ref=judge_report_ref,
         output_refs=(judge_report_ref,),
