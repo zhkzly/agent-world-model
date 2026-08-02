@@ -99,8 +99,8 @@ class WorkExecutionContext(V2Contract):
 class WorkDispatchResult(V2Contract):
     coordinate: WorkCoordinate
     before_state: Literal["ready", "repair_ready", "stale"]
-    after_state: Literal["committed", "repair_ready", "blocked"]
-    attempt_ref: ArtifactRef
+    after_state: Literal["committed", "repair_ready", "blocked", "waiting"]
+    attempt_ref: ArtifactRef | None = None
     commit_ref: ArtifactRef | None = None
     evaluation_ref: ArtifactRef | None = None
 
@@ -471,7 +471,19 @@ class WorkScheduler:
             before_state = "stale"
         else:
             before_state = "ready"
-        resolved = self.resolve_inputs(coordinate)
+        try:
+            resolved = self.resolve_inputs(coordinate)
+        except WorkResumeError:
+            # The parent commit this dispatch was classified against became
+            # inactive between classification and dispatch (for example a
+            # changed parent re-committed mid-wave).  Hold the child for the
+            # next wave instead of crashing the whole run; the classification
+            # pass re-evaluates the exact readiness facts.
+            return WorkDispatchResult(
+                coordinate=coordinate,
+                before_state=before_state,
+                after_state="waiting",
+            )
         repair_action_ref: ArtifactRef | None = None
         semantic_repair_context_ref: ArtifactRef | None = None
         if scheduled.state == "repair_ready":
