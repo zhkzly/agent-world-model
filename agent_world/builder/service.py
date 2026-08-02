@@ -2107,13 +2107,24 @@ class EnvironmentBuilder:
                             "the required component entry_path and whose role equals the "
                             "fixed component role"
                         )
+                    # A pydantic model-level validator reports location ("root",),
+                    # which the Scheduler reads as non-actionable and denies the
+                    # repair the framework's own ``retryable=True`` intends.  Use
+                    # the catalog's declared declaration group (the phase name)
+                    # as the issue path so the correction can actually be
+                    # authorized and the builder re-run with the feedback.
+                    issue_location = (
+                        (phase,)
+                        if default_issue.location == ("root",)
+                        else default_issue.location
+                    )
                     translated.append(
                         (
                             frontier,
                             phase,
                             SafeValidationIssue(
                                 code,
-                                default_issue.location,
+                                issue_location,
                                 message,
                                 violated_condition=issue_condition,
                                 expected_category=issue_expected,

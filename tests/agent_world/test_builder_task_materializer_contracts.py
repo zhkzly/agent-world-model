@@ -679,7 +679,7 @@ def test_blocked_completion_feedback_names_the_minimal_safe_shape() -> None:
     else:  # pragma: no cover - the witnessed mixed declaration must fail
         raise AssertionError("mixed blocked CandidateCompletion unexpectedly passed")
 
-    assert diagnostic.issue_codes == ("completion_blocked_claims_outputs@root",)
+    assert diagnostic.issue_codes == ("completion_blocked_claims_outputs@completion_declarations",)
     assert "return only schema_version, status=blocked" in diagnostic.feedback
     assert "omit every candidate output field" in diagnostic.feedback
     assert "private rejected output" not in diagnostic.feedback
@@ -3075,7 +3075,7 @@ def test_builder_diagnostic_uses_validation_frontier_without_rejected_values() -
 
     assert diagnostic.validation_phase == "completion_declarations"
     assert diagnostic.frontier_ordinal == 20
-    assert diagnostic.issue_codes == ("completion_files_missing@root",)
+    assert diagnostic.issue_codes == ("completion_files_missing@completion_declarations",)
     assert "/private/workspace/secret" not in diagnostic.feedback
     assert all(not code.startswith("builder_agent.output:") for code in diagnostic.issue_codes)
 
@@ -3550,7 +3550,7 @@ def test_builder_completion_feedback_names_required_path_and_role() -> None:
 
     assert diagnostic.validation_phase == "completion_manifest_binding"
     assert diagnostic.frontier_ordinal == 25
-    assert diagnostic.issue_codes == ("completion_required_role_missing@root",)
+    assert diagnostic.issue_codes == ("completion_required_role_missing@completion_manifest_binding",)
     issue = diagnostic.issues[0]
     assert issue.violated_condition == (
         "CandidateCompletion.files must declare required component path "
