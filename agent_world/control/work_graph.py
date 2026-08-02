@@ -4037,6 +4037,10 @@ def _agent_component_definition(
             maximum_model_fallbacks=1,
             maximum_session_continuations=maximum_session_continuations,
             maximum_process_recoveries=1,
+            # Declared together with repair_target_coordinates: the Builder has
+            # no mutation root of its own, so an actionable build failure
+            # routes one causal rework of the frozen Design parent.
+            maximum_automatic_backjump=1 if repair_targets else 0,
             maximum_total_repair_attempts=5,
         ),
         required_claim_id=claim_id,
