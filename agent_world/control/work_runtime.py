@@ -38,7 +38,7 @@ from agent_world.invocation.recovery import (
     RouteLivenessChecker,
 )
 
-from .budget import DurableLeaseBudgetCoordinator, LeaseBudgetLedger
+from .budget import BudgetExceeded, DurableLeaseBudgetCoordinator, LeaseBudgetLedger
 from .continuation_store import (
     DiagnosticSemanticRepairSeedRecord,
     DiagnosticWorkspaceRecoveryRecord,
@@ -90,6 +90,31 @@ def _add_usage(left: BudgetUsage, right: BudgetUsage) -> BudgetUsage:
             if field_name != "schema_version"
         }
     )
+
+
+# Adapter terminals whose *only* wall cost is a bounded wait on a dead or silent
+# provider stream (transport liveness), not real Agent/tool work. When such a
+# terminal is the reason a settle overshoots on wall_seconds alone, the overshoot
+# is the idle interval itself -- see ``provider_stream_idle_timeout_seconds`` --
+# so it must not be laundered into a fatal wall_seconds budget exhaustion. The
+# component prefixes an adapter may stamp are stripped before matching so both
+# the raw and ``*_backend_``-prefixed forms are recognized.
+_TRANSPORT_LIVENESS_TIMEOUT_CODES = frozenset(
+    {
+        "direct_provider_stream_stalled",
+        "direct_provider_timeout",
+        "direct_no_first_provider_event",
+        "codex_provider_stream_stalled",
+        "codex_no_first_provider_event",
+    }
+)
+
+
+def _is_transport_liveness_timeout(error_code: str | None) -> bool:
+    if not error_code:
+        return False
+    normalized = error_code.removeprefix("agent_backend_").removeprefix("verifier_backend_")
+    return normalized in _TRANSPORT_LIVENESS_TIMEOUT_CODES
 
 
 def restore_work_budget_ledger(
@@ -1738,12 +1763,109 @@ class WorkControlRuntime:
             and not settlement_already_recorded
         ):
             observed = observed.model_copy(update={"repair_attempts": observed.repair_attempts + 1})
-        settled = self.budget_coordinator.settle(
-            scope_id=definition.coordinate.scope_id,
-            lease_id=operation.budget_lease_ref.artifact_id,
-            observed_actual=observed,
-            unknown_upper_bound=execution.unknown_upper_bound,
+        try:
+            settled = self.budget_coordinator.settle(
+                scope_id=definition.coordinate.scope_id,
+                lease_id=operation.budget_lease_ref.artifact_id,
+                observed_actual=observed,
+                unknown_upper_bound=execution.unknown_upper_bound,
+            )
+        except BudgetExceeded as exc:
+            # A wall-only overshoot whose terminal is a transport-liveness
+            # timeout is not real work that outgrew its lease: the provider
+            # stream went dead and the adapter sat in a bounded idle/first-event
+            # wait before emitting a *retryable* transport terminal. That idle
+            # interval is transport liveness, not a work/output budget (see
+            # provider_stream_idle_timeout_seconds), so charging it into the
+            # operation's work-wall and then laundering the retryable stall into
+            # a fatal wall_seconds budget_exhausted mis-attributes transport as
+            # capacity. Clamp the observed wall to the admitted lease -- the true
+            # work-wall never exceeded it -- and settle honestly so the operation
+            # terminalizes as its own retryable transport failure and normal
+            # invocation recovery routes an authorized fresh retry.
+            if exc.dimensions == ("wall_seconds",) and _is_transport_liveness_timeout(
+                execution.error_code
+            ):
+                reserved_wall = self.artifacts.get_json(
+                    operation.budget_lease_ref, BudgetLease
+                ).reserved.wall_seconds
+                if observed.wall_seconds > reserved_wall:
+                    observed = observed.model_copy(update={"wall_seconds": reserved_wall})
+                    execution = execution.model_copy(
+                        update={"observed_actual": observed}
+                    )
+                    execution_ref = self.artifacts.put_json(
+                        artifact_id=self._id(
+                            execution_type.replace("control.", ""), execution.execution_id
+                        ),
+                        artifact_type=execution_type,
+                        value=execution,
+                        dependencies=(head.active_operation_ref, *output_refs),
+                    )
+                    settled = self.budget_coordinator.settle(
+                        scope_id=definition.coordinate.scope_id,
+                        lease_id=operation.budget_lease_ref.artifact_id,
+                        observed_actual=observed,
+                        unknown_upper_bound=execution.unknown_upper_bound,
+                    )
+                    return self._commit_settled_operation(
+                        lock,
+                        head=head,
+                        attempt=attempt,
+                        operation=operation,
+                        execution=execution,
+                        execution_ref=execution_ref,
+                        settled=settled,
+                        observed=observed,
+                        output_refs=output_refs,
+                    )
+            # A real turn overshot its admitted lease or the scope aggregate.
+            # BudgetLease is a hard cap and cannot record the overshoot, but the
+            # work physically happened, so it must still reach a terminal,
+            # durable boundary instead of stranding a running OperationRun.
+            # Release the lease (an honest "cost could not be admitted" record),
+            # retire the operation as terminal with its true observed cost as
+            # evidence, and clear active_operation_ref so the Scheduler's
+            # budget-exhaustion handler can settle the attempt with correct
+            # dimension attribution rather than crashing on a live operation.
+            self._retire_operation_on_budget_overshoot(
+                lock,
+                head=head,
+                attempt=attempt,
+                operation=operation,
+                execution=execution,
+                execution_ref=execution_ref,
+                observed=observed,
+                output_refs=output_refs,
+            )
+            raise BudgetExceeded(exc.dimensions) from exc
+        return self._commit_settled_operation(
+            lock,
+            head=head,
+            attempt=attempt,
+            operation=operation,
+            execution=execution,
+            execution_ref=execution_ref,
+            settled=settled,
+            observed=observed,
+            output_refs=output_refs,
         )
+
+    def _commit_settled_operation(
+        self,
+        lock: WorkControlLock,
+        *,
+        head: WorkControlHead,
+        attempt: WorkAttempt,
+        operation: OperationRun,
+        execution: ProposalExecution | ValidationExecution | AssuranceExecution,
+        execution_ref: ArtifactRef,
+        settled: BudgetLease,
+        observed: BudgetUsage,
+        output_refs: tuple[ArtifactRef, ...],
+    ) -> WorkControlHead:
+        """Adopt one settled OperationRun as the WorkAttempt's terminal boundary."""
+
         settled_ref = self.artifacts.put_json(
             artifact_id=settled.lease_id,
             artifact_type="control.budget_lease",
@@ -1811,6 +1933,97 @@ class WorkControlRuntime:
             }
         )
         return self.heads.compare_and_swap(
+            lock,
+            expected_head=head,
+            next_head=next_head,
+        )
+
+    def _retire_operation_on_budget_overshoot(
+        self,
+        lock: WorkControlLock,
+        *,
+        head: WorkControlHead,
+        attempt: WorkAttempt,
+        operation: OperationRun,
+        execution: ProposalExecution | ValidationExecution | AssuranceExecution,
+        execution_ref: ArtifactRef,
+        observed: BudgetUsage,
+        output_refs: tuple[ArtifactRef, ...],
+    ) -> None:
+        """Settle a running operation whose real cost overshot its budget lease.
+
+        The budget lease is a hard admission cap, so an overshoot cannot be
+        recorded as a settled lease.  The turn nonetheless physically executed,
+        so this releases the lease and retires the OperationRun as terminal with
+        its true observed cost preserved as durable evidence, then clears
+        ``active_operation_ref``.  The caller re-raises ``BudgetExceeded`` so the
+        Scheduler settles the attempt as budget-exhausted with correct dimension
+        attribution instead of crashing on a stranded live operation.
+        """
+
+        released = self.budget_coordinator.release(
+            scope_id=head.coordinate.scope_id,
+            lease_id=operation.budget_lease_ref.artifact_id,
+        )
+        released_ref = self.artifacts.put_json(
+            artifact_id=released.lease_id,
+            artifact_type="control.budget_lease",
+            value=released,
+            dependencies=(operation.budget_lease_ref, execution_ref),
+        )
+        terminal = OperationRun(
+            **{
+                **operation.model_dump(mode="python"),
+                "revision": operation.revision + 1,
+                "status": "terminal",
+                "budget_lease_ref": released_ref,
+                "execution_ref": execution_ref,
+                "output_refs": output_refs,
+                "observed_actual": observed,
+                "unknown_upper_bound": execution.unknown_upper_bound,
+                "conservative_committed": _add_usage(
+                    observed,
+                    execution.unknown_upper_bound,
+                ),
+                "error_code": execution.error_code,
+                "finished_at": execution.finished_at,
+            }
+        )
+        terminal_ref = self._persist_operation(
+            terminal,
+            dependencies=(
+                head.active_operation_ref,
+                execution_ref,
+                released_ref,
+                *output_refs,
+            ),
+        )
+        checkpointed = self._replace_operation_ref(
+            attempt,
+            old=head.active_operation_ref,
+            new=terminal_ref,
+        )
+        actual, unknown = self._attempt_usage(checkpointed)
+        checkpointed = checkpointed.model_copy(
+            update={
+                "observed_actual": actual,
+                "unknown_upper_bound": unknown,
+                "conservative_committed": _add_usage(actual, unknown),
+            }
+        )
+        attempt_ref = self._persist_attempt(
+            checkpointed,
+            dependencies=(head.attempt_ref, terminal_ref, execution_ref, released_ref),
+        )
+        next_head = head.model_copy(
+            update={
+                "revision": head.revision + 1,
+                "attempt_ref": attempt_ref,
+                "active_operation_ref": None,
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        self.heads.compare_and_swap(
             lock,
             expected_head=head,
             next_head=next_head,
@@ -1994,6 +2207,130 @@ class WorkControlRuntime:
             next_head=next_head,
         )
 
+    def resume_uncommenced_running(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        input_refs: tuple[ArtifactRef, ...],
+    ) -> WorkControlHead:
+        """Re-open a crash-left ``running`` head that never crossed the dispatch fence.
+
+        The Scheduler durably writes ``status="running", active_operation_ref=None``
+        in :meth:`begin` *before* a leaf opens its first OperationRun.  A SIGKILL
+        in that window leaves a durable head that consumed zero model/tool work but
+        can never progress: :meth:`reconcile_abandoned_operation` skips it (there is
+        no active operation to settle) and the Scheduler otherwise pins it
+        ``running`` forever.
+
+        This is deliberately distinct from :meth:`supersede_stale`: that path
+        requires the immutable definition or inputs to have *changed* so it cannot
+        bypass repair-budget authority.  An orphaned never-commenced attempt is the
+        SAME definition and inputs, so its justification is "never commenced", not
+        "inputs changed".  Because the attempt consumed nothing, archiving it and
+        opening one fresh attempt cannot double-spend real work.
+        """
+
+        definition = WorkDefinition.model_validate(definition.model_dump(mode="python"))
+        previous = self.heads.read_head(definition.coordinate)
+        if previous is None:
+            raise WorkRuntimeError("uncommenced resume requires an existing running head")
+        if previous.status != "running" or previous.active_operation_ref is not None:
+            raise WorkRuntimeError(
+                "uncommenced resume is only valid for a running head with no active operation"
+            )
+        input_fingerprint = self.heads.input_fingerprint(input_refs)
+        if (
+            previous.definition_digest != definition.definition_digest
+            or previous.input_fingerprint != input_fingerprint
+        ):
+            raise WorkRuntimeError(
+                "uncommenced resume requires the same definition and inputs; a changed "
+                "definition is superseded through repair authority instead"
+            )
+        prior_attempt = self.artifacts.get_json(previous.attempt_ref, WorkAttempt)
+        prior_attempt = prior_attempt.model_copy(
+            update={
+                "status": "interrupted",
+                "finished_at": datetime.now(UTC),
+                "failure_code": "orphaned_uncommenced_execution",
+            }
+        )
+        prior_attempt_ref = self._persist_attempt(
+            prior_attempt,
+            dependencies=(previous.attempt_ref,),
+        )
+        self._finish_attempt_span(
+            prior_attempt,
+            status="error",
+            error_code=prior_attempt.failure_code,
+        )
+        ordinal = self._next_unused_attempt_ordinal(
+            definition,
+            minimum=prior_attempt.ordinal + 1,
+        )
+        definition_ref = self._persist_definition(definition, input_refs)
+        now = datetime.now(UTC)
+        telemetry_trace_id, telemetry_span_id = self._start_attempt_span(
+            definition,
+            ordinal=ordinal,
+            input_refs=input_refs,
+            repair_mode="uncommenced_resume",
+        )
+        attempt = WorkAttempt(
+            attempt_id=self._id("attempt", definition.work_id, str(ordinal)),
+            work_id=definition.work_id,
+            coordinate=definition.coordinate,
+            ordinal=ordinal,
+            parent_attempt_id=prior_attempt.attempt_id,
+            status="running",
+            definition_digest=definition.definition_digest,
+            proposal_policy_digest=definition.proposal_policy.content_digest(),
+            validation_policy_digest=definition.validation_policy.content_digest(),
+            assurance_policy_digest=(
+                definition.assurance_policy.content_digest()
+                if definition.assurance_policy is not None
+                else None
+            ),
+            repair_policy_digest=definition.repair_policy.content_digest(),
+            telemetry_trace_id=telemetry_trace_id,
+            telemetry_span_id=telemetry_span_id,
+            input_refs=input_refs,
+            scheduled_at=now,
+            started_at=now,
+            diagnostic_only=self.diagnostic_only,
+            releasable=not self.diagnostic_only,
+        )
+        attempt_ref = self._persist_attempt(
+            attempt,
+            dependencies=tuple(
+                dict.fromkeys(
+                    (
+                        prior_attempt_ref,
+                        definition_ref,
+                        *input_refs,
+                    )
+                )
+            ),
+        )
+        next_head = WorkControlHead(
+            scope_id=previous.scope_id,
+            coordinate=definition.coordinate,
+            work_id=definition.work_id,
+            definition_digest=definition.definition_digest,
+            acceptance_digest=definition.acceptance_digest,
+            input_fingerprint=input_fingerprint,
+            revision=previous.revision + 1,
+            status="running",
+            attempt_ref=attempt_ref,
+            updated_at=now,
+        )
+        return self.heads.compare_and_swap(
+            lock,
+            expected_head=previous,
+            next_head=next_head,
+        )
+
     def checkpoint_proposal(
         self,
         lock: WorkControlLock,
@@ -2164,7 +2501,7 @@ class WorkControlRuntime:
                 return execution.model
         return attempt.model_override
 
-    def _prior_same_class_retry_count(
+    def _prior_same_route_retry_count(
         self,
         *,
         definition: WorkDefinition,
@@ -2172,7 +2509,13 @@ class WorkControlRuntime:
         failure_class: InvocationFailureClass,
         current_model: str | None,
     ) -> int:
-        """Count only prior same-model retry actions with the same closed class."""
+        """Count only prior same-model retry actions with the same closed class.
+
+        A route is one (model, failure-class) recovery sequence, so the count
+        the policy gates on (``prior_same_route_retry_count``) is exactly the
+        number of prior infrastructure retries that reused ``current_model`` and
+        resolved to the same closed ``failure_class``.
+        """
 
         if current_model is None:
             return 0
@@ -2222,7 +2565,7 @@ class WorkControlRuntime:
             terminal_details=terminal_details,
             private_continuation_available=private_continuation_available,
             private_workspace_recovery_available=private_workspace_recovery_available,
-            prior_same_class_retry_count=self._prior_same_class_retry_count(
+            prior_same_route_retry_count=self._prior_same_route_retry_count(
                 definition=definition,
                 input_refs=attempt.input_refs,
                 failure_class=failure_class,
@@ -2259,7 +2602,7 @@ class WorkControlRuntime:
                 ),
                 "failure_class": decision.failure_class.value,
                 "route": decision.route.value,
-                "prior_same_class_retry_count": evidence.prior_same_class_retry_count,
+                "prior_same_route_retry_count": evidence.prior_same_route_retry_count,
                 "current_model": evidence.current_model,
                 "compatible_fallback_models": evidence.compatible_fallback_models,
                 "target_model": decision.target_model,

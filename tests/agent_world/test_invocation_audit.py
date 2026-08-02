@@ -13,9 +13,9 @@ import agent_world.invocation.audit as audit
 from agent_world.builder.models import CandidateCompletion
 from agent_world.config import AgentBackendConfig, FoundryConfig, ResearchConfig
 from agent_world.invocation.capabilities import NodeCapabilityRequirement
+from agent_world.invocation.codex_sdk import _provider_output_schema
 from agent_world.invocation.contracts import (
     InvocationError,
-    InvocationEvent,
     InvocationExecutionMode,
     InvocationLimits,
     InvocationRequest,
@@ -59,21 +59,18 @@ class _FakeProfileProvider:
         **_: object,
     ) -> ResolvedAgentProfile:
         builtin_tools = requirement.intrinsic_builtin_tools
-        agent_workspace = workspace / ".agent-runtime" / "workspace"
-        agent_workspace.mkdir(parents=True)
+        workspace.mkdir(parents=True)
         return cast(
             ResolvedAgentProfile,
             SimpleNamespace(
                 allowed_builtin_tools=builtin_tools,
                 output_schema=output_schema,
-                structured_output_transport=(
-                    "json_object" if not builtin_tools else "provider_schema"
-                ),
-                workspace=agent_workspace,
+                workspace=workspace,
                 lineage_id=lineage_id,
                 model="audit-model",
                 profile_hash="a" * 64,
                 codex_config_sha256="b" * 64,
+                skills=(),
                 limits=InvocationLimits(),
                 rollout_token_limit=None,
             ),
@@ -108,14 +105,7 @@ class _FakeRoutedBackend:
         if "workspace_edit" in profile.allowed_builtin_tools and request.session is None:
             marker = profile.workspace / "candidate" / "invocation-audit-marker.txt"
             marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(
-                (
-                    "uv 0.0.0\nPython 3.12.0\n"
-                    if "./.agent-world-tools/uv --version" in request.prompt
-                    else "ok"
-                ),
-                encoding="utf-8",
-            )
+            marker.write_text("ok", encoding="utf-8")
         session = None
         if execution_mode is InvocationExecutionMode.AGENTIC:
             session = InvocationSession(
@@ -139,22 +129,7 @@ class _FakeRoutedBackend:
                 else {"status": "ok"}
             ),
             usage=None,
-            events=(
-                (
-                    InvocationEvent(
-                        sequence=0,
-                        method="item/completed",
-                        payload={
-                            "diagnosticCommandProof": [
-                                {"label": item.label, "outcome": "succeeded"}
-                                for item in request.diagnostic_command_expectations
-                            ]
-                        },
-                    ),
-                )
-                if request.diagnostic_command_expectations
-                else ()
-            ),
+            events=(),
             error=None,
             duration_ms=1,
             backend_version="fake-audit",
@@ -263,7 +238,6 @@ def _config(tmp_path: Path) -> FoundryConfig:
         agent=AgentBackendConfig(
             model="audit-model",
             api_key_environment="OPENAI_API_KEY",
-            structured_output_transport="json_object",
         ),
         research=ResearchConfig(provider="bing_rss"),
     )
@@ -275,7 +249,7 @@ async def test_invocation_audit_covers_all_distinct_real_mechanisms_safely(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(audit, "TelemetryStore", _FakeTelemetry)
-    monkeypatch.setattr(audit, "IsolatedAgentProfileProvider", _FakeProfileProvider)
+    monkeypatch.setattr(audit, "AgentProfileProvider", _FakeProfileProvider)
     monkeypatch.setattr(audit, "CodexSdkBackend", lambda **_: object())
     monkeypatch.setattr(audit, "DirectLlmBackend", lambda **_: object())
     monkeypatch.setattr(audit, "RoutedInvocationBackend", _FakeRoutedBackend)
@@ -289,21 +263,11 @@ async def test_invocation_audit_covers_all_distinct_real_mechanisms_safely(
         item for item in report.lanes if item.lane_id == "codex_engineer_workspace_write"
     )
     assert workspace.workspace_write_verified is True
-    assert workspace.workspace_toolchain_verified is None
-    toolchain = next(
-        item for item in report.lanes if item.lane_id == "codex_engineer_workspace_toolchain"
-    )
-    assert toolchain.workspace_toolchain_verified is True
-    assert toolchain.workspace_toolchain_command_proofs == {
-        "workspace_toolchain_visible": "succeeded",
-        "uv_version": "succeeded",
-        "python312_version": "succeeded",
-    }
-    assert workspace.node_id == "environment-engineer.runtime-build"
-    plan = next(
-        item for item in report.lanes if item.lane_id == "codex_engineer_implementation_plan_read"
-    )
-    assert plan.node_id == "environment-engineer.implementation-plan"
+    assert workspace.node_id == "invocation-audit.engineer-workspace-write"
+    engineer_read = next(item for item in report.lanes if item.lane_id == "codex_engineer_read")
+    assert engineer_read.node_id == "invocation-audit.engineer-read"
+    assert engineer_read.physical_turn_count == 2
+    assert engineer_read.session_continuity_scope == "same_backend_instance"
     candidate_completion = next(
         item for item in report.lanes if item.lane_id == "codex_engineer_candidate_completion"
     )
@@ -348,26 +312,25 @@ def test_invocation_audit_rejects_unknown_lane_before_a_provider_call() -> None:
         audit._select_lanes(("not-a-lane",))
 
 
-def test_invocation_audit_uses_the_real_special_engineer_profile_coordinates() -> None:
+def test_invocation_audit_uses_diagnostic_or_exact_profile_coordinates() -> None:
     lanes = {item.lane_id: item for item in audit._AUDIT_LANES}
 
-    assert lanes["direct_engineer_structured"].node_id == (
-        "environment-engineer.tool-semantics-batch"
+    assert lanes["direct_engineer_structured"].node_id == "invocation-audit.direct-engineer"
+    assert lanes["codex_engineer_read"].node_id == "invocation-audit.engineer-read"
+    assert lanes["codex_engineer_workspace_write"].node_id == (
+        "invocation-audit.engineer-workspace-write"
     )
-    assert lanes["codex_engineer_implementation_plan_read"].node_id == (
-        "environment-engineer.implementation-plan"
+    assert lanes["codex_engineer_candidate_completion"].node_id == (
+        "environment-engineer.runtime-build"
     )
-    assert lanes["codex_engineer_workspace_write"].node_id == ("environment-engineer.runtime-build")
-    toolchain_prompt = audit._prompt_for_lane(
-        lanes["codex_engineer_workspace_toolchain"],
-        "json_envelope",
-    )
-    assert (
-        "test -x ./.agent-world-tools/uv && test -x ./.agent-world-tools/python3.12"
-        in toolchain_prompt
-    )
-    assert "./.agent-world-tools/uv --version" in toolchain_prompt
-    assert "./.agent-world-tools/python3.12 --version" in toolchain_prompt
+    assert lanes["codex_engineer_read"].require_session_resume is True
+    workspace_prompt = audit._prompt_for_lane(lanes["codex_engineer_workspace_write"])
+    assert "Follow the one mounted Agent World Skill" in workspace_prompt
+    assert "direct-host production InvocationBackend audit" in workspace_prompt
+    assert ".agent-world-tools" not in workspace_prompt
+    direct_prompt = audit._prompt_for_lane(lanes["direct_engineer_structured"])
+    assert "Return exactly this logical artifact" in direct_prompt
+    assert "Runtime Skill" not in direct_prompt
     assert lanes["codex_engineer_candidate_completion"].output_contract == (
         "candidate_completion_blocked"
     )
@@ -396,6 +359,33 @@ def test_candidate_completion_audit_uses_json_mode_like_the_builder() -> None:
     observation = audit._structured_output_observation(lane, result)
 
     assert observation.kind == "exact_match"
+
+
+def test_candidate_completion_audit_blocked_value_fits_strict_schema() -> None:
+    """The exact Agent instruction must fit Codex's strict transport schema.
+
+    The logical model permits omitted inactive fields, while the compiled
+    provider schema requires every property.  An audit must make that physical
+    difference explicit rather than asking the Agent for an impossible short
+    object and then treating its placeholders as a semantic failure.
+    """
+
+    lane = next(
+        item for item in audit._AUDIT_LANES if item.lane_id == "codex_engineer_candidate_completion"
+    )
+    expected = audit._expected_output_for_lane(lane)
+    provider_schema = _provider_output_schema(audit._output_schema_for_lane(lane))  # noqa: SLF001
+    required = provider_schema.get("required")
+
+    assert isinstance(required, list)
+    assert set(expected) == set(required)
+    completion = CandidateCompletion.model_validate_json(json.dumps(expected))
+    assert completion.status == "blocked"
+    assert completion.files == ()
+    assert completion.public_test_paths == ()
+    prompt = audit._prompt_for_lane(lane)
+    assert '"project_root":null' in prompt
+    assert "transport placeholders" in prompt
 
 
 def test_candidate_completion_audit_observation_keeps_only_closed_schema_categories() -> None:
@@ -431,14 +421,14 @@ async def test_invocation_audit_reports_backend_phase_without_raw_exception_text
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(audit, "TelemetryStore", _FakeTelemetry)
-    monkeypatch.setattr(audit, "IsolatedAgentProfileProvider", _FakeProfileProvider)
+    monkeypatch.setattr(audit, "AgentProfileProvider", _FakeProfileProvider)
     monkeypatch.setattr(audit, "CodexSdkBackend", lambda **_: object())
     monkeypatch.setattr(audit, "DirectLlmBackend", lambda **_: object())
     monkeypatch.setattr(audit, "RoutedInvocationBackend", _RaisingRoutedBackend)
 
     report = await audit.run_invocation_audit(
         _config(tmp_path),
-        lane_ids=("codex_challenger_solver",),
+        lane_ids=("direct_challenger_episode_solver",),
     )
 
     lane = report.lanes[0]
@@ -446,7 +436,6 @@ async def test_invocation_audit_reports_backend_phase_without_raw_exception_text
     assert lane.failure_code == "invocation_audit_backend_invoke_exception"
     assert lane.terminal_details == {
         "phase": "backend_invoke",
-        "structured_output_transport": "json_object",
     }
     serialized = (tmp_path / "state" / "invocation-audit.json").read_text(encoding="utf-8")
     assert "raw provider detail" not in serialized
@@ -458,14 +447,14 @@ async def test_invocation_audit_reports_the_exact_failed_physical_turn_safely(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(audit, "TelemetryStore", _FakeTelemetry)
-    monkeypatch.setattr(audit, "IsolatedAgentProfileProvider", _FakeProfileProvider)
+    monkeypatch.setattr(audit, "AgentProfileProvider", _FakeProfileProvider)
     monkeypatch.setattr(audit, "CodexSdkBackend", lambda **_: object())
     monkeypatch.setattr(audit, "DirectLlmBackend", lambda **_: object())
     monkeypatch.setattr(audit, "RoutedInvocationBackend", _ResumeFailingRoutedBackend)
 
     report = await audit.run_invocation_audit(
         _config(tmp_path),
-        lane_ids=("codex_engineer_implementation_plan_read",),
+        lane_ids=("codex_engineer_read",),
     )
 
     lane = report.lanes[0]
@@ -486,7 +475,7 @@ async def test_invocation_audit_reports_a_closed_candidate_completion_mismatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(audit, "TelemetryStore", _FakeTelemetry)
-    monkeypatch.setattr(audit, "IsolatedAgentProfileProvider", _FakeProfileProvider)
+    monkeypatch.setattr(audit, "AgentProfileProvider", _FakeProfileProvider)
     monkeypatch.setattr(audit, "CodexSdkBackend", lambda **_: object())
     monkeypatch.setattr(audit, "DirectLlmBackend", lambda **_: object())
     monkeypatch.setattr(audit, "RoutedInvocationBackend", _CandidateCompletionMismatchBackend)
@@ -514,7 +503,7 @@ async def test_candidate_completion_audit_writes_only_a_redacted_opted_in_termin
 ) -> None:
     _CandidateCompletionTerminalExcerptBackend.requests.clear()
     monkeypatch.setattr(audit, "TelemetryStore", _FakeTelemetry)
-    monkeypatch.setattr(audit, "IsolatedAgentProfileProvider", _FakeProfileProvider)
+    monkeypatch.setattr(audit, "AgentProfileProvider", _FakeProfileProvider)
     monkeypatch.setattr(audit, "CodexSdkBackend", lambda **_: object())
     monkeypatch.setattr(audit, "DirectLlmBackend", lambda **_: object())
     monkeypatch.setattr(
@@ -539,7 +528,11 @@ async def test_candidate_completion_audit_writes_only_a_redacted_opted_in_termin
         is True
     )
     debug_path = Path(lane.diagnostic_terminal_feedback_path)
-    debug = json.loads(await asyncio.to_thread(debug_path.read_text, encoding="utf-8"))
+    # This is a bounded local sidecar read after the audited invocation has
+    # already settled.  Keep it synchronous: the test proves its contents, not
+    # a thread-pool boundary, and must remain runnable where thread creation is
+    # deliberately unavailable to the test harness.
+    debug = json.loads(debug_path.read_text(encoding="utf-8"))  # noqa: ASYNC240 - assertion
     assert debug["kind"] == "invocation_audit_terminal_debug"
     assert debug["failure_code"] == "turn_failed_unclassified_codex_error"
     assert debug["terminal_error_excerpt"].startswith("unsupported response format")
@@ -556,7 +549,7 @@ async def test_invocation_audit_keeps_prior_run_record_when_a_subset_runs_later(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(audit, "TelemetryStore", _FakeTelemetry)
-    monkeypatch.setattr(audit, "IsolatedAgentProfileProvider", _FakeProfileProvider)
+    monkeypatch.setattr(audit, "AgentProfileProvider", _FakeProfileProvider)
     monkeypatch.setattr(audit, "CodexSdkBackend", lambda **_: object())
     monkeypatch.setattr(audit, "DirectLlmBackend", lambda **_: object())
     monkeypatch.setattr(audit, "RoutedInvocationBackend", _FakeRoutedBackend)
@@ -567,7 +560,7 @@ async def test_invocation_audit_keeps_prior_run_record_when_a_subset_runs_later(
     )
     second = await audit.run_invocation_audit(
         _config(tmp_path),
-        lane_ids=("codex_challenger_solver",),
+        lane_ids=("direct_challenger_episode_solver",),
     )
 
     records = {
@@ -592,7 +585,7 @@ async def test_invocation_audit_cancellation_writes_non_running_report_and_attem
     _BlockingRoutedBackend.instances.clear()
     _BlockingRoutedBackend.created = asyncio.Event()
     monkeypatch.setattr(audit, "TelemetryStore", _FakeTelemetry)
-    monkeypatch.setattr(audit, "IsolatedAgentProfileProvider", _FakeProfileProvider)
+    monkeypatch.setattr(audit, "AgentProfileProvider", _FakeProfileProvider)
     monkeypatch.setattr(audit, "CodexSdkBackend", lambda **_: object())
     monkeypatch.setattr(audit, "DirectLlmBackend", lambda **_: object())
     monkeypatch.setattr(audit, "RoutedInvocationBackend", _BlockingRoutedBackend)
@@ -600,7 +593,7 @@ async def test_invocation_audit_cancellation_writes_non_running_report_and_attem
     task = asyncio.create_task(
         audit.run_invocation_audit(
             _config(tmp_path),
-            lane_ids=("codex_challenger_solver",),
+            lane_ids=("direct_challenger_episode_solver",),
         )
     )
     await _BlockingRoutedBackend.created.wait()

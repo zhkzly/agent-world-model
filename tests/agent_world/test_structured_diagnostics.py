@@ -17,6 +17,13 @@ def test_direct_output_limit_retains_an_explicit_five_million_budget() -> None:
     }
 
 
+def test_direct_output_limit_without_adapter_cap_retains_only_closed_provider_facts() -> None:
+    assert direct_output_limit_details(configured_max_output_tokens=None) == {
+        "terminal_status": "incomplete",
+        "terminal_reason": "max_output_tokens",
+    }
+
+
 def test_codex_physical_output_ceiling_has_safe_continuation_feedback() -> None:
     error = InvocationError(
         code="turn_failed_output_limit",
@@ -58,6 +65,125 @@ def test_sdk_resume_exception_has_safe_session_lifecycle_feedback() -> None:
     assert "restoring a prior thread" in safe_terminal_condition(error)
     assert "session-state/worker-lifecycle" in (safe_terminal_expected_category(error) or "")
     assert "thread persistence" in (safe_terminal_remediation(error) or "")
+
+
+def test_codex_no_first_event_keeps_provider_liveness_feedback_out_of_prompt_repair() -> None:
+    error = InvocationError(
+        code="codex_no_first_provider_event",
+        message="private worker or Provider text must not persist",
+        retryable=True,
+        details={
+            "waiting_phase": "parent_waiting",
+            "first_event_timeout_seconds": 120,
+            "observed_provider_event_count": 0,
+            "private_detail": "must not persist",
+        },
+    )
+
+    assert safe_terminal_details(error) == {
+        "waiting_phase": "parent_waiting",
+        "first_event_timeout_seconds": 120,
+        "observed_provider_event_count": 0,
+    }
+    assert "no validated Provider event" in safe_terminal_condition(error)
+    assert "Codex SDK/app-server liveness control" in (safe_terminal_expected_category(error) or "")
+    assert "profile-matched Codex SDK/app-server control" in (
+        safe_terminal_remediation(error) or ""
+    )
+    assert terminal_failure_retryable(error) is True
+
+
+def test_codex_started_stream_stall_keeps_worker_topology_out_of_agent_repair() -> None:
+    error = InvocationError(
+        code="codex_provider_stream_stalled",
+        message="private worker and Provider content must not persist",
+        retryable=True,
+        details={
+            "waiting_phase": "parent_awaiting_worker_result",
+            "idle_timeout_seconds": 300,
+            "observed_provider_event_count": 59,
+            "workspace": "/private/host/path",
+            "provider_text": "must not persist",
+        },
+    )
+
+    assert safe_terminal_details(error) == {
+        "waiting_phase": "parent_awaiting_worker_result",
+        "idle_timeout_seconds": 300,
+        "observed_provider_event_count": 59,
+    }
+    assert "59 validated Provider event(s)" in safe_terminal_condition(error)
+    expected = safe_terminal_expected_category(error) or ""
+    assert "Codex SDK/app-server liveness control" in expected
+    assert "Agent workspace mapping" in expected
+    remediation = safe_terminal_remediation(error) or ""
+    assert "profile-matched Codex SDK/app-server control" in remediation
+    assert terminal_failure_retryable(error) is True
+
+
+def test_codex_provider_unavailable_keeps_closed_capacity_class_in_feedback() -> None:
+    provider_text_canary = "INTERNAL_PROVIDER_SECRET_MUST_NOT_ESCAPE"
+
+    error = InvocationError(
+        code="turn_failed_provider_unavailable",
+        message=provider_text_canary,
+        retryable=True,
+        details={
+            "terminal_error_shape": "object",
+            "codex_error_info": "enum:internalservererror",
+            "diagnostic_error_excerpt": provider_text_canary,
+        },
+    )
+
+    assert safe_terminal_details(error) == {
+        "terminal_error_shape": "object",
+        "codex_error_info": "enum:internalservererror",
+    }
+    condition = safe_terminal_condition(error)
+    assert (
+        condition
+        == "the Codex Provider returned an internal server error before a terminal response"
+    )
+    assert provider_text_canary not in condition
+    assert terminal_failure_retryable(error) is True
+
+    overloaded = InvocationError(
+        code="turn_failed_provider_unavailable",
+        message="opaque provider text",
+        retryable=True,
+        details={
+            "terminal_error_shape": "object",
+            "codex_error_info": "enum:serveroverloaded",
+        },
+    )
+    assert (
+        safe_terminal_condition(overloaded)
+        == "the Codex Provider reported that it is overloaded before a terminal response"
+    )
+
+
+def test_opaque_retryable_codex_terminal_keeps_its_safe_classification_signal() -> None:
+    """An ``enum:other`` retry remains diagnosable without Provider prose."""
+
+    provider_text_canary = "OPAQUE_PROVIDER_TEXT_MUST_NOT_ESCAPE"
+    error = InvocationError(
+        code="turn_failed_provider_unavailable",
+        message=provider_text_canary,
+        retryable=True,
+        details={
+            "terminal_error_shape": "object",
+            "codex_error_info": "enum:other",
+            "advisory_text_signals": ["transport_or_connection"],
+            "message": provider_text_canary,
+        },
+    )
+
+    assert safe_terminal_details(error) == {
+        "terminal_error_shape": "object",
+        "codex_error_info": "enum:other",
+        "advisory_text_signals": ["transport_or_connection"],
+    }
+    assert provider_text_canary not in repr(safe_terminal_details(error))
 
 
 def test_direct_rejected_schema_has_safe_adapter_feedback() -> None:
@@ -116,6 +242,53 @@ def test_direct_provider_unavailable_keeps_a_safe_liveness_fingerprint() -> None
     assert terminal_failure_retryable(error) is True
 
 
+def test_direct_provider_unavailable_keeps_a_safe_connection_class() -> None:
+    error = InvocationError(
+        code="direct_provider_unavailable",
+        message="DIRECT_PROVIDER_SECRET_MESSAGE",
+        retryable=True,
+        details={
+            "provider_error_shape": "missing",
+            "transport_exception_kind": "connection",
+            "message": "DIRECT_PROVIDER_SECRET_MESSAGE",
+        },
+    )
+
+    assert safe_terminal_details(error) == {
+        "provider_error_shape": "missing",
+        "transport_exception_kind": "connection",
+    }
+    assert "transport=connection" in safe_terminal_condition(error)
+    assert "DIRECT_PROVIDER_SECRET_MESSAGE" not in safe_terminal_condition(error)
+
+
+def test_direct_provider_rejected_keeps_only_advisory_text_signals() -> None:
+    error = InvocationError(
+        code="direct_provider_rejected",
+        message="DIRECT_PROVIDER_SECRET_MESSAGE",
+        retryable=False,
+        details={
+            "provider_error_shape": "object",
+            "provider_error_type": "absent",
+            "provider_error_code": "other",
+            "provider_error_param": "absent",
+            "advisory_text_signals": ["context_or_token_limit"],
+            "provider_message": "DIRECT_PROVIDER_SECRET_MESSAGE",
+        },
+    )
+
+    assert safe_terminal_details(error) == {
+        "provider_error_shape": "object",
+        "provider_error_type": "absent",
+        "provider_error_code": "other",
+        "provider_error_param": "absent",
+        "advisory_text_signals": ["context_or_token_limit"],
+    }
+    assert "context_or_token_limit" in safe_terminal_condition(error)
+    assert "DIRECT_PROVIDER_SECRET_MESSAGE" not in safe_terminal_condition(error)
+    assert terminal_failure_retryable(error) is False
+
+
 def test_direct_streamed_provider_unavailable_keeps_a_safe_retry_route() -> None:
     provider_message_canary = "DIRECT_PROVIDER_STREAM_SECRET_MESSAGE"
     error = InvocationError(
@@ -170,14 +343,12 @@ def test_direct_provider_stream_stall_routes_to_transport_liveness_not_prompt_re
     assert terminal_failure_retryable(error) is True
 
 
-def test_direct_malformed_json_envelope_has_prompt_and_skill_feedback() -> None:
+def test_direct_malformed_json_has_prompt_schema_and_adapter_feedback() -> None:
     error = InvocationError(
-        code="direct_structured_output_transport_invalid",
+        code="direct_structured_output_invalid_json",
         message="DIRECT_PROVIDER_SECRET_MESSAGE",
         retryable=False,
         details={
-            "transport": "json_envelope",
-            "envelope_shape": "artifact_json_string",
             "response_shape": "object",
             "parse_failure": "syntax",
             "parse_offset": 916,
@@ -187,14 +358,13 @@ def test_direct_malformed_json_envelope_has_prompt_and_skill_feedback() -> None:
     )
 
     assert safe_terminal_details(error) == {
-        "transport": "json_envelope",
-        "envelope_shape": "artifact_json_string",
         "response_shape": "object",
         "parse_failure": "syntax",
         "parse_offset": 916,
         "response_characters": 5558,
     }
-    assert "transport=json_envelope" in safe_terminal_condition(error)
-    assert "json-envelope instruction" in (safe_terminal_expected_category(error) or "")
-    assert "JSON string escaping" in (safe_terminal_remediation(error) or "")
+    assert "parse=syntax" in safe_terminal_condition(error)
+    assert "Direct Prompt, native schema" in (safe_terminal_expected_category(error) or "")
+    assert "Runtime Skill" not in (safe_terminal_expected_category(error) or "")
+    assert "native schema" in (safe_terminal_remediation(error) or "")
     assert terminal_failure_retryable(error) is False

@@ -11,7 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
-from typing import Any, Protocol, TypeVar, cast
+from typing import Any, NoReturn, Protocol, TypeVar, cast
 
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from pydantic import BaseModel, JsonValue, ValidationError
@@ -62,10 +62,13 @@ from agent_world.invocation import (
     InvocationRequest,
     InvocationResult,
     NodeCapabilityRequirement,
+    ProfileResolutionError,
     ResolvedAgentProfile,
     assert_agent_output_advisory,
+    safe_profile_resolution_category,
     standalone_component_ownership,
 )
+from agent_world.invocation.structured_prompt import render_direct_structured_prompt
 
 from .models import (
     BoundVerifierCaseIntent,
@@ -567,6 +570,7 @@ class VerifierCompiler:
                 ),
             )
         self._write_json(workspace / "verifier-context.json", context)
+        output_schema = VerifierIntent.model_json_schema(mode="validation")
         try:
             assert_agent_output_advisory(
                 VerifierIntent,
@@ -577,7 +581,7 @@ class VerifierCompiler:
                     role="challenger",
                     lineage_id=f"{lineage_id}.batch.{batch_index}",
                     workspace=workspace,
-                    output_schema=VerifierIntent.model_json_schema(mode="validation"),
+                    output_schema=output_schema,
                     permissions=permissions,
                     requirement=NodeCapabilityRequirement.structured_output(
                         node_id="challenger.verifier-compile-batch",
@@ -591,7 +595,7 @@ class VerifierCompiler:
                     role="challenger",
                     lineage_id=f"{lineage_id}.batch.{batch_index}",
                     workspace=workspace,
-                    output_schema=VerifierIntent.model_json_schema(mode="validation"),
+                    output_schema=output_schema,
                     permissions=permissions,
                     requirement=NodeCapabilityRequirement.structured_output(
                         node_id="challenger.verifier-compile-batch",
@@ -606,6 +610,25 @@ class VerifierCompiler:
                 str(exc),
                 permission_denied=True,
             ) from exc
+        except ProfileResolutionError as exc:
+            raise VerifierCompilationError(
+                "Verifier Direct profile could not be materialized",
+                safe_code="verifier_profile_resolution_error",
+                safe_category=(
+                    "Verifier Direct profile resolution category: "
+                    f"{safe_profile_resolution_category(exc)}"
+                ),
+                retryable=False,
+                expected_category=(
+                    "a Direct Challenger profile with the reported profile-resolution "
+                    "category corrected"
+                ),
+                remediation=(
+                    "Inspect the safe Direct profile-resolution category and the shared "
+                    "Agent/Direct profile construction path; do not edit the Prompt "
+                    "or Runtime Skill."
+                ),
+            ) from exc
         ownership = invocation_ownership or standalone_component_ownership(
             invocation_id=invocation_id,
             component="judge",
@@ -615,15 +638,18 @@ class VerifierCompiler:
             semantic_repair_seed,
             profile=profile,
         )
+        direct_prompt = render_direct_structured_prompt(
+            append_authorized_semantic_repair_context(
+                self._prompt(context),
+                correction_brief=correction_brief,
+                semantic_repair_seed=semantic_repair_seed,
+            ),
+        )
         try:
             invocation = await self.backend.invoke(
                 InvocationRequest(
                     invocation_id=invocation_id,
-                    prompt=append_authorized_semantic_repair_context(
-                        self._prompt(context),
-                        correction_brief=correction_brief,
-                        semantic_repair_seed=semantic_repair_seed,
-                    ),
+                    prompt=direct_prompt,
                     profile=profile,
                     session=None,
                     ownership=ownership,
@@ -1339,8 +1365,33 @@ class VerifierCompiler:
                 str(exc),
                 permission_denied=True,
             ) from exc
+        except ProfileResolutionError as exc:
+            raise VerifierCompilationError(
+                "Verifier Direct profile could not be materialized",
+                safe_code="verifier_profile_resolution_error",
+                safe_category=(
+                    "Verifier Direct profile resolution category: "
+                    f"{safe_profile_resolution_category(exc)}"
+                ),
+                retryable=False,
+                expected_category=(
+                    "a Direct Challenger profile with the reported profile-resolution "
+                    "category corrected"
+                ),
+                remediation=(
+                    "Inspect the safe Direct profile-resolution category and the shared "
+                    "Agent/Direct profile construction path; do not edit the Prompt "
+                    "or Runtime Skill."
+                ),
+            ) from exc
+        # Verifier semantics are prompt-only Direct LLM work. A correction is
+        # a fresh physical request containing the immutable context plus its
+        # authorized framework feedback, never a hidden Codex thread resume.
         session = None
-        current_prompt = prompt
+        immutable_prompt = render_direct_structured_prompt(
+            prompt,
+        )
+        current_prompt = immutable_prompt
         results: list[InvocationResult] = []
         batch_accounting = accounting or _VerifierBatchAccounting()
         active_repair_entry: str | None = None
@@ -1357,7 +1408,7 @@ class VerifierCompiler:
                 await repair_authority.complete(
                     active_repair_entry,
                     remaining_issue_codes=remaining_issue_codes,
-                    continued_session=True,
+                    continued_session=False,
                     remaining_diagnostic=diagnostic,
                 )
             except Exception as exc:
@@ -1384,7 +1435,7 @@ class VerifierCompiler:
                         role="challenger",
                         repair_mode=repair_mode,
                         issue_codes=issue_codes,
-                        continued_session=True,
+                        continued_session=False,
                         diagnostic=diagnostic,
                     )
                 else:
@@ -1394,7 +1445,7 @@ class VerifierCompiler:
                         role="challenger",
                         repair_mode=repair_mode,
                         issue_codes=issue_codes,
-                        continued_session=True,
+                        continued_session=False,
                         diagnostic=diagnostic,
                         feedback_contract_id="feedback.verifier.intent",
                         repair_target=repair_target,
@@ -1442,6 +1493,7 @@ class VerifierCompiler:
                                 "lineage_id": lineage_id,
                                 "attempt": attempt,
                             },
+                            execution_mode=InvocationExecutionMode.SINGLE_SHOT_STRUCTURED,
                         )
                     )
                 except asyncio.CancelledError:
@@ -1498,7 +1550,7 @@ class VerifierCompiler:
                 diagnostic = self._validation_diagnostic(exc)
                 issue_codes = diagnostic.issue_codes
                 await complete_repair(issue_codes, diagnostic)
-                if attempt >= self.maximum_structured_reworks or result.session is None:
+                if attempt >= self.maximum_structured_reworks:
                     raise VerifierCompilationError(
                         "Verifier IR remained invalid at framework phase "
                         f"{diagnostic.validation_phase}: {', '.join(issue_codes)}",
@@ -1513,11 +1565,14 @@ class VerifierCompiler:
                         invocation_results=results,
                     ) from exc
                 await authorize_repair(issue_codes, diagnostic)
-                session = result.session
                 current_prompt = (
-                    "The previous VerifierIntent violated the framework contract. Correct the "
-                    "same private verifier proposal without reading or changing Runtime code. "
-                    f"Framework-authored safe diagnostics:\n{diagnostic.feedback}"
+                    immutable_prompt
+                    + "\n\n"
+                    + (
+                        "The previous VerifierIntent violated the framework contract. Correct the "
+                        "same artifact without reading or changing Runtime code. "
+                        f"Framework-authored safe diagnostics:\n{diagnostic.feedback}"
+                    )
                 )
         raise AssertionError("unreachable verifier compilation state")
 
@@ -1695,7 +1750,7 @@ class VerifierCompiler:
             raise ValueError("VerifierIntent task scope is unknown")
         reference_issues: list[SafeValidationIssue] = []
         for case_index, case in enumerate(intent.cases):
-            seen_expectations: set[tuple[str, int, bool]] = set()
+            seen_expectations: dict[tuple[str, int], bool] = {}
             for expectation_index, expectation in enumerate(case.expectations):
                 location = (
                     "cases",
@@ -1711,23 +1766,71 @@ class VerifierCompiler:
                             location,
                             "Use a one-based action ordinal between 1 and the number of "
                             f"actions in this case ({len(case.actions)}).",
+                            violated_condition=(
+                                "each expectation must point to an action in its own case"
+                            ),
+                            expected_category=(
+                                "a one-based after_action_ordinal between 1 and the number of "
+                                "actions in that case"
+                            ),
+                            remediation=(
+                                "Point the expectation at an existing action in the same case."
+                            ),
                         )
                     )
-                key = (
-                    str(expectation.kind),
-                    expectation.after_action_ordinal,
-                    expectation.expected,
-                )
-                if key in seen_expectations:
+                key = (str(expectation.kind), expectation.after_action_ordinal)
+                previous_expected = seen_expectations.get(key)
+                if key in seen_expectations and previous_expected == expectation.expected:
                     reference_issues.append(
                         SafeValidationIssue(
                             "intent_expectation_duplicate",
                             location,
                             "Each (kind, after_action_ordinal, expected) combination may "
                             "appear only once in a case.",
+                            violated_condition=(
+                                "each case must contain at most one expectation with the same "
+                                "kind, after_action_ordinal, and expected value"
+                            ),
+                            expected_category=(
+                                "one expectation for each unique (kind, after_action_ordinal, "
+                                "expected) combination; compatible coverage rows may reuse it"
+                            ),
+                            remediation=(
+                                "Merge duplicate expectation entries and keep the one compatible "
+                                "expectation that covers every matching row."
+                            ),
                         )
                     )
-                seen_expectations.add(key)
+                elif key in seen_expectations:
+                    reference_issues.append(
+                        SafeValidationIssue(
+                            "intent_expectation_polarity_conflict",
+                            (
+                                "cases",
+                                case_index,
+                                "expectations",
+                                expectation_index,
+                                "expected",
+                            ),
+                            "One action point cannot be expected to both satisfy and violate "
+                            "the same property kind.",
+                            violated_condition=(
+                                "each semantic trajectory has one expected polarity for each "
+                                "kind and after_action_ordinal"
+                            ),
+                            expected_category=(
+                                "one expected polarity per kind/action ordinal; an opposite "
+                                "polarity must use a separate negative trajectory"
+                            ),
+                            remediation=(
+                                "Move the opposite expectation to a distinct trajectory whose "
+                                "domain reset input or action can really produce the opposite "
+                                "outcome; do not add true and false expectations to one action."
+                            ),
+                        )
+                    )
+                else:
+                    seen_expectations[key] = expectation.expected
         if reference_issues:
             raise StructuredValidationError(
                 ValidationDiagnostic(
@@ -1817,13 +1920,46 @@ class VerifierCompiler:
         preferred = [item.task_type for item in intent.solve_recipes if item.preferred]
         if len(set(preferred)) != len(preferred):
             raise ValueError("each task type may have at most one preferred solve recipe")
-        for recipe in intent.solve_recipes:
+        for recipe_index, recipe in enumerate(intent.solve_recipes):
             requirement = tasks.get(recipe.task_type)
             if requirement is None:
                 raise ValueError(
                     f"VerifierIntent recipe {recipe.recipe_id} is outside this task batch"
                 )
-            _validate_solve_recipe(recipe, requirement=requirement, design=design)
+            _validate_solve_recipe(
+                recipe,
+                requirement=requirement,
+                design=design,
+                location=("intent", "solve_recipes", recipe_index),
+            )
+        missing_preferred_recipes = set(tasks) - set(preferred)
+        if missing_preferred_recipes:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="verifier",
+                    validation_phase="solve_recipe",
+                    frontier_ordinal=25,
+                    issues=(
+                        SafeValidationIssue(
+                            "intent_release_recipe_missing",
+                            ("intent", "solve_recipes"),
+                            "This release path has no interactive solver; each assigned task "
+                            "needs one preferred ParameterizedSolveRecipe.",
+                            violated_condition=(
+                                "every assigned task type has exactly one preferred solve recipe"
+                            ),
+                            expected_category=(
+                                "one preferred ParameterizedSolveRecipe for each assigned task type"
+                            ),
+                            remediation=(
+                                "Add one public-input-only preferred recipe for every assigned "
+                                "task. Use only declared tools, schema-valid arguments, public "
+                                "goal/reset observation pointers, and earlier public results."
+                            ),
+                        ),
+                    ),
+                )
+            )
 
         missing_kinds = set(required_property_families) - observed_kinds
         if missing_kinds:
@@ -1956,7 +2092,10 @@ class VerifierCompiler:
 
         bound_cases = VerifierCompiler._bind_intent_cases(intent)
         rules = design_rule_index(design)
-        required = tuple(dict.fromkeys(required_rule_ids))
+        required = VerifierCompiler._runtime_case_rule_ids(
+            design,
+            required_rule_ids,
+        )
         if not set(required) <= set(rules):
             raise ValueError("VerifierIntent compiler received an unknown Rule")
         allowed_tasks = set(allowed_task_types)
@@ -2068,9 +2207,10 @@ class VerifierCompiler:
                             "and after_action_ordinal pointing to a compatible row tool"
                         ),
                         remediation=(
-                            "Add a separate compatible expectation with expected=false; when "
-                            "this row lists tool_ids, point its ordinal at one of those tool "
-                            "actions."
+                            "Add the expected=false coverage in a separate negative semantic "
+                            "trajectory whose action or reset input can really produce the "
+                            "opposite outcome; when this row lists tool_ids, point its ordinal "
+                            "at one of those tool actions."
                         ),
                     )
                 )
@@ -2305,11 +2445,12 @@ class VerifierCompiler:
             if task_type in allowed_tasks
         }
         rules = design_rule_index(design)
-        required_rules = (
-            set(design.verification.required_rule_ids)
+        requested_rule_ids = (
+            design.verification.required_rule_ids
             if required_rule_ids is None
-            else set(required_rule_ids)
+            else required_rule_ids
         )
+        required_rules = set(VerifierCompiler._runtime_case_rule_ids(design, requested_rule_ids))
         unknown_required_rules = required_rules - set(rules)
         if unknown_required_rules:
             raise ValueError(
@@ -2344,7 +2485,9 @@ class VerifierCompiler:
             raise ValueError("VerifierDraft requires both public and sealed cases")
         cases_by_id = {case.case_id: case for case in draft.cases}
         obligations: dict[str, list[tuple[str, bool]]] = {}
-        for case in draft.cases:
+        trajectory_polarities: dict[tuple[str, str, int, str], bool] = {}
+        trajectory_issues: list[SafeValidationIssue] = []
+        for case_index_value, case in enumerate(draft.cases):
             requirement = tasks.get(case.task_type)
             if requirement is None:
                 raise ValueError(
@@ -2431,9 +2574,62 @@ class VerifierCompiler:
                         f"assertion {assertion.assertion_id} binds {assertion.rule_id} to "
                         f"unrelated tool {action_tool}"
                     )
+                trajectory_identity = sha256_digest(
+                    canonical_json_bytes(
+                        {
+                            "task_type": case.task_type,
+                            "evaluator_goal": case.evaluator_goal,
+                            "actor": case.actor,
+                            "reset_config": case.reset_config,
+                            "actions": [action.model_dump(mode="json") for action in case.actions],
+                        }
+                    )
+                )
+                polarity_key = (
+                    trajectory_identity,
+                    assertion.rule_id,
+                    assertion.action_index,
+                    str(rules[assertion.rule_id].family),
+                )
+                previous_expected = trajectory_polarities.get(polarity_key)
+                if (
+                    polarity_key in trajectory_polarities
+                    and previous_expected != assertion.expected
+                ):
+                    trajectory_issues.append(
+                        SafeValidationIssue(
+                            "draft_assertion_polarity_conflict",
+                            ("cases", case_index_value, "assertions", "expected"),
+                            "Paired copies of one semantic trajectory cannot require opposite "
+                            "outcomes for the same Rule action.",
+                            violated_condition=(
+                                "one semantic trajectory has one expected polarity for each "
+                                "Rule/action binding"
+                            ),
+                            expected_category=(
+                                "separate positive and negative trajectories with distinct "
+                                "domain actions or reset inputs"
+                            ),
+                            remediation=(
+                                "Keep one polarity for this trajectory and bind the opposite "
+                                "polarity to a distinct, compatible negative trajectory."
+                            ),
+                        )
+                    )
+                else:
+                    trajectory_polarities[polarity_key] = assertion.expected
                 obligations.setdefault(assertion.rule_id, []).append(
                     (case.partition, assertion.expected)
                 )
+        if trajectory_issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="verifier",
+                    validation_phase="rule_binding",
+                    frontier_ordinal=30,
+                    issues=tuple(trajectory_issues),
+                )
+            )
         for task_type, requirement in tasks.items():
             task_cases = [case for case in draft.cases if case.task_type == task_type]
             covered_tools = {action.tool_id for case in task_cases for action in case.actions}
@@ -2452,7 +2648,7 @@ class VerifierCompiler:
         preferred = [recipe.task_type for recipe in draft.solve_recipes if recipe.preferred]
         if len(set(preferred)) != len(preferred):
             raise ValueError("each task type may have at most one preferred solve recipe")
-        for recipe in draft.solve_recipes:
+        for recipe_index, recipe in enumerate(draft.solve_recipes):
             requirement = tasks.get(recipe.task_type)
             if requirement is None:
                 raise ValueError(
@@ -2463,6 +2659,36 @@ class VerifierCompiler:
                 recipe,
                 requirement=requirement,
                 design=design,
+                location=("draft", "solve_recipes", recipe_index),
+            )
+        missing_preferred_recipes = set(tasks) - set(preferred)
+        if missing_preferred_recipes:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="verifier",
+                    validation_phase="solve_recipe",
+                    frontier_ordinal=25,
+                    issues=(
+                        SafeValidationIssue(
+                            "draft_release_recipe_missing",
+                            ("draft", "solve_recipes"),
+                            "The frozen release path has no interactive solver, so every task "
+                            "needs one preferred ParameterizedSolveRecipe.",
+                            violated_condition=(
+                                "every task in this verifier shard has exactly one preferred "
+                                "solve recipe"
+                            ),
+                            expected_category=(
+                                "one preferred ParameterizedSolveRecipe for each task type in "
+                                "this shard"
+                            ),
+                            remediation=(
+                                "Regenerate or repair the Verifier Intent with public-input-only "
+                                "preferred recipes for every task."
+                            ),
+                        ),
+                    ),
+                )
             )
         for prop in draft.properties:
             if not set(prop.case_ids) <= set(cases_by_id):
@@ -2521,11 +2747,15 @@ class VerifierCompiler:
                     f"Rule {rule_id} lacks canonical {canonical_kind} property binding"
                 )
         property_kinds: set[str] = {str(item.kind) for item in draft.properties}
-        effective_property_families: set[str] = (
-            set(str(item) for item in design.verification.required_property_families)
-            if required_property_families is None
-            else set(str(item) for item in required_property_families)
-        )
+        effective_property_families: set[str] = {
+            str(item)
+            for item in (
+                design.verification.required_property_families
+                if required_property_families is None
+                else required_property_families
+            )
+            if item != "sampling"
+        }
         missing_families = effective_property_families - property_kinds
         if missing_families:
             raise ValueError(
@@ -2543,15 +2773,17 @@ class VerifierCompiler:
     def _prompt(context: Mapping[str, JsonValue]) -> str:
         context_json = canonical_json_bytes(context).decode("utf-8")
         return (
-            """You are the isolated Challenger inside Agent World Foundry.
+            """You are the Challenger inside Agent World Foundry.
 Project purpose: prove that an untrusted generated Runtime implements the evidence-backed
 WorldSpec with real programmatic state transitions, without sharing expected answers with it.
 
 The framework has already compiled the only information you need into the compact JSON context
 below. You have no tools and must not request files, shell commands, source code, or more context.
-Produce exactly one compact VerifierIntent structured output. You propose only domain reset
-configs, tool-action trajectories, and family-level expectations such as "transition after action
-N should be true". Never enumerate Rule ids or properties: framework code expands each family
+Produce exactly one compact VerifierIntent structured output. Return one syntactically valid RFC
+8259 JSON object only: no Markdown, prose, `NaN`, `Infinity`, or `-Infinity` literals.
+You propose only domain reset configs, tool-action trajectories, and family-level expectations.
+For example: "transition after action N should be true". Never enumerate Rule ids or properties:
+framework code expands each family
 expectation to the complete frozen Rule closure and rejects uncovered rules deterministically.
 The verifier context and requested output are different schemas. The context's `schema_version`
 is context data only: never copy it into VerifierIntent. The top-level VerifierIntent v2
@@ -2567,9 +2799,11 @@ Before answering, perform a two-pass coverage audit over every
 property_kind, tool_ids, and polarity to choose compatible trajectories and expectations, but never
 emit the id itself. One compatible semantic trajectory may satisfy several coverage entries. For
 each coverage requirement provide a positive semantic expectation; when positive_and_negative is
-true, also provide a negative expectation. Framework code pairs every semantic trajectory into
-public and sealed cases and assigns both case ids and independent uint64 seeds. You must not
-propose or infer disclosure partitions, ids, or seeds.
+true, also provide a negative expectation in a separate semantically distinct trajectory. A negative
+trajectory must change a legitimate domain reset input or action so the opposite outcome can really
+occur; it is not a second expectation item on the same action. Framework code pairs every semantic
+trajectory into public and sealed cases and assigns both case ids and independent uint64 seeds. You
+must not propose or infer disclosure partitions, ids, or seeds.
 In pass one, choose a concrete `(kind, expected, after_action_ordinal, action tool_id)` mapping for
 each row before composing the final cases. `rule_count` counts the framework's private Rules in a
 row; it never removes that row's own expectation obligation. In pass two, scan the completed
@@ -2579,8 +2813,12 @@ equal the row's property_kind. If a row lists tool_ids, the expectation's after_
 point to an action whose tool_id is one of those values: merely including that tool elsewhere in the
 same trajectory does not cover the row. This applies equally to `positive_only` error_semantics
 rows. For a row with positive_and_negative=true, check that both boolean expectation entries exist
-before returning. For a row with no tool_ids, use a compatible action in the selected task. Do not
-return while any ledger row lacks its mapped expectation.
+before returning, but never put both polarities at the same `(kind, after_action_ordinal)` in one
+case. One expectation item may satisfy every compatible coverage row. Within one case, emit each
+`(kind, after_action_ordinal)` at most once: merge overlapping row mappings onto that one item
+instead of adding duplicates or an opposite polarity. For a row with no tool_ids, use a
+compatible action in the selected task. Do not return while any ledger row lacks its mapped
+expectation.
 Coverage requirements with `scope="world_shared"` and `task_type=null` apply across the assigned
 real tasks; `world_shared` is never a case task_type. Choose case task_type only from `tasks`.
 Use meaningful multi-action trajectories, error paths, idempotency, permissions, rollback, and
@@ -2611,12 +2849,32 @@ one action permits only ordinal 1. Never use zero and never use an ordinal large
 of actions in that case. Framework code deterministically converts the ordinal to its private
 zero-based Verifier IR index.
 
-You may also propose bounded ParameterizedSolveRecipe values. A recipe is only a solving
-accelerator, never an expected answer or proof. It may reference public_goal, reset_observation,
-or earlier public tool results/observations through strict RFC 6901 pointers. It cannot reference
-initial_config, evaluator_goal, Rule IR, snapshots, source code, or release policy. Use at most one
-preferred recipe per task type. Every recipe must use only tools available to every allowed task
-actor, satisfy tool input schemas, include all required tools, and meet minimum_tool_calls.
+This release path intentionally has no hidden interactive solver. `solve_recipes` is therefore
+required: return exactly one `preferred=true` ParameterizedSolveRecipe for each assigned task type.
+It is a public-input-only solving plan, not an expected answer or proof. Do not omit it, return an
+empty list, or rely on public/sealed case pairing as a solve recipe.
+
+Solve-recipe binding audit is mandatory before returning. A matching field name is not proof that a
+pointer is valid: a `number` source cannot fill an `integer` tool argument. For each required
+recipe argument, consult `solve_recipe_binding_guide`; it lists type-compatible `public_goal`
+pointers already derivable from this context. The guide is not a value source and is not exhaustive:
+you may use another source only after checking its exact resolved schema. If the guide has no
+compatible public-goal pointer, use a schema-valid `{"kind":"literal","value":...}` or an
+earlier compatible public tool result/observation. Never cast, round, parse, or otherwise transform
+a pointer value inside a recipe. A literal must also satisfy the selected field's enum, format, and
+bounds. Every RFC 6901 pointer segment must descend through a structured source node: each object
+key must select an object property and each index must select an array item. A pointer may stop at a
+scalar leaf but must never traverse a segment beyond one; if the source value is a scalar, stop the
+pointer there or select a shorter, structured source rather than adding another segment.
+
+Before returning, verify that every bounded ParameterizedSolveRecipe uses every tool required by its
+task,
+meets its minimum_tool_calls, and that each literal and each RFC 6901 pointer is valid for the
+selected input or visible source schema. A recipe may reference public_goal, reset_observation, or
+earlier public tool results/observations only. It cannot reference initial_config, evaluator_goal,
+Rule IR, snapshots, source code, or release policy. Use at most one preferred recipe per task type;
+every recipe must use only tools available to every allowed task actor and satisfy tool input
+schemas.
 
 `reset_config_schema_id` selects a schema from `reset_config_schemas`; it is a context reference,
 not a Runtime field. Never copy it into reset_config. Keep trajectories on their exact task type.
@@ -2657,10 +2915,15 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
         )
         if len(selected_tasks) != len(selected_task_types):
             raise ValueError("Challenger context references an unknown task type")
-        selected_rule_ids = (
-            set(design.verification.required_rule_ids)
-            if required_rule_ids is None
-            else set(required_rule_ids)
+        selected_rule_ids = set(
+            VerifierCompiler._runtime_case_rule_ids(
+                design,
+                (
+                    design.verification.required_rule_ids
+                    if required_rule_ids is None
+                    else required_rule_ids
+                ),
+            )
         )
         if not selected_rule_ids <= set(rules):
             raise ValueError("Challenger context references an unknown Rule")
@@ -2714,7 +2977,7 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
             coverage_groups[key] = coverage_groups.get(key, 0) + 1
 
         return {
-            "schema_version": "agent-world.challenger-context.v4",
+            "schema_version": "agent-world.challenger-context.v5",
             "reset_config_schemas": [
                 {"schema_id": schema_id, "schema": schema}
                 for schema_id, schema in sorted(reset_schemas.items())
@@ -2729,6 +2992,10 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
                 for tool in design.world_spec.tools
                 if tool.surface.tool_id in relevant_tool_ids
             ],
+            "solve_recipe_binding_guide": _solve_recipe_binding_guide(
+                selected_tasks,
+                design.world_spec.tools,
+            ),
             "tasks": [
                 {
                     "task_type": task.task_type,
@@ -2746,11 +3013,15 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
                 _coverage_requirement_projection(key, rule_count=count)
                 for key, count in sorted(coverage_groups.items())
             ],
-            "required_property_families": list(
-                design.verification.required_property_families
-                if required_property_families is None
-                else required_property_families
-            ),
+            "required_property_families": [
+                cast(JsonValue, str(item))
+                for item in (
+                    design.verification.required_property_families
+                    if required_property_families is None
+                    else required_property_families
+                )
+                if item != "sampling"
+            ],
             "required_metamorphic_relations": list(
                 design.verification.required_metamorphic_relations
                 if (
@@ -2781,7 +3052,8 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
                 *task.terminal_conditions,
             )
         }
-        rule_tools: dict[str, set[str]] = {rule_id: set() for rule_id in design_rule_index(design)}
+        rules = design_rule_index(design)
+        rule_tools: dict[str, set[str]] = {rule_id: set() for rule_id in rules}
         for tool in design.world_spec.tools:
             semantics = tool.semantics
             for rule in (
@@ -2795,7 +3067,10 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
             if semantics.permission.condition is not None:
                 rule_tools[semantics.permission.condition.rule_id].add(tool.surface.tool_id)
 
-        for rule_id in design.verification.required_rule_ids:
+        for rule_id in VerifierCompiler._runtime_case_rule_ids(
+            design,
+            design.verification.required_rule_ids,
+        ):
             owner = task_rule_owners.get(rule_id)
             if owner is None:
                 associated_tools = rule_tools[rule_id]
@@ -2827,7 +3102,11 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
             for task in design.curriculum.task_types
         }
         covered: set[str] = set().union(*assignments.values()) if assignments else set()
-        missing = {str(item) for item in design.verification.required_property_families} - covered
+        missing = {
+            str(item)
+            for item in design.verification.required_property_families
+            if item != "sampling"
+        } - covered
         if missing:
             first_task = design.curriculum.task_types[0].task_type
             assignments[first_task].update(missing)
@@ -2835,6 +3114,25 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
             task.task_type: tuple(sorted(assignments[task.task_type]))
             for task in design.curriculum.task_types
         }
+
+    @staticmethod
+    def _runtime_case_rule_ids(
+        design: EnvironmentDesign,
+        rule_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        """Keep action-case coverage separate from task-materialization sampling.
+
+        ``VerificationRequirements`` deliberately names the complete Rule closure. Curriculum
+        sampling constraints are still hard-gated by task materialization/reset, where their
+        inputs exist; binding them to arbitrary Runtime actions makes a valid Candidate
+        impossible to judge. The Verifier IR therefore owns every non-sampling Rule only.
+        """
+
+        rules = design_rule_index(design)
+        unknown = set(rule_ids) - set(rules)
+        if unknown:
+            raise ValueError(f"Verifier runtime case scope has unknown Rules: {sorted(unknown)}")
+        return tuple(rule_id for rule_id in rule_ids if rules[rule_id].family != "sampling")
 
     def _batch_budgets(self, budget: Budget, batch_count: int) -> tuple[Budget, ...]:
         if batch_count < 1 or batch_count > self.maximum_task_shards:
@@ -2973,57 +3271,114 @@ def _validate_solve_recipe(
     *,
     requirement: TaskRequirement,
     design: EnvironmentDesign,
+    location: tuple[str | int, ...],
 ) -> None:
     tools = {tool.surface.tool_id: tool for tool in design.world_spec.tools}
     required_tools = set(requirement.required_tool_ids)
     used_tools = {step.tool_id for step in recipe.steps}
     missing = required_tools - used_tools
     if missing:
-        raise ValueError(f"solve recipe {recipe.recipe_id} omits required tools: {sorted(missing)}")
+        _raise_solve_recipe_issue(
+            code="recipe_required_tool_coverage_missing",
+            location=(*location, "steps"),
+            message="The recipe does not use every tool required by its assigned task.",
+            violated_condition="each recipe must cover every tool required by its task",
+            expected_category="a recipe covering the task's required tools",
+            remediation="Add steps using each required tool for this task.",
+        )
     if len(recipe.steps) < requirement.minimum_tool_calls:
-        raise ValueError(f"solve recipe {recipe.recipe_id} does not meet minimum_tool_calls")
+        _raise_solve_recipe_issue(
+            code="recipe_minimum_step_count_missing",
+            location=(*location, "steps"),
+            message="The recipe has fewer steps than its assigned task requires.",
+            violated_condition="each recipe must meet its task's minimum tool-call count",
+            expected_category="a recipe with at least the task's required number of steps",
+            remediation="Add valid steps until the task's minimum tool-call count is met.",
+        )
 
     boundary_by_actor = {
         actor.actor: actor for actor in design.world_spec.boundary.actors_and_authority
     }
     for step_index, step in enumerate(recipe.steps):
+        step_location = (*location, "steps", step_index)
         tool = tools.get(step.tool_id)
         if tool is None:
-            raise ValueError(
-                f"solve recipe {recipe.recipe_id} references unknown tool {step.tool_id}"
+            _raise_solve_recipe_issue(
+                code="recipe_tool_unknown",
+                location=(*step_location, "tool_id"),
+                message="This recipe step selects no tool from the frozen ToolContractSet.",
+                violated_condition="each recipe step must reference a frozen tool",
+                expected_category="a step whose tool_id is declared in the ToolContractSet",
+                remediation="Replace this step's tool with a tool declared by the frozen design.",
             )
         denied = set(requirement.allowed_actor_ids) - set(tool.semantics.permission.allowed_actors)
         if denied:
-            raise ValueError(
-                f"solve recipe {recipe.recipe_id} uses {step.tool_id}, unavailable to task "
-                f"actors {sorted(denied)}"
+            _raise_solve_recipe_issue(
+                code="recipe_tool_actor_permission_denied",
+                location=(*step_location, "tool_id"),
+                message="This step's tool is unavailable to an actor assigned to the task.",
+                violated_condition="a selected tool must be available to every assigned actor",
+                expected_category="a step using a tool permitted for the task actors",
+                remediation="Choose a task-permitted tool for this step.",
             )
         input_schema = tool.surface.input_schema
         properties = input_schema.get("properties")
         required = input_schema.get("required", [])
         if not isinstance(properties, dict) or not isinstance(required, list):
-            raise ValueError(f"tool {step.tool_id} has no closed object input schema")
+            _raise_solve_recipe_issue(
+                code="recipe_tool_input_schema_unavailable",
+                location=(*step_location, "arguments"),
+                message="The frozen tool input contract is not a closed object schema.",
+                violated_condition="the frozen tool input contract must be a closed object schema",
+                expected_category="a repaired frozen ToolContractSet",
+                remediation="Repair the frozen tool input contract before retrying the recipe.",
+                retryable=False,
+            )
         required_names = {item for item in required if isinstance(item, str)}
         if len(required_names) != len(required):
-            raise ValueError(f"tool {step.tool_id} required fields must be strings")
+            _raise_solve_recipe_issue(
+                code="recipe_tool_required_fields_invalid",
+                location=(*step_location, "arguments"),
+                message="The frozen tool input contract has invalid required-field metadata.",
+                violated_condition="the frozen tool input contract must declare required names",
+                expected_category="a repaired frozen ToolContractSet",
+                remediation="Repair the frozen tool input contract before retrying the recipe.",
+                retryable=False,
+            )
         unknown_arguments = set(step.arguments) - set(properties)
         missing_arguments = required_names - set(step.arguments)
         if unknown_arguments or missing_arguments:
-            raise ValueError(
-                f"solve recipe {recipe.recipe_id} step {step.step_id} arguments do not match "
-                f"{step.tool_id}; missing={sorted(missing_arguments)}, "
-                f"unknown={sorted(unknown_arguments)}"
+            _raise_solve_recipe_issue(
+                code="recipe_argument_names_mismatch",
+                location=(*step_location, "arguments"),
+                message="This step's argument names do not match the selected tool contract.",
+                violated_condition="a step must have required, declared arguments only",
+                expected_category="an arguments object matching the selected tool fields",
+                remediation="Use exactly the selected tool's required and declared fields.",
             )
-        for name, argument in step.arguments.items():
+        for argument_index, (name, argument) in enumerate(step.arguments.items()):
+            argument_location = (*step_location, "arguments", argument_index)
             target_schema = properties[name]
             if not isinstance(target_schema, dict):
-                raise ValueError(f"tool {step.tool_id} argument schema {name} is invalid")
+                _raise_solve_recipe_issue(
+                    code="recipe_tool_argument_schema_invalid",
+                    location=argument_location,
+                    message="The selected tool's frozen argument schema is invalid.",
+                    violated_condition="each frozen tool argument must have a valid schema",
+                    expected_category="a repaired frozen ToolContractSet",
+                    remediation="Repair the frozen tool argument schema before retrying.",
+                    retryable=False,
+                )
             if isinstance(argument, RecipeLiteral):
                 errors = tuple(Draft202012Validator(target_schema).iter_errors(argument.value))
                 if errors:
-                    raise ValueError(
-                        f"solve recipe {recipe.recipe_id} literal for {step.tool_id}.{name} "
-                        "violates the tool input schema"
+                    _raise_solve_recipe_issue(
+                        code="recipe_literal_schema_mismatch",
+                        location=argument_location,
+                        message="This literal does not satisfy the selected tool argument schema.",
+                        violated_condition="a literal must satisfy its selected argument schema",
+                        expected_category="a schema-compatible literal",
+                        remediation="Use a schema-compatible literal.",
                     )
                 continue
             assert isinstance(argument, RecipePointer)
@@ -3035,11 +3390,26 @@ def _validate_solve_recipe(
                 design=design,
                 tools=tools,
                 boundary_by_actor=boundary_by_actor,
+                location=argument_location,
             )
             if not _schemas_compatible(source_schema, target_schema):
-                raise ValueError(
-                    f"solve recipe {recipe.recipe_id} pointer for {step.tool_id}.{name} "
-                    "has an incompatible declared type"
+                _raise_solve_recipe_issue(
+                    code="recipe_pointer_type_mismatch",
+                    location=argument_location,
+                    message=(
+                        "This pointer's resolved source has type "
+                        f"`{_schema_type_label(source_schema)}`, but selected tool argument "
+                        f"`{name}` requires `{_schema_type_label(target_schema)}`."
+                    ),
+                    violated_condition="a pointer source type must fit its selected argument type",
+                    expected_category=(
+                        "a pointer whose resolved source type fits the selected tool argument "
+                        "type"
+                    ),
+                    remediation=(
+                        "Use a compatible pointer source, or replace this binding with a "
+                        "literal that validates against the selected tool argument schema."
+                    ),
                 )
 
 
@@ -3052,6 +3422,7 @@ def _recipe_pointer_schema(
     design: EnvironmentDesign,
     tools: Mapping[str, ToolContract],
     boundary_by_actor: Mapping[str, ActorBoundary],
+    location: tuple[str | int, ...],
 ) -> Mapping[str, JsonValue]:
     if pointer.source == "public_goal":
         schema: Mapping[str, JsonValue] = requirement.public_goal_schema
@@ -3065,7 +3436,14 @@ def _recipe_pointer_schema(
     else:
         previous_index = pointer.previous_step_index
         if previous_index is None or previous_index >= step_index:
-            raise ValueError(f"solve recipe {recipe.recipe_id} reads a non-previous step")
+            _raise_solve_recipe_issue(
+                code="recipe_pointer_previous_step_invalid",
+                location=location,
+                message="This pointer does not reference an earlier recipe step.",
+                violated_condition="a previous-step pointer may reference only an earlier step",
+                expected_category="a pointer to a preceding recipe step",
+                remediation="Point to an earlier step or a public goal/reset observation.",
+            )
         previous_tool = tools[recipe.steps[previous_index].tool_id]
         if pointer.source == "previous_tool_result":
             schema = previous_tool.surface.output_schema
@@ -3077,7 +3455,12 @@ def _recipe_pointer_schema(
                 for actor in requirement.allowed_actor_ids
             ]
             visible_fields = set.intersection(*visibility_sets) if visibility_sets else set()
-    return _schema_at_pointer(schema, pointer.pointer, visible_fields=visible_fields)
+    return _schema_at_pointer(
+        schema,
+        pointer.pointer,
+        visible_fields=visible_fields,
+        location=location,
+    )
 
 
 def _schema_at_pointer(
@@ -3085,29 +3468,104 @@ def _schema_at_pointer(
     pointer: str,
     *,
     visible_fields: set[str] | None,
+    location: tuple[str | int, ...],
 ) -> Mapping[str, JsonValue]:
     current: Mapping[str, JsonValue] = schema
     for index, raw in enumerate(pointer.split("/")[1:]):
         token = raw.replace("~1", "/").replace("~0", "~")
         if index == 0 and visible_fields is not None and token not in visible_fields:
-            raise ValueError(f"recipe pointer reads an actor-invisible field: {pointer}")
+            _raise_solve_recipe_issue(
+                code="recipe_pointer_actor_visibility_denied",
+                location=location,
+                message="This pointer reads a field hidden from an actor assigned to the task.",
+                violated_condition="a pointer may read only fields visible to every assigned actor",
+                expected_category="a pointer to a field visible to every assigned actor",
+                remediation="Use a public goal, visible observation, or previous public result.",
+            )
         schema_type = current.get("type")
         if schema_type == "object":
             properties = current.get("properties")
             if not isinstance(properties, dict) or not isinstance(properties.get(token), dict):
-                raise ValueError(f"recipe pointer is absent from its source schema: {pointer}")
+                _raise_solve_recipe_issue(
+                    code="recipe_pointer_path_absent",
+                    location=location,
+                    message="This pointer path is absent from its selected source schema.",
+                    violated_condition="a pointer path must exist in its selected source schema",
+                    expected_category="a pointer path declared by the selected source schema",
+                    remediation="Use a path that exists in the selected source schema.",
+                )
             current = cast(Mapping[str, JsonValue], properties[token])
             continue
         if schema_type == "array":
             if not token.isdecimal() or (len(token) > 1 and token.startswith("0")):
-                raise ValueError(f"recipe pointer has a non-canonical array index: {pointer}")
+                _raise_solve_recipe_issue(
+                    code="recipe_pointer_array_index_noncanonical",
+                    location=location,
+                    message="This pointer uses a non-canonical array index.",
+                    violated_condition="array pointer segments must be canonical decimal indexes",
+                    expected_category="a pointer with canonical array indexes",
+                    remediation="Use canonical non-negative decimal array indexes.",
+                )
             items = current.get("items")
             if not isinstance(items, dict):
-                raise ValueError(f"recipe pointer array source has no item schema: {pointer}")
+                _raise_solve_recipe_issue(
+                    code="recipe_pointer_array_schema_invalid",
+                    location=location,
+                    message="The selected frozen array source has no item schema.",
+                    violated_condition="a frozen array source must declare an item schema",
+                    expected_category="a repaired frozen source schema",
+                    remediation="Repair the frozen source schema before retrying the recipe.",
+                    retryable=False,
+                )
             current = items
             continue
-        raise ValueError(f"recipe pointer traverses a scalar schema: {pointer}")
+        _raise_solve_recipe_issue(
+            code="recipe_pointer_traverses_scalar",
+            location=location,
+            message="This pointer traverses beyond a scalar value in its selected source schema.",
+            violated_condition="a pointer may traverse only object properties or array items",
+            expected_category="a pointer that stops at or traverses a structured source value",
+            remediation="Use a shorter pointer or select a structured source value.",
+        )
     return current
+
+
+def _raise_solve_recipe_issue(
+    *,
+    code: str,
+    location: tuple[str | int, ...],
+    message: str,
+    violated_condition: str,
+    expected_category: str,
+    remediation: str,
+    retryable: bool = True,
+) -> NoReturn:
+    """Raise one framework-authored, candidate-safe solve-recipe diagnostic.
+
+    Recipe text comes from the Challenger and can be both wrong and sensitive.
+    The correction loop therefore receives only a structural location and a
+    closed explanation authored here; it never gets a stringified rejected
+    identifier, pointer, literal, or schema error.
+    """
+
+    raise StructuredValidationError(
+        ValidationDiagnostic(
+            owner_component="verifier",
+            validation_phase="solve_recipe",
+            frontier_ordinal=25,
+            issues=(
+                SafeValidationIssue(
+                    code,
+                    location,
+                    message,
+                    retryable=retryable,
+                    violated_condition=violated_condition,
+                    expected_category=expected_category,
+                    remediation=remediation,
+                ),
+            ),
+        )
+    )
 
 
 def _schemas_compatible(
@@ -3119,3 +3577,74 @@ def _schemas_compatible(
     if source_type == target_type:
         return True
     return source_type == "integer" and target_type == "number"
+
+
+def _schema_type_label(schema: Mapping[str, JsonValue]) -> str:
+    """Return one bounded, model-visible label for a JSON-schema value type."""
+
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str):
+        return schema_type
+    return "schema-defined value"
+
+
+def _solve_recipe_binding_guide(
+    tasks: Sequence[TaskRequirement],
+    tools: Sequence[ToolContract],
+) -> list[JsonValue]:
+    """Project type-compatible public-goal bindings into the Direct Agent view.
+
+    This is an advisory reading aid, not a new runtime contract or a generated
+    answer: it summarizes only schemas already visible in the Challenger
+    context.  In particular, an empty pointer list deliberately leaves the
+    model to choose a schema-valid literal or a later public result.
+    """
+
+    tools_by_id = {tool.surface.tool_id: tool for tool in tools}
+    guide: list[JsonValue] = []
+    for task in tasks:
+        goal_properties = task.public_goal_schema.get("properties")
+        if not isinstance(goal_properties, dict):
+            continue
+        for tool_id in task.required_tool_ids:
+            tool = tools_by_id.get(tool_id)
+            if tool is None:
+                continue
+            input_schema = tool.surface.input_schema
+            input_properties = input_schema.get("properties")
+            required = input_schema.get("required")
+            if not isinstance(input_properties, dict) or not isinstance(required, list):
+                continue
+            arguments: list[JsonValue] = []
+            for argument_name in sorted(item for item in required if isinstance(item, str)):
+                target_schema = input_properties.get(argument_name)
+                if not isinstance(target_schema, dict):
+                    continue
+                pointers: list[JsonValue] = []
+                for source_name, source_schema in sorted(goal_properties.items()):
+                    if not isinstance(source_schema, dict):
+                        continue
+                    if not _schemas_compatible(source_schema, target_schema):
+                        continue
+                    pointers.append(
+                        {
+                            "pointer": "/"
+                            + source_name.replace("~", "~0").replace("/", "~1"),
+                            "value_type": _schema_type_label(source_schema),
+                        }
+                    )
+                arguments.append(
+                    {
+                        "argument": argument_name,
+                        "target_type": _schema_type_label(target_schema),
+                        "type_compatible_public_goal_pointers": pointers,
+                    }
+                )
+            guide.append(
+                {
+                    "task_type": task.task_type,
+                    "tool_id": tool_id,
+                    "required_arguments": arguments,
+                }
+            )
+    return guide

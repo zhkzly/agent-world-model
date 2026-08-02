@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import JsonValue
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.config import AgentBackendConfig
 from agent_world.contracts import Budget, PublicTask, RuntimeAction
 from agent_world.contracts.reachability import (
@@ -15,11 +15,11 @@ from agent_world.contracts.reachability import (
     RecipePointer,
 )
 from agent_world.invocation import (
+    InvocationExecutionMode,
     InvocationOwnerKind,
     InvocationOwnership,
     InvocationRequest,
     InvocationResult,
-    InvocationSession,
     InvocationStatus,
     InvocationUsage,
     TokenBreakdown,
@@ -104,19 +104,12 @@ class _BudgetProbeBackend:
 
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
         self.requests.append(request)
-        session = InvocationSession(
-            thread_id="thread:budget-probe",
-            lineage_id=request.profile.lineage_id,
-            workspace=request.profile.workspace,
-            profile_hash=request.profile.profile_hash,
-            codex_config_sha256=request.profile.codex_config_sha256,
-        )
         cap = request.profile.rollout_token_limit
         assert cap is not None
         return InvocationResult(
             invocation_id=request.invocation_id,
             status=InvocationStatus.COMPLETED,
-            session=session,
+            session=None,
             turn_id=f"turn:{len(self.requests)}",
             final_text=None,
             structured_output={
@@ -336,10 +329,10 @@ def test_recipe_argument_materialization_is_closed_and_copying() -> None:
 
 
 @pytest.mark.asyncio
-async def test_interactive_solver_hard_caps_each_turn_without_breaking_session(
+async def test_interactive_solver_hard_caps_each_prompt_only_turn(
     tmp_path: Path,
 ) -> None:
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="configured-model",
             api_key_environment="OPENAI_API_KEY",
@@ -372,18 +365,29 @@ async def test_interactive_solver_hard_caps_each_turn_without_breaking_session(
     assert outcome.certified
     assert outcome.usage.llm_tokens == 10
     assert [request.profile.rollout_token_limit for request in backend.requests] == [5, 5]
-    assert backend.requests[0].session is None
-    assert backend.requests[1].session is not None
-    assert backend.requests[1].session.profile_hash == backend.requests[1].profile.profile_hash
+    assert all(request.session is None for request in backend.requests)
+    assert all(
+        request.execution_mode is InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
+        for request in backend.requests
+    )
+    assert all(request.profile.skills == () for request in backend.requests)
+    assert all(not hasattr(request.profile, "base_instructions") for request in backend.requests)
+    assert all(
+        not hasattr(request.profile, "developer_instructions") for request in backend.requests
+    )
+    assert all(request.profile.backend == "direct_llm" for request in backend.requests)
+    assert '"executed_public_trace": []' in backend.requests[0].prompt
+    assert '"executed_public_trace": [{' in backend.requests[1].prompt
+    assert '"counter": 1' in backend.requests[1].prompt
 
 
 @pytest.mark.asyncio
 async def test_interactive_solver_binds_each_turn_to_the_same_explicit_operation(
     tmp_path: Path,
 ) -> None:
-    """The solver's session is private; durable recovery owns the operation."""
+    """The stateless solver's physical turns share only the durable operation."""
 
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="configured-model",
             api_key_environment="OPENAI_API_KEY",

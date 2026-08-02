@@ -243,6 +243,20 @@ def test_leaf_code_revision_changes_with_source_model_and_runtime_asset(tmp_path
         this_module,
         assets={"runtime-skill:test": skill},
     )
+    skill_bundle = tmp_path / "runtime-skill"
+    (skill_bundle / "references").mkdir(parents=True)
+    (skill_bundle / "SKILL.md").write_text("read the reference", encoding="utf-8")
+    reference = skill_bundle / "references" / "protocol.md"
+    reference.write_text("protocol v1", encoding="utf-8")
+    with_skill_bundle = leaf_code_revision(
+        this_module,
+        assets={"runtime-skill:bundle": skill_bundle},
+    )
+    reference.write_text("protocol v2", encoding="utf-8")
+    changed_skill_reference = leaf_code_revision(
+        this_module,
+        assets={"runtime-skill:bundle": skill_bundle},
+    )
 
     assert a == b  # stable across calls for identical source
     assert a.startswith("framework.impl.")
@@ -250,6 +264,7 @@ def test_leaf_code_revision_changes_with_source_model_and_runtime_asset(tmp_path
     assert with_model != other_model  # different model → different revision
     assert with_skill != a  # mounted Runtime Skill participates
     assert changed_skill != with_skill  # edited Runtime Skill breaks stale reuse
+    assert changed_skill_reference != with_skill_bundle  # references are semantic too
     with pytest.raises(ValueError):
         leaf_code_revision()  # at least one module required
     with pytest.raises(ValueError):

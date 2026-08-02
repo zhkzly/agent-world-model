@@ -93,18 +93,24 @@ class InvocationRecoveryEvidence:
     parsed_semantic_candidate: bool = False
     private_continuation_available: bool = False
     # This is deliberately distinct from a Provider-thread continuation.  It
-    # means the leaf has verified that an isolated writable workspace contains
+    # means the leaf has verified that a dedicated writable workspace contains
     # an uncommitted draft after a closed terminal.  The draft remains private
     # and untrusted; policy may authorize a *new* session to inspect it only
     # within the existing same-model infrastructure-retry budget.
     private_workspace_recovery_available: bool = False
-    prior_same_class_retry_count: int = 0
+    # A same-model fresh session is one route-local recovery sequence, not a
+    # separate allowance for every transient terminal subclass. The limit is
+    # frozen in the WorkDefinition and shared with the RepairLedger.
+    prior_same_route_retry_count: int = 0
+    same_route_retry_limit: int = 1
     current_model: str | None = None
     compatible_fallback_models: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.prior_same_class_retry_count < 0:
-            raise ValueError("prior_same_class_retry_count cannot be negative")
+        if self.prior_same_route_retry_count < 0:
+            raise ValueError("prior_same_route_retry_count cannot be negative")
+        if self.same_route_retry_limit < 0:
+            raise ValueError("same_route_retry_limit cannot be negative")
         if any(not model or model != model.strip() for model in self.compatible_fallback_models):
             raise ValueError("compatible fallback models must be non-empty canonical names")
         if len(set(self.compatible_fallback_models)) != len(self.compatible_fallback_models):
@@ -154,8 +160,9 @@ class InvocationRecoveryPolicy:
     The policy is intentionally conservative.  A malformed structured response
     is not silently deemed a Prompt bug, a Runtime Skill bug, or an adapter
     bug: it produces an attribution-audit route.  A parsed semantic candidate
-    may use a bounded repair only when its feedback is exact.  Only a closed
-    transient route failure can select the fresh-session retry/fallback branch.
+    may use a bounded repair only when its feedback is exact. A closed
+    transient route failure may continue an already-proved Agent session;
+    otherwise it selects the fresh-session retry/fallback branch.
     """
 
     def decide(self, evidence: InvocationRecoveryEvidence) -> InvocationRecoveryDecision:
@@ -186,6 +193,38 @@ class InvocationRecoveryPolicy:
                         (InvocationAttributionLens.PROMPT_INPUT, AttributionSupport.UNKNOWN),
                         (InvocationAttributionLens.RUNTIME_SKILL, AttributionSupport.UNKNOWN),
                     ),
+                )
+            # A Direct turn has no resumable Provider session or private draft
+            # to continue. A ``max_output_tokens`` terminal is also not a
+            # useful same-model retry: this exact physical route has already
+            # exhausted its response envelope. If the graph declared a later
+            # compatible model, make that one fresh, visible route change.
+            # This is deliberately narrower than treating every malformed or
+            # incomplete response as retryable.
+            terminal_code = (
+                (evidence.terminal_code or "")
+                .removeprefix("agent_backend_")
+                .removeprefix("verifier_backend_")
+            )
+            target = _next_fallback_model(evidence)
+            if terminal_code == "direct_output_limit" and target is not None:
+                return self._decision(
+                    InvocationRecoveryRoute.MODEL_FALLBACK,
+                    failure_class,
+                    (
+                        (
+                            InvocationAttributionLens.CODE_PROVIDER_PROFILE,
+                            AttributionSupport.SUPPORTED,
+                        ),
+                        (InvocationAttributionLens.PROMPT_INPUT, AttributionSupport.UNKNOWN),
+                        (InvocationAttributionLens.RUNTIME_SKILL, AttributionSupport.UNKNOWN),
+                        (
+                            InvocationAttributionLens.FEEDBACK_OBSERVABILITY,
+                            AttributionSupport.UNKNOWN,
+                        ),
+                    ),
+                    requires_fresh_node_session=True,
+                    target_model=target,
                 )
             return self._decision(
                 InvocationRecoveryRoute.ATTRIBUTION_AUDIT,
@@ -251,7 +290,21 @@ class InvocationRecoveryPolicy:
                         ),
                     ),
                 )
-            if evidence.prior_same_class_retry_count == 0:
+            if evidence.prior_same_route_retry_count < evidence.same_route_retry_limit:
+                if evidence.private_continuation_available:
+                    return self._decision(
+                        InvocationRecoveryRoute.SESSION_CONTINUATION,
+                        failure_class,
+                        (
+                            (
+                                InvocationAttributionLens.CODE_PROVIDER_PROFILE,
+                                AttributionSupport.SUPPORTED,
+                            ),
+                            (InvocationAttributionLens.PROMPT_INPUT, AttributionSupport.WEAKENED),
+                            (InvocationAttributionLens.RUNTIME_SKILL, AttributionSupport.WEAKENED),
+                        ),
+                        requires_route_liveness_gate=True,
+                    )
                 return self._decision(
                     (
                         InvocationRecoveryRoute.WORKSPACE_RECOVERY
@@ -270,23 +323,22 @@ class InvocationRecoveryPolicy:
                     requires_fresh_node_session=True,
                     requires_route_liveness_gate=True,
                 )
-            if evidence.prior_same_class_retry_count == 1:
-                target = _next_fallback_model(evidence)
-                if target is not None:
-                    return self._decision(
-                        InvocationRecoveryRoute.MODEL_FALLBACK,
-                        failure_class,
+            target = _next_fallback_model(evidence)
+            if target is not None:
+                return self._decision(
+                    InvocationRecoveryRoute.MODEL_FALLBACK,
+                    failure_class,
+                    (
                         (
-                            (
-                                InvocationAttributionLens.CODE_PROVIDER_PROFILE,
-                                AttributionSupport.SUPPORTED,
-                            ),
-                            (InvocationAttributionLens.PROMPT_INPUT, AttributionSupport.WEAKENED),
-                            (InvocationAttributionLens.RUNTIME_SKILL, AttributionSupport.WEAKENED),
+                            InvocationAttributionLens.CODE_PROVIDER_PROFILE,
+                            AttributionSupport.SUPPORTED,
                         ),
-                        requires_fresh_node_session=True,
-                        target_model=target,
-                    )
+                        (InvocationAttributionLens.PROMPT_INPUT, AttributionSupport.WEAKENED),
+                        (InvocationAttributionLens.RUNTIME_SKILL, AttributionSupport.WEAKENED),
+                    ),
+                    requires_fresh_node_session=True,
+                    target_model=target,
+                )
             return self._decision(
                 InvocationRecoveryRoute.TERMINAL,
                 failure_class,
@@ -324,7 +376,6 @@ class InvocationRecoveryPolicy:
             return InvocationFailureClass.OUTPUT_CEILING
         if normalized in {
             "direct_structured_output_invalid_json",
-            "direct_structured_output_transport_invalid",
             "turn_failed_output_schema",
         }:
             return InvocationFailureClass.MALFORMED_TRANSPORT
@@ -357,6 +408,16 @@ class InvocationRecoveryPolicy:
             # compatible-model fallback; left UNKNOWN it produced no route at
             # all and the attempt sat until its full declared wall expired.
             "direct_no_first_provider_event",
+            # Codex has the same first-event transport question after its
+            # worker/app-server starts. A safe local lifecycle frame does not
+            # prove Prompt or Runtime Skill delivery; zero validated Provider
+            # events therefore routes through the same recorded liveness gate.
+            "codex_no_first_provider_event",
+            # A started Codex worker can also stop emitting Provider events
+            # mid-turn. This is adapter/route liveness evidence, not Agent
+            # feedback: the parent records only a safe count and idle interval
+            # before the Scheduler chooses one authorized fresh execution.
+            "codex_provider_stream_stalled",
             # Older Scheduler leaves normalize a closed adapter transport
             # terminal under this framework-owned safe code. It is still not
             # a semantic model failure; retryability remains an independent

@@ -708,6 +708,175 @@ class DiagnosticSemanticRepairSeedRecord(V2Contract):
         )
 
 
+class DiagnosticSemanticRepairContinuationRecord(V2Contract):
+    """Private Agent session retained between a diagnostic failure and repair.
+
+    A marked diagnostic node is deliberately settled before an operator asks
+    for a semantic repair.  The normal :class:`NodeContinuationRecord` cannot
+    be created at that point because it must name the later RepairAction.  A
+    tool-enabled Builder Agent, unlike a Direct structured turn, needs both
+    the parsed failure feedback *and* its private workspace/session in order
+    to make a local correction.  This pending record is therefore private
+    recovery state only: it is promoted to a normal action-bound continuation
+    only after the exact Scheduler authorization exists.
+    """
+
+    pending_id: Identifier
+    work_id: Identifier
+    attempt_id: Identifier
+    thread_id: NonEmptyStr
+    lineage_id: Identifier
+    workspace: NonEmptyStr
+    profile_digest: ContentHash
+    codex_config_digest: ContentHash
+    model: NonEmptyStr
+    output_schema_digest: ContentHash
+    definition_digest: ContentHash
+    proposal_policy_digest: ContentHash
+    input_fingerprint: ContentHash
+    source_output_commitment: ContentHash
+    previous_execution_ref: ArtifactRef
+    record_commitment: ContentHash
+    created_at: AwareDatetime
+
+    @model_validator(mode="after")
+    def validate_private_binding(self) -> DiagnosticSemanticRepairContinuationRecord:
+        if not Path(self.workspace).is_absolute():
+            raise ValueError("diagnostic semantic continuation must use an absolute workspace")
+        if self.previous_execution_ref.artifact_type != "control.proposal_execution":
+            raise ValueError("diagnostic semantic continuation source must be a proposal execution")
+        expected = self.compute_record_commitment(
+            work_id=self.work_id,
+            attempt_id=self.attempt_id,
+            thread_id=self.thread_id,
+            lineage_id=self.lineage_id,
+            workspace=self.workspace,
+            profile_digest=self.profile_digest,
+            codex_config_digest=self.codex_config_digest,
+            model=self.model,
+            output_schema_digest=self.output_schema_digest,
+            definition_digest=self.definition_digest,
+            proposal_policy_digest=self.proposal_policy_digest,
+            input_fingerprint=self.input_fingerprint,
+            source_output_commitment=self.source_output_commitment,
+            previous_execution_ref=self.previous_execution_ref,
+        )
+        if self.record_commitment != expected:
+            raise ValueError("diagnostic semantic continuation commitment mismatch")
+        if self.pending_id != self.pending_id_for(expected):
+            raise ValueError("diagnostic semantic continuation id is not derived from commitment")
+        return self
+
+    @staticmethod
+    def compute_record_commitment(
+        *,
+        work_id: str,
+        attempt_id: str,
+        thread_id: str,
+        lineage_id: str,
+        workspace: str,
+        profile_digest: str,
+        codex_config_digest: str,
+        model: str,
+        output_schema_digest: str,
+        definition_digest: str,
+        proposal_policy_digest: str,
+        input_fingerprint: str,
+        source_output_commitment: str,
+        previous_execution_ref: ArtifactRef,
+    ) -> ContentHash:
+        return sha256_digest(
+            canonical_json_bytes(
+                {
+                    "work_id": work_id,
+                    "attempt_id": attempt_id,
+                    "thread_id": thread_id,
+                    "lineage_id": lineage_id,
+                    "workspace": workspace,
+                    "profile_digest": profile_digest,
+                    "codex_config_digest": codex_config_digest,
+                    "model": model,
+                    "output_schema_digest": output_schema_digest,
+                    "definition_digest": definition_digest,
+                    "proposal_policy_digest": proposal_policy_digest,
+                    "input_fingerprint": input_fingerprint,
+                    "source_output_commitment": source_output_commitment,
+                    "previous_execution_ref": previous_execution_ref.model_dump(mode="json"),
+                }
+            )
+        )
+
+    @staticmethod
+    def pending_id_for(record_commitment: str) -> Identifier:
+        return (
+            "diagnostic-semantic-continuation-pending:"
+            f"{record_commitment.removeprefix('sha256:')[:24]}"
+        )
+
+    @classmethod
+    def capture(
+        cls,
+        *,
+        work_id: Identifier,
+        attempt_id: Identifier,
+        session: InvocationSession,
+        model: str,
+        output_schema_digest: ContentHash,
+        definition_digest: ContentHash,
+        proposal_policy_digest: ContentHash,
+        input_fingerprint: ContentHash,
+        source_output_commitment: ContentHash,
+        previous_execution_ref: ArtifactRef,
+    ) -> DiagnosticSemanticRepairContinuationRecord:
+        workspace = str(session.workspace.expanduser().resolve())
+        profile_digest = NodeContinuationRecord._normalize_digest(session.profile_hash)
+        config_digest = NodeContinuationRecord._normalize_digest(session.codex_config_sha256)
+        record_commitment = cls.compute_record_commitment(
+            work_id=work_id,
+            attempt_id=attempt_id,
+            thread_id=session.thread_id,
+            lineage_id=session.lineage_id,
+            workspace=workspace,
+            profile_digest=profile_digest,
+            codex_config_digest=config_digest,
+            model=model,
+            output_schema_digest=output_schema_digest,
+            definition_digest=definition_digest,
+            proposal_policy_digest=proposal_policy_digest,
+            input_fingerprint=input_fingerprint,
+            source_output_commitment=source_output_commitment,
+            previous_execution_ref=previous_execution_ref,
+        )
+        return cls(
+            pending_id=cls.pending_id_for(record_commitment),
+            work_id=work_id,
+            attempt_id=attempt_id,
+            thread_id=session.thread_id,
+            lineage_id=session.lineage_id,
+            workspace=workspace,
+            profile_digest=profile_digest,
+            codex_config_digest=config_digest,
+            model=model,
+            output_schema_digest=output_schema_digest,
+            definition_digest=definition_digest,
+            proposal_policy_digest=proposal_policy_digest,
+            input_fingerprint=input_fingerprint,
+            source_output_commitment=source_output_commitment,
+            previous_execution_ref=previous_execution_ref,
+            record_commitment=record_commitment,
+            created_at=datetime.now(UTC),
+        )
+
+    def restore_session(self) -> InvocationSession:
+        return InvocationSession(
+            thread_id=self.thread_id,
+            lineage_id=self.lineage_id,
+            workspace=Path(self.workspace),
+            profile_hash=self.profile_digest.removeprefix("sha256:"),
+            codex_config_sha256=self.codex_config_digest.removeprefix("sha256:"),
+        )
+
+
 class DiagnosticWorkspaceRecoveryRecord(V2Contract):
     """Private Builder-draft offer retained by one settled diagnostic failure.
 
@@ -1081,6 +1250,140 @@ class SemanticRepairSeedStore:
         return path.resolve(strict=True)
 
 
+class DiagnosticSemanticRepairContinuationStore:
+    """Permission-restricted pending Agent sessions for diagnostic repair.
+
+    This store deliberately sits between a settled diagnostic semantic failure
+    and a separately authorized correction.  It never makes a session visible
+    to an Artifact, scene, telemetry event, or runtime Agent.
+    """
+
+    def __init__(self, root: str | os.PathLike[str]) -> None:
+        requested = Path(root).expanduser()
+        if requested.exists() and requested.is_symlink():
+            raise ContinuationStoreError(
+                "diagnostic semantic continuation root cannot be a symlink"
+            )
+        requested.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if requested.is_symlink() or not requested.is_dir():
+            raise ContinuationStoreError(
+                "diagnostic semantic continuation root must be a real directory"
+            )
+        os.chmod(requested, 0o700)
+        self.root = requested.resolve(strict=True)
+
+    def save(
+        self,
+        record: DiagnosticSemanticRepairContinuationRecord,
+        *,
+        known_secret_values: tuple[str, ...] = (),
+    ) -> DiagnosticSemanticRepairContinuationRecord:
+        record = DiagnosticSemanticRepairContinuationRecord.model_validate(
+            record.model_dump(mode="python")
+        )
+        content = record.stable_json_bytes()
+        assert_secret_free(
+            content,
+            known_secret_values=known_secret_values,
+            context="private diagnostic semantic continuation",
+        )
+        destination = self._path(record.pending_id)
+        temporary = self.root / f".{uuid.uuid4().hex}.tmp"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb", closefd=True) as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, destination, follow_symlinks=False)
+            except FileExistsError:
+                if destination.read_bytes() != content:
+                    raise ContinuationStoreError(
+                        "diagnostic semantic continuation id already binds other state"
+                    ) from None
+            directory = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return record
+
+    def find_pending(
+        self,
+        *,
+        work_id: Identifier,
+        attempt_id: Identifier,
+        definition_digest: ContentHash,
+        proposal_policy_digest: ContentHash,
+        input_fingerprint: ContentHash,
+        previous_execution_ref: ArtifactRef,
+        workspace_root: Path,
+    ) -> DiagnosticSemanticRepairContinuationRecord | None:
+        """Return the one session captured by this exact diagnostic attempt."""
+
+        matches: list[DiagnosticSemanticRepairContinuationRecord] = []
+        for path in sorted(self.root.glob("*.json")):
+            if path.is_symlink() or not path.is_file():
+                raise ContinuationStoreError(
+                    "diagnostic semantic continuation store contains an unsafe entry"
+                )
+            record = self._read(path)
+            if (
+                record.work_id == work_id
+                and record.attempt_id == attempt_id
+                and record.definition_digest == definition_digest
+                and record.proposal_policy_digest == proposal_policy_digest
+                and record.input_fingerprint == input_fingerprint
+                and record.previous_execution_ref == previous_execution_ref
+            ):
+                matches.append(record)
+        if len(matches) > 1:
+            raise ContinuationStoreError(
+                "diagnostic attempt binds conflicting semantic continuations"
+            )
+        if not matches:
+            return None
+        record = matches[0]
+        root = workspace_root.expanduser().resolve(strict=True)
+        workspace = Path(record.workspace)
+        try:
+            resolved = workspace.resolve(strict=True)
+            resolved.relative_to(root)
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise ContinuationStoreError(
+                "diagnostic semantic continuation workspace is outside its authorized root"
+            ) from exc
+        if workspace.is_symlink() or not resolved.is_dir():
+            raise ContinuationStoreError("diagnostic semantic continuation workspace is unsafe")
+        return record
+
+    def _read(self, path: Path) -> DiagnosticSemanticRepairContinuationRecord:
+        flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise ContinuationStoreError(
+                "cannot safely read diagnostic semantic continuation"
+            ) from exc
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            raw = stream.read()
+        try:
+            return DiagnosticSemanticRepairContinuationRecord.model_validate_json(raw)
+        except Exception as exc:
+            raise ContinuationStoreError("invalid diagnostic semantic continuation") from exc
+
+    def _path(self, pending_id: str) -> Path:
+        key = hashlib.sha256(pending_id.encode("utf-8")).hexdigest()
+        return self.root / f"{key}.json"
+
+
 class DiagnosticWorkspaceRecoveryStore:
     """Permission-restricted pending private Builder workspace offers.
 
@@ -1297,6 +1600,35 @@ class NodeContinuationStore:
     ) -> NodeContinuationRecord | None:
         """Load the immutable record named by a public WorkAttempt commitment."""
 
+        record = self.inspect_commitment(record_commitment)
+        if record is None:
+            return None
+        root = workspace_root.expanduser().resolve(strict=True)
+        workspace = Path(record.workspace)
+        try:
+            resolved = workspace.resolve(strict=True)
+            resolved.relative_to(root)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise ContinuationStoreError(
+                "continuation workspace is outside its authorized root"
+            ) from exc
+        if workspace.is_symlink() or not resolved.is_dir():
+            raise ContinuationStoreError("continuation workspace is not a safe directory")
+        return record
+
+    def inspect_commitment(
+        self,
+        record_commitment: ContentHash,
+    ) -> NodeContinuationRecord | None:
+        """Read commitment-bound metadata without authorizing its workspace.
+
+        Diagnostic clone orchestration needs the immutable workspace path to
+        recover the exact marked ``runs/`` root that owns it.  Callers must
+        subsequently validate that root and call :meth:`load_commitment`
+        before using the record to restore a session.  This method alone is
+        never execution authority.
+        """
+
         continuation_id = NodeContinuationRecord.continuation_id_for(record_commitment)
         path = self._path(continuation_id)
         flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
@@ -1314,17 +1646,6 @@ class NodeContinuationStore:
             raise ContinuationStoreError("invalid private continuation state") from exc
         if record.record_commitment != record_commitment:
             raise ContinuationStoreError("continuation commitment does not match its record")
-        root = workspace_root.expanduser().resolve(strict=True)
-        workspace = Path(record.workspace)
-        try:
-            resolved = workspace.resolve(strict=True)
-            resolved.relative_to(root)
-        except (FileNotFoundError, ValueError, OSError) as exc:
-            raise ContinuationStoreError(
-                "continuation workspace is outside its authorized root"
-            ) from exc
-        if workspace.is_symlink() or not resolved.is_dir():
-            raise ContinuationStoreError("continuation workspace is not a safe directory")
         return record
 
     def find_repair_binding(
@@ -1384,6 +1705,8 @@ class NodeContinuationStore:
 
 __all__ = [
     "ContinuationStoreError",
+    "DiagnosticSemanticRepairContinuationRecord",
+    "DiagnosticSemanticRepairContinuationStore",
     "DiagnosticSemanticRepairSeedRecord",
     "DiagnosticWorkspaceRecoveryRecord",
     "DiagnosticWorkspaceRecoveryStore",

@@ -17,6 +17,7 @@ from agent_world.judge.rules import (
     RuleExecutionContext,
     evaluate_rule,
     initially_evaluable_invariants,
+    initially_evaluable_rules,
     rule_value_sources,
 )
 
@@ -208,6 +209,25 @@ def test_initial_rule_router_defers_action_invariants_but_keeps_state_invariants
     assert initially_evaluable_invariants((state_invariant, action_invariant)) == (
         state_invariant,
     )
+    sampling_rule = Rule(
+        rule_id="rule:sampling-window",
+        family="sampling",
+        description="A requested action window is ordered.",
+        boolean_operator="all",
+        case_sensitivity="positive_only",
+        clauses=(
+            RuleClause(
+                clause_id="clause:sampling-window",
+                left=_reference("args", "/start", "number"),
+                operator="less_than",
+                right=_reference("args", "/end", "number"),
+            ),
+        ),
+    )
+
+    assert initially_evaluable_rules(
+        (state_invariant, action_invariant, sampling_rule)
+    ) == (state_invariant,)
 
 
 def test_weak_exists_assertion_shape_is_not_expressible() -> None:

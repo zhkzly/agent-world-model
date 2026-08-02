@@ -54,12 +54,15 @@ class AgentOutput(SemanticAdvisoryOutput, BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
 
 
-# Tool semantics was empirically shown to exhaust a 65k-token provider turn
-# when four coupled tools were authored together.  This is a physical work
-# boundary, not an Agent preference: all layers retain the same frozen order
-# while each proposal owns at most two tools.
-MAX_TOOLS_PER_SEMANTICS_BATCH = 2
-MAX_SEMANTICS_BATCHES = 4
+# A real ToolSemantics turn exhausted a Provider-owned structured-output
+# envelope after sustained progress.  The framework must not pretend that its
+# logical budget is a physical Provider cap.  Instead the physical boundary is
+# one complete tool: cross-tool facts are frozen by SharedToolSemantics first,
+# and independent singleton leaves may then be scheduled within configured
+# capacity.  This is topology, not a request for the Agent to invent less
+# business meaning.
+MAX_TOOLS_PER_SEMANTICS_BATCH = 1
+MAX_SEMANTICS_BATCHES = 8
 
 
 class PlannedSearchQuery(AgentOutput):
@@ -1166,11 +1169,11 @@ class ToolSemanticsDraft(AgentOutput):
 class WorldClosureDraft(AgentOutput):
     """Global invariants authored after all tool contracts are visible."""
 
-    invariants: Annotated[tuple[Rule, ...], Field(min_length=1)]
+    invariants: tuple[Rule, ...]
 
 
 class WorldClosureSourceDraft(AgentOutput):
-    invariants: Annotated[tuple[RuleDraft, ...], Field(min_length=1)]
+    invariants: tuple[RuleDraft, ...]
 
 
 class WorldClosureReferenceTerm(AgentOutput):
@@ -1346,7 +1349,7 @@ class TrainingContractContext(AgentOutput):
     root_state_schema: dict[str, JsonValue]
     initial_state_constraints: tuple[Rule, ...] = ()
     tools: Annotated[tuple[TrainingToolContext, ...], Field(min_length=1)]
-    world_invariants: Annotated[tuple[TrainingRuleCatalogEntry, ...], Field(min_length=1)]
+    world_invariants: tuple[TrainingRuleCatalogEntry, ...]
     task_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
     fidelity: Annotated[tuple[FidelityStatement, ...], Field(min_length=1)]
     evidence_claims: tuple[Claim, ...] = ()
@@ -1504,7 +1507,7 @@ class WorldModelDraft(AgentOutput):
     boundary: WorldBoundary
     state: StateSchema
     tools: Annotated[tuple[ToolContract, ...], Field(min_length=1)]
-    invariants: Annotated[tuple[Rule, ...], Field(min_length=1)]
+    invariants: tuple[Rule, ...]
     task_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
     fidelity: Annotated[tuple[FidelityStatement, ...], Field(min_length=1)]
 
@@ -1714,11 +1717,11 @@ class ToolCouplingGroupPlan(V2Contract):
         tuple[Literal["namespace", "state_overlap"], ...], Field(min_length=1)
     ]
     mode: Literal["single_batch", "multi_batch"]
-    # Captured pre-BC-17 plans may contain four-tool groups.  They are
-    # read-only diagnostic inputs only: ``derive_final_design_definitions``
-    # rejects an oversized physical batch before any new graph can execute or
-    # release.  Keep this decoder ceiling so test-node can genuinely rerun a
-    # compatible historical two-tool shard without replaying it.
+    # Captured historical plans may contain wider groups.  They remain
+    # read-only diagnostic inputs: ``derive_final_design_definitions`` rejects
+    # every non-singleton physical batch before a new graph can execute or
+    # release.  Keep this decoder ceiling only so a project Agent can inspect
+    # the captured topology without treating it as a new execution plan.
     batches: Annotated[
         tuple[
             Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=4)],
@@ -1753,8 +1756,8 @@ class ToolCouplingPlan(V2Contract):
     architecture_ref: ArtifactRef
     groups: Annotated[tuple[ToolCouplingGroupPlan, ...], Field(min_length=1, max_length=8)]
     # See ``ToolCouplingGroupPlan.batches``: new plans are mechanically
-    # emitted at the two-tool cap, while this wider decoder is needed only to
-    # inspect a captured ancestor closure in diagnostic mode.
+    # singleton shards, while this wider decoder is needed only to inspect a
+    # captured ancestor closure in diagnostic mode.
     execution_batches: Annotated[
         tuple[
             Annotated[tuple[Identifier, ...], Field(min_length=1, max_length=4)],
@@ -1892,7 +1895,7 @@ class WorldRuleSemanticsSourceDraft(AgentOutput):
     """Executable reset/global rules authored only after schema closure exists."""
 
     initial_state_rules: InitialStateRulesSourceDraft
-    invariants: Annotated[tuple[RuleDraft, ...], Field(min_length=1, max_length=64)]
+    invariants: Annotated[tuple[RuleDraft, ...], Field(max_length=64)]
 
 
 class ToolRuleConditionsSourceDraft(AgentOutput):
@@ -2012,7 +2015,7 @@ class ToolSemanticSourceDraft(AgentOutput):
 
 
 class ToolSemanticsBatchSourceDraft(AgentOutput):
-    """A bounded group of state-coupled tools repaired as one semantic unit."""
+    """One complete physical ToolSemantics shard for one frozen tool."""
 
     tools: Annotated[
         tuple[ToolSemanticSourceDraft, ...],

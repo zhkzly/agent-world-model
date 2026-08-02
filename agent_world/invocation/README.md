@@ -26,14 +26,15 @@ path. The application-wide semaphore applies across both transports.
 
 ## Execution contract
 
-1. The controller creates an `AgentProfileSpec` with explicit model,
-   `ReasoningEffort`, instructions, skill/hook bundles, built-in capabilities,
-   MCP tool allowlists, network domains, credential handles, output schema and
-   limits.
-2. `ProfileResolver` creates one private materialization root containing an
-   isolated `HOME`, `CODEX_HOME`, stable workspace, content-addressed skills,
-   hook configuration and MCP configuration. Ambient user/project Codex config
-   is rejected rather than inherited.
+1. The controller creates an `AgentProfileSpec` with an explicit model,
+   `ReasoningEffort`, output schema, limits, and exactly one Runtime Skill only
+   for an Agentic node. A Direct LLM has no Skill, Hook, tool, workspace input,
+   or profile-owned instruction surface.
+2. `ProfileResolver` creates private SDK state (`HOME`/`CODEX_HOME`) and a
+   real Agent workspace. It mounts the content-addressed Runtime Skill through
+   Codex's normal local Skill discovery path, while the SDK receives that
+   workspace as its actual cwd. Runtime profiles have no base/developer
+   instruction fields and no Hook bundle.
 3. Authentication and routing are explicit and environment-handle only.
    `CredentialBinding` resolves the allowlisted `OPENAI_API_KEY`; the optional
    `OPENAI_BASE_URL` is another private worker value.  The worker selects its
@@ -64,55 +65,38 @@ path. The application-wide semaphore applies across both transports.
    material before writing NDJSON. A soft timeout requests `turn.interrupt()`;
    the parent kills the complete worker/app-server process group if it does not
    stop during the grace period.
-6. Codex requires interactive trust for non-managed hooks. When and only when a
-   resolved profile contains resolver-vetted, content-addressed hooks, the
-   worker launches the exact runtime bundled with the pinned SDK using Codex's
-   one-run `--dangerously-bypass-hook-trust` flag. This bypasses hook review,
-   not tool approval or sandboxing; no project or ambient hooks are loadable.
-7. A Direct request reads the same two private environment values only in
+6. A Direct request reads the same two private environment values only in
    memory, constructs `AsyncOpenAI` inside `direct_llm.py`, and discards the
    response after redaction and local schema-envelope decoding. It has no
    subprocess, tool surface, transcript, session, or durable provider payload.
 
-## Isolation boundary
+## Private SDK state, direct-host execution
 
-This layer enforces:
+This layer keeps only the state that genuinely belongs to the invocation:
 
-- no ambient `HOME`, `CODEX_HOME`, Skills, Hooks, MCP config or credentials;
-- explicit content-addressed copies of Skills and Hooks;
-- explicit MCP server and per-server tool allowlists;
+- one private `CODEX_HOME` with plugins disabled and one verified mounted
+  Runtime Skill; it prevents accidental global Skill/Hook/plugin inheritance,
+  not host access;
 - API-key and optional base-URL values only in the dedicated worker/app-server
-  environment; the Agent shell still receives the separately compiled,
-  credential-free `shell_environment_policy`;
-- `cli_auth_credentials_store = "keyring"` plus a fail-closed check that
-  rejects an `auth.json` cache under the isolated `CODEX_HOME`;
-- `shell_environment_policy.inherit = "none"`, so Agent shell commands do not
-  inherit SDK/MCP credentials;
-- no full-access sandbox profile and no interactive escalation; a generated
-  custom permissions profile denies the host filesystem by default, opens only
-  the runtime roots and declared bundles for reading, and grants the isolated
-  workspace either read-only or write access exactly as requested;
-- no undeclared workspace/materialization Agent control files; a custom
-  project-root marker plus zero-byte project-doc budget prevents parent
-  discovery;
-- hash verification of copied bundles, generated `config.toml`, merged
-  `hooks.json`, and the complete public resolved-profile marker before each
-  invocation;
-- same-profile, same-lineage, same-workspace thread continuation;
-- process-level timeout/cancellation and recursive result redaction.
+  environment; `cli_auth_credentials_store = "keyring"` and a fail-closed
+  `auth.json` check prevent credentials from being written to disk;
+- `shell_environment_policy.inherit = "none"` so shell commands do not inherit
+  the provider credential, while the configured shell has the normal host
+  `PATH`, Python, `uv`, and a writable local temporary/cache directory;
+- a project-root marker solely to keep Codex from walking up to the Foundry
+  checkout and loading unrelated project configuration;
+- hash verification of the mounted Skill and generated config, same-profile
+  continuation ownership, process cancellation, and recursive result
+  redaction.
 
-It does **not** make generated code trusted and does not replace an OS/container
-supervisor. Codex workspace sandboxing does not provide CPU/memory/process
-quotas, sealed-verifier isolation, package verification, or release authority.
-HTTP MCP servers are pinned to configured URLs and stdio MCP servers are
-explicit profile capabilities, but a server's own internal network behavior
-still requires ToolBroker/OS network enforcement. The experimental Codex
-domain proxy and bundled-runtime hook flag must be checked by `agent-world
-doctor` on the actual installed versions. Candidate runtime execution belongs
-in the Judge supervisor, not in this SDK worker.
+It deliberately does **not** create a bwrap/unshare sandbox, namespace,
+virtual `/workspace` or `/state`, tool facade, generated permission profile,
+or path translation layer. The worker explicitly uses SDK
+`Sandbox.full_access`; the Code Agent works in its real cwd and can use normal
+host commands. Candidate runtime execution remains a separate direct-host
+Judge process with framework-owned cwd, temporary state, resource limits,
+timeouts, and release gates.
 
-The isolated materialization directory can contain session state and must be
-treated as sensitive runtime state. Authentication files are forbidden there;
-the controller rejects any `auth.json` cache. The controller owns the
-directory lifecycle and must delete it after the implementation lineage is
-closed; it must never be copied into `envpkg v3` or release evidence.
+Private materialization may contain session state and must not be copied into
+`envpkg v3` or release evidence. This is credential/provenance hygiene, not a
+claim that generated code is OS-isolated or trusted.

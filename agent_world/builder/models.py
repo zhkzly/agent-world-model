@@ -280,8 +280,6 @@ class ImplementationContract(V2Contract):
         "LICENSE",
     )
     python_requires: Literal[">=3.12,<3.13"] = ">=3.12,<3.13"
-    root_project_mode: Literal["virtual-read-only-source-tree"] = "virtual-read-only-source-tree"
-    dependency_install_mode: Literal["offline-wheel-only"] = "offline-wheel-only"
     source_builds: Literal["prohibited"] = "prohibited"
     install_network: Literal["disabled"] = "disabled"
     required_license_role: Literal["license"] = "license"
@@ -359,7 +357,18 @@ class CandidateFileDeclaration(V2Contract):
 class CandidateRuntimeDeclaration(V2Contract):
     protocol: Literal["agent-world.runtime.v2"] = "agent-world.runtime.v2"
     transport: Literal["stdio-jsonl"] = "stdio-jsonl"
-    argv: Annotated[tuple[NonEmptyStr, ...], Field(min_length=2, max_length=32)]
+    argv: Annotated[
+        tuple[NonEmptyStr, ...],
+        Field(
+            min_length=2,
+            max_length=32,
+            description=(
+                "Framework launch metadata, not a build command: start with "
+                "`.venv/bin/python` or `.venv/bin/python3`, then `-m` and the import "
+                "module derived exactly from entry_path."
+            ),
+        ),
+    ]
     workdir: Literal["."] = "."
     entry_path: NonEmptyStr
     startup_timeout_seconds: Annotated[float, Field(gt=0, le=300)] = 30
@@ -411,7 +420,18 @@ class CandidateTaskMaterializerDeclaration(V2Contract):
 
 
 class CandidatePublicSelfCheckDeclaration(V2Contract):
-    argv: Annotated[tuple[NonEmptyStr, ...], Field(min_length=3, max_length=3)]
+    argv: Annotated[
+        tuple[NonEmptyStr, ...],
+        Field(
+            min_length=3,
+            max_length=3,
+            description=(
+                "Framework launch metadata, not a build command: start with "
+                "`.venv/bin/python` or `.venv/bin/python3`, then `-m` and the import "
+                "module derived exactly from entry_path."
+            ),
+        ),
+    ]
     entry_path: NonEmptyStr
 
     @field_validator("entry_path")
@@ -445,10 +465,14 @@ def normalize_candidate_completion_output(value: JsonValue) -> JsonValue:
     The callable name ``materialize`` is fixed by the implementation contract.
     Its module is uniquely derived from one lexically importable ``entry_path``;
     normalize any ``*:materialize`` spelling to that canonical representation
-    without asking an Agent to make a semantic choice. An arbitrary callable
-    remains invalid. Component declarations and file roles also repeat one fixed
-    relationship. Normalize that relationship only when every referenced path is
-    unique and no path claims conflicting component roles.
+    without asking an Agent to make a semantic choice. The runtime and public
+    self-check launch argv are the same kind of framework-owned mechanics: the
+    fixed Python interpreter and module invocation are uniquely derived from a
+    valid entry path, so no Agent-supplied wrapper or argument may alter them.
+    An arbitrary callable or invalid entry path remains invalid. Component
+    declarations and file roles also repeat one fixed relationship. Normalize
+    that relationship only when every referenced path is unique and no path
+    claims conflicting component roles.
     """
 
     if not isinstance(value, dict):
@@ -486,6 +510,16 @@ def normalize_candidate_completion_output(value: JsonValue) -> JsonValue:
                 for stripped, declaration in zip(stripped_paths, declarations, strict=True)
             }
 
+            # A complete declaration inventory with all three project-root
+            # files under one outer ``candidate/`` prefix is sufficient proof
+            # of that syntax-only namespace mistake.  Do not make this
+            # framework-owned normalization conditional on the Agent having
+            # already made every component entry-path declaration consistent:
+            # otherwise the first reported error is a misleading root-file
+            # miss and hides the actual component mismatch.
+            for declaration, stripped in zip(declarations, stripped_paths, strict=True):
+                declaration["path"] = stripped
+
             def resolve_declared_path(raw: object, role: str) -> str | None:
                 if not isinstance(raw, str):
                     return None
@@ -519,12 +553,6 @@ def normalize_candidate_completion_output(value: JsonValue) -> JsonValue:
                         resolve_declared_path(path, "public_test") for path in public_tests
                     )
                     if all(path is not None for path in resolved_tests):
-                        for declaration, stripped in zip(
-                            declarations,
-                            stripped_paths,
-                            strict=True,
-                        ):
-                            declaration["path"] = stripped
                         for field, resolved in resolved_components.items():
                             component = proposal[field]
                             assert isinstance(component, dict)
@@ -605,17 +633,34 @@ def normalize_candidate_completion_output(value: JsonValue) -> JsonValue:
                 pass
             else:
                 task_materializer["entrypoint"] = f"{module}:materialize"
+    for component_name in ("runtime", "public_self_check"):
+        component = proposal.get(component_name)
+        if not isinstance(component, dict):
+            continue
+        entry_path = component.get("entry_path")
+        if not isinstance(entry_path, str):
+            continue
+        try:
+            module = _module_name_for_path(entry_path)
+        except ValueError:
+            continue
+        component["argv"] = [".venv/bin/python", "-m", module]
     return proposal
 
 
 class CandidateCompletion(WorkspaceProposalOutput, V2Contract):
-    """The only structured object an Engineer may claim after a turn."""
+    """The only structured object an Engineer may claim after a turn.
+
+    A blocked response semantically declares only ``schema_version``,
+    ``status``, and ``blocking_reason``.  The strict Provider transport may
+    additionally carry inactive declaration fields as ``null`` or empty
+    arrays; every non-null Candidate output declaration remains reserved for
+    a completed response.
+    """
 
     status: Literal["completed", "blocked"]
     blocking_reason: NonEmptyStr | None = None
     project_root: Literal["candidate"] | None = None
-    root_project_mode: Literal["virtual-read-only-source-tree"] | None = None
-    dependency_install_mode: Literal["offline-wheel-only"] | None = None
     runtime: CandidateRuntimeDeclaration | None = None
     task_materializer: CandidateTaskMaterializerDeclaration | None = None
     public_self_check: CandidatePublicSelfCheckDeclaration | None = None
@@ -643,8 +688,6 @@ class CandidateCompletion(WorkspaceProposalOutput, V2Contract):
                     value is not None
                     for value in (
                         self.project_root,
-                        self.root_project_mode,
-                        self.dependency_install_mode,
                         self.runtime,
                         self.task_materializer,
                         self.public_self_check,
@@ -666,8 +709,6 @@ class CandidateCompletion(WorkspaceProposalOutput, V2Contract):
             )
         required = {
             "project_root": self.project_root,
-            "root_project_mode": self.root_project_mode,
-            "dependency_install_mode": self.dependency_install_mode,
             "runtime": self.runtime,
             "task_materializer": self.task_materializer,
             "public_self_check": self.public_self_check,
@@ -714,7 +755,12 @@ class CandidateCompletion(WorkspaceProposalOutput, V2Contract):
             if declaration is None or declaration.role != role:
                 raise PydanticCustomError(
                     "completion_required_role_missing",
-                    "a required component path is missing its fixed file role",
+                    "CandidateCompletion.files must declare required component path "
+                    "`{required_path}` with fixed role `{required_role}`",
+                    {
+                        "required_path": str(path),
+                        "required_role": role,
+                    },
                 )
         for path in self.public_test_paths:
             declaration = by_path.get(path)
@@ -723,6 +769,13 @@ class CandidateCompletion(WorkspaceProposalOutput, V2Contract):
                     "completion_public_test_role_invalid",
                     "every public test path must be declared with role public_test",
                 )
+        declared_public_tests = {item.path for item in self.files if item.role == "public_test"}
+        if declared_public_tests != set(self.public_test_paths):
+            raise PydanticCustomError(
+                "completion_public_test_role_invalid",
+                "files with role public_test and public_test_paths must contain exactly "
+                "the same paths",
+            )
         return self
 
 

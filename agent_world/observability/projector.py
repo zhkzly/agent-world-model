@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
-from typing import TypeGuard
+from typing import Literal, TypeGuard
 
 from agent_world.artifact_store import ArtifactStore, ArtifactWriter
 from agent_world.builder.models import BuilderWorkspaceProgress, BuildRecord
@@ -29,18 +29,22 @@ from agent_world.control.work import (
     ValidationIssue,
     ValidationReport,
     WorkAttempt,
+    classify_progress,
     work_input_fingerprint,
 )
 from agent_world.control.work_graph import WorkGraphManifest
 from agent_world.control.work_store import WorkControlHead, WorkControlStore
-from agent_world.invocation import InvocationControlStore
+from agent_world.invocation import InvocationControlRecord, InvocationControlStore
 
 from .paths import ObservabilityError, ObservabilityRoot
 from .render import render_coordinate, render_scene
 from .scene import (
     MAX_WATERMARK_COORDINATES,
+    ActiveWorkPointer,
     BudgetExhaustion,
     CandidateWorkspaceLiveness,
+    CodexTerminalEnvelope,
+    FrontierProgress,
     InvocationLivenessPhase,
     OperationPhase,
     PipelineStage,
@@ -48,10 +52,12 @@ from .scene import (
     RunSceneIndex,
     RuntimeAgentActivityCounts,
     RuntimeAgentLiveness,
+    RuntimeAgentRequestShape,
     Scene,
     SceneHead,
     SceneIssue,
     SceneTierBEvent,
+    active_work_digest,
     fold,
 )
 from .subprocess_scene import safe_dynamic_text
@@ -145,7 +151,8 @@ class SceneProjector:
         events = self._tier_b_events(
             tuple(attempt.telemetry_trace_id or run_id for attempt in attempts)
         )
-        scene = fold(scene_heads, events)
+        active_work = self._active_work(scope_id, heads)
+        scene = fold(scene_heads, events, active_work=active_work)
         self._materialize(scene)
         return scene
 
@@ -193,12 +200,14 @@ class SceneProjector:
                 )
             )
         )
+        active_work = self._active_work(scope_id, heads)
         return (
             cached_coordinates == expected_visible
             and cached.watermark.coordinate_overflow_count
             == max(0, len(expected_coordinates) - len(expected_visible))
             and cached.watermark.aggregate_digest == expected_aggregate
             and cached.watermark.graph_digest == self._graph_digest(scope_id, ordered)
+            and cached.watermark.active_work_digest == active_work_digest(active_work)
         )
 
     def safe_scope_id(self, scope_id: str) -> str:
@@ -256,7 +265,11 @@ class SceneProjector:
         # failed descendant instead of the permitted Builder repair.
         report = self._repair_authorization_report(head) or self._validation_report(attempt)
         candidate_files = self.candidate_files_for_attempt(attempt)
-        prior_issue_ids = self._previous_issue_ids(attempt)
+        previous_reports = self._previous_validation_reports(
+            attempt,
+            policy_digest=(report.policy_digest if report is not None else None),
+        )
+        prior_issue_ids = previous_reports[-1].blocking_issue_ids if previous_reports else ()
         source_run_id = run_id or attempt.telemetry_trace_id
         issues = tuple(
             self._scene_issue(issue, candidate_files=candidate_files)
@@ -269,6 +282,7 @@ class SceneProjector:
             terminal_failure_elapsed_ms,
         ) = self._operation_timing(attempt)
         runtime_agent_liveness = self._runtime_agent_liveness(attempt)
+        runtime_agent_request_shape = self._runtime_agent_request_shape(attempt)
         attempt_elapsed_ms, attempt_elapsed_estimated = _attempt_elapsed_ms(
             attempt,
             observed_at=observed_at,
@@ -284,6 +298,7 @@ class SceneProjector:
             source_run_id=source_run_id,
         )
         budget_exhaustion = self._budget_exhaustion(attempt, report)
+        codex_terminal_envelope = self._codex_terminal_envelope(attempt, report)
         coordinate = head.coordinate
         return SceneHead(
             scope_id=self._safe(head.scope_id),
@@ -305,6 +320,7 @@ class SceneProjector:
             input_fingerprint=head.input_fingerprint,
             issues=issues,
             previous_issue_ids=prior_issue_ids,
+            frontier_progress=self._frontier_progress(report, previous_reports),
             run_id=self._safe(source_run_id) if source_run_id is not None else None,
             graph_digest=graph_digest,
             updated_at=head.updated_at,
@@ -315,9 +331,85 @@ class SceneProjector:
             terminal_failure_phase=terminal_failure_phase,
             terminal_failure_elapsed_ms=terminal_failure_elapsed_ms,
             runtime_agent_liveness=runtime_agent_liveness,
+            codex_terminal_envelope=codex_terminal_envelope,
+            runtime_agent_request_shape=runtime_agent_request_shape,
             candidate_workspace_liveness=candidate_workspace_liveness,
             budget_exhaustion=budget_exhaustion,
         )
+
+    def _active_work(
+        self,
+        scope_id: str,
+        heads: Sequence[WorkControlHead],
+    ) -> tuple[ActiveWorkPointer, ...]:
+        """Aggregate live control records without leaking private invocation data.
+
+        A WorkControlHead is updated after a Scheduler transition, whereas an
+        InvocationControlRecord is written before dispatch.  During a retry,
+        that gap is expected: the durable head can still say ``failed`` or
+        ``repair_authorized`` while a successor physical turn is actually
+        running.  The top-level Scene must show both facts.
+        """
+
+        if self.invocation_control is None:
+            return ()
+        labels = {
+            head.coordinate.coordinate_key: self._safe(
+                f"{head.coordinate.component}.{head.coordinate.stage}.{head.coordinate.artifact_slot}"
+            )
+            for head in heads
+        }
+        try:
+            records = self.invocation_control.list_records()
+        except Exception:
+            return ()
+        grouped: dict[str, list[InvocationControlRecord]] = {}
+        for record in records:
+            coordinate_key = record.owner.coordinate
+            if (
+                record.settled
+                or record.owner.owner_kind.value != "work_operation"
+                or record.owner.scope_id != scope_id
+                or coordinate_key not in labels
+            ):
+                continue
+            grouped.setdefault(coordinate_key, []).append(record)
+        active: list[ActiveWorkPointer] = []
+        for coordinate_key, grouped_records in grouped.items():
+            routes = {item.route for item in grouped_records}
+            route: Literal["codex_sdk", "direct_llm", "mixed"] = (
+                "codex_sdk"
+                if routes == {"codex_sdk"}
+                else "direct_llm" if routes == {"direct_llm"} else "mixed"
+            )
+            activity_times = tuple(
+                item.last_provider_progress_at
+                or item.last_local_activity_at
+                or item.updated_at
+                for item in grouped_records
+            )
+            first_provider_times = tuple(
+                item.first_provider_progress_at
+                for item in grouped_records
+                if item.first_provider_progress_at is not None
+            )
+            active.append(
+                ActiveWorkPointer(
+                    coordinate_key=coordinate_key,
+                    coordinate_label=labels[coordinate_key],
+                    route=route,
+                    active_turn_count=len(grouped_records),
+                    provider_progress_count=sum(
+                        item.provider_progress_count for item in grouped_records
+                    ),
+                    started_at=min(item.started_at for item in grouped_records),
+                    last_activity_at=max(activity_times),
+                    first_provider_progress_at=(
+                        min(first_provider_times) if first_provider_times else None
+                    ),
+                )
+            )
+        return tuple(sorted(active, key=lambda item: (item.started_at, item.coordinate_key)))
 
     def _operation_timing(
         self,
@@ -349,20 +441,47 @@ class SceneProjector:
         )
 
     def _runtime_agent_liveness(self, attempt: WorkAttempt) -> RuntimeAgentLiveness | None:
-        """Project safe liveness bound to this exact durable proposal invocation.
+        """Project safe liveness for every physical turn of one proposal operation.
 
         Telemetry remains the richer primary source when it contains one exact
         span.  A durable invocation-control record is the fallback when a
         worker exited or a parent recovered before telemetry could materialize
         a usable terminal span.  Neither path exposes prompt, response,
         endpoint, private session, or workspace data.
+
+        A Code Agent may legitimately use a bounded same-workspace pre-commit
+        correction.  Those are multiple *physical* InvocationBackend calls
+        beneath one Scheduler Proposal operation, so the operation ownership
+        (rather than only its first dispatch id) is the fence for the control
+        projection.  This keeps a live second turn observable without turning
+        it into a Scheduler repair or leaking private invocation identities.
         """
 
-        invocation_id = self._proposal_invocation_id(attempt)
-        if invocation_id is None:
-            return None
-        telemetry_liveness = self._telemetry_runtime_agent_liveness(attempt, invocation_id)
-        control_liveness = self._control_runtime_agent_liveness(attempt, invocation_id)
+        control_records = self._control_records_for_attempt(attempt)
+        control_liveness = self._control_runtime_agent_liveness(
+            attempt,
+            records=control_records,
+        )
+        if not control_records:
+            # Older/synthetic telemetry-only states and a newly started
+            # operation before control admission still retain one exact
+            # dispatch fence.  Preserve that established telemetry path; the
+            # ownership aggregate is an enhancement, not a prerequisite for
+            # observing a live Agent turn.
+            invocation_id = self._proposal_invocation_id(attempt)
+            if invocation_id is None:
+                return None
+            return self._telemetry_runtime_agent_liveness(attempt, invocation_id)
+        # A one-turn proposal still benefits from the richer telemetry activity
+        # breakdown.  With several records, the control aggregate is the only
+        # unambiguous view: a per-invocation telemetry span must not be
+        # double-counted or arbitrarily selected.
+        if len(control_records) != 1:
+            return control_liveness
+        telemetry_liveness = self._telemetry_runtime_agent_liveness(
+            attempt,
+            control_records[0].invocation_id,
+        )
         if telemetry_liveness is None:
             return control_liveness
         if control_liveness is None:
@@ -443,52 +562,149 @@ class SceneProjector:
     def _control_runtime_agent_liveness(
         self,
         attempt: WorkAttempt,
-        invocation_id: str,
+        *,
+        records: tuple[InvocationControlRecord, ...] | None = None,
     ) -> RuntimeAgentLiveness | None:
-        """Project redacted durable control facts after exact Work ownership checks."""
+        """Project redacted control facts after exact Work ownership checks."""
 
-        if self.invocation_control is None:
+        records = records if records is not None else self._control_records_for_attempt(attempt)
+        if not records:
             return None
-        try:
-            record = self.invocation_control.read(invocation_id)
-        except Exception:
+        started = tuple(
+            elapsed
+            for record in records
+            if (elapsed := _elapsed_ms(attempt.started_at, record.started_at)) is not None
+        )
+        if not started:
             return None
-        if record is None or not self._control_record_belongs_to_attempt(
-            record.owner.owner_kind.value,
-            record.owner.owner_id,
-            record.owner.scope_id,
-            record.owner.coordinate,
-            record.owner.immutable_input_closure_digest,
-            attempt,
-            invocation_id,
-        ):
-            return None
-        started_elapsed_ms = _elapsed_ms(attempt.started_at, record.started_at)
-        if started_elapsed_ms is None:
-            return None
+        first_progress = tuple(
+            elapsed
+            for record in records
+            if (
+                elapsed := _elapsed_ms(
+                    attempt.started_at,
+                    record.first_provider_progress_at,
+                )
+            )
+            is not None
+        )
+        last_progress = tuple(
+            elapsed
+            for record in records
+            if (
+                elapsed := _elapsed_ms(
+                    attempt.started_at,
+                    record.last_provider_progress_at,
+                )
+            )
+            is not None
+        )
+        heartbeats = tuple(
+            (elapsed, _control_liveness_phase(record.last_local_phase.value))
+            for record in records
+            if (
+                elapsed := _elapsed_ms(
+                    attempt.started_at,
+                    record.last_local_activity_at,
+                )
+            )
+            is not None
+        )
+        terminal = tuple(
+            elapsed
+            for record in records
+            if record.settled
+            and (elapsed := _elapsed_ms(attempt.started_at, record.updated_at)) is not None
+        )
+        latest_heartbeat = max(heartbeats, key=lambda item: item[0], default=None)
         return RuntimeAgentLiveness(
-            started_elapsed_ms=started_elapsed_ms,
-            first_progress_elapsed_ms=_elapsed_ms(
-                attempt.started_at,
-                record.first_provider_progress_at,
-            ),
-            last_progress_elapsed_ms=_elapsed_ms(
-                attempt.started_at,
-                record.last_provider_progress_at,
-            ),
-            last_local_heartbeat_elapsed_ms=_elapsed_ms(
-                attempt.started_at,
-                record.last_local_activity_at,
+            started_elapsed_ms=min(started),
+            first_progress_elapsed_ms=min(first_progress) if first_progress else None,
+            last_progress_elapsed_ms=max(last_progress) if last_progress else None,
+            last_local_heartbeat_elapsed_ms=(
+                latest_heartbeat[0] if latest_heartbeat is not None else None
             ),
             last_local_heartbeat_phase=(
-                _control_liveness_phase(record.last_local_phase.value)
-                if record.last_local_activity_at is not None
-                else None
+                latest_heartbeat[1] if latest_heartbeat is not None else None
             ),
-            terminal_elapsed_ms=(
-                _elapsed_ms(attempt.started_at, record.updated_at) if record.settled else None
-            ),
-            observed_event_count=record.provider_progress_count,
+            terminal_elapsed_ms=max(terminal) if terminal else None,
+            observed_event_count=sum(record.provider_progress_count for record in records),
+        )
+
+    def _runtime_agent_request_shape(
+        self,
+        attempt: WorkAttempt,
+    ) -> RuntimeAgentRequestShape | None:
+        """Project safe request dimensions only from an exact control record.
+
+        A telemetry trace may be absent precisely when a Direct stream emitted
+        no first Provider event.  The durable control-plane record is therefore
+        the authoritative source for request-shape comparison, but never for
+        raw Prompt/Skill/schema content.
+        """
+
+        records = tuple(
+            record
+            for record in self._control_records_for_attempt(attempt)
+            if record.request_shape is not None
+        )
+        if not records:
+            return None
+        # The latest physical turn is the effective request currently being
+        # executed (or whose result became the accepted Candidate); it is also
+        # the only request shape a project-execution Agent needs to compare
+        # against the preceding scene.
+        record = max(records, key=lambda item: (item.updated_at, item.invocation_id))
+        shape = record.request_shape
+        if shape is None:  # pragma: no cover - filtered above
+            return None
+        return RuntimeAgentRequestShape(
+            prompt_bytes=shape.prompt_bytes,
+            runtime_skill_count=shape.runtime_skill_count,
+            output_schema_bytes=shape.output_schema_bytes,
+            allowed_builtin_tool_count=shape.allowed_builtin_tool_count,
+            execution_mode=shape.execution_mode,
+            continued_session=shape.continued_session,
+        )
+
+    def _control_records_for_attempt(
+        self,
+        attempt: WorkAttempt,
+    ) -> tuple[InvocationControlRecord, ...]:
+        """Return all exact physical records owned by one Proposal operation.
+
+        The Work operation id and immutable input fingerprint are the durable
+        fence.  An invocation id alone cannot identify a bounded internal
+        Code-Agent correction because its second turn intentionally has a new
+        physical id.
+        """
+
+        if self.invocation_control is None:
+            return ()
+        try:
+            operations = tuple(
+                self.artifacts.get_json(reference, OperationRun)
+                for reference in attempt.operation_run_refs
+            )
+        except Exception:
+            return ()
+        proposal_operations = tuple(item for item in operations if item.kind == "proposal")
+        if len(proposal_operations) != 1:
+            return ()
+        operation = proposal_operations[0]
+        expected_closure = work_input_fingerprint(operation.input_refs).removeprefix("sha256:")
+        try:
+            records = self.invocation_control.list_records()
+        except Exception:
+            return ()
+        return tuple(
+            record
+            for record in records
+            if record.owner.owner_kind.value == "work_operation"
+            and record.owner.owner_id == operation.operation_run_id
+            and record.owner.scope_id == attempt.coordinate.scope_id
+            and record.owner.coordinate == attempt.coordinate.coordinate_key
+            and record.owner.immutable_input_closure_digest == expected_closure
         )
 
     def _control_record_belongs_to_attempt(
@@ -792,7 +1008,84 @@ class SceneProjector:
             operation_not_started=not attempt.operation_run_refs,
         )
 
-    def _previous_issue_ids(self, attempt: WorkAttempt) -> tuple[str, ...]:
+    def _codex_terminal_envelope(
+        self,
+        attempt: WorkAttempt,
+        report: ValidationReport | None,
+    ) -> CodexTerminalEnvelope | None:
+        """Project one verified closed Codex terminal fact for investigation.
+
+        This is deliberately not generic feedback.  A Code Agent cannot act
+        on an app-server terminal envelope, and no provider prose is useful or
+        safe in a project view.  The compact fact lets the project-execution
+        Agent distinguish a known terminal category from a missing/opaque
+        envelope before choosing a D-layer investigation.
+        """
+
+        if report is None or report.status != "error" or len(report.issues) != 1:
+            return None
+        failure_code = report.issues[0].code
+        if not failure_code.startswith("turn_failed_"):
+            return None
+        evidence_refs = tuple(
+            ref
+            for ref in report.evidence_refs
+            if ref.artifact_type == "control.leaf_failure_evidence"
+        )
+        if len(evidence_refs) != 1:
+            return None
+        try:
+            evidence = self.artifacts.get_json(evidence_refs[0])
+        except ValueError:
+            return None
+        if not isinstance(evidence, Mapping):
+            return None
+        if (
+            evidence.get("attempt_id") != attempt.attempt_id
+            or evidence.get("failure_code") != failure_code
+            or evidence.get("coordinate") != report.coordinate.model_dump(mode="json")
+        ):
+            return None
+        details = evidence.get("terminal_details")
+        if not isinstance(details, Mapping):
+            return None
+        candidate: dict[str, object] = {}
+        for key in ("terminal_error_shape", "codex_error_info"):
+            value = details.get(key)
+            if isinstance(value, str):
+                candidate[key] = value
+        http_status = details.get("http_status")
+        if isinstance(http_status, int) and not isinstance(http_status, bool):
+            candidate["http_status"] = http_status
+        advisory_signals = details.get("advisory_text_signals")
+        if isinstance(advisory_signals, list) and all(
+            isinstance(signal, str) for signal in advisory_signals
+        ):
+            candidate["advisory_text_signals"] = tuple(advisory_signals)
+        if not candidate:
+            return None
+        try:
+            return CodexTerminalEnvelope.model_validate(candidate)
+        except ValueError:
+            # The Artifact is Tier B input.  A malformed or newly introduced
+            # value must disappear from the compact Agent view rather than
+            # becoming raw dynamic text or a speculative new repair route.
+            return None
+
+    def _previous_validation_reports(
+        self,
+        attempt: WorkAttempt,
+        *,
+        policy_digest: str | None,
+    ) -> tuple[ValidationReport, ...]:
+        """Return the durable prior report lineage for one coordinate.
+
+        The control plane's progress lattice needs the earlier states to
+        distinguish genuine sibling progress from A -> B -> A oscillation.
+        A scene must project that result, not infer authority from a raw issue
+        count or only the last pair of identifiers.
+        """
+
         if attempt.parent_attempt_id is None:
             return ()
         candidates: list[WorkAttempt] = []
@@ -809,18 +1102,54 @@ class SceneProjector:
                 candidates.append(candidate)
         if not candidates:
             return ()
-        previous = max(
-            candidates,
-            key=lambda item: (item.finished_at or item.scheduled_at, item.ordinal),
-        )
-        report = self._validation_report(previous)
-        if report is None:
-            return ()
-        return tuple(
-            sorted(
-                issue.normalized_identity for issue in report.issues if issue.severity == "blocker"
+        reports = tuple(
+            report
+            for candidate in sorted(
+                candidates,
+                key=lambda item: (item.finished_at or item.scheduled_at, item.ordinal),
             )
+            if (report := self._validation_report(candidate)) is not None
+            and (policy_digest is None or report.policy_digest == policy_digest)
         )
+        return reports
+
+    @staticmethod
+    def _frontier_progress(
+        report: ValidationReport | None,
+        previous_reports: tuple[ValidationReport, ...],
+    ) -> FrontierProgress | None:
+        """Map the authoritative repair classification into the scene vocabulary.
+
+        This is a read-only projection.  It grants no repair authority; that
+        remains exclusively in the WorkRepairLedger.  Returning ``None`` asks
+        the pure scene reducer to use its conservative fallback when no exact
+        same-policy lineage is available.
+        """
+
+        if report is None or not previous_reports:
+            return None
+        previous = previous_reports[-1]
+        if (
+            previous.coordinate != report.coordinate
+            or previous.policy_digest != report.policy_digest
+            or any(
+                item.coordinate != report.coordinate or item.policy_digest != report.policy_digest
+                for item in previous_reports
+            )
+        ):
+            return None
+        classification = classify_progress(
+            previous,
+            report,
+            history=previous_reports[:-1],
+        )
+        if classification == "resolved":
+            return "resolved"
+        if classification == "strict_progress":
+            return "strict_progress"
+        if classification in {"unchanged", "oscillating", "regressed"}:
+            return "no_progress"
+        return "unknown"
 
     def candidate_files_for_attempt(self, attempt: WorkAttempt) -> dict[str, str]:
         """Resolve only declared generated files from gate id -> role -> BuildRecord.

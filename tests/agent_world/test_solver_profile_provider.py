@@ -5,12 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.config import AgentBackendConfig
 from agent_world.contracts import PermissionScope
 from agent_world.invocation import (
     NodeCapabilityRequirement,
+    ProfileResolutionError,
     SandboxMode,
+    safe_profile_resolution_category,
     verify_resolved_profile,
 )
 from agent_world.judge.reachability import InteractiveSolveDecision, SolverProfileProvider
@@ -18,15 +20,13 @@ from agent_world.judge.reachability import InteractiveSolveDecision, SolverProfi
 
 def _provider(
     *,
-    structured_output_transport: str = "provider_schema",
     fallback_models: tuple[str, ...] = (),
-) -> IsolatedAgentProfileProvider:
-    return IsolatedAgentProfileProvider(
+) -> AgentProfileProvider:
+    return AgentProfileProvider(
         AgentBackendConfig(
             model="configured-real-model",
             fallback_models=fallback_models,
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
-            structured_output_transport=structured_output_transport,  # type: ignore[arg-type]
         ),
         source_environment={
             "PATH": "/usr/bin:/bin",
@@ -79,12 +79,16 @@ def test_solver_profile_is_fresh_source_blind_and_capability_empty(tmp_path: Pat
     )
 
     assert first.profile_id == "challenger"
-    assert first.profile_version == "reachability-solver-1"
-    assert first.sandbox is SandboxMode.READ_ONLY
+    # The episode solver is a normal prompt-only Challenger profile, not a
+    # special tool-free Codex session profile.
+    assert first.profile_version == "12"
+    assert first.sandbox is SandboxMode.FULL_ACCESS
     assert first.allowed_builtin_tools == ()
     assert first.allowed_network_domains == ()
     assert first.skills == ()
-    assert first.hooks == ()
+    assert not hasattr(first, "hooks")
+    assert not hasattr(first, "base_instructions")
+    assert not hasattr(first, "developer_instructions")
     assert first.effective_capability_plan.node_id == "challenger.reachability-solver"
     assert first.effective_capability_plan.intrinsic_builtin_tools == ()
     assert first.effective_capability_plan.external.to_public_dict() == {
@@ -112,41 +116,23 @@ def test_solver_profile_is_fresh_source_blind_and_capability_empty(tmp_path: Pat
     assert private_names.isdisjoint(staged_names)
     assert "AGENTS.md" not in staged_names
     assert ".codex" not in staged_names
-    assert {item.name for item in first.workspace.iterdir()} == {
-        ".agent-world-project-root",
-        ".agent-world-tmp",
-    }
+    assert list(first.workspace.iterdir()) == []
 
     worker_environment = first.worker_environment()
-    assert worker_environment["HOME"] == str(first.home)
-    assert worker_environment["CODEX_HOME"] == str(first.codex_home)
+    assert "HOME" not in worker_environment
+    assert "CODEX_HOME" not in worker_environment
     assert worker_environment["OPENAI_API_KEY"] == "test-model-credential"
     assert "AMBIENT_SECRET" not in worker_environment
     public_profile = json.dumps(first.to_public_dict(), sort_keys=True)
     assert "test-model-credential" not in public_profile
     assert "must-not-cross-solver-boundary" not in public_profile
-
-    config_text = (first.codex_home / "config.toml").read_text(encoding="utf-8")
-    # The solver's isolation is a property of its resolved profile -- asserted
-    # above: no skills, no MCP, no credentials, no ambient environment.  It is not
-    # a list of disabled feature flags in generated configuration.  That list is
-    # gone: it duplicated the runtime's own decisions about which tools exist, and
-    # an unrecognized key in it used to stop the app-server from booting.
-    assert "[features]" not in config_text
-    assert "web_search" not in config_text
-    assert 'inherit = "none"' in config_text
-    assert "[[skills.config]]" not in config_text
-    assert "[mcp_servers." not in config_text
-    # Source-blind is about content, not path depth: the solver's runtime root
-    # lives under the framework workspace (asserted above), but none of that
-    # workspace's private files or ambient Codex config may be staged into it.
+    assert first.backend == "direct_llm"
+    assert first.codex_bin is None
+    assert not first.home.exists()
+    assert not first.codex_home.exists()
+    assert first.to_public_dict()["codex_home"] is None
     assert not (first.workspace / "AGENTS.md").exists()
     assert not (first.workspace / ".codex").exists()
-    assert "rollout_budget.limit_tokens = 4096" in config_text
-    assert "rollout_budget.reminder_at_remaining_tokens = [409]" in config_text
-    assert "rollout_budget.sampling_token_weight = 1.0" in config_text
-    assert "rollout_budget.prefill_token_weight = 1.0" in config_text
-    assert "rollout_budget.reminder_interval_tokens" not in config_text
     verify_resolved_profile(first)
     verify_resolved_profile(second)
 
@@ -245,33 +231,67 @@ def test_solver_profile_defensively_copies_output_schema(tmp_path: Path) -> None
     verify_resolved_profile(profile)
 
 
-def test_solver_keeps_codex_transport_when_direct_json_object_is_configured(tmp_path: Path) -> None:
-    provider = _provider(structured_output_transport="json_object")
+def test_solver_and_direct_profile_are_prompt_only(tmp_path: Path) -> None:
+    provider = _provider()
 
     direct = provider.resolve(
         role="challenger",
-        lineage_id="direct-json-object",
+        lineage_id="direct-prompt-only",
         workspace=tmp_path / "direct",
         output_schema=_solver_schema(),
         permissions=PermissionScope(),
         requirement=NodeCapabilityRequirement.structured_output(
-            node_id="challenger.direct-json-object",
+            node_id="challenger.direct-prompt-only",
             role="challenger",
         ),
         rollout_token_limit=2_048,
     )
     solver = provider.resolve_solver(
-        lineage_id="solver-json-object",
+        lineage_id="solver-prompt-only",
         workspace=tmp_path / "solver",
         output_schema=_solver_schema(),
         rollout_token_limit=2_048,
     )
 
-    assert direct.structured_output_transport == "json_object"
-    assert solver.structured_output_transport == "provider_schema"
+    assert direct.backend == "direct_llm"
+    assert solver.backend == "direct_llm"
+    assert direct.skills == ()
+    assert solver.skills == ()
 
 
-def test_single_token_solver_budget_has_no_invalid_reminder_threshold(
+def test_direct_profile_ignores_a_cached_codex_agent_runtime(tmp_path: Path) -> None:
+    """A Direct node may follow a real Agent node in one scheduler process."""
+
+    provider = _provider()
+    provider.codex_bin = tmp_path / "cached-codex" / "codex"
+    provider.codex_bin_sha256 = "a" * 64
+
+    direct = provider.resolve(
+        role="challenger",
+        lineage_id="direct-after-agent",
+        workspace=tmp_path / "direct-after-agent",
+        output_schema=_solver_schema(),
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.structured_output(
+            node_id="challenger.direct-after-agent",
+            role="challenger",
+        ),
+        rollout_token_limit=2_048,
+    )
+
+    assert direct.backend == "direct_llm"
+    assert direct.codex_bin is None
+    assert direct.codex_bin_sha256 is None
+    verify_resolved_profile(direct)
+    assert (
+        safe_profile_resolution_category(
+            ProfileResolutionError("Direct profile cannot declare a Codex runtime")
+        )
+        == "direct_inherited_agent_runtime"
+    )
+
+
+def test_single_token_solver_budget_stays_direct_without_a_codex_config(
     tmp_path: Path,
 ) -> None:
     profile = _provider().resolve_solver(
@@ -281,7 +301,7 @@ def test_single_token_solver_budget_has_no_invalid_reminder_threshold(
         rollout_token_limit=1,
     )
 
-    config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
-    assert "rollout_budget.limit_tokens = 1" in config_text
-    assert "rollout_budget.reminder_at_remaining_tokens = []" in config_text
+    assert profile.rollout_token_limit == 1
+    assert profile.backend == "direct_llm"
+    assert not profile.codex_home.exists()
     verify_resolved_profile(profile)

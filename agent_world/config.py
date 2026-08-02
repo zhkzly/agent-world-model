@@ -35,7 +35,7 @@ class ConfigModel(BaseModel):
 class AgentBackendConfig(ConfigModel):
     model: str = Field(min_length=1)
     # Explicit candidates for a *new* same-node diagnostic definition after a
-    # classified transient has exhausted its one fresh-session retry.  This is
+    # classified transient has exhausted its configured fresh-session retries. This is
     # deliberately configuration rather than a leaf-local fallback: route
     # selection remains visible, profile-hashed, and subject to the Work
     # control-plane's immutable parent closure.
@@ -67,22 +67,30 @@ class AgentBackendConfig(ConfigModel):
     invocation_timeout_seconds: float = Field(default=2_700, gt=0)
     structured_invocation_timeout_seconds: float = Field(default=2_700, gt=0)
     # A Provider stream that has started but stops yielding events is a
-    # transport-liveness condition, not an output-token cap.  Direct calls
-    # retain their declared logical timeout until the stream has made real
-    # progress; set this to ``None`` only when an external supervisor owns
-    # that post-progress liveness decision.
-    direct_stream_idle_timeout_seconds: float | None = Field(default=300, gt=0)
-    # Time-to-first-Provider-event is the narrower question of whether the
-    # transport is alive at all.  Before any event there is no partial result to
-    # protect, and a silent socket is indistinguishable from a dropped one, so
-    # this bound is much tighter than the logical wall above.  It is not a
-    # thinking-time limit: reasoning is bounded by the invocation timeouts, and
-    # the idle bound governs silence only after real progress.  A real run has
-    # already shown the failure mode this prevents -- a stream that opened,
-    # emitted zero events, and held the node for its full 8-hour wall with no
-    # retryable terminal for policy to act on.  Set to ``None`` only when an
-    # external supervisor owns first-event liveness.
-    direct_first_event_timeout_seconds: float | None = Field(default=120, gt=0)
+    # transport-liveness condition, not an output-token cap.  Both Direct and
+    # Codex adapters retain their declared logical timeout until the stream has
+    # made real progress; set this to ``None`` only when an external supervisor
+    # owns that post-progress liveness decision.
+    provider_stream_idle_timeout_seconds: float | None = Field(default=300, gt=0)
+    # Time-to-first-Provider-event asks whether either configured transport is
+    # alive at all.  Before any validated event there is no partial result to
+    # protect, and a silent Direct stream or Codex worker is indistinguishable
+    # from a dropped transport, so this bound is much tighter than the logical
+    # wall above.  It is not a thinking-time limit: once an event arrives the
+    # bound retires and normal invocation/idle policies apply.  Set to ``None``
+    # only when an external supervisor owns first-event liveness.
+    provider_first_event_timeout_seconds: float | None = Field(default=120, gt=0)
+    # Bounded provider-level transport retries the backend SDK may spend
+    # *before any Provider event is observed*.  This is deliberately narrow:
+    # the official OpenAI/Codex SDKs retry only connection failures, 429, and
+    # >=500 with exponential backoff, and never resume a stream that has
+    # already emitted content.  A pre-first-event transport 5xx carries no
+    # semantic signal and no turn progress, so absorbing it here does not hide
+    # a turn failure from the Scheduler -- it only smooths an intermittent
+    # relay/tunnel.  Semantic and turn-level retries remain the Scheduler's;
+    # this never resends a turn whose stream already produced Provider output.
+    # Set to ``0`` to restore the previous "Scheduler owns every retry" policy.
+    provider_transport_max_retries: int = Field(default=2, ge=0, le=5)
     # These two values are the logical Environment Builder session envelope.
     # A provider can still stop one SDK turn at its own smaller output ceiling;
     # the WorkGraph turns that ceiling into explicit resumable physical turns.
@@ -92,17 +100,22 @@ class AgentBackendConfig(ConfigModel):
     # Scheduler records the resulting absolute retry instant and checks the
     # prior ICP record before it opens the fresh node-local session.
     infrastructure_retry_backoff_seconds: float = Field(default=5.0, ge=0)
-    # ``json_object`` is the Direct, tool-free structured-node transport.  It
-    # asks the provider for one JSON object without making the model manually
-    # serialize a second JSON document into a string.  Local Pydantic and
-    # semantic validation remain the acceptance path.  Agentic Builder turns
-    # retain their provider-schema protocol and their resumable logical
-    # session envelope.
-    structured_output_transport: Literal["provider_schema", "json_envelope", "json_object"] = (
-        "provider_schema"
-    )
+    # A classified transient may need more than one fresh physical attempt on
+    # the same configured model before a later model is selected. The value is
+    # frozen into every eligible Agent/Direct WorkDefinition, so changing it is
+    # a visible control-policy revision rather than a hidden adapter loop.
+    maximum_same_model_infrastructure_retries: int = Field(default=2, ge=1, le=5)
+    # ``structured_turn_token_limit`` is a framework-owned logical budget. It
+    # is deliberately not an implicit HTTP ``max_output_tokens`` parameter:
+    # Providers have distinct physical envelopes, and forcing the framework
+    # budget into that field can truncate an otherwise valid structured turn.
+    # Leave this unset to let the configured Provider apply its normal output
+    # policy. Configure a positive value only when a deployment explicitly
+    # needs a provider-side cap, which remains separate from framework budget
+    # accounting and Scheduler policy.
+    direct_provider_max_output_tokens: int | None = Field(default=None, gt=0)
     tool_output_token_limit: int = Field(default=2_048, ge=512, le=32_768)
-    # A real isolated structured-node diagnostic can need the same long
+    # A real structured-node diagnostic can need the same long
     # observation envelope as CandidateBuild.  Keep this finite so leases,
     # recovery, and aggregate budgets remain accountable, but do not silently
     # reintroduce a short one-million-token ceiling below an explicitly
@@ -246,6 +259,7 @@ def _require_exact_jina_origin(value: HttpUrl, *, official_host: str) -> None:
 
 class JudgeConfig(ConfigModel):
     clean_build_timeout_seconds: float = Field(default=600, gt=0)
+    runtime_episode_concurrency: int = Field(default=8, ge=1, le=16)
     uv_cache_dir: Path | None = None
     maximum_tasks_per_verifier_batch: int = Field(default=2, ge=1, le=8)
     maximum_structured_reworks: int = Field(default=3, ge=0, le=8)

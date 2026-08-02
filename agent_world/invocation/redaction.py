@@ -18,7 +18,7 @@ _TERMINAL_DIAGNOSTIC_ASSIGNMENT = re.compile(
     r"(?i)\b(api[ _-]?key|authorization|token|secret|password)\b\s*[:=]\s*\S+"
 )
 _TERMINAL_DIAGNOSTIC_OPAQUE = re.compile(r"\b[A-Za-z0-9._~+/=-]{32,}\b")
-_TERMINAL_DIAGNOSTIC_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9._-])/(?:[^\s'\"<>]+)")
+_LOCAL_DIAGNOSTIC_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9._-])/(?:[^\s'\"<>]+)")
 _CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
 _SENSITIVE_NAMES = frozenset(
     {
@@ -107,18 +107,19 @@ def redacted_terminal_diagnostic_excerpt(
     return compact[:maximum_characters] if compact else None
 
 
-def redacted_command_diagnostic_excerpt(
+def redacted_local_diagnostic_excerpt(
     value: object,
     *,
     redactor: Redactor,
     maximum_characters: int = 256,
 ) -> str | None:
-    """Return a local-only shell failure excerpt without path or secret detail.
+    """Return a local-only diagnostic excerpt without filesystem detail.
 
-    A constructed command audit needs the concrete shell failure rather than
-    merely a nonzero result. Unlike a Provider terminal, command output can
-    also echo private absolute sandbox/profile paths, so remove those after
-    the existing credential/URL/opaque-token scrub.
+    App-server startup failures can include host paths as well as routes and
+    credentials.  A project-execution Agent only needs the failure shape, so
+    retain a bounded redacted excerpt while removing those local paths.  This
+    helper is deliberately general: it does not assert an old tool façade or
+    any filesystem-isolation topology.
     """
 
     excerpt = redacted_terminal_diagnostic_excerpt(
@@ -128,7 +129,7 @@ def redacted_command_diagnostic_excerpt(
     )
     if excerpt is None:
         return None
-    return _TERMINAL_DIAGNOSTIC_ABSOLUTE_PATH.sub("[REDACTED_PATH]", excerpt)
+    return _LOCAL_DIAGNOSTIC_ABSOLUTE_PATH.sub("[REDACTED_PATH]", excerpt)
 
 
 def _sensitive_key(value: str) -> bool:

@@ -1,10 +1,9 @@
-"""Three hermetic Agent profiles used by every semantic pipeline node."""
+"""Private invocation profiles for Direct LLM and real Codex Agent nodes."""
 
 from __future__ import annotations
 
 import copy
 import hashlib
-import json
 import os
 import shutil
 import uuid
@@ -42,8 +41,8 @@ _FALLBACK_ROUTE_DIRECTORY_PREFIX = "route-"
 _FALLBACK_ROUTE_DIGEST_LENGTH = 64
 
 
-def logical_workspace_for_isolated_agent_workspace(workspace: Path) -> Path:
-    """Recover the frozen input root from one isolated profile workspace.
+def logical_workspace_for_agent_workspace(workspace: Path) -> Path:
+    """Recover the frozen input root from one Agent profile workspace.
 
     Primary profiles live directly below ``.agent-runtime``.  A selected
     fallback model uses a child route root so it cannot overwrite the primary
@@ -54,10 +53,10 @@ def logical_workspace_for_isolated_agent_workspace(workspace: Path) -> Path:
 
     requested = workspace.expanduser()
     if requested.is_symlink():
-        raise ValueError("isolated Agent workspace must not be a symlink")
+        raise ValueError("Agent workspace must not be a symlink")
     resolved = requested.resolve(strict=True)
     if not resolved.is_dir() or resolved.name != "workspace":
-        raise ValueError("isolated Agent workspace has an invalid layout")
+        raise ValueError("Agent workspace has an invalid layout")
     materialization_root = resolved.parent
     runtime_root = materialization_root
     if materialization_root.name != ".agent-runtime":
@@ -69,64 +68,15 @@ def logical_workspace_for_isolated_agent_workspace(workspace: Path) -> Path:
             or any(character not in "0123456789abcdef" for character in route_digest)
             or materialization_root.parent.name != ".agent-runtime"
         ):
-            raise ValueError("isolated Agent fallback workspace has an invalid layout")
+            raise ValueError("Agent fallback workspace has an invalid layout")
         runtime_root = materialization_root.parent
     if runtime_root.is_symlink() or runtime_root.parent.is_symlink():
-        raise ValueError("isolated Agent runtime layout must not contain symlinks")
+        raise ValueError("Agent runtime layout must not contain symlinks")
     return runtime_root.parent
 
 
-def _logical_output_schema_instructions(
-    output_schema: JsonObject | None,
-    *,
-    transport: str,
-) -> str | None:
-    """Render the logical contract when a Direct transport cannot carry it.
-
-    ``json_envelope`` deliberately asks the Provider to enforce only a small
-    outer object.  The model still needs the complete inner artifact contract;
-    otherwise it can produce a syntactically valid envelope whose payload uses
-    plausible but wrong field names.  ``json_object`` has the same need because
-    its compatible-gateway response mode carries no JSON Schema at all.
-    """
-
-    if output_schema is None or transport == "provider_schema":
-        return None
-    schema_json = json.dumps(
-        output_schema,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    if transport == "json_envelope":
-        transport_instruction = (
-            "Return only the outer JSON object with the one field artifact_json. "
-            "Its string value must decode to one JSON value that satisfies the "
-            "logical schema below; the small outer envelope is not the artifact schema."
-        )
-    elif transport == "json_object":
-        transport_instruction = "Return one direct JSON value satisfying the logical schema below."
-    else:
-        raise ValueError(f"unsupported structured output transport: {transport}")
-    return "\n".join(
-        (
-            "## Logical structured output contract",
-            transport_instruction,
-            "Use the literal property names and closed-object rules in this schema. "
-            "Do not substitute aliases, add prose, Markdown fences, or extra fields.",
-            "Input/context documents may have their own schema_version or similarly named "
-            "fields; they are data for the task, not fields to copy into this output. When this "
-            "logical schema declares a const value, emit exactly that value if you include the "
-            "field; otherwise omit a defaulted field only when this schema permits omission.",
-            "<logical_output_schema_json>",
-            schema_json,
-            "</logical_output_schema_json>",
-        )
-    )
-
-
-class IsolatedAgentProfileProvider:
-    """Resolve exactly three roles; no ambient profile, skill, hook or MCP fallback."""
+class AgentProfileProvider:
+    """Resolve exactly three roles; no ambient profile, Skill, or MCP fallback."""
 
     def __init__(
         self,
@@ -142,16 +92,11 @@ class IsolatedAgentProfileProvider:
         self.source_environment = dict(
             os.environ if source_environment is None else source_environment
         )
-        try:
-            codex_runtime = resolve_codex_runtime(config.codex_bin)
-        except CodexRuntimeUnavailable as exc:
-            raise ValueError(str(exc)) from exc
-        # The outer worker and its inner bwrap command sandbox must use this
-        # same pinned executable.  Materializing it on every profile prevents
-        # the worker's bundled-runtime fallback from becoming an invisible
-        # unmounted dependency at command execution time.
-        self.codex_bin = codex_runtime.path
-        self.codex_bin_sha256 = codex_runtime.sha256
+        # A prompt-only Direct LLM must not resolve, pin, or materialize the
+        # Codex runtime at all. Resolve that executable lazily only for a node
+        # that actually asks for Agent tools.
+        self.codex_bin: Path | None = None
+        self.codex_bin_sha256: str | None = None
         handle = "model-auth"
         binding = CredentialBinding(
             handle=handle,
@@ -163,6 +108,18 @@ class IsolatedAgentProfileProvider:
             credential_bindings={handle: binding},
             allowed_credential_handles=(handle,),
         )
+
+    def _ensure_codex_runtime(self) -> None:
+        """Resolve the pinned SDK executable only for a real Codex Agent."""
+
+        if self.codex_bin is not None:
+            return
+        try:
+            codex_runtime = resolve_codex_runtime(self.config.codex_bin)
+        except CodexRuntimeUnavailable as exc:
+            raise ValueError(str(exc)) from exc
+        self.codex_bin = codex_runtime.path
+        self.codex_bin_sha256 = codex_runtime.sha256
 
     def resolve(
         self,
@@ -211,6 +168,9 @@ class IsolatedAgentProfileProvider:
             job_permission=permissions,
             requirement=requirement,
         )
+        agentic = bool(capability_plan.intrinsic_builtin_tools)
+        if agentic:
+            self._ensure_codex_runtime()
         logical_workspace = workspace.expanduser().resolve()
         logical_workspace.mkdir(parents=True, exist_ok=True)
         materialization_root = logical_workspace / ".agent-runtime"
@@ -227,15 +187,17 @@ class IsolatedAgentProfileProvider:
                 f"{_FALLBACK_ROUTE_DIRECTORY_PREFIX}{route_digest}"
             )
         agent_workspace = materialization_root / "workspace"
-        resolved = self.resolver.resolve(
-            self._spec(
-                role,
-                cast(JsonObject, output_schema),
-                capability_plan=capability_plan,
-                rollout_token_limit=rollout_token_limit,
-                invocation_timeout_seconds=invocation_timeout_seconds,
-                model_override=model_override,
-            ),
+        spec = self._spec(
+            role,
+            cast(JsonObject, output_schema),
+            capability_plan=capability_plan,
+            rollout_token_limit=rollout_token_limit,
+            invocation_timeout_seconds=invocation_timeout_seconds,
+            model_override=model_override,
+        )
+        resolve_profile = self.resolver.resolve if agentic else self.resolver.resolve_direct
+        resolved = resolve_profile(
+            spec,
             # Framework artifact/job ids intentionally use typed ``:``
             # separators, while ProfileResolver requires an identity that is
             # safe to place in Codex configuration and local runtime paths.
@@ -248,7 +210,8 @@ class IsolatedAgentProfileProvider:
             workspace=agent_workspace,
             source_environment=self.source_environment,
         )
-        self._copy_framework_inputs(logical_workspace, resolved.workspace)
+        if agentic:
+            self._copy_framework_inputs(logical_workspace, resolved.workspace)
         return resolved
 
     def resolve_solver(
@@ -258,16 +221,18 @@ class IsolatedAgentProfileProvider:
         workspace: Path,
         output_schema: dict[str, object],
         rollout_token_limit: int,
+        invocation_timeout_seconds: float | None = None,
         model_override: str | None = None,
     ) -> ResolvedAgentProfile:
-        """Materialize Challenger's tool-free interactive reachability mode.
+        """Materialize a source-blind, prompt-only public episode solver.
 
-        The supplied ``workspace`` is only a framework-owned parent for private
-        runtime directories.  Its contents are deliberately not staged or
-        mounted into the Agent workspace: task, observation and tool schemas
-        reach the solver exclusively through the invocation prompt.  A fresh
-        materialization root on every call also prevents one sampled episode
-        from inheriting another episode's Codex state or history.
+        The interactive Challenger does not receive a Codex tool, workspace
+        input, Runtime source, or private evaluator state.  It is therefore a
+        Direct LLM loop, not a tool-free pseudo-Agent session.  Each turn gets
+        its complete public episode trace from the node Prompt.  The supplied
+        ``workspace`` remains only a framework-owned parent for an empty,
+        per-run profile root, so no candidate or Judge-private file can be
+        copied into the Direct profile by accident.
         """
 
         if isinstance(rollout_token_limit, bool) or not isinstance(rollout_token_limit, int):
@@ -294,33 +259,23 @@ class IsolatedAgentProfileProvider:
         materialization_root = runtime_parent / f"{lineage_digest}-{uuid.uuid4().hex}"
         agent_workspace = materialization_root / "workspace"
 
-        requirement = NodeCapabilityRequirement(
-            node_id=_SOLVER_NODE_ID,
+        # ``resolve`` stages framework input files below the logical workspace.
+        # Give it a new empty child rather than the caller's Judge workspace so
+        # this Direct LLM can never inherit candidate or evaluator files.
+        direct_logical_workspace = agent_workspace / "prompt-only"
+        return self.resolve(
             role="challenger",
-            sandbox=SandboxMode.READ_ONLY,
-            intrinsic_builtin_tools=(),
-            external=ExternalCapabilitySet(),
-        )
-        capability_plan = compile_effective_capability_plan(
-            role_maximum=self._role_maximum("challenger"),
-            job_permission=PermissionScope(),
-            requirement=requirement,
-        )
-        return self.resolver.resolve(
-            self._solver_spec(
-                cast(JsonObject, solver_schema),
-                capability_plan=capability_plan,
-                rollout_token_limit=rollout_token_limit,
-                model_override=model_override,
-            ),
-            # Judge lineage ids intentionally carry typed ':' separators, while
-            # ProfileResolver accepts filesystem-safe identities only.  Bind the
-            # full caller identity through a collision-resistant digest instead
-            # of weakening the resolver's global name policy.
             lineage_id=f"reachability-{full_lineage_digest}",
-            materialization_root=materialization_root,
-            workspace=agent_workspace,
-            source_environment=self.source_environment,
+            workspace=direct_logical_workspace,
+            output_schema=cast(dict[str, object], solver_schema),
+            permissions=PermissionScope(),
+            requirement=NodeCapabilityRequirement.structured_output(
+                node_id=_SOLVER_NODE_ID,
+                role="challenger",
+            ),
+            rollout_token_limit=rollout_token_limit,
+            invocation_timeout_seconds=invocation_timeout_seconds,
+            model_override=model_override,
         )
 
     def profile_descriptor(
@@ -337,23 +292,26 @@ class IsolatedAgentProfileProvider:
             job_permission=permissions,
             requirement=requirement,
         )
+        if capability_plan.intrinsic_builtin_tools:
+            self._ensure_codex_runtime()
         spec = self._spec(role, None, capability_plan=capability_plan)
+        agentic = bool(capability_plan.intrinsic_builtin_tools)
         return {
             "profile_id": spec.profile_id,
             "profile_version": spec.profile_version,
-            "backend": "codex_sdk",
+            "backend": "codex_sdk" if agentic else "direct_llm",
             "model": spec.model,
             "model_provider": spec.model_provider,
             "openai_base_url_environment": spec.openai_base_url_environment,
-            "codex_bin_sha256": spec.codex_bin_sha256,
+            "codex_bin_sha256": spec.codex_bin_sha256 if agentic else None,
             "reasoning_effort": spec.reasoning_effort.value,
             "sandbox": spec.sandbox.value,
             "allowed_builtin_tools": list(spec.allowed_builtin_tools),
             "allowed_network_domains": list(spec.allowed_network_domains),
             "skills": [item.name for item in spec.skills],
-            "hooks": [],
             "mcp_servers": [],
             "authentication_kind": "api_key",
+            "direct_provider_max_output_tokens": spec.direct_provider_max_output_tokens,
             "effective_capability_plan": capability_plan.to_public_dict(),
         }
 
@@ -367,108 +325,38 @@ class IsolatedAgentProfileProvider:
         invocation_timeout_seconds: float | None = None,
         model_override: str | None = None,
     ) -> AgentProfileSpec:
-        skill_names = {
-            "researcher": "research-world-evidence",
-            "environment-engineer": "engineer-agent-world",
-            "challenger": "challenge-agent-world",
+        skill_names: dict[str, tuple[str, ...]] = {
+            "researcher": ("research-world-evidence",),
+            "environment-engineer": ("engineer-agent-world",),
+            "challenger": ("challenge-agent-world",),
         }
         reasoning = {
             "researcher": self.config.reasoning_researcher,
             "environment-engineer": self.config.reasoning_engineer,
             "challenger": self.config.reasoning_challenger,
         }
-        instructions = {
-            "researcher": (
-                "Research and synthesize only from framework-provided fetched evidence. "
-                "Never claim a search or fetch occurred merely from model memory."
-            ),
-            "environment-engineer": (
-                "Design or implement the complete executable programmatic world in the isolated "
-                "workspace. WorldSpec owns semantics; implement only declared Candidate surfaces."
-            ),
-            "challenger": (
-                "Challenge evidence, design and black-box behavior without editing candidate code "
-                "or deciding release. Produce only the requested typed verifier proposal."
-            ),
-        }
-        skill_name = skill_names[role]
-        instruction = instructions[role]
+        selected_skill_names = skill_names[role]
         if role == "environment-engineer":
             engineer_node_modes = {
-                "environment-engineer.implementation-plan": (
-                    "engineer-build-planning",
-                    (
-                        "Read the frozen implementation inputs and produce one compact advisory "
-                        "implementation map, not an exhaustive rule transcription. Do not write "
-                        "candidate source."
-                    ),
-                ),
-                "environment-engineer.runtime-build": (
-                    "engineer-environment-codegen",
-                    (
-                        "Implement one complete executable Candidate in the isolated workspace. "
-                        "Frozen WorldSpec and the implementation contract own semantics; use only "
-                        "declared Candidate interfaces."
-                    ),
-                ),
+                "environment-engineer.implementation-plan": ("engineer-build-planning",),
+                "environment-engineer.runtime-build": ("engineer-environment-codegen",),
             }
-            selected = engineer_node_modes.get(capability_plan.node_id)
-            if selected is not None:
-                skill_name, instruction = selected
-        skill_source = self.assets_root / skill_name
-        tool_free = not capability_plan.intrinsic_builtin_tools
-        workspace_toolchain = (
-            role == "environment-engineer"
-            and capability_plan.sandbox is SandboxMode.WORKSPACE_WRITE
-            and "shell" in capability_plan.intrinsic_builtin_tools
-        )
-        runtime_build = (
-            role == "environment-engineer"
-            and capability_plan.node_id == "environment-engineer.runtime-build"
-        )
-        structured_output_transport = self.config.structured_output_transport
-        if structured_output_transport == "json_object" and not tool_free:
-            # ``json_object`` is deliberately a DirectLlmBackend transport:
-            # it eliminates a fragile double-serialization task for one-shot
-            # Designer proposals.  A workspace Agent turn continues to use
-            # the Codex SDK's native schema channel, while its logical Builder
-            # budget and continuation policy remain unchanged.
-            structured_output_transport = "provider_schema"
-        developer_instruction_parts: list[str] = []
-        if tool_free or runtime_build:
-            developer_instruction_parts.append(
-                skill_source.joinpath("SKILL.md").read_text(encoding="utf-8")
+            selected_skill_names = engineer_node_modes.get(
+                capability_plan.node_id,
+                selected_skill_names,
             )
-        if runtime_build:
-            developer_instruction_parts.append(
-                "\n".join(
-                    (
-                        "## Isolated CandidateBuild working context",
-                        "You are already at the isolated workspace root. Use relative paths such "
-                        "as `inputs/...` and `candidate/...`; never reconstruct or search for "
-                        "host, Codex, or profile absolute paths.",
-                        "Use `./.agent-world-tools/uv` for every uv operation and "
-                        "`./.agent-world-tools/python3.12` for compact JSON inspection. Bare "
-                        "`uv`, bare `python`, and a generation-workspace `.venv` are not "
-                        "provisioned interfaces. For uv commands that select or create a Python "
-                        "runtime, pass `--python ./.agent-world-tools/python3.12` explicitly; "
-                        "do not rely on PATH or `UV_PYTHON`.",
-                        "Read every frozen input through focused fields rather than dumping full "
-                        "JSON into tool output. After the initial concise pass, create the "
-                        "`candidate/` project skeleton before any further deep schema lookup, "
-                        "then validate incrementally.",
-                        "If one shell command fails, first run `pwd` and retry the intended "
-                        "relative command. Do not spend the turn scanning parent directories or "
-                        "guessing an alternate host toolchain.",
-                    )
-                )
+        agentic = bool(capability_plan.intrinsic_builtin_tools)
+        # Never even select a Runtime Skill for a Direct LLM route.  Its only
+        # semantic input is the node's rendered Prompt; a path that happens to
+        # exist must not become an implicit instruction dependency later.
+        skills = (
+            tuple(
+                SkillBundleSpec(name=skill_name, source=self.assets_root / skill_name)
+                for skill_name in selected_skill_names
             )
-        logical_output_schema_instructions = _logical_output_schema_instructions(
-            output_schema,
-            transport=structured_output_transport,
+            if agentic
+            else ()
         )
-        if logical_output_schema_instructions is not None:
-            developer_instruction_parts.append(logical_output_schema_instructions)
         # Role is a capability boundary, not a timeout class.  Environment
         # Engineer serves both structured Designer transactions and Builder
         # codegen: the latter already passes its own immutable per-turn budget
@@ -488,112 +376,58 @@ class IsolatedAgentProfileProvider:
         )
         return AgentProfileSpec(
             profile_id=role,
-            profile_version="7",
+            profile_version="12",
             model=self._configured_model(model_override),
             model_provider=API_KEY_RUNTIME_PROVIDER,
             openai_base_url_environment=self.config.openai_base_url_environment,
             reasoning_effort=ReasoningEffort(reasoning[role]),
-            base_instructions=(
-                "Agent World Foundry turns a short human need into a real executable environment "
-                "whose program code owns state transitions and whose release is decided by "
-                "framework gates. " + instruction
-            ),
-            developer_instructions=("\n\n".join(developer_instruction_parts) or None),
+            # There is intentionally no profile-owned instruction field. A
+            # Direct LLM receives its rendered Prompt; a Codex Agent receives
+            # only the focused mounted Skills for its node plus the visible
+            # Prompt that names the turn-specific work.
             authentication_handle="model-auth",
             effective_capability_plan=capability_plan,
-            codex_bin=self.codex_bin,
-            codex_bin_sha256=self.codex_bin_sha256,
+            # ``self.codex_bin`` is a lazy cache for real Codex Agent nodes.
+            # A Direct profile can be resolved after an Agent node in the same
+            # process, but it must remain prompt-only: carrying that cache into
+            # the Direct spec makes ``ProfileResolver.resolve_direct`` reject
+            # an otherwise valid profile as a pseudo-Agent runtime.
+            codex_bin=self.codex_bin if agentic else None,
+            codex_bin_sha256=self.codex_bin_sha256 if agentic else None,
             sandbox=capability_plan.sandbox,
             allowed_builtin_tools=capability_plan.intrinsic_builtin_tools,
             allowed_network_domains=capability_plan.external.network_domains,
-            skills=()
-            if tool_free
-            else (
-                SkillBundleSpec(
-                    name=skill_name,
-                    source=skill_source,
-                ),
-            ),
-            hooks=(),
+            skills=skills,
             mcp_servers=(),
             credential_handles=(
                 "model-auth",
                 *capability_plan.external.credential_handles,
             ),
             output_schema=output_schema,
-            structured_output_transport=structured_output_transport,
             rollout_token_limit=rollout_token_limit,
+            direct_provider_max_output_tokens=(self.config.direct_provider_max_output_tokens),
             tool_output_token_limit=self.config.tool_output_token_limit,
-            required_runtime_tools=("uv",) if workspace_toolchain else (),
             limits=InvocationLimits(
                 timeout_seconds=min(
                     self.config.invocation_timeout_seconds,
                     operation_timeout,
                 ),
-                direct_stream_idle_timeout_seconds=self.config.direct_stream_idle_timeout_seconds,
-                direct_first_event_timeout_seconds=(self.config.direct_first_event_timeout_seconds),
+                provider_stream_idle_timeout_seconds=(
+                    self.config.provider_stream_idle_timeout_seconds
+                ),
+                provider_first_event_timeout_seconds=(
+                    self.config.provider_first_event_timeout_seconds
+                ),
                 max_events=structured_event_limit,
+                provider_transport_max_retries=(self.config.provider_transport_max_retries),
             ),
-        )
-
-    def _solver_spec(
-        self,
-        output_schema: JsonObject,
-        *,
-        capability_plan: EffectiveCapabilityPlan,
-        rollout_token_limit: int,
-        model_override: str | None = None,
-    ) -> AgentProfileSpec:
-        return AgentProfileSpec(
-            profile_id="challenger",
-            profile_version="reachability-solver-1",
-            model=self._configured_model(model_override),
-            model_provider=API_KEY_RUNTIME_PROVIDER,
-            openai_base_url_environment=self.config.openai_base_url_environment,
-            reasoning_effort=ReasoningEffort(self.config.reasoning_challenger),
-            base_instructions=(
-                "Agent World Foundry turns a short human need into a real executable "
-                "environment whose program code owns state transitions. You are Challenger "
-                "in isolated reachability-solver mode. Use only the PublicTask, public "
-                "observations, public tool schemas, and public tool results present in the "
-                "invocation conversation. Select one public tool action at a time. You have "
-                "no authority to determine reward, termination, reachability, or release. "
-                "Never request or infer candidate source, sealed cases, EvaluatorGoal, Rule "
-                "IR, verifier internals, or release policy."
-            ),
-            authentication_handle="model-auth",
-            effective_capability_plan=capability_plan,
-            codex_bin=self.codex_bin,
-            codex_bin_sha256=self.codex_bin_sha256,
-            sandbox=SandboxMode.READ_ONLY,
-            allowed_builtin_tools=(),
-            allowed_network_domains=(),
-            skills=(),
-            hooks=(),
-            mcp_servers=(),
-            credential_handles=("model-auth",),
-            output_schema=output_schema,
-            # The reachability solver has no tools, but it is not a Direct
-            # one-shot proposal: its interactive loop is an Agentic Codex
-            # session and resumes that session for later public actions.
-            # ``json_object`` is only implemented by DirectLlmBackend, so
-            # retain Codex's native schema transport for this profile.
-            structured_output_transport=(
-                "provider_schema"
-                if self.config.structured_output_transport == "json_object"
-                else self.config.structured_output_transport
-            ),
-            rollout_token_limit=rollout_token_limit,
-            tool_output_token_limit=self.config.tool_output_token_limit,
-            limits=InvocationLimits(timeout_seconds=self.config.invocation_timeout_seconds),
         )
 
     def _role_maximum(self, role: str) -> RoleCapabilityMaximum:
         """Return the widest capability set a role may ever request.
 
         A ceiling, not a grant: a node still has to request a capability and the
-        job permission still has to allow it.  Only the sandbox primitives are
-        enumerated -- the Codex runtime's own tools are not modelled here, so a
+        job permission still has to allow it. Runtime tools are not modelled here, so a
         role cannot end up holding a tool the runtime withholds or vice versa.
         """
 
@@ -614,7 +448,7 @@ class IsolatedAgentProfileProvider:
         return RoleCapabilityMaximum(
             role=role,
             policy_version="2",
-            maximum_sandbox=(SandboxMode.WORKSPACE_WRITE if write else SandboxMode.READ_ONLY),
+            maximum_sandbox=SandboxMode.FULL_ACCESS,
             intrinsic_builtin_tools=intrinsic,
             external=ExternalCapabilitySet(network_domains=network_domains),
         )
@@ -667,7 +501,7 @@ class IsolatedAgentProfileProvider:
 
 
 def _profile_lineage_id(value: str) -> str:
-    """Map one logical framework lineage to ProfileResolver's safe namespace."""
+    """Map one logical framework lineage to ProfileResolver's private layout."""
 
     if not value or value != value.strip():
         raise ValueError("lineage_id must be non-empty and canonical")
@@ -745,4 +579,4 @@ def _validate_closed_output_envelope(schema: Mapping[str, Any]) -> None:
     visit(schema, location="#")
 
 
-__all__ = ["IsolatedAgentProfileProvider"]
+__all__ = ["AgentProfileProvider", "logical_workspace_for_agent_workspace"]

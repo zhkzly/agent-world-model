@@ -1,10 +1,11 @@
-"""Compact, versioned Agent-facing forms for existing Rule source contracts.
+"""Compact, versioned Direct-LLM Prompt forms for existing Rule contracts.
 
-The provider-facing JSON envelope deliberately stays shallow.  These protocols
-replace only the generated recursive JSON Schema text copied into a prompt for
-providers that have been observed to reject that text.  They are not a parser,
-new Rule language, or acceptance path: the original Pydantic source models,
-frozen Tool Rule bindings, and deterministic compilers remain authoritative.
+Native provider schema carries the structural response shape.  This Prompt
+protocol supplies only the Rule semantics that a schema cannot express:
+framework-derived fields, frozen binding aliases, and cross-field meaning.
+It is not a parser, new Rule language, or acceptance path: the original
+Pydantic source models, frozen Tool Rule bindings, and deterministic compilers
+remain authoritative.
 """
 
 from __future__ import annotations
@@ -12,11 +13,10 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 
-# V10 is the provider-compatible prompt form.  The separate descriptive schema
-# below is retained for deterministic contract tests only: a real v2 probe
-# established that this gateway rejects JSON-Schema syntax even when it is
-# acyclic, so it must never be interpolated into the provider prompt.
-COMPACT_RULE_PROTOCOL_VERSION = "rule-output-protocol.v10"
+# V14 is the concise logical form. The separate descriptive schema below is
+# retained for deterministic contract tests only; it is never copied into the
+# Direct Prompt because the provider already receives the native strict schema.
+COMPACT_RULE_PROTOCOL_VERSION = "rule-output-protocol.v14"
 
 
 _TOOL_RULE_DRAFT = """\
@@ -63,6 +63,22 @@ Never emit reference, lookup_by_key, bound_lookup_by_key, source,
 pointer, collection_pointer, key_field, value_pointer, raw value_type for a
 binding, or free-form expression text. key_value_type is the required
 bound_lookup_by_constant exception, not a raw binding annotation.
+
+For every term, frozen context also gives term_binding_aliases as the final
+closed ledger keyed by the exact term kind: bound_reference,
+bound_lookup_by_constant, or bound_lookup_by_reference. Copy one alias exactly
+from the matching list. The longer binding groups explain the selected alias;
+they do not authorize extrapolating numbers, renumbering aliases, or using an
+alias from another term kind. Before serialization, independently check every
+binding_id against its matching ledger list.
+
+Frozen context also gives ordered_term_binding_aliases by returned value type.
+For an ordered comparison, ordering="number" requires both sides to be number
+or any (including matching typed constants or arithmetic). ordering="date" or
+"date-time" requires both sides to be string or any *and* represent that
+temporal meaning, not a generic identifier, status, or arbitrary text. If the
+terms do not satisfy those conditions, use an equality/containment clause or a
+different semantically valid comparison instead of inventing an ordering.
 """
 
 
@@ -85,6 +101,12 @@ Pre-serialization representation audit (run it independently for every TOOL):
 4. Do the same final kind check for optional numbers: idempotency_key.retention_seconds is
    null or a positive number, and observation.staleness_bound_seconds is null or a
    non-negative number. Do not turn a scalar, boolean, or null into explanatory prose.
+5. For every bound Rule term, select binding_id only from the matching
+   term_binding_aliases list. Copy it byte-for-byte; do not infer a missing alias from a
+   neighboring number or another term kind.
+6. For every ordered clause, check both alias selections against the matching
+   ordered_term_binding_aliases value-type list and check any constant's declared value_type.
+   Do not apply number ordering to generic strings or temporal ordering to identifiers/statuses.
 """
 
 
@@ -92,9 +114,9 @@ _TOOL_SEMANTICS_BATCH = f"""\
 Compact Rule output protocol: {COMPACT_RULE_PROTOCOL_VERSION}.
 
 Return the original ToolSemanticsBatchSourceDraft shape, not an abbreviated
-summary. The complete logical root is {{"tools":[TOOL, ...]}}. It contains one
-TOOL for each frozen target tool id, in the exact target order, with no extra
-or missing tools (at most two). Each TOOL has exactly these roots:
+summary. The complete logical root is {{"tools":[TOOL]}}. It contains exactly
+one TOOL for the one frozen target tool id, with no extra or missing tool. Each
+TOOL has exactly these roots:
 * tool_id
 * conditions: {{"tool_id", "preconditions", "postconditions"}}
 * state_transition: {{"tool_id", "transition"}}; transition has at least one RULE
@@ -103,6 +125,12 @@ or missing tools (at most two). Each TOOL has exactly these roots:
 * reliability: {{"tool_id", "idempotency", "retry", "timeout", "transaction",
   "rollback", "concurrency"}}
 Every nested tool_id equals the enclosing TOOL tool_id.
+Return the smallest semantically sufficient closed behavior for that one tool.
+Include only conditions, transitions, errors, access/observation, and
+reliability facts needed to define its behavior. Do not narrate reasoning,
+repeat equivalent Rules, enumerate examples or trajectories, duplicate frozen
+context, or expand alternatives. Do not omit a necessary behavior merely to be
+short.
 The uppercase names TOOL, RULE, CLAUSE, ERROR, and ATOM are explanatory names
 only: never emit them, a placeholder, an ellipsis, or null for a required
 identifier/text field. Use the actual frozen tool id, concrete non-empty
@@ -118,10 +146,27 @@ permission is {{"permission_id", "required_scopes_by_actor", "condition",
 The non-empty required_scopes_by_actor map is the complete allowed-actor set:
 its concrete actor-id keys are exactly the actors permitted by this tool. Do
 not emit allowed_actors; framework code derives that core projection. An actor
-absent from this map is not permitted. observation is {{"visible_fields_by_actor",
-"consistency", "staleness_bound_seconds"}}, where consistency is
-strong|read_after_write|eventual|snapshot. Every map value is an array of
-concrete top-level observation field names or scope identifiers as applicable.
+absent from this map is not permitted. For every actor present, each scope must
+be copied exactly from that actor's authorities in frozen world_boundary data;
+an empty scope list is valid.
+
+observation is {{"visible_fields_by_actor", "consistency",
+"staleness_bound_seconds"}}, where consistency is strong|read_after_write|
+eventual|snapshot. visible_fields_by_actor has keys exactly equal to every
+frozen boundary actor, whether or not each actor has permission to call the
+tool. Each value is an array of concrete top-level field names from that
+target tool's frozen observation_schema only: never use output fields, state
+paths, dotted paths, wildcards, resource names, or invented fields. Framework
+code derives each actor's redacted-field complement, so do not emit a
+redacted_fields_by_actor field.
+
+A permission condition is optional. For one tool, use only aliases from its
+frozen permission_rule_context_catalogs entry anywhere within condition; that
+entry preserves aliases from the full rule_context_catalogs entry but excludes
+observation, tool_result, and post_state sources. If the actor/scope map already
+expresses static access, set condition to null rather than inventing a Rule. If
+the map covers every frozen boundary actor and condition is non-null, set its
+case_sensitivity to positive_and_negative.
 
 idempotency is either {{"mode":"not_supported","duplicate_observation"}},
 {{"mode":"natural","duplicate_observation"}}, or {{"mode":"idempotency_key",
@@ -135,6 +180,11 @@ no_effect|may_commit|rolled_back|unknown. transaction is {{"atomicity", "commit_
 concurrency is {{"isolation", "conflict_detection", "conflict_error_code",
 "ordering_guarantee"}} with isolation
 serial|serializable|snapshot|read_committed|optimistic|last_write_wins.
+Every timeout_error_code, retryable_error_codes entry, rollback_trigger_codes
+entry, and non-null conflict_error_code must be an error_code declared in this
+same TOOL's errors.errors list. A code named in retryable_error_codes must
+refer to an ERROR whose retryable field is true. Every compensation_tools entry
+must be a frozen tool id.
 
 {_TOOL_RULE_DRAFT}
 
@@ -156,7 +206,7 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
         "tools": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 2,
+            "maxItems": 1,
             "items": {"$ref": "#/$defs/tool"},
         }
     },
@@ -566,7 +616,7 @@ _TOOL_SEMANTICS_BATCH_SHAPE: dict[str, object] = {
 
 
 def tool_semantics_batch_protocol_schema() -> dict[str, object]:
-    """Return an isolated descriptive schema for the compact v10 prompt form."""
+    """Return an isolated descriptive schema for the compact v14 Prompt form."""
 
     return deepcopy(_TOOL_SEMANTICS_BATCH_SHAPE)
 
@@ -581,7 +631,7 @@ def tool_semantics_batch_protocol(
     *,
     target_tool_ids: tuple[str, ...] | None = None,
 ) -> str:
-    """Return the compact v10 form for one frozen ToolSemantics batch.
+    """Return the compact v14 form for one frozen ToolSemantics batch.
 
     The reusable Rule section is intentionally separated above so WorldRules
     and Curriculum can adopt a future context-appropriate protocol without
@@ -589,8 +639,8 @@ def tool_semantics_batch_protocol(
     The acyclic descriptive schema remains a test-only characterization rather
     than provider prompt text because the configured gateway rejects it.
 
-    A live physical batch may additionally bind its exact one- or two-tool
-    target near the end of the provider-visible protocol.  The generic compact
+    A live physical batch additionally binds its one exact target near the end
+    of the provider-visible protocol.  The generic compact
     form deliberately cannot name that data, but leaving it only in the much
     earlier frozen-context JSON caused models to substitute a plausible whole
     inventory.  This is a Prompt projection, not a new semantic contract:
@@ -600,17 +650,17 @@ def tool_semantics_batch_protocol(
     if target_tool_ids is None:
         return _TOOL_SEMANTICS_BATCH
     if (
-        not 1 <= len(target_tool_ids) <= 2
+        len(target_tool_ids) != 1
         or len(set(target_tool_ids)) != len(target_tool_ids)
         or any(not tool_id or tool_id != tool_id.strip() for tool_id in target_tool_ids)
     ):
-        raise ValueError("ToolSemantics protocol requires one exact unique target-tool batch")
+        raise ValueError("ToolSemantics protocol requires one exact unique target tool")
     rendered_ids = json.dumps(target_tool_ids, ensure_ascii=False, separators=(",", ":"))
     return f"""{_TOOL_SEMANTICS_BATCH}
 
 Invocation-specific final completion gate:
 Exact target tools: {rendered_ids}.
-Return exactly {len(target_tool_ids)} tools in this order; do not add, omit, rename, or reorder.
+Return exactly one tool in this order; do not add, omit, rename, or reorder.
 Before serializing, verify every TOOL has all five required roots: conditions, state_transition,
 errors, access_observation, and reliability, then run the representation audit above for every
 target. In particular, reliability.tool_id is required and rollback.guarantees is one non-empty

@@ -46,7 +46,7 @@ def test_production_defaults_reserve_full_v3_judge_capacity(tmp_path: Path) -> N
     campaign = config.expansion.campaign_budget
 
     assert config.agent.structured_turn_token_limit == 65_536
-    assert config.agent.structured_output_transport == "provider_schema"
+    assert config.agent.direct_provider_max_output_tokens is None
     assert config.agent.environment_codegen_physical_turn_token_limit == 128_000
 
     assert direct.llm_tokens == 10_000_000
@@ -139,24 +139,25 @@ def test_legacy_literal_base_url_is_rejected_without_reflecting_its_value(tmp_pa
     assert "provider.example.test" not in str(raised.value)
 
 
-def test_json_envelope_transport_is_explicitly_configured() -> None:
+def test_legacy_structured_output_transport_is_rejected() -> None:
+    with pytest.raises(ValidationError, match="structured_output_transport"):
+        AgentBackendConfig(
+            model="gpt-5.4-mini",
+            api_key_environment="COMPATIBLE_API_KEY",
+            structured_output_transport="json_object",  # type: ignore[call-arg]
+        )
+
+
+def test_direct_provider_cap_is_optional_and_separate_from_framework_budget() -> None:
     config = AgentBackendConfig(
         model="gpt-5.4-mini",
         api_key_environment="COMPATIBLE_API_KEY",
-        structured_output_transport="json_envelope",
+        direct_provider_max_output_tokens=123_456,
+        structured_turn_token_limit=5_000_000,
     )
 
-    assert config.structured_output_transport == "json_envelope"
-
-
-def test_direct_json_object_transport_is_explicitly_configured() -> None:
-    config = AgentBackendConfig(
-        model="gpt-5.4-mini",
-        api_key_environment="COMPATIBLE_API_KEY",
-        structured_output_transport="json_object",
-    )
-
-    assert config.structured_output_transport == "json_object"
+    assert config.direct_provider_max_output_tokens == 123_456
+    assert config.structured_turn_token_limit == 5_000_000
 
 
 def test_environment_codegen_limit_allows_one_full_live_diagnostic_session() -> None:

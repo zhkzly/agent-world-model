@@ -65,6 +65,10 @@ from agent_world.contracts.supply_chain import (
     SupplyChainEvidence,
 )
 from agent_world.invocation import InvocationOwnership
+from agent_world.judge_budgeting import (
+    integration_budget_requirements,
+    task_materializer_call_counts,
+)
 from agent_world.observability.subprocess_scene import (
     RuntimeSubprocessScene,
     runtime_subprocess_scene,
@@ -98,22 +102,23 @@ from .rules import (
     design_rule_index,
     evaluate_rule,
     evaluate_task_reward,
-    initially_evaluable_invariants,
+    initially_evaluable_rules,
 )
 from .semantics import ToolExecutionEvidence, validate_tool_execution
 from .supervisor import (
     CandidateBuildError,
-    CandidateSandboxRunner,
+    CandidateProcessRunner,
     CleanCandidate,
     CleanCandidateBuilder,
-    IsolationPolicy,
-    IsolationUnavailable,
+    HostExecutionPolicy,
+    HostExecutionUnavailable,
     JudgeInfrastructureError,
     LaunchContract,
     RuntimeProcessCrashed,
     RuntimeRequestTimeout,
     RuntimeSupervisor,
-    SandboxProcessResult,
+    ProcessResult,
+    candidate_clean_build_failure_is_agent_actionable,
 )
 from .task_semantics import (
     DifficultyContrastCandidate,
@@ -135,6 +140,22 @@ FindingOwner = Literal[
     "release_policy",
 ]
 _CONTENT_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _supply_chain_failure_summary(failure_codes: tuple[str, ...]) -> str:
+    """Turn typed supply failures into concise, build-actionable feedback."""
+
+    failure_details = tuple(
+        (
+            "supply_root_license_unknown — [project].license must be a non-unknown "
+            'expression or an exact { file = "LICENSE" } declaration; '
+            "license-files alone is only an inventory"
+            if code == "supply_root_license_unknown"
+            else code
+        )
+        for code in failure_codes
+    )
+    return "Supply-chain assurance failed: " + "; ".join(failure_details)
 
 
 def _is_content_hash(value: object) -> bool:
@@ -185,10 +206,17 @@ _FORBIDDEN_SOURCE_PARTS = frozenset(
 
 
 class _CandidateTaskFailure(ValueError):
-    """Candidate-owned materializer or Runtime defect safe to route to Builder."""
+    """Candidate-facing materializer or Runtime failure safe to disclose to Builder."""
 
-    def __init__(self, message: str, *, details: Mapping[str, JsonValue] | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: Mapping[str, JsonValue] | None = None,
+        repair_remediation: str | None = None,
+    ) -> None:
         self.details = dict(details or {})
+        self.repair_remediation = repair_remediation
         super().__init__(message)
 
 
@@ -199,6 +227,18 @@ class _RuntimeContractFailure(_CandidateTaskFailure):
         self.mismatch_paths = tuple(mismatch_paths)
         joined = ", ".join(self.mismatch_paths)
         super().__init__(f"Runtime handshake differs from WorldSpec at: {joined}")
+
+
+class JudgeBudgetDeficitError(ValueError):
+    """One framework-owned Judge lease is below its frozen-input requirement."""
+
+    def __init__(self, *, available: Budget, required: Budget, deficits: tuple[str, ...]) -> None:
+        self.available = available
+        self.required = required
+        self.deficits = deficits
+        super().__init__(
+            "Judge child lease is below its compiled worst-case reservation: " + ", ".join(deficits)
+        )
 
 
 def _runtime_contract_mismatch_paths(
@@ -256,6 +296,11 @@ def _candidate_failure_summary(exc: BaseException) -> str:
     """Preserve deterministic protocol coordinates in Builder-safe feedback."""
 
     summary = str(exc)
+    if isinstance(exc, _CandidateTaskFailure) and exc.details:
+        candidate_coordinates = _sandbox_failure_coordinates(exc.details)
+        if candidate_coordinates:
+            summary += "; " + "; ".join(candidate_coordinates)
+        return summary
     if isinstance(exc, RuntimeProcessCrashed):
         crash_coordinates: list[str] = []
         exit_code = exc.details.get("exit_code")
@@ -326,10 +371,10 @@ def _runtime_protocol_failure_record(
 
 
 _PYTHON_EXCEPTION_LINE = re.compile(
-    r"(?m)^(?P<exception>[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))(?::|$)"
+    r"(?m)\b(?P<exception>[A-Za-z_][A-Za-z0-9_]*(?:Error|Exception))(?::|$)"
 )
 _PYTHON_MISSING_MODULE = re.compile(
-    r"(?m)^ModuleNotFoundError: No module named ['\"]"
+    r"ModuleNotFoundError: No module named ['\"]"
     r"(?P<module>[A-Za-z_][A-Za-z0-9_.]*)['\"]$"
 )
 
@@ -340,12 +385,62 @@ def _python_stderr_exception_name(stderr: str) -> str | None:
 
 
 def _python_missing_module(stderr: str) -> str | None:
-    matches = tuple(_PYTHON_MISSING_MODULE.finditer(stderr[-16_384:]))
+    # Python commonly wraps the exception in a launcher diagnostic, leaving
+    # a trailing ')' after the quoted module name. The stable module token is
+    # still safe to surface; requiring end-of-line loses the actual repair
+    # coordinate for that common form.
+    matches = tuple(
+        re.finditer(
+            r"ModuleNotFoundError: No module named ['\"]"
+            r"(?P<module>[A-Za-z_][A-Za-z0-9_.]*)['\"]",
+            stderr[-16_384:],
+        )
+    )
     return matches[-1].group("module") if matches else None
 
 
+def _sandbox_failure_details(result: ProcessResult) -> dict[str, JsonValue]:
+    """Extract only stable, repair-safe coordinates from one sandbox terminal.
+
+    Raw sandbox stdout and stderr are intentionally ephemeral. An exception
+    class, importable module identifier, exit status, and truncation fact are
+    Candidate-facing only after the framework has already proved the workspace
+    projection. They can then identify a Candidate-owned import or code defect
+    without leaking candidate-controlled or secret-bearing text into repair
+    feedback.
+    """
+
+    details: dict[str, JsonValue] = {}
+    if isinstance(result.exit_code, int) and not isinstance(result.exit_code, bool):
+        details["exit_code"] = result.exit_code
+    if result.failure_class and re.fullmatch(r"[a-z][a-z0-9_]{0,80}", result.failure_class):
+        details["failure_class"] = result.failure_class
+    if result.stdout_truncated or result.stderr_truncated:
+        details["output_truncated"] = True
+    exception_name = _python_stderr_exception_name(result.stderr)
+    if exception_name is not None:
+        details["stderr_exception"] = exception_name
+    missing_module = _python_missing_module(result.stderr)
+    if missing_module is not None:
+        details["missing_module"] = missing_module
+    return details
+
+
+def _sandbox_failure_coordinates(details: Mapping[str, JsonValue]) -> tuple[str, ...]:
+    """Render the bounded details that a repair recipient can act on."""
+
+    coordinates: list[str] = []
+    for key in ("exit_code", "failure_class", "stderr_exception", "missing_module"):
+        value = details.get(key)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            coordinates.append(f"{key}={value}")
+    if details.get("output_truncated") is True:
+        coordinates.append("output_truncated=true")
+    return tuple(coordinates)
+
+
 def _public_test_failure_feedback(
-    result: SandboxProcessResult,
+    result: ProcessResult,
     *,
     known_secret_canaries: Sequence[str | bytes] = (),
 ) -> str | None:
@@ -450,6 +545,26 @@ class _MaterializationGateResult:
     episodes: int
     envelopes: tuple[FrameworkTaskEnvelope, ...]
     owner: FindingOwner
+    repair_remediation: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _MaterializerCampaign:
+    """One deterministic materializer pass and its bounded transport facts."""
+
+    materializations: tuple[dict[str, Any], ...]
+    runner_invocations: int
+    adaptive_batch_splits: int
+
+
+@dataclass(frozen=True, slots=True)
+class _RuntimeInitialStateCheck:
+    """One isolated Runtime reset check, retained in campaign order."""
+
+    index: int
+    final_state_digest: str
+    reset_observation: JsonValue
+    rule_violations: tuple[dict[str, JsonValue], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -596,7 +711,7 @@ class _RealEpisodeDriver(EpisodeDriver):
 
 
 class EnvironmentJudge:
-    """Build, isolate and independently execute every release claim."""
+    """Build and independently execute every release claim on the host."""
 
     def __init__(
         self,
@@ -604,25 +719,54 @@ class EnvironmentJudge:
         artifact_store: ArtifactWriter,
         interactive_challenger: InteractiveChallengerStrategy | None = None,
         clean_builder: CleanCandidateBuilder | None = None,
-        runtime_isolation: IsolationPolicy | None = None,
+        runtime_execution: HostExecutionPolicy | None = None,
         telemetry: TelemetryStore | None = None,
         known_secret_canaries: Sequence[str | bytes] = (),
+        runtime_episode_concurrency: int = 8,
     ) -> None:
         self.artifacts = artifact_store
         self.interactive_challenger = interactive_challenger
         self.clean_builder = clean_builder or CleanCandidateBuilder()
-        self.runtime_isolation = runtime_isolation or IsolationPolicy(purpose="runtime")
+        self.runtime_execution = runtime_execution or HostExecutionPolicy(purpose="runtime")
         self.telemetry = telemetry
         self._known_secret_canaries = tuple(known_secret_canaries)
-        if self.runtime_isolation.purpose != "runtime":
-            raise ValueError("EnvironmentJudge Runtime isolation must be purpose=runtime")
-        self.sandbox_runner = CandidateSandboxRunner(isolation=self.runtime_isolation)
+        if (
+            isinstance(runtime_episode_concurrency, bool)
+            or not isinstance(runtime_episode_concurrency, int)
+            or runtime_episode_concurrency <= 0
+        ):
+            raise ValueError("runtime episode concurrency must be one positive integer")
+        self.runtime_episode_concurrency = runtime_episode_concurrency
+        if self.runtime_execution.purpose != "runtime":
+            raise ValueError("EnvironmentJudge Runtime execution must be purpose=runtime")
+        self.process_runner = CandidateProcessRunner(
+            execution=self.runtime_execution,
+        )
 
     @property
     def known_secret_canaries(self) -> tuple[str | bytes, ...]:
         """Return the process-private canaries for nested Judge construction."""
 
         return self._known_secret_canaries
+
+    async def _verify_candidate_workspace_execution(
+        self,
+        clean: CleanCandidate,
+        manifest: CandidateManifest,
+    ) -> None:
+        """Prove framework path mechanics before attributing a dynamic failure.
+
+        Judge execution receives a clean copy of the Candidate project. A
+        failure to start that exact host cwd/environment is not evidence that
+        a Code Agent should rewrite imports, paths, or tests. The runner raises
+        a typed infrastructure error and this method intentionally has no
+        Candidate-feedback output.
+        """
+
+        await self.process_runner.verify_workspace_execution(
+            clean.root,
+            visible_workspace_paths=tuple(item.path for item in manifest.files),
+        )
 
     @staticmethod
     def required_evaluation_episodes(
@@ -632,7 +776,7 @@ class EnvironmentJudge:
     ) -> int:
         """Worst-case lease reservation for the complete successful Judge path."""
 
-        task_call_counts = EnvironmentJudge._task_materializer_call_counts(design.curriculum)
+        task_call_counts = task_materializer_call_counts(design.curriculum)
         task_calls = sum(task_call_counts.values())
         protocol = design.verification.minimum_unknown_seed_episodes + 1
         recipes = EnvironmentJudge._recipe_index(verifier.solve_recipes)
@@ -664,18 +808,21 @@ class EnvironmentJudge:
         provider pricing are not knowable from frozen Design/Verifier contracts.
         """
 
-        call_counts = EnvironmentJudge._task_materializer_call_counts(design.curriculum)
+        call_counts = task_materializer_call_counts(design.curriculum)
         recipes = EnvironmentJudge._recipe_index(verifier.solve_recipes)
         interactive_attempts: dict[str, int] = {}
         reachability_tool_calls = 0
         for requirement in design.curriculum.task_types:
             count = call_counts[requirement.task_type]
             policy = requirement.reachability_policy
-            # No recipe means the Challenger is the first strategy.  With a recipe,
-            # a second reserved attempt is the real Challenger fallback.
+            # A ReleaseAssuranceLeaf deliberately owns no hidden interactive
+            # Challenger. In that path the Verifier supplies recipes and a
+            # recipe failure becomes a verifier finding; reserve a model fallback
+            # only when this Judge actually has one configured.
             interactive_attempts[requirement.task_type] = (
                 count
-                if requirement.task_type not in recipes or policy.maximum_solver_attempts >= 2
+                if self.interactive_challenger is not None
+                and (requirement.task_type not in recipes or policy.maximum_solver_attempts >= 2)
                 else 0
             )
             recipe = recipes.get(requirement.task_type)
@@ -703,6 +850,10 @@ class EnvironmentJudge:
                 reachability_tool_calls
                 + sum(len(case.actions) for case in verifier.cases)
                 + MAX_PUBLIC_TESTS
+                # One framework-owned workspace-projection probe runs before
+                # any Candidate dynamic execution. It is neither a model turn
+                # nor Candidate feedback, but it is a real isolated process.
+                + 1
                 + 2
             ),
             build_seconds=self.clean_builder.timeout_seconds,
@@ -725,14 +876,14 @@ class EnvironmentJudge:
     ) -> Budget:
         """Reserve real install/reset/invoke work without reserving Challenger work."""
 
-        task_calls = sum(self._task_materializer_call_counts(design.curriculum).values())
+        requirements = integration_budget_requirements(design)
         return Budget(
             llm_tokens=0,
             agent_turns=0,
             search_calls=0,
-            tool_calls=MAX_PUBLIC_TESTS + 2,
+            tool_calls=requirements.tool_calls,
             build_seconds=self.clean_builder.timeout_seconds,
-            evaluation_episodes=task_calls + 2,
+            evaluation_episodes=requirements.evaluation_episodes,
             container_seconds=available.container_seconds,
             live_probe_cost=0,
             repair_attempts=0,
@@ -893,6 +1044,8 @@ class EnvironmentJudge:
                 )
                 evidence_refs.append(install_ref)
 
+                await self._verify_candidate_workspace_execution(clean, manifest)
+
                 supply_chain = self._supply_chain_gate(
                     integration_id,
                     clean,
@@ -1005,6 +1158,7 @@ class EnvironmentJudge:
                     status=materialization.status,
                     evidence_ref=materialization.evidence_ref,
                     summary=materialization.summary,
+                    suggested_repair=materialization.repair_remediation,
                     owner=materialization.owner,
                     candidate_ref=candidate_ref,
                     release_profile=release_profile,
@@ -1059,6 +1213,11 @@ class EnvironmentJudge:
         except CandidateBuildError as exc:
             if exc.record is not None:
                 clean_build_seconds = exc.record.duration_ms / 1000
+            owner: FindingOwner = (
+                "build"
+                if candidate_clean_build_failure_is_agent_actionable(exc.code)
+                else "judge_infrastructure"
+            )
             build_ref = self._evidence(
                 integration_id,
                 "integration-clean-install",
@@ -1074,10 +1233,17 @@ class EnvironmentJudge:
             )
             self._record_gate(
                 gate_id="clean_deployment",
-                status="fail",
+                status="fail" if owner == "build" else "error",
                 evidence_ref=build_ref,
-                summary="Candidate failed its frozen offline build.",
-                owner="build",
+                summary=(
+                    "Candidate failed its frozen offline dependency installation."
+                    if owner == "build"
+                    else (
+                        "Framework clean Candidate delivery failed before a "
+                        "Candidate-attributable result."
+                    )
+                ),
+                owner=owner,
                 candidate_ref=candidate_ref,
                 release_profile=release_profile,
                 gate_results=gate_results,
@@ -1085,7 +1251,7 @@ class EnvironmentJudge:
                 findings=findings,
                 run_id=integration_id,
             )
-        except (IsolationUnavailable, JudgeInfrastructureError) as exc:
+        except (HostExecutionUnavailable, JudgeInfrastructureError) as exc:
             infrastructure_ref = self._evidence(
                 integration_id,
                 "integration-infrastructure",
@@ -1286,6 +1452,8 @@ class EnvironmentJudge:
                 )
                 evidence_refs.append(install_ref)
 
+                await self._verify_candidate_workspace_execution(clean, manifest)
+
                 supply_chain = self._supply_chain_gate(
                     run_id,
                     clean,
@@ -1412,6 +1580,7 @@ class EnvironmentJudge:
                     status=materialization.status,
                     evidence_ref=materialization.evidence_ref,
                     summary=materialization.summary,
+                    suggested_repair=materialization.repair_remediation,
                     owner=materialization.owner,
                     candidate_ref=candidate_ref,
                     release_profile=release_profile,
@@ -1578,6 +1747,11 @@ class EnvironmentJudge:
         except CandidateBuildError as exc:
             if exc.record is not None:
                 clean_build_seconds = exc.record.duration_ms / 1000
+            owner: FindingOwner = (
+                "build"
+                if candidate_clean_build_failure_is_agent_actionable(exc.code)
+                else "judge_infrastructure"
+            )
             value = (
                 asdict(exc.record)
                 if exc.record is not None
@@ -1596,10 +1770,17 @@ class EnvironmentJudge:
             )
             self._record_gate(
                 gate_id="clean_deployment",
-                status="fail",
+                status="fail" if owner == "build" else "error",
                 evidence_ref=build_ref,
-                summary="Candidate failed its frozen offline build.",
-                owner="build",
+                summary=(
+                    "Candidate failed its frozen offline dependency installation."
+                    if owner == "build"
+                    else (
+                        "Framework clean Candidate delivery failed before a "
+                        "Candidate-attributable result."
+                    )
+                ),
+                owner=owner,
                 candidate_ref=candidate_ref,
                 release_profile=release_profile,
                 gate_results=gate_results,
@@ -1607,7 +1788,7 @@ class EnvironmentJudge:
                 findings=findings,
                 run_id=run_id,
             )
-        except (IsolationUnavailable, JudgeInfrastructureError) as exc:
+        except (HostExecutionUnavailable, JudgeInfrastructureError) as exc:
             infrastructure_ref = self._evidence(
                 run_id,
                 "judge-infrastructure",
@@ -1690,7 +1871,7 @@ class EnvironmentJudge:
                 "form a closed supply chain."
             )
         else:
-            summary = "Supply-chain assurance failed: " + ", ".join(evidence.failure_codes)
+            summary = _supply_chain_failure_summary(evidence.failure_codes)
         return _AssuranceGateResult(
             status=evidence.status,
             evidence_ref=evidence_ref,
@@ -1715,12 +1896,12 @@ class EnvironmentJudge:
             path: str,
             ref: ArtifactRef,
         ) -> tuple[PublicTestExecution, str | None]:
-            result = await self.sandbox_runner.run_public_test(
+            result = await self.process_runner.run_public_test(
                 clean.root,
                 test_path=path,
                 visible_workspace_paths=visible_paths,
-                timeout_seconds=min(30.0, self.sandbox_runner.timeout_seconds),
-                max_output_bytes=min(256 * 1024, self.sandbox_runner.max_output_bytes),
+                timeout_seconds=min(30.0, self.process_runner.timeout_seconds),
+                max_output_bytes=min(256 * 1024, self.process_runner.max_output_bytes),
             )
             failure_class = result.failure_class or (
                 None if result.succeeded else "public_test_failed"
@@ -1779,6 +1960,7 @@ class EnvironmentJudge:
             strict_data_parse_passed=inspection.strict_data_parse_passed,
             python_compile_passed=inspection.python_compile_passed,
             failure_codes=tuple(sorted(failures)),
+            component_import_violations=inspection.component_import_violations,
         )
         evidence_ref = self._typed_evidence(
             run_id,
@@ -1796,6 +1978,7 @@ class EnvironmentJudge:
             failed_public_tests = tuple(item for item in evidence.public_tests if not item.passed)
             summary = self._static_assurance_failure_summary(
                 inspection,
+                failure_codes=evidence.failure_codes,
                 failed_public_tests=failed_public_tests,
                 public_test_diagnostics=public_test_diagnostics,
             )
@@ -1811,6 +1994,7 @@ class EnvironmentJudge:
     def _static_assurance_failure_summary(
         inspection: StaticSourceInspection,
         *,
+        failure_codes: tuple[str, ...] | None = None,
         failed_public_tests: tuple[PublicTestExecution, ...],
         public_test_diagnostics: tuple[tuple[str, str], ...] = (),
     ) -> str:
@@ -1822,7 +2006,10 @@ class EnvironmentJudge:
         text or a private evaluator condition.
         """
 
-        summary = "Static assurance failed: " + ", ".join(inspection.failure_codes) + "."
+        effective_failure_codes = (
+            tuple(sorted(failure_codes)) if failure_codes is not None else inspection.failure_codes
+        )
+        summary = "Static assurance failed: " + ", ".join(effective_failure_codes) + "."
         failed_sources = tuple(
             f"{item.path.removeprefix('candidate/')} ({item.role})"
             for item in inspection.files
@@ -1846,13 +2033,42 @@ class EnvironmentJudge:
         if failed_sources:
             summary += " Files: " + ", ".join(failed_sources) + "."
         if inspection.component_import_violations:
-            summary += (
-                " Executable sources may not import `configuration`; move shared executable "
-                "helpers into `runtime`. Visibility: runtime->runtime; "
-                "task_materializer->runtime/task_materializer; "
-                "public_verifier->runtime/task_materializer/public_verifier."
+            roles_by_path = {item.path: item.role for item in inspection.files}
+
+            def render_component_import(violation: str) -> str:
+                source, separator, target = violation.partition("->")
+                if not separator:
+                    return violation.removeprefix("candidate/")
+                source = source.removeprefix("candidate/")
+                target = target.removeprefix("candidate/")
+                target_role = roles_by_path.get(
+                    violation.partition("->")[2],
+                    "undeclared",
+                )
+                return f"{source}->{target} (target role={target_role})"
+
+            rendered_component_imports = tuple(
+                render_component_import(violation)
+                for violation in inspection.component_import_violations
             )
-        if "static_forbidden_pattern" in inspection.failure_codes:
+            displayed_component_imports = rendered_component_imports[:3]
+            remaining_component_imports = len(rendered_component_imports) - len(
+                displayed_component_imports
+            )
+            summary += (
+                " Disallowed component imports: "
+                + ", ".join(displayed_component_imports)
+                + (
+                    f", and {remaining_component_imports} more"
+                    if remaining_component_imports
+                    else ""
+                )
+                + ". A runtime source may import only runtime; a task_materializer source may "
+                "import runtime or task_materializer; a public_verifier source may import any "
+                "executable role. Remove or restructure the listed import/re-export, or move a "
+                "genuinely shared helper into runtime."
+            )
+        if "static_forbidden_pattern" in effective_failure_codes:
             displayed_locations = forbidden_locations[:6]
             if displayed_locations:
                 summary += " Static-policy locations: " + ", ".join(
@@ -1893,15 +2109,24 @@ class EnvironmentJudge:
         # tells the repair Agent what to inspect in its own candidate workspace.
         fallback = (
             "Static assurance failed with "
-            f"{len(inspection.failure_codes)} failure code(s), {len(failed_sources)} source "
+            f"{len(effective_failure_codes)} failure code(s), {len(failed_sources)} source "
             f"file(s), {len(inspection.component_import_violations)} component-import "
             f"violation(s), "
             f"and {len(failed_public_test_paths)} failed public test(s). "
-            "Inspect every Candidate source/import. Executable sources may not import "
-            "`configuration`; move shared executable helpers into `runtime`. Visibility: "
+            "Inspect the exact failed Candidate imports and declared source roles. "
             "runtime->runtime; task_materializer->runtime/task_materializer; "
             "public_verifier->runtime/task_materializer/public_verifier."
         )
+        if inspection.component_import_violations:
+            source, separator, target = inspection.component_import_violations[0].partition("->")
+            if separator:
+                fallback += (
+                    " First disallowed import: "
+                    + source.removeprefix("candidate/")
+                    + "->"
+                    + target.removeprefix("candidate/")
+                    + "."
+                )
         if framework_private_locations:
             fallback += (
                 " Implement only declared schema fields; remove any generic private-name "
@@ -1967,7 +2192,7 @@ class EnvironmentJudge:
         manifest: CandidateManifest,
     ) -> tuple[GateStatus, ArtifactRef, str]:
         descriptor = candidate.public_self_check
-        result = await self.sandbox_runner.run(
+        result = await self.process_runner.run_python_module(
             clean.root,
             argv=descriptor.argv,
             visible_workspace_paths=self._role_visible_paths(manifest, "public_verifier"),
@@ -1976,6 +2201,10 @@ class EnvironmentJudge:
             failure_prefix="public_self_check",
         )
         passed = result.succeeded
+        failure_details = _sandbox_failure_details(result)
+        failure_summary = "Public self-check failed in the clean sandbox."
+        if failure_details:
+            failure_summary += " " + "; ".join(_sandbox_failure_coordinates(failure_details))
         evidence_ref = self._evidence(
             run_id,
             "public-self-check",
@@ -1989,15 +2218,14 @@ class EnvironmentJudge:
                 "stderr_hash": sha256_digest(result.stderr.encode()),
                 "network": "disabled",
                 "workspace": "read-only",
+                **failure_details,
             },
             dependencies=(candidate_ref, candidate.public_verifier_ref),
         )
         return (
             "pass" if passed else "fail",
             evidence_ref,
-            "Public self-check passed in the clean sandbox."
-            if passed
-            else "Public self-check failed in the clean sandbox.",
+            "Public self-check passed in the clean sandbox." if passed else failure_summary,
         )
 
     async def _integration_protocol_gate(
@@ -2159,6 +2387,7 @@ class EnvironmentJudge:
     ) -> _MaterializationGateResult:
         episodes = 0
         calls: tuple[TaskMaterializerCall, ...] = ()
+        repair_remediation: str | None = None
         try:
             schema, curriculum = self._load_task_contract(candidate)
             if curriculum != design.curriculum:
@@ -2178,20 +2407,20 @@ class EnvironmentJudge:
             payload_calls = tuple(
                 call.model_dump(mode="json", exclude={"schema_version"}) for call in calls
             )
-            first_result = await self.sandbox_runner.run_task_materializer(
-                clean.root,
+            first_campaign = await self._run_task_materializer_campaign(
+                candidate_root=clean.root,
                 entrypoint=candidate.task_materializer.entrypoint,
                 calls=payload_calls,
                 visible_workspace_paths=self._role_visible_paths(manifest, "task_materializer"),
             )
-            second_result = await self.sandbox_runner.run_task_materializer(
-                clean.root,
+            second_campaign = await self._run_task_materializer_campaign(
+                candidate_root=clean.root,
                 entrypoint=candidate.task_materializer.entrypoint,
                 calls=payload_calls,
                 visible_workspace_paths=self._role_visible_paths(manifest, "task_materializer"),
             )
-            first = self._task_runner_outputs(first_result, expected_count=len(calls))
-            second = self._task_runner_outputs(second_result, expected_count=len(calls))
+            first = first_campaign.materializations
+            second = second_campaign.materializations
             if canonical_json_bytes(first) != canonical_json_bytes(second):
                 raise _CandidateTaskFailure(
                     "Task Materializer is not deterministic across isolated invocations"
@@ -2231,73 +2460,28 @@ class EnvironmentJudge:
                 curriculum=curriculum,
             )
             requirements = {item.task_type: item for item in curriculum.task_types}
-            runtime_initial_views: dict[int, tuple[str, JsonValue]] = {}
-            rule_violations: list[dict[str, JsonValue]] = []
-            for index, envelope in enumerate(envelopes):
-                async with self._episode_driver(
-                    clean,
-                    candidate,
-                    manifest,
-                    envelope,
-                    design,
-                ) as driver:
-                    episodes += 1
-                    runtime_initial_views[index] = (
-                        driver.final_state_digest,
-                        driver.reset_observation,
-                    )
-                    snapshot = driver._pre_snapshot
-                    context = RuleExecutionContext(
-                        actor=envelope.call.actor,
-                        pre_state=snapshot["observation"],
-                        post_state=snapshot["observation"],
-                        args={},
-                        tool_result=None,
-                        error=None,
-                        observation=snapshot["observation"],
-                        events=[],
-                        reset_config=envelope.materialization.initial_config,
-                        task_goal=envelope.evaluator_goal,
-                        seed=envelope.call.seed,
-                        terminated=False,
-                        truncated=False,
-                    )
-                    requirement = requirements[envelope.call.task_type]
-                    for rule in (
-                        *initially_evaluable_invariants(design.world_spec.invariants),
-                        *design.world_spec.state.initial_state_constraints,
-                        *requirement.initial_state_constraints,
-                        *design.curriculum.sampling_constraints,
-                    ):
-                        evaluation = evaluate_rule(rule, context)
-                        if not evaluation.result:
-                            failed_clauses = tuple(
-                                clause.clause_id
-                                for clause, passed in zip(
-                                    rule.clauses,
-                                    evaluation.clause_results,
-                                    strict=True,
-                                )
-                                if not passed
-                            )
-                            rule_violations.append(
-                                {
-                                    "task_type": envelope.call.task_type,
-                                    "seed": envelope.call.seed,
-                                    "rule_id": rule.rule_id,
-                                    "failed_clause_ids": list(failed_clauses),
-                                }
-                            )
+            initial_checks = await self._run_runtime_initial_state_checks(
+                clean=clean,
+                candidate=candidate,
+                manifest=manifest,
+                envelopes=envelopes,
+                design=design,
+                requirements=requirements,
+            )
+            episodes += len(initial_checks)
+            runtime_initial_views = {
+                check.index: (check.final_state_digest, check.reset_observation)
+                for check in initial_checks
+            }
+            rule_violations = [
+                violation for check in initial_checks for violation in check.rule_violations
+            ]
             if rule_violations:
                 grouped: dict[
                     tuple[str, str, tuple[str, ...]],
                     dict[str, Any],
                 ] = {}
-                rule_lookup = {
-                    rule.rule_id: rule
-                    for requirement in curriculum.task_types
-                    for rule in requirement.initial_state_constraints
-                }
+                rule_lookup = self._initial_state_rule_lookup(design, curriculum)
                 for item in rule_violations:
                     task_type = cast(str, item["task_type"])
                     rule_id = cast(str, item["rule_id"])
@@ -2319,13 +2503,26 @@ class EnvironmentJudge:
                         example_seeds.append(cast(int, item["seed"]))
                 violation_groups: list[dict[str, JsonValue]] = []
                 previews: list[str] = []
+                rule_scopes = self._initial_state_rule_scope_lookup(design, curriculum)
                 for (task_type, rule_id, clause_ids), group in grouped.items():
-                    rule = rule_lookup[rule_id]
+                    rule = rule_lookup.get(rule_id)
+                    if rule is None:
+                        raise JudgeInfrastructureError(
+                            "task_materializer_rule_feedback_lookup_missing",
+                            "framework could not render a failed initial-state rule for feedback",
+                        )
                     failed_contracts = [
                         clause.model_dump(mode="json", exclude={"schema_version"})
                         for clause in rule.clauses
                         if clause.clause_id in clause_ids
                     ]
+                    rule_scope = rule_scopes.get(rule_id)
+                    if rule_scope is None:
+                        raise JudgeInfrastructureError(
+                            "task_materializer_rule_feedback_scope_missing",
+                            "framework could not identify a failed initial-state rule scope",
+                        )
+                    group["rule_scope"] = rule_scope
                     group["failed_clause_contracts"] = failed_contracts
                     violation_groups.append(cast(dict[str, JsonValue], group))
                     coordinates = []
@@ -2341,19 +2538,32 @@ class EnvironmentJudge:
                         coordinates.append(f"{left} {clause.operator} {right}")
                     previews.append(
                         f"{group['count']}x task_type={task_type} rule={rule_id} "
-                        f"clauses={list(clause_ids)} comparisons={coordinates} "
+                        f"scope={rule_scope} clauses={list(clause_ids)} comparisons={coordinates} "
                         f"example_seeds={group['example_seeds']}"
                     )
-                preview = " | ".join(previews[:16])
-                if len(previews) > 16:
-                    preview += f" | ... {len(previews) - 16} more groups"
+                preview = previews[0]
+                if len(previews) > 1:
+                    preview += f" | ... {len(previews) - 1} more groups in failure_details"
+                first_group = violation_groups[0]
+                repair_remediation = (
+                    "Make Task Materializer initial_config satisfy the frozen Rule while "
+                    "preserving task reachability and actor/tool permissions: "
+                    f"task_type={first_group['task_type']} rule={first_group['rule_id']} "
+                    f"scope={first_group['rule_scope']} "
+                    f"clauses={first_group['failed_clause_ids']}. "
+                    "If no Candidate state can satisfy both the frozen Rule and reachability, "
+                    "return blocked and name the upstream WorldRules/TaskRequirement conflict; "
+                    "do not bypass a Rule or test."
+                )
                 raise _CandidateTaskFailure(
-                    f"{len(rule_violations)} materialized task Rule violations: {preview}",
+                    f"{len(rule_violations)} materialized task Rule violations across "
+                    f"{len(violation_groups)} groups: {preview}",
                     details={
                         "violation_count": len(rule_violations),
                         "violation_group_count": len(violation_groups),
                         "violation_groups": cast(JsonValue, violation_groups),
                     },
+                    repair_remediation=repair_remediation,
                 )
             difficulty_evidence = self._validate_runtime_difficulty_contrasts(
                 contrasts,
@@ -2365,6 +2575,18 @@ class EnvironmentJudge:
                 "callable": "materialize(seed, task_type, actor, difficulty)",
                 "materialized_count": len(envelopes),
                 "deterministic_replay_count": len(second),
+                "materializer_transport": {
+                    "runner_invocations": (
+                        first_campaign.runner_invocations + second_campaign.runner_invocations
+                    ),
+                    "adaptive_batch_splits": (
+                        first_campaign.adaptive_batch_splits + second_campaign.adaptive_batch_splits
+                    ),
+                    "per_pass_runner_invocations": (
+                        first_campaign.runner_invocations,
+                        second_campaign.runner_invocations,
+                    ),
+                },
                 "task_type_counts": dict(
                     sorted(Counter(item.call.task_type for item in envelopes).items())
                 ),
@@ -2391,6 +2613,8 @@ class EnvironmentJudge:
                 ],
                 "framework_owned_fields": ["public_instruction", "evaluator_goal"],
                 "runtime_received_fields": ["seed", "actor", "initial_config"],
+                "curriculum_sampling_rule_count": len(design.curriculum.sampling_constraints),
+                "curriculum_sampling_execution_boundary": "task_materialization_reset",
                 "network": "disabled",
                 "workspace": "read-only",
             }
@@ -2428,6 +2652,9 @@ class EnvironmentJudge:
             status = "fail"
             summary = _candidate_failure_summary(exc)
             owner = "build"
+            repair_remediation = (
+                exc.repair_remediation if isinstance(exc, _CandidateTaskFailure) else None
+            )
             envelopes = ()
         except JudgeInfrastructureError as exc:
             record = {
@@ -2438,6 +2665,7 @@ class EnvironmentJudge:
             status = "error"
             summary = str(exc)
             owner = "judge_infrastructure"
+            repair_remediation = None
             envelopes = ()
         evidence_ref = self._evidence(
             run_id,
@@ -2456,6 +2684,7 @@ class EnvironmentJudge:
             episodes,
             envelopes,
             owner,
+            repair_remediation,
         )
 
     async def _task_reachability_gate(
@@ -3221,22 +3450,7 @@ class EnvironmentJudge:
     ) -> dict[str, int]:
         """Compile each task type's finite stratified release sample."""
 
-        return {
-            requirement.task_type: (
-                len(requirement.allowed_actor_ids)
-                * (
-                    max(
-                        2,
-                        curriculum.minimum_distinct_initial_states,
-                        curriculum.minimum_distinct_tasks_per_type,
-                        requirement.reachability_policy.samples_per_task_actor,
-                    )
-                    + 2 * len(requirement.difficulty_dimensions)
-                )
-                + requirement.reachability_policy.random_tail_samples
-            )
-            for requirement in curriculum.task_types
-        }
+        return task_materializer_call_counts(curriculum)
 
     @staticmethod
     def _task_materializer_calls(
@@ -3327,13 +3541,18 @@ class EnvironmentJudge:
 
     @staticmethod
     def _task_runner_outputs(
-        result: SandboxProcessResult,
+        result: ProcessResult,
         *,
         expected_count: int,
     ) -> tuple[dict[str, Any], ...]:
         if not result.succeeded:
+            details = _sandbox_failure_details(result)
+            summary = "Task Materializer exited unsuccessfully, timed out, or exceeded limits"
+            if details:
+                summary += "; " + "; ".join(_sandbox_failure_coordinates(details))
             raise _CandidateTaskFailure(
-                "Task Materializer exited unsuccessfully, timed out, or exceeded limits"
+                summary,
+                details=details,
             )
         try:
             payload = json.loads(result.stdout)
@@ -3352,6 +3571,283 @@ class EnvironmentJudge:
                 "Task Materializer runner response violated the closed v3 contract"
             )
         return tuple(payload["materializations"])
+
+    @staticmethod
+    def _is_aggregate_materializer_output_limit(
+        result: ProcessResult,
+    ) -> bool:
+        """Whether only the framework's aggregate reply transport was bounded.
+
+        A successful process with only stdout truncation has run the candidate
+        materializer successfully.  The partial aggregate JSON is unusable, but
+        retrying smaller framework-owned batches can preserve the per-process
+        output ceiling.  Timeouts, process failures, stderr truncation, and
+        single-call output overflows remain real Candidate or infrastructure
+        failures and must not be disguised as transport splitting.
+        """
+
+        return (
+            result.exit_code == 0
+            and not result.failure_class
+            and result.stdout_truncated
+            and not result.stderr_truncated
+        )
+
+    async def _run_task_materializer_campaign(
+        self,
+        *,
+        candidate_root: Path,
+        entrypoint: str,
+        calls: Sequence[Mapping[str, JsonValue]],
+        visible_workspace_paths: Sequence[str],
+    ) -> _MaterializerCampaign:
+        """Materialize one deterministic call campaign without widening I/O limits.
+
+        The runner's stdout ceiling applies to an untrusted process and must
+        remain in force.  A curriculum can nevertheless contain thousands of
+        valid small materializations, whose *aggregate* JSON exceeds that
+        ceiling.  On exactly that terminal shape, bisect the framework-owned
+        input batch.  The returned order stays identical to ``calls`` and a
+        singleton overflow remains precise, repair-safe Candidate feedback.
+        """
+
+        payload_calls = tuple(calls)
+        if not payload_calls:
+            raise JudgeInfrastructureError(
+                "task_materializer_empty_campaign",
+                "framework task-materializer campaign must contain at least one call",
+            )
+
+        async def run_batch(
+            batch: tuple[Mapping[str, JsonValue], ...],
+        ) -> _MaterializerCampaign:
+            result = await self.process_runner.run_task_materializer(
+                candidate_root,
+                entrypoint=entrypoint,
+                calls=batch,
+                visible_workspace_paths=visible_workspace_paths,
+            )
+            if self._is_aggregate_materializer_output_limit(result):
+                if len(batch) == 1:
+                    details = _sandbox_failure_details(result)
+                    details["materializer_response_scope"] = "single_call"
+                    raise _CandidateTaskFailure(
+                        "Task Materializer single-call response exceeded the sandbox output limit",
+                        details=details,
+                    )
+                midpoint = len(batch) // 2
+                # Keep adaptive recovery bounded: a pathological Candidate must
+                # not turn one truncated response into thousands of concurrent
+                # sandbox processes.  The campaign itself is finite and every
+                # physical run remains independently observable.
+                left = await run_batch(batch[:midpoint])
+                right = await run_batch(batch[midpoint:])
+                return _MaterializerCampaign(
+                    materializations=left.materializations + right.materializations,
+                    runner_invocations=1 + left.runner_invocations + right.runner_invocations,
+                    adaptive_batch_splits=1
+                    + left.adaptive_batch_splits
+                    + right.adaptive_batch_splits,
+                )
+            return _MaterializerCampaign(
+                materializations=self._task_runner_outputs(result, expected_count=len(batch)),
+                runner_invocations=1,
+                adaptive_batch_splits=0,
+            )
+
+        return await run_batch(payload_calls)
+
+    async def _run_runtime_initial_state_checks(
+        self,
+        *,
+        clean: CleanCandidate,
+        candidate: EnvironmentCandidate,
+        manifest: CandidateManifest,
+        envelopes: Sequence[FrameworkTaskEnvelope],
+        design: EnvironmentDesign,
+        requirements: Mapping[str, TaskRequirement],
+    ) -> tuple[_RuntimeInitialStateCheck, ...]:
+        """Exercise independent Runtime resets with bounded host concurrency.
+
+        Each materialized task gets a new state directory and a read-only
+        Candidate workspace.  The checks therefore have no shared Candidate
+        state and may run concurrently.  Scheduling remains bounded so one
+        oversized curriculum cannot fan out into unbounded sandbox processes;
+        results and any failure are selected by original campaign index, not
+        completion order.
+        """
+
+        if not envelopes:
+            return ()
+        next_index = 0
+        results: dict[int, _RuntimeInitialStateCheck] = {}
+        failures: list[tuple[int, BaseException]] = []
+        scheduling_lock = asyncio.Lock()
+
+        async def worker() -> None:
+            nonlocal next_index
+            while True:
+                async with scheduling_lock:
+                    if next_index >= len(envelopes) or failures:
+                        return
+                    index = next_index
+                    next_index += 1
+                try:
+                    result = await self._runtime_initial_state_check(
+                        index=index,
+                        clean=clean,
+                        candidate=candidate,
+                        manifest=manifest,
+                        envelope=envelopes[index],
+                        design=design,
+                        requirements=requirements,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException as exc:
+                    async with scheduling_lock:
+                        failures.append((index, exc))
+                    return
+                async with scheduling_lock:
+                    results[index] = result
+
+        await asyncio.gather(
+            *(worker() for _ in range(min(self.runtime_episode_concurrency, len(envelopes))))
+        )
+        if failures:
+            _, first_failure = min(failures, key=lambda item: item[0])
+            raise first_failure
+        if len(results) != len(envelopes):
+            raise JudgeInfrastructureError(
+                "task_materializer_runtime_campaign_incomplete",
+                "framework Runtime initial-state campaign completed without every result",
+            )
+        return tuple(results[index] for index in range(len(envelopes)))
+
+    async def _runtime_initial_state_check(
+        self,
+        *,
+        index: int,
+        clean: CleanCandidate,
+        candidate: EnvironmentCandidate,
+        manifest: CandidateManifest,
+        envelope: FrameworkTaskEnvelope,
+        design: EnvironmentDesign,
+        requirements: Mapping[str, TaskRequirement],
+    ) -> _RuntimeInitialStateCheck:
+        """Validate one task's reset state without exposing Candidate output."""
+
+        rule_violations: list[dict[str, JsonValue]] = []
+        async with self._episode_driver(
+            clean,
+            candidate,
+            manifest,
+            envelope,
+            design,
+        ) as driver:
+            snapshot = driver._pre_snapshot
+            context = RuleExecutionContext(
+                actor=envelope.call.actor,
+                pre_state=snapshot["observation"],
+                post_state=snapshot["observation"],
+                args={},
+                tool_result=None,
+                error=None,
+                observation=snapshot["observation"],
+                events=[],
+                reset_config=envelope.materialization.initial_config,
+                task_goal=envelope.evaluator_goal,
+                seed=envelope.call.seed,
+                terminated=False,
+                truncated=False,
+            )
+            requirement = requirements[envelope.call.task_type]
+            for rule in initially_evaluable_rules(
+                (
+                    *design.world_spec.invariants,
+                    *design.world_spec.state.initial_state_constraints,
+                    *requirement.initial_state_constraints,
+                    *design.curriculum.sampling_constraints,
+                )
+            ):
+                evaluation = evaluate_rule(rule, context)
+                if not evaluation.result:
+                    failed_clauses = tuple(
+                        clause.clause_id
+                        for clause, passed in zip(
+                            rule.clauses,
+                            evaluation.clause_results,
+                            strict=True,
+                        )
+                        if not passed
+                    )
+                    rule_violations.append(
+                        {
+                            "task_type": envelope.call.task_type,
+                            "seed": envelope.call.seed,
+                            "rule_id": rule.rule_id,
+                            "failed_clause_ids": list(failed_clauses),
+                        }
+                    )
+            return _RuntimeInitialStateCheck(
+                index=index,
+                final_state_digest=driver.final_state_digest,
+                reset_observation=driver.reset_observation,
+                rule_violations=tuple(rule_violations),
+            )
+
+    @staticmethod
+    def _initial_state_rule_lookup(
+        design: EnvironmentDesign,
+        curriculum: CurriculumRequirements,
+    ) -> dict[str, Rule]:
+        """Index every rule that the initial-state campaign can evaluate.
+
+        Feedback previously indexed only task-local initial rules even though
+        the campaign also evaluates WorldSpec invariants, global state
+        constraints, and curriculum sampling constraints.  A real global-rule
+        failure then degraded into ``KeyError`` instead of disclosing the
+        precise candidate-owned rule clause.  This is a feedback projection,
+        not a new semantic contract.
+        """
+
+        rules = (
+            *design.world_spec.invariants,
+            *design.world_spec.state.initial_state_constraints,
+            *(
+                rule
+                for requirement in curriculum.task_types
+                for rule in requirement.initial_state_constraints
+            ),
+            *curriculum.sampling_constraints,
+        )
+        return {rule.rule_id: rule for rule in rules}
+
+    @staticmethod
+    def _initial_state_rule_scope_lookup(
+        design: EnvironmentDesign,
+        curriculum: CurriculumRequirements,
+    ) -> dict[str, str]:
+        """Project the frozen owner scope needed for safe materializer feedback."""
+
+        scopes = {rule.rule_id: "world_invariant" for rule in design.world_spec.invariants}
+        scopes.update(
+            {
+                rule.rule_id: "world_initial_state"
+                for rule in design.world_spec.state.initial_state_constraints
+            }
+        )
+        scopes.update(
+            {
+                rule.rule_id: "task_initial_state"
+                for requirement in curriculum.task_types
+                for rule in requirement.initial_state_constraints
+            }
+        )
+        scopes.update(
+            {rule.rule_id: "curriculum_sampling" for rule in curriculum.sampling_constraints}
+        )
+        return scopes
 
     @staticmethod
     def _validate_runtime_difficulty_contrasts(
@@ -3497,7 +3993,7 @@ class EnvironmentJudge:
             clean.root,
             LaunchContract(argv=runtime.argv, cwd=runtime.workdir),
             visible_workspace_paths=self._role_visible_paths(manifest, "runtime"),
-            isolation=self.runtime_isolation,
+            execution=self.runtime_execution,
             request_timeout_seconds=runtime.request_timeout_seconds,
             shutdown_grace_seconds=runtime.shutdown_timeout_seconds,
             on_subprocess_scene=(
@@ -3860,6 +4356,7 @@ class EnvironmentJudge:
         status: GateStatus,
         evidence_ref: ArtifactRef,
         summary: str,
+        suggested_repair: str | None = None,
         owner: FindingOwner,
         candidate_ref: ArtifactRef,
         release_profile: ReleaseProfile,
@@ -3889,7 +4386,7 @@ class EnvironmentJudge:
                     evidence_ref,
                     owner=owner,
                     summary=f"{gate_id} did not pass.",
-                    suggested_repair=summary,
+                    suggested_repair=suggested_repair or summary,
                     disclosure=disclosure,
                 )
             )
@@ -4158,8 +4655,10 @@ def _require_budget_at_least(available: Budget, required: Budget) -> None:
         if name != "schema_version" and getattr(available, name) < getattr(required, name)
     )
     if deficits:
-        raise ValueError(
-            "Judge child lease is below its compiled worst-case reservation: " + ", ".join(deficits)
+        raise JudgeBudgetDeficitError(
+            available=available,
+            required=required,
+            deficits=deficits,
         )
 
 

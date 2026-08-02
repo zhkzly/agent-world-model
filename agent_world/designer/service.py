@@ -23,7 +23,7 @@ from typing import Any, Literal, Protocol, TypeVar, cast, overload
 from jsonschema import Draft202012Validator, SchemaError  # type: ignore[import-untyped]
 from pydantic import BaseModel, JsonValue, ValidationError
 
-from agent_world.agent_profiles import logical_workspace_for_isolated_agent_workspace
+from agent_world.agent_profiles import logical_workspace_for_agent_workspace
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.contracts import (
     ActorBoundary,
@@ -102,6 +102,7 @@ from agent_world.control.work_store import WorkControlHead
 from agent_world.invocation import (
     AgentOutputAuthority,
     CapabilityResolutionError,
+    InvocationExecutionMode,
     NodeCapabilityRequirement,
     assert_agent_output_advisory,
     standalone_component_ownership,
@@ -112,6 +113,7 @@ from agent_world.invocation.contracts import (
     InvocationResult,
     ResolvedAgentProfile,
 )
+from agent_world.invocation.structured_prompt import render_direct_structured_prompt
 from agent_world.research import (
     ResearchBundle,
     ResearchEvidenceUnavailable,
@@ -263,8 +265,6 @@ MAX_DESIGN_FANOUT_CONCURRENCY = 3
 DIRECT_DESIGN_BASE_TURNS = 8
 DIRECT_DESIGN_MAX_CORRECTIONS = 2
 DIRECT_DESIGN_MAX_TURNS = DIRECT_DESIGN_BASE_TURNS + DIRECT_DESIGN_MAX_CORRECTIONS
-_TRANSPORT_ARTIFACT_FIELD = "artifact_json"
-
 # Acceptance-critical version of the semantic-layer scaffold/compiler code.  It
 # is derived from the source of the modules that author every semantic design
 # leaf, so editing any of them bumps this id, which flows into each semantic
@@ -4149,15 +4149,14 @@ class EnvironmentDesigner:
                     "additional_evidence": [item.model_dump(mode="json") for item in additions],
                     "citation_catalog": project_evidence_citation_catalog(
                         combined_evidence,
-                        newly_fetched_evidence_ids=tuple(
-                            item.evidence_id for item in additions
-                        ),
+                        newly_fetched_evidence_ids=tuple(item.evidence_id for item in additions),
                     ),
                     "source_files": source_manifest,
                     "challenged_claim_ids": list(challenged),
                     "findings": repair_disclosures,
                 },
             )
+
             def validate_reconciliation(value: EvidenceSynthesisSourceDraft) -> None:
                 synthesis = compile_evidence_synthesis(value, evidence=combined_evidence)
                 graph = EvidenceGraph(
@@ -4891,7 +4890,10 @@ class EnvironmentDesigner:
         )
         schema = model.model_json_schema(mode="validation")
         schema_digest = sha256_digest(canonical_json_bytes(schema))
-        requirement = capability_requirement or NodeCapabilityRequirement.structured_read(
+        # Semantic design work has no legitimate workspace/tool dependency.
+        # Keep it on the explicit prompt-only Direct path unless a caller
+        # deliberately requests a tool-enabled capability.
+        requirement = capability_requirement or NodeCapabilityRequirement.structured_output(
             node_id=f"{role}.structured-output",
             role=role,
         )
@@ -5006,6 +5008,11 @@ class EnvironmentDesigner:
                 )
             profile_workspace = workspace
             profile = resolve_profile_for_attempt(profile_workspace, model_override=None)
+            if not profile.allowed_builtin_tools:
+                immutable_prompt = render_direct_structured_prompt(
+                    immutable_prompt,
+                )
+                current_prompt = immutable_prompt
 
             async def begin_repair_with_route_liveness() -> WorkControlHead:
                 """Admit one already-authorized repair through the shared gate.
@@ -5144,12 +5151,12 @@ class EnvironmentDesigner:
                     if record is not None:
                         continuation_workspace = Path(record.workspace)
                         try:
-                            profile_workspace = logical_workspace_for_isolated_agent_workspace(
+                            profile_workspace = logical_workspace_for_agent_workspace(
                                 continuation_workspace
                             )
                         except (OSError, ValueError) as exc:
                             raise WorkRuntimeError(
-                                "continuation workspace does not match the isolated profile layout"
+                                "continuation workspace does not match the Agent profile layout"
                             ) from exc
                         if profile_workspace != frozen_input_workspace:
                             raise WorkRuntimeError(
@@ -5442,7 +5449,7 @@ class EnvironmentDesigner:
                         if record is not None and Path(record.workspace) != profile.workspace:
                             continuation_workspace = Path(record.workspace)
                             try:
-                                profile_workspace = logical_workspace_for_isolated_agent_workspace(
+                                profile_workspace = logical_workspace_for_agent_workspace(
                                     continuation_workspace
                                 )
                             except (OSError, ValueError) as exc:
@@ -5610,10 +5617,7 @@ class EnvironmentDesigner:
                         "proposal dispatch must be recovered before another invocation"
                     )
                 attempt = runtime.artifacts.get_json(head.attempt_ref, WorkAttempt)
-                if (
-                    attempt.model_override is not None
-                    and profile.model != attempt.model_override
-                ):
+                if attempt.model_override is not None and profile.model != attempt.model_override:
                     profile = resolve_profile_for_attempt(
                         profile_workspace,
                         model_override=attempt.model_override,
@@ -5644,6 +5648,11 @@ class EnvironmentDesigner:
                                 "attempt": attempt.ordinal,
                                 "repair_mode": repair_mode,
                             },
+                            execution_mode=(
+                                InvocationExecutionMode.AGENTIC
+                                if profile.allowed_builtin_tools
+                                else InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
+                            ),
                         ),
                         declared_wall_seconds=definition.proposal_policy.budget.wall_seconds,
                     )
@@ -5803,7 +5812,7 @@ class EnvironmentDesigner:
                     error_code=(
                         None
                         if result.succeeded and output_commitment is not None
-                        else "transport_output_missing"
+                        else "structured_output_missing"
                         if result.succeeded
                         else result.error.code
                         if result.error is not None
@@ -5892,13 +5901,10 @@ class EnvironmentDesigner:
                 try:
                     validation_stage: Literal["transport", "shape", "semantic"] = "transport"
                     if result.structured_output is None:
-                        raise self._transport_validation_error(
-                            "transport_output_missing",
+                        raise self._structured_output_validation_error(
+                            "structured_output_missing",
                             "The backend must return one complete structured artifact.",
                         )
-                    transport_error = self._transport_envelope_error(result.structured_output)
-                    if transport_error is not None:
-                        raise transport_error
                     validation_stage = "shape"
                     output = model.model_validate_json(
                         canonical_json_bytes(result.structured_output)
@@ -5973,7 +5979,10 @@ class EnvironmentDesigner:
                             validation_issues=diagnostic.issue_codes,
                             lineage_id=lineage_id,
                         ) from exc
-                    session = result.session
+                    # Direct LLM corrections carry the frozen prompt plus the
+                    # authorized feedback again. They never inherit a hidden
+                    # Codex thread, even if a faulty test double returns one.
+                    session = result.session if profile.allowed_builtin_tools else None
                     correction_prompt = correction_from_report(
                         report,
                         pending_repair_roots,
@@ -6202,7 +6211,7 @@ class EnvironmentDesigner:
             authority=AgentOutputAuthority.SEMANTIC_ADVISORY,
         )
         schema = model.model_json_schema(mode="validation")
-        requirement = capability_requirement or NodeCapabilityRequirement.structured_read(
+        requirement = capability_requirement or NodeCapabilityRequirement.structured_output(
             node_id=f"{role}.structured-output",
             role=role,
         )
@@ -6228,7 +6237,7 @@ class EnvironmentDesigner:
                 target=repair_target,
                 status="error",
                 issue_codes=("capability_resolution_error",),
-                summary="The semantic transaction could not resolve its isolated Agent profile.",
+                summary="The semantic transaction could not resolve its Agent profile.",
                 results=(),
             )
             raise DesignerError(
@@ -6242,7 +6251,13 @@ class EnvironmentDesigner:
                 lineage_id=lineage_id,
             ) from exc
         session = None
-        immutable_prompt = prompt
+        immutable_prompt = (
+            render_direct_structured_prompt(
+                prompt,
+            )
+            if not profile.allowed_builtin_tools
+            else prompt
+        )
         current_prompt = immutable_prompt
         last_result: InvocationResult | None = None
         repair_mode = "initial"
@@ -6422,6 +6437,11 @@ class EnvironmentDesigner:
                             "attempt": attempt,
                             "repair_mode": repair_mode,
                         },
+                        execution_mode=(
+                            InvocationExecutionMode.AGENTIC
+                            if profile.allowed_builtin_tools
+                            else InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
+                        ),
                     ),
                     # ICP owns the declared physical wall in production. This
                     # value is only for an isolated compatibility adapter or
@@ -6509,13 +6529,10 @@ class EnvironmentDesigner:
             try:
                 validation_stage: Literal["transport", "shape", "semantic"] = "transport"
                 if result.structured_output is None:
-                    raise self._transport_validation_error(
-                        "transport_output_missing",
+                    raise self._structured_output_validation_error(
+                        "structured_output_missing",
                         "The backend must return one complete structured artifact.",
                     )
-                transport_error = self._transport_envelope_error(result.structured_output)
-                if transport_error is not None:
-                    raise transport_error
                 validation_stage = "shape"
                 output = model.model_validate_json(canonical_json_bytes(result.structured_output))
                 if (
@@ -6618,7 +6635,7 @@ class EnvironmentDesigner:
                     if diagnostic is not None
                     else self._structured_repair_feedback(exc)
                 )
-                session = result.session
+                session = result.session if profile.allowed_builtin_tools else None
                 pending_repair_roots = (
                     repair_projection.roots(diagnostic)
                     if repair_projection is not None and diagnostic is not None
@@ -6688,40 +6705,14 @@ class EnvironmentDesigner:
                 )
 
     @staticmethod
-    def _transport_validation_error(code: str, message: str) -> StructuredValidationError:
+    def _structured_output_validation_error(code: str, message: str) -> StructuredValidationError:
         return StructuredValidationError(
             ValidationDiagnostic(
                 owner_component="design",
-                validation_phase="structured_output_transport",
+                validation_phase="structured_output",
                 frontier_ordinal=0,
-                issues=(SafeValidationIssue(code, ("artifact_json",), message),),
+                issues=(SafeValidationIssue(code, ("structured_output",), message),),
             )
-        )
-
-    @staticmethod
-    def _transport_envelope_error(value: JsonValue) -> StructuredValidationError | None:
-        """Explain an undecoded provider envelope without exposing its payload."""
-
-        if not isinstance(value, dict) or set(value) != {_TRANSPORT_ARTIFACT_FIELD}:
-            return None
-        payload = value[_TRANSPORT_ARTIFACT_FIELD]
-        if isinstance(payload, str):
-            try:
-                json.loads(payload)
-            except json.JSONDecodeError:
-                return EnvironmentDesigner._transport_validation_error(
-                    "transport_invalid_json",
-                    "transport artifact_json must contain one valid JSON object.",
-                )
-            return EnvironmentDesigner._transport_validation_error(
-                "transport_envelope_invalid",
-                "Return the complete logical artifact object instead of a nested transport "
-                "envelope.",
-            )
-        return EnvironmentDesigner._transport_validation_error(
-            "transport_envelope_invalid",
-            "transport artifact_json must be a JSON string containing the complete logical "
-            "artifact object.",
         )
 
     @staticmethod
@@ -6783,10 +6774,6 @@ class EnvironmentDesigner:
             return exc.diagnostic.issue_codes
         if not isinstance(exc, ValidationError):
             message = str(exc)
-            if message.startswith("transport artifact_json must contain"):
-                return ("transport_invalid_json",)
-            if message.startswith("transport artifact_json"):
-                return ("transport_envelope_invalid",)
             task_schema_match = re.search(
                 r"initial_config_schema(?:\.([A-Za-z0-9_.\[\]-]+))? uses "
                 r"unsupported open/composed schema keywords",
@@ -6880,16 +6867,6 @@ class EnvironmentDesigner:
             return exc.diagnostic.feedback
         if not isinstance(exc, ValidationError):
             issue_codes = EnvironmentDesigner._validation_issue_codes(exc)
-            if issue_codes == ("transport_invalid_json",):
-                return (
-                    "- transport_invalid_json at artifact_json: transport artifact_json must "
-                    "contain one valid JSON object"
-                )
-            if issue_codes == ("transport_envelope_invalid",):
-                return (
-                    "- transport_envelope_invalid at artifact_json: return the complete logical "
-                    "artifact object instead of a nested transport envelope"
-                )
             return "\n".join(
                 f"- {code} at <semantic>: the framework-authored semantic constraint failed; "
                 "correct the complete typed artifact using only frozen inputs"
@@ -10913,10 +10890,15 @@ class EnvironmentDesigner:
                             expected_category="an exact frozen evidence claim identifier",
                         )
                     )
-            if "task_goal" in EnvironmentDesigner._nested_values(
-                rule.model_dump(mode="json"),
-                "source",
-            ):
+            rule_sources = frozenset(
+                value
+                for value in EnvironmentDesigner._nested_values(
+                    rule.model_dump(mode="json"),
+                    "source",
+                )
+                if isinstance(value, str)
+            )
+            if "task_goal" in rule_sources:
                 issues.append(
                     SafeValidationIssue(
                         "curriculum_sampling_task_goal_forbidden",
@@ -10926,6 +10908,40 @@ class EnvironmentDesigner:
                             "sampling Rule sources exclude evaluator-only task_goal"
                         ),
                         expected_category="a sampling Rule over non-task-goal sources",
+                    )
+                )
+            action_scoped_sources = sorted(
+                {
+                    "args",
+                    "tool_result",
+                    "error",
+                    "events",
+                    "terminated",
+                    "truncated",
+                }
+                & rule_sources
+            )
+            if action_scoped_sources:
+                issues.append(
+                    SafeValidationIssue(
+                        "curriculum_sampling_action_source_forbidden",
+                        ("sampling_constraints", sampling_index),
+                        (
+                            "Sampling Rules execute during task materialization/reset before any "
+                            "tool action and cannot read action-scoped sources: "
+                            f"{action_scoped_sources}."
+                        ),
+                        violated_condition=(
+                            "sampling Rule sources are available during task materialization/reset"
+                        ),
+                        expected_category=(
+                            "a sampling Rule over actor, pre_state, post_state, observation, "
+                            "reset_config, or seed"
+                        ),
+                        remediation=(
+                            "Rewrite this sampling Rule using only reset-available values; move "
+                            "post-action behavior into a task or tool Rule instead."
+                        ),
                     )
                 )
         if issues:
@@ -12234,7 +12250,7 @@ class EnvironmentDesigner:
 
     @staticmethod
     def _research_plan_prompt(request: EnvironmentRequest) -> str:
-        return f"""You are the isolated Researcher for an Agent World Foundry.
+        return f"""You are the Researcher for an Agent World Foundry.
 Project purpose: compile a short human need into a faithful executable programmatic environment.
 Your role here is only to plan real searches. Do not answer from memory and do not design code.
 
@@ -12261,7 +12277,7 @@ unsupported facts must remain unknown.
             sort_keys=True,
             separators=(",", ":"),
         )
-        return f"""You are the isolated Researcher for an Agent World Foundry.
+        return f"""You are the Researcher for an Agent World Foundry.
 Project purpose: ground an executable environment in retrieved source bodies.
 
 Use only the framework-generated CitationCatalog embedded below. Each entry contains bounded,
@@ -12318,6 +12334,12 @@ unions, array wrappers, references, required lists and closed JSON Schema. Bind 
 only to exact supplied claim ids and keep
 unsupported behavior explicitly bounded in fidelity or unresolved questions.
 
+Choose the smallest public surface that directly serves the stated need and admitted claims. Every
+public tool must map to a concrete requested user action or necessary constraint. Do not invent
+speculative workflow/orchestration, synchronization/integration, administrative, audit, helper,
+or future-extension tools. Keep internal coordination as state and behavior inside required tools
+unless the need or evidence makes a separate public action indispensable.
+
 Do not emit Schema IR or raw JSON Schema, reset/global rules, tool transition/error/permission/
 retry semantics, tasks, reward, verifier, runtime code, fixed cases, replay trajectories, expected
 answers, or release decisions. Do not use tools.
@@ -12335,7 +12357,11 @@ Rule IR rather than leaving them as prose or trusting an LLM during rollout.
 Use only the frozen request, evidence claim catalog, WorldSkeleton and compiled ToolSemantics.
 Produce exactly WorldRuleSemanticsSourceDraft. Author the smallest complete initial-state and global
 invariant RuleDraft set. Initial rules use family `initial_state`; global rules use family
-`invariant`. Rule identities are framework mechanics: omit optional `rule_id`; code derives stable
+`invariant`. Emit only genuine global relationships that remain after the frozen tool-local rules;
+an empty list is correct when the closed Rule Draft ADT cannot express another global property
+without merely restating the state Schema. Never use a constant-only comparison,
+collection-existence restatement, tautology, placeholder, or no-op. Rule identities are framework
+mechanics: omit optional `rule_id`; code derives stable
 `rule:state:<ordinal>` and `rule:world:<ordinal>` identities after the proposal. Every pointer and
 value type must exist in the frozen schemas, cite only supplied claim ids, and never read task_goal.
 Rules must be general properties, not fixed booking cases, expected answers or trajectories.
@@ -12383,13 +12409,17 @@ and an independent Judge can both evaluate. This transaction owns the coupled be
 the ordered tool ids {ids}; the framework owns their identities, schemas, state, protocols, and
 release decisions.
 
-Produce exactly ToolSemanticsBatchSourceDraft and preserve the exact tool order and every nested
-tool_id. For each tool provide conditions, the smallest complete pre-state/args to post-state/output
-transition RuleDraft set, explicit error paths including timeout behavior, actor permission and
+Produce exactly ToolSemanticsBatchSourceDraft for the one frozen target tool and preserve its exact
+tool_id at every nested location. Return the smallest semantically sufficient closed behavior: do
+not narrate reasoning, repeat equivalent Rules, enumerate examples or trajectories, duplicate
+frozen context, or expand alternatives; do not omit a necessary behavior merely to be short. For
+that tool provide conditions, the smallest complete pre-state/args to post-state/output transition
+RuleDraft set, explicit error paths including timeout behavior, actor permission and
 complete per-actor observation visibility, plus idempotency/retry/transaction/rollback/
-concurrency policy. All rule ids for a tool must start with `rule:<tool_id>:`. Use only frozen state
-and schema paths, only supplied evidence claim ids, and never read evaluator-only task_goal. Keep
-state effects consistent across the tools in this batch; do not silently invent another resource.
+concurrency policy. Rule ids and families are framework mechanics: omit them; code derives their
+closed tool/section/ordinal identity. Use only frozen state and schema paths, only supplied
+evidence claim ids, and never read evaluator-only task_goal. Do not silently invent another
+resource.
 For every `lookup_by_key`, copy collection_pointer, primary key and item field names exactly from
 that tool's frozen `rule_context_catalogs` input; never infer a collection path from prose.
 The frozen coupling groups and shared_tool_contracts are mandatory. For every tool covered by a
@@ -12444,8 +12474,11 @@ field merely because its list may be empty. Every task needs at least one succes
 with scalar non-overlapping task_goal pointers. Rule identities are framework mechanics: omit
 optional `rule_id` from sampling and every task Rule. The compiler derives
 `rule:sampling:<ordinal>` and `rule:task:<task_type>:<section>:<ordinal>` from the frozen plan.
-Sampling Rules use family `sampling` and never read task_goal; initial-state Rules use
-`initial_state` and never read task_goal; success/failure/terminal Rules use `task_success`,
+Sampling Rules use family `sampling` and only read reset-available actor, pre_state, post_state,
+observation, reset_config, or seed values; they never read action-only args, tool_result, error,
+events, evaluator-only task_goal, terminated, or truncated. Initial-state Rules use
+`initial_state` with that same reset-only source set; success/failure/terminal Rules use
+`task_success`,
 `task_failure`, and `task_terminal` respectively. Evaluator Rules never read Runtime `terminated`
 or `truncated`. Coverage is design-stage only, so runtime_implemented and verifier_covered remain
 absent. Framework code will compile task schemas, evaluator bindings, RewardSpec and
@@ -12552,7 +12585,11 @@ leaving them as prose.
 Use the framework-frozen `request`, `evidence_graph`, `world_boundary`, and `world_state_shape`
 JSON inputs below. Produce exactly InitialStateRulesSourceDraft. Emit only genuine global
 constraints on valid initial world state; an empty list is correct when the frozen schemas and later
-task materialization fully determine initialization. Every emitted Rule must use family
+task materialization fully determine initialization. A global initial-state constraint applies to
+every later task materialization. Do not require a resource collection to be empty when the
+requested workflow needs pre-existing instances and its permitted actor/tool path cannot create
+them; leave global initialization unconstrained when valid seed state belongs to later task
+materialization. Every emitted Rule must use family
 `initial_state`, use only the closed typed Rule IR, and never read evaluator-only task_goal. Omit
 optional `rule_id`: framework code derives the stable `rule:state:<ordinal>` identity. Use the
 discriminated clause variants exactly; ordered clauses must choose `number`, `date`, or `date-time`.
@@ -12775,7 +12812,10 @@ transition. Do not change or restate the boundary, state, surfaces, or tool sema
 Use only the discriminated closed Rule Draft ADT, exact staged schemas/constraint ids, and exact
 evidence claim ids. Every rule uses family `invariant`; omit optional `rule_id` because framework
 code derives `rule:world:<ordinal>`. Rules must not read task_goal. Cover the supplied
-core_invariants with executable cross-resource Rules rather than prose. Schema validity is already
+core_invariants with executable cross-resource Rules rather than prose when the closed Rule Draft
+ADT can express them as genuine global relationships beyond frozen tool-local rules. An empty list
+is correct otherwise. Never use a constant-only comparison, collection-existence restatement,
+tautology, placeholder, or no-op. Schema validity is already
 enforced independently by the framework, so do not copy the complete root state schema into a
 `schema_valid` invariant. Do not emit tasks, reward, verifier, runtime code, replay trajectories,
 or expected answers. Framework assembly will validate the complete resulting WorldSpec and request
@@ -12806,8 +12846,10 @@ Preserve the exact frozen world task_dimensions as the difficulty dimension ids 
 task plan must name a stable unique task_type, a precise objective, the complete allowed actor set,
 only frozen tools available to every allowed actor, applicable difficulty dimensions, and a real
 minimum tool-call lower bound. Prefer a small set of semantically distinct end-to-end tasks over
-one artificial task per tool. Sampling Rules, if any, must use only the sampling family, cannot
-read task_goal, and must use the discriminated Rule Draft ADT with explicit ordering semantics.
+one artificial task per tool. Sampling Rules, if any, must use only the sampling family and
+reset-available actor, pre_state, post_state, observation, reset_config, or seed values; they
+cannot read action-only args, tool_result, error, events, evaluator-only task_goal, terminated,
+or truncated. They must use the discriminated Rule Draft ADT with explicit ordering semantics.
 Omit optional `rule_id`: framework code derives `rule:sampling:<ordinal>`. Use exact evidence ids.
 
 Coverage is still design-stage: runtime_implemented and verifier_covered must remain `absent`.
@@ -12844,8 +12886,10 @@ exact scalar value type
 identical closed public/evaluator goal schemas, total identity bindings, the initial-config schema
 from the frozen world state, and the release reachability policy. Give each frozen multi-level
 difficulty dimension a real semantic effect under same-seed materialization through reachable
-configuration/goal ranges. Initial-state Rules may read reset_config/pre_state but must never read
-the evaluator-only task_goal. At least one success Rule and one terminal Rule must read task_goal.
+configuration/goal ranges. Initial-state Rules may only read reset-available actor, pre_state,
+post_state, observation, reset_config, or seed values; they must never read action-only args,
+tool_result, error, events, evaluator-only task_goal, terminated, or truncated. At least one
+success Rule and one terminal Rule must read task_goal.
 
 Use only the discriminated Rule Draft ADT, exact state pointers, and exact evidence ids from the
 frozen inputs. Ordered clauses must explicitly choose `number`, `date`, or `date-time`. Omit
@@ -12868,7 +12912,7 @@ Original need:
             sort_keys=True,
             separators=(",", ":"),
         )
-        return f"""You are the isolated Researcher revising an Agent World evidence graph.
+        return f"""You are the Researcher revising an Agent World evidence graph.
 Project purpose: keep a programmatic training environment faithful when later fetched evidence
 proves an earlier hard claim wrong.
 
@@ -12887,7 +12931,7 @@ CitationCatalog:
 
     @staticmethod
     def _assumption_closure_prompt() -> str:
-        return """You are the isolated Researcher closing already-recorded release uncertainties
+        return """You are the Researcher closing already-recorded release uncertainties
 against a frozen executable WorldSpec boundary, tool surface, fidelity catalog, and evidence claim
 catalog. Each frozen issue retains every artifact origin, including coverage dimensions. Project
 purpose: make release assumptions explicit without allowing an Agent to rewrite a validated world,

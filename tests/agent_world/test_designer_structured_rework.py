@@ -4,12 +4,13 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider as RuntimeAgentProfileProvider
 from agent_world.artifact_store import ArtifactStore, ArtifactWriter
 from agent_world.config import AgentBackendConfig
 from agent_world.contracts import (
@@ -337,11 +338,20 @@ class _RecordingRepairAuthority:
 
 
 class _ProfileProvider:
-    def resolve(self, **_: object) -> ResolvedAgentProfile:
+    def resolve(self, **kwargs: object) -> ResolvedAgentProfile:
         # The recording backend deliberately does not inspect provider-specific
         # profile material. The production InvocationBackend still receives a
         # fully resolved profile through this exact interface.
-        return cast(ResolvedAgentProfile, object())
+        return cast(
+            ResolvedAgentProfile,
+            SimpleNamespace(
+                allowed_builtin_tools=(),
+                model="test-model",
+                model_provider="test-provider",
+                profile_hash="a" * 64,
+                output_schema=kwargs["output_schema"],
+            ),
+        )
 
 
 @pytest.mark.asyncio
@@ -363,14 +373,14 @@ async def test_independent_gather_preserves_successful_sibling_before_leaf_error
     assert settled == ["committed"]
 
 
-class _InvalidTransportBackend:
+class _InvalidShapeBackend:
     def __init__(self) -> None:
         self.requests: list[InvocationRequest] = []
 
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
         self.requests.append(request)
         output = (
-            {"artifact_json": "{TOP_SECRET_REJECTED"}
+            {"wrong_field": "TOP_SECRET_REJECTED"}
             if len(self.requests) == 1
             else {"value": "valid"}
         )
@@ -391,14 +401,14 @@ class _InvalidTransportBackend:
         return False
 
 
-class _TransportShapeSequenceBackend:
+class _ShapeSequenceBackend:
     def __init__(self) -> None:
         self.requests: list[InvocationRequest] = []
 
     async def invoke(self, request: InvocationRequest) -> InvocationResult:
         self.requests.append(request)
         outputs: tuple[dict[str, object], ...] = (
-            {"artifact_json": "{TOP_SECRET_REJECTED"},
+            {"wrong_field": "TOP_SECRET_REJECTED"},
             {"wrong_field": "still rejected"},
             {"value": "valid"},
         )
@@ -1175,10 +1185,10 @@ def test_state_schema_lifecycle_diagnostics_are_direct_and_non_dependent(
 
 
 @pytest.mark.asyncio
-async def test_invalid_transport_json_gets_safe_specific_rework_feedback(
+async def test_invalid_native_object_gets_safe_specific_rework_feedback(
     tmp_path: Path,
 ) -> None:
-    backend = _InvalidTransportBackend()
+    backend = _InvalidShapeBackend()
     designer = EnvironmentDesigner(
         artifact_store=cast(ArtifactWriter, object()),
         research_artifact_store=cast(ArtifactWriter, object()),
@@ -1190,7 +1200,7 @@ async def test_invalid_transport_json_gets_safe_specific_rework_feedback(
 
     output, _ = await designer.run_structured_agent(
         role="environment-engineer",
-        lineage_id="lineage:transport-rework",
+        lineage_id="lineage:shape-rework",
         workspace=tmp_path,
         model=_Output,
         prompt="Create the complete artifact from immutable input.",
@@ -1202,13 +1212,13 @@ async def test_invalid_transport_json_gets_safe_specific_rework_feedback(
 
     assert output == _Output(value="valid")
     correction = backend.requests[1].prompt
-    assert "transport artifact_json must contain one valid JSON object" in correction
+    assert "value" in correction
     assert "TOP_SECRET_REJECTED" not in correction
 
 
 @pytest.mark.asyncio
-async def test_transport_to_shape_uses_monotonic_typed_frontiers(tmp_path: Path) -> None:
-    backend = _TransportShapeSequenceBackend()
+async def test_shape_rework_uses_monotonic_typed_frontiers(tmp_path: Path) -> None:
+    backend = _ShapeSequenceBackend()
     authority = _RecordingRepairAuthority()
     designer = EnvironmentDesigner(
         artifact_store=cast(ArtifactWriter, object()),
@@ -1223,7 +1233,7 @@ async def test_transport_to_shape_uses_monotonic_typed_frontiers(tmp_path: Path)
     try:
         output, _ = await designer.run_structured_agent(
             role="environment-engineer",
-            lineage_id="lineage:transport-shape-frontiers",
+            lineage_id="lineage:shape-frontiers",
             workspace=tmp_path,
             model=_Output,
             prompt="Create the complete artifact from immutable input.",
@@ -1243,9 +1253,9 @@ async def test_transport_to_shape_uses_monotonic_typed_frontiers(tmp_path: Path)
     assert output == _Output(value="valid")
     first = cast(ValidationDiagnostic, authority.authorizations[0]["diagnostic"])
     shape = cast(ValidationDiagnostic, authority.completion_diagnostics[0])
-    assert first.validation_phase == "structured_output_transport"
-    assert first.frontier_ordinal == 0
-    assert first.issue_codes == ("transport_invalid_json@artifact_json",)
+    assert first.validation_phase == "output_shape"
+    assert first.frontier_ordinal == 10
+    assert first.issue_codes
     assert shape.frontier_ordinal == 10
     assert authority.authorizations[1]["diagnostic"] == shape
     assert authority.completion_diagnostics == [shape, None]
@@ -1544,7 +1554,7 @@ async def test_legacy_structured_work_records_retry_gate_and_applies_fallback_ro
         infrastructure_retry_backoff_seconds=0,
     )
     backend = _TransientThenFallbackBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = RuntimeAgentProfileProvider(
         AgentBackendConfig(
             model="grok-4.5",
             fallback_models=("gpt-5.3-codex-spark",),

@@ -710,8 +710,8 @@ def test_infrastructure_error_during_semantic_repair_terminalizes_without_retry(
             head,
             _execution(_attempt(artifacts, head), 2),
         )
-        transport_error = ValidationReport(
-            report_id="report:repair-transport-error",
+        malformed_output_error = ValidationReport(
+            report_id="report:repair-malformed-output",
             attempt_id=_attempt(artifacts, head).attempt_id,
             coordinate=definition.coordinate,
             policy_id=definition.validation_policy.policy_id,
@@ -721,9 +721,9 @@ def test_infrastructure_error_during_semantic_repair_terminalizes_without_retry(
             frontier_ordinal=20,
             issues=(
                 ValidationIssue(
-                    code="agent_backend_structured_output_transport_invalid",
+                    code="agent_backend_structured_output_invalid_json",
                     path=("operation",),
-                    violated_condition="The provider transport rejected the proposal envelope.",
+                    violated_condition="The provider returned malformed native structured output.",
                     expected_category="a configuration change outside this repair",
                     retryable=True,
                 ),
@@ -732,7 +732,7 @@ def test_infrastructure_error_during_semantic_repair_terminalizes_without_retry(
             evaluated_at=datetime.now(UTC),
         )
         head = _checkpoint_validation_and_evaluate(
-            runtime, artifacts, lock, definition, head, transport_error
+            runtime, artifacts, lock, definition, head, malformed_output_error
         )
 
     assert head.status == "failed"

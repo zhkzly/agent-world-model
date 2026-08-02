@@ -225,14 +225,15 @@ def _config(tmp_path: Path) -> FoundryConfig:
     )
 
 
-def _judge(tmp_path: Path) -> EnvironmentJudge:
+def _judge(tmp_path: Path, *, interactive: bool = False) -> EnvironmentJudge:
     store = ArtifactStore(tmp_path / "judge-budget-artifacts")
     return EnvironmentJudge(
         artifact_store=store.issue_writer(
             producer="environment-judge",
             allowed_artifact_types=("judge_report",),
             allowed_artifact_type_prefixes=("judge.",),
-        )
+        ),
+        interactive_challenger=object() if interactive else None,  # type: ignore[arg-type]
     )
 
 
@@ -325,7 +326,7 @@ def test_judge_root_cause_fingerprint_is_stable_across_candidate_revisions() -> 
 
 def test_default_budget_covers_canonical_two_task_reachability(tmp_path: Path) -> None:
     available = _config(tmp_path).generation_budget
-    required = _judge(tmp_path).required_evaluation_budget(
+    required = _judge(tmp_path, interactive=True).required_evaluation_budget(
         design=_design(),
         verifier=_verifier(),
         available=available,
@@ -333,7 +334,7 @@ def test_default_budget_covers_canonical_two_task_reachability(tmp_path: Path) -
 
     assert required.llm_tokens == 40_960
     assert required.agent_turns == 80
-    assert required.tool_calls == 356
+    assert required.tool_calls == 357
     assert required.evaluation_episodes == 37
     assert required.build_seconds == 300
     for dimension in type(required).model_fields:
@@ -343,7 +344,7 @@ def test_default_budget_covers_canonical_two_task_reachability(tmp_path: Path) -
 
 def test_budget_compiler_aggregates_each_task_policy_independently(tmp_path: Path) -> None:
     available = _config(tmp_path).generation_budget
-    required = _judge(tmp_path).required_evaluation_budget(
+    required = _judge(tmp_path, interactive=True).required_evaluation_budget(
         design=_design(
             ReachabilityPolicy(
                 random_tail_samples=0,
@@ -358,8 +359,27 @@ def test_budget_compiler_aggregates_each_task_policy_independently(tmp_path: Pat
 
     assert required.llm_tokens == 28_672
     assert required.agent_turns == 56
-    assert required.tool_calls == 260
+    assert required.tool_calls == 261
     assert required.evaluation_episodes == 34
+
+
+def test_release_judge_without_interactive_solver_does_not_reserve_hidden_turns(
+    tmp_path: Path,
+) -> None:
+    available = _config(tmp_path).generation_budget
+    release_judge = EnvironmentJudge(
+        artifact_store=ArtifactStore(tmp_path / "release-judge-artifacts"),
+    )
+
+    required = release_judge.required_evaluation_budget(
+        design=_design(),
+        verifier=_verifier(),
+        available=available,
+    )
+
+    assert release_judge.interactive_challenger is None
+    assert required.llm_tokens == 0
+    assert required.agent_turns == 0
 
 
 def test_controller_persists_and_fail_closed_settles_judge_leases(
@@ -388,6 +408,7 @@ def test_controller_persists_and_fail_closed_settles_judge_leases(
     success_run = _RunState(
         run_id="run:judge-lease-success",
         job_ref=success_job,
+        scope_id=success_job.artifact_id,
         ledger=BudgetLedger(requested),
     )
     success_work = app.controller._reserve_judge_work(  # noqa: SLF001
@@ -425,6 +446,7 @@ def test_controller_persists_and_fail_closed_settles_judge_leases(
     failed_run = _RunState(
         run_id="run:judge-lease-unknown",
         job_ref=failed_job,
+        scope_id=failed_job.artifact_id,
         ledger=BudgetLedger(requested),
     )
     failed_work = app.controller._reserve_judge_work(  # noqa: SLF001
@@ -457,6 +479,7 @@ def test_controller_persists_and_fail_closed_settles_judge_leases(
     zero_time_run = _RunState(
         run_id="run:judge-lease-zero-time",
         job_ref=failed_job,
+        scope_id=failed_job.artifact_id,
         ledger=BudgetLedger(zero_time),
     )
     with pytest.raises(BudgetExceeded) as captured:

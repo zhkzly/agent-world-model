@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from agent_world.control.telemetry import TelemetryStore, WorkSpan
 
-from .codex_sdk import _decode_json_envelope, _decode_provider_json_ir, _transport_output_schema
+from .codex_sdk import _decode_provider_json_ir, _provider_output_schema
 from .contracts import (
     InvocationError,
     InvocationEvent,
@@ -33,25 +33,23 @@ from .contracts import (
     TokenBreakdown,
     json_compatible,
 )
+from .liveness import ProviderFirstEventBudget
 from .profiles import ProfileResolutionError, verify_resolved_profile
 from .redaction import Redactor
 from .structured_diagnostics import (
+    advisory_provider_unavailable,
     direct_invalid_json_details,
     direct_no_first_provider_event_details,
     direct_output_limit_details,
     direct_provider_exception_details,
     direct_provider_response_error_details,
     direct_provider_stream_stalled_details,
-    direct_transport_decode_details,
 )
 
 _DIRECT_EVENT_METHOD = "direct.response.completed"
 _DIRECT_STREAM_EVENT_METHOD = "direct.response.stream.event"
 _DIRECT_SCHEMA_NAME = "agent_world_structured_output"
 _DIRECT_LIVENESS_HEARTBEAT_SECONDS = 30.0
-# Scheduler/RepairLedger owns retry admission and accounting.  The HTTP SDK
-# must not make invisible transport retries beneath InvocationBackend.
-_DIRECT_SDK_MAX_RETRIES = 0
 
 
 class _DirectStreamIdleTimeout(TimeoutError):
@@ -245,6 +243,20 @@ class DirectLlmBackend:
         started = time.monotonic()
         profile = request.profile
         redactor = Redactor.from_values(profile.secret_values)
+        # Route eligibility is a declaration-level fact. Classify a Direct
+        # request that carries an Agent bundle or hidden instruction before
+        # physical profile verification: otherwise a malformed bundle obscures
+        # the actual Direct-vs-Agent error as generic profile integrity. A
+        # request that passes this closed gate is still fully verified before
+        # any credential or Provider interaction.
+        ineligible = _direct_ineligibility_code(request)
+        if ineligible is not None:
+            return _local_failure(
+                request,
+                status=InvocationStatus.FAILED,
+                code=ineligible,
+                started=started,
+            )
         _emit_lifecycle(request, InvocationLifecyclePhase.PROFILE_VERIFYING)
         try:
             verify_resolved_profile(profile)
@@ -265,14 +277,6 @@ class DirectLlmBackend:
             )
         _emit_lifecycle(request, InvocationLifecyclePhase.PROFILE_VERIFIED)
 
-        ineligible = _direct_ineligibility_code(request)
-        if ineligible is not None:
-            return _local_failure(
-                request,
-                status=InvocationStatus.FAILED,
-                code=ineligible,
-                started=started,
-            )
         assert profile.output_schema is not None
         if profile.rollout_token_limit is None:
             return _local_failure(
@@ -316,10 +320,7 @@ class DirectLlmBackend:
             )
 
         try:
-            text_format = _direct_text_format(
-                profile.output_schema,
-                transport=profile.structured_output_transport,
-            )
+            text_format = _direct_text_format(profile.output_schema)
         except (TypeError, ValueError):
             return _local_failure(
                 request,
@@ -336,7 +337,13 @@ class DirectLlmBackend:
                 api_key=api_key,
                 base_url=base_url,
                 timeout=profile.limits.timeout_seconds,
-                max_retries=_DIRECT_SDK_MAX_RETRIES,
+                # Bounded pre-first-event transport retry only.  The SDK retries
+                # connection failures / 429 / >=500 with backoff and never
+                # resumes a stream that already emitted content, so this smooths
+                # an intermittent relay without hiding a turn failure from the
+                # Scheduler.  ``0`` restores the prior Scheduler-owns-every-retry
+                # policy.  See ``AgentConfig.provider_transport_max_retries``.
+                max_retries=profile.limits.provider_transport_max_retries,
             )
             # A request inside the Invocation Control Plane has exactly one
             # parent-side wall supervisor.  Keep this adapter-local wall only
@@ -352,26 +359,29 @@ class DirectLlmBackend:
             # what makes "the transport is alive" falsifiable; two independent
             # ones would let a request idle twice as long, and none at all is the
             # defect that let a silent stream consume an 8-hour logical wall.
-            first_event_budget = _FirstEventBudget(
-                profile.limits.direct_first_event_timeout_seconds
+            first_event_budget = ProviderFirstEventBudget(
+                profile.limits.provider_first_event_timeout_seconds
             )
+            provider_request: dict[str, Any] = {
+                "model": profile.model,
+                "input": request.prompt,
+                "reasoning": {"effort": profile.reasoning_effort.value},
+                "store": False,
+                "stream": True,
+                "text": {"format": text_format},
+            }
+            # Do not smuggle the framework rollout budget into the Provider
+            # request.  The former is scheduler accounting; the latter is an
+            # optional physical cap and is omitted by default.
+            if profile.direct_provider_max_output_tokens is not None:
+                provider_request["max_output_tokens"] = (
+                    profile.direct_provider_max_output_tokens
+                )
             async with asyncio.timeout(adapter_timeout):
                 if on_liveness is not None:
                     on_liveness("direct_request_dispatched")
                 stream = await _await_with_liveness_heartbeats(
-                    client.responses.create(
-                        model=profile.model,
-                        input=request.prompt,
-                        instructions=_combined_instructions(
-                            profile.base_instructions,
-                            profile.developer_instructions,
-                        ),
-                        max_output_tokens=profile.rollout_token_limit,
-                        reasoning={"effort": profile.reasoning_effort.value},
-                        store=False,
-                        stream=True,
-                        text={"format": text_format},
-                    ),
+                    client.responses.create(**provider_request),
                     heartbeat_seconds=self._liveness_heartbeat_seconds,
                     on_liveness=on_liveness,
                     waiting_phase="direct_awaiting_response",
@@ -394,7 +404,7 @@ class DirectLlmBackend:
                             # bounds transport liveness instead -- neither is a
                             # limit on how long the model may reason.
                             idle_timeout_seconds=(
-                                profile.limits.direct_stream_idle_timeout_seconds
+                                profile.limits.provider_stream_idle_timeout_seconds
                                 if observed_provider_event_count > 0
                                 else None
                             ),
@@ -521,7 +531,7 @@ class DirectLlmBackend:
             )
             if code == "direct_output_limit":
                 terminal_details = direct_output_limit_details(
-                    configured_max_output_tokens=profile.rollout_token_limit,
+                    configured_max_output_tokens=profile.direct_provider_max_output_tokens,
                 )
             return _local_failure(
                 request,
@@ -565,22 +575,14 @@ class DirectLlmBackend:
                 details=direct_invalid_json_details(output_text, exc),
             )
         try:
-            raw_output = json_compatible(decoded_output)
-            if profile.structured_output_transport in {"provider_schema", "json_object"}:
-                structured_output = _decode_provider_json_ir(raw_output)
-            else:
-                structured_output = _decode_json_envelope(raw_output)
+            structured_output = _decode_provider_json_ir(json_compatible(decoded_output))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             return _local_failure(
                 request,
                 status=InvocationStatus.FAILED,
-                code="direct_structured_output_transport_invalid",
+                code="direct_structured_output_invalid_json",
                 started=started,
-                details=direct_transport_decode_details(
-                    raw_output,
-                    transport=profile.structured_output_transport,
-                    exc=exc,
-                ),
+                details=direct_invalid_json_details(output_text, exc),
             )
 
         return InvocationResult(
@@ -623,39 +625,6 @@ def _default_client_factory(
     )
 
 
-class _FirstEventBudget:
-    """One deadline shared by every wait that precedes the first Provider event.
-
-    Opening the stream and reading its first event are separate awaits but the
-    same question: is this transport alive at all?  Holding one monotonic
-    deadline across both keeps the answer bounded no matter how the SDK splits
-    the work.  ``None`` disables the bound and restores the pre-policy behavior.
-    """
-
-    __slots__ = ("_deadline", "timeout_seconds")
-
-    def __init__(self, timeout_seconds: float | None) -> None:
-        self.timeout_seconds = timeout_seconds
-        self._deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
-
-    @property
-    def enabled(self) -> bool:
-        return self._deadline is not None
-
-    def remaining(self) -> float | None:
-        if self._deadline is None:
-            return None
-        return self._deadline - time.monotonic()
-
-    def expired(self, phase: str) -> _DirectFirstEventTimeout:
-        # ``timeout_seconds`` is not None whenever a deadline exists.
-        assert self.timeout_seconds is not None
-        return _DirectFirstEventTimeout(
-            first_event_timeout_seconds=self.timeout_seconds,
-            phase=phase,
-        )
-
-
 async def _await_with_liveness_heartbeats(
     operation: Any,
     *,
@@ -663,7 +632,7 @@ async def _await_with_liveness_heartbeats(
     on_liveness: Callable[[str], None] | None,
     waiting_phase: str,
     idle_timeout_seconds: float | None = None,
-    first_event_budget: _FirstEventBudget | None = None,
+    first_event_budget: ProviderFirstEventBudget | None = None,
 ) -> Any:
     """Await one SDK boundary while truthfully reporting local waiting.
 
@@ -695,7 +664,11 @@ async def _await_with_liveness_heartbeats(
         if idle_timeout_seconds is not None:
             return _DirectStreamIdleTimeout(idle_timeout_seconds=idle_timeout_seconds)
         assert first_event_budget is not None
-        return first_event_budget.expired(waiting_phase)
+        assert first_event_budget.timeout_seconds is not None
+        return _DirectFirstEventTimeout(
+            first_event_timeout_seconds=first_event_budget.timeout_seconds,
+            phase=waiting_phase,
+        )
 
     try:
         while True:
@@ -719,26 +692,14 @@ async def _await_with_liveness_heartbeats(
             await asyncio.gather(task, return_exceptions=True)
 
 
-def _combined_instructions(base: str, developer: str | None) -> str:
-    return "\n\n".join(part for part in (base, developer) if part)
+def _direct_text_format(schema: JsonObject) -> JsonObject:
+    """Return the native strict schema contract for one Direct proposal."""
 
-
-def _direct_text_format(schema: JsonObject, *, transport: str) -> JsonObject:
-    """Return the smallest provider-format contract for one Direct proposal.
-
-    ``json_object`` is intentionally not a weakened acceptance path: it only
-    removes the outer ``artifact_json`` string which otherwise makes a model
-    double-escape a large logical artifact.  The original local schema and
-    semantic compiler still run after the transport decode.
-    """
-
-    if transport == "json_object":
-        return {"type": "json_object"}
     return {
         "type": "json_schema",
         "name": _DIRECT_SCHEMA_NAME,
         "strict": True,
-        "schema": _transport_output_schema(schema, transport=transport),
+        "schema": _provider_output_schema(schema),
     }
 
 
@@ -817,10 +778,18 @@ def _emit_provider_progress(request: InvocationRequest, activity: str) -> None:
 def _direct_ineligibility_code(request: InvocationRequest) -> str | None:
     if request.execution_mode is not InvocationExecutionMode.SINGLE_SHOT_STRUCTURED:
         return "direct_execution_mode_ineligible"
+    if request.profile.backend != "direct_llm":
+        return "direct_profile_backend_ineligible"
     if request.session is not None:
         return "direct_session_ineligible"
     if request.profile.allowed_builtin_tools:
         return "direct_tools_ineligible"
+    if request.profile.skills:
+        return "direct_runtime_bundles_ineligible"
+    if request.profile.allowed_network_domains or any(
+        request.profile.effective_capability_plan.external.to_public_dict().values()
+    ):
+        return "direct_external_capabilities_ineligible"
     if request.profile.output_schema is None:
         return "direct_schema_required"
     return None
@@ -858,10 +827,25 @@ def _direct_response_error_terminal(
         return InvocationStatus.FAILED, "direct_provider_unavailable", True, details
     if provider_code == "rate_limited":
         return InvocationStatus.FAILED, "direct_rate_limited", True, details
+    if provider_code == "other" and advisory_provider_unavailable(details):
+        return InvocationStatus.FAILED, "direct_provider_unavailable", True, details
     if provider_code in {"structured_output_schema", "request_parameter", "context_window"}:
         return InvocationStatus.FAILED, "direct_invalid_request", False, details
     if provider_code == "model_route":
         return InvocationStatus.FAILED, "direct_model_unavailable", False, details
+    # A failed terminal whose error object is absent or not code-bearing carries
+    # no Provider-supplied evidence of a request incompatibility. A genuine
+    # request rejection (bad schema/param, context window, model route) always
+    # arrives as a code-bearing ``object`` error, already routed above. An
+    # empty/``non_object`` failed envelope is instead the signature of a
+    # transport- or gateway-degraded terminal (the same class the
+    # ``APIConnectionError`` and ``direct_no_first_provider_event`` paths treat
+    # as transport-owned). Route it to a bounded retryable provider-unavailable
+    # terminal rather than a non-retryable rejection, so one degenerate envelope
+    # cannot kill an entire scope with ``no_repair_authority`` when a fresh
+    # session or compatible-model fallback would have recovered it.
+    if details.get("provider_error_shape") in {"missing", "non_object"}:
+        return InvocationStatus.FAILED, "direct_provider_unavailable", True, details
     return InvocationStatus.FAILED, "direct_provider_rejected", False, details
 
 

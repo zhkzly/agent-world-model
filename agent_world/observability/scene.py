@@ -29,6 +29,8 @@ MAX_MISSING_COORDINATES = 32
 MAX_WATERMARK_COORDINATES = 64
 MAX_FRONTIER_SAMPLES = 4
 MAX_ROOT_INDEX_ENTRIES = 64
+MAX_ACTIVE_WORK_POINTERS = 16
+_EMPTY_ACTIVE_WORK_DIGEST = sha256_digest(canonical_json_bytes(()))
 
 type HeadStatus = Literal[
     "running",
@@ -128,6 +130,39 @@ type InvocationLivenessPhase = Literal[
     "cleanup_finished",
     "terminal_received",
     "owner_lost",
+]
+type CodexTerminalErrorShape = Literal["missing", "non_object", "object"]
+type CodexTerminalErrorInfo = Literal[
+    "absent",
+    "non_object",
+    "object:other",
+    "active_turn_not_steerable",
+    "enum:contextwindowexceeded",
+    "enum:sessionbudgetexceeded",
+    "enum:usagelimitexceeded",
+    "enum:serveroverloaded",
+    "enum:internalservererror",
+    "enum:unauthorized",
+    "enum:badrequest",
+    "enum:cyberpolicy",
+    "enum:sandboxerror",
+    "enum:threadrollbackfailed",
+    "enum:other",
+    "transport:http_connection_failed",
+    "transport:response_stream_connection_failed",
+    "transport:response_stream_disconnected",
+    "transport:response_too_many_failed_attempts",
+]
+type ProviderAdvisoryTextSignal = Literal[
+    "authentication_or_authorization",
+    "model_or_route_availability",
+    "context_or_token_limit",
+    "request_or_schema_compatibility",
+    "capacity_or_rate_limit",
+    "transport_or_connection",
+    "timeout_or_deadline",
+    "policy_or_content_filter",
+    "provider_internal_error",
 ]
 
 
@@ -229,6 +264,54 @@ class RuntimeAgentLiveness(V2Contract):
         return self
 
 
+class CodexTerminalEnvelope(V2Contract):
+    """Closed, content-free facts from one failed Codex terminal envelope.
+
+    This is a project-execution Agent observation, not feedback for the
+    runtime Code Agent.  The projector reads it only from the already-redacted
+    leaf-failure evidence whose attempt, coordinate, and failure code match
+    the current validation report.  It intentionally excludes provider text,
+    endpoint, workspace, request, and session material.
+    """
+
+    terminal_error_shape: CodexTerminalErrorShape | None = None
+    codex_error_info: CodexTerminalErrorInfo | None = None
+    http_status: Annotated[int, Field(ge=100, le=599)] | None = None
+    advisory_text_signals: Annotated[
+        tuple[ProviderAdvisoryTextSignal, ...], Field(max_length=9)
+    ] = ()
+
+    @model_validator(mode="after")
+    def validate_nonempty(self) -> CodexTerminalEnvelope:
+        if (
+            self.terminal_error_shape is None
+            and self.codex_error_info is None
+            and self.http_status is None
+            and not self.advisory_text_signals
+        ):
+            raise ValueError("Codex terminal envelope requires at least one closed fact")
+        if len(set(self.advisory_text_signals)) != len(self.advisory_text_signals):
+            raise ValueError("Codex terminal envelope advisory signals must be unique")
+        return self
+
+
+class RuntimeAgentRequestShape(V2Contract):
+    """Content-free dimensions of the exact request that reached an adapter.
+
+    This exists so the project-execution Agent can compare a zero-event node
+    with a passing control without loading Prompt text, Runtime Skill text,
+    output schemas, endpoints, sessions, or workspace paths.  It is evidence
+    for attribution, never a request-size policy or an acceptance contract.
+    """
+
+    prompt_bytes: Annotated[int, Field(ge=0)]
+    runtime_skill_count: Annotated[int, Field(ge=0)]
+    output_schema_bytes: Annotated[int, Field(ge=0)] | None = None
+    allowed_builtin_tool_count: Annotated[int, Field(ge=0)]
+    execution_mode: Literal["agentic", "single_shot_structured"]
+    continued_session: bool
+
+
 class CandidateWorkspaceLiveness(V2Contract):
     """Content-free Builder workspace heartbeat for this exact attempt."""
 
@@ -298,6 +381,37 @@ class CoordinatePointer(V2Contract):
     markdown_path: Annotated[NonEmptyStr, Field(max_length=512)]
 
 
+class ActiveWorkPointer(V2Contract):
+    """A compact, redacted live-operation overlay for one coordinate.
+
+    This is navigation evidence for the project-execution Agent, not a
+    Scheduler state transition or a Provider transcript.  Multiple physical
+    turns may be active beneath one coordinate, so the pointer intentionally
+    aggregates counts and never exposes an invocation id, workspace, prompt,
+    response, or model identifier.
+    """
+
+    coordinate_key: ContentHash
+    coordinate_label: Annotated[NonEmptyStr, Field(max_length=512)]
+    route: Literal["codex_sdk", "direct_llm", "mixed"]
+    active_turn_count: Annotated[int, Field(ge=1)]
+    provider_progress_count: Annotated[int, Field(ge=0)]
+    started_at: AwareDatetime
+    last_activity_at: AwareDatetime
+    first_provider_progress_at: AwareDatetime | None = None
+
+    @model_validator(mode="after")
+    def validate_timing(self) -> ActiveWorkPointer:
+        if self.last_activity_at < self.started_at:
+            raise ValueError("active work cannot have activity before it starts")
+        if (
+            self.first_provider_progress_at is not None
+            and self.first_provider_progress_at < self.started_at
+        ):
+            raise ValueError("first Provider progress cannot precede active work")
+        return self
+
+
 class CoordinateWatermark(V2Contract):
     """One durable-head version included in a materialized scene."""
 
@@ -316,6 +430,10 @@ class SceneWatermark(V2Contract):
     coordinate_overflow_count: Annotated[int, Field(ge=0)] = 0
     aggregate_digest: ContentHash
     graph_digest: ContentHash
+    # Live invocation-control records are replaceable observations, but they
+    # must participate in cache freshness or a newly active retry remains
+    # hidden behind an older failed/repair head.
+    active_work_digest: ContentHash = _EMPTY_ACTIVE_WORK_DIGEST
     projected_from_run_id: Annotated[NonEmptyStr, Field(max_length=512)] | None = None
     projected_at: AwareDatetime
 
@@ -366,6 +484,8 @@ class CoordinateScene(V2Contract):
     terminal_failure_phase: OperationPhase | None = None
     terminal_failure_elapsed_ms: Annotated[int, Field(ge=0)] | None = None
     runtime_agent_liveness: RuntimeAgentLiveness | None = None
+    codex_terminal_envelope: CodexTerminalEnvelope | None = None
+    runtime_agent_request_shape: RuntimeAgentRequestShape | None = None
     candidate_workspace_liveness: CandidateWorkspaceLiveness | None = None
     budget_exhaustion: BudgetExhaustion | None = None
 
@@ -419,6 +539,10 @@ class RunSceneIndex(V2Contract):
     frontier_size: Annotated[int, Field(ge=0)]
     frontier_delta: int
     next_action_hint: NextActionHint | None = None
+    active_work: Annotated[
+        tuple[ActiveWorkPointer, ...], Field(max_length=MAX_ACTIVE_WORK_POINTERS)
+    ] = ()
+    active_work_overflow_count: Annotated[int, Field(ge=0)] = 0
     coordinate_pointers: Annotated[
         tuple[CoordinatePointer, ...], Field(max_length=MAX_COORDINATE_POINTERS)
     ] = ()
@@ -433,6 +557,8 @@ class RunSceneIndex(V2Contract):
             self.coordinate_pointers
         ):
             raise ValueError("scene coordinate pointers must be unique")
+        if len({item.coordinate_key for item in self.active_work}) != len(self.active_work):
+            raise ValueError("scene active-work coordinates must be unique")
         return self
 
 
@@ -498,6 +624,13 @@ class SceneHead:
     run_id: str | None
     graph_digest: str
     updated_at: datetime
+    # The projector may obtain the full immediate repair lineage from durable
+    # validation reports.  Keeping that derived classification on the
+    # read-model input prevents this compact view from reimplementing a weaker
+    # issue-set-only approximation of the control-plane progress lattice.
+    # Hand-built view fixtures deliberately leave it absent and exercise the
+    # conservative local fallback below.
+    frontier_progress: FrontierProgress | None = None
     subprocess_available: bool = False
     # The terminal ValidationReport.status for this head, when one exists.
     # ``error`` denotes an infrastructure/transport terminal; ``failed`` denotes
@@ -516,6 +649,8 @@ class SceneHead:
     terminal_failure_phase: OperationPhase | None = None
     terminal_failure_elapsed_ms: int | None = None
     runtime_agent_liveness: RuntimeAgentLiveness | None = None
+    codex_terminal_envelope: CodexTerminalEnvelope | None = None
+    runtime_agent_request_shape: RuntimeAgentRequestShape | None = None
     candidate_workspace_liveness: CandidateWorkspaceLiveness | None = None
     budget_exhaustion: BudgetExhaustion | None = None
 
@@ -537,7 +672,12 @@ class Scene:
     frontier_records: tuple[FrontierRecord, ...]
 
 
-def fold(heads: Sequence[SceneHead], tier_b_events: Sequence[SceneTierBEvent]) -> Scene:
+def fold(
+    heads: Sequence[SceneHead],
+    tier_b_events: Sequence[SceneTierBEvent],
+    *,
+    active_work: Sequence[ActiveWorkPointer] = (),
+) -> Scene:
     """Fold only cold durable heads and Tier B facts into one bounded scene.
 
     This signature is intentionally shared by the eager runtime projection and
@@ -560,6 +700,9 @@ def fold(heads: Sequence[SceneHead], tier_b_events: Sequence[SceneTierBEvent]) -
         if item.event_type == "runtime_subprocess_scene" and item.coordinate_key is not None
     }
     ordered_heads = tuple(sorted(heads, key=lambda item: item.coordinate_key))
+    ordered_active_work = tuple(
+        sorted(active_work, key=lambda item: (item.started_at, item.coordinate_key))
+    )
     coordinates = tuple(
         _coordinate_scene(
             head,
@@ -631,14 +774,20 @@ def fold(heads: Sequence[SceneHead], tier_b_events: Sequence[SceneTierBEvent]) -
     latest = max(ordered_heads, key=lambda item: (item.updated_at, item.coordinate_key))
     index = RunSceneIndex(
         scope_id=ordered_heads[0].scope_id,
-        overall_status=_overall_status(coordinates),
+        overall_status=_overall_status(coordinates, active_work=ordered_active_work),
         stuck_coordinate=(_pointer(stuck) if stuck is not None else None),
         stuck_reason=(_stuck_reason(stuck) if stuck is not None else None),
         missing_coordinates=tuple(_pointer(item) for item in missing[:MAX_MISSING_COORDINATES]),
         missing_coordinates_overflow_count=max(0, len(missing) - MAX_MISSING_COORDINATES),
         frontier_size=sum(len(head.issues) for head in ordered_heads),
         frontier_delta=sum(item.frontier_diff.delta for item in coordinates),
-        next_action_hint=(_next_action(stuck) if stuck is not None else None),
+        next_action_hint=(
+            "wait_for_running_work"
+            if ordered_active_work
+            else (_next_action(stuck) if stuck is not None else None)
+        ),
+        active_work=ordered_active_work[:MAX_ACTIVE_WORK_POINTERS],
+        active_work_overflow_count=max(0, len(ordered_active_work) - MAX_ACTIVE_WORK_POINTERS),
         coordinate_pointers=tuple(pointers[:MAX_COORDINATE_POINTERS]),
         additional_stuck_count=max(0, len(stuck_scenes) - MAX_COORDINATE_POINTERS),
         watermark=SceneWatermark(
@@ -646,6 +795,7 @@ def fold(heads: Sequence[SceneHead], tier_b_events: Sequence[SceneTierBEvent]) -
             coordinate_overflow_count=max(0, len(ordered_heads) - MAX_WATERMARK_COORDINATES),
             aggregate_digest=aggregate_digest,
             graph_digest=ordered_heads[0].graph_digest,
+            active_work_digest=active_work_digest(ordered_active_work),
             projected_from_run_id=latest.run_id,
             projected_at=latest.updated_at,
         ),
@@ -681,11 +831,22 @@ def _coordinate_scene(head: SceneHead, *, subprocess_available: bool) -> Coordin
         for item in visible_issues
     )
     multi_file_gate = any(item.multi_file_gate for item in ordered_issues)
-    candidate_issue = (
-        None
-        if multi_file_gate
-        else next((item for item in visible_issues if item.candidate_file), None)
-    )
+    blocker_candidate_files = {
+        item.candidate_file
+        for item in ordered_issues
+        if item.severity == "blocker" and item.candidate_file is not None
+    }
+    candidate_issue = None
+    if not multi_file_gate and len(blocker_candidate_files) == 1:
+        sole_candidate_file = next(iter(blocker_candidate_files))
+        candidate_issue = next(
+            (
+                item
+                for item in visible_issues
+                if item.severity == "blocker" and item.candidate_file == sole_candidate_file
+            ),
+            None,
+        )
     candidate_file = candidate_issue.candidate_file if candidate_issue is not None else None
     repair_target = _repair_target(
         head,
@@ -719,7 +880,9 @@ def _coordinate_scene(head: SceneHead, *, subprocess_available: bool) -> Coordin
         unresolved_issue_digest=issue_digest,
         previous_issue_digest=previous_digest,
         frontier_diff=frontier_diff,
-        frontier_progress=_frontier_progress(issue_ids, prior_ids, head.head_status),
+        frontier_progress=(
+            head.frontier_progress or _frontier_progress(issue_ids, prior_ids, head.head_status)
+        ),
         repair_authority=head.repair_authority,
         candidate_file=candidate_file,
         contract_pointer=contract_pointer,
@@ -739,6 +902,8 @@ def _coordinate_scene(head: SceneHead, *, subprocess_available: bool) -> Coordin
         terminal_failure_phase=head.terminal_failure_phase,
         terminal_failure_elapsed_ms=head.terminal_failure_elapsed_ms,
         runtime_agent_liveness=head.runtime_agent_liveness,
+        codex_terminal_envelope=head.codex_terminal_envelope,
+        runtime_agent_request_shape=head.runtime_agent_request_shape,
         candidate_workspace_liveness=head.candidate_workspace_liveness,
         budget_exhaustion=head.budget_exhaustion,
     )
@@ -752,6 +917,15 @@ def _repair_target(
 ) -> RepairTarget | None:
     if head.head_status == "committed":
         return None
+    # An infrastructure/transport terminal (ValidationReport.status == "error")
+    # is not evidence of a design defect: the leaf never produced a proposal to
+    # judge.  It must never route to Candidate code or the frozen WorldSpec,
+    # even if the Scheduler has authorized an infrastructure retry on a Builder
+    # coordinate.  Otherwise a transient Provider terminal tells the project
+    # Agent to edit unrelated generated code and creates a repair loop.  This
+    # must precede every semantic repair-authority branch.
+    if head.validation_status == "error" and head.issues:
+        return "infrastructure_transport"
     # A causal Integration failure can authorize a Builder repair whose source
     # closure spans several files.  ``multi_file_gate`` normally prevents the
     # view from guessing one editable file, but an already-authorized
@@ -761,14 +935,6 @@ def _repair_target(
         "build.candidate_build."
     ):
         return "generated_candidate_code"
-    # An infrastructure/transport terminal (ValidationReport.status == "error")
-    # is not evidence of a design defect: the leaf never produced a proposal to
-    # judge.  It must never route to design_worldspec, or a transient bad-JSON
-    # transport failure would tell the agent to edit the frozen WorldSpec and
-    # thrash.  This check precedes the Designer branch precisely because the
-    # same coordinate can emit both lanes across attempts.
-    if head.validation_status == "error" and head.issues:
-        return "infrastructure_transport"
     if multi_file_gate:
         return "needs_human"
     if head.pipeline_stage == "Designer" and head.issues:
@@ -824,7 +990,21 @@ def _pointer(scene: CoordinateScene) -> CoordinatePointer:
     )
 
 
-def _overall_status(coordinates: tuple[CoordinateScene, ...]) -> SceneStatus:
+def active_work_digest(items: Sequence[ActiveWorkPointer]) -> str:
+    """Hash safe live facts so cache reads cannot hide a new retry."""
+
+    return sha256_digest(
+        canonical_json_bytes(tuple(item.model_dump(mode="json") for item in items))
+    )
+
+
+def _overall_status(
+    coordinates: tuple[CoordinateScene, ...],
+    *,
+    active_work: Sequence[ActiveWorkPointer] = (),
+) -> SceneStatus:
+    if active_work:
+        return "running"
     priorities: tuple[SceneStatus, ...] = (
         "needs_human",
         "failed",
@@ -929,14 +1109,17 @@ def _next_action(scene: CoordinateScene) -> NextActionHint | None:
 
 
 __all__ = [
+    "ActiveWorkPointer",
     "CandidateWorkspaceLiveness",
     "BudgetExhaustion",
     "CoordinatePointer",
     "CoordinateScene",
     "CoordinateWatermark",
+    "CodexTerminalEnvelope",
     "FrontierDiff",
     "FrontierRecord",
     "MAX_COORDINATE_POINTERS",
+    "MAX_ACTIVE_WORK_POINTERS",
     "MAX_FRONTIER_SAMPLES",
     "MAX_MISSING_COORDINATES",
     "MAX_ROOT_INDEX_ENTRIES",
@@ -948,6 +1131,7 @@ __all__ = [
     "RunSceneIndex",
     "RuntimeAgentActivityCounts",
     "RuntimeAgentLiveness",
+    "RuntimeAgentRequestShape",
     "Scene",
     "SceneHead",
     "SceneIssue",
@@ -955,5 +1139,6 @@ __all__ = [
     "SceneWatermark",
     "ScopeIndexEntry",
     "TopIssue",
+    "active_work_digest",
     "fold",
 ]

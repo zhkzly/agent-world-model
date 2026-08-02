@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.config import load_foundry_config
 from agent_world.contracts import PermissionScope
 from agent_world.control import TelemetryStore
@@ -27,7 +27,7 @@ async def test_real_codex_sdk_profile_round_trip_is_explicitly_opt_in(tmp_path: 
         pytest.fail("AGENT_WORLD_RUN_LIVE=1 requires an explicit AGENT_WORLD_CONFIG")
 
     config = load_foundry_config()
-    provider = IsolatedAgentProfileProvider(config.agent)
+    provider = AgentProfileProvider(config.agent)
     logical_workspace = tmp_path / "live-researcher"
     logical_workspace.mkdir()
     profile = provider.resolve(
@@ -74,7 +74,7 @@ async def test_real_codex_sdk_custom_runtime_can_read_isolated_workspace(
         pytest.fail("AGENT_WORLD_RUN_LIVE=1 requires an explicit AGENT_WORLD_CONFIG")
 
     config = load_foundry_config()
-    provider = IsolatedAgentProfileProvider(config.agent)
+    provider = AgentProfileProvider(config.agent)
     logical_workspace = tmp_path / "live-shell-probe"
     logical_workspace.mkdir()
     nonce = os.urandom(12).hex()
@@ -135,7 +135,7 @@ async def test_real_engineer_write_stays_in_resolved_workspace_and_emits_safe_ac
         pytest.fail("AGENT_WORLD_RUN_LIVE=1 requires an explicit AGENT_WORLD_CONFIG")
 
     config = load_foundry_config()
-    provider = IsolatedAgentProfileProvider(config.agent)
+    provider = AgentProfileProvider(config.agent)
     logical_workspace = tmp_path / "live-engineer-write"
     logical_workspace.mkdir()
     nonce = os.urandom(12).hex()
@@ -150,7 +150,7 @@ async def test_real_engineer_write_stays_in_resolved_workspace_and_emits_safe_ac
             "additionalProperties": False,
         },
         permissions=PermissionScope(),
-        requirement=NodeCapabilityRequirement.isolated_build(
+        requirement=NodeCapabilityRequirement.host_build(
             node_id="environment-engineer.live-workspace-activity",
         ),
         rollout_token_limit=16_384,

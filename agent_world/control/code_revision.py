@@ -29,6 +29,7 @@ those modules outright: an acceptance identity may not depend on them.
 from __future__ import annotations
 
 import importlib.util
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -53,6 +54,48 @@ def _module_source_bytes(module_name: str) -> bytes:
     return Path(spec.origin).read_bytes()
 
 
+def _asset_digest(asset_path: Path) -> str:
+    """Hash one semantic runtime asset file or bundle directory.
+
+    Runtime Skills are packages, not only their top-level ``SKILL.md``.  Their
+    references and scripts can change Agent behavior just as directly as the
+    entry document, so acceptance identity must bind the complete regular-file
+    closure.  Symlinks and special files are rejected to keep the closure
+    portable and unambiguous.
+    """
+
+    candidate = asset_path.resolve()
+    if candidate.is_file():
+        return sha256_digest(candidate.read_bytes())
+    if not candidate.is_dir():
+        raise ValueError(f"cannot locate runtime asset {str(asset_path)!r}")
+
+    entries: dict[str, dict[str, object]] = {}
+    for path in sorted(candidate.rglob("*"), key=lambda item: item.relative_to(candidate).as_posix()):
+        relative = path.relative_to(candidate).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"runtime asset bundle may not contain symlinks: {relative}")
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(f"runtime asset bundle contains unsupported entry: {relative}")
+        mode = stat.S_IMODE(path.stat().st_mode)
+        entries[relative] = {
+            "sha256": sha256_digest(path.read_bytes()),
+            "executable": bool(mode & 0o111),
+        }
+    if not entries:
+        raise ValueError(f"runtime asset bundle is empty: {str(asset_path)!r}")
+    return sha256_digest(
+        canonical_json_bytes(
+            {
+                "protocol": "framework.runtime-asset-bundle.v1",
+                "files": entries,
+            }
+        )
+    )
+
+
 def leaf_code_revision(
     *module_names: str,
     model: str | None = None,
@@ -62,10 +105,11 @@ def leaf_code_revision(
     """Return a stable acceptance-critical revision id for a leaf implementation.
 
     ``module_names`` are the dotted module paths whose source authors the leaf's
-    behavior. ``assets`` optionally binds named, in-tree runtime assets such as
-    a mounted Runtime Skill. ``model`` binds the Agent model identity when the
-    leaf's output depends on it. The result is stable across processes for
-    identical inputs and changes whenever a named module or asset changes.
+    behavior. ``assets`` optionally binds named, in-tree runtime asset files or
+    complete bundle directories such as a mounted Runtime Skill. ``model``
+    binds the Agent model identity when the leaf's output depends on it. The
+    result is stable across processes for identical inputs and changes whenever
+    a named module or any regular file in an asset bundle changes.
 
     Physical invocation-control modules are rejected: an acceptance identity may
     depend on what a leaf asks for and what counts as correct, never on how one
@@ -97,10 +141,10 @@ def leaf_code_revision(
         for name, asset_path in sorted(assets.items()):
             if not name:
                 raise ValueError("leaf_code_revision asset name cannot be empty")
-            candidate = Path(asset_path)
-            if not candidate.is_file():
-                raise ValueError(f"cannot locate runtime asset {name!r}")
-            resolved_assets[name] = sha256_digest(candidate.read_bytes())
+            try:
+                resolved_assets[name] = _asset_digest(Path(asset_path))
+            except ValueError as exc:
+                raise ValueError(f"cannot bind runtime asset {name!r}: {exc}") from exc
         payload["assets"] = resolved_assets
     digest = sha256_digest(canonical_json_bytes(payload))
     short = digest.split(":", 1)[-1][:16] if ":" in digest else digest[:16]

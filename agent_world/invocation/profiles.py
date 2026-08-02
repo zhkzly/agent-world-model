@@ -1,9 +1,9 @@
-"""Hermetic Agent profile recipes and materialization.
+"""Agent profile recipes and materialization.
 
 ``ProfileResolver`` is the only place where host paths and credential handles
-become an executable profile.  It copies explicitly selected capabilities into
-an isolated ``CODEX_HOME`` and never copies ambient user/repository Codex
-configuration.
+become an executable profile. It uses a private ``CODEX_HOME`` to keep
+credentials off disk and to mount the selected Runtime Skill; it does not
+create a filesystem namespace or a workspace sandbox.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ import math
 import os
 import re
 import shutil
-import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -27,12 +26,9 @@ from .contracts import (
     CredentialDescriptor,
     InvocationLimits,
     JsonObject,
-    JsonValue,
     ReasoningEffort,
     ResolvedAgentProfile,
     ResolvedBundle,
-    ResolvedRuntimeInterpreter,
-    ResolvedRuntimeTool,
     SandboxMode,
     json_compatible,
 )
@@ -45,19 +41,12 @@ _SENSITIVE_NAME = re.compile(
     r"(?:api[_-]?key|auth(?:entication|orization)?|bearer|cookie|credential|password|private[_-]?key|secret|session|token)",
     re.IGNORECASE,
 )
-_SENSITIVE_HOOK_FIELD = re.compile(
-    r"^(?:api[_-]?key|auth(?:entication|orization)?|bearer(?:[_-]?token)?|cookie|"
-    r"credentials?|password|private[_-]?key|secrets?|session(?:[_-]?(?:id|key|token))?|token)$",
-    re.IGNORECASE,
-)
 _SAFE_BASE_ENVIRONMENT_NAMES = frozenset(
     {"PATH", "LANG", "LC_ALL", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR"}
 )
 _SUPPORTED_BUILTIN_TOOLS = frozenset({"shell", "workspace_edit"})
 _CONTROL_PATHS = (".codex", ".agents", "AGENTS.md")
 _PROJECT_ROOT_MARKER = ".agent-world-project-root"
-_PERMISSIONS_PROFILE = "agent_world_isolated"
-_WORKSPACE_TOOLCHAIN_DIRECTORY = ".agent-world-tools"
 
 
 class ProfileResolutionError(RuntimeError):
@@ -66,6 +55,40 @@ class ProfileResolutionError(RuntimeError):
 
 class CredentialResolutionError(ProfileResolutionError):
     """Raised for missing, undeclared, or conflicting credential handles."""
+
+
+def safe_profile_resolution_category(error: ProfileResolutionError) -> str:
+    """Project a local profile failure into a closed, message-free category.
+
+    Profile resolution runs before an invocation exists, so its exception cannot
+    be handed to the Provider-terminal diagnostic path. Raw messages can
+    include workspace paths or credential-handle names, while an opaque type is
+    too weak to tell a project-execution Agent which control-plane surface to
+    inspect. Keep only the few categories that change that next investigation.
+    """
+
+    if isinstance(error, CredentialResolutionError):
+        return "credential_binding"
+    message = str(error)
+    if message == "Direct profile cannot declare a Codex runtime":
+        return "direct_inherited_agent_runtime"
+    if message.startswith("Direct profile cannot declare") or message.startswith(
+        "Direct profile must not request"
+    ):
+        return "direct_capability_boundary"
+    if message.startswith("Direct profile requires"):
+        return "direct_runtime_contract"
+    if message.startswith("Direct workspace") or message.startswith("Direct profile workspace"):
+        return "direct_workspace_integrity"
+    if message.startswith("Direct profile root") or message.startswith(
+        "materialization root is already bound"
+    ):
+        return "profile_materialization_binding"
+    if "control path" in message or "configuration" in message:
+        return "profile_configuration_binding"
+    if "modified" in message or "changed" in message or "unavailable" in message:
+        return "profile_integrity"
+    return "profile_resolution_other"
 
 
 class McpTransport(StrEnum):
@@ -81,25 +104,6 @@ class SkillBundleSpec:
 
     def __post_init__(self) -> None:
         _validate_name("skill", self.name)
-
-
-@dataclass(frozen=True, slots=True)
-class HookBundleSpec:
-    """A hook directory containing a complete ``hooks.json`` fragment.
-
-    Hook commands may use ``${BUNDLE_ROOT}``; the resolver replaces it with the
-    content-addressed copied directory.  Other top-level keys are rejected.
-    """
-
-    name: str
-    source: Path
-    config_filename: str = "hooks.json"
-    expected_sha256: str | None = None
-
-    def __post_init__(self) -> None:
-        _validate_name("hook", self.name)
-        if Path(self.config_filename).name != self.config_filename:
-            raise ValueError("hook config_filename must be a plain filename")
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,7 +209,6 @@ class AgentProfileSpec:
     profile_id: str
     profile_version: str
     model: str
-    base_instructions: str
     authentication_handle: str
     effective_capability_plan: EffectiveCapabilityPlan
     codex_bin: Path | None = None
@@ -213,31 +216,25 @@ class AgentProfileSpec:
     model_provider: str | None = None
     openai_base_url_environment: str | None = None
     reasoning_effort: ReasoningEffort = ReasoningEffort.HIGH
-    developer_instructions: str | None = None
-    sandbox: SandboxMode = SandboxMode.READ_ONLY
+    sandbox: SandboxMode = SandboxMode.FULL_ACCESS
     allowed_builtin_tools: tuple[str, ...] = ()
     allowed_network_domains: tuple[str, ...] = ()
     skills: tuple[SkillBundleSpec, ...] = ()
-    hooks: tuple[HookBundleSpec, ...] = ()
     mcp_servers: tuple[McpServerSpec, ...] = ()
     credential_handles: tuple[str, ...] = ()
     output_schema: JsonObject | None = None
-    structured_output_transport: str = "provider_schema"
     rollout_token_limit: int | None = None
+    # An optional physical Provider request cap.  This is intentionally
+    # separate from ``rollout_token_limit``, which stays framework-owned.
+    direct_provider_max_output_tokens: int | None = None
     tool_output_token_limit: int = 2_048
     limits: InvocationLimits = field(default_factory=InvocationLimits)
-    # Framework-owned build executables are not ambient shell capabilities.
-    # They are resolved from the explicit source environment, copied below the
-    # private profile root, and mounted only from that isolated location.
-    required_runtime_tools: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _validate_name("profile_id", self.profile_id)
         _validate_name("profile_version", self.profile_version)
         if not self.model:
             raise ValueError("model must not be empty")
-        if not self.base_instructions.strip():
-            raise ValueError("base_instructions must not be empty")
         if self.effective_capability_plan.role != self.profile_id:
             raise ValueError("effective capability role must match profile_id")
         if (self.codex_bin is None) != (self.codex_bin_sha256 is None):
@@ -261,15 +258,10 @@ class AgentProfileSpec:
         unknown_tools = set(self.allowed_builtin_tools) - _SUPPORTED_BUILTIN_TOOLS
         if unknown_tools:
             raise ValueError(f"unsupported builtin tools: {sorted(unknown_tools)!r}")
-        if self.sandbox is SandboxMode.READ_ONLY and "workspace_edit" in self.allowed_builtin_tools:
-            raise ValueError("read-only profiles cannot allow workspace_edit")
-        if (
-            self.sandbox is SandboxMode.WORKSPACE_WRITE
-            and "workspace_edit" not in self.allowed_builtin_tools
-        ):
-            raise ValueError("workspace-write profiles must explicitly allow workspace_edit")
+        if self.sandbox is not SandboxMode.FULL_ACCESS:
+            raise ValueError("Agent profiles must use Codex full-access execution")
         if self.sandbox is not self.effective_capability_plan.sandbox:
-            raise ValueError("sandbox must equal the effective capability plan")
+            raise ValueError("execution mode must equal the effective capability plan")
         if self.allowed_builtin_tools != (self.effective_capability_plan.intrinsic_builtin_tools):
             raise ValueError("builtin tools must equal the effective intrinsic capability set")
         if self.allowed_network_domains != (
@@ -299,7 +291,6 @@ class AgentProfileSpec:
             if not _DOMAIN.fullmatch(domain):
                 raise ValueError(f"invalid network domain: {domain!r}")
         _ensure_unique("skill", (item.name for item in self.skills))
-        _ensure_unique("hook", (item.name for item in self.hooks))
         _ensure_unique("MCP server", (item.name for item in self.mcp_servers))
         _ensure_unique("credential handle", self.credential_handles)
         if self.authentication_handle not in self.credential_handles:
@@ -319,19 +310,15 @@ class AgentProfileSpec:
             normalized = json_compatible(self.output_schema)
             if not isinstance(normalized, dict):
                 raise TypeError("output_schema must be a JSON object")
-        if self.structured_output_transport not in {
-            "provider_schema",
-            "json_envelope",
-            "json_object",
-        }:
-            raise ValueError("unsupported structured output transport")
         if self.rollout_token_limit is not None and self.rollout_token_limit <= 0:
             raise ValueError("rollout_token_limit must be positive when configured")
+        if (
+            self.direct_provider_max_output_tokens is not None
+            and self.direct_provider_max_output_tokens <= 0
+        ):
+            raise ValueError("direct_provider_max_output_tokens must be positive when configured")
         if self.tool_output_token_limit <= 0:
             raise ValueError("tool_output_token_limit must be positive")
-        _ensure_unique("required runtime tool", self.required_runtime_tools)
-        for name in self.required_runtime_tools:
-            _validate_name("required runtime tool", name)
 
 
 class ProfileResolver:
@@ -435,33 +422,13 @@ class ProfileResolver:
         else:
             _atomic_write_bytes(root_marker, b"", mode=0o400)
 
-        source_bundles: list[tuple[str, str, Path, str, str | None]] = []
+        source_skills: list[tuple[str, Path, str]] = []
         for skill_bundle in spec.skills:
             digest = self._hash_bundle(skill_bundle.source)
             self._check_expected_hash(
                 "skill", skill_bundle.name, digest, skill_bundle.expected_sha256
             )
-            source_bundles.append(("skill", skill_bundle.name, skill_bundle.source, digest, None))
-        for hook_bundle in spec.hooks:
-            digest = self._hash_bundle(hook_bundle.source)
-            self._check_expected_hash("hook", hook_bundle.name, digest, hook_bundle.expected_sha256)
-            source_bundles.append(
-                (
-                    "hook",
-                    hook_bundle.name,
-                    hook_bundle.source,
-                    digest,
-                    hook_bundle.config_filename,
-                )
-            )
-
-        runtime_tool_sources, missing_runtime_tools = self._resolve_runtime_tool_sources(
-            spec.required_runtime_tools,
-            source_environment,
-        )
-        runtime_interpreter = (
-            self._resolve_runtime_interpreter() if spec.required_runtime_tools else None
-        )
+            source_skills.append((skill_bundle.name, skill_bundle.source, digest))
 
         bindings = {handle: self._bindings[handle] for handle in spec.credential_handles}
         auth_binding = bindings[spec.authentication_handle]
@@ -516,13 +483,6 @@ class ProfileResolver:
                         f"MCP server {server.name!r} requires an mcp/tool environment binding"
                     )
 
-        non_auth_handles = set(spec.credential_handles) - {spec.authentication_handle}
-        if spec.hooks and non_auth_handles:
-            raise CredentialResolutionError(
-                "profiles with hooks cannot expose non-auth credentials until a credential broker "
-                "isolates hook subprocesses"
-            )
-
         profile_hash = _canonical_hash(
             {
                 "profile_id": spec.profile_id,
@@ -532,40 +492,30 @@ class ProfileResolver:
                 "openai_base_url_environment": spec.openai_base_url_environment,
                 "openai_base_url_value_digest": base_url_digest,
                 "reasoning_effort": spec.reasoning_effort.value,
-                "base_instructions": spec.base_instructions,
-                "developer_instructions": spec.developer_instructions,
                 "effective_capability_plan": (spec.effective_capability_plan.to_public_dict()),
                 "sandbox": spec.sandbox.value,
                 "allowed_builtin_tools": list(spec.allowed_builtin_tools),
                 "allowed_network_domains": list(spec.allowed_network_domains),
                 "bundles": [
-                    {"kind": kind, "name": name, "sha256": digest}
-                    for kind, name, _source, digest, _config in source_bundles
+                    {"kind": "skill", "name": name, "sha256": digest}
+                    for name, _source, digest in source_skills
                 ],
-                "runtime_tools": [
-                    {"name": name, "sha256": digest}
-                    for name, _source, digest in runtime_tool_sources
-                ],
-                "missing_runtime_tools": list(missing_runtime_tools),
-                "runtime_interpreter": (
-                    runtime_interpreter.to_safe_dict() if runtime_interpreter is not None else None
-                ),
                 "mcp_servers": [_mcp_public_dict(server) for server in spec.mcp_servers],
                 "credential_handles": list(spec.credential_handles),
                 "authentication_handle": spec.authentication_handle,
                 "codex_bin_sha256": spec.codex_bin_sha256,
                 "authentication_kind": "api_key",
                 "output_schema": spec.output_schema,
-                "structured_output_transport": spec.structured_output_transport,
                 "rollout_token_limit": spec.rollout_token_limit,
+                "direct_provider_max_output_tokens": spec.direct_provider_max_output_tokens,
                 "tool_output_token_limit": spec.tool_output_token_limit,
                 "limits": {
                     "timeout_seconds": spec.limits.timeout_seconds,
-                    "direct_stream_idle_timeout_seconds": (
-                        spec.limits.direct_stream_idle_timeout_seconds
+                    "provider_stream_idle_timeout_seconds": (
+                        spec.limits.provider_stream_idle_timeout_seconds
                     ),
-                    "direct_first_event_timeout_seconds": (
-                        spec.limits.direct_first_event_timeout_seconds
+                    "provider_first_event_timeout_seconds": (
+                        spec.limits.provider_first_event_timeout_seconds
                     ),
                     "interrupt_grace_seconds": spec.limits.interrupt_grace_seconds,
                     "kill_grace_seconds": spec.limits.kill_grace_seconds,
@@ -591,61 +541,21 @@ class ProfileResolver:
                 )
 
         resolved_skills: list[ResolvedBundle] = []
-        resolved_hooks: list[ResolvedBundle] = []
-        hook_fragments: list[JsonObject] = []
-        for kind, name, source, digest, config_filename in source_bundles:
-            if kind == "skill":
-                destination = root / "bundles" / "skills" / name
-            else:
-                destination = root / "bundles" / "hooks" / name
+        for name, source, digest in source_skills:
+            # Codex discovers local Skills from its own home ``skills/`` tree.
+            # ``skills.config`` only controls an already discovered Skill; it
+            # does not make an arbitrary external bundle a model-visible
+            # Skill.  Materialize the verified read-only bundle at the actual
+            # discovery root so the runtime Agent receives its name,
+            # description, and SKILL.md path in the turn's Skill catalog.
+            destination = codex_home / "skills" / name
             self._copy_verified_bundle(source, destination, digest)
-            resolved = ResolvedBundle(kind=kind, name=name, path=destination, sha256=digest)
-            if kind == "skill":
-                if not (destination / "SKILL.md").is_file():
-                    raise ProfileResolutionError(f"skill {name!r} has no SKILL.md")
-                resolved_skills.append(resolved)
-            else:
-                config_path = destination / str(config_filename)
-                fragment = _read_json_object(config_path)
-                if set(fragment) != {"hooks"} or not isinstance(fragment.get("hooks"), dict):
-                    raise ProfileResolutionError(
-                        f"hook bundle {name!r} must contain only a hooks object"
-                    )
-                _reject_sensitive_keys(fragment)
-                hook_fragments.append(
-                    {
-                        key: _replace_bundle_root(value, destination)
-                        for key, value in fragment.items()
-                    }
-                )
-                resolved_hooks.append(resolved)
-
-        runtime_tools = (
-            self._materialize_runtime_tools(root, runtime_tool_sources)
-            if spec.required_runtime_tools
-            else ()
-        )
-        if runtime_tools:
-            assert runtime_interpreter is not None
-            self._materialize_workspace_tool_facades(
-                resolved_workspace,
-                runtime_tools=runtime_tools,
-                interpreter=runtime_interpreter,
-            )
-
-        hooks_json = _merge_hook_fragments(hook_fragments)
-        hooks_path = codex_home / "hooks.json"
-        hooks_config_hash: str | None = None
-        if hooks_json:
-            _atomic_write_json(hooks_path, {"hooks": hooks_json}, mode=0o600)
-            hooks_config_hash = hashlib.sha256(hooks_path.read_bytes()).hexdigest()
-        elif hooks_path.exists():
-            raise ProfileResolutionError("unexpected hooks.json exists for a hook-free profile")
+            resolved = ResolvedBundle(kind="skill", name=name, path=destination, sha256=digest)
+            if not (destination / "SKILL.md").is_file():
+                raise ProfileResolutionError(f"skill {name!r} has no SKILL.md")
+            resolved_skills.append(resolved)
 
         shell_environment = self._base_environment(source_environment)
-        if spec.required_runtime_tools:
-            assert runtime_interpreter is not None
-            shell_environment["PATH"] = self._isolated_tool_path(root, runtime_interpreter)
         shell_environment.update(
             {
                 "HOME": str(resolved_workspace / ".agent-world-tmp" / "home"),
@@ -654,31 +564,9 @@ class ProfileResolver:
                 "XDG_CACHE_HOME": str(resolved_workspace / ".agent-world-tmp" / "cache"),
             }
         )
-        runtime_read_roots = (
-            [runtime_interpreter.root]
-            if runtime_interpreter is not None
-            else [Path(sys.prefix).resolve()]
-        )
-        if spec.required_runtime_tools:
-            # This directory contains only the declared, copied executables.
-            # Mounting it permits shell PATH lookup without granting the Agent
-            # its ambient host bin directory.
-            runtime_read_roots.append(root / "toolchain" / "bin")
-        if spec.codex_bin is not None:
-            # The Codex app-server re-executes its own runtime inside the Linux
-            # sandbox when it services shell/workspace tools.  A custom binary
-            # can start successfully in the outer worker while being absent
-            # from the inner bwrap mount, causing every Agent tool call to fail
-            # with ENOENT.  Bind only the already content-pinned executable,
-            # never its ambient parent directory.
-            runtime_read_roots.append(spec.codex_bin)
         config_text = _render_codex_config(
             spec,
-            codex_home=codex_home,
             workspace=resolved_workspace,
-            skills=tuple(resolved_skills),
-            hooks=tuple(resolved_hooks),
-            runtime_read_roots=tuple(runtime_read_roots),
             bindings={
                 handle: binding
                 for handle, binding in bindings.items()
@@ -691,9 +579,6 @@ class ProfileResolver:
         config_hash = hashlib.sha256(config_text.encode("utf-8")).hexdigest()
 
         base_environment = self._base_environment(source_environment)
-        if spec.required_runtime_tools:
-            assert runtime_interpreter is not None
-            base_environment["PATH"] = self._isolated_tool_path(root, runtime_interpreter)
         base_environment["TMPDIR"] = str(resolved_workspace / ".agent-world-tmp")
         descriptors = tuple(
             CredentialDescriptor(
@@ -714,8 +599,6 @@ class ProfileResolver:
             model_provider=spec.model_provider,
             openai_base_url_environment=spec.openai_base_url_environment,
             reasoning_effort=spec.reasoning_effort,
-            base_instructions=spec.base_instructions,
-            developer_instructions=spec.developer_instructions,
             lineage_id=lineage_id,
             materialization_root=root,
             home=home,
@@ -726,22 +609,17 @@ class ProfileResolver:
             allowed_builtin_tools=tuple(spec.allowed_builtin_tools),
             allowed_network_domains=tuple(spec.allowed_network_domains),
             skills=tuple(resolved_skills),
-            hooks=tuple(resolved_hooks),
-            runtime_tools=runtime_tools,
-            missing_runtime_tools=missing_runtime_tools,
-            runtime_interpreter=runtime_interpreter,
             credential_descriptors=descriptors,
             authentication_kind="api_key",
             authentication_environment=auth_binding.target_environment,
             codex_bin=spec.codex_bin,
             codex_bin_sha256=spec.codex_bin_sha256,
             output_schema=spec.output_schema,
-            structured_output_transport=spec.structured_output_transport,
             rollout_token_limit=spec.rollout_token_limit,
+            direct_provider_max_output_tokens=spec.direct_provider_max_output_tokens,
             tool_output_token_limit=spec.tool_output_token_limit,
             limits=spec.limits,
             codex_config_sha256=config_hash,
-            hooks_config_sha256=hooks_config_hash,
             _credential_environment=MappingProxyType(credential_environment),
             _base_environment=MappingProxyType(base_environment),
         )
@@ -758,215 +636,229 @@ class ProfileResolver:
         )
         return resolved_profile
 
+    def resolve_direct(
+        self,
+        spec: AgentProfileSpec,
+        *,
+        lineage_id: str,
+        materialization_root: Path,
+        workspace: Path | None = None,
+        source_environment: Mapping[str, str] | None = None,
+    ) -> ResolvedAgentProfile:
+        """Resolve a prompt-only Direct LLM profile without a Codex runtime.
+
+        A Direct turn needs a model route, a rendered Prompt, a native output
+        schema, and the model credential. It must not silently acquire a
+        CODEX_HOME, Skill bundle, workspace input copy, hook, or
+        Codex executable merely because both execution forms share control
+        plane provenance. The tiny marker below is integrity evidence for the
+        framework; it is never model-visible configuration.
+        """
+
+        _validate_name("lineage_id", lineage_id)
+        source_environment = os.environ if source_environment is None else source_environment
+        if spec.allowed_builtin_tools:
+            raise ProfileResolutionError("Direct profile cannot declare builtin tools")
+        if spec.skills or spec.mcp_servers:
+            raise ProfileResolutionError("Direct profile cannot declare runtime bundles or MCP")
+        if spec.codex_bin is not None or spec.codex_bin_sha256 is not None:
+            raise ProfileResolutionError("Direct profile cannot declare a Codex runtime")
+        if spec.sandbox is not SandboxMode.FULL_ACCESS:
+            raise ProfileResolutionError("Direct profile must use the shared full-access mode")
+        if any(spec.effective_capability_plan.external.to_public_dict().values()):
+            raise ProfileResolutionError("Direct profile cannot declare external capabilities")
+        if spec.output_schema is None:
+            raise ProfileResolutionError("Direct profile requires an output schema")
+        if spec.model_provider != API_KEY_RUNTIME_PROVIDER:
+            raise ProfileResolutionError("Direct profile requires the API-key runtime provider")
+        if tuple(spec.credential_handles) != (spec.authentication_handle,):
+            raise CredentialResolutionError(
+                "Direct profile may expose only its model authentication handle"
+            )
+
+        binding = self._bindings.get(spec.authentication_handle)
+        if (
+            not isinstance(binding, CredentialBinding)
+            or binding.purpose != "model_api_key"
+            or spec.authentication_handle not in self._allowed_handles
+        ):
+            raise CredentialResolutionError(
+                "Direct authentication handle must resolve to an allowed model API-key binding"
+            )
+        api_key = source_environment.get(binding.source_environment)
+        if api_key is None or not api_key:
+            raise CredentialResolutionError(
+                f"credential handle {binding.handle!r} is unavailable from its configured source"
+            )
+        if len(api_key) < 5:
+            raise CredentialResolutionError(
+                f"credential handle {binding.handle!r} is too short for safe redaction"
+            )
+        base_url: str | None = None
+        base_url_digest: str | None = None
+        if spec.openai_base_url_environment is not None:
+            base_url = source_environment.get(spec.openai_base_url_environment)
+            if base_url is None or not base_url:
+                raise CredentialResolutionError(
+                    "configured API base-URL environment is unavailable"
+                )
+            _validate_runtime_base_url(base_url)
+            base_url_digest = hashlib.sha256(base_url.encode("utf-8")).hexdigest()
+
+        root = materialization_root.expanduser().resolve()
+        resolved_workspace = (workspace or root / "workspace").expanduser().resolve()
+        if not resolved_workspace.is_relative_to(root):
+            raise ProfileResolutionError("Direct workspace must be inside materialization_root")
+        if resolved_workspace == root:
+            raise ProfileResolutionError("Direct workspace must be a dedicated descendant")
+        workspace_relative = resolved_workspace.relative_to(root)
+        if workspace_relative.parts[0] in {"home", "codex-home", "bundles"}:
+            raise ProfileResolutionError("Direct workspace uses a reserved runtime directory")
+        self._reject_ambient_configuration(root)
+        self._make_private_directory(root)
+        for unused_runtime_path in (
+            root / "home",
+            root / "codex-home",
+            root / "bundles",
+        ):
+            if unused_runtime_path.exists() or unused_runtime_path.is_symlink():
+                raise ProfileResolutionError(
+                    "Direct profile root contains unexpected Agent runtime material"
+                )
+        self._make_private_directory(resolved_workspace)
+        if any(resolved_workspace.iterdir()):
+            raise ProfileResolutionError("Direct profile workspace must remain empty")
+        for control_path in _CONTROL_PATHS:
+            if (root / control_path).exists() or (resolved_workspace / control_path).exists():
+                raise ProfileResolutionError("Direct profile cannot inherit Agent control files")
+
+        direct_runtime_hash = _canonical_hash(
+            {
+                "runtime": "direct_llm.prompt_only.v1",
+                "model": spec.model,
+                "model_provider": spec.model_provider,
+                "openai_base_url_environment": spec.openai_base_url_environment,
+                "openai_base_url_value_digest": base_url_digest,
+                "reasoning_effort": spec.reasoning_effort.value,
+                "effective_capability_plan": spec.effective_capability_plan.to_public_dict(),
+                "output_schema": spec.output_schema,
+                "rollout_token_limit": spec.rollout_token_limit,
+                "direct_provider_max_output_tokens": spec.direct_provider_max_output_tokens,
+                "limits": {
+                    "timeout_seconds": spec.limits.timeout_seconds,
+                    "provider_stream_idle_timeout_seconds": (
+                        spec.limits.provider_stream_idle_timeout_seconds
+                    ),
+                    "provider_first_event_timeout_seconds": (
+                        spec.limits.provider_first_event_timeout_seconds
+                    ),
+                    "max_events": spec.limits.max_events,
+                },
+            }
+        )
+        profile_hash = _canonical_hash(
+            {
+                "profile_id": spec.profile_id,
+                "profile_version": spec.profile_version,
+                # A Direct profile has no session or workspace capability.  Its
+                # profile hash must therefore identify the stable prompt-only
+                # runtime configuration, not this physical WorkAttempt's
+                # lineage.  The resolved-profile marker below still binds the
+                # exact lineage and workspace.  Keeping lineage in this hash
+                # made a fresh, Scheduler-authorized semantic repair reject a
+                # valid parsed seed before the model was called, despite the
+                # model, response schema, and Direct runtime all matching.
+                "direct_runtime_hash": direct_runtime_hash,
+                "credential_handles": [spec.authentication_handle],
+            }
+        )
+        marker_path = root / "resolved-profile.json"
+        if marker_path.exists():
+            marker = _read_json_object(marker_path)
+            expected = {
+                "profile_hash": profile_hash,
+                "lineage_id": lineage_id,
+                "workspace": str(resolved_workspace),
+            }
+            if {key: marker.get(key) for key in expected} != expected:
+                raise ProfileResolutionError(
+                    "materialization root is already bound to a different Direct profile or lineage"
+                )
+
+        profile = ResolvedAgentProfile(
+            profile_id=spec.profile_id,
+            profile_version=spec.profile_version,
+            profile_hash=profile_hash,
+            backend="direct_llm",
+            model=spec.model,
+            model_provider=spec.model_provider,
+            openai_base_url_environment=spec.openai_base_url_environment,
+            reasoning_effort=spec.reasoning_effort,
+            lineage_id=lineage_id,
+            materialization_root=root,
+            # Kept as inert absolute paths while Agent and Direct share the
+            # profile record type. DirectLlmBackend never exports or opens
+            # either path; direct verification asserts they do not exist.
+            home=root / "home",
+            codex_home=root / "codex-home",
+            workspace=resolved_workspace,
+            effective_capability_plan=spec.effective_capability_plan,
+            sandbox=spec.sandbox,
+            allowed_builtin_tools=(),
+            allowed_network_domains=(),
+            skills=(),
+            credential_descriptors=(
+                CredentialDescriptor(
+                    handle=spec.authentication_handle,
+                    target_environment=binding.target_environment,
+                    purpose=binding.purpose,
+                ),
+            ),
+            authentication_kind="api_key",
+            authentication_environment=binding.target_environment,
+            codex_bin=None,
+            codex_bin_sha256=None,
+            output_schema=spec.output_schema,
+            rollout_token_limit=spec.rollout_token_limit,
+            direct_provider_max_output_tokens=spec.direct_provider_max_output_tokens,
+            tool_output_token_limit=spec.tool_output_token_limit,
+            limits=spec.limits,
+            # This is an inert direct-runtime fingerprint kept only because
+            # the shared immutable profile record has an Agent session binding
+            # field. It is never exposed as a Codex configuration or used by a
+            # Direct request.
+            codex_config_sha256=direct_runtime_hash,
+            _credential_environment=MappingProxyType(
+                {
+                    binding.target_environment: api_key,
+                    **(
+                        {spec.openai_base_url_environment: base_url}
+                        if spec.openai_base_url_environment is not None and base_url is not None
+                        else {}
+                    ),
+                }
+            ),
+            _base_environment=MappingProxyType({}),
+        )
+        _atomic_write_json(
+            marker_path,
+            {
+                "schema_version": "agent-world.resolved-direct-profile.v1",
+                "profile_hash": profile_hash,
+                "lineage_id": lineage_id,
+                "workspace": str(resolved_workspace),
+                "profile": profile.to_public_dict(),
+            },
+            mode=0o600,
+        )
+        return profile
+
     def _base_environment(self, source: Mapping[str, str]) -> dict[str, str]:
         return {
             name: source[name]
             for name in self._base_environment_names
             if name in source and source[name]
         }
-
-    @staticmethod
-    def _isolated_tool_path(
-        root: Path,
-        interpreter: ResolvedRuntimeInterpreter,
-    ) -> str:
-        """Return the small truthful PATH for a provisioned shell profile."""
-
-        candidates = (
-            root / "toolchain" / "bin",
-            interpreter.executable.parent,
-            Path("/usr/bin"),
-            Path("/bin"),
-        )
-        entries: list[str] = []
-        for candidate in candidates:
-            text = str(candidate)
-            if text not in entries:
-                entries.append(text)
-        return os.pathsep.join(entries)
-
-    @staticmethod
-    def _resolve_runtime_interpreter() -> ResolvedRuntimeInterpreter:
-        """Pin the framework Python used by offline ``uv`` Candidate builds.
-
-        The old profile exposed ``sys.prefix`` (normally a virtual environment
-        whose Python entries are symlinks outside the sandbox).  That makes a
-        readable but non-executable interpreter appear to the Agent.  Resolve
-        the real interpreter and mount its actual prefix instead.
-        """
-
-        try:
-            executable = Path(sys.executable).resolve(strict=True)
-        except OSError as exc:
-            raise ProfileResolutionError("framework Python runtime is unavailable") from exc
-        if (
-            not executable.is_file()
-            or executable.is_symlink()
-            or not os.access(executable, os.X_OK)
-        ):
-            raise ProfileResolutionError("framework Python runtime is not executable")
-        version = f"{sys.version_info.major}.{sys.version_info.minor}"
-        if version != "3.12":
-            raise ProfileResolutionError(
-                "isolated Candidate toolchains require the framework to run under Python 3.12"
-            )
-        root = executable.parent.parent
-        if not (root / "bin").is_dir() or not executable.is_relative_to(root):
-            raise ProfileResolutionError("framework Python runtime root is invalid")
-        return ResolvedRuntimeInterpreter(
-            version=version,
-            executable=executable,
-            root=root,
-            sha256=_hash_file(executable),
-        )
-
-    def _materialize_workspace_tool_facades(
-        self,
-        workspace: Path,
-        *,
-        runtime_tools: tuple[ResolvedRuntimeTool, ...],
-        interpreter: ResolvedRuntimeInterpreter,
-    ) -> None:
-        """Expose declared build tools through stable workspace-relative commands.
-
-        Current Codex app-server sandboxes can ignore a configured shell PATH
-        even though the tool directory is mounted.  The Agent must not have to
-        discover a private absolute profile path, so provide explicit relative
-        executable copies under the framework-owned workspace root.  They are
-        direct executables rather than shell wrappers, removing an additional
-        wrapper-interpreter dependency; the later real audit still proves
-        whether their runtime can start in the active sandbox.  The copies are
-        not Candidate output and are never trusted by a later framework gate.
-        """
-
-        tool_root = workspace / _WORKSPACE_TOOLCHAIN_DIRECTORY
-        self._make_private_directory(tool_root)
-        by_name = {tool.name: tool for tool in runtime_tools}
-        for tool in runtime_tools:
-            self._copy_workspace_tool_executable(
-                source=tool.path,
-                destination=tool_root / tool.name,
-                digest=tool.sha256,
-                description=f"runtime tool {tool.name!r}",
-            )
-        if "uv" in by_name and "python3.12" not in by_name:
-            self._copy_workspace_tool_executable(
-                source=interpreter.executable,
-                destination=tool_root / "python3.12",
-                digest=interpreter.sha256,
-                description="Python 3.12 interpreter",
-            )
-
-    @staticmethod
-    def _copy_workspace_tool_executable(
-        source: Path,
-        destination: Path,
-        *,
-        digest: str,
-        description: str,
-    ) -> None:
-        """Materialize one hash-pinned, directly executable workspace tool."""
-
-        if (
-            source.is_symlink()
-            or not source.is_file()
-            or not os.access(source, os.X_OK)
-            or _hash_file(source) != digest
-        ):
-            raise ProfileResolutionError(f"pinned {description} is unavailable")
-        if destination.exists() or destination.is_symlink():
-            if (
-                destination.is_symlink()
-                or not destination.is_file()
-                or not os.access(destination, os.X_OK)
-                or _hash_file(destination) != digest
-            ):
-                raise ProfileResolutionError(f"workspace copy of {description} was modified")
-            return
-
-        temporary = destination.with_name(f".{destination.name}.copying")
-        if temporary.exists() or temporary.is_symlink():
-            if temporary.is_dir() and not temporary.is_symlink():
-                raise ProfileResolutionError(
-                    f"workspace copy staging path is unexpectedly a directory: {temporary}"
-                )
-            temporary.unlink()
-        shutil.copyfile(source, temporary)
-        temporary.chmod(0o500)
-        if _hash_file(temporary) != digest:
-            temporary.unlink()
-            raise ProfileResolutionError(f"{description} changed while materializing workspace")
-        temporary.replace(destination)
-
-    @staticmethod
-    def _resolve_runtime_tool_sources(
-        names: tuple[str, ...],
-        source_environment: Mapping[str, str],
-    ) -> tuple[list[tuple[str, Path, str]], tuple[str, ...]]:
-        """Pin declared tool binaries without exposing ambient PATH at runtime."""
-
-        path_value = source_environment.get("PATH", "")
-        search_roots = tuple(
-            Path(item).expanduser()
-            for item in path_value.split(os.pathsep)
-            if item and Path(item).is_absolute()
-        )
-        resolved: list[tuple[str, Path, str]] = []
-        missing: list[str] = []
-        for name in names:
-            executable: Path | None = None
-            for directory in search_roots:
-                candidate = directory / name
-                try:
-                    target = candidate.resolve(strict=True)
-                except OSError:
-                    continue
-                if not target.is_file() or target.is_symlink() or not os.access(target, os.X_OK):
-                    continue
-                executable = target
-                break
-            if executable is None:
-                missing.append(name)
-                continue
-            resolved.append((name, executable, _hash_file(executable)))
-        return resolved, tuple(missing)
-
-    def _materialize_runtime_tools(
-        self,
-        root: Path,
-        sources: list[tuple[str, Path, str]],
-    ) -> tuple[ResolvedRuntimeTool, ...]:
-        """Copy each pinned executable into the profile-owned toolchain."""
-
-        toolchain = root / "toolchain"
-        tool_bin = toolchain / "bin"
-        self._make_private_directory(toolchain)
-        self._make_private_directory(tool_bin)
-        resolved: list[ResolvedRuntimeTool] = []
-        for name, source, digest in sources:
-            destination = tool_bin / name
-            if destination.exists():
-                if (
-                    destination.is_symlink()
-                    or not destination.is_file()
-                    or not os.access(destination, os.X_OK)
-                    or _hash_file(destination) != digest
-                ):
-                    raise ProfileResolutionError(f"materialized runtime tool {name!r} was modified")
-            else:
-                temporary = tool_bin / f".{name}.copying"
-                if temporary.exists():
-                    temporary.unlink()
-                shutil.copyfile(source, temporary)
-                temporary.chmod(0o500)
-                if _hash_file(temporary) != digest:
-                    temporary.unlink()
-                    raise ProfileResolutionError(
-                        f"runtime tool {name!r} changed while materializing"
-                    )
-                temporary.replace(destination)
-            resolved.append(ResolvedRuntimeTool(name=name, path=destination, sha256=digest))
-        return tuple(resolved)
 
     def _reject_ambient_configuration(self, root: Path) -> None:
         # The custom marker written into the workspace terminates Codex project
@@ -991,7 +883,7 @@ class ProfileResolver:
     @staticmethod
     def _make_private_directory(path: Path) -> None:
         if path.is_symlink():
-            raise ProfileResolutionError(f"isolated directory must not be a symlink: {path}")
+            raise ProfileResolutionError(f"profile directory must not be a symlink: {path}")
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
         path.chmod(0o700)
 
@@ -1056,21 +948,17 @@ class ProfileResolver:
 def _render_codex_config(
     spec: AgentProfileSpec,
     *,
-    codex_home: Path,
     workspace: Path,
-    skills: tuple[ResolvedBundle, ...],
-    hooks: tuple[ResolvedBundle, ...],
-    runtime_read_roots: tuple[Path, ...],
     bindings: Mapping[str, CredentialBinding],
     shell_environment: Mapping[str, str],
 ) -> str:
-    # KEEP THIS FILE SMALL.  Codex ships working defaults for its tools, sandbox
-    # and permissions; every line written here overrides one of them, and each
+    # KEEP THIS FILE SMALL. Codex ships working defaults for its tools and
+    # permissions; every line written here overrides one of them, and each
     # override is a place where a generated profile can disagree with the runtime
     # that actually executes it.  A previous version emitted ~83 lines -- 21
     # feature flags, a hand-rebuilt shell environment, and a domain allowlist --
-    # and the observable result was tools that existed but could not work
-    # tools that existed but could not work, which failed silently and had to be
+    # and the observable result was tools that existed but could not work,
+    # which failed silently and had to be
     # re-diagnosed per node.  Runtime tools are never named here at all: the Codex
     # runtime owns which of its tools exist, and a second copy of that decision in
     # generated config can only disagree with it.
@@ -1080,12 +968,14 @@ def _render_codex_config(
     #   1. no interactive approval -- there is no human at this terminal;
     #   2. credentials never reach disk -- the provider key stays in the worker's
     #      memory and must not be materialized into a Codex auth file;
-    #   3. writes stay inside the isolated workspace -- Judge and Registry
-    #      evidence is only meaningful if a candidate cannot write elsewhere.
+    #   3. plugin discovery stays off -- verified Runtime Skills live directly
+    #      under this private CODEX_HOME's local Skill discovery root, while
+    #      ambient plugin marketplaces must never synchronize or execute.
+    #      Besides widening the effective Agent surface, the latter has
+    #      produced a real app-server startup liveness failure.
     # Everything else is the SDK's business.  Do not re-add flags defensively.
     lines = [
         'approval_policy = "never"',
-        f"default_permissions = {_toml_string(_PERMISSIONS_PROFILE)}",
         # The worker supplies its custom provider through the per-thread SDK
         # request config.  Disallow Codex's file credential store so an
         # accidental login path cannot materialize auth.json here.
@@ -1097,6 +987,9 @@ def _render_codex_config(
         # workspace as its own project root so nothing above it is in scope.
         f"project_root_markers = [{_toml_string(_PROJECT_ROOT_MARKER)}]",
         "project_doc_max_bytes = 0",
+        "",
+        "[features]",
+        "plugins = false",
     ]
     if spec.rollout_token_limit is not None:
         reminder_thresholds = (
@@ -1112,19 +1005,10 @@ def _render_codex_config(
                 "rollout_budget.prefill_token_weight = 1.0",
             ]
         )
-    # The Agent runs inside a disposable workspace with full authority over it:
-    # network on, filesystem write, no domain allowlist, no per-path rules.  The
-    # containment that matters is the workspace itself -- it is created per
-    # invocation, nothing outside it is an input to Judge or Registry, and a
-    # candidate becomes real only by passing validation and an immutable commit.
-    # Writing per-path filesystem rules here bought nothing and cost correctness:
-    # a tool could exist and still be unable to work, which fails silently and
-    # has to be re-diagnosed at every node.
-    #
     # The shell keeps ``inherit = "none"`` for one non-negotiable reason: the
     # parent environment holds the provider credential, which must never reach a
     # subprocess or a snapshot.  The few values below are what a shell needs to
-    # function at all (its pinned toolchain and a writable temp/cache inside the
+    # function at all (a normal host PATH and a writable temp/cache inside the
     # workspace), not a policy.
     lines.extend(
         [
@@ -1138,27 +1022,9 @@ def _render_codex_config(
     for name, value in sorted(shell_environment.items()):
         lines.append(f"{_toml_key(name)} = {_toml_string(value)}")
 
-    lines.extend(
-        [
-            "",
-            f"[permissions.{_toml_key(_PERMISSIONS_PROFILE)}]",
-            'description = "Agent World disposable invocation workspace"',
-            "",
-            f"[permissions.{_toml_key(_PERMISSIONS_PROFILE)}.filesystem]",
-            # ``:root`` is Codex's own name for the whole tree.  ``:all`` is not a
-            # key it recognizes and made the app-server fail at session open --
-            # a reminder that inventing config vocabulary fails later and less
-            # legibly than using the runtime's.
-            '":root" = "write"',
-            "",
-            f"[permissions.{_toml_key(_PERMISSIONS_PROFILE)}.network]",
-            "enabled = true",
-        ]
-    )
-
-    # Declaring the workspace as a project keeps Codex from resolving a project
-    # above it.  ``untrusted`` refers to project-local config/hooks, not to the
-    # Agent's authority inside the workspace, which is full.
+    # Declaring the workspace as a project prevents Codex from treating the
+    # Foundry checkout as the Agent's project. It is orientation only: the
+    # worker selects SDK ``Sandbox.full_access`` explicitly for every Agent turn.
     lines.extend(
         [
             "",
@@ -1166,16 +1032,6 @@ def _render_codex_config(
             'trust_level = "untrusted"',
         ]
     )
-
-    for skill in skills:
-        lines.extend(
-            [
-                "",
-                "[[skills.config]]",
-                f"path = {_toml_string(str(skill.path))}",
-                "enabled = true",
-            ]
-        )
 
     for server in spec.mcp_servers:
         lines.extend(["", f"[mcp_servers.{_toml_key(server.name)}]"])
@@ -1223,50 +1079,6 @@ def _render_codex_config(
                 lines.append(f"{_toml_key(name)} = {_toml_string(value)}")
 
     return "\n".join(lines) + "\n"
-
-
-def _merge_hook_fragments(fragments: list[JsonObject]) -> dict[str, JsonValue]:
-    merged: dict[str, JsonValue] = {}
-    for fragment in fragments:
-        hooks = fragment["hooks"]
-        if not isinstance(hooks, dict):
-            raise ProfileResolutionError("hook fragment hooks must be an object")
-        for event, groups in hooks.items():
-            if not isinstance(groups, list):
-                raise ProfileResolutionError(f"hook event {event!r} must contain a list")
-            current = merged.setdefault(event, [])
-            if not isinstance(current, list):
-                raise AssertionError("merged hook event unexpectedly changed type")
-            current.extend(groups)
-    return merged
-
-
-def _replace_bundle_root(value: JsonValue, root: Path) -> JsonValue:
-    if isinstance(value, str):
-        return value.replace("${BUNDLE_ROOT}", str(root))
-    if isinstance(value, list):
-        return [_replace_bundle_root(item, root) for item in value]
-    if isinstance(value, dict):
-        return {key: _replace_bundle_root(item, root) for key, item in value.items()}
-    return value
-
-
-def _reject_sensitive_keys(value: JsonValue) -> None:
-    if isinstance(value, dict):
-        for key, item in value.items():
-            # Hook event names such as ``SessionStart`` are ordinary schema
-            # keys.  Reject credential-shaped field names exactly instead of
-            # treating every occurrence of the word "session" as a secret.
-            if _SENSITIVE_HOOK_FIELD.fullmatch(key):
-                raise ProfileResolutionError(
-                    f"hook configuration contains a sensitive field {key!r}; use credential handles"
-                )
-            _reject_sensitive_keys(item)
-    elif isinstance(value, list):
-        for item in value:
-            _reject_sensitive_keys(item)
-    elif isinstance(value, str) and _looks_secret(value):
-        raise ProfileResolutionError("hook configuration appears to contain secret material")
 
 
 def _mcp_public_dict(server: McpServerSpec) -> JsonObject:
@@ -1421,6 +1233,11 @@ def verify_resolved_profile(profile: ResolvedAgentProfile) -> None:
         raise ProfileResolutionError("materialization root identity changed")
     if not profile.workspace.resolve().is_relative_to(root):
         raise ProfileResolutionError("resolved workspace escaped its materialization root")
+    if profile.backend == "direct_llm":
+        _verify_direct_profile(profile, root)
+        return
+    if profile.backend != "codex_sdk":  # pragma: no cover - dataclass already closes this value
+        raise ProfileResolutionError("resolved profile has an unsupported backend")
     for path in (profile.home, profile.codex_home, profile.workspace):
         if not path.is_dir() or path.is_symlink():
             raise ProfileResolutionError(f"resolved directory is missing or replaced: {path}")
@@ -1444,17 +1261,6 @@ def verify_resolved_profile(profile: ResolvedAgentProfile) -> None:
         raise ProfileResolutionError(f"cannot read materialized Codex config: {exc}") from exc
     if config_hash != profile.codex_config_sha256:
         raise ProfileResolutionError("materialized Codex config was modified")
-    hooks_path = profile.codex_home / "hooks.json"
-    if profile.hooks_config_sha256 is None:
-        if hooks_path.exists():
-            raise ProfileResolutionError("unexpected hooks.json exists for a hook-free profile")
-    else:
-        try:
-            hooks_hash = hashlib.sha256(hooks_path.read_bytes()).hexdigest()
-        except OSError as exc:
-            raise ProfileResolutionError("cannot read materialized hooks config") from exc
-        if hooks_path.is_symlink() or hooks_hash != profile.hooks_config_sha256:
-            raise ProfileResolutionError("materialized hooks config was modified")
     auth_path = profile.codex_home / "auth.json"
     if auth_path.exists() or auth_path.is_symlink():
         raise ProfileResolutionError("file-backed Codex authentication is forbidden")
@@ -1465,65 +1271,6 @@ def verify_resolved_profile(profile: ResolvedAgentProfile) -> None:
             raise ProfileResolutionError("configured Codex binary is not executable")
         if _hash_file(profile.codex_bin) != profile.codex_bin_sha256:
             raise ProfileResolutionError("configured Codex binary changed after resolution")
-
-    tool_bin = profile.materialization_root / "toolchain" / "bin"
-    expected_tools = {tool.name: tool for tool in profile.runtime_tools}
-    if profile.runtime_tools or profile.missing_runtime_tools:
-        if not tool_bin.is_dir() or tool_bin.is_symlink():
-            raise ProfileResolutionError("isolated runtime toolchain is unavailable")
-        actual_names = {path.name for path in tool_bin.iterdir()}
-        if actual_names != set(expected_tools):
-            raise ProfileResolutionError("isolated runtime toolchain contents changed")
-    for name, tool in expected_tools.items():
-        if tool.path != tool_bin / name:
-            raise ProfileResolutionError("resolved runtime tool escaped its isolated toolchain")
-        if tool.path.is_symlink() or not tool.path.is_file() or not os.access(tool.path, os.X_OK):
-            raise ProfileResolutionError("resolved runtime tool is unavailable")
-        if _hash_file(tool.path) != tool.sha256:
-            raise ProfileResolutionError("resolved runtime tool changed after resolution")
-
-    interpreter = profile.runtime_interpreter
-    if interpreter is not None:
-        if (
-            interpreter.executable.is_symlink()
-            or not interpreter.executable.is_file()
-            or not os.access(interpreter.executable, os.X_OK)
-            or not interpreter.executable.is_relative_to(interpreter.root)
-            or _hash_file(interpreter.executable) != interpreter.sha256
-        ):
-            raise ProfileResolutionError("resolved runtime interpreter changed after resolution")
-    if expected_tools:
-        assert interpreter is not None
-        facade_root = profile.workspace / _WORKSPACE_TOOLCHAIN_DIRECTORY
-        if not facade_root.is_dir() or facade_root.is_symlink():
-            raise ProfileResolutionError("workspace runtime tool facades are unavailable")
-        expected_facades = set(expected_tools)
-        if "uv" in expected_tools and "python3.12" not in expected_tools:
-            expected_facades.add("python3.12")
-        if {path.name for path in facade_root.iterdir()} != expected_facades:
-            raise ProfileResolutionError("workspace runtime tool facades changed")
-        for name, tool in expected_tools.items():
-            facade = facade_root / name
-            if (
-                facade.is_symlink()
-                or not facade.is_file()
-                or not os.access(facade, os.X_OK)
-                or _hash_file(facade) != tool.sha256
-            ):
-                raise ProfileResolutionError("workspace runtime tool facade changed")
-        python_facade = facade_root / "python3.12"
-        expected_python_facade_digest = (
-            expected_tools["python3.12"].sha256
-            if "python3.12" in expected_tools
-            else interpreter.sha256
-        )
-        if "python3.12" in expected_facades and (
-            python_facade.is_symlink()
-            or not python_facade.is_file()
-            or not os.access(python_facade, os.X_OK)
-            or _hash_file(python_facade) != expected_python_facade_digest
-        ):
-            raise ProfileResolutionError("workspace Python tool facade changed")
 
     marker = _read_json_object(root / "resolved-profile.json")
     expected_marker = {
@@ -1536,12 +1283,40 @@ def verify_resolved_profile(profile: ResolvedAgentProfile) -> None:
     if {key: marker.get(key) for key in expected_marker} != expected_marker:
         raise ProfileResolutionError("resolved profile marker was modified")
 
-    for bundle in (*profile.skills, *profile.hooks):
+    for bundle in profile.skills:
         actual = _hash_existing_bundle(bundle.path)
         if actual != bundle.sha256:
             raise ProfileResolutionError(
                 f"materialized {bundle.kind} bundle {bundle.name!r} was modified"
             )
+
+
+def _verify_direct_profile(profile: ResolvedAgentProfile, root: Path) -> None:
+    """Verify a Direct profile without treating it as a stripped Codex home."""
+
+    if not profile.workspace.is_dir() or profile.workspace.is_symlink():
+        raise ProfileResolutionError("Direct profile workspace is missing or replaced")
+    if profile.home.exists() or profile.codex_home.exists():
+        raise ProfileResolutionError(
+            "Direct profile unexpectedly materialized Agent runtime directories"
+        )
+    if any(profile.workspace.iterdir()):
+        raise ProfileResolutionError("Direct profile workspace was modified")
+    if any((root / name).exists() for name in (*_CONTROL_PATHS, "bundles")):
+        raise ProfileResolutionError("Direct profile acquired Agent runtime material")
+    expected_root_entries = {"workspace", "resolved-profile.json"}
+    if {path.name for path in root.iterdir()} != expected_root_entries:
+        raise ProfileResolutionError("Direct profile root contains unexpected material")
+    marker = _read_json_object(root / "resolved-profile.json")
+    expected_marker = {
+        "schema_version": "agent-world.resolved-direct-profile.v1",
+        "profile_hash": profile.profile_hash,
+        "lineage_id": profile.lineage_id,
+        "workspace": str(profile.workspace),
+        "profile": profile.to_public_dict(),
+    }
+    if {key: marker.get(key) for key in expected_marker} != expected_marker:
+        raise ProfileResolutionError("resolved Direct profile marker was modified")
 
 
 def _hash_existing_bundle(source: Path) -> str:

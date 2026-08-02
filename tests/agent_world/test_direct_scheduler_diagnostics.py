@@ -15,7 +15,12 @@ from pydantic import HttpUrl
 
 from agent_world.app import build_application
 from agent_world.config import AgentBackendConfig, FoundryConfig, ResearchConfig
-from agent_world.control import JobRunSnapshot, WorkScheduler
+from agent_world.control import (
+    JobRunSnapshot,
+    WorkCoordinate,
+    WorkDependencyUnavailableError,
+    WorkScheduler,
+)
 
 
 def _config(tmp_path: Path) -> FoundryConfig:
@@ -78,3 +83,57 @@ async def test_direct_job_records_text_free_scheduler_exception_diagnostic(
     assert str(diagnostic["error_site"]).startswith("agent_world/control/work_scheduler.py:")
     assert diagnostic["message_fingerprint"].startswith("sha256:")
     assert "scheduler bounds must be positive" not in str(diagnostic)
+
+
+@pytest.mark.asyncio
+async def test_direct_job_diagnostic_names_safe_unavailable_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A scheduling race exposes actionable coordinates without raw exception text."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "unit-test-credential-canary")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://unit.invalid/v1")
+    app = build_application(_config(tmp_path))
+    child = WorkCoordinate(
+        scope_id="job:safe-dependency-diagnostic",
+        component="design",
+        stage="world_architecture",
+        artifact_slot="world_architecture",
+    )
+    parent = WorkCoordinate(
+        scope_id="job:safe-dependency-diagnostic",
+        component="research",
+        stage="evidence_synthesis",
+        artifact_slot="evidence_synthesis",
+    )
+
+    class _DependencyRaceRunner:
+        async def run(self, **_kwargs: object) -> object:
+            raise WorkDependencyUnavailableError(
+                child=child,
+                parent=parent,
+                parent_status="failed",
+                reason_code="parent_not_committed",
+            )
+
+    app.controller.direct_work_runner = _DependencyRaceRunner()  # type: ignore[assignment]
+    result = await app.controller.generate(
+        "生成一个最小本地预约环境",
+        request_id="scheduler-diagnostic:dependency",
+    )
+
+    snapshot = app.controller.artifacts.get_json(result.final_snapshot_ref, JobRunSnapshot)
+    diagnostic_ref = next(
+        ref
+        for ref in snapshot.latest_artifact_refs
+        if ref.artifact_type == "control.scheduler_execution_diagnostic"
+    )
+    diagnostic = app.controller.artifacts.get_json(diagnostic_ref)
+    assert diagnostic["work_dependency"] == {
+        "child_coordinate_key": child.coordinate_key,
+        "parent_coordinate_key": parent.coordinate_key,
+        "parent_status": "failed",
+        "reason_code": "parent_not_committed",
+    }
+    assert "evidence_synthesis" not in str(diagnostic)

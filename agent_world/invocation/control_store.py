@@ -30,9 +30,11 @@ from .contracts import (
     InvocationStatus,
 )
 
-_SCHEMA_VERSION = 3
-_PREVIOUS_SCHEMA_VERSION = 2
-_LEGACY_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 5
+_PREVIOUS_SCHEMA_VERSION = 4
+_OLDER_SCHEMA_VERSION = 3
+_LEGACY_SCHEMA_VERSION = 2
+_OLDEST_SCHEMA_VERSION = 1
 _SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SAFE_CODE = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,159}$")
 _SAFE_ACTIVITY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -91,6 +93,88 @@ class InvocationTerminalFact:
 
 
 @dataclass(frozen=True, slots=True)
+class InvocationRequestShape:
+    """Content-free dimensions of one request at the real adapter boundary.
+
+    The control record must never become a second prompt or profile store.
+    These are deliberately only scalar byte counts and closed transport/mode
+    labels.  They let a project-execution Agent distinguish a small passing
+    probe from a large zero-event request without disclosing either request's
+    text, JSON schema, endpoint, credentials, session id, or workspace.
+    """
+
+    prompt_bytes: int
+    runtime_skill_count: int
+    output_schema_bytes: int | None
+    allowed_builtin_tool_count: int
+    execution_mode: Literal["agentic", "single_shot_structured"]
+    continued_session: bool
+
+    def __post_init__(self) -> None:
+        for label, value in (
+            ("prompt_bytes", self.prompt_bytes),
+            ("runtime_skill_count", self.runtime_skill_count),
+            ("allowed_builtin_tool_count", self.allowed_builtin_tool_count),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{label} must be a non-negative integer")
+        if self.output_schema_bytes is not None and (
+            not isinstance(self.output_schema_bytes, int)
+            or isinstance(self.output_schema_bytes, bool)
+            or self.output_schema_bytes < 0
+        ):
+            raise ValueError("output_schema_bytes must be null or a non-negative integer")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "prompt_bytes": self.prompt_bytes,
+            "runtime_skill_count": self.runtime_skill_count,
+            "output_schema_bytes": self.output_schema_bytes,
+            "allowed_builtin_tool_count": self.allowed_builtin_tool_count,
+            "execution_mode": self.execution_mode,
+            "continued_session": self.continued_session,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: object) -> InvocationRequestShape:
+        expected = {
+            "prompt_bytes",
+            "runtime_skill_count",
+            "output_schema_bytes",
+            "allowed_builtin_tool_count",
+            "execution_mode",
+            "continued_session",
+        }
+        if not isinstance(raw, dict) or set(raw) != expected:
+            raise InvocationControlStoreError("invalid invocation request shape")
+        execution_mode = raw["execution_mode"]
+        continued_session = raw["continued_session"]
+        if execution_mode not in {"agentic", "single_shot_structured"}:
+            raise InvocationControlStoreError("invalid invocation request execution mode")
+        if not isinstance(continued_session, bool):
+            raise InvocationControlStoreError("invalid invocation request continuation flag")
+        try:
+            return cls(
+                prompt_bytes=_nonnegative_int(raw["prompt_bytes"], "prompt_bytes"),
+                runtime_skill_count=_nonnegative_int(
+                    raw["runtime_skill_count"], "runtime_skill_count"
+                ),
+                output_schema_bytes=(
+                    None
+                    if raw["output_schema_bytes"] is None
+                    else _nonnegative_int(raw["output_schema_bytes"], "output_schema_bytes")
+                ),
+                allowed_builtin_tool_count=_nonnegative_int(
+                    raw["allowed_builtin_tool_count"], "allowed_builtin_tool_count"
+                ),
+                execution_mode=execution_mode,
+                continued_session=continued_session,
+            )
+        except ValueError as exc:
+            raise InvocationControlStoreError("invalid invocation request shape") from exc
+
+
+@dataclass(frozen=True, slots=True)
 class InvocationControlRecord:
     """One redacted record for one physical invocation attempt."""
 
@@ -101,6 +185,7 @@ class InvocationControlRecord:
     profile_digest: str
     envelope_digest: str
     declared_wall_seconds: float
+    request_shape: InvocationRequestShape | None
     owner_pid: int
     # A PID alone is not a durable owner identity: it can be reused after a
     # crash and, crucially, it may be a PID from a different namespace.  Linux
@@ -191,6 +276,9 @@ class InvocationControlRecord:
             "profile_digest": self.profile_digest,
             "envelope_digest": self.envelope_digest,
             "declared_wall_seconds": self.declared_wall_seconds,
+            "request_shape": (
+                self.request_shape.to_dict() if self.request_shape is not None else None
+            ),
             "owner_pid": self.owner_pid,
             "owner_process_identity_kind": self.owner_process_identity_kind,
             "owner_process_identity": self.owner_process_identity,
@@ -251,6 +339,7 @@ class InvocationControlRecord:
                     "last_local_activity_at",
                     "owner_process_identity_kind",
                     "owner_process_identity",
+                    "request_shape",
                 }
             )
         elif version == _PREVIOUS_SCHEMA_VERSION:
@@ -259,9 +348,28 @@ class InvocationControlRecord:
                     "first_provider_progress_at",
                     "last_provider_progress_at",
                     "last_local_activity_at",
+                    "owner_process_identity_kind",
+                    "owner_process_identity",
+                    "request_shape",
                 }
             )
-        elif version != _LEGACY_SCHEMA_VERSION:
+        elif version == _OLDER_SCHEMA_VERSION:
+            expected.update(
+                {
+                    "first_provider_progress_at",
+                    "last_provider_progress_at",
+                    "last_local_activity_at",
+                }
+            )
+        elif version == _LEGACY_SCHEMA_VERSION:
+            expected.update(
+                {
+                    "first_provider_progress_at",
+                    "last_provider_progress_at",
+                    "last_local_activity_at",
+                }
+            )
+        elif version != _OLDEST_SCHEMA_VERSION:
             raise InvocationControlStoreError("invalid invocation control record shape")
         if set(raw) != expected:
             raise InvocationControlStoreError("invalid invocation control record shape")
@@ -291,15 +399,22 @@ class InvocationControlRecord:
                 declared_wall_seconds=_positive_float(
                     raw["declared_wall_seconds"], "declared_wall_seconds"
                 ),
+                request_shape=(
+                    None
+                    if raw["request_shape"] is None
+                    else InvocationRequestShape.from_dict(raw["request_shape"])
+                )
+                if version == _SCHEMA_VERSION
+                else None,
                 owner_pid=_positive_int(raw["owner_pid"], "owner_pid"),
                 owner_process_identity_kind=(
                     _owner_identity_kind(raw["owner_process_identity_kind"])
-                    if version == _SCHEMA_VERSION
+                    if version in {_SCHEMA_VERSION, _PREVIOUS_SCHEMA_VERSION}
                     else "legacy"
                 ),
                 owner_process_identity=(
                     _optional_process_identity(raw["owner_process_identity"])
-                    if version == _SCHEMA_VERSION
+                    if version in {_SCHEMA_VERSION, _PREVIOUS_SCHEMA_VERSION}
                     else None
                 ),
                 status=status,
@@ -310,7 +425,13 @@ class InvocationControlRecord:
                         raw["first_provider_progress_at"],
                         "first_provider_progress_at",
                     )
-                    if version in {_SCHEMA_VERSION, _PREVIOUS_SCHEMA_VERSION}
+                    if version
+                    in {
+                        _SCHEMA_VERSION,
+                        _PREVIOUS_SCHEMA_VERSION,
+                        _OLDER_SCHEMA_VERSION,
+                        _LEGACY_SCHEMA_VERSION,
+                    }
                     else None
                 ),
                 last_provider_progress_at=(
@@ -318,12 +439,24 @@ class InvocationControlRecord:
                         raw["last_provider_progress_at"],
                         "last_provider_progress_at",
                     )
-                    if version in {_SCHEMA_VERSION, _PREVIOUS_SCHEMA_VERSION}
+                    if version
+                    in {
+                        _SCHEMA_VERSION,
+                        _PREVIOUS_SCHEMA_VERSION,
+                        _OLDER_SCHEMA_VERSION,
+                        _LEGACY_SCHEMA_VERSION,
+                    }
                     else None
                 ),
                 last_local_activity_at=(
                     _optional_datetime(raw["last_local_activity_at"], "last_local_activity_at")
-                    if version in {_SCHEMA_VERSION, _PREVIOUS_SCHEMA_VERSION}
+                    if version
+                    in {
+                        _SCHEMA_VERSION,
+                        _PREVIOUS_SCHEMA_VERSION,
+                        _OLDER_SCHEMA_VERSION,
+                        _LEGACY_SCHEMA_VERSION,
+                    }
                     else None
                 ),
                 local_event_count=_nonnegative_int(raw["local_event_count"], "local_event_count"),
@@ -368,6 +501,7 @@ class InvocationControlStore:
         profile_digest: str,
         envelope_digest: str,
         declared_wall_seconds: float,
+        request_shape: InvocationRequestShape | None = None,
     ) -> InvocationControlRecord:
         now = datetime.now(UTC)
         owner_pid = os.getpid()
@@ -381,6 +515,7 @@ class InvocationControlStore:
                 profile_digest=profile_digest,
                 envelope_digest=envelope_digest,
                 declared_wall_seconds=declared_wall_seconds,
+                request_shape=request_shape,
                 owner_pid=owner_pid,
                 owner_process_identity_kind=owner_identity_kind,
                 owner_process_identity=owner_identity,
@@ -412,7 +547,7 @@ class InvocationControlStore:
         """Read one immutable terminal record without touching the source store.
 
         A settled control record is immutable.  Diagnostic recovery may need to
-        carry exactly that safe fact into a new isolated state root so its
+        carry exactly that safe fact into a new marked diagnostic state root so its
         route-liveness gate can verify the prior physical attempt.  Unlike
         :meth:`read`, this deliberately creates no source-side lock file: the
         caller is reading a historical snapshot, not coordinating a live
@@ -766,9 +901,13 @@ def _optional_activity(value: object) -> str | None:
 
 
 def _owner_identity_kind(value: object) -> Literal["linux_proc", "pid_only", "legacy"]:
-    if not isinstance(value, str) or value not in {"linux_proc", "pid_only", "legacy"}:
-        raise InvocationControlStoreError("invalid invocation owner identity kind")
-    return value
+    if value == "linux_proc":
+        return "linux_proc"
+    if value == "pid_only":
+        return "pid_only"
+    if value == "legacy":
+        return "legacy"
+    raise InvocationControlStoreError("invalid invocation owner identity kind")
 
 
 def _optional_process_identity(value: object) -> str | None:

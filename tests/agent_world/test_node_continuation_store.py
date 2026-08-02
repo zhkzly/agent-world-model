@@ -116,6 +116,27 @@ def test_private_continuation_restores_only_exact_model_schema_and_commitment(
     assert all((os.stat(path).st_mode & 0o777) == 0o600 for path in store.root.iterdir())
 
 
+def test_continuation_metadata_inspection_does_not_authorize_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "source-runs" / "workspace"
+    workspace.mkdir(parents=True)
+    store = NodeContinuationStore(tmp_path / "continuations")
+    record = _capture(workspace, previous_candidate={"tools": []})
+    store.save(record)
+
+    # Clone orchestration may recover the commitment-bound path, but execution
+    # still requires a separate exact-root containment check.
+    assert store.inspect_commitment(record.record_commitment) == record
+    unrelated_root = tmp_path / "unrelated-runs"
+    unrelated_root.mkdir()
+    with pytest.raises(ContinuationStoreError, match="outside its authorized root"):
+        store.load_commitment(
+            record.record_commitment,
+            workspace_root=unrelated_root,
+        )
+
+
 def test_private_workspace_recovery_keeps_draft_without_provider_thread(tmp_path: Path) -> None:
     """A draft recovery is private state for a fresh session, not a session restore."""
 

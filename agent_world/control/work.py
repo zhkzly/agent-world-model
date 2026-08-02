@@ -477,10 +477,10 @@ class RepairPolicy(V2Contract):
     # All current graph factories pass this field explicitly and consequently
     # bind the chosen authority into their digest.
     maximum_model_fallbacks: Annotated[int, Field(ge=0)] = 0
-    # Provider output ceilings are neither semantic corrections nor transient
-    # infrastructure retries.  This count is derived from the declared logical
-    # session envelope and the physical-turn reservation; it is separately
-    # metered by Agent/token/wall budgets rather than repair_attempts.
+    # A same-session continuation needs a declared logical Agent-session
+    # envelope. Provider output ceilings consume this allowance without a
+    # repair charge; classified transient terminals also require it, but
+    # consume the infrastructure-retry allowance and a normal repair charge.
     maximum_session_continuations: Annotated[int, Field(ge=0)] = 0
     maximum_process_recoveries: Annotated[int, Field(ge=0, le=2)] = 2
     maximum_automatic_backjump: Annotated[int, Field(ge=0, le=1)] = 0
@@ -753,8 +753,8 @@ class ProposalExecution(V2Contract):
         agent_interrupted_after_dispatch = (
             self.executor == "agent"
             and self.status == "interrupted"
-            and self.error_code is not None
-            and self.error_code.startswith("process_interrupted")
+            and self.invocation_id is not None
+            and all(value is None for value in agent_fields[1:])
         )
         if self.executor == "agent" and any(value is None for value in agent_fields):
             missing_provider_provenance = any(value is not None for value in agent_fields[1:])
@@ -1431,10 +1431,15 @@ class WorkRepairLedgerEntry(V2Contract):
     decision: ExecutingRepairDecision
     reason_code: Identifier = "legacy_unspecified"
     # The source route for a transient retry/fallback.  It is a configured
-    # model identifier, never a provider session or response value.  Keeping
-    # it on the durable ledger lets policy prove one fresh retry per current
-    # model instead of accidentally spending Grok's retry on a later route.
+    # model identifier, never a provider session or response value. Keeping it
+    # on the durable ledger lets policy prove one retry per current model,
+    # regardless of whether that retry resumes a thread or starts a fresh one.
     route_model: NonEmptyStr | None = None
+    # A physical recovery of an already-authorized semantic repair consumes
+    # that repair lineage's route allowance, not the allowance used to deliver
+    # the original node. This remains a safe Artifact reference, never a
+    # Provider session, prompt, or private workspace handle.
+    semantic_repair_context_ref: ArtifactRef | None = None
     source_evaluation_ref: ArtifactRef
     report_before_ref: ArtifactRef
     report_after_ref: ArtifactRef | None = None
@@ -1463,8 +1468,14 @@ class WorkRepairLedgerEntry(V2Contract):
         if self.route_model is not None and self.decision not in {
             "infrastructure_retry",
             "model_fallback",
+            "session_continuation",
         }:
             raise ValueError("only transient recovery entries may declare a route model")
+        if self.semantic_repair_context_ref is not None:
+            if self.semantic_repair_context_ref.artifact_type != "control.repair_action":
+                raise ValueError("semantic repair context must be a RepairAction Artifact")
+            if self.decision not in {"infrastructure_retry", "model_fallback"}:
+                raise ValueError("only transient recovery entries may retain semantic context")
         expected_types = {
             "repair_action_ref": (self.repair_action_ref, "control.repair_action"),
             "source_evaluation_ref": (
@@ -1537,6 +1548,12 @@ class RepairAction(V2Contract):
     # provider session handle.
     repair_seed_attempt_ref: ArtifactRef | None = None
     repair_seed_output_refs: tuple[ArtifactRef, ...] = ()
+    # A classified transport recovery may re-run an already-authorized
+    # *structured* semantic correction on a fresh Provider session.  The
+    # recovery action owns route/budget authority; this ref names the earlier
+    # semantic action whose bounded feedback and private parsed seed remain
+    # applicable.  It is never a provider session, prompt, or response.
+    semantic_repair_context_ref: ArtifactRef | None = None
     allowed_mutation_roots: tuple[NonEmptyStr, ...] = ()
     causal_evidence_refs: tuple[ArtifactRef, ...] = ()
     reason_code: Identifier
@@ -1587,12 +1604,16 @@ class RepairAction(V2Contract):
             "model_fallback",
             "session_continuation",
         }
+        uncharged_output_ceiling_continuation = (
+            self.decision == "session_continuation"
+            and self.reason_code == "provider_output_ceiling"
+        )
         charged_repair = self.decision in {
             "local_correction",
             "parent_correction",
             "infrastructure_retry",
             "model_fallback",
-        }
+        } or (self.decision == "session_continuation" and not uncharged_output_ceiling_continuation)
         if charged_repair != (self.repair_attempt_charge == 1):
             raise ValueError("only an executing repair action consumes one repair attempt")
         if physical_attempt != (self.repair_attempt_ordinal >= 1):
@@ -1621,9 +1642,12 @@ class RepairAction(V2Contract):
                 "and mutation roots"
             )
         if self.route_liveness_required:
-            if self.decision != "infrastructure_retry" or self.retry_not_before is None:
+            if (
+                self.decision not in {"infrastructure_retry", "session_continuation"}
+                or self.retry_not_before is None
+            ):
                 raise ValueError(
-                    "route liveness gate requires one same-model infrastructure retry and backoff"
+                    "route liveness gate requires one same-model retry and backoff"
                 )
         elif self.retry_not_before is not None:
             raise ValueError("only a route-liveness-gated retry may carry a retry backoff")
@@ -1641,6 +1665,7 @@ class RepairAction(V2Contract):
         if self.route_model is not None and self.decision not in {
             "infrastructure_retry",
             "model_fallback",
+            "session_continuation",
         }:
             raise ValueError("only transient recovery may declare a route model")
         if self.decision == "session_continuation":
@@ -1650,6 +1675,16 @@ class RepairAction(V2Contract):
                 raise ValueError(
                     "session continuation requires exact immutable inputs and mutation roots"
                 )
+            if self.reason_code == "provider_output_ceiling":
+                if self.route_model is not None or self.repair_attempt_charge != 0:
+                    raise ValueError("output-ceiling continuation cannot claim a transient route")
+            elif self.reason_code == "provider_session_continuation":
+                if self.route_model is None or self.repair_attempt_charge != 1:
+                    raise ValueError(
+                        "transient session continuation requires route and repair charge"
+                    )
+            else:
+                raise ValueError("session continuation reason is not recognized")
         if self.decision in {"local_correction", "parent_correction"} and not (
             self.immutable_input_refs and self.allowed_mutation_roots
         ):
@@ -1659,6 +1694,17 @@ class RepairAction(V2Contract):
             "parent_correction",
         }:
             raise ValueError("only a semantic correction may restore a committed repair seed")
+        if self.semantic_repair_context_ref is not None:
+            if self.semantic_repair_context_ref.artifact_type != "control.repair_action":
+                raise ValueError("semantic repair context must be a RepairAction Artifact")
+            if self.decision not in {"infrastructure_retry", "model_fallback"}:
+                raise ValueError(
+                    "only transient recovery may retain an authorized semantic repair context"
+                )
+            if not self.allowed_mutation_roots:
+                raise ValueError(
+                    "semantic repair recovery requires the original mutation authority"
+                )
         if not physical_attempt and self.allowed_mutation_roots:
             raise ValueError("non-executing decision cannot grant mutation authority")
         return self

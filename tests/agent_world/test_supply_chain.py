@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 from pathlib import Path
 
 import pytest
@@ -20,7 +18,7 @@ from agent_world.contracts import (
     parse_envpkg_metadata_toml,
     sha256_digest,
 )
-from agent_world.judge import CleanCandidateBuilder, IsolationPolicy, IsolationUnavailable
+from agent_world.judge import CleanCandidateBuilder, HostExecutionPolicy, HostExecutionUnavailable
 from agent_world.judge.assurance import inspect_supply_chain
 
 
@@ -100,6 +98,39 @@ def test_builder_projects_virtual_root_name_mismatch_as_safe_repair_feedback() -
     assert "untrusted-virtual-root" not in diagnostic.feedback
     assert "supply-chain-probe" not in persisted
     assert "untrusted-virtual-root" not in persisted
+
+
+def test_builder_projects_build_system_as_safe_repair_feedback() -> None:
+    """A framework-owned offline-build rejection identifies its safe repair route."""
+
+    pyproject, lock = _root_project()
+    pyproject["build-system"] = {
+        "requires": ["setuptools"],
+        "build-backend": "untrusted_backend",
+    }
+
+    with pytest.raises(CandidateWorkspaceError) as captured:
+        _validate(pyproject, lock)
+
+    workspace_error = captured.value
+    assert workspace_error.safe_diagnostic is not None
+    assert workspace_error.safe_diagnostic.code == "dependency_build_system_prohibited"
+    try:
+        raise BuilderError("candidate.validation", str(workspace_error)) from workspace_error
+    except BuilderError as builder_error:
+        diagnostic = EnvironmentBuilder._validation_diagnostic(  # noqa: SLF001 - true projection boundary
+            builder_error
+        )
+
+    issue = diagnostic.issues[0]
+    persisted = json.dumps(diagnostic.persistence_projection())
+    assert diagnostic.validation_phase == "dependency_contract"
+    assert issue.issue_code == (
+        "candidate_dependency_build_system_prohibited@candidate.pyproject.toml"
+    )
+    assert "Remove [build-system]" in diagnostic.feedback
+    assert "untrusted_backend" not in diagnostic.feedback
+    assert "untrusted_backend" not in persisted
 
 
 def test_builder_rejects_an_editable_root_project() -> None:
@@ -280,13 +311,13 @@ async def test_supply_gate_rejects_a_real_installed_component_absent_from_uv_loc
     state_root = tmp_path / "state"
     store = ArtifactStore(state_root / "artifacts")
     graph = build_judge_candidate_graph(state_root, store)
-    isolation = IsolationPolicy(purpose="build")
+    isolation = HostExecutionPolicy(purpose="build")
     try:
         await isolation.ensure_available()
-    except IsolationUnavailable as exc:
-        pytest.skip(f"real bubblewrap isolation unavailable: {exc.code}: {exc}")
+    except HostExecutionUnavailable as exc:
+        pytest.skip(f"real host execution unavailable: {exc.code}: {exc}")
     builder = CleanCandidateBuilder(
-        build_isolation=isolation,
+        build_execution=isolation,
         uv_path=graph.uv_path,
         uv_cache_dir=graph.uv_cache_dir,
         timeout_seconds=60,
@@ -355,56 +386,3 @@ def test_envpkg_toml_has_a_strict_canonical_round_trip_without_manifest_hash_cyc
     assert b"manifest_hash" not in raw
     with pytest.raises(ValueError, match="canonical flat TOML"):
         parse_envpkg_metadata_toml(raw.replace(b"format =", b"format  =", 1))
-
-
-@pytest.mark.asyncio
-async def test_real_build_sandbox_denies_a_hook_that_mutates_candidate_source(
-    tmp_path: Path,
-) -> None:
-    isolation = IsolationPolicy(purpose="build")
-    try:
-        await isolation.ensure_available()
-    except IsolationUnavailable as exc:
-        pytest.skip(f"real bubblewrap isolation unavailable: {exc.code}: {exc}")
-
-    source = tmp_path / "source"
-    source.mkdir()
-    original = b"SOURCE_BYTES_MUST_NOT_CHANGE\n"
-    (source / "runtime.py").write_bytes(original)
-    (source / "malicious_build_hook.py").write_text(
-        """from pathlib import Path
-try:
-    Path('/workspace/runtime.py').write_text('MUTATED')
-except OSError as exc:
-    Path('/state/mutation-result').write_text(type(exc).__name__)
-    raise
-""",
-        encoding="utf-8",
-    )
-    (source / ".venv").mkdir()
-    state = tmp_path / "state"
-    state.mkdir()
-    command = isolation.wrap_command(
-        workspace=source,
-        cwd_relative=".",
-        argv=("/usr/bin/python3", "malicious_build_hook.py"),
-        state_dir=state,
-        visible_workspace_paths=("runtime.py", "malicious_build_hook.py"),
-    )
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env={"PATH": "/usr/bin:/bin"},
-        start_new_session=True,
-    )
-    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
-
-    assert process.returncode not in {None, 0}, (stdout, stderr)
-    assert (state / "mutation-result").read_text(encoding="utf-8") in {
-        "OSError",
-        "PermissionError",
-    }
-    assert (source / "runtime.py").read_bytes() == original
-    assert os.stat(source / "runtime.py", follow_symlinks=False).st_nlink == 1

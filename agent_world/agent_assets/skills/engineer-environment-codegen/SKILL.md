@@ -1,119 +1,168 @@
 ---
 name: engineer-environment-codegen
-description: Implement or repair one executable Agent World Candidate from frozen Builder inputs in the isolated workspace. Use only for runtime CandidateBuild work.
+description: Implement, test, or repair one executable Agent World Candidate from frozen Builder inputs in its direct host workspace. Use only for CandidateBuild, including an initial build, continuation, fresh draft recovery, or authorized correction.
 ---
 
 # Engineer Environment Codegen
 
-## Isolated workspace operating rules
+## Work in the supplied workspace
 
-You are already at the isolated workspace root. Use only relative paths:
-`inputs/...` for frozen framework inputs and `candidate/...` for the project
-you create. Do not reconstruct absolute host, Codex, profile, or parent paths,
-and do not search outside the workspace for a toolchain. Use the framework
-commands `./.agent-world-tools/uv` for every uv operation and
-`./.agent-world-tools/python3.12` for focused JSON inspection. Bare `uv`, bare
-`python`, and a generation-workspace `.venv` are not provisioned interfaces.
-For uv commands that select or create a Python runtime, pass
-`--python ./.agent-world-tools/python3.12` explicitly; do not rely on PATH or
-`UV_PYTHON`.
+Use only relative workspace paths:
 
-Read all frozen inputs through the fields needed for the next implementation
-step; do not dump whole JSON documents into tool output and then re-query them
-because the output was truncated. After the initial concise pass, create the
-`candidate/` project skeleton before deeper schema lookups and validate in
-small increments. If a shell command fails, run `pwd`, correct the relative
-command once, and continue from the frozen inputs. Do not spend the turn
-probing host directories or substituting an undeclared build tool.
+- `inputs/...` contains immutable framework inputs.
+- `candidate/...` is the only project you may create or edit.
+Use the normal host `uv` and Python available through `PATH`. The framework has
+already set this directory as the SDK `cwd` with full access; it does not mount
+virtual paths or provide copied tool facades. Keep implementation work in
+`candidate/` and read frozen facts from `inputs/`; do not depend on a parent
+checkout, a profile directory, or a prior thread's private draft.
 
-Read the frozen Builder inputs before editing:
+Candidate runtime tests start child Python with `sys.executable`; the public
+runtime itself knows only the declared `AGENT_WORLD_STATE_DIR` interface.
 
+## First pass: establish a running spine
+
+Before broad exploration:
+
+1. Run `pwd` and list only the current workspace. Never inspect `..`, a host
+   checkout, profile directories, or an earlier thread.
+2. Run the mounted `candidate_contract_map.py` once. It makes the cross-file,
+   frozen acceptance surface compact before you choose a source layout; it
+   does not validate Candidate code or replace Integration.
+3. Inspect only the authoritative input fields needed to choose the initial
+   source layout, one state slice, and one tool slice. Do not dump complete
+   JSON documents, enumerate every tool first, or repeat an inspection that
+   already answered the decision.
+4. Read the phase-specific references below, create the Candidate skeleton,
+   and run the closest executable check before starting the next slice.
+
+The first pass must create real Candidate source early. Do not postpone all
+writing until after exhaustive input or reference reading. Frozen JSON is
+authoritative, but an advisory plan is not a reason to scan every input before
+building and checking a coherent vertical slice.
+
+When `inputs/implementation-plan.md` is present, read it first only as a compact
+orientation index: use it to choose the first source slice and the relevant
+frozen sections. It cannot establish semantics. Before implementing each slice,
+read the exact corresponding frozen JSON fields; do not consume every input
+before writing the first Candidate skeleton.
+
+Read these frozen inputs narrowly as the current decision needs them:
+
+- `inputs/implementation-plan.md`, when present, as advisory orientation only
 - `inputs/world-spec.json`
 - `inputs/curriculum.json`
 - `inputs/implementation-contract.json`
 - `inputs/task-materializer-output.schema.json`
-- `inputs/implementation-plan.md`, when present, as non-authoritative guidance
 
-The JSON inputs are authoritative. The optional plan may improve execution
-order but cannot change semantics. Create the complete project only under
-`candidate/`; never read Builder inputs at candidate runtime.
+Read every relevant field before claiming the corresponding behavior is
+complete. Frozen JSON wins over the advisory plan.
 
-1. Implement every WorldSpec state transition, permission, observable field,
-   error, idempotency and rollback behavior in real program code. Do not use
-   fixed task replay, environment-id branches, fixture registries, mocks,
-   stubs, generated release checks, or a generic blacklist of framework-only
-   names. Implement only fields and behavior declared by the frozen schemas.
-2. Implement the exact `agent-world.runtime.v2` JSONL handshake, reset, invoke,
-   snapshot and close ABI in the frozen implementation contract. Runtime state
-   belongs in `AGENT_WORLD_STATE_DIR`; candidate source is read-only under
-   Judge isolation.
-   The handshake result `operations` is exactly the JSON string array
-   `["handshake","reset","invoke","snapshot","close"]` in that order;
-   never emit operation objects or metadata there. Assert that exact shape in a
-   standalone public Runtime test. For every reset, invoke, and snapshot result,
-   `state_digest` must be exactly `sha256:` followed by 64 lowercase hexadecimal
-   characters; a bare hash digest is invalid. Assert that exact wire format in a
-   standalone public Runtime test.
-3. Implement the exact deterministic Task Materializer v3 entrypoint and
-   output schema. It must handle unseen valid seeds, actors, task types and
-   difficulty inputs using only its declared output fields. Framework-only
-   metadata never crosses reset, but an identifier defined by WorldSpec (for
-   example a tool `task_id` argument) is ordinary domain semantics and must be
-   implemented exactly.
-4. Deliver a real Python 3.12 virtual uv project: `pyproject.toml`, resolved
-   `uv.lock`, non-empty declared `LICENSE`, runtime, materializer, public
-   self-check and standalone public tests. Keep the root virtual and
-   non-installed (`[tool.uv] package = false`), with only lock-pinned registry
-   wheels installable offline. In `uv.lock`, the one `{ virtual = "." }` root
-   package must be named exactly `[project].name`; every other package is a
-   registry dependency. Copy `inputs/implementation-contract.json`
-   `python_requires` verbatim into `[project].requires-python`; `uv.lock`
-   must use that same range or uv's canonical `==3.12.*` range, never a broad
-   `>=3.12` shorthand. Remove caches, virtual environments, links and
-   undeclared files before final output.
-5. Run the actual local build and public tests when capability permits. Their
-   result is diagnostic evidence, never release authority. If a real blocker
-   prevents completion, report it honestly; do not weaken a frozen contract.
-   Judge invokes each declared public test as an isolated standalone script
-   with the candidate project root and optional `src/` layout importable. Use
-   ordinary imports from declared candidate modules; do not edit `sys.path`,
-   rely on `PYTHONPATH`, or depend on a writable source tree.
+## Load detail progressively
 
-## Component source visibility
+This is one CandidateBuild method, not three additional Skills. Load each
+bundled detail only when its phase begins:
 
-Candidate file roles describe physical source visibility under isolated
-execution, not merely documentation categories. A `runtime` source may import
-only files declared `runtime`; a `task_materializer` source may import
-`runtime` or `task_materializer`; a `public_verifier` source may import any of
-those three executable roles. Configuration, documentation, lock, test, and
-license files are not reusable executable dependencies. When a helper is
-needed by Runtime and another component, declare it `runtime` (or make each
-component self-contained); do not label a shared Python module `configuration`
-just because it mostly contains constants. Before returning, compare every
-declared Python import with the final file roles and make each component
-independently importable from its allowed source view.
+1. Before implementing Runtime or Task Materializer, read
+   [references/runtime-and-materializer.md](references/runtime-and-materializer.md).
+2. Before writing `pyproject.toml`, `LICENSE`, or `uv.lock`, read
+   [references/python-project-delivery.md](references/python-project-delivery.md).
+3. Before returning `CandidateCompletion`, read
+   [references/completion-contract.md](references/completion-contract.md).
 
-Before returning, inspect the final regular-file inventory and make the
-completion declaration describe that exact tree's paths and roles. The
-framework derives hashes and executable modes from physical regular files; do
-not declare or infer executable metadata in `CandidateCompletion`. `entry_path` is always a
-candidate-relative POSIX source-file path ending in `.py`; it is not an import
-module. For example, a physical file
-`candidate/candidate/runtime.py` has `entry_path="candidate/runtime.py"`,
-while its launch argv is `['.venv/bin/python', '-m', 'candidate.runtime']`.
-Likewise a materializer at `candidate/materializer.py` uses
-`entrypoint="candidate.materializer:materialize"` and that `.py` entry path.
-Conversely, a materializer file directly at `candidate/task_materializer.py`
-uses `entry_path="task_materializer.py"` and
-`entrypoint="task_materializer:materialize"`; do not add a `candidate.` module
-prefix unless there is an actual `candidate/` package directory inside the
-project root.
-List every final regular file once in `files`, using the fixed roles for runtime,
-materializer, public verifier, public tests, `pyproject.toml`, `uv.lock`, and
-`LICENSE`. Do not put workspace prefixes, filesystem paths, or filenames before
-the materializer colon.
+Do not load the completion reference during the initial build. Do not copy
+reference text into the node Prompt. These are read-only parts of this Skill.
 
-Return only the requested `CandidateCompletion` JSON. Declarations are paths
-relative to `candidate/`, not the outer workspace. Do not create Candidate,
-Judge, envpkg, SBOM, supply-chain, validation, or release artifacts; framework
-code derives those after it independently inspects the physical project.
+## Build and debug as a Code Agent
+
+Implement the real declared behavior; do not use fixed replay,
+environment-specific branches, fixture registries, mocks, stubs, generated
+release checks, or framework-name blacklists.
+
+Use a tight internal engineering loop:
+
+1. Implement one coherent slice.
+2. Run its closest executable check or public test.
+3. Read the actual failure, locate the producing Candidate source,
+   configuration, test, or metadata boundary, and make the smallest coherent
+   correction.
+4. Rerun that same check before moving on.
+
+Do not make a test green by deleting, weakening, or bypassing frozen behavior.
+Before completion, run every final public test, Runtime and materializer entry
+check, uv metadata/lock check, and the bundled deterministic Candidate-tree
+preflight. Public tests are standalone Python programs: do not assume `pytest`
+or another development tool exists merely because it was available while you
+were writing. A check that passed before the last relevant edit is stale.
+
+Public tests alone are not sufficient. In this same workspace, also run the
+declared public self-check module, a Runtime handshake/error-path probe, and
+representative Task Materializer calls for every task type against the frozen
+output schema. Use the Candidate's physical relative import root (for example
+`candidate/src` for a `src/` layout, otherwise `candidate`); never encode or
+try to discover a later Judge mount, host path, or deployment layout. See
+[references/runtime-and-materializer.md](references/runtime-and-materializer.md)
+for the component-specific acceptance method and the Candidate-owned complete
+materializer campaign. The map's campaign is a required local check, not a
+future-Judge guess.
+
+Run the acceptance map and project-mechanics preflight from the mounted Skill
+bundle with the normal host Python:
+
+```text
+SKILL_DIR="$CODEX_HOME/skills/engineer-environment-codegen"
+python "$SKILL_DIR/scripts/candidate_contract_map.py" --workspace .
+python "$SKILL_DIR/scripts/check_materializer_campaign.py" \
+  --workspace . --import-root <actual-candidate-import-root> \
+  --entrypoint <actual-module:materialize>
+python "$SKILL_DIR/scripts/check_runtime_handshake_contract.py" \
+  --workspace . --import-root <actual-candidate-import-root> \
+  --runtime-argv <the completed runtime.argv command>
+python "$SKILL_DIR/scripts/check_public_tests.py" \
+  --workspace . --test <each-final-public-test-path>
+python "$SKILL_DIR/scripts/check_candidate_tree.py" --workspace .
+```
+
+Do not copy these scripts into `candidate/`. The map exposes only frozen
+input facts; the materializer campaign checks Candidate-local callable
+mechanics; the handshake check starts the Candidate command and compares its
+public tool projection canonically with the frozen WorldSpec; the tree
+preflight checks deterministic project mechanics; the public-test preflight
+uses a clean frozen offline environment and direct Python execution, matching
+the public-test boundary. None decides business semantics or replaces
+Integration or Judge.
+
+
+Inspect the final inventory for accidental Builder-only paths and derived
+debris. Return `completed` only when the final tree, tests, preflight, and full
+completion declaration agree. If capabilities are genuinely absent or frozen
+inputs are mutually impossible, return an honest blocked result with one safe
+current reason.
+
+These checks are the Code Agent's own development loop. Framework Candidate
+validation, Integration, Judge, and release remain independent.
+
+## Continuation and authorized correction
+
+The node Prompt tells you whether this is an initial build, same-session
+continuation, fresh draft recovery, or authorized correction.
+
+- A workspace draft is not an Artifact or trusted answer. Inspect it against
+  frozen `inputs/`, keep only valid work, and never recover an old thread unless
+  the current Prompt explicitly says this is a same-session continuation.
+- For an authorized correction, read its disclosure before editing. Repair the
+  producing boundary: locate the candidate boundary that can produce each
+  stated failure, preserve unrelated working behavior and public tests, rerun
+  the disclosed boundary and affected checks, then return a full replacement
+  `CandidateCompletion`, never a patch.
+- When feedback conflicts with frozen inputs or cannot be satisfied without
+  breaking another frozen rule, do not disguise the contradiction with a test
+  workaround. Return an honest blocked completion rather than a test-only
+  workaround, with the smallest safe explanation.
+
+Return only the requested `CandidateCompletion` JSON. Do not create Candidate,
+Judge, package, SBOM, validation, or release Artifacts; framework code derives
+them after inspecting the physical project. Before returning a blocked result,
+load the completion reference: the Provider's strict transport envelope needs
+all top-level fields even though only `schema_version`, `status`, and
+`blocking_reason` carry blocked semantics.

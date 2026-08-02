@@ -27,7 +27,7 @@ if __package__ in {None, ""}:
 
 from agent_world.invocation.redaction import (  # noqa: E402
     Redactor,
-    redacted_command_diagnostic_excerpt,
+    redacted_local_diagnostic_excerpt,
     redacted_terminal_diagnostic_excerpt,
 )
 from agent_world.invocation.runtime_provider import (  # noqa: E402
@@ -39,12 +39,14 @@ from agent_world.invocation.runtime_provider import (  # noqa: E402
 from agent_world.invocation.runtime_provider import (  # noqa: E402
     OPENAI_BASE_URL_ENVIRONMENT as _OPENAI_BASE_URL_ENVIRONMENT,
 )
+from agent_world.invocation.structured_diagnostics import (  # noqa: E402
+    advisory_provider_unavailable,
+    advisory_terminal_text_signals,
+)
 
 PROTOCOL_VERSION = "agent-world.codex-worker.v1"
 SUPPORTED_SDK_VERSION = "0.144.4"
 _ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_DIAGNOSTIC_COMMAND_LABEL = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
-_DIAGNOSTIC_COMMAND_MAX_EXPECTATIONS = 8
 _RESULT_RESERVE_BYTES = 64 * 1024
 _SDK_EXECUTION_PHASES = frozenset(
     {
@@ -210,41 +212,6 @@ def _optional_string(value: Any, label: str) -> str | None:
     return _require_string(value, label)
 
 
-def _parse_diagnostic_command_expectations(value: object) -> tuple[tuple[str, str], ...]:
-    """Validate private audit probes before they can affect event projection.
-
-    The outer request type already restricts this to a diagnostic audit. The
-    worker revalidates it because it is a protocol boundary. The command
-    fragments never appear in compact events, telemetry, or the final result.
-    """
-
-    if value is None:
-        return ()
-    if not isinstance(value, list) or len(value) > _DIAGNOSTIC_COMMAND_MAX_EXPECTATIONS:
-        raise ValueError("diagnostic_command_expectations must be a bounded list")
-    parsed: list[tuple[str, str]] = []
-    labels: set[str] = set()
-    for item in value:
-        if not isinstance(item, Mapping) or set(item) != {"label", "command_fragment"}:
-            raise ValueError("diagnostic command expectation has an invalid shape")
-        label = item.get("label")
-        fragment = item.get("command_fragment")
-        if (
-            not isinstance(label, str)
-            or not _DIAGNOSTIC_COMMAND_LABEL.fullmatch(label)
-            or label in labels
-            or not isinstance(fragment, str)
-            or not fragment
-            or len(fragment) > 256
-            or "\n" in fragment
-            or "\r" in fragment
-        ):
-            raise ValueError("diagnostic command expectation is invalid")
-        labels.add(label)
-        parsed.append((label, fragment))
-    return tuple(parsed)
-
-
 def _completed_turn_payload(
     method: str,
     event_payload: Mapping[str, Any],
@@ -330,13 +297,16 @@ def _terminal_turn_failure(
             }
         )
         return "turn_failed_output_limit", details
-    # The generated protocol supplied no recognized closed kind.  Do not use
-    # ``code``, ``type``, ``message`` or ``additionalDetails`` as a routing
-    # proxy: provider-controlled prose cannot authorize a retry. It can,
-    # however, be reduced in this private worker into bounded *advisory*
-    # signals for the project-execution Agent. The signals never change the
-    # terminal code and never retain a character of provider text.
+    # The generated protocol supplied no recognized closed kind.  Do not retain
+    # ``code``, ``type``, ``message`` or ``additionalDetails``.  Reduce the
+    # message inside this private worker to bounded signals; when *all* signals
+    # identify only a transport disconnect or Provider internal failure, treat
+    # the terminal as unavailable so the central policy can spend its bounded
+    # infrastructure retry.  Mixed/semantic/auth/quota signals remain
+    # unclassified and cannot mutate Prompt, Skill, schema, or candidate.
     _add_advisory_terminal_text_signals(details, error)
+    if advisory_provider_unavailable(details):
+        return "turn_failed_provider_unavailable", details
     return "turn_failed_unclassified_codex_error", details
 
 
@@ -432,99 +402,7 @@ def _add_advisory_terminal_text_signals(
     authorize a retry or mutation.
     """
 
-    message = error.get("message")
-    if not isinstance(message, str):
-        return
-    # Bound local inspection too: raw provider text never crosses the worker,
-    # and an unbounded error body should not consume diagnostic CPU.
-    text = message[:16_384].casefold()
-    signals: list[str] = []
-    for signal, markers in (
-        (
-            "authentication_or_authorization",
-            (
-                "unauthorized",
-                "forbidden",
-                "authentication",
-                "api key",
-                "credential",
-                "permission denied",
-                "access denied",
-            ),
-        ),
-        (
-            "model_or_route_availability",
-            (
-                "model not found",
-                "model unavailable",
-                "unknown model",
-                "unsupported model",
-                "deployment not found",
-                "no such model",
-            ),
-        ),
-        (
-            "context_or_token_limit",
-            (
-                "context window",
-                "context length",
-                "maximum context",
-                "too many tokens",
-                "token limit",
-                "input too long",
-                "max tokens",
-            ),
-        ),
-        (
-            "request_or_schema_compatibility",
-            (
-                "json schema",
-                "response format",
-                "response_format",
-                "output schema",
-                "structured output",
-                "unsupported parameter",
-                "invalid parameter",
-                "unknown parameter",
-                "invalid request",
-                "unsupported request",
-            ),
-        ),
-        (
-            "capacity_or_rate_limit",
-            (
-                "rate limit",
-                "too many requests",
-                "quota",
-                "usage limit",
-                "capacity",
-                "overloaded",
-            ),
-        ),
-        (
-            "transport_or_connection",
-            (
-                "connection refused",
-                "connection reset",
-                "connection failed",
-                "stream disconnected",
-                "network error",
-                "socket error",
-                "dns",
-            ),
-        ),
-        ("timeout_or_deadline", ("timed out", "timeout", "deadline exceeded")),
-        (
-            "policy_or_content_filter",
-            ("content filter", "safety policy", "policy violation", "blocked by policy"),
-        ),
-        (
-            "provider_internal_error",
-            ("internal server error", "internal error", "server error", "http 5"),
-        ),
-    ):
-        if any(marker in text for marker in markers):
-            signals.append(signal)
+    signals = advisory_terminal_text_signals(error.get("message"))
     if signals:
         details["advisory_text_signals"] = signals
 
@@ -613,10 +491,6 @@ def _provider_http_status_failure_code(status: object) -> str:
 def _compact_notification_payload(
     method: str,
     event_payload: Mapping[str, Any],
-    *,
-    diagnostic_command_expectations: tuple[tuple[str, str], ...] = (),
-    diagnostic_command_matches: dict[str, tuple[str, ...]] | None = None,
-    diagnostic_command_redactor: Redactor | None = None,
 ) -> dict[str, Any]:
     """Project SDK notifications to bounded telemetry metadata.
 
@@ -644,15 +518,6 @@ def _compact_notification_payload(
         }
         if projected:
             compact[key] = projected
-        if key == "item" and value.get("type") == "commandExecution":
-            command_proofs = _compact_diagnostic_command_proofs(
-                value,
-                diagnostic_command_expectations,
-                diagnostic_command_matches,
-                diagnostic_command_redactor,
-            )
-            if command_proofs:
-                compact["diagnosticCommandProof"] = command_proofs
     token_usage = event_payload.get("tokenUsage")
     if isinstance(token_usage, dict):
         compact["tokenUsage"] = {
@@ -664,73 +529,6 @@ def _compact_notification_payload(
         }
     compact["sourceMethod"] = method
     return compact
-
-
-def _compact_diagnostic_command_proofs(
-    item: Mapping[str, Any],
-    expectations: tuple[tuple[str, str], ...],
-    matches_by_item_id: dict[str, tuple[str, ...]] | None,
-    redactor: Redactor | None,
-) -> list[dict[str, Any]]:
-    """Project expected-command completion states, never command detail.
-
-    Codex may emit a command text when an item starts and its exit code only
-    when that same item completes. Keep their private item id in worker memory
-    for this one turn so the safe projection does not falsely report an
-    expected command as unobserved merely because the SDK split its fields.
-    """
-
-    if not expectations:
-        return []
-    item_id = item.get("id")
-    command = item.get("command")
-    status = item.get("status")
-    exit_code = item.get("exitCode")
-    labels: tuple[str, ...] = ()
-    if isinstance(command, str):
-        labels = tuple(label for label, fragment in expectations if fragment in command)
-        if labels and isinstance(item_id, str) and matches_by_item_id is not None:
-            matches_by_item_id[item_id] = labels
-    if not labels and isinstance(item_id, str) and matches_by_item_id is not None:
-        labels = matches_by_item_id.get(item_id, ())
-    if not labels or not isinstance(status, str):
-        return []
-    if status == "completed" and exit_code == 0:
-        outcome = "succeeded"
-    elif exit_code == 127:
-        outcome = "not_found"
-    elif exit_code == 126:
-        outcome = "not_executable"
-    elif status == "failed" or isinstance(exit_code, int):
-        outcome = "failed"
-    elif status == "completed":
-        outcome = "unknown"
-    else:
-        return []
-    if isinstance(item_id, str) and matches_by_item_id is not None:
-        matches_by_item_id.pop(item_id, None)
-    safe_exit_code = (
-        exit_code
-        if isinstance(exit_code, int) and not isinstance(exit_code, bool) and 0 <= exit_code <= 255
-        else None
-    )
-    excerpt = (
-        redacted_command_diagnostic_excerpt(
-            item.get("aggregatedOutput"),
-            redactor=redactor,
-        )
-        if outcome != "succeeded" and redactor is not None
-        else None
-    )
-    proofs: list[dict[str, Any]] = []
-    for label in labels:
-        proof: dict[str, Any] = {"label": label, "outcome": outcome}
-        if safe_exit_code is not None:
-            proof["exitCode"] = safe_exit_code
-        if excerpt is not None:
-            proof["diagnosticExcerpt"] = excerpt
-        proofs.append(proof)
-    return proofs
 
 
 def _validated_codex_binary(path_text: str, expected_digest: str) -> Path:
@@ -774,18 +572,90 @@ def _status_result(
     }
 
 
-def _sdk_execution_error_details(phase: str) -> dict[str, str]:
-    """Return the one safe phase fact for an otherwise opaque SDK exception.
+def _sdk_execution_error_details(
+    phase: str,
+    *,
+    diagnostic_exception: object | None = None,
+    diagnostic_redactor: Redactor | None = None,
+) -> dict[str, Any]:
+    """Return safe SDK-startup facts, with an opt-in local excerpt when needed.
 
     The outer exception can include a Provider body, runtime route, or local
     filesystem detail.  The phase is framework-owned control flow, so it is
     enough to distinguish a failed continuation restore from a failure after a
-    model turn began without retaining exception prose.
+    model turn began without retaining exception prose.  The one exception is
+    an explicitly diagnostic probe: a bounded, path/URL/secret-scrubbed
+    exception excerpt lets a project-execution Agent tell an app-server boot
+    problem from a malformed request.  It is stripped from normal feedback by
+    ``safe_terminal_details`` and written only to the private audit/Doctor
+    sidecar.
     """
 
-    return {
+    details: dict[str, Any] = {
         "worker_phase": phase if phase in _SDK_EXECUTION_PHASES else "unknown",
     }
+    if diagnostic_exception is not None and diagnostic_redactor is not None:
+        excerpt = redacted_local_diagnostic_excerpt(
+            diagnostic_exception,
+            redactor=diagnostic_redactor,
+        )
+        if excerpt is not None:
+            details["diagnostic_error_excerpt"] = excerpt
+    return details
+
+
+def _structured_output_invalid_json_details(
+    final_text: str,
+    error: json.JSONDecodeError | ValueError,
+    *,
+    diagnostic_capture_terminal_excerpt: bool,
+    redactor: Redactor,
+) -> dict[str, Any]:
+    """Describe a malformed final response without retaining its contents.
+
+    A Codex Agent can complete its turn yet emit prose, a markdown fence, or a
+    truncated JSON value where the profile requires structured output.  The
+    normal failure path needs only closed shape/parse facts; raw final text is
+    not Scheduler feedback.  An explicitly opted-in local diagnostic may add
+    one bounded, double-redacted excerpt so the project-execution Agent can
+    distinguish an instruction/Skill conflict from an adapter/schema issue.
+    """
+
+    stripped = final_text.lstrip()
+    if not stripped:
+        response_shape = "empty"
+    elif stripped.startswith("```"):
+        response_shape = "markdown_fence"
+    elif stripped.startswith("{"):
+        response_shape = "object"
+    elif stripped.startswith("["):
+        response_shape = "array"
+    else:
+        response_shape = "non_json"
+
+    parse_failure = "syntax"
+    parse_offset: int | None = None
+    if isinstance(error, json.JSONDecodeError):
+        parse_offset = max(0, error.pos)
+        if error.msg == "Extra data":
+            parse_failure = "extra_data"
+        elif error.msg.startswith("Unterminated") or error.pos >= len(final_text):
+            parse_failure = "truncated"
+    elif "constant" in str(error).lower():
+        parse_failure = "nonfinite_number"
+
+    details: dict[str, Any] = {
+        "response_shape": response_shape,
+        "parse_failure": parse_failure,
+        "response_characters": len(final_text),
+    }
+    if parse_offset is not None:
+        details["parse_offset"] = parse_offset
+    if diagnostic_capture_terminal_excerpt:
+        excerpt = redacted_terminal_diagnostic_excerpt(final_text, redactor=redactor)
+        if excerpt is not None:
+            details["diagnostic_error_excerpt"] = excerpt
+    return details
 
 
 async def _interrupt(turn: Any, timeout_seconds: float) -> None:
@@ -822,7 +692,7 @@ def _app_server_environment(
     return environment
 
 
-def _app_server_launch_args(codex_binary: Path, *, hooks_enabled: bool) -> tuple[str, ...]:
+def _app_server_launch_args(codex_binary: Path) -> tuple[str, ...]:
     """Build a Codex app-server command without upstream routing material."""
 
     # No ``--strict-config``.  It makes the app-server refuse to start on any key
@@ -831,17 +701,12 @@ def _app_server_launch_args(codex_binary: Path, *, hooks_enabled: bool) -> tuple
     # at fault.  Codex ignoring a setting it does not understand is the tolerant
     # behavior we want; the settings that actually matter are asserted by the
     # framework itself rather than by refusing to boot.
-    launch_args = [str(codex_binary)]
-    if hooks_enabled:
-        # Resolver-vetted hooks are copied into the otherwise empty
-        # CODEX_HOME.  The SDK has no hook-trust API, so automation must use
-        # the official CLI flag with the exact runtime bundled by the SDK.
-        launch_args.append("--dangerously-bypass-hook-trust")
-    launch_args.extend(("app-server", "--listen", "stdio://"))
-    return tuple(launch_args)
+    return (str(codex_binary), "app-server", "--listen", "stdio://")
 
 
-def _thread_config_for_api_key_provider(base_url: str) -> dict[str, Any]:
+def _thread_config_for_api_key_provider(
+    base_url: str, *, transport_max_retries: int = 0
+) -> dict[str, Any]:
     """Return the private, in-memory custom-provider override for one thread.
 
     Codex 0.144.4 no longer implicitly authenticates its built-in ``openai``
@@ -850,16 +715,22 @@ def _thread_config_for_api_key_provider(base_url: str) -> dict[str, Any]:
     materialized ``config.toml`` or passed on the process command line.
     """
 
+    retries = transport_max_retries if isinstance(transport_max_retries, int) else 0
+    retries = max(0, retries)
     return {
         f"model_providers.{_API_KEY_RUNTIME_PROVIDER}": {
             "name": "Agent World API-key provider",
             "base_url": base_url,
             "env_key": _OPENAI_API_KEY_ENVIRONMENT,
             "wire_api": "responses",
-            # The Scheduler owns retries.  Do not permit invisible provider
-            # retries below the InvocationBackend boundary.
-            "request_max_retries": 0,
-            "stream_max_retries": 0,
+            # The Scheduler still owns semantic and turn-level retries.  These
+            # bounded transport retries only cover connection failures / 429 /
+            # >=500 *before* a Provider event is observed; Codex never resumes a
+            # stream that already emitted content, so a smoothed intermittent
+            # relay does not hide a turn failure.  ``0`` restores the prior
+            # "Scheduler owns every retry" policy.
+            "request_max_retries": retries,
+            "stream_max_retries": retries,
             "supports_websockets": False,
         }
     }
@@ -901,10 +772,6 @@ async def _run(payload: dict[str, Any]) -> None:
         max_events=int(limits.get("max_events", 20_000)),
         max_protocol_bytes=int(limits.get("max_protocol_bytes", 32 * 1024 * 1024)),
     )
-    structured_output_transport = payload.get("structured_output_transport", "provider_schema")
-    if structured_output_transport not in {"provider_schema", "json_envelope"}:
-        raise ValueError("unsupported structured output transport")
-
     authentication_kind = _require_string(payload.get("authentication_kind"), "authentication_kind")
     if authentication_kind != "api_key":
         raise ValueError("only API-key environment authentication is supported")
@@ -953,6 +820,7 @@ async def _run(payload: dict[str, Any]) -> None:
             ApprovalMode,
             AsyncCodex,
             CodexConfig,
+            Sandbox,
         )
         from openai_codex import (
             __version__ as sdk_version,
@@ -1033,8 +901,8 @@ async def _run(payload: dict[str, Any]) -> None:
         )
         return
     sandbox_name = _require_string(payload.get("sandbox"), "sandbox")
-    if sandbox_name not in {"read-only", "workspace-write"}:
-        raise ValueError(f"unsupported sandbox: {sandbox_name!r}")
+    if sandbox_name != "full-access":
+        raise ValueError(f"unsupported execution mode: {sandbox_name!r}")
     reasoning_name = _require_string(payload.get("reasoning_effort"), "reasoning_effort")
     reasoning_effort = {
         "low": SdkReasoningEffort.low,
@@ -1056,16 +924,9 @@ async def _run(payload: dict[str, Any]) -> None:
 
     timeout_seconds = float(limits.get("timeout_seconds", 600.0))
     interrupt_grace_seconds = float(limits.get("interrupt_grace_seconds", 5.0))
-    hooks_enabled = payload.get("hooks_enabled", False)
-    if not isinstance(hooks_enabled, bool):
-        raise ValueError("hooks_enabled must be a boolean")
     diagnostic_capture_terminal_excerpt = payload.get("diagnostic_capture_terminal_excerpt", False)
     if not isinstance(diagnostic_capture_terminal_excerpt, bool):
         raise ValueError("diagnostic_capture_terminal_excerpt must be a boolean")
-    diagnostic_command_expectations = _parse_diagnostic_command_expectations(
-        payload.get("diagnostic_command_expectations", [])
-    )
-    diagnostic_command_matches: dict[str, tuple[str, ...]] = {}
     deadline = started + timeout_seconds
     thread_id: str | None = None
     turn_id: str | None = None
@@ -1077,7 +938,7 @@ async def _run(payload: dict[str, Any]) -> None:
 
     try:
         app_server_environment = _app_server_environment(os.environ, runtime_path=None)
-        launch_args = _app_server_launch_args(codex_binary, hooks_enabled=hooks_enabled)
+        launch_args = _app_server_launch_args(codex_binary)
         config = CodexConfig(
             cwd=str(workspace),
             env=app_server_environment,
@@ -1088,27 +949,29 @@ async def _run(payload: dict[str, Any]) -> None:
         )
         async with AsyncCodex(config) as codex:
             emitter.lifecycle("sdk_session_open")
-            base_instructions = _require_string(
-                payload.get("base_instructions"), "base_instructions"
-            )
-            developer_instructions = _optional_string(
-                payload.get("developer_instructions"), "developer_instructions"
-            )
             model = _require_string(payload.get("model"), "model")
             model_provider = _optional_string(payload.get("model_provider"), "model_provider")
             if model_provider != _API_KEY_RUNTIME_PROVIDER:
                 raise ValueError("API-key profile must use the framework-owned custom provider")
-            thread_config = _thread_config_for_api_key_provider(base_url)
+            raw_transport_retries = payload.get("provider_transport_max_retries", 0)
+            transport_max_retries = (
+                raw_transport_retries
+                if isinstance(raw_transport_retries, int)
+                and not isinstance(raw_transport_retries, bool)
+                and raw_transport_retries >= 0
+                else 0
+            )
+            thread_config = _thread_config_for_api_key_provider(
+                base_url, transport_max_retries=transport_max_retries
+            )
             requested_thread_id = payload.get("thread_id")
             if requested_thread_id is None:
                 worker_phase = "thread_start"
                 emitter.lifecycle(worker_phase)
                 thread = await codex.thread_start(
                     approval_mode=ApprovalMode.deny_all,
-                    base_instructions=base_instructions,
                     config=thread_config,
                     cwd=str(workspace),
-                    developer_instructions=developer_instructions,
                     # The parent binds this persisted Codex thread to a
                     # mode-0700 SQLite home below /dev/shm for the lifetime of
                     # its private framework session.  A new physical worker
@@ -1117,6 +980,7 @@ async def _run(payload: dict[str, Any]) -> None:
                     ephemeral=False,
                     model=model,
                     model_provider=model_provider,
+                    sandbox=Sandbox.full_access,
                 )
             else:
                 worker_phase = "thread_resume"
@@ -1124,12 +988,11 @@ async def _run(payload: dict[str, Any]) -> None:
                 thread = await codex.thread_resume(
                     _require_string(requested_thread_id, "thread_id"),
                     approval_mode=ApprovalMode.deny_all,
-                    base_instructions=base_instructions,
                     config=thread_config,
                     cwd=str(workspace),
-                    developer_instructions=developer_instructions,
                     model=model,
                     model_provider=model_provider,
+                    sandbox=Sandbox.full_access,
                 )
             thread_id = thread.id
             if requested_thread_id is not None and thread_id != requested_thread_id:
@@ -1144,6 +1007,7 @@ async def _run(payload: dict[str, Any]) -> None:
                 effort=reasoning_effort,
                 model=model,
                 output_schema=payload.get("output_schema"),
+                sandbox=Sandbox.full_access,
             )
             turn_id = turn.id
             remaining = deadline - time.monotonic()
@@ -1187,13 +1051,7 @@ async def _run(payload: dict[str, Any]) -> None:
                         )
                         emitter.event(
                             notification.method,
-                            _compact_notification_payload(
-                                notification.method,
-                                event_payload,
-                                diagnostic_command_expectations=diagnostic_command_expectations,
-                                diagnostic_command_matches=diagnostic_command_matches,
-                                diagnostic_command_redactor=redactor,
-                            ),
+                            _compact_notification_payload(notification.method, event_payload),
                         )
                         if terminal_turn is not None:
                             completed_turn = terminal_turn
@@ -1264,7 +1122,11 @@ async def _run(payload: dict[str, Any]) -> None:
                 code="authentication_failed" if authentication_error else "sdk_execution_failed",
                 message=message or type(exc).__name__,
                 retryable=not authentication_error,
-                error_details=_sdk_execution_error_details(worker_phase),
+                error_details=_sdk_execution_error_details(
+                    worker_phase,
+                    diagnostic_exception=(message if diagnostic_capture_terminal_excerpt else None),
+                    diagnostic_redactor=(redactor if diagnostic_capture_terminal_excerpt else None),
+                ),
                 thread_id=thread_id,
                 turn_id=turn_id,
                 usage=usage,
@@ -1348,6 +1210,12 @@ async def _run(payload: dict[str, Any]) -> None:
                     started=started,
                     code="structured_output_invalid_json",
                     message=f"output_schema was requested but final response is not JSON: {exc}",
+                    error_details=_structured_output_invalid_json_details(
+                        final_text,
+                        exc,
+                        diagnostic_capture_terminal_excerpt=diagnostic_capture_terminal_excerpt,
+                        redactor=redactor,
+                    ),
                     thread_id=thread_id,
                     turn_id=turn_id,
                     final_text=final_text,
@@ -1365,7 +1233,6 @@ async def _run(payload: dict[str, Any]) -> None:
             turn_id=turn_id,
             final_text=final_text,
             structured_output=structured_output,
-            structured_output_transport=structured_output_transport,
             usage=usage,
             backend_version=sdk_version,
         )

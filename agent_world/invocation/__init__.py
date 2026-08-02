@@ -26,7 +26,6 @@ from .capabilities import (
 from .codex_sdk import CodexSdkBackend
 from .contracts import (
     CredentialDescriptor,
-    DiagnosticCommandExpectation,
     InvocationBackend,
     InvocationError,
     InvocationEvent,
@@ -45,8 +44,6 @@ from .contracts import (
     ReasoningEffort,
     ResolvedAgentProfile,
     ResolvedBundle,
-    ResolvedRuntimeInterpreter,
-    ResolvedRuntimeTool,
     SandboxMode,
     TokenBreakdown,
 )
@@ -57,6 +54,7 @@ from .control_store import (
     InvocationControlStore,
     InvocationControlStoreError,
     InvocationPhysicalStatus,
+    InvocationRequestShape,
     InvocationTerminalFact,
 )
 from .direct_llm import DirectLlmBackend
@@ -66,12 +64,12 @@ from .profiles import (
     CodexLoginBinding,
     CredentialBinding,
     CredentialResolutionError,
-    HookBundleSpec,
     McpServerSpec,
     McpTransport,
     ProfileResolutionError,
     ProfileResolver,
     SkillBundleSpec,
+    safe_profile_resolution_category,
     verify_resolved_profile,
 )
 from .recovery import (
@@ -98,13 +96,11 @@ __all__ = [
     "CodexSdkBackend",
     "CredentialBinding",
     "CredentialDescriptor",
-    "DiagnosticCommandExpectation",
     "CredentialResolutionError",
     "DirectLlmBackend",
     "EffectiveCapabilityPlan",
     "ExternalCapabilitySet",
     "EpisodeActionProposalOutput",
-    "HookBundleSpec",
     "InvocationAlreadyActiveError",
     "InvocationBackend",
     "InvocationControlPlane",
@@ -121,6 +117,7 @@ __all__ = [
     "InvocationOwnerKind",
     "InvocationOwnership",
     "InvocationPhysicalStatus",
+    "InvocationRequestShape",
     "InvocationRequest",
     "InvocationResult",
     "InvocationAttributionLens",
@@ -141,11 +138,10 @@ __all__ = [
     "NodeCapabilityRequirement",
     "ProfileResolutionError",
     "ProfileResolver",
+    "safe_profile_resolution_category",
     "ReasoningEffort",
     "ResolvedAgentProfile",
     "ResolvedBundle",
-    "ResolvedRuntimeInterpreter",
-    "ResolvedRuntimeTool",
     "RoleCapabilityMaximum",
     "RouteLivenessCheck",
     "RouteLivenessChecker",

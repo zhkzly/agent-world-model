@@ -23,7 +23,10 @@ reasoning_challenger = "medium"
 invocation_timeout_seconds = 2700
 structured_invocation_timeout_seconds = 2700
 environment_codegen_invocation_timeout_seconds = 2700
-structured_output_transport = "provider_schema"
+provider_first_event_timeout_seconds = 120
+provider_stream_idle_timeout_seconds = 300
+infrastructure_retry_backoff_seconds = 5
+maximum_same_model_infrastructure_retries = 1
 tool_output_token_limit = 2048
 structured_turn_token_limit = 65536
 environment_codegen_turn_token_limit = 262144
@@ -105,44 +108,52 @@ TOML、`ResolvedAgentProfile`、生成的 `$CODEX_HOME/config.toml` 与所有 Ar
 materialized config、`--config` override 或命令行参数。系统不调用 `login_api_key()`，也不物化
 `auth.json`。base URL 不得带用户名、密码、query 或 fragment；无效或缺失时在真实调用前 fail closed。
 
-`structured_output_transport` 默认是 `provider_schema`：直接把收窄后的 JSON Schema 交给
-provider。只有已通过真实 probe 证明某个兼容 gateway 会拒绝嵌套 schema 时，才显式设为
-`json_envelope`。后者只把 provider 层收窄为 `{"artifact_json":"..."}`，内部 JSON 仍由
-原始 Pydantic contract、确定性 compiler、Scheduler repair 和所有 Release Gate 验证；它不是
-模板、mock 或放宽输出/发布验收的开关。
+所有 Direct LLM 和 Codex Agent structured turn 都使用 provider 原生严格 JSON Schema。
+Direct 的语义输入只有模型与渲染后的 Prompt；Agent 才会额外挂载一个专有 Skill 和显式工具。
+系统不保留 JSON envelope/object 等兼容输出协议，也不会把它们作为配置、诊断或重试选项。
+
+只有 Invocation Control 已记录并分类为可重试的基础设施终态，Scheduler 才按
+`maximum_same_model_infrastructure_retries` 在同一模型上建立全新的物理会话。每个后续重试的
+退避是 `infrastructure_retry_backoff_seconds` 的递增倍数；达到上限后才使用显式配置且获得
+节点授权的 `fallback_models`，没有备用模型则终止。该次数会冻结进 WorkDefinition，因此不是
+SDK 内不可观测的隐式循环，也不消费语义修复额度。默认值 `1` 保持保守；真实 bad case 证明一次
+重试不足时，可以在一次 E2E 配置中显式设为 `2`，但不能对非 transient、未终态化或语义失败套用。
 
 真实的长时单节点诊断可以显式把 `structured_turn_token_limit` 提高到
 `5_000_000`，并配套提高 `structured_invocation_timeout_seconds` 与该次诊断的总预算。它仍是
 可观测、可结算的有限 lease，目的在于避免把仍在推进的 Agent 误截断为短时失败；不能借此绕过
 Scheduler 的预算、终态和重试授权。
 
-## 三种隔离 Agent Profile
+`provider_first_event_timeout_seconds` 不是输入、输出或思考 token 上限。它只覆盖一次真实
+Direct/Codex transport 从 dispatch 到首个已验证 Provider event 的期间；首事件到达后该计时立即
+退休，后续仍使用声明的逻辑 wall 和 Direct 的 post-progress idle 策略。若 Direct stream 或
+Codex worker/app-server 在此期间始终零事件，框架分别以
+`direct_no_first_provider_event` / `codex_no_first_provider_event` 记录可重试 transport 终态，
+保留安全 local lifecycle；不能把 `sdk_session_open`、活着的 PID 或 local heartbeat 冒充成模型
+已读到 Prompt/Skill 的证据。
+
+## 三个 Agent 角色与私有 SDK 状态
 
 系统只物化三种 profile：
 
-- `researcher`：只读 workspace、真实 evidence Skill、无 workspace edit、无发布权；
-- `environment-engineer`：独立可写 workspace、真实 build/test、无 sealed verifier；
-- `challenger`：只读设计和运行观测、产生 data-only verifier proposal、无代码修改权。
+- `researcher`：真实 evidence 工作；
+- `environment-engineer`：真实代码编写、命令和测试工作；
+- `challenger`：产生 data-only verifier proposal。
 
-每次物化都使用独立 HOME、CODEX_HOME、workspace、Skill bundle 和项目根 marker。默认不
-继承全局 Skills、Hooks、MCP、AGENTS.md 或 shell 环境。当前内置组合显式配置空 Hooks 与空
-MCP；后续接入 MCP 时必须通过 `McpServerSpec` 同时声明 server、transport、tool allowlist、
-domain 和 credential handle，不能把 MCP SDK 调用散落到 pipeline core。
+Codex Agent 每次调用都有私有 `CODEX_HOME`、当前工作目录、唯一 Runtime Skill 和项目根
+marker；这是避免错误继承项目外的 Skill/Hook/凭证文件的上下文整理，不是文件系统、网络或
+工具权限沙盒。SDK 使用 `full-access`，Agent 在其真实工作目录和主机 `uv`/Python/PATH 上工作；
+不创建 bwrap/unshare、虚拟 `/workspace`/`/state`、工具门面或生成的权限表。Direct LLM 没有
+`CODEX_HOME`、Skill、Hook、工具或 workspace 输入，只有模型和渲染 Prompt/input。
 
-`engineer_network_domain_ceiling` 是 Environment Engineer 角色的 operator ceiling，不是默认
-联网授权；`engineer_dependency_network_domains` 是 Builder 节点执行 `uv lock`/真实依赖检查时
-实际需要的精确域名，必须是 ceiling 的子集，默认空即 Builder Agent 离线。每次真实调用先由 framework 编译 `EffectiveCapabilityPlan`：角色 ceiling、当前
-Generate/Expand Job 的 `PermissionScope` 与节点的 typed requirement 三者都允许，最终 profile
-才获得节点实际需要的外部能力。Builder requirement 总是包含隔离 workspace 的内建
-`shell + workspace_edit`，并仅在 `engineer_dependency_network_domains` 非空时要求其中的精确
-域名。CLI 会把这个显式选择冻结进 Generate/Expand Job；为保持 ResearchToolchain 原有的任意
-公开 Web 检索，它在 Job 网络授权中同时写入 `*`，但 Engineer 最终仍受角色 ceiling 和节点
-requirement 收窄，只获得精确 dependency domains。Python API 调用方若未授予同一网络范围，
-Builder 会在模型调用前返回 `needs_human`。内建 sandbox 能力和外部 `tool_allowlist` 是不同命名空间。
+`EffectiveCapabilityPlan` 仍记录节点角色、是否为 Direct/Agent、Skill 选择、预算和外部
+credential 需求，供调度与审计使用；它不再生成 SDK sandbox、host 路径投影、工具门面或网络
+封锁。`engineer_network_domain_ceiling` 与 `engineer_dependency_network_domains` 仅描述
+依赖/研究调用的可解释配置，不能被误读为对 full-access Code Agent 的 OS 防火墙。
 
-计划及三份输入的 canonical hash 都进入 profile hash 与 continuation identity。缺少节点必需的
-domain/tool/credential 时调用会在物化 profile 前 fail closed，并由生成流程报告
-`needs_human`；不会继承全局 Codex 权限，也不会把空交集替换成 ceiling。
+计划及三份输入的 canonical hash 都进入 profile hash 与 continuation identity。缺少模型或研究
+所需凭证时调用会在物化前 fail closed，并由生成流程报告 `needs_human`；不会把凭证写入
+Codex 配置、Artifact、日志或 package。
 
 ## Research Provider
 
@@ -370,23 +381,21 @@ wall time 是共享 deadline，不按并发数量相加。恢复时不能确定�
 
 ## Judge 安装策略
 
-clean build 固定在无网络 bubblewrap 中执行。候选源码以逐文件只读视图挂载，依赖环境先在
-独立的可写目录生成，再由 framework 复制到 clean materialization 的 `.venv`；依赖构建过程
-不能修改候选源码：
+clean build 直接在主机进程执行。framework 复制 Candidate 到干净目录，把依赖环境生成在
+独立目录后复制到 clean materialization 的 `.venv`，并在安装前后复验 source tree digest；
+依赖构建过程不能修改候选源码：
 
 ```text
 uv sync --frozen --no-dev --offline --no-build --no-editable \
   --no-config --no-install-project --no-install-workspace --no-install-local
 ```
 
-必须显式配置 `uv_cache_dir`，目录必须是真实、可读且可搜索的预填充 uv cache；它会以
-只读目录挂入 build sandbox，候选 lock 中的全部依赖都必须已在该 cache 可用。系统不会用一个
-临时空 cache 冒充生产就绪，也不会在 cache miss 时回退网络。Doctor 会先用诊断专属临时 cache
-为最小项目实际执行 `uv lock --offline`，再把配置的生产 cache 以与 Judge 相同的只读方式挂入
-bubblewrap，执行同一 dependency-only sync；lock 步骤不会反向要求只读生产 cache
-可写。最后 Doctor 在独立的只读 runtime sandbox 中执行安装所得的 Python，并要求其精确为
-3.12。该探针证明解释器、uv、cache 挂载和 bubblewrap 能协作；每个真实候选的具体依赖是否
-齐全，仍由其 clean-build Gate 逐包证明。
+必须显式配置 `uv_cache_dir`，目录必须是真实、可读且可搜索的预填充 uv cache；候选 lock 中
+的全部依赖都必须已在该 cache 可用。系统不会用一个临时空 cache 冒充生产就绪，也不会在 cache
+miss 时回退网络。Doctor 会先用诊断专属临时 cache 为最小项目实际执行 `uv lock --offline`，再
+以同一 `--offline` dependency-only sync 验证配置 cache。最后 Doctor 以 framework-owned 主机
+进程执行安装所得的 Python，并要求其精确为 3.12。该探针证明解释器、uv、cache 和直接主机
+执行链能够协作；每个真实候选的具体依赖是否齐全，仍由其 clean-build Gate 逐包证明。
 
 当前没有域名受限的依赖 fetch broker，因此不存在在线 clean-build 发布成功路径，也不存在
 `--share-net` 降级。cache miss 会诚实地使 clean-deployment Gate 失败；依赖必须在发布前由受信
@@ -395,9 +404,10 @@ bubblewrap，执行同一 dependency-only sync；lock 步骤不会反向要求�
 PyPI registry、包含 hash/size 的 `files.pythonhosted.org` wheel；path、Git、direct URL、editable、
 自定义 index、候选 build backend 和 sdist 构建都被拒绝。
 
-无论 clean build 是否联网，候选 Runtime、task generator、public self-check、consumer adapter、
-public/repair/sealed verifier 和并发探针始终使用另一份 `purpose = "runtime"` 的离线隔离策略：
-只读 workspace、独立可写 state 目录、无宿主网络。不存在“隔离不可用就退回宿主机执行”的路径。
+Candidate Runtime、task generator、public self-check、consumer adapter、public/repair/sealed
+verifier 和并发探针均由 framework-owned 主机进程启动，使用 framework 选择的 cwd、临时状态
+目录、资源限制、超时和安全输出采集。它们不使用 namespace/mount/虚拟路径；`uv sync` 的
+offline 供应链约束不等同于对运行时代码施加主机网络沙盒。
 
 ## Preflight
 
@@ -409,8 +419,8 @@ uv run agent-world --config /path/to/config.toml doctor --production
 ```
 
 默认 preflight 检查 state root、真实认证句柄、官方 Codex SDK、显式 Codex CLI 版本、uv、
-bubblewrap namespace、profile 物化，并执行一次真实 clean-build readiness probe：生成最小 uv
-工程和真实 lock、通过生产 `CleanCandidateBuilder` 安装、再通过生产 runtime isolation 执行精确
+直接 host-process probe 和 profile 物化，并执行一次真实 clean-build readiness probe：生成最小 uv
+工程和真实 lock、通过生产 `CleanCandidateBuilder` 安装、再通过生产 runtime host execution 执行精确
 Python 3.12 检查。未配置或无法读取 `uv_cache_dir` 时会 fail closed。报告把
 `local_execution_ready`、`configuration_ready`、两个 live 验证和 `production_ready` 分开；默认
 Doctor 不会把“配置看起来完整”宣称为真实外部服务已验证。`--live-agent` 会真实消费一次 Codex SDK
@@ -423,15 +433,15 @@ structured-output turn，`--live-research` 会真实消费一次 search/fetch/ex
 `agent_world.app.build_application()` 是唯一生产 composition root。它一次性装配：
 
 - 同一份 `ArtifactStore` 与 `EnvironmentRegistry`；
-- 三种隔离 profile 和唯一的 `CodexSdkBackend`；
+- 三个 Agent 角色的私有 SDK 状态和唯一的 `CodexSdkBackend`；
 - 真实 Search/Fetch/Extract toolchain；
 - Direct Designer、独立 Discovery lane 和真实 Campaign 使用的 Expansion Designer；
-- Environment Builder、Verifier Compiler、clean-build/runtime 隔离 Judge；
+- Environment Builder、Verifier Compiler、clean-build/runtime direct-host Judge；
 - 拥有预算、返工路由和发布决策的 `FoundryController`。
 
 模型环境句柄、base-URL 环境句柄和 Jina 环境句柄会在装配时解析。值只作为进程内 credential 和
 Artifact/Registry secret canary 存活，不会进入对象公开描述、异常、事件、Artifact 或 envpkg。
-Codex `auth.json` 不属于支持的认证路径；若它出现在隔离 `CODEX_HOME`，调用会 fail closed。
+Codex `auth.json` 不属于支持的认证路径；若它出现在私有 `CODEX_HOME`，调用会 fail closed。
 
 完整首包流程：
 

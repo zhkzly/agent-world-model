@@ -198,7 +198,7 @@ def _evidence_synthesis_prompt(
         sort_keys=True,
         separators=(",", ":"),
     )
-    return f"""You are the isolated Researcher for an Agent World Foundry.
+    return f"""You are the Researcher for an Agent World Foundry.
 Project purpose: ground an executable environment in retrieved source bodies.
 
 Use only the framework-generated CitationCatalog below. Each entry contains bounded passages from

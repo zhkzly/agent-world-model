@@ -66,6 +66,11 @@ EXIT_OPERATION_FAILED = 1
 EXIT_NOT_RELEASED = 2
 EXIT_INTERRUPTED = 130
 
+# This is solely a process-exit liveness bound.  A real invocation has already
+# settled before this code runs, so it neither caps model reasoning nor changes
+# a Scheduler lease, retry decision, or Provider request.
+_CLI_EXECUTOR_SHUTDOWN_SECONDS = 5.0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -113,15 +118,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=INVOCATION_AUDIT_LANE_IDS,
         help="run one named invocation lane (repeatable; default runs every lane sequentially)",
     )
-    invocation_audit.add_argument(
-        "--structured-output-transport",
-        choices=("provider_schema", "json_envelope", "json_object"),
-        help=(
-            "diagnostic-only override for resolved structured profiles; workspace Agent lanes "
-            "retain their native provider-schema transport"
-        ),
-    )
-
     test_node = commands.add_parser(
         "test-node",
         help="copy one captured scope and genuinely rerun exactly one frozen WorkGraph node",
@@ -164,14 +160,6 @@ def build_parser() -> argparse.ArgumentParser:
             "freeze one new diagnostic definition that records the selected node's current "
             "Prompt/Runtime-Skill/leaf/compiler revision while retaining its frozen input "
             "closure and proposal budget"
-        ),
-    )
-    test_node.add_argument(
-        "--diagnostic-structured-output-transport",
-        choices=("provider_schema", "json_envelope", "json_object"),
-        help=(
-            "freeze one profile-only diagnostic definition and run the copied node under this "
-            "different structured-output transport; cannot combine with another diagnostic change"
         ),
     )
     test_node.add_argument(
@@ -297,15 +285,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "freeze one new diagnostic definition that records the selected descendant's "
             "current Prompt/Runtime-Skill/leaf/compiler revision while retaining its frozen "
-            "input closure and proposal budget"
-        ),
-    )
-    test_descendant_node.add_argument(
-        "--diagnostic-structured-output-transport",
-        choices=("provider_schema", "json_envelope", "json_object"),
-        help=(
-            "freeze one profile-only diagnostic definition and run the descendant under this "
-            "different structured-output transport; cannot combine with another diagnostic change"
+            "input closure and proposal budget; a settled Candidate with one exact causal "
+            "feedback route receives a new feedback-bound RepairAction, never the old action "
+            "or session"
         ),
     )
     test_descendant_node.add_argument(
@@ -418,17 +400,17 @@ def build_parser() -> argparse.ArgumentParser:
         "test-final-node",
         help=(
             "freeze the exact final graph from a committed diagnostic Design and VerifierPlan "
-            "closure, then genuinely dispatch one independent initial implementation-plan or "
-            "Challenger node"
+            "closure, then genuinely dispatch one implementation-plan, Challenger, or "
+            "Integration node"
         ),
     )
     test_final_node.add_argument("scope_id", help="captured WorkGraph scope id")
     test_final_node.add_argument(
         "target_stage",
-        choices=("implementation_plan", "verifier_intent_batch"),
+        choices=("implementation_plan", "verifier_intent_batch", "runtime_integration"),
         help=(
-            "one initial final-graph boundary; batch selection is derived from the persisted "
-            "VerifierPlan"
+            "one final-graph boundary; batch selection is derived from the persisted "
+            "VerifierPlan, and Integration reuses an exact committed Candidate"
         ),
     )
     test_final_node.add_argument(
@@ -792,10 +774,48 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _run_cli_coroutine(
+    coroutine: Any,
+    *,
+    executor_shutdown_seconds: float = _CLI_EXECUTOR_SHUTDOWN_SECONDS,
+) -> Any:
+    """Run one CLI coroutine without a post-terminal 300-second executor wait.
+
+    ``asyncio.run`` gives the default executor a fixed five-minute shutdown
+    grace period.  Network SDK DNS/transport work can leave a worker thread
+    behind after an invocation has already emitted its durable terminal.  CLI
+    output must not appear to be a still-running Agent call during that
+    unrelated interpreter cleanup.  The normal application lifetime is one
+    coroutine, so a dedicated loop keeps the existing command boundary while
+    bounding only this final cleanup phase.
+    """
+
+    if executor_shutdown_seconds <= 0:
+        raise ValueError("executor_shutdown_seconds must be positive")
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coroutine)
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.run_until_complete(loop.shutdown_default_executor(executor_shutdown_seconds))
+        # ``main`` owns this process-wide runner, just as ``asyncio.run``
+        # does.  Restoring an ambient loop is both unnecessary here and can
+        # accidentally create one on Python versions which no longer provide
+        # an implicit current loop.
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        return asyncio.run(_dispatch(args))
+        return _run_cli_coroutine(_dispatch(args))
     except KeyboardInterrupt:
         _write_error("interrupted", "operation interrupted")
         return EXIT_INTERRUPTED
@@ -853,7 +873,6 @@ async def _dispatch(args: argparse.Namespace) -> int:
         audit_report = await run_invocation_audit(
             config,
             lane_ids=tuple(args.lane or ()),
-            structured_output_transport=args.structured_output_transport,
         )
         _write_json(audit_report)
         return EXIT_OK if audit_report.status == "passed" else EXIT_OPERATION_FAILED
@@ -869,7 +888,6 @@ async def _dispatch(args: argparse.Namespace) -> int:
             proposal_llm_tokens=args.proposal_llm_tokens,
             proposal_wall_seconds=args.proposal_wall_seconds,
             refresh_current_implementation=args.refresh_current_implementation,
-            diagnostic_structured_output_transport=args.diagnostic_structured_output_transport,
             diagnostic_model=args.diagnostic_model,
             diagnostic_source_model=args.diagnostic_source_model,
         )
@@ -900,7 +918,6 @@ async def _dispatch(args: argparse.Namespace) -> int:
             authorize_semantic_repair=args.authorize_semantic_repair,
             diagnostic_terminal_feedback=args.diagnostic_terminal_feedback,
             refresh_current_implementation=args.refresh_current_implementation,
-            diagnostic_structured_output_transport=args.diagnostic_structured_output_transport,
             diagnostic_model=args.diagnostic_model,
             diagnostic_source_model=args.diagnostic_source_model,
         )

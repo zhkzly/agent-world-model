@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
+from v3_fixture import portable_counter_contracts
 
+import agent_world.control.test_node as test_node_module
+from agent_world.artifact_store import ArtifactStore
 from agent_world.contracts import (
     ArtifactRef,
     Budget,
@@ -24,11 +29,13 @@ from agent_world.control.work_graph import (
     _TOOL_SEMANTICS_BATCH_VALIDATOR_MODULES,
     _VERIFIER_INTENT_BATCH_VALIDATOR_MODULES,
     _VERIFIER_PLAN_VALIDATOR_MODULES,
+    CANDIDATE_BUILD_DEVELOPMENT_AGENT_TURNS,
     GenerationWorkGraph,
     JoinPolicy,
     WorkGraphEpoch,
     WorkGraphError,
     WorkGroupDefinition,
+    bind_model_route_recovery_policy,
     compile_design_work_graph,
     compile_world_work_graph,
     complete_generation_work_graph,
@@ -38,16 +45,23 @@ from agent_world.control.work_graph import (
     derive_world_plan_definitions,
     deterministic_boundary_work_definition,
     research_acquisition_work_definition,
+    research_plan_work_definition,
     research_synthesis_work_definition,
     structured_agent_work_definition,
     tool_semantics_batch_definition,
     verifier_plan_work_definition,
+    world_architecture_work_definition,
 )
 from agent_world.designer.models import (
     CurriculumPlanSourceDraft,
     CurriculumTaskPlanSourceDraft,
     ToolCouplingGroupPlan,
     ToolCouplingPlan,
+)
+from agent_world.judge import VerifierBatchPlan, VerifierBatchPlanItem
+from agent_world.judge_budgeting import (
+    integration_budget_requirements,
+    release_without_interactive_budget_requirements,
 )
 
 
@@ -157,6 +171,125 @@ def test_tool_semantics_batch_definition_binds_current_revisions() -> None:
     )
 
 
+def test_all_direct_design_agent_leaves_bind_prompt_skill_and_validator_revisions() -> None:
+    """No live Direct design leaf may silently retain the unversioned default.
+
+    The graph has one true topology-discovery Architecture parent, then a
+    committed shared contract before independent singleton tool shards.  This
+    test checks the provenance rule, not whether a model can author the
+    semantics: a Prompt, Runtime Skill, profile-shaping, or validator edit must
+    make the affected current definition discoverable for a fresh node run.
+    """
+
+    plan = research_plan_work_definition(
+        scope_id="job:hotel",
+        agent_wall_seconds=120,
+        agent_token_limit=10_000,
+    )
+    acquisition = research_acquisition_work_definition(
+        scope_id="job:hotel",
+        dependency_coordinate=plan.coordinate,
+        wall_seconds=120,
+        maximum_search_calls=1,
+        maximum_tool_calls=3,
+    )
+    synthesis = research_synthesis_work_definition(
+        scope_id="job:hotel",
+        dependency_coordinate=acquisition.coordinate,
+        agent_wall_seconds=120,
+        agent_token_limit=10_000,
+    )
+    architecture = world_architecture_work_definition(
+        scope_id="job:hotel",
+        dependency_coordinate=synthesis.coordinate,
+        agent_wall_seconds=120,
+        agent_token_limit=10_000,
+    )
+    architecture_ref = _artifact_ref("architecture:hotel", "design.world_architecture_source")
+    coupling = ToolCouplingPlan(
+        plan_id="plan:hotel-tool-singletons",
+        architecture_ref=architecture_ref,
+        groups=(
+            ToolCouplingGroupPlan(
+                group_id="group:booking",
+                ordered_tool_ids=("hotel.search", "hotel.reserve"),
+                namespaces=("hotel",),
+                coupling_reasons=("state_overlap",),
+                mode="multi_batch",
+                batches=(("hotel.search",), ("hotel.reserve",)),
+            ),
+        ),
+        execution_batches=(("hotel.search",), ("hotel.reserve",)),
+    )
+    legacy_definitions, _ = derive_final_design_definitions(
+        scope_id="job:hotel",
+        bootstrap_definitions=(plan, acquisition, synthesis, architecture),
+        architecture_source_ref=architecture_ref,
+        coupling_plan=coupling,
+        agent_wall_seconds=120,
+        agent_token_limit=10_000,
+    )
+    world_definitions, modeling = derive_world_plan_definitions(
+        scope_id="job:hotel",
+        bootstrap_definitions=(plan, acquisition, synthesis, architecture),
+        architecture_source_ref=architecture_ref,
+        coupling_plan=coupling,
+        agent_wall_seconds=120,
+        agent_token_limit=10_000,
+    )
+    curriculum_plan = CurriculumPlanSourceDraft(
+        coverage_dimensions=(CoverageDimension(dimension="reservation"),),
+        task_plans=(
+            CurriculumTaskPlanSourceDraft(
+                task_type="reservation-create",
+                objective="Create a reservation for the requested room.",
+                allowed_actor_ids=("user",),
+                required_tool_ids=("hotel.reserve",),
+                difficulty_dimensions=("lead-time",),
+            ),
+        ),
+        difficulty_dimensions=(
+            DifficultyDimension(
+                dimension="lead-time",
+                description="Requested reservation lead time.",
+                levels=("short", "long"),
+            ),
+        ),
+        generation_seed_space="all uint64 seeds",
+    )
+    task_definitions, _ = derive_task_requirement_design_definitions(
+        scope_id="job:hotel",
+        world_definitions=world_definitions,
+        curriculum_plan_ref=_artifact_ref(
+            "curriculum-plan:hotel",
+            "design.curriculum_plan_source",
+        ),
+        curriculum_plan=curriculum_plan,
+        modeling_template=modeling,
+        agent_wall_seconds=120,
+        agent_token_limit=10_000,
+    )
+    direct_agent_definitions = tuple(
+        definition
+        for definition in (*legacy_definitions, *task_definitions)
+        if definition.proposal_policy.executor == "agent"
+    )
+
+    assert direct_agent_definitions
+    assert all(
+        definition.proposal_policy.implementation_revision_id != "framework.impl.unversioned.v0"
+        for definition in direct_agent_definitions
+    )
+    assert all(
+        current_runtime_revisions_for_definition(definition)
+        == (
+            definition.proposal_policy.implementation_revision_id,
+            definition.validation_policy.validator_revision_id,
+        )
+        for definition in direct_agent_definitions
+    )
+
+
 def test_builder_agent_definitions_bind_current_prompt_skill_and_validator_revisions() -> None:
     """Every Builder Agent boundary supports a causal implementation refresh."""
 
@@ -194,6 +327,49 @@ def test_builder_agent_definitions_bind_current_prompt_skill_and_validator_revis
     assert candidate_build.validation_policy.validator_revision_id.startswith(
         "framework.validator-build-candidate."
     )
+    # CandidateBuild reserves one same-workspace pre-commit correction as part
+    # of the Code Agent's own build/test/debug loop.  This is deliberately not
+    # a Scheduler RepairAction or an unbounded retry budget.
+    assert candidate_build.proposal_policy.budget.agent_turns == 2
+    assert implementation_plan.proposal_policy.budget.agent_turns == 1
+
+
+def test_runtime_refresh_restores_candidate_bounded_development_turn() -> None:
+    """A stale diagnostic Candidate definition cannot disable its own dev loop.
+
+    This is the true current-runtime budget projection used by
+    ``--refresh-current-implementation``.  The frozen source models the exact
+    old single-turn Candidate definition that passed a first build but would
+    otherwise have suppressed its framework-owned, same-workspace correction.
+    """
+
+    design_definitions, modeling = _complete_design_closure()
+    graph = complete_generation_work_graph(
+        scope_id="job:hotel",
+        design_graph=_design_graph(design_definitions, modeling),
+        verifier_batch_count=1,
+    )
+    candidate = next(
+        item for item in graph.definitions if item.coordinate.stage == "candidate_build"
+    )
+    stale_candidate = candidate.model_copy(
+        update={
+            "proposal_policy": candidate.proposal_policy.model_copy(
+                update={
+                    "budget": candidate.proposal_policy.budget.model_copy(update={"agent_turns": 1})
+                }
+            )
+        }
+    )
+
+    refreshed_budget = test_node_module._current_runtime_operation_budget(  # noqa: SLF001
+        app=None,
+        source=SimpleNamespace(definition=stale_candidate),
+    )
+
+    assert stale_candidate.proposal_policy.budget.agent_turns == 1
+    assert refreshed_budget == candidate.proposal_policy.budget
+    assert refreshed_budget.agent_turns == CANDIDATE_BUILD_DEVELOPMENT_AGENT_TURNS
 
 
 def test_assured_code_definitions_bind_current_execution_and_feedback_revisions() -> None:
@@ -560,6 +736,71 @@ def _design_graph(
     )
 
 
+def test_final_graph_sizes_judge_work_from_frozen_design_and_plan(
+    tmp_path,
+) -> None:
+    """A real final graph cannot substitute a fixed probe count for its Design."""
+
+    design_definitions, modeling = _complete_design_closure()
+    design = portable_counter_contracts(ArtifactStore(tmp_path / "artifacts")).design
+    plan = VerifierBatchPlan(
+        plan_id="verifier-plan:budget-derived",
+        design_ref=_artifact_ref("design:budget-derived", "design.environment_design"),
+        world_spec_ref=_artifact_ref("world:budget-derived", "design.world_spec"),
+        maximum_tasks_per_batch=1,
+        batches=(
+            VerifierBatchPlanItem(
+                batch_id="verifier-batch:budget-derived",
+                batch_index=0,
+                task_types=(design.curriculum.task_types[0].task_type,),
+                required_rule_ids=(),
+                required_property_families=(),
+                semantic_case_limit=2,
+                context_hash=sha256_digest(b"budget-derived"),
+            ),
+        ),
+    )
+    graph = complete_generation_work_graph(
+        scope_id="job:hotel",
+        design_graph=_design_graph(design_definitions, modeling),
+        verifier_batch_count=len(plan.batches),
+        environment_design=design,
+        verifier_batch_plan=plan,
+    )
+    definitions = {
+        (item.coordinate.component, item.coordinate.stage): item for item in graph.definitions
+    }
+
+    integration = definitions[("integration", "runtime_integration")]
+    release = definitions[("judge", "release_assurance")]
+    assert integration.proposal_policy.budget.evaluation_episodes == (
+        integration_budget_requirements(design).evaluation_episodes
+    )
+    assert (
+        integration.proposal_policy.budget.tool_calls
+        == integration_budget_requirements(design).tool_calls
+    )
+    assert release.proposal_policy.budget.evaluation_episodes == (
+        release_without_interactive_budget_requirements(design, plan).evaluation_episodes
+    )
+    assert (
+        release.proposal_policy.budget.tool_calls
+        == release_without_interactive_budget_requirements(design, plan).tool_calls
+    )
+
+
+def test_strict_final_graph_rejects_missing_frozen_judge_budget_inputs() -> None:
+    design_definitions, modeling = _complete_design_closure()
+
+    with pytest.raises(WorkGraphError, match="EnvironmentDesign and VerifierPlan"):
+        complete_generation_work_graph(
+            scope_id="job:hotel",
+            design_graph=_design_graph(design_definitions, modeling),
+            verifier_batch_count=1,
+            strict_input_contracts=True,
+        )
+
+
 def test_complete_generation_graph_cannot_stop_at_modeling_boundary() -> None:
     design_definitions, modeling = _complete_design_closure()
     graph = complete_generation_work_graph(
@@ -742,15 +983,19 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
                 coupling_reasons=("namespace", "state_overlap"),
                 mode="multi_batch",
                 batches=(
-                    ("hotel.search", "hotel.hold"),
-                    ("hotel.confirm", "hotel.cancel"),
+                    ("hotel.search",),
+                    ("hotel.hold",),
+                    ("hotel.confirm",),
+                    ("hotel.cancel",),
                     ("hotel.modify",),
                 ),
             ),
         ),
         execution_batches=(
-            ("hotel.search", "hotel.hold"),
-            ("hotel.confirm", "hotel.cancel"),
+            ("hotel.search",),
+            ("hotel.hold",),
+            ("hotel.confirm",),
+            ("hotel.cancel",),
             ("hotel.modify",),
         ),
     )
@@ -778,15 +1023,30 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
         "tool-batch-1",
         "tool-batch-2",
         "tool-batch-3",
+        "tool-batch-4",
+        "tool-batch-5",
     )
-    assert all(shared[0].coordinate in item.dependency_coordinates for item in batches)
+    assert all(
+        item.dependency_coordinates
+        == (architecture.coordinate, synthesis.coordinate, shared[0].coordinate)
+        for item in batches
+    )
+    assert all(
+        next(
+            slot for slot in item.output_slots if slot.slot_id == "output:tool-semantics"
+        ).minimum_count
+        == 1
+        for item in batches
+    )
     assert rules.dependency_coordinates == (
         architecture.coordinate,
         synthesis.coordinate,
         *(item.coordinate for item in batches),
     )
     assert rules.proposal_policy.acceptance_transform_id == "framework.world-rules-compiler.v4"
-    assert rules.validation_policy.validator_revision_id == "framework.validator.world-rules.v4"
+    assert rules.validation_policy.validator_revision_id.startswith(
+        "framework.validator-world-rules."
+    )
     assert curriculum_plan.dependency_coordinates == (
         synthesis.coordinate,
         architecture.coordinate,
@@ -887,20 +1147,22 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
     assert graph.release_eligible
     assert graph.require(architecture.coordinate) == architecture
 
-    oversized_coupling = coupling.model_copy(
+    historical_multi_tool_coupling = coupling.model_copy(
         update={
             "execution_batches": (
-                ("hotel.search", "hotel.hold", "hotel.confirm"),
-                ("hotel.cancel", "hotel.modify"),
+                ("hotel.search", "hotel.hold"),
+                ("hotel.confirm",),
+                ("hotel.cancel",),
+                ("hotel.modify",),
             )
         }
     )
-    with pytest.raises(WorkGraphError, match="invalid physical batch"):
+    with pytest.raises(WorkGraphError, match="singleton physical tool shards"):
         derive_final_design_definitions(
             scope_id="job:hotel",
             bootstrap_definitions=(plan, acquisition, synthesis, architecture),
-            architecture_source_ref=oversized_coupling.architecture_ref,
-            coupling_plan=oversized_coupling,
+            architecture_source_ref=historical_multi_tool_coupling.architecture_ref,
+            coupling_plan=historical_multi_tool_coupling,
             agent_wall_seconds=120,
             agent_token_limit=10_000,
         )
@@ -1169,6 +1431,36 @@ def test_tool_semantics_policy_keeps_the_configured_token_budget() -> None:
     assert definition.repair_policy.strict_progress_bonus_corrections == 1
     assert definition.repair_policy.maximum_infrastructure_retries == 1
     assert definition.repair_policy.maximum_automatic_backjump == 0
+
+
+def test_model_route_recovery_binding_reaches_every_configured_fallback() -> None:
+    agent_definition = research_plan_work_definition(
+        scope_id="job:hotel",
+        agent_wall_seconds=300,
+        agent_token_limit=5_000_000,
+    )
+    deterministic_definition = research_acquisition_work_definition(
+        scope_id="job:hotel",
+        dependency_coordinate=agent_definition.coordinate,
+        wall_seconds=300,
+        maximum_search_calls=3,
+        maximum_tool_calls=8,
+    )
+
+    bound_agent, bound_deterministic = bind_model_route_recovery_policy(
+        (agent_definition, deterministic_definition),
+        model_routes=("grok-4.5", "gpt-5.3-codex-spark", "gpt-5.4-mini"),
+        maximum_same_model_infrastructure_retries=2,
+    )
+
+    assert agent_definition.repair_policy.maximum_model_fallbacks == 1
+    assert agent_definition.repair_policy.maximum_total_repair_attempts == 3
+    assert bound_agent.repair_policy.maximum_infrastructure_retries == 2
+    assert bound_agent.repair_policy.maximum_model_fallbacks == 2
+    # Two semantic corrections, two infrastructure retries per model, and two
+    # visible model transitions are all identity-bound before graph freezing.
+    assert bound_agent.repair_policy.maximum_total_repair_attempts == 10
+    assert bound_deterministic.repair_policy == deterministic_definition.repair_policy
 
 
 def test_research_acquisition_is_real_tools_with_code_owned_evidence_admission() -> None:

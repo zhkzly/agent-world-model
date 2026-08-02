@@ -410,6 +410,34 @@ def test_running_invocation_projects_throttled_safe_progress(tmp_path: Path) -> 
         span.finish(status="passed")
 
 
+def test_finishing_span_preserves_buffered_provider_event_time(tmp_path: Path) -> None:
+    """A terminal write must not masquerade as fresh Provider progress.
+
+    The last event below remains buffered when the span finishes.  Keeping its
+    observed timestamp lets a scene distinguish an idle Provider stream from a
+    merely late terminal cleanup.
+    """
+
+    with TelemetryStore(tmp_path / "telemetry") as store:
+        span = store.start_span(
+            trace_id="run:provider-idle",
+            component="invocation",
+            operation="agent.invoke",
+        )
+        span.progress("item.started", {"item": {"type": "reasoning"}})
+        time.sleep(0.01)
+        span.progress("item.updated", {"item": {"type": "commandExecution"}})
+        time.sleep(0.02)
+        span.finish(status="failed", error_code="provider_stream_stalled")
+
+        inspected = store.inspect_trace("run:provider-idle")
+
+    row = inspected["spans"][0]
+    assert row["last_progress_at_ns"] is not None
+    assert row["ended_at_ns"] is not None
+    assert row["ended_at_ns"] - row["last_progress_at_ns"] >= 10_000_000
+
+
 @pytest.mark.parametrize(
     ("item_type", "expected"),
     (

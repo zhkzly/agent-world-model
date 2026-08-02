@@ -16,11 +16,12 @@ from .contracts import InvocationError, JsonObject, JsonValue
 
 _MAX_SAFE_RESPONSE_CHARACTERS = 2_000_000
 _DIRECT_INVALID_JSON_CODE = "direct_structured_output_invalid_json"
-_DIRECT_TRANSPORT_INVALID_CODE = "direct_structured_output_transport_invalid"
 _DIRECT_OUTPUT_LIMIT_CODE = "direct_output_limit"
 _DIRECT_INVALID_REQUEST_CODE = "direct_invalid_request"
 _DIRECT_PROVIDER_STREAM_STALLED_CODE = "direct_provider_stream_stalled"
 _DIRECT_NO_FIRST_EVENT_CODE = "direct_no_first_provider_event"
+_CODEX_NO_FIRST_EVENT_CODE = "codex_no_first_provider_event"
+_CODEX_PROVIDER_STREAM_STALLED_CODE = "codex_provider_stream_stalled"
 _DIRECT_PROVIDER_EXCEPTION_CODES = frozenset(
     {
         "direct_authentication_failed",
@@ -75,7 +76,6 @@ _NON_RETRYABLE_TERMINAL_CODES = frozenset(
         _PROVIDER_THREAD_ROLLBACK_CODE,
         _PROVIDER_UNCLASSIFIED_CODE,
         _DIRECT_INVALID_JSON_CODE,
-        _DIRECT_TRANSPORT_INVALID_CODE,
         _DIRECT_OUTPUT_LIMIT_CODE,
         _DIRECT_INVALID_REQUEST_CODE,
     }
@@ -93,16 +93,6 @@ _RESPONSE_SHAPES = frozenset(
     }
 )
 _PARSE_FAILURES = frozenset({"syntax", "truncated", "extra_data", "nonfinite_number"})
-_ENVELOPE_SHAPES = frozenset(
-    {
-        "artifact_json_string",
-        "artifact_json_object",
-        "artifact_json_array",
-        "artifact_json_scalar",
-        "non_envelope",
-        "provider_ir",
-    }
-)
 _CODEX_PROVIDER_ERROR_SHAPES = frozenset({"missing", "non_object", "object"})
 _CODEX_PROVIDER_ERROR_INFO = frozenset(
     {
@@ -127,7 +117,16 @@ _CODEX_PROVIDER_ERROR_INFO = frozenset(
         "transport:response_too_many_failed_attempts",
     }
 )
-_CODEX_ADVISORY_TEXT_SIGNALS = frozenset(
+# A provider may return an otherwise opaque terminal whose only useful
+# explanation is in a human-readable field.  That text may contain request,
+# route, credential, or user material, so it never crosses the adapter.  Both
+# Direct and Codex paths may retain only one or more of these fixed advisory
+# categories.  They help the project-execution Agent choose its next read.
+# One deliberately narrower helper below may also recognize a set containing
+# only connection/internal-error signals as Provider unavailability.  That
+# classification can authorize only the existing bounded infrastructure retry;
+# it never authorizes a Prompt, Skill, schema, or semantic mutation.
+_PROVIDER_ADVISORY_TEXT_SIGNALS = frozenset(
     {
         "authentication_or_authorization",
         "model_or_route_availability",
@@ -154,6 +153,7 @@ _CODEX_WORKER_PHASES = frozenset(
 )
 _CODEX_TERMINAL_DETAIL_CODES = frozenset(
     {
+        _CODEX_NO_FIRST_EVENT_CODE,
         _PROVIDER_QUOTA_EXHAUSTED_CODE,
         _SESSION_BUDGET_EXHAUSTED_CODE,
         _USAGE_LIMIT_EXCEEDED_CODE,
@@ -210,6 +210,7 @@ _DIRECT_PROVIDER_ERROR_PARAMS = frozenset(
         "other",
     }
 )
+_DIRECT_TRANSPORT_EXCEPTION_KINDS = frozenset({"connection", "timeout"})
 
 
 def direct_invalid_json_details(output_text: str, exc: Exception) -> JsonObject:
@@ -223,50 +224,29 @@ def direct_invalid_json_details(output_text: str, exc: Exception) -> JsonObject:
     }
 
 
-def direct_transport_decode_details(
-    value: JsonValue,
-    *,
-    transport: str,
-    exc: Exception,
-) -> JsonObject:
-    """Describe a decoded outer transport failure with no inner payload bytes."""
-
-    if transport in {"provider_schema", "json_object"}:
-        return {"transport": transport, "envelope_shape": "provider_ir"}
-    if not isinstance(value, dict) or set(value) != {"artifact_json"}:
-        return {"transport": "json_envelope", "envelope_shape": "non_envelope"}
-    payload = value["artifact_json"]
-    if isinstance(payload, str):
-        return {
-            "transport": "json_envelope",
-            "envelope_shape": "artifact_json_string",
-            **direct_invalid_json_details(payload, exc),
-        }
-    return {
-        "transport": "json_envelope",
-        "envelope_shape": _envelope_shape(payload),
-    }
-
-
-def direct_output_limit_details(*, configured_max_output_tokens: int) -> JsonObject:
+def direct_output_limit_details(*, configured_max_output_tokens: int | None) -> JsonObject:
     """Describe a provider output ceiling without retaining its response body.
 
-    The value is the declared adapter request parameter, not an inference from
-    provider prose.  Keeping it in a small bounded vocabulary lets the
-    Scheduler distinguish a causal policy change from a semantic retry.
+    When a Direct request had no adapter-declared cap, retain the closed
+    Provider terminal fact without inventing one.  When it did have a cap, the
+    value is the declared adapter request parameter, not an inference from
+    Provider prose.
     """
 
+    safe: JsonObject = {
+        "terminal_status": "incomplete",
+        "terminal_reason": "max_output_tokens",
+    }
+    if configured_max_output_tokens is None:
+        return safe
     if (
         isinstance(configured_max_output_tokens, bool)
         or not isinstance(configured_max_output_tokens, int)
         or not 1 <= configured_max_output_tokens <= _MAX_SAFE_OUTPUT_TOKEN_LIMIT
     ):
-        return {}
-    return {
-        "terminal_status": "incomplete",
-        "terminal_reason": "max_output_tokens",
-        "configured_max_output_tokens": configured_max_output_tokens,
-    }
+        return safe
+    safe["configured_max_output_tokens"] = configured_max_output_tokens
+    return safe
 
 
 def direct_provider_stream_stalled_details(
@@ -325,6 +305,57 @@ def direct_no_first_provider_event_details(
     }
 
 
+def codex_no_first_provider_event_details(first_event_timeout_seconds: float) -> JsonObject:
+    """Describe a Codex worker that never emitted a validated Provider event.
+
+    The worker may have emitted safe local lifecycle frames such as
+    ``sdk_session_open``.  Those prove only local startup, not Prompt/Skill
+    delivery to the Provider, so the terminal retains the parent waiting phase
+    and delegates the richer local chronology to the Invocation Control record.
+    """
+
+    if (
+        isinstance(first_event_timeout_seconds, bool)
+        or not isinstance(first_event_timeout_seconds, (int, float))
+        or not 0 < first_event_timeout_seconds <= _MAX_SAFE_DIRECT_STREAM_IDLE_SECONDS
+    ):
+        return {}
+    return {
+        "waiting_phase": "parent_waiting",
+        "first_event_timeout_seconds": first_event_timeout_seconds,
+        "observed_provider_event_count": 0,
+    }
+
+
+def codex_provider_stream_stalled_details(
+    *,
+    idle_timeout_seconds: float,
+    observed_provider_event_count: int,
+) -> JsonObject:
+    """Describe a started Codex worker that stopped producing Provider events.
+
+    This is parent-side liveness evidence only. It deliberately carries no
+    worker stdout, Provider text, host path, mount topology, or prompt/Skill
+    content, so Scheduler can route a retry without mistaking it for a Code
+    Agent repair instruction.
+    """
+
+    if (
+        isinstance(idle_timeout_seconds, bool)
+        or not isinstance(idle_timeout_seconds, (int, float))
+        or not 0 < idle_timeout_seconds <= _MAX_SAFE_DIRECT_STREAM_IDLE_SECONDS
+        or isinstance(observed_provider_event_count, bool)
+        or not isinstance(observed_provider_event_count, int)
+        or not 1 <= observed_provider_event_count <= _MAX_SAFE_DIRECT_STREAM_EVENT_COUNT
+    ):
+        return {}
+    return {
+        "waiting_phase": "parent_awaiting_worker_result",
+        "idle_timeout_seconds": idle_timeout_seconds,
+        "observed_provider_event_count": observed_provider_event_count,
+    }
+
+
 def direct_provider_exception_details(exc: Exception) -> JsonObject:
     """Project a Direct HTTP exception into a closed, secret-safe fingerprint.
 
@@ -343,6 +374,9 @@ def direct_provider_exception_details(exc: Exception) -> JsonObject:
     body: object = getattr(exc, "body", None)
     if body is None:
         details["provider_error_shape"] = "missing"
+        transport_kind = _direct_transport_exception_kind(exc)
+        if transport_kind is not None:
+            details["transport_exception_kind"] = transport_kind
         return details
     if not isinstance(body, Mapping):
         details["provider_error_shape"] = "non_object"
@@ -372,12 +406,14 @@ def direct_provider_response_error_details(error: object | None) -> JsonObject:
     if isinstance(error, Mapping):
         code = error.get("code")
         param = error.get("param")
+        message = error.get("message")
     elif hasattr(error, "code") or hasattr(error, "param"):
         code = getattr(error, "code", None)
         param = getattr(error, "param", None)
+        message = getattr(error, "message", None)
     else:
         return {"provider_error_shape": "non_object"}
-    return {
+    details: JsonObject = {
         "provider_error_shape": "object",
         # ``event.type == \"error\"`` is a stream-protocol label, not a
         # Provider error type. Do not invent one for either terminal surface.
@@ -385,6 +421,147 @@ def direct_provider_response_error_details(error: object | None) -> JsonObject:
         "provider_error_code": _direct_provider_error_code(code),
         "provider_error_param": _direct_provider_error_param(param),
     }
+    # A recognized closed code already selects the policy route.  When the
+    # code is unknown, project only content-free advisory categories from the
+    # provider message.  In particular, never store the message itself or use
+    # a category to reclassify this non-retryable terminal.
+    if details["provider_error_code"] == "other":
+        signals = advisory_terminal_text_signals(message)
+        if signals:
+            details["advisory_text_signals"] = signals
+    return details
+
+
+def advisory_terminal_text_signals(value: object) -> list[JsonValue]:
+    """Reduce opaque Provider prose to bounded, content-free clues.
+
+    The helper intentionally returns no raw character from ``value``.  It is
+    shared by Direct streaming errors and the Codex worker's opaque terminal
+    envelope so the two InvocationBackend routes offer the same safe project
+    debugging aid.
+    """
+
+    if not isinstance(value, str):
+        return []
+    # Bound local inspection too.  The original message is never returned,
+    # logged, placed in telemetry, or persisted in an Artifact.
+    text = value[:16_384].casefold()
+    signals: list[JsonValue] = []
+    for signal, markers in (
+        (
+            "authentication_or_authorization",
+            (
+                "unauthorized",
+                "forbidden",
+                "authentication",
+                "api key",
+                "credential",
+                "permission denied",
+                "access denied",
+            ),
+        ),
+        (
+            "model_or_route_availability",
+            (
+                "model not found",
+                "model unavailable",
+                "unknown model",
+                "unsupported model",
+                "deployment not found",
+                "no such model",
+            ),
+        ),
+        (
+            "context_or_token_limit",
+            (
+                "context window",
+                "context length",
+                "maximum context",
+                "too many tokens",
+                "token limit",
+                "input too long",
+                "max tokens",
+            ),
+        ),
+        (
+            "request_or_schema_compatibility",
+            (
+                "json schema",
+                "response format",
+                "response_format",
+                "output schema",
+                "structured output",
+                "unsupported parameter",
+                "invalid parameter",
+                "unknown parameter",
+                "invalid request",
+                "unsupported request",
+            ),
+        ),
+        (
+            "capacity_or_rate_limit",
+            (
+                "rate limit",
+                "too many requests",
+                "quota",
+                "usage limit",
+                "capacity",
+                "overloaded",
+            ),
+        ),
+        (
+            "transport_or_connection",
+            (
+                "connection refused",
+                "connection reset",
+                "connection failed",
+                "stream disconnected",
+                "network error",
+                "socket error",
+                "dns",
+            ),
+        ),
+        ("timeout_or_deadline", ("timed out", "timeout", "deadline exceeded")),
+        (
+            "policy_or_content_filter",
+            ("content filter", "safety policy", "policy violation", "blocked by policy"),
+        ),
+        (
+            "provider_internal_error",
+            ("internal server error", "internal error", "server error", "http 5"),
+        ),
+    ):
+        if any(marker in text for marker in markers):
+            signals.append(signal)
+    return signals
+
+
+def advisory_provider_unavailable(details: Mapping[str, object]) -> bool:
+    """Recognize one narrow transient class from an otherwise opaque terminal.
+
+    Some OpenAI-compatible routes collapse a transport disconnect or Provider
+    5xx into the closed ``other`` discriminator and expose the only useful
+    class in the human-readable message.  The adapter has already reduced that
+    message to a fixed vocabulary before this helper runs.  Treat it as
+    Provider unavailability only when *every* retained signal is transient and
+    none points at authentication, request/schema compatibility, model routing,
+    context, quota, or policy.
+
+    Callers must still verify that their closed Provider code/discriminator is
+    unknown before using this fallback.  The result authorizes at most the
+    central policy's bounded infrastructure retry or Builder workspace
+    recovery; it is never semantic-repair authority.
+    """
+
+    raw = details.get("advisory_text_signals")
+    if not isinstance(raw, list) or not raw or len(set(map(str, raw))) != len(raw):
+        return False
+    signals = {
+        item for item in raw if isinstance(item, str) and item in _PROVIDER_ADVISORY_TEXT_SIGNALS
+    }
+    return len(signals) == len(raw) and signals.issubset(
+        {"transport_or_connection", "provider_internal_error"}
+    )
 
 
 def _direct_provider_error_body(body: Mapping[object, object]) -> Mapping[object, object]:
@@ -460,6 +637,44 @@ def _normalized_provider_label(value: object) -> str | None:
     return value.strip().casefold() if isinstance(value, str) else None
 
 
+def _direct_transport_exception_kind(exc: Exception) -> str | None:
+    """Return a closed transport class without retaining exception prose.
+
+    The official client exposes ``APIConnectionError`` and
+    ``APITimeoutError`` without a Provider response body. Their messages can
+    carry route, proxy, or request material. Keep only the class-derived
+    category, including common HTTP-client causes, so a real zero-event node
+    can distinguish connection loss from a deadline without persisting an
+    exception transcript.
+    """
+
+    names = {type(exc).__name__}
+    cause = exc.__cause__
+    if cause is not None:
+        names.add(type(cause).__name__)
+    context = exc.__context__
+    if context is not None:
+        names.add(type(context).__name__)
+    if names & {
+        "APITimeoutError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "TimeoutException",
+    }:
+        return "timeout"
+    if names & {
+        "APIConnectionError",
+        "ConnectError",
+        "NetworkError",
+        "ProxyError",
+        "ReadError",
+    }:
+        return "connection"
+    return None
+
+
 def safe_terminal_condition(error: InvocationError | None) -> str:
     """Return a bounded terminal condition without trusting provider text."""
 
@@ -468,14 +683,16 @@ def safe_terminal_condition(error: InvocationError | None) -> str:
     code = safe_terminal_code(error)
     if code == _DIRECT_INVALID_JSON_CODE:
         return _invalid_json_condition(safe_terminal_details(error))
-    if code == _DIRECT_TRANSPORT_INVALID_CODE:
-        return _transport_decode_condition(safe_terminal_details(error))
     if code == _DIRECT_OUTPUT_LIMIT_CODE:
         return _output_limit_condition(error.details)
     if code == _DIRECT_PROVIDER_STREAM_STALLED_CODE:
         return _direct_provider_stream_stalled_condition(safe_terminal_details(error))
     if code == _DIRECT_NO_FIRST_EVENT_CODE:
         return _direct_no_first_provider_event_condition(safe_terminal_details(error))
+    if code == _CODEX_NO_FIRST_EVENT_CODE:
+        return _codex_no_first_provider_event_condition(safe_terminal_details(error))
+    if code == _CODEX_PROVIDER_STREAM_STALLED_CODE:
+        return _codex_provider_stream_stalled_condition(safe_terminal_details(error))
     if code == _DIRECT_INVALID_REQUEST_CODE:
         return _direct_invalid_request_condition(safe_terminal_details(error))
     if code in _DIRECT_PROVIDER_EXCEPTION_CODES:
@@ -522,7 +739,7 @@ def safe_terminal_condition(error: InvocationError | None) -> str:
     if code == _PROVIDER_INVALID_REQUEST_CODE:
         return "the Provider rejected the declared Agent request as invalid"
     if code == _PROVIDER_SANDBOX_CODE:
-        return "the Codex runtime reported a sandbox error while executing the turn"
+        return "the Codex runtime reported an execution-environment error while executing the turn"
     if code == _PROVIDER_THREAD_ROLLBACK_CODE:
         return "the Codex runtime could not roll back the failed thread state"
     if code == _PROVIDER_UNCLASSIFIED_CODE:
@@ -611,8 +828,8 @@ def safe_terminal_expected_category(error: InvocationError | None) -> str | None
         )
     if code == _PROVIDER_SANDBOX_CODE:
         return (
-            "a Builder sandbox/capability/workspace configuration that permits the declared "
-            "operation; do not issue a model correction or blind retry"
+            "a Codex SDK/profile/workspace startup investigation; do not issue a model correction "
+            "or blind retry"
         )
     if code == _PROVIDER_THREAD_ROLLBACK_CODE:
         return (
@@ -641,19 +858,31 @@ def safe_terminal_expected_category(error: InvocationError | None) -> str | None
         return (
             "a profile-matched Direct Provider liveness control and either a corrected Direct "
             "stream/route boundary or one Scheduler-authorized fresh physical execution; do not "
-            "change the Prompt or Runtime Skill without semantic output"
+            "change the rendered Direct Prompt or output budget without semantic output"
         )
     if code == _DIRECT_NO_FIRST_EVENT_CODE:
         return (
             "a Direct transport/route liveness control at the same profile, then one "
             "policy-authorized fresh physical execution or an explicit compatible-model "
             "fallback; zero Provider events means no semantic candidate existed, so a Prompt, "
-            "Runtime Skill, or output-budget change has no supporting evidence"
+            "provider schema, or output-budget change has no supporting evidence"
+        )
+    if code == _CODEX_NO_FIRST_EVENT_CODE:
+        return (
+            "a profile-matched Codex SDK/app-server liveness control, then one "
+            "policy-authorized fresh physical execution or an explicit compatible-model "
+            "fallback; zero Provider events means the Prompt and Runtime Skill were not "
+            "proven to reach the model"
+        )
+    if code == _CODEX_PROVIDER_STREAM_STALLED_CODE:
+        return (
+            "a profile-matched Codex SDK/app-server liveness control and either a corrected "
+            "worker/route boundary or one Scheduler-authorized fresh physical execution; do "
+            "not change the Prompt, Runtime Skill, output budget, or Agent workspace mapping "
+            "without semantic output evidence"
         )
     if code == _DIRECT_INVALID_JSON_CODE:
         return _direct_invalid_json_expected_category(safe_terminal_details(error))
-    if code == _DIRECT_TRANSPORT_INVALID_CODE:
-        return _direct_transport_expected_category(safe_terminal_details(error))
     if code == _DIRECT_INVALID_REQUEST_CODE:
         return _direct_invalid_request_expected_category(safe_terminal_details(error))
     if code == "direct_provider_unavailable":
@@ -719,8 +948,6 @@ def safe_terminal_remediation(error: InvocationError | None) -> str | None:
     code = safe_terminal_code(error)
     if code == _DIRECT_INVALID_JSON_CODE:
         return _direct_invalid_json_remediation(safe_terminal_details(error))
-    if code == _DIRECT_TRANSPORT_INVALID_CODE:
-        return _direct_transport_remediation(safe_terminal_details(error))
     if code == _DIRECT_INVALID_REQUEST_CODE:
         return _direct_invalid_request_remediation(safe_terminal_details(error))
     if code == _DIRECT_PROVIDER_STREAM_STALLED_CODE:
@@ -737,6 +964,20 @@ def safe_terminal_remediation(error: InvocationError | None) -> str | None:
             "the same route. If that control passes, this attempt lost its transport: use only "
             "an existing Scheduler-authorized fresh execution or the explicit compatible-model "
             "fallback. Do not read this as slow reasoning -- the declared wall was not spent."
+        )
+    if code == _CODEX_NO_FIRST_EVENT_CODE:
+        return (
+            "Read the Invocation Control record's safe local phase and zero Provider-event "
+            "count, then run one profile-matched Codex SDK/app-server control with the mounted "
+            "Skill. If it passes, treat this as a worker/route transport loss and use only an "
+            "existing Scheduler-authorized fresh execution or compatible-model fallback."
+        )
+    if code == _CODEX_PROVIDER_STREAM_STALLED_CODE:
+        return (
+            "Read the Invocation Control record's safe Provider-event count and idle interval, "
+            "then run one profile-matched Codex SDK/app-server control with the mounted Skill. "
+            "If it passes, treat this attempt as a worker/route transport loss and use only an "
+            "existing Scheduler-authorized fresh execution or compatible-model fallback."
         )
     if code == _SDK_EXECUTION_FAILED_CODE and (
         safe_terminal_details(error).get("worker_phase") == "thread_resume"
@@ -756,7 +997,7 @@ def safe_terminal_remediation(error: InvocationError | None) -> str | None:
             "capacity, then spend at most the declared infrastructure retry."
         )
     if code in {"direct_authentication_failed", "direct_model_unavailable"}:
-        return "Inspect Direct credential/model routing outside the Agent Prompt and Runtime Skill."
+        return "Inspect Direct credential/model routing outside the rendered Direct Prompt."
     if code in {"direct_provider_timeout", "direct_provider_rejected"}:
         return (
             "Inspect the retained Direct safe Provider fingerprint before selecting a "
@@ -811,8 +1052,7 @@ def safe_terminal_remediation(error: InvocationError | None) -> str | None:
             "before retrying."
         ),
         _PROVIDER_SANDBOX_CODE: (
-            "Audit Builder workspace, sandbox, and capability profile against the operation "
-            "that ran."
+            "Audit Codex SDK startup, profile materialization, and the actual Agent workspace."
         ),
         _PROVIDER_THREAD_ROLLBACK_CODE: (
             "Audit Codex session/continuation handling and use a fresh diagnostic thread if "
@@ -842,18 +1082,23 @@ def safe_terminal_details(error: InvocationError | None) -> JsonObject:
         return {}
     if error.code == _DIRECT_INVALID_JSON_CODE:
         return _safe_direct_invalid_json_details(error.details)
-    if error.code == _DIRECT_TRANSPORT_INVALID_CODE:
-        return _safe_direct_transport_details(error.details)
     if error.code == _DIRECT_OUTPUT_LIMIT_CODE:
         return _safe_direct_output_limit_details(error.details)
     if error.code == _DIRECT_PROVIDER_STREAM_STALLED_CODE:
         return _safe_direct_provider_stream_stalled_details(error.details)
     if error.code == _DIRECT_NO_FIRST_EVENT_CODE:
         return _safe_direct_no_first_provider_event_details(error.details)
+    if error.code == _CODEX_NO_FIRST_EVENT_CODE:
+        return _safe_codex_no_first_provider_event_details(error.details)
+    if error.code == _CODEX_PROVIDER_STREAM_STALLED_CODE:
+        return _safe_codex_provider_stream_stalled_details(error.details)
     if error.code == _DIRECT_INVALID_REQUEST_CODE:
         return _safe_direct_invalid_request_details(error.details)
     if error.code in _DIRECT_PROVIDER_EXCEPTION_CODES:
-        return _safe_direct_invalid_request_details(error.details)
+        return _safe_direct_provider_exception_details(
+            error.details,
+            allow_advisory=error.code == "direct_provider_rejected",
+        )
     if error.code == _SDK_EXECUTION_FAILED_CODE:
         phase = error.details.get("worker_phase")
         if isinstance(phase, str) and phase in _CODEX_WORKER_PHASES:
@@ -871,14 +1116,20 @@ def safe_terminal_details(error: InvocationError | None) -> JsonObject:
         safe["codex_error_info"] = info
     signals = details.get("advisory_text_signals")
     if (
-        error.code == _PROVIDER_UNCLASSIFIED_CODE
+        error.code in {_PROVIDER_UNCLASSIFIED_CODE, _PROVIDER_UNAVAILABLE_CODE}
         and isinstance(signals, list)
-        and 1 <= len(signals) <= len(_CODEX_ADVISORY_TEXT_SIGNALS)
+        and 1 <= len(signals) <= len(_PROVIDER_ADVISORY_TEXT_SIGNALS)
         and all(
-            isinstance(signal, str) and signal in _CODEX_ADVISORY_TEXT_SIGNALS for signal in signals
+            isinstance(signal, str) and signal in _PROVIDER_ADVISORY_TEXT_SIGNALS
+            for signal in signals
         )
         and len(set(signals)) == len(signals)
     ):
+        # For an opaque ``enum:other`` this category was the exact evidence
+        # that narrowed the terminal to a retryable transport or Provider-
+        # internal route. It never exposes Provider prose and never changes
+        # Scheduler routing after persistence, but retaining it lets the
+        # project-execution Agent distinguish those D-layer hypotheses.
         safe["advisory_text_signals"] = signals
     if error.code == _PROVIDER_OUTPUT_LIMIT_CODE:
         terminal_status = details.get("terminal_status")
@@ -915,6 +1166,32 @@ def _safe_direct_invalid_request_details(details: JsonObject) -> JsonObject:
         value = details.get(key)
         if isinstance(value, str) and value in allowed:
             safe[key] = value
+    transport_kind = details.get("transport_exception_kind")
+    if isinstance(transport_kind, str) and transport_kind in _DIRECT_TRANSPORT_EXCEPTION_KINDS:
+        safe["transport_exception_kind"] = transport_kind
+    return safe
+
+
+def _safe_direct_provider_exception_details(
+    details: JsonObject,
+    *,
+    allow_advisory: bool,
+) -> JsonObject:
+    """Project Direct terminal facts and optional non-routing advice safely."""
+
+    safe = _safe_direct_invalid_request_details(details)
+    signals = details.get("advisory_text_signals")
+    if (
+        allow_advisory
+        and isinstance(signals, list)
+        and 1 <= len(signals) <= len(_PROVIDER_ADVISORY_TEXT_SIGNALS)
+        and len(set(signals)) == len(signals)
+        and all(
+            isinstance(signal, str) and signal in _PROVIDER_ADVISORY_TEXT_SIGNALS
+            for signal in signals
+        )
+    ):
+        safe["advisory_text_signals"] = signals
     return safe
 
 
@@ -931,33 +1208,18 @@ def _safe_direct_invalid_json_details(details: JsonObject) -> JsonObject:
     }
 
 
-def _safe_direct_transport_details(details: JsonObject) -> JsonObject:
-    transport = details.get("transport")
-    envelope_shape = details.get("envelope_shape")
+def _safe_direct_output_limit_details(details: JsonObject) -> JsonObject:
     if (
-        transport not in {"json_envelope", "provider_schema", "json_object"}
-        or envelope_shape not in _ENVELOPE_SHAPES
+        details.get("terminal_status") != "incomplete"
+        or details.get("terminal_reason") != "max_output_tokens"
     ):
         return {}
-    safe: JsonObject = {"transport": transport, "envelope_shape": envelope_shape}
-    parsed = _json_parse_details(details)
-    if parsed is not None:
-        shape, failure, offset, characters = parsed
-        safe.update(
-            {
-                "response_shape": shape,
-                "parse_failure": failure,
-                "parse_offset": offset,
-                "response_characters": characters,
-            }
-        )
-    return safe
-
-
-def _safe_direct_output_limit_details(details: JsonObject) -> JsonObject:
     configured = _configured_output_limit(details)
     if configured is None:
-        return {}
+        return {
+            "terminal_status": "incomplete",
+            "terminal_reason": "max_output_tokens",
+        }
     return {
         "terminal_status": "incomplete",
         "terminal_reason": "max_output_tokens",
@@ -1003,6 +1265,44 @@ def _safe_direct_no_first_provider_event_details(details: JsonObject) -> JsonObj
     }
 
 
+def _safe_codex_no_first_provider_event_details(details: JsonObject) -> JsonObject:
+    waiting_phase = details.get("waiting_phase")
+    first_event_timeout_seconds = details.get("first_event_timeout_seconds")
+    if (
+        waiting_phase != "parent_waiting"
+        or isinstance(first_event_timeout_seconds, bool)
+        or not isinstance(first_event_timeout_seconds, (int, float))
+        or not 0 < first_event_timeout_seconds <= _MAX_SAFE_DIRECT_STREAM_IDLE_SECONDS
+    ):
+        return {}
+    return {
+        "waiting_phase": waiting_phase,
+        "first_event_timeout_seconds": first_event_timeout_seconds,
+        "observed_provider_event_count": 0,
+    }
+
+
+def _safe_codex_provider_stream_stalled_details(details: JsonObject) -> JsonObject:
+    waiting_phase = details.get("waiting_phase")
+    idle_timeout_seconds = details.get("idle_timeout_seconds")
+    observed_provider_event_count = details.get("observed_provider_event_count")
+    if (
+        waiting_phase != "parent_awaiting_worker_result"
+        or isinstance(idle_timeout_seconds, bool)
+        or not isinstance(idle_timeout_seconds, (int, float))
+        or not 0 < idle_timeout_seconds <= _MAX_SAFE_DIRECT_STREAM_IDLE_SECONDS
+        or isinstance(observed_provider_event_count, bool)
+        or not isinstance(observed_provider_event_count, int)
+        or not 1 <= observed_provider_event_count <= _MAX_SAFE_DIRECT_STREAM_EVENT_COUNT
+    ):
+        return {}
+    return {
+        "waiting_phase": waiting_phase,
+        "idle_timeout_seconds": idle_timeout_seconds,
+        "observed_provider_event_count": observed_provider_event_count,
+    }
+
+
 def _direct_no_first_provider_event_condition(details: JsonObject) -> str:
     waiting_phase = details.get("waiting_phase")
     first_event_timeout_seconds = details.get("first_event_timeout_seconds")
@@ -1017,6 +1317,18 @@ def _direct_no_first_provider_event_condition(details: JsonObject) -> str:
         )
         return f"{stage} within {first_event_timeout_seconds:g} seconds"
     return "the Direct Provider produced no first event before its liveness bound"
+
+
+def _codex_no_first_provider_event_condition(details: JsonObject) -> str:
+    first_event_timeout_seconds = details.get("first_event_timeout_seconds")
+    if isinstance(first_event_timeout_seconds, (int, float)) and not isinstance(
+        first_event_timeout_seconds, bool
+    ):
+        return (
+            "the Codex worker produced no validated Provider event within "
+            f"{first_event_timeout_seconds:g} seconds"
+        )
+    return "the Codex worker produced no validated Provider event before its liveness bound"
 
 
 def _direct_provider_stream_stalled_condition(details: JsonObject) -> str:
@@ -1036,6 +1348,23 @@ def _direct_provider_stream_stalled_condition(details: JsonObject) -> str:
     return "the Direct Provider stream stopped yielding events after it had started"
 
 
+def _codex_provider_stream_stalled_condition(details: JsonObject) -> str:
+    idle_timeout_seconds = details.get("idle_timeout_seconds")
+    observed_provider_event_count = details.get("observed_provider_event_count")
+    if (
+        isinstance(idle_timeout_seconds, (int, float))
+        and not isinstance(idle_timeout_seconds, bool)
+        and isinstance(observed_provider_event_count, int)
+        and not isinstance(observed_provider_event_count, bool)
+    ):
+        return (
+            "the Codex worker emitted "
+            f"{observed_provider_event_count} validated Provider event(s) then yielded no next "
+            f"event for {idle_timeout_seconds:g} seconds"
+        )
+    return "the Codex worker stopped yielding Provider events after it had started"
+
+
 def _invalid_json_condition(details: JsonObject) -> str:
     parsed = _json_parse_details(details)
     if parsed is None:
@@ -1047,33 +1376,12 @@ def _invalid_json_condition(details: JsonObject) -> str:
     )
 
 
-def _transport_decode_condition(details: JsonObject) -> str:
-    transport = details.get("transport")
-    envelope_shape = details.get("envelope_shape")
-    if (
-        transport not in {"json_envelope", "provider_schema", "json_object"}
-        or envelope_shape not in _ENVELOPE_SHAPES
-    ):
-        return "structured output transport invalid (safe encoding detail unavailable)"
-    parsed = _json_parse_details(details)
-    if parsed is None:
-        return (
-            "structured output transport invalid "
-            f"(transport={transport}; envelope={envelope_shape})"
-        )
-    _shape, failure, offset, characters = parsed
-    return (
-        "structured output transport invalid "
-        f"(transport={transport}; envelope={envelope_shape}; parse={failure}; "
-        f"offset={offset}; chars={characters})"
-    )
-
-
 def _output_limit_condition(details: JsonObject) -> str:
     configured = _configured_output_limit(details)
     if configured is None:
         return (
-            "the provider stopped because the declared structured output token limit was exhausted"
+            "the provider stopped because its structured output envelope was exhausted "
+            "without a Direct adapter-declared output cap"
         )
     return (
         "the provider stopped because the declared structured output token limit was exhausted "
@@ -1085,11 +1393,11 @@ def _direct_invalid_json_expected_category(details: JsonObject) -> str:
     parsed = _json_parse_details(details)
     if parsed is not None:
         return (
-            "an effective Prompt, Runtime Skill, and Direct output-encoding audit using the safe "
-            "parse shape; make one explicit causal change before another real invocation"
+            "an effective Direct Prompt, native schema, and output-decoding audit using the "
+            "safe parse shape; make one explicit causal change before another real invocation"
         )
     return (
-        "one safe Direct output transport investigation; improve terminal feedback before another "
+        "one safe Direct output-encoding investigation; improve terminal feedback before another "
         "real invocation if it remains ambiguous"
     )
 
@@ -1098,44 +1406,12 @@ def _direct_invalid_json_remediation(details: JsonObject) -> str:
     parsed = _json_parse_details(details)
     if parsed is not None:
         return (
-            "Audit the effective output instructions and Runtime Skill against the safe parse "
-            "shape; change the shared transport prompt or adapter only after identifying the cause."
+            "Audit the effective Direct output instructions, native schema, and adapter against "
+            "the safe parse shape; make one causal change before another real boundary execution."
         )
     return (
-        "Improve the Direct malformed-output feedback projection before changing Prompt, Runtime "
-        "Skill, adapter, or model route."
-    )
-
-
-def _direct_transport_expected_category(details: JsonObject) -> str:
-    if _is_malformed_json_envelope_string(details):
-        return (
-            "a corrected shared json-envelope instruction that explicitly serializes the inner "
-            "artifact, after auditing effective Prompt and Runtime Skill; do not blind retry"
-        )
-    return (
-        "a corrected Direct output transport/adapter definition after auditing effective Prompt "
-        "and Runtime Skill; do not blind retry"
-    )
-
-
-def _direct_transport_remediation(details: JsonObject) -> str:
-    if _is_malformed_json_envelope_string(details):
-        return (
-            "Audit the shared json-envelope prompt for standard JSON string escaping and inspect "
-            "any Runtime Skill output instruction; then run this frozen boundary once."
-        )
-    return (
-        "Audit adapter decode logic, configured transport, effective Prompt, and Runtime Skill; "
-        "make one explicit causal change before another real boundary execution."
-    )
-
-
-def _is_malformed_json_envelope_string(details: JsonObject) -> bool:
-    return (
-        details.get("transport") == "json_envelope"
-        and details.get("envelope_shape") == "artifact_json_string"
-        and _json_parse_details(details) is not None
+        "Improve the Direct malformed-output feedback projection before changing Prompt, native "
+        "schema, adapter, or model route."
     )
 
 
@@ -1173,6 +1449,9 @@ def _direct_provider_exception_condition(code: str, details: JsonObject) -> str:
     status = details.get("http_status")
     if _safe_http_status(status):
         facts.append(f"http_status={status}")
+    transport_kind = details.get("transport_exception_kind")
+    if isinstance(transport_kind, str) and transport_kind in _DIRECT_TRANSPORT_EXCEPTION_KINDS:
+        facts.append(f"transport={transport_kind}")
     for key, label in (
         ("provider_error_shape", "shape"),
         ("provider_error_type", "type"),
@@ -1182,7 +1461,9 @@ def _direct_provider_exception_condition(code: str, details: JsonObject) -> str:
         value = details.get(key)
         if isinstance(value, str):
             facts.append(f"{label}={value}")
-    return f"{condition} ({'; '.join(facts)})" if facts else condition
+    result = f"{condition} ({'; '.join(facts)})" if facts else condition
+    advisory = _advisory_text_signal_phrase(details)
+    return f"{result}; advisory redacted-text signals: {advisory}" if advisory else result
 
 
 def _direct_invalid_request_expected_category(details: JsonObject) -> str:
@@ -1224,8 +1505,8 @@ def _direct_invalid_request_remediation(details: JsonObject) -> str:
         )
     if kind == "context_window":
         return (
-            "Inspect effective Prompt, Runtime Skill, and input size; split or reduce the boundary "
-            "before one new real execution."
+            "Inspect effective Direct Prompt and input size; split or reduce the boundary before "
+            "one new real execution."
         )
     if kind == "model_route":
         return "Inspect the Direct model/profile route before one authorized real execution."
@@ -1267,6 +1548,8 @@ def _direct_invalid_request_kind(details: JsonObject) -> str:
 def _provider_unavailable_condition(details: JsonObject) -> str:
     source = details.get("codex_error_info")
     phrases = {
+        "enum:internalservererror": "returned an internal server error",
+        "enum:serveroverloaded": "reported that it is overloaded",
         "transport:http_connection_failed": "connection failed",
         "transport:response_stream_connection_failed": "response-stream connection failed",
         "transport:response_stream_disconnected": "response stream disconnected",
@@ -1326,10 +1609,11 @@ def _advisory_text_signal_phrase(details: JsonObject) -> str | None:
     if (
         not isinstance(signals, list)
         or not signals
-        or len(signals) > len(_CODEX_ADVISORY_TEXT_SIGNALS)
+        or len(signals) > len(_PROVIDER_ADVISORY_TEXT_SIGNALS)
         or len(set(signals)) != len(signals)
         or not all(
-            isinstance(signal, str) and signal in _CODEX_ADVISORY_TEXT_SIGNALS for signal in signals
+            isinstance(signal, str) and signal in _PROVIDER_ADVISORY_TEXT_SIGNALS
+            for signal in signals
         )
     ):
         return None
@@ -1421,22 +1705,16 @@ def _parse_offset(exc: Exception) -> int:
     return min(max(0, exc.pos), _MAX_SAFE_RESPONSE_CHARACTERS)
 
 
-def _envelope_shape(value: JsonValue) -> str:
-    if isinstance(value, dict):
-        return "artifact_json_object"
-    if isinstance(value, list):
-        return "artifact_json_array"
-    return "artifact_json_scalar"
-
-
 __all__ = [
+    "advisory_terminal_text_signals",
+    "codex_no_first_provider_event_details",
+    "codex_provider_stream_stalled_details",
     "direct_invalid_json_details",
     "direct_no_first_provider_event_details",
     "direct_output_limit_details",
     "direct_provider_response_error_details",
     "direct_provider_stream_stalled_details",
     "direct_provider_exception_details",
-    "direct_transport_decode_details",
     "safe_terminal_code",
     "safe_terminal_condition",
     "safe_terminal_details",

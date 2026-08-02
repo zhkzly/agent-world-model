@@ -556,7 +556,7 @@ class WorldSpec(V2Contract):
     boundary: WorldBoundary
     state: StateSchema
     tools: Annotated[tuple[ToolContract, ...], Field(min_length=1)]
-    invariants: Annotated[tuple[Rule, ...], Field(min_length=1, max_length=512)]
+    invariants: Annotated[tuple[Rule, ...], Field(max_length=512)]
     task_dimensions: Annotated[tuple[Identifier, ...], Field(min_length=1)]
     fidelity: Annotated[tuple[FidelityStatement, ...], Field(min_length=1)]
     unknowns: tuple[NonEmptyStr, ...] = ()

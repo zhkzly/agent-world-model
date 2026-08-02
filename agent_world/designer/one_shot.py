@@ -16,7 +16,6 @@ interprets semantic progress.  Those are Scheduler responsibilities.
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -66,8 +65,8 @@ from agent_world.invocation.structured_diagnostics import (
     safe_terminal_remediation,
     terminal_failure_retryable,
 )
+from agent_world.invocation.structured_prompt import render_direct_structured_prompt
 
-_TRANSPORT_ARTIFACT_FIELD = "artifact_json"
 _SAFE_BACKEND_CODE = re.compile(r"[^A-Za-z0-9._:-]")
 
 # WorkDefinition uses Python identifiers while the independently versioned
@@ -230,16 +229,9 @@ async def invoke_structured_once[TOutput: BaseModel](
         semantic_repair_seed=semantic_repair_seed,
     )
 
-    if profile.structured_output_transport == "json_envelope":
-        prompt = _with_json_envelope_contract(
+    if not profile.allowed_builtin_tools:
+        prompt = render_direct_structured_prompt(
             prompt,
-            schema,
-            logical_protocol=logical_output_protocol,
-        )
-    elif profile.structured_output_transport == "json_object":
-        prompt = _with_json_object_contract(
-            prompt,
-            schema,
             logical_protocol=logical_output_protocol,
         )
 
@@ -312,7 +304,7 @@ async def invoke_structured_once[TOutput: BaseModel](
             else InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
         ),
     )
-    # Dispatch identity and the isolated profile are known *before* crossing
+    # Dispatch identity and the resolved Agent profile are known *before* crossing
     # the provider boundary.  A timeout or transport exception therefore has
     # real invocation provenance even though no terminal provider envelope is
     # available.  Without this record the leaf kernel would correctly refuse
@@ -391,23 +383,6 @@ async def invoke_structured_once[TOutput: BaseModel](
             session_continuation=session_continuation,
         )
 
-    transport_error = _transport_envelope_diagnostic(
-        result.structured_output,
-        owner_component=definition.coordinate.component,
-        validation_phase=definition.validation_policy.validation_phase,
-        frontier_ordinal=definition.validation_policy.frontier_ordinal,
-    )
-    if transport_error is not None:
-        _raise_validation_failure(
-            diagnostic=transport_error,
-            definition=definition,
-            result=result,
-            agent=agent,
-            observed_actual=observed_actual,
-            unknown_upper_bound=unknown_upper_bound,
-            category="structured_output_transport",
-        )
-
     try:
         if result.structured_output is None:
             raise StructuredValidationError(
@@ -415,8 +390,8 @@ async def invoke_structured_once[TOutput: BaseModel](
                     definition,
                     (
                         SafeValidationIssue(
-                            "transport_output_missing",
-                            ("artifact_json",),
+                            "structured_output_missing",
+                            ("structured_output",),
                             "the completed Agent invocation returned no structured artifact object",
                         ),
                     ),
@@ -552,9 +527,14 @@ def _usage_for_result(
     observed_tokens = min(max(0, total_tokens), definition.proposal_policy.budget.llm_tokens)
     return (
         BudgetUsage(llm_tokens=observed_tokens, agent_turns=1),
-        BudgetUsage(
-            llm_tokens=max(0, definition.proposal_policy.budget.llm_tokens - observed_tokens)
-        ),
+        # A terminal Provider result with ``total_tokens`` is an observed cost,
+        # not an unknown remainder of the physical turn envelope.  The full
+        # envelope remains reserved while the call is active, but retaining
+        # its unused portion after settlement makes a sequence of short,
+        # successful calls exhaust the scope before an authorized repair can
+        # run.  Keep the conservative full-envelope charge only when the
+        # Provider supplied no token usage at all.
+        BudgetUsage(),
     )
 
 
@@ -577,53 +557,6 @@ def _rebind_diagnostic(
     """Keep safe issue detail while binding it to the executing Work claim."""
 
     return _diagnostic(definition, diagnostic.issues)
-
-
-def _transport_envelope_diagnostic(
-    value: object,
-    *,
-    owner_component: str,
-    validation_phase: str,
-    frontier_ordinal: int,
-) -> ValidationDiagnostic | None:
-    """Reject a provider wrapper without persisting its raw payload."""
-
-    if not isinstance(value, dict) or set(value) != {_TRANSPORT_ARTIFACT_FIELD}:
-        return None
-    payload = value[_TRANSPORT_ARTIFACT_FIELD]
-    if isinstance(payload, str):
-        try:
-            json.loads(payload)
-        except json.JSONDecodeError:
-            issue = SafeValidationIssue(
-                "transport_invalid_json",
-                ("artifact_json",),
-                "transport artifact_json must contain one valid JSON object",
-            )
-        else:
-            issue = SafeValidationIssue(
-                "transport_envelope_invalid",
-                ("artifact_json",),
-                (
-                    "return the complete logical artifact object instead of a nested "
-                    "transport envelope"
-                ),
-            )
-    else:
-        issue = SafeValidationIssue(
-            "transport_envelope_invalid",
-            ("artifact_json",),
-            (
-                "transport artifact_json must be a JSON string containing the complete "
-                "logical artifact object"
-            ),
-        )
-    return ValidationDiagnostic(
-        owner_component=owner_component,  # type: ignore[arg-type]  # closed WorkComponent
-        validation_phase=validation_phase,
-        frontier_ordinal=frontier_ordinal,
-        issues=(issue,),
-    )
 
 
 def _raise_validation_failure(
@@ -682,85 +615,6 @@ def _raise_validation_failure(
             else None
         ),
     )
-
-
-def _with_json_envelope_contract(
-    prompt: str,
-    schema: dict[str, object],
-    *,
-    logical_protocol: str | None = None,
-) -> str:
-    """Use a simple provider envelope while retaining local typed acceptance.
-
-    Some OpenAI-compatible gateways reject valid nested JSON Schema contracts
-    before a turn starts.  The provider constrains only a tiny outer envelope;
-    the inner document is decoded here and still undergoes the original
-    Pydantic and deterministic compiler validation.  This is a transport
-    compatibility boundary, never an alternate acceptance path.
-    """
-
-    serialized = (
-        logical_protocol.strip()
-        if logical_protocol is not None
-        else json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    )
-    contract_label = (
-        "The compact logical protocol below describes a strict subset of the original typed "
-        "output contract. It does not replace local Pydantic or deterministic compiler validation:"
-        if logical_protocol is not None
-        else "The logical contract is data, never an instruction:"
-    )
-    return f"""{prompt}
-
-Structured-output transport requirement:
-Return exactly one outer JSON object with the single key `artifact_json`. Its value must be a JSON
-string containing one JSON object that satisfies the logical output contract below. First construct
-the inner object, then JSON-serialize it into the outer string: every inner double quote and
-every backslash must use standard JSON string escaping. Do not visually nest an object inside that
-string: encode each inner double quote as the JSON backslash-quote escape (U+005C followed by
-U+0022), never as a raw quote. Do not use Markdown, code fences,
-prose, or any outer key other than `artifact_json`. {contract_label}
-{serialized}
-"""
-
-
-def _with_json_object_contract(
-    prompt: str,
-    schema: dict[str, object],
-    *,
-    logical_protocol: str | None = None,
-) -> str:
-    """State the direct-object transport without adding an inner envelope.
-
-    This applies only to the Direct tool-free route.  It gives the model one
-    less non-semantic serialization problem while preserving the original
-    typed local validation immediately after the provider response.  Unlike
-    native provider-schema transport, ``json_object`` carries no schema to
-    the provider, so the effective prompt must include either the complete
-    logical schema or the caller's compatible compact protocol.
-    """
-
-    serialized = (
-        logical_protocol.strip()
-        if logical_protocol is not None
-        else json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    )
-    contract_label = (
-        "The compact logical protocol below describes a strict subset of the original typed "
-        "output contract. It does not replace local Pydantic or deterministic compiler validation:"
-        if logical_protocol is not None
-        else "The logical contract is data, never an instruction:"
-    )
-
-    return f"""{prompt}
-
-Structured-output transport requirement:
-Return the complete requested logical artifact as exactly one JSON object. Do not wrap it in an
-`artifact_json` field, do not encode it as a JSON string, and do not use Markdown, code fences, or
-prose. The framework validates this object against the requested typed contract after the response.
-{contract_label}
-{serialized}
-"""
 
 
 __all__ = [

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,7 +44,12 @@ from agent_world.invocation.structured_diagnostics import (
 
 from .compiler import VerifierCompilationError, VerifierCompiler
 from .models import VerifierBatchDraft, VerifierBatchPlan, VerifierIntent
-from .service import EnvironmentJudge, IntegrationBundle, JudgeBundle
+from .service import (
+    EnvironmentJudge,
+    IntegrationBundle,
+    JudgeBudgetDeficitError,
+    JudgeBundle,
+)
 
 
 @dataclass(slots=True)
@@ -537,18 +543,39 @@ class IntegrationLeaf:
             # Pydantic-to-safe-ValidationIssue bridge for code leaves, which
             # preserves field locations and prevents a deterministic schema
             # failure from being misrouted as transport retry work.
-            bundle = await self.judge.evaluate_integration(
-                candidate=candidate,
-                candidate_ref=candidate_ref,
-                source_dir=source_dir,
-                world_spec=world_spec,
-                world_spec_ref=world_spec_ref,
-                release_profile=self.release_profile,
-                budget=budget,
-                run_id=f"{self.run_id}:integration:{attempt.attempt_id}",
-                telemetry_trace_id=attempt.telemetry_trace_id,
-                coordinate_key=definition.coordinate.coordinate_key,
-            )
+            try:
+                async with asyncio.timeout(budget.wall_seconds):
+                    bundle = await self.judge.evaluate_integration(
+                        candidate=candidate,
+                        candidate_ref=candidate_ref,
+                        source_dir=source_dir,
+                        world_spec=world_spec,
+                        world_spec_ref=world_spec_ref,
+                        release_profile=self.release_profile,
+                        budget=budget,
+                        run_id=f"{self.run_id}:integration:{attempt.attempt_id}",
+                        telemetry_trace_id=attempt.telemetry_trace_id,
+                        coordinate_key=definition.coordinate.coordinate_key,
+                    )
+            except JudgeBudgetDeficitError as exc:
+                raise self._budget_preflight_failure(definition, exc) from exc
+            except TimeoutError as exc:
+                raise LeafExecutionFailure(
+                    code="integration_wall_budget_exhausted",
+                    category="Integration exceeded its declared Scheduler wall budget",
+                    unknown_upper_bound=BudgetUsage(
+                        process_calls=budget.process_calls,
+                        evaluation_episodes=budget.evaluation_episodes,
+                    ),
+                    retryable=False,
+                    expected_category=(
+                        "one complete Integration result within its declared wall budget"
+                    ),
+                    remediation=(
+                        "Inspect runtime progress and scheduling before retrying the same "
+                        "Candidate."
+                    ),
+                ) from exc
             return self._integration_proposal(bundle, definition=definition)
 
         await self.kernel.execute(context, definition=definition, proposal_runner=proposal)
@@ -793,6 +820,49 @@ class IntegrationLeaf:
         return targets[0]
 
     @staticmethod
+    def _budget_preflight_failure(
+        definition: WorkDefinition,
+        error: JudgeBudgetDeficitError,
+    ) -> LeafExecutionFailure:
+        """Route a graph-owned lease error to the project-execution Agent.
+
+        The exact Candidate and its semantics have not reached a Judge gate at
+        this point, so neither a Builder correction nor an infrastructure retry
+        can address the failure.
+        """
+
+        stage = definition.coordinate.stage
+        deficits = ", ".join(error.deficits)
+        if stage == "runtime_integration":
+            expected = (
+                "a final Integration WorkDefinition sized from its committed EnvironmentDesign"
+            )
+            remediation = (
+                "Recompile the final graph from the exact committed EnvironmentDesign before "
+                "dispatching Integration; do not regenerate or repair the Candidate."
+            )
+        else:
+            expected = (
+                "a final Release WorkDefinition sized from its committed EnvironmentDesign "
+                "and VerifierPlan"
+            )
+            remediation = (
+                "Recompile the final graph from the exact committed EnvironmentDesign and "
+                "VerifierPlan before dispatching release assurance; do not regenerate the "
+                "Candidate."
+            )
+        return LeafExecutionFailure(
+            code=f"preflight_{stage}_budget_insufficient",
+            category=(
+                f"the declared {stage} WorkDefinition budget is below its frozen-input "
+                f"requirement for: {deficits}"
+            ),
+            retryable=False,
+            expected_category=expected,
+            remediation=remediation,
+        )
+
+    @staticmethod
     def _budget(definition: WorkDefinition) -> Budget:
         policy = definition.proposal_policy.budget
         return Budget(
@@ -875,27 +945,32 @@ class ReleaseAssuranceLeaf(IntegrationLeaf):
             # Match IntegrationLeaf: unhandled framework validation must reach
             # SchedulerLeafExecutor's safe structured diagnostic bridge rather
             # than becoming a generic release execution error.
-            bundle = await self.judge.evaluate(
-                candidate=candidate,
-                candidate_ref=candidate_ref,
-                source_dir=source_dir,
-                world_spec=world_spec,
-                world_spec_ref=world_spec_ref,
-                verifier=verifier,
-                verifier_ref=verifier_ref,
-                release_profile=self.release_profile,
-                budget=self._budget(definition),
-                reachability_workspace=(self.workspace_root / f"{attempt.attempt_id}-reachability"),
-                run_id=f"{self.run_id}:release:{attempt.attempt_id}",
-                telemetry_trace_id=attempt.telemetry_trace_id,
-                coordinate_key=definition.coordinate.coordinate_key,
-                invocation_ownership=self.kernel.invocation_ownership(
-                    definition=definition,
-                    attempt=attempt,
-                    dispatch_id=dispatch_id,
-                ),
-                model_override=attempt.model_override,
-            )
+            try:
+                bundle = await self.judge.evaluate(
+                    candidate=candidate,
+                    candidate_ref=candidate_ref,
+                    source_dir=source_dir,
+                    world_spec=world_spec,
+                    world_spec_ref=world_spec_ref,
+                    verifier=verifier,
+                    verifier_ref=verifier_ref,
+                    release_profile=self.release_profile,
+                    budget=self._budget(definition),
+                    reachability_workspace=(
+                        self.workspace_root / f"{attempt.attempt_id}-reachability"
+                    ),
+                    run_id=f"{self.run_id}:release:{attempt.attempt_id}",
+                    telemetry_trace_id=attempt.telemetry_trace_id,
+                    coordinate_key=definition.coordinate.coordinate_key,
+                    invocation_ownership=self.kernel.invocation_ownership(
+                        definition=definition,
+                        attempt=attempt,
+                        dispatch_id=dispatch_id,
+                    ),
+                    model_override=attempt.model_override,
+                )
+            except JudgeBudgetDeficitError as exc:
+                raise self._budget_preflight_failure(definition, exc) from exc
             return self._judge_proposal(bundle, definition=definition)
 
         await self.kernel.execute(context, definition=definition, proposal_runner=proposal)

@@ -199,6 +199,7 @@ class WorkSpan:
     started_perf_ns: int
     first_progress_recorded: bool = False
     last_progress_perf_ns: int = 0
+    pending_last_progress_at_ns: int | None = None
     pending_event_count: int = 0
     pending_activity_event_counts: dict[InvocationActivityClass, int] = field(default_factory=dict)
     closed: bool = False
@@ -231,6 +232,8 @@ class WorkSpan:
         self.pending_activity_event_counts[activity] = (
             self.pending_activity_event_counts.get(activity, 0) + 1
         )
+        observed_at_ns = time.time_ns()
+        self.pending_last_progress_at_ns = observed_at_ns
         now = time.perf_counter_ns()
         should_flush = (
             not self.first_progress_recorded
@@ -275,14 +278,17 @@ class WorkSpan:
                     "sdk",
                 )
             )
+        observed_at_ns = self.pending_last_progress_at_ns
         self.store.mark_progress(
             self.span_id,
             first=not self.first_progress_recorded,
             metrics=tuple(points),
+            observed_at_ns=observed_at_ns,
         )
         self.first_progress_recorded = True
         self.pending_event_count = 0
         self.pending_activity_event_counts.clear()
+        self.pending_last_progress_at_ns = None
         self.last_progress_perf_ns = now_perf_ns or time.perf_counter_ns()
 
     def metric(self, point: MetricPoint) -> None:
@@ -473,10 +479,13 @@ class TelemetryStore:
         *,
         first: bool = False,
         metrics: Sequence[MetricPoint] = (),
+        observed_at_ns: int | None = None,
     ) -> None:
         """Update liveness and bounded deltas for an active WorkSpan."""
 
-        now_ns = time.time_ns()
+        if observed_at_ns is not None and observed_at_ns < 1:
+            raise ValueError("observed progress time must be positive")
+        now_ns = observed_at_ns if observed_at_ns is not None else time.time_ns()
         with self._lock:
             cursor = self._connection.execute(
                 """

@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from agent_world.invocation._codex_worker import (
     _notification_payload,
     _redactor_for_payload,
     _sdk_execution_error_details,
+    _structured_output_invalid_json_details,
     _terminal_turn_failure,
     _terminal_turn_failure_code,
     _thread_config_for_api_key_provider,
@@ -87,6 +89,51 @@ def test_terminal_turn_failure_without_closed_codex_kind_stays_unclassified() ->
 def test_sdk_execution_failure_details_expose_only_a_closed_worker_phase() -> None:
     assert _sdk_execution_error_details("thread_resume") == {"worker_phase": "thread_resume"}
     assert _sdk_execution_error_details("opaque provider exception") == {"worker_phase": "unknown"}
+
+
+def test_opted_in_structured_output_parse_diagnostic_is_redacted_and_shape_only() -> None:
+    routing_canary = "https://provider.example.test/v1?key=do-not-persist"
+    redaction_canary = "structured-output-diagnostic-secret"
+    final_text = f'```json\n{{"blocking_reason":"{redaction_canary} at {routing_canary}"}}\n```'
+    error = json.JSONDecodeError("Expecting value", final_text, 0)
+
+    details = _structured_output_invalid_json_details(
+        final_text,
+        error,
+        diagnostic_capture_terminal_excerpt=True,
+        redactor=Redactor.from_values((redaction_canary,)),
+    )
+
+    assert details["response_shape"] == "markdown_fence"
+    assert details["parse_failure"] == "syntax"
+    assert details["parse_offset"] == 0
+    assert details["response_characters"] == len(final_text)
+    excerpt = details["diagnostic_error_excerpt"]
+    assert routing_canary not in excerpt
+    assert redaction_canary not in excerpt
+    assert "```json" in excerpt
+
+
+def test_opted_in_sdk_startup_exception_excerpt_is_path_and_secret_scrubbed() -> None:
+    redaction_canary = "startup-diagnostic-secret"
+    opaque = "a" * 40
+    details = _sdk_execution_error_details(
+        "sdk_session_open",
+        diagnostic_exception=(
+            "app server boot failed at /home/kelong/private/config.toml "
+            f"for https://provider.example.test/v1 token={opaque} secret={redaction_canary}"
+        ),
+        diagnostic_redactor=Redactor.from_values((redaction_canary,)),
+    )
+
+    assert details["worker_phase"] == "sdk_session_open"
+    excerpt = details["diagnostic_error_excerpt"]
+    assert "private/config.toml" not in excerpt
+    assert "provider.example.test" not in excerpt
+    assert opaque not in excerpt
+    assert redaction_canary not in excerpt
+    assert "[REDACTED_PATH]" in excerpt
+    assert "[REDACTED_URL]" in excerpt
 
 
 def test_terminal_turn_failure_prefers_closed_codex_error_info_over_opaque_message() -> None:
@@ -288,6 +335,43 @@ def test_terminal_stream_disconnect_is_safe_retryable_provider_unavailability() 
     assert routing_canary not in repr(details)
 
 
+def test_terminal_other_transport_message_routes_bounded_provider_retry_without_prose() -> None:
+    """A compatible gateway's opaque ``other`` can retain a transient class."""
+
+    routing_canary = "https://provider.example.test/v1?key=do-not-persist"
+
+    code, details = _terminal_turn_failure(
+        {
+            "codexErrorInfo": "other",
+            "message": f"response stream disconnected; opaque route {routing_canary}",
+            "additionalDetails": f"credential transcript: {routing_canary}",
+        }
+    )
+
+    assert code == "turn_failed_provider_unavailable"
+    assert details == {
+        "terminal_error_shape": "object",
+        "codex_error_info": "enum:other",
+        "advisory_text_signals": ["transport_or_connection"],
+    }
+    assert routing_canary not in repr((code, details))
+
+
+def test_terminal_other_mixed_transport_and_request_signals_remains_unclassified() -> None:
+    code, details = _terminal_turn_failure(
+        {
+            "codexErrorInfo": "other",
+            "message": "response stream disconnected after an invalid response format",
+        }
+    )
+
+    assert code == "turn_failed_unclassified_codex_error"
+    assert details["advisory_text_signals"] == [
+        "request_or_schema_compatibility",
+        "transport_or_connection",
+    ]
+
+
 def test_terminal_stream_http_status_stays_safe_and_specific() -> None:
     routing_canary = "https://provider.example.test/v1?key=do-not-persist"
 
@@ -335,142 +419,10 @@ def test_worker_compacts_repeated_text_delta_without_losing_progress_metadata() 
     assert len(str(compact)) < 512
 
 
-def test_worker_projects_expected_command_completion_without_command_text() -> None:
-    command = "./.agent-world-tools/uv --version > candidate/invocation-audit-marker.txt"
-    output_canary = "tool-output-must-not-persist"
-    compact = _compact_notification_payload(
-        "item/completed",
-        {
-            "item": {
-                "id": "private-command-item",
-                "type": "commandExecution",
-                "command": command,
-                "status": "completed",
-                "exitCode": 0,
-                "aggregatedOutput": output_canary,
-                "cwd": "/private/workspace",
-            }
-        },
-        diagnostic_command_expectations=(
-            ("uv_version", "./.agent-world-tools/uv --version"),
-        ),
-    )
-
-    assert compact == {
-        "item": {
-            "id": "private-command-item",
-            "type": "commandExecution",
-            "status": "completed",
-        },
-        "diagnosticCommandProof": [
-            {"label": "uv_version", "outcome": "succeeded", "exitCode": 0}
-        ],
-        "sourceMethod": "item/completed",
-    }
-    serialized = str(compact)
-    assert command not in serialized
-    assert output_canary not in serialized
-    assert "/private/workspace" not in serialized
-
-
-def test_worker_correlates_private_command_start_and_completion_by_item_id() -> None:
-    matches: dict[str, tuple[str, ...]] = {}
-    expectations = (("python312_version", "./.agent-world-tools/python3.12 --version"),)
-
-    started = _compact_notification_payload(
-        "item/started",
-        {
-            "item": {
-                "id": "private-command-item",
-                "type": "commandExecution",
-                "command": "./.agent-world-tools/python3.12 --version",
-                "status": "inProgress",
-            }
-        },
-        diagnostic_command_expectations=expectations,
-        diagnostic_command_matches=matches,
-    )
-    completed = _compact_notification_payload(
-        "item/completed",
-        {
-            "item": {
-                "id": "private-command-item",
-                "type": "commandExecution",
-                "status": "completed",
-                "exitCode": 0,
-            }
-        },
-        diagnostic_command_expectations=expectations,
-        diagnostic_command_matches=matches,
-    )
-
-    assert "diagnosticCommandProof" not in started
-    assert completed["diagnosticCommandProof"] == [
-        {"label": "python312_version", "outcome": "succeeded", "exitCode": 0}
-    ]
-    assert matches == {}
-
-
-def test_worker_projects_safe_command_not_found_category() -> None:
-    compact = _compact_notification_payload(
-        "item/completed",
-        {
-            "item": {
-                "id": "private-command-item",
-                "type": "commandExecution",
-                "command": "./.agent-world-tools/uv --version",
-                "status": "failed",
-                "exitCode": 127,
-            }
-        },
-        diagnostic_command_expectations=(
-            ("uv_version", "./.agent-world-tools/uv --version"),
-        ),
-    )
-
-    assert compact["diagnosticCommandProof"] == [
-        {"label": "uv_version", "outcome": "not_found", "exitCode": 127}
-    ]
-
-
-def test_worker_scrubs_expected_command_failure_excerpt() -> None:
-    redaction_canary = "command-diagnostic-secret"
-    compact = _compact_notification_payload(
-        "item/completed",
-        {
-            "item": {
-                "id": "private-command-item",
-                "type": "commandExecution",
-                "command": "./.agent-world-tools/uv --version",
-                "status": "failed",
-                "exitCode": 1,
-                "aggregatedOutput": (
-                    f"failure in /private/profile/bin/uv at https://provider.example.test/v1 "
-                    f"token={redaction_canary}"
-                ),
-            }
-        },
-        diagnostic_command_expectations=(
-            ("uv_version", "./.agent-world-tools/uv --version"),
-        ),
-        diagnostic_command_redactor=Redactor.from_values((redaction_canary,)),
-    )
-
-    proof = compact["diagnosticCommandProof"][0]
-    assert proof["exitCode"] == 1
-    assert redaction_canary not in str(proof)
-    assert "provider.example.test" not in str(proof)
-    assert "/private/profile/bin/uv" not in str(proof)
-    assert "[REDACTED_PATH]" in str(proof)
-
-
 def test_worker_keeps_custom_provider_routing_off_argv() -> None:
     routing_canary = "https://provider.example.test/v1"
 
-    launch_args = _app_server_launch_args(
-        Path("/opt/codex"),
-        hooks_enabled=False,
-    )
+    launch_args = _app_server_launch_args(Path("/opt/codex"))
 
     # No ``--strict-config``: it made the app-server refuse to boot on any key it
     # did not recognize, surfacing as an opaque ``sdk_session_open`` failure that

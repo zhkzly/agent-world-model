@@ -16,7 +16,7 @@ from v3_fixture import (
     portable_counter_contracts,
 )
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.artifact_store import ArtifactStore, ArtifactWriter
 from agent_world.builder import (
     BuildBundle,
@@ -232,7 +232,7 @@ def _real_controller(root: Path) -> FoundryController:
         ),
     )
     registry = EnvironmentRegistry(root / "registry", artifacts)
-    profiles = IsolatedAgentProfileProvider(agent, source_environment={})
+    profiles = AgentProfileProvider(agent, source_environment={})
     backend = CodexSdkBackend()
     research = build_research_toolchain(research_config, source_environment={})
     designer = EnvironmentDesigner(
@@ -330,6 +330,7 @@ def test_discovery_budget_preflight_fails_terminally_without_touching_direct(
         run = _RunState(
             run_id="run:discovery-preflight",
             job_ref=job_ref,
+            scope_id=job_ref.artifact_id,
             ledger=BudgetLedger(request.budget),
         )
         run.remember(request_ref, job_ref)
@@ -567,6 +568,7 @@ def test_expansion_identity_gate_rejection_is_typed_design_rework(tmp_path: Path
     run = _RunState(
         run_id="candidate-run:identity-rework",
         job_ref=subject_ref,
+        scope_id=subject_ref.artifact_id,
         ledger=BudgetLedger(Budget(repair_attempts=1, wall_seconds=30)),
     )
 
@@ -2425,6 +2427,7 @@ def _discovery_scenario(tmp_path: Path, name: str) -> _DiscoveryScenario:
     run = _RunState(
         run_id=f"run:{name}",
         job_ref=job_ref,
+        scope_id=job_ref.artifact_id,
         ledger=BudgetLedger(controller.config.generation_budget),
     )
     run.remember(request_ref, job_ref, spec_ref, state_ref)
@@ -2632,6 +2635,7 @@ def _builder_repair_scenario(tmp_path: Path, name: str) -> _BuilderRepairScenari
     run = _RunState(
         run_id=f"run:{name}:builder-repair",
         job_ref=discovery.run.job_ref,
+        scope_id=discovery.run.job_ref.artifact_id,
         ledger=BudgetLedger(control_budget),
     )
     run.remember(

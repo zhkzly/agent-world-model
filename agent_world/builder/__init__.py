@@ -15,6 +15,11 @@ from .models import (
     RepairDisclosure,
     normalize_candidate_completion_output,
 )
+from .precommit import (
+    CandidatePrecommitInfrastructureError,
+    CandidateWorkspaceProbe,
+    HostCandidateWorkspaceProbe,
+)
 from .service import (
     AgentProfileProvider,
     BuildBundle,
@@ -41,16 +46,19 @@ __all__ = [
     "BuilderLeaf",
     "BuilderSessionState",
     "CandidateCompletion",
+    "CandidateWorkspaceProbe",
     "CandidateFileDeclaration",
     "CandidatePublicSelfCheckDeclaration",
     "CandidateRuntimeDeclaration",
     "CandidateTaskMaterializerDeclaration",
     "CandidateWorkspaceError",
     "CandidateWorkspaceValidator",
+    "CandidatePrecommitInfrastructureError",
     "EnvironmentBuilder",
     "ImplementationContract",
     "ImplementationPlan",
     "ImplementationPlanDraft",
+    "HostCandidateWorkspaceProbe",
     "RepairDisclosure",
     "ValidatedCandidateFile",
     "ValidatedCandidateWorkspace",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -28,7 +28,9 @@ _MISSING = object()
 _MAX_RUNTIME_CONTAINER_ITEMS = 10_000
 _MAX_INTEGER_BITS = 4096
 _FORMAT_CHECKER = FormatChecker()
-_ACTION_ONLY_RULE_SOURCES = frozenset({"args", "tool_result", "error", "events"})
+_RESET_UNAVAILABLE_RULE_SOURCES = frozenset(
+    {"args", "tool_result", "error", "events", "terminated", "truncated"}
+)
 
 
 class RuleEvaluationError(ValueError):
@@ -144,18 +146,26 @@ def rule_value_sources(rule: Rule) -> frozenset[str]:
     return frozenset(sources)
 
 
-def initially_evaluable_invariants(invariants: tuple[Rule, ...]) -> tuple[Rule, ...]:
-    """Route only invariants whose inputs exist before the first Runtime action.
+def initially_evaluable_rules(rules: Iterable[Rule]) -> tuple[Rule, ...]:
+    """Keep only Rules whose declared inputs exist at Runtime reset.
 
-    Action-scoped roots intentionally contain no meaningful value during reset.  Those
-    invariants remain mandatory in ``validate_tool_execution`` after every real action.
+    Action-scoped roots intentionally contain no meaningful value during reset. Callers
+    must not fabricate an empty action merely to evaluate them: World invariants remain
+    mandatory in ``validate_tool_execution`` after every real action, while task and
+    sampling rules are evaluated only by a boundary that has their declared inputs.
     """
 
     return tuple(
         rule
-        for rule in invariants
-        if not (rule_value_sources(rule) & _ACTION_ONLY_RULE_SOURCES)
+        for rule in rules
+        if not (rule_value_sources(rule) & _RESET_UNAVAILABLE_RULE_SOURCES)
     )
+
+
+def initially_evaluable_invariants(invariants: tuple[Rule, ...]) -> tuple[Rule, ...]:
+    """Backward-compatible invariant-specific name for reset routing."""
+
+    return initially_evaluable_rules(invariants)
 
 
 def evaluate_task_reward(
@@ -469,6 +479,7 @@ __all__ = [
     "evaluate_task_reward",
     "evaluate_task_reward_contract",
     "evaluate_rule",
+    "initially_evaluable_rules",
     "initially_evaluable_invariants",
     "rule_value_sources",
 ]

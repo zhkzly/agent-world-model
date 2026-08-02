@@ -7,7 +7,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from agent_world.agent_profiles import logical_workspace_for_isolated_agent_workspace
+from agent_world.agent_profiles import logical_workspace_for_agent_workspace
 from agent_world.artifact_store import ArtifactStoreError
 from agent_world.contracts import (
     ArtifactRef,
@@ -41,6 +41,12 @@ from agent_world.control.work import (
 from agent_world.control.work_scheduler import WorkExecutionContext
 from agent_world.designer.one_shot import invoke_structured_once
 from agent_world.invocation import InvocationError, NodeCapabilityRequirement
+from agent_world.invocation.contracts import JsonObject
+from agent_world.invocation.recovery import (
+    InvocationFailureClass,
+    InvocationRecoveryEvidence,
+    InvocationRecoveryPolicy,
+)
 from agent_world.invocation.structured_diagnostics import (
     safe_terminal_code,
     safe_terminal_condition,
@@ -139,7 +145,7 @@ class BuildPlanningLeaf:
             # The private record stores the exact Agent workspace. Recover the
             # logical frozen-input root so profile resolution can reproduce
             # its primary or selected-fallback materialization layout.
-            workspace = logical_workspace_for_isolated_agent_workspace(session.workspace)
+            workspace = logical_workspace_for_agent_workspace(session.workspace)
             lineage_id = session.lineage_id
             prompt = self._continuation_prompt()
         self.builder.materialize_implementation_inputs(
@@ -304,42 +310,19 @@ class BuildPlanningLeaf:
 
     @staticmethod
     def _prompt(*, design_id: str) -> str:
-        return f"""You are the isolated Environment Engineer in BuildImplementationPlan mode.
+        return f"""You are BuildImplementationPlan for frozen design `{design_id}`.
 
-This is a read-only preparation boundary before one later CandidateBuild turn. Read the four
-immutable files in `inputs/`: `world-spec.json`, `curriculum.json`,
-`implementation-contract.json`, and `task-materializer-output.schema.json`.
+Follow the mounted `engineer-build-planning` Skill. This is advisory preparation
+for the later CandidateBuild turn only.
 
-Return a compact implementation map for frozen design `{design_id}`, targeted at roughly 8,000
-characters and never more than the 12,000-character output field. Cover: the smallest module/file
-layout; the shared implementation patterns that map state, tool transitions, permissions, and
-errors to code; the Task Materializer v3 mapping; the runtime JSONL/ABI boundary; public
-self-check/public-test strategy; validation order; and genuine risks or unresolved details with
-their authoritative frozen input.
-
-Where a Runtime ABI field has an exact wire-format literal, preserve that literal in the plan and
-its public-test strategy rather than reducing it to a generic type label. In particular, do not
-summarize a content-digest format as merely "a digest".
-
-Do not exhaustively restate every JSON field, Rule, transition, or schema clause. Group repeated
-patterns and cite a concrete tool/rule/input only where it changes implementation behavior or
-prevents ambiguity. CandidateBuild will read the complete frozen inputs itself; this plan is an
-orientation map, not a second transcription of the world.
-
-Do not write `candidate/`, do not create source files, and do not claim that code, tests, a
-Candidate, a Judge result, or release exists. Your text is advisory only: it cannot alter WorldSpec,
-curriculum, implementation contract, permissions, budgets, validation, repair, or release policy.
-Return only the requested ImplementationPlanDraft JSON."""
+Return one complete `ImplementationPlanDraft` JSON for this design only."""
 
     @staticmethod
     def _continuation_prompt() -> str:
-        return """Continue the same read-only BuildImplementationPlan task in the same workspace.
+        return """Continue the same BuildImplementationPlan task in the same workspace.
 
-The prior physical turn ended before it returned its complete structured plan. Preserve the frozen
-facts already inspected; reread an input only when needed to resolve an ambiguity. Return the full
-compact ImplementationPlanDraft JSON now: an orientation map under the 12,000-character contract,
-not an exhaustive transcription of all rules or schemas. Do not write candidate source, create
-files, run tests, or describe the interruption."""
+Follow the mounted `engineer-build-planning` Skill and return the complete
+requested `ImplementationPlanDraft` JSON only."""
 
 
 @dataclass(slots=True)
@@ -401,7 +384,7 @@ class BuilderLeaf:
         permissions = _generation_permissions(context, self.kernel)
         session_token_limit = definition.proposal_policy.session_token_limit
         session_wall_seconds = definition.proposal_policy.session_wall_seconds
-        continuation = self._load_output_limited_continuation(
+        continuation = self._load_session_continuation(
             context=context,
             attempt=attempt,
             definition=definition,
@@ -520,7 +503,13 @@ class BuilderLeaf:
                 bundle = await self.builder.resume_interrupted_workspace_build(
                     design=design,
                     design_ref=design_ref,
-                    workspace=workspace_recovery.workspace_for_recovery(),
+                    # The old workspace is authorized only as an untrusted
+                    # draft source.  The fresh Agent must receive a new
+                    # child-local workspace; Builder copies the eligible
+                    # candidate tree without exposing any host-path mapping to
+                    # the Agent.
+                    workspace=self.workspace_root / attempt.attempt_id,
+                    recovery_workspace=workspace_recovery.workspace_for_recovery(),
                     budget=self._budget(definition),
                     permissions=permissions,
                     run_id=self.run_id,
@@ -574,7 +563,7 @@ class BuilderLeaf:
                     )
                 else:
                     resumed_session = continuation.restore_session()
-                    bundle = await self.builder.resume_output_limited_build(
+                    bundle = await self.builder.resume_interrupted_session_build(
                         design=design,
                         design_ref=design_ref,
                         workspace=resumed_session.workspace,
@@ -606,7 +595,7 @@ class BuilderLeaf:
                         ),
                     )
                 resumed_session = continuation.restore_session()
-                bundle = await self.builder.resume_output_limited_build(
+                bundle = await self.builder.resume_interrupted_session_build(
                     design=design,
                     design_ref=design_ref,
                     workspace=resumed_session.workspace,
@@ -675,6 +664,9 @@ class BuilderLeaf:
                 if backend_terminal is not None
                 else not (preflight or exc.stage == "framework.diagnostic")
             )
+            terminal_details = (
+                safe_terminal_details(backend_terminal) if backend_terminal is not None else {}
+            )
             raise LeafExecutionFailure(
                 code=code,
                 category=(
@@ -700,19 +692,19 @@ class BuilderLeaf:
                     if backend_terminal is not None
                     else None
                 ),
-                terminal_details=(
-                    safe_terminal_details(backend_terminal)
-                    if backend_terminal is not None
-                    else None
-                ),
-                session_continuation=self._session_continuation_from_error(
+                terminal_details=terminal_details,
+                session_continuation=self._resumable_session_from_error(
                     code=code,
+                    terminal_details=terminal_details,
+                    retryable=retryable,
                     state=exc.state,
                     provenance=provenance,
                     definition=definition,
                 ),
                 workspace_recovery=self._workspace_recovery_from_error(
                     code=code,
+                    terminal_details=terminal_details,
+                    retryable=retryable,
                     state=exc.state,
                     provenance=provenance,
                     definition=definition,
@@ -744,7 +736,7 @@ class BuilderLeaf:
             agent=provenance,
         )
 
-    def _load_output_limited_continuation(
+    def _load_session_continuation(
         self,
         *,
         context: WorkExecutionContext,
@@ -753,10 +745,10 @@ class BuilderLeaf:
     ) -> NodeContinuationRecord | None:
         """Load only the private session authorized for this exact successor.
 
-        A semantic repair is deliberately not a continuation: it follows its
-        own feedback route.  This branch is available solely for the closed
-        Provider output ceiling and checks every public/private binding before
-        the Builder is allowed to reopen the same SDK thread.
+        A semantic repair is deliberately not a transport continuation: it
+        follows its own feedback route. This branch handles an output ceiling
+        or a classified transient terminal only after the Scheduler checks
+        every public/private binding before reopening the same SDK thread.
         """
 
         repair_action_ref = context.repair_action_ref
@@ -977,17 +969,38 @@ class BuilderLeaf:
 
         The Scheduler action carries only immutable artifact references.  This
         leaf verifies the whole relationship before materializing anything:
-        current successor -> exact prior WorkAttempt -> exact output closure
-        -> one Candidate.  It deliberately does not scan history, revive a
-        provider thread, or choose a "latest" candidate.
+        current successor -> authorized semantic correction -> exact output
+        closure -> one Candidate.  A Provider retry may be the current physical
+        action, but it must explicitly bind that original semantic correction;
+        it may not erase its feedback and fall back to an unrelated fresh build.
+        This path deliberately does not scan history, revive a provider thread,
+        or choose a "latest" candidate.
         """
 
-        repair_action_ref = context.repair_action_ref
-        if repair_action_ref is None:
+        physical_action_ref = context.repair_action_ref
+        if physical_action_ref is None:
             return None
-        action = self.kernel.runtime.artifacts.get_json(repair_action_ref, RepairAction)
+        physical_action = self.kernel.runtime.artifacts.get_json(
+            physical_action_ref,
+            RepairAction,
+        )
+        semantic_action_ref = context.semantic_repair_context_ref or physical_action_ref
+        action = self.kernel.runtime.artifacts.get_json(semantic_action_ref, RepairAction)
         if action.decision != "local_correction" or action.repair_seed_attempt_ref is None:
             return None
+        transport_recovery = semantic_action_ref != physical_action_ref
+        if transport_recovery and (
+            physical_action.decision not in {"infrastructure_retry", "model_fallback"}
+            or physical_action.semantic_repair_context_ref != semantic_action_ref
+            or physical_action.definition_digest != action.definition_digest
+            or physical_action.target_coordinate != action.target_coordinate
+            or physical_action.input_fingerprint != action.input_fingerprint
+            or physical_action.immutable_input_refs != action.immutable_input_refs
+            or physical_action.allowed_mutation_roots != action.allowed_mutation_roots
+        ):
+            raise self._semantic_repair_preflight_failure(
+                "preflight_builder_repair_transport_context_invalid"
+            )
         if attempt.parent_attempt_id is None:
             raise self._semantic_repair_preflight_failure(
                 "preflight_builder_repair_seed_parent_missing"
@@ -1011,7 +1024,7 @@ class BuilderLeaf:
             raise self._semantic_repair_preflight_failure(
                 "preflight_builder_repair_seed_invalid"
             ) from exc
-        if (
+        seed_policy_matches = (
             seed_attempt.attempt_id != attempt.parent_attempt_id
             or seed_attempt.work_id != definition.work_id
             or seed_attempt.coordinate != definition.coordinate
@@ -1023,6 +1036,15 @@ class BuilderLeaf:
             or seed_attempt.repair_policy_digest != definition.repair_policy.content_digest()
             or seed_attempt.input_refs != attempt.input_refs
             or seed_attempt.output_refs != action.repair_seed_output_refs
+        )
+        if (
+            seed_policy_matches
+            and not transport_recovery
+            and not self._is_refreshed_causal_snapshot_seed(
+                action=action,
+                seed_attempt=seed_attempt,
+                definition=definition,
+            )
         ):
             raise self._semantic_repair_preflight_failure(
                 "preflight_builder_repair_seed_binding_invalid"
@@ -1057,6 +1079,46 @@ class BuilderLeaf:
             candidate_ref=candidate_ref,
             candidate=candidate,
             correction_feedback=canonical_json_bytes(brief.prompt_projection()),
+        )
+
+    def _is_refreshed_causal_snapshot_seed(
+        self,
+        *,
+        action: RepairAction,
+        seed_attempt: WorkAttempt,
+        definition: WorkDefinition,
+    ) -> bool:
+        """Prove the one safe old-Candidate/new-authoring revision bridge.
+
+        A Prompt or mounted Runtime Skill revision creates a new Candidate
+        definition, so a committed snapshot from the immediately preceding
+        correction has the old policy digests by construction. It may be
+        restored only when that preceding attempt is itself bound to a causal
+        local correction and the new action carries the *same* immutable
+        downstream feedback route. This does not select history, resume a
+        provider thread, or allow a generic old candidate to satisfy a new
+        definition.
+        """
+
+        if seed_attempt.repair_action_ref is None:
+            return False
+        try:
+            prior_action = self.kernel.runtime.artifacts.get_json(
+                seed_attempt.repair_action_ref,
+                RepairAction,
+            )
+        except (ArtifactStoreError, ValueError, TypeError):
+            return False
+        return (
+            prior_action.decision == "local_correction"
+            and prior_action.reason_code == "causal_downstream_failure"
+            and prior_action.current_coordinate == definition.coordinate
+            and prior_action.target_coordinate == definition.coordinate
+            and prior_action.definition_digest != definition.definition_digest
+            and prior_action.input_fingerprint == action.input_fingerprint
+            and prior_action.immutable_input_refs == action.immutable_input_refs
+            and prior_action.allowed_mutation_roots == action.allowed_mutation_roots
+            and prior_action.causal_evidence_refs == action.causal_evidence_refs
         )
 
     @staticmethod
@@ -1200,18 +1262,33 @@ class BuilderLeaf:
         )
 
     @classmethod
-    def _session_continuation_from_error(
+    def _resumable_session_from_error(
         cls,
         *,
         code: str,
+        terminal_details: JsonObject,
+        retryable: bool,
         state: BuilderSessionState | None,
         provenance: AgentExecutionProvenance | None,
         definition: WorkDefinition,
     ) -> LeafSessionContinuation | None:
-        """Expose private state only for the exact closed Provider ceiling."""
+        """Expose a same-thread recovery only for a classified terminal."""
+
+        failure_class = InvocationRecoveryPolicy.classify(
+            InvocationRecoveryEvidence(
+                terminal_code=code,
+                retryable=retryable,
+                terminal_details=terminal_details,
+            )
+        )
 
         if (
-            code != "turn_failed_output_limit"
+            failure_class
+            not in {
+                InvocationFailureClass.OUTPUT_CEILING,
+                InvocationFailureClass.TRANSIENT_CAPACITY,
+                InvocationFailureClass.TRANSIENT_TRANSPORT,
+            }
             or state is None
             or state.invocation_session is None
             or provenance is None
@@ -1233,6 +1310,8 @@ class BuilderLeaf:
         cls,
         *,
         code: str,
+        terminal_details: JsonObject,
+        retryable: bool,
         state: BuilderSessionState | None,
         provenance: AgentExecutionProvenance | None,
         definition: WorkDefinition,
@@ -1241,19 +1320,24 @@ class BuilderLeaf:
 
         A `BuilderError` without a complete CandidateCompletion cannot itself
         become a candidate.  This merely records that a fresh same-model
-        session may inspect the isolated draft under the existing retry action.
+        session may inspect the private draft under the existing retry action.
         Any semantic or filesystem acceptance still happens later in
         `EnvironmentBuilder._validate_and_commit`.
         """
 
-        normalized = code.removeprefix("agent_backend_").removeprefix("verifier_backend_")
+        failure_class = InvocationRecoveryPolicy.classify(
+            InvocationRecoveryEvidence(
+                terminal_code=code,
+                retryable=retryable,
+                terminal_details=terminal_details,
+            )
+        )
         if (
-            normalized
+            not retryable
+            or failure_class
             not in {
-                "turn_failed_provider_unavailable",
-                "direct_provider_unavailable",
-                "direct_provider_timeout",
-                "transport_failed",
+                InvocationFailureClass.TRANSIENT_CAPACITY,
+                InvocationFailureClass.TRANSIENT_TRANSPORT,
             }
             or state is None
             or provenance is None
@@ -1431,6 +1515,11 @@ class BuilderLeaf:
             return (
                 "a current framework-owned ImplementationContract compiled by "
                 "BuildImplementationPlan from the exact frozen EnvironmentDesign"
+            )
+        if stage == "profile_resolution":
+            return (
+                "one unchanged Engineer model, Runtime Skill set, output schema, "
+                "physical turn envelope, and Agent workspace binding"
             )
         return "a corrected Builder preflight configuration outside this attempt"
 

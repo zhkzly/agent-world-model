@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.artifact_store import ArtifactStore
 from agent_world.config import AgentBackendConfig
 from agent_world.contracts import (
@@ -182,7 +182,7 @@ async def test_research_plan_leaf_commits_one_context_bound_scheduler_attempt(
         runtime=runtime,
     )
     backend = _PlanBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",

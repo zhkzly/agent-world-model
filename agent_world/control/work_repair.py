@@ -12,6 +12,7 @@ from agent_world.contracts import ArtifactRef, BudgetUsage
 
 from .work import (
     ExecutingRepairDecision,
+    FeedbackEvaluation,
     RepairAction,
     RepairPolicy,
     ValidationReport,
@@ -46,13 +47,31 @@ class WorkRepairLedger:
         self._entries = list(entries)
 
     @classmethod
-    def restore(cls, artifacts: ArtifactWriter, *, scope_id: str) -> WorkRepairLedger:
+    def restore(
+        cls,
+        artifacts: ArtifactWriter,
+        *,
+        scope_id: str,
+        diagnostic_only: bool | None = None,
+        active_repair_action_refs: tuple[ArtifactRef, ...] = (),
+    ) -> WorkRepairLedger:
         """Restore one exact WorkGraph scope without parsing unrelated history.
 
         Old live stores are retained as audit evidence, not a compatibility
         input to a new Direct job.  Read only the untyped coordinate envelope
         needed to select this scope, then validate the current typed contract.
         A malformed entry in the requested scope still fails closed.
+
+        A test-node clone deliberately reuses a production scope and immutable
+        input closure, so its first real diagnostic attempt may otherwise
+        collide with an exhausted production repair entry.  When a caller
+        explicitly selects ``diagnostic_only``, the authoritative
+        FeedbackEvaluation distinguishes the two ownership domains.  A
+        currently repair-authorized Work head is retained explicitly: it is
+        live control state which the Scheduler must either dispatch or
+        supersede, including records produced before diagnostic provenance was
+        propagated to causal repair proxies.  This never revives a settled
+        production retry allowance in a non-releasable experiment.
         """
 
         grouped: dict[str, list[WorkRepairLedgerEntry]] = {}
@@ -63,9 +82,18 @@ class WorkRepairLedger:
             coordinate = raw.get("coordinate") if isinstance(raw, Mapping) else None
             if not isinstance(coordinate, Mapping) or coordinate.get("scope_id") != scope_id:
                 continue
-            grouped.setdefault(ref.artifact_id, []).append(
-                artifacts.get_json(ref, WorkRepairLedgerEntry)
-            )
+            entry = artifacts.get_json(ref, WorkRepairLedgerEntry)
+            if (
+                diagnostic_only is not None
+                and entry.repair_action_ref not in active_repair_action_refs
+            ):
+                evaluation = artifacts.get_json(
+                    entry.source_evaluation_ref,
+                    FeedbackEvaluation,
+                )
+                if evaluation.diagnostic_only is not diagnostic_only:
+                    continue
+            grouped.setdefault(ref.artifact_id, []).append(entry)
         restored: list[WorkRepairLedgerEntry] = []
         for entry_id, revisions in grouped.items():
             if any(item.entry_id != entry_id for item in revisions):
@@ -112,6 +140,7 @@ class WorkRepairLedger:
         evaluation_ref: ArtifactRef,
         report: ValidationReport,
         report_ref: ArtifactRef,
+        causal_strict_progress: bool = False,
     ) -> WorkRepairLedgerEntry:
         definition = WorkDefinition.model_validate(definition.model_dump(mode="python"))
         action = RepairAction.model_validate(action.model_dump(mode="python"))
@@ -148,11 +177,18 @@ class WorkRepairLedger:
         if action.repair_attempt_ordinal != ordinal:
             raise WorkRepairDenied("repair_attempt_ordinal_mismatch")
         charged_ordinal = 1 + sum(
-            entry.decision != "session_continuation" and entry.outcome != "rejected"
+            (
+                entry.decision != "session_continuation"
+                or entry.reason_code != "provider_output_ceiling"
+            )
+            and entry.outcome != "rejected"
             for entry in prior
         )
         if (
-            action.decision != "session_continuation"
+            not (
+                action.decision == "session_continuation"
+                and action.reason_code == "provider_output_ceiling"
+            )
             and charged_ordinal > policy.maximum_total_repair_attempts
         ):
             raise WorkRepairDenied("repair_total_exhausted")
@@ -164,11 +200,23 @@ class WorkRepairLedger:
         # recovery policy may instead authorize its explicit next-model route.
         # Treating that transport recurrence as semantic no-progress used to
         # block the policy-selected fallback before it could start.
-        if any(
+        semantic_no_progress = any(
             entry.outcome == "no_progress"
             and entry.decision in {"local_correction", "parent_correction"}
             for entry in prior
-        ):
+        )
+        # A later correction against the same semantic route would be blind
+        # repetition.  A transient recovery that explicitly carries the
+        # original semantic context is different: it replays that already
+        # authorized correction on a fresh Provider route, preserving its
+        # feedback/seed rather than emitting the original prompt again.  It
+        # still has to satisfy the exact source-route, per-route, fallback,
+        # and total-budget checks below.
+        semantic_context_recovery = (
+            action.decision in {"infrastructure_retry", "model_fallback"}
+            and action.semantic_repair_context_ref is not None
+        )
+        if semantic_no_progress and not semantic_context_recovery:
             raise WorkRepairDenied("repair_no_progress_terminal")
 
         if action.workspace_recovery and (
@@ -185,10 +233,6 @@ class WorkRepairLedger:
                 or definition.proposal_policy.session_wall_seconds is None
             ):
                 raise WorkRepairDenied("session_continuation_not_declared")
-            if report.status != "error" or tuple(issue.code for issue in report.issues) != (
-                "turn_failed_output_limit",
-            ):
-                raise WorkRepairDenied("session_continuation_requires_closed_output_limit")
             if (
                 action.target_coordinate != definition.coordinate
                 or action.allowed_mutation_roots != definition.allowed_mutation_roots
@@ -197,6 +241,29 @@ class WorkRepairLedger:
             continuation_count = sum(entry.decision == "session_continuation" for entry in prior)
             if continuation_count >= policy.maximum_session_continuations:
                 raise WorkRepairDenied("session_continuation_exhausted")
+            if action.reason_code == "provider_output_ceiling":
+                if report.status != "error" or tuple(issue.code for issue in report.issues) != (
+                    "turn_failed_output_limit",
+                ):
+                    raise WorkRepairDenied("session_continuation_requires_closed_output_limit")
+            elif action.reason_code == "provider_session_continuation":
+                if (
+                    report.status != "error"
+                    or not report.infrastructure_retryable
+                    or action.route_model is None
+                ):
+                    raise WorkRepairDenied("session_continuation_requires_transient_terminal")
+                infrastructure_count = sum(
+                    entry.decision in {"infrastructure_retry", "session_continuation"}
+                    and entry.reason_code != "provider_output_ceiling"
+                    and entry.route_model == action.route_model
+                    and entry.semantic_repair_context_ref == action.semantic_repair_context_ref
+                    for entry in prior
+                )
+                if infrastructure_count >= policy.maximum_infrastructure_retries:
+                    raise WorkRepairDenied("repair_infrastructure_exhausted")
+            else:
+                raise WorkRepairDenied("session_continuation_reason_invalid")
         elif action.decision == "local_correction":
             if not report.repair_actionable:
                 raise WorkRepairDenied("repair_diagnostic_not_actionable")
@@ -215,10 +282,21 @@ class WorkRepairLedger:
             normal = policy.maximum_local_corrections
             if local_ordinal > normal + policy.strict_progress_bonus_corrections:
                 raise WorkRepairDenied("repair_local_exhausted")
-            if local_ordinal > normal and (
-                not local_prior or local_prior[-1].outcome != "progressed"
-            ):
-                raise WorkRepairDenied("repair_progress_bonus_denied")
+            if local_ordinal > normal:
+                if not local_prior:
+                    raise WorkRepairDenied("repair_progress_bonus_denied")
+                previous = local_prior[-1]
+                durable_progress = previous.outcome == "progressed"
+                downstream_progress = (
+                    causal_strict_progress
+                    and action.reason_code == "causal_downstream_failure"
+                    and previous.reason_code == "causal_downstream_failure"
+                    and previous.outcome == "resolved"
+                )
+                if not durable_progress and not downstream_progress:
+                    raise WorkRepairDenied("repair_progress_bonus_denied")
+            elif causal_strict_progress:
+                raise WorkRepairDenied("repair_progress_bonus_not_required")
         elif action.decision in {"infrastructure_retry", "model_fallback"}:
             if report.status != "error":
                 raise WorkRepairDenied("transport_recovery_requires_error_report")
@@ -227,16 +305,35 @@ class WorkRepairLedger:
                     raise WorkRepairDenied("model_fallback_requires_target_model")
                 if action.route_model is None:
                     raise WorkRepairDenied("model_fallback_requires_source_route")
-                fallback_count = sum(entry.decision == "model_fallback" for entry in prior)
+                fallback_count = sum(
+                    entry.decision == "model_fallback"
+                    and entry.semantic_repair_context_ref == action.semantic_repair_context_ref
+                    for entry in prior
+                )
                 if fallback_count >= policy.maximum_model_fallbacks:
                     raise WorkRepairDenied("repair_model_fallback_exhausted")
+                direct_output_ceiling_fallback = (
+                    action.reason_code == "direct_output_ceiling_model_fallback"
+                )
+                if direct_output_ceiling_fallback:
+                    blocker_codes = {
+                        issue.code.removeprefix("agent_backend_").removeprefix("verifier_backend_")
+                        for issue in report.issues
+                        if issue.severity == "blocker"
+                    }
+                    if report.infrastructure_retryable or blocker_codes != {"direct_output_limit"}:
+                        raise WorkRepairDenied(
+                            "direct_output_ceiling_fallback_requires_exact_terminal"
+                        )
                 # A fallback is only admissible after the exact same current
                 # node has consumed its one fresh-session infrastructure
                 # retry. The typed recovery policy selected it; the ledger
                 # still proves that no upstream Work was reopened.
-                if not any(
-                    entry.decision == "infrastructure_retry"
+                if not direct_output_ceiling_fallback and not any(
+                    entry.decision in {"infrastructure_retry", "session_continuation"}
+                    and entry.reason_code != "provider_output_ceiling"
                     and entry.route_model == action.route_model
+                    and entry.semantic_repair_context_ref == action.semantic_repair_context_ref
                     for entry in prior
                 ):
                     raise WorkRepairDenied("model_fallback_requires_prior_infrastructure_retry")
@@ -267,6 +364,7 @@ class WorkRepairLedger:
                     infrastructure_count = sum(
                         entry.decision == "infrastructure_retry"
                         and entry.reason_code != "process_interrupted"
+                        and entry.semantic_repair_context_ref == action.semantic_repair_context_ref
                         for entry in prior
                     )
                 else:
@@ -274,6 +372,7 @@ class WorkRepairLedger:
                         entry.decision == "infrastructure_retry"
                         and entry.reason_code != "process_interrupted"
                         and entry.route_model == action.route_model
+                        and entry.semantic_repair_context_ref == action.semantic_repair_context_ref
                         for entry in prior
                     )
                 if infrastructure_count >= policy.maximum_infrastructure_retries:
@@ -326,6 +425,7 @@ class WorkRepairLedger:
             decision=cast(ExecutingRepairDecision, action.decision),
             reason_code=action.reason_code,
             route_model=action.route_model,
+            semantic_repair_context_ref=action.semantic_repair_context_ref,
             source_evaluation_ref=evaluation_ref,
             report_before_ref=report_ref,
             repair_attempt_ordinal=ordinal,

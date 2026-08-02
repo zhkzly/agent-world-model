@@ -8,6 +8,7 @@ import pytest
 from agent_world.artifact_store import ArtifactStore
 from agent_world.contracts import ArtifactRef, sha256_digest
 from agent_world.control.work import (
+    FeedbackEvaluation,
     RepairAction,
     ValidationIssue,
     ValidationReport,
@@ -184,6 +185,86 @@ def test_scope_restore_ignores_unparseable_foreign_legacy_ledger_entry(
     )
 
     assert restored.entries == (current,)
+
+
+def test_diagnostic_restore_excludes_production_repair_history(
+    tmp_path: Path,
+) -> None:
+    """A copied test-node state must not consume a live run's retry allowance."""
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    artifacts = store.issue_writer(
+        producer="framework",
+        allowed_artifact_type_prefixes=("control.",),
+    )
+    definition = _definition()
+    report = _report("production-route", (_issue("provider_unavailable"),), status="error")
+    report_ref = _ref(report.report_id, "control.validation_report")
+    evaluation = FeedbackEvaluation(
+        evaluation_id="evaluation:production-route",
+        attempt_id=report.attempt_id,
+        work_id=definition.work_id,
+        coordinate=definition.coordinate,
+        claim_id=definition.required_claim_id,
+        acceptance_digest=definition.acceptance_digest,
+        policy_digest=definition.validation_policy.content_digest(),
+        status="error",
+        effect=definition.validation_policy.effect,
+        readiness_effect="blocks",
+        validation_report_ref=report_ref,
+        diagnostic_only=False,
+        releasable=True,
+        evaluated_at=datetime.now(UTC),
+    )
+    evaluation_ref = artifacts.put_json(
+        artifact_id=evaluation.evaluation_id,
+        artifact_type="control.feedback_evaluation",
+        value=evaluation,
+    )
+    action, action_ref, _unused_evaluation_ref, _unused_report_ref, _budget_ref = _authorization(
+        ordinal=1,
+        report=report,
+        decision="infrastructure_retry",
+        reason_code="retryable_infrastructure_failure",
+        definition=definition,
+    )
+    action = action.model_copy(
+        update={
+            "source_evaluation_ref": evaluation_ref,
+            "route_model": "test-model",
+        }
+    )
+    entry = WorkRepairLedger().authorize(
+        definition=definition,
+        action=action,
+        action_ref=action_ref,
+        evaluation_ref=evaluation_ref,
+        report=report,
+        report_ref=report_ref,
+    )
+    artifacts.put_json(
+        artifact_id=entry.entry_id,
+        artifact_type="control.work_repair_ledger_entry",
+        value=entry,
+    )
+
+    assert WorkRepairLedger.restore(artifacts, scope_id=definition.coordinate.scope_id).entries == (
+        entry,
+    )
+    assert (
+        WorkRepairLedger.restore(
+            artifacts,
+            scope_id=definition.coordinate.scope_id,
+            diagnostic_only=True,
+        ).entries
+        == ()
+    )
+    assert WorkRepairLedger.restore(
+        artifacts,
+        scope_id=definition.coordinate.scope_id,
+        diagnostic_only=True,
+        active_repair_action_refs=(action_ref,),
+    ).entries == (entry,)
 
 
 def test_repair_epoch_isolates_definition_and_input_revisions() -> None:

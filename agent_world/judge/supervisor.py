@@ -12,6 +12,7 @@ import signal
 import stat
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -37,19 +38,8 @@ from agent_world.observability.subprocess_scene import (
     runtime_subprocess_scene,
 )
 
-_SANDBOX_TMP = PurePosixPath("/") / "tmp"
-_SANDBOX_HOME = _SANDBOX_TMP / "home"
-_SANDBOX_UV_CACHE = _SANDBOX_TMP / "uv-cache"
-_PRODUCTION_BWRAP = Path("/usr/bin/bwrap")
-_PRODUCTION_SYSTEM_ROOTS = (Path("/usr"),)
 _PRODUCTION_PYTHON = Path(sys.executable).resolve()
-_PRODUCTION_PYTHON_ROOT = _PRODUCTION_PYTHON.parents[1]
-_SANDBOX_PYTHON_ROOT = "/opt/agent-world/python"
-_SANDBOX_PYTHON = f"{_SANDBOX_PYTHON_ROOT}/bin/{_PRODUCTION_PYTHON.name}"
-_SANDBOX_UV_CACHE_SOURCE = "/opt/agent-world/uv-cache"
 _APPROVED_INTERPRETERS = frozenset({".venv/bin/python", ".venv/bin/python3", "python", "python3"})
-_TASK_MATERIALIZER_RUNNER_DESTINATION = "/opt/agent-world/bin/task-materializer-runner.py"
-_PUBLIC_TEST_RUNNER_DESTINATION = "/opt/agent-world/bin/public-test-runner.py"
 
 
 @functools.lru_cache(maxsize=1)
@@ -120,7 +110,9 @@ module_name, function_name = entrypoint.split(":", 1)
 if function_name != "materialize":
     fail("candidate entrypoint must name materialize")
 
-workspace = os.environ.get("AGENT_WORLD_WORKSPACE", "/workspace")
+workspace = os.environ.get("AGENT_WORLD_WORKSPACE")
+if not workspace:
+    fail("framework did not provide Candidate workspace", 70)
 for candidate_path in (os.path.join(workspace, "src"), workspace):
     if candidate_path not in sys.path:
         sys.path.insert(0, candidate_path)
@@ -215,7 +207,9 @@ if (
 ):
     fail("framework public-test runner received an invalid candidate-relative test path")
 
-workspace = os.environ.get("AGENT_WORLD_WORKSPACE", "/workspace")
+workspace = os.environ.get("AGENT_WORLD_WORKSPACE")
+if not workspace:
+    fail("framework did not provide Candidate workspace")
 test_path = os.path.join(workspace, *relative.parts)
 if not os.path.isfile(test_path):
     fail("framework public-test runner could not find the declared test file")
@@ -232,6 +226,69 @@ runpy.run_path(test_path, run_name="__main__")
 """
 
 
+_AGENT_WORKSPACE_PROJECTION_PROBE_SOURCE = r"""from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+def fail(message: str) -> None:
+    # This is a framework-owned mechanical probe.  Its output is deliberately
+    # not Candidate feedback or test evidence.
+    sys.stderr.write(message + "\n")
+    raise SystemExit(70)
+
+
+actual_text = os.environ.get("AGENT_WORLD_WORKSPACE")
+if not actual_text:
+    fail("framework did not provide Candidate workspace")
+expected = Path(actual_text).resolve()
+if Path.cwd().resolve() != expected:
+    fail("framework Candidate workspace used an unexpected working directory")
+if not expected.is_dir():
+    fail("framework Candidate workspace is not a directory")
+"""
+
+
+_CANDIDATE_MODULE_RUNNER_SOURCE = r"""from __future__ import annotations
+
+import os
+import re
+import runpy
+import sys
+
+
+def fail(message: str, exit_code: int = 70) -> None:
+    sys.stderr.write(message + "\n")
+    raise SystemExit(exit_code)
+
+
+if len(sys.argv) < 2:
+    fail("framework candidate-module runner requires one module name")
+
+module_name = sys.argv[1]
+if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", module_name) is None:
+    fail("framework candidate-module runner received an invalid module name")
+
+# Candidate projects are deliberately virtual roots, so framework-owned launch
+# setup restores their read-only root and optional src/ import roots after the
+# Python interpreter has initialized.  This is not candidate-controlled
+# PYTHONPATH and it does not expose any parent or host path.
+workspace = os.environ.get("AGENT_WORLD_WORKSPACE")
+if not workspace:
+    fail("framework did not provide Candidate workspace")
+for import_root in (os.path.join(workspace, "src"), workspace):
+    if import_root not in sys.path:
+        sys.path.insert(0, import_root)
+
+# Preserve the ordinary `python -m module [args...]` program view while keeping
+# this bootstrap outside the Candidate source tree.
+sys.argv = [module_name, *sys.argv[2:]]
+runpy.run_module(module_name, run_name="__main__", alter_sys=True)
+"""
+
+
 class JudgeInfrastructureError(RuntimeError):
     def __init__(
         self, code: str, message: str, *, details: Mapping[str, Any] | None = None
@@ -244,7 +301,7 @@ class JudgeInfrastructureError(RuntimeError):
         return {"code": self.code, "message": str(self), "details": self.details}
 
 
-class IsolationUnavailable(JudgeInfrastructureError):
+class HostExecutionUnavailable(JudgeInfrastructureError):
     pass
 
 
@@ -259,6 +316,20 @@ class CandidateBuildError(JudgeInfrastructureError):
     ) -> None:
         super().__init__(code, message, details=details)
         self.record = record
+
+
+def candidate_clean_build_failure_is_agent_actionable(error_code: str) -> bool:
+    """Whether a clean-build terminal can be corrected from Candidate source.
+
+    A completed offline ``uv sync`` that exits non-zero is evidence about the
+    frozen Candidate project: the Code Agent can inspect its own
+    ``pyproject.toml``, dependencies, and ``uv.lock`` and reproduce that
+    command from the project root. Every other typed clean-build terminal
+    describes framework delivery, integrity, tooling, or liveness.
+    Those facts must never be routed back as a Candidate repair instruction.
+    """
+
+    return error_code == "uv_sync_failed"
 
 
 class RuntimeRequestTimeout(JudgeInfrastructureError):
@@ -373,302 +444,162 @@ class ValidatedLaunch:
     env: Mapping[str, str]
 
 
+def _candidate_module_runner_argv(
+    argv: Sequence[str],
+    runner_path: Path,
+) -> tuple[str, ...]:
+    """Turn approved Candidate module metadata into a framework bootstrap call.
+
+    CandidateCompletion already makes the interpreter and module name
+    deterministic.  The framework therefore owns the source-root bootstrap;
+    the Candidate neither declares an environment variable nor learns about a
+    later process launch path.
+    """
+
+    if len(argv) < 3 or argv[1] != "-m":
+        raise JudgeInfrastructureError(
+            "invalid_candidate_module_launch",
+            "Candidate module launch must use an interpreter followed by -m and one module",
+        )
+    module_name = argv[2]
+    if re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", module_name) is None:
+        raise JudgeInfrastructureError(
+            "invalid_candidate_module_launch",
+            "Candidate module launch name is invalid",
+        )
+    return (argv[0], str(runner_path), module_name, *argv[3:])
+
+
 @dataclass(frozen=True, slots=True)
-class IsolationPolicy:
-    bubblewrap_path: Path = _PRODUCTION_BWRAP
+class HostProcessLaunch:
+    """One directly executable host process with framework-owned launch state."""
+
+    argv: tuple[str, ...]
+    cwd: Path
+    env: Mapping[str, str]
+
+
+@dataclass(frozen=True, slots=True)
+class HostExecutionPolicy:
+    """Prepare direct host processes for all Candidate execution boundaries.
+
+    This project intentionally has no bwrap, user/PID namespace, mount, or
+    virtual-path execution mode.  The framework still owns the clean copied
+    Candidate tree, cwd, child environment, state directory, resource limits,
+    timeout, and output capture; it simply starts the process on the host.
+    """
+
     purpose: Literal["runtime", "build"] = "runtime"
-    workspace_read_only: bool = True
     probe_timeout_seconds: float = 5.0
-    system_roots: tuple[Path, ...] = _PRODUCTION_SYSTEM_ROOTS
-    python_runtime_root: Path = _PRODUCTION_PYTHON_ROOT
 
     def validate(self) -> None:
         if os.name != "posix":
-            raise IsolationUnavailable(
-                "unsupported_platform", "production Judge isolation requires POSIX bubblewrap"
+            raise HostExecutionUnavailable(
+                "unsupported_platform", "Candidate host execution requires POSIX process support"
             )
-        bwrap = self.bubblewrap_path
-        if bwrap != _PRODUCTION_BWRAP:
-            raise IsolationUnavailable(
-                "unapproved_bubblewrap",
-                f"production Judge requires bubblewrap at {_PRODUCTION_BWRAP}",
-            )
-        if not bwrap.is_absolute() or not bwrap.is_file() or not os.access(bwrap, os.X_OK):
-            raise IsolationUnavailable(
-                "bubblewrap_unavailable",
-                f"required bubblewrap executable is unavailable: {bwrap}",
-            )
-        if self.system_roots != _PRODUCTION_SYSTEM_ROOTS:
-            raise IsolationUnavailable(
-                "unapproved_system_roots",
-                "production Judge exposes only the read-only /usr system root",
-            )
-        if self.python_runtime_root != _PRODUCTION_PYTHON_ROOT:
-            raise IsolationUnavailable(
-                "unapproved_python_runtime",
-                "production Judge must use the framework-pinned Python runtime",
-            )
-        if (
-            sys.version_info[:2] != (3, 12)
-            or not self.python_runtime_root.is_dir()
-            or not _PRODUCTION_PYTHON.is_file()
-        ):
-            raise IsolationUnavailable(
+        if sys.version_info[:2] != (3, 12) or not _PRODUCTION_PYTHON.is_file():
+            raise HostExecutionUnavailable(
                 "python_runtime_unavailable",
-                "production Judge requires a complete framework Python 3.12 runtime",
-            )
-        if not all(root.is_absolute() and root.is_dir() for root in self.system_roots):
-            raise IsolationUnavailable(
-                "invalid_system_root", "required read-only system root is unavailable"
-            )
-        if not isinstance(self.workspace_read_only, bool):
-            raise IsolationUnavailable(
-                "invalid_isolation_policy", "isolation policy flags must be boolean"
-            )
-        if not self.workspace_read_only:
-            raise IsolationUnavailable(
-                "writable_judge_workspace_rejected",
-                "production Judge and clean-build candidate workspaces are always read-only",
+                "Candidate host execution requires the framework Python 3.12 runtime",
             )
         if self.probe_timeout_seconds <= 0:
             raise ValueError("probe_timeout_seconds must be positive")
 
     async def ensure_available(self) -> None:
-        """Prove namespace creation works; finding bwrap on PATH is insufficient."""
+        """Prove that the host can start the framework Python directly."""
 
         self.validate()
-        with tempfile.TemporaryDirectory(
-            prefix="agent-world-bwrap-probe-",
-            dir=_trusted_temp_root(),
-        ) as workspace_text:
-            workspace = Path(workspace_text)
-            state_dir = workspace / "state"
-            state_dir.mkdir(mode=0o700)
-            command = self.wrap_command(
-                workspace=workspace,
-                cwd_relative=".",
-                argv=("/usr/bin/true",),
-                state_dir=state_dir,
-                writable_workspace=False,
-                visible_workspace_paths=(),
+        _ensure_host_child_watcher()
+        process = await asyncio.create_subprocess_exec(
+            str(_PRODUCTION_PYTHON),
+            "-c",
+            "pass",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            env=_scrubbed_host_env(),
+            start_new_session=True,
+        )
+        try:
+            await asyncio.wait_for(process.wait(), timeout=self.probe_timeout_seconds)
+        except TimeoutError as exc:
+            await _terminate_process_group(process)
+            raise HostExecutionUnavailable(
+                "host_execution_probe_timeout", "host execution probe timed out"
+            ) from exc
+        except BaseException:
+            await _terminate_process_group(process)
+            raise
+        if process.returncode != 0:
+            raise HostExecutionUnavailable(
+                "host_execution_probe_failed", "framework Python could not start on the host"
             )
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=_scrubbed_host_env(),
-                start_new_session=True,
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=self.probe_timeout_seconds
-                )
-            except TimeoutError as exc:
-                await _terminate_process_group(process)
-                raise IsolationUnavailable(
-                    "bubblewrap_probe_timeout", "bubblewrap isolation probe timed out"
-                ) from exc
-            except BaseException:
-                await _terminate_process_group(process)
-                raise
-            if process.returncode != 0:
-                raise IsolationUnavailable(
-                    "bubblewrap_probe_failed",
-                    "bubblewrap is installed but cannot create the required isolation namespaces",
-                    details={
-                        "exit_code": process.returncode,
-                        "stdout": _decode_limited(stdout, 16 * 1024),
-                        "stderr": _decode_limited(stderr, 16 * 1024),
-                    },
-                )
 
-    def wrap_command(
+    def prepare_process(
         self,
         *,
         workspace: Path,
         cwd_relative: str,
         argv: Sequence[str],
         state_dir: Path,
-        writable_workspace: bool = False,
-        visible_workspace_paths: Sequence[str] | None = None,
+        visible_workspace_paths: Sequence[str],
         extra_env: Mapping[str, str] | None = None,
-        extra_read_only_binds: Mapping[Path, str] | None = None,
-        extra_ephemeral_overlay_binds: Mapping[Path, str] | None = None,
-        extra_writable_directory_binds: Mapping[Path, str] | None = None,
-        process_limit: int | None = None,
-    ) -> tuple[str, ...]:
+    ) -> HostProcessLaunch:
         self.validate()
         workspace = Path(workspace).resolve(strict=True)
         state_dir = Path(state_dir).resolve(strict=True)
         if not workspace.is_dir() or not state_dir.is_dir():
-            raise IsolationUnavailable(
-                "invalid_isolation_mount", "workspace and state mounts must be directories"
+            raise HostExecutionUnavailable(
+                "invalid_host_execution_root", "workspace and state directories are required"
             )
-        cwd_host = _resolve_relative_directory(workspace, cwd_relative, field_name="sandbox cwd")
-        cwd_inside = "/workspace"
-        relative = cwd_host.relative_to(workspace).as_posix()
-        if relative != ".":
-            cwd_inside = f"/workspace/{relative}"
-
-        command: list[str] = [
-            str(self.bubblewrap_path),
-            "--die-with-parent",
-            "--new-session",
-            "--unshare-all",
-            "--unshare-user",
-        ]
-        command.extend(["--disable-userns", "--clearenv"])
-        for root in self.system_roots:
-            command.extend(["--ro-bind", str(root), str(root)])
-        command.extend(
-            [
-                "--symlink",
-                "usr/bin",
-                "/bin",
-                "--symlink",
-                "usr/sbin",
-                "/sbin",
-                "--symlink",
-                "usr/lib",
-                "/lib",
-                "--symlink",
-                "usr/lib64",
-                "/lib64",
-                "--dir",
-                "/etc",
-            ]
-        )
-        for host_path in _minimal_etc_mounts():
-            command.extend(["--ro-bind", str(host_path), str(host_path)])
-        command.extend(
-            [
-                "--proc",
-                "/proc",
-                "--dev",
-                "/dev",
-                "--tmpfs",
-                str(_SANDBOX_TMP),
-                "--dir",
-                str(_SANDBOX_HOME),
-                "--dir",
-                "/run",
-                "--dir",
-                "/opt",
-                "--dir",
-                "/opt/agent-world",
-                "--dir",
-                "/opt/agent-world/bin",
-                "--dir",
-                _SANDBOX_PYTHON_ROOT,
-            ]
-        )
-        command.extend(
-            [
-                "--ro-bind",
-                str(self.python_runtime_root),
-                _SANDBOX_PYTHON_ROOT,
-            ]
-        )
-        if writable_workspace:
-            raise IsolationUnavailable(
-                "writable_candidate_workspace_rejected",
-                "candidate source cannot be exposed as a writable build/runtime workspace",
-            )
-        if visible_workspace_paths is None:
-            raise IsolationUnavailable(
-                "workspace_visibility_required",
-                "read-only candidate execution requires an explicit workspace file allowlist",
-            )
-        mounts, directories, venv = _validate_workspace_file_view(
+        cwd_host = _resolve_relative_directory(workspace, cwd_relative, field_name="host cwd")
+        _validate_workspace_file_view(
             workspace,
-            cwd_relative=relative,
+            cwd_relative=cwd_host.relative_to(workspace).as_posix() or ".",
             visible_paths=visible_workspace_paths,
         )
-        command.extend(["--tmpfs", "/workspace"])
-        for directory in directories:
-            command.extend(["--dir", f"/workspace/{directory}"])
-        if venv is not None:
-            command.extend(["--ro-bind", str(venv), "/workspace/.venv"])
-        for source, destination in mounts:
-            command.extend(["--ro-bind", str(source), f"/workspace/{destination}"])
-        if extra_writable_directory_binds:
-            command.extend(["--dir", "/workspace/.venv"])
-        command.extend(["--remount-ro", "/workspace"])
-        command.extend(["--bind", str(state_dir), "/state"])
-
-        for host_path, destination in (extra_writable_directory_binds or {}).items():
-            source = Path(host_path).resolve(strict=True)
-            if self.purpose != "build" or source.is_symlink() or not source.is_dir():
-                raise IsolationUnavailable(
-                    "invalid_isolation_bind",
-                    "writable directory binds are restricted to real build directories",
-                )
-            if destination != "/workspace/.venv":
-                raise IsolationUnavailable(
-                    "invalid_isolation_bind",
-                    f"unsafe writable build bind destination: {destination}",
-                )
-            command.extend(["--bind", str(source), destination])
-
-        for host_path, destination in (extra_read_only_binds or {}).items():
-            source = Path(host_path).resolve(strict=True)
-            if not source.is_file():
-                raise IsolationUnavailable(
-                    "invalid_isolation_bind", f"read-only bind source is not a file: {source}"
-                )
-            if (
-                not destination.startswith("/opt/agent-world/bin/")
-                or ".." in PurePosixPath(destination).parts
-            ):
-                raise IsolationUnavailable(
-                    "invalid_isolation_bind", f"unsafe isolation bind destination: {destination}"
-                )
-            command.extend(["--ro-bind", str(source), destination])
-
-        allowed_directories = {_SANDBOX_UV_CACHE_SOURCE}
-        for host_path, destination in (extra_ephemeral_overlay_binds or {}).items():
-            source = Path(host_path).resolve(strict=True)
-            if source.is_symlink() or not source.is_dir():
-                raise IsolationUnavailable(
-                    "invalid_isolation_bind",
-                    f"read-only bind source is not a real directory: {source}",
-                )
-            if destination not in allowed_directories:
-                raise IsolationUnavailable(
-                    "invalid_isolation_bind",
-                    f"unsafe isolation directory bind destination: {destination}",
-                )
-            command.extend(["--overlay-src", str(source), "--tmp-overlay", destination])
-
-        child_env = {
-            "PATH": "/workspace/.venv/bin:/opt/agent-world/bin:/usr/local/bin:/usr/bin:/bin",
-            "HOME": str(_SANDBOX_HOME),
-            "TMPDIR": str(_SANDBOX_TMP),
-            "LANG": "C.UTF-8",
-            "LC_ALL": "C.UTF-8",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONUNBUFFERED": "1",
-            "AGENT_WORLD_WORKSPACE": "/workspace",
-            "AGENT_WORLD_STATE_DIR": "/state",
-            "UV_PYTHON": _SANDBOX_PYTHON,
-            "UV_PYTHON_DOWNLOADS": "never",
-        }
+        home = state_dir / "home"
+        temporary = state_dir / "tmp"
+        home.mkdir(mode=0o700, exist_ok=True)
+        temporary.mkdir(mode=0o700, exist_ok=True)
+        child_env = _scrubbed_host_env()
+        child_env.update(
+            {
+                "PATH": f"{workspace}/.venv/bin:/usr/local/bin:/usr/bin:/bin",
+                "HOME": str(home),
+                "TMPDIR": str(temporary),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONUNBUFFERED": "1",
+                "AGENT_WORLD_WORKSPACE": str(workspace),
+                "AGENT_WORLD_STATE_DIR": str(state_dir),
+                "UV_PYTHON": str(_PRODUCTION_PYTHON),
+                "UV_PYTHON_DOWNLOADS": "never",
+            }
+        )
         child_env.update(_validate_runtime_env(extra_env or {}))
-        for name, value in sorted(child_env.items()):
-            command.extend(["--setenv", name, value])
-        sandbox_argv = tuple(argv)
-        if process_limit is not None:
-            if process_limit < 1:
-                raise ValueError("sandbox process_limit must be positive")
-            sandbox_argv = (
-                "/usr/bin/prlimit",
-                f"--nproc={process_limit}:{process_limit}",
-                "--",
-                *sandbox_argv,
-            )
-        command.extend(["--chdir", cwd_inside, "--", *sandbox_argv])
-        return tuple(command)
+        return HostProcessLaunch(argv=tuple(argv), cwd=cwd_host, env=child_env)
+
+
+def _ensure_host_child_watcher() -> None:
+    """Use a main-loop watcher that can reap direct local child processes.
+
+    Python 3.12 defaults to ``ThreadedChildWatcher`` on POSIX. In the real
+    local execution shape used by this project, that watcher can leave a child
+    that has already exited unreaped, making a zero-work Python probe appear to
+    hang. ``SafeChildWatcher`` waits from the main event-loop thread and avoids
+    that false liveness failure. Candidate execution is always started by the
+    main Foundry loop; callers from another thread keep their existing watcher.
+    """
+
+    if os.name != "posix" or threading.current_thread() is not threading.main_thread():
+        return
+    policy = asyncio.get_event_loop_policy()
+    watcher = policy.get_child_watcher()
+    if isinstance(watcher, asyncio.ThreadedChildWatcher):
+        watcher = asyncio.SafeChildWatcher()
+        policy.set_child_watcher(watcher)
+    if isinstance(watcher, asyncio.SafeChildWatcher):
+        watcher.attach_loop(asyncio.get_running_loop())
 
 
 @dataclass(frozen=True, slots=True)
@@ -713,8 +644,8 @@ class CleanCandidate:
 
 @dataclass(slots=True)
 class CleanCandidateBuilder:
-    build_isolation: IsolationPolicy = field(
-        default_factory=lambda: IsolationPolicy(purpose="build")
+    build_execution: HostExecutionPolicy = field(
+        default_factory=lambda: HostExecutionPolicy(purpose="build")
     )
     uv_path: Path | None = None
     uv_cache_dir: Path | None = None
@@ -733,10 +664,8 @@ class CleanCandidateBuilder:
     )
 
     def __post_init__(self) -> None:
-        if self.build_isolation.purpose != "build":
-            raise ValueError("CleanCandidateBuilder requires a build-purpose isolation policy")
-        if not self.build_isolation.workspace_read_only:
-            raise ValueError("clean builds require a read-only candidate source view")
+        if self.build_execution.purpose != "build":
+            raise ValueError("CleanCandidateBuilder requires a build-purpose host execution policy")
         for name, value in (
             ("timeout_seconds", self.timeout_seconds),
             ("max_output_bytes", self.max_output_bytes),
@@ -764,7 +693,7 @@ class CleanCandidateBuilder:
                 "expected source files and candidate source-tree digest must be supplied together"
             )
 
-        await self.build_isolation.ensure_available()
+        await self.build_execution.ensure_available()
         source = await _run_blocking(_resolve_candidate_source, source_dir)
         uv_path = await _run_blocking(_resolve_uv_executable, self.uv_path)
 
@@ -808,8 +737,8 @@ class CleanCandidateBuilder:
                     expected_source_files,
                     expected_source_tree_digest,
                 )
-            inner_command = [
-                "/opt/agent-world/bin/uv",
+            actual_command = [
+                str(uv_path),
                 "sync",
                 "--frozen",
                 "--no-dev",
@@ -821,56 +750,36 @@ class CleanCandidateBuilder:
                 "--no-install-workspace",
                 "--no-install-local",
             ]
-            cache_inside = (
-                _SANDBOX_UV_CACHE_SOURCE
-                if self.uv_cache_dir is not None
-                else str(_SANDBOX_UV_CACHE)
-            )
-            wrapped = self.build_isolation.wrap_command(
+            cache_dir = self.uv_cache_dir or state_dir / "uv-cache"
+            cache_dir.mkdir(mode=0o700, exist_ok=True)
+            launch = self.build_execution.prepare_process(
                 workspace=clean_root,
                 cwd_relative=".",
-                argv=inner_command,
+                argv=actual_command,
                 state_dir=state_dir,
-                writable_workspace=False,
                 visible_workspace_paths=visible_source_paths,
                 extra_env={
-                    "UV_PROJECT_ENVIRONMENT": "/workspace/.venv",
-                    "UV_CACHE_DIR": cache_inside,
+                    "UV_PROJECT_ENVIRONMENT": str(dependency_environment),
+                    "UV_CACHE_DIR": str(cache_dir),
                     "UV_LINK_MODE": "copy",
                     "UV_NO_PROGRESS": "1",
                 },
-                extra_read_only_binds={uv_path: "/opt/agent-world/bin/uv"},
-                extra_ephemeral_overlay_binds=(
-                    {self.uv_cache_dir: _SANDBOX_UV_CACHE_SOURCE}
-                    if self.uv_cache_dir is not None
-                    else None
-                ),
-                extra_writable_directory_binds={dependency_environment: "/workspace/.venv"},
-                process_limit=self.resource_limits.processes,
             )
             started = time.monotonic()
             outcome = await _run_captured_process(
-                wrapped,
+                launch.argv,
                 timeout_seconds=self.timeout_seconds,
                 max_output_bytes=self.max_output_bytes,
                 limits=self.resource_limits,
                 failure_prefix="uv_sync",
+                cwd=launch.cwd,
+                env=launch.env,
             )
             duration_ms = int((time.monotonic() - started) * 1000)
-            if outcome.exit_code != 0 and outcome.stderr.lstrip().startswith("bwrap:"):
-                raise IsolationUnavailable(
-                    "bubblewrap_launch_failed",
-                    "Bubblewrap failed before the candidate build process started",
-                    details={
-                        "exit_code": outcome.exit_code,
-                        "stderr_hash": sha256_digest(outcome.stderr.encode("utf-8")),
-                        "failure_class": outcome.failure_class,
-                    },
-                )
             if outcome.exit_code != 0:
                 record = InstallRecord(
                     success=False,
-                    command=tuple(inner_command),
+                    command=("uv", *actual_command[1:]),
                     cwd_ref=".",
                     exit_code=outcome.exit_code,
                     stdout=outcome.stdout,
@@ -916,7 +825,7 @@ class CleanCandidateBuilder:
             installed_hash = await _run_blocking(_validate_and_hash_installed, clean_root)
             record = InstallRecord(
                 success=True,
-                command=tuple(inner_command),
+                command=("uv", *actual_command[1:]),
                 cwd_ref=".",
                 exit_code=outcome.exit_code,
                 stdout=outcome.stdout,
@@ -963,8 +872,8 @@ class CleanCandidateBuilder:
 
 
 @dataclass(frozen=True, slots=True)
-class SandboxProcessResult:
-    """Bounded subprocess result; stdout/stderr remain ephemeral Judge memory."""
+class ProcessResult:
+    """Bounded host-process result; stdout/stderr remain ephemeral Judge memory."""
 
     argv: tuple[str, ...]
     exit_code: int | None
@@ -986,10 +895,10 @@ class SandboxProcessResult:
 
 
 @dataclass(slots=True)
-class CandidateSandboxRunner:
-    """Run finite candidate commands without importing candidate code in Judge."""
+class CandidateProcessRunner:
+    """Run finite Candidate commands directly on the host without importing them in Judge."""
 
-    isolation: IsolationPolicy = field(default_factory=IsolationPolicy)
+    execution: HostExecutionPolicy = field(default_factory=HostExecutionPolicy)
     timeout_seconds: float = 60.0
     max_output_bytes: int = 1024 * 1024
     max_input_bytes: int = 1024 * 1024
@@ -1014,20 +923,19 @@ class CandidateSandboxRunner:
         stdin_bytes: bytes | None = None,
         timeout_seconds: float | None = None,
         max_output_bytes: int | None = None,
-        extra_read_only_binds: Mapping[Path, str] | None = None,
         failure_prefix: str = "candidate_command",
-    ) -> SandboxProcessResult:
+    ) -> ProcessResult:
         if isinstance(visible_workspace_paths, (str, bytes)):
             raise JudgeInfrastructureError(
                 "invalid_workspace_visibility",
                 "candidate command visibility must be an explicit sequence of file paths",
             )
-        await self.isolation.ensure_available()
+        await self.execution.ensure_available()
         launch = LaunchContract(argv=tuple(argv), cwd=cwd).validate(project_root)
         if stdin_bytes is not None and len(stdin_bytes) > self.max_input_bytes:
             raise JudgeInfrastructureError(
-                "sandbox_input_limit_exceeded",
-                "framework-owned sandbox input exceeds its configured limit",
+                "process_input_limit_exceeded",
+                "framework-owned process input exceeds its configured limit",
             )
         effective_timeout = min(timeout_seconds or self.timeout_seconds, self.timeout_seconds)
         effective_output_limit = min(
@@ -1035,7 +943,7 @@ class CandidateSandboxRunner:
             self.max_output_bytes,
         )
         if effective_timeout <= 0 or effective_output_limit <= 0:
-            raise ValueError("sandbox timeout and output limit must be positive")
+            raise ValueError("process timeout and output limit must be positive")
 
         with tempfile.TemporaryDirectory(
             prefix="agent-world-command-state-",
@@ -1043,35 +951,34 @@ class CandidateSandboxRunner:
         ) as state_text:
             state_dir = Path(state_text)
             os.chmod(state_dir, 0o700)
-            wrapped = self.isolation.wrap_command(
+            host_launch = self.execution.prepare_process(
                 workspace=project_root,
                 cwd_relative=launch.cwd_relative,
                 argv=launch.argv,
                 state_dir=state_dir,
-                writable_workspace=False,
                 visible_workspace_paths=visible_workspace_paths,
                 extra_env=launch.env,
-                extra_read_only_binds=extra_read_only_binds,
-                process_limit=self.resource_limits.processes,
             )
             started = time.monotonic()
             try:
                 outcome = await _run_captured_process(
-                    wrapped,
+                    host_launch.argv,
                     timeout_seconds=effective_timeout,
                     max_output_bytes=effective_output_limit,
                     limits=self.resource_limits,
                     failure_prefix=failure_prefix,
                     stdin_bytes=stdin_bytes,
+                    cwd=host_launch.cwd,
+                    env=host_launch.env,
                 )
             except OSError as exc:
                 raise JudgeInfrastructureError(
-                    "sandbox_process_spawn_failed",
-                    "Judge could not spawn the required isolated subprocess",
+                    "host_process_spawn_failed",
+                    "Judge could not spawn the required host subprocess",
                     details={"error_type": type(exc).__name__},
                 ) from exc
             duration_ms = int((time.monotonic() - started) * 1000)
-        return SandboxProcessResult(
+        return ProcessResult(
             argv=launch.argv,
             exit_code=outcome.exit_code,
             stdout=outcome.stdout,
@@ -1089,7 +996,7 @@ class CandidateSandboxRunner:
         entrypoint: str,
         calls: Sequence[Mapping[str, JsonValue]],
         visible_workspace_paths: Sequence[str],
-    ) -> SandboxProcessResult:
+    ) -> ProcessResult:
         if isinstance(visible_workspace_paths, (str, bytes)) or not visible_workspace_paths:
             raise JudgeInfrastructureError(
                 "workspace_visibility_required",
@@ -1123,11 +1030,46 @@ class CandidateSandboxRunner:
             runner_path.chmod(0o400)
             return await self.run(
                 project_root,
-                argv=(".venv/bin/python", _TASK_MATERIALIZER_RUNNER_DESTINATION),
+                argv=(".venv/bin/python", str(runner_path)),
                 visible_workspace_paths=visible_workspace_paths,
                 stdin_bytes=stdin_bytes,
-                extra_read_only_binds={runner_path: _TASK_MATERIALIZER_RUNNER_DESTINATION},
                 failure_prefix="task_materializer",
+            )
+
+    async def run_python_module(
+        self,
+        project_root: Path,
+        *,
+        argv: Sequence[str],
+        visible_workspace_paths: Sequence[str],
+        timeout_seconds: float | None = None,
+        max_output_bytes: int | None = None,
+        failure_prefix: str = "candidate_module",
+    ) -> ProcessResult:
+        """Run Candidate ``python -m`` metadata with framework-owned import roots.
+
+        The Candidate is a virtual, dependency-only project.  Its declared
+        module may therefore live under ``src/`` without being installed into
+        the clean environment.  Materializing that import root is an execution
+        responsibility of the framework, just like the public-test and task
+        materializer runners; it is not repair feedback for the Code Agent.
+        """
+
+        with tempfile.TemporaryDirectory(
+            prefix="agent-world-candidate-module-",
+            dir=_trusted_temp_root(),
+        ) as runner_text:
+            runner_path = Path(runner_text) / "candidate-module-runner.py"
+            runner_path.write_text(_CANDIDATE_MODULE_RUNNER_SOURCE, encoding="utf-8")
+            runner_path.chmod(0o400)
+            runner_argv = _candidate_module_runner_argv(argv, runner_path)
+            return await self.run(
+                project_root,
+                argv=runner_argv,
+                visible_workspace_paths=visible_workspace_paths,
+                timeout_seconds=timeout_seconds,
+                max_output_bytes=max_output_bytes,
+                failure_prefix=failure_prefix,
             )
 
     async def run_public_test(
@@ -1138,15 +1080,15 @@ class CandidateSandboxRunner:
         visible_workspace_paths: Sequence[str],
         timeout_seconds: float | None = None,
         max_output_bytes: int | None = None,
-    ) -> SandboxProcessResult:
-        """Run one declared public test with the virtual candidate import roots.
+    ) -> ProcessResult:
+        """Run one declared public test with framework-owned Candidate import roots.
 
         Candidate projects are intentionally installed with ``--no-install-project``.
         A direct ``python tests/test_x.py`` therefore loses the project root from
         ``sys.path`` before the test has a chance to exercise candidate code.  The
-        framework-owned runner restores only the read-only candidate root and
-        optional ``src/`` layout inside the existing sandbox; it does not expose a
-        host path or let the candidate override ``PYTHONPATH``.
+        framework-owned runner restores the Candidate root and optional ``src/``
+        layout on the direct host process; it does not let the Candidate override
+        ``PYTHONPATH``.
         """
 
         if (
@@ -1177,14 +1119,46 @@ class CandidateSandboxRunner:
                 project_root,
                 argv=(
                     ".venv/bin/python",
-                    _PUBLIC_TEST_RUNNER_DESTINATION,
+                    str(runner_path),
                     path.as_posix(),
                 ),
                 visible_workspace_paths=visible_workspace_paths,
                 timeout_seconds=timeout_seconds,
                 max_output_bytes=max_output_bytes,
-                extra_read_only_binds={runner_path: _PUBLIC_TEST_RUNNER_DESTINATION},
                 failure_prefix="public_test",
+            )
+
+    async def verify_workspace_execution(
+        self,
+        project_root: Path,
+        *,
+        visible_workspace_paths: Sequence[str],
+    ) -> None:
+        """Prove the framework-owned host cwd/environment before Candidate tests.
+
+        This is deliberately a framework-only mechanical boundary.  A
+        Candidate public test can be attributed to Candidate code only after
+        the framework has separately proved the direct host process sees the
+        intended Candidate root. No probe output reaches Agent feedback.
+        """
+
+        with tempfile.TemporaryDirectory(
+            prefix="agent-world-workspace-projection-",
+            dir=_trusted_temp_root(),
+        ) as probe_text:
+            probe_path = Path(probe_text) / "candidate-workspace-execution.py"
+            probe_path.write_text(_AGENT_WORKSPACE_PROJECTION_PROBE_SOURCE, encoding="utf-8")
+            probe_path.chmod(0o400)
+            result = await self.run(
+                project_root,
+                argv=(".venv/bin/python", str(probe_path)),
+                visible_workspace_paths=visible_workspace_paths,
+                failure_prefix="candidate_workspace_execution",
+            )
+        if not result.succeeded:
+            raise JudgeInfrastructureError(
+                "candidate_workspace_execution_invalid",
+                "framework Candidate host workspace did not satisfy its mechanical contract",
             )
 
 
@@ -1197,7 +1171,7 @@ class RuntimeSupervisor:
         launch: LaunchContract,
         *,
         visible_workspace_paths: Sequence[str],
-        isolation: IsolationPolicy | None = None,
+        execution: HostExecutionPolicy | None = None,
         protocol_limits: ProtocolLimits = DEFAULT_PROTOCOL_LIMITS,
         resource_limits: ResourceLimits | None = None,
         request_timeout_seconds: float = 10.0,
@@ -1211,7 +1185,7 @@ class RuntimeSupervisor:
         if isinstance(visible_workspace_paths, (str, bytes)) or not visible_workspace_paths:
             raise ValueError("RuntimeSupervisor requires a non-empty role file allowlist")
         self.visible_workspace_paths = tuple(visible_workspace_paths)
-        self.isolation = isolation or IsolationPolicy()
+        self.execution = execution or HostExecutionPolicy()
         self.protocol_limits = protocol_limits
         self.resource_limits = resource_limits or ResourceLimits()
         self.request_timeout_seconds = request_timeout_seconds
@@ -1229,6 +1203,7 @@ class RuntimeSupervisor:
         self._stderr_truncated = False
         self._request_lock = asyncio.Lock()
         self._state_temp: tempfile.TemporaryDirectory[str] | None = None
+        self._module_runner_temp: tempfile.TemporaryDirectory[str] | None = None
         self._handshake: RuntimeResponse | None = None
         self._closed = False
 
@@ -1254,7 +1229,7 @@ class RuntimeSupervisor:
             raise JudgeInfrastructureError(
                 "runtime_already_started", "runtime process is already started"
             )
-        await self.isolation.ensure_available()
+        await self.execution.ensure_available()
         self._validated_launch = self.launch.validate(self.project_root)
         self._state_temp = tempfile.TemporaryDirectory(
             prefix="agent-world-runtime-state-",
@@ -1262,23 +1237,32 @@ class RuntimeSupervisor:
         )
         state_dir = Path(self._state_temp.name)
         os.chmod(state_dir, 0o700)
-        wrapped = self.isolation.wrap_command(
-            workspace=self.project_root,
-            cwd_relative=self._validated_launch.cwd_relative,
-            argv=self._validated_launch.argv,
-            state_dir=state_dir,
-            writable_workspace=False,
-            visible_workspace_paths=self.visible_workspace_paths,
-            extra_env=self._validated_launch.env,
-            process_limit=self.resource_limits.processes,
-        )
         try:
+            launch_argv = self._validated_launch.argv
+            if len(launch_argv) >= 3 and launch_argv[1] == "-m":
+                self._module_runner_temp = tempfile.TemporaryDirectory(
+                    prefix="agent-world-runtime-module-",
+                    dir=_trusted_temp_root(),
+                )
+                runner_path = Path(self._module_runner_temp.name) / "candidate-module-runner.py"
+                runner_path.write_text(_CANDIDATE_MODULE_RUNNER_SOURCE, encoding="utf-8")
+                runner_path.chmod(0o400)
+                launch_argv = _candidate_module_runner_argv(launch_argv, runner_path)
+            host_launch = self.execution.prepare_process(
+                workspace=self.project_root,
+                cwd_relative=self._validated_launch.cwd_relative,
+                argv=launch_argv,
+                state_dir=state_dir,
+                visible_workspace_paths=self.visible_workspace_paths,
+                extra_env=self._validated_launch.env,
+            )
             self._process = await asyncio.create_subprocess_exec(
-                *wrapped,
+                *host_launch.argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=_scrubbed_host_env(),
+                cwd=host_launch.cwd,
+                env=host_launch.env,
                 start_new_session=True,
                 preexec_fn=_rlimit_preexec(self.resource_limits),
                 limit=self.protocol_limits.max_message_bytes + 1,
@@ -1423,6 +1407,9 @@ class RuntimeSupervisor:
         if self._state_temp is not None:
             self._state_temp.cleanup()
             self._state_temp = None
+        if self._module_runner_temp is not None:
+            self._module_runner_temp.cleanup()
+            self._module_runner_temp = None
 
     async def __aenter__(self) -> RuntimeSupervisor:
         await self.start()
@@ -1524,13 +1511,16 @@ async def _run_captured_process(
     limits: ResourceLimits,
     failure_prefix: str,
     stdin_bytes: bytes | None = None,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> _CapturedOutcome:
     process = await asyncio.create_subprocess_exec(
         *argv,
         stdin=(asyncio.subprocess.PIPE if stdin_bytes is not None else asyncio.subprocess.DEVNULL),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env=_scrubbed_host_env(),
+        cwd=str(cwd) if cwd is not None else None,
+        env=dict(env) if env is not None else _scrubbed_host_env(),
         start_new_session=True,
         preexec_fn=_rlimit_preexec(limits),
     )
@@ -1630,9 +1620,6 @@ def _rlimit_preexec(limits: ResourceLimits):
         )
         resource.setrlimit(resource.RLIMIT_FSIZE, (limits.file_size_bytes, limits.file_size_bytes))
         resource.setrlimit(resource.RLIMIT_NOFILE, (limits.open_files, limits.open_files))
-        # RLIMIT_NPROC is applied by trusted ``prlimit`` *inside* the new user/PID
-        # namespaces. Applying it to the host-side bwrap launcher can make Linux
-        # reject namespace creation based on unrelated host UID process counts.
 
     return apply_limits
 
@@ -1725,21 +1712,21 @@ def _validate_workspace_file_view(
     cwd_relative: str,
     visible_paths: Sequence[str],
 ) -> tuple[tuple[tuple[Path, str], ...], tuple[str, ...], Path | None]:
-    """Validate and compile one exact, role-scoped candidate workspace view."""
+    """Validate one exact, role-scoped set of Candidate file paths."""
 
     if isinstance(visible_paths, (str, bytes)):
-        raise IsolationUnavailable(
+        raise HostExecutionUnavailable(
             "invalid_workspace_visibility",
             "workspace visibility must be a sequence of package-relative file paths",
         )
     root = root.resolve(strict=True)
-    mounts: list[tuple[Path, str]] = []
+    visible_files: list[tuple[Path, str]] = []
     seen: set[str] = set()
     directories: set[str] = set()
 
     cwd = PurePosixPath(cwd_relative)
     if cwd_relative != ".":
-        _validate_real_directory_chain(root, cwd, label="sandbox cwd")
+        _validate_real_directory_chain(root, cwd, label="host cwd")
         for index in range(1, len(cwd.parts) + 1):
             directories.add(PurePosixPath(*cwd.parts[:index]).as_posix())
 
@@ -1751,7 +1738,7 @@ def _validate_workspace_file_view(
             or "\\" in raw_path
             or len(raw_path) > 4096
         ):
-            raise IsolationUnavailable(
+            raise HostExecutionUnavailable(
                 "invalid_workspace_visibility",
                 "visible workspace paths must be bounded non-empty POSIX strings",
             )
@@ -1765,18 +1752,18 @@ def _validate_workspace_file_view(
             or not relative.parts
             or relative.parts[0] == ".venv"
         ):
-            raise IsolationUnavailable(
+            raise HostExecutionUnavailable(
                 "workspace_visibility_escape",
                 f"visible workspace path is not a canonical candidate file: {raw_path!r}",
             )
         if canonical in seen:
-            raise IsolationUnavailable(
+            raise HostExecutionUnavailable(
                 "duplicate_workspace_visibility",
                 f"visible workspace path is duplicated: {canonical}",
             )
         seen.add(canonical)
         source = _validate_real_file_chain(root, relative)
-        mounts.append((source, canonical))
+        visible_files.append((source, canonical))
         for index in range(1, len(relative.parts)):
             directories.add(PurePosixPath(*relative.parts[:index]).as_posix())
 
@@ -1786,21 +1773,21 @@ def _validate_workspace_file_view(
         venv_stat = venv_candidate.lstat()
     except OSError as exc:
         venv = None
-        if mounts:
-            raise IsolationUnavailable(
+        if visible_files:
+            raise HostExecutionUnavailable(
                 "candidate_venv_missing",
                 "role-scoped candidate execution requires the clean .venv dependency tree",
             ) from exc
     if venv is not None:
         if stat.S_ISLNK(venv_stat.st_mode) or not stat.S_ISDIR(venv_stat.st_mode):
-            raise IsolationUnavailable(
+            raise HostExecutionUnavailable(
                 "candidate_venv_invalid",
                 "candidate .venv must be a real directory",
             )
         directories.add(".venv")
 
     return (
-        tuple(sorted(mounts, key=lambda item: item[1])),
+        tuple(sorted(visible_files, key=lambda item: item[1])),
         tuple(sorted(directories, key=lambda item: (item.count("/"), item))),
         venv,
     )
@@ -1813,12 +1800,12 @@ def _validate_real_directory_chain(root: Path, relative: PurePosixPath, *, label
         try:
             current_stat = current.lstat()
         except OSError as exc:
-            raise IsolationUnavailable(
+            raise HostExecutionUnavailable(
                 "workspace_visibility_missing",
                 f"{label} is absent from the candidate workspace: {relative.as_posix()}",
             ) from exc
         if stat.S_ISLNK(current_stat.st_mode) or not stat.S_ISDIR(current_stat.st_mode):
-            raise IsolationUnavailable(
+            raise HostExecutionUnavailable(
                 "workspace_visibility_unsafe_parent",
                 f"{label} traverses a symlink or non-directory: {relative.as_posix()}",
             )
@@ -1836,12 +1823,12 @@ def _validate_real_file_chain(root: Path, relative: PurePosixPath) -> Path:
     try:
         source_stat = source.lstat()
     except OSError as exc:
-        raise IsolationUnavailable(
+        raise HostExecutionUnavailable(
             "workspace_visibility_missing",
             f"visible workspace file is absent: {relative.as_posix()}",
         ) from exc
     if stat.S_ISLNK(source_stat.st_mode) or not stat.S_ISREG(source_stat.st_mode):
-        raise IsolationUnavailable(
+        raise HostExecutionUnavailable(
             "workspace_visibility_not_regular",
             f"visible workspace path is not a real regular file: {relative.as_posix()}",
         )
@@ -1897,18 +1884,6 @@ def _validate_launch_executable(
         raise JudgeInfrastructureError(
             "launch_executable_not_executable", f"launch executable is not executable: {executable}"
         )
-
-
-def _minimal_etc_mounts() -> list[Path]:
-    candidates = [
-        Path("/etc/ld.so.cache"),
-        Path("/etc/passwd"),
-        Path("/etc/group"),
-        Path("/etc/nsswitch.conf"),
-        Path("/etc/ssl"),
-        Path("/etc/ca-certificates"),
-    ]
-    return [path for path in candidates if path.exists()]
 
 
 _COPY_IGNORED_NAMES = frozenset({".git", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache"})
@@ -2113,7 +2088,7 @@ def _validate_installed_tree(root: Path) -> None:
             target = os.readlink(path)
             target_path = PurePosixPath(target)
             if target_path.is_absolute():
-                if not _is_exact_pinned_python_link(path, root=root, target=target):
+                if not _is_exact_framework_python_link(path, root=root, target=target):
                     raise CandidateBuildError(
                         "installed_symlink_escape",
                         f"installed symlink escapes approved roots: {relative}",
@@ -2163,8 +2138,8 @@ def _hash_tree(root: Path) -> str:
     return digest.hexdigest()
 
 
-def _is_exact_pinned_python_link(path: Path, *, root: Path, target: str) -> bool:
-    """Accept only uv's interpreter links to the framework-owned sandbox Python."""
+def _is_exact_framework_python_link(path: Path, *, root: Path, target: str) -> bool:
+    """Accept only uv's links to the framework-owned host Python."""
 
     try:
         relative = path.relative_to(root)
@@ -2173,12 +2148,12 @@ def _is_exact_pinned_python_link(path: Path, *, root: Path, target: str) -> bool
     return (
         relative.parent == Path(".venv/bin")
         and relative.name in {"python", "python3", _PRODUCTION_PYTHON.name}
-        and target == _SANDBOX_PYTHON
+        and target == str(_PRODUCTION_PYTHON)
     )
 
 
 def _validate_pinned_venv_interpreter_link(path: Path, *, root: Path) -> None:
-    """Validate a possibly chained uv interpreter link without resolving `/opt` on the host."""
+    """Validate a possibly chained uv interpreter link to framework Python."""
 
     current = path
     seen: set[Path] = set()
@@ -2190,11 +2165,11 @@ def _validate_pinned_venv_interpreter_link(path: Path, *, root: Path) -> None:
         seen.add(current)
         target = os.readlink(current)
         if PurePosixPath(target).is_absolute():
-            if _is_exact_pinned_python_link(current, root=root, target=target):
+            if _is_exact_framework_python_link(current, root=root, target=target):
                 return
             raise JudgeInfrastructureError(
                 "launch_path_escape",
-                "launch interpreter does not target the framework-pinned sandbox Python",
+                "launch interpreter does not target the framework Python",
             )
         current = Path(os.path.normpath(current.parent / target))
         try:

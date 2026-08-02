@@ -1,4 +1,4 @@
-"""Preflight the real dependencies and isolation boundaries of a Foundry run."""
+"""Preflight the real dependencies and direct-host execution boundaries of a Foundry run."""
 
 from __future__ import annotations
 
@@ -7,16 +7,20 @@ import importlib.metadata
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.config import FoundryConfig
 from agent_world.contracts import PermissionScope
 from agent_world.control import TelemetryStore
@@ -35,9 +39,9 @@ from agent_world.invocation.codex_runtime import CodexRuntimeUnavailable, resolv
 from agent_world.invocation.contracts import JsonObject
 from agent_world.invocation.structured_diagnostics import safe_terminal_details
 from agent_world.judge import (
-    CandidateSandboxRunner,
+    CandidateProcessRunner,
     CleanCandidateBuilder,
-    IsolationPolicy,
+    HostExecutionPolicy,
 )
 from agent_world.research import SearchQuery, build_research_toolchain
 
@@ -64,6 +68,18 @@ _LIVE_AGENT_DEBUG_FILENAME = "doctor-live-agent-debug.json"
 # marker can never be mistaken for Agent-authored candidate material.
 _LIVE_AGENT_PROBE_FILENAME = "agent-world-live-agent-probe.txt"
 _LIVE_AGENT_PROBE_CONTENT = "agent-world-live-agent-probe-ok"
+_LOCAL_EXECUTION_CHECKS = frozenset(
+    {
+        "state_root",
+        "executable_uv",
+        "standalone_python",
+        "codex_sdk",
+        "codex_runtime",
+        "judge_host_execution",
+        "clean_build",
+        "profile_materialization",
+    }
+)
 
 
 class DoctorCheck(BaseModel):
@@ -87,6 +103,13 @@ class DoctorReport(BaseModel):
     checks: tuple[DoctorCheck, ...]
 
 
+def _local_execution_ready(checks: Iterable[DoctorCheck]) -> bool:
+    """Require every named direct-host prerequisite, not a stale subset."""
+
+    observed = {check.check: check.status for check in checks}
+    return all(observed.get(name) == "pass" for name in _LOCAL_EXECUTION_CHECKS)
+
+
 async def run_doctor(
     config: FoundryConfig,
     *,
@@ -108,7 +131,10 @@ async def run_doctor(
         checks.append(DoctorCheck(check="state_root", status="fail", summary=str(exc)))
 
     checks.append(_authentication_check(config))
-    checks.append(_executable_check("uv", shutil.which("uv")))
+    checks.append(_model_catalog_check(config))
+    uv_executable = shutil.which("uv")
+    checks.append(_executable_check("uv", uv_executable))
+    checks.append(_standalone_python_check(uv_executable))
 
     try:
         version = importlib.metadata.version("openai-codex")
@@ -131,22 +157,22 @@ async def run_doctor(
     checks.append(await _codex_runtime_check(config))
 
     try:
-        await IsolationPolicy(purpose="runtime").ensure_available()
-        await IsolationPolicy(purpose="build").ensure_available()
+        await HostExecutionPolicy(purpose="runtime").ensure_available()
+        await HostExecutionPolicy(purpose="build").ensure_available()
         checks.append(
             DoctorCheck(
-                check="judge_isolation",
+                check="judge_host_execution",
                 status="pass",
-                summary="runtime and configured clean-build bubblewrap probes passed",
+                summary="runtime and configured clean-build host-process probes passed",
             )
         )
     except Exception as exc:
-        checks.append(DoctorCheck(check="judge_isolation", status="fail", summary=str(exc)))
+        checks.append(DoctorCheck(check="judge_host_execution", status="fail", summary=str(exc)))
 
     checks.append(await _clean_build_readiness_check(config))
 
     try:
-        provider = IsolatedAgentProfileProvider(config.agent)
+        provider = AgentProfileProvider(config.agent)
         with tempfile.TemporaryDirectory(
             prefix="doctor-profile-",
             dir=config.state_root,
@@ -166,13 +192,13 @@ async def run_doctor(
                 raise ValueError("profile authentication kind is invalid")
         checks.append(
             DoctorCheck(
-                check="profile_isolation",
+                check="profile_materialization",
                 status="pass",
-                summary="isolated Researcher profile materialized and removed",
+                summary="private Researcher profile state materialized and removed",
             )
         )
     except Exception as exc:
-        checks.append(DoctorCheck(check="profile_isolation", status="fail", summary=str(exc)))
+        checks.append(DoctorCheck(check="profile_materialization", status="fail", summary=str(exc)))
 
     live_agent_check: DoctorCheck
     if live_agent:
@@ -232,22 +258,11 @@ async def run_doctor(
             )
         )
 
-    local_names = {
-        "state_root",
-        "executable_uv",
-        "codex_sdk",
-        "codex_runtime",
-        "judge_isolation",
-        "clean_build",
-        "profile_isolation",
-    }
-    local_execution_ready = all(
-        item.status == "pass" for item in checks if item.check in local_names
-    )
+    local_execution_ready = _local_execution_ready(checks)
     configuration_ready = local_execution_ready and all(
-        item.status == "pass"
+        item.status != "fail"
         for item in checks
-        if item.check in {"model_authentication", "research_configuration"}
+        if item.check in {"model_authentication", "research_configuration", "model_catalog"}
     )
     live_agent_verified = live_agent_check.status == "pass"
     live_research_check = next(item for item in checks if item.check == "live_research")
@@ -286,10 +301,10 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
     compact current-status file and the ordinary telemetry trace make a long
     control observable from a second process while it is still running.
 
-    This probe asks the Agent to USE A TOOL -- write a file into its own isolated
+    This probe asks the Agent to USE A TOOL -- write a file in its direct host
     workspace -- and then verifies that file on disk.  A prompt-only round trip
     ("return this object, do not call tools") proves the transport and nothing
-    else: worker spawn, app-server startup, sandbox mounts and tool dispatch can
+    else: worker spawn, app-server startup, direct SDK tool dispatch can
     all be broken while it still passes.  Those are exactly the layers that fail
     in practice, so the control has to cross them.  The structured answer alone is
     not sufficient evidence: only the observed workspace file proves a tool ran.
@@ -336,7 +351,7 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
             prefix="doctor-live-agent-",
             dir=config.state_root,
         ) as temporary:
-            provider = IsolatedAgentProfileProvider(config.agent)
+            provider = AgentProfileProvider(config.agent)
             # The Engineer role is the one with workspace-write authority, so it
             # is the only role that can prove tool dispatch end to end.  Probing
             # a read-only role would leave the write path -- the one CandidateBuild
@@ -355,7 +370,7 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                     "additionalProperties": False,
                 },
                 permissions=_live_agent_probe_permissions(config),
-                requirement=NodeCapabilityRequirement.isolated_build(
+                requirement=NodeCapabilityRequirement.host_build(
                     node_id="engineer.doctor-live-agent",
                 ),
                 rollout_token_limit=rollout_token_limit,
@@ -366,7 +381,9 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                     invocation_id=invocation_id,
                     prompt=(
                         "This is a production Agent readiness probe. Use your real "
-                        "tools; do not simulate their results.\n"
+                        "tools; do not simulate their results. Follow the mounted "
+                        "`engineer-agent-world` Skill only for its supplied "
+                        "workspace/tool method; this is not a CandidateBuild.\n"
                         f"1. Write a file named {_LIVE_AGENT_PROBE_FILENAME} in your "
                         "current working directory. Its content must be exactly the "
                         f"single line {_LIVE_AGENT_PROBE_CONTENT}\n"
@@ -391,7 +408,7 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                     ),
                 )
             )
-            # Observed while the isolated workspace still exists.  The Agent's own
+            # Observed while the Agent workspace still exists.  The Agent's own
             # booleans are a self-report; this is the framework's independent
             # evidence that a tool really ran, so the two are recorded separately.
             tool_evidence = _live_agent_tool_evidence(result, probe_marker)
@@ -421,7 +438,7 @@ async def _live_agent_check(config: FoundryConfig) -> DoctorCheck:
                 status="fail",
                 summary=(
                     "the Codex turn completed but its workspace write was not "
-                    "observed on disk; tool dispatch or sandbox mounting is broken "
+                    "observed on disk; tool dispatch or the Agent workspace setup is broken "
                     "even though the transport works"
                 ),
             )
@@ -615,7 +632,7 @@ def _live_agent_tool_evidence(
 
     ``workspace_write_observed`` is the only load-bearing field: a model can
     report ``wrote_file: true`` without a tool ever running, so the file on disk
-    is what proves worker spawn, sandbox mounts and tool dispatch all work.  The
+    is what proves worker spawn and tool dispatch both work. The
     self-report is retained beside it because a disagreement between the two is
     itself the useful diagnostic -- a real run reported false while the file was
     present, which told us more than either fact alone.
@@ -681,6 +698,106 @@ def _authentication_check(config: FoundryConfig) -> DoctorCheck:
     )
 
 
+def _model_catalog_check(config: FoundryConfig) -> DoctorCheck:
+    """Fail fast when a configured model name is absent from the gateway catalogue.
+
+    Some OpenAI-compatible gateways collapse an *unknown model name* into a
+    generic ``5xx``/``internal_server_error`` terminal indistinguishable from a
+    transient capacity blip.  Recovery then treats it as ``TRANSIENT_CAPACITY``
+    and spends the whole retry+fallback budget before reporting a misleading
+    "provider unavailable".  A configured model name is deterministic control
+    state, so validate it against the gateway's ``/models`` catalogue once at
+    preflight and turn it into a plain configuration error.
+
+    This probe spends no model tokens.  It is tolerant of gateways that do not
+    implement ``/models`` (or transiently fail it): those are reported as
+    ``skipped`` so a healthy deployment behind a minimal gateway still passes.
+    Only a catalogue that is present AND is missing a configured name fails.
+    """
+
+    agent = config.agent
+    base_url_environment = agent.openai_base_url_environment
+    if base_url_environment is None:
+        return DoctorCheck(
+            check="model_catalog",
+            status="skipped",
+            summary="no OpenAI-compatible base URL configured; model catalogue not applicable",
+        )
+    base_url = os.environ.get(base_url_environment)
+    api_key = os.environ.get(agent.api_key_environment)
+    if not base_url or not api_key:
+        return DoctorCheck(
+            check="model_catalog",
+            status="skipped",
+            summary="base URL or credential environment absent; catalogue probe skipped",
+        )
+
+    catalogue = _fetch_model_catalogue(base_url, api_key)
+    if catalogue is None:
+        return DoctorCheck(
+            check="model_catalog",
+            status="skipped",
+            summary="gateway did not expose a usable /models catalogue; probe skipped",
+        )
+
+    required = (agent.model, *agent.fallback_models)
+    missing = tuple(name for name in required if name not in catalogue)
+    if missing:
+        # Never echo the raw catalogue (it can name unrelated deployments); only
+        # report the configured names the deployment itself already owns.
+        return DoctorCheck(
+            check="model_catalog",
+            status="fail",
+            summary=(
+                "configured model name(s) absent from the gateway catalogue: "
+                + ", ".join(missing)
+                + " -- fix the configured model/fallback_models rather than retrying"
+            ),
+        )
+    return DoctorCheck(
+        check="model_catalog",
+        status="pass",
+        summary=f"all {len(required)} configured model name(s) present in the gateway catalogue",
+    )
+
+
+def _fetch_model_catalogue(base_url: str, api_key: str) -> frozenset[str] | None:
+    """Return the gateway's advertised model ids, or ``None`` when unavailable.
+
+    The credential is sent only to the exact configured base URL over the
+    standard bearer header; the response is parsed for ``data[].id`` and nothing
+    is persisted.  Any transport, status, or shape problem yields ``None`` so
+    the caller degrades to ``skipped`` rather than failing a healthy gateway.
+    """
+
+    url = base_url.rstrip("/") + "/models"
+    request = urllib.request.Request(  # noqa: S310 - fixed https gateway control probe
+        url,
+        method="GET",
+        headers={"Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:  # noqa: S310
+            if getattr(response, "status", 200) != 200:
+                return None
+            body = response.read(1_000_000)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    try:
+        parsed = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    entries = parsed.get("data") if isinstance(parsed, dict) else None
+    if not isinstance(entries, list):
+        return None
+    ids = {
+        entry["id"]
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    }
+    return frozenset(ids) if ids else None
+
+
 def _research_credential_check(config: FoundryConfig) -> DoctorCheck:
     name = config.research.jina_api_key_environment
     if config.research.provider == "jina" and (name is None or not os.environ.get(name)):
@@ -701,6 +818,66 @@ def _executable_check(name: str, executable: str | None) -> DoctorCheck:
         check=f"executable_{name}",
         status="pass" if executable else "fail",
         summary=f"{name} executable available" if executable else f"{name} executable missing",
+    )
+
+
+def _standalone_python_check(uv_executable: str | None) -> DoctorCheck:
+    """Confirm uv can locate a relocatable standalone Python 3.12 offline.
+
+    Candidate builds no longer copy the framework interpreter; the
+    profile resolver asks uv for a relocatable standalone distribution whose
+    stdlib stays valid when referenced in place.  If no such distribution is
+    installed, ``uv venv`` inside a workspace fails, so surface the gap here
+    rather than deep inside a build node.
+    """
+
+    if uv_executable is None:
+        return DoctorCheck(
+            check="standalone_python",
+            status="fail",
+            summary="uv is unavailable to locate a standalone Python 3.12",
+        )
+    try:
+        # Resolve exactly as a candidate build does: from a neutral working
+        # directory (so uv does not discover this framework's own project
+        # ``.venv``, whose interpreter is a symlink without a co-located
+        # stdlib) and requiring a uv-managed standalone distribution. Probing
+        # from the framework cwd would resolve the local venv and report a
+        # false negative even when a valid standalone is installed.
+        with tempfile.TemporaryDirectory() as neutral_cwd:
+            found = subprocess.run(  # noqa: S603 -- host uv, fixed args, discovery only.
+                [uv_executable, "python", "find", "--managed-python", "3.12"],
+                check=True,
+                capture_output=True,
+                text=True,
+                cwd=neutral_cwd,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "UV_PYTHON_DOWNLOADS": "never",
+                    "UV_NO_PROGRESS": "1",
+                    "UV_NO_PROJECT": "1",
+                },
+            )
+    except (OSError, subprocess.CalledProcessError):
+        return DoctorCheck(
+            check="standalone_python",
+            status="fail",
+            summary="no relocatable standalone Python 3.12 is installed for uv "
+            "(install one with: uv python install 3.12)",
+        )
+    interpreter = Path(found.stdout.strip())
+    root = interpreter.parent.parent
+    if not (root / "lib" / "python3.12" / "encodings" / "__init__.py").is_file():
+        return DoctorCheck(
+            check="standalone_python",
+            status="fail",
+            summary="uv resolved a Python 3.12 without a co-located stdlib "
+            "(install a standalone build with: uv python install 3.12)",
+        )
+    return DoctorCheck(
+        check="standalone_python",
+        status="pass",
+        summary="relocatable standalone Python 3.12 available to uv",
     )
 
 
@@ -785,7 +962,7 @@ async def _codex_runtime_check(config: FoundryConfig) -> DoctorCheck:
 
 
 async def _clean_build_readiness_check(config: FoundryConfig) -> DoctorCheck:
-    """Exercise the exact production clean-build and runtime isolation path."""
+    """Exercise the exact production clean-build and direct-host runtime path."""
 
     judge = config.judge
     cache = judge.uv_cache_dir
@@ -839,7 +1016,7 @@ async def _clean_build_readiness_check(config: FoundryConfig) -> DoctorCheck:
             )
 
             builder = CleanCandidateBuilder(
-                build_isolation=IsolationPolicy(purpose="build"),
+                build_execution=HostExecutionPolicy(purpose="build"),
                 uv_path=uv_path,
                 uv_cache_dir=cache,
                 timeout_seconds=judge.clean_build_timeout_seconds,
@@ -849,8 +1026,8 @@ async def _clean_build_readiness_check(config: FoundryConfig) -> DoctorCheck:
                     raise RuntimeError(
                         "clean build used a network policy different from Judge configuration"
                     )
-                runtime_result = await CandidateSandboxRunner(
-                    isolation=IsolationPolicy(purpose="runtime"),
+                runtime_result = await CandidateProcessRunner(
+                    execution=HostExecutionPolicy(purpose="runtime"),
                     timeout_seconds=min(judge.clean_build_timeout_seconds, 30.0),
                     max_output_bytes=16 * 1024,
                 ).run(
@@ -861,7 +1038,7 @@ async def _clean_build_readiness_check(config: FoundryConfig) -> DoctorCheck:
                 )
                 if not runtime_result.succeeded:
                     raise RuntimeError(
-                        "installed interpreter failed in runtime isolation "
+                        "installed interpreter failed in host execution "
                         f"({runtime_result.failure_class or runtime_result.exit_code})"
                     )
                 try:
@@ -872,14 +1049,14 @@ async def _clean_build_readiness_check(config: FoundryConfig) -> DoctorCheck:
                     ) from exc
                 if version != {"major": 3, "minor": 12}:
                     raise RuntimeError(
-                        "runtime isolation did not execute the required Python 3.12 interpreter"
+                        "runtime host execution did not use the required Python 3.12 interpreter"
                     )
 
         return DoctorCheck(
             check="clean_build",
             status="pass",
             summary=(
-                "real uv lock + frozen clean sync + runtime sandbox passed on exact "
+                "real uv lock + frozen clean sync + runtime host execution passed on exact "
                 "Python 3.12 (offline/no-network with the configured read-only uv cache)"
             ),
         )

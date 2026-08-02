@@ -13,6 +13,20 @@ def render_scene(scene: RunSceneIndex, coordinates: tuple[CoordinateScene, ...])
         f"Scope: {_text(scene.scope_id)}",
         f"Frontier: {scene.frontier_size} ({_delta(scene.frontier_delta)})",
     ]
+    if scene.active_work:
+        lines.append("Active work: wait for the live operation before acting on prior failures.")
+        for work in scene.active_work:
+            provider_state = (
+                "first Provider progress observed"
+                if work.first_provider_progress_at is not None
+                else "awaiting first Provider progress"
+            )
+            lines.append(
+                "- "
+                f"{_text(work.coordinate_label)}: {work.active_turn_count} active turn(s), "
+                f"{work.provider_progress_count} Provider progress event(s), {provider_state}; "
+                f"last activity {_text(work.last_activity_at.isoformat())}."
+            )
     stuck = (
         _coordinate_by_key(coordinates, scene.stuck_coordinate.coordinate_key)
         if scene.stuck_coordinate
@@ -211,6 +225,33 @@ def _append_timing(lines: list[str], scene: CoordinateScene) -> None:
                 "activity=" + (", ".join(activity_parts) if activity_parts else "none observed")
             )
         lines.append(f"Runtime Agent liveness: {'; '.join(details)}")
+    terminal_envelope = scene.codex_terminal_envelope
+    if terminal_envelope is not None:
+        facts: list[str] = []
+        if terminal_envelope.terminal_error_shape is not None:
+            facts.append(f"shape={terminal_envelope.terminal_error_shape}")
+        if terminal_envelope.codex_error_info is not None:
+            facts.append(f"info={terminal_envelope.codex_error_info}")
+        if terminal_envelope.http_status is not None:
+            facts.append(f"http-status={terminal_envelope.http_status}")
+        if terminal_envelope.advisory_text_signals:
+            facts.append("signals=" + ",".join(terminal_envelope.advisory_text_signals))
+        lines.append("Runtime Agent terminal envelope: " + "; ".join(facts))
+    request_shape = scene.runtime_agent_request_shape
+    if request_shape is not None:
+        shape = [
+            f"prompt={request_shape.prompt_bytes}B",
+            f"runtime-skills={request_shape.runtime_skill_count}",
+            (
+                f"output-schema={request_shape.output_schema_bytes}B"
+                if request_shape.output_schema_bytes is not None
+                else "output-schema=none"
+            ),
+            f"builtin-tools={request_shape.allowed_builtin_tool_count}",
+            f"mode={request_shape.execution_mode}",
+            f"continued-session={'yes' if request_shape.continued_session else 'no'}",
+        ]
+        lines.append("Runtime Agent request shape: " + "; ".join(shape))
     workspace = scene.candidate_workspace_liveness
     if workspace is not None:
         heartbeat = (

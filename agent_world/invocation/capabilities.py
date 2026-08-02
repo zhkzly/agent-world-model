@@ -1,10 +1,9 @@
-"""Framework-owned least-privilege plans for specialized Agent invocations.
+"""Framework-owned capability plans for specialized Agent invocations.
 
-The request/job permission contract authorizes *external* capabilities.  It
-does not describe the intrinsic sandbox primitives needed to read a staged
-workspace or, for the Builder node, edit that isolated workspace.  Keeping the
-two namespaces separate prevents a request for a domain or an MCP tool from
-silently granting shell or source-edit authority.
+The request/job permission contract authorizes external capabilities.  Codex
+Agents run with the one full-host SDK execution mode chosen by this project;
+the plan still records the tools a node expects, without introducing a second
+filesystem namespace or workspace sandbox.
 """
 
 from __future__ import annotations
@@ -19,13 +18,9 @@ from typing import Protocol
 from .contracts import JsonObject, SandboxMode
 
 _CAPABILITY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
-# Intrinsic tools are the sandbox primitives the framework has to reason about,
-# because they decide whether an Agent can change anything: shell execution and
-# workspace edits.  The Codex runtime's own tools are not enumerated here and are
-# not written into generated configuration -- the runtime decides which of its
-# tools exist, and an Agent gets whatever its runtime provides.  Naming a runtime
-# tool here only creates a second, weaker copy of that decision which can
-# disagree with it.
+# Intrinsic tools record the node's expected Codex tools. The runtime owns its
+# actual tool catalog; this metadata must not become a second restrictive
+# filesystem or command policy.
 _INTRINSIC_BUILTIN_TOOLS = frozenset({"shell", "workspace_edit"})
 _DOMAIN = re.compile(r"^(?:\*|(?:(?:\*|\*\*)\.)?[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)$")
 
@@ -115,7 +110,7 @@ class ExternalCapabilitySet:
 
 @dataclass(frozen=True, slots=True)
 class RoleCapabilityMaximum:
-    """Framework/operator ceiling for one of the three specialized roles."""
+    """Framework/operator capability declaration for one specialized role."""
 
     role: str
     policy_version: str
@@ -160,17 +155,16 @@ class NodeCapabilityRequirement:
         node_id: str,
         role: str,
     ) -> NodeCapabilityRequirement:
-        """Read framework-staged files and return typed output; no write authority.
+        """Read framework-staged files and return typed output.
 
-        Only the sandbox primitive is declared.  Whatever other tools the Codex
-        runtime offers this turn are the runtime's business, not something this
-        requirement enumerates.
+        The runtime's full-host SDK mode is invariant; this requirement only
+        names whether the node expects a shell tool.
         """
 
         return cls(
             node_id=node_id,
             role=role,
-            sandbox=SandboxMode.READ_ONLY,
+            sandbox=SandboxMode.FULL_ACCESS,
             intrinsic_builtin_tools=("shell",),
         )
 
@@ -186,28 +180,23 @@ class NodeCapabilityRequirement:
         return cls(
             node_id=node_id,
             role=role,
-            sandbox=SandboxMode.READ_ONLY,
+            sandbox=SandboxMode.FULL_ACCESS,
             intrinsic_builtin_tools=(),
         )
 
     @classmethod
-    def isolated_build(
+    def host_build(
         cls,
         *,
         node_id: str,
         external: ExternalCapabilitySet | None = None,
     ) -> NodeCapabilityRequirement:
-        """Edit/test the candidate workspace with only explicitly required externals.
-
-        Declares the two sandbox primitives that let this node change something.
-        Other runtime tools are not enumerated: the Codex runtime provides what it
-        provides, and writes remain confined to the isolated candidate workspace.
-        """
+        """Edit and test a Candidate in its direct host working directory."""
 
         return cls(
             node_id=node_id,
             role="environment-engineer",
-            sandbox=SandboxMode.WORKSPACE_WRITE,
+            sandbox=SandboxMode.FULL_ACCESS,
             intrinsic_builtin_tools=("shell", "workspace_edit"),
             external=external if external is not None else ExternalCapabilitySet(),
         )
@@ -280,16 +269,18 @@ def compile_effective_capability_plan(
     """Resolve an exact plan or fail before any credential/workspace materialization.
 
     The effective external set is the node requirement after proving that every
-    item is present in both the role ceiling and the job grant.  Broader grants
-    are intentionally discarded.  Intrinsic sandbox primitives are checked
-    against the role ceiling only; they are not external request capabilities.
+    item is present in both the role declaration and the job grant. Broader
+    grants are intentionally discarded. The Codex execution mode is invariant
+    and therefore has no read/write rank or namespace policy.
     """
 
     missing: list[str] = []
     if requirement.role != role_maximum.role:
         missing.append("role")
-    if _sandbox_rank(requirement.sandbox) > _sandbox_rank(role_maximum.maximum_sandbox):
-        missing.append("intrinsic.sandbox")
+    if requirement.sandbox is not SandboxMode.FULL_ACCESS:
+        missing.append("intrinsic.execution_mode")
+    if role_maximum.maximum_sandbox is not SandboxMode.FULL_ACCESS:
+        missing.append("role_maximum.execution_mode")
     if not set(requirement.intrinsic_builtin_tools) <= set(role_maximum.intrinsic_builtin_tools):
         missing.append("intrinsic.builtin_tools")
 
@@ -338,10 +329,6 @@ def compile_effective_capability_plan(
         job_permission_hash=_canonical_hash(granted.to_public_dict()),
         node_requirement_hash=_canonical_hash(requirement.to_public_dict()),
     )
-
-
-def _sandbox_rank(value: SandboxMode) -> int:
-    return 1 if value is SandboxMode.READ_ONLY else 2
 
 
 def _domains_cover(requested: set[str], allowed: tuple[str, ...]) -> bool:

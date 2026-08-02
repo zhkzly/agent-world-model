@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import HttpUrl
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.builder import BuilderError
 from agent_world.cli import _job_permissions
 from agent_world.config import AgentBackendConfig, FoundryConfig, ResearchConfig
@@ -20,6 +20,7 @@ from agent_world.invocation import (
     RoleCapabilityMaximum,
     SandboxMode,
     compile_effective_capability_plan,
+    verify_resolved_profile,
 )
 from agent_world.judge import VerifierCompilationError
 from agent_world.research import ResearchAccessPolicy
@@ -29,7 +30,7 @@ def _engineer_maximum() -> RoleCapabilityMaximum:
     return RoleCapabilityMaximum(
         role="environment-engineer",
         policy_version="1",
-        maximum_sandbox=SandboxMode.WORKSPACE_WRITE,
+        maximum_sandbox=SandboxMode.FULL_ACCESS,
         intrinsic_builtin_tools=("shell", "workspace_edit"),
         external=ExternalCapabilitySet(
             network_domains=("files.pythonhosted.org", "pypi.org"),
@@ -37,8 +38,8 @@ def _engineer_maximum() -> RoleCapabilityMaximum:
     )
 
 
-def _provider() -> IsolatedAgentProfileProvider:
-    return IsolatedAgentProfileProvider(
+def _provider() -> AgentProfileProvider:
+    return AgentProfileProvider(
         AgentBackendConfig(
             model="configured-real-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -51,11 +52,11 @@ def _provider() -> IsolatedAgentProfileProvider:
 
 
 def test_resolved_profile_clamps_timeout_to_node_budget(tmp_path: Path) -> None:
-    provider = IsolatedAgentProfileProvider(
+    provider = AgentProfileProvider(
         AgentBackendConfig(
             model="configured-real-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
-            direct_stream_idle_timeout_seconds=321,
+            provider_stream_idle_timeout_seconds=321,
         ),
         source_environment={
             "PATH": "/usr/bin:/bin",
@@ -77,7 +78,7 @@ def test_resolved_profile_clamps_timeout_to_node_budget(tmp_path: Path) -> None:
     )
 
     assert profile.limits.timeout_seconds == 900
-    assert profile.limits.direct_stream_idle_timeout_seconds == 321
+    assert profile.limits.provider_stream_idle_timeout_seconds == 321
     assert profile.limits.max_events == 65_536
     assert profile.allowed_builtin_tools == ()
 
@@ -87,7 +88,7 @@ def test_environment_engineer_timeout_uses_explicit_operation_budget(
 ) -> None:
     """Structured design must not inherit the unrelated Builder codegen cap."""
 
-    provider = IsolatedAgentProfileProvider(
+    provider = AgentProfileProvider(
         AgentBackendConfig(
             model="configured-real-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -118,7 +119,7 @@ def test_environment_engineer_timeout_uses_explicit_operation_budget(
         workspace=tmp_path / "runtime-build",
         output_schema={"type": "object", "additionalProperties": False},
         permissions=PermissionScope(),
-        requirement=NodeCapabilityRequirement.isolated_build(
+        requirement=NodeCapabilityRequirement.host_build(
             node_id="environment-engineer.runtime-build"
         ),
         invocation_timeout_seconds=120,
@@ -148,9 +149,7 @@ def test_structured_environment_engineer_event_budget_tracks_token_budget(
 
 
 def test_exact_node_requirement_discards_broader_external_job_grants() -> None:
-    requirement = NodeCapabilityRequirement.isolated_build(
-        node_id="environment-engineer.runtime-build"
-    )
+    requirement = NodeCapabilityRequirement.host_build(node_id="environment-engineer.runtime-build")
 
     plan = compile_effective_capability_plan(
         role_maximum=_engineer_maximum(),
@@ -161,7 +160,7 @@ def test_exact_node_requirement_discards_broader_external_job_grants() -> None:
         requirement=requirement,
     )
 
-    assert plan.sandbox is SandboxMode.WORKSPACE_WRITE
+    assert plan.sandbox is SandboxMode.FULL_ACCESS
     assert plan.intrinsic_builtin_tools == ("shell", "workspace_edit")
     assert plan.external.network_domains == ()
     assert plan.external.tool_allowlist == ()
@@ -172,7 +171,7 @@ def test_required_external_domain_needs_both_role_ceiling_and_job_permission() -
     requirement = NodeCapabilityRequirement(
         node_id="environment-engineer.dependency-inspection",
         role="environment-engineer",
-        sandbox=SandboxMode.READ_ONLY,
+        sandbox=SandboxMode.FULL_ACCESS,
         intrinsic_builtin_tools=("shell",),
         external=ExternalCapabilitySet(network_domains=("pypi.org",)),
     )
@@ -199,7 +198,7 @@ def test_job_cannot_grant_an_external_tool_absent_from_role_maximum() -> None:
     requirement = NodeCapabilityRequirement(
         node_id="environment-engineer.external-tool",
         role="environment-engineer",
-        sandbox=SandboxMode.READ_ONLY,
+        sandbox=SandboxMode.FULL_ACCESS,
         intrinsic_builtin_tools=("shell",),
         external=ExternalCapabilitySet(tool_allowlist=("mcp.package-inspect",)),
     )
@@ -224,12 +223,12 @@ def test_engineer_profile_keeps_intrinsic_build_tools_but_gets_no_implicit_netwo
         workspace=tmp_path / "engineer",
         output_schema={"type": "object", "additionalProperties": False},
         permissions=PermissionScope(),
-        requirement=NodeCapabilityRequirement.isolated_build(
+        requirement=NodeCapabilityRequirement.host_build(
             node_id="environment-engineer.runtime-build"
         ),
     )
 
-    assert profile.sandbox is SandboxMode.WORKSPACE_WRITE
+    assert profile.sandbox is SandboxMode.FULL_ACCESS
     assert profile.allowed_builtin_tools == ("shell", "workspace_edit")
     assert profile.allowed_network_domains == ()
     assert profile.effective_capability_plan.external.network_domains == ()
@@ -242,7 +241,7 @@ def test_engineer_profile_keeps_intrinsic_build_tools_but_gets_no_implicit_netwo
 
 
 def test_engineer_runtime_skills_are_selected_by_exact_build_node(tmp_path: Path) -> None:
-    """Planning stays read-only while CandidateBuild receives only codegen guidance."""
+    """CandidateBuild mounts one focused Skill with progressive resources."""
 
     provider = _provider()
     planning = provider.resolve(
@@ -262,29 +261,132 @@ def test_engineer_runtime_skills_are_selected_by_exact_build_node(tmp_path: Path
         workspace=tmp_path / "codegen",
         output_schema={"type": "object", "additionalProperties": False},
         permissions=PermissionScope(),
-        requirement=NodeCapabilityRequirement.isolated_build(
+        requirement=NodeCapabilityRequirement.host_build(
             node_id="environment-engineer.runtime-build"
         ),
     )
 
-    assert planning.sandbox is SandboxMode.READ_ONLY
+    assert planning.sandbox is SandboxMode.FULL_ACCESS
     assert planning.allowed_builtin_tools == ("shell",)
     assert tuple(bundle.name for bundle in planning.skills) == ("engineer-build-planning",)
-    assert codegen.sandbox is SandboxMode.WORKSPACE_WRITE
+    assert not hasattr(planning, "base_instructions")
+    assert not hasattr(planning, "developer_instructions")
+    assert codegen.sandbox is SandboxMode.FULL_ACCESS
     assert codegen.allowed_builtin_tools == ("shell", "workspace_edit")
     assert tuple(bundle.name for bundle in codegen.skills) == ("engineer-environment-codegen",)
-    assert codegen.developer_instructions is not None
-    assert "Engineer Environment Codegen" in codegen.developer_instructions
-    assert "Isolated CandidateBuild working context" in codegen.developer_instructions
-    assert "Use relative paths such as `inputs/...` and `candidate/...`" in (
-        codegen.developer_instructions
+    assert not hasattr(codegen, "base_instructions")
+    assert not hasattr(codegen, "developer_instructions")
+    codegen_skill = (codegen.skills[0].path / "SKILL.md").read_text(encoding="utf-8")
+    normalized_codegen_skill = " ".join(codegen_skill.split())
+    assert "Engineer Environment Codegen" in codegen_skill
+    assert "Work in the supplied workspace" in codegen_skill
+    assert "`inputs/...` contains immutable framework inputs" in codegen_skill
+    assert "`candidate/...` is the only project you may create or edit" in codegen_skill
+    assert "normal host `uv` and Python" in codegen_skill
+    assert "direct host workspace" in codegen_skill
+    assert "do not depend on a parent checkout" in normalized_codegen_skill
+    assert ".agent-world-tools" not in codegen_skill
+    assert "AGENT_WORLD_PYTHON_RUNTIME" not in codegen_skill
+    assert "`sys.executable`" in codegen_skill
+    assert "Load detail progressively" in codegen_skill
+    runtime_reference = (
+        codegen.skills[0].path / "references" / "runtime-and-materializer.md"
+    ).read_text(encoding="utf-8")
+    assert "Component visibility" in runtime_reference
+    assert "A `runtime` source may import only files declared `runtime`" in runtime_reference
+    delivery_reference = (
+        codegen.skills[0].path / "references" / "python-project-delivery.md"
+    ).read_text(encoding="utf-8")
+    assert '`license-files = ["LICENSE"]` is only a' in delivery_reference
+    assert "--project candidate" in delivery_reference
+    assert "`pip freeze`" in delivery_reference
+    preflight = codegen.skills[0].path / "scripts" / "check_candidate_tree.py"
+    assert preflight.is_file()
+    assert "Deterministic preflight" in preflight.read_text(encoding="utf-8")
+    contract_map = codegen.skills[0].path / "scripts" / "candidate_contract_map.py"
+    assert contract_map.is_file()
+    assert "frozen CandidateBuild acceptance map" in contract_map.read_text(encoding="utf-8")
+    materializer_campaign = codegen.skills[0].path / "scripts" / "check_materializer_campaign.py"
+    assert materializer_campaign.is_file()
+    assert "Candidate-owned" in materializer_campaign.read_text(encoding="utf-8")
+    runtime_handshake = codegen.skills[0].path / "scripts" / "check_runtime_handshake_contract.py"
+    assert runtime_handshake.is_file()
+    assert "frozen WorldSpec surface" in runtime_handshake.read_text(encoding="utf-8")
+    public_tests = codegen.skills[0].path / "scripts" / "check_public_tests.py"
+    assert public_tests.is_file()
+    assert "clean frozen offline project copy" in public_tests.read_text(encoding="utf-8")
+
+
+def test_direct_profiles_have_no_skill_and_agent_profiles_mount_one_skill(
+    tmp_path: Path,
+) -> None:
+    """Direct routes stay prompt-only while Agent routes own their one Skill."""
+
+    provider = AgentProfileProvider(
+        AgentBackendConfig(
+            model="configured-real-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-model-credential",
+        },
     )
-    assert "./.agent-world-tools/uv" in codegen.developer_instructions
-    assert "./.agent-world-tools/python3.12" in codegen.developer_instructions
-    assert "--python ./.agent-world-tools/python3.12" in codegen.developer_instructions
-    instructions = " ".join(codegen.developer_instructions.split())
-    assert "Component source visibility" in instructions
-    assert "A `runtime` source may import only files declared `runtime`" in instructions
+    direct = provider.resolve(
+        role="environment-engineer",
+        lineage_id="direct-native-schema",
+        workspace=tmp_path / "direct",
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.structured_output(
+            node_id="environment-engineer.tool-semantics-batch",
+            role="environment-engineer",
+        ),
+    )
+    agent = provider.resolve(
+        role="environment-engineer",
+        lineage_id="agent-native-schema",
+        workspace=tmp_path / "agent",
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.host_build(
+            node_id="invocation-audit.engineer-workspace-write"
+        ),
+    )
+
+    assert direct.skills == ()
+    assert tuple(bundle.name for bundle in agent.skills) == ("engineer-agent-world",)
+
+
+@pytest.mark.parametrize(
+    ("role", "node_id", "skill_name"),
+    (
+        ("researcher", "researcher.evidence-acquisition", "research-world-evidence"),
+        ("environment-engineer", "environment-engineer.workspace-review", "engineer-agent-world"),
+        ("challenger", "challenger.public-review", "challenge-agent-world"),
+    ),
+)
+def test_other_tool_enabled_agents_mount_one_role_skill(
+    tmp_path: Path,
+    role: str,
+    node_id: str,
+    skill_name: str,
+) -> None:
+    """A tool-enabled Codex turn has one matching Skill, not hidden role prose."""
+
+    profile = _provider().resolve(
+        role=role,
+        lineage_id=f"agent-skill-{node_id}",
+        workspace=tmp_path / node_id.replace(".", "-"),
+        output_schema={"type": "object", "additionalProperties": False},
+        permissions=PermissionScope(),
+        requirement=NodeCapabilityRequirement.structured_read(node_id=node_id, role=role),
+    )
+
+    assert profile.allowed_builtin_tools == ("shell",)
+    assert tuple(bundle.name for bundle in profile.skills) == (skill_name,)
+    assert not hasattr(profile, "base_instructions")
+    assert not hasattr(profile, "developer_instructions")
 
 
 def test_profile_provider_binds_typed_framework_lineage_to_stable_safe_identity(
@@ -300,7 +402,7 @@ def test_profile_provider_binds_typed_framework_lineage_to_stable_safe_identity(
         requirement=NodeCapabilityRequirement(
             node_id="researcher.requirement-research",
             role="researcher",
-            sandbox=SandboxMode.READ_ONLY,
+            sandbox=SandboxMode.FULL_ACCESS,
             intrinsic_builtin_tools=("shell",),
             external=ExternalCapabilitySet(),
         ),
@@ -311,171 +413,78 @@ def test_profile_provider_binds_typed_framework_lineage_to_stable_safe_identity(
     )
 
 
-def test_tool_free_structured_profile_injects_role_skill_without_shell(
+@pytest.mark.parametrize(
+    ("role", "node_id"),
+    (
+        ("researcher", "researcher.research-plan"),
+        ("researcher", "researcher.evidence-synthesis"),
+        ("environment-engineer", "environment-engineer.world-architecture"),
+        ("environment-engineer", "environment-engineer.shared-tool-semantics"),
+        ("environment-engineer", "environment-engineer.tool-semantics-batch"),
+        ("environment-engineer", "environment-engineer.world-rules"),
+        ("environment-engineer", "environment-engineer.curriculum-plan"),
+        ("environment-engineer", "environment-engineer.task-requirement"),
+        ("environment-engineer", "environment-engineer.task-curriculum"),
+        ("environment-engineer", "environment-engineer.semantic-revision"),
+        ("challenger", "challenger.verifier-compile-batch"),
+    ),
+)
+def test_direct_structured_profiles_have_only_model_and_rendered_prompt(
     tmp_path: Path,
+    role: str,
+    node_id: str,
 ) -> None:
-    profile = _provider().resolve(
-        role="researcher",
-        lineage_id="tool-free-evidence-synthesis",
-        workspace=tmp_path / "tool-free-researcher",
-        output_schema={"type": "object", "additionalProperties": False},
-        permissions=PermissionScope(),
-        requirement=NodeCapabilityRequirement.structured_output(
-            node_id="researcher.evidence-synthesis",
-            role="researcher",
-        ),
-    )
+    """A Direct LLM must never inherit a role Skill or hidden semantic prompt."""
 
-    assert profile.allowed_builtin_tools == ()
-    assert profile.skills == ()
-    assert profile.developer_instructions is not None
-    assert "Research World Evidence" in profile.developer_instructions
-    assert "Citation catalog ownership" in profile.developer_instructions
-    assert "`evidence_catalog_indexes`" in profile.developer_instructions
-    # Tool-free is expressed by the resolved profile, asserted above, not by a
-    # feature flag in generated configuration.  This profile is routed to the
-    # Direct transport, which has no tool surface to disable in the first place.
-    config_text = (profile.codex_home / "config.toml").read_text(encoding="utf-8")
-    assert "[features]" not in config_text
-
-
-def test_tool_free_challenger_profile_loads_action_input_schema_audit(
-    tmp_path: Path,
-) -> None:
-    profile = IsolatedAgentProfileProvider(
-        AgentBackendConfig(
-            model="configured-real-model",
-            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
-            structured_output_transport="json_envelope",
-        ),
-        source_environment={
-            "PATH": "/usr/bin:/bin",
-            "AGENT_WORLD_TEST_MODEL_KEY": "test-model-credential",
-        },
-    ).resolve(
-        role="challenger",
-        lineage_id="tool-free-challenger-action-schema-audit",
-        workspace=tmp_path / "tool-free-challenger",
-        output_schema={"type": "object", "additionalProperties": False},
-        permissions=PermissionScope(),
-        requirement=NodeCapabilityRequirement.structured_output(
-            node_id="challenger.verifier-compile-batch",
-            role="challenger",
-        ),
-    )
-
-    assert profile.allowed_builtin_tools == ()
-    assert profile.developer_instructions is not None
-    assert "Action-input schema audit" in profile.developer_instructions
-    assert "additionalProperties` is `false`" in profile.developer_instructions
-    assert "Positive means one `expectations` item" in profile.developer_instructions
-    assert "`expected=true`" in profile.developer_instructions
-    assert "two-pass internal" in profile.developer_instructions
-    assert "coverage audit" in profile.developer_instructions
-    assert "positive_only` `error_semantics` row" in profile.developer_instructions
-    assert "merely including the tool elsewhere" in profile.developer_instructions
-    assert (
-        "Input/context documents may have their own schema_version"
-        in profile.developer_instructions
-    )
-    assert "The Challenger context and the requested `VerifierIntent` are different documents" in (
-        profile.developer_instructions
-    )
-    assert 'literal `"v2"`' in profile.developer_instructions
-
-
-def test_tool_free_engineer_profile_requires_closed_evidence_claim_catalog(
-    tmp_path: Path,
-) -> None:
-    """BC-17/T1 guard: semantic authors may copy, never mint, evidence IDs."""
-
-    profile = _provider().resolve(
-        role="environment-engineer",
-        lineage_id="tool-free-architecture-claim-binding",
-        workspace=tmp_path / "tool-free-engineer",
-        output_schema={"type": "object", "additionalProperties": False},
-        permissions=PermissionScope(),
-        requirement=NodeCapabilityRequirement.structured_output(
-            node_id="environment-engineer.world-architecture",
-            role="environment-engineer",
-        ),
-    )
-
-    assert profile.allowed_builtin_tools == ()
-    assert profile.developer_instructions is not None
-    assert "Closed evidence-claim binding" in profile.developer_instructions
-    assert "closed enum" in profile.developer_instructions
-    assert "Never mint, rename, infer, or describe a claim id" in profile.developer_instructions
-    assert "Tool-semantics scalar observations" in profile.developer_instructions
-    assert "errors.errors[*].observation" in profile.developer_instructions
-    assert "one concrete user-visible sentence" in profile.developer_instructions
-    assert "Tool-semantics representation audit" in profile.developer_instructions
-    assert "`reliability.rollback.guarantees`" in profile.developer_instructions
-    assert "never a list or object" in profile.developer_instructions
-    assert "`reliability.tool_id`" in profile.developer_instructions
-    assert "Tool-semantics Rule clause closure" in profile.developer_instructions
-    assert "they **must omit** `ordering`" in profile.developer_instructions
-    assert "Lookup keys use one flat, closed variant" in profile.developer_instructions
-    assert "a nested `key`, arithmetic as a key" in profile.developer_instructions
-    assert "WorldRules semantic ownership" in profile.developer_instructions
-    assert "Omit this optional field" in profile.developer_instructions
-    assert "WorldRules even if it appears in the output schema" in profile.developer_instructions
-    assert "rule:state:<ordinal>" in profile.developer_instructions
-    assert "rule:world:<ordinal>" in profile.developer_instructions
-    assert "CurriculumPlan semantic ownership" in profile.developer_instructions
-    assert "`difficulty_dimensions` is also a closed top-level catalog" in (
-        profile.developer_instructions
-    )
-    assert "`task_dimension_catalog`" in profile.developer_instructions
-    assert "do not add, remove, rename," in profile.developer_instructions
-    assert "or reorder any id" in profile.developer_instructions
-    assert "rule:sampling:<ordinal>" in profile.developer_instructions
-    assert "rule:task:<task_type>:<section>:<ordinal>" in profile.developer_instructions
-    assert "`terminal_conditions` (non-empty)" in profile.developer_instructions
-    assert "Every task has at least one success Rule and at least one terminal Rule" in (
-        profile.developer_instructions
-    )
-    assert "Evaluator Rules never read Runtime-reported `terminated` or `truncated`" in (
-        profile.developer_instructions
-    )
-
-
-def test_task_curriculum_agent_view_remains_tool_free_and_deny_by_default(
-    tmp_path: Path,
-) -> None:
-    """TaskCurriculum receives its frozen facts in the prompt, not broad workspace access."""
-
-    profile = _provider().resolve(
-        role="environment-engineer",
-        lineage_id="tool-free-task-curriculum-view",
-        workspace=tmp_path / "task-curriculum",
+    provider = _provider()
+    profile = provider.resolve(
+        role=role,
+        lineage_id=f"direct-prompt-only-{node_id}",
+        workspace=tmp_path / node_id.replace(".", "-"),
         output_schema={"type": "object", "additionalProperties": False},
         permissions=PermissionScope(
             network_domains=("pypi.org",),
             tool_allowlist=("unused.external-tool",),
         ),
         requirement=NodeCapabilityRequirement.structured_output(
-            node_id="environment-engineer.task-curriculum",
-            role="environment-engineer",
+            node_id=node_id,
+            role=role,
         ),
     )
 
     assert profile.allowed_builtin_tools == ()
     assert profile.skills == ()
+    assert not hasattr(profile, "hooks")
+    assert not hasattr(profile, "base_instructions")
+    assert not hasattr(profile, "developer_instructions")
     assert profile.effective_capability_plan.intrinsic_builtin_tools == ()
     assert profile.effective_capability_plan.external == ExternalCapabilitySet()
-    assert profile.developer_instructions is not None
-    instructions = " ".join(profile.developer_instructions.split())
-    assert "TaskRequirement semantic ownership" in instructions
-    assert "`coverage_dimensions[*].rule_ids`" in instructions
-    assert "`coverage_rule_catalog`" in instructions
-    assert "Do not mint an ID or use a task/sampling Rule ID" in instructions
+    assert profile.backend == "direct_llm"
+    assert profile.codex_bin is None
+    assert provider.codex_bin is None
+    assert not profile.home.exists()
+    assert not profile.codex_home.exists()
+    assert list(profile.workspace.iterdir()) == []
+    assert "HOME" not in profile.worker_environment()
+    assert "CODEX_HOME" not in profile.worker_environment()
+    assert profile.to_public_dict()["home"] is None
+    assert profile.to_public_dict()["codex_home"] is None
+    verify_resolved_profile(profile)
+
+
+def test_runtime_skills_have_no_secondary_default_prompt_surface() -> None:
+    """A mounted runtime Skill is one SKILL.md, never a sidecar default Prompt."""
+
+    assets_root = Path("agent_world/agent_assets/skills")
+    for skill_file in sorted(assets_root.glob("*/SKILL.md")):
+        skill_root = skill_file.parent
+        assert (skill_root / "SKILL.md").is_file()
+        agent_metadata = skill_root / "agents"
+        assert not agent_metadata.exists() or not tuple(agent_metadata.iterdir())
 
 
 def test_profile_identity_binds_even_unused_job_permission_scope(tmp_path: Path) -> None:
-    requirement = NodeCapabilityRequirement.isolated_build(
-        node_id="environment-engineer.runtime-build"
-    )
+    requirement = NodeCapabilityRequirement.host_build(node_id="environment-engineer.runtime-build")
     provider = _provider()
     narrow = provider.resolve(
         role="environment-engineer",
@@ -508,7 +517,7 @@ def test_provider_rejects_external_network_before_materializing_workspace(
     requirement = NodeCapabilityRequirement(
         node_id="environment-engineer.dependency-inspection",
         role="environment-engineer",
-        sandbox=SandboxMode.READ_ONLY,
+        sandbox=SandboxMode.FULL_ACCESS,
         intrinsic_builtin_tools=("shell",),
         external=ExternalCapabilitySet(network_domains=("pypi.org",)),
     )
@@ -550,11 +559,11 @@ def test_cli_dependency_grant_preserves_public_research_and_profiles_exact_build
         run_permissions=permissions,
         allowed_source_kinds=("web",),
     )
-    requirement = NodeCapabilityRequirement.isolated_build(
+    requirement = NodeCapabilityRequirement.host_build(
         node_id="environment-engineer.runtime-build",
         external=ExternalCapabilitySet(network_domains=("pypi.org",)),
     )
-    profile = IsolatedAgentProfileProvider(
+    profile = AgentProfileProvider(
         agent,
         source_environment={
             "PATH": "/usr/bin:/bin",

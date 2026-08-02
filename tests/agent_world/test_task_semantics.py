@@ -420,3 +420,32 @@ def test_initial_and_sampling_rules_cannot_read_evaluator_goal() -> None:
             },
             initial_state_constraints=(initial,),
         )
+
+
+def test_sampling_rules_cannot_read_action_scoped_values() -> None:
+    curriculum = _curriculum()
+    action_scoped_sampling = Rule(
+        rule_id="rule:sampling-action-args",
+        family="sampling",
+        description="Sampling must be checked before any Runtime action exists.",
+        boolean_operator="all",
+        case_sensitivity="positive_only",
+        clauses=(
+            RuleClause(
+                clause_id="rule:sampling-action-args:clause",
+                left=RuleValueRef(
+                    source="args",
+                    pointer="/amount",
+                    value_type="number",
+                ),
+                operator="greater_than",
+                right=RuleConstant(value_type="number", value=0),
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="must be evaluable during task materialization/reset"):
+        CurriculumRequirements(
+            **curriculum.model_dump(exclude={"sampling_constraints"}),
+            sampling_constraints=(action_scoped_sampling,),
+        )

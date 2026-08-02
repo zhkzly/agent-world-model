@@ -288,6 +288,158 @@ async def test_diagnostic_parsed_candidate_binds_after_explicit_semantic_repair_
 
 
 @pytest.mark.asyncio
+async def test_diagnostic_agent_session_binds_after_explicit_semantic_repair_authorization(
+    tmp_path: Path,
+) -> None:
+    """A completed Agent turn remains privately repairable after later auth.
+
+    This is the Code-Agent counterpart to the parsed Direct seed test above.
+    It proves that a diagnostic semantic failure can settle first, then bind
+    its real workspace/thread only after one exact RepairAction exists.  The
+    session never enters an Artifact or the public WorkAttempt payload.
+    """
+
+    model = "grok-4.5"
+    definition = structured_agent_work_definition(
+        scope_id="job:diagnostic-semantic-continuation",
+        component="build",
+        stage="candidate_build",
+        artifact_slot="environment_candidate",
+        dependency_coordinates=(),
+        claim_id="builder.candidate.metadata.repairs",
+        claim="A complete Candidate declaration may receive one local correction.",
+        timing_reason="A field-addressable completion mismatch is repairable.",
+        output_contract_id="contract:candidate-completion.v1",
+        allowed_mutation_roots=("/candidate",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=0,
+        maximum_total_repair_attempts=1,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:environment-candidate",
+                direction="output",
+                artifact_types=("design.candidate_build",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="build",
+            ),
+        ),
+    )
+    artifacts, definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(llm_tokens=2_000, agent_turns=2, repair_attempts=1, wall_seconds=300),
+        session_continuations=True,
+        model_routes=(model,),
+        diagnostic_only=True,
+    )
+    assert runtime.continuation_workspace_root is not None
+    workspace = runtime.continuation_workspace_root / "candidate-repair"
+    (workspace / "candidate").mkdir(parents=True)
+    profile_digest = sha256_digest(canonical_json_bytes({"profile": "engineer"}))
+    config_digest = sha256_digest(canonical_json_bytes({"config": "engineer"}))
+    schema_digest = sha256_digest(canonical_json_bytes({"schema": "candidate-completion"}))
+    session = InvocationSession(
+        thread_id="private-candidate-repair-thread",
+        lineage_id="implementation:diagnostic-semantic-continuation",
+        workspace=workspace,
+        profile_hash=profile_digest.removeprefix("sha256:"),
+        codex_config_sha256=config_digest.removeprefix("sha256:"),
+    )
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+
+    def provenance(dispatch_id: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="test-provider",
+            model=model,
+            profile_digest=profile_digest,
+            output_schema_digest=schema_digest,
+        )
+
+    async def execute(context) -> None:
+        async def proposal(_context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+            agent = provenance(dispatch_id)
+            if attempt.ordinal == 1:
+                raise LeafValidationFailure(
+                    issues=(
+                        ValidationIssue(
+                            code="task_materializer_binding_mismatch",
+                            path=("task_materializer",),
+                            violated_condition=(
+                                "entrypoint must equal the module derived from entry_path"
+                            ),
+                            expected_category="a matching module:materialize declaration",
+                            remediation="Use the module derived from the candidate-relative path.",
+                        ),
+                    ),
+                    output_commitment=sha256_digest(
+                        canonical_json_bytes(
+                            {"invocation_id": dispatch_id, "completion": "rejected"}
+                        )
+                    ),
+                    category="candidate_metadata",
+                    agent=agent,
+                    semantic_repair_continuation=LeafSemanticRepairContinuation(
+                        session=session,
+                        model=model,
+                        output_schema_digest=schema_digest,
+                    ),
+                )
+            assert attempt.ordinal == 2
+            assert attempt.continuation_commitment is not None
+            assert runtime.continuations is not None
+            record = runtime.continuations.load_commitment(
+                attempt.continuation_commitment,
+                workspace_root=runtime.continuation_workspace_root,
+            )
+            assert record is not None
+            assert record.restore_session() == session
+            output = artifacts.put_json(
+                artifact_id="diagnostic-semantic-continuation:repaired",
+                artifact_type="design.candidate_build",
+                value={"repaired": True},
+                dependencies=context.external_input_refs,
+            )
+            return LeafProposal(
+                output_refs=(output,),
+                subject_refs=(output,),
+                agent=agent,
+            )
+
+        await kernel.execute(context, definition=definition, proposal_runner=proposal)
+
+    first = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+    assert [result.after_state for result in first] == ["blocked"]
+    failed = heads.read_head(definition.coordinate)
+    assert failed is not None and failed.status == "failed"
+    failed_attempt = artifacts.get_json(failed.attempt_ref, WorkAttempt)
+    assert failed_attempt.continuation_commitment is None
+    assert list(runtime.diagnostic_semantic_repair_continuations.root.glob("*.json"))
+
+    with heads.exclusive(definition.coordinate) as lock:
+        authorized = runtime.authorize_diagnostic_semantic_repair(
+            lock,
+            definition=definition,
+            input_refs=failed_attempt.input_refs,
+        )
+
+    assert authorized.status == "repair_authorized"
+    authorized_attempt = artifacts.get_json(authorized.attempt_ref, WorkAttempt)
+    assert authorized_attempt.continuation_commitment is not None
+    assert "private-candidate-repair-thread" not in authorized_attempt.model_dump_json()
+
+    repaired = await scheduler.dispatch_one(
+        definition.coordinate,
+        executors={definition.work_id: execute},
+    )
+    assert repaired.after_state == "committed"
+
+
+@pytest.mark.asyncio
 async def test_diagnostic_candidate_draft_binds_only_after_explicit_infrastructure_retry(
     tmp_path: Path,
 ) -> None:
@@ -979,6 +1131,803 @@ async def test_scheduler_records_backoff_gate_then_falls_back_without_rerunning_
 
 
 @pytest.mark.asyncio
+async def test_scheduler_runs_two_definition_bound_same_model_retries_with_scaled_backoff(
+    tmp_path: Path,
+) -> None:
+    """Two classified transients may use two fresh sessions when policy binds two."""
+
+    definition = structured_agent_work_definition(
+        scope_id="job:two-same-model-retries",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One isolated Researcher call produces a bounded research plan.",
+        timing_reason="Acquisition cannot begin without an exact plan.",
+        output_contract_id="contract:research-plan",
+        agent_role="researcher",
+        allowed_mutation_roots=(),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=0,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=2,
+        maximum_model_fallbacks=0,
+        maximum_total_repair_attempts=2,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:research-plan",
+                direction="output",
+                artifact_types=("design.research_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="research",
+            ),
+        ),
+    )
+    store = InvocationControlStore(tmp_path / "invocation-control")
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(
+            llm_tokens=3_000,
+            agent_turns=3,
+            repair_attempts=2,
+            wall_seconds=300,
+        ),
+        model_routes=("gpt-5.4-mini",),
+        route_liveness_checker=InvocationControlRouteLivenessChecker(store),
+        require_route_liveness_gate=True,
+        infrastructure_retry_backoff_seconds=0.01,
+    )
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+    attempts: list[WorkAttempt] = []
+
+    def provenance(dispatch_id: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="openai-compatible",
+            model="gpt-5.4-mini",
+            profile_digest=sha256_digest(canonical_json_bytes({"profile": "mini"})),
+            output_schema_digest=sha256_digest(canonical_json_bytes({"schema": "plan"})),
+        )
+
+    def record_closed_transient(*, attempt: WorkAttempt, dispatch_id: str) -> None:
+        ownership = leaf.invocation_ownership(
+            definition=definition,
+            attempt=attempt,
+            dispatch_id=dispatch_id,
+        )
+        store.begin(
+            invocation_id=dispatch_id,
+            owner=ownership,
+            route="codex_sdk",
+            model="gpt-5.4-mini",
+            profile_digest="sha256:" + "a" * 64,
+            envelope_digest="b" * 64,
+            declared_wall_seconds=30,
+        )
+        store.settle(
+            dispatch_id,
+            terminal=InvocationTerminalFact(
+                status=InvocationStatus.FAILED,
+                code="turn_failed_provider_unavailable",
+                retryable=True,
+            ),
+        )
+
+    async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        attempts.append(attempt)
+        if attempt.ordinal < 3:
+            record_closed_transient(attempt=attempt, dispatch_id=dispatch_id)
+            raise LeafExecutionFailure(
+                code="agent_backend_turn_failed_provider_unavailable",
+                category="the configured provider temporarily rejected the route",
+                retryable=True,
+                terminal_details={"codex_error_info": "enum:internalservererror"},
+                agent=provenance(dispatch_id),
+            )
+        output_ref = artifacts.put_json(
+            artifact_id=f"research-plan:{attempt.attempt_id}",
+            artifact_type="design.research_plan",
+            value={"model": "gpt-5.4-mini"},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            agent=provenance(dispatch_id),
+        )
+
+    async def execute(context) -> None:
+        await leaf.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == [
+        "repair_ready",
+        "repair_ready",
+        "committed",
+    ]
+    assert [attempt.model_override for attempt in attempts] == [None, None, None]
+    assert attempts[1].route_liveness_evidence_ref is not None
+    assert attempts[2].route_liveness_evidence_ref is not None
+    actions = tuple(
+        artifacts.get_json(entry.repair_action_ref, RepairAction)
+        for entry in runtime.repairs.entries
+    )
+    assert [action.decision for action in actions] == [
+        "infrastructure_retry",
+        "infrastructure_retry",
+    ]
+    delays: list[float] = []
+    for action in actions:
+        assert action.retry_not_before is not None
+        delays.append((action.retry_not_before - action.authorized_at).total_seconds())
+    assert delays == pytest.approx((0.01, 0.02))
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_switches_direct_output_ceiling_to_the_next_model_once(
+    tmp_path: Path,
+) -> None:
+    """A Direct response ceiling changes route; it never repeats the same turn."""
+
+    definition = structured_agent_work_definition(
+        scope_id="job:direct-output-ceiling",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One isolated Researcher call produces a bounded research plan.",
+        timing_reason="Acquisition cannot begin without an exact plan.",
+        output_contract_id="contract:research-plan",
+        agent_role="researcher",
+        allowed_mutation_roots=(),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=0,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_model_fallbacks=1,
+        maximum_total_repair_attempts=1,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:research-plan",
+                direction="output",
+                artifact_types=("design.research_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="research",
+            ),
+        ),
+    )
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(
+            llm_tokens=2_000,
+            agent_turns=2,
+            repair_attempts=1,
+            wall_seconds=300,
+        ),
+        model_routes=("gpt-5.3-codex-spark", "gpt-5.4-mini"),
+    )
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+    attempts: list[WorkAttempt] = []
+
+    def provenance(dispatch_id: str, model: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="openai-compatible",
+            model=model,
+            profile_digest=sha256_digest(canonical_json_bytes({"profile": model})),
+            output_schema_digest=sha256_digest(canonical_json_bytes({"schema": "plan"})),
+        )
+
+    async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        attempts.append(attempt)
+        if attempt.ordinal == 1:
+            assert attempt.model_override is None
+            raise LeafExecutionFailure(
+                code="agent_backend_direct_output_limit",
+                category="the direct provider exhausted its physical response envelope",
+                retryable=False,
+                terminal_details={"terminal_reason": "max_output_tokens"},
+                agent=provenance(dispatch_id, "gpt-5.3-codex-spark"),
+            )
+        assert attempt.ordinal == 2
+        assert attempt.model_override == "gpt-5.4-mini"
+        output_ref = artifacts.put_json(
+            artifact_id=f"research-plan:{attempt.attempt_id}",
+            artifact_type="design.research_plan",
+            value={"model": attempt.model_override},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            agent=provenance(dispatch_id, "gpt-5.4-mini"),
+        )
+
+    async def execute(context) -> None:
+        await leaf.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == ["repair_ready", "committed"]
+    assert [attempt.model_override for attempt in attempts] == [None, "gpt-5.4-mini"]
+    actions = tuple(
+        artifacts.get_json(entry.repair_action_ref, RepairAction)
+        for entry in runtime.repairs.entries
+    )
+    assert len(actions) == 1
+    assert actions[0].decision == "model_fallback"
+    assert actions[0].reason_code == "direct_output_ceiling_model_fallback"
+    assert actions[0].model_override == "gpt-5.4-mini"
+    assert not actions[0].route_liveness_required
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_falls_back_after_cross_class_transient_failure_during_semantic_repair(
+    tmp_path: Path,
+) -> None:
+    """A transient recovery retains the exact authorized semantic repair.
+
+    This is the true Scheduler boundary reproduced by the E2E ToolSemantics
+    failure: Grok yields a parsed candidate with precise semantic findings;
+    its authorized fresh correction loses the Provider before its first event,
+    then the one permitted same-model retry receives a closed capacity
+    terminal.  Those are different transient subclasses on the same failed
+    route, not authority for a second Grok retry. Spark must receive the same
+    correction brief and private parsed seed without reusing a Provider
+    session or redispatching an upstream node.
+    """
+
+    definition = structured_agent_work_definition(
+        scope_id="job:semantic-repair-transport-fallback",
+        component="research",
+        stage="research_plan",
+        artifact_slot="research_plan",
+        dependency_coordinates=(),
+        claim_id="research.plan.valid",
+        claim="One isolated Researcher call produces a bounded research plan.",
+        timing_reason="A classified transport terminal must preserve its fallback path.",
+        output_contract_id="contract:research-plan",
+        agent_role="researcher",
+        allowed_mutation_roots=("/",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_model_fallbacks=1,
+        maximum_total_repair_attempts=3,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:research-plan",
+                direction="output",
+                artifact_types=("design.research_plan",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="research",
+            ),
+        ),
+    )
+    store = InvocationControlStore(tmp_path / "invocation-control")
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(
+            llm_tokens=4_000,
+            agent_turns=4,
+            repair_attempts=3,
+            wall_seconds=300,
+        ),
+        model_routes=("grok-4.5", "gpt-5.3-codex-spark"),
+        route_liveness_checker=InvocationControlRouteLivenessChecker(store),
+        require_route_liveness_gate=True,
+    )
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+    attempts: list[WorkAttempt] = []
+    received_briefs = []
+    received_seeds: list[LeafSemanticRepairSeed | None] = []
+    candidate = {"steps": [{"kind": "research"}]}
+
+    def provenance(dispatch_id: str, model: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="openai-compatible",
+            model=model,
+            profile_digest=sha256_digest(canonical_json_bytes({"profile": model})),
+            output_schema_digest=sha256_digest(canonical_json_bytes({"schema": "plan"})),
+        )
+
+    def record_closed_transient(
+        *,
+        attempt: WorkAttempt,
+        dispatch_id: str,
+        model: str,
+        code: str,
+    ) -> None:
+        store.begin(
+            invocation_id=dispatch_id,
+            owner=leaf.invocation_ownership(
+                definition=definition,
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+            ),
+            route="direct_llm",
+            model=model,
+            profile_digest="sha256:" + "a" * 64,
+            envelope_digest="b" * 64,
+            declared_wall_seconds=30,
+        )
+        store.settle(
+            dispatch_id,
+            terminal=InvocationTerminalFact(
+                status=InvocationStatus.FAILED,
+                code=code,
+                retryable=True,
+            ),
+        )
+
+    async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        attempts.append(attempt)
+        current_model = attempt.model_override or "grok-4.5"
+        if attempt.ordinal in {2, 3}:
+            assert current_model == "grok-4.5"
+            brief = leaf.agent_correction_brief(context, definition=definition)
+            seed = leaf.agent_semantic_repair_seed(
+                context,
+                definition=definition,
+                attempt=attempt,
+            )
+            received_briefs.append(brief)
+            received_seeds.append(seed)
+            assert brief is not None
+            assert brief.issues[0].code == "semantic_required_step_missing"
+            assert seed is not None and seed.previous_candidate == candidate
+            terminal_code = (
+                "direct_no_first_provider_event"
+                if attempt.ordinal == 2
+                else "direct_provider_unavailable"
+            )
+            record_closed_transient(
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+                model=current_model,
+                code=terminal_code,
+            )
+            raise LeafExecutionFailure(
+                code=f"agent_backend_{terminal_code}",
+                category=(
+                    "the Direct Provider stream emitted no first event"
+                    if attempt.ordinal == 2
+                    else "the configured Direct Provider was temporarily unavailable"
+                ),
+                retryable=True,
+                terminal_details=(
+                    {"waiting_phase": "direct_awaiting_stream_event"}
+                    if attempt.ordinal == 2
+                    else {}
+                ),
+                agent=provenance(dispatch_id, current_model),
+            )
+        if attempt.ordinal == 1:
+            assert current_model == "grok-4.5"
+            raise LeafValidationFailure(
+                issues=(
+                    ValidationIssue(
+                        code="semantic_required_step_missing",
+                        path=("steps",),
+                        violated_condition="the parsed plan omits its required verification step",
+                        expected_category="one complete plan including that verification step",
+                    ),
+                ),
+                output_commitment=sha256_digest(canonical_json_bytes(candidate)),
+                category="semantic_plan",
+                agent=provenance(dispatch_id, current_model),
+                semantic_repair_seed=LeafSemanticRepairSeed(
+                    model=current_model,
+                    profile_digest=provenance(dispatch_id, current_model).profile_digest,
+                    output_schema_digest=provenance(
+                        dispatch_id, current_model
+                    ).output_schema_digest,
+                    previous_candidate=candidate,
+                ),
+            )
+        assert attempt.ordinal == 4
+        assert current_model == "gpt-5.3-codex-spark"
+        brief = leaf.agent_correction_brief(context, definition=definition)
+        seed = leaf.agent_semantic_repair_seed(
+            context,
+            definition=definition,
+            attempt=attempt,
+        )
+        received_briefs.append(brief)
+        received_seeds.append(seed)
+        assert brief is not None
+        assert brief.issues[0].code == "semantic_required_step_missing"
+        assert seed is not None and seed.previous_candidate == candidate
+        output_ref = artifacts.put_json(
+            artifact_id=f"research-plan:{attempt.attempt_id}",
+            artifact_type="design.research_plan",
+            value={"model": current_model},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            agent=provenance(dispatch_id, current_model),
+        )
+
+    async def execute(context) -> None:
+        await leaf.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == [
+        "repair_ready",
+        "repair_ready",
+        "repair_ready",
+        "committed",
+    ]
+    assert [attempt.model_override for attempt in attempts] == [
+        None,
+        None,
+        None,
+        "gpt-5.3-codex-spark",
+    ]
+    assert len({attempt.input_refs for attempt in attempts}) == 1
+    actions = tuple(
+        artifacts.get_json(entry.repair_action_ref, RepairAction)
+        for entry in runtime.repairs.entries
+    )
+    assert [action.decision for action in actions] == [
+        "local_correction",
+        "infrastructure_retry",
+        "model_fallback",
+    ]
+    assert actions[1].semantic_repair_context_ref == runtime.repairs.entries[0].repair_action_ref
+    assert actions[2].semantic_repair_context_ref == runtime.repairs.entries[0].repair_action_ref
+    assert actions[2].model_override == "gpt-5.3-codex-spark"
+    assert not actions[2].route_liveness_required
+    assert len(received_briefs) == 3
+    assert len(received_seeds) == 3
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_retries_committed_candidate_snapshot_repair_after_transport_terminal(
+    tmp_path: Path,
+) -> None:
+    """A Candidate snapshot repair survives a fresh transport recovery.
+
+    This is the Scheduler boundary behind the live Candidate failure: a
+    downstream Integration finding authorizes a Candidate correction whose
+    seed is the already-committed Candidate closure, not a private parsed
+    Direct-output seed.  When that correction reaches a classified Provider
+    terminal, the next fresh Agent attempt must retain the original safe
+    feedback and snapshot authority rather than becoming a blind initial
+    build.
+    """
+
+    scope_id = "job:candidate-snapshot-transport-recovery"
+    candidate = structured_agent_work_definition(
+        scope_id=scope_id,
+        component="build",
+        stage="candidate_build",
+        artifact_slot="environment_candidate",
+        dependency_coordinates=(),
+        claim_id="build.candidate.valid",
+        claim="One committed Candidate can receive an Integration-owned repair.",
+        timing_reason="Integration must run against a complete Candidate closure.",
+        output_contract_id="contract:environment-candidate.v3",
+        agent_role="environment_engineer",
+        allowed_mutation_roots=("/source", "/runtime"),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_model_fallbacks=0,
+        # The initial Candidate delivery consumes one same-model retry before
+        # it commits. A later Integration-selected correction must still get
+        # its own fresh-route retry: it is a separate semantic-repair lineage.
+        maximum_total_repair_attempts=3,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:environment-candidate",
+                direction="output",
+                artifact_types=("build.environment_candidate",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="build",
+            ),
+        ),
+    )
+    integration_base = deterministic_boundary_work_definition(
+        scope_id=scope_id,
+        component="integration",
+        stage="runtime_integration",
+        artifact_slot="integration_report",
+        dependency_coordinates=(candidate.coordinate,),
+        claim_id="integration.runtime.executable",
+        claim="One isolated runtime gate verifies the current Candidate.",
+        timing_reason="Only the independent runtime gate can identify this repair target.",
+        effect="block_release",
+        success_maturity="integration_passed",
+    )
+    integration = integration_base.model_copy(
+        update={
+            "repair_target_coordinates": (candidate.coordinate,),
+            "repair_policy": integration_base.repair_policy.model_copy(
+                update={
+                    "maximum_automatic_backjump": 1,
+                    "maximum_total_repair_attempts": 1,
+                }
+            ),
+            "allowed_mutation_roots": candidate.allowed_mutation_roots,
+        }
+    )
+    graph = GenerationWorkGraph.compile((candidate, integration), mode="diagnostic")
+    artifacts = ArtifactStore(tmp_path / "artifacts").issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.", "build.", "release."),
+    )
+    root_ref = artifacts.put_json(
+        artifact_id="candidate-snapshot-context",
+        artifact_type="control.generation_context",
+        value={"context": "candidate-snapshot-transport-recovery"},
+    )
+    manifest = graph.manifest(
+        topology_id="topology:candidate-snapshot-transport-recovery",
+        external_root_refs=(root_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(root_ref,),
+    )
+    heads = WorkControlStore(tmp_path / "work-control")
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(
+            Budget(
+                llm_tokens=5_000,
+                agent_turns=4,
+                repair_attempts=3,
+                process_calls=4,
+                wall_seconds=300,
+            )
+        ),
+    )
+    scheduler = WorkScheduler(
+        graph=graph,
+        manifest=manifest,
+        manifest_ref=manifest_ref,
+        heads=heads,
+        artifacts=artifacts,
+        runtime=runtime,
+    )
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+    candidate_attempts: list[WorkAttempt] = []
+    integration_attempts: list[int] = []
+    received_briefs: list[tuple[ValidationIssue, ...]] = []
+    received_private_seeds: list[LeafSemanticRepairSeed | None] = []
+
+    def provenance(dispatch_id: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="openai-compatible",
+            model="gpt-5.4-mini",
+            profile_digest=sha256_digest(canonical_json_bytes({"profile": "engineer"})),
+            output_schema_digest=sha256_digest(
+                canonical_json_bytes({"schema": "environment-candidate"})
+            ),
+        )
+
+    def candidate_output(
+        context,
+        attempt: WorkAttempt,
+        dispatch_id: str,
+    ) -> LeafProposal:
+        output_ref = artifacts.put_json(
+            artifact_id=f"candidate-snapshot:{attempt.ordinal}",
+            artifact_type="build.environment_candidate",
+            value={"candidate_revision": attempt.ordinal},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            agent=provenance(dispatch_id),
+        )
+
+    async def candidate_proposal(
+        context,
+        attempt: WorkAttempt,
+        dispatch_id: str,
+    ) -> LeafProposal:
+        candidate_attempts.append(attempt)
+        if attempt.ordinal == 1:
+            # This is the already-consumed infrastructure retry from the
+            # initial Candidate delivery.  It must not spend the later
+            # Integration-repair route's allowance.
+            raise LeafExecutionFailure(
+                code="agent_backend_turn_failed_provider_unavailable",
+                category="the configured Provider became unavailable before a terminal response",
+                retryable=True,
+                agent=provenance(dispatch_id),
+            )
+        if attempt.ordinal == 2:
+            initial_physical_action = artifacts.get_json(context.repair_action_ref, RepairAction)
+            assert initial_physical_action.decision == "infrastructure_retry"
+            assert initial_physical_action.semantic_repair_context_ref is None
+            return candidate_output(context, attempt, dispatch_id)
+
+        brief = kernel.agent_correction_brief(context, definition=candidate)
+        assert brief is not None
+        received_briefs.append(brief.issues)
+        received_private_seeds.append(
+            kernel.agent_semantic_repair_seed(
+                context,
+                definition=candidate,
+                attempt=attempt,
+            )
+        )
+        if attempt.ordinal == 3:
+            semantic_action = artifacts.get_json(context.repair_action_ref, RepairAction)
+            assert context.semantic_repair_context_ref == context.repair_action_ref
+            assert semantic_action.decision == "local_correction"
+            assert semantic_action.repair_seed_attempt_ref is not None
+            assert (
+                len(
+                    tuple(
+                        ref
+                        for ref in semantic_action.repair_seed_output_refs
+                        if ref.artifact_type == "build.environment_candidate"
+                    )
+                )
+                == 1
+            )
+            raise LeafExecutionFailure(
+                code="agent_backend_turn_failed_provider_unavailable",
+                category="the configured Provider became unavailable before a terminal response",
+                retryable=True,
+                agent=provenance(dispatch_id),
+            )
+
+        assert attempt.ordinal == 4
+        physical_action = artifacts.get_json(context.repair_action_ref, RepairAction)
+        assert physical_action.decision == "infrastructure_retry"
+        assert physical_action.semantic_repair_context_ref is not None
+        return candidate_output(context, attempt, dispatch_id)
+
+    async def integration_proposal(
+        context,
+        attempt: WorkAttempt,
+        _dispatch_id: str,
+    ) -> LeafProposal:
+        integration_attempts.append(attempt.ordinal)
+        if attempt.ordinal == 1:
+            raise LeafValidationFailure(
+                issues=(
+                    ValidationIssue(
+                        code="runtime_protocol_rejects_candidate",
+                        path=("runtime", "handshake"),
+                        violated_condition="The isolated runtime protocol rejected this Candidate.",
+                        expected_category="a Candidate source satisfying the runtime protocol",
+                        remediation="Repair the Candidate runtime handshake implementation.",
+                    ),
+                ),
+                output_commitment=sha256_digest(b"failed-integration-candidate-snapshot"),
+                category="isolated_runtime_protocol",
+                parent_repair_target=candidate.coordinate,
+            )
+        output_ref = artifacts.put_json(
+            artifact_id="integration-after-candidate-snapshot-retry",
+            artifact_type="release.final_telemetry_summary",
+            value={"candidate_parent_commit": context.parent_commit_refs[0].revision_id},
+            dependencies=context.parent_output_refs,
+        )
+        return LeafProposal(output_refs=(output_ref,), subject_refs=(output_ref,))
+
+    async def execute_candidate(context) -> None:
+        await kernel.execute(context, definition=candidate, proposal_runner=candidate_proposal)
+
+    async def execute_integration(context) -> None:
+        await kernel.execute(context, definition=integration, proposal_runner=integration_proposal)
+
+    results = await scheduler.run_until_stalled(
+        executors={
+            candidate.work_id: execute_candidate,
+            integration.work_id: execute_integration,
+        },
+        maximum_concurrency=1,
+    )
+
+    assert [attempt.ordinal for attempt in candidate_attempts] == [1, 2, 3, 4]
+    assert integration_attempts == [1, 2]
+    assert received_private_seeds == [None, None]
+    assert received_briefs == [
+        (
+            ValidationIssue(
+                code="causal_runtime_protocol_rejects_candidate",
+                path=(
+                    "causal_feedback",
+                    "integration",
+                    "runtime_integration",
+                    "runtime",
+                    "handshake",
+                ),
+                violated_condition="The isolated runtime protocol rejected this Candidate.",
+                expected_category="a Candidate source satisfying the runtime protocol",
+                remediation="Repair the Candidate runtime handshake implementation.",
+            ),
+        ),
+        (
+            ValidationIssue(
+                code="causal_runtime_protocol_rejects_candidate",
+                path=(
+                    "causal_feedback",
+                    "integration",
+                    "runtime_integration",
+                    "runtime",
+                    "handshake",
+                ),
+                violated_condition="The isolated runtime protocol rejected this Candidate.",
+                expected_category="a Candidate source satisfying the runtime protocol",
+                remediation="Repair the Candidate runtime handshake implementation.",
+            ),
+        ),
+    ]
+    actions = tuple(
+        artifacts.get_json(entry.repair_action_ref, RepairAction)
+        for entry in runtime.repairs.entries
+    )
+    assert [action.decision for action in actions] == [
+        "infrastructure_retry",
+        "local_correction",
+        "infrastructure_retry",
+    ]
+    assert actions[0].semantic_repair_context_ref is None
+    assert actions[2].semantic_repair_context_ref == runtime.repairs.entries[1].repair_action_ref
+    assert actions[2].allowed_mutation_roots == candidate.allowed_mutation_roots
+    assert runtime.repairs.entries[2].semantic_repair_context_ref == (
+        runtime.repairs.entries[1].repair_action_ref
+    )
+    assert candidate_attempts[3].semantic_repair_seed_commitment is None
+    assert [entry.outcome for entry in runtime.repairs.entries] == [
+        "resolved",
+        "no_progress",
+        "resolved",
+    ]
+    candidate_head = heads.read_head(candidate.coordinate)
+    integration_head = heads.read_head(integration.coordinate)
+    assert candidate_head is not None and candidate_head.status == "committed"
+    assert integration_head is not None and integration_head.status == "committed"
+    assert [item.after_state for item in results] == [
+        "repair_ready",
+        "committed",
+        "blocked",
+        "repair_ready",
+        "committed",
+        "committed",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_scheduler_retries_each_fallback_route_before_advancing_again(
     tmp_path: Path,
 ) -> None:
@@ -1279,7 +2228,7 @@ async def test_closed_output_ceiling_creates_one_private_session_continuation_at
         strict_progress_bonus_corrections=0,
         maximum_infrastructure_retries=0,
         maximum_session_continuations=1,
-        maximum_total_repair_attempts=0,
+        maximum_total_repair_attempts=1,
         output_slots=(
             ArtifactSlotContract(
                 slot_id="output:research-plan",
@@ -1384,6 +2333,148 @@ async def test_closed_output_ceiling_creates_one_private_session_continuation_at
     )
     assert proposal_execution.continuation_commitment == session_commitment
     assert "private-thread-output-ceiling" not in attempt.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_closed_transient_with_resumable_session_continues_same_thread(
+    tmp_path: Path,
+) -> None:
+    """A settled Provider terminal resumes the exact Agent session first.
+
+    This crosses the real Scheduler/continuation-store boundary. It proves
+    that a transport terminal spends the declared infrastructure retry while
+    retaining the private thread and workspace; a fresh draft recovery remains
+    the fallback only when that session is unavailable.
+    """
+
+    definition = structured_agent_work_definition(
+        scope_id="job:transient-session-continuation",
+        component="build",
+        stage="candidate_build",
+        artifact_slot="candidate_build",
+        dependency_coordinates=(),
+        claim_id="builder.candidate.completes",
+        claim="A transient Provider terminal may continue the exact Agent session.",
+        timing_reason="A resumable thread preserves work already completed in its workspace.",
+        output_contract_id="contract:candidate-build",
+        agent_role="environment_engineer",
+        allowed_mutation_roots=("/candidate",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        session_token_limit=2_000,
+        session_wall_seconds=120,
+        maximum_local_corrections=0,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=1,
+        maximum_session_continuations=1,
+        maximum_total_repair_attempts=1,
+        output_slots=(
+            ArtifactSlotContract(
+                slot_id="output:candidate-build",
+                direction="output",
+                artifact_types=("design.candidate_build",),
+                minimum_count=1,
+                maximum_count=1,
+                producer_component="build",
+            ),
+        ),
+    )
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(
+            llm_tokens=2_000,
+            agent_turns=2,
+            repair_attempts=1,
+            wall_seconds=300,
+        ),
+        session_continuations=True,
+    )
+    workspace = tmp_path / "continuation-workspaces" / "workspace"
+    workspace.mkdir()
+    session = InvocationSession(
+        thread_id="private-thread-transient",
+        lineage_id="job:transient-session-continuation",
+        workspace=workspace.resolve(),
+        profile_hash="a" * 64,
+        codex_config_sha256="b" * 64,
+    )
+    schema_digest = sha256_digest(canonical_json_bytes({"schema": "candidate-build"}))
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+    seen_attempts: list[int] = []
+
+    def provenance(dispatch_id: str) -> AgentExecutionProvenance:
+        return AgentExecutionProvenance(
+            invocation_id=dispatch_id,
+            provider="openai-compatible",
+            model="gpt-5.4-mini",
+            profile_digest=f"sha256:{session.profile_hash}",
+            output_schema_digest=schema_digest,
+        )
+
+    async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        seen_attempts.append(attempt.ordinal)
+        if attempt.ordinal == 1:
+            raise LeafExecutionFailure(
+                code="agent_backend_turn_failed_provider_unavailable",
+                category="the Provider ended before a terminal CandidateCompletion",
+                retryable=True,
+                observed_actual=BudgetUsage(llm_tokens=1_000, agent_turns=1),
+                agent=provenance(dispatch_id),
+                session_continuation=LeafSessionContinuation(
+                    session=session,
+                    model="gpt-5.4-mini",
+                    output_schema_digest=schema_digest,
+                ),
+            )
+        assert attempt.ordinal == 2
+        assert attempt.continuation_commitment is not None
+        assert runtime.continuations is not None
+        record = runtime.continuations.load_commitment(
+            attempt.continuation_commitment,
+            workspace_root=tmp_path / "continuation-workspaces",
+        )
+        assert record is not None
+        assert record.restore_session() == session
+        output_ref = artifacts.put_json(
+            artifact_id="candidate-build:continued-after-transient",
+            artifact_type="design.candidate_build",
+            value={"continued_same_thread": True},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            observed_actual=BudgetUsage(llm_tokens=1_000, agent_turns=1),
+            agent=provenance(dispatch_id),
+        )
+
+    async def execute(context) -> None:
+        await kernel.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == ["repair_ready", "committed"]
+    assert seen_attempts == [1, 2]
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "committed"
+    attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+    assert attempt.repair_attempt_charge == 1
+    action = artifacts.get_json(attempt.repair_action_ref, RepairAction)
+    assert action.decision == "session_continuation"
+    assert action.reason_code == "provider_session_continuation"
+    assert action.repair_attempt_charge == 1
+    assert action.route_model == "gpt-5.4-mini"
+    assert action.route_liveness_required
+    assert action.retry_not_before is not None
+    recovery_ref = next(
+        ref
+        for ref in action.causal_evidence_refs
+        if ref.artifact_type == "control.invocation_recovery_decision"
+    )
+    recovery = artifacts.get_json(recovery_ref)
+    assert recovery["route"] == "session_continuation"
+    assert recovery["private_session_continuation_available"] is True
 
 
 @pytest.mark.asyncio
@@ -1975,27 +3066,6 @@ def test_direct_runner_recovers_an_old_running_definition_before_current_graph_r
         }
     )
     current_graph = GenerationWorkGraph.compile((current_definition,), mode="diagnostic")
-
-    DirectWorkRunner._reconcile_abandoned_operations(  # noqa: SLF001
-        graph=current_graph,
-        runtime=runtime,
-    )
-
-    recovered = heads.read_head(historical_definition.coordinate)
-    assert recovered is not None
-    assert recovered.status == "failed"
-    assert recovered.active_operation_ref is None
-    assert recovered.definition_digest == historical_definition.definition_digest
-    attempt = artifacts.get_json(recovered.attempt_ref, WorkAttempt)
-    assert attempt.definition_digest == historical_definition.definition_digest
-    operation = next(
-        artifacts.get_json(ref, OperationRun)
-        for ref in attempt.operation_run_refs
-        if artifacts.get_json(ref, OperationRun).kind == "proposal"
-    )
-    assert operation.status == "terminal"
-    assert operation.error_code == "process_interrupted_after_dispatch"
-
     current_manifest = current_graph.manifest(
         topology_id="topology:current-definition-after-recovery",
         external_root_refs=(root_ref,),
@@ -2014,6 +3084,28 @@ def test_direct_runner_recovers_an_old_running_definition_before_current_graph_r
         artifacts=artifacts,
         runtime=runtime,
     )
+
+    DirectWorkRunner._reconcile_abandoned_operations(  # noqa: SLF001
+        graph=current_graph,
+        runtime=runtime,
+        scheduler=current_scheduler,
+    )
+
+    recovered = heads.read_head(historical_definition.coordinate)
+    assert recovered is not None
+    assert recovered.status == "failed"
+    assert recovered.active_operation_ref is None
+    assert recovered.definition_digest == historical_definition.definition_digest
+    attempt = artifacts.get_json(recovered.attempt_ref, WorkAttempt)
+    assert attempt.definition_digest == historical_definition.definition_digest
+    operation = next(
+        artifacts.get_json(ref, OperationRun)
+        for ref in attempt.operation_run_refs
+        if artifacts.get_json(ref, OperationRun).kind == "proposal"
+    )
+    assert operation.status == "terminal"
+    assert operation.error_code == "process_interrupted_after_dispatch"
+
     assert current_scheduler.snapshot().work[0].state == "stale"
 
 
@@ -2671,6 +3763,185 @@ async def test_postproposal_framework_error_settles_the_real_agent_turn(
 
 
 @pytest.mark.asyncio
+async def test_multiturn_agent_proposal_cannot_replace_scheduler_dispatch_authority(
+    tmp_path: Path,
+) -> None:
+    """A child physical turn is diagnosed and settled instead of orphaning Work."""
+
+    definition = structured_agent_work_definition(
+        scope_id="job:agent-child-invocation-id",
+        component="build",
+        stage="candidate_build",
+        artifact_slot="environment_candidate",
+        dependency_coordinates=(),
+        claim_id="build.candidate.valid",
+        claim="One logical CandidateBuild may own bounded internal Agent turns.",
+        timing_reason="Integration requires a committed Candidate closure.",
+        output_contract_id="contract:environment-candidate.v3",
+        agent_role="environment_engineer",
+        allowed_mutation_roots=("/candidate",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_infrastructure_retries=0,
+    )
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(llm_tokens=1_000, agent_turns=1, wall_seconds=300),
+    )
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+
+    async def proposal(context, _attempt: WorkAttempt, _dispatch_id: str) -> LeafProposal:
+        output_ref = artifacts.put_json(
+            artifact_id="candidate-from-child-turn",
+            artifact_type="design.environment_candidate",
+            value={"candidate": "complete"},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            observed_actual=BudgetUsage(llm_tokens=37, agent_turns=1),
+            agent=AgentExecutionProvenance(
+                invocation_id="child-physical-invocation",
+                provider="openai-compatible",
+                model="gpt-5.4-mini",
+                profile_digest=sha256_digest(
+                    canonical_json_bytes({"profile": "environment-engineer"})
+                ),
+                output_schema_digest=sha256_digest(
+                    canonical_json_bytes({"schema": "candidate-completion"})
+                ),
+            ),
+        )
+
+    async def execute(context) -> None:
+        await leaf.execute(context, definition=definition, proposal_runner=proposal)
+
+    results = await scheduler.run_until_stalled(executors={definition.work_id: execute})
+
+    assert [result.after_state for result in results] == ["blocked"]
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "failed"
+    attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+    assert attempt.validation_report_ref is not None
+    report = artifacts.get_json(attempt.validation_report_ref, ValidationReport)
+    assert report.status == "error"
+    assert report.issues[0].code == "agent_proposal_dispatch_binding_invalid"
+    proposal_execution = artifacts.get_json(
+        next(
+            ref
+            for ref in attempt.operation_run_refs
+            if artifacts.get_json(ref, OperationRun).kind == "proposal"
+        ),
+        OperationRun,
+    )
+    assert proposal_execution.status == "terminal"
+    execution = artifacts.get_json(proposal_execution.execution_ref, ProposalExecution)
+    assert execution.invocation_id == proposal_execution.dispatch_id
+    assert attempt.observed_actual.llm_tokens == 37
+
+
+@pytest.mark.asyncio
+async def test_scheduler_last_resort_settles_unhandled_active_operation(
+    tmp_path: Path,
+) -> None:
+    """An executor exception cannot leave its already-dispatched operation running."""
+
+    artifacts, definition, heads, runtime, scheduler = _setup(tmp_path)
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+
+    async def execute(context) -> None:
+        input_refs = tuple(
+            dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+        )
+        leaf._start_proposal(definition, input_refs)  # noqa: SLF001 - true owner boundary
+        raise RuntimeError("constructed post-dispatch framework failure")
+
+    with pytest.raises(RuntimeError, match="constructed post-dispatch"):
+        await scheduler.dispatch_one(
+            definition.coordinate,
+            executors={definition.work_id: execute},
+        )
+
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "failed"
+    attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+    assert attempt.validation_report_ref is not None
+    report = artifacts.get_json(attempt.validation_report_ref, ValidationReport)
+    assert report.status == "error"
+    assert report.issues[0].code == "scheduler_executor_framework_error"
+    assert all(
+        artifacts.get_json(ref, OperationRun).status == "terminal"
+        for ref in attempt.operation_run_refs
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_last_resort_settles_dispatched_agent_without_fake_profile(
+    tmp_path: Path,
+) -> None:
+    """A post-dispatch framework error keeps only its known Agent dispatch id."""
+
+    definition = structured_agent_work_definition(
+        scope_id="job:agent-last-resort",
+        component="build",
+        stage="candidate_build",
+        artifact_slot="environment_candidate",
+        dependency_coordinates=(),
+        claim_id="build.candidate.valid",
+        claim="One real Agent proposal must settle after a framework exception.",
+        timing_reason="No dispatched Agent operation may remain a ghost running head.",
+        output_contract_id="contract:agent-last-resort.v1",
+        allowed_mutation_roots=("/candidate",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=0,
+        maximum_model_fallbacks=0,
+        maximum_process_recoveries=0,
+        maximum_total_repair_attempts=1,
+    )
+    artifacts, definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(llm_tokens=1_000, agent_turns=1, wall_seconds=300),
+    )
+    leaf = SchedulerLeafExecutor(runtime=runtime)
+
+    async def execute(context) -> None:
+        input_refs = tuple(
+            dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+        )
+        leaf._start_proposal(definition, input_refs)  # noqa: SLF001 - true dispatch fence
+        raise RuntimeError("constructed Agent framework failure")
+
+    with pytest.raises(RuntimeError, match="constructed Agent framework failure"):
+        await scheduler.dispatch_one(
+            definition.coordinate,
+            executors={definition.work_id: execute},
+        )
+
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "failed"
+    attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+    proposal_run = next(
+        artifacts.get_json(ref, OperationRun)
+        for ref in attempt.operation_run_refs
+        if artifacts.get_json(ref, OperationRun).kind == "proposal"
+    )
+    execution = artifacts.get_json(proposal_run.execution_ref, ProposalExecution)
+    assert execution.status == "interrupted"
+    assert execution.error_code == "scheduler_executor_framework_error"
+    assert execution.invocation_id == proposal_run.dispatch_id
+    assert execution.provider is None
+    assert execution.model is None
+    assert execution.profile_digest is None
+    assert execution.output_schema_digest is None
+
+
+@pytest.mark.asyncio
 async def test_leaf_kernel_translates_code_leaf_pydantic_errors_to_safe_field_diagnostics(
     tmp_path: Path,
 ) -> None:
@@ -2788,13 +4059,16 @@ async def test_leaf_kernel_binds_real_agent_dispatch_provenance(tmp_path: Path) 
 async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_owner(
     tmp_path: Path,
 ) -> None:
-    """A downstream code check repairs Build once, then only its suffix reruns.
+    """Strictly shrinking downstream feedback earns one bounded bonus repair.
 
     This is the regression for the previous "repair target only exists in the
-    graph" bug.  The failing Integration leaf cannot retry itself or mutate a
-    candidate.  It emits one safe route; Scheduler validates the declared edge,
-    authorizes the target's own Agent repair budget, and stale input fingerprints
-    re-open Integration after the new Candidate WorkCommit exists.
+    graph" bug and the later Candidate r1 -> Integration -> Candidate r2 failure:
+    Candidate's local validator marked the first repair ``resolved`` before
+    Integration proved that two original blockers had only shrunk to one.  The
+    failing Integration leaf cannot retry itself or mutate a candidate.  It
+    emits exact safe routes; Scheduler grants the second correction only because
+    the same causal issue set is a strict subset, then stale input fingerprints
+    re-open only Integration after each new Candidate WorkCommit.
     """
 
     artifacts, _definition, heads, _runtime, _scheduler = _setup(tmp_path)
@@ -2858,7 +4132,7 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
         artifacts=artifacts,
         heads=heads,
         budget=LeaseBudgetLedger(
-            Budget(llm_tokens=3_000, agent_turns=3, repair_attempts=1, wall_seconds=300)
+            Budget(llm_tokens=3_000, agent_turns=3, repair_attempts=2, wall_seconds=300)
         ),
     )
     scheduler = WorkScheduler(
@@ -2876,7 +4150,7 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
 
     async def target_proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
         target_turns.append(attempt.ordinal)
-        if attempt.ordinal == 2:
+        if attempt.ordinal in {2, 3}:
             brief = kernel.agent_correction_brief(context, definition=target)
             assert brief is not None
             repair_issues.append(brief.issues)
@@ -2900,18 +4174,31 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
 
     async def source_proposal(context, attempt: WorkAttempt, _dispatch_id: str) -> LeafProposal:
         source_turns.append(attempt.ordinal)
-        if attempt.ordinal == 1:
-            raise LeafValidationFailure(
-                issues=(
+        if attempt.ordinal in {1, 2}:
+            issues = [
+                ValidationIssue(
+                    code="runtime_protocol_rejects_candidate",
+                    path=("runtime", "handshake"),
+                    violated_condition="The isolated runtime protocol rejected this candidate.",
+                    expected_category="candidate source satisfying the runtime protocol",
+                    remediation="Repair the Candidate runtime handshake implementation.",
+                )
+            ]
+            if attempt.ordinal == 1:
+                issues.append(
                     ValidationIssue(
-                        code="runtime_protocol_rejects_candidate",
-                        path=("runtime", "handshake"),
-                        violated_condition="The isolated runtime protocol rejected this candidate.",
-                        expected_category="candidate source satisfying the runtime protocol",
-                        remediation="Repair the Candidate runtime handshake implementation.",
-                    ),
+                        code="runtime_launch_rejects_candidate",
+                        path=("runtime", "launch"),
+                        violated_condition="The isolated runtime could not launch this candidate.",
+                        expected_category="candidate source satisfying the runtime launch contract",
+                        remediation="Repair the Candidate runtime launch implementation.",
+                    )
+                )
+            raise LeafValidationFailure(
+                issues=tuple(issues),
+                output_commitment=sha256_digest(
+                    f"failed-real-integration-evidence:{attempt.ordinal}".encode()
                 ),
-                output_commitment=sha256_digest(b"failed-real-integration-evidence"),
                 category="isolated_runtime_protocol",
                 parent_repair_target=target.coordinate,
             )
@@ -2934,10 +4221,38 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
         maximum_concurrency=1,
     )
 
-    assert target_turns == [1, 2]
-    assert source_turns == [1, 2]
-    assert len(repair_issues) == 1
+    assert target_turns == [1, 2, 3]
+    assert source_turns == [1, 2, 3]
+    assert len(repair_issues) == 2
     assert repair_issues[0] == (
+        ValidationIssue(
+            code="causal_runtime_protocol_rejects_candidate",
+            path=(
+                "causal_feedback",
+                "integration",
+                "runtime_integration",
+                "runtime",
+                "handshake",
+            ),
+            violated_condition="The isolated runtime protocol rejected this candidate.",
+            expected_category="candidate source satisfying the runtime protocol",
+            remediation="Repair the Candidate runtime handshake implementation.",
+        ),
+        ValidationIssue(
+            code="causal_runtime_launch_rejects_candidate",
+            path=(
+                "causal_feedback",
+                "integration",
+                "runtime_integration",
+                "runtime",
+                "launch",
+            ),
+            violated_condition="The isolated runtime could not launch this candidate.",
+            expected_category="candidate source satisfying the runtime launch contract",
+            remediation="Repair the Candidate runtime launch implementation.",
+        ),
+    )
+    assert repair_issues[1] == (
         ValidationIssue(
             code="causal_runtime_protocol_rejects_candidate",
             path=(
@@ -2957,8 +4272,12 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
         "ready",
         "repair_ready",
         "stale",
+        "repair_ready",
+        "stale",
     ]
     assert [item.after_state for item in results] == [
+        "committed",
+        "blocked",
         "committed",
         "blocked",
         "committed",
@@ -2971,11 +4290,63 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
     assert target_head.repair_action_ref is not None
     action = artifacts.get_json(target_head.repair_action_ref, RepairAction)
     assert action.reason_code == "causal_downstream_failure"
+    assert action.repair_attempt_ordinal == 2
     assert any(
         ref.artifact_type == "control.parent_repair_route" for ref in action.causal_evidence_refs
     )
+    assert any(ref.artifact_type == "control.repair_action" for ref in action.causal_evidence_refs)
     assert action.repair_seed_attempt_ref is not None
     seed_attempt = artifacts.get_json(action.repair_seed_attempt_ref, WorkAttempt)
     assert seed_attempt.status == "succeeded"
     assert action.repair_seed_output_refs == seed_attempt.output_refs
-    assert runtime.repairs.entries[0].outcome == "resolved"
+    assert [entry.outcome for entry in runtime.repairs.entries] == ["resolved", "resolved"]
+
+
+def test_verifier_group_leases_restore_a_full_turn_per_batch() -> None:
+    """Direct runner must size the verifier group so each batch keeps a full turn.
+
+    ``_verifier_intent_group`` splits the group token and wall leases evenly
+    across its batches. A high-``reasoning_challenger`` batch is one real turn
+    that genuinely spends the per-turn envelope (~49-56k tokens, and observed
+    ~456s of continuous provider progress). The frozen graph defaults (48_000
+    tokens / 900s) split below that floor for any multi-batch plan, turning a
+    clean judge turn into a fatal ``budget_exhausted`` settle overshoot on the
+    first attempt. The runner therefore scales both leases by the batch count so
+    the even split restores the full per-turn envelope.
+    """
+
+    runner = object.__new__(DirectWorkRunner)
+    runner.structured_turn_token_limit = 5_000_000
+    runner.structured_turn_wall_seconds = 28_800.0
+
+    budget = Budget(llm_tokens=100_000_000, wall_seconds=1_000_000.0)
+
+    for batch_count in (1, 2, 4):
+        group_tokens = runner._verifier_group_tokens(  # noqa: SLF001
+            budget, batch_count=batch_count
+        )
+        group_wall = runner._verifier_group_wall(  # noqa: SLF001
+            budget, batch_count=batch_count
+        )
+        # The graph splits the group lease evenly; every batch must recover a
+        # full per-turn envelope rather than a starved fraction.
+        assert group_tokens // batch_count == runner.structured_turn_token_limit
+        assert group_wall / batch_count == pytest.approx(runner.structured_turn_wall_seconds)
+        # Both leases stay strictly above the frozen graph defaults that caused
+        # the fatal per-batch overshoots for any real multi-batch plan.
+        if batch_count > 1:
+            assert group_tokens > 48_000
+            assert group_wall > 900.0
+
+
+def test_verifier_group_leases_are_clamped_to_remaining_scope_budget() -> None:
+    """A group lease can never exceed the scope's remaining budget."""
+
+    runner = object.__new__(DirectWorkRunner)
+    runner.structured_turn_token_limit = 5_000_000
+    runner.structured_turn_wall_seconds = 28_800.0
+
+    scarce = Budget(llm_tokens=10_000, wall_seconds=120.0)
+
+    assert runner._verifier_group_tokens(scarce, batch_count=4) == 10_000  # noqa: SLF001
+    assert runner._verifier_group_wall(scarce, batch_count=4) == pytest.approx(120.0)  # noqa: SLF001

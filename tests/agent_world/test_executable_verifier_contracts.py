@@ -5,6 +5,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -553,7 +554,7 @@ def test_challenger_context_is_deduplicated_and_omits_rule_expressions() -> None
     context = VerifierCompiler._challenger_context(design)
     serialized = json.dumps(context, sort_keys=True)
 
-    assert context["schema_version"] == "agent-world.challenger-context.v4"
+    assert context["schema_version"] == "agent-world.challenger-context.v5"
     reset_config_schemas = context["reset_config_schemas"]
     assert isinstance(reset_config_schemas, list)
     assert len(reset_config_schemas) == 1
@@ -581,14 +582,23 @@ def test_challenger_context_is_deduplicated_and_omits_rule_expressions() -> None
     assert '"task_type": "shared"' not in serialized
     prompt = VerifierCompiler._prompt(context)
     assert "You have no tools" in prompt
+    assert "syntactically valid RFC\n8259 JSON object only" in prompt
+    assert "`NaN`, `Infinity`, or `-Infinity` literals" in prompt
     assert "two-pass coverage audit" in prompt
     assert "`rule_count` counts the framework's private Rules" in prompt
     assert "`positive_only` error_semantics" in prompt
     assert "positive means an `expectations` item" in prompt
     assert "`expected=true`" in prompt
     assert "merely including that tool elsewhere" in prompt
+    assert "One expectation item may satisfy every compatible coverage row" in prompt
+    assert "never put both polarities" in prompt
+    assert "Within one case, emit each" in prompt
+    assert "`(kind, after_action_ordinal)` at most once" in prompt
     assert "Action-input schema audit is mandatory" in prompt
     assert "additionalProperties=false" in prompt
+    assert "Solve-recipe binding audit is mandatory" in prompt
+    assert "A matching field name is not proof" in prompt
+    assert "`solve_recipe_binding_guide`" in prompt
 
 
 def test_compact_intent_expands_to_complete_rule_bound_verifier() -> None:
@@ -644,6 +654,228 @@ def test_compact_intent_expands_to_complete_rule_bound_verifier() -> None:
         design.verification.required_rule_ids
     )
     VerifierCompiler._validate_draft(compiled, design)
+
+
+def test_verifier_requires_preferred_recipe_for_release_without_hidden_solver() -> None:
+    design = _design()
+    draft = _draft(design)
+    rules = design_rule_index(design)
+    intent = VerifierIntent(
+        cases=tuple(
+            VerifierCaseIntent(
+                task_type=case.task_type,
+                evaluator_goal=case.evaluator_goal,
+                actor=case.actor,
+                reset_config=case.reset_config,
+                actions=case.actions,
+                expectations=tuple(
+                    PropertyExpectationIntent(
+                        kind={
+                            "error_condition": "error_semantics",
+                        }.get(rules[item.rule_id].family, rules[item.rule_id].family),  # type: ignore[arg-type]
+                        after_action_ordinal=item.action_index + 1,
+                        expected=item.expected,
+                    )
+                    for item in case.assertions
+                ),
+            )
+            for case in draft.cases
+        ),
+        solve_recipes=(),
+    )
+
+    with pytest.raises(StructuredValidationError) as intent_error:
+        VerifierCompiler._validate_intent(  # noqa: SLF001 - compiler boundary under test
+            intent,
+            design,
+            allowed_task_types=("increase",),
+            required_rule_ids=design.verification.required_rule_ids,
+            required_property_families=design.verification.required_property_families,
+            require_metamorphic=False,
+        )
+    with pytest.raises(StructuredValidationError) as draft_error:
+        VerifierCompiler._validate_draft(  # noqa: SLF001 - compiler boundary under test
+            draft.model_copy(update={"solve_recipes": ()}),
+            design,
+        )
+
+    assert intent_error.value.diagnostic.issue_codes == (
+        "intent_release_recipe_missing@intent.solve_recipes",
+    )
+    assert draft_error.value.diagnostic.issue_codes == (
+        "draft_release_recipe_missing@draft.solve_recipes",
+    )
+
+
+def test_sampling_rules_are_owned_by_task_materialization_not_runtime_cases() -> None:
+    design = _design()
+    sampling = _rule(
+        "rule:sampling",
+        "sampling",
+        _ref_value("pre_state", "/counter/value"),
+        "greater_or_equal",
+        _constant(0),
+    )
+    scoped_design = design.model_copy(
+        update={
+            "curriculum": design.curriculum.model_copy(
+                update={"sampling_constraints": (sampling,)}
+            ),
+            "verification": design.verification.model_copy(
+                update={
+                    "required_rule_ids": (
+                        *design.verification.required_rule_ids,
+                        sampling.rule_id,
+                    ),
+                    "required_property_families": (
+                        *design.verification.required_property_families,
+                        "sampling",
+                    ),
+                }
+            ),
+        }
+    )
+
+    assignments = VerifierCompiler._assign_required_rules(scoped_design)  # noqa: SLF001
+    assert sampling.rule_id not in {
+        rule_id for rule_ids in assignments.values() for rule_id in rule_ids
+    }
+    context = VerifierCompiler._challenger_context(scoped_design)  # noqa: SLF001
+    assert "sampling" not in context["required_property_families"]
+    assert '"property_kind":"sampling"' not in json.dumps(context, sort_keys=True)
+    VerifierCompiler._validate_draft(_draft(design), scoped_design)  # noqa: SLF001
+
+
+def test_solve_recipe_feedback_is_exact_safe_and_shared_by_intent_and_draft() -> None:
+    """A constructed invalid recipe reaches the real compiler feedback boundary.
+
+    This is not a mocked Agent response: both validators receive a normal typed
+    candidate and must expose the same structural, non-secret correction fact.
+    """
+
+    design = _design()
+    draft = _draft(design)
+    rules = design_rule_index(design)
+    invalid_recipe = draft.solve_recipes[0].model_copy(
+        update={
+            "steps": (
+                ParameterizedSolveStep(
+                    step_id="step:untrusted-tool",
+                    tool_id="counter.untrusted",
+                    arguments={},
+                ),
+                *draft.solve_recipes[0].steps,
+            )
+        }
+    )
+    cases = tuple(
+        VerifierCaseIntent(
+            task_type=case.task_type,
+            evaluator_goal=case.evaluator_goal,
+            actor=case.actor,
+            reset_config=case.reset_config,
+            actions=case.actions,
+            expectations=tuple(
+                PropertyExpectationIntent(
+                    kind={
+                        "error_condition": "error_semantics",
+                    }.get(rules[item.rule_id].family, rules[item.rule_id].family),  # type: ignore[arg-type]
+                    after_action_ordinal=item.action_index + 1,
+                    expected=item.expected,
+                )
+                for item in case.assertions
+            ),
+        )
+        for case in draft.cases
+    )
+    intent = VerifierIntent(cases=cases, solve_recipes=(invalid_recipe,))
+
+    with pytest.raises(StructuredValidationError) as intent_error:
+        VerifierCompiler._validate_intent(  # noqa: SLF001 - compiler boundary under test
+            intent,
+            design,
+            allowed_task_types=("increase",),
+            required_rule_ids=design.verification.required_rule_ids,
+            required_property_families=design.verification.required_property_families,
+            require_metamorphic=False,
+        )
+    with pytest.raises(StructuredValidationError) as draft_error:
+        VerifierCompiler._validate_draft(  # noqa: SLF001 - compiler boundary under test
+            draft.model_copy(update={"solve_recipes": (invalid_recipe,)}),
+            design,
+        )
+
+    for root, diagnostic in (
+        ("intent", intent_error.value.diagnostic),
+        ("draft", draft_error.value.diagnostic),
+    ):
+        assert diagnostic.validation_phase == "solve_recipe"
+        assert diagnostic.frontier_ordinal == 25
+        assert len(diagnostic.issues) == 1
+        issue = diagnostic.issues[0]
+        assert issue.code == "recipe_tool_unknown"
+        assert issue.location == (root, "solve_recipes", 0, "steps", 0, "tool_id")
+        assert issue.expected_category is not None
+        assert issue.remediation is not None
+        assert issue.actionable_for_agent
+        assert "counter.untrusted" not in diagnostic.feedback
+        assert "step:untrusted-tool" not in diagnostic.feedback
+
+
+def test_solve_recipe_type_feedback_and_agent_view_expose_compatible_bindings() -> None:
+    """The real recipe boundary explains a type mismatch without replaying Agent output."""
+
+    design = _design()
+    task = design.curriculum.task_types[0]
+    numeric_goal = {
+        **task.public_goal_schema,
+        "properties": {
+            "target": {"type": "number"},
+        },
+    }
+    numeric_task = task.model_copy(update={"public_goal_schema": numeric_goal})
+    numeric_design = design.model_copy(
+        update={
+            "curriculum": design.curriculum.model_copy(
+                update={"task_types": (numeric_task,)}
+            )
+        }
+    )
+    recipe = _draft(numeric_design).solve_recipes[0]
+
+    with pytest.raises(StructuredValidationError) as captured:
+        verifier_compiler_module._validate_solve_recipe(  # noqa: SLF001
+            recipe,
+            requirement=numeric_task,
+            design=numeric_design,
+            location=("intent", "solve_recipes", 0),
+        )
+
+    issue = captured.value.diagnostic.issues[0]
+    assert issue.code == "recipe_pointer_type_mismatch"
+    assert issue.location == ("intent", "solve_recipes", 0, "steps", 0, "arguments", 0)
+    assert "type `number`" in issue.message
+    assert "`amount` requires `integer`" in issue.message
+    assert issue.remediation == (
+        "Use a compatible pointer source, or replace this binding with a literal that "
+        "validates against the selected tool argument schema."
+    )
+    assert "/target" not in issue.feedback
+
+    context = VerifierCompiler._challenger_context(numeric_design)  # noqa: SLF001
+    assert context["solve_recipe_binding_guide"] == [
+        {
+            "task_type": "increase",
+            "tool_id": "counter.increment",
+            "required_arguments": [
+                {
+                    "argument": "amount",
+                    "target_type": "integer",
+                    "type_compatible_public_goal_pointers": [],
+                }
+            ],
+        }
+    ]
 
 
 def test_verifier_rule_binding_reports_all_independent_missing_obligations() -> None:
@@ -1004,6 +1236,15 @@ def test_verifier_intent_uses_one_based_ordinals_and_reports_all_bad_references(
     assert len(diagnostic.issues) == len(cases)
     assert all(issue.code == "intent_action_ordinal_out_of_range" for issue in diagnostic.issues)
     assert all("after_action_ordinal" in issue.issue_code for issue in diagnostic.issues)
+    assert all(
+        issue.violated_condition == "each expectation must point to an action in its own case"
+        for issue in diagnostic.issues
+    )
+    assert all(
+        issue.expected_category
+        == "a one-based after_action_ordinal between 1 and the number of actions in that case"
+        for issue in diagnostic.issues
+    )
     assert "one-based" in diagnostic.feedback
     prompt = VerifierCompiler._prompt({})
     assert "one-based" in prompt
@@ -1011,6 +1252,9 @@ def test_verifier_intent_uses_one_based_ordinals_and_reports_all_bad_references(
     assert "`expectations`" in prompt
     assert "`checks`" in prompt
     assert "The verifier context and requested output are different schemas" in prompt
+    assert "no hidden interactive solver" in prompt
+    assert "`solve_recipes` is therefore" in prompt
+    assert "separate semantically distinct trajectory" in prompt
     assert 'literal `"v2"`' in prompt
     schema = VerifierIntent.model_json_schema(mode="validation")
     definitions = schema["$defs"]
@@ -1022,6 +1266,127 @@ def test_verifier_intent_uses_one_based_ordinals_and_reports_all_bad_references(
     expectations_schema = properties["expectations"]
     assert isinstance(expectations_schema, dict)
     assert "literal field name" in str(expectations_schema["description"])
+
+
+def test_verifier_intent_duplicate_expectation_has_one_safe_actionable_diagnostic() -> None:
+    """Duplicate coverage work remains a semantic rejection, never silent code deduplication."""
+
+    design = _design()
+    duplicate_case = VerifierCaseIntent(
+        task_type="increase",
+        evaluator_goal={"target": 5},
+        actor="user",
+        reset_config={"initial": 2},
+        actions=(RuntimeAction(tool_id="counter.increment", arguments={"amount": 3}),),
+        expectations=(
+            PropertyExpectationIntent(
+                kind="transition",
+                after_action_ordinal=1,
+                expected=True,
+            ),
+            PropertyExpectationIntent(
+                kind="transition",
+                after_action_ordinal=1,
+                expected=True,
+            ),
+        ),
+    )
+    distinct_case = duplicate_case.model_copy(
+        update={
+            "expectations": (
+                PropertyExpectationIntent(
+                    kind="precondition",
+                    after_action_ordinal=1,
+                    expected=True,
+                ),
+            )
+        }
+    )
+    intent = VerifierIntent(cases=(duplicate_case, distinct_case), solve_recipes=())
+
+    with pytest.raises(StructuredValidationError) as captured:
+        VerifierCompiler._validate_intent(  # noqa: SLF001 - semantic boundary under test
+            intent,
+            design,
+            allowed_task_types=("increase",),
+            required_rule_ids=design.verification.required_rule_ids,
+            required_property_families=design.verification.required_property_families,
+            require_metamorphic=False,
+        )
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic.validation_phase == "intent_references"
+    assert diagnostic.issue_codes == (
+        "intent_expectation_duplicate@cases.0.expectations.1.after_action_ordinal",
+    )
+    issue = diagnostic.issues[0]
+    assert issue.violated_condition == (
+        "each case must contain at most one expectation with the same kind, "
+        "after_action_ordinal, and expected value"
+    )
+    assert issue.expected_category == (
+        "one expectation for each unique (kind, after_action_ordinal, expected) combination; "
+        "compatible coverage rows may reuse it"
+    )
+    assert issue.remediation == (
+        "Merge duplicate expectation entries and keep the one compatible expectation that covers "
+        "every matching row."
+    )
+
+
+def test_verifier_intent_rejects_opposite_polarities_on_one_action() -> None:
+    """A negative obligation needs a different trajectory, not a second boolean label."""
+
+    design = _design()
+    conflicting_case = VerifierCaseIntent(
+        task_type="increase",
+        evaluator_goal={"target": 5},
+        actor="user",
+        reset_config={"initial": 2},
+        actions=(RuntimeAction(tool_id="counter.increment", arguments={"amount": 3}),),
+        expectations=(
+            PropertyExpectationIntent(
+                kind="transition",
+                after_action_ordinal=1,
+                expected=True,
+            ),
+            PropertyExpectationIntent(
+                kind="transition",
+                after_action_ordinal=1,
+                expected=False,
+            ),
+        ),
+    )
+    second_case = conflicting_case.model_copy(
+        update={
+            "expectations": (
+                PropertyExpectationIntent(
+                    kind="precondition",
+                    after_action_ordinal=1,
+                    expected=True,
+                ),
+            )
+        }
+    )
+
+    with pytest.raises(StructuredValidationError) as captured:
+        VerifierCompiler._validate_intent(  # noqa: SLF001 - semantic boundary under test
+            VerifierIntent(cases=(conflicting_case, second_case), solve_recipes=()),
+            design,
+            allowed_task_types=("increase",),
+            required_rule_ids=design.verification.required_rule_ids,
+            required_property_families=design.verification.required_property_families,
+            require_metamorphic=False,
+        )
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic.validation_phase == "intent_references"
+    assert diagnostic.issue_codes == (
+        "intent_expectation_polarity_conflict@cases.0.expectations.1.expected",
+    )
+    issue = diagnostic.issues[0]
+    assert "one expected polarity" in issue.expected_category
+    assert "distinct trajectory" in issue.remediation
 
 
 def test_verifier_intent_compiles_one_based_ordinal_to_zero_based_index() -> None:
@@ -1281,6 +1646,7 @@ async def test_one_shot_verifier_batch_uses_the_scheduler_dispatch_and_never_ret
     assert (  # type: ignore[attr-defined]
         backend.requests[0].execution_mode is InvocationExecutionMode.SINGLE_SHOT_STRUCTURED
     )
+    assert "Structured-output transport requirement:" not in backend.requests[0].prompt  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
@@ -1761,10 +2127,14 @@ async def test_legacy_verifier_does_not_spend_a_hidden_icp_retry(
 
     class Profile:
         rollout_token_limit = 100
+        allowed_builtin_tools: tuple[str, ...] = ()
+
+        def __init__(self, output_schema: dict[str, object]) -> None:
+            self.output_schema = output_schema
 
     class Profiles:
-        def resolve(self, **_kwargs: object) -> Profile:
-            return Profile()
+        def resolve(self, **kwargs: object) -> Profile:
+            return Profile(cast(dict[str, object], kwargs["output_schema"]))
 
     class ControlPlaneRetryBackend:
         owns_declared_lifecycle = True

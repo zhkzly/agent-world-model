@@ -1,6 +1,6 @@
 """Real envpkg-v3 fixture shared by Registry and consumer integration tests.
 
-The candidate files in this module are executed by uv, bubblewrap and real child
+The candidate files in this module are executed by uv and real local child
 processes.  They intentionally contain no candidate evaluator, answer, witness,
 consumer adapter or release callback.
 """
@@ -129,9 +129,10 @@ import json
 import os
 import sys
 
-assert os.path.isfile("/workspace/runtime.py")
-assert not os.path.exists("/workspace/task_materializer.py")
-assert not os.path.exists("/workspace/world/rule_ir.json")
+workspace = os.environ["AGENT_WORLD_WORKSPACE"]
+assert os.path.isfile(os.path.join(workspace, "runtime.py"))
+assert not os.path.exists(os.path.join(workspace, "task_materializer.py"))
+assert not os.path.exists(os.path.join(workspace, "world", "rule_ir.json"))
 
 ABI = "agent-world.runtime.v2"
 OPERATIONS = ["handshake", "reset", "invoke", "snapshot", "close"]
@@ -310,9 +311,10 @@ TASK_MATERIALIZER_SOURCE = r"""from __future__ import annotations
 
 import os
 
-assert os.path.isfile("/workspace/task_materializer.py")
-assert os.path.isfile("/workspace/runtime.py")
-assert not os.path.exists("/workspace/world/rule_ir.json")
+workspace = os.environ["AGENT_WORLD_WORKSPACE"]
+assert os.path.isfile(os.path.join(workspace, "task_materializer.py"))
+assert os.path.isfile(os.path.join(workspace, "runtime.py"))
+assert not os.path.exists(os.path.join(workspace, "world", "rule_ir.json"))
 
 
 def materialize(seed, task_type, actor, difficulty):
@@ -337,9 +339,10 @@ import json
 import os
 
 assert os.path.isdir(os.environ["AGENT_WORLD_STATE_DIR"])
-assert os.path.isfile("/workspace/public_check.py")
-assert os.path.isfile("/workspace/runtime.py")
-assert os.path.isfile("/workspace/task_materializer.py")
+workspace = os.environ["AGENT_WORLD_WORKSPACE"]
+assert os.path.isfile(os.path.join(workspace, "public_check.py"))
+assert os.path.isfile(os.path.join(workspace, "runtime.py"))
+assert os.path.isfile(os.path.join(workspace, "task_materializer.py"))
 print(json.dumps({"status": "pass", "network_required": False}, sort_keys=True))
 """
 
@@ -1616,8 +1619,6 @@ def build_judge_candidate_graph(
     completion = CandidateCompletion(
         status="completed",
         project_root="candidate",
-        root_project_mode="virtual-read-only-source-tree",
-        dependency_install_mode="offline-wheel-only",
         runtime=CandidateRuntimeDeclaration(
             argv=(".venv/bin/python", "-m", "runtime"),
             entry_path="runtime.py",
@@ -2230,8 +2231,6 @@ def build_release_graph(
     completion = CandidateCompletion(
         status="completed",
         project_root="candidate",
-        root_project_mode="virtual-read-only-source-tree",
-        dependency_install_mode="offline-wheel-only",
         runtime=CandidateRuntimeDeclaration(
             argv=(".venv/bin/python", "-m", "runtime"),
             entry_path="runtime.py",

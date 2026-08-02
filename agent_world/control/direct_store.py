@@ -62,6 +62,7 @@ class DirectJobHead(V2Contract):
     request_fingerprint: ContentHash
     request_ref: ArtifactRef
     job_ref: ArtifactRef
+    scope_id: Identifier | None = None
     run_id: Identifier
     snapshot_ref: ArtifactRef
     snapshot_revision: Annotated[int, Field(ge=1)]
@@ -233,6 +234,12 @@ class DirectJobStore:
         )
         if any(getattr(current, field) != getattr(next_head, field) for field in immutable_fields):
             raise DirectJobHeadConflictError("Direct job identity cannot change")
+        # scope_id is derived from job.job_id and stable for the life of a run.
+        # Heads written before this field existed carry None; the first
+        # checkpoint after upgrade may promote None -> concrete, but a concrete
+        # scope_id can never drift to a different value.
+        if current.scope_id is not None and current.scope_id != next_head.scope_id:
+            raise DirectJobHeadConflictError("Direct job scope identity cannot change")
         if current.result_ref is not None:
             raise DirectJobHeadConflictError("completed Direct job head is immutable")
         if next_head.snapshot_revision < current.snapshot_revision:
@@ -303,6 +310,7 @@ def new_direct_job_head(
     snapshot_ref: ArtifactRef,
     snapshot_revision: int,
     status: DirectJobStatus,
+    scope_id: Identifier | None = None,
     result_ref: ArtifactRef | None = None,
     previous_result_ref: ArtifactRef | None = None,
 ) -> DirectJobHead:
@@ -313,6 +321,7 @@ def new_direct_job_head(
         request_fingerprint=request_fingerprint,
         request_ref=request_ref,
         job_ref=job_ref,
+        scope_id=scope_id,
         run_id=run_id,
         snapshot_ref=snapshot_ref,
         snapshot_revision=snapshot_revision,

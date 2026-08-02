@@ -34,7 +34,7 @@ from agent_world.invocation import (
     InvocationSession,
     InvocationStatus,
 )
-from agent_world.judge import IsolationPolicy, IsolationUnavailable
+from agent_world.judge import HostExecutionPolicy, HostExecutionUnavailable
 
 
 def _doctor_config(tmp_path: Path, *, judge: JudgeConfig) -> FoundryConfig:
@@ -74,14 +74,14 @@ def _write_probe_marker(workspace: Path) -> None:
     )
 
 
-async def _require_real_isolation() -> None:
+async def _require_host_execution() -> None:
     if shutil.which("uv") is None:
         pytest.skip("real uv executable is unavailable")
     try:
-        await IsolationPolicy(purpose="runtime").ensure_available()
-        await IsolationPolicy(purpose="build").ensure_available()
-    except IsolationUnavailable as exc:
-        pytest.skip(f"real bubblewrap isolation unavailable: {exc.code}: {exc}")
+        await HostExecutionPolicy(purpose="runtime").ensure_available()
+        await HostExecutionPolicy(purpose="build").ensure_available()
+    except HostExecutionUnavailable as exc:
+        pytest.skip(f"real host execution unavailable: {exc.code}: {exc}")
 
 
 @pytest.mark.asyncio
@@ -106,11 +106,41 @@ async def test_doctor_fails_closed_when_offline_cache_is_not_configured(
     assert not report.production_ready
 
 
+def test_doctor_local_readiness_counts_host_execution_and_profile_materialization() -> None:
+    """Renamed local checks must still participate in Doctor's aggregate verdict."""
+
+    local_checks = (
+        "state_root",
+        "executable_uv",
+        "standalone_python",
+        "codex_sdk",
+        "codex_runtime",
+        "judge_host_execution",
+        "clean_build",
+        "profile_materialization",
+    )
+    passed = tuple(
+        DoctorCheck(check=name, status="pass", summary="controlled prerequisite")
+        for name in local_checks
+    )
+
+    assert doctor_module._local_execution_ready(passed)  # noqa: SLF001
+    stale_name = tuple(
+        DoctorCheck(
+            check="judge_isolation" if check.check == "judge_host_execution" else check.check,
+            status=check.status,
+            summary=check.summary,
+        )
+        for check in passed
+    )
+    assert not doctor_module._local_execution_ready(stale_name)  # noqa: SLF001
+
+
 @pytest.mark.asyncio
 async def test_doctor_executes_real_offline_clean_build_and_runtime_probe(
     tmp_path: Path,
 ) -> None:
-    await _require_real_isolation()
+    await _require_host_execution()
     cache = tmp_path / "uv-cache"
     cache.mkdir()
     report = await run_doctor(
@@ -292,6 +322,8 @@ async def test_live_agent_probe_publishes_live_safe_trace_and_terminal_status(
     assert running["wall_timeout_seconds"] == 28_800
     assert received and received[0].metadata["trace_id"] == running["trace_id"]
     assert received[0].metadata["run_id"] == running["trace_id"]
+    assert tuple(bundle.name for bundle in received[0].profile.skills) == ("engineer-agent-world",)
+    assert "`engineer-agent-world` Skill" in received[0].prompt
 
     with TelemetryStore(config.state_root / "telemetry") as reader:
         active = reader.active_work(running["trace_id"])
@@ -445,7 +477,10 @@ async def test_live_agent_probe_status_does_not_expose_provider_message(
         "terminal_error_shape": "object",
     }
     debug_path = Path(status["debug_feedback_path"])
-    debug = json.loads(await asyncio.to_thread(debug_path.read_text, encoding="utf-8"))
+    # The invocation has settled; this tiny local sidecar read is deliberately
+    # synchronous so the test does not turn a filesystem assertion into a
+    # child-thread liveness test under the desktop command runner.
+    debug = json.loads(debug_path.read_text(encoding="utf-8"))  # noqa: ASYNC240
     assert debug["terminal_error_excerpt"] == "unsupported response_format [REDACTED_URL]"
     assert debug["trace_id"] == status["trace_id"]
     assert "provider-secret-text-must-not-be-persisted" not in json.dumps(status, sort_keys=True)

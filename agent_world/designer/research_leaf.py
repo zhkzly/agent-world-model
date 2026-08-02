@@ -143,10 +143,11 @@ class ResearchPlanLeaf:
 
         await self.kernel.execute(context, definition=definition, proposal_runner=proposal)
 
+
 def _research_plan_prompt(request: EnvironmentRequest) -> str:
     """Prompt only a research plan; tools and factual claims stay out of this turn."""
 
-    return f"""You are the isolated Researcher for an Agent World Foundry.
+    return f"""You are the Researcher for an Agent World Foundry.
 Project purpose: compile a short human need into a faithful executable programmatic environment.
 Your role here is only to plan real searches. Do not answer from memory and do not design code.
 

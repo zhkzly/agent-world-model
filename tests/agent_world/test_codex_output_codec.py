@@ -8,7 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
+from agent_world.builder.models import CandidateCompletion
 from agent_world.config import AgentBackendConfig
 from agent_world.contracts import PermissionScope
 from agent_world.designer.models import (
@@ -21,10 +22,8 @@ from agent_world.designer.models import (
     ToolStateTransitionDraft,
 )
 from agent_world.invocation import (
-    DiagnosticCommandExpectation,
+    InvocationError,
     InvocationLimits,
-    InvocationOwnerKind,
-    InvocationOwnership,
     InvocationRequest,
     InvocationResult,
     InvocationSession,
@@ -33,16 +32,14 @@ from agent_world.invocation import (
 )
 from agent_world.invocation.codex_sdk import (
     CodexSdkBackend,
-    _decode_json_envelope,
     _decode_provider_json_ir,
     _open_ephemeral_sqlite_home,
     _provider_output_schema,
-    _telemetry_event_payload,
 )
 
 
 def _request(tmp_path: Path) -> InvocationRequest:
-    provider = IsolatedAgentProfileProvider(
+    provider = AgentProfileProvider(
         AgentBackendConfig(
             model="configured-real-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -109,7 +106,7 @@ def test_worker_payload_passes_logical_schema_directly_to_codex_sdk(
 
     assert payload["output_schema"] == _provider_output_schema(request.profile.output_schema or {})
     assert payload["prompt"] == request.prompt
-    assert payload["sandbox"] == "read-only"
+    assert payload["sandbox"] == "full-access"
     assert request.profile.codex_bin is not None
     assert request.profile.codex_bin_sha256 is not None
     assert payload["codex_bin"] == str(request.profile.codex_bin)
@@ -119,6 +116,8 @@ def test_worker_payload_passes_logical_schema_directly_to_codex_sdk(
     assert payload["openai_base_url_environment"] == "OPENAI_BASE_URL"
     assert payload["sensitive_environment_names"] == ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
     assert payload["diagnostic_capture_terminal_excerpt"] is False
+    assert "base_instructions" not in payload
+    assert "developer_instructions" not in payload
     assert "provider.example.test" not in json.dumps(payload, sort_keys=True)
     assert payload["output_schema"]["properties"]["dynamic"] == {
         "type": "object",
@@ -153,22 +152,33 @@ def test_worker_payload_passes_logical_schema_directly_to_codex_sdk(
     }
 
 
-def test_json_envelope_transport_uses_a_shallow_provider_schema(tmp_path: Path) -> None:
+def test_codex_worker_payload_has_no_transport_selector(tmp_path: Path) -> None:
     request = _request(tmp_path)
-    envelope_request = replace(
-        request,
-        profile=replace(request.profile, structured_output_transport="json_envelope"),
+    payload = CodexSdkBackend._worker_payload(request)
+
+    assert "structured_output_transport" not in payload
+
+
+def test_candidate_blocked_completion_matches_the_strict_provider_envelope() -> None:
+    provider_schema = _provider_output_schema(
+        CandidateCompletion.model_json_schema(mode="validation")
     )
-
-    payload = CodexSdkBackend._worker_payload(envelope_request)
-
-    assert payload["structured_output_transport"] == "json_envelope"
-    assert payload["output_schema"] == {
-        "type": "object",
-        "properties": {"artifact_json": {"type": "string"}},
-        "required": ["artifact_json"],
-        "additionalProperties": False,
+    payload = {
+        "schema_version": "v2",
+        "status": "blocked",
+        "blocking_reason": "provider transport probe",
+        "project_root": None,
+        "runtime": None,
+        "task_materializer": None,
+        "public_self_check": None,
+        "public_test_paths": [],
+        "files": [],
     }
+
+    assert set(provider_schema["required"]) == set(payload)
+    completion = CandidateCompletion.model_validate_json(json.dumps(payload))
+    assert completion.status == "blocked"
+    assert completion.blocking_reason == "provider transport probe"
 
 
 def test_worker_payload_forwards_terminal_excerpt_capture_only_when_explicitly_opted_in(
@@ -184,63 +194,6 @@ def test_worker_payload_forwards_terminal_excerpt_capture_only_when_explicitly_o
         CodexSdkBackend._worker_payload(diagnostic_request)["diagnostic_capture_terminal_excerpt"]
         is True
     )
-
-
-def test_worker_payload_forwards_private_audit_command_expectations_without_durable_output(
-    tmp_path: Path,
-) -> None:
-    request = _request(tmp_path)
-    diagnostic_request = replace(
-        request,
-        ownership=InvocationOwnership(
-            owner_kind=InvocationOwnerKind.DIAGNOSTIC_AUDIT,
-            owner_id="diagnostic:command-proof",
-            scope_id="diagnostic:scope",
-        ),
-        diagnostic_command_expectations=(
-            DiagnosticCommandExpectation(
-                label="uv_version",
-                command_fragment="./.agent-world-tools/uv --version",
-            ),
-        ),
-    )
-
-    payload = CodexSdkBackend._worker_payload(diagnostic_request)
-
-    assert payload["diagnostic_command_expectations"] == [
-        {
-            "label": "uv_version",
-            "command_fragment": "./.agent-world-tools/uv --version",
-        }
-    ]
-
-
-def test_normal_telemetry_strips_local_diagnostic_command_sidecar() -> None:
-    diagnostic_canary = "local-command-failure-must-not-reach-telemetry"
-
-    payload = _telemetry_event_payload(
-        {
-            "item": {"type": "commandExecution", "status": "failed"},
-            "diagnosticCommandProof": [
-                {
-                    "label": "uv_version",
-                    "outcome": "failed",
-                    "diagnosticExcerpt": diagnostic_canary,
-                }
-            ],
-        }
-    )
-
-    assert payload == {"item": {"type": "commandExecution", "status": "failed"}}
-    assert diagnostic_canary not in str(payload)
-
-
-def test_json_envelope_decodes_the_inner_json_document_or_gateway_object() -> None:
-    assert _decode_json_envelope({"artifact_json": '{"status":"ok"}'}) == {"status": "ok"}
-    assert _decode_json_envelope({"artifact_json": {"status": "ok"}}) == {"status": "ok"}
-    assert _decode_json_envelope({"status": "ok"}) == {"status": "ok"}
-    with pytest.raises(ValueError, match="must be a JSON string or object"):
-        _decode_json_envelope({"artifact_json": 7})
 
 
 @pytest.mark.asyncio
@@ -325,10 +278,19 @@ def test_ephemeral_sqlite_home_is_memory_backed_and_removed_after_use() -> None:
 
 
 @pytest.mark.asyncio
-async def test_backend_reuses_private_sqlite_home_for_a_resumed_session(
+async def test_backend_reuses_private_sqlite_home_after_a_failed_turn_with_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A closed Provider terminal may retain the private thread for one resume.
+
+    This is the adapter boundary behind CandidateBuild's same-session recovery:
+    the first physical turn is terminal and retryable, but its thread is real
+    and remains bound to the volatile SQLite home.  The next physical turn
+    must reuse that exact local runtime instead of treating a bare thread id
+    as portable state or silently creating a fresh Agent session.
+    """
+
     backend = CodexSdkBackend()
     initial = _request(tmp_path)
     observed_homes: list[Path] = []
@@ -340,16 +302,35 @@ async def test_backend_reuses_private_sqlite_home_for_a_resumed_session(
         **_: object,
     ) -> InvocationResult:
         observed_homes.append(sqlite_home)
+        session = InvocationSession(
+            thread_id="retained-thread",
+            lineage_id=request.profile.lineage_id,
+            workspace=request.profile.workspace,
+            profile_hash=request.profile.profile_hash,
+            codex_config_sha256=request.profile.codex_config_sha256,
+        )
+        if request.session is None:
+            return InvocationResult(
+                invocation_id=request.invocation_id,
+                status=InvocationStatus.FAILED,
+                session=session,
+                turn_id="turn:failed",
+                final_text=None,
+                structured_output=None,
+                usage=None,
+                events=(),
+                error=InvocationError(
+                    code="turn_failed_provider_unavailable",
+                    message="closed transient provider terminal",
+                    retryable=True,
+                ),
+                duration_ms=1,
+                backend_version="test",
+            )
         return InvocationResult(
             invocation_id=request.invocation_id,
             status=InvocationStatus.COMPLETED,
-            session=InvocationSession(
-                thread_id="retained-thread",
-                lineage_id=request.profile.lineage_id,
-                workspace=request.profile.workspace,
-                profile_hash=request.profile.profile_hash,
-                codex_config_sha256=request.profile.codex_config_sha256,
-            ),
+            session=session,
             turn_id="turn:test",
             final_text="completed",
             structured_output=None,
@@ -364,6 +345,8 @@ async def test_backend_reuses_private_sqlite_home_for_a_resumed_session(
 
     first = await backend._invoke_with_capacity(initial)
     assert first.session is not None
+    assert first.status is InvocationStatus.FAILED
+    assert first.error is not None and first.error.retryable is True
     second = await backend._invoke_with_capacity(
         replace(initial, invocation_id="codec-contract-resume", session=first.session)
     )
@@ -402,52 +385,6 @@ async def test_resume_without_private_runtime_state_fails_before_a_worker_starts
     assert result.status is InvocationStatus.FAILED
     assert result.error is not None
     assert result.error.code == "session_runtime_unavailable"
-
-
-@pytest.mark.asyncio
-async def test_missing_declared_runtime_tool_fails_before_a_worker_starts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider = IsolatedAgentProfileProvider(
-        AgentBackendConfig(
-            model="configured-real-model",
-            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
-        ),
-        source_environment={
-            "PATH": str(tmp_path / "empty-bin"),
-            "AGENT_WORLD_TEST_MODEL_KEY": "test-model-credential",
-        },
-    )
-    profile = provider.resolve(
-        role="environment-engineer",
-        lineage_id="missing-runtime-tool",
-        workspace=tmp_path / "engineer",
-        output_schema={"type": "object", "additionalProperties": False},
-        permissions=PermissionScope(),
-        requirement=NodeCapabilityRequirement.isolated_build(
-            node_id="environment-engineer.runtime-build"
-        ),
-    )
-    request = InvocationRequest(
-        invocation_id="missing-runtime-tool",
-        prompt="This call must fail during toolchain preflight.",
-        profile=profile,
-    )
-    backend = CodexSdkBackend()
-
-    async def unexpected_worker(**_: object) -> InvocationResult:
-        raise AssertionError("a missing runtime tool must fail before worker startup")
-
-    monkeypatch.setattr(backend, "_invoke_worker_process", unexpected_worker)
-
-    result = await backend._invoke_with_capacity(request)
-
-    assert result.status is InvocationStatus.FAILED
-    assert result.error is not None
-    assert result.error.code == "runtime_toolchain_unavailable"
-    assert result.error.retryable is False
-    assert result.error.message == "required isolated runtime toolchain is unavailable: uv"
 
 
 @pytest.mark.asyncio

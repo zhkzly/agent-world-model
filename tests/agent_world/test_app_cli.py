@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -14,7 +17,7 @@ import pytest
 from pydantic import HttpUrl
 from v3_fixture import build_judge_candidate_graph
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.app import (
     ApplicationConfigurationError,
     DirectRunReader,
@@ -27,6 +30,7 @@ from agent_world.cli import (
     _parse_capability_signal,
     _parse_rollout_action,
     _parse_suite_selection,
+    _run_cli_coroutine,
     build_parser,
 )
 from agent_world.config import AgentBackendConfig, FoundryConfig, JudgeConfig, ResearchConfig
@@ -94,6 +98,45 @@ def _filesystem_config(tmp_path: Path) -> FoundryConfig:
             use_jina_reader_fallback=False,
         ),
     )
+
+
+def test_cli_runner_bounds_post_terminal_default_executor_shutdown() -> None:
+    """A settled Direct failure must not spend asyncio's default 300-second grace.
+
+    This simulates only a stuck SDK-owned executor thread after the coroutine
+    has already returned.  It does not model a Provider call or change its
+    lifetime policy.
+    """
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocked_executor_work() -> None:
+        started.set()
+        release.wait()
+        finished.set()
+
+    async def settled_command() -> str:
+        asyncio.get_running_loop().run_in_executor(None, blocked_executor_work)
+        while not started.is_set():
+            await asyncio.sleep(0)
+        return "settled"
+
+    try:
+        started_at = time.monotonic()
+        with pytest.warns(RuntimeWarning, match="executor did not finishing joining"):
+            result = _run_cli_coroutine(
+                settled_command(),
+                executor_shutdown_seconds=0.01,
+            )
+        elapsed = time.monotonic() - started_at
+    finally:
+        release.set()
+
+    assert result == "settled"
+    assert elapsed < 1
+    assert finished.wait(timeout=1)
 
 
 def _observe_execution(attempt: WorkAttempt, definition: WorkDefinition) -> ProposalExecution:
@@ -294,9 +337,14 @@ def test_production_app_assembles_real_components_and_secret_canaries(
     routing_canary = "https://provider.example.test/v1"
     monkeypatch.setenv("OPENAI_API_KEY", canary)
     monkeypatch.setenv("OPENAI_BASE_URL", routing_canary)
-    app = build_application(_filesystem_config(tmp_path))
+    config = _filesystem_config(tmp_path)
+    app = build_application(
+        config.model_copy(
+            update={"agent": config.agent.model_copy(update={"max_concurrent_invocations": 2})}
+        )
+    )
 
-    assert isinstance(app.profiles, IsolatedAgentProfileProvider)
+    assert isinstance(app.profiles, AgentProfileProvider)
     assert isinstance(app.backend, InvocationControlPlane)
     assert app.backend.require_explicit_ownership
     assert isinstance(app.invocation_control, InvocationControlStore)
@@ -315,6 +363,8 @@ def test_production_app_assembles_real_components_and_secret_canaries(
     assert app.judge.interactive_challenger.profiles is app.profiles
     assert isinstance(app.registry, EnvironmentRegistry)
     assert isinstance(app.controller, FoundryController)
+    assert app.controller.direct_work_runner is not None
+    assert app.controller.direct_work_runner.maximum_concurrency == 2
     assert app.artifacts.capability_issuance_sealed
 
     with pytest.raises(ArtifactStoreError, match="issuance is sealed"):
@@ -685,6 +735,7 @@ def test_direct_run_reader_exposes_live_progress_and_budget_without_content() ->
     head = SimpleNamespace(
         run_id="run:live",
         job_ref=job_ref,
+        scope_id="job:live",
         request_ref=request_ref,
         snapshot_ref=snapshot_ref,
         model_dump=lambda **_kwargs: {"run_id": "run:live"},
@@ -731,6 +782,8 @@ def test_direct_run_reader_exposes_live_progress_and_budget_without_content() ->
     inspected = reader.inspect("request:live")
     active = inspected["active_work"]
 
+    # AC2: inspect surfaces the persisted head.scope_id directly.
+    assert inspected["scope_id"] == "job:live"
     assert isinstance(active, dict)
     assert active["builder_workspace"]["progress"]["file_count"] == 7
     assert active["usage"]["observed_actual"]["llm_tokens"] == 250
@@ -821,9 +874,12 @@ def test_direct_run_reader_uses_scheduler_ledger_for_live_budget(tmp_path: Path)
         requested=Budget(llm_tokens=500, agent_turns=2, wall_seconds=60),
         elapsed_wall_seconds=1,
     )
+    # A pre-migration head has no persisted scope_id; inspect must fall back to
+    # the EnvironmentJob.job_id deref (AC2).
     head = SimpleNamespace(
         run_id=snapshot.run_id,
         job_ref=job_ref,
+        scope_id=None,
         request_ref=request_ref,
         snapshot_ref=snapshot_ref,
         model_dump=lambda **_kwargs: {"run_id": snapshot.run_id},
@@ -847,7 +903,9 @@ def test_direct_run_reader_uses_scheduler_ledger_for_live_budget(tmp_path: Path)
         heads,
     )
 
-    usage = reader.inspect("request:scheduler-live")["active_work"]["usage"]
+    inspected = reader.inspect("request:scheduler-live")
+    assert inspected["scope_id"] == job.job_id
+    usage = inspected["active_work"]["usage"]
 
     assert usage["projection_source"] == "scheduler_scope_lease_ledger"
     assert usage["observed_actual"]["llm_tokens"] == 240

@@ -423,6 +423,29 @@ def test_task_requirement_loader_accepts_native_plan_overlay(
     assert selected_join.design_epoch_ref == overlay_design_epoch_ref
     assert selected_join.curriculum_plan_definition == overlay_plan
 
+    # A copied diagnostic root can retain an older terminal TaskCurriculum
+    # head with the same public coordinate and definition digest but a
+    # different immutable input closure. Selection must not call it complete;
+    # the descendant Scheduler owns the later fingerprint comparison and will
+    # classify this head as stale before dispatching the overlay's real join.
+    existing_join_head = heads.read_head(task_curriculum.coordinate)
+    assert existing_join_head is not None
+    original_read_head = heads.read_head
+
+    def stale_join_read_head(coordinate: WorkCoordinate):
+        if coordinate == selected_join.join_definition.coordinate:
+            return existing_join_head.model_copy(
+                update={"definition_digest": selected_join.join_definition.definition_digest}
+            )
+        return original_read_head(coordinate)
+
+    monkeypatch.setattr(heads, "read_head", stale_join_read_head)
+    selected_after_stale_head = DiagnosticTaskCurriculumJoinRunner._load_plan_derived_join(  # noqa: SLF001
+        app=app,
+        scope_id=scope_id,
+    )
+    assert selected_after_stale_head == selected_join
+
     # A current VerifierPlan implementation refresh is a different diagnostic
     # shape: upstream CurriculumPlan remains the original normal commit, while
     # only the deterministic VerifierPlan becomes diagnostic.  The final-node

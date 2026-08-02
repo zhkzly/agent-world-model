@@ -37,6 +37,7 @@ from agent_world.control.work_store import WorkControlStore
 from agent_world.invocation import (
     InvocationControlStore,
     InvocationLifecyclePhase,
+    InvocationRequestShape,
     InvocationStatus,
     InvocationTerminalFact,
 )
@@ -47,6 +48,7 @@ from agent_world.invocation.structured_diagnostics import (
     safe_terminal_remediation,
 )
 from agent_world.observability import (
+    ActiveWorkPointer,
     CoordinateScene,
     ObservabilityReader,
     ObservabilityRoot,
@@ -57,6 +59,7 @@ from agent_world.observability import (
     fold,
     safe_dynamic_text,
 )
+from agent_world.observability.render import render_scene
 from agent_world.observability.scene import (
     MAX_COORDINATE_POINTERS,
     MAX_TOP_ISSUES,
@@ -547,6 +550,94 @@ def test_projector_materializes_secret_safe_thrashing_candidate_scene(tmp_path: 
     assert len(heads.read_scope_heads(definition.coordinate.scope_id)) == 1
 
 
+def test_projector_reflects_control_progress_for_disjoint_sibling_blockers(
+    tmp_path: Path,
+) -> None:
+    """The Tier A view must not turn real strict progress into thrashing.
+
+    This executes the durable WorkAttempt -> ValidationReport ->
+    FeedbackEvaluation -> SceneProjector boundary twice.  The second exact
+    repair removes the first actionable blocker and exposes a different
+    actionable blocker at the same validation frontier.  The WorkRepairLedger
+    authorizes the bonus correction as strict progress; the read model must
+    describe the same fact without independently granting that authority.
+    """
+
+    artifacts, heads, runtime, definition, input_ref, candidate_ref, root, canary = _harness(
+        tmp_path
+    )
+    with heads.exclusive(definition.coordinate) as lock:
+        head = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(input_ref, candidate_ref),
+            elapsed_wall_seconds=0,
+        )
+        head = _checkpoint_proposal(
+            runtime,
+            artifacts,
+            lock,
+            definition,
+            _execution(_attempt(artifacts, head), definition, 1),
+        )
+        head = _checkpoint_failed_evaluation(
+            runtime,
+            artifacts,
+            lock,
+            definition,
+            head,
+            _failed_runtime_report(
+                _attempt(artifacts, head),
+                definition,
+                label="first-sibling",
+                issue_code="integration_gate_first_sibling_missing",
+                violated_condition="The first sibling obligation is missing.",
+            ),
+        )
+        assert head.status == "repair_authorized"
+
+        head = runtime.begin_authorized_repair(lock, definition=definition)
+        head = _checkpoint_proposal(
+            runtime,
+            artifacts,
+            lock,
+            definition,
+            _execution(_attempt(artifacts, head), definition, 2),
+        )
+        head = _checkpoint_failed_evaluation(
+            runtime,
+            artifacts,
+            lock,
+            definition,
+            head,
+            _failed_runtime_report(
+                _attempt(artifacts, head),
+                definition,
+                label="second-sibling",
+                issue_code="integration_gate_second_sibling_missing",
+                violated_condition="The next sibling obligation is missing.",
+            ),
+        )
+
+    assert head.status == "repair_authorized"
+    scene_scope_id = safe_dynamic_text(
+        definition.coordinate.scope_id,
+        known_secret_canaries=(canary,),
+    )
+    index = RunSceneIndex.model_validate_json(root.scene_json_path(scene_scope_id).read_bytes())
+    assert index.stuck_coordinate is not None
+    assert index.stuck_reason == "authorized_repair"
+    coordinate = CoordinateScene.model_validate_json(
+        root.coordinate_json_path(
+            scene_scope_id,
+            index.stuck_coordinate.coordinate_key,
+        ).read_bytes()
+    )
+    assert coordinate.frontier_progress == "strict_progress"
+    assert coordinate.frontier_diff.previous_size == 1
+    assert coordinate.frontier_diff.current_size == 1
+
+
 def test_projector_does_not_fabricate_progress_for_a_timeout(tmp_path: Path) -> None:
     """A timed-out Agent operation must be debuggable from the safe scene.
 
@@ -657,6 +748,111 @@ def test_projector_does_not_fabricate_progress_for_a_timeout(tmp_path: Path) -> 
     assert "First progress:" not in coordinate_markdown
     assert "Terminal failure phase: proposal (1 ms)" in coordinate_markdown
     assert "Last completed phase: validation" in coordinate_markdown
+
+
+def test_projector_surfaces_only_closed_codex_terminal_facts(tmp_path: Path) -> None:
+    """A real leaf-failure record informs D-layer investigation safely.
+
+    The Code Agent cannot act on an app-server terminal.  The project Agent
+    nevertheless needs its closed terminal kind in the current scene to avoid
+    guessing whether a Candidate path, Prompt, or Runtime Skill caused the
+    failure.  Raw provider text is deliberately present in the Tier B fixture
+    and must not cross into Tier A.
+    """
+
+    artifacts, heads, runtime, definition, input_ref, candidate_ref, root, canary = _harness(
+        tmp_path
+    )
+    with heads.exclusive(definition.coordinate) as lock:
+        head = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(input_ref, candidate_ref),
+            elapsed_wall_seconds=0,
+        )
+        head = _checkpoint_proposal(
+            runtime,
+            artifacts,
+            lock,
+            definition,
+            _execution(_attempt(artifacts, head), definition, 1),
+        )
+        attempt = _attempt(artifacts, head)
+        failure_ref = artifacts.put_json(
+            artifact_id="leaf-failure:scene:closed-codex-terminal",
+            artifact_type="control.leaf_failure_evidence",
+            value={
+                "attempt_id": attempt.attempt_id,
+                "coordinate": definition.coordinate.model_dump(mode="json"),
+                "failure_code": "turn_failed_provider_unavailable",
+                "failure_category": "closed Codex terminal",
+                "retryable_infrastructure": True,
+                "terminal_details": {
+                    "terminal_error_shape": "object",
+                    "codex_error_info": "enum:other",
+                    "advisory_text_signals": ["transport_or_connection"],
+                    "untrusted_provider_text": canary,
+                },
+            },
+            dependencies=attempt.input_refs,
+        )
+        report = ValidationReport(
+            report_id="report:scene:closed-codex-terminal",
+            attempt_id=attempt.attempt_id,
+            coordinate=definition.coordinate,
+            policy_id=definition.validation_policy.policy_id,
+            policy_digest=definition.validation_policy.content_digest(),
+            status="error",
+            validation_phase=definition.validation_policy.validation_phase,
+            frontier_ordinal=definition.validation_policy.frontier_ordinal,
+            issues=(
+                ValidationIssue(
+                    code="turn_failed_provider_unavailable",
+                    path=("operation",),
+                    violated_condition="the Agent backend returned a non-success terminal result",
+                    expected_category="one fresh execution under the declared replay policy",
+                ),
+            ),
+            evidence_refs=(failure_ref,),
+            diagnostic_quality="actionable",
+            evaluated_at=datetime.now(UTC),
+        )
+        _checkpoint_failed_evaluation(runtime, artifacts, lock, definition, head, report)
+
+    scene_scope_id = safe_dynamic_text(
+        definition.coordinate.scope_id,
+        known_secret_canaries=(canary,),
+    )
+    index = RunSceneIndex.model_validate_json(root.scene_json_path(scene_scope_id).read_bytes())
+    coordinate = CoordinateScene.model_validate_json(
+        root.coordinate_json_path(
+            scene_scope_id,
+            index.coordinate_pointers[0].coordinate_key,
+        ).read_bytes()
+    )
+
+    assert coordinate.repair_target == "infrastructure_transport"
+    assert coordinate.codex_terminal_envelope is not None
+    assert coordinate.codex_terminal_envelope.terminal_error_shape == "object"
+    assert coordinate.codex_terminal_envelope.codex_error_info == "enum:other"
+    assert coordinate.codex_terminal_envelope.advisory_text_signals == (
+        "transport_or_connection",
+    )
+    assert (
+        "Runtime Agent terminal envelope: shape=object; info=enum:other; "
+        "signals=transport_or_connection"
+    ) in (
+        root.coordinate_markdown_path(scene_scope_id, coordinate.coordinate_key).read_text()
+    )
+    tier_a_text = "\n".join(
+        (
+            root.scene_json_path(scene_scope_id).read_text(),
+            root.scene_markdown_path(scene_scope_id).read_text(),
+            root.coordinate_json_path(scene_scope_id, coordinate.coordinate_key).read_text(),
+            root.coordinate_markdown_path(scene_scope_id, coordinate.coordinate_key).read_text(),
+        )
+    )
+    assert canary not in tier_a_text
 
 
 def test_projector_routes_codex_physical_output_ceiling_to_continuation(
@@ -1123,6 +1319,14 @@ def test_projector_recovers_control_liveness_after_an_interrupted_agent_dispatch
             profile_digest="profile:scene-control",
             envelope_digest="a" * 64,
             declared_wall_seconds=120,
+            request_shape=InvocationRequestShape(
+                prompt_bytes=4096,
+                runtime_skill_count=1,
+                output_schema_bytes=8192,
+                allowed_builtin_tool_count=0,
+                execution_mode="single_shot_structured",
+                continued_session=False,
+            ),
         )
         control.record_local(invocation_id, InvocationLifecyclePhase.WORKER_SPAWNED)
         control.record_provider_progress(invocation_id, activity="codex_provider_event")
@@ -1162,6 +1366,7 @@ def test_projector_recovers_control_liveness_after_an_interrupted_agent_dispatch
         artifacts=artifacts,
         heads=heads,
         invocation_control=control,
+        known_secret_canaries=(_canary,),
     ).rebuild(definition.coordinate.scope_id)
     coordinate = next(
         item
@@ -1175,15 +1380,156 @@ def test_projector_recovers_control_liveness_after_an_interrupted_agent_dispatch
     assert coordinate.runtime_agent_liveness.last_local_heartbeat_phase == "cleanup_finished"
     assert coordinate.runtime_agent_liveness.terminal_elapsed_ms is not None
     assert coordinate.runtime_agent_liveness.observed_event_count == 1
+    assert coordinate.runtime_agent_request_shape is not None
+    assert coordinate.runtime_agent_request_shape.prompt_bytes == 4096
+    assert coordinate.runtime_agent_request_shape.runtime_skill_count == 1
+    assert coordinate.runtime_agent_request_shape.output_schema_bytes == 8192
     # The scene may explain liveness, but it must not reveal the raw physical
     # invocation id that connects the private adapter/control plane.
     assert invocation_id not in str(coordinate.model_dump(mode="json"))
+    markdown = root.coordinate_markdown_path(
+        safe_dynamic_text(definition.coordinate.scope_id, known_secret_canaries=(_canary,)),
+        coordinate.coordinate_key,
+    ).read_text(encoding="utf-8")
+    assert "Runtime Agent request shape:" in markdown
+    assert "prompt=4096B" in markdown
 
 
-def test_projector_reads_a_legacy_interrupted_dispatch_without_provider_provenance(
+def test_projector_aggregates_bounded_precommit_agent_turns_by_work_operation(
     tmp_path: Path,
 ) -> None:
-    """A v1-style interrupted execution still has its exact dispatch fence."""
+    """A same-workspace Code-Agent correction remains visible as one live node.
+
+    The Scheduler has one Proposal operation, while the Builder is permitted to
+    use a new physical invocation id for a bounded pre-commit correction.  The
+    scene must not lose the second turn merely because it is not the original
+    dispatch id, and it must not expose either physical id.
+    """
+
+    artifacts, heads, runtime, definition, input_ref, candidate_ref, root, _canary = _harness(
+        tmp_path
+    )
+    control = InvocationControlStore(tmp_path / "invocation-control")
+    first_id = "dispatch:scene:precommit"
+    correction_id = "build:scene:precommit-correction"
+
+    with heads.exclusive(definition.coordinate) as lock:
+        head = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(input_ref, candidate_ref),
+            elapsed_wall_seconds=0,
+        )
+        runtime.schedule_operation(
+            lock,
+            definition=definition,
+            kind="proposal",
+            replay_mode="non_replayable",
+            elapsed_wall_seconds=0,
+        )
+        head = runtime.start_operation(
+            lock,
+            definition=definition,
+            dispatch_id=first_id,
+        )
+        attempt = _attempt(artifacts, head)
+        ownership = runtime.invocation_ownership_for_active_proposal_locked(
+            lock,
+            definition=definition,
+            attempt=attempt,
+            dispatch_id=first_id,
+        )
+        control.begin(
+            invocation_id=first_id,
+            owner=ownership,
+            route="codex_sdk",
+            model="gpt-5.4-mini",
+            profile_digest="profile:scene-precommit",
+            envelope_digest="c" * 64,
+            declared_wall_seconds=120,
+            request_shape=InvocationRequestShape(
+                prompt_bytes=4096,
+                runtime_skill_count=1,
+                output_schema_bytes=8192,
+                allowed_builtin_tool_count=2,
+                execution_mode="agentic",
+                continued_session=False,
+            ),
+        )
+        control.record_provider_progress(first_id, activity="codex_provider_event")
+        control.settle(
+            first_id,
+            terminal=InvocationTerminalFact(
+                status=InvocationStatus.COMPLETED,
+                code="completed",
+                retryable=False,
+            ),
+            final_phase=InvocationLifecyclePhase.TERMINAL_RECEIVED,
+        )
+        control.begin(
+            invocation_id=correction_id,
+            owner=ownership,
+            route="codex_sdk",
+            model="gpt-5.4-mini",
+            profile_digest="profile:scene-precommit",
+            envelope_digest="c" * 64,
+            declared_wall_seconds=120,
+            request_shape=InvocationRequestShape(
+                prompt_bytes=768,
+                runtime_skill_count=1,
+                output_schema_bytes=8192,
+                allowed_builtin_tool_count=2,
+                execution_mode="agentic",
+                continued_session=True,
+            ),
+        )
+        control.record_provider_progress(correction_id, activity="codex_provider_event")
+        control.record_provider_progress(correction_id, activity="codex_provider_event")
+
+    scene = SceneProjector(
+        root=root,
+        artifacts=artifacts,
+        heads=heads,
+        invocation_control=control,
+        known_secret_canaries=(_canary,),
+    ).rebuild(definition.coordinate.scope_id)
+    coordinate = next(
+        item
+        for item in scene.coordinates
+        if item.coordinate_key == definition.coordinate.coordinate_key
+    )
+    assert coordinate.head_status == "running"
+    assert coordinate.runtime_agent_liveness is not None
+    assert coordinate.runtime_agent_liveness.observed_event_count == 3
+    assert coordinate.runtime_agent_liveness.first_progress_elapsed_ms is not None
+    assert coordinate.runtime_agent_liveness.last_progress_elapsed_ms is not None
+    assert coordinate.runtime_agent_liveness.terminal_elapsed_ms is not None
+    assert coordinate.runtime_agent_request_shape is not None
+    assert coordinate.runtime_agent_request_shape.prompt_bytes == 768
+    assert coordinate.runtime_agent_request_shape.continued_session is True
+    assert scene.index.overall_status == "running"
+    assert len(scene.index.active_work) == 1
+    active = scene.index.active_work[0]
+    assert active.coordinate_key == definition.coordinate.coordinate_key
+    assert active.route == "codex_sdk"
+    assert active.active_turn_count == 1
+    assert active.provider_progress_count == 2
+    assert active.first_provider_progress_at is not None
+    assert correction_id not in str(active.model_dump(mode="json"))
+    rendered = str(coordinate.model_dump(mode="json"))
+    assert first_id not in rendered
+    assert correction_id not in rendered
+
+
+def test_projector_reads_an_interrupted_dispatch_without_provider_provenance(
+    tmp_path: Path,
+) -> None:
+    """A post-dispatch interruption retains its exact dispatch fence.
+
+    The current contract requires that fence on an interrupted Agent execution,
+    but correctly does not invent Provider/profile/model/schema facts when the
+    process disappears before the adapter reports them.
+    """
 
     artifacts, heads, runtime, definition, input_ref, candidate_ref, root, _canary = _harness(
         tmp_path
@@ -1238,9 +1584,9 @@ def test_projector_reads_a_legacy_interrupted_dispatch_without_provider_provenan
             ),
             final_phase=InvocationLifecyclePhase.CLEANUP_FINISHED,
         )
-        # This is the historical shape written before recovery retained the
-        # dispatch id in ProposalExecution.  The OperationRun still has the
-        # exact fence, while all Provider provenance remains absent.
+        # The exact dispatch identity is durable while adapter provenance is
+        # absent.  The control record, rather than guessed model facts, is the
+        # only safe source for the resulting liveness projection.
         runtime.checkpoint_proposal(
             lock,
             definition=definition,
@@ -1250,7 +1596,8 @@ def test_projector_reads_a_legacy_interrupted_dispatch_without_provider_provenan
                 executor="agent",
                 operation=definition.proposal_policy.operation,
                 status="interrupted",
-                error_code="process_interrupted_legacy_owner_loss",
+                invocation_id=invocation_id,
+                error_code="process_interrupted_owner_loss",
                 observed_actual=BudgetUsage(),
                 unknown_upper_bound=BudgetUsage(),
                 conservative_committed=BudgetUsage(),
@@ -1586,6 +1933,63 @@ def test_fold_never_guesses_a_candidate_file_for_a_multi_file_gate() -> None:
     assert coordinate.repair_target == "needs_human"
 
 
+def test_fold_never_guesses_between_distinct_single_file_gate_targets() -> None:
+    """Two precise gate/file mappings still require one source-closure repair.
+
+    Picking whichever issue sorts first would misdirect the project-execution
+    Agent even though every individual mapping is valid.
+    """
+
+    runtime_issue = SceneIssue(
+        normalized_identity=sha256_digest(b"runtime-protocol-issue"),
+        code="integration_gate_runtime_protocol_fail",
+        path=("integration", "gate", 0),
+        violated_condition="The Runtime response used the wrong ABI literal.",
+        expected_category="the exact Runtime v2 response envelope",
+        severity="blocker",
+        actionable=True,
+        gate_id="runtime_protocol",
+        candidate_file="candidate/runtime.py",
+    )
+    materializer_issue = SceneIssue(
+        normalized_identity=sha256_digest(b"task-materializer-issue"),
+        code="integration_gate_task_materialization_fail",
+        path=("integration", "gate", 1),
+        violated_condition="The materializer campaign could not cross the Runtime boundary.",
+        expected_category="a successful task materialization campaign",
+        severity="blocker",
+        actionable=True,
+        gate_id="task_materialization",
+        candidate_file="candidate/task_materializer.py",
+    )
+    head = SceneHead(
+        scope_id="job:distinct-file-gates",
+        coordinate_key=sha256_digest(b"distinct-file-coordinate"),
+        coordinate_label="build.candidate_build.environment_candidate",
+        head_status="repair_authorized",
+        revision=4,
+        attempt_ref_revision=sha256_digest(b"distinct-file-attempt"),
+        attempt_ref_id="attempt:distinct-file",
+        attempt_ordinal=2,
+        failure_code=None,
+        frontier_ordinal=20,
+        pipeline_stage="Builder",
+        repair_authority="authorized",
+        input_fingerprint=sha256_digest(b"distinct-file-input"),
+        issues=(runtime_issue, materializer_issue),
+        previous_issue_ids=(),
+        run_id=None,
+        graph_digest=sha256_digest(b"distinct-file-graph"),
+        updated_at=datetime.now(UTC),
+        validation_status="failed",
+    )
+
+    coordinate = fold((head,), ()).coordinates[0]
+
+    assert coordinate.candidate_file is None
+    assert coordinate.repair_target == "generated_candidate_code"
+
+
 def _designer_head(
     *,
     validation_status,
@@ -1802,6 +2206,120 @@ def test_fold_prioritizes_authorized_multifile_candidate_repair() -> None:
     assert selected.repair_target == "generated_candidate_code"
     assert selected.candidate_file is None
     assert scene.index.next_action_hint == "repair_candidate_code"
+
+
+def test_fold_prioritizes_candidate_transport_over_authorized_code_repair() -> None:
+    """A Builder infrastructure retry is never displayed as a code repair.
+
+    The Scheduler can correctly authorize one bounded retry after a Codex
+    Provider terminal.  That authority is operational, not evidence that the
+    generated Candidate caused the terminal.  The project Agent must inspect
+    the transport route instead of editing the Candidate.
+    """
+
+    now = datetime.now(UTC)
+    transport_issue = SceneIssue(
+        normalized_identity=sha256_digest(b"candidate-provider-unavailable"),
+        code="turn_failed_provider_unavailable",
+        path=("operation",),
+        violated_condition="the configured Provider ended before a terminal response",
+        expected_category="one bounded infrastructure retry, not a model correction",
+        severity="blocker",
+        actionable=True,
+    )
+    target = SceneHead(
+        scope_id="job:candidate-transport-scene",
+        coordinate_key=sha256_digest(b"candidate-transport-target"),
+        coordinate_label="build.candidate_build.environment_candidate",
+        head_status="repair_authorized",
+        revision=2,
+        attempt_ref_revision=sha256_digest(b"candidate-transport-attempt"),
+        attempt_ref_id="attempt:candidate-transport",
+        attempt_ordinal=2,
+        failure_code="validation_error",
+        frontier_ordinal=1,
+        pipeline_stage="Builder",
+        repair_authority="authorized",
+        input_fingerprint=sha256_digest(b"candidate-transport-input"),
+        issues=(transport_issue,),
+        previous_issue_ids=(),
+        run_id=None,
+        graph_digest=sha256_digest(b"candidate-transport-graph"),
+        updated_at=now,
+        validation_status="error",
+    )
+
+    scene = fold((target,), ())
+    coordinate = scene.coordinates[0]
+
+    assert coordinate.repair_target == "infrastructure_transport"
+    assert coordinate.repair_target != "generated_candidate_code"
+    assert scene.index.next_action_hint == "inspect_infrastructure"
+    assert scene.index.next_action_hint != "repair_candidate_code"
+
+
+def test_fold_keeps_a_prior_repair_visible_while_successor_work_is_live() -> None:
+    """The root map must show a live retry without erasing its prior branch.
+
+    A physical invocation is admitted before the Scheduler durably advances its
+    coordinate head.  During that intentional gap, a project-execution Agent
+    needs both facts: it must wait for the live turn and retain the previous
+    transport failure as the reason that turn exists.  Neither a terminal head
+    nor a live control record is sufficient on its own.
+    """
+
+    now = datetime.now(UTC)
+    issue = SceneIssue(
+        normalized_identity=sha256_digest(b"root-live-retry-provider-terminal"),
+        code="turn_failed_provider_unavailable",
+        path=("operation",),
+        violated_condition="the prior Provider turn ended before a terminal response",
+        expected_category="a bounded infrastructure retry",
+        severity="blocker",
+        actionable=True,
+    )
+    head = SceneHead(
+        scope_id="job:root-live-retry",
+        coordinate_key=sha256_digest(b"root-live-retry-coordinate"),
+        coordinate_label="build.candidate_build.environment_candidate",
+        head_status="repair_authorized",
+        revision=2,
+        attempt_ref_revision=sha256_digest(b"root-live-retry-attempt"),
+        attempt_ref_id="attempt:root-live-retry",
+        attempt_ordinal=2,
+        failure_code="validation_error",
+        frontier_ordinal=1,
+        pipeline_stage="Builder",
+        repair_authority="authorized",
+        input_fingerprint=sha256_digest(b"root-live-retry-input"),
+        issues=(issue,),
+        previous_issue_ids=(),
+        run_id=None,
+        graph_digest=sha256_digest(b"root-live-retry-graph"),
+        updated_at=now,
+        validation_status="error",
+    )
+    active = ActiveWorkPointer(
+        coordinate_key=head.coordinate_key,
+        coordinate_label=head.coordinate_label,
+        route="codex_sdk",
+        active_turn_count=1,
+        provider_progress_count=3,
+        started_at=now,
+        last_activity_at=now,
+        first_provider_progress_at=now,
+    )
+
+    scene = fold((head,), (), active_work=(active,))
+
+    assert scene.index.overall_status == "running"
+    assert scene.index.next_action_hint == "wait_for_running_work"
+    assert scene.index.stuck_coordinate is not None
+    assert scene.index.stuck_coordinate.coordinate_key == head.coordinate_key
+    assert scene.coordinates[0].repair_target == "infrastructure_transport"
+    rendered = render_scene(scene.index, scene.coordinates)
+    assert "Active work: wait for the live operation" in rendered
+    assert "Repair target: infrastructure/transport terminal" in rendered
 
 
 def test_fold_prefers_the_latest_equally_blocked_coordinate_for_current_view() -> None:

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Engineer Agent World"
-  short_description: "Design and implement executable agent environments"
-  default_prompt: "Turn the supplied v2 artifacts into a complete executable environment or repair the existing candidate."

@@ -14,8 +14,10 @@ from .paths import ObservabilityError, ObservabilityRoot
 from .projector import SceneProjector
 from .query import ObservabilityReader, SceneRead
 from .scene import (
+    ActiveWorkPointer,
     BudgetExhaustion,
     CandidateWorkspaceLiveness,
+    CodexTerminalEnvelope,
     CoordinatePointer,
     CoordinateScene,
     FrontierDiff,
@@ -24,12 +26,14 @@ from .scene import (
     RunSceneIndex,
     RuntimeAgentActivityCounts,
     RuntimeAgentLiveness,
+    RuntimeAgentRequestShape,
     Scene,
     SceneHead,
     SceneIssue,
     SceneTierBEvent,
     SceneWatermark,
     TopIssue,
+    active_work_digest,
     fold,
 )
 from .subprocess_scene import (
@@ -41,8 +45,10 @@ from .subprocess_scene import (
 )
 
 __all__ = [
+    "ActiveWorkPointer",
     "BudgetExhaustion",
     "CandidateWorkspaceLiveness",
+    "CodexTerminalEnvelope",
     "CoordinatePointer",
     "CoordinateScene",
     "DebugTranscriptStatus",
@@ -59,6 +65,7 @@ __all__ = [
     "RunSceneIndex",
     "RuntimeAgentActivityCounts",
     "RuntimeAgentLiveness",
+    "RuntimeAgentRequestShape",
     "RuntimeSubprocessScene",
     "Scene",
     "SceneHead",
@@ -68,6 +75,7 @@ __all__ = [
     "SceneTierBEvent",
     "SceneWatermark",
     "TopIssue",
+    "active_work_digest",
     "fold",
     "runtime_subprocess_scene",
     "runtime_subprocess_scene_from_payload",

@@ -12,11 +12,11 @@ from uuid import uuid4
 
 import pytest
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.config import AgentBackendConfig
 from agent_world.contracts import PermissionScope
 from agent_world.control.telemetry import TelemetryStore
-from agent_world.designer.models import TrainingSemanticSourceDraft
+from agent_world.designer.models import SharedToolSemanticsSourceDraft, TrainingSemanticSourceDraft
 from agent_world.invocation import (
     DirectLlmBackend,
     InvocationExecutionMode,
@@ -24,9 +24,11 @@ from agent_world.invocation import (
     InvocationResult,
     InvocationStatus,
     NodeCapabilityRequirement,
+    ResolvedBundle,
     RoutedInvocationBackend,
 )
-from agent_world.invocation.codex_sdk import _transport_output_schema
+from agent_world.invocation.capabilities import ExternalCapabilitySet
+from agent_world.invocation.codex_sdk import _provider_output_schema
 
 
 class _FakeResponses:
@@ -40,9 +42,7 @@ class _FakeResponses:
         self.requests: list[dict[str, object]] = []
         self.status = status
         self.incomplete_reason = incomplete_reason
-        self.output_text = output_text or json.dumps(
-            {"artifact_json": json.dumps({"title": "Hotel booking"})}
-        )
+        self.output_text = output_text or json.dumps({"title": "Hotel booking"})
 
     def _response(self) -> SimpleNamespace:
         return SimpleNamespace(
@@ -228,6 +228,10 @@ class _FakeDirectProviderError(Exception):
         self.body = body
 
 
+class APIConnectionError(Exception):
+    """Mimic the official SDK's content-free connection failure type."""
+
+
 class _RejectingResponses(_FakeResponses):
     def __init__(self, error: Exception) -> None:
         super().__init__()
@@ -269,18 +273,18 @@ class _RecordingBackend:
 def _request(
     tmp_path: Path,
     *,
-    transport: str = "json_envelope",
+    direct_provider_max_output_tokens: int | None = None,
 ) -> tuple[InvocationRequest, str, str]:
     # Values are generated at test runtime, never committed as fixture
     # material. The production contract exposes only their environment names.
     credential = uuid4().hex
     base_url = f"https://{uuid4().hex}.invalid/v1"
-    provider = IsolatedAgentProfileProvider(
+    provider = AgentProfileProvider(
         AgentBackendConfig(
             model="direct-structured-test-model",
             api_key_environment="OPENAI_API_KEY",
             openai_base_url_environment="OPENAI_BASE_URL",
-            structured_output_transport=transport,
+            direct_provider_max_output_tokens=direct_provider_max_output_tokens,
         ),
         source_environment={
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -325,11 +329,11 @@ def _tree_contains(root: Path, value: str) -> bool:
     return False
 
 
-def test_provider_schema_preserves_task_curriculum_required_rule_lists() -> None:
-    """A direct route can enforce the logical curriculum shape, not just an envelope."""
+def test_native_provider_schema_preserves_task_curriculum_required_rule_lists() -> None:
+    """A Direct route carries the logical curriculum shape natively."""
 
     logical_schema = TrainingSemanticSourceDraft.model_json_schema(mode="validation")
-    provider_schema = _transport_output_schema(logical_schema, transport="provider_schema")
+    provider_schema = _provider_output_schema(logical_schema)
 
     definitions = provider_schema["$defs"]
     assert isinstance(definitions, dict)
@@ -343,6 +347,22 @@ def test_provider_schema_preserves_task_curriculum_required_rule_lists() -> None
         "failure_conditions",
         "terminal_conditions",
     }.issubset(required)
+
+
+def test_native_provider_schema_removes_description_beside_a_reference() -> None:
+    """The compatible strict-schema route accepts no annotation beside ``$ref``."""
+
+    logical_schema = SharedToolSemanticsSourceDraft.model_json_schema(mode="validation")
+    logical_property = logical_schema["$defs"]["SharedErrorPolicySourceDraft"]["properties"][
+        "required_error_suffix"
+    ]
+    assert logical_property["description"].startswith("Required final Identifier")
+
+    provider_schema = _provider_output_schema(logical_schema)
+    provider_property = provider_schema["$defs"]["SharedErrorPolicySourceDraft"]["properties"][
+        "required_error_suffix"
+    ]
+    assert provider_property == {"$ref": "#/$defs/Identifier"}
 
 
 @pytest.mark.asyncio
@@ -386,23 +406,28 @@ async def test_direct_backend_uses_responses_json_schema_without_subprocess(
     assert result.usage is not None
     assert result.usage.turn is not None
     assert result.usage.turn.total_tokens == 18
-    assert factory_observations == [(True, True, request.profile.limits.timeout_seconds, 0)]
+    assert factory_observations == [
+        (
+            True,
+            True,
+            request.profile.limits.timeout_seconds,
+            request.profile.limits.provider_transport_max_retries,
+        )
+    ]
     assert client.closed
 
     assert len(client.responses.requests) == 1
     provider_request = client.responses.requests[0]
     assert provider_request["model"] == request.profile.model
     assert provider_request["input"] == request.prompt
-    instructions = provider_request["instructions"]
-    assert isinstance(instructions, str)
-    assert "Logical structured output contract" in instructions
-    assert "artifact_json" in instructions
-    logical_schema = instructions.split("<logical_output_schema_json>\n", 1)[1].split(
-        "\n</logical_output_schema_json>",
-        1,
-    )[0]
-    assert json.loads(logical_schema) == request.profile.output_schema
-    assert provider_request["max_output_tokens"] == 333
+    # A Direct LLM receives only its rendered node Prompt.  The scheduler's
+    # prompt builder owns any logical output protocol; the adapter must not
+    # hide a copied Skill, developer text, or schema behind this field.
+    assert "instructions" not in provider_request
+    # Framework accounting remains at 333 tokens but must not become an
+    # accidental Provider request cap.
+    assert request.profile.rollout_token_limit == 333
+    assert "max_output_tokens" not in provider_request
     assert provider_request["store"] is False
     assert provider_request["stream"] is True
     assert provider_request["reasoning"] == {
@@ -416,8 +441,8 @@ async def test_direct_backend_uses_responses_json_schema_without_subprocess(
             "strict": True,
             "schema": {
                 "type": "object",
-                "properties": {"artifact_json": {"type": "string"}},
-                "required": ["artifact_json"],
+                "properties": {"title": {"type": "string"}},
+                "required": ["title"],
                 "additionalProperties": False,
             },
         }
@@ -446,23 +471,20 @@ async def test_direct_backend_uses_responses_json_schema_without_subprocess(
 
 
 @pytest.mark.asyncio
-async def test_direct_backend_uses_direct_json_object_without_an_inner_envelope(
+async def test_direct_backend_always_uses_native_json_schema(
     tmp_path: Path,
 ) -> None:
-    """A compatible Direct route can remove fragile double serialization."""
+    """No Direct configuration can select a second JSON output protocol."""
 
-    request, _, _ = _request(tmp_path, transport="json_object")
+    request, _, _ = _request(tmp_path)
     client = _FakeClient(output_text=json.dumps({"title": "Hotel booking"}))
 
     result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
 
     assert result.status is InvocationStatus.COMPLETED
     assert result.structured_output == {"title": "Hotel booking"}
-    assert client.responses.requests[0]["text"] == {"format": {"type": "json_object"}}
-    instructions = client.responses.requests[0]["instructions"]
-    assert isinstance(instructions, str)
-    assert "Return one direct JSON value satisfying the logical schema below." in instructions
-    assert "<logical_output_schema_json>" in instructions
+    assert client.responses.requests[0]["text"]["format"]["type"] == "json_schema"
+    assert "instructions" not in client.responses.requests[0]
 
 
 @pytest.mark.asyncio
@@ -482,6 +504,63 @@ async def test_direct_backend_rejects_implicit_agentic_execution(tmp_path: Path)
     assert result.status is InvocationStatus.FAILED
     assert result.error is not None
     assert result.error.code == "direct_execution_mode_ineligible"
+    assert invoked is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile_update", "expected_code"),
+    (
+        (
+            {
+                "skills": (
+                    ResolvedBundle(
+                        kind="skill",
+                        name="unexpected-skill",
+                        path=Path("unexpected-skill"),
+                        sha256="0" * 64,
+                    ),
+                )
+            },
+            "direct_runtime_bundles_ineligible",
+        ),
+        (
+            {
+                "allowed_network_domains": ("example.com",),
+                "effective_capability_plan": "external-capability-plan",
+            },
+            "direct_external_capabilities_ineligible",
+        ),
+    ),
+)
+async def test_direct_backend_rejects_forbidden_profile_capabilities_before_transport(
+    tmp_path: Path,
+    profile_update: dict[str, object],
+    expected_code: str,
+) -> None:
+    request, _, _ = _request(tmp_path)
+    invoked = False
+
+    def client_factory(**_: object) -> object:
+        nonlocal invoked
+        invoked = True
+        raise AssertionError("ineligible Direct request must not construct a client")
+
+    if profile_update.get("effective_capability_plan") == "external-capability-plan":
+        profile_update = {
+            **profile_update,
+            "effective_capability_plan": replace(
+                request.profile.effective_capability_plan,
+                external=ExternalCapabilitySet(network_domains=("example.com",)),
+            ),
+        }
+    result = await DirectLlmBackend(client_factory=client_factory).invoke(
+        replace(request, profile=replace(request.profile, **profile_update))
+    )
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == expected_code
     assert invoked is False
 
 
@@ -520,33 +599,20 @@ async def test_direct_backend_reports_non_json_without_retaining_provider_text(
 
 
 @pytest.mark.asyncio
-async def test_direct_backend_reports_invalid_envelope_without_retaining_provider_text(
+async def test_direct_backend_returns_native_object_without_compatibility_unwrapping(
     tmp_path: Path,
 ) -> None:
     request, _, _ = _request(tmp_path)
     provider_output_canary = f"provider-output-{uuid4().hex}"
-    encoded = f"Gateway diagnostic: {provider_output_canary}"
-    client = _FakeClient(output_text=json.dumps({"artifact_json": encoded}))
+    client = _FakeClient(output_text=json.dumps({"untouched_field": provider_output_canary}))
 
     result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
 
-    assert result.status is InvocationStatus.FAILED
-    assert result.error is not None
-    assert result.error.code == "direct_structured_output_transport_invalid"
-    assert result.error.retryable is False
-    assert result.error.details == {
-        "transport": "json_envelope",
-        "envelope_shape": "artifact_json_string",
-        "response_shape": "non_json",
-        "parse_failure": "syntax",
-        "parse_offset": 0,
-        "response_characters": len(encoded),
-    }
+    assert result.status is InvocationStatus.COMPLETED
+    assert result.error is None
     assert result.final_text is None
-    assert result.structured_output is None
+    assert result.structured_output == {"untouched_field": provider_output_canary}
     assert client.closed
-    assert provider_output_canary not in repr(result)
-    assert not _tree_contains(tmp_path, provider_output_canary)
 
 
 @pytest.mark.asyncio
@@ -586,6 +652,28 @@ async def test_direct_backend_projects_safe_rejected_schema_fingerprint(
     assert client.closed
     assert provider_message_canary not in repr(result)
     assert not _tree_contains(tmp_path, provider_message_canary)
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_preserves_connection_class_without_exception_text(
+    tmp_path: Path,
+) -> None:
+    request, _, _ = _request(tmp_path)
+    provider_message_canary = f"provider-message-{uuid4().hex}"
+    client = _FakeClient(responses=_RejectingResponses(APIConnectionError(provider_message_canary)))
+
+    result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_provider_unavailable"
+    assert result.error.retryable is True
+    assert result.error.details == {
+        "provider_error_shape": "missing",
+        "transport_exception_kind": "connection",
+    }
+    assert provider_message_canary not in repr(result)
+    assert client.closed
 
 
 @pytest.mark.asyncio
@@ -630,6 +718,83 @@ async def test_direct_backend_projects_safe_stream_error_as_retryable_unavailabl
 
 
 @pytest.mark.asyncio
+async def test_direct_backend_projects_opaque_stream_error_as_advisory_without_prose(
+    tmp_path: Path,
+) -> None:
+    """Opaque Direct errors preserve a safe hypothesis, never Provider text."""
+
+    request, _, _ = _request(tmp_path)
+    provider_message_canary = f"provider-message-{uuid4().hex}"
+    responses = _TerminalEventResponses(
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="error",
+            code="gateway_rejected_request",
+            message=(
+                "maximum context length exceeded; invalid response format; "
+                f"opaque-provider-detail={provider_message_canary}"
+            ),
+        ),
+    )
+    client = _FakeClient(responses=responses)
+
+    result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_provider_rejected"
+    assert result.error.retryable is False
+    assert result.error.details == {
+        "provider_error_shape": "object",
+        "provider_error_type": "absent",
+        "provider_error_code": "other",
+        "provider_error_param": "absent",
+        "advisory_text_signals": [
+            "context_or_token_limit",
+            "request_or_schema_compatibility",
+        ],
+    }
+    assert provider_message_canary not in repr(result)
+    assert not _tree_contains(tmp_path, provider_message_canary)
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_routes_opaque_transport_stream_error_as_retryable_unavailable(
+    tmp_path: Path,
+) -> None:
+    request, _, _ = _request(tmp_path)
+    provider_message_canary = f"provider-message-{uuid4().hex}"
+    responses = _TerminalEventResponses(
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(
+            type="error",
+            code="gateway_error",
+            message=(
+                "response stream disconnected before completion; "
+                f"opaque-provider-detail={provider_message_canary}"
+            ),
+        ),
+    )
+    client = _FakeClient(responses=responses)
+
+    result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_provider_unavailable"
+    assert result.error.retryable is True
+    assert result.error.details == {
+        "provider_error_shape": "object",
+        "provider_error_type": "absent",
+        "provider_error_code": "other",
+        "provider_error_param": "absent",
+        "advisory_text_signals": ["transport_or_connection"],
+    }
+    assert provider_message_canary not in repr(result)
+    assert not _tree_contains(tmp_path, provider_message_canary)
+
+
+@pytest.mark.asyncio
 async def test_direct_backend_projects_safe_response_failed_error_as_rate_limited(
     tmp_path: Path,
 ) -> None:
@@ -665,6 +830,40 @@ async def test_direct_backend_projects_safe_response_failed_error_as_rate_limite
     assert client.closed
     assert provider_message_canary not in repr(result)
     assert not _tree_contains(tmp_path, provider_message_canary)
+
+
+@pytest.mark.asyncio
+async def test_direct_backend_routes_contentless_failed_envelope_as_retryable_unavailable(
+    tmp_path: Path,
+) -> None:
+    """A ``response.failed`` whose error object is absent is transport-degraded.
+
+    A genuine request rejection always arrives as a code-bearing error object
+    (see the schema/rate-limit fixtures above). A failed terminal with no error
+    object carries zero Provider evidence of request incompatibility, so it must
+    route to a bounded retryable provider-unavailable terminal rather than a
+    non-retryable rejection that would kill the scope with no repair authority.
+    """
+
+    request, _, _ = _request(tmp_path)
+    response = _FakeResponses(status="failed")._response()
+    response.error = None
+    responses = _TerminalEventResponses(
+        SimpleNamespace(type="response.created"),
+        SimpleNamespace(type="response.failed", response=response),
+    )
+    client = _FakeClient(responses=responses)
+
+    result = await DirectLlmBackend(client_factory=lambda **_: client).invoke(request)
+
+    assert result.status is InvocationStatus.FAILED
+    assert result.error is not None
+    assert result.error.code == "direct_provider_unavailable"
+    assert result.error.retryable is True
+    assert result.error.details == {"provider_error_shape": "missing"}
+    assert result.final_text is None
+    assert result.structured_output is None
+    assert client.closed
 
 
 @pytest.mark.asyncio
@@ -721,8 +920,8 @@ async def test_direct_backend_does_not_apply_idle_liveness_before_first_provider
             request.profile,
             limits=replace(
                 request.profile.limits,
-                direct_stream_idle_timeout_seconds=0.02,
-                direct_first_event_timeout_seconds=None,
+                provider_stream_idle_timeout_seconds=0.02,
+                provider_first_event_timeout_seconds=None,
             ),
         ),
     )
@@ -777,8 +976,8 @@ async def test_direct_backend_terminalizes_a_stream_that_never_emits_a_first_eve
             limits=replace(
                 request.profile.limits,
                 timeout_seconds=30.0,
-                direct_stream_idle_timeout_seconds=300.0,
-                direct_first_event_timeout_seconds=0.05,
+                provider_stream_idle_timeout_seconds=300.0,
+                provider_first_event_timeout_seconds=0.05,
             ),
         ),
     )
@@ -836,7 +1035,7 @@ async def test_direct_backend_terminalizes_a_request_that_never_returns_a_stream
             limits=replace(
                 request.profile.limits,
                 timeout_seconds=30.0,
-                direct_first_event_timeout_seconds=0.05,
+                provider_first_event_timeout_seconds=0.05,
             ),
         ),
     )
@@ -883,8 +1082,8 @@ async def test_direct_first_event_bound_does_not_curtail_a_slow_but_live_stream(
             request.profile,
             limits=replace(
                 request.profile.limits,
-                direct_stream_idle_timeout_seconds=None,
-                direct_first_event_timeout_seconds=0.02,
+                provider_stream_idle_timeout_seconds=None,
+                provider_first_event_timeout_seconds=0.02,
             ),
         ),
     )
@@ -923,7 +1122,7 @@ async def test_direct_backend_records_local_waiting_without_faking_provider_prog
         request,
         profile=replace(
             request.profile,
-            limits=replace(request.profile.limits, direct_stream_idle_timeout_seconds=None),
+            limits=replace(request.profile.limits, provider_stream_idle_timeout_seconds=None),
         ),
     )
     responses = _StallingStreamResponses()
@@ -974,7 +1173,7 @@ async def test_direct_backend_terminalizes_a_started_silent_stream_with_safe_liv
             request.profile,
             limits=replace(
                 request.profile.limits,
-                direct_stream_idle_timeout_seconds=0.02,
+                provider_stream_idle_timeout_seconds=0.02,
             ),
         ),
     )
@@ -1025,7 +1224,7 @@ async def test_direct_backend_reports_output_limit_without_retaining_provider_te
 ) -> None:
     """A provider output ceiling is safe feedback, not a semantic sample."""
 
-    request, _, _ = _request(tmp_path)
+    request, _, _ = _request(tmp_path, direct_provider_max_output_tokens=333)
     provider_output_canary = f"provider-output-{uuid4().hex}"
     client = _FakeClient(
         responses=_FakeResponses(
@@ -1046,6 +1245,7 @@ async def test_direct_backend_reports_output_limit_without_retaining_provider_te
         "terminal_reason": "max_output_tokens",
         "configured_max_output_tokens": 333,
     }
+    assert client.responses.requests[0]["max_output_tokens"] == 333
     assert result.usage is not None and result.usage.turn is not None
     assert result.usage.turn.total_tokens == 18
     assert result.final_text is None

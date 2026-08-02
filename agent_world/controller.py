@@ -65,7 +65,6 @@ from agent_world.contracts import (
     SemanticLineage,
     TrustedEvaluatorDescriptor,
     V2Contract,
-    WorldSpec,
     canonical_json_bytes,
     compile_framework_package_payloads,
     sha256_digest,
@@ -92,13 +91,11 @@ from agent_world.control import (
     ErrorAuditPolicy,
     ExpansionCandidateAttempt,
     FeedbackResult,
-    GenerationWorkGraph,
     JobRunSnapshot,
     LeaseBudgetLedger,
     MetricPoint,
     NodeAttempt,
     NodeCommit,
-    NodeContinuationStore,
     NodeKind,
     QuarantineReviewBundle,
     QuarantineReviewPolicy,
@@ -114,17 +111,14 @@ from agent_world.control import (
     TelemetryReleaseSummary,
     TelemetryStore,
     ValidationDiagnostic,
-    WorkControlRuntime,
     WorkControlStore,
+    WorkDependencyUnavailableError,
     WorkExecutorMissingError,
-    WorkReadinessProjection,
     WorkReadinessSnapshot,
     WorkSpan,
     claim,
-    deterministic_boundary_work_definition,
     new_direct_job_head,
     reduce_maturity,
-    restore_work_budget_ledger,
 )
 from agent_world.control.direct_runner import (
     DirectWorkRun,
@@ -132,7 +126,6 @@ from agent_world.control.direct_runner import (
     SemanticPrefixRun,
 )
 from agent_world.designer import (
-    DIRECT_DESIGN_BASE_TURNS,
     AdmissionBundle,
     DesignBundle,
     DesignerBudgetPlanError,
@@ -203,7 +196,7 @@ _RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "critical": 3}
 
 
 class ProfileDescriptorProvider(Protocol):
-    """Expose a public, non-secret description of one isolated Agent profile."""
+    """Expose a public, non-secret description of one resolved Agent profile."""
 
     def profile_descriptor(
         self,
@@ -362,6 +355,7 @@ class DiscoveryResumeResult(V2Contract):
 class _RunState:
     run_id: str
     job_ref: ArtifactRef
+    scope_id: str
     ledger: BudgetLedger
     attempts: list[NodeAttempt] = field(default_factory=list)
     latest: dict[str, ArtifactRef] = field(default_factory=dict)
@@ -480,14 +474,6 @@ class _ReleasePlan:
     semantic_lineage: SemanticLineage
     semantic_lineage_ref: ArtifactRef
     evidence_summary_ref: ArtifactRef
-
-
-@dataclass(frozen=True, slots=True)
-class _RecoveredDesignCheckpoint:
-    """A previously passed immutable Direct design adopted by a new run."""
-
-    bundle: DesignBundle
-    modeling_gate_ref: ArtifactRef
 
 
 @dataclass(slots=True)
@@ -666,6 +652,15 @@ class FoundryController:
                 infrastructure_retry_backoff_seconds=(
                     config.agent.infrastructure_retry_backoff_seconds
                 ),
+                maximum_same_model_infrastructure_retries=(
+                    config.agent.maximum_same_model_infrastructure_retries
+                ),
+                # A Scheduler wave must use the same admission capacity as the
+                # routed InvocationBackend.  Otherwise it can mark many Work
+                # heads running while their calls are merely queued outside
+                # the Provider boundary, which makes liveness/scene evidence
+                # ambiguous and defeats configured ToolSemantics parallelism.
+                maximum_concurrency=config.agent.max_concurrent_invocations,
                 projector=self.scene_projector,
             )
             if self.telemetry is not None
@@ -908,19 +903,9 @@ class FoundryController:
                 previous_snapshot,
                 artifact_types=("control.job_run_snapshot",),
             )
-            recovered_design = self._recover_direct_design_checkpoint(
-                snapshot=previous_snapshot,
-                job=job,
-                job_ref=head.job_ref,
-                request=request,
-                request_ref=head.request_ref,
-            )
-            resume_subject_ref = (
-                recovered_design.bundle.design_ref if recovered_design is not None else head.job_ref
-            )
             self.artifacts.record_event(
                 event_type="generation_resume_requested",
-                subject_ref=resume_subject_ref,
+                subject_ref=head.job_ref,
                 related_refs=(head.job_ref, head.result_ref),
                 details=(KeyValue(key="previous_run_id", value=head.run_id),),
             )
@@ -933,7 +918,6 @@ class FoundryController:
                 job=job,
                 job_ref=head.job_ref,
                 request_ref=head.request_ref,
-                recovered_design=recovered_design,
                 prior_head=head,
             )
 
@@ -985,7 +969,6 @@ class FoundryController:
             job=job,
             job_ref=job_ref,
             request_ref=request_ref,
-            recovered_design=None,
             prior_head=None,
         )
 
@@ -1000,7 +983,6 @@ class FoundryController:
         job: EnvironmentJob,
         job_ref: ArtifactRef,
         request_ref: ArtifactRef,
-        recovered_design: _RecoveredDesignCheckpoint | None,
         prior_head: DirectJobHead | None,
     ) -> GenerateResult:
         # Direct Generation has one executable success path: the durable
@@ -1043,6 +1025,7 @@ class FoundryController:
             run = _RunState(
                 run_id=f"run:{uuid.uuid4().hex}",
                 job_ref=job_ref,
+                scope_id=job.job_id,
                 ledger=BudgetLedger(request.budget),
                 direct_request_id=request.request_id,
                 direct_request_fingerprint=request_fingerprint,
@@ -1084,6 +1067,7 @@ class FoundryController:
         run = _RunState(
             run_id=f"run:{uuid.uuid4().hex}",
             job_ref=job_ref,
+            scope_id=job.job_id,
             ledger=BudgetLedger(request.budget),
             direct_request_id=request.request_id,
             direct_request_fingerprint=request_fingerprint,
@@ -1292,6 +1276,16 @@ class FoundryController:
                 "cause_types": cast(JsonValue, cause_types),
                 "message_fingerprint": sha256_digest(str(error).encode("utf-8", errors="replace")),
             }
+            if isinstance(error, WorkDependencyUnavailableError):
+                evidence["work_dependency"] = cast(
+                    JsonValue,
+                    {
+                        "child_coordinate_key": error.child.coordinate_key,
+                        "parent_coordinate_key": error.parent.coordinate_key,
+                        "parent_status": self._safe_identifier(error.parent_status),
+                        "reason_code": self._safe_identifier(error.reason_code),
+                    },
+                )
             ref = self.artifacts.put_json(
                 artifact_id=self._stable_id(
                     "scheduler-direct-diagnostic",
@@ -1644,6 +1638,7 @@ class FoundryController:
         run = _RunState(
             run_id=run_id,
             job_ref=job_ref,
+            scope_id=job.job_id,
             ledger=BudgetLedger(campaign.candidate_budget),
         )
         if self.telemetry is not None:
@@ -4226,474 +4221,6 @@ class FoundryController:
             task.exception()
         except asyncio.CancelledError:
             return
-
-    def _recover_direct_design_checkpoint(
-        self,
-        *,
-        snapshot: JobRunSnapshot,
-        job: EnvironmentJob,
-        job_ref: ArtifactRef,
-        request: EnvironmentRequest,
-        request_ref: ArtifactRef,
-    ) -> _RecoveredDesignCheckpoint | None:
-        """Adopt a complete passed design; never infer one from partial artifacts."""
-
-        if snapshot.job_ref != job_ref:
-            raise DirectJobStoreError("resume snapshot does not bind the Direct job")
-
-        def only(artifact_type: str) -> ArtifactRef | None:
-            matches = tuple(
-                ref for ref in snapshot.latest_artifact_refs if ref.artifact_type == artifact_type
-            )
-            if not matches:
-                return None
-            if len(matches) != 1:
-                raise DirectJobStoreError(
-                    f"resume snapshot has ambiguous {artifact_type} checkpoints"
-                )
-            return matches[0]
-
-        evidence_ref = only("design.evidence_graph")
-        coverage_ref = only("design.coverage_map")
-        world_ref = only("design.world_spec")
-        design_ref = only("design.environment_design")
-        baseline_ref = only("design.baseline_checkpoint")
-        required = (
-            evidence_ref,
-            coverage_ref,
-            world_ref,
-            design_ref,
-            baseline_ref,
-        )
-        if any(ref is None for ref in required):
-            return None
-        assert evidence_ref is not None
-        assert coverage_ref is not None
-        assert world_ref is not None
-        assert design_ref is not None
-        assert baseline_ref is not None
-
-        evidence = self.artifacts.get_json(evidence_ref, EvidenceGraph)
-        coverage = self.artifacts.get_json(coverage_ref, CoverageMap)
-        world = self.artifacts.get_json(world_ref, WorldSpec)
-        design = self.artifacts.get_json(design_ref, EnvironmentDesign)
-        baseline = self.artifacts.get_json(baseline_ref, DesignBaselineCheckpoint)
-        matching_gates: list[tuple[ArtifactRef, GateResult]] = []
-        for possible_gate_ref in snapshot.latest_artifact_refs:
-            if possible_gate_ref.artifact_type != "control.modeling_gate":
-                continue
-            possible_gate = self.artifacts.get_json(possible_gate_ref, GateResult)
-            self.artifacts.require_exact_json(
-                possible_gate_ref,
-                possible_gate,
-                artifact_types=("control.modeling_gate",),
-            )
-            if (
-                possible_gate.status == "pass"
-                and possible_gate.hard
-                and possible_gate.subject_ref == design_ref
-                and set(possible_gate.evidence_refs) == {evidence_ref, coverage_ref, world_ref}
-            ):
-                matching_gates.append((possible_gate_ref, possible_gate))
-        if len(matching_gates) != 1:
-            raise DirectJobStoreError(
-                "resume snapshot has no unique passed Gate for its final design"
-            )
-        gate_ref, gate = matching_gates[0]
-        self.artifacts.require_exact_json(
-            evidence_ref,
-            evidence,
-            artifact_types=("design.evidence_graph",),
-        )
-        self.artifacts.require_exact_json(
-            coverage_ref,
-            coverage,
-            artifact_types=("design.coverage_map",),
-        )
-        self.artifacts.require_exact_json(
-            world_ref,
-            world,
-            artifact_types=("design.world_spec",),
-        )
-        self.artifacts.require_exact_json(
-            design_ref,
-            design,
-            artifact_types=("design.environment_design",),
-        )
-        self.artifacts.require_exact_json(
-            baseline_ref,
-            baseline,
-            artifact_types=("design.baseline_checkpoint",),
-        )
-        bindings_valid = (
-            job.request_ref == request_ref
-            and design.job_ref == job_ref
-            and design.request_ref == request_ref
-            and design.evidence_graph_ref == evidence_ref
-            and design.coverage_map_ref == coverage_ref
-            and design.world_spec == world
-            and world.evidence_graph_ref == evidence_ref
-            and world.coverage_map_ref == coverage_ref
-            and coverage.evidence_graph_ref == evidence_ref
-            and baseline.origin_job_ref == job_ref
-            and baseline.request_ref == request_ref
-            and baseline.evidence_graph_ref == evidence_ref
-            and baseline.coverage_map_ref == coverage_ref
-            and baseline.world_spec_ref == world_ref
-            and baseline.scope_fingerprint == world.boundary.content_digest()
-            and gate.status == "pass"
-            and gate.hard
-            and gate.subject_ref == design_ref
-            and set(gate.evidence_refs) == {evidence_ref, coverage_ref, world_ref}
-        )
-        if not bindings_valid:
-            raise DirectJobStoreError(
-                "complete Direct design checkpoint has inconsistent immutable bindings"
-            )
-        bundle = DesignBundle(
-            evidence_graph=evidence,
-            evidence_graph_ref=evidence_ref,
-            coverage_map=coverage,
-            coverage_map_ref=coverage_ref,
-            world_spec=world,
-            world_spec_ref=world_ref,
-            design=design,
-            design_ref=design_ref,
-            baseline=baseline,
-            baseline_ref=baseline_ref,
-            research_usage=BudgetUsage(),
-            invocation_usage=BudgetUsage(),
-            invocation_results=(),
-        )
-        recomputed_gate_ref, failures = self._modeling_gate(
-            job=job,
-            request=request,
-            design=bundle,
-        )
-        if failures or recomputed_gate_ref != gate_ref:
-            raise DirectJobStoreError(
-                "stored Direct design no longer passes the current Modeling Gate"
-            )
-        return _RecoveredDesignCheckpoint(
-            bundle=bundle,
-            modeling_gate_ref=gate_ref,
-        )
-
-    async def _run_design(
-        self,
-        *,
-        run: _RunState,
-        job: EnvironmentJob,
-        job_ref: ArtifactRef,
-        request: EnvironmentRequest,
-        request_ref: ArtifactRef,
-    ) -> DesignBundle:
-        work = self._reserve_designer_work(
-            run,
-            purpose="direct-design",
-            base_turns=DIRECT_DESIGN_BASE_TURNS,
-            maximum_corrections=job.budget.repair_attempts,
-            controller_owns_structured_repairs=True,
-        )
-        attempt_id = self._start_attempt(
-            run,
-            "design",
-            (
-                job_ref,
-                request_ref,
-                work.lease_ref,
-            ),
-        )
-        await self._persist_snapshot(run, status="running")
-        work_settled = False
-        settled_invocation_usage = BudgetUsage()
-        try:
-            work_runtime = WorkControlRuntime(
-                artifacts=self.artifacts,
-                heads=self.work_control,
-                budget=restore_work_budget_ledger(
-                    self.artifacts,
-                    reserved=work.lease.reserved,
-                    scope_id=job.job_id,
-                ),
-                repair_scope_id=job.job_id,
-                continuations=NodeContinuationStore(self.work_control.root / "continuations"),
-                continuation_workspace_root=self.config.state_root / "runs",
-                projector=self.scene_projector,
-                run_id=run.run_id,
-                model_routes=self.config.agent.model_routes,
-                route_liveness_checker=self.route_liveness_checker,
-                require_route_liveness_gate=self.route_liveness_checker is not None,
-                infrastructure_retry_backoff_seconds=(
-                    self.config.agent.infrastructure_retry_backoff_seconds
-                ),
-            )
-            bundle = await self.designer.generate(
-                job=job,
-                job_ref=job_ref,
-                request=request,
-                request_ref=request_ref,
-                workspace=self._workspace_for(run.run_id, "design"),
-                invocation_budget=work.lease.reserved,
-                work_runtime=work_runtime,
-            )
-            invocation_actual, invocation_unknown = self._designer_bundle_settlement(bundle)
-            self._settle_designer_work(
-                run,
-                work,
-                invocation_actual,
-                unknown_upper_bound=invocation_unknown,
-            )
-            work_settled = True
-            settled_invocation_usage = bundle.invocation_usage
-            run.ledger.consume(bundle.research_usage)
-            usage = self._add_usage(bundle.invocation_usage, bundle.research_usage)
-            modeling_gate_ref, policy_failures = self._modeling_gate(
-                job=job,
-                request=request,
-                design=bundle,
-            )
-            run.remember(modeling_gate_ref)
-            pre_boundary_graph = GenerationWorkGraph.compile(
-                work_runtime.definitions,
-                # Legacy Direct orchestration has not been replaced by the
-                # Scheduler-owned full vertical graph.  Its Design checkpoint
-                # remains useful diagnostic evidence, but must never be
-                # represented as a production/release topology.
-                mode="diagnostic",
-            )
-            modeling_definition = deterministic_boundary_work_definition(
-                scope_id=job.job_id,
-                component="design",
-                stage="modeling_boundary",
-                artifact_slot="environment_design",
-                dependency_coordinates=pre_boundary_graph.required_terminal_coordinates,
-                claim_id="design.modeling_boundary.passed",
-                claim=(
-                    "The exact design satisfies release-profile risk, evidence, coverage, "
-                    "and unresolved-assumption policy."
-                ),
-                timing_reason="Builder and Verifier may consume only a policy-closed design.",
-                effect="block_compile",
-                success_maturity="modeling_closed",
-            )
-            final_design_refs = (
-                bundle.evidence_graph_ref,
-                bundle.coverage_map_ref,
-                bundle.world_spec_ref,
-                bundle.design_ref,
-                bundle.baseline_ref,
-            )
-            modeling_head = work_runtime.execute_deterministic_boundary(
-                definition=modeling_definition,
-                input_refs=final_design_refs,
-                # The modeling Claim validates the exact Design revision.  The
-                # Gate is causal evidence, not the object downstream Builder and
-                # Verifier consume; WorkCommit.consumer_refs therefore exposes
-                # the Design as its validated subject and keeps the Gate only as
-                # new validation evidence.
-                subject_ref=bundle.design_ref,
-                output_refs=(modeling_gate_ref,),
-                issues=tuple(
-                    (
-                        self._safe_identifier(failure),
-                        ("modeling_boundary", index),
-                        failure,
-                        "a release-profile modeling condition that passes",
-                    )
-                    for index, failure in enumerate(policy_failures)
-                ),
-            )
-            graph = GenerationWorkGraph.compile(
-                work_runtime.definitions,
-                mode="diagnostic",
-                required_terminal_coordinates=(modeling_definition.coordinate,),
-            )
-            manifest = graph.manifest(
-                topology_id="topology:direct-environment-generation-v2",
-                external_root_refs=(job_ref, request_ref),
-            )
-            manifest_ref = self.artifacts.put_json(
-                artifact_id=f"{job.job_id}:work-graph-manifest",
-                artifact_type="control.work_graph_manifest",
-                value=manifest,
-                dependencies=(job_ref, request_ref),
-            )
-            readiness = WorkReadinessProjection.project(
-                graph=graph,
-                manifest=manifest,
-                manifest_ref=manifest_ref,
-                work_store=self.work_control,
-                artifacts=self.artifacts,
-            )
-            readiness_ref = self.artifacts.put_json(
-                artifact_id=f"{job.job_id}:design-readiness",
-                artifact_type="control.work_readiness",
-                value=readiness,
-                dependencies=(
-                    manifest_ref,
-                    *readiness.satisfied_commit_refs,
-                    *readiness.blocking_evaluation_refs,
-                ),
-            )
-            run.remember(manifest_ref, readiness_ref)
-            if policy_failures:
-                finding_ref = self._control_failure_finding(
-                    run,
-                    node="design",
-                    event_kind=ControlEventKind.CONTRACT_FAILURE,
-                    code="modeling_gate_failed",
-                    error_type="ModelingGateRejected",
-                    subject_ref=bundle.design_ref,
-                    causal_refs=(modeling_gate_ref,),
-                    repair_context=policy_failures,
-                )
-                self._finish_attempt(
-                    run,
-                    attempt_id,
-                    status="failed",
-                    output_refs=(modeling_gate_ref,),
-                    finding_refs=(finding_ref,),
-                    failure_code="modeling_gate_failed",
-                    failure_summary=(
-                        "Framework Modeling Gate rejected the design: " + ", ".join(policy_failures)
-                    ),
-                    usage=usage,
-                )
-                await self._persist_snapshot(run, status="running")
-                raise _GenerationHalt(
-                    status="failed",
-                    code="modeling_gate_failed",
-                    summary="Framework Modeling Boundary rejected the design revision.",
-                    finding_refs=(finding_ref,),
-                )
-            if modeling_head.status != "committed" or readiness.status != "ready":
-                raise _GenerationHalt(
-                    status="failed",
-                    code="design_work_graph_not_ready",
-                    summary="Production Design WorkGraph did not reach exact ready state.",
-                )
-            outputs = (
-                bundle.evidence_graph_ref,
-                bundle.coverage_map_ref,
-                bundle.world_spec_ref,
-                bundle.design_ref,
-                bundle.baseline_ref,
-                modeling_gate_ref,
-                manifest_ref,
-                readiness_ref,
-            )
-            run.remember(*outputs)
-            self._finish_attempt(
-                run,
-                attempt_id,
-                status="passed",
-                output_refs=outputs,
-                usage=usage,
-                profile_hash=self._last_profile_hash(bundle.invocation_results),
-                session_id=self._last_session_id(bundle.invocation_results),
-            )
-            await self._persist_snapshot(run, status="running")
-            return bundle
-        except _GenerationHalt:
-            raise
-        except BudgetExceeded as exc:
-            failure_usage = (
-                settled_invocation_usage
-                if work_settled
-                else self._settle_failed_designer_work(run, work, exc)
-            )
-            self._finish_attempt(
-                run,
-                attempt_id,
-                status="budget_exhausted",
-                failure_code="design_budget_exhausted",
-                failure_summary="Design completed outside the reserved vector budget.",
-                usage=failure_usage,
-            )
-            raise _GenerationHalt(
-                status="budget_exhausted",
-                code="design_budget_exhausted",
-                summary=f"Design exhausted budget dimensions: {', '.join(exc.dimensions)}.",
-            ) from exc
-        except DesignerError as exc:
-            failure_usage = self._settle_designer_error(
-                run,
-                work,
-                exc,
-                settled_invocation_usage if work_settled else None,
-            )
-            status, code = self._designer_failure_status(
-                exc,
-                default_code=(
-                    "framework_invariant_violation"
-                    if exc.framework_invariant
-                    else "designer_infrastructure_error"
-                    if exc.infrastructure_error
-                    else f"design_{self._safe_identifier(exc.stage)}"
-                ),
-            )
-            finding_ref = self._control_failure_finding(
-                run,
-                node="design",
-                event_kind=(
-                    ControlEventKind.PERMISSION_REQUIRED
-                    if status == "needs_human"
-                    else ControlEventKind.INFRASTRUCTURE_FAILURE
-                    if exc.framework_invariant or exc.infrastructure_error
-                    else ControlEventKind.COMPONENT_FAILURE
-                ),
-                code=code,
-                error_type=type(exc).__name__,
-                subject_ref=exc.subject_ref,
-                exception=exc,
-            )
-            self._finish_attempt(
-                run,
-                attempt_id,
-                status=status,
-                finding_refs=(finding_ref,),
-                failure_code=code,
-                failure_summary="Environment Designer did not produce a valid design revision.",
-                usage=failure_usage,
-                profile_hash=self._last_profile_hash(exc.results),
-                session_id=self._last_session_id(exc.results),
-            )
-            raise _GenerationHalt(
-                status=self._generate_status(status),
-                code=code,
-                summary="Environment Designer stopped without a valid baseline.",
-                finding_refs=(finding_ref,),
-            ) from exc
-        except Exception as exc:
-            failure_usage = (
-                settled_invocation_usage
-                if work_settled
-                else self._settle_failed_designer_work(run, work, exc)
-            )
-            finding_ref = self._control_failure_finding(
-                run,
-                node="design",
-                event_kind=ControlEventKind.INFRASTRUCTURE_FAILURE,
-                code="designer_infrastructure_error",
-                error_type=type(exc).__name__,
-                exception=exc,
-            )
-            self._finish_attempt(
-                run,
-                attempt_id,
-                status="failed",
-                finding_refs=(finding_ref,),
-                failure_code="designer_infrastructure_error",
-                failure_summary="Environment Designer failed outside its invocation protocol.",
-                usage=failure_usage,
-            )
-            raise _GenerationHalt(
-                status="failed",
-                code="designer_infrastructure_error",
-                summary="Environment Designer infrastructure failed closed.",
-                finding_refs=(finding_ref,),
-            ) from exc
 
     async def _run_direct_design_revision(
         self,
@@ -7990,7 +7517,7 @@ class FoundryController:
                 producer=_FRAMEWORK_ACTOR,
                 status="passed",
                 effect="block_integration",
-                summary="Clean isolated install/start/reset/invoke execution passed.",
+                summary="Clean host install/start/reset/invoke execution passed.",
                 evidence_refs=(integration_ref,),
                 dependency_refs=(build.candidate_ref,),
                 evaluated_at=evaluated_at,
@@ -9631,6 +9158,10 @@ class FoundryController:
         run = _RunState(
             run_id=head.run_id,
             job_ref=head.job_ref,
+            scope_id=(
+                head.scope_id
+                or self.artifacts.get_json(head.job_ref, EnvironmentJob).job_id
+            ),
             ledger=ledger,
             attempts=list(snapshot.attempts),
             latest={ref.artifact_id: ref for ref in snapshot.latest_artifact_refs},
@@ -9772,6 +9303,7 @@ class FoundryController:
             request_fingerprint=run.direct_request_fingerprint,
             request_ref=run.direct_request_ref,
             job_ref=run.job_ref,
+            scope_id=run.scope_id,
             run_id=run.run_id,
             snapshot_ref=run.direct_head.snapshot_ref,
             snapshot_revision=run.direct_head.snapshot_revision,
@@ -9824,6 +9356,7 @@ class FoundryController:
             request_fingerprint=request_fingerprint,
             request_ref=request_ref,
             job_ref=run.job_ref,
+            scope_id=run.scope_id,
             run_id=run.run_id,
             snapshot_ref=snapshot_ref,
             snapshot_revision=run.snapshot_revision,

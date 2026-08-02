@@ -20,6 +20,15 @@ from v3_fixture import (
 )
 
 from agent_world.artifact_store import ArtifactStore
+from agent_world.builder import (
+    CandidateCompletion,
+    CandidateFileDeclaration,
+    CandidatePublicSelfCheckDeclaration,
+    CandidateRuntimeDeclaration,
+    CandidateTaskMaterializerDeclaration,
+    CandidateWorkspaceValidator,
+)
+from agent_world.builder.precommit import HostCandidateWorkspaceProbe
 from agent_world.consumer import LocalEnvServiceProcess, LocalRolloutConsumer
 from agent_world.contracts import (
     Budget,
@@ -32,17 +41,14 @@ from agent_world.contracts import (
     candidate_source_tree_digest,
     sha256_digest,
 )
-from agent_world.contracts.supply_chain import (
-    StaticAssuranceEvidence,
-    SupplyChainEvidence,
-)
+from agent_world.contracts.supply_chain import StaticAssuranceEvidence
 from agent_world.control.telemetry import TelemetryStore
 from agent_world.judge import (
-    CandidateSandboxRunner,
+    CandidateProcessRunner,
     CleanCandidateBuilder,
     EnvironmentJudge,
-    IsolationPolicy,
-    IsolationUnavailable,
+    HostExecutionPolicy,
+    HostExecutionUnavailable,
     LaunchContract,
     ProtocolViolation,
     RuntimeProcessCrashed,
@@ -54,18 +60,19 @@ from agent_world.judge.assurance import inspect_static_sources
 from agent_world.judge.service import (
     _candidate_failure_summary,
     _runtime_contract_mismatch_paths,
+    _supply_chain_failure_summary,
 )
 from agent_world.registry import EnvironmentRegistry
 from agent_world.task_materialization import TaskMaterializerV3Compiler
 
 
-async def _require_real_isolation(purpose: str = "runtime") -> IsolationPolicy:
-    isolation = IsolationPolicy(purpose=purpose)  # type: ignore[arg-type]
+async def _require_host_execution(purpose: str = "runtime") -> HostExecutionPolicy:
+    execution = HostExecutionPolicy(purpose=purpose)  # type: ignore[arg-type]
     try:
-        await isolation.ensure_available()
-    except IsolationUnavailable as exc:
-        pytest.skip(f"real bubblewrap isolation unavailable: {exc.code}: {exc}")
-    return isolation
+        await execution.ensure_available()
+    except HostExecutionUnavailable as exc:
+        pytest.skip(f"real host execution unavailable: {exc.code}: {exc}")
+    return execution
 
 
 def _json_keys(value: object) -> set[str]:
@@ -159,8 +166,9 @@ def test_static_assurance_rejects_runtime_import_of_isolated_materializer(
     )
     assert len(summary) <= 512
     assert "runtime.py (runtime)" in summary
-    assert "Executable sources may not import `configuration`" in summary
-    assert "Visibility: runtime->runtime" in summary
+    assert "runtime.py->materializer.py (target role=task_materializer)" in summary
+    assert "A runtime source may import only runtime" in summary
+    assert "may not import `configuration`" not in summary
 
 
 def test_static_assurance_reports_safe_locations_for_framework_private_identifiers(
@@ -200,6 +208,23 @@ def test_static_assurance_reports_safe_locations_for_framework_private_identifie
     assert "runtime.py:1 (framework private identifier)" in summary
     assert "declared schema fields" in summary
     assert "evaluator_goal" not in summary
+
+
+def test_static_assurance_summary_retains_failures_added_after_source_inspection(
+    tmp_path: Path,
+) -> None:
+    inspection = inspect_static_sources(
+        tmp_path,
+        SimpleNamespace(files=()),  # type: ignore[arg-type]
+    )
+
+    summary = EnvironmentJudge._static_assurance_failure_summary(  # noqa: SLF001
+        inspection,
+        failure_codes=("static_public_test_binding_invalid",),
+        failed_public_tests=(),
+    )
+
+    assert summary == "Static assurance failed: static_public_test_binding_invalid."
 
 
 def test_runtime_contract_diff_reports_all_repair_coordinates(tmp_path: Path) -> None:
@@ -264,6 +289,57 @@ def test_protocol_failure_summary_preserves_missing_and_extra_coordinates() -> N
     )
 
 
+def test_handshake_key_validation_aggregates_all_tool_entries() -> None:
+    request = make_request("handshake")
+    tool = {
+        "tool_id": "counter.increment",
+        "namespace": "counter",
+        "name": "increment",
+        "input_schema": {"type": "object"},
+        "output_schema": {"type": "object"},
+        "observation_schema": {"type": "object"},
+        "schema_version": "v2",
+        "transport": "runtime",
+    }
+    wire = {
+        "abi_version": "agent-world.runtime.v2",
+        "request_id": request.request_id,
+        "operation": "handshake",
+        "ok": True,
+        "result": {
+            "runtime_id": "counter-runtime",
+            "operations": ["handshake", "reset", "invoke", "snapshot", "close"],
+            "tools": [tool, {**tool, "tool_id": "counter.decrement", "name": "decrement"}],
+        },
+    }
+
+    with pytest.raises(ProtocolViolation) as error:
+        decode_response(
+            (json.dumps(wire, separators=(",", ":")) + "\n").encode(),
+            expected_request=request,
+        )
+
+    assert error.value.code == "schema_mismatch"
+    assert error.value.details == {
+        "missing": [],
+        "extra": ["schema_version", "transport"],
+        "tool_key_issue_groups": [
+            {
+                "count": 2,
+                "sample_indexes": [0, 1],
+                "missing": [],
+                "extra": ["schema_version", "transport"],
+            }
+        ],
+    }
+    assert _candidate_failure_summary(error.value) == (
+        "response.result[handshake].tools have invalid keys in 2 entries; check every "
+        "tools[] entry against the implementation-contract handshake fields "
+        "(tool_id, namespace, name, input_schema, output_schema, observation_schema; "
+        "optional description); extra=schema_version,transport"
+    )
+
+
 def test_runtime_crash_summary_discloses_only_safe_candidate_owned_coordinates() -> None:
     failure = RuntimeProcessCrashed(
         "runtime_process_crashed",
@@ -295,12 +371,12 @@ async def _evaluate_real_judge_graph(
     judge = EnvironmentJudge(
         artifact_store=judge_writer(store),
         clean_builder=CleanCandidateBuilder(
-            build_isolation=await _require_real_isolation("build"),
+            build_execution=await _require_host_execution("build"),
             uv_path=graph.uv_path,
             uv_cache_dir=graph.uv_cache_dir,
             timeout_seconds=60,
         ),
-        runtime_isolation=await _require_real_isolation(),
+        runtime_execution=await _require_host_execution(),
     )
     budget = judge.required_evaluation_budget(
         design=graph.design,
@@ -334,12 +410,12 @@ async def test_integration_runs_before_verifier_and_cannot_authorize_release(
     judge = EnvironmentJudge(
         artifact_store=judge_writer(store),
         clean_builder=CleanCandidateBuilder(
-            build_isolation=await _require_real_isolation("build"),
+            build_execution=await _require_host_execution("build"),
             uv_path=graph.uv_path,
             uv_cache_dir=graph.uv_cache_dir,
             timeout_seconds=60,
         ),
-        runtime_isolation=await _require_real_isolation(),
+        runtime_execution=await _require_host_execution(),
     )
     budget = judge.required_integration_budget(
         design=graph.design,
@@ -374,6 +450,57 @@ async def test_integration_runs_before_verifier_and_cannot_authorize_release(
 
 
 @pytest.mark.asyncio
+async def test_integration_workspace_projection_failure_is_not_builder_feedback(
+    tmp_path: Path,
+) -> None:
+    """A framework layout failure cannot be repaired from a Candidate workspace."""
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    graph = build_judge_candidate_graph(tmp_path, store)
+    judge = EnvironmentJudge(
+        artifact_store=judge_writer(store),
+        clean_builder=CleanCandidateBuilder(
+            build_execution=await _require_host_execution("build"),
+            uv_path=graph.uv_path,
+            uv_cache_dir=graph.uv_cache_dir,
+            timeout_seconds=60,
+        ),
+        runtime_execution=await _require_host_execution(),
+    )
+    # Deliberately violate the framework's own projection policy.  The
+    # Candidate source is untouched, so the result must route to
+    # judge_infrastructure rather than a Builder repair turn.
+    judge.process_runner = CandidateProcessRunner(
+        execution=judge.runtime_execution,
+    )
+    budget = judge.required_integration_budget(
+        design=graph.design,
+        available=Budget(container_seconds=600, wall_seconds=600),
+    )
+
+    integrated = await judge.evaluate_integration(
+        candidate=graph.candidate,
+        candidate_ref=graph.candidate_ref,
+        source_dir=graph.workspace,
+        world_spec=graph.design.world_spec,
+        world_spec_ref=graph.world_spec_ref,
+        release_profile=graph.release_profile,
+        budget=budget,
+        run_id="integration-framework-projection-failure",
+    )
+
+    gate = next(
+        item for item in integrated.report.gate_results if item.gate_id == "clean_deployment"
+    )
+    finding = next(
+        item for item in integrated.report.findings if item.category == "clean_deployment"
+    )
+    assert gate.status == "error"
+    assert finding.owner == "judge_infrastructure"
+    assert finding.suggested_repair == "Required Integration infrastructure failed closed."
+
+
+@pytest.mark.asyncio
 async def test_integration_protocol_evidence_keeps_real_handshake_crash_scene(
     tmp_path: Path,
 ) -> None:
@@ -395,12 +522,12 @@ async def test_integration_protocol_evidence_keeps_real_handshake_crash_scene(
         judge = EnvironmentJudge(
             artifact_store=judge_writer(store),
             clean_builder=CleanCandidateBuilder(
-                build_isolation=await _require_real_isolation("build"),
+                build_execution=await _require_host_execution("build"),
                 uv_path=graph.uv_path,
                 uv_cache_dir=graph.uv_cache_dir,
                 timeout_seconds=60,
             ),
-            runtime_isolation=await _require_real_isolation(),
+            runtime_execution=await _require_host_execution(),
             telemetry=telemetry,
         )
         async with judge.clean_builder.materialize(
@@ -435,8 +562,8 @@ async def test_integration_protocol_evidence_keeps_real_handshake_crash_scene(
 
 
 @pytest.mark.asyncio
-async def test_role_file_view_rejects_escape_and_symlink_paths(tmp_path: Path) -> None:
-    isolation = await _require_real_isolation()
+async def test_workspace_file_declaration_rejects_escape_and_symlink_paths(tmp_path: Path) -> None:
+    execution = await _require_host_execution()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / ".venv").mkdir()
@@ -449,8 +576,8 @@ async def test_role_file_view_rejects_escape_and_symlink_paths(tmp_path: Path) -
     state.mkdir()
 
     for visible_path in ("../runtime.py", "runtime-link.py", "linked-parent/module.py"):
-        with pytest.raises(IsolationUnavailable):
-            isolation.wrap_command(
+        with pytest.raises(HostExecutionUnavailable):
+            execution.prepare_process(
                 workspace=workspace,
                 cwd_relative=".",
                 argv=("/usr/bin/true",),
@@ -464,10 +591,10 @@ async def test_clean_build_and_runtime_supervisor_execute_complete_abi_v2(
     tmp_path: Path,
 ) -> None:
     source, uv_path, uv_cache = write_candidate_project(tmp_path)
-    runtime_isolation = await _require_real_isolation()
-    build_isolation = await _require_real_isolation("build")
+    runtime_execution = await _require_host_execution()
+    build_execution = await _require_host_execution("build")
     builder = CleanCandidateBuilder(
-        build_isolation=build_isolation,
+        build_execution=build_execution,
         uv_path=uv_path,
         uv_cache_dir=uv_cache,
         timeout_seconds=60,
@@ -485,13 +612,13 @@ async def test_clean_build_and_runtime_supervisor_execute_complete_abi_v2(
         assert candidate.root != source
         interpreter = candidate.root / ".venv" / "bin" / "python"
         assert interpreter.is_symlink()
-        assert os.readlink(interpreter) == "/opt/agent-world/python/bin/python3.12"
+        assert interpreter.resolve() == Path(sys.executable).resolve()  # noqa: ASYNC240 - assertion
 
         supervisor = RuntimeSupervisor(
             candidate.root,
             LaunchContract(argv=(".venv/bin/python", "runtime.py")),
             visible_workspace_paths=("runtime.py",),
-            isolation=runtime_isolation,
+            execution=runtime_execution,
             request_timeout_seconds=5,
         )
         handshake = await supervisor.start()
@@ -562,7 +689,7 @@ async def test_clean_build_and_runtime_supervisor_execute_complete_abi_v2(
                 candidate.root,
                 LaunchContract(argv=(".venv/bin/python", "runtime.py")),
                 visible_workspace_paths=("runtime.py",),
-                isolation=runtime_isolation,
+                execution=runtime_execution,
                 request_timeout_seconds=5,
             ) as fresh:
                 response = await fresh.reset(
@@ -607,14 +734,14 @@ async def test_public_test_runner_imports_virtual_project_from_nested_test_path(
         "uv.lock",
     )
     builder = CleanCandidateBuilder(
-        build_isolation=await _require_real_isolation("build"),
+        build_execution=await _require_host_execution("build"),
         uv_path=uv_path,
         uv_cache_dir=uv_cache,
         timeout_seconds=60,
     )
 
     async with builder.materialize(source) as candidate:
-        runner = CandidateSandboxRunner(isolation=await _require_real_isolation())
+        runner = CandidateProcessRunner(execution=await _require_host_execution())
         direct = await runner.run(
             candidate.root,
             argv=(".venv/bin/python", "tests/test_imports.py"),
@@ -636,6 +763,111 @@ async def test_public_test_runner_imports_virtual_project_from_nested_test_path(
 
 
 @pytest.mark.asyncio
+async def test_framework_precommit_preserves_candidate_agent_workspace_layout(
+    tmp_path: Path,
+) -> None:
+    """Framework projection, not Agent path rewriting, preserves workspace/candidate."""
+
+    agent_workspace_public_test = """from agent_workspace_probe.runtime import marker
+
+assert marker == "candidate-import-ok"
+"""
+    source, uv_path, uv_cache = write_candidate_project(
+        tmp_path,
+        public_test_source=agent_workspace_public_test,
+    )
+    existing_files = candidate_files(source)
+    probe_package = source / "src" / "agent_workspace_probe"
+    probe_package.mkdir(parents=True)
+    (probe_package / "__init__.py").write_text("", encoding="utf-8")
+    (probe_package / "runtime.py").write_text(
+        'marker = "candidate-import-ok"\n',
+        encoding="utf-8",
+    )
+    completion = CandidateCompletion(
+        status="completed",
+        project_root="candidate",
+        runtime=CandidateRuntimeDeclaration(
+            argv=(".venv/bin/python", "-m", "runtime"),
+            entry_path="runtime.py",
+        ),
+        task_materializer=CandidateTaskMaterializerDeclaration(
+            entrypoint="task_materializer:materialize",
+            entry_path="task_materializer.py",
+        ),
+        public_self_check=CandidatePublicSelfCheckDeclaration(
+            argv=(".venv/bin/python", "-m", "public_check"),
+            entry_path="public_check.py",
+        ),
+        public_test_paths=("public_test.py",),
+        files=tuple(
+            CandidateFileDeclaration(path=item.path, role=item.role) for item in existing_files
+        )
+        + (
+            CandidateFileDeclaration(
+                path="src/agent_workspace_probe/__init__.py",
+                role="documentation",
+            ),
+            CandidateFileDeclaration(
+                path="src/agent_workspace_probe/runtime.py",
+                role="documentation",
+            ),
+        ),
+    )
+    validated = CandidateWorkspaceValidator().validate(source, completion)
+    probe = HostCandidateWorkspaceProbe(
+        clean_builder=CleanCandidateBuilder(
+            build_execution=await _require_host_execution("build"),
+            uv_path=uv_path,
+            uv_cache_dir=uv_cache,
+            timeout_seconds=60,
+        ),
+        process_runner=CandidateProcessRunner(
+            execution=await _require_host_execution(),
+            timeout_seconds=10,
+        ),
+    )
+
+    async with probe.clean_builder.materialize(
+        source,
+        expected_source_files=validated.package_files,
+        expected_source_tree_digest=validated.candidate_source_tree_digest,
+    ) as clean:
+        await probe.process_runner.verify_workspace_execution(
+            clean.root,
+            visible_workspace_paths=tuple(item.path for item in validated.files),
+        )
+        direct = await probe.process_runner.run_public_test(
+            clean.root,
+            test_path="public_test.py",
+            visible_workspace_paths=tuple(item.path for item in validated.files),
+        )
+        module = await probe.process_runner.run_python_module(
+            clean.root,
+            argv=(".venv/bin/python", "-m", "agent_workspace_probe.runtime"),
+            visible_workspace_paths=tuple(item.path for item in validated.files),
+        )
+        supervisor = RuntimeSupervisor(
+            clean.root,
+            LaunchContract(argv=(".venv/bin/python", "-m", "runtime")),
+            visible_workspace_paths=("runtime.py",),
+            execution=await _require_host_execution(),
+            request_timeout_seconds=5,
+        )
+        runtime_handshake = await supervisor.start()
+        await supervisor.close()
+    assert direct.succeeded, (direct.stdout, direct.stderr, direct.failure_class)
+    assert module.succeeded, (module.stdout, module.stderr, module.failure_class)
+    assert runtime_handshake.ok
+
+    await probe.validate(
+        candidate_root=source,
+        completion=completion,
+        validated=validated,
+    )
+
+
+@pytest.mark.asyncio
 async def test_real_role_isolation_crash_returns_builder_safe_import_coordinates(
     tmp_path: Path,
 ) -> None:
@@ -653,7 +885,7 @@ async def test_real_role_isolation_crash_returns_builder_safe_import_coordinates
     files = candidate_files(source)
     source_digest = candidate_source_tree_digest(files)
     builder = CleanCandidateBuilder(
-        build_isolation=await _require_real_isolation("build"),
+        build_execution=await _require_host_execution("build"),
         uv_path=uv_path,
         uv_cache_dir=uv_cache,
         timeout_seconds=60,
@@ -668,7 +900,7 @@ async def test_real_role_isolation_crash_returns_builder_safe_import_coordinates
             clean.root,
             LaunchContract(argv=(".venv/bin/python", "runtime.py")),
             visible_workspace_paths=("runtime.py",),
-            isolation=await _require_real_isolation(),
+            execution=await _require_host_execution(),
             request_timeout_seconds=5,
         )
         with pytest.raises(RuntimeProcessCrashed) as captured:
@@ -685,9 +917,9 @@ async def test_candidate_materializer_is_public_only_and_framework_compiles_goal
     tmp_path: Path,
 ) -> None:
     source, uv_path, uv_cache = write_candidate_project(tmp_path)
-    isolation = await _require_real_isolation()
+    isolation = await _require_host_execution()
     builder = CleanCandidateBuilder(
-        build_isolation=await _require_real_isolation("build"),
+        build_execution=await _require_host_execution("build"),
         uv_path=uv_path,
         uv_cache_dir=uv_cache,
         timeout_seconds=60,
@@ -712,8 +944,8 @@ async def test_candidate_materializer_is_public_only_and_framework_compiles_goal
 
     assert "task_materializer" not in sys.modules
     async with builder.materialize(source) as candidate:
-        runner = CandidateSandboxRunner(
-            isolation=isolation,
+        runner = CandidateProcessRunner(
+            execution=isolation,
             timeout_seconds=10,
             max_output_bytes=128 * 1024,
         )
@@ -780,9 +1012,9 @@ async def test_released_envpkg_v3_runs_framework_consumer_and_rpc_process(
     state_root = tmp_path / "state"
     store = ArtifactStore(state_root / "artifacts")
     graph = build_release_graph(state_root, store)
-    runtime_isolation = await _require_real_isolation()
+    runtime_execution = await _require_host_execution()
     builder = CleanCandidateBuilder(
-        build_isolation=await _require_real_isolation("build"),
+        build_execution=await _require_host_execution("build"),
         uv_path=graph.uv_path,
         uv_cache_dir=graph.uv_cache_dir,
         timeout_seconds=60,
@@ -820,7 +1052,7 @@ async def test_released_envpkg_v3_runs_framework_consumer_and_rpc_process(
     consumer = LocalRolloutConsumer(
         registry=registry,
         clean_builder=builder,
-        runtime_isolation=runtime_isolation,
+        runtime_execution=runtime_execution,
     )
     episode = await consumer.start(snapshot.snapshot_id, seed=8_459_123)
     async with episode:
@@ -921,9 +1153,9 @@ async def test_complete_environment_judge_report_releases_and_serves_over_rpc(
     state_root = tmp_path / "state"
     store = ArtifactStore(state_root / "artifacts")
     graph = build_judge_candidate_graph(state_root, store)
-    runtime_isolation = await _require_real_isolation()
+    runtime_execution = await _require_host_execution()
     clean_builder = CleanCandidateBuilder(
-        build_isolation=await _require_real_isolation("build"),
+        build_execution=await _require_host_execution("build"),
         uv_path=graph.uv_path,
         uv_cache_dir=graph.uv_cache_dir,
         timeout_seconds=60,
@@ -931,7 +1163,7 @@ async def test_complete_environment_judge_report_releases_and_serves_over_rpc(
     judge = EnvironmentJudge(
         artifact_store=judge_writer(store),
         clean_builder=clean_builder,
-        runtime_isolation=runtime_isolation,
+        runtime_execution=runtime_execution,
     )
     integration_budget = judge.required_integration_budget(
         design=graph.design,
@@ -1019,7 +1251,7 @@ async def test_complete_environment_judge_report_releases_and_serves_over_rpc(
     consumer = LocalRolloutConsumer(
         registry=registry,
         clean_builder=clean_builder,
-        runtime_isolation=runtime_isolation,
+        runtime_execution=runtime_execution,
     )
     episode = await consumer.start(snapshot.snapshot_id, seed=17)
     async with episode:
@@ -1135,40 +1367,12 @@ async def test_real_public_test_failure_blocks_release_with_typed_static_evidenc
     assert not evidence.public_tests[0].passed
 
 
-@pytest.mark.asyncio
-async def test_unknown_root_license_blocks_release_with_typed_supply_evidence(
-    tmp_path: Path,
-) -> None:
-    state_root = tmp_path / "state"
-    store = ArtifactStore(state_root / "artifacts")
-    graph = build_judge_candidate_graph(
-        state_root,
-        store,
-        project_license=None,
-    )
+def test_unknown_root_license_feedback_names_the_missing_project_declaration() -> None:
+    summary = _supply_chain_failure_summary(("supply_root_license_unknown",))
 
-    report = await _evaluate_real_judge_graph(
-        state_root=state_root,
-        store=store,
-        graph=graph,
-        run_id="judge-unknown-root-license",
-    )
-
-    gates = {result.gate_id: result for result in report.gate_results}
-    assert report.verdict == "fail"
-    assert gates["supply_chain"].status == "fail"
-    assert gates["static_assurance"].status == "pass"
-    evidence_ref = next(
-        ref
-        for ref in gates["supply_chain"].evidence_refs
-        if ref.artifact_type == "judge.supply_chain_evidence"
-    )
-    evidence = store.get_json(evidence_ref, SupplyChainEvidence)
-    assert evidence.status == "fail"
-    assert evidence.root_license is not None
-    assert evidence.root_license.status == "unknown"
-    assert evidence.candidate_license_files
-    assert "supply_root_license_unknown" in evidence.failure_codes
+    assert "supply_root_license_unknown" in summary
+    assert "[project].license must be a non-unknown" in summary
+    assert "license-files alone is only an inventory" in summary
 
 
 @pytest.mark.parametrize(

@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
+import pytest
+
+from agent_world.artifact_store import ArtifactStore
 from agent_world.contracts import (
     ArtifactRef,
     Finding,
@@ -12,6 +19,12 @@ from agent_world.contracts import (
     sha256_digest,
 )
 from agent_world.judge import IntegrationLeaf
+from agent_world.judge.service import (
+    EnvironmentJudge,
+    _candidate_failure_summary,
+    _RuntimeInitialStateCheck,
+)
+from agent_world.judge.supervisor import RuntimeProcessCrashed, ProcessResult
 
 
 def _ref(label: str, artifact_type: str) -> ArtifactRef:
@@ -22,6 +35,18 @@ def _ref(label: str, artifact_type: str) -> ArtifactRef:
         content_hash=sha256_digest(f"content:{label}".encode()),
         media_type="application/json",
         size_bytes=1,
+    )
+
+
+def _judge(tmp_path: Path, *, runtime_episode_concurrency: int = 8) -> EnvironmentJudge:
+    store = ArtifactStore(tmp_path / "artifacts")
+    return EnvironmentJudge(
+        artifact_store=store.issue_writer(
+            producer="test-judge",
+            allowed_artifact_types=("judge_report",),
+            allowed_artifact_type_prefixes=("judge.",),
+        ),
+        runtime_episode_concurrency=runtime_episode_concurrency,
     )
 
 
@@ -130,3 +155,249 @@ def test_integration_repair_feedback_excludes_skipped_downstream_gate_noise() ->
     ]
     assert all("Deployment probe" not in issue.violated_condition for issue in issues)
     assert issues[0].remediation == "Return the exact handshake operations string array."
+
+
+def test_sandbox_failure_feedback_exposes_safe_missing_module_coordinate() -> None:
+    result = ProcessResult(
+        argv=(".venv/bin/python", "-m", "meeting_room.runtime"),
+        exit_code=1,
+        stdout="",
+        stderr=(
+            "/workspace/.venv/bin/python: Error while finding module specification for "
+            "'meeting_room.runtime' (ModuleNotFoundError: No module named 'meeting_room')\n"
+        ),
+        stdout_truncated=False,
+        stderr_truncated=False,
+        duration_ms=10,
+    )
+
+    with pytest.raises(ValueError, match="missing_module=meeting_room"):
+        EnvironmentJudge._task_runner_outputs(result, expected_count=1)  # noqa: SLF001
+
+    runtime_error = RuntimeProcessCrashed(
+        "runtime_process_crashed",
+        "runtime exited without a response",
+        details={"exit_code": 1, "stderr": result.stderr},
+    )
+    assert _candidate_failure_summary(runtime_error).endswith(
+        "stderr_exception=ModuleNotFoundError; missing_module=meeting_room"
+    )
+
+
+class _AggregateBoundedMaterializerRunner:
+    """Return a normal per-call result but truncate every aggregate response."""
+
+    def __init__(self, *, truncate_single_call: bool = False) -> None:
+        self.calls: list[tuple[dict[str, object], ...]] = []
+        self._truncate_single_call = truncate_single_call
+
+    async def run_task_materializer(
+        self,
+        _candidate_root: Path,
+        *,
+        entrypoint: str,
+        calls: tuple[dict[str, object], ...],
+        visible_workspace_paths: tuple[str, ...],
+    ) -> ProcessResult:
+        assert entrypoint == "task_materializer:materialize"
+        assert visible_workspace_paths == ("task_materializer.py",)
+        self.calls.append(calls)
+        if len(calls) > 1 or self._truncate_single_call:
+            return ProcessResult(
+                argv=(".venv/bin/python", "task-materializer-runner.py"),
+                exit_code=0,
+                stdout="",
+                stderr="",
+                stdout_truncated=True,
+                stderr_truncated=False,
+                duration_ms=1,
+            )
+        materializations = [{"seed": calls[0]["seed"]}]
+        return ProcessResult(
+            argv=(".venv/bin/python", "task-materializer-runner.py"),
+            exit_code=0,
+            stdout=json.dumps(
+                {
+                    "protocol": "agent-world.task-materializer-runner.v3",
+                    "ok": True,
+                    "materializations": materializations,
+                }
+            ),
+            stderr="",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            duration_ms=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_materializer_campaign_splits_only_aggregate_output_limit(tmp_path: Path) -> None:
+    judge = _judge(tmp_path)
+    runner = _AggregateBoundedMaterializerRunner()
+    judge.process_runner = runner  # type: ignore[assignment]
+    calls = tuple(
+        {
+            "seed": seed,
+            "task_type": "reserve",
+            "actor": "member",
+            "difficulty": {},
+        }
+        for seed in range(4)
+    )
+
+    campaign = await judge._run_task_materializer_campaign(  # noqa: SLF001
+        candidate_root=tmp_path,
+        entrypoint="task_materializer:materialize",
+        calls=calls,
+        visible_workspace_paths=("task_materializer.py",),
+    )
+
+    assert [item["seed"] for item in campaign.materializations] == [0, 1, 2, 3]
+    assert campaign.runner_invocations == 7
+    assert campaign.adaptive_batch_splits == 3
+    assert [len(item) for item in runner.calls] == [4, 2, 1, 1, 2, 1, 1]
+
+
+@pytest.mark.asyncio
+async def test_materializer_campaign_keeps_single_response_overflow_actionable(
+    tmp_path: Path,
+) -> None:
+    judge = _judge(tmp_path)
+    judge.process_runner = _AggregateBoundedMaterializerRunner(  # type: ignore[assignment]
+        truncate_single_call=True
+    )
+
+    with pytest.raises(ValueError, match="single-call response exceeded"):
+        await judge._run_task_materializer_campaign(  # noqa: SLF001
+            candidate_root=tmp_path,
+            entrypoint="task_materializer:materialize",
+            calls=(
+                {
+                    "seed": 1,
+                    "task_type": "reserve",
+                    "actor": "member",
+                    "difficulty": {},
+                },
+            ),
+            visible_workspace_paths=("task_materializer.py",),
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_initial_state_campaign_is_bounded_and_preserves_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    judge = _judge(tmp_path, runtime_episode_concurrency=2)
+    active = 0
+    maximum_active = 0
+    started: list[int] = []
+
+    async def fake_check(
+        _self: EnvironmentJudge,
+        *,
+        index: int,
+        **_kwargs: object,
+    ) -> _RuntimeInitialStateCheck:
+        nonlocal active, maximum_active
+        active += 1
+        maximum_active = max(maximum_active, active)
+        started.append(index)
+        await asyncio.sleep(0)
+        active -= 1
+        return _RuntimeInitialStateCheck(
+            index=index,
+            final_state_digest=f"sha256:{index}",
+            reset_observation={"index": index},
+            rule_violations=(),
+        )
+
+    monkeypatch.setattr(EnvironmentJudge, "_runtime_initial_state_check", fake_check)
+    checks = await judge._run_runtime_initial_state_checks(  # noqa: SLF001
+        clean=SimpleNamespace(),
+        candidate=SimpleNamespace(),
+        manifest=SimpleNamespace(),
+        envelopes=tuple(SimpleNamespace() for _ in range(9)),
+        design=SimpleNamespace(),
+        requirements={},
+    )
+
+    assert maximum_active == 2
+    assert started == list(range(9))
+    assert [check.index for check in checks] == list(range(9))
+
+
+def test_initial_state_rule_feedback_lookup_covers_every_evaluated_rule() -> None:
+    rules = {name: SimpleNamespace(rule_id=name) for name in ("world", "state", "task", "sampling")}
+    design = SimpleNamespace(
+        world_spec=SimpleNamespace(
+            invariants=(rules["world"],),
+            state=SimpleNamespace(initial_state_constraints=(rules["state"],)),
+        )
+    )
+    curriculum = SimpleNamespace(
+        task_types=(SimpleNamespace(initial_state_constraints=(rules["task"],)),),
+        sampling_constraints=(rules["sampling"],),
+    )
+
+    lookup = EnvironmentJudge._initial_state_rule_lookup(  # noqa: SLF001
+        design,  # type: ignore[arg-type]
+        curriculum,  # type: ignore[arg-type]
+    )
+
+    assert set(lookup) == {"world", "state", "task", "sampling"}
+    scopes = EnvironmentJudge._initial_state_rule_scope_lookup(  # noqa: SLF001
+        design,  # type: ignore[arg-type]
+        curriculum,  # type: ignore[arg-type]
+    )
+    assert scopes == {
+        "world": "world_invariant",
+        "state": "world_initial_state",
+        "task": "task_initial_state",
+        "sampling": "curriculum_sampling",
+    }
+
+
+def test_integration_uses_separate_bounded_materializer_repair_story(
+    tmp_path: Path,
+) -> None:
+    judge = _judge(tmp_path)
+    candidate_ref = _ref("candidate", "build.environment_candidate")
+    evidence_ref = _ref("materialization", "judge.evaluation_evidence")
+    gate_results: list[GateResult] = []
+    evidence_refs: list[ArtifactRef] = []
+    findings: list[Finding] = []
+    remediation = (
+        "Make Task Materializer initial_config satisfy rule:state:0 while preserving "
+        "reachability; if the frozen inputs conflict, return blocked."
+    )
+
+    judge._record_gate(  # noqa: SLF001
+        gate_id="task_materialization",
+        status="fail",
+        evidence_ref=evidence_ref,
+        summary="7307 violations with complete grouped evidence stored separately.",
+        suggested_repair=remediation,
+        owner="build",
+        candidate_ref=candidate_ref,
+        release_profile=SimpleNamespace(required_hard_gates=()),  # type: ignore[arg-type]
+        gate_results=gate_results,
+        evidence_refs=evidence_refs,
+        findings=findings,
+        run_id="integration:materializer-feedback",
+    )
+
+    report = IntegrationReport(
+        report_id="integration-report:materializer-feedback",
+        revision=1,
+        candidate_ref=candidate_ref,
+        status="failed",
+        gate_results=tuple(gate_results),
+        findings=tuple(findings),
+        evidence_refs=tuple(evidence_refs),
+    )
+    issues, routeable = IntegrationLeaf._integration_repair_feedback(report)  # noqa: SLF001
+
+    assert routeable is True
+    assert issues[0].remediation == remediation
+    assert "7307 violations" not in issues[0].remediation

@@ -7,7 +7,7 @@ import pytest
 
 from agent_world.artifact_store import ArtifactStore
 from agent_world.contracts import Budget, BudgetUsage
-from agent_world.control.budget import LeaseBudgetLedger
+from agent_world.control.budget import BudgetExceeded, LeaseBudgetLedger
 from agent_world.control.models import BudgetLease
 from agent_world.control.work import (
     FeedbackEvaluation,
@@ -596,6 +596,29 @@ def test_runtime_reactivates_exact_history_without_inventing_attempt_lease(
         attempt.status == "interrupted" and attempt.failure_code == "historical_commit_reactivated"
         for attempt in interrupted_attempts
     )
+    historical_commit = writer.get_json(historical_commit_ref, WorkCommit)
+    duplicate_commit_ref = writer.put_json(
+        artifact_id="work-commit:explicit-epoch-duplicate",
+        artifact_type="control.work_commit",
+        value=historical_commit,
+        dependencies=writer.dependencies(historical_commit_ref),
+    )
+    assert duplicate_commit_ref != historical_commit_ref
+    with pytest.raises(WorkResumeError, match="multiple exact historical"):
+        store.find_historical_commit(
+            definition=changed,
+            input_refs=(input_ref,),
+            artifacts=writer,
+        )
+    selected = store.find_historical_commit(
+        definition=changed,
+        input_refs=(input_ref,),
+        artifacts=writer,
+        required_commit_ref=historical_commit_ref,
+    )
+    assert selected is not None
+    assert selected[1] == historical_commit_ref
+
     changed_validator = changed.model_copy(
         update={
             "validation_policy": definition.validation_policy.model_copy(
@@ -797,6 +820,219 @@ def test_deterministic_boundary_recovers_a_report_written_before_head_commit(
     recovered_attempt = writer.get_json(recovered.attempt_ref, WorkAttempt)
     assert len(recovered_attempt.operation_run_refs) == 2
     assert recovered_attempt.output_refs == (gate_ref,)
+
+
+def test_finish_operation_settlement_overshoot_retires_the_running_operation(
+    tmp_path: Path,
+) -> None:
+    """A real turn that overshoots its admitted lease must still reach a terminal.
+
+    ``BudgetLease`` is a hard admission cap and cannot record an overshoot, so
+    ``settle`` raises ``BudgetExceeded``. The work physically happened, so the
+    running ``OperationRun`` must not be stranded: ``finish_operation`` retires
+    it as terminal with its true observed cost, releases the lease, clears
+    ``active_operation_ref`` via CAS, and re-raises so the Scheduler's
+    budget-exhaustion handler can settle the attempt on a clean boundary
+    instead of crashing on a live operation.
+    """
+
+    base = _definition()
+    definition = base.model_copy(
+        update={
+            "proposal_policy": ProposalPolicy(
+                policy_id="proposal:overshoot",
+                executor="code",
+                operation="design.modeling_boundary",
+                # A two-tool-call lease is all this operation is admitted to spend.
+                budget=OperationBudget(wall_seconds=5, tool_calls=2),
+            )
+        }
+    )
+    writer = _writer(tmp_path)
+    store = WorkControlStore(tmp_path / "work-control")
+    runtime = WorkControlRuntime(
+        artifacts=writer,
+        heads=store,
+        # The scope aggregate has ample room; only the per-lease cap binds.
+        budget=LeaseBudgetLedger(
+            Budget(wall_seconds=1_000, llm_tokens=100_000, agent_turns=10, tool_calls=512)
+        ),
+    )
+    input_ref = writer.put_json(
+        artifact_id="hotel:closed-design",
+        artifact_type="design.environment_design",
+        value={"revision": 2},
+    )
+    gate_ref = writer.put_json(
+        artifact_id="hotel:passed-modeling-gate",
+        artifact_type="control.modeling_gate",
+        value={"status": "pass"},
+        dependencies=(input_ref,),
+    )
+    with store.exclusive(definition.coordinate) as lock:
+        runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(input_ref,),
+            elapsed_wall_seconds=0,
+        )
+        runtime.schedule_operation(
+            lock,
+            definition=definition,
+            kind="proposal",
+            replay_mode=definition.proposal_policy.replay_mode,
+            elapsed_wall_seconds=0,
+        )
+        head = runtime.start_operation(
+            lock,
+            definition=definition,
+            dispatch_id="dispatch:overshoot",
+        )
+        assert head.active_operation_ref is not None
+        operation = writer.get_json(head.active_operation_ref, OperationRun)
+        now = operation.started_at
+        # The real turn made ten tool calls — five times its admitted lease.
+        overshoot = ProposalExecution(
+            execution_id="execution:overshoot",
+            attempt_id=writer.get_json(head.attempt_ref, WorkAttempt).attempt_id,
+            executor="code",
+            executor_revision_id=definition.proposal_policy.executor_revision_id,
+            operation=definition.proposal_policy.operation,
+            status="completed",
+            output_commitment=gate_ref.content_hash,
+            observed_actual=BudgetUsage(tool_calls=10),
+            conservative_committed=BudgetUsage(tool_calls=10),
+            started_at=now,
+            finished_at=now,
+            duration_ms=0,
+        )
+        with pytest.raises(BudgetExceeded) as exc_info:
+            runtime.checkpoint_proposal(
+                lock,
+                definition=definition,
+                execution=overshoot,
+                output_refs=(gate_ref,),
+            )
+
+    assert "tool_calls" in exc_info.value.dimensions
+
+    # The head cleared its running operation instead of stranding a ghost.
+    head = store.read_head(definition.coordinate)
+    assert head is not None
+    assert head.active_operation_ref is None
+    attempt = writer.get_json(head.attempt_ref, WorkAttempt)
+    proposal = next(
+        writer.get_json(ref, OperationRun)
+        for ref in attempt.operation_run_refs
+        if writer.get_json(ref, OperationRun).kind == "proposal"
+    )
+    # Retired as terminal, carrying its true observed cost as durable evidence.
+    assert proposal.status == "terminal"
+    assert proposal.observed_actual.tool_calls == 10
+
+
+def test_finish_operation_transport_stall_wall_overshoot_terminalizes_retryable(
+    tmp_path: Path,
+) -> None:
+    """A wall-only overshoot caused by a dead-stream idle wait is not exhaustion.
+
+    When the *only* exceeded dimension is ``wall_seconds`` and the terminal is a
+    transport-liveness timeout (e.g. ``direct_provider_stream_stalled``), the
+    overshoot is the bounded idle wait on a silent provider stream, not real
+    work that outgrew its lease. Charging that idle interval into the work-wall
+    and then raising a fatal ``wall_seconds`` ``BudgetExceeded`` would launder a
+    retryable transport stall into a non-retryable budget exhaustion. Instead
+    ``finish_operation`` clamps the observed wall to the admitted lease and
+    settles honestly, so the operation terminalizes as its own retryable
+    transport failure and normal invocation recovery can route a fresh retry.
+    """
+
+    base = _definition()
+    definition = base.model_copy(
+        update={
+            "proposal_policy": ProposalPolicy(
+                policy_id="proposal:stall",
+                executor="code",
+                operation="design.modeling_boundary",
+                # A five-second wall is all this operation is admitted to spend.
+                budget=OperationBudget(wall_seconds=5),
+            )
+        }
+    )
+    writer = _writer(tmp_path)
+    store = WorkControlStore(tmp_path / "work-control")
+    runtime = WorkControlRuntime(
+        artifacts=writer,
+        heads=store,
+        budget=LeaseBudgetLedger(
+            Budget(wall_seconds=1_000, llm_tokens=100_000, agent_turns=10, tool_calls=512)
+        ),
+    )
+    input_ref = writer.put_json(
+        artifact_id="hotel:closed-design",
+        artifact_type="design.environment_design",
+        value={"revision": 2},
+    )
+    with store.exclusive(definition.coordinate) as lock:
+        runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(input_ref,),
+            elapsed_wall_seconds=0,
+        )
+        runtime.schedule_operation(
+            lock,
+            definition=definition,
+            kind="proposal",
+            replay_mode=definition.proposal_policy.replay_mode,
+            elapsed_wall_seconds=0,
+        )
+        head = runtime.start_operation(
+            lock,
+            definition=definition,
+            dispatch_id="dispatch:stall",
+        )
+        assert head.active_operation_ref is not None
+        operation = writer.get_json(head.active_operation_ref, OperationRun)
+        now = operation.started_at
+        # The adapter sat in a bounded idle wait on a dead stream: observed wall
+        # (ten seconds) overshoots the five-second lease, and wall is the ONLY
+        # exceeded dimension. The terminal is a retryable transport stall.
+        stalled = ProposalExecution(
+            execution_id="execution:stall",
+            attempt_id=writer.get_json(head.attempt_ref, WorkAttempt).attempt_id,
+            executor="code",
+            executor_revision_id=definition.proposal_policy.executor_revision_id,
+            operation=definition.proposal_policy.operation,
+            status="failed",
+            error_code="direct_provider_stream_stalled",
+            observed_actual=BudgetUsage(wall_seconds=10),
+            conservative_committed=BudgetUsage(wall_seconds=10),
+            started_at=now,
+            finished_at=now,
+            duration_ms=0,
+        )
+        # No BudgetExceeded: the transport stall is not budget exhaustion.
+        runtime.checkpoint_proposal(
+            lock,
+            definition=definition,
+            execution=stalled,
+        )
+
+    head = store.read_head(definition.coordinate)
+    assert head is not None
+    assert head.active_operation_ref is None
+    attempt = writer.get_json(head.attempt_ref, WorkAttempt)
+    proposal = next(
+        writer.get_json(ref, OperationRun)
+        for ref in attempt.operation_run_refs
+        if writer.get_json(ref, OperationRun).kind == "proposal"
+    )
+    # Terminalized as its true retryable transport failure, wall clamped to the
+    # admitted lease so the idle wait never poses as consumed work budget.
+    assert proposal.status == "terminal"
+    assert proposal.error_code == "direct_provider_stream_stalled"
+    assert proposal.observed_actual.wall_seconds == 5
 
 
 def test_restored_work_budget_is_isolated_by_scope(tmp_path: Path) -> None:

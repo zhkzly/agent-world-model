@@ -95,6 +95,10 @@ class StaticAssuranceEvidence(V2Contract):
     strict_data_parse_passed: bool
     python_compile_passed: bool
     failure_codes: tuple[Identifier, ...] = ()
+    # These are source-path relationships only.  They deliberately retain no
+    # Candidate text, but make a component-visibility failure independently
+    # actionable for an authorized Builder correction.
+    component_import_violations: tuple[NonEmptyStr, ...] = ()
 
     @model_validator(mode="after")
     def status_matches_checks(self) -> StaticAssuranceEvidence:

@@ -22,7 +22,7 @@ from agent_world.agent_output_authority import (
     SemanticAdvisoryOutput,
     register_agent_output_contract,
 )
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.artifact_store import ArtifactStore
 from agent_world.config import AgentBackendConfig
 from agent_world.contracts import (
@@ -438,7 +438,7 @@ async def test_one_shot_returns_safe_field_feedback_without_component_retry(
 
     definition = _definition()
     backend = _MalformedOutputBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -482,7 +482,7 @@ async def test_one_shot_returns_safe_field_feedback_without_component_retry(
     assert failure.agent is not None
     assert failure.observed_actual.llm_tokens == 11
     assert failure.observed_actual.agent_turns == 1
-    assert failure.unknown_upper_bound.llm_tokens == 989
+    assert failure.unknown_upper_bound.llm_tokens == 0
 
 
 @pytest.mark.asyncio
@@ -491,7 +491,7 @@ async def test_structured_read_uses_one_real_agentic_turn(tmp_path: Path) -> Non
 
     definition = _definition()
     backend = _StaticOutputBackend({"title": "Frozen input inspection"})
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-read-agent-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -553,7 +553,7 @@ async def test_one_shot_resolves_the_durable_fallback_route_for_its_physical_tur
         }
     )
     backend = _SemanticOutputBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="grok-4.5",
             fallback_models=("gpt-5.3-codex-spark", "gpt-5.4-mini"),
@@ -717,7 +717,7 @@ async def test_one_shot_marks_provider_contract_rejection_non_retryable(
 
     definition = _definition()
     backend = _ProviderRejectedBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -756,7 +756,7 @@ async def test_one_shot_routes_codex_stream_disconnect_to_bounded_infrastructure
 
     definition = _definition()
     backend = _ProviderDisconnectBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -803,7 +803,7 @@ async def test_one_shot_routes_direct_started_stream_stall_to_liveness_recovery(
 
     definition = _definition()
     backend = _DirectProviderStreamStalledBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -837,7 +837,7 @@ async def test_one_shot_routes_direct_started_stream_stall_to_liveness_recovery(
     assert failure.expected_category == (
         "a profile-matched Direct Provider liveness control and either a corrected Direct "
         "stream/route boundary or one Scheduler-authorized fresh physical execution; do not "
-        "change the Prompt or Runtime Skill without semantic output"
+        "change the rendered Direct Prompt or output budget without semantic output"
     )
     assert failure.remediation == (
         "Inspect the safe Provider-event count, idle interval, and local waiting heartbeat; "
@@ -862,7 +862,7 @@ async def test_one_shot_routes_provider_quota_to_external_recovery(
 
     definition = _definition()
     backend = _QuotaExhaustedBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -911,7 +911,7 @@ async def test_one_shot_routes_session_budget_to_a_new_declared_envelope(
 
     definition = _definition()
     backend = _SessionBudgetExhaustedBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -964,7 +964,7 @@ async def test_one_shot_projects_safe_direct_json_diagnostic_without_blind_retry
 
     definition = _definition()
     backend = _DirectInvalidJsonBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -1017,7 +1017,7 @@ async def test_one_shot_projects_output_limit_as_a_new_policy_choice(
         }
     )
     backend = _DirectOutputLimitBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -1082,7 +1082,7 @@ async def test_agentic_output_limit_retains_only_a_private_resumable_session(
         maximum_session_continuations=39,
     )
     backend = _AgenticOutputLimitBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -1174,7 +1174,7 @@ async def test_bc44_provider_rejection_cannot_authorize_a_scheduler_retry(
     )
     leaf = SchedulerLeafExecutor(runtime=runtime)
     backend = _ProviderRejectedBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -1297,7 +1297,7 @@ async def test_scheduler_passes_a_parsed_direct_candidate_only_to_its_authorized
     backend = _SequenceOutputBackend(
         [{"title": "prior-invalid-title"}, {"title": "repaired-title"}]
     )
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -1336,7 +1336,11 @@ async def test_scheduler_passes_a_parsed_direct_candidate_only_to_its_authorized
             definition=definition,
             attempt=attempt,
             dispatch_id=dispatch_id,
-            lineage_id="lineage:direct-semantic-repair-seed",
+            # Production Direct repairs always run in a fresh physical attempt
+            # and therefore a new lineage/workspace.  The parsed seed must bind
+            # the stable Direct runtime configuration, while WorkAttempt and
+            # its marker bind this exact attempt identity.
+            lineage_id=f"lineage:direct-semantic-repair-seed:{attempt.attempt_id}",
             workspace=tmp_path / "direct-semantic-repair" / attempt.attempt_id,
             model=_StrictOneShotOutput,
             prompt="Produce one research plan title.",
@@ -1369,11 +1373,22 @@ async def test_scheduler_passes_a_parsed_direct_candidate_only_to_its_authorized
     assert received_seeds[0] is None
     assert received_seeds[1] is not None
     assert received_seeds[1].previous_candidate == {"title": "prior-invalid-title"}
+    # The second Direct request is a distinct physical attempt, but it must
+    # retain the same prompt-only runtime identity that authorized the parsed
+    # seed. WorkAttempt/lineage remain separately bound below the profile.
+    assert backend.requests[0].profile.lineage_id != backend.requests[1].profile.lineage_id
+    assert backend.requests[0].profile.profile_hash == backend.requests[1].profile.profile_hash
     assert backend.requests[0].session is None
     assert backend.requests[1].session is None
     assert "<prior_candidate_json>" not in backend.requests[0].prompt
     prior_candidate_marker = '<prior_candidate_json>\n{"title":"prior-invalid-title"}'
     assert prior_candidate_marker in backend.requests[1].prompt
+    assert "This is a minimal semantic patch, not a request to redesign the artifact." in (
+        backend.requests[1].prompt
+    )
+    assert "do not remove,\nrewrite, reorder, summarize, or substitute valid trajectories" in (
+        backend.requests[1].prompt
+    )
     assert "the title still names the rejected plan" in backend.requests[1].prompt
     assert "repair_action_ref" not in backend.requests[1].prompt
     head = heads.read_head(definition.coordinate)
@@ -1382,16 +1397,15 @@ async def test_scheduler_passes_a_parsed_direct_candidate_only_to_its_authorized
 
 
 @pytest.mark.asyncio
-async def test_one_shot_declares_json_envelope_without_weakening_local_validation(
+async def test_one_shot_uses_native_schema_without_compatibility_prompt(
     tmp_path: Path,
 ) -> None:
     definition = _definition()
     backend = _SemanticOutputBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
-            structured_output_transport="json_envelope",
         ),
         source_environment={
             "PATH": "/usr/bin:/bin",
@@ -1404,9 +1418,9 @@ async def test_one_shot_declares_json_envelope_without_weakening_local_validatio
         profiles=profiles,
         definition=definition,
         attempt=_attempt(definition),
-        dispatch_id="dispatch:one-shot:json-envelope",
-        lineage_id="lineage:one-shot:json-envelope",
-        workspace=tmp_path / "json-envelope",
+        dispatch_id="dispatch:one-shot:native-schema",
+        lineage_id="lineage:one-shot:native-schema",
+        workspace=tmp_path / "native-schema",
         model=_StrictOneShotOutput,
         prompt="Produce the requested title object.",
         permissions=PermissionScope(),
@@ -1414,24 +1428,21 @@ async def test_one_shot_declares_json_envelope_without_weakening_local_validatio
 
     assert turn.output.title == "Hotel booking"
     assert len(backend.requests) == 1
-    assert "Structured-output transport requirement:" in backend.requests[0].prompt
-    assert "every inner double quote" in backend.requests[0].prompt
-    assert "every backslash" in backend.requests[0].prompt
-    assert "U+005C followed by" in backend.requests[0].prompt
-    assert '"title"' in backend.requests[0].prompt
+    assert "Structured-output transport requirement:" not in backend.requests[0].prompt
+    assert "artifact_json" not in backend.requests[0].prompt
+    assert backend.requests[0].profile.skills == ()
 
 
 @pytest.mark.asyncio
-async def test_one_shot_declares_direct_json_object_without_an_inner_envelope(
+async def test_one_shot_default_route_has_no_second_json_protocol(
     tmp_path: Path,
 ) -> None:
     definition = _definition()
     backend = _SemanticOutputBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
-            structured_output_transport="json_object",
         ),
         source_environment={
             "PATH": "/usr/bin:/bin",
@@ -1444,9 +1455,9 @@ async def test_one_shot_declares_direct_json_object_without_an_inner_envelope(
         profiles=profiles,
         definition=definition,
         attempt=_attempt(definition),
-        dispatch_id="dispatch:one-shot:json-object",
-        lineage_id="lineage:one-shot:json-object",
-        workspace=tmp_path / "json-object",
+        dispatch_id="dispatch:one-shot:native-default",
+        lineage_id="lineage:one-shot:native-default",
+        workspace=tmp_path / "native-default",
         model=_StrictOneShotOutput,
         prompt="Produce the requested title object.",
         permissions=PermissionScope(),
@@ -1454,23 +1465,21 @@ async def test_one_shot_declares_direct_json_object_without_an_inner_envelope(
 
     assert turn.output.title == "Hotel booking"
     assert len(backend.requests) == 1
-    assert "Return the complete requested logical artifact" in backend.requests[0].prompt
-    assert "Do not wrap it in an\n`artifact_json` field" in backend.requests[0].prompt
+    assert "Structured-output transport requirement:" not in backend.requests[0].prompt
 
 
 @pytest.mark.asyncio
 async def test_one_shot_can_use_a_compact_logical_protocol_without_changing_the_model(
     tmp_path: Path,
 ) -> None:
-    """A compact prompt contract changes transport text, never local parsing."""
+    """A compact prompt contract changes node text, never local parsing."""
 
     definition = _definition()
     backend = _SemanticOutputBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
-            structured_output_transport="json_envelope",
         ),
         source_environment={
             "PATH": "/usr/bin:/bin",
@@ -1484,9 +1493,9 @@ async def test_one_shot_can_use_a_compact_logical_protocol_without_changing_the_
         profiles=profiles,
         definition=definition,
         attempt=_attempt(definition),
-        dispatch_id="dispatch:one-shot:compact-envelope",
-        lineage_id="lineage:one-shot:compact-envelope",
-        workspace=tmp_path / "compact-envelope",
+        dispatch_id="dispatch:one-shot:compact-native",
+        lineage_id="lineage:one-shot:compact-native",
+        workspace=tmp_path / "compact-native",
         model=_StrictOneShotOutput,
         prompt="Produce the requested title object.",
         permissions=PermissionScope(),
@@ -1497,21 +1506,23 @@ async def test_one_shot_can_use_a_compact_logical_protocol_without_changing_the_
     assert len(backend.requests) == 1
     assert protocol in backend.requests[0].prompt
     assert '"title"' not in backend.requests[0].prompt
+    assert not hasattr(backend.requests[0].profile, "base_instructions")
+    assert not hasattr(backend.requests[0].profile, "developer_instructions")
+    assert backend.requests[0].profile.skills == ()
 
 
 @pytest.mark.asyncio
-async def test_one_shot_carries_a_compact_logical_protocol_over_json_object(
+async def test_one_shot_keeps_a_compact_logical_protocol_on_native_schema(
     tmp_path: Path,
 ) -> None:
-    """A Direct JSON object still needs its logical output instructions."""
+    """Native schema constrains shape but must not drop node mechanics."""
 
     definition = _definition()
     backend = _SemanticOutputBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
-            structured_output_transport="json_object",
         ),
         source_environment={
             "PATH": "/usr/bin:/bin",
@@ -1525,9 +1536,52 @@ async def test_one_shot_carries_a_compact_logical_protocol_over_json_object(
         profiles=profiles,
         definition=definition,
         attempt=_attempt(definition),
-        dispatch_id="dispatch:one-shot:compact-object",
-        lineage_id="lineage:one-shot:compact-object",
-        workspace=tmp_path / "compact-object",
+        dispatch_id="dispatch:one-shot:compact-native-schema",
+        lineage_id="lineage:one-shot:compact-native-schema",
+        workspace=tmp_path / "compact-native-schema",
+        model=_StrictOneShotOutput,
+        prompt="Produce the requested title object.",
+        permissions=PermissionScope(),
+        logical_output_protocol=protocol,
+    )
+
+    assert turn.output == _StrictOneShotOutput(title="Hotel booking")
+    assert len(backend.requests) == 1
+    assert "Compact output protocol:" in backend.requests[0].prompt
+    assert protocol in backend.requests[0].prompt
+    assert not hasattr(backend.requests[0].profile, "base_instructions")
+    assert not hasattr(backend.requests[0].profile, "developer_instructions")
+    assert backend.requests[0].profile.skills == ()
+
+
+@pytest.mark.asyncio
+async def test_one_shot_carries_a_compact_logical_protocol_without_extra_transport(
+    tmp_path: Path,
+) -> None:
+    """A Direct native-schema turn still needs its logical output instructions."""
+
+    definition = _definition()
+    backend = _SemanticOutputBackend()
+    profiles = AgentProfileProvider(
+        AgentBackendConfig(
+            model="test-structured-model",
+            api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
+        ),
+        source_environment={
+            "PATH": "/usr/bin:/bin",
+            "AGENT_WORLD_TEST_MODEL_KEY": "test-only-credential",
+        },
+    )
+    protocol = "compact-protocol-test.v1: return one title string field."
+
+    turn = await invoke_structured_once(
+        backend=backend,
+        profiles=profiles,
+        definition=definition,
+        attempt=_attempt(definition),
+        dispatch_id="dispatch:one-shot:compact-native-second",
+        lineage_id="lineage:one-shot:compact-native-second",
+        workspace=tmp_path / "compact-native-second",
         model=_StrictOneShotOutput,
         prompt="Produce the requested title object.",
         permissions=PermissionScope(),
@@ -1538,6 +1592,9 @@ async def test_one_shot_carries_a_compact_logical_protocol_over_json_object(
     assert len(backend.requests) == 1
     assert protocol in backend.requests[0].prompt
     assert '"title"' not in backend.requests[0].prompt
+    assert not hasattr(backend.requests[0].profile, "base_instructions")
+    assert not hasattr(backend.requests[0].profile, "developer_instructions")
+    assert backend.requests[0].profile.skills == ()
 
 
 @pytest.mark.asyncio
@@ -1548,7 +1605,7 @@ async def test_one_shot_preserves_actionable_structured_semantic_details(
 
     definition = _definition()
     backend = _SemanticOutputBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -1609,7 +1666,7 @@ async def test_one_shot_keeps_unknown_architecture_compiler_errors_non_actionabl
 
     definition = _definition()
     backend = _SemanticOutputBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -1692,7 +1749,7 @@ async def test_one_shot_turns_known_architecture_model_contracts_into_actionable
 
     definition = _definition()
     backend = _StaticOutputBackend(output)
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -1851,7 +1908,7 @@ async def test_one_shot_renders_only_safe_local_correction_diagnostics(
 
     definition = _definition()
     backend = _SemanticOutputBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -1921,7 +1978,7 @@ async def test_one_shot_projects_existing_attempt_repair_state_into_invocation_m
 
     definition = _definition()
     backend = _SemanticOutputBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -2028,7 +2085,7 @@ async def test_one_shot_timeout_preserves_dispatch_provenance_for_terminal_settl
         }
     )
     backend = _DeclaredWallExpiredBackend()
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         AgentBackendConfig(
             model="test-structured-model",
             api_key_environment="AGENT_WORLD_TEST_MODEL_KEY",
@@ -2062,7 +2119,7 @@ async def test_one_shot_timeout_preserves_dispatch_provenance_for_terminal_settl
     assert failure.agent is not None
     assert failure.agent.invocation_id == "dispatch:one-shot:timeout"
     assert failure.agent.model == "test-structured-model"
-    # A typed terminal carries real measured usage, so the conservative unknown
-    # upper bound is the remaining reservation rather than the whole budget.  It
-    # must still be charged: an interrupted physical turn is never free.
-    assert 0 < failure.unknown_upper_bound.llm_tokens <= 1_000
+    # A typed terminal with measured Provider usage settles at that observed
+    # amount. The full envelope was reserved while it was active, but no
+    # unobserved token remainder remains once the Provider supplied a total.
+    assert failure.unknown_upper_bound.llm_tokens == 0

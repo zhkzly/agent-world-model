@@ -15,7 +15,7 @@ import hashlib
 import json
 import time
 from dataclasses import replace
-from typing import Literal
+from typing import Literal, cast
 
 from .contracts import (
     InvocationBackend,
@@ -33,6 +33,7 @@ from .control_store import (
     InvocationAlreadyActiveError,
     InvocationControlStore,
     InvocationControlStoreError,
+    InvocationRequestShape,
     InvocationTerminalFact,
 )
 
@@ -80,6 +81,7 @@ class InvocationControlPlane:
                 profile_digest=f"sha256:{request.profile.profile_hash}",
                 envelope_digest=_envelope_digest(request),
                 declared_wall_seconds=request.profile.limits.supervisor_wall_ceiling_seconds,
+                request_shape=_request_shape(request),
             )
             self.store.record_local(request.invocation_id, InvocationLifecyclePhase.ADMITTED)
         except InvocationAlreadyActiveError:
@@ -252,6 +254,39 @@ def _envelope_digest(request: InvocationRequest) -> str:
     }
     encoded = json.dumps(safe_envelope, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _request_shape(request: InvocationRequest) -> InvocationRequestShape:
+    """Return only safe byte counts for durable/scene comparison.
+
+    The runtime has no profile-owned hidden instruction layer. Record the
+    visible Prompt size, actual mounted Skill count, transport schema size,
+    and granted tool count so a project-execution Agent can compare a zero-event
+    request with a passing control without persisting content.
+    """
+
+    output_schema = request.profile.output_schema
+    return InvocationRequestShape(
+        prompt_bytes=len(request.prompt.encode("utf-8")),
+        runtime_skill_count=len(request.profile.skills),
+        output_schema_bytes=(
+            len(
+                json.dumps(
+                    output_schema,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+            if output_schema is not None
+            else None
+        ),
+        allowed_builtin_tool_count=len(request.profile.allowed_builtin_tools),
+        execution_mode=cast(
+            Literal["agentic", "single_shot_structured"], request.execution_mode.value
+        ),
+        continued_session=request.session is not None,
+    )
 
 
 def _inferred_ownership(request: InvocationRequest) -> InvocationOwnership:

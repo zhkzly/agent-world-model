@@ -85,7 +85,7 @@ def test_cli_interrupt_terminalizes_real_audit_and_physical_attempt(tmp_path: Pa
             str(config_path),
             "invocation-audit",
             "--lane",
-            "codex_challenger_solver",
+            "codex_engineer_read",
         ),
         cwd=repository,
         env=environment,

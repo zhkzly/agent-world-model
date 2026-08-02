@@ -116,7 +116,7 @@ def test_read_only_tool_is_valid_but_empty_footprint_is_not() -> None:
         _plan(2, namespace="hotel", reads=())
 
 
-def test_bc17_eight_tools_compile_to_at_most_four_stable_two_tool_batches() -> None:
+def test_tool_semantics_eight_tools_compile_to_eight_stable_singleton_shards() -> None:
     plans = tuple(
         _plan(
             index,
@@ -131,16 +131,16 @@ def test_bc17_eight_tools_compile_to_at_most_four_stable_two_tool_batches() -> N
 
     batches = EnvironmentDesigner._tool_semantic_batches(architecture)
 
-    assert len(batches) == 4
-    assert all(1 <= len(batch) <= 2 for batch in batches)
-    assert ToolSemanticsBatchSourceDraft.model_json_schema()["properties"]["tools"]["maxItems"] == 2
-    assert tool_semantics_batch_protocol_schema()["properties"]["tools"]["maxItems"] == 2
+    assert len(batches) == 8
+    assert all(len(batch) == 1 for batch in batches)
+    assert ToolSemanticsBatchSourceDraft.model_json_schema()["properties"]["tools"]["maxItems"] == 1
+    assert tool_semantics_batch_protocol_schema()["properties"]["tools"]["maxItems"] == 1
     assert tuple(tool_id for batch in batches for tool_id in batch) == tuple(
         item.tool_id for item in plans
     )
 
 
-def test_bc17_five_coupled_tools_keep_one_shared_group_and_three_execution_batches() -> None:
+def test_five_coupled_tools_keep_one_shared_group_and_singleton_execution_shards() -> None:
     plans = tuple(
         _plan(index, namespace="hotel", reads=("inventory", "reservations")) for index in range(5)
     )
@@ -164,11 +164,7 @@ def test_bc17_five_coupled_tools_keep_one_shared_group_and_three_execution_batch
     assert len(plan.groups) == 1
     assert plan.groups[0].mode == "multi_batch"
     assert plan.groups[0].shared_state_entity_ids == ("inventory", "reservations")
-    expected_batches = (
-        ("hotel.tool-0", "hotel.tool-1"),
-        ("hotel.tool-2", "hotel.tool-3"),
-        ("hotel.tool-4",),
-    )
+    expected_batches = tuple((f"hotel.tool-{index}",) for index in range(5))
     assert plan.groups[0].batches == expected_batches
     assert plan.execution_batches == expected_batches
 
@@ -336,7 +332,14 @@ def test_tool_batch_prompt_discloses_only_the_target_tool_state_footprint() -> N
         boundary=SimpleNamespace(
             primary_domain="hotel",
             actors_and_authority=(
-                SimpleNamespace(model_dump=lambda **_kwargs: {"actor": "guest"}),
+                SimpleNamespace(
+                    actor="guest",
+                    authorities=("read_booking",),
+                    model_dump=lambda **_kwargs: {
+                        "actor": "guest",
+                        "authorities": ["read_booking"],
+                    },
+                ),
             ),
             systems_of_record=("hotel_system",),
             transition_authorities=("hotel",),
@@ -381,14 +384,23 @@ def test_tool_batch_prompt_discloses_only_the_target_tool_state_footprint() -> N
     )
     frozen = json.loads(prompt.split("Frozen context:\n", maxsplit=1)[1])
 
-    assert 'The complete logical root is exactly {"tools":[...]}' in prompt
-    assert "independent JSON representation audit for every target tool" in prompt
-    assert "The selected value_bindings entry's value_type is the value returned" in prompt
-    assert "reliability.tool_id" in prompt
-    assert "rollback guarantee" in prompt
+    instruction, _separator, _context = prompt.partition("Frozen context:\n")
+    assert "compact ToolSemantics output protocol appended after this Prompt" in instruction
+    assert "target_tools for each exact surface and state footprint" in instruction
+    assert (
+        "rule_context_catalogs and permission_rule_context_catalogs for permitted Rule"
+        in instruction
+    )
+    assert "actor_authorities_by_actor as the exact permission-scope lookup" in instruction
+    assert "infer a missing state root or binding" in instruction
+    assert "never extrapolate, renumber, or cross term kinds" not in instruction
+    assert "reliability.tool_id" not in instruction
     assert "architecture" not in frozen
     assert "world_skeleton" not in frozen
     assert [item["tool_id"] for item in frozen["target_tools"]] == ["hotel.booking.get"]
+    assert frozen["target_tools"][0]["actor_authorities_by_actor"] == {
+        "guest": ["read_booking"]
+    }
     assert "private_records" not in prompt
     catalog = frozen["rule_context_catalogs"]["hotel.booking.get"]
     assert catalog["collections"] == [
@@ -401,6 +413,29 @@ def test_tool_batch_prompt_discloses_only_the_target_tool_state_footprint() -> N
     assert all(
         item["source"] not in {"pre_state", "post_state"} or item["pointer"].startswith("/bookings")
         for item in catalog["reference_bindings"]
+    )
+    assert set(catalog["term_binding_aliases"]) == {
+        "bound_reference",
+        "bound_lookup_by_constant",
+        "bound_lookup_by_reference",
+    }
+    assert set(catalog["ordered_term_binding_aliases"]) == {"number", "string"}
+    permission_catalog = frozen["permission_rule_context_catalogs"]["hotel.booking.get"]
+    assert all(
+        item["source"] in {"args", "pre_state"}
+        for item in permission_catalog["reference_bindings"]
+    )
+    assert all(
+        group["source"] in {"args", "pre_state"}
+        for group in permission_catalog["lookup_binding_groups"]
+    )
+    assert all(
+        group["source"] in {"args", "pre_state"}
+        and all(
+            item["key_source"] in {"args", "pre_state"}
+            for item in group["reference_key_bindings"]
+        )
+        for group in permission_catalog["lookup_reference_binding_groups"]
     )
 
 
@@ -482,18 +517,16 @@ def test_restricted_rule_catalog_keeps_tool_io_but_removes_unowned_state_binding
     )
 
 
-def test_targeted_tool_semantics_protocol_repeats_the_exact_batch_at_the_final_gate() -> None:
-    """The late protocol tells a stateless model which frozen batch it owns."""
+def test_targeted_tool_semantics_protocol_repeats_the_exact_singleton_at_the_final_gate() -> None:
+    """The late protocol tells a stateless model which one frozen tool it owns."""
 
     generic = tool_semantics_batch_protocol()
-    targeted = tool_semantics_batch_protocol(
-        target_tool_ids=("todo.localstorage.add_task", "todo.localstorage.mark_task_done"),
-    )
+    targeted = tool_semantics_batch_protocol(target_tool_ids=("todo.localstorage.add_task",))
 
     assert "Invocation-specific final completion gate" not in generic
     assert "Invocation-specific final completion gate" in targeted
-    assert '["todo.localstorage.add_task","todo.localstorage.mark_task_done"]' in targeted
-    assert "Return exactly 2 tools in this order" in targeted
+    assert '["todo.localstorage.add_task"]' in targeted
+    assert "Return exactly one tool in this order" in targeted
     assert "conditions, state_transition,\nerrors, access_observation, and reliability" in targeted
     assert tool_semantics_representation_audit() in targeted
     assert "reliability.tool_id is required" in targeted
@@ -503,10 +536,12 @@ def test_targeted_tool_semantics_protocol_repeats_the_exact_batch_at_the_final_g
         targeted.split()
     )
 
-    with pytest.raises(ValueError, match="exact unique target-tool batch"):
+    with pytest.raises(ValueError, match="one exact unique target tool"):
         tool_semantics_batch_protocol(target_tool_ids=())
-    with pytest.raises(ValueError, match="exact unique target-tool batch"):
+    with pytest.raises(ValueError, match="one exact unique target tool"):
         tool_semantics_batch_protocol(target_tool_ids=("tool:a", "tool:a"))
+    with pytest.raises(ValueError, match="one exact unique target tool"):
+        tool_semantics_batch_protocol(target_tool_ids=("tool:a", "tool:b"))
 
 
 def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
@@ -705,6 +740,16 @@ def test_compact_tool_rule_protocol_parses_and_compiles_only_frozen_bindings(
     assert "state_transition.transition => transition" in protocol
     assert "Never emit key_binding_id" in protocol
     assert "Never emit reference, lookup_by_key" in protocol
+    assert "term_binding_aliases as the final" in protocol
+    assert "do not infer a missing alias" in protocol
+    assert "ordered_term_binding_aliases by returned value type" in protocol
+    assert "generic strings or temporal ordering to identifiers/statuses" in protocol
+    assert "permission_rule_context_catalogs" in protocol
+    assert "set condition to null rather than inventing a Rule" in protocol
+    assert "keys exactly equal to every\nfrozen boundary actor" in protocol
+    assert "frozen observation_schema only" in protocol
+    assert "each scope must\nbe copied exactly from that actor's authorities" in protocol
+    assert "must be an error_code declared in this\nsame TOOL's errors.errors list" in protocol
     assert "Pre-serialization representation audit" in protocol
     assert "rollback.guarantees" in protocol
     assert "concurrency.conflict_error_code is either null or one identifier string" in protocol

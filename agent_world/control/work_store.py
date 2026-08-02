@@ -70,6 +70,28 @@ class WorkResumeError(WorkControlStoreError):
     """A head cannot prove an exact reusable WorkCommit."""
 
 
+class WorkDependencyUnavailableError(WorkResumeError):
+    """One scheduled child lost a deterministic parent readiness fact."""
+
+    def __init__(
+        self,
+        *,
+        child: WorkCoordinate,
+        parent: WorkCoordinate,
+        parent_status: str,
+        reason_code: str,
+    ) -> None:
+        self.child = child
+        self.parent = parent
+        self.parent_status = parent_status
+        self.reason_code = reason_code
+        parent_label = ".".join((parent.component, parent.stage, parent.artifact_slot))
+        super().__init__(
+            f"cannot resolve inputs: parent {parent_label} is {parent_status}; "
+            f"reason={reason_code}"
+        )
+
+
 class WorkControlHead(V2Contract):
     """Mutable pointer to immutable WorkGraph authority Artifacts."""
 
@@ -479,6 +501,52 @@ class WorkControlStore:
             conflict_prefix="causal repair",
         )
 
+    def authorize_refreshed_causal_repair(
+        self,
+        lock: WorkControlLock,
+        *,
+        expected_head: WorkControlHead,
+        next_head: WorkControlHead,
+    ) -> WorkControlHead:
+        """Install one new causal action after an explicit authoring revision.
+
+        The old terminal Attempt remains immutable evidence, while the
+        replacement action belongs to a new Prompt/Skill/leaf definition with
+        the same coordinate, Work identity, and frozen input closure. This is
+        intentionally narrower than ordinary causal repair: it may change the
+        definition and acceptance identities only while reopening a settled
+        head as one newly authorized action.
+        """
+
+        next_head = WorkControlHead.model_validate(next_head.model_dump(mode="python"))
+        self._validate_lock(lock, next_head.coordinate)
+        current = self.read_head(next_head.coordinate)
+        if current != expected_head:
+            raise WorkHeadConflictError("WorkGraph head changed before refreshed causal repair")
+        if current.status not in {"committed", "failed", "needs_human", "interrupted"}:
+            raise WorkHeadConflictError("refreshed causal repair target is not terminal")
+        if (
+            next_head.scope_id != current.scope_id
+            or next_head.coordinate != current.coordinate
+            or next_head.work_id != current.work_id
+            or next_head.definition_digest == current.definition_digest
+            or next_head.input_fingerprint != current.input_fingerprint
+            or next_head.revision != current.revision + 1
+            or next_head.status != "repair_authorized"
+            or next_head.attempt_ref != current.attempt_ref
+            or next_head.active_operation_ref is not None
+            or next_head.evaluation_ref is None
+            or next_head.repair_action_ref is None
+            or next_head.commit_ref is not None
+            or not next_head.invalidated_by_refs
+        ):
+            raise WorkHeadConflictError("invalid refreshed causal repair authorization transition")
+        self._atomic_write(
+            self._head_path(next_head.scope_id, next_head.coordinate.coordinate_key),
+            next_head.stable_json_bytes(),
+        )
+        return next_head
+
     def authorize_infrastructure_retry(
         self,
         lock: WorkControlLock,
@@ -755,6 +823,7 @@ class WorkControlStore:
         definition: WorkDefinition,
         input_refs: tuple[ArtifactRef, ...],
         artifacts: ArtifactWriter,
+        required_commit_ref: ArtifactRef | None = None,
     ) -> tuple[WorkCommit, ArtifactRef] | None:
         """Restore one exact immutable commit after an unrelated head superseded it.
 
@@ -772,6 +841,7 @@ class WorkControlStore:
             definition=definition,
             input_refs=input_refs,
             artifacts=artifacts,
+            required_commit_ref=required_commit_ref,
         )
         if found is None:
             return None
@@ -820,12 +890,18 @@ class WorkControlStore:
         definition: WorkDefinition,
         input_refs: tuple[ArtifactRef, ...],
         artifacts: ArtifactWriter,
+        required_commit_ref: ArtifactRef | None = None,
     ) -> tuple[WorkCommit, ArtifactRef, ArtifactRef] | None:
         """Find one exact prior success without changing the mutable projection."""
 
         expected_fingerprint = self.input_fingerprint(input_refs)
         candidates: dict[str, tuple[WorkCommit, ArtifactRef, ArtifactRef]] = {}
-        for commit_ref in artifacts.list_revisions():
+        commit_refs = (
+            (required_commit_ref,)
+            if required_commit_ref is not None
+            else artifacts.list_revisions()
+        )
+        for commit_ref in commit_refs:
             if commit_ref.artifact_type != "control.work_commit":
                 continue
             try:

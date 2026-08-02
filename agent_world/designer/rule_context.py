@@ -214,10 +214,82 @@ class RuleContextCatalog:
         framework-owned vocabulary before source materialization.
         """
 
+        return self._prompt_projection(
+            reference_bindings=self.prompt_reference_bindings(),
+            lookup_bindings=self.prompt_lookup_bindings(),
+            lookup_reference_bindings=self.prompt_lookup_reference_bindings(),
+        )
+
+    def prompt_projection_for_sources(
+        self,
+        *,
+        allowed_sources: frozenset[str],
+    ) -> dict[str, object]:
+        """Project only aliases whose complete materialization uses allowed sources.
+
+        This is an Agent-facing choice view, not a second binding vocabulary:
+        every alias is selected from the full catalog before filtering, so it
+        still resolves through this catalog's normal materializer.  It lets a
+        rule family expose its narrower existing source contract without
+        renumbering aliases or changing executable Rule semantics.
+        """
+
+        reference_bindings = {
+            alias: binding
+            for alias, binding in self.prompt_reference_bindings().items()
+            if binding.source in allowed_sources
+        }
+        lookup_bindings = {
+            alias: binding
+            for alias, binding in self.prompt_lookup_bindings().items()
+            if binding.source in allowed_sources
+        }
+        lookup_reference_bindings = {
+            alias: binding
+            for alias, binding in self.prompt_lookup_reference_bindings().items()
+            if (
+                binding.lookup_binding.source in allowed_sources
+                and binding.key_binding.source in allowed_sources
+            )
+        }
+        return self._prompt_projection(
+            reference_bindings=reference_bindings,
+            lookup_bindings=lookup_bindings,
+            lookup_reference_bindings=lookup_reference_bindings,
+        )
+
+    def _prompt_projection(
+        self,
+        *,
+        reference_bindings: Mapping[str, FrozenRuleReferenceBinding],
+        lookup_bindings: Mapping[str, FrozenRuleLookupBinding],
+        lookup_reference_bindings: Mapping[str, FrozenRuleLookupReferenceBinding],
+    ) -> dict[str, object]:
+        """Render a compact projection from aliases owned by this catalog."""
+
+        def ordered_aliases(*, value_types: frozenset[RuleValueType]) -> dict[str, list[str]]:
+            return {
+                "bound_reference": [
+                    alias
+                    for alias, binding in reference_bindings.items()
+                    if binding.value_type in value_types
+                ],
+                "bound_lookup_by_constant": [
+                    alias
+                    for alias, binding in lookup_bindings.items()
+                    if binding.value_type in value_types
+                ],
+                "bound_lookup_by_reference": [
+                    alias
+                    for alias, binding in lookup_reference_bindings.items()
+                    if binding.lookup_binding.value_type in value_types
+                ],
+            }
+
         lookup_groups: dict[
             tuple[str, str, str, str], list[tuple[str, FrozenRuleLookupBinding]]
         ] = {}
-        for alias, lookup_binding in self.prompt_lookup_bindings().items():
+        for alias, lookup_binding in lookup_bindings.items():
             lookup_groups.setdefault(
                 (
                     lookup_binding.source,
@@ -232,7 +304,7 @@ class RuleContextCatalog:
             tuple[str, str, str, str, str, str],
             list[tuple[str, FrozenRuleLookupReferenceBinding]],
         ] = {}
-        for alias, lookup_reference_binding in self.prompt_lookup_reference_bindings().items():
+        for alias, lookup_reference_binding in lookup_reference_bindings.items():
             lookup = lookup_reference_binding.lookup_binding
             lookup_reference_groups.setdefault(
                 (
@@ -247,6 +319,15 @@ class RuleContextCatalog:
             ).append((alias, lookup_reference_binding))
 
         return {
+            "term_binding_aliases": {
+                "bound_reference": list(reference_bindings),
+                "bound_lookup_by_constant": list(lookup_bindings),
+                "bound_lookup_by_reference": list(lookup_reference_bindings),
+            },
+            "ordered_term_binding_aliases": {
+                "number": ordered_aliases(value_types=frozenset({"number", "any"})),
+                "string": ordered_aliases(value_types=frozenset({"string", "any"})),
+            },
             "collections": [
                 {
                     "collection_pointer": pointer,
@@ -262,7 +343,7 @@ class RuleContextCatalog:
                     "pointer": binding.pointer,
                     "value_type": binding.value_type,
                 }
-                for alias, binding in self.prompt_reference_bindings().items()
+                for alias, binding in reference_bindings.items()
             ],
             "lookup_binding_groups": [
                 {

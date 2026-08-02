@@ -101,6 +101,89 @@ class _CapturedScope:
     successor_definition: WorkDefinition
     source_target_attempt_ref: ArtifactRef
     source_target_output_ref: ArtifactRef
+    graph: GenerationWorkGraph
+
+
+def test_continuation_workspace_authority_is_one_marked_diagnostic_runs_root(
+    tmp_path: Path,
+) -> None:
+    diagnostic_root = tmp_path / ".agent-world-live" / "test-node-source"
+    work_control = WorkControlStore(diagnostic_root / "work-control")
+    work_control.mark_test_node_diagnostic_clone()
+    workspace = diagnostic_root / "runs" / "candidate" / ".agent-runtime" / "workspace"
+    workspace.mkdir(parents=True)
+
+    assert test_node_module._marked_diagnostic_runs_root(workspace) == (  # noqa: SLF001
+        diagnostic_root / "runs"
+    )
+
+    unmarked_workspace = (
+        tmp_path / ".agent-world-live" / "test-node-unmarked" / "runs" / "workspace"
+    )
+    unmarked_workspace.mkdir(parents=True)
+    with pytest.raises(
+        NodeError,
+        match="does not belong to one exact marked diagnostic runs root",
+    ):
+        test_node_module._marked_diagnostic_runs_root(unmarked_workspace)  # noqa: SLF001
+
+
+def test_snapshot_repair_uses_fresh_diagnostic_workspace_not_prior_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt_ref = object()
+    action_ref = object()
+    coordinate = object()
+    attempt = SimpleNamespace(
+        # A successful Agent attempt retains this provenance commitment, but
+        # the snapshot action below is the authority for a fresh-session repair.
+        continuation_commitment="sha256:prior-agent-provenance",
+    )
+    action = SimpleNamespace(repair_seed_attempt_ref=object())
+
+    class _Artifacts:
+        @staticmethod
+        def get_json(ref: object, model: object) -> object:
+            if ref is action_ref and model is RepairAction:
+                return action
+            if ref is attempt_ref and model is WorkAttempt:
+                return attempt
+            raise AssertionError((ref, model))
+
+    app = SimpleNamespace(
+        controller=SimpleNamespace(
+            work_control=SimpleNamespace(
+                read_head=lambda requested: (
+                    SimpleNamespace(
+                        status="repair_authorized",
+                        repair_action_ref=action_ref,
+                        attempt_ref=attempt_ref,
+                    )
+                    if requested is coordinate
+                    else None
+                ),
+            ),
+            artifacts=_Artifacts(),
+        ),
+    )
+    monkeypatch.setattr(
+        test_node_module,
+        "NodeContinuationStore",
+        lambda *_args, **_kwargs: pytest.fail(
+            "snapshot repair must not inspect the prior continuation store"
+        ),
+    )
+
+    diagnostic_root = tmp_path / "fresh-diagnostic"
+    assert (
+        test_node_module._authorized_semantic_continuation_workspace_root(  # noqa: SLF001
+            app=app,
+            definition=SimpleNamespace(coordinate=coordinate),
+            diagnostic_root=diagnostic_root,
+        )
+        == diagnostic_root / "runs"
+    )
 
 
 def _config(tmp_path: Path) -> FoundryConfig:
@@ -139,6 +222,9 @@ def _definition(
 def _capture_scope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    repairable_target: bool = False,
+    infrastructure_retryable_target: bool = False,
 ) -> _CapturedScope:
     # The only credential material is process-local and random.  Its variable
     # name is the only credential reference that reaches configuration/artifacts.
@@ -233,6 +319,31 @@ def _capture_scope(
             ),
         }
     )
+    if repairable_target:
+        target = target.model_copy(
+            update={
+                "repair_policy": target.repair_policy.model_copy(
+                    update={
+                        "maximum_local_corrections": 1,
+                        "strict_progress_bonus_corrections": 0,
+                        "maximum_infrastructure_retries": 0,
+                        "maximum_total_repair_attempts": 1,
+                    }
+                ),
+                "allowed_mutation_roots": ("/candidate",),
+            }
+        )
+    if infrastructure_retryable_target:
+        target = target.model_copy(
+            update={
+                "repair_policy": target.repair_policy.model_copy(
+                    update={
+                        "maximum_infrastructure_retries": 1,
+                        "maximum_total_repair_attempts": 1,
+                    }
+                )
+            }
+        )
     successor = _definition(
         scope_id=scope_id,
         stage="unheaded_successor",
@@ -355,7 +466,91 @@ def _capture_scope(
         successor_definition=successor,
         source_target_attempt_ref=target_head.attempt_ref,
         source_target_output_ref=target_output_ref,
+        graph=graph,
     )
+
+
+def test_final_graph_reconciliation_reuses_committed_definition_and_keeps_override_fresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1.1/R1.2/R1.3: reconciliation reuses committed definitions but leaves an
+    explicitly overridden target fresh.
+
+    ``complete_generation_work_graph`` recompiles every final definition from
+    live compiler functions, so a committed coordinate acquires a divergent
+    ``definition_digest`` (fresh ``repair_policy`` / ``*_revision_id``) and the
+    active-commit gate orphans the parent.  The diagnostic reconciliation must
+    swap that fresh definition for the exact committed one, unless the caller
+    intentionally overrides it (budget overlay), in which case it stays fresh.
+    """
+
+    captured = _capture_scope(tmp_path, monkeypatch)
+    app = build_application(captured.config)
+    committed_head = app.controller.work_control.read_head(
+        captured.target_definition.coordinate
+    )
+    assert committed_head is not None and committed_head.status == "committed"
+
+    # Mimic the live-compiler divergence: the same coordinate/work_id, but a
+    # different repair_policy budget → a different definition_digest.
+    divergent_target = captured.target_definition.model_copy(
+        update={
+            "repair_policy": captured.target_definition.repair_policy.model_copy(
+                update={
+                    "maximum_infrastructure_retries": 3,
+                    "maximum_model_fallbacks": 2,
+                    "maximum_total_repair_attempts": 13,
+                }
+            )
+        }
+    )
+    assert divergent_target.definition_digest != committed_head.definition_digest
+
+    fresh_definitions = tuple(
+        divergent_target
+        if definition.coordinate == captured.target_definition.coordinate
+        else definition
+        for definition in captured.graph.definitions
+    )
+    fresh_graph = GenerationWorkGraph.compile(
+        fresh_definitions,
+        mode=captured.graph.mode,
+        strict_input_contracts=True,
+        required_terminal_coordinates=captured.graph.required_terminal_coordinates,
+        groups=captured.graph.groups,
+        milestones=captured.graph.milestones,
+    )
+
+    runner = FinalNodeRunner(
+        config=captured.config,
+        diagnostic_state_root=captured.state_root,
+    )
+
+    # Passthrough: the committed coordinate reuses the committed definition.
+    reconciled = runner._reconcile_final_graph_with_committed(  # noqa: SLF001
+        app=app,
+        scope_id=captured.scope_id,
+        graph=fresh_graph,
+    )
+    reconciled_target = reconciled.require(captured.target_definition.coordinate)
+    assert reconciled_target.definition_digest == committed_head.definition_digest
+    assert reconciled_target.definition_digest != divergent_target.definition_digest
+
+    # Overlay preservation (R1.3): an explicitly excluded target stays fresh.
+    reconciled_override = runner._reconcile_final_graph_with_committed(  # noqa: SLF001
+        app=app,
+        scope_id=captured.scope_id,
+        graph=fresh_graph,
+        exclude_coordinates=(captured.target_definition.coordinate,),
+    )
+    assert (
+        reconciled_override.require(
+            captured.target_definition.coordinate
+        ).definition_digest
+        == divergent_target.definition_digest
+    )
+    app.telemetry.close()
 
 
 def _assert_diagnostic_result_artifacts(
@@ -486,11 +681,12 @@ async def test_test_node_refreshes_a_current_implementation_as_one_new_scheduler
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A code/Prompt/Skill revision is durable evidence, not a budget disguise."""
+    """A code/Prompt/Skill refresh preserves its frozen Agent model lineage."""
 
     captured = _capture_scope(tmp_path, monkeypatch)
     updated_implementation = "framework.test-node-current-implementation.v1"
     updated_validator = "framework.test-node-current-validator.v1"
+    inherited_model = "gpt-5.4-mini"
     monkeypatch.setattr(
         test_node_module,
         "current_runtime_revisions_for_definition",
@@ -500,10 +696,25 @@ async def test_test_node_refreshes_a_current_implementation_as_one_new_scheduler
             else None
         ),
     )
+    monkeypatch.setattr(
+        test_node_module,
+        "_inherited_diagnostic_runtime_profile_config",
+        lambda *, app, manifest_ref, definition, config: (
+            config.model_copy(
+                update={
+                    "agent": config.agent.model_copy(
+                        update={"model": inherited_model, "fallback_models": ()}
+                    )
+                }
+            ),
+            (SimpleNamespace(model=inherited_model),),
+        ),
+    )
     dispatched_definitions: list[WorkDefinition] = []
 
     def executor_factory(execution: NodeExecution):
         async def execute(context) -> None:
+            assert execution.app.config.agent.model == inherited_model
             dispatched_definitions.append(execution.definition)
             input_refs = tuple(
                 dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
@@ -553,6 +764,8 @@ async def test_test_node_refreshes_a_current_implementation_as_one_new_scheduler
     assert override.source_definition_digest == captured.target_definition.definition_digest
     assert override.implementation_revision_id == updated_implementation
     assert override.validator_revision_id == updated_validator
+    assert override.source_proposal_budget == captured.target_definition.proposal_policy.budget
+    assert override.proposal_budget == captured.target_definition.proposal_policy.budget
     assert override.diagnostic_only is True
     assert override.releasable is False
 
@@ -567,7 +780,7 @@ def test_runtime_profile_overlay_freezes_one_changed_agent_provenance(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A transport experiment becomes a new epoch, not a hidden config retry."""
+    """A model experiment becomes a new epoch, not a hidden config retry."""
 
     captured = _capture_scope(tmp_path, monkeypatch)
     WorkControlStore(captured.state_root / "work-control").mark_test_node_diagnostic_clone()
@@ -595,9 +808,7 @@ def test_runtime_profile_overlay_freezes_one_changed_agent_provenance(
             context_ref=manifest.external_root_refs[0],
         ),
         source_model=captured.config.agent.model,
-        model=captured.config.agent.model,
-        source_transport="provider_schema",
-        transport="json_object",
+        model="gpt-5.4-mini",
     )
 
     assert overlay.definition.coordinate == definition.coordinate
@@ -610,14 +821,26 @@ def test_runtime_profile_overlay_freezes_one_changed_agent_provenance(
     assert override.source_manifest_ref == manifest_ref
     assert override.source_definition_digest == definition.definition_digest
     assert override.source_model == captured.config.agent.model
-    assert override.model == captured.config.agent.model
-    assert override.source_structured_output_transport == "provider_schema"
-    assert override.structured_output_transport == "json_object"
+    assert override.model == "gpt-5.4-mini"
     assert override.implementation_revision_id == (
         overlay.definition.proposal_policy.implementation_revision_id
     )
     assert override.diagnostic_only is True
     assert override.releasable is False
+    inherited_config, inherited_overrides = (
+        test_node_module._inherited_diagnostic_runtime_profile_config(  # noqa: SLF001
+            app=app,
+            manifest_ref=overlay.manifest_ref,
+            definition=overlay.definition,
+            config=captured.config,
+        )
+    )
+    assert inherited_overrides == (override,)
+    assert inherited_config.agent.model == "gpt-5.4-mini"
+    assert inherited_config.agent.model_routes == (
+        "gpt-5.4-mini",
+        captured.config.agent.model,
+    )
 
 
 def test_test_node_reconstructs_legacy_definition_without_implicit_model_fallback(
@@ -702,21 +925,162 @@ def test_runtime_profile_overlay_freezes_one_model_only_change(
             definition=definition,
             context_ref=manifest.external_root_refs[0],
         ),
-        source_model="gpt-5.4-mini",
+        source_model=captured.config.agent.model,
         model="gpt-5.3-codex-spark",
-        source_transport="json_envelope",
-        transport="json_envelope",
     )
 
     override = artifacts.get_json(overlay.override_ref, DiagnosticRuntimeProfileOverride)
-    assert override.source_model == "gpt-5.4-mini"
+    assert override.source_model == captured.config.agent.model
     assert override.model == "gpt-5.3-codex-spark"
-    assert override.source_structured_output_transport == "json_envelope"
-    assert override.structured_output_transport == "json_envelope"
     assert (
         overlay.definition.proposal_policy.implementation_revision_id
         != definition.proposal_policy.implementation_revision_id
     )
+    inherited_config, inherited_overrides = (
+        test_node_module._inherited_diagnostic_runtime_profile_config(  # noqa: SLF001
+            app=app,
+            manifest_ref=overlay.manifest_ref,
+            definition=overlay.definition,
+            config=captured.config,
+        )
+    )
+    assert inherited_overrides == (override,)
+    assert inherited_config.agent.model == "gpt-5.3-codex-spark"
+    assert inherited_config.agent.model_routes == (
+        "gpt-5.3-codex-spark",
+        captured.config.agent.model,
+    )
+
+
+def test_inherited_profile_ignores_one_provable_duplicate_overlay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A repeated historic model wrapper must not block its frozen repair turn."""
+
+    captured = _capture_scope(tmp_path, monkeypatch)
+    WorkControlStore(captured.state_root / "work-control").mark_test_node_diagnostic_clone()
+    app = build_application(captured.config)
+    artifacts = app.controller.artifacts
+    manifest_ref = next(
+        ref
+        for ref in artifacts.list_revisions()
+        if ref.artifact_type == "control.work_graph_manifest"
+    )
+    manifest = artifacts.get_json(manifest_ref, WorkGraphManifest)
+    graph = NodeRunner._reconstruct_graph(artifacts, manifest)  # noqa: SLF001 - frozen test input
+    definition = next(
+        item for item in graph.definitions if item.coordinate.stage == "evidence_synthesis"
+    )
+    source = test_node_module._ProposalEnvelopeOverlaySource(  # noqa: SLF001
+        graph=graph,
+        manifest=manifest,
+        manifest_ref=manifest_ref,
+        definition=definition,
+        context_ref=manifest.external_root_refs[0],
+    )
+    first = test_node_module._apply_diagnostic_runtime_profile_overlay(  # noqa: SLF001
+        app=app,
+        source=source,
+        source_model=captured.config.agent.model,
+        model="grok-4.5",
+    )
+    second = test_node_module._apply_diagnostic_runtime_profile_overlay(  # noqa: SLF001
+        app=app,
+        source=test_node_module._ProposalEnvelopeOverlaySource(  # noqa: SLF001
+            graph=first.graph,
+            manifest=first.manifest,
+            manifest_ref=first.manifest_ref,
+            definition=first.definition,
+            context_ref=source.context_ref,
+        ),
+        source_model=captured.config.agent.model,
+        model="grok-4.5",
+    )
+
+    inherited_config, inherited_overrides = (
+        test_node_module._inherited_diagnostic_runtime_profile_config(  # noqa: SLF001
+            app=app,
+            manifest_ref=second.manifest_ref,
+            definition=second.definition,
+            config=captured.config,
+        )
+    )
+
+    assert len(inherited_overrides) == 2
+    assert inherited_config.agent.model == "grok-4.5"
+
+
+def test_model_diagnostic_promotes_a_configured_fallback_without_duplicate_route(
+    tmp_path: Path,
+) -> None:
+    """A model-only node diagnostic must remain executable after promotion."""
+
+    config = _config(tmp_path)
+    source_model = config.agent.model
+    promoted_model = "gpt-5.3-codex-spark"
+    configured = config.model_copy(
+        update={
+            "agent": config.agent.model_copy(
+                update={"fallback_models": (promoted_model, "gpt-5.4-mini")}
+            )
+        }
+    )
+
+    change = test_node_module._diagnostic_runtime_profile_change(  # noqa: SLF001
+        configured,
+        diagnostic_model=promoted_model,
+        diagnostic_source_model=source_model,
+    )
+
+    assert change.config.agent.model == promoted_model
+    assert change.config.agent.fallback_models == (source_model, "gpt-5.4-mini")
+    assert change.config.agent.model_routes == (
+        promoted_model,
+        source_model,
+        "gpt-5.4-mini",
+    )
+    # The captured/live configuration itself stays untouched; only the
+    # isolated diagnostic application receives the normalized route list.
+    assert configured.agent.model == source_model
+    assert configured.agent.fallback_models == (promoted_model, "gpt-5.4-mini")
+
+
+def test_terminal_retry_preserves_only_later_configured_model_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A proved retry route keeps its declared successors for later fallback."""
+
+    base = _config(tmp_path)
+    config = base.model_copy(
+        update={
+            "agent": base.agent.model_copy(
+                update={
+                    "model": "gpt-5.4-mini",
+                    "fallback_models": ("gpt-5.3-codex-spark", "grok-4.5"),
+                }
+            )
+        }
+    )
+    app = SimpleNamespace(
+        controller=SimpleNamespace(artifacts=SimpleNamespace(get_json=lambda _ref, _type: object()))
+    )
+    monkeypatch.setattr(
+        test_node_module.TestNodeRunner,
+        "_proposal_executions",
+        lambda _artifacts, _attempt: (SimpleNamespace(model="gpt-5.3-codex-spark"),),
+    )
+
+    retried = test_node_module._diagnostic_terminal_profile_config(  # noqa: SLF001
+        app=app,
+        retry_head=SimpleNamespace(attempt_ref=object()),
+        config=config,
+    )
+
+    assert retried.agent.model == "gpt-5.3-codex-spark"
+    assert retried.agent.fallback_models == ("grok-4.5",)
+    assert config.agent.model_routes == ("gpt-5.4-mini", "gpt-5.3-codex-spark", "grok-4.5")
 
 
 @pytest.mark.asyncio
@@ -727,7 +1091,7 @@ async def test_test_node_nonterminal_scheduler_error_rebuilds_fresh_running_scen
     """A harness failure cannot inherit a stale successful scene from its parent."""
 
     captured = _capture_scope(tmp_path, monkeypatch)
-    diagnostic_parent = tmp_path / "diagnostics"
+    diagnostic_parent = tmp_path / ".agent-world-live"
 
     def executor_factory(_execution: NodeExecution):
         async def execute(_context) -> None:
@@ -885,17 +1249,18 @@ async def test_diagnostic_descendant_dispatches_one_unheaded_successor_from_diag
 
 
 @pytest.mark.asyncio
-async def test_diagnostic_descendant_runtime_refresh_regenerates_without_reusing_authorized_repair(
+async def test_diagnostic_descendant_runtime_refresh_reauthorizes_settled_causal_repair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Prompt/Skill revision supersedes old repair state rather than borrowing it.
+    """A Prompt/Skill revision derives new repair authority from settled evidence.
 
     This is the true Scheduler boundary for a real bad-case shape: a candidate
-    already has precise semantic repair authority, but a causal runtime
-    implementation revision requires a fresh definition.  The regenerated
-    attempt must retain its immutable parent closure while receiving neither
-    the old RepairAction nor its private continuation binding.
+    first completed one precise semantic correction, but a causal runtime
+    implementation revision needs another turn. The refreshed attempt retains
+    its immutable parent closure, source snapshot, and exact downstream
+    feedback while receiving neither the old RepairAction nor its private
+    continuation binding.
     """
 
     captured = _capture_scope(tmp_path, monkeypatch)
@@ -1218,7 +1583,7 @@ async def test_diagnostic_descendant_runtime_refresh_regenerates_without_reusing
 
     regenerated = await DescendantRunner(
         config=captured.config,
-        diagnostic_state_root=committed_root,
+        diagnostic_state_root=Path(executed_repair.diagnostic_state_root),
         diagnostic_parent=diagnostic_parent,
         executor_factory=regeneration_executor_factory,
     ).run(
@@ -1230,21 +1595,30 @@ async def test_diagnostic_descendant_runtime_refresh_regenerates_without_reusing
 
     assert regenerated.status == "committed"
     assert regenerated.runtime_implementation_override_ref is not None
-    assert regenerated.superseded_stale_attempt_ref == authorized_head.attempt_ref
+    assert regenerated.superseded_stale_attempt_ref == executed_repair.target_attempt_ref
     assert regenerated.superseded_stale_definition_digest == repair_successor.definition_digest
-    assert regenerated.superseded_authorized_repair_action_ref == old_repair_action_ref
-    assert seen_repair_actions == [None]
+    assert regenerated.superseded_authorized_repair_action_ref is None
+    assert regenerated.authorized_repair_action_ref is not None
+    assert regenerated.authorized_repair_action_ref != old_repair_action_ref
+    assert seen_repair_actions == [regenerated.authorized_repair_action_ref]
     regenerated_artifacts = ArtifactStore(Path(regenerated.diagnostic_state_root) / "artifacts")
-    prior_attempt = committed_artifacts.get_json(
-        authorized_head.attempt_ref,
-        WorkAttempt,
-    )
     regenerated_attempt = regenerated_artifacts.get_json(
         regenerated.target_attempt_ref,
         WorkAttempt,
     )
-    assert regenerated_attempt.parent_attempt_id == prior_attempt.attempt_id
-    assert regenerated_attempt.repair_action_ref is None
+    refreshed_action = regenerated_artifacts.get_json(
+        regenerated.authorized_repair_action_ref,
+        RepairAction,
+    )
+    old_action = committed_artifacts.get_json(old_repair_action_ref, RepairAction)
+    assert regenerated_attempt.parent_attempt_id == executed_attempt.attempt_id
+    assert regenerated_attempt.repair_action_ref == regenerated.authorized_repair_action_ref
+    assert refreshed_action.definition_digest != old_action.definition_digest
+    assert refreshed_action.causal_evidence_refs == (
+        source_evaluation_ref,
+        source_report_ref,
+        route_ref,
+    )
 
 
 @pytest.mark.asyncio
@@ -1481,17 +1855,19 @@ async def test_diagnostic_descendant_allows_one_explicit_retryable_infrastructur
 
 
 @pytest.mark.asyncio
-async def test_diagnostic_descendant_recovers_one_private_candidate_draft_in_a_fresh_session(
+async def test_diagnostic_descendant_recovers_nested_private_candidate_drafts_in_fresh_sessions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A copied diagnostic child may inspect, but never adopt, its parent's draft.
+    """Each copied diagnostic child may inspect, but never adopt, its parent's draft.
 
     The first descendant executes a real Scheduler boundary and creates normal
     files under its private ``runs/`` workspace before a classified Provider
     terminal.  The next descendant receives neither that directory nor an old
     Provider thread; its sole authority is the action-bound private recovery
-    record copied with the durable diagnostic control state.
+    record copied with the durable diagnostic control state.  If that fresh
+    child itself receives a transport terminal after writing more files, its
+    new draft belongs to the child rather than to its source root.
     """
 
     captured = _capture_scope(tmp_path, monkeypatch)
@@ -1554,9 +1930,9 @@ async def test_diagnostic_descendant_recovers_one_private_candidate_draft_in_a_f
         agent_token_limit=1_000,
         maximum_local_corrections=1,
         strict_progress_bonus_corrections=0,
-        maximum_infrastructure_retries=1,
+        maximum_infrastructure_retries=2,
         maximum_model_fallbacks=0,
-        maximum_total_repair_attempts=2,
+        maximum_total_repair_attempts=3,
         input_slots=(
             ArtifactSlotContract(
                 slot_id="input:diagnostic-target",
@@ -1610,6 +1986,7 @@ async def test_diagnostic_descendant_recovers_one_private_candidate_draft_in_a_f
     config_digest = sha256_digest(canonical_json_bytes({"config": "diagnostic-engineer"}))
     schema_digest = sha256_digest(canonical_json_bytes({"schema": "candidate-completion"}))
     written_workspace: Path | None = None
+    retried_workspace: Path | None = None
 
     def provenance(dispatch_id: str) -> AgentExecutionProvenance:
         return AgentExecutionProvenance(
@@ -1696,10 +2073,12 @@ async def test_diagnostic_descendant_recovers_one_private_candidate_draft_in_a_f
     first_root = Path(first.diagnostic_state_root)
     assert written_workspace.is_relative_to(first_root / "runs")
 
-    def recovered_executor_factory(execution: NodeExecution):
+    def retried_failure_executor_factory(execution: NodeExecution):
         kernel = SchedulerLeafExecutor(runtime=execution.runtime)
 
-        async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        async def proposal(_context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+            nonlocal retried_workspace
+            assert execution.app.config.agent.model == model
             assert attempt.continuation_commitment is not None
             assert execution.runtime.continuations is not None
             assert execution.runtime.continuation_workspace_root == first_root / "runs"
@@ -1717,6 +2096,104 @@ async def test_diagnostic_descendant_recovers_one_private_candidate_draft_in_a_f
                 (written_workspace / "candidate" / "runtime.py")
                 .read_text(encoding="utf-8")
                 .startswith("def draft_runtime")
+            )
+            workspace = execution.workspace_root
+            (workspace / "candidate").mkdir(parents=True)
+            (workspace / "candidate" / "runtime.py").write_text(
+                "def recovered_draft_runtime(): return 'still-untrusted'\n",
+                encoding="utf-8",
+            )
+            retried_workspace = workspace.resolve()
+            ownership = kernel.invocation_ownership(
+                definition=execution.definition,
+                attempt=attempt,
+                dispatch_id=dispatch_id,
+            )
+            execution.app.invocation_control.begin(
+                invocation_id=dispatch_id,
+                owner=ownership,
+                route="codex_sdk",
+                model=model,
+                profile_digest=profile_digest,
+                envelope_digest="e" * 64,
+                declared_wall_seconds=60,
+            )
+            execution.app.invocation_control.settle(
+                dispatch_id,
+                terminal=InvocationTerminalFact(
+                    status=InvocationStatus.FAILED,
+                    code="turn_failed_provider_unavailable",
+                    retryable=True,
+                ),
+            )
+            raise LeafExecutionFailure(
+                code="agent_backend_turn_failed_provider_unavailable",
+                category="the Provider closed after a fresh recovery workspace was written",
+                retryable=True,
+                observed_actual=BudgetUsage(llm_tokens=1_000, agent_turns=1),
+                agent=provenance(dispatch_id),
+                workspace_recovery=LeafWorkspaceRecovery(
+                    workspace=workspace.resolve(),
+                    lineage_id="implementation:diagnostic-private-retry-draft",
+                    profile_digest=profile_digest,
+                    codex_config_digest=config_digest,
+                    model=model,
+                    output_schema_digest=schema_digest,
+                ),
+            )
+
+        async def execute(context) -> None:
+            await kernel.execute(context, definition=execution.definition, proposal_runner=proposal)
+
+        return execute
+
+    drifted_config = captured.config.model_copy(
+        update={
+            "agent": captured.config.agent.model_copy(
+                update={"model": "different-current-default", "fallback_models": ()}
+            )
+        }
+    )
+    retried_failure = await DescendantRunner(
+        config=drifted_config,
+        diagnostic_state_root=first_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=retried_failure_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=candidate.coordinate.coordinate_key,
+        required_manifest_ref=manifest_ref,
+        infrastructure_retry=True,
+    )
+    assert retried_failure.status == "failed"
+    assert retried_failure.infrastructure_retry_action_ref is not None
+    assert retried_workspace is not None
+    retry_root = Path(retried_failure.diagnostic_state_root)
+    assert retried_workspace.is_relative_to(retry_root / "runs")
+    assert not retried_workspace.is_relative_to(first_root / "runs")
+
+    def recovered_executor_factory(execution: NodeExecution):
+        kernel = SchedulerLeafExecutor(runtime=execution.runtime)
+
+        async def proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+            assert execution.app.config.agent.model == model
+            assert attempt.continuation_commitment is not None
+            assert execution.runtime.continuations is not None
+            assert execution.runtime.continuation_workspace_root == retry_root / "runs"
+            record = execution.runtime.continuations.load_commitment(
+                attempt.continuation_commitment,
+                workspace_root=execution.runtime.continuation_workspace_root,
+            )
+            assert record is not None
+            assert record.continuation_kind == "workspace_recovery"
+            assert record.thread_id is None
+            assert record.workspace_for_recovery() == retried_workspace
+            with pytest.raises(ContinuationStoreError, match="cannot resume a Provider thread"):
+                record.restore_session()
+            assert (
+                (retried_workspace / "candidate" / "runtime.py")
+                .read_text(encoding="utf-8")
+                .startswith("def recovered_draft_runtime")
             )
             output_ref = execution.app.controller.artifacts.put_json(
                 artifact_id=f"candidate-workspace-recovered:{execution.run_id}",
@@ -1737,8 +2214,8 @@ async def test_diagnostic_descendant_recovers_one_private_candidate_draft_in_a_f
         return execute
 
     recovered = await DescendantRunner(
-        config=captured.config,
-        diagnostic_state_root=first_root,
+        config=drifted_config,
+        diagnostic_state_root=retry_root,
         diagnostic_parent=diagnostic_parent,
         executor_factory=recovered_executor_factory,
     ).run(
@@ -1749,15 +2226,15 @@ async def test_diagnostic_descendant_recovers_one_private_candidate_draft_in_a_f
     )
     assert recovered.status == "committed"
     assert recovered.infrastructure_retry_action_ref is not None
-    retry_artifacts = ArtifactStore(Path(recovered.diagnostic_state_root) / "artifacts")
-    action = retry_artifacts.get_json(recovered.infrastructure_retry_action_ref, RepairAction)
-    retry_attempt = retry_artifacts.get_json(recovered.target_attempt_ref, WorkAttempt)
+    recovery_artifacts = ArtifactStore(Path(recovered.diagnostic_state_root) / "artifacts")
+    action = recovery_artifacts.get_json(recovered.infrastructure_retry_action_ref, RepairAction)
+    recovery_attempt = recovery_artifacts.get_json(recovered.target_attempt_ref, WorkAttempt)
     assert action.workspace_recovery is True
     # The recovery commitment existed only while the fresh Agent was inspecting
     # the private draft (asserted inside ``recovered_executor_factory``).  A
     # successful commit must clear it so no future attempt can reuse the draft.
-    assert retry_attempt.continuation_commitment is None
-    assert str(written_workspace) not in retry_attempt.model_dump_json()
+    assert recovery_attempt.continuation_commitment is None
+    assert str(retried_workspace) not in recovery_attempt.model_dump_json()
 
 
 @pytest.mark.asyncio
@@ -2004,6 +2481,294 @@ async def test_diagnostic_descendant_authorizes_then_executes_one_actionable_sem
     assert repaired_attempt.parent_attempt_id == first_attempt.attempt_id
     assert repaired_attempt.repair_action_ref == authorized.authorized_repair_action_ref
     assert repaired_attempt.repair_attempt_charge == 1
+
+
+@pytest.mark.asyncio
+async def test_initial_test_node_failure_can_authorize_and_execute_one_semantic_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An isolated first-node failure can use the explicit repair bridge.
+
+    The target's only parent is a normal captured commit, which is exactly the
+    shape produced by ``test-node``.  A plain descendant remains forbidden;
+    only the two explicit semantic-repair phases may cross the bridge after
+    the initial failure is proved diagnostic-only.
+    """
+
+    captured = _capture_scope(tmp_path, monkeypatch, repairable_target=True)
+    diagnostic_parent = tmp_path / ".agent-world-live"
+    first_calls: list[str] = []
+
+    def failing_executor_factory(execution: NodeExecution):
+        kernel = SchedulerLeafExecutor(runtime=execution.runtime)
+
+        async def proposal(_context, _attempt, _dispatch_id) -> LeafProposal:
+            first_calls.append("rejected-initial-target")
+            raise LeafValidationFailure(
+                issues=(
+                    ValidationIssue(
+                        code="test_initial_target_binding_alias_invalid",
+                        path=("candidate", "binding_id"),
+                        violated_condition=(
+                            "the initial candidate selected a binding outside the frozen alias set"
+                        ),
+                        expected_category="one alias from the frozen target catalog",
+                        remediation="Preserve valid content and replace only the invalid alias.",
+                    ),
+                ),
+                output_commitment=sha256_digest(b"test-initial-target-invalid-alias"),
+                category="deterministic_binding_alias",
+            )
+
+        async def execute(context) -> None:
+            await kernel.execute(
+                context,
+                definition=execution.definition,
+                proposal_runner=proposal,
+            )
+
+        return execute
+
+    first = await NodeRunner(
+        config=captured.config,
+        source_state_root=captured.state_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=failing_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+    )
+
+    assert first_calls == ["rejected-initial-target"]
+    assert first.status == "failed"
+    assert first.validation_report.repair_actionable is True
+    first_root = Path(first.diagnostic_state_root)
+    first_app = build_application(captured.config.model_copy(update={"state_root": first_root}))
+    first_artifacts = first_app.controller.artifacts
+    manifest_ref = next(
+        ref
+        for ref in first_artifacts.list_revisions()
+        if ref.artifact_type == "control.work_graph_manifest"
+    )
+    parent_head = first_app.controller.work_control.read_head(captured.parent_coordinate)
+    assert parent_head is not None and parent_head.commit_ref is not None
+    parent_commit = first_artifacts.get_json(parent_head.commit_ref, WorkCommit)
+    assert not parent_commit.diagnostic_only
+
+    with pytest.raises(NodeError) as ordinary_descendant:
+        await DescendantRunner(
+            config=captured.config,
+            diagnostic_state_root=first_root,
+            diagnostic_parent=diagnostic_parent,
+        ).run(
+            scope_id=captured.scope_id,
+            target_coordinate=captured.target_definition.coordinate.coordinate_key,
+            required_manifest_ref=manifest_ref,
+        )
+    assert ordinary_descendant.value.code == "test_descendant_no_diagnostic_parent"
+
+    authorization_executor_calls: list[NodeExecution] = []
+
+    def forbidden_authorization_executor(execution: NodeExecution):
+        authorization_executor_calls.append(execution)
+        raise AssertionError("semantic repair authorization must not create an executor")
+
+    authorized = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=first_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=forbidden_authorization_executor,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+        required_manifest_ref=manifest_ref,
+        authorize_semantic_repair=True,
+    )
+
+    assert authorization_executor_calls == []
+    assert authorized.status == "repair_authorized"
+    assert authorized.authorized_repair_action_ref is not None
+    first_attempt = first_artifacts.get_json(first.target_attempt_ref, WorkAttempt)
+    authorized_artifacts = ArtifactStore(Path(authorized.diagnostic_state_root) / "artifacts")
+    action = authorized_artifacts.get_json(
+        authorized.authorized_repair_action_ref,
+        RepairAction,
+    )
+    assert action.decision == "local_correction"
+    assert action.immutable_input_refs == first_attempt.input_refs
+    assert action.allowed_mutation_roots == ("/candidate",)
+
+    repair_briefs: list[tuple[ValidationIssue, ...]] = []
+
+    def repaired_executor_factory(execution: NodeExecution):
+        kernel = SchedulerLeafExecutor(runtime=execution.runtime)
+
+        async def execute(context) -> None:
+            brief = kernel.agent_correction_brief(context, definition=execution.definition)
+            assert brief is not None
+            repair_briefs.append(brief.issues)
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"initial-target-repaired:{execution.run_id}",
+                artifact_type="design.test_node_target",
+                value={"source": "one-authorized-initial-target-repair"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+            )
+
+        return execute
+
+    repaired = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=Path(authorized.diagnostic_state_root),
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=repaired_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+        required_manifest_ref=manifest_ref,
+        execute_authorized_repair=True,
+    )
+
+    assert repaired.status == "committed"
+    assert repaired.reserved_budget.repair_attempts == 1
+    assert len(repair_briefs) == 1
+    assert repair_briefs[0][0].code == "test_initial_target_binding_alias_invalid"
+    repaired_artifacts = ArtifactStore(Path(repaired.diagnostic_state_root) / "artifacts")
+    repaired_attempt = repaired_artifacts.get_json(repaired.target_attempt_ref, WorkAttempt)
+    assert repaired_attempt.parent_attempt_id == first_attempt.attempt_id
+    assert repaired_attempt.repair_action_ref == authorized.authorized_repair_action_ref
+    assert repaired_attempt.repair_attempt_charge == 1
+
+
+@pytest.mark.asyncio
+async def test_initial_test_node_failure_can_retry_one_infrastructure_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The initial test-node bridge applies to a classified route retry too.
+
+    Its only parent is an ordinary captured commit. The retry remains safe
+    because the failed target itself is a marked diagnostic terminal and the
+    runtime rechecks its exact retryable report before creating the attempt.
+    """
+
+    captured = _capture_scope(
+        tmp_path,
+        monkeypatch,
+        infrastructure_retryable_target=True,
+    )
+    diagnostic_parent = tmp_path / ".agent-world-live"
+    first_calls: list[str] = []
+
+    def failing_executor_factory(execution: NodeExecution):
+        kernel = SchedulerLeafExecutor(runtime=execution.runtime)
+
+        async def proposal(_context, _attempt, _dispatch_id) -> LeafProposal:
+            first_calls.append("retryable-initial-target")
+            raise LeafExecutionFailure(
+                code="test_initial_target_provider_unavailable",
+                category="one typed transient provider-route failure",
+                retryable=True,
+                expected_category="one fresh physical attempt after same-route liveness succeeds",
+            )
+
+        async def execute(context) -> None:
+            await kernel.execute(
+                context,
+                definition=execution.definition,
+                proposal_runner=proposal,
+            )
+
+        return execute
+
+    first = await NodeRunner(
+        config=captured.config,
+        source_state_root=captured.state_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=failing_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+    )
+
+    assert first_calls == ["retryable-initial-target"]
+    assert first.status == "failed"
+    assert first.validation_report.infrastructure_retryable is True
+    first_root = Path(first.diagnostic_state_root)
+    first_app = build_application(captured.config.model_copy(update={"state_root": first_root}))
+    first_artifacts = first_app.controller.artifacts
+    manifest_ref = next(
+        ref
+        for ref in first_artifacts.list_revisions()
+        if ref.artifact_type == "control.work_graph_manifest"
+    )
+    parent_head = first_app.controller.work_control.read_head(captured.parent_coordinate)
+    assert parent_head is not None and parent_head.commit_ref is not None
+    parent_commit = first_artifacts.get_json(parent_head.commit_ref, WorkCommit)
+    assert not parent_commit.diagnostic_only
+
+    retry_calls: list[WorkCoordinate] = []
+
+    def recovered_executor_factory(execution: NodeExecution):
+        kernel = SchedulerLeafExecutor(runtime=execution.runtime)
+
+        async def proposal(context, _attempt, _dispatch_id) -> LeafProposal:
+            retry_calls.append(context.coordinate)
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"initial-target-retry-recovered:{execution.run_id}",
+                artifact_type="design.test_node_target",
+                value={"source": "one-initial-target-infrastructure-retry"},
+                dependencies=input_refs,
+            )
+            return LeafProposal(output_refs=(output_ref,), subject_refs=(output_ref,))
+
+        async def execute(context) -> None:
+            await kernel.execute(
+                context,
+                definition=execution.definition,
+                proposal_runner=proposal,
+            )
+
+        return execute
+
+    retried = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=first_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=recovered_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+        required_manifest_ref=manifest_ref,
+        infrastructure_retry=True,
+    )
+
+    assert retry_calls == [captured.target_definition.coordinate]
+    assert retried.status == "committed"
+    assert retried.infrastructure_retry_action_ref is not None
+    retried_artifacts = ArtifactStore(Path(retried.diagnostic_state_root) / "artifacts")
+    action = retried_artifacts.get_json(
+        retried.infrastructure_retry_action_ref,
+        RepairAction,
+    )
+    previous_attempt = first_artifacts.get_json(first.target_attempt_ref, WorkAttempt)
+    retry_attempt = retried_artifacts.get_json(retried.target_attempt_ref, WorkAttempt)
+    assert action.decision == "infrastructure_retry"
+    assert retry_attempt.parent_attempt_id == previous_attempt.attempt_id
+    assert retry_attempt.repair_action_ref == retried.infrastructure_retry_action_ref
+    assert retry_attempt.repair_attempt_charge == 1
 
 
 @pytest.mark.asyncio
@@ -2275,6 +3040,124 @@ async def test_test_node_failed_target_is_terminal_evidence_not_a_repair_loop(
     assert diagnostic_head.status == "failed"
     assert diagnostic_head.repair_action_ref is None
     assert diagnostic_head.commit_ref is None
+
+
+@pytest.mark.asyncio
+async def test_descendant_refresh_restarts_one_locally_failed_node_after_authoring_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed Code-Agent development loop may start a fresh first attempt.
+
+    This is not an unbounded retry and it does not borrow a Scheduler repair
+    action.  The source is one fully observed local validation failure; the
+    overlay changes its authoring revision, then the ordinary Scheduler opens
+    a new attempt with the same frozen parent closure.
+    """
+
+    captured = _capture_scope(tmp_path, monkeypatch)
+    diagnostic_parent = tmp_path / ".agent-world-live"
+
+    def failing_executor_factory(execution: NodeExecution):
+        async def execute(context) -> None:
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"local-refresh-failed:{execution.run_id}",
+                artifact_type="design.test_node_target",
+                value={"source": "local-validation-failure"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+                issues=(
+                    (
+                        "test_node_local_authoring_failure",
+                        ("candidate",),
+                        "The first local authoring revision failed its real validation boundary.",
+                        "the frozen target acceptance condition",
+                    ),
+                ),
+            )
+
+        return execute
+
+    failed = await NodeRunner(
+        config=captured.config,
+        source_state_root=captured.state_root,
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=failing_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+    )
+    assert failed.status == "failed"
+    assert failed.validation_report.status == "failed"
+    failed_artifacts = ArtifactStore(Path(failed.diagnostic_state_root) / "artifacts")
+    manifest_ref = next(
+        reference
+        for reference in failed_artifacts.list_revisions()
+        if reference.artifact_type == "control.work_graph_manifest"
+    )
+
+    updated_implementation = "framework.test-descendant-local-refresh.v1"
+    updated_validator = "framework.test-descendant-local-validator.v1"
+    monkeypatch.setattr(
+        test_node_module,
+        "current_runtime_revisions_for_definition",
+        lambda definition: (
+            (updated_implementation, updated_validator)
+            if definition.coordinate == captured.target_definition.coordinate
+            else None
+        ),
+    )
+    dispatched: list[WorkDefinition] = []
+
+    def refreshed_executor_factory(execution: NodeExecution):
+        async def execute(context) -> None:
+            dispatched.append(execution.definition)
+            input_refs = tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            )
+            output_ref = execution.app.controller.artifacts.put_json(
+                artifact_id=f"local-refresh-passed:{execution.run_id}",
+                artifact_type="design.test_node_target",
+                value={"source": "fresh-current-authoring-revision"},
+                dependencies=input_refs,
+            )
+            execution.runtime.execute_deterministic_boundary(
+                definition=execution.definition,
+                input_refs=input_refs,
+                subject_ref=output_ref,
+                output_refs=(output_ref,),
+            )
+
+        return execute
+
+    refreshed = await DescendantRunner(
+        config=captured.config,
+        diagnostic_state_root=Path(failed.diagnostic_state_root),
+        diagnostic_parent=diagnostic_parent,
+        executor_factory=refreshed_executor_factory,
+    ).run(
+        scope_id=captured.scope_id,
+        target_coordinate=captured.target_definition.coordinate.coordinate_key,
+        required_manifest_ref=manifest_ref,
+        refresh_current_implementation=True,
+    )
+
+    assert refreshed.status == "committed"
+    assert refreshed.runtime_implementation_override_ref is not None
+    assert refreshed.authorized_repair_action_ref is None
+    assert refreshed.reserved_budget.repair_attempts == 0
+    assert refreshed.superseded_stale_attempt_ref == failed.target_attempt_ref
+    assert len(dispatched) == 1
+    assert dispatched[0].proposal_policy.implementation_revision_id == updated_implementation
+    assert dispatched[0].validation_policy.validator_revision_id == updated_validator
 
 
 @pytest.mark.asyncio
@@ -2638,7 +3521,7 @@ def test_test_node_cli_accepts_exact_scope_coordinate_and_source_override(tmp_pa
     assert parsed.proposal_llm_tokens is None
     assert parsed.proposal_wall_seconds is None
     assert parsed.refresh_current_implementation is False
-    assert parsed.diagnostic_structured_output_transport is None
+    assert not hasattr(parsed, "diagnostic_structured_output_transport")
     assert parsed.diagnostic_model is None
     assert parsed.diagnostic_source_model is None
 
@@ -2680,23 +3563,19 @@ def test_test_node_cli_accepts_one_current_runtime_implementation_refresh(tmp_pa
     assert parsed.proposal_wall_seconds is None
 
 
-def test_test_node_cli_accepts_one_profile_transport_overlay(tmp_path: Path) -> None:
-    parsed = build_parser().parse_args(
-        [
-            "test-node",
-            "generate-job:test-node",
-            "research.evidence_synthesis.evidence_synthesis",
-            "--source-state-root",
-            str(tmp_path / "captured-state"),
-            "--diagnostic-structured-output-transport",
-            "json_object",
-        ]
-    )
-
-    assert parsed.diagnostic_structured_output_transport == "json_object"
-    assert parsed.refresh_current_implementation is False
-    assert parsed.proposal_llm_tokens is None
-    assert parsed.proposal_wall_seconds is None
+def test_test_node_cli_rejects_legacy_profile_transport_overlay(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "test-node",
+                "generate-job:test-node",
+                "research.evidence_synthesis.evidence_synthesis",
+                "--source-state-root",
+                str(tmp_path / "captured-state"),
+                "--diagnostic-structured-output-transport",
+                "json_object",
+            ]
+        )
 
 
 def test_test_node_cli_accepts_one_model_only_profile_overlay(tmp_path: Path) -> None:
@@ -2716,7 +3595,7 @@ def test_test_node_cli_accepts_one_model_only_profile_overlay(tmp_path: Path) ->
 
     assert parsed.diagnostic_source_model == "gpt-5.4-mini"
     assert parsed.diagnostic_model == "gpt-5.3-codex-spark"
-    assert parsed.diagnostic_structured_output_transport is None
+    assert not hasattr(parsed, "diagnostic_structured_output_transport")
 
 
 def test_descendant_node_cli_requires_marked_diagnostic_source(tmp_path: Path) -> None:
@@ -2738,7 +3617,7 @@ def test_descendant_node_cli_requires_marked_diagnostic_source(tmp_path: Path) -
     assert parsed.proposal_llm_tokens is None
     assert parsed.proposal_wall_seconds is None
     assert parsed.infrastructure_retry is False
-    assert parsed.diagnostic_structured_output_transport is None
+    assert not hasattr(parsed, "diagnostic_structured_output_transport")
     assert parsed.diagnostic_model is None
     assert parsed.diagnostic_source_model is None
 
@@ -2852,24 +3731,21 @@ def test_descendant_node_cli_accepts_one_feedback_only_diagnostic(
     assert parsed.proposal_wall_seconds is None
 
 
-def test_descendant_node_cli_accepts_one_profile_transport_overlay(
+def test_descendant_node_cli_rejects_legacy_profile_transport_overlay(
     tmp_path: Path,
 ) -> None:
-    parsed = build_parser().parse_args(
-        [
-            "test-descendant-node",
-            "generate-job:test-node",
-            "build.candidate_build.environment_candidate",
-            "--diagnostic-state-root",
-            str(tmp_path / ".agent-world-live" / "test-node-source"),
-            "--diagnostic-structured-output-transport",
-            "json_object",
-        ]
-    )
-
-    assert parsed.diagnostic_structured_output_transport == "json_object"
-    assert parsed.infrastructure_retry is False
-    assert parsed.diagnostic_terminal_feedback is False
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "test-descendant-node",
+                "generate-job:test-node",
+                "build.candidate_build.environment_candidate",
+                "--diagnostic-state-root",
+                str(tmp_path / ".agent-world-live" / "test-node-source"),
+                "--diagnostic-structured-output-transport",
+                "json_object",
+            ]
+        )
 
 
 def test_descendant_node_cli_accepts_one_model_only_profile_overlay(
@@ -2891,7 +3767,7 @@ def test_descendant_node_cli_accepts_one_model_only_profile_overlay(
 
     assert parsed.diagnostic_source_model == "gpt-5.4-mini"
     assert parsed.diagnostic_model == "gpt-5.3-codex-spark"
-    assert parsed.diagnostic_structured_output_transport is None
+    assert not hasattr(parsed, "diagnostic_structured_output_transport")
 
 
 def test_world_plan_node_cli_requires_one_marked_legacy_diagnostic_root(
@@ -3014,6 +3890,26 @@ def test_final_node_cli_selects_one_frozen_initial_batch(
     assert parsed.proposal_wall_seconds is None
 
 
+def test_final_node_cli_selects_runtime_integration_without_a_model_envelope(
+    tmp_path: Path,
+) -> None:
+    diagnostic_state = str(tmp_path / ".agent-world-live" / "test-node-plan-derived-design")
+    parsed = build_parser().parse_args(
+        [
+            "test-final-node",
+            "generate-job:test-node",
+            "runtime_integration",
+            "--diagnostic-state-root",
+            diagnostic_state,
+        ]
+    )
+
+    assert parsed.target_stage == "runtime_integration"
+    assert parsed.batch_index is None
+    assert parsed.proposal_llm_tokens is None
+    assert parsed.proposal_wall_seconds is None
+
+
 def test_final_node_cli_accepts_one_explicit_long_diagnostic_envelope(
     tmp_path: Path,
 ) -> None:
@@ -3113,6 +4009,12 @@ def test_final_node_target_selection_binds_one_physical_batch() -> None:
         stage="implementation_plan",
         artifact_slot="implementation_plan",
     )
+    runtime_integration = WorkCoordinate(
+        scope_id=scope_id,
+        component="integration",
+        stage="runtime_integration",
+        artifact_slot="integration_report",
+    )
     first_batch = WorkCoordinate(
         scope_id=scope_id,
         component="verifier",
@@ -3125,7 +4027,12 @@ def test_final_node_target_selection_binds_one_physical_batch() -> None:
     graph = SimpleNamespace(
         definitions=tuple(
             SimpleNamespace(coordinate=coordinate)
-            for coordinate in (implementation_plan, first_batch, second_batch)
+            for coordinate in (
+                implementation_plan,
+                first_batch,
+                second_batch,
+                runtime_integration,
+            )
         )
     )
     plan = SimpleNamespace(batches=(object(), object()))
@@ -3148,6 +4055,15 @@ def test_final_node_target_selection_binds_one_physical_batch() -> None:
         )
         == second_batch
     )
+    assert (
+        FinalNodeRunner._initial_target(
+            final_graph=graph,  # type: ignore[arg-type]
+            verifier_plan=plan,  # type: ignore[arg-type]
+            target_stage="runtime_integration",
+            batch_index=None,
+        )
+        == runtime_integration
+    )
     with pytest.raises(NodeError, match="1-based index"):
         FinalNodeRunner._initial_target(
             final_graph=graph,  # type: ignore[arg-type]
@@ -3155,6 +4071,55 @@ def test_final_node_target_selection_binds_one_physical_batch() -> None:
             target_stage="verifier_intent_batch",
             batch_index=3,
         )
+
+
+def test_final_node_reports_inactive_candidate_before_integration_dispatch() -> None:
+    with pytest.raises(
+        NodeError,
+        match="CandidateBuild predecessor is not active",
+    ):
+        FinalNodeRunner._require_dispatchable_final_target(  # noqa: SLF001
+            target_stage="runtime_integration",
+            scheduled_state="waiting",
+        )
+
+    FinalNodeRunner._require_dispatchable_final_target(  # noqa: SLF001
+        target_stage="runtime_integration",
+        scheduled_state="stale",
+    )
+
+    with pytest.raises(NodeError, match="implementation_plan is blocked"):
+        FinalNodeRunner._require_dispatchable_final_target(  # noqa: SLF001
+            target_stage="implementation_plan",
+            scheduled_state="blocked",
+        )
+
+
+@pytest.mark.parametrize(
+    ("diagnostic_only", "releasable", "expected"),
+    (
+        (False, True, True),
+        (True, False, True),
+        (False, False, False),
+        (True, True, False),
+    ),
+)
+def test_final_epoch_verifier_plan_anchor_accepts_only_normal_or_diagnostic_modes(
+    diagnostic_only: bool,
+    releasable: bool,
+    expected: bool,
+) -> None:
+    commit = SimpleNamespace(
+        diagnostic_only=diagnostic_only,
+        releasable=releasable,
+    )
+
+    assert (
+        DescendantRunner._is_eligible_final_epoch_verifier_plan_anchor(  # type: ignore[arg-type]  # noqa: SLF001
+            commit
+        )
+        is expected
+    )
 
 
 def test_final_epoch_overlay_feedback_routes_stale_design_predecessor_to_final_harness() -> None:

@@ -21,6 +21,7 @@ from agent_world.contracts import (
     ArtifactRef,
     Budget,
     BudgetUsage,
+    EnvironmentDesign,
     EnvironmentJob,
     EnvironmentRequest,
     GenerationContext,
@@ -65,6 +66,7 @@ from .work import WorkAttempt, WorkCommit, WorkCoordinate, WorkDefinition
 from .work_epoch import WorkGraphEpochRuntime
 from .work_graph import (
     GenerationWorkGraph,
+    bind_model_route_recovery_policy,
     compile_design_work_graph,
     compile_world_work_graph,
     complete_generation_work_graph,
@@ -208,6 +210,7 @@ class DirectWorkRunner:
     route_liveness_checker: RouteLivenessChecker | None = None
     require_route_liveness_gate: bool = False
     infrastructure_retry_backoff_seconds: float = 0.0
+    maximum_same_model_infrastructure_retries: int = 1
     maximum_concurrency: int = 4
     projector: SceneProjector | None = None
 
@@ -397,19 +400,45 @@ class DirectWorkRunner:
         kernel = SchedulerLeafExecutor(runtime=runtime)
         plan_ref = self._active_output(verifier_plan, artifact_type="judge.verifier_batch_plan")
         plan = self.artifacts.get_json(plan_ref, VerifierBatchPlan)
-        final_graph = complete_generation_work_graph(
-            scope_id=job.job_id,
-            design_graph=design_graph,
-            implementation_plan_token_limit=self._codegen_physical_turn_tokens(context.budget),
-            implementation_plan_wall_seconds=self._codegen_session_wall(context.budget),
-            implementation_plan_session_token_limit=self._codegen_session_tokens(context.budget),
-            implementation_plan_session_wall_seconds=self._codegen_session_wall(context.budget),
-            builder_token_limit=self._codegen_physical_turn_tokens(context.budget),
-            builder_wall_seconds=self._codegen_session_wall(context.budget),
-            builder_session_token_limit=self._codegen_session_tokens(context.budget),
-            builder_session_wall_seconds=self._codegen_session_wall(context.budget),
-            verifier_batch_count=len(plan.batches),
-            strict_input_contracts=True,
+        modeling_definition = self._one_definition(
+            design_graph,
+            component="design",
+            stage="modeling_boundary",
+        )
+        design_ref = self._active_output(
+            modeling_definition,
+            artifact_type="design.environment_design",
+        )
+        design = self.artifacts.get_json(design_ref, EnvironmentDesign)
+        if plan.design_ref != design_ref:
+            raise DirectWorkRunnerError(
+                "committed VerifierPlan does not bind the final graph EnvironmentDesign"
+            )
+        final_graph = self._bind_model_route_recovery_graph(
+            complete_generation_work_graph(
+                scope_id=job.job_id,
+                design_graph=design_graph,
+                implementation_plan_token_limit=self._codegen_physical_turn_tokens(context.budget),
+                implementation_plan_wall_seconds=self._codegen_session_wall(context.budget),
+                implementation_plan_session_token_limit=self._codegen_session_tokens(
+                    context.budget
+                ),
+                implementation_plan_session_wall_seconds=self._codegen_session_wall(context.budget),
+                builder_token_limit=self._codegen_physical_turn_tokens(context.budget),
+                builder_wall_seconds=self._codegen_session_wall(context.budget),
+                builder_session_token_limit=self._codegen_session_tokens(context.budget),
+                builder_session_wall_seconds=self._codegen_session_wall(context.budget),
+                verifier_batch_count=len(plan.batches),
+                verifier_token_limit=self._verifier_group_tokens(
+                    context.budget, batch_count=len(plan.batches)
+                ),
+                verifier_wall_seconds=self._verifier_group_wall(
+                    context.budget, batch_count=len(plan.batches)
+                ),
+                environment_design=design,
+                verifier_batch_plan=plan,
+                strict_input_contracts=True,
+            )
         )
         final_manifest, final_manifest_ref, _final_epoch, final_epoch_ref = epochs.freeze_final(
             context_ref=context_ref,
@@ -509,7 +538,9 @@ class DirectWorkRunner:
         kernel = SchedulerLeafExecutor(runtime=runtime)
         epochs = WorkGraphEpochRuntime(artifacts=self.artifacts, heads=self.heads)
 
-        bootstrap_definitions = self._bootstrap_definitions(job)
+        bootstrap_definitions = self._bind_model_route_recovery_definitions(
+            self._bootstrap_definitions(job)
+        )
         bootstrap_graph = GenerationWorkGraph.compile(
             bootstrap_definitions,
             mode="diagnostic",
@@ -564,6 +595,7 @@ class DirectWorkRunner:
             agent_wall_seconds=self._agent_wall(context.budget),
             agent_token_limit=self._agent_tokens(context.budget),
         )
+        world_definitions = self._bind_model_route_recovery_definitions(world_definitions)
         world_graph = compile_world_work_graph(
             scope_id=job.job_id,
             world_definitions=world_definitions,
@@ -623,6 +655,9 @@ class DirectWorkRunner:
             modeling_template=modeling_template,
             agent_wall_seconds=self._agent_wall(context.budget),
             agent_token_limit=self._agent_tokens(context.budget),
+        )
+        final_design_definitions = self._bind_model_route_recovery_definitions(
+            final_design_definitions
         )
         task_requirement_order = tuple(
             item.coordinate
@@ -713,6 +748,38 @@ class DirectWorkRunner:
             agent_token_limit=agent_tokens,
         )
         return plan, acquisition, synthesis, architecture
+
+    def _bind_model_route_recovery_definitions(
+        self,
+        definitions: tuple[WorkDefinition, ...],
+    ) -> tuple[WorkDefinition, ...]:
+        """Freeze configured same-route retry and fallback policy into eligible Agent nodes."""
+
+        return bind_model_route_recovery_policy(
+            definitions,
+            model_routes=self.model_routes,
+            maximum_same_model_infrastructure_retries=(
+                self.maximum_same_model_infrastructure_retries
+            ),
+        )
+
+    def _bind_model_route_recovery_graph(
+        self,
+        graph: GenerationWorkGraph,
+    ) -> GenerationWorkGraph:
+        """Recompile a graph after route policy becomes definition-bound."""
+
+        definitions = self._bind_model_route_recovery_definitions(graph.definitions)
+        if definitions == graph.definitions:
+            return graph
+        return GenerationWorkGraph.compile(
+            definitions,
+            mode=graph.mode,
+            strict_input_contracts=True,
+            required_terminal_coordinates=graph.required_terminal_coordinates,
+            groups=graph.groups,
+            milestones=graph.milestones,
+        )
 
     def _bootstrap_executors(
         self,
@@ -850,9 +917,10 @@ class DirectWorkRunner:
         release_judge = EnvironmentJudge(
             artifact_store=self.judge.artifacts,
             clean_builder=self.judge.clean_builder,
-            runtime_isolation=self.judge.runtime_isolation,
+            runtime_execution=self.judge.runtime_execution,
             telemetry=self.judge.telemetry,
             known_secret_canaries=self.judge.known_secret_canaries,
+            runtime_episode_concurrency=self.judge.runtime_episode_concurrency,
         )
         dossier_compiler = ReleaseDossierCompiler(artifacts=self.artifacts, heads=self.heads)
         executors: dict[str, object] = {}
@@ -952,7 +1020,11 @@ class DirectWorkRunner:
         # after its dispatch fence before considering a new ready wave; never
         # allow an active lease to turn a recovery into a misleading budget
         # exhaustion.
-        self._reconcile_abandoned_operations(graph=graph, runtime=runtime)
+        self._reconcile_abandoned_operations(
+            graph=graph,
+            runtime=runtime,
+            scheduler=scheduler,
+        )
         if stop_after_first_block:
             preferred_keys = {
                 coordinate.coordinate_key: index for index, coordinate in enumerate(preferred_order)
@@ -1010,11 +1082,35 @@ class DirectWorkRunner:
         *,
         graph: GenerationWorkGraph,
         runtime: WorkControlRuntime,
+        scheduler: WorkScheduler,
     ) -> None:
         for definition in graph.topological_definitions():
             with runtime.heads.exclusive(definition.coordinate) as lock:
                 head = runtime.heads.read_head(definition.coordinate)
-                if head is None or head.status != "running" or head.active_operation_ref is None:
+                if head is None or head.status != "running":
+                    continue
+                if head.active_operation_ref is None:
+                    # A never-commenced orphan: the prior process died between the
+                    # Scheduler's durable ``begin`` and the leaf's first
+                    # ``start_operation``.  No OperationRun exists to settle, so the
+                    # ordinary reconcile path skips it and the Scheduler would pin it
+                    # ``running`` forever.  Reset it to a fresh running attempt only
+                    # when the current graph definition matches the frozen head:
+                    # it is then the SAME definition/inputs and consumed zero work,
+                    # so re-opening one attempt cannot double-spend.  A head whose
+                    # frozen definition differs from the current graph is a
+                    # changed-definition case (supersede authority), not a
+                    # never-commenced same-definition reset, and is left untouched.
+                    if (
+                        head.work_id == definition.work_id
+                        and head.definition_digest == definition.definition_digest
+                    ):
+                        resolved = scheduler.resolve_inputs(definition.coordinate)
+                        runtime.resume_uncommenced_running(
+                            lock,
+                            definition=definition,
+                            input_refs=resolved.all_input_refs,
+                        )
                     continue
                 recovery_definition = (
                     definition
@@ -1341,6 +1437,49 @@ class DirectWorkRunner:
 
     def _agent_tokens(self, budget: Budget) -> int:
         return min(self.structured_turn_token_limit, max(1, budget.llm_tokens))
+
+    def _verifier_group_tokens(self, budget: Budget, *, batch_count: int) -> int:
+        """Size the whole verifier-intent group so each batch keeps a full turn.
+
+        ``_verifier_intent_group`` splits the group token limit evenly across its
+        batches (``token_limit // batch_count``), and each batch is one real
+        Challenger turn. The canonical control-plane sizes a structured verifier
+        turn at ``structured_turn_token_limit`` (the same per-turn cap the legacy
+        controller reserves via ``verifier_turn_cap``). A high ``reasoning_challenger``
+        turn genuinely spends ~49-56k tokens, so a batch must receive that full
+        per-turn envelope rather than the frozen 48k graph default, which is
+        below the reasoning floor and turns every clean judge turn into a fatal
+        ``budget_exhausted(llm_tokens)`` settle overshoot. Multiply the per-turn
+        cap by the batch count so the even split restores a full turn per batch,
+        clamped to the remaining scope tokens.
+        """
+
+        per_turn = self._agent_tokens(budget)
+        return min(max(1, per_turn * max(1, batch_count)), max(1, budget.llm_tokens))
+
+    def _verifier_group_wall(self, budget: Budget, *, batch_count: int) -> float:
+        """Size the whole verifier-intent group so each batch keeps a full turn wall.
+
+        ``_verifier_intent_group`` splits the group wall evenly across its batches
+        (``wall_seconds / batch_count``), and each batch is one real Challenger
+        turn. The canonical control-plane grants the verifier group the full
+        remaining scope wall and sizes a structured turn at
+        ``structured_turn_wall_seconds`` (the transport timeout envelope). The
+        frozen 900s graph default splits to 450s per batch, which a genuine
+        high-``reasoning_challenger`` turn (observed ~456s of continuous provider
+        progress, well inside the idle-timeout liveness window) overruns — turning
+        a clean judge turn into a fatal ``budget_exhausted(wall_seconds)`` settle
+        overshoot on the first attempt. This is the wall analogue of the
+        undersized token lease and is disjoint from the transport-liveness clamp:
+        the clamp only rescues a *false* overshoot where a stalled turn's
+        last-progress→terminal gap equals the idle timeout, whereas this is real
+        work that needs a real lease. Multiply the per-turn wall by the batch
+        count so the even split restores a full turn per batch, clamped to the
+        remaining scope wall.
+        """
+
+        per_turn = self._agent_wall(budget)
+        return min(max(1.0, per_turn * max(1, batch_count)), max(1.0, budget.wall_seconds))
 
     def _codegen_session_tokens(self, budget: Budget) -> int:
         return min(self.environment_codegen_session_token_limit, max(1, budget.llm_tokens))

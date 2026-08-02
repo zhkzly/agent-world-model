@@ -42,7 +42,7 @@ from .work_graph import (
     WorkGroupDefinition,
 )
 from .work_runtime import WorkControlRuntime, WorkRuntimeError
-from .work_store import WorkControlStore, WorkResumeError
+from .work_store import WorkControlStore, WorkDependencyUnavailableError, WorkResumeError
 
 type ScheduledState = Literal[
     "ready", "repair_ready", "waiting", "running", "committed", "blocked", "stale"
@@ -90,6 +90,10 @@ class WorkExecutionContext(V2Contract):
     parent_commit_refs: tuple[ArtifactRef, ...] = ()
     parent_output_refs: tuple[ArtifactRef, ...] = ()
     repair_action_ref: ArtifactRef | None = None
+    # The physical action may be a transport retry/fallback.  In that case
+    # this separately binds the original semantic action whose precise
+    # feedback remains authorized for the fresh Provider turn.
+    semantic_repair_context_ref: ArtifactRef | None = None
 
 
 class WorkDispatchResult(V2Contract):
@@ -238,11 +242,21 @@ class WorkScheduler:
                 if parents_available
                 else None
             )
+            unavailable_dependencies = tuple(
+                dependency
+                for dependency in definition.dependency_coordinates
+                if dependency.coordinate_key not in active
+            )
             if head is not None and head.status == "committed":
+                if expected_inputs is None:
+                    scheduled[key] = ScheduledWork(
+                        coordinate=definition.coordinate,
+                        state="waiting",
+                        waiting_on=unavailable_dependencies,
+                    )
+                    continue
                 committed = (
-                    None
-                    if expected_inputs is None
-                    else self._require_usable_commit(
+                    self._require_usable_commit(
                         definition=definition,
                         input_refs=expected_inputs,
                     )
@@ -283,9 +297,21 @@ class WorkScheduler:
                 # example, an explicitly frozen diagnostic-feedback variant)
                 # must not inherit that old authority.  Reconcile it as stale
                 # so ``dispatch_one`` opens a fresh WorkAttempt instead.
+                #
+                # The exact input closure is unknowable until every causal
+                # parent has an active commit.  Treating an old authorization
+                # as repair-ready in that state lets dispatch outrun snapshot:
+                # ``resolve_inputs`` then fails on the unavailable parent.
+                # Hold the child at the causal boundary instead.
+                if expected_inputs is None:
+                    scheduled[key] = ScheduledWork(
+                        coordinate=definition.coordinate,
+                        state="waiting",
+                        waiting_on=unavailable_dependencies,
+                    )
+                    continue
                 if head.definition_digest != definition.definition_digest or (
-                    expected_inputs is not None
-                    and head.input_fingerprint != self.heads.input_fingerprint(expected_inputs)
+                    head.input_fingerprint != self.heads.input_fingerprint(expected_inputs)
                 ):
                     scheduled[key] = ScheduledWork(
                         coordinate=definition.coordinate,
@@ -298,6 +324,23 @@ class WorkScheduler:
                 )
                 continue
             if head is not None and head.status == "running":
+                # A ``running`` head with no active OperationRun never crossed the
+                # dispatch fence: the Scheduler durably wrote it in ``begin`` before
+                # a leaf opened its first operation, and a crash in that window left
+                # a never-commenced attempt that consumed zero work.  Recovery
+                # (``_reconcile_abandoned_operations``) runs before the first
+                # snapshot and resets such an orphan to a fresh running attempt via
+                # ``resume_uncommenced_running``; that fresh attempt is still
+                # ``running & active_operation_ref is None`` and must be
+                # re-dispatchable rather than pinned forever.  ``dispatch_one``'s
+                # ready branch already tolerates an existing running head with no
+                # active operation, so it re-runs the fresh attempt cleanly.
+                if head.active_operation_ref is None:
+                    scheduled[key] = ScheduledWork(
+                        coordinate=definition.coordinate,
+                        state="ready",
+                    )
+                    continue
                 scheduled[key] = ScheduledWork(
                     coordinate=definition.coordinate,
                     state="running",
@@ -311,9 +354,15 @@ class WorkScheduler:
                 # inputs.  Either change invalidates the old terminal verdict;
                 # dispatch will create a new attempt rather than silently reuse
                 # it or leave the replacement definition permanently blocked.
+                if expected_inputs is None:
+                    scheduled[key] = ScheduledWork(
+                        coordinate=definition.coordinate,
+                        state="waiting",
+                        waiting_on=unavailable_dependencies,
+                    )
+                    continue
                 if head.definition_digest != definition.definition_digest or (
-                    expected_inputs is not None
-                    and head.input_fingerprint != self.heads.input_fingerprint(expected_inputs)
+                    head.input_fingerprint != self.heads.input_fingerprint(expected_inputs)
                 ):
                     scheduled[key] = ScheduledWork(
                         coordinate=definition.coordinate,
@@ -424,6 +473,7 @@ class WorkScheduler:
             before_state = "ready"
         resolved = self.resolve_inputs(coordinate)
         repair_action_ref: ArtifactRef | None = None
+        semantic_repair_context_ref: ArtifactRef | None = None
         if scheduled.state == "repair_ready":
             action: RepairAction
             with self.heads.exclusive(coordinate) as lock:
@@ -434,6 +484,11 @@ class WorkScheduler:
                 if repair_action_ref is None:
                     raise WorkRuntimeError("repair-ready Work lacks RepairAction")
                 action = self.artifacts.get_json(repair_action_ref, RepairAction)
+                semantic_repair_context_ref = (
+                    repair_action_ref
+                    if action.decision in {"local_correction", "parent_correction"}
+                    else action.semantic_repair_context_ref
+                )
             if action.route_liveness_required:
                 await self._await_retry_backoff(action)
             with self.heads.exclusive(coordinate) as lock:
@@ -445,6 +500,11 @@ class WorkScheduler:
                 ):
                     raise WorkRuntimeError("repair-ready Work changed during retry admission")
                 action = self.artifacts.get_json(repair_action_ref, RepairAction)
+                semantic_repair_context_ref = (
+                    repair_action_ref
+                    if action.decision in {"local_correction", "parent_correction"}
+                    else action.semantic_repair_context_ref
+                )
                 if action.target_coordinate != coordinate:
                     raise WorkRuntimeError(
                         "parent repair must be scheduled at its causal target coordinate"
@@ -515,6 +575,7 @@ class WorkScheduler:
             parent_commit_refs=resolved.parent_commit_refs,
             parent_output_refs=resolved.parent_output_refs,
             repair_action_ref=repair_action_ref,
+            semantic_repair_context_ref=semantic_repair_context_ref,
         )
         try:
             # Do not pay for a real model/tool proposal when the complete
@@ -556,6 +617,15 @@ class WorkScheduler:
             # own cancellation translation.  Cancellation never admits an
             # infrastructure retry here.
             self._settle_cancelled_dispatch(definition)
+            raise
+        except Exception:
+            # A leaf may finish its external work and then fail while
+            # checkpointing deterministic proposal/validation state. Keep a
+            # final owner fence here so an unhandled framework exception
+            # cannot leave an active OperationRun publicly ``running``. The
+            # leaf kernel normally emits the more precise framework report;
+            # this path is only the non-retryable last resort.
+            self._settle_failed_dispatch(definition)
             raise
         self._route_parent_repair_if_requested(definition)
         head = self.heads.read_head(coordinate)
@@ -612,6 +682,22 @@ class WorkScheduler:
                 lock,
                 definition=definition,
                 interrupted_dispatch_code="process_interrupted_cancelled",
+                allow_infrastructure_retry=False,
+            )
+
+    def _settle_failed_dispatch(self, definition: WorkDefinition) -> None:
+        """Terminalize one unhandled executor failure without authorizing retry."""
+
+        if self.runtime is None:
+            return
+        with self.heads.exclusive(definition.coordinate) as lock:
+            head = self.heads.read_head(definition.coordinate)
+            if head is None or head.status != "running" or head.active_operation_ref is None:
+                return
+            self.runtime.reconcile_abandoned_operation(
+                lock,
+                definition=definition,
+                interrupted_dispatch_code="scheduler_executor_framework_error",
                 allow_infrastructure_retry=False,
             )
 
@@ -681,21 +767,19 @@ class WorkScheduler:
         for parent_coordinate in definition.dependency_coordinates:
             parent = self.graph.require(parent_coordinate)
             head = self.heads.read_head(parent.coordinate)
-            parent_label = ".".join(
-                (
-                    parent.coordinate.component,
-                    parent.coordinate.stage,
-                    parent.coordinate.artifact_slot,
-                )
-            )
             if head is None:
-                raise WorkResumeError(
-                    f"cannot resolve inputs: parent {parent_label} has no Work head"
+                raise WorkDependencyUnavailableError(
+                    child=coordinate,
+                    parent=parent.coordinate,
+                    parent_status="missing",
+                    reason_code="parent_head_missing",
                 )
             if head.status != "committed":
-                raise WorkResumeError(
-                    f"cannot resolve inputs: parent {parent_label} is {head.status}, "
-                    "required committed"
+                raise WorkDependencyUnavailableError(
+                    child=coordinate,
+                    parent=parent.coordinate,
+                    parent_status=head.status,
+                    reason_code="parent_not_committed",
                 )
             attempt = self.artifacts.get_json(head.attempt_ref, WorkAttempt)
             active = self._require_usable_commit(
@@ -703,9 +787,11 @@ class WorkScheduler:
                 input_refs=attempt.input_refs,
             )
             if active is None:
-                raise WorkResumeError(
-                    f"cannot resolve inputs: parent {parent_label} WorkCommit is no longer "
-                    "active for its exact frozen definition/input closure"
+                raise WorkDependencyUnavailableError(
+                    child=coordinate,
+                    parent=parent.coordinate,
+                    parent_status=head.status,
+                    reason_code="parent_commit_inactive",
                 )
             commit, commit_ref = active
             parent_commit_refs.append(commit_ref)

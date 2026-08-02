@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import runpy
 import stat
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +14,7 @@ from pydantic import ValidationError
 from v3_fixture import candidate_files, portable_counter_contracts, write_candidate_project
 
 import agent_world.builder.leaf as builder_leaf_module
+import agent_world.builder.workspace as builder_workspace_module
 from agent_world.artifact_store import ArtifactStore
 from agent_world.builder import (
     BuilderError,
@@ -33,7 +37,14 @@ from agent_world.builder.models import (
     TaskMaterializerContract,
     ToolBindingRequirement,
 )
+from agent_world.builder.precommit import (
+    CandidatePrecommitInfrastructureError,
+    _classify_clean_build_error,
+    _public_test_diagnostic,
+)
+from agent_world.builder.workspace import CandidateWorkspaceDiagnostic
 from agent_world.contracts import (
+    ArtifactRef,
     Budget,
     EnvironmentCandidate,
     EnvironmentJob,
@@ -68,15 +79,482 @@ from agent_world.control import (
 from agent_world.control.continuation_store import NodeContinuationRecord, NodeContinuationStore
 from agent_world.control.work import RepairAction, work_input_fingerprint
 from agent_world.control.work_scheduler import WorkExecutionContext
-from agent_world.invocation import InvocationSession, InvocationStatus
+from agent_world.invocation import (
+    InvocationRequest,
+    InvocationResult,
+    InvocationSession,
+    InvocationStatus,
+    InvocationUsage,
+    ProfileResolutionError,
+    TokenBreakdown,
+)
+from agent_world.judge import CandidateBuildError
+
+
+def test_candidate_skill_preflight_reports_actionable_project_mechanics(tmp_path: Path) -> None:
+    script = Path(
+        "agent_world/agent_assets/skills/engineer-environment-codegen/"
+        "scripts/check_candidate_tree.py"
+    )
+    inputs = tmp_path / "inputs"
+    candidate = tmp_path / "candidate"
+    inputs.mkdir()
+    candidate.mkdir()
+    (inputs / "implementation-contract.json").write_text(
+        json.dumps(
+            {
+                "python_requires": ">=3.12,<3.13",
+                "required_root_files": ["pyproject.toml", "uv.lock", "LICENSE"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (candidate / "pyproject.toml").write_text(
+        "\n".join(
+            (
+                "[project]",
+                'name = "candidate-project"',
+                'version = "0.1.0"',
+                'requires-python = ">=3.12,<3.13"',
+                'license = { file = "LICENSE" }',
+                "",
+                "[tool.uv]",
+                "package = false",
+            )
+        ),
+        encoding="utf-8",
+    )
+    (candidate / "uv.lock").write_text(
+        "\n".join(
+            (
+                "version = 1",
+                "revision = 1",
+                'requires-python = ">=3.12,<3.13"',
+                "",
+                "[[package]]",
+                'name = "candidate-project"',
+                'version = "0.1.0"',
+                'source = { virtual = "." }',
+            )
+        ),
+        encoding="utf-8",
+    )
+    (candidate / "LICENSE").write_text("project-selected license\n", encoding="utf-8")
+    (candidate / "runtime.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    passed = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--workspace", str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert passed.returncode == 0
+    assert "OK candidate-tree-preflight" in passed.stdout
+
+    pyproject = candidate / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            'license = { file = "LICENSE" }',
+            'license = "MIT"',
+        ),
+        encoding="utf-8",
+    )
+    expression_passed = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--workspace", str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert expression_passed.returncode == 0
+    assert "OK candidate-tree-preflight" in expression_passed.stdout
+
+    (candidate / ".venv").mkdir()
+    failed = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--workspace", str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode == 1
+    assert "candidate_derived_path" in failed.stdout
+    assert "path=.venv" in failed.stdout
+
+    (candidate / ".venv").rmdir()
+    (candidate / ".python-version").write_text("3.12\n", encoding="utf-8")
+    unsupported_file = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--workspace", str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert unsupported_file.returncode == 1
+    assert "candidate_file_type_not_allowed" in unsupported_file.stdout
+    assert "path=.python-version" in unsupported_file.stdout
+
+
+def test_candidate_skill_tree_admission_policy_matches_framework() -> None:
+    """The Agent-visible preflight must not admit a framework-rejected file type."""
+
+    script = Path(
+        "agent_world/agent_assets/skills/engineer-environment-codegen/"
+        "scripts/check_candidate_tree.py"
+    )
+    policy = runpy.run_path(str(script))
+
+    assert policy["_FORBIDDEN_DIRECTORIES"] == builder_workspace_module._FORBIDDEN_DIRECTORIES
+    assert policy["_FORBIDDEN_FILENAMES"] == builder_workspace_module._FORBIDDEN_FILENAMES
+    assert policy["_ALLOWED_SUFFIXES"] == builder_workspace_module._ALLOWED_SUFFIXES
+    assert policy["_ALLOWED_EXTENSIONLESS"] == builder_workspace_module._ALLOWED_EXTENSIONLESS
+
+
+def test_candidate_public_test_preflight_uses_direct_frozen_python(tmp_path: Path) -> None:
+    script = Path(
+        "agent_world/agent_assets/skills/engineer-environment-codegen/scripts/check_public_tests.py"
+    )
+    candidate = tmp_path / "candidate"
+    tests = candidate / "tests"
+    tests.mkdir(parents=True)
+    (candidate / "pyproject.toml").write_text(
+        "\n".join(
+            (
+                "[project]",
+                'name = "candidate-public-test-proof"',
+                'version = "0.1.0"',
+                'requires-python = ">=3.12,<3.13"',
+                "",
+                "[tool.uv]",
+                "package = false",
+            )
+        ),
+        encoding="utf-8",
+    )
+    (candidate / "uv.lock").write_text(
+        "\n".join(
+            (
+                "version = 1",
+                "revision = 1",
+                'requires-python = ">=3.12,<3.13"',
+                "",
+                "[[package]]",
+                'name = "candidate-public-test-proof"',
+                'version = "0.1.0"',
+                'source = { virtual = "." }',
+            )
+        ),
+        encoding="utf-8",
+    )
+    public_test = tests / "test_public.py"
+    public_test.write_text("assert 2 + 2 == 4\n", encoding="utf-8")
+    command = [
+        sys.executable,
+        str(script),
+        "--workspace",
+        str(tmp_path),
+        "--test",
+        "tests/test_public.py",
+    ]
+
+    passed = subprocess.run(command, check=False, capture_output=True, text=True)  # noqa: S603
+    assert passed.returncode == 0, passed.stderr
+    assert "OK candidate-public-tests count=1" in passed.stdout
+    assert not (candidate / ".venv").exists()
+
+    public_test.write_text("import missing_public_test_dependency\n", encoding="utf-8")
+    failed = subprocess.run(command, check=False, capture_output=True, text=True)  # noqa: S603
+    assert failed.returncode == 1
+    assert "public_test_import_unavailable path=tests/test_public.py" in failed.stdout
+    assert "missing_public_test_dependency" not in failed.stdout
+
+
+def test_candidate_contract_map_exposes_cross_file_materializer_campaign(
+    tmp_path: Path,
+) -> None:
+    script = Path(
+        "agent_world/agent_assets/skills/engineer-environment-codegen/"
+        "scripts/candidate_contract_map.py"
+    )
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    (inputs / "implementation-contract.json").write_text(
+        json.dumps(
+            {
+                "python_requires": ">=3.12,<3.13",
+                "required_root_files": ["pyproject.toml", "uv.lock", "LICENSE"],
+                "runtime": {
+                    "abi_version": "agent-world.runtime.v2",
+                    "operations": [{"operation": "handshake"}, {"operation": "reset"}],
+                },
+                "task_materializer": {
+                    "candidate_output_fields": [
+                        "seed",
+                        "task_type",
+                        "actor",
+                        "difficulty",
+                        "public_goal",
+                        "initial_config",
+                    ],
+                    "task_types": ["reserve"],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (inputs / "curriculum.json").write_text(
+        json.dumps(
+            {
+                "minimum_distinct_initial_states": 3,
+                "minimum_distinct_tasks_per_type": 10,
+                "difficulty_dimensions": [{"dimension": "load", "levels": ["basic", "advanced"]}],
+                "task_types": [
+                    {
+                        "task_type": "reserve",
+                        "allowed_actor_ids": ["operator"],
+                        "difficulty_dimensions": ["load"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (inputs / "world-spec.json").write_text(
+        json.dumps({"tools": [{"surface": {"tool_id": "booking.reserve"}}]}),
+        encoding="utf-8",
+    )
+
+    passed = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--workspace", str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert passed.returncode == 0
+    assert "CANDIDATE-CONTRACT-MAP v1" in passed.stdout
+    assert "task_type=reserve actors=[operator] difficulty=load=[basic,advanced]" in passed.stdout
+    assert "distinct initial_config>=3" in passed.stdout
+    assert "distinct full materializations>=10" in passed.stdout
+    assert "tools=[booking.reserve]" in passed.stdout
+
+    curriculum = inputs / "curriculum.json"
+    curriculum.write_text(
+        curriculum.read_text(encoding="utf-8").replace('"load"', '"unknown"', 1),
+        encoding="utf-8",
+    )
+    failed = subprocess.run(  # noqa: S603
+        [sys.executable, str(script), "--workspace", str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode == 1
+    assert "task_difficulty_dimension_unknown" in failed.stdout
+    assert "inputs/curriculum.json:/task_types/0/difficulty_dimensions" in failed.stdout
+
+
+def test_candidate_materializer_campaign_reports_diversity_with_safe_coordinates(
+    tmp_path: Path,
+) -> None:
+    script = Path(
+        "agent_world/agent_assets/skills/engineer-environment-codegen/"
+        "scripts/check_materializer_campaign.py"
+    )
+    inputs = tmp_path / "inputs"
+    source = tmp_path / "candidate" / "src" / "sample_candidate"
+    inputs.mkdir()
+    source.mkdir(parents=True)
+    (inputs / "implementation-contract.json").write_text(
+        json.dumps({"task_materializer": {"task_types": ["reserve"]}}),
+        encoding="utf-8",
+    )
+    (inputs / "curriculum.json").write_text(
+        json.dumps(
+            {
+                "minimum_distinct_initial_states": 3,
+                "minimum_distinct_tasks_per_type": 10,
+                "difficulty_dimensions": [{"dimension": "load", "levels": ["basic", "advanced"]}],
+                "task_types": [
+                    {
+                        "task_type": "reserve",
+                        "allowed_actor_ids": ["operator"],
+                        "difficulty_dimensions": ["load"],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "__init__.py").write_text("", encoding="utf-8")
+    materializer = source / "materializer.py"
+    materializer.write_text(
+        "\n".join(
+            (
+                "def materialize(seed, task_type, actor, difficulty):",
+                "    return {",
+                "        'seed': seed, 'task_type': task_type, 'actor': actor,",
+                "        'difficulty': dict(difficulty),",
+                "        'public_goal': {'level': difficulty['load'], 'seed': seed},",
+                "        'initial_config': {'seed': seed},",
+                "    }",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable,
+        str(script),
+        "--workspace",
+        str(tmp_path),
+        "--import-root",
+        "candidate/src",
+        "--entrypoint",
+        "sample_candidate.materializer:materialize",
+    ]
+    passed = subprocess.run(command, check=False, capture_output=True, text=True)  # noqa: S603
+    assert passed.returncode == 0
+    assert "OK candidate-materializer-campaign" in passed.stdout
+
+    materializer.write_text(
+        materializer.read_text(encoding="utf-8").replace("{'seed': seed}", "{'seed': 0}"),
+        encoding="utf-8",
+    )
+    failed = subprocess.run(command, check=False, capture_output=True, text=True)  # noqa: S603
+    assert failed.returncode == 1
+    assert "materializer_initial_diversity" in failed.stdout
+    assert "path=task:reserve/actor:operator/initial_config" in failed.stdout
+
+
+def test_candidate_runtime_handshake_preflight_compares_frozen_schema_losslessly(
+    tmp_path: Path,
+) -> None:
+    script = Path(
+        "agent_world/agent_assets/skills/engineer-environment-codegen/"
+        "scripts/check_runtime_handshake_contract.py"
+    )
+    inputs = tmp_path / "inputs"
+    source = tmp_path / "candidate" / "src"
+    inputs.mkdir()
+    source.mkdir(parents=True)
+    (inputs / "world-spec.json").write_text(
+        json.dumps(
+            {
+                "tools": [
+                    {
+                        "surface": {
+                            "tool_id": "booking.reserve",
+                            "namespace": "booking",
+                            "name": "reserve",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {
+                                    "room_id": {
+                                        "type": "string",
+                                        "description": "Room to reserve.",
+                                    }
+                                },
+                                "required": ["room_id"],
+                                "additionalProperties": False,
+                            },
+                            "output_schema": {
+                                "type": "object",
+                                "properties": {
+                                    "reservation_id": {
+                                        "type": "string",
+                                        "description": "Identifier assigned by the booking system.",
+                                    }
+                                },
+                                "required": ["reservation_id"],
+                                "additionalProperties": False,
+                            },
+                            "observation_schema": {
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": False,
+                            },
+                        }
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    runtime = source / "candidate_runtime.py"
+    runtime.write_text(
+        """from __future__ import annotations
+import json
+import sys
+
+TOOLS = [{
+    \"tool_id\": \"booking.reserve\",
+    \"namespace\": \"booking\",
+    \"name\": \"reserve\",
+    \"input_schema\": {
+        \"type\": \"object\",
+        \"properties\": {
+            \"room_id\": {
+                \"type\": \"string\",
+                \"description\": \"Room to reserve.\",
+            }
+        },
+        \"required\": [\"room_id\"],
+        \"additionalProperties\": False,
+    },
+    \"output_schema\": {
+        \"type\": \"object\",
+        \"properties\": {
+            \"reservation_id\": {
+                \"type\": \"string\",
+                \"description\": \"Identifier assigned by the booking system.\",
+            }
+        },
+        \"required\": [\"reservation_id\"],
+        \"additionalProperties\": False,
+    },
+    \"observation_schema\": {
+        \"type\": \"object\",
+        \"properties\": {},
+        \"additionalProperties\": False,
+    },
+}]
+
+for _line in sys.stdin:
+    print(json.dumps({\"ok\": True, \"result\": {\"tools\": TOOLS}}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    command = [
+        sys.executable,
+        str(script),
+        "--workspace",
+        str(tmp_path),
+        "--import-root",
+        "candidate/src",
+        "--runtime-argv",
+        sys.executable,
+        "candidate_runtime.py",
+    ]
+
+    passed = subprocess.run(command, check=False, capture_output=True, text=True)  # noqa: S603
+    assert passed.returncode == 0
+    assert "OK candidate-runtime-handshake-contract tools=1" in passed.stdout
+
+    runtime.write_text(
+        runtime.read_text(encoding="utf-8").replace(
+            "Room to reserve.",
+            "Room identifier to create or update.",
+        ),
+        encoding="utf-8",
+    )
+    failed = subprocess.run(command, check=False, capture_output=True, text=True)  # noqa: S603
+    assert failed.returncode == 1
+    assert "runtime_tool_surface_mismatch" in failed.stdout
+    assert "tools[booking.reserve].input_schema/properties/room_id/description" in failed.stdout
+    assert "Room identifier to create or update." not in failed.stdout
 
 
 def _completed_values() -> dict[str, object]:
     return {
         "status": "completed",
         "project_root": "candidate",
-        "root_project_mode": "virtual-read-only-source-tree",
-        "dependency_install_mode": "offline-wheel-only",
         "runtime": CandidateRuntimeDeclaration(
             argv=(".venv/bin/python", "-m", "environment.runtime"),
             entry_path="src/environment/runtime.py",
@@ -108,22 +586,277 @@ def _completed_values() -> dict[str, object]:
     }
 
 
-def test_completed_candidate_requires_materializer_v3_and_supply_chain_echo() -> None:
+def test_completed_candidate_requires_materializer_v3_without_framework_execution_echo() -> None:
     completion = CandidateCompletion.model_validate(_completed_values())
 
     assert completion.task_materializer is not None
     assert completion.task_materializer.protocol == "python-callable-v3"
-    assert completion.root_project_mode == "virtual-read-only-source-tree"
-    assert completion.dependency_install_mode == "offline-wheel-only"
+    properties = CandidateCompletion.model_json_schema(mode="validation")["properties"]
+    assert "root_project_mode" not in properties
+    assert "dependency_install_mode" not in properties
+
+
+def test_python_launch_contract_is_visible_to_the_engineer() -> None:
+    expected = ".venv/bin/python` or `.venv/bin/python3"
+    runtime_schema = CandidateRuntimeDeclaration.model_json_schema(mode="validation")
+    self_check_schema = CandidatePublicSelfCheckDeclaration.model_json_schema(mode="validation")
+
+    assert expected in runtime_schema["properties"]["argv"]["description"]
+    assert expected in self_check_schema["properties"]["argv"]["description"]
+
+    prompt = EnvironmentBuilder._initial_prompt(  # noqa: SLF001
+        SimpleNamespace(design_id="design:python-launch", revision=1),
+        has_implementation_plan=False,
+    )
+    assert "`engineer-environment-codegen`" in prompt
+    assert "references" in prompt
+    assert "[build-system]" not in prompt
+    assert "uv.lock" not in prompt
+
+    skill_root = Path("agent_world/agent_assets/skills/engineer-environment-codegen")
+    skill = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    normalized_skill = " ".join(skill.split())
+    assert "Load detail progressively" in skill
+    assert "Build and debug as a Code Agent" in skill
+    assert "These checks are the Code Agent's own development loop" in skill
+    assert "strict transport envelope needs all top-level fields" in normalized_skill
+
+    completion_reference = (skill_root / "references" / "completion-contract.md").read_text(
+        encoding="utf-8"
+    )
+    normalized_completion = " ".join(completion_reference.split())
+    assert "`runtime.argv` and `public_self_check.argv`" in normalized_completion
+    assert "Do not declare bare `python`, `uv run`, or a script path" in normalized_completion
+    assert "`task_materializer.entry_path` → `task_materializer`" in normalized_completion
+
+    delivery_reference = (skill_root / "references" / "python-project-delivery.md").read_text(
+        encoding="utf-8"
+    )
+    normalized_delivery = " ".join(delivery_reference.split())
+    assert "Treat the license as project semantics" in normalized_delivery
+    assert '`license = { file = "LICENSE" }`' in normalized_delivery
+    assert "`pip freeze`" in normalized_delivery
+    assert "--project candidate" in normalized_delivery
+    assert "A check that passed before the last relevant edit is stale" in normalized_skill
+
+    runtime_reference = (skill_root / "references" / "runtime-and-materializer.md").read_text(
+        encoding="utf-8"
+    )
+    normalized_runtime = " ".join(runtime_reference.split())
+    assert "world-spec.state.initial_state_constraints" in normalized_runtime
+    assert "applies to every task family" in normalized_runtime
+    assert "frozen design is not implementable" in normalized_runtime
+    assert "Reset and snapshot state projections" in runtime_reference
+    assert "not permission to return `{}`" in runtime_reference
+    assert "complete `world-spec.state.root_state_schema`" in normalized_runtime
+    assert (skill_root / "scripts" / "check_candidate_tree.py").is_file()
+    assert (skill_root / "scripts" / "candidate_contract_map.py").is_file()
+    assert (skill_root / "scripts" / "check_materializer_campaign.py").is_file()
+
+
+def test_candidate_completion_schema_explains_semantic_blocked_shape() -> None:
+    schema = CandidateCompletion.model_json_schema(mode="validation")
+
+    assert "blocked response semantically declares only" in schema["description"]
+    assert "strict Provider transport" in schema["description"]
+    assert "every non-null Candidate output declaration remains reserved" in schema["description"]
+
+
+def test_blocked_completion_feedback_names_the_minimal_safe_shape() -> None:
+    values = _completed_values()
+    values["status"] = "blocked"
+    values["blocking_reason"] = "safe current blocker"
+
+    try:
+        CandidateCompletion.model_validate(values)
+    except ValidationError as validation_error:
+        try:
+            raise BuilderError("agent.output", "private rejected output") from validation_error
+        except BuilderError as builder_error:
+            diagnostic = EnvironmentBuilder._validation_diagnostic(  # noqa: SLF001
+                builder_error
+            )
+    else:  # pragma: no cover - the witnessed mixed declaration must fail
+        raise AssertionError("mixed blocked CandidateCompletion unexpectedly passed")
+
+    assert diagnostic.issue_codes == ("completion_blocked_claims_outputs@root",)
+    assert "return only schema_version, status=blocked" in diagnostic.feedback
+    assert "omit every candidate output field" in diagnostic.feedback
+    assert "private rejected output" not in diagnostic.feedback
 
 
 def test_builder_repair_prompt_preserves_unrelated_regression_obligations() -> None:
     prompt = EnvironmentBuilder._repair_prompt(4, "repair-disclosure-4.json")  # noqa: SLF001
     normalized = " ".join(prompt.split())
 
-    assert "unrelated to the disclosed Finding as regression obligations" in normalized
-    assert "do not delete, relax, invert, or replace" in normalized
-    assert "Add or strengthen a focused regression test" in normalized
+    assert "Follow the mounted `engineer-environment-codegen` Skill" in normalized
+    assert "complete authorized correction disclosure" in normalized
+    assert len(prompt) < 900
+
+    skill = Path("agent_world/agent_assets/skills/engineer-environment-codegen/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized_skill = " ".join(skill.split())
+    assert "preserve unrelated working behavior and public tests" in normalized_skill
+    assert "full replacement `CandidateCompletion`, never a patch" in normalized_skill
+
+
+def test_snapshot_repair_prompt_routes_runtime_failures_to_production_boundary() -> None:
+    prompt = EnvironmentBuilder._scheduler_snapshot_repair_prompt(  # noqa: SLF001
+        2,
+        "scheduler-snapshot-repair-2.json",
+    )
+    normalized = " ".join(prompt.split())
+
+    assert "evidence about its producing boundary" in normalized
+    assert "Do not edit a public test to mask such a failure" in normalized
+    assert "Run the disclosed failed boundary and affected public checks again" in normalized
+    assert len(prompt) < 1_600
+
+    skill = Path("agent_world/agent_assets/skills/engineer-environment-codegen/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    normalized_skill = " ".join(skill.split())
+    assert "locate the candidate boundary that can produce each stated failure" in normalized_skill
+    assert (
+        "Return an honest blocked completion rather than a test-only workaround" in normalized_skill
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_once_keeps_one_safe_precommit_correction_inside_code_agent_cycle(
+    tmp_path: Path,
+) -> None:
+    """A real Candidate validation finding gets one same-session self-correction.
+
+    The preceding workspace-validator test proves the count-only diagnostic is
+    extracted from a physical tree.  This test crosses the production
+    ``build_once`` boundary: that safe finding must reach the Code Agent in
+    its already-owned workspace before the outer Scheduler sees a failed
+    Candidate WorkAttempt.  It is intentionally not a Scheduler RepairAction.
+    """
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    control_artifacts = store.issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.", "design."),
+    )
+    builder_artifacts = store.issue_writer(
+        producer="environment-builder",
+        allowed_artifact_type_prefixes=("build.",),
+    )
+    design = portable_counter_contracts(store).design
+    design_ref = control_artifacts.put_json(
+        artifact_id="design:builder-precommit-cycle",
+        artifact_type="design.environment_design",
+        value=design,
+    )
+    workspace = (tmp_path / "workspace").resolve()
+
+    class ProfileProvider:
+        def resolve(self, **kwargs: object) -> object:
+            return SimpleNamespace(
+                workspace=Path(str(kwargs["workspace"])).resolve(),
+                lineage_id=str(kwargs["lineage_id"]),
+                profile_hash="a" * 64,
+                codex_config_sha256="b" * 64,
+                rollout_token_limit=1_000,
+                limits=SimpleNamespace(timeout_seconds=600.0),
+            )
+
+    class Backend:
+        def __init__(self) -> None:
+            self.requests: list[InvocationRequest] = []
+            self.sessions: list[InvocationSession] = []
+
+        async def invoke(self, request: InvocationRequest) -> InvocationResult:
+            self.requests.append(request)
+            profile = request.profile
+            session = InvocationSession(
+                thread_id="private-precommit-session",
+                lineage_id=profile.lineage_id,
+                workspace=profile.workspace,
+                profile_hash=profile.profile_hash,
+                codex_config_sha256=profile.codex_config_sha256,
+            )
+            self.sessions.append(session)
+            return InvocationResult(
+                invocation_id=request.invocation_id,
+                status=InvocationStatus.COMPLETED,
+                session=session,
+                turn_id=f"turn-{len(self.requests)}",
+                final_text=None,
+                structured_output=CandidateCompletion.model_validate(
+                    _completed_values()
+                ).model_dump(mode="json"),
+                usage=InvocationUsage(turn=TokenBreakdown(total_tokens=10)),
+                events=(),
+                error=None,
+                duration_ms=1,
+                backend_version="constructed-precommit-boundary",
+            )
+
+        async def cancel(self, _invocation_id: str) -> bool:
+            return False
+
+    class PrecommitBuilder(EnvironmentBuilder):
+        validation_calls = 0
+
+        async def _validate_and_commit(  # type: ignore[no-untyped-def,override]
+            self, *, completion, state, invocation
+        ):
+            self.validation_calls += 1
+            if self.validation_calls == 1:
+                workspace_error = CandidateWorkspaceError(
+                    "candidate contains undeclared files: ['unsafe-name-not-feedback.py']",
+                    safe_diagnostic=CandidateWorkspaceDiagnostic(
+                        "manifest_undeclared_files",
+                        1,
+                    ),
+                )
+                raise BuilderError(
+                    "candidate.validation",
+                    str(workspace_error),
+                    state=state,
+                    invocation=invocation,
+                ) from workspace_error
+            return SimpleNamespace(state=state, invocation=invocation)
+
+    backend = Backend()
+    builder = PrecommitBuilder(
+        artifact_store=builder_artifacts,
+        invocation_backend=backend,
+        profile_provider=ProfileProvider(),
+        maximum_precommit_reworks=1,
+        workspace_heartbeat_seconds=60.0,
+    )
+
+    result = await builder.build_once(
+        design=design,
+        design_ref=design_ref,
+        workspace=workspace,
+        budget=Budget(
+            llm_tokens=2_000,
+            agent_turns=2,
+            build_seconds=1_200,
+            wall_seconds=1_200,
+        ),
+        permissions=PermissionScope(),
+        run_id="run:builder-precommit-cycle",
+        attempt_id="attempt:builder-precommit-cycle",
+    )
+
+    assert result.invocation.turns == 2
+    assert result.invocation.invocation_id == backend.requests[0].invocation_id
+    assert result.invocation.invocation_id != backend.requests[1].invocation_id
+    assert builder.validation_calls == 2
+    assert len(backend.requests) == 2
+    assert backend.requests[0].session is None
+    assert backend.requests[1].session == backend.sessions[0]
+    repair_prompt = backend.requests[1].prompt
+    assert "candidate_manifest_undeclared_files" in repair_prompt
+    assert "one-for-one declaration of every final regular candidate file" in repair_prompt
+    assert "unsafe-name-not-feedback.py" not in repair_prompt
 
 
 def test_runtime_contract_uses_declared_schema_and_repair_feedback_allows_domain_task_id() -> None:
@@ -153,13 +886,34 @@ def test_runtime_contract_uses_declared_schema_and_repair_feedback_allows_domain
         SimpleNamespace(design_id="design:wire-format", revision=1),
         has_implementation_plan=True,
     )
-    assert (
-        "literal `sha256:` prefix followed by 64 lowercase hexadecimal characters" in initial_prompt
-    )
-    skill = Path("agent_world/agent_assets/skills/engineer-environment-codegen/SKILL.md").read_text(
+    assert "Follow the mounted `engineer-environment-codegen` Skill" in initial_prompt
+    assert "Read it first only to orient the implementation order" in initial_prompt
+    assert "after the frozen JSON inputs" not in initial_prompt
+    assert len(initial_prompt) < 1_600
+    assert "state_digest is a wire value" not in initial_prompt
+    skill_root = Path("agent_world/agent_assets/skills/engineer-environment-codegen")
+    runtime_reference = (skill_root / "references" / "runtime-and-materializer.md").read_text(
         encoding="utf-8"
     )
-    assert "`state_digest` must be exactly `sha256:` followed by 64 lowercase hexadecimal" in skill
+    assert "`state_digest` is exactly `sha256:` followed by" in runtime_reference
+    completion_reference = (skill_root / "references" / "completion-contract.md").read_text(
+        encoding="utf-8"
+    )
+    assert "framework owns" in completion_reference
+    assert "root_project_mode" not in completion_reference
+    assert "dependency_install_mode" not in completion_reference
+
+    planning_prompt = builder_leaf_module.BuildPlanningLeaf._prompt(  # noqa: SLF001
+        design_id="design:wire-format"
+    )
+    assert "Follow the mounted `engineer-build-planning` Skill" in planning_prompt
+    assert len(planning_prompt) < 900
+    assert "runtime JSONL/ABI boundary" not in planning_prompt
+    planning_skill = Path(
+        "agent_world/agent_assets/skills/engineer-build-planning/SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "Task Materializer v3 mapping" in planning_skill
+    assert "Do not write `candidate/`" in planning_skill
 
     disclosure = RepairDisclosure(
         disclosure_id="repair-disclosure:domain-task-id",
@@ -304,6 +1058,59 @@ def test_builder_leaf_projects_safe_source_phase_through_framework_diagnostic() 
     assert expected == "a typed remediation for Builder phase agent.output"
 
 
+def test_builder_profile_resolution_feedback_is_safe_and_actionable() -> None:
+    error = EnvironmentBuilder._profile_resolution_error(  # noqa: SLF001
+        ProfileResolutionError(
+            "materialization root is already bound to /private/workspace SECRET_PROFILE"
+        )
+    )
+
+    assert error.stage == "profile_resolution"
+    assert "category=profile_materialization_binding" in str(error)
+    assert "/private/workspace" not in str(error)
+    assert "SECRET_PROFILE" not in str(error)
+    assert BuilderLeaf._preflight_expected_category(error.stage) == (  # noqa: SLF001
+        "one unchanged Engineer model, Runtime Skill set, output schema, "
+        "physical turn envelope, and Agent workspace binding"
+    )
+
+
+def test_builder_reused_workspace_reproduces_initial_profile_turn_envelope(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    builder = EnvironmentBuilder(
+        artifact_store=store.issue_writer(
+            producer="environment-builder",
+            allowed_artifact_type_prefixes=("build.",),
+        ),
+        invocation_backend=SimpleNamespace(),
+        profile_provider=SimpleNamespace(),
+        maximum_precommit_reworks=2,
+        turn_token_limit=5_000_000,
+        turn_timeout_seconds=28_800,
+    )
+    budget = Budget(
+        llm_tokens=100_000_000,
+        agent_turns=2,
+        build_seconds=100_000_000,
+        wall_seconds=28_800,
+    )
+
+    initial_turn_limit = builder._initial_profile_turn_limit(budget)  # noqa: SLF001
+    reused = builder._initial_turn_envelope(  # noqa: SLF001
+        budget,
+        turn_limit=initial_turn_limit,
+    )
+    incorrectly_recomputed_as_one_turn = builder._initial_turn_envelope(  # noqa: SLF001
+        budget,
+        turn_limit=1,
+    )
+
+    assert initial_turn_limit == 2
+    assert reused != incorrectly_recomputed_as_one_turn
+
+
 def test_builder_quota_terminal_has_safe_nonretryable_diagnostic() -> None:
     diagnostic = EnvironmentBuilder._validation_diagnostic(  # noqa: SLF001 - feedback contract
         BuilderError(
@@ -353,6 +1160,104 @@ def test_builder_preserves_safe_codex_stream_disconnect_feedback() -> None:
         "retry; do not issue a model correction"
     )
     assert "TOP_SECRET_PROVIDER_TRANSCRIPT" not in diagnostic.feedback
+
+
+def test_candidate_public_test_feedback_never_teaches_framework_path_projection() -> None:
+    diagnostic = EnvironmentBuilder._workspace_validation_diagnostic(  # noqa: SLF001
+        CandidateWorkspaceDiagnostic("candidate_workspace_public_test_failed", 1)
+    )
+
+    issue = diagnostic.issues[0]
+    assert issue.message == (
+        "One declared public test failed. Inspect and correct Candidate code or that test in the "
+        "current Candidate workspace."
+    )
+    assert issue.violated_condition == "each declared public test must pass"
+    assert issue.expected_category == (
+        "a Candidate implementation and public test that pass from the Code Agent's current "
+        "workspace"
+    )
+    assert "projection" not in diagnostic.feedback
+    assert "/workspace" not in diagnostic.feedback
+    assert "mount" not in diagnostic.feedback
+
+
+def test_candidate_public_test_import_feedback_is_safe_and_actionable() -> None:
+    diagnostic = EnvironmentBuilder._workspace_validation_diagnostic(  # noqa: SLF001
+        CandidateWorkspaceDiagnostic("candidate_workspace_public_test_import_unavailable", 1)
+    )
+
+    issue = diagnostic.issues[0]
+    assert issue.message == (
+        "A declared public test has an unavailable Python import. Correct its import or lock the "
+        "required dependency in the current Candidate workspace."
+    )
+    assert issue.violated_condition == (
+        "each declared public test must import and execute from the frozen offline Candidate "
+        "project"
+    )
+    assert issue.expected_category == (
+        "a standalone declared public test whose imports are available from Candidate source "
+        "or frozen project dependencies"
+    )
+    assert "pytest" not in diagnostic.feedback
+    assert "projection" not in diagnostic.feedback
+    assert "/workspace" not in diagnostic.feedback
+
+
+def test_candidate_public_test_missing_import_is_classified_without_raw_module_name() -> None:
+    result = SimpleNamespace(
+        stderr="Traceback\nModuleNotFoundError: No module named 'candidate_controlled_name'\n",
+    )
+
+    assert _public_test_diagnostic(result) == CandidateWorkspaceDiagnostic(
+        "candidate_workspace_public_test_import_unavailable", 1
+    )
+
+
+def test_clean_build_topology_failure_never_becomes_candidate_feedback() -> None:
+    """Only an in-project frozen uv failure is a possible Engineer correction.
+
+    This is a classification test, not a replacement for the real local-process
+    projection proof: it prevents a future catch-all wrapper from asking the
+    Agent to repair unavailable tools, source handoff, mounts, or timeouts.
+    """
+
+    actionable = _classify_clean_build_error(
+        CandidateBuildError("uv_sync_failed", "safe internal test")
+    )
+    assert isinstance(actionable, CandidateWorkspaceError)
+    assert actionable.safe_diagnostic == CandidateWorkspaceDiagnostic(
+        "candidate_workspace_materialization_failed"
+    )
+
+    for framework_code in (
+        "uv_unavailable",
+        "invalid_candidate_source",
+        "candidate_source_digest_changed",
+        "uv_sync_timeout",
+    ):
+        with pytest.raises(CandidatePrecommitInfrastructureError):
+            _classify_clean_build_error(CandidateBuildError(framework_code, "internal"))
+
+
+def test_candidate_dependency_feedback_names_only_agent_visible_work() -> None:
+    diagnostic = EnvironmentBuilder._workspace_validation_diagnostic(  # noqa: SLF001
+        CandidateWorkspaceDiagnostic("candidate_workspace_materialization_failed")
+    )
+
+    issue = diagnostic.issues[0]
+    assert issue.message == (
+        "The Candidate's frozen offline dependency check exited unsuccessfully. Inspect its "
+        "project metadata, declared dependencies, and uv.lock from the current Candidate "
+        "project."
+    )
+    assert issue.violated_condition == (
+        "the Candidate's frozen offline dependency-only installation must complete successfully"
+    )
+    assert "framework" not in diagnostic.feedback
+    assert "/workspace" not in diagnostic.feedback
+    assert "mount" not in diagnostic.feedback
 
 
 @pytest.mark.asyncio
@@ -767,7 +1672,7 @@ async def test_builder_leaf_resumes_only_the_private_output_limited_session(tmp_
     ``test_closed_output_ceiling_creates_one_private_session_continuation_attempt``
     proves the normal Scheduler authorization and durable private checkpoint.
     This constructed boundary proves that CandidateBuild consumes that exact
-    checkpoint with ``resume_output_limited_build`` rather than starting a
+    checkpoint with ``resume_interrupted_session_build`` rather than starting a
     fresh Builder turn or feeding Provider text back to the model.
     """
 
@@ -1081,7 +1986,7 @@ async def test_builder_leaf_resumes_only_the_private_output_limited_session(tmp_
             self.normal_calls += 1
             raise AssertionError("a session continuation must not start a fresh Builder workspace")
 
-        async def resume_output_limited_build(self, **kwargs):
+        async def resume_interrupted_session_build(self, **kwargs):
             self.resume_kwargs = dict(kwargs)
             return SimpleNamespace(
                 state=success_state,
@@ -1380,8 +2285,9 @@ async def test_builder_leaf_uses_private_draft_in_a_fresh_workspace_recovery_ses
 
     The Scheduler proof owns authorization and private-record binding.  This
     adapter proof verifies the next boundary: Builder receives the exact
-    private workspace plus binding facts, starts no old Provider session, and
-    must return an ordinary complete bundle before the leaf can expose output.
+    private draft *source* plus a separate child-local target workspace,
+    starts no old Provider session, and must return an ordinary complete bundle
+    before the leaf can expose output.
     """
 
     store = ArtifactStore(tmp_path / "artifacts")
@@ -1645,7 +2551,11 @@ async def test_builder_leaf_uses_private_draft_in_a_fresh_workspace_recovery_ses
     assert builder.normal_calls == 0
     assert len(builder.recovery_calls) == 1
     call = builder.recovery_calls[0]
-    assert call["workspace"] == workspace.resolve()
+    assert call["recovery_workspace"] == workspace.resolve()
+    assert (
+        call["workspace"] == (tmp_path / "empty-builder-workspace" / attempt.attempt_id).resolve()
+    )
+    assert call["workspace"] != call["recovery_workspace"]
     assert call["recovery_lineage_id"] == record.lineage_id
     assert call["recovery_profile_digest"] == profile_digest
     assert call["recovery_codex_config_digest"] == config_digest
@@ -1653,6 +2563,54 @@ async def test_builder_leaf_uses_private_draft_in_a_fresh_workspace_recovery_ses
     assert call["model_override"] is None
     assert "session" not in call
     assert proposal.output_refs == output_refs
+
+
+def test_workspace_recovery_clones_only_candidate_into_fresh_workspace(tmp_path: Path) -> None:
+    """A new recovery session gets copied draft files, never the old workspace.
+
+    The source draft is untrusted and has no Artifact authority.  This boundary
+    verifies the framework's mechanical handoff: the child keeps its own
+    immutable inputs while receiving a detached copy of the prior ``candidate/``
+    tree that a fresh Agent can inspect and edit.
+    """
+
+    source = tmp_path / "source" / ".agent-runtime" / "workspace"
+    destination = tmp_path / "child" / ".agent-runtime" / "workspace"
+    source_candidate = source / "candidate"
+    (source_candidate / "package").mkdir(parents=True)
+    source_file = source_candidate / "package" / "runtime.py"
+    source_file.write_text("VALUE = 'draft'\n", encoding="utf-8")
+    # ``uv`` commonly leaves this ordinary virtual environment behind while an
+    # Engineer self-checks a draft.  Its internal link used to make recovery reject
+    # the whole otherwise-safe draft.
+    source_venv = source_candidate / ".venv"
+    (source_venv / "bin").mkdir(parents=True)
+    (source_venv / "bin" / "python").symlink_to("../../missing-python")
+    (source / "inputs").mkdir()
+    (source / "inputs" / "source-only.json").write_text("old\n", encoding="utf-8")
+
+    (destination / "inputs").mkdir(parents=True)
+    (destination / "inputs" / "implementation-contract.json").write_text(
+        "fresh-framework-input\n",
+        encoding="utf-8",
+    )
+
+    EnvironmentBuilder._clone_private_candidate_draft(  # noqa: SLF001 - recovery boundary
+        source_workspace=source,
+        destination_workspace=destination,
+    )
+
+    copied_file = destination / "candidate" / "package" / "runtime.py"
+    assert copied_file.read_text(encoding="utf-8") == "VALUE = 'draft'\n"
+    assert (destination / "inputs" / "implementation-contract.json").read_text(
+        encoding="utf-8"
+    ) == "fresh-framework-input\n"
+    assert not (destination / "inputs" / "source-only.json").exists()
+    assert source_venv.is_dir()
+    assert not (destination / "candidate" / ".venv").exists()
+
+    source_file.write_text("VALUE = 'changed-after-copy'\n", encoding="utf-8")
+    assert copied_file.read_text(encoding="utf-8") == "VALUE = 'draft'\n"
 
 
 @pytest.mark.asyncio
@@ -1960,6 +2918,129 @@ async def test_builder_leaf_repairs_committed_seed_in_a_fresh_session(
     assert proposal.output_refs == output_refs
 
 
+def test_builder_snapshot_repair_keeps_semantic_feedback_across_provider_retry(
+    tmp_path: Path,
+) -> None:
+    """A transport retry of a Candidate repair restores its exact source seed."""
+
+    def ref(identifier: str, artifact_type: str) -> ArtifactRef:
+        digest = sha256_digest(identifier.encode("utf-8"))
+        return ArtifactRef(
+            artifact_id=identifier,
+            artifact_type=artifact_type,
+            revision_id=digest,
+            content_hash=digest,
+            media_type="application/json",
+            size_bytes=0,
+        )
+
+    input_ref = ref("context:repair-retry", "control.generation_context")
+    semantic_action_ref = ref("repair:semantic", "control.repair_action")
+    physical_action_ref = ref("repair:transport", "control.repair_action")
+    source_attempt_ref = ref("attempt:candidate-before-repair", "control.work_attempt")
+    candidate_ref = ref("candidate:before-repair", "build.environment_candidate")
+    definition_digest = sha256_digest(b"definition:repair-retry")
+    fingerprint = work_input_fingerprint((input_ref,))
+    immutable_inputs = (input_ref,)
+    mutation_roots = ("/source", "/runtime")
+    semantic_action = SimpleNamespace(
+        decision="local_correction",
+        repair_seed_attempt_ref=source_attempt_ref,
+        repair_seed_output_refs=(candidate_ref,),
+        definition_digest=definition_digest,
+        target_coordinate="candidate-coordinate",
+        input_fingerprint=fingerprint,
+        immutable_input_refs=immutable_inputs,
+        allowed_mutation_roots=mutation_roots,
+    )
+    physical_action = SimpleNamespace(
+        decision="infrastructure_retry",
+        semantic_repair_context_ref=semantic_action_ref,
+        definition_digest=definition_digest,
+        target_coordinate="candidate-coordinate",
+        input_fingerprint=fingerprint,
+        immutable_input_refs=immutable_inputs,
+        allowed_mutation_roots=mutation_roots,
+    )
+    source_attempt = SimpleNamespace(
+        attempt_id="attempt:candidate-before-repair",
+        work_id="candidate-work",
+        coordinate="candidate-coordinate",
+        status="succeeded",
+        definition_digest=definition_digest,
+        proposal_policy_digest="proposal-policy",
+        validation_policy_digest="validation-policy",
+        repair_policy_digest="repair-policy",
+        input_refs=immutable_inputs,
+        output_refs=(candidate_ref,),
+        repair_action_ref=None,
+    )
+    candidate = SimpleNamespace(candidate_id="candidate:before-repair")
+
+    class Artifacts:
+        values = {
+            semantic_action_ref.revision_id: semantic_action,
+            physical_action_ref.revision_id: physical_action,
+            source_attempt_ref.revision_id: source_attempt,
+            candidate_ref.revision_id: candidate,
+        }
+
+        def get_json(self, artifact_ref: ArtifactRef, _model: object) -> object:
+            return self.values[artifact_ref.revision_id]
+
+        def require_exact_json(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    class Kernel:
+        runtime = SimpleNamespace(artifacts=Artifacts())
+
+        @staticmethod
+        def agent_correction_brief(
+            _context: object,
+            *,
+            definition: object,
+        ) -> SimpleNamespace:
+            assert definition is not None
+            return SimpleNamespace(
+                prompt_projection=lambda: {"clusters": [{"code": "runtime-schema"}]}
+            )
+
+    definition = SimpleNamespace(
+        definition_digest=definition_digest,
+        coordinate="candidate-coordinate",
+        work_id="candidate-work",
+        allowed_mutation_roots=mutation_roots,
+        proposal_policy=SimpleNamespace(content_digest=lambda: "proposal-policy"),
+        validation_policy=SimpleNamespace(content_digest=lambda: "validation-policy"),
+        repair_policy=SimpleNamespace(content_digest=lambda: "repair-policy"),
+    )
+    context = SimpleNamespace(
+        repair_action_ref=physical_action_ref,
+        semantic_repair_context_ref=semantic_action_ref,
+    )
+    attempt = SimpleNamespace(
+        parent_attempt_id="attempt:interrupted-repair",
+        input_refs=immutable_inputs,
+    )
+    leaf = BuilderLeaf(
+        builder=object(),  # type: ignore[arg-type] - no builder call in this loader proof
+        workspace_root=tmp_path / "workspaces",
+        run_id="run:repair-retry",
+        kernel=Kernel(),  # type: ignore[arg-type] - constructed authority boundary
+    )
+
+    seed = leaf._load_snapshot_repair_seed(  # noqa: SLF001 - repair-binding boundary
+        context=context,
+        attempt=attempt,
+        definition=definition,
+    )
+
+    assert seed is not None
+    assert seed.candidate_ref == candidate_ref
+    assert seed.candidate is candidate
+    assert b"runtime-schema" in seed.correction_feedback
+
+
 def test_completed_candidate_requires_a_real_license_role_file() -> None:
     values = _completed_values()
     files = values["files"]
@@ -1970,7 +3051,7 @@ def test_completed_candidate_requires_a_real_license_role_file() -> None:
         if not isinstance(item, CandidateFileDeclaration) or item.path != "LICENSE"
     )
 
-    with pytest.raises(ValidationError, match="required component path"):
+    with pytest.raises(ValidationError, match="required component path `LICENSE`"):
         CandidateCompletion.model_validate(values)
 
 
@@ -1997,6 +3078,67 @@ def test_builder_diagnostic_uses_validation_frontier_without_rejected_values() -
     assert diagnostic.issue_codes == ("completion_files_missing@root",)
     assert "/private/workspace/secret" not in diagnostic.feedback
     assert all(not code.startswith("builder_agent.output:") for code in diagnostic.issue_codes)
+
+
+def test_builder_draft_recovery_uses_shared_started_stream_stall_classification(
+    tmp_path: Path,
+) -> None:
+    """A written Candidate draft may survive the same closed transient as policy permits.
+
+    This protects the Builder leaf from drifting from the central invocation
+    recovery classifier: a started Codex stream stall is transport evidence,
+    while an unrelated retryable-looking terminal must not gain draft recovery.
+    """
+
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "draft.py").write_text("VALUE = 1\n", encoding="utf-8")
+    profile = SimpleNamespace(
+        model="grok-4.5",
+        profile_hash="a" * 64,
+        codex_config_sha256="b" * 64,
+    )
+    state = SimpleNamespace(
+        workspace=tmp_path,
+        lineage_id="implementation:workspace-recovery",
+        profile=profile,
+    )
+    provenance = SimpleNamespace(
+        model=profile.model,
+        profile_digest=f"sha256:{profile.profile_hash}",
+        output_schema_digest=BuilderLeaf._candidate_schema_digest(),  # noqa: SLF001
+    )
+    definition = SimpleNamespace(
+        repair_policy=SimpleNamespace(maximum_infrastructure_retries=1),
+    )
+
+    recovery = BuilderLeaf._workspace_recovery_from_error(  # noqa: SLF001
+        code="agent_backend_codex_provider_stream_stalled",
+        terminal_details={
+            "waiting_phase": "parent_awaiting_worker_result",
+            "idle_timeout_seconds": 300,
+            "observed_provider_event_count": 2,
+        },
+        retryable=True,
+        state=state,
+        provenance=provenance,
+        definition=definition,
+    )
+
+    assert recovery is not None
+    assert recovery.workspace == tmp_path.resolve()
+    assert recovery.model == "grok-4.5"
+    assert (
+        BuilderLeaf._workspace_recovery_from_error(  # noqa: SLF001
+            code="agent_backend_turn_failed_provider_rejected",
+            terminal_details={"codex_error_info": "enum:other"},
+            retryable=True,
+            state=state,
+            provenance=provenance,
+            definition=definition,
+        )
+        is None
+    )
 
 
 def test_builder_workspace_progress_records_counts_without_file_names(tmp_path: Path) -> None:
@@ -2031,6 +3173,9 @@ def test_builder_precommit_removes_only_derived_candidate_ephemera(
     package = candidate / "environment"
     cache = package / "__pycache__"
     cache.mkdir(parents=True)
+    venv = candidate / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text("derived", encoding="utf-8")
     source = package / "runtime.py"
     source.write_text("value = 1\n", encoding="utf-8")
     (cache / "runtime.cpython-312.pyc").write_bytes(b"derived")
@@ -2044,6 +3189,7 @@ def test_builder_precommit_removes_only_derived_candidate_ephemera(
     assert source.is_file()
     assert ordinary_build_named_file.is_file()
     assert not cache.exists()
+    assert not venv.exists()
     assert not loose_bytecode.exists()
 
 
@@ -2056,10 +3202,13 @@ def test_builder_precommit_never_follows_cache_symlink(tmp_path: Path) -> None:
     marker.write_bytes(b"outside")
     cache_link = candidate / "__pycache__"
     cache_link.symlink_to(external, target_is_directory=True)
+    venv_link = candidate / ".venv"
+    venv_link.symlink_to(external, target_is_directory=True)
 
     EnvironmentBuilder._remove_derived_candidate_ephemera(candidate)  # noqa: SLF001
 
     assert cache_link.is_symlink()
+    assert venv_link.is_symlink()
     assert marker.read_bytes() == b"outside"
 
 
@@ -2074,6 +3223,66 @@ def test_workspace_validation_rejects_a_declared_but_missing_license(tmp_path: P
 
     with pytest.raises(CandidateWorkspaceError, match="declared files are missing.*LICENSE"):
         CandidateWorkspaceValidator().validate(tmp_path, completion)
+
+
+def test_workspace_license_inventory_without_project_declaration_is_actionable(
+    tmp_path: Path,
+) -> None:
+    project, _uv_path, _uv_cache = write_candidate_project(
+        tmp_path,
+        project_license=None,
+    )
+    pyproject = project / "pyproject.toml"
+    pyproject.write_text(
+        pyproject.read_text(encoding="utf-8").replace(
+            "dependencies = []",
+            'license-files = ["LICENSE"]\ndependencies = []',
+        ),
+        encoding="utf-8",
+    )
+    completion = CandidateCompletion(
+        status="completed",
+        project_root="candidate",
+        runtime=CandidateRuntimeDeclaration(
+            argv=(".venv/bin/python", "-m", "runtime"),
+            entry_path="runtime.py",
+        ),
+        task_materializer=CandidateTaskMaterializerDeclaration(
+            entrypoint="task_materializer:materialize",
+            entry_path="task_materializer.py",
+        ),
+        public_self_check=CandidatePublicSelfCheckDeclaration(
+            argv=(".venv/bin/python", "-m", "public_check"),
+            entry_path="public_check.py",
+        ),
+        public_test_paths=("public_test.py",),
+        files=tuple(
+            CandidateFileDeclaration(path=item.path, role=item.role)  # type: ignore[arg-type]
+            for item in candidate_files(project)
+        ),
+    )
+
+    with pytest.raises(CandidateWorkspaceError) as captured:
+        CandidateWorkspaceValidator().validate(project, completion)
+
+    workspace_error = captured.value
+    assert workspace_error.safe_diagnostic is not None
+    assert workspace_error.safe_diagnostic.code == "project_license_declaration_missing"
+    try:
+        raise BuilderError("candidate.validation", str(workspace_error)) from workspace_error
+    except BuilderError as builder_error:
+        diagnostic = EnvironmentBuilder._validation_diagnostic(  # noqa: SLF001
+            builder_error
+        )
+
+    issue = diagnostic.issues[0]
+    assert diagnostic.validation_phase == "project_contract"
+    assert issue.issue_code == (
+        "candidate_project_license_declaration_missing@candidate.pyproject.toml.LICENSE"
+    )
+    assert issue.location == ("candidate", "pyproject.toml", "LICENSE")
+    assert "[project].license-files alone" in diagnostic.feedback
+    assert 'license = "MIT"' in diagnostic.feedback
 
 
 def test_workspace_manifest_gap_becomes_safe_actionable_repair_feedback(tmp_path: Path) -> None:
@@ -2150,8 +3359,6 @@ source = { virtual = "." }
     completion = CandidateCompletion(
         status="completed",
         project_root="candidate",
-        root_project_mode="virtual-read-only-source-tree",
-        dependency_install_mode="offline-wheel-only",
         runtime=CandidateRuntimeDeclaration(
             argv=(".venv/bin/python", "-m", "runtime"),
             entry_path="runtime.py",
@@ -2209,8 +3416,6 @@ def test_workspace_derives_executable_mode_from_physical_tree(tmp_path: Path) ->
     completion = CandidateCompletion(
         status="completed",
         project_root="candidate",
-        root_project_mode="virtual-read-only-source-tree",
-        dependency_install_mode="offline-wheel-only",
         runtime=CandidateRuntimeDeclaration(
             argv=(".venv/bin/python", "-m", "runtime"),
             entry_path="runtime.py",
@@ -2241,16 +3446,14 @@ def test_workspace_derives_executable_mode_from_physical_tree(tmp_path: Path) ->
 
 
 @pytest.mark.parametrize("field", ("root_project_mode", "dependency_install_mode"))
-def test_completed_candidate_cannot_omit_supply_chain_contract(field: str) -> None:
+def test_completed_candidate_rejects_framework_execution_echo(field: str) -> None:
     values = _completed_values()
-    values.pop(field)
+    values[field] = "framework-owned"
 
     with pytest.raises(ValidationError) as captured:
         CandidateCompletion.model_validate(values)
 
-    assert captured.value.errors(include_url=False)[0]["type"] == (
-        "completion_missing_declarations"
-    )
+    assert captured.value.errors(include_url=False)[0]["type"] == "extra_forbidden"
 
 
 def test_candidate_completion_has_no_consumer_adapter_or_task_generator_fields() -> None:
@@ -2322,6 +3525,43 @@ def test_builder_distinguishes_entrypoint_format_from_module_binding() -> None:
     )
 
 
+def test_builder_completion_feedback_names_required_path_and_role() -> None:
+    """A real nested-package mismatch must not leave the Engineer guessing."""
+
+    raw = _outer_prefixed_completion_output()
+    task = raw["task_materializer"]
+    assert isinstance(task, dict)
+    task["entry_path"] = "task_materializer.py"
+    task["entrypoint"] = "task_materializer:materialize"
+
+    try:
+        CandidateCompletion.model_validate_json(
+            json.dumps(normalize_candidate_completion_output(raw))
+        )
+    except ValidationError as validation_error:
+        try:
+            raise BuilderError("agent.output", "private raw output") from validation_error
+        except BuilderError as builder_error:
+            diagnostic = EnvironmentBuilder._validation_diagnostic(  # noqa: SLF001
+                builder_error
+            )
+    else:  # pragma: no cover - the witnessed malformed completion must fail
+        raise AssertionError("invalid CandidateCompletion unexpectedly passed")
+
+    assert diagnostic.validation_phase == "completion_manifest_binding"
+    assert diagnostic.frontier_ordinal == 25
+    assert diagnostic.issue_codes == ("completion_required_role_missing@root",)
+    issue = diagnostic.issues[0]
+    assert issue.violated_condition == (
+        "CandidateCompletion.files must declare required component path "
+        "`task_materializer.py` with fixed role `task_materializer`"
+    )
+    assert issue.expected_category == (
+        "one `files` declaration whose candidate-relative path equals the required component "
+        "entry_path and whose role equals the fixed component role"
+    )
+
+
 def test_task_materializer_binding_supports_src_and_main_mapping() -> None:
     declaration = CandidateTaskMaterializerDeclaration(
         entrypoint="environment.tasks:materialize",
@@ -2335,8 +3575,6 @@ def _outer_prefixed_completion_output() -> dict[str, object]:
     return {
         "status": "completed",
         "project_root": "candidate",
-        "root_project_mode": "virtual-read-only-source-tree",
-        "dependency_install_mode": "offline-wheel-only",
         "runtime": {
             "argv": [".venv/bin/python", "-m", "candidate.runtime"],
             "entry_path": "candidate/runtime.py",
@@ -2462,6 +3700,27 @@ def test_framework_canonicalizes_materializer_module_fixed_by_entry_path() -> No
     assert completion.task_materializer.entrypoint == "candidate.materializer:materialize"
 
 
+def test_framework_canonicalizes_python_launches_fixed_by_entry_path() -> None:
+    raw = _outer_prefixed_completion_output()
+    runtime = raw["runtime"]
+    public_self_check = raw["public_self_check"]
+    assert isinstance(runtime, dict)
+    assert isinstance(public_self_check, dict)
+    runtime["argv"] = ["python", "candidate/runtime.py", "--not-framework-owned"]
+    public_self_check["argv"] = ["uv", "run", "candidate/self_check.py"]
+
+    completion = _parse_json_completion(normalize_candidate_completion_output(raw))
+
+    assert completion.runtime is not None
+    assert completion.public_self_check is not None
+    assert completion.runtime.argv == (".venv/bin/python", "-m", "candidate.runtime")
+    assert completion.public_self_check.argv == (
+        ".venv/bin/python",
+        "-m",
+        "candidate.self_check",
+    )
+
+
 def test_framework_does_not_normalize_an_arbitrary_materializer_callable() -> None:
     raw = _outer_prefixed_completion_output()
     task = raw["task_materializer"]
@@ -2548,6 +3807,23 @@ def test_framework_does_not_normalize_conflicting_component_role_claims() -> Non
     normalized = normalize_candidate_completion_output(raw)
 
     with pytest.raises(ValidationError, match="public test path"):
+        _parse_json_completion(normalized)
+
+
+def test_candidate_completion_rejects_public_test_role_not_listed_for_execution() -> None:
+    raw = _outer_prefixed_completion_output()
+    files = raw["files"]
+    assert isinstance(files, list)
+    files.append(
+        {
+            "path": "candidate/public_tests/__init__.py",
+            "role": "public_test",
+        }
+    )
+
+    normalized = normalize_candidate_completion_output(raw)
+
+    with pytest.raises(ValidationError, match="exactly the same paths"):
         _parse_json_completion(normalized)
 
 

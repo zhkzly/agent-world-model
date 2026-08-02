@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from agent_world.contracts import ArtifactRef, sha256_digest
 from agent_world.control import (
     DirectJobAlreadyRunningError,
+    DirectJobHead,
     DirectJobHeadConflictError,
     DirectJobStore,
     new_direct_job_head,
@@ -98,6 +100,99 @@ def test_direct_job_store_is_single_writer_restart_safe_and_identity_immutable(
                 expected_head=completed,
                 next_head=completed.model_copy(update={"updated_at": datetime.now(UTC)}),
             )
+
+
+def test_direct_job_head_persists_scope_id_and_tolerates_legacy_heads(
+    tmp_path: Path,
+) -> None:
+    # AC1: a freshly written head round-trips scope_id, and a legacy head JSON
+    # without the key still validates with scope_id is None.
+    request_ref = _ref("request-artifact:scope", "control.environment_request")
+    job_ref = _ref("generate-job:scope", "control.environment_job")
+    snapshot_ref = _ref("run:scope:state", "control.job_run_snapshot")
+    fingerprint = sha256_digest(b"canonical-scope-request")
+
+    head = new_direct_job_head(
+        request_id="request:scope-one",
+        request_fingerprint=fingerprint,
+        request_ref=request_ref,
+        job_ref=job_ref,
+        scope_id="generate-job:scope",
+        run_id="run:direct-scope",
+        snapshot_ref=snapshot_ref,
+        snapshot_revision=1,
+        status="running",
+    )
+    assert head.scope_id == "generate-job:scope"
+    round_tripped = DirectJobHead.model_validate_json(head.stable_json_bytes())
+    assert round_tripped == head
+    assert round_tripped.scope_id == "generate-job:scope"
+
+    legacy_payload = json.loads(head.stable_json_bytes())
+    legacy_payload.pop("scope_id")
+    legacy = DirectJobHead.model_validate_json(json.dumps(legacy_payload))
+    assert legacy.scope_id is None
+
+
+def test_direct_job_head_scope_id_is_immutable_but_allows_promotion(
+    tmp_path: Path,
+) -> None:
+    # AC3: a checkpoint may promote None -> concrete scope_id, but a concrete
+    # scope_id can never drift to a different value.
+    store = DirectJobStore(tmp_path / "direct-jobs")
+    request_id = "request:scope-immutable"
+    request_ref = _ref("request-artifact:scope-immutable", "control.environment_request")
+    job_ref = _ref("generate-job:scope-immutable", "control.environment_job")
+    first_snapshot = _ref("run:scope:state:one", "control.job_run_snapshot")
+    second_snapshot = _ref("run:scope:state:two", "control.job_run_snapshot")
+    third_snapshot = _ref("run:scope:state:three", "control.job_run_snapshot")
+    fingerprint = sha256_digest(b"canonical-scope-immutable-request")
+
+    with store.exclusive(request_id) as lock:
+        # A legacy-style head with no scope_id, mimicking a pre-migration run.
+        legacy_head = new_direct_job_head(
+            request_id=request_id,
+            request_fingerprint=fingerprint,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            run_id="run:scope-immutable",
+            snapshot_ref=first_snapshot,
+            snapshot_revision=1,
+            status="running",
+        )
+        assert legacy_head.scope_id is None
+        store.compare_and_swap(lock, expected_head=None, next_head=legacy_head)
+
+        # None -> concrete promotion is accepted at the next checkpoint.
+        promoted = new_direct_job_head(
+            request_id=request_id,
+            request_fingerprint=fingerprint,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            scope_id="generate-job:scope-immutable",
+            run_id="run:scope-immutable",
+            snapshot_ref=second_snapshot,
+            snapshot_revision=2,
+            status="running",
+        )
+        assert store.compare_and_swap(
+            lock, expected_head=legacy_head, next_head=promoted
+        ) == promoted
+
+        # concrete -> different scope_id is rejected as identity drift.
+        drifted = new_direct_job_head(
+            request_id=request_id,
+            request_fingerprint=fingerprint,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            scope_id="generate-job:some-other-scope",
+            run_id="run:scope-immutable",
+            snapshot_ref=third_snapshot,
+            snapshot_revision=3,
+            status="running",
+        )
+        with pytest.raises(DirectJobHeadConflictError, match="scope identity cannot change"):
+            store.compare_and_swap(lock, expected_head=promoted, next_head=drifted)
 
 
 def test_failed_direct_head_requires_explicit_restart_and_preserves_prior_result(

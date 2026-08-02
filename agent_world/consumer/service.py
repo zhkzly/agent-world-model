@@ -36,10 +36,10 @@ from agent_world.contracts import (
 )
 from agent_world.judge import (
     CandidateComponentRole,
-    CandidateSandboxRunner,
+    CandidateProcessRunner,
     CleanCandidate,
     CleanCandidateBuilder,
-    IsolationPolicy,
+    HostExecutionPolicy,
     LaunchContract,
     RuntimeSupervisor,
     ToolExecutionEvidence,
@@ -53,7 +53,7 @@ from agent_world.judge.rules import (
     RuleExecutionContext,
     contract_rule_index,
     evaluate_rule,
-    initially_evaluable_invariants,
+    initially_evaluable_rules,
 )
 from agent_world.registry import EnvironmentRegistry, ResolvedEnvironmentPackage
 from agent_world.task_materialization import (
@@ -113,12 +113,14 @@ class LocalRolloutConsumer:
         *,
         registry: EnvironmentRegistry,
         clean_builder: CleanCandidateBuilder,
-        runtime_isolation: IsolationPolicy | None = None,
+        runtime_execution: HostExecutionPolicy | None = None,
     ) -> None:
         self._registry = registry
         self._clean_builder = clean_builder
-        self._runtime_isolation = runtime_isolation or IsolationPolicy(purpose="runtime")
-        self._sandbox_runner = CandidateSandboxRunner(isolation=self._runtime_isolation)
+        self._runtime_execution = runtime_execution or HostExecutionPolicy(purpose="runtime")
+        self._process_runner = CandidateProcessRunner(
+            execution=self._runtime_execution,
+        )
 
     async def rollout(
         self,
@@ -226,7 +228,7 @@ class LocalRolloutConsumer:
             actor=actor,
             difficulty=difficulty,
         )
-        result = await self._sandbox_runner.run_task_materializer(
+        result = await self._process_runner.run_task_materializer(
             root,
             entrypoint=manifest.task_materializer.entrypoint,
             visible_workspace_paths=_role_paths(manifest, "task_materializer"),
@@ -235,7 +237,7 @@ class LocalRolloutConsumer:
         if not result.succeeded:
             raise LocalConsumerError(
                 "task_materializer_failed",
-                "released task materializer failed in the isolated consumer",
+                "released task materializer failed in the framework-owned consumer process",
             )
         try:
             runner_envelope = json.loads(result.stdout)
@@ -414,7 +416,7 @@ class LocalEpisode:
                 cwd=manifest.runtime.workdir,
             ),
             visible_workspace_paths=_role_paths(manifest, "runtime"),
-            isolation=consumer._runtime_isolation,
+            execution=consumer._runtime_execution,
             request_timeout_seconds=manifest.runtime.request_timeout_seconds,
             shutdown_grace_seconds=manifest.runtime.shutdown_timeout_seconds,
         )
@@ -509,11 +511,13 @@ class LocalEpisode:
             if item.task_type == self._task.task_type
         )
         try:
-            for rule in (
-                *initially_evaluable_invariants(self._contracts.world_spec.invariants),
-                *self._contracts.world_spec.state.initial_state_constraints,
-                *requirement.initial_state_constraints,
-                *self._contracts.curriculum.sampling_constraints,
+            for rule in initially_evaluable_rules(
+                (
+                    *self._contracts.world_spec.invariants,
+                    *self._contracts.world_spec.state.initial_state_constraints,
+                    *requirement.initial_state_constraints,
+                    *self._contracts.curriculum.sampling_constraints,
+                )
             ):
                 if not evaluate_rule(rule, initial_context).result:
                     raise LocalConsumerError(

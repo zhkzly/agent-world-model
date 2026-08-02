@@ -28,6 +28,9 @@ _RULE_PROPERTY_FAMILY = {
 
 _MAX_POINTER_LENGTH = 4096
 _MAX_POINTER_SEGMENTS = 32
+_SAMPLING_UNAVAILABLE_RULE_SOURCES = frozenset(
+    {"args", "tool_result", "error", "events", "terminated", "truncated"}
+)
 _UNSAFE_TASK_SCHEMA_KEYS = frozenset(
     {
         "$dynamicRef",
@@ -410,6 +413,17 @@ class CurriculumRequirements(V2Contract):
             raise ValueError(
                 "sampling constraints cannot read evaluator-only task_goal: "
                 f"{sorted(goal_dependent_sampling)}"
+            )
+        action_scoped_sampling = {
+            rule.rule_id: sorted(_rule_sources(rule) & _SAMPLING_UNAVAILABLE_RULE_SOURCES)
+            for rule in self.sampling_constraints
+            if _rule_sources(rule) & _SAMPLING_UNAVAILABLE_RULE_SOURCES
+        }
+        if action_scoped_sampling:
+            raise ValueError(
+                "sampling constraints must be evaluable during task materialization/reset and "
+                "cannot read action-scoped values: "
+                f"{action_scoped_sampling}"
             )
         return self
 

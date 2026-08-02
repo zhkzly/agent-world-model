@@ -364,6 +364,34 @@ def test_world_rules_compiler_canonicalizes_agent_rule_ids_before_persisting(
     assert compiled.world.invariants[0].rule_id == "rule:world:0"
 
 
+def test_world_rules_compiler_accepts_no_additional_global_invariant(
+    tmp_path: Path,
+) -> None:
+    """Tool-local semantics need no placeholder World Rule when closure is empty."""
+
+    world, skeleton, graph, tool_semantics, _closure = _inputs(tmp_path)
+    compiled = compile_world_rules(
+        WorldRuleSemanticsSourceDraft(
+            initial_state_rules=InitialStateRulesSourceDraft(),
+            invariants=(),
+        ),
+        architecture=_counter_architecture_source(skeleton),
+        tool_semantics=(tool_semantics,),
+        evidence_graph=graph,
+        evidence_graph_ref=world.evidence_graph_ref,
+    )
+
+    assert compiled.canonical_source.invariants == ()
+    assert compiled.world.invariants == ()
+    validated_world = WorldSpec.model_validate(
+        {
+            **world.model_dump(),
+            "invariants": (),
+        }
+    )
+    assert validated_world.invariants == ()
+
+
 @pytest.mark.parametrize(
     ("source", "compiler", "expected_code", "expected_path"),
     (
@@ -417,6 +445,7 @@ def test_world_rule_prompts_keep_rule_id_ownership_in_framework() -> None:
     legacy_world = EnvironmentDesigner._world_rules_prompt(request)
     legacy_initial = EnvironmentDesigner._initial_state_rules_prompt(request)
     legacy_closure = EnvironmentDesigner._world_closure_prompt(request)
+    normalized_legacy_initial = " ".join(legacy_initial.split())
 
     assert "initial_state_rules.initial_state_constraints" in active
     assert "family `initial_state`" in active
@@ -424,8 +453,15 @@ def test_world_rule_prompts_keep_rule_id_ownership_in_framework() -> None:
     assert "omit optional `rule_id`" in active
     assert "rule:state:<ordinal>" in active
     assert "rule:world:<ordinal>" in active
+    assert "applies to every later task materialization" in active
+    assert "permitted actor/tool path cannot create them" in active
+    assert "an empty list is correct" in active
+    assert "collection-existence restatement" in active
+    assert "constant-only comparison" in active
     assert "omit optional `rule_id`" in legacy_world
+    assert "an empty list is correct" in legacy_world
     assert "optional `rule_id`" in legacy_initial
+    assert "applies to every later task materialization" in normalized_legacy_initial
     assert "optional `rule_id`" in legacy_closure
 
 
@@ -507,6 +543,15 @@ def test_task_curriculum_prompts_and_view_keep_semantics_bounded(tmp_path: Path)
     assert "omit optional `rule_id`" in active
     assert "rule:sampling:<ordinal>" in active
     assert "rule:task:<task_type>:<section>:<ordinal>" in active
+    for prompt in (
+        active,
+        active_plan,
+        active_task,
+        legacy_training,
+        legacy_plan,
+        legacy_task,
+    ):
+        assert "action-only args, tool_result, error, events" in " ".join(prompt.split())
     assert "Sampling Rules use family `sampling`" in active
     assert "initial-state Rules use family `initial_state`" in active
     assert "success Rules use `task_success`" in active
@@ -534,7 +579,7 @@ def test_task_curriculum_prompts_and_view_keep_semantics_bounded(tmp_path: Path)
     assert "optional `rule_id`" in legacy_task
     assert legacy_task.count("use non-root, non-overlapping RFC 6901 pointers") == 1
     assert "`terminal_conditions` must" in legacy_task
-    assert "Initial-state Rules may read reset_config/pre_state" in legacy_task
+    assert "Initial-state Rules may only read reset-available actor, pre_state" in legacy_task
 
     assert "Produce exactly one `CurriculumPlanSourceDraft`" in active_plan
     assert "one independent TaskRequirement call" in active_plan
@@ -2852,6 +2897,24 @@ def test_task_curriculum_compiler_derives_ids_and_reports_source_rule_family(
         world=world,
         evidence_graph=graph,
     )
+    action_scoped_sampling = sampling_rule.model_copy(
+        update={
+            "clauses": (
+                sampling_rule.clauses[0].model_copy(
+                    update={"left": pre_counter.model_copy(update={"source": "args"})}
+                ),
+            )
+        }
+    )
+    with pytest.raises(StructuredValidationError) as action_scoped_error:
+        compile_curriculum_plan_semantics(
+            source.curriculum_plan.model_copy(
+                update={"sampling_constraints": (action_scoped_sampling,)}
+            ),
+            world=world,
+            evidence_graph=graph,
+        )
+    assert "curriculum_sampling_action_source_forbidden" in str(action_scoped_error.value)
     compiled_requirement = compile_task_requirement_semantics(
         source.task_requirements[0],
         curriculum_plan=compiled_plan.canonical_source,

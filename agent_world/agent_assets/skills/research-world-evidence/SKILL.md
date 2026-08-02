@@ -1,41 +1,28 @@
 ---
 name: research-world-evidence
-description: Research real workflows, tool ecosystems, state rules, errors, permissions, and constraints for Agent World environment design. Use for direct requirement research or non-blocking Discovery when outputs must be grounded in fetched source content and expressed as v2 evidence/coverage artifacts.
+description: Working method for a tool-enabled Codex Researcher turn that gathers or inspects source material for Agent World. Direct LLM evidence synthesis does not load this Skill.
 ---
 
 # Research World Evidence
 
-Collect evidence that lets the Foundry turn a human need into a faithful executable world.
+This Skill is mounted only for an actual Researcher Agent with granted tools.
+Direct evidence nodes receive their bounded CitationCatalog in the node Prompt
+and use no Skill or workspace tools.
 
-1. Read only the request and framework-provided research inputs.
-2. Plan queries across workflows, systems of record, tools, APIs/SDKs/CLIs/MCP, state rules,
-   errors, permissions, time, concurrency, and rollback.
-3. Treat search hits and snippets as leads. Cite a claim as observed only when the supplied
-   fetch/extraction record contains supporting body text and provenance.
-4. Separate observed claims, inference, product decisions, and bounded assumptions. Preserve
-   conflicts and unknowns instead of guessing.
-5. Update coverage by dimension; do not collapse it into one score.
-6. Return exactly the requested structured output. Do not write runtime code, alter release
-   state, request sealed artifacts, or invent a provider success.
-
-## Bounded source reading
-
-- When the prompt embeds an `EvidencePassagePack`, the node is tool-free. Use only that pack and
-  return the typed artifact; do not look for workspace files.
-- Never print a complete source body into the conversation. Read the catalog first, then use
-  narrow line ranges or bounded searches such as `rg -n -m 8 -C 1`.
-- Use at most 12 shell calls for one synthesis artifact and request at most 1,500 output tokens per
-  call. Batch related source checks when that reduces round trips.
-- Stop using tools while at least 16,000 rollout tokens remain, then return the requested typed
-  artifact. Preserve missing coverage as an unresolved question instead of spending the output
-  budget on exhaustive reading.
-
-If evidence is unavailable, return the unresolved question or failure explicitly.
-
-## Citation catalog ownership
-
-When a framework-provided CitationCatalog appears, evidence identity is framework-owned. Select
-the one-based `citation_index` entries through `evidence_catalog_indexes`; never copy, rename,
-infer, or invent an opaque evidence ID. Before returning, check that every observed claim has at
-least one catalog index and that every chosen index exists in the supplied catalog. If no entry
-supports a fact, leave it unresolved rather than fabricating a citation.
+1. Start with the current node Prompt: it defines the research question,
+   permitted sources, output artifact, and budget/authority boundary.
+2. Plan narrow checks across the facts that matter to the requested workflow:
+   users, systems of record, public actions, state rules, errors, permissions,
+   time, concurrency, and rollback.
+3. Treat search results and snippets as leads. Ground an observed claim only
+   in supplied or fetched body text with usable provenance. Keep inference,
+   product decisions, bounded assumptions, conflicts, and unknowns distinct.
+4. Use targeted reads/searches; do not dump full source bodies into the
+   conversation or artifact. Stop when the Prompt's required coverage is
+   supported or the remaining gap is genuinely unresolved.
+5. When the Prompt supplies a citation catalog, copy only its permitted
+   identifiers/indexes exactly. Never mint, rename, or infer an opaque evidence
+   identity from a source title or business meaning.
+6. Return only the requested structured research artifact. Do not write
+   runtime code, alter release state, fabricate a provider/tool success, or
+   request sealed artifacts.

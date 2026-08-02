@@ -82,6 +82,7 @@ _SECRET_PATTERNS = (
 )
 _APPROVED_REGISTRY_URLS = frozenset({"https://pypi.org/simple", "https://pypi.org/simple/"})
 _APPROVED_ARTIFACT_HOST = "files.pythonhosted.org"
+_UNKNOWN_LICENSE_VALUES = frozenset({"", "unknown", "none", "n/a", "na", "unspecified"})
 _FORBIDDEN_UV_CONFIGURATION_KEYS = frozenset(
     {
         "config-settings",
@@ -466,6 +467,7 @@ class CandidateWorkspaceValidator:
         requires_python = project.get("requires-python")
         if not isinstance(name, str) or not name.strip():
             raise CandidateWorkspaceError("pyproject project.name must be non-empty")
+        CandidateWorkspaceValidator._validate_project_license(project, files=files)
         lock_requires_python = lock.get("requires-python")
         if not isinstance(requires_python, str) or not isinstance(lock_requires_python, str):
             raise CandidateWorkspaceError(
@@ -487,9 +489,7 @@ class CandidateWorkspaceValidator:
             raise CandidateWorkspaceError(
                 "pyproject requires-python and uv's canonical lock range must exactly represent "
                 f"the implementation contract ({python_requires})",
-                safe_diagnostic=CandidateWorkspaceDiagnostic(
-                    "python_requires_contract_mismatch"
-                ),
+                safe_diagnostic=CandidateWorkspaceDiagnostic("python_requires_contract_mismatch"),
             )
         if not isinstance(lock.get("version"), int):
             raise CandidateWorkspaceError("uv.lock does not contain a uv lock format version")
@@ -499,6 +499,43 @@ class CandidateWorkspaceValidator:
             project_name=name,
         )
         return name
+
+    @staticmethod
+    def _validate_project_license(
+        project: dict[str, object],
+        *,
+        files: list[ValidatedCandidateFile],
+    ) -> None:
+        """Require the same root-license declaration that Integration consumes.
+
+        A non-empty ``LICENSE`` file and PEP 639 ``license-files`` inventory do
+        not by themselves declare the root project's license.  Catch that
+        mechanical metadata gap while the Code Agent still owns its workspace,
+        before an otherwise valid Candidate reaches the independent supply
+        gate.
+        """
+
+        value = project.get("license")
+        declared = False
+        if isinstance(value, str):
+            declared = value.strip().casefold() not in _UNKNOWN_LICENSE_VALUES
+        elif isinstance(value, dict) and set(value) == {"file"}:
+            path = value.get("file")
+            declared = isinstance(path, str) and any(
+                item.path == path and item.role == "license" for item in files
+            )
+        elif isinstance(value, dict) and set(value) == {"text"}:
+            text = value.get("text")
+            declared = (
+                isinstance(text, str) and text.strip().casefold() not in _UNKNOWN_LICENSE_VALUES
+            )
+        if not declared:
+            raise CandidateWorkspaceError(
+                "candidate [project].license must declare a non-unknown expression, "
+                "license file, or license text; [project].license-files alone is only "
+                "an inventory",
+                safe_diagnostic=CandidateWorkspaceDiagnostic("project_license_declaration_missing"),
+            )
 
     @staticmethod
     def _validate_dependency_policy(
@@ -512,27 +549,40 @@ class CandidateWorkspaceValidator:
         if "build-system" in pyproject:
             raise CandidateWorkspaceError(
                 "candidate build-system hooks are prohibited; the project is executed "
-                "directly from its read-only source tree"
+                "directly from its read-only source tree",
+                safe_diagnostic=CandidateWorkspaceDiagnostic("dependency_build_system_prohibited"),
             )
         tool = pyproject.get("tool", {})
         if tool is None:
             tool = {}
         if not isinstance(tool, dict):
-            raise CandidateWorkspaceError("pyproject [tool] must be a table")
+            raise CandidateWorkspaceError(
+                "pyproject [tool] must be a table",
+                safe_diagnostic=CandidateWorkspaceDiagnostic("dependency_uv_configuration_invalid"),
+            )
         uv = tool.get("uv", {})
         if uv is None:
             uv = {}
         if not isinstance(uv, dict):
-            raise CandidateWorkspaceError("pyproject [tool.uv] must be a table")
+            raise CandidateWorkspaceError(
+                "pyproject [tool.uv] must be a table",
+                safe_diagnostic=CandidateWorkspaceDiagnostic("dependency_uv_configuration_invalid"),
+            )
         forbidden = sorted(_FORBIDDEN_UV_CONFIGURATION_KEYS.intersection(uv))
         if forbidden:
             raise CandidateWorkspaceError(
-                f"candidate dependency source configuration is prohibited: {forbidden}"
+                f"candidate dependency source configuration is prohibited: {forbidden}",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "dependency_uv_configuration_forbidden"
+                ),
             )
         if uv.get("package") is not False:
             raise CandidateWorkspaceError(
                 "candidate pyproject must set [tool.uv] package=false for a virtual, "
-                "non-installed root"
+                "non-installed root",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "dependency_virtual_root_mode_invalid"
+                ),
             )
 
         project = pyproject.get("project")
@@ -541,38 +591,70 @@ class CandidateWorkspaceValidator:
         optional = project.get("optional-dependencies", {})
         if optional is not None:
             if not isinstance(optional, dict):
-                raise CandidateWorkspaceError("project.optional-dependencies must be a table")
+                raise CandidateWorkspaceError(
+                    "project.optional-dependencies must be a table",
+                    safe_diagnostic=CandidateWorkspaceDiagnostic("dependency_declaration_invalid"),
+                )
             requirement_groups.extend(optional.values())
         dependency_groups = pyproject.get("dependency-groups", {})
         if dependency_groups is not None:
             if not isinstance(dependency_groups, dict):
-                raise CandidateWorkspaceError("dependency-groups must be a table")
+                raise CandidateWorkspaceError(
+                    "dependency-groups must be a table",
+                    safe_diagnostic=CandidateWorkspaceDiagnostic("dependency_declaration_invalid"),
+                )
             requirement_groups.extend(dependency_groups.values())
         for group in requirement_groups:
             if not isinstance(group, list) or not all(isinstance(item, str) for item in group):
-                raise CandidateWorkspaceError("dependency declarations must be string arrays")
+                raise CandidateWorkspaceError(
+                    "dependency declarations must be string arrays",
+                    safe_diagnostic=CandidateWorkspaceDiagnostic("dependency_declaration_invalid"),
+                )
             for raw in group:
                 try:
                     requirement = Requirement(raw)
                 except InvalidRequirement as exc:
-                    raise CandidateWorkspaceError(f"invalid dependency requirement: {raw}") from exc
+                    raise CandidateWorkspaceError(
+                        f"invalid dependency requirement: {raw}",
+                        safe_diagnostic=CandidateWorkspaceDiagnostic(
+                            "dependency_declaration_invalid"
+                        ),
+                    ) from exc
                 if requirement.url is not None:
                     raise CandidateWorkspaceError(
-                        f"direct URL/path dependency is prohibited: {requirement.name}"
+                        f"direct URL/path dependency is prohibited: {requirement.name}",
+                        safe_diagnostic=CandidateWorkspaceDiagnostic(
+                            "dependency_direct_source_prohibited"
+                        ),
                     )
 
         packages = lock.get("package")
         if not isinstance(packages, list) or not packages:
-            raise CandidateWorkspaceError("uv.lock requires a non-empty package array")
+            raise CandidateWorkspaceError(
+                "uv.lock requires a non-empty package array",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "dependency_lock_package_array_invalid"
+                ),
+            )
         root_source = {"virtual": "."}
         root_count = 0
         for raw_package in packages:
             if not isinstance(raw_package, dict):
-                raise CandidateWorkspaceError("uv.lock package entries must be tables")
+                raise CandidateWorkspaceError(
+                    "uv.lock package entries must be tables",
+                    safe_diagnostic=CandidateWorkspaceDiagnostic(
+                        "dependency_lock_package_array_invalid"
+                    ),
+                )
             name = raw_package.get("name")
             source = raw_package.get("source")
             if not isinstance(name, str) or not isinstance(source, dict):
-                raise CandidateWorkspaceError("uv.lock package requires name and source tables")
+                raise CandidateWorkspaceError(
+                    "uv.lock package requires name and source tables",
+                    safe_diagnostic=CandidateWorkspaceDiagnostic(
+                        "dependency_lock_package_array_invalid"
+                    ),
+                )
             if name == project_name:
                 if source != root_source:
                     raise CandidateWorkspaceError(
@@ -594,12 +676,18 @@ class CandidateWorkspaceValidator:
             if source.get("registry") not in _APPROVED_REGISTRY_URLS or set(source) != {"registry"}:
                 raise CandidateWorkspaceError(
                     f"dependency {name} must come from the fixed HTTPS PyPI registry; "
-                    "path/Git/URL/editable sources are prohibited"
+                    "path/Git/URL/editable sources are prohibited",
+                    safe_diagnostic=CandidateWorkspaceDiagnostic(
+                        "dependency_registry_source_invalid"
+                    ),
                 )
             wheels = raw_package.get("wheels")
             if not isinstance(wheels, list) or not wheels:
                 raise CandidateWorkspaceError(
-                    f"dependency {name} has no locked wheel; source builds are prohibited"
+                    f"dependency {name} has no locked wheel; source builds are prohibited",
+                    safe_diagnostic=CandidateWorkspaceDiagnostic(
+                        "dependency_locked_wheels_missing"
+                    ),
                 )
             for wheel in wheels:
                 CandidateWorkspaceValidator._validate_locked_distribution(
@@ -632,7 +720,10 @@ class CandidateWorkspaceValidator:
     ) -> None:
         if not isinstance(value, dict):
             raise CandidateWorkspaceError(
-                f"dependency {package_name} {distribution} record must be a table"
+                f"dependency {package_name} {distribution} record must be a table",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "dependency_locked_distribution_invalid"
+                ),
             )
         url = value.get("url")
         digest = value.get("hash")
@@ -646,14 +737,20 @@ class CandidateWorkspaceValidator:
             or size <= 0
         ):
             raise CandidateWorkspaceError(
-                f"dependency {package_name} {distribution} lacks URL/hash/size provenance"
+                f"dependency {package_name} {distribution} lacks URL/hash/size provenance",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "dependency_locked_distribution_invalid"
+                ),
             )
         parsed = urlsplit(url)
         try:
             port = parsed.port
         except ValueError as exc:
             raise CandidateWorkspaceError(
-                f"dependency {package_name} {distribution} URL has an invalid port"
+                f"dependency {package_name} {distribution} URL has an invalid port",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "dependency_locked_distribution_invalid"
+                ),
             ) from exc
         if (
             parsed.scheme != "https"
@@ -667,7 +764,10 @@ class CandidateWorkspaceValidator:
         ):
             raise CandidateWorkspaceError(
                 f"dependency {package_name} {distribution} must use the approved "
-                "files.pythonhosted.org HTTPS origin"
+                "files.pythonhosted.org HTTPS origin",
+                safe_diagnostic=CandidateWorkspaceDiagnostic(
+                    "dependency_locked_distribution_invalid"
+                ),
             )
 
     @staticmethod

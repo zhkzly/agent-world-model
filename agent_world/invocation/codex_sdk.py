@@ -38,10 +38,21 @@ from .contracts import (
     TokenBreakdown,
     json_compatible,
 )
+from .liveness import ProviderFirstEventBudget, ProviderProgressWatch
 from .profiles import ProfileResolutionError, verify_resolved_profile
 from .redaction import Redactor
+from .structured_diagnostics import (
+    codex_no_first_provider_event_details,
+    codex_provider_stream_stalled_details,
+)
 
 _PROVIDER_SCHEMA_OMIT_KEYS = frozenset({"default", "discriminator"})
+# The localhost-compatible strict-schema route rejects a JSON Schema ``$ref``
+# with adjacent annotation keywords, even though that form is valid JSON
+# Schema. The logical Pydantic schema retains the explanation; only the
+# Provider-facing generation schema removes it. Structural constraints remain
+# on the referenced definition and are still enforced after the response.
+_PROVIDER_REF_SIBLING_OMIT_KEYS = frozenset({"description"})
 _JSON_VALUE_IR = "AgentWorldJsonValueIR"
 _JSON_OBJECT_IR = "AgentWorldJsonObjectIR"
 _JSON_ENTRY_IR = "AgentWorldJsonEntryIR"
@@ -389,18 +400,6 @@ class CodexSdkBackend:
                 retryable=True,
             )
         _emit_lifecycle(request, InvocationLifecyclePhase.PROFILE_VERIFIED)
-        if request.profile.missing_runtime_tools:
-            return _local_failure(
-                request,
-                status=InvocationStatus.FAILED,
-                code="runtime_toolchain_unavailable",
-                message=(
-                    "required isolated runtime toolchain is unavailable: "
-                    + ", ".join(request.profile.missing_runtime_tools)
-                ),
-                started=started,
-            )
-
         payload = self._worker_payload(request)
         encoded_payload = (
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
@@ -539,12 +538,21 @@ class CodexSdkBackend:
                 kill_grace_seconds=request.profile.limits.kill_grace_seconds,
             )
 
+        provider_progress_watch = ProviderProgressWatch()
+
+        def mark_provider_progress(method: str, payload: Mapping[str, Any] | None) -> None:
+            """Record a valid worker Provider event without retaining its contents."""
+
+            provider_progress_watch.observe()
+            if on_first_progress is not None:
+                on_first_progress(method, payload)
+
         stdout_capture_task = asyncio.create_task(
             _capture_stdout(
                 process.stdout,
                 request=request,
                 redactor=redactor,
-                on_first_progress=on_first_progress,
+                on_first_progress=mark_provider_progress,
             )
         )
         stderr_capture_task = asyncio.create_task(
@@ -555,6 +563,12 @@ class CodexSdkBackend:
             )
         )
         hard_timed_out = False
+        no_first_provider_event = False
+        provider_stream_stalled = False
+        stalled_provider_event_count = 0
+        process_wait_task: asyncio.Task[int] | None = None
+        first_progress_wait_task: asyncio.Task[None] | None = None
+        stream_idle_wait_task: asyncio.Task[int] | None = None
         try:
             assert process.stdin is not None
             process.stdin.write(encoded_payload)
@@ -563,15 +577,122 @@ class CodexSdkBackend:
             _emit_lifecycle(request, InvocationLifecyclePhase.PAYLOAD_DISPATCHED)
             try:
                 _emit_lifecycle(request, InvocationLifecyclePhase.PARENT_WAITING)
-                if request.lifecycle_supervision is InvocationLifecycleSupervision.CONTROL_PLANE:
-                    await process.wait()
-                else:
-                    hard_timeout = (
-                        request.profile.limits.timeout_seconds
+                process_wait_task = asyncio.create_task(process.wait())
+                first_event_budget = ProviderFirstEventBudget(
+                    request.profile.limits.provider_first_event_timeout_seconds
+                )
+                normal_lifecycle_deadline = (
+                    None
+                    if request.lifecycle_supervision is InvocationLifecycleSupervision.CONTROL_PLANE
+                    else (
+                        time.monotonic()
+                        + request.profile.limits.timeout_seconds
                         + request.profile.limits.interrupt_grace_seconds
                         + 0.5
                     )
-                    await asyncio.wait_for(process.wait(), timeout=hard_timeout)
+                )
+                if first_event_budget.enabled:
+                    first_progress_wait_task = asyncio.create_task(
+                        provider_progress_watch.wait_for_first_progress()
+                    )
+                    first_event_remaining = first_event_budget.remaining()
+                    assert first_event_remaining is not None
+                    normal_lifecycle_remaining = (
+                        None
+                        if normal_lifecycle_deadline is None
+                        else normal_lifecycle_deadline - time.monotonic()
+                    )
+                    wait_timeout = (
+                        first_event_remaining
+                        if normal_lifecycle_remaining is None
+                        else min(first_event_remaining, normal_lifecycle_remaining)
+                    )
+                    if wait_timeout <= 0:
+                        hard_timed_out = (
+                            normal_lifecycle_remaining is not None
+                            and normal_lifecycle_remaining <= first_event_remaining
+                        )
+                        no_first_provider_event = not hard_timed_out
+                    else:
+                        completed, _ = await asyncio.wait(
+                            (process_wait_task, first_progress_wait_task),
+                            timeout=wait_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not completed:
+                            hard_timed_out = (
+                                normal_lifecycle_remaining is not None
+                                and normal_lifecycle_remaining <= first_event_remaining
+                            )
+                            no_first_provider_event = not hard_timed_out
+                    if hard_timed_out or no_first_provider_event:
+                        await _terminate_process_tree(
+                            process,
+                            grace_seconds=request.profile.limits.kill_grace_seconds,
+                        )
+                if not hard_timed_out and not no_first_provider_event:
+                    stream_idle_timeout_seconds = (
+                        request.profile.limits.provider_stream_idle_timeout_seconds
+                    )
+                    if stream_idle_timeout_seconds is not None:
+                        # This parent-side watch intentionally begins after the
+                        # first-event race above.  With first-event liveness
+                        # disabled it waits for one event indefinitely, then
+                        # applies only to the subsequent no-progress interval.
+                        stream_idle_wait_task = asyncio.create_task(
+                            provider_progress_watch.wait_for_started_stream_stall(
+                                stream_idle_timeout_seconds
+                            )
+                        )
+                    wait_tasks: tuple[asyncio.Task[int], ...] = (process_wait_task,)
+                    if stream_idle_wait_task is not None:
+                        wait_tasks = (*wait_tasks, stream_idle_wait_task)
+                    if (
+                        request.lifecycle_supervision
+                        is InvocationLifecycleSupervision.CONTROL_PLANE
+                    ):
+                        completed, _ = await asyncio.wait(
+                            wait_tasks,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    else:
+                        assert normal_lifecycle_deadline is not None
+                        remaining = normal_lifecycle_deadline - time.monotonic()
+                        if remaining <= 0:
+                            hard_timed_out = True
+                            completed = set()
+                            await _terminate_process_tree(
+                                process,
+                                grace_seconds=request.profile.limits.kill_grace_seconds,
+                            )
+                        else:
+                            completed, _ = await asyncio.wait(
+                                wait_tasks,
+                                timeout=remaining,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if not completed:
+                                hard_timed_out = True
+                                await _terminate_process_tree(
+                                    process,
+                                    grace_seconds=request.profile.limits.kill_grace_seconds,
+                                )
+                    # A completed worker takes precedence if terminal protocol
+                    # records and the idle clock become ready in the same event
+                    # loop turn.  Only a still-running worker is a stalled
+                    # Provider stream.
+                    if (
+                        not hard_timed_out
+                        and stream_idle_wait_task is not None
+                        and stream_idle_wait_task in completed
+                        and not process_wait_task.done()
+                    ):
+                        provider_stream_stalled = True
+                        stalled_provider_event_count = stream_idle_wait_task.result()
+                        await _terminate_process_tree(
+                            process,
+                            grace_seconds=request.profile.limits.kill_grace_seconds,
+                        )
             except TimeoutError:
                 hard_timed_out = True
                 await _terminate_process_tree(
@@ -603,6 +724,15 @@ class CodexSdkBackend:
                 retryable=True,
             )
         finally:
+            if first_progress_wait_task is not None and not first_progress_wait_task.done():
+                first_progress_wait_task.cancel()
+                await asyncio.gather(first_progress_wait_task, return_exceptions=True)
+            if stream_idle_wait_task is not None and not stream_idle_wait_task.done():
+                stream_idle_wait_task.cancel()
+                await asyncio.gather(stream_idle_wait_task, return_exceptions=True)
+            if process_wait_task is not None and not process_wait_task.done():
+                process_wait_task.cancel()
+                await asyncio.gather(process_wait_task, return_exceptions=True)
             async with self._lock:
                 self._active.pop(request.invocation_id, None)
 
@@ -633,6 +763,41 @@ class CodexSdkBackend:
                 started=started,
                 events=tuple(stdout_capture.events),
                 worker_exit_code=process.returncode,
+            )
+        if no_first_provider_event:
+            first_event_timeout_seconds = (
+                request.profile.limits.provider_first_event_timeout_seconds
+            )
+            assert first_event_timeout_seconds is not None
+            return _local_failure(
+                request,
+                status=InvocationStatus.FAILED,
+                code="codex_no_first_provider_event",
+                message="Codex worker produced no first Provider event",
+                started=started,
+                events=tuple(stdout_capture.events),
+                details=codex_no_first_provider_event_details(first_event_timeout_seconds),
+                worker_exit_code=process.returncode,
+                retryable=True,
+            )
+        if provider_stream_stalled:
+            stream_idle_timeout_seconds = (
+                request.profile.limits.provider_stream_idle_timeout_seconds
+            )
+            assert stream_idle_timeout_seconds is not None
+            return _local_failure(
+                request,
+                status=InvocationStatus.FAILED,
+                code="codex_provider_stream_stalled",
+                message="Codex worker stopped yielding Provider events after progress",
+                started=started,
+                events=tuple(stdout_capture.events),
+                details=codex_provider_stream_stalled_details(
+                    idle_timeout_seconds=stream_idle_timeout_seconds,
+                    observed_provider_event_count=stalled_provider_event_count,
+                ),
+                worker_exit_code=process.returncode,
+                retryable=True,
             )
         if stdout_capture.overflowed:
             return _local_failure(
@@ -713,18 +878,10 @@ class CodexSdkBackend:
             "model": profile.model,
             "model_provider": profile.model_provider,
             "reasoning_effort": profile.reasoning_effort.value,
-            "base_instructions": profile.base_instructions,
-            "developer_instructions": profile.developer_instructions,
             "sandbox": profile.sandbox.value,
             "output_schema": (
-                _transport_output_schema(
-                    output_schema,
-                    transport=profile.structured_output_transport,
-                )
-                if output_schema is not None
-                else None
+                _provider_output_schema(output_schema) if output_schema is not None else None
             ),
-            "structured_output_transport": profile.structured_output_transport,
             "thread_id": request.session.thread_id if request.session else None,
             "authentication_kind": profile.authentication_kind,
             "authentication_environment": profile.authentication_environment,
@@ -732,7 +889,6 @@ class CodexSdkBackend:
             "codex_bin": str(profile.codex_bin) if profile.codex_bin is not None else None,
             "codex_bin_sha256": profile.codex_bin_sha256,
             "sensitive_environment_names": list(profile.sensitive_environment_names),
-            "hooks_enabled": bool(profile.hooks),
             # Explicit diagnostic controls may request a redacted terminal
             # excerpt for a local, non-artifact Code-Agent view. This never
             # changes ordinary runtime traffic or the Scheduler's feedback
@@ -740,36 +896,17 @@ class CodexSdkBackend:
             "diagnostic_capture_terminal_excerpt": (
                 request.metadata.get("diagnostic_capture_terminal_excerpt") is True
             ),
-            # The worker compares these framework-owned audit fragments only
-            # in memory. Its compact event contains labels/outcomes, never
-            # the command strings or their output.
-            "diagnostic_command_expectations": [
-                item.to_worker_payload() for item in request.diagnostic_command_expectations
-            ],
             "limits": {
                 "timeout_seconds": limits.timeout_seconds,
                 "interrupt_grace_seconds": limits.interrupt_grace_seconds,
                 "max_events": limits.max_events,
                 "max_protocol_bytes": limits.max_protocol_bytes,
             },
+            # Bounded pre-first-event transport retry the Codex custom provider
+            # may spend before a Provider event is observed.  See
+            # ``AgentConfig.provider_transport_max_retries``.
+            "provider_transport_max_retries": limits.provider_transport_max_retries,
         }
-
-
-def _transport_output_schema(schema: JsonObject, *, transport: str) -> JsonObject:
-    if transport == "provider_schema":
-        return _provider_output_schema(schema)
-    if transport == "json_envelope":
-        # Profile construction injects the inner source contract into the
-        # runtime instructions and local Pydantic/compiler validation still
-        # owns acceptance. This outer contract exists only for
-        # OpenAI-compatible gateways that reject nested schemas.
-        return {
-            "type": "object",
-            "properties": {"artifact_json": {"type": "string"}},
-            "required": ["artifact_json"],
-            "additionalProperties": False,
-        }
-    raise ValueError("unsupported structured output transport")
 
 
 def _provider_output_schema(schema: JsonObject) -> JsonObject:
@@ -853,6 +990,8 @@ def _normalize_provider_schema_node(
     normalized: JsonObject = {}
     for key, child in value.items():
         if key in _PROVIDER_SCHEMA_OMIT_KEYS:
+            continue
+        if "$ref" in value and key in _PROVIDER_REF_SIBLING_OMIT_KEYS:
             continue
         target_key = "anyOf" if key == "oneOf" else key
         if target_key in normalized:
@@ -988,30 +1127,6 @@ def _decode_provider_json_ir(value: JsonValue) -> JsonValue:
     if keys == {"aw_object_entries"}:
         return _decode_provider_json_entries(value["aw_object_entries"])
     return {key: _decode_provider_json_ir(item) for key, item in value.items()}
-
-
-def _decode_json_envelope(value: JsonValue) -> JsonValue:
-    """Decode a shallow envelope, or preserve a gateway's direct JSON object.
-
-    A compatibility gateway can ignore a requested output schema and return the
-    logical document directly. That document still receives the exact same
-    local Pydantic validation; accepting it avoids reclassifying a usable typed
-    proposal as a transport failure.  Some compatible gateways enforce the
-    outer object name but not its string-valued field and return the logical
-    JSON object directly under ``artifact_json``.  That is still only an
-    encoding variation: it is passed through the same exact local Pydantic and
-    deterministic compiler checks as a decoded string.  Scalars and arrays
-    remain invalid, so this never accepts an abbreviated or untyped candidate.
-    """
-
-    if not isinstance(value, Mapping) or set(value) != {"artifact_json"}:
-        return value
-    encoded = value["artifact_json"]
-    if isinstance(encoded, Mapping):
-        return json_compatible(encoded)
-    if not isinstance(encoded, str):
-        raise ValueError("structured output envelope artifact_json must be a JSON string or object")
-    return json_compatible(json.loads(encoded, parse_constant=_reject_json_constant))
 
 
 def _decode_provider_json_entries(value: JsonValue) -> JsonObject:
@@ -1270,20 +1385,14 @@ def _result_from_worker(
     structured_output: JsonValue | None = None
     if raw.get("structured_output") is not None:
         provider_output = json_compatible(redactor.value(raw["structured_output"]))
-        transport = raw.get("structured_output_transport", "provider_schema")
         try:
-            if transport == "provider_schema":
-                structured_output = _decode_provider_json_ir(provider_output)
-            elif transport == "json_envelope":
-                structured_output = _decode_json_envelope(provider_output)
-            else:
-                raise ValueError("worker returned an unsupported structured output transport")
+            structured_output = _decode_provider_json_ir(provider_output)
         except (TypeError, ValueError, json.JSONDecodeError):
             return _local_failure(
                 request,
                 status=InvocationStatus.FAILED,
-                code="structured_output_transport_invalid",
-                message="worker returned an invalid structured output transport envelope",
+                code="structured_output_native_schema_invalid",
+                message="worker returned invalid native structured output",
                 started=started,
                 events=events,
                 worker_exit_code=worker_exit_code,

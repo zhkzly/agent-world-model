@@ -12,7 +12,7 @@ import pytest
 from pydantic import HttpUrl
 from v3_fixture import ReleaseGraph, build_release_graph
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.artifact_store import ArtifactStore, ArtifactWriter
 from agent_world.builder import EnvironmentBuilder
 from agent_world.config import AgentBackendConfig, FoundryConfig, ResearchConfig
@@ -156,7 +156,7 @@ def _direct_controller(
         research=research_config,
         release_profile=release_profile,
     )
-    profiles = IsolatedAgentProfileProvider(agent, source_environment={})
+    profiles = AgentProfileProvider(agent, source_environment={})
     backend = CodexSdkBackend()
     research = build_research_toolchain(research_config, source_environment={})
     controller_artifacts = _framework_writer(store)

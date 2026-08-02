@@ -1,10 +1,9 @@
 """Resolve the exact Codex app-server executable a profile must authorize.
 
-The outer Python worker can launch the SDK-bundled CLI from its own environment,
-but the CLI re-execs that executable inside its command sandbox.  Therefore the
-same content-pinned executable has to be part of the resolved Agent profile;
-leaving bundled-runtime discovery only in the worker creates an invisible
-runtime dependency that bwrap cannot execute.
+The outer Python worker and the SDK app-server both execute directly on the
+host.  Therefore the same content-pinned executable has to be part of the
+resolved Agent profile; leaving bundled-runtime discovery only in the worker
+creates an invisible runtime dependency for the app-server.
 """
 
 from __future__ import annotations

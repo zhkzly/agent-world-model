@@ -12,9 +12,10 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from agent_world.agent_profiles import IsolatedAgentProfileProvider
+from agent_world.agent_profiles import AgentProfileProvider
 from agent_world.artifact_store import ArtifactStore
 from agent_world.builder import BuilderWorkspaceProgress, EnvironmentBuilder
+from agent_world.builder.precommit import HostCandidateWorkspaceProbe
 from agent_world.config import FoundryConfig, load_foundry_config
 from agent_world.consumer import (
     CAPABILITY_FEEDBACK_ARTIFACT_ID_PREFIX,
@@ -61,10 +62,11 @@ from agent_world.invocation import (
     RoutedInvocationBackend,
 )
 from agent_world.judge import (
+    CandidateProcessRunner,
     CleanCandidateBuilder,
     EnvironmentJudge,
+    HostExecutionPolicy,
     InteractiveChallengerStrategy,
-    IsolationPolicy,
     VerifierCompiler,
 )
 from agent_world.observability import DebugTranscriptWriter, ObservabilityReader, ObservabilityRoot
@@ -89,7 +91,7 @@ class FoundryApplication:
     config: FoundryConfig
     artifacts: ArtifactStore
     registry: EnvironmentRegistry
-    profiles: IsolatedAgentProfileProvider
+    profiles: AgentProfileProvider
     backend: InvocationBackend
     invocation_control: InvocationControlStore
     telemetry: TelemetryStore
@@ -225,8 +227,15 @@ class DirectRunReader:
                     "details": [item.model_dump(mode="json") for item in event.details],
                 }
             )
+        # scope_id equals EnvironmentJob.job_id.  New heads persist it directly;
+        # heads written before the field existed fall back to the one job deref
+        # (identical to prior behavior) only when the value is absent.
+        scope_id = head.scope_id or self._artifacts.get_json(
+            snapshot.job_ref, EnvironmentJob
+        ).job_id
         output: dict[str, object] = {
             "head": head.model_dump(mode="json"),
+            "scope_id": scope_id,
             "snapshot": snapshot.model_dump(mode="json"),
             "events": events,
             "active_work": self._active_work(head.run_id, snapshot),
@@ -502,7 +511,7 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         known_secret_canaries=canaries,
         reservation_ttl_seconds=config.expansion.version_reservation_ttl_seconds,
     )
-    profiles = IsolatedAgentProfileProvider(
+    profiles = AgentProfileProvider(
         config.agent,
         source_environment=environment,
     )
@@ -567,6 +576,7 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
     expansion_source = ExpansionSourceRouter((expansion_source_engine,))
     for configured_source in config.expansion.sources:
         expansion_source.validate_descriptor(configured_source.descriptor())
+    clean_builder = _clean_candidate_builder(config)
     builder = EnvironmentBuilder(
         artifact_store=builder_artifacts,
         invocation_backend=backend,
@@ -581,6 +591,13 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         # turn and the Scheduler owns any durable continuation.
         turn_token_limit=config.agent.environment_codegen_physical_turn_token_limit,
         turn_timeout_seconds=config.agent.environment_codegen_invocation_timeout_seconds,
+        workspace_probe=HostCandidateWorkspaceProbe(
+            clean_builder=clean_builder,
+            process_runner=CandidateProcessRunner(
+                execution=HostExecutionPolicy(purpose="runtime"),
+                timeout_seconds=30.0,
+            ),
+        ),
     )
     verifier_compiler = VerifierCompiler(
         artifact_store=judge_artifacts,
@@ -589,7 +606,6 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
         maximum_structured_reworks=config.judge.maximum_structured_reworks,
         maximum_tasks_per_batch=config.judge.maximum_tasks_per_verifier_batch,
     )
-    clean_builder = _clean_candidate_builder(config)
     judge = EnvironmentJudge(
         artifact_store=judge_artifacts,
         interactive_challenger=InteractiveChallengerStrategy(
@@ -597,9 +613,10 @@ def build_application(config: FoundryConfig) -> FoundryApplication:
             profile_provider=profiles,
         ),
         clean_builder=clean_builder,
-        runtime_isolation=IsolationPolicy(purpose="runtime"),
+        runtime_execution=HostExecutionPolicy(purpose="runtime"),
         telemetry=telemetry,
         known_secret_canaries=canaries,
+        runtime_episode_concurrency=config.judge.runtime_episode_concurrency,
     )
     controller = FoundryController(
         config=config,
@@ -679,7 +696,7 @@ def open_consumption(config: FoundryConfig) -> ConsumptionApplication:
         rollout=LocalRolloutConsumer(
             registry=registry,
             clean_builder=clean_builder,
-            runtime_isolation=IsolationPolicy(purpose="runtime"),
+            runtime_execution=HostExecutionPolicy(purpose="runtime"),
         ),
         feedback=FeedbackRecorder(
             registry=registry,
@@ -817,7 +834,7 @@ def _clean_candidate_builder(config: FoundryConfig) -> CleanCandidateBuilder:
 
     try:
         return CleanCandidateBuilder(
-            build_isolation=IsolationPolicy(purpose="build"),
+            build_execution=HostExecutionPolicy(purpose="build"),
             uv_cache_dir=config.judge.uv_cache_dir,
             timeout_seconds=config.judge.clean_build_timeout_seconds,
         )

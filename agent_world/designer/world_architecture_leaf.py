@@ -183,7 +183,7 @@ def _world_architecture_prompt(need: str, evidence_graph: EvidenceGraph) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
-    return f"""You are the isolated Environment Architect for an Agent World Foundry.
+    return f"""You are the Environment Architect for an Agent World Foundry.
 Project purpose: turn one human need into a real programmatic environment whose state transitions
 are executed by code, not narrated by an LLM. Your one transaction owns a coherent world boundary,
 state meaning, public tool surfaces, and global invariants. Framework code owns schema graphs,
@@ -200,6 +200,12 @@ be one mutable string with declared enum states. Each resource is owned exactly 
 has a non-empty read/write state footprint. Every tool's namespace must be declared by boundary.
 The framework derives tool ids, all schema node ids, JSON Schema wrappers, references, immutable
 closure, and tool-coupling plan.
+
+Choose the smallest public surface that directly serves the stated need and admitted claims. Every
+public tool must map to a concrete requested user action or necessary constraint. Do not invent
+speculative workflow/orchestration, synchronization/integration, administrative, audit, helper,
+or future-extension tools. Keep internal coordination as state and behavior inside required tools
+unless the need or evidence makes a separate public action indispensable.
 
 Do not emit raw JSON Schema, schema IR, reset or transition rules, task/reward/verifier/runtime
 code, fixtures, expected answers, trajectories, repair decisions, or a release decision.

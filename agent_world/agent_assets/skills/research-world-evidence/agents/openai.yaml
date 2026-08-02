@@ -1,4 +1,0 @@
-interface:
-  display_name: "Research World Evidence"
-  short_description: "Collect source-backed environment and tool evidence"
-  default_prompt: "Research the requested environment and return source-backed claims without inventing missing facts."

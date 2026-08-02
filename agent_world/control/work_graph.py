@@ -14,10 +14,16 @@ from pydantic import Field, model_validator
 from agent_world.contracts import (
     ArtifactRef,
     ContentHash,
+    EnvironmentDesign,
     Identifier,
     V2Contract,
     canonical_json_bytes,
     sha256_digest,
+)
+from agent_world.judge_budgeting import (
+    JudgeOperationBudgetRequirements,
+    integration_budget_requirements,
+    release_without_interactive_budget_requirements,
 )
 
 from .code_revision import leaf_code_revision
@@ -34,6 +40,7 @@ from .work import (
 
 if TYPE_CHECKING:
     from agent_world.designer.models import CurriculumPlanSourceDraft, ToolCouplingPlan
+    from agent_world.judge.models import VerifierBatchPlan
 
 
 class WorkGraphError(RuntimeError):
@@ -79,8 +86,10 @@ _SHARED_SCHEDULER_FEEDBACK_MODULES = (
 # ``implementation_revision_id`` flows into ``acceptance_digest``, so any module
 # named by a leaf's implementation tuple invalidates every already-committed
 # output of that leaf when its source changes.  That is correct for surfaces
-# which author *meaning*: the rendered Prompt, the output schema, the mounted
-# Runtime Skill, and the model identity.  It is wrong for the physical
+# which author *meaning*: the rendered Prompt, the output schema, an Agent's
+# mounted Runtime Skill, and the model identity.  Direct LLM leaves deliberately
+# have no mounted Skill: their Prompt is their complete semantic surface.  It is
+# wrong for the physical
 # invocation control plane -- transport adapters, worker lifecycle, liveness
 # supervision, retry/fallback routing, ownership and recovery.  Those decide
 # only *how* one physical attempt is admitted, observed and settled; a fix
@@ -99,10 +108,24 @@ _SHARED_SCHEDULER_FEEDBACK_MODULES = (
 # answer.  Never include it merely because the leaf calls into it.
 # ``leaf_code_revision`` enforces this mechanically.
 
+_RESEARCH_PLAN_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.designer.models",
+    "agent_world.designer.one_shot",
+    "agent_world.designer.research_leaf",
+)
+_RESEARCH_PLAN_VALIDATOR_MODULES = (
+    "agent_world.designer.models",
+    "agent_world.designer.research_leaf",
+    "agent_world.designer.validators",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
+)
 _EVIDENCE_SYNTHESIS_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
     "agent_world.designer.evidence_synthesis_leaf",
     "agent_world.designer.evidence_synthesis_compiler",
     "agent_world.designer.models",
+    "agent_world.designer.one_shot",
 )
 _EVIDENCE_SYNTHESIS_VALIDATOR_MODULES = (
     "agent_world.designer.evidence_synthesis_compiler",
@@ -110,12 +133,29 @@ _EVIDENCE_SYNTHESIS_VALIDATOR_MODULES = (
     "agent_world.designer.validators",
     *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
-_EVIDENCE_SYNTHESIS_SKILL = (
-    Path(__file__).resolve().parents[1]
-    / "agent_assets"
-    / "skills"
-    / "research-world-evidence"
-    / "SKILL.md"
+_WORLD_ARCHITECTURE_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.designer.models",
+    "agent_world.designer.one_shot",
+    "agent_world.designer.world_architecture_leaf",
+)
+_WORLD_ARCHITECTURE_VALIDATOR_MODULES = (
+    "agent_world.designer.architecture_compiler",
+    "agent_world.designer.models",
+    "agent_world.designer.world_architecture_leaf",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
+)
+_SHARED_TOOL_SEMANTICS_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.designer.final_design_leaves",
+    "agent_world.designer.models",
+    "agent_world.designer.one_shot",
+)
+_SHARED_TOOL_SEMANTICS_VALIDATOR_MODULES = (
+    "agent_world.designer.final_design_compiler",
+    "agent_world.designer.models",
+    "agent_world.designer.validation",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _TOOL_SEMANTICS_BATCH_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -132,12 +172,53 @@ _TOOL_SEMANTICS_BATCH_VALIDATOR_MODULES = (
     "agent_world.designer.validation",
     *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
-_TOOL_SEMANTICS_BATCH_SKILL = (
-    Path(__file__).resolve().parents[1]
-    / "agent_assets"
-    / "skills"
-    / "engineer-agent-world"
-    / "SKILL.md"
+_WORLD_RULES_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.designer.final_design_leaves",
+    "agent_world.designer.models",
+    "agent_world.designer.one_shot",
+)
+_WORLD_RULES_VALIDATOR_MODULES = (
+    "agent_world.designer.final_design_compiler",
+    "agent_world.designer.models",
+    "agent_world.designer.validation",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
+)
+_LEGACY_CURRICULUM_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.designer.final_design_leaves",
+    "agent_world.designer.models",
+    "agent_world.designer.one_shot",
+)
+_LEGACY_CURRICULUM_VALIDATOR_MODULES = (
+    "agent_world.designer.final_design_compiler",
+    "agent_world.designer.models",
+    "agent_world.designer.validation",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
+)
+_CURRICULUM_PLAN_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.designer.final_design_leaves",
+    "agent_world.designer.models",
+    "agent_world.designer.one_shot",
+)
+_CURRICULUM_PLAN_VALIDATOR_MODULES = (
+    "agent_world.designer.final_design_compiler",
+    "agent_world.designer.models",
+    "agent_world.designer.validation",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
+)
+_TASK_REQUIREMENT_IMPLEMENTATION_MODULES = (
+    "agent_world.agent_profiles",
+    "agent_world.designer.final_design_leaves",
+    "agent_world.designer.models",
+    "agent_world.designer.one_shot",
+)
+_TASK_REQUIREMENT_VALIDATOR_MODULES = (
+    "agent_world.designer.final_design_compiler",
+    "agent_world.designer.models",
+    "agent_world.designer.validation",
+    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _VERIFIER_INTENT_BATCH_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -149,13 +230,6 @@ _VERIFIER_INTENT_BATCH_VALIDATOR_MODULES = (
     "agent_world.judge.leaf",
     "agent_world.judge.models",
     *_SHARED_SCHEDULER_FEEDBACK_MODULES,
-)
-_VERIFIER_INTENT_BATCH_SKILL = (
-    Path(__file__).resolve().parents[1]
-    / "agent_assets"
-    / "skills"
-    / "challenge-agent-world"
-    / "SKILL.md"
 )
 _VERIFIER_PLAN_IMPLEMENTATION_MODULES = (
     "agent_world.judge.compiler",
@@ -187,7 +261,6 @@ _IMPLEMENTATION_PLAN_SKILL = (
     / "agent_assets"
     / "skills"
     / "engineer-build-planning"
-    / "SKILL.md"
 )
 _CANDIDATE_BUILD_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -198,10 +271,12 @@ _CANDIDATE_BUILD_IMPLEMENTATION_MODULES = (
 _CANDIDATE_BUILD_VALIDATOR_MODULES = (
     "agent_world.builder.leaf",
     "agent_world.builder.models",
+    "agent_world.builder.precommit",
     "agent_world.builder.service",
     "agent_world.builder.workspace",
     "agent_world.control.leaf_executor",
     "agent_world.control.validation",
+    "agent_world.judge.supervisor",
     *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _CANDIDATE_BUILD_SKILL = (
@@ -209,12 +284,18 @@ _CANDIDATE_BUILD_SKILL = (
     / "agent_assets"
     / "skills"
     / "engineer-environment-codegen"
-    / "SKILL.md"
 )
+# CandidateBuild is a Code Agent's bounded development cycle: one initial
+# build/test turn and one same-workspace pre-commit correction when framework
+# validation gives it actionable feedback.  This is distinct from Scheduler
+# RepairAction budget and must remain shared with diagnostic current-runtime
+# refreshes.
+CANDIDATE_BUILD_DEVELOPMENT_AGENT_TURNS = 2
 _RUNTIME_INTEGRATION_IMPLEMENTATION_MODULES = (
     "agent_world.control.direct_runner",
     "agent_world.control.leaf_executor",
     "agent_world.judge.assurance",
+    "agent_world.judge_budgeting",
     "agent_world.judge.leaf",
     "agent_world.judge.service",
     "agent_world.judge.supervisor",
@@ -224,6 +305,7 @@ _RUNTIME_INTEGRATION_VALIDATOR_MODULES = (
     "agent_world.control.leaf_executor",
     "agent_world.control.validation",
     "agent_world.judge.assurance",
+    "agent_world.judge_budgeting",
     "agent_world.judge.leaf",
     "agent_world.judge.service",
     *_SHARED_SCHEDULER_FEEDBACK_MODULES,
@@ -232,6 +314,7 @@ _RELEASE_ASSURANCE_IMPLEMENTATION_MODULES = (
     "agent_world.control.direct_runner",
     "agent_world.control.leaf_executor",
     "agent_world.judge.assurance",
+    "agent_world.judge_budgeting",
     "agent_world.judge.compiler",
     "agent_world.judge.leaf",
     "agent_world.judge.reachability",
@@ -243,24 +326,36 @@ _RELEASE_ASSURANCE_VALIDATOR_MODULES = (
     "agent_world.control.leaf_executor",
     "agent_world.control.validation",
     "agent_world.judge.compiler",
+    "agent_world.judge_budgeting",
     "agent_world.judge.leaf",
     "agent_world.judge.service",
     *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 
 
-def evidence_synthesis_implementation_revision() -> Identifier:
-    """Hash the exact runtime authoring surface for EvidenceSynthesis.
+def research_plan_implementation_revision() -> Identifier:
+    """Hash the complete direct ResearchPlan Prompt, profile, and schema surface."""
 
-    The compiled WorkDefinition must change when either the leaf Prompt/schema
-    path or its mounted research Runtime Skill changes.  This is provenance for
-    a fresh semantic generation, not a request to make framework identities or
-    business claims model-authored.
-    """
+    return leaf_code_revision(
+        *_RESEARCH_PLAN_IMPLEMENTATION_MODULES,
+        label="research-plan",
+    )
+
+
+def research_plan_validator_revision() -> Identifier:
+    """Hash ResearchPlan semantic admission and its Scheduler feedback route."""
+
+    return leaf_code_revision(
+        *_RESEARCH_PLAN_VALIDATOR_MODULES,
+        label="validator-research-plan",
+    )
+
+
+def evidence_synthesis_implementation_revision() -> Identifier:
+    """Hash the exact direct Prompt/profile/schema surface for EvidenceSynthesis."""
 
     return leaf_code_revision(
         *_EVIDENCE_SYNTHESIS_IMPLEMENTATION_MODULES,
-        assets={"runtime-skill:research-world-evidence": _EVIDENCE_SYNTHESIS_SKILL},
         label="research-evidence-synthesis",
     )
 
@@ -274,12 +369,47 @@ def evidence_synthesis_validator_revision() -> Identifier:
     )
 
 
+def world_architecture_implementation_revision() -> Identifier:
+    """Hash the complete direct Architecture Prompt, profile, and schema surface."""
+
+    return leaf_code_revision(
+        *_WORLD_ARCHITECTURE_IMPLEMENTATION_MODULES,
+        label="design-world-architecture",
+    )
+
+
+def world_architecture_validator_revision() -> Identifier:
+    """Hash Architecture compilation and its Scheduler feedback route."""
+
+    return leaf_code_revision(
+        *_WORLD_ARCHITECTURE_VALIDATOR_MODULES,
+        label="validator-world-architecture",
+    )
+
+
+def shared_tool_semantics_implementation_revision() -> Identifier:
+    """Hash the direct SharedToolSemantics Prompt, profile, and schema surface."""
+
+    return leaf_code_revision(
+        *_SHARED_TOOL_SEMANTICS_IMPLEMENTATION_MODULES,
+        label="design-shared-tool-semantics",
+    )
+
+
+def shared_tool_semantics_validator_revision() -> Identifier:
+    """Hash shared-contract compilation and its Scheduler feedback route."""
+
+    return leaf_code_revision(
+        *_SHARED_TOOL_SEMANTICS_VALIDATOR_MODULES,
+        label="validator-shared-tool-semantics",
+    )
+
+
 def tool_semantics_batch_implementation_revision() -> Identifier:
-    """Hash the full prompt/profile/Skill surface for one ToolSemantics batch."""
+    """Hash the complete direct Prompt/profile/schema surface for ToolSemantics."""
 
     return leaf_code_revision(
         *_TOOL_SEMANTICS_BATCH_IMPLEMENTATION_MODULES,
-        assets={"runtime-skill:engineer-agent-world": _TOOL_SEMANTICS_BATCH_SKILL},
         label="design-tool-semantics-batch",
     )
 
@@ -293,12 +423,83 @@ def tool_semantics_batch_validator_revision() -> Identifier:
     )
 
 
+def world_rules_implementation_revision() -> Identifier:
+    """Hash the direct WorldRules Prompt, profile, and schema surface."""
+
+    return leaf_code_revision(
+        *_WORLD_RULES_IMPLEMENTATION_MODULES,
+        label="design-world-rules",
+    )
+
+
+def world_rules_validator_revision() -> Identifier:
+    """Hash WorldRules compilation and its Scheduler feedback route."""
+
+    return leaf_code_revision(
+        *_WORLD_RULES_VALIDATOR_MODULES,
+        label="validator-world-rules",
+    )
+
+
+def legacy_curriculum_implementation_revision() -> Identifier:
+    """Hash the retired aggregate Curriculum prompt if a diagnostic graph uses it."""
+
+    return leaf_code_revision(
+        *_LEGACY_CURRICULUM_IMPLEMENTATION_MODULES,
+        label="design-task-curriculum-legacy",
+    )
+
+
+def legacy_curriculum_validator_revision() -> Identifier:
+    """Hash retired aggregate Curriculum admission and feedback handling."""
+
+    return leaf_code_revision(
+        *_LEGACY_CURRICULUM_VALIDATOR_MODULES,
+        label="validator-task-curriculum-legacy",
+    )
+
+
+def curriculum_plan_implementation_revision() -> Identifier:
+    """Hash the direct CurriculumPlan Prompt, profile, and schema surface."""
+
+    return leaf_code_revision(
+        *_CURRICULUM_PLAN_IMPLEMENTATION_MODULES,
+        label="design-curriculum-plan",
+    )
+
+
+def curriculum_plan_validator_revision() -> Identifier:
+    """Hash CurriculumPlan compilation and its Scheduler feedback route."""
+
+    return leaf_code_revision(
+        *_CURRICULUM_PLAN_VALIDATOR_MODULES,
+        label="validator-curriculum-plan",
+    )
+
+
+def task_requirement_implementation_revision() -> Identifier:
+    """Hash the direct TaskRequirement Prompt, profile, and schema surface."""
+
+    return leaf_code_revision(
+        *_TASK_REQUIREMENT_IMPLEMENTATION_MODULES,
+        label="design-task-requirement",
+    )
+
+
+def task_requirement_validator_revision() -> Identifier:
+    """Hash TaskRequirement compilation and its Scheduler feedback route."""
+
+    return leaf_code_revision(
+        *_TASK_REQUIREMENT_VALIDATOR_MODULES,
+        label="validator-task-requirement",
+    )
+
+
 def verifier_intent_batch_implementation_revision() -> Identifier:
-    """Hash the Challenger's complete prompt/profile/Skill authoring surface."""
+    """Hash the Challenger's direct Prompt/profile/schema authoring surface."""
 
     return leaf_code_revision(
         *_VERIFIER_INTENT_BATCH_IMPLEMENTATION_MODULES,
-        assets={"runtime-skill:challenge-agent-world": _VERIFIER_INTENT_BATCH_SKILL},
         label="verifier-intent-batch",
     )
 
@@ -424,6 +625,16 @@ def current_runtime_revisions_for_definition(
     coordinate = definition.coordinate
     if (
         coordinate.component == "research"
+        and coordinate.stage == "research_plan"
+        and coordinate.artifact_slot == "research_plan"
+        and definition.proposal_policy.output_contract_id == "contract:research-plan"
+    ):
+        return (
+            research_plan_implementation_revision(),
+            research_plan_validator_revision(),
+        )
+    if (
+        coordinate.component == "research"
         and coordinate.stage == "evidence_synthesis"
         and coordinate.artifact_slot == "evidence_synthesis"
         and definition.proposal_policy.output_contract_id == "contract:evidence-synthesis"
@@ -431,6 +642,27 @@ def current_runtime_revisions_for_definition(
         return (
             evidence_synthesis_implementation_revision(),
             evidence_synthesis_validator_revision(),
+        )
+    if (
+        coordinate.component == "design"
+        and coordinate.stage == "world_architecture"
+        and coordinate.artifact_slot == "world_architecture"
+        and definition.proposal_policy.output_contract_id == "contract:world-architecture-source.v3"
+    ):
+        return (
+            world_architecture_implementation_revision(),
+            world_architecture_validator_revision(),
+        )
+    if (
+        coordinate.component == "design"
+        and coordinate.stage == "shared_tool_semantics"
+        and coordinate.artifact_slot == "shared_tool_semantics"
+        and definition.proposal_policy.output_contract_id
+        == "contract:shared-tool-semantics-source.v3"
+    ):
+        return (
+            shared_tool_semantics_implementation_revision(),
+            shared_tool_semantics_validator_revision(),
         )
     if (
         coordinate.component == "design"
@@ -442,6 +674,46 @@ def current_runtime_revisions_for_definition(
         return (
             tool_semantics_batch_implementation_revision(),
             tool_semantics_batch_validator_revision(),
+        )
+    if (
+        coordinate.component == "design"
+        and coordinate.stage == "world_rules"
+        and coordinate.artifact_slot == "world_rules"
+        and definition.proposal_policy.output_contract_id == "contract:world-rules-source.v3"
+    ):
+        return (
+            world_rules_implementation_revision(),
+            world_rules_validator_revision(),
+        )
+    if (
+        coordinate.component == "design"
+        and coordinate.stage == "task_curriculum"
+        and coordinate.artifact_slot == "task_curriculum"
+        and definition.proposal_policy.output_contract_id == "contract:task-curriculum-source.v3"
+    ):
+        return (
+            legacy_curriculum_implementation_revision(),
+            legacy_curriculum_validator_revision(),
+        )
+    if (
+        coordinate.component == "design"
+        and coordinate.stage == "curriculum_plan"
+        and coordinate.artifact_slot == "curriculum_plan"
+        and definition.proposal_policy.output_contract_id == "contract:curriculum-plan-source.v1"
+    ):
+        return (
+            curriculum_plan_implementation_revision(),
+            curriculum_plan_validator_revision(),
+        )
+    if (
+        coordinate.component == "design"
+        and coordinate.stage == "task_requirement"
+        and coordinate.artifact_slot == "task_requirement_source"
+        and definition.proposal_policy.output_contract_id == "contract:task-requirement-source.v1"
+    ):
+        return (
+            task_requirement_implementation_revision(),
+            task_requirement_validator_revision(),
         )
     if (
         coordinate.component == "verifier"
@@ -1425,6 +1697,80 @@ def structured_agent_work_definition(
     )
 
 
+def bind_model_route_recovery_policy(
+    definitions: Iterable[WorkDefinition],
+    *,
+    model_routes: tuple[str, ...],
+    maximum_same_model_infrastructure_retries: int = 1,
+) -> tuple[WorkDefinition, ...]:
+    """Bind Agent recovery authority to the complete configured model order.
+
+    A non-zero ``maximum_model_fallbacks`` declares that a node may use the
+    configured model-route policy.  The concrete count cannot be known inside
+    a static WorkDefinition factory: it is supplied only by the composition
+    root, before the graph is frozen.  Keeping that binding here means the
+    effective route chain is identity-bound and visible in the durable
+    definition rather than being a hidden scheduler override.
+
+    Nodes that explicitly declare zero infrastructure authority remain
+    unchanged. For an eligible Agent/Direct node, the configured number of
+    fresh infrastructure retries is available per configured model and each
+    transition to a later configured model consumes one repair action. The
+    total ceiling therefore also covers the semantic allowance plus that
+    finite route chain.
+    """
+
+    items = tuple(definitions)
+    if maximum_same_model_infrastructure_retries < 1:
+        raise WorkGraphError("same-model infrastructure retry limit must be positive")
+    if not model_routes:
+        return items
+    if len(set(model_routes)) != len(model_routes) or any(
+        not model or model != model.strip() for model in model_routes
+    ):
+        raise WorkGraphError("model recovery binding requires unique canonical model routes")
+
+    fallback_count = len(model_routes) - 1
+    rebound: list[WorkDefinition] = []
+    for definition in items:
+        policy = definition.repair_policy
+        if (
+            definition.proposal_policy.executor != "agent"
+            or policy.maximum_infrastructure_retries == 0
+        ):
+            rebound.append(definition)
+            continue
+        semantic_allowance = (
+            policy.maximum_local_corrections + policy.strict_progress_bonus_corrections
+        )
+        route_recovery_allowance = (
+            maximum_same_model_infrastructure_retries * len(model_routes)
+            + (
+                fallback_count
+                if policy.maximum_model_fallbacks > 0
+                else 0
+            )
+        )
+        rebound_policy = policy.model_copy(
+            update={
+                "maximum_infrastructure_retries": (
+                    maximum_same_model_infrastructure_retries
+                ),
+                "maximum_model_fallbacks": (
+                    fallback_count
+                    if policy.maximum_model_fallbacks > 0
+                    else 0
+                ),
+                "maximum_total_repair_attempts": max(
+                    policy.maximum_total_repair_attempts,
+                    semantic_allowance + route_recovery_allowance,
+                ),
+            }
+        )
+        rebound.append(definition.model_copy(update={"repair_policy": rebound_policy}))
+    return tuple(rebound)
+
+
 def research_plan_work_definition(
     *,
     scope_id: Identifier,
@@ -1447,7 +1793,8 @@ def research_plan_work_definition(
         timing_reason="Real search must consume one validated bounded query plan.",
         output_contract_id="contract:research-plan",
         acceptance_transform_id="framework.direct-structured-output.v3",
-        validator_revision_id="framework.validator.research-plan.v3",
+        implementation_revision_id=research_plan_implementation_revision(),
+        validator_revision_id=research_plan_validator_revision(),
         agent_role="researcher",
         allowed_mutation_roots=("/",),
         agent_wall_seconds=agent_wall_seconds,
@@ -1600,7 +1947,8 @@ def world_architecture_work_definition(
         ),
         output_contract_id="contract:world-architecture-source.v3",
         acceptance_transform_id="framework.architecture-compiler.v3",
-        validator_revision_id="framework.validator.world-architecture.v3",
+        implementation_revision_id=world_architecture_implementation_revision(),
+        validator_revision_id=world_architecture_validator_revision(),
         agent_role="environment_engineer",
         allowed_mutation_roots=("/boundary", "/state_entities", "/tool_inventory"),
         agent_wall_seconds=agent_wall_seconds,
@@ -2074,6 +2422,8 @@ def complete_generation_work_graph(
     verifier_wall_seconds: float = 900.0,
     verifier_token_limit: int = 48_000,
     verifier_batch_count: int,
+    environment_design: EnvironmentDesign | None = None,
+    verifier_batch_plan: VerifierBatchPlan | None = None,
     integration_wall_seconds: float = 600.0,
     release_wall_seconds: float = 900.0,
     strict_input_contracts: bool = False,
@@ -2081,11 +2431,12 @@ def complete_generation_work_graph(
     """Compile the one releasable Direct/Evolve topology.
 
     The function accepts the exact intermediate ``design_graph`` rather than a
-    loose list of definitions.  Its committed VerifierPlan determines the
-    supplied physical Challenger count; :class:`WorkGraphEpochRuntime` checks
-    that count against the exact persisted plan before freezing the final epoch.
-    Callers cannot create a production graph whose terminal is merely
-    ``ModelingBoundary`` or whose Agent fan-out is unknown.
+    loose list of definitions.  A real final graph additionally receives the
+    committed Design and VerifierPlan used to derive finite Judge reservations.
+    That avoids treating a fixed probe count as a surrogate for the actual
+    task-materialization and verifier work.  Structural graph tests may omit
+    those inputs only while ``strict_input_contracts`` is false; no normal
+    Direct or diagnostic execution may do so.
     """
 
     if design_graph.mode != "diagnostic" or design_graph.release_eligible:
@@ -2112,6 +2463,29 @@ def complete_generation_work_graph(
 
     if not 1 <= verifier_batch_count <= 8:
         raise WorkGraphError("Verifier batch count must be within the fixed 1..8 capacity")
+    if (environment_design is None) != (verifier_batch_plan is None):
+        raise WorkGraphError(
+            "final graph Judge budget derivation requires both EnvironmentDesign and VerifierPlan"
+        )
+    if strict_input_contracts and environment_design is None:
+        raise WorkGraphError(
+            "strict final graph requires committed EnvironmentDesign and VerifierPlan "
+            "for Judge budgets"
+        )
+    if verifier_batch_plan is not None and len(verifier_batch_plan.batches) != verifier_batch_count:
+        raise WorkGraphError(
+            "final graph verifier batch count does not match the committed VerifierPlan"
+        )
+    integration_budget = (
+        integration_budget_requirements(environment_design)
+        if environment_design is not None
+        else None
+    )
+    release_budget = (
+        release_without_interactive_budget_requirements(environment_design, verifier_batch_plan)
+        if environment_design is not None and verifier_batch_plan is not None
+        else None
+    )
 
     (
         physical_implementation_plan_token_limit,
@@ -2265,6 +2639,7 @@ def complete_generation_work_graph(
         allowed_mutation_roots=("/source", "/dependencies", "/runtime", "/materializer"),
         implementation_revision_id=runtime_integration_implementation_revision(),
         validator_revision_id=runtime_integration_validator_revision(),
+        proposal_budget_requirements=integration_budget,
         input_slots=(
             ArtifactSlotContract(
                 slot_id="input:environment-candidate",
@@ -2304,6 +2679,7 @@ def complete_generation_work_graph(
         allowed_mutation_roots=("/verifier", "/source", "/runtime"),
         implementation_revision_id=release_assurance_implementation_revision(),
         validator_revision_id=release_assurance_validator_revision(),
+        proposal_budget_requirements=release_budget,
         input_slots=(
             ArtifactSlotContract(
                 slot_id="input:release-candidate",
@@ -2600,10 +2976,11 @@ def derive_final_design_definitions(
         or len(scheduled_tool_ids) != len(declared_tool_ids)
     ):
         raise WorkGraphError("ToolCouplingPlan does not freeze an exact tool-batch partition")
-    # Defense in depth for unvalidated/model-constructed coupling plans.  The
-    # typed ToolSemantics source contract carries the same two-tool cap.
-    if any(not batch or len(batch) > 2 for batch in execution_batches):
-        raise WorkGraphError("ToolCouplingPlan contains an invalid physical batch")
+    # Defense in depth for unvalidated/model-constructed coupling plans.  A
+    # historical wider plan remains inspectable, but no new graph may execute
+    # it: one complete tool is the current physical Provider boundary.
+    if any(len(batch) != 1 for batch in execution_batches):
+        raise WorkGraphError("ToolCouplingPlan requires singleton physical tool shards")
 
     context_slot = ArtifactSlotContract(
         slot_id="input:generation-context",
@@ -2683,7 +3060,8 @@ def derive_final_design_definitions(
                 ),
                 output_contract_id="contract:shared-tool-semantics-source.v3",
                 acceptance_transform_id="framework.shared-tool-semantics-compiler.v3",
-                validator_revision_id="framework.validator.shared-tool-semantics.v3",
+                implementation_revision_id=shared_tool_semantics_implementation_revision(),
+                validator_revision_id=shared_tool_semantics_validator_revision(),
                 agent_role="environment_engineer",
                 allowed_mutation_roots=(
                     "/atomicity_domains",
@@ -2801,7 +3179,8 @@ def derive_final_design_definitions(
         timing_reason="Task generation needs an executable, invariant-closed world.",
         output_contract_id="contract:world-rules-source.v3",
         acceptance_transform_id="framework.world-rules-compiler.v4",
-        validator_revision_id="framework.validator.world-rules.v4",
+        implementation_revision_id=world_rules_implementation_revision(),
+        validator_revision_id=world_rules_validator_revision(),
         agent_role="environment_engineer",
         allowed_mutation_roots=("/initial_state_rules", "/invariants"),
         agent_wall_seconds=agent_wall_seconds,
@@ -2860,7 +3239,8 @@ def derive_final_design_definitions(
         timing_reason="Builder and Verifier require one frozen curriculum and task protocol.",
         output_contract_id="contract:task-curriculum-source.v3",
         acceptance_transform_id="framework.training-semantics-compiler.v3",
-        validator_revision_id="framework.validator.task-curriculum.v3",
+        implementation_revision_id=legacy_curriculum_implementation_revision(),
+        validator_revision_id=legacy_curriculum_validator_revision(),
         agent_role="environment_engineer",
         allowed_mutation_roots=("/curriculum_plan", "/task_requirements"),
         agent_wall_seconds=agent_wall_seconds,
@@ -3043,7 +3423,8 @@ def curriculum_plan_work_definition(
         ),
         output_contract_id="contract:curriculum-plan-source.v1",
         acceptance_transform_id="framework.curriculum-plan-compiler.v1",
-        validator_revision_id="framework.validator.curriculum-plan.v1",
+        implementation_revision_id=curriculum_plan_implementation_revision(),
+        validator_revision_id=curriculum_plan_validator_revision(),
         agent_role="environment_engineer",
         allowed_mutation_roots=(
             "/coverage_dimensions",
@@ -3195,7 +3576,8 @@ def derive_task_requirement_design_definitions(
             ),
             output_contract_id="contract:task-requirement-source.v1",
             acceptance_transform_id="framework.task-requirement-compiler.v1",
-            validator_revision_id="framework.validator.task-requirement.v1",
+            implementation_revision_id=task_requirement_implementation_revision(),
+            validator_revision_id=task_requirement_validator_revision(),
             agent_role="environment_engineer",
             allowed_mutation_roots=(
                 "/task_type",
@@ -3596,7 +3978,13 @@ def _agent_component_definition(
                 # consume that dimension.
                 build_seconds=(wall_seconds if is_candidate_build else 0),
                 llm_tokens=token_limit,
-                agent_turns=1,
+                # CandidateBuild is a Code Agent, not a one-shot text
+                # emitter.  Reserve one same-workspace pre-commit correction
+                # after its real local/framework validation.  This is part of
+                # the original proposal's development cycle; Scheduler
+                # semantic repairs remain a separate, explicitly charged
+                # policy path.
+                agent_turns=CANDIDATE_BUILD_DEVELOPMENT_AGENT_TURNS if is_candidate_build else 1,
             ),
             session_token_limit=session_token_limit,
             session_wall_seconds=session_wall_seconds,
@@ -3651,6 +4039,7 @@ def _assured_code_definition(
     allowed_mutation_roots: tuple[str, ...],
     implementation_revision_id: Identifier,
     validator_revision_id: Identifier,
+    proposal_budget_requirements: JudgeOperationBudgetRequirements | None = None,
     input_slots: tuple[ArtifactSlotContract, ...] = (),
 ) -> WorkDefinition:
     coordinate = WorkCoordinate(
@@ -3690,10 +4079,28 @@ def _assured_code_definition(
             implementation_revision_id=implementation_revision_id,
             budget=OperationBudget(
                 wall_seconds=wall_seconds,
-                tool_calls=max(16, len(probe_ids) * 8),
+                llm_tokens=(
+                    proposal_budget_requirements.llm_tokens
+                    if proposal_budget_requirements is not None
+                    else 0
+                ),
+                agent_turns=(
+                    proposal_budget_requirements.agent_turns
+                    if proposal_budget_requirements is not None
+                    else 0
+                ),
+                tool_calls=(
+                    proposal_budget_requirements.tool_calls
+                    if proposal_budget_requirements is not None
+                    else max(16, len(probe_ids) * 8)
+                ),
                 process_calls=max(1, len(probe_ids) * 2),
                 build_seconds=wall_seconds,
-                evaluation_episodes=max(64, len(probe_ids) * 16),
+                evaluation_episodes=(
+                    proposal_budget_requirements.evaluation_episodes
+                    if proposal_budget_requirements is not None
+                    else max(64, len(probe_ids) * 16)
+                ),
                 container_seconds=wall_seconds,
             ),
         ),
@@ -3786,6 +4193,7 @@ __all__ = [
     "WorkGraphError",
     "WorkGraphEpoch",
     "WorkGroupDefinition",
+    "bind_model_route_recovery_policy",
     "compile_design_work_graph",
     "compile_world_work_graph",
     "complete_generation_work_graph",

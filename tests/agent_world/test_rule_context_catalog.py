@@ -315,6 +315,22 @@ def test_prompt_projection_uses_compact_aliases_without_losing_frozen_bindings()
         catalog.resolve_reference_binding(alias) is binding
         for alias, binding in reference_aliases.items()
     )
+    assert projection["term_binding_aliases"] == {
+        "bound_reference": list(reference_aliases),
+        "bound_lookup_by_constant": list(aliases),
+        "bound_lookup_by_reference": list(lookup_reference_aliases),
+    }
+    ordered_aliases = projection["ordered_term_binding_aliases"]
+    assert ordered_aliases["number"]["bound_reference"] == [
+        alias
+        for alias, binding in reference_aliases.items()
+        if binding.value_type in {"number", "any"}
+    ]
+    assert ordered_aliases["string"]["bound_lookup_by_constant"] == [
+        alias
+        for alias, binding in aliases.items()
+        if binding.value_type in {"string", "any"}
+    ]
     serialized_projection = json.dumps(projection, sort_keys=True)
     assert "binding:reference:" not in serialized_projection
     assert "binding:lookup:" not in serialized_projection
@@ -324,6 +340,59 @@ def test_prompt_projection_uses_compact_aliases_without_losing_frozen_bindings()
         for binding in sorted(catalog.lookup_bindings.values(), key=lambda item: item.binding_id)
     ]
     assert len(json.dumps(groups, sort_keys=True)) < len(json.dumps(legacy, sort_keys=True))
+
+
+def test_source_filtered_prompt_projection_preserves_full_catalog_aliases() -> None:
+    """A narrower rule-family view cannot remap aliases from the full catalog."""
+
+    catalog = _catalog()
+    allowed = frozenset({"args", "pre_state"})
+    projection = catalog.prompt_projection_for_sources(allowed_sources=allowed)
+
+    reference_bindings = projection["reference_bindings"]
+    assert isinstance(reference_bindings, list)
+    projected_references = {
+        item["binding_id"]: item["source"]
+        for item in reference_bindings
+        if isinstance(item, dict)
+    }
+    expected_references = {
+        alias: binding.source
+        for alias, binding in catalog.prompt_reference_bindings().items()
+        if binding.source in allowed
+    }
+    assert projected_references == expected_references
+    assert all(
+        catalog.resolve_reference_binding(alias) is catalog.prompt_reference_bindings()[alias]
+        for alias in projected_references
+    )
+    alias_ledger = projection["term_binding_aliases"]
+    assert isinstance(alias_ledger, dict)
+    assert alias_ledger["bound_reference"] == list(projected_references)
+    ordered_ledger = projection["ordered_term_binding_aliases"]
+    assert isinstance(ordered_ledger, dict)
+    assert all(
+        alias in alias_ledger["bound_reference"]
+        for aliases in ordered_ledger.values()
+        for alias in aliases["bound_reference"]
+    )
+
+    lookup_groups = projection["lookup_binding_groups"]
+    assert isinstance(lookup_groups, list)
+    assert all(
+        isinstance(group, dict) and group["source"] in allowed for group in lookup_groups
+    )
+    lookup_reference_groups = projection["lookup_reference_binding_groups"]
+    assert isinstance(lookup_reference_groups, list)
+    assert all(
+        isinstance(group, dict)
+        and group["source"] in allowed
+        and all(
+            isinstance(item, dict) and item["key_source"] in allowed
+            for item in group["reference_key_bindings"]
+        )
+        for group in lookup_reference_groups
+    )
 
 
 def test_bound_tool_terms_expand_only_from_frozen_local_defs_catalog() -> None:

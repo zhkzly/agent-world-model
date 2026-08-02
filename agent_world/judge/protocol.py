@@ -6,7 +6,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
@@ -532,22 +532,60 @@ def _validate_handshake_result(result: Mapping[str, JsonValue], *, request_id: s
             "handshake tools must be a list of tool contract objects",
             request_id=request_id,
         )
+    # Report one complete, bounded key-shape diagnosis before reading any
+    # individual tool fields.  A generated Runtime commonly constructs every
+    # tool from the same source record; stopping at tools[0] turns one
+    # mechanical projection mistake into an expensive repair-by-repair loop.
+    required_tool_keys = {
+        "tool_id",
+        "namespace",
+        "name",
+        "input_schema",
+        "output_schema",
+        "observation_schema",
+    }
+    allowed_tool_keys = required_tool_keys | {"description"}
+    key_issue_indexes: dict[tuple[tuple[str, ...], tuple[str, ...]], list[int]] = {}
+    for index, tool in enumerate(tools):
+        assert isinstance(tool, dict)
+        keys = set(tool)
+        missing = tuple(sorted(required_tool_keys - keys))
+        extra = tuple(sorted(keys - allowed_tool_keys))
+        if missing or extra:
+            key_issue_indexes.setdefault((missing, extra), []).append(index)
+    if key_issue_indexes:
+        issue_groups: list[dict[str, JsonValue]] = []
+        for (missing, extra), indexes in sorted(key_issue_indexes.items()):
+            issue_groups.append(
+                {
+                    "count": len(indexes),
+                    "sample_indexes": cast(list[JsonValue], indexes[:8]),
+                    "missing": cast(list[JsonValue], list(missing)),
+                    "extra": cast(list[JsonValue], list(extra)),
+                }
+            )
+        all_missing = sorted({field for missing, _extra in key_issue_indexes for field in missing})
+        all_extra = sorted({field for _missing, extra in key_issue_indexes for field in extra})
+        issue_count = sum(len(indexes) for indexes in key_issue_indexes.values())
+        raise ProtocolViolation(
+            "schema_mismatch",
+            (
+                "response.result[handshake].tools have invalid keys in "
+                f"{issue_count} entries; check every tools[] entry against the "
+                "implementation-contract handshake fields "
+                "(tool_id, namespace, name, input_schema, output_schema, "
+                "observation_schema; optional description)"
+            ),
+            request_id=request_id,
+            details={
+                "missing": cast(list[JsonValue], all_missing),
+                "extra": cast(list[JsonValue], all_extra),
+                "tool_key_issue_groups": cast(list[JsonValue], issue_groups),
+            },
+        )
     tool_ids: list[str] = []
     for index, tool in enumerate(tools):
         assert isinstance(tool, dict)
-        _require_exact_keys(
-            tool,
-            required={
-                "tool_id",
-                "namespace",
-                "name",
-                "input_schema",
-                "output_schema",
-                "observation_schema",
-            },
-            optional={"description"},
-            path=f"response.result[handshake].tools[{index}]",
-        )
         tool_id = tool["tool_id"]
         if not isinstance(tool_id, str) or not _TOOL_NAME_RE.fullmatch(tool_id):
             raise ProtocolViolation(
