@@ -784,6 +784,7 @@ def _prepare_diagnostic_clone(
     diagnostic_parent: Path | None = None,
     marker_error_code: str,
     marker_message: str,
+    config: FoundryConfig | None = None,
 ) -> Path:
     """Create one marked, isolated diagnostic copy of a captured state root.
 
@@ -800,16 +801,20 @@ def _prepare_diagnostic_clone(
 
     ``diagnostic_parent`` may be None (most CLI constructions omit it); the
     helper then mirrors ``TestNodeRunner._diagnostic_parent`` by preferring a
-    ``.agent-world-live`` ancestor of the source root, falling back to the
-    current working directory's ``.agent-world-live``.
+    ``.agent-world-live`` ancestor of the source root and of the configured
+    state root (when ``config`` is given), falling back to the current working
+    directory's ``.agent-world-live``.
     """
 
     parent = diagnostic_parent
     if parent is None:
+        ancestors = list(source_root.parents)
+        if config is not None:
+            ancestors.extend(config.state_root.parents)
         parent = next(
             (
                 candidate
-                for candidate in source_root.parents
+                for candidate in ancestors
                 if candidate.name == ".agent-world-live"
             ),
             Path.cwd() / ".agent-world-live",
@@ -1251,6 +1256,12 @@ class TestNodeRunner:
                 "source state root must be a real directory",
             )
         return resolved
+
+    def _diagnostic_parent(self, source_root: Path) -> Path:
+        for candidate in (*source_root.parents, *self.config.state_root.parents):
+            if candidate.name == ".agent-world-live":
+                return candidate
+        return Path.cwd() / ".agent-world-live"
 
     def _assert_no_symlinks(source_root: Path) -> None:
         for directory, directories, files in os.walk(source_root, followlinks=False):
@@ -2169,6 +2180,7 @@ class DiagnosticDescendantNodeRunner:
             diagnostic_parent=self.diagnostic_parent,
             marker_error_code="test_descendant_diagnostic_marker_failed",
             marker_message="fresh diagnostic descendant state could not be marked",
+            config=self.config,
         )
 
         # Keep the production composition root at the same lazy import seam as
@@ -4955,6 +4967,7 @@ class DiagnosticWorldPlanNodeRunner:
             diagnostic_parent=self.diagnostic_parent,
             marker_error_code="test_world_plan_diagnostic_marker_failed",
             marker_message="fresh diagnostic World-plan state could not be marked",
+            config=self.config,
         )
 
         # Keep the production composition root at the same lazy-import seam as
@@ -5145,6 +5158,7 @@ class DiagnosticTaskRequirementNodeRunner:
             diagnostic_parent=self.diagnostic_parent,
             marker_error_code="test_task_requirement_diagnostic_marker_failed",
             marker_message="fresh diagnostic TaskRequirement state could not be marked",
+            config=self.config,
         )
 
         from agent_world.app import build_application
@@ -6141,6 +6155,7 @@ class DiagnosticFinalNodeRunner:
             diagnostic_parent=self.diagnostic_parent,
             marker_error_code="test_final_node_diagnostic_marker_failed",
             marker_message="fresh diagnostic final-node state could not be marked",
+            config=self.config,
         )
 
         from agent_world.app import build_application
