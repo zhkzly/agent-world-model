@@ -1942,6 +1942,19 @@ class EnvironmentBuilder:
                 frontier_ordinal=10,
             )
             catalog: dict[str, tuple[str, int, str, str]] = {
+                "task_materializer_fields_fixed": (
+                    "completion_declarations",
+                    25,
+                    "task_materializer_fields_fixed",
+                    "Task Materializer v3 candidate output fields are fixed; return exactly "
+                    "the declared field set.",
+                ),
+                "task_materializer_task_types_unique": (
+                    "completion_declarations",
+                    25,
+                    "task_materializer_task_types_unique",
+                    "Task Materializer task types must be unique.",
+                ),
                 "task_materializer_entrypoint_format": (
                     "completion_entrypoint_format",
                     15,

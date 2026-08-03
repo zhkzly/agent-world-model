@@ -258,9 +258,15 @@ class TaskMaterializerContract(V2Contract):
             "initial_config",
         )
         if self.candidate_output_fields != expected_fields:
-            raise ValueError("Task Materializer v3 candidate output fields are fixed")
+            raise PydanticCustomError(
+                "task_materializer_fields_fixed",
+                "Task Materializer v3 candidate output fields are fixed",
+            )
         if len(set(self.task_types)) != len(self.task_types):
-            raise ValueError("Task Materializer task types must be unique")
+            raise PydanticCustomError(
+                "task_materializer_task_types_unique",
+                "Task Materializer task types must be unique",
+            )
         return self
 
 
