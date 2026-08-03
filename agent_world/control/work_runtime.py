@@ -4618,6 +4618,28 @@ class WorkControlRuntime:
                 report_ref=report_ref,
             )
         except WorkRepairDenied as exc:
+            # A repair chain that exhausted its charged or local-correction
+            # budget without converging (progressed corrections that never
+            # close, or identical no-progress blockers) has no further
+            # same-model route.  The bounded escape is the next compatible
+            # model on a fresh session carrying the same repair context.
+            if (
+                str(exc) in {"repair_local_exhausted", "repair_total_exhausted"}
+                and decision == "local_correction"
+                and definition.repair_policy.maximum_model_fallbacks > 0
+            ):
+                fallback_route = self._exhausted_chain_fallback(
+                    lock,
+                    definition=definition,
+                    head=head,
+                    terminal_attempt=terminal_attempt,
+                    terminal_ref=terminal_ref,
+                    evaluation_ref=evaluation_ref,
+                    report=report,
+                    report_ref=report_ref,
+                )
+                if fallback_route is not None:
+                    return fallback_route
             denied_attempt = terminal_attempt.model_copy(
                 update={"failure_code": f"repair_denied_{exc}"}
             )
@@ -4821,6 +4843,131 @@ class WorkControlRuntime:
     def _has_exact_output_limit(report: ValidationReport) -> bool:
         return report.status == "error" and tuple(issue.code for issue in report.issues) == (
             "turn_failed_output_limit",
+        )
+
+    def _exhausted_chain_fallback(
+        self,
+        lock: WorkControlLock,
+        *,
+        definition: WorkDefinition,
+        head: WorkControlHead,
+        terminal_attempt: WorkAttempt,
+        terminal_ref: ArtifactRef,
+        evaluation_ref: ArtifactRef,
+        report: ValidationReport,
+        report_ref: ArtifactRef,
+    ) -> WorkControlHead | None:
+        """Route a converged-out repair chain to the next compatible model.
+
+        Called when the RepairLedger denied another local correction because
+        the chain exhausted its local or total budget without converging.  The
+        current model cannot close this node; a fresh session on the next
+        compatible model carries the same repair context (the original
+        semantic action) so its correction brief and seed stay applicable.
+        Returns None when no compatible model remains or the fallback is not
+        admissible, leaving the caller to record the deny.
+        """
+
+        current_model = self._proposal_model(terminal_attempt)
+        candidates = self._compatible_fallback_models(current_model)
+        target = next((m for m in candidates if m != current_model), None)
+        if target is None:
+            return None
+        semantic_repair_context_ref = self._attempt_semantic_repair_context(
+            terminal_attempt
+        )
+        recovery_mutation_roots: tuple[str, ...] = ()
+        if semantic_repair_context_ref is not None:
+            semantic_source = self.artifacts.get_json(
+                semantic_repair_context_ref,
+                RepairAction,
+            )
+            recovery_mutation_roots = semantic_source.allowed_mutation_roots
+        ordinal = (
+            len(
+                self.repairs.entries_for(
+                    definition,
+                    input_refs=terminal_attempt.input_refs,
+                )
+            )
+            + 1
+        )
+        authorized_at = datetime.now(UTC)
+        action = RepairAction(
+            action_id=self._id("repair-action", terminal_attempt.attempt_id, str(ordinal)),
+            repair_policy_id=definition.repair_policy.policy_id,
+            repair_epoch_digest=repair_epoch_digest(
+                definition,
+                terminal_attempt.input_refs,
+            ),
+            definition_digest=definition.definition_digest,
+            input_fingerprint=work_input_fingerprint(terminal_attempt.input_refs),
+            source_evaluation_ref=evaluation_ref,
+            current_coordinate=definition.coordinate,
+            target_coordinate=definition.coordinate,
+            decision="model_fallback",
+            jump_distance=0,
+            repair_attempt_ordinal=ordinal,
+            immutable_input_refs=terminal_attempt.input_refs,
+            semantic_repair_context_ref=semantic_repair_context_ref,
+            allowed_mutation_roots=recovery_mutation_roots,
+            reason_code="semantic_no_progress_model_fallback",
+            repair_attempt_charge=1,
+            model_override=target,
+            route_model=current_model,
+            retry_not_before=None,
+            route_liveness_required=False,
+            workspace_recovery=False,
+            authorized_at=authorized_at,
+        )
+        action_ref = self.artifacts.put_json(
+            artifact_id=action.action_id,
+            artifact_type="control.repair_action",
+            value=action,
+            dependencies=(report_ref, evaluation_ref, *terminal_attempt.input_refs),
+        )
+        try:
+            entry = self.repairs.authorize(
+                definition=definition,
+                action=action,
+                action_ref=action_ref,
+                evaluation_ref=evaluation_ref,
+                report=report,
+                report_ref=report_ref,
+            )
+        except WorkRepairDenied:
+            return None
+        self.artifacts.put_json(
+            artifact_id=entry.entry_id,
+            artifact_type="control.work_repair_ledger_entry",
+            value=entry,
+            dependencies=(action_ref, evaluation_ref, report_ref),
+        )
+        next_head = head.model_copy(
+            update={
+                "revision": head.revision + 1,
+                "status": "repair_authorized",
+                "attempt_ref": terminal_ref,
+                "evaluation_ref": evaluation_ref,
+                "repair_action_ref": action_ref,
+                "invalidated_by_refs": tuple(
+                    dict.fromkeys(
+                        (
+                            *head.invalidated_by_refs,
+                            terminal_ref,
+                            report_ref,
+                            evaluation_ref,
+                            action_ref,
+                        )
+                    )
+                ),
+                "updated_at": datetime.now(UTC),
+            }
+        )
+        return self.heads.compare_and_swap(
+            lock,
+            expected_head=head,
+            next_head=next_head,
         )
 
     def _fail_head(
