@@ -139,8 +139,7 @@ def test_rule_reference_type_or_missing_value_fails_closed() -> None:
 
     with pytest.raises(RuleEvaluationError, match="expected string"):
         evaluate_rule(wrong_type, _context())
-    with pytest.raises(RuleEvaluationError, match="left value is absent"):
-        evaluate_rule(missing, _context())
+    assert not evaluate_rule(missing, _context()).result
 
 
 def test_verifier_assertion_can_only_obligate_the_real_rule() -> None:

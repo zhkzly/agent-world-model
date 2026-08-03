@@ -37,8 +37,21 @@ from agent_world.contracts import canonical_json_bytes, sha256_digest
 
 # The physical invocation control plane: adapters, worker lifecycle, liveness
 # supervision, retry/fallback routing, ownership, recovery and audit.  None of
-# it authors meaning, so none of it may enter an acceptance identity.
+# it authors meaning, so none of it may enter an acceptance identity.  The
+# Scheduler equivalents are listed explicitly rather than by the broad
+# ``agent_world.control.`` prefix because deterministic semantic compilers also
+# live in that package.
 _CONTROL_PLANE_MODULE_PREFIX = "agent_world.invocation."
+_CONTROL_PLANE_MODULES = frozenset(
+    {
+        "agent_world.control.direct_runner",
+        "agent_world.control.leaf_executor",
+        "agent_world.control.validation",
+        "agent_world.control.work_repair",
+        "agent_world.control.work_runtime",
+        "agent_world.control.work_scheduler",
+    }
+)
 
 
 def _module_source_bytes(module_name: str) -> bytes:
@@ -71,7 +84,9 @@ def _asset_digest(asset_path: Path) -> str:
         raise ValueError(f"cannot locate runtime asset {str(asset_path)!r}")
 
     entries: dict[str, dict[str, object]] = {}
-    for path in sorted(candidate.rglob("*"), key=lambda item: item.relative_to(candidate).as_posix()):
+    for path in sorted(
+        candidate.rglob("*"), key=lambda item: item.relative_to(candidate).as_posix()
+    ):
         relative = path.relative_to(candidate).as_posix()
         if path.is_symlink():
             raise ValueError(f"runtime asset bundle may not contain symlinks: {relative}")
@@ -119,11 +134,13 @@ def leaf_code_revision(
     if not module_names:
         raise ValueError("leaf_code_revision requires at least one module name")
     control_plane = sorted(
-        name for name in set(module_names) if name.startswith(_CONTROL_PLANE_MODULE_PREFIX)
+        name
+        for name in set(module_names)
+        if name.startswith(_CONTROL_PLANE_MODULE_PREFIX) or name in _CONTROL_PLANE_MODULES
     )
     if control_plane:
         raise ValueError(
-            "leaf_code_revision cannot bind physical invocation-control modules "
+            "leaf_code_revision cannot bind physical invocation/scheduler-control modules "
             f"into an acceptance identity: {', '.join(control_plane)}. "
             "A transport, liveness, retry or ownership change must not make an "
             "already-committed semantic Artifact stale; record it in the "

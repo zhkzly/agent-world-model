@@ -19,8 +19,11 @@ from agent_world.control import (
     JobRunSnapshot,
     WorkCoordinate,
     WorkDependencyUnavailableError,
+    WorkRepairDenied,
+    WorkRuntimeError,
     WorkScheduler,
 )
+from agent_world.control.direct_runner import DirectWorkRunnerError
 
 
 def _config(tmp_path: Path) -> FoundryConfig:
@@ -137,3 +140,77 @@ async def test_direct_job_diagnostic_names_safe_unavailable_dependency(
         "reason_code": "parent_not_committed",
     }
     assert "evidence_synthesis" not in str(diagnostic)
+
+
+@pytest.mark.asyncio
+async def test_direct_job_diagnostic_names_safe_repair_policy_denial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A denied repair reports its stable framework code, never its raw text."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "unit-test-credential-canary")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://unit.invalid/v1")
+    app = build_application(_config(tmp_path))
+
+    class _RepairDeniedRunner:
+        async def run(self, **_kwargs: object) -> object:
+            try:
+                raise WorkRepairDenied("repair_feedback_refresh_exhausted")
+            except WorkRepairDenied as cause:
+                raise WorkRuntimeError("causal repair denied") from cause
+
+    app.controller.direct_work_runner = _RepairDeniedRunner()  # type: ignore[assignment]
+    result = await app.controller.generate(
+        "生成一个最小本地预约环境",
+        request_id="scheduler-diagnostic:repair-denial",
+    )
+
+    snapshot = app.controller.artifacts.get_json(result.final_snapshot_ref, JobRunSnapshot)
+    diagnostic_ref = next(
+        ref
+        for ref in snapshot.latest_artifact_refs
+        if ref.artifact_type == "control.scheduler_execution_diagnostic"
+    )
+    diagnostic = app.controller.artifacts.get_json(diagnostic_ref)
+    assert diagnostic["work_repair_denial"] == {"code": "repair_feedback_refresh_exhausted"}
+    assert "causal repair denied" not in str(diagnostic)
+
+
+@pytest.mark.asyncio
+async def test_direct_job_diagnostic_names_safe_frozen_resume_invariant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frozen-prefix invariant exposes coordinates without raw exception text."""
+
+    monkeypatch.setenv("OPENAI_API_KEY", "unit-test-credential-canary")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://unit.invalid/v1")
+    app = build_application(_config(tmp_path))
+
+    class _FrozenPrefixFailureRunner:
+        async def run(self, **_kwargs: object) -> object:
+            raise DirectWorkRunnerError(
+                "framework-internal detail must not become scene text",
+                safe_code="frozen_protected_prerequisite_not_committed",
+                safe_coordinate_keys=("generate-job:diagnostic.design.world_rules.world_rules",),
+            )
+
+    app.controller.direct_work_runner = _FrozenPrefixFailureRunner()  # type: ignore[assignment]
+    result = await app.controller.generate(
+        "生成一个最小本地预约环境",
+        request_id="scheduler-diagnostic:frozen-prefix",
+    )
+
+    snapshot = app.controller.artifacts.get_json(result.final_snapshot_ref, JobRunSnapshot)
+    diagnostic_ref = next(
+        ref
+        for ref in snapshot.latest_artifact_refs
+        if ref.artifact_type == "control.scheduler_execution_diagnostic"
+    )
+    diagnostic = app.controller.artifacts.get_json(diagnostic_ref)
+    assert diagnostic["direct_runner_invariant"] == {
+        "code": "frozen_protected_prerequisite_not_committed",
+        "coordinate_keys": ["generate-job:diagnostic.design.world_rules.world_rules"],
+    }
+    assert "framework-internal detail" not in str(diagnostic)

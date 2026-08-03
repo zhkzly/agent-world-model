@@ -70,15 +70,21 @@ _REQUIRED_PRODUCTION_STAGES = frozenset(
 )
 _BEHAVIOR_STAGES = frozenset({"shared_tool_semantics", "world_behavior", "tool_semantics_batch"})
 
-# Every refreshable leaf is executed and repaired through this shared Scheduler
-# boundary.  Its source must participate in each validation revision: otherwise
-# a feedback/repair-route change could silently reuse a frozen leaf as though
-# the current control-plane behavior were unchanged.
-_SHARED_SCHEDULER_FEEDBACK_MODULES = (
-    "agent_world.control.leaf_executor",
-    "agent_world.control.work_repair",
-    "agent_world.control.work_runtime",
-    "agent_world.control.work_scheduler",
+# These modules own attempt lifecycle, retry/repair routing, safe-feedback
+# presentation, and topology scheduling.  They are deliberately *not*
+# acceptance-critical: changing how an accepted answer is retried, observed or
+# explained must never make that accepted answer stale. ``leaf_code_revision``
+# rejects this set so a future validator tuple cannot accidentally recreate the
+# full-prefix replay failure that recovery is meant to prevent.
+_SCHEDULER_CONTROL_PLANE_MODULES = frozenset(
+    {
+        "agent_world.control.direct_runner",
+        "agent_world.control.leaf_executor",
+        "agent_world.control.validation",
+        "agent_world.control.work_repair",
+        "agent_world.control.work_runtime",
+        "agent_world.control.work_scheduler",
+    }
 )
 
 # SEMANTIC IDENTITY vs CONTROL-PLANE VERSION.
@@ -118,7 +124,6 @@ _RESEARCH_PLAN_VALIDATOR_MODULES = (
     "agent_world.designer.models",
     "agent_world.designer.research_leaf",
     "agent_world.designer.validators",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _EVIDENCE_SYNTHESIS_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -131,7 +136,6 @@ _EVIDENCE_SYNTHESIS_VALIDATOR_MODULES = (
     "agent_world.designer.evidence_synthesis_compiler",
     "agent_world.designer.models",
     "agent_world.designer.validators",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _WORLD_ARCHITECTURE_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -143,7 +147,6 @@ _WORLD_ARCHITECTURE_VALIDATOR_MODULES = (
     "agent_world.designer.architecture_compiler",
     "agent_world.designer.models",
     "agent_world.designer.world_architecture_leaf",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _SHARED_TOOL_SEMANTICS_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -155,7 +158,6 @@ _SHARED_TOOL_SEMANTICS_VALIDATOR_MODULES = (
     "agent_world.designer.final_design_compiler",
     "agent_world.designer.models",
     "agent_world.designer.validation",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _TOOL_SEMANTICS_BATCH_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -170,7 +172,6 @@ _TOOL_SEMANTICS_BATCH_VALIDATOR_MODULES = (
     "agent_world.designer.models",
     "agent_world.designer.rule_context",
     "agent_world.designer.validation",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _WORLD_RULES_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -182,7 +183,6 @@ _WORLD_RULES_VALIDATOR_MODULES = (
     "agent_world.designer.final_design_compiler",
     "agent_world.designer.models",
     "agent_world.designer.validation",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _LEGACY_CURRICULUM_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -194,7 +194,6 @@ _LEGACY_CURRICULUM_VALIDATOR_MODULES = (
     "agent_world.designer.final_design_compiler",
     "agent_world.designer.models",
     "agent_world.designer.validation",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _CURRICULUM_PLAN_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -206,7 +205,6 @@ _CURRICULUM_PLAN_VALIDATOR_MODULES = (
     "agent_world.designer.final_design_compiler",
     "agent_world.designer.models",
     "agent_world.designer.validation",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _TASK_REQUIREMENT_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -218,7 +216,6 @@ _TASK_REQUIREMENT_VALIDATOR_MODULES = (
     "agent_world.designer.final_design_compiler",
     "agent_world.designer.models",
     "agent_world.designer.validation",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _VERIFIER_INTENT_BATCH_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -229,7 +226,6 @@ _VERIFIER_INTENT_BATCH_VALIDATOR_MODULES = (
     "agent_world.judge.compiler",
     "agent_world.judge.leaf",
     "agent_world.judge.models",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _VERIFIER_PLAN_IMPLEMENTATION_MODULES = (
     "agent_world.judge.compiler",
@@ -240,7 +236,6 @@ _VERIFIER_PLAN_VALIDATOR_MODULES = (
     "agent_world.judge.compiler",
     "agent_world.judge.leaf",
     "agent_world.judge.models",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _IMPLEMENTATION_PLAN_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -252,15 +247,10 @@ _IMPLEMENTATION_PLAN_IMPLEMENTATION_MODULES = (
 _IMPLEMENTATION_PLAN_VALIDATOR_MODULES = (
     "agent_world.builder.leaf",
     "agent_world.builder.models",
-    "agent_world.control.leaf_executor",
     "agent_world.designer.one_shot",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _IMPLEMENTATION_PLAN_SKILL = (
-    Path(__file__).resolve().parents[1]
-    / "agent_assets"
-    / "skills"
-    / "engineer-build-planning"
+    Path(__file__).resolve().parents[1] / "agent_assets" / "skills" / "engineer-build-planning"
 )
 _CANDIDATE_BUILD_IMPLEMENTATION_MODULES = (
     "agent_world.agent_profiles",
@@ -274,16 +264,10 @@ _CANDIDATE_BUILD_VALIDATOR_MODULES = (
     "agent_world.builder.precommit",
     "agent_world.builder.service",
     "agent_world.builder.workspace",
-    "agent_world.control.leaf_executor",
-    "agent_world.control.validation",
     "agent_world.judge.supervisor",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _CANDIDATE_BUILD_SKILL = (
-    Path(__file__).resolve().parents[1]
-    / "agent_assets"
-    / "skills"
-    / "engineer-environment-codegen"
+    Path(__file__).resolve().parents[1] / "agent_assets" / "skills" / "engineer-environment-codegen"
 )
 # CandidateBuild is a Code Agent's bounded development cycle: one initial
 # build/test turn and one same-workspace pre-commit correction when framework
@@ -292,8 +276,6 @@ _CANDIDATE_BUILD_SKILL = (
 # refreshes.
 CANDIDATE_BUILD_DEVELOPMENT_AGENT_TURNS = 2
 _RUNTIME_INTEGRATION_IMPLEMENTATION_MODULES = (
-    "agent_world.control.direct_runner",
-    "agent_world.control.leaf_executor",
     "agent_world.judge.assurance",
     "agent_world.judge_budgeting",
     "agent_world.judge.leaf",
@@ -302,17 +284,12 @@ _RUNTIME_INTEGRATION_IMPLEMENTATION_MODULES = (
     "agent_world.judge.visibility",
 )
 _RUNTIME_INTEGRATION_VALIDATOR_MODULES = (
-    "agent_world.control.leaf_executor",
-    "agent_world.control.validation",
     "agent_world.judge.assurance",
     "agent_world.judge_budgeting",
     "agent_world.judge.leaf",
     "agent_world.judge.service",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 _RELEASE_ASSURANCE_IMPLEMENTATION_MODULES = (
-    "agent_world.control.direct_runner",
-    "agent_world.control.leaf_executor",
     "agent_world.judge.assurance",
     "agent_world.judge_budgeting",
     "agent_world.judge.compiler",
@@ -323,13 +300,10 @@ _RELEASE_ASSURANCE_IMPLEMENTATION_MODULES = (
     "agent_world.judge.visibility",
 )
 _RELEASE_ASSURANCE_VALIDATOR_MODULES = (
-    "agent_world.control.leaf_executor",
-    "agent_world.control.validation",
     "agent_world.judge.compiler",
     "agent_world.judge_budgeting",
     "agent_world.judge.leaf",
     "agent_world.judge.service",
-    *_SHARED_SCHEDULER_FEEDBACK_MODULES,
 )
 
 
@@ -1746,25 +1720,18 @@ def bind_model_route_recovery_policy(
             rebound.append(definition)
             continue
         semantic_allowance = (
-            policy.maximum_local_corrections + policy.strict_progress_bonus_corrections
+            policy.maximum_local_corrections
+            + policy.strict_progress_bonus_corrections
+            + policy.maximum_feedback_refresh_corrections
         )
-        route_recovery_allowance = (
-            maximum_same_model_infrastructure_retries * len(model_routes)
-            + (
-                fallback_count
-                if policy.maximum_model_fallbacks > 0
-                else 0
-            )
+        route_recovery_allowance = maximum_same_model_infrastructure_retries * len(model_routes) + (
+            fallback_count if policy.maximum_model_fallbacks > 0 else 0
         )
         rebound_policy = policy.model_copy(
             update={
-                "maximum_infrastructure_retries": (
-                    maximum_same_model_infrastructure_retries
-                ),
+                "maximum_infrastructure_retries": (maximum_same_model_infrastructure_retries),
                 "maximum_model_fallbacks": (
-                    fallback_count
-                    if policy.maximum_model_fallbacks > 0
-                    else 0
+                    fallback_count if policy.maximum_model_fallbacks > 0 else 0
                 ),
                 "maximum_total_repair_attempts": max(
                     policy.maximum_total_repair_attempts,
@@ -3971,6 +3938,32 @@ def _agent_component_definition(
     )
     digest = _stable_work_identity_digest(coordinate)
     is_candidate_build = component == "build" and stage == "candidate_build"
+    repair_policy = RepairPolicy(
+        policy_id=f"repair:{stage}:{digest}",
+        policy_revision_id="framework.repair-authority.v2",
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=1,
+        maximum_infrastructure_retries=1,
+        maximum_model_fallbacks=1,
+        maximum_session_continuations=maximum_session_continuations,
+        maximum_process_recoveries=1,
+        # Declared together with repair_target_coordinates: the Builder has
+        # no mutation root of its own, so an actionable build failure routes
+        # one causal rework of the frozen Design parent.
+        maximum_automatic_backjump=1 if repair_targets else 0,
+        maximum_total_repair_attempts=8,
+    )
+    if is_candidate_build:
+        # Deliberately set this new field only on CandidateBuild. Explicitly
+        # serializing its default on every other Agent Work would alter their
+        # frozen definition digest and incorrectly re-run an already committed
+        # prefix merely because the Candidate repair policy improved.
+        repair_policy = repair_policy.model_copy(
+            update={
+                "policy_revision_id": "framework.repair-authority.v3",
+                "maximum_feedback_refresh_corrections": 1,
+            }
+        )
     return WorkDefinition(
         work_id=f"work:{stage}:{digest}",
         coordinate=coordinate,
@@ -4028,21 +4021,7 @@ def _agent_component_definition(
             budget=OperationBudget(wall_seconds=min(120.0, wall_seconds), process_calls=2),
         ),
         assurance_policy=assurance,
-        repair_policy=RepairPolicy(
-            policy_id=f"repair:{stage}:{digest}",
-            policy_revision_id="framework.repair-authority.v2",
-            maximum_local_corrections=1,
-            strict_progress_bonus_corrections=1,
-            maximum_infrastructure_retries=1,
-            maximum_model_fallbacks=1,
-            maximum_session_continuations=maximum_session_continuations,
-            maximum_process_recoveries=1,
-            # Declared together with repair_target_coordinates: the Builder has
-            # no mutation root of its own, so an actionable build failure
-            # routes one causal rework of the frozen Design parent.
-            maximum_automatic_backjump=1 if repair_targets else 0,
-            maximum_total_repair_attempts=8,
-        ),
+        repair_policy=repair_policy,
         required_claim_id=claim_id,
         allowed_mutation_roots=allowed_mutation_roots,
         success_maturity=success_maturity,

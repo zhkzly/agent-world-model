@@ -465,6 +465,14 @@ class RepairPolicy(V2Contract):
     policy_revision_id: Identifier = "framework.repair-authority.v1"
     maximum_local_corrections: Annotated[int, Field(ge=0, le=1)] = 1
     strict_progress_bonus_corrections: Annotated[int, Field(ge=0, le=1)] = 1
+    # A feedback renderer may be corrected after an Agent has already consumed
+    # its ordinary semantic turn.  One newly disclosed, framework-authored
+    # feedback state deserves one bounded local repair; treating it as a blind
+    # retry would make "fix feedback, then retry" impossible in a live run.
+    # This is deliberately separate from semantic progress: the Candidate may
+    # have made no observable Gate progress simply because it never saw the
+    # missing safe diagnostic.
+    maximum_feedback_refresh_corrections: Annotated[int, Field(ge=0, le=1)] = 0
     maximum_infrastructure_retries: Annotated[int, Field(ge=0)] = 1
     # A fallback is a new physical attempt after the same route has already
     # consumed its fresh-session retry. It shares the global charged-repair
@@ -506,13 +514,21 @@ class RepairPolicy(V2Contract):
         """
 
         serialized: dict[str, Any] = handler(self)
-        if "maximum_model_fallbacks" not in self.model_fields_set:
-            serialized.pop("maximum_model_fallbacks", None)
+        for field_name in (
+            "maximum_model_fallbacks",
+            "maximum_feedback_refresh_corrections",
+        ):
+            if field_name not in self.model_fields_set:
+                serialized.pop(field_name, None)
         return serialized
 
     @model_validator(mode="after")
     def validate_single_limit(self) -> RepairPolicy:
-        semantic_limit = self.maximum_local_corrections + self.strict_progress_bonus_corrections
+        semantic_limit = (
+            self.maximum_local_corrections
+            + self.strict_progress_bonus_corrections
+            + self.maximum_feedback_refresh_corrections
+        )
         if semantic_limit > self.maximum_total_repair_attempts:
             raise ValueError("semantic correction allowance exceeds total repair attempts")
         if self.maximum_infrastructure_retries > self.maximum_total_repair_attempts:
@@ -526,6 +542,8 @@ class RepairPolicy(V2Contract):
             raise ValueError("infrastructure retry allowance exceeds total repair attempts")
         if self.maximum_local_corrections == 0 and self.strict_progress_bonus_corrections:
             raise ValueError("a progress bonus requires an initial local correction")
+        if self.maximum_local_corrections == 0 and self.maximum_feedback_refresh_corrections:
+            raise ValueError("a feedback refresh requires an initial local correction")
         if self.maximum_automatic_backjump and self.maximum_total_repair_attempts == 0:
             raise ValueError("a backjump requires a non-zero repair allowance")
         return self
@@ -592,6 +610,7 @@ class WorkDefinition(V2Contract):
         mutation_repair = (
             self.repair_policy.maximum_local_corrections
             or self.repair_policy.strict_progress_bonus_corrections
+            or self.repair_policy.maximum_feedback_refresh_corrections
             or self.repair_policy.maximum_automatic_backjump
             or self.repair_policy.maximum_session_continuations
         )
@@ -677,6 +696,50 @@ class WorkDefinition(V2Contract):
                 }
             )
         )
+
+
+class NodeResumeAuthority(V2Contract):
+    """Explicit authority to reopen one exact failed Work coordinate.
+
+    This is intentionally a framework control artifact, not Agent feedback.
+    It binds the current Direct-run summary, the immutable GenerationContext
+    and frozen graph epoch, failed attempt, and original definition before the
+    Scheduler creates one fresh attempt.  A ``JobRunSnapshot`` is an audit
+    summary, not the authority that owns an epoch: a crash can leave its epoch
+    projection absent while the exact Context/Epoch/WorkCommit closure remains
+    durable.  Ancestor commits are never invalidated by this authority.
+    """
+
+    authority_id: Identifier
+    source_snapshot_ref: ArtifactRef
+    source_context_ref: ArtifactRef
+    source_epoch_ref: ArtifactRef
+    source_attempt_ref: ArtifactRef
+    coordinate: WorkCoordinate
+    source_definition_digest: ContentHash
+    source_input_fingerprint: ContentHash
+    reason: Literal["operator_retry", "budget_amendment"] = "operator_retry"
+    budget_amendment_ref: ArtifactRef | None = None
+
+    @model_validator(mode="after")
+    def validate_resume_authority(self) -> NodeResumeAuthority:
+        if self.source_snapshot_ref.artifact_type != "control.job_run_snapshot":
+            raise ValueError("resume authority must bind a JobRunSnapshot")
+        if self.source_context_ref.artifact_type != "control.generation_context":
+            raise ValueError("resume authority must bind a GenerationContext")
+        if self.source_epoch_ref.artifact_type != "control.work_graph_epoch":
+            raise ValueError("resume authority must bind a WorkGraphEpoch")
+        if self.source_attempt_ref.artifact_type != "control.work_attempt":
+            raise ValueError("resume authority must bind a WorkAttempt")
+        if self.reason == "budget_amendment":
+            if (
+                self.budget_amendment_ref is None
+                or self.budget_amendment_ref.artifact_type != "control.scope_budget_amendment"
+            ):
+                raise ValueError("budget-amendment resume must bind its amendment Artifact")
+        elif self.budget_amendment_ref is not None:
+            raise ValueError("ordinary operator resume cannot bind a budget amendment")
+        return self
 
 
 def repair_epoch_digest(
@@ -1065,6 +1128,49 @@ class ValidationReport(V2Contract):
         )
 
     @property
+    def repair_feedback_digest(self) -> ContentHash:
+        """Digest the safe feedback an authorized repair could actually see.
+
+        Progress remains intentionally based on stable blocker identities: a
+        wording-only change must not masquerade as a repaired Runtime.  This
+        second digest serves the different question of whether framework-owned
+        feedback became materially different after the previous Agent turn.
+        It contains only the existing safe diagnostic fields, never rejected
+        values, Provider text, a workspace path, or sealed evidence.
+        """
+
+        blockers = tuple(
+            sorted(
+                (
+                    {
+                        "identity": issue.normalized_identity,
+                        "violated_condition": issue.violated_condition,
+                        "expected_category": issue.expected_category,
+                        "remediation": issue.remediation,
+                        "severity": issue.severity,
+                        "retryable": issue.retryable,
+                    }
+                    for issue in self.issues
+                    if issue.severity == "blocker"
+                ),
+                key=lambda item: str(item["identity"]),
+            )
+        )
+        return sha256_digest(
+            canonical_json_bytes(
+                {
+                    "coordinate": self.coordinate.model_dump(mode="json"),
+                    "policy_digest": self.policy_digest,
+                    "status": self.status,
+                    "diagnostic_quality": self.diagnostic_quality,
+                    "validation_phase": self.validation_phase,
+                    "frontier_ordinal": self.frontier_ordinal,
+                    "blockers": blockers,
+                }
+            )
+        )
+
+    @property
     def repair_actionable(self) -> bool:
         return self.status == "failed" and self.diagnostic_quality == "actionable"
 
@@ -1203,6 +1309,11 @@ class WorkAttempt(V2Contract):
     validation_report_ref: ArtifactRef | None = None
     feedback_evaluation_ref: ArtifactRef | None = None
     repair_action_ref: ArtifactRef | None = None
+    # An explicit operator resume is separate from semantic RepairAction
+    # authority.  It reopens the *same* immutable WorkDefinition/input
+    # closure after a terminal execution boundary, so it must retain the
+    # framework control Artifact that authorized that exceptional transition.
+    resume_authority_ref: ArtifactRef | None = None
     repair_attempt_charge: Annotated[int, Field(ge=0, le=1)] = 0
     # A fallback is a fresh physical node attempt with the same immutable
     # closure, not a change to the frozen WorkDefinition.  The selected model
@@ -1270,6 +1381,13 @@ class WorkAttempt(V2Contract):
             and self.repair_action_ref.artifact_type != "control.repair_action"
         ):
             raise ValueError("work attempt repair action ref has the wrong Artifact type")
+        if (
+            self.resume_authority_ref is not None
+            and self.resume_authority_ref.artifact_type != "control.node_resume_authority"
+        ):
+            raise ValueError("work attempt resume authority ref has the wrong Artifact type")
+        if self.resume_authority_ref is not None and self.repair_action_ref is not None:
+            raise ValueError("operator resume cannot impersonate a semantic RepairAction")
         if self.repair_attempt_charge and self.repair_action_ref is None:
             raise ValueError("repair charge requires an exact RepairAction")
         if self.model_override is not None and self.repair_action_ref is None:
@@ -1429,6 +1547,9 @@ class WorkRepairLedgerEntry(V2Contract):
     repair_policy_digest: ContentHash
     repair_action_ref: ArtifactRef
     decision: ExecutingRepairDecision
+    # Records why a local semantic correction was admitted.  It is a
+    # framework-owned accounting label; Agents do not choose or see it.
+    correction_basis: Literal["ordinary", "strict_progress", "feedback_refresh"] = "ordinary"
     reason_code: Identifier = "legacy_unspecified"
     # The source route for a transient retry/fallback.  It is a configured
     # model identifier, never a provider session or response value. Keeping it
@@ -1646,9 +1767,7 @@ class RepairAction(V2Contract):
                 self.decision not in {"infrastructure_retry", "session_continuation"}
                 or self.retry_not_before is None
             ):
-                raise ValueError(
-                    "route liveness gate requires one same-model retry and backoff"
-                )
+                raise ValueError("route liveness gate requires one same-model retry and backoff")
         elif self.retry_not_before is not None:
             raise ValueError("only a route-liveness-gated retry may carry a retry backoff")
         if self.decision == "model_fallback":
@@ -1824,6 +1943,7 @@ __all__ = [
     "ExecutingRepairDecision",
     "EvaluationStatus",
     "FeedbackEvaluation",
+    "NodeResumeAuthority",
     "OperationBudget",
     "OperationKind",
     "OperationRun",

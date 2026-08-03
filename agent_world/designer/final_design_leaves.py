@@ -1210,6 +1210,7 @@ def _tool_batch_prompt(
     surfaces = {item.surface.tool_id: item.surface for item in skeleton.tool_surfaces}
     plans = {item.tool_id: item for item in architecture.tool_inventory.tools}
     roots = {item.entity: item.root_field for item in architecture.state_entities}
+    shared_requirements = _shared_requirements_by_tool(contracts, tool_ids)
     return _prompt(
         inputs,
         role="one physical tool-behavior batch",
@@ -1221,10 +1222,17 @@ def _tool_batch_prompt(
             "Use target_tools for each exact surface and state footprint, rule_context_catalogs "
             "and permission_rule_context_catalogs for permitted Rule vocabulary, and each "
             "target tool's actor_authorities_by_actor as the exact permission-scope lookup, "
-            "shared_contracts for cross-tool facts, and claims for evidence. Do not read outside "
+            "shared_contracts for cross-tool facts, shared_requirements_by_tool for the exact "
+            "mandatory local projection of those facts, and claims for evidence. "
+            "shared_requirements_by_tool is not optional background: before returning, set its "
+            "transaction.atomicity, concurrency.isolation, and idempotency.mode values exactly; "
+            "add one errors.errors entry for every required error suffix with its stated retryable "
+            "value; and include every required rollback compensation tool. Do not read outside "
             "this context, call tools, infer a missing state root or binding, or change any frozen "
             "schema, architecture, tool inventory, shared contract, task, runtime, verifier, or "
-            "release decision."
+            "release decision. When a Rule compares a bound state value to a literal, use that "
+            "binding's enum_values when present; never invent a lifecycle or status literal "
+            "outside the disclosed finite domain."
         ),
         context={
             "world_boundary": {
@@ -1273,6 +1281,7 @@ def _tool_batch_prompt(
             ),
             "target_tool_ids": tool_ids,
             "shared_contracts": tuple(item.model_dump(mode="json") for item in contracts),
+            "shared_requirements_by_tool": shared_requirements,
             "rule_context_catalogs": {
                 tool_id: rule_contexts[tool_id].prompt_projection() for tool_id in tool_ids
             },
@@ -1285,6 +1294,66 @@ def _tool_batch_prompt(
             "claims": _claim_catalog(evidence),
         },
     )
+
+
+def _shared_requirements_by_tool(
+    contracts: tuple[SharedToolSemanticsContract, ...],
+    tool_ids: tuple[str, ...],
+) -> dict[str, dict[str, object]]:
+    """Project compiler-enforced shared policy onto each visible Tool.
+
+    The raw shared contract remains in the Prompt because it conveys the
+    cross-tool rationale.  A singleton ToolSemantics call, however, must not
+    infer which distant shared-domain entries apply to its one Tool.  This is
+    a lossless view of fields already enforced by
+    ``_validate_tool_source_batch_against_shared_contracts``; it creates no
+    new policy or authority.
+    """
+
+    requirements: dict[str, dict[str, object]] = {}
+    for tool_id in tool_ids:
+        contract = next(
+            (item for item in contracts if tool_id in item.member_tool_ids),
+            None,
+        )
+        if contract is None:
+            continue
+        source = contract.source
+        requirements[tool_id] = {
+            "contract_id": contract.contract_id,
+            "reliability": {
+                "transaction_atomicity": next(
+                    domain.atomicity
+                    for domain in source.atomicity_domains
+                    if tool_id in domain.member_tool_ids
+                ),
+                "concurrency_isolation": next(
+                    domain.isolation
+                    for domain in source.concurrency_domains
+                    if tool_id in domain.member_tool_ids
+                ),
+                "idempotency_mode": next(
+                    domain.mode
+                    for domain in source.idempotency_domains
+                    if tool_id in domain.member_tool_ids
+                ),
+            },
+            "required_errors": tuple(
+                {
+                    "policy_id": policy.policy_id,
+                    "error_code_final_identifier_segment": policy.required_error_suffix,
+                    "retryable": policy.retryable,
+                }
+                for policy in source.error_policies
+                if tool_id in policy.member_tool_ids
+            ),
+            "required_rollback_compensation_tools": tuple(
+                edge.compensation_tool_id
+                for edge in source.compensation_edges
+                if edge.failure_tool_id == tool_id
+            ),
+        }
+    return requirements
 
 
 def _tool_batch_rule_contexts(
@@ -1378,7 +1447,13 @@ def _curriculum_plan_prompt(
             "one `DifficultyDimension` for every `task_dimension_catalog` id, exactly once and "
             "in its supplied order; do not rename, omit, add, or reorder ids. Each task plan may "
             "select only applicable ids from that catalog. Each task plan must use only frozen "
-            "actors and tools and state a precise reachable objective. Sampling Rules use family "
+            "actors and tools and state a precise reachable objective. `allowed_actor_ids` are "
+            "alternative task callers, not a roster of all actors who appear in a collaborative "
+            "workflow. For every task plan, every listed actor must be allowed to invoke every "
+            "listed required tool. `task_authoring_access` is the authoritative compact matrix "
+            "for that check. `required_tool_ids` are only calls made by the task caller; do not "
+            "include verifier-only calls or calls made solely by another workflow participant. "
+            "Sampling Rules use family "
             "`sampling` and only read reset-available actor, pre_state, post_state, observation, "
             "reset_config, or seed values; never read action-only args, tool_result, error, "
             "events, "
@@ -1392,10 +1467,32 @@ def _curriculum_plan_prompt(
         ),
         context={
             "world": world.model_dump(mode="json"),
+            "task_authoring_access": _task_authoring_access(world),
             "task_dimension_catalog": world.task_dimensions,
             "coverage_rule_catalog": coverage_rule_catalog(world),
             "claims": _claim_catalog(evidence),
         },
+    )
+
+
+def _task_authoring_access(world: WorldModelDraft) -> tuple[dict[str, object], ...]:
+    """Project existing per-actor tool permission facts for curriculum authoring.
+
+    This is intentionally a compact read-only projection of ``WorldModel`` rather
+    than a new task policy.  The compiler remains the authority that validates
+    every actor/tool pair in an authored plan.
+    """
+
+    return tuple(
+        {
+            "actor_id": actor.actor,
+            "permitted_tool_ids": tuple(
+                tool.surface.tool_id
+                for tool in world.tools
+                if actor.actor in tool.semantics.permission.allowed_actors
+            ),
+        }
+        for actor in world.boundary.actors_and_authority
     )
 
 

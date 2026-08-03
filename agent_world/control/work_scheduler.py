@@ -215,6 +215,19 @@ class WorkScheduler:
         )
 
     def snapshot(self) -> WorkScheduleSnapshot:
+        """Classify one graph using one shared immutable-closure audit.
+
+        Work heads remain live mutable state and are still read for every
+        coordinate.  Their bound commits and evidence are immutable, though;
+        sharing their verification cache for this single synchronous snapshot
+        preserves the full integrity check while avoiding repeated traversal of
+        common ancestor closures.
+        """
+
+        with self.artifacts.verified_closure():
+            return self._snapshot_with_verified_closure()
+
+    def _snapshot_with_verified_closure(self) -> WorkScheduleSnapshot:
         active: dict[str, tuple[WorkCommit, ArtifactRef]] = {}
         scheduled: dict[str, ScheduledWork] = {}
         groups_by_aggregate = {
@@ -336,6 +349,18 @@ class WorkScheduler:
                 # ready branch already tolerates an existing running head with no
                 # active operation, so it re-runs the fresh attempt cleanly.
                 if head.active_operation_ref is None:
+                    if expected_inputs is None:
+                        # This no-op running head cannot be resumed until the
+                        # same causal input closure that it would dispatch
+                        # with becomes available.  In particular, never pass
+                        # ``None`` to the fingerprint boundary merely because
+                        # a parent is still being refreshed.
+                        scheduled[key] = ScheduledWork(
+                            coordinate=definition.coordinate,
+                            state="waiting",
+                            waiting_on=unavailable_dependencies,
+                        )
+                        continue
                     if (
                         head.definition_digest != definition.definition_digest
                         or head.input_fingerprint
@@ -629,6 +654,8 @@ class WorkScheduler:
                     lock,
                     definition=definition,
                     dimensions=exc.dimensions,
+                    requested=exc.requested,
+                    available=exc.available,
                 )
         except KeyboardInterrupt:
             # A terminal SIGINT can surface as ``KeyboardInterrupt`` rather
@@ -734,7 +761,7 @@ class WorkScheduler:
         *,
         executors: Mapping[str, WorkExecutor],
         maximum_concurrency: int = 2,
-        maximum_dispatches: int = 128,
+        maximum_dispatches: int | None = None,
     ) -> tuple[WorkDispatchResult, ...]:
         """Execute ready waves until a durable terminal state or framework error.
 
@@ -742,10 +769,19 @@ class WorkScheduler:
         frozen graph requires that exact unit of work, but framework wiring
         cannot perform it.  Raise a typed error rather than silently returning
         an empty wave and letting a caller misreport an unknown semantic block.
+
+        ``maximum_dispatches`` is intentionally opt-in.  A fixed global wave
+        ceiling is not a safety boundary: repair policy, operation leases, and
+        no-progress checks already bound real work.  Treating an otherwise
+        healthy long graph as an error after an arbitrary number of dispatches
+        can strand a newly committed parent just before its stale descendants
+        are re-derived.
         """
 
-        if maximum_concurrency < 1 or maximum_dispatches < 1:
-            raise ValueError("scheduler bounds must be positive")
+        if maximum_concurrency < 1 or (
+            maximum_dispatches is not None and maximum_dispatches < 1
+        ):
+            raise ValueError("scheduler bounds must be positive when supplied")
         results: list[WorkDispatchResult] = []
         semaphore = asyncio.Semaphore(maximum_concurrency)
 
@@ -753,7 +789,7 @@ class WorkScheduler:
             async with semaphore:
                 return await self.dispatch_one(coordinate, executors=executors)
 
-        while len(results) < maximum_dispatches:
+        while maximum_dispatches is None or len(results) < maximum_dispatches:
             snapshot = self.snapshot()
             missing_executors = tuple(
                 item.coordinate
@@ -780,11 +816,16 @@ class WorkScheduler:
                 ready.append(item.coordinate)
             if not ready:
                 return tuple(results)
-            remaining = maximum_dispatches - len(results)
-            wave = tuple(ready[:remaining])
+            wave = (
+                tuple(ready)
+                if maximum_dispatches is None
+                else tuple(ready[: maximum_dispatches - len(results)])
+            )
             completed = await asyncio.gather(*(dispatch(item) for item in wave))
             results.extend(completed)
-        if any(item.state in {"ready", "repair_ready", "stale"} for item in self.snapshot().work):
+        if maximum_dispatches is not None and any(
+            item.state in {"ready", "repair_ready", "stale"} for item in self.snapshot().work
+        ):
             raise WorkRuntimeError("scheduler dispatch limit exhausted before convergence")
         return tuple(results)
 

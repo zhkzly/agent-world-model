@@ -55,7 +55,6 @@ required_hard_gates = [
   "schema",
   "supply_chain",
   "static_assurance",
-  "public_self_check",
   "runtime_protocol",
   "task_materialization",
   "task_reachability",
@@ -77,9 +76,10 @@ allow_unresolved_assumptions = false
 可观测视图，以避免把私有 live 状态误作通用 Agent 观测输入。
 
 配置 loader 会把 TOML array 显式转换为严格 `ReleaseProfile` tuple。省略
-`required_hard_gates` 时使用与上面相同的封闭十门默认；显式覆盖意味着有意定义一套 release
+`required_hard_gates` 时使用与上面相同的封闭九门默认；显式覆盖意味着有意定义一套 release
 policy，不能用它跳过 framework 始终强制的安全检查，也不能让 Agent、Policy 或 LLM score 覆盖
-失败 Gate。生产配置建议保留上面的完整列表，使 no-mock 发布合同在配置审查中可见。
+失败 Gate。`public_self_check` 和 Candidate 生成的 public tests 会保留为可读诊断证据，
+但不能配置为硬发布门。生产配置建议保留上面的完整列表，使 no-mock 发布合同在配置审查中可见。
 
 `YOUR_CODEX_MODEL` 必须替换为当前 Codex SDK 账户可用的真实模型。`codex_bin` 指向用户
 明确选择的当前官方 Codex CLI；profile 会绑定其内容哈希，worker 在启动 app-server 前再次

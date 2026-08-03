@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from v3_fixture import (
+    RUNTIME_SOURCE,
     SEEDED_RUNTIME_SOURCE,
     JudgeCandidateGraph,
     build_judge_candidate_graph,
@@ -450,10 +451,10 @@ async def test_integration_runs_before_verifier_and_cannot_authorize_release(
 
 
 @pytest.mark.asyncio
-async def test_integration_workspace_projection_failure_is_not_builder_feedback(
+async def test_integration_shared_workspace_has_no_spurious_builder_failure(
     tmp_path: Path,
 ) -> None:
-    """A framework layout failure cannot be repaired from a Candidate workspace."""
+    """Declared sibling files remain usable from the shared Candidate workspace."""
 
     store = ArtifactStore(tmp_path / "artifacts")
     graph = build_judge_candidate_graph(tmp_path, store)
@@ -467,9 +468,8 @@ async def test_integration_workspace_projection_failure_is_not_builder_feedback(
         ),
         runtime_execution=await _require_host_execution(),
     )
-    # Deliberately violate the framework's own projection policy.  The
-    # Candidate source is untouched, so the result must route to
-    # judge_infrastructure rather than a Builder repair turn.
+    # The shared-workspace runner keeps the declaration checks but does not
+    # pretend that sibling Candidate components are absent from the filesystem.
     judge.process_runner = CandidateProcessRunner(
         execution=judge.runtime_execution,
     )
@@ -486,18 +486,11 @@ async def test_integration_workspace_projection_failure_is_not_builder_feedback(
         world_spec_ref=graph.world_spec_ref,
         release_profile=graph.release_profile,
         budget=budget,
-        run_id="integration-framework-projection-failure",
+        run_id="integration-shared-workspace",
     )
 
-    gate = next(
-        item for item in integrated.report.gate_results if item.gate_id == "clean_deployment"
-    )
-    finding = next(
-        item for item in integrated.report.findings if item.category == "clean_deployment"
-    )
-    assert gate.status == "error"
-    assert finding.owner == "judge_infrastructure"
-    assert finding.suggested_repair == "Required Integration infrastructure failed closed."
+    assert integrated.report.status == "ready", integrated.report.findings
+    assert not integrated.report.findings
 
 
 @pytest.mark.asyncio
@@ -559,6 +552,55 @@ async def test_integration_protocol_evidence_keeps_real_handshake_crash_scene(
     event_payload = json.loads(events[0]["payload_json"])
     assert event_payload["exit_code"] == 17
     assert crash_marker in event_payload["stderr_tail"]
+
+
+@pytest.mark.asyncio
+async def test_release_protocol_accepts_fixed_config_across_distinct_unknown_seeds(
+    tmp_path: Path,
+) -> None:
+    """Unknown seeds are probes, not a requirement to invent state entropy.
+
+    This Runtime correctly resets from the frozen config and therefore has the
+    same digest for different seeds when that config is held fixed.  The release
+    protocol gate must still verify same-seed restart replay and exact Runtime
+    protocol without forcing a meaningless seed field into business state.
+    """
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    graph = build_judge_candidate_graph(tmp_path, store, runtime_source=RUNTIME_SOURCE)
+    judge = EnvironmentJudge(
+        artifact_store=judge_writer(store),
+        clean_builder=CleanCandidateBuilder(
+            build_execution=await _require_host_execution("build"),
+            uv_path=graph.uv_path,
+            uv_cache_dir=graph.uv_cache_dir,
+            timeout_seconds=60,
+        ),
+        runtime_execution=await _require_host_execution(),
+    )
+    async with judge.clean_builder.materialize(
+        graph.workspace,
+        expected_source_files=graph.candidate_manifest.files,
+        expected_source_tree_digest=graph.candidate_manifest.candidate_source_tree_digest,
+    ) as clean:
+        status, evidence_ref, summary, episodes = await judge._protocol_gate(  # noqa: SLF001
+            "release-fixed-config-seed-probe",
+            clean,
+            graph.candidate,
+            graph.candidate_ref,
+            graph.candidate_manifest,
+            graph.design.world_spec,
+            graph.world_spec_ref,
+            graph.verifier,
+            graph.design,
+            telemetry_trace_id="release-fixed-config-seed-probe",
+            coordinate_key=None,
+        )
+
+    evidence = store.get_json(evidence_ref)
+    assert status == "pass", summary
+    assert episodes == graph.design.verification.minimum_unknown_seed_episodes + 1
+    assert evidence["same_seed_restart_replay"] == "exact"
 
 
 @pytest.mark.asyncio
@@ -868,7 +910,7 @@ assert marker == "candidate-import-ok"
 
 
 @pytest.mark.asyncio
-async def test_real_role_isolation_crash_returns_builder_safe_import_coordinates(
+async def test_real_shared_workspace_runtime_can_import_declared_sibling(
     tmp_path: Path,
 ) -> None:
     source, uv_path, uv_cache = write_candidate_project(tmp_path)
@@ -903,13 +945,10 @@ async def test_real_role_isolation_crash_returns_builder_safe_import_coordinates
             execution=await _require_host_execution(),
             request_timeout_seconds=5,
         )
-        with pytest.raises(RuntimeProcessCrashed) as captured:
-            await supervisor.start()
+        handshake = await supervisor.start()
+        await supervisor.close()
 
-    assert _candidate_failure_summary(captured.value) == (
-        "runtime exited without a response; exit_code=1; "
-        "stderr_exception=ModuleNotFoundError; missing_module=task_materializer"
-    )
+    assert handshake.ok
 
 
 @pytest.mark.asyncio
@@ -1214,7 +1253,15 @@ async def test_complete_environment_judge_report_releases_and_serves_over_rpc(
     )
     assert judged.report.verdict == "pass", judged.report.findings
     assert tuple(result.gate_id for result in judged.report.gate_results) == canonical_gates
-    assert all(result.hard and result.status == "pass" for result in judged.report.gate_results)
+    assert all(result.status == "pass" for result in judged.report.gate_results)
+    assert not next(
+        result for result in judged.report.gate_results if result.gate_id == "public_self_check"
+    ).hard
+    assert all(
+        result.hard
+        for result in judged.report.gate_results
+        if result.gate_id != "public_self_check"
+    )
     assert not judged.report.findings
 
     manifest, manifest_ref, framework_payloads = commit_judged_manifest(
@@ -1330,7 +1377,7 @@ async def test_complete_environment_judge_report_releases_and_serves_over_rpc(
 
 
 @pytest.mark.asyncio
-async def test_real_public_test_failure_blocks_release_with_typed_static_evidence(
+async def test_real_public_test_failure_is_diagnostic_not_release_blocker(
     tmp_path: Path,
 ) -> None:
     state_root = tmp_path / "state"
@@ -1349,19 +1396,20 @@ async def test_real_public_test_failure_blocks_release_with_typed_static_evidenc
     )
 
     gates = {result.gate_id: result for result in report.gate_results}
-    assert report.verdict == "fail"
+    assert report.verdict == "pass"
     assert gates["supply_chain"].status == "pass"
-    assert gates["static_assurance"].status == "fail"
+    assert gates["static_assurance"].status == "pass"
     assert "public_test.py" in gates["static_assurance"].summary
-    assert "AssertionError: intentional-public-test-diagnostic" in gates["static_assurance"].summary
+    assert "Candidate public-test diagnostics" in gates["static_assurance"].summary
     evidence_ref = next(
         ref
         for ref in gates["static_assurance"].evidence_refs
         if ref.artifact_type == "judge.static_assurance_evidence"
     )
     evidence = store.get_json(evidence_ref, StaticAssuranceEvidence)
-    assert evidence.status == "fail"
-    assert evidence.failure_codes == ("static_public_test_failed",)
+    assert evidence.status == "pass"
+    assert evidence.failure_codes == ()
+    assert evidence.public_test_diagnostic_codes == ("static_public_test_failed",)
     assert len(evidence.public_tests) == 1
     assert evidence.public_tests[0].exit_code == 1
     assert not evidence.public_tests[0].passed

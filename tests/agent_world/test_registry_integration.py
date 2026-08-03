@@ -27,6 +27,7 @@ from agent_world.contracts import (
     ExpansionSourceCatalog,
     ExpansionSourceDescriptor,
     FrameworkPackagePayload,
+    GenerationContext,
     IntegrationReport,
     JudgeReport,
     MutationIntent,
@@ -38,11 +39,17 @@ from agent_world.contracts import (
 from agent_world.control import (
     DirectJobResumeRequiredError,
     DirectRequestConflictError,
+    GenerationWorkGraph,
     JobRunSnapshot,
+    LeaseBudgetLedger,
     MetricPoint,
     ReleaseDossier,
     TelemetryReleaseSummary,
     TelemetryStore,
+    WorkAttempt,
+    WorkControlRuntime,
+    WorkGraphEpoch,
+    deterministic_boundary_work_definition,
     new_direct_job_head,
 )
 from agent_world.controller import FoundryController, GenerateResult
@@ -234,6 +241,923 @@ def _direct_controller(
         judge=EnvironmentJudge(artifact_store=judge_artifacts),
         registry=registry,
     )
+
+
+def test_frozen_node_resume_discovers_epoch_from_context_not_snapshot_projection(
+    tmp_path: Path,
+) -> None:
+    """A crash may omit an already-frozen epoch from the compact run summary.
+
+    Recovery must still use the exact Context -> Epoch -> WorkDefinition ->
+    stopped WorkHead closure.  This is intentionally a control-plane proof;
+    it does not simulate an Agent or a Provider response.
+    """
+
+    state_root = tmp_path / "foundry"
+    store = ArtifactStore(state_root / "artifacts")
+    registry = EnvironmentRegistry(state_root / "registry", store)
+    release_profile = ReleaseProfile(profile_id="frozen-resume-projection-gap")
+    controller = _direct_controller(state_root, store, registry, release_profile)
+    artifacts = controller.artifacts
+    budget = Budget(wall_seconds=600)
+    request = EnvironmentRequest(
+        request_id="request:frozen-resume-projection-gap",
+        need="Resume exactly one frozen node without replaying its prefix.",
+        budget=budget,
+        release_profile=release_profile,
+    )
+    request_ref = artifacts.put_json(
+        artifact_id=request.request_id,
+        artifact_type="control.environment_request",
+        value=request,
+    )
+    job = EnvironmentJob(
+        job_id="generate-job:frozen-resume-projection-gap",
+        kind="generate",
+        request_ref=request_ref,
+        budget=budget,
+        release_profile=release_profile,
+    )
+    job_ref = artifacts.put_json(
+        artifact_id=f"{job.job_id}:job",
+        artifact_type="control.environment_job",
+        value=job,
+        dependencies=(request_ref,),
+    )
+    context = GenerationContext(
+        context_id="generation-context:frozen-resume-projection-gap",
+        job_ref=job_ref,
+        kind="generate",
+        request_ref=request_ref,
+        permissions=PermissionScope(),
+        budget=budget,
+        release_profile=release_profile,
+    )
+    context_ref = artifacts.put_json(
+        artifact_id=context.context_id,
+        artifact_type="control.generation_context",
+        value=context,
+        dependencies=context.root_refs,
+    )
+    definition = deterministic_boundary_work_definition(
+        scope_id=job.job_id,
+        component="design",
+        stage="resume_boundary",
+        artifact_slot="resume_boundary",
+        dependency_coordinates=(),
+        claim_id="resume_boundary.passed",
+        claim="The frozen resume boundary has a durable stopped attempt.",
+        timing_reason="The controller must recover the exact stopped node.",
+        effect="block_release",
+        success_maturity="resume_boundary_closed",
+    )
+    graph = GenerationWorkGraph.compile((definition,), mode="diagnostic")
+    definition_ref = artifacts.put_json(
+        artifact_id=f"work-definition:{definition.work_id}",
+        artifact_type="control.work_definition",
+        value=definition,
+        dependencies=(context_ref,),
+    )
+    manifest = graph.manifest(
+        topology_id="topology:frozen-resume-projection-gap",
+        external_root_refs=(context_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=f"work-graph-manifest:{manifest.graph_id}",
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(context_ref, definition_ref),
+    )
+    epoch = WorkGraphEpoch(
+        epoch_id="epoch:bootstrap:frozen-resume-projection-gap",
+        scope_id=job.job_id,
+        epoch_kind="bootstrap",
+        context_ref=context_ref,
+        manifest_ref=manifest_ref,
+    )
+    epoch_ref = artifacts.put_json(
+        artifact_id=epoch.epoch_id,
+        artifact_type="control.work_graph_epoch",
+        value=epoch,
+        dependencies=(context_ref, manifest_ref, definition_ref),
+    )
+
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=controller.work_control,
+        budget=LeaseBudgetLedger(budget),
+    )
+    with controller.work_control.exclusive(definition.coordinate) as lock:
+        started = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(context_ref,),
+            elapsed_wall_seconds=0,
+        )
+    started_attempt = store.get_json(started.attempt_ref, WorkAttempt)
+    interrupted_attempt = started_attempt.model_copy(
+        update={
+            "status": "interrupted",
+            "finished_at": datetime.now(UTC),
+            "failure_code": "process_interrupted_cancelled",
+        }
+    )
+    interrupted_attempt_ref = artifacts.put_json(
+        artifact_id=interrupted_attempt.attempt_id,
+        artifact_type="control.work_attempt",
+        value=interrupted_attempt,
+        dependencies=(started.attempt_ref,),
+    )
+    with controller.work_control.exclusive(definition.coordinate) as lock:
+        controller.work_control.compare_and_swap(
+            lock,
+            expected_head=started,
+            next_head=started.model_copy(
+                update={
+                    "revision": started.revision + 1,
+                    "status": "interrupted",
+                    "attempt_ref": interrupted_attempt_ref,
+                    "updated_at": datetime.now(UTC),
+                }
+            ),
+        )
+
+    # This deliberately omits both context_ref and epoch_ref: it reproduces a
+    # controller crash between epoch persistence and compact-snapshot update.
+    snapshot = JobRunSnapshot(
+        run_id="run:frozen-resume-projection-gap",
+        job_ref=job_ref,
+        revision=1,
+        status="failed",
+        reserved_budget=budget,
+        observed_actual_budget=BudgetUsage(),
+        unknown_upper_bound_budget=BudgetUsage(),
+        conservative_committed_budget=BudgetUsage(),
+        latest_artifact_refs=(job_ref, request_ref),
+        failure_code="controller_interrupted",
+        failure_summary="The compact run projection did not record the frozen epoch.",
+    )
+    snapshot_ref = artifacts.put_json(
+        artifact_id=f"{snapshot.run_id}:state",
+        artifact_type="control.job_run_snapshot",
+        value=snapshot,
+        dependencies=(job_ref, request_ref),
+    )
+    direct_head = new_direct_job_head(
+        request_id=request.request_id,
+        request_fingerprint=sha256_digest(b"frozen-resume-projection-gap"),
+        request_ref=request_ref,
+        job_ref=job_ref,
+        scope_id=job.job_id,
+        run_id=snapshot.run_id,
+        snapshot_ref=snapshot_ref,
+        snapshot_revision=snapshot.revision,
+        status="failed",
+    )
+
+    selected = controller._select_frozen_resume_target(  # noqa: SLF001 - control-plane regression
+        head=direct_head,
+        from_frozen_epoch=None,
+        from_coordinate="design.resume_boundary.resume_boundary",
+    )
+
+    assert selected == (
+        snapshot_ref,
+        snapshot,
+        context_ref,
+        epoch_ref,
+        definition.coordinate,
+        definition,
+    )
+
+
+def test_frozen_resume_selects_committed_but_stale_consumer_after_parent_revision(
+    tmp_path: Path,
+) -> None:
+    """A repaired parent must resume its stale consumer, not an old downstream gate.
+
+    This reproduces the Candidate r9 control-plane shape with deterministic
+    boundaries: the consumer has a physical ``committed`` head, but its input
+    closure names the parent's r1 Artifact.  After the parent commits r9, the
+    frozen Scheduler must expose the consumer as the only resumable frontier.
+    """
+
+    state_root = tmp_path / "foundry"
+    store = ArtifactStore(state_root / "artifacts")
+    registry = EnvironmentRegistry(state_root / "registry", store)
+    release_profile = ReleaseProfile(profile_id="stale-consumer-resume")
+    controller = _direct_controller(state_root, store, registry, release_profile)
+    artifacts = controller.artifacts
+    budget = Budget(wall_seconds=600)
+    request = EnvironmentRequest(
+        request_id="request:stale-consumer-resume",
+        need="Refresh only the consumer after its parent source revision changes.",
+        budget=budget,
+        release_profile=release_profile,
+    )
+    request_ref = artifacts.put_json(
+        artifact_id=request.request_id,
+        artifact_type="control.environment_request",
+        value=request,
+    )
+    job = EnvironmentJob(
+        job_id="generate-job:stale-consumer-resume",
+        kind="generate",
+        request_ref=request_ref,
+        budget=budget,
+        release_profile=release_profile,
+    )
+    job_ref = artifacts.put_json(
+        artifact_id=f"{job.job_id}:job",
+        artifact_type="control.environment_job",
+        value=job,
+        dependencies=(request_ref,),
+    )
+    context = GenerationContext(
+        context_id="generation-context:stale-consumer-resume",
+        job_ref=job_ref,
+        kind="generate",
+        request_ref=request_ref,
+        permissions=PermissionScope(),
+        budget=budget,
+        release_profile=release_profile,
+    )
+    context_ref = artifacts.put_json(
+        artifact_id=context.context_id,
+        artifact_type="control.generation_context",
+        value=context,
+        dependencies=context.root_refs,
+    )
+    parent_r1 = deterministic_boundary_work_definition(
+        scope_id=job.job_id,
+        component="design",
+        stage="candidate_source",
+        artifact_slot="candidate_source",
+        dependency_coordinates=(),
+        claim_id="candidate.source.ready",
+        claim="The Candidate source closure is ready for its consumer.",
+        timing_reason="Integration requires one exact Candidate source revision.",
+        effect="block_integration",
+        success_maturity="candidate_ready",
+    )
+    integration = deterministic_boundary_work_definition(
+        scope_id=job.job_id,
+        component="integration",
+        stage="candidate_integration",
+        artifact_slot="integration_report",
+        dependency_coordinates=(parent_r1.coordinate,),
+        claim_id="candidate.integration.ready",
+        claim="Integration validates the exact Candidate source closure.",
+        timing_reason="A later gate may consume only current Integration evidence.",
+        effect="block_release",
+        success_maturity="integration_ready",
+    )
+    for definition in (parent_r1, integration):
+        artifacts.put_json(
+            artifact_id=f"work-definition:{definition.work_id}",
+            artifact_type="control.work_definition",
+            value=definition,
+            dependencies=(context_ref,),
+        )
+
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=controller.work_control,
+        budget=LeaseBudgetLedger(budget),
+    )
+    source_r1 = artifacts.put_json(
+        artifact_id="candidate:r1",
+        artifact_type="control.candidate_source",
+        value={"revision": "r1"},
+        dependencies=(context_ref,),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=parent_r1,
+        input_refs=(context_ref,),
+        subject_ref=source_r1,
+        output_refs=(source_r1,),
+    )
+    integration_r1 = artifacts.put_json(
+        artifact_id="integration:r1",
+        artifact_type="control.integration_report",
+        value={"candidate_revision": "r1"},
+        dependencies=(source_r1,),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=integration,
+        input_refs=(context_ref, source_r1),
+        subject_ref=integration_r1,
+        output_refs=(integration_r1,),
+    )
+
+    # Change an acceptance-bearing definition field as well as the output.
+    # Changing timing prose alone deliberately permits historical-commit reuse,
+    # which is correct for a non-semantic scheduling adjustment but does not
+    # model Candidate r9's new source closure.
+    parent_r2 = parent_r1.model_copy(
+        update={
+            "claim": "The refreshed Candidate source closure is ready for its consumer.",
+            "timing_reason": "The Candidate source revision was refreshed.",
+        }
+    )
+    artifacts.put_json(
+        artifact_id=f"work-definition:{parent_r2.work_id}",
+        artifact_type="control.work_definition",
+        value=parent_r2,
+        dependencies=(context_ref,),
+    )
+    old_parent_head = controller.work_control.read_head(parent_r1.coordinate)
+    assert old_parent_head is not None and old_parent_head.status == "committed"
+    revision_runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=controller.work_control,
+        budget=LeaseBudgetLedger(budget),
+    )
+    with controller.work_control.exclusive(parent_r1.coordinate) as lock:
+        revision_runtime.supersede_stale(
+            lock,
+            definition=parent_r2,
+            input_refs=(context_ref,),
+            previous=old_parent_head,
+            elapsed_wall_seconds=0,
+        )
+    source_r2 = artifacts.put_json(
+        artifact_id="candidate:r2",
+        artifact_type="control.candidate_source",
+        value={"revision": "r2"},
+        dependencies=(context_ref,),
+    )
+    revision_runtime.execute_deterministic_boundary(
+        definition=parent_r2,
+        input_refs=(context_ref,),
+        subject_ref=source_r2,
+        output_refs=(source_r2,),
+    )
+
+    graph = GenerationWorkGraph.compile((parent_r2, integration), mode="diagnostic")
+    manifest = graph.manifest(
+        topology_id="topology:stale-consumer-resume",
+        external_root_refs=(context_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=f"work-graph-manifest:{manifest.graph_id}",
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(context_ref,),
+    )
+    epoch = WorkGraphEpoch(
+        epoch_id="epoch:bootstrap:stale-consumer-resume",
+        scope_id=job.job_id,
+        epoch_kind="bootstrap",
+        context_ref=context_ref,
+        manifest_ref=manifest_ref,
+    )
+    epoch_ref = artifacts.put_json(
+        artifact_id=epoch.epoch_id,
+        artifact_type="control.work_graph_epoch",
+        value=epoch,
+        dependencies=(context_ref, manifest_ref),
+    )
+    snapshot = JobRunSnapshot(
+        run_id="run:stale-consumer-resume",
+        job_ref=job_ref,
+        revision=1,
+        status="failed",
+        reserved_budget=budget,
+        observed_actual_budget=BudgetUsage(),
+        unknown_upper_bound_budget=BudgetUsage(),
+        conservative_committed_budget=BudgetUsage(),
+        latest_artifact_refs=(job_ref, request_ref, context_ref, epoch_ref),
+        failure_code="owner_lost",
+        failure_summary="The original owner stopped after the parent revision committed.",
+    )
+    snapshot_ref = artifacts.put_json(
+        artifact_id=f"{snapshot.run_id}:state",
+        artifact_type="control.job_run_snapshot",
+        value=snapshot,
+        dependencies=(job_ref, context_ref, epoch_ref),
+    )
+    direct_head = new_direct_job_head(
+        request_id=request.request_id,
+        request_fingerprint=sha256_digest(b"stale-consumer-resume"),
+        request_ref=request_ref,
+        job_ref=job_ref,
+        scope_id=job.job_id,
+        run_id=snapshot.run_id,
+        snapshot_ref=snapshot_ref,
+        snapshot_revision=snapshot.revision,
+        status="failed",
+    )
+
+    states = controller._frozen_epoch_schedule_states(  # noqa: SLF001 - control-plane proof
+        context_ref=context_ref,
+        epoch_ref=epoch_ref,
+    )
+    assert states[integration.coordinate.coordinate_key] == "stale"
+    selected = controller._select_frozen_resume_target(  # noqa: SLF001 - control-plane proof
+        head=direct_head,
+        from_frozen_epoch=None,
+        from_coordinate=None,
+    )
+
+    assert selected == (
+        snapshot_ref,
+        snapshot,
+        context_ref,
+        epoch_ref,
+        integration.coordinate,
+        integration,
+    )
+
+
+def test_resume_advances_an_explicit_committed_frontier_in_the_same_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed epoch can advance without reopening any of its own nodes.
+
+    This is the control-plane half of recovery: the Runner independently proves
+    active Commit closure immediately before it derives the suffix.  Here the
+    Controller must preserve the original job/context/epoch and must not invent
+    a stopped-coordinate retry authority.
+    """
+
+    state_root = tmp_path / "foundry"
+    store = ArtifactStore(state_root / "artifacts")
+    registry = EnvironmentRegistry(state_root / "registry", store)
+    release_profile = ReleaseProfile(profile_id="committed-frontier")
+    controller = _direct_controller(state_root, store, registry, release_profile)
+    artifacts = controller.artifacts
+    budget = Budget(wall_seconds=600)
+    request = EnvironmentRequest(
+        request_id="request:committed-frontier",
+        need="Advance only the causal suffix of one fully committed epoch.",
+        budget=budget,
+        release_profile=release_profile,
+    )
+    request_ref = artifacts.put_json(
+        artifact_id=request.request_id,
+        artifact_type="control.environment_request",
+        value=request,
+    )
+    job = EnvironmentJob(
+        job_id="generate-job:committed-frontier",
+        kind="generate",
+        request_ref=request_ref,
+        budget=budget,
+        release_profile=release_profile,
+    )
+    job_ref = artifacts.put_json(
+        artifact_id=f"{job.job_id}:job",
+        artifact_type="control.environment_job",
+        value=job,
+        dependencies=(request_ref,),
+    )
+    context = GenerationContext(
+        context_id="generation-context:committed-frontier",
+        job_ref=job_ref,
+        kind="generate",
+        request_ref=request_ref,
+        permissions=PermissionScope(),
+        budget=budget,
+        release_profile=release_profile,
+    )
+    context_ref = artifacts.put_json(
+        artifact_id=context.context_id,
+        artifact_type="control.generation_context",
+        value=context,
+        dependencies=context.root_refs,
+    )
+    definition = deterministic_boundary_work_definition(
+        scope_id=job.job_id,
+        component="design",
+        stage="committed_frontier",
+        artifact_slot="committed_frontier",
+        dependency_coordinates=(),
+        claim_id="committed_frontier.passed",
+        claim="This frozen epoch is fully committed before its successor is derived.",
+        timing_reason="A framework repair must not replay already committed work.",
+        effect="block_release",
+        success_maturity="committed_frontier_closed",
+    )
+    graph = GenerationWorkGraph.compile((definition,), mode="diagnostic")
+    definition_ref = artifacts.put_json(
+        artifact_id=f"work-definition:{definition.work_id}",
+        artifact_type="control.work_definition",
+        value=definition,
+        dependencies=(context_ref,),
+    )
+    manifest = graph.manifest(
+        topology_id="topology:committed-frontier",
+        external_root_refs=(context_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=f"work-graph-manifest:{manifest.graph_id}",
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(context_ref, definition_ref),
+    )
+    epoch = WorkGraphEpoch(
+        epoch_id="epoch:bootstrap:committed-frontier",
+        scope_id=job.job_id,
+        epoch_kind="bootstrap",
+        context_ref=context_ref,
+        manifest_ref=manifest_ref,
+    )
+    epoch_ref = artifacts.put_json(
+        artifact_id=epoch.epoch_id,
+        artifact_type="control.work_graph_epoch",
+        value=epoch,
+        dependencies=(context_ref, manifest_ref, definition_ref),
+    )
+    output_ref = artifacts.put_json(
+        artifact_id="committed-frontier:output",
+        artifact_type="test.semantic_source",
+        value={"status": "committed"},
+        dependencies=(context_ref,),
+    )
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=controller.work_control,
+        budget=LeaseBudgetLedger(budget),
+    )
+    committed_head = runtime.execute_deterministic_boundary(
+        definition=definition,
+        input_refs=(context_ref,),
+        subject_ref=output_ref,
+        output_refs=(output_ref,),
+    )
+    assert committed_head.status == "committed"
+
+    run_id = "run:committed-frontier"
+    running_snapshot = JobRunSnapshot(
+        run_id=run_id,
+        job_ref=job_ref,
+        revision=1,
+        status="running",
+        reserved_budget=budget,
+        observed_actual_budget=BudgetUsage(),
+        unknown_upper_bound_budget=BudgetUsage(),
+        conservative_committed_budget=BudgetUsage(),
+        latest_artifact_refs=(request_ref, job_ref, context_ref, epoch_ref),
+    )
+    running_snapshot_ref = artifacts.put_json(
+        artifact_id=f"{run_id}:state",
+        artifact_type="control.job_run_snapshot",
+        value=running_snapshot,
+        dependencies=(request_ref, job_ref, context_ref, epoch_ref),
+    )
+    snapshot = running_snapshot.model_copy(
+        update={
+            "revision": 2,
+            "status": "failed",
+            "failure_code": "framework_fix_pending",
+            "failure_summary": (
+                "A later control-plane boundary stopped after this frontier committed."
+            ),
+        }
+    )
+    snapshot_ref = artifacts.put_json(
+        artifact_id=f"{run_id}:state",
+        artifact_type="control.job_run_snapshot",
+        value=snapshot,
+        dependencies=(running_snapshot_ref, request_ref, job_ref, context_ref, epoch_ref),
+    )
+    failed_result = GenerateResult(
+        run_id=run_id,
+        status="failed",
+        request_ref=request_ref,
+        job_ref=job_ref,
+        final_snapshot_ref=snapshot_ref,
+        failure_code="framework_fix_pending",
+        failure_summary="A later control-plane boundary stopped after this frontier committed.",
+    )
+    failed_result_ref = artifacts.put_json(
+        artifact_id=f"{run_id}:generate-result",
+        artifact_type="control.generate_result",
+        value=failed_result,
+        dependencies=(request_ref, job_ref, snapshot_ref),
+    )
+    fingerprint = controller._direct_request_fingerprint(  # noqa: SLF001
+        request,
+        enable_discovery=False,
+        discovery_budget=controller.config.discovery_budget,
+    )
+    with controller.direct_jobs.exclusive(request.request_id) as lock:
+        running_direct_head = new_direct_job_head(
+            request_id=request.request_id,
+            request_fingerprint=fingerprint,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            scope_id=job.job_id,
+            run_id=run_id,
+            snapshot_ref=running_snapshot_ref,
+            snapshot_revision=running_snapshot.revision,
+            status="running",
+        )
+        controller.direct_jobs.compare_and_swap(
+            lock,
+            expected_head=None,
+            next_head=running_direct_head,
+        )
+        failed_direct_head = new_direct_job_head(
+            request_id=request.request_id,
+            request_fingerprint=fingerprint,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            scope_id=job.job_id,
+            run_id=run_id,
+            snapshot_ref=snapshot_ref,
+            snapshot_revision=snapshot.revision,
+            status="failed",
+        )
+        controller.direct_jobs.compare_and_swap(
+            lock,
+            expected_head=running_direct_head,
+            next_head=failed_direct_head,
+        )
+        completed_direct_head = new_direct_job_head(
+            request_id=request.request_id,
+            request_fingerprint=fingerprint,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            scope_id=job.job_id,
+            run_id=run_id,
+            snapshot_ref=snapshot_ref,
+            snapshot_revision=snapshot.revision,
+            status="failed",
+            result_ref=failed_result_ref,
+        )
+        controller.direct_jobs.compare_and_swap(
+            lock,
+            expected_head=failed_direct_head,
+            next_head=completed_direct_head,
+        )
+
+    captured: dict[str, object] = {}
+
+    async def intercept_execute_direct_locked(**kwargs: object) -> GenerateResult:
+        captured.update(kwargs)
+        return failed_result
+
+    monkeypatch.setattr(controller, "_execute_direct_locked", intercept_execute_direct_locked)
+
+    resumed = asyncio.run(
+        controller.resume_generation(
+            request.request_id,
+            from_frozen_epoch=epoch_ref.artifact_id,
+        )
+    )
+
+    assert resumed == failed_result
+    assert captured["recovery_context_ref"] == context_ref
+    assert captured["recovery_epoch_ref"] == epoch_ref
+    assert captured["recovery_frontier"] is True
+    assert captured.get("recovery_coordinate") is None
+    assert captured.get("resume_authority_ref") is None
+    assert controller.work_control.read_head(definition.coordinate) == committed_head
+
+
+def test_resume_keeps_a_running_crash_boundary_in_the_same_job(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead owner resumes its exact running node, never the graph prefix.
+
+    This exercises the controller handoff between a recovered Direct head and
+    the frozen WorkGraph.  The actual Work-level reconciliation is covered by
+    the DirectWorkRunner recovery boundary tests; this regression proves the
+    controller does not reject the running head or misclassify it as a
+    terminal operator retry before that reconciliation can happen.
+    """
+
+    state_root = tmp_path / "foundry"
+    store = ArtifactStore(state_root / "artifacts")
+    registry = EnvironmentRegistry(state_root / "registry", store)
+    release_profile = ReleaseProfile(profile_id="running-crash-boundary")
+    controller = _direct_controller(state_root, store, registry, release_profile)
+    artifacts = controller.artifacts
+    budget = Budget(wall_seconds=600)
+    request = EnvironmentRequest(
+        request_id="request:running-crash-boundary",
+        need="Resume the exact node whose owner crashed after dispatch.",
+        budget=budget,
+        release_profile=release_profile,
+    )
+    request_ref = artifacts.put_json(
+        artifact_id=request.request_id,
+        artifact_type="control.environment_request",
+        value=request,
+    )
+    job = EnvironmentJob(
+        job_id="generate-job:running-crash-boundary",
+        kind="generate",
+        request_ref=request_ref,
+        budget=budget,
+        release_profile=release_profile,
+    )
+    job_ref = artifacts.put_json(
+        artifact_id=f"{job.job_id}:job",
+        artifact_type="control.environment_job",
+        value=job,
+        dependencies=(request_ref,),
+    )
+    context = GenerationContext(
+        context_id="generation-context:running-crash-boundary",
+        job_ref=job_ref,
+        kind="generate",
+        request_ref=request_ref,
+        permissions=PermissionScope(),
+        budget=budget,
+        release_profile=release_profile,
+    )
+    context_ref = artifacts.put_json(
+        artifact_id=context.context_id,
+        artifact_type="control.generation_context",
+        value=context,
+        dependencies=context.root_refs,
+    )
+    definition = deterministic_boundary_work_definition(
+        scope_id=job.job_id,
+        component="design",
+        stage="crash_boundary",
+        artifact_slot="crash_boundary",
+        dependency_coordinates=(),
+        claim_id="crash_boundary.passed",
+        claim="A crashed node is reconciled before the run advances.",
+        timing_reason="The Direct owner can die after dispatch.",
+        effect="block_release",
+        success_maturity="crash_boundary_closed",
+    )
+    graph = GenerationWorkGraph.compile((definition,), mode="diagnostic")
+    definition_ref = artifacts.put_json(
+        artifact_id=f"work-definition:{definition.work_id}",
+        artifact_type="control.work_definition",
+        value=definition,
+        dependencies=(context_ref,),
+    )
+    manifest = graph.manifest(
+        topology_id="topology:running-crash-boundary",
+        external_root_refs=(context_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=f"work-graph-manifest:{manifest.graph_id}",
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(context_ref, definition_ref),
+    )
+    epoch = WorkGraphEpoch(
+        epoch_id="epoch:bootstrap:running-crash-boundary",
+        scope_id=job.job_id,
+        epoch_kind="bootstrap",
+        context_ref=context_ref,
+        manifest_ref=manifest_ref,
+    )
+    epoch_ref = artifacts.put_json(
+        artifact_id=epoch.epoch_id,
+        artifact_type="control.work_graph_epoch",
+        value=epoch,
+        dependencies=(context_ref, manifest_ref, definition_ref),
+    )
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=controller.work_control,
+        budget=LeaseBudgetLedger(budget),
+    )
+    with controller.work_control.exclusive(definition.coordinate) as lock:
+        running_work_head = runtime.begin(
+            lock,
+            definition=definition,
+            input_refs=(context_ref,),
+            elapsed_wall_seconds=0,
+        )
+
+    run_id = "run:running-crash-boundary"
+    running_snapshot = JobRunSnapshot(
+        run_id=run_id,
+        job_ref=job_ref,
+        revision=1,
+        status="running",
+        reserved_budget=budget,
+        observed_actual_budget=BudgetUsage(),
+        unknown_upper_bound_budget=BudgetUsage(),
+        conservative_committed_budget=BudgetUsage(),
+        latest_artifact_refs=(job_ref, request_ref),
+    )
+    running_snapshot_ref = artifacts.put_json(
+        artifact_id=f"{run_id}:state",
+        artifact_type="control.job_run_snapshot",
+        value=running_snapshot,
+        dependencies=(job_ref, request_ref),
+    )
+    failed_snapshot = running_snapshot.model_copy(
+        update={
+            "revision": 2,
+            "status": "failed",
+            "failure_code": "scheduler_direct_owner_lost",
+            "failure_summary": "The Direct owner process exited after dispatch.",
+        }
+    )
+    failed_snapshot_ref = artifacts.put_json(
+        artifact_id=f"{run_id}:state",
+        artifact_type="control.job_run_snapshot",
+        value=failed_snapshot,
+        dependencies=(running_snapshot_ref, job_ref, request_ref),
+    )
+    failed_result = GenerateResult(
+        run_id=run_id,
+        status="failed",
+        request_ref=request_ref,
+        job_ref=job_ref,
+        final_snapshot_ref=failed_snapshot_ref,
+        failure_code="scheduler_direct_owner_lost",
+        failure_summary="The Direct owner process exited after dispatch.",
+    )
+    failed_result_ref = artifacts.put_json(
+        artifact_id=f"{run_id}:generate-result",
+        artifact_type="control.generate_result",
+        value=failed_result,
+        dependencies=(request_ref, job_ref, failed_snapshot_ref),
+    )
+    fingerprint = controller._direct_request_fingerprint(  # noqa: SLF001
+        request,
+        enable_discovery=False,
+        discovery_budget=controller.config.discovery_budget,
+    )
+    with controller.direct_jobs.exclusive(request.request_id) as lock:
+        running_direct_head = new_direct_job_head(
+            request_id=request.request_id,
+            request_fingerprint=fingerprint,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            scope_id=job.job_id,
+            run_id=run_id,
+            snapshot_ref=running_snapshot_ref,
+            snapshot_revision=1,
+            status="running",
+        )
+        controller.direct_jobs.compare_and_swap(
+            lock,
+            expected_head=None,
+            next_head=running_direct_head,
+        )
+        failed_direct_head = new_direct_job_head(
+            request_id=request.request_id,
+            request_fingerprint=fingerprint,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            scope_id=job.job_id,
+            run_id=run_id,
+            snapshot_ref=failed_snapshot_ref,
+            snapshot_revision=2,
+            status="failed",
+        )
+        controller.direct_jobs.compare_and_swap(
+            lock,
+            expected_head=running_direct_head,
+            next_head=failed_direct_head,
+        )
+        completed_direct_head = new_direct_job_head(
+            request_id=request.request_id,
+            request_fingerprint=fingerprint,
+            request_ref=request_ref,
+            job_ref=job_ref,
+            scope_id=job.job_id,
+            run_id=run_id,
+            snapshot_ref=failed_snapshot_ref,
+            snapshot_revision=2,
+            status="failed",
+            result_ref=failed_result_ref,
+        )
+        controller.direct_jobs.compare_and_swap(
+            lock,
+            expected_head=failed_direct_head,
+            next_head=completed_direct_head,
+        )
+
+    captured: dict[str, object] = {}
+
+    async def intercept_execute_direct_locked(**kwargs: object) -> GenerateResult:
+        captured.update(kwargs)
+        return failed_result
+
+    monkeypatch.setattr(controller, "_execute_direct_locked", intercept_execute_direct_locked)
+
+    resumed = asyncio.run(
+        controller.resume_generation(
+            request.request_id,
+            from_coordinate="design.crash_boundary.crash_boundary",
+        )
+    )
+
+    assert resumed == failed_result
+    assert captured["recovery_context_ref"] == context_ref
+    assert captured["recovery_epoch_ref"] == epoch_ref
+    assert captured["recovery_coordinate"] == definition.coordinate
+    # A running attempt has not reached the terminal-retry boundary.  The
+    # frozen runner must reconcile it before any new leaf dispatch.
+    assert captured["resume_authority_ref"] is None
+    assert controller.work_control.read_head(definition.coordinate) == running_work_head
 
 
 def test_controller_reconciles_registry_event_failure_after_atomic_publish(
@@ -769,9 +1693,7 @@ def test_registry_prepares_and_atomically_publishes_immutable_package(tmp_path: 
         if ref.artifact_type == "judge.reachability_public_evidence"
     )
     evidence_digest = reachability_ref.content_hash.removeprefix("sha256:")
-    evidence_blob = (
-        store.root / "blobs" / "sha256" / evidence_digest[:2] / evidence_digest
-    )
+    evidence_blob = store.root / "blobs" / "sha256" / evidence_digest[:2] / evidence_digest
     evidence_bytes = evidence_blob.read_bytes()
     evidence_mode = evidence_blob.stat().st_mode & 0o777
     evidence_blob.chmod(0o600)
@@ -1275,9 +2197,7 @@ def test_registry_rejects_incomplete_integration_gate_closure(tmp_path: Path) ->
         value=incomplete,
         dependencies=store.dependencies(manifest.integration_report_ref),
     )
-    revised_manifest = manifest.model_copy(
-        update={"integration_report_ref": incomplete_ref}
-    )
+    revised_manifest = manifest.model_copy(update={"integration_report_ref": incomplete_ref})
     revised_manifest_ref = _framework_writer(store).put_json(
         artifact_id="manifest:missing-integration-gate",
         artifact_type="environment_package_manifest",
@@ -1313,14 +2233,10 @@ def test_registry_rejects_dossier_without_the_exact_prepackage_closure(tmp_path:
         artifact_type="release.dossier",
         value=truncated_dossier,
         dependencies=tuple(
-            ref
-            for ref in store.dependencies(manifest.release_dossier_ref)
-            if ref != missing_commit
+            ref for ref in store.dependencies(manifest.release_dossier_ref) if ref != missing_commit
         ),
     )
-    revised_manifest = manifest.model_copy(
-        update={"release_dossier_ref": truncated_dossier_ref}
-    )
+    revised_manifest = manifest.model_copy(update={"release_dossier_ref": truncated_dossier_ref})
     revised_manifest_ref = _framework_writer(store).put_json(
         artifact_id="manifest:missing-prepackage-commit",
         artifact_type="environment_package_manifest",
@@ -1363,9 +2279,7 @@ def test_registry_rejects_incomplete_release_telemetry(tmp_path: Path) -> None:
         dependencies=store.dependencies(manifest.telemetry_summary_ref),
     )
     dossier = store.get_json(manifest.release_dossier_ref, ReleaseDossier)
-    revised_dossier = dossier.model_copy(
-        update={"telemetry_summary_ref": incomplete_telemetry_ref}
-    )
+    revised_dossier = dossier.model_copy(update={"telemetry_summary_ref": incomplete_telemetry_ref})
     revised_dossier_ref = _framework_writer(store).put_json(
         artifact_id="release-dossier:missing-telemetry-node",
         artifact_type="release.dossier",

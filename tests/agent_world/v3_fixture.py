@@ -132,8 +132,9 @@ import sys
 
 workspace = os.environ["AGENT_WORLD_WORKSPACE"]
 assert os.path.isfile(os.path.join(workspace, "runtime.py"))
-assert not os.path.exists(os.path.join(workspace, "task_materializer.py"))
-assert not os.path.exists(os.path.join(workspace, "world", "rule_ir.json"))
+# Runtime and Task Materializer share the Candidate workspace.  Component
+# boundaries are enforced by their declared interfaces, not by making sibling
+# source files disappear from the process environment.
 
 ABI = "agent-world.runtime.v2"
 OPERATIONS = ["handshake", "reset", "invoke", "snapshot", "close"]
@@ -315,7 +316,6 @@ import os
 workspace = os.environ["AGENT_WORLD_WORKSPACE"]
 assert os.path.isfile(os.path.join(workspace, "task_materializer.py"))
 assert os.path.isfile(os.path.join(workspace, "runtime.py"))
-assert not os.path.exists(os.path.join(workspace, "world", "rule_ir.json"))
 
 
 def materialize(seed, task_type, actor, difficulty):
@@ -2609,9 +2609,7 @@ def build_release_graph(
                 update={
                     "status": "fail" if index == 0 else "pass",
                     "summary": (
-                        "Independent real-process evidence failed."
-                        if index == 0
-                        else gate.summary
+                        "Independent real-process evidence failed." if index == 0 else gate.summary
                     ),
                 }
             )

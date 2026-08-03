@@ -25,7 +25,7 @@ from agent_world.control.work_graph import (
     _IMPLEMENTATION_PLAN_VALIDATOR_MODULES,
     _RELEASE_ASSURANCE_VALIDATOR_MODULES,
     _RUNTIME_INTEGRATION_VALIDATOR_MODULES,
-    _SHARED_SCHEDULER_FEEDBACK_MODULES,
+    _SCHEDULER_CONTROL_PLANE_MODULES,
     _TOOL_SEMANTICS_BATCH_VALIDATOR_MODULES,
     _VERIFIER_INTENT_BATCH_VALIDATOR_MODULES,
     _VERIFIER_PLAN_VALIDATOR_MODULES,
@@ -59,6 +59,7 @@ from agent_world.designer.models import (
     ToolCouplingPlan,
 )
 from agent_world.judge import VerifierBatchPlan, VerifierBatchPlanItem
+from agent_world.judge.service import EnvironmentJudge
 from agent_world.judge_budgeting import (
     integration_budget_requirements,
     release_without_interactive_budget_requirements,
@@ -131,8 +132,8 @@ def test_evidence_synthesis_definition_binds_current_prompt_skill_and_compiler_r
     )
 
 
-def test_refreshable_validator_revisions_bind_shared_scheduler_feedback_route() -> None:
-    """Feedback/control changes invalidate every registered refreshable leaf."""
+def test_refreshable_validator_revisions_exclude_scheduler_control_plane() -> None:
+    """Feedback/lifecycle edits do not stale accepted semantic artifacts."""
 
     for modules in (
         _EVIDENCE_SYNTHESIS_VALIDATOR_MODULES,
@@ -144,7 +145,7 @@ def test_refreshable_validator_revisions_bind_shared_scheduler_feedback_route() 
         _RUNTIME_INTEGRATION_VALIDATOR_MODULES,
         _RELEASE_ASSURANCE_VALIDATOR_MODULES,
     ):
-        assert set(_SHARED_SCHEDULER_FEEDBACK_MODULES).issubset(modules)
+        assert not set(_SCHEDULER_CONTROL_PLANE_MODULES).intersection(modules)
 
 
 def test_tool_semantics_batch_definition_binds_current_revisions() -> None:
@@ -332,6 +333,20 @@ def test_builder_agent_definitions_bind_current_prompt_skill_and_validator_revis
     # a Scheduler RepairAction or an unbounded retry budget.
     assert candidate_build.proposal_policy.budget.agent_turns == 2
     assert implementation_plan.proposal_policy.budget.agent_turns == 1
+    # A public Judge feedback renderer may be fixed after the Candidate has
+    # already consumed its original repair. CandidateBuild gets exactly one
+    # evidence-bound feedback refresh; other Agent leaves do not.
+    assert candidate_build.repair_policy.maximum_feedback_refresh_corrections == 1
+    assert implementation_plan.repair_policy.maximum_feedback_refresh_corrections == 0
+    assert "maximum_feedback_refresh_corrections" in candidate_build.repair_policy.model_dump(
+        mode="json"
+    )
+    # Omit the new closed default from old non-Candidate policy bytes so an
+    # invocation/repair enhancement cannot stale an already committed plan.
+    assert (
+        "maximum_feedback_refresh_corrections"
+        not in implementation_plan.repair_policy.model_dump(mode="json")
+    )
 
 
 def test_runtime_refresh_restores_candidate_bounded_development_turn() -> None:
@@ -787,6 +802,55 @@ def test_final_graph_sizes_judge_work_from_frozen_design_and_plan(
         release.proposal_policy.budget.tool_calls
         == release_without_interactive_budget_requirements(design, plan).tool_calls
     )
+
+
+def test_release_budget_covers_runtime_preflight_for_the_plan_maximum(tmp_path) -> None:
+    """Frozen Release reservation must dominate the real Judge preflight.
+
+    The graph is compiled before batch drafts exist.  This builds the largest
+    VerifierIR still permitted by the frozen plan and checks the exact runtime
+    preflight formula, rather than merely asserting two compiler helpers agree.
+    """
+
+    design = portable_counter_contracts(ArtifactStore(tmp_path / "artifacts")).design
+    plan = VerifierBatchPlan(
+        plan_id="verifier-plan:release-budget-bound",
+        design_ref=_artifact_ref("design:release-budget-bound", "design.environment_design"),
+        world_spec_ref=_artifact_ref("world:release-budget-bound", "design.world_spec"),
+        maximum_tasks_per_batch=1,
+        batches=tuple(
+            VerifierBatchPlanItem(
+                batch_id=f"verifier-batch:release-budget-bound:{index}",
+                batch_index=index,
+                task_types=(requirement.task_type,),
+                required_rule_ids=(),
+                required_property_families=(),
+                semantic_case_limit=3,
+                context_hash=sha256_digest(f"release-budget-bound:{index}".encode()),
+            )
+            for index, requirement in enumerate(design.curriculum.task_types)
+        ),
+    )
+    maximum_cases = sum(item.semantic_case_limit for item in plan.batches)
+    verifier_at_plan_maximum = SimpleNamespace(
+        solve_recipes=tuple(
+            SimpleNamespace(
+                task_type=item.task_type,
+                preferred=True,
+                recipe_id=f"recipe:release-budget-bound:{index}",
+            )
+            for index, item in enumerate(design.curriculum.task_types)
+        ),
+        cases=tuple(object() for _ in range(maximum_cases)),
+    )
+
+    compiled = release_without_interactive_budget_requirements(design, plan)
+    runtime_required = EnvironmentJudge.required_evaluation_episodes(
+        design=design,
+        verifier=verifier_at_plan_maximum,
+    )
+
+    assert compiled.evaluation_episodes >= runtime_required
 
 
 def test_strict_final_graph_rejects_missing_frozen_judge_budget_inputs() -> None:

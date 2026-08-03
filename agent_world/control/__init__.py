@@ -18,6 +18,7 @@ from .budget import (
     BudgetLedger,
     DurableLeaseBudgetCoordinator,
     LeaseBudgetLedger,
+    ScopeBudgetAmendment,
     ScopeBudgetSnapshot,
 )
 from .campaign import (
@@ -129,6 +130,7 @@ from .work import (
     DiagnosticQuality,
     EvaluationStatus,
     FeedbackEvaluation,
+    NodeResumeAuthority,
     OperationBudget,
     OperationKind,
     OperationRun,
@@ -276,6 +278,7 @@ __all__ = [
     "LeaseBudgetLedger",
     "DurableLeaseBudgetCoordinator",
     "ScopeBudgetSnapshot",
+    "ScopeBudgetAmendment",
     "MetricPoint",
     "JobRunSnapshot",
     "NodeAttempt",
@@ -287,6 +290,7 @@ __all__ = [
     "SemanticRepairSeedRecord",
     "SemanticRepairSeedStore",
     "NodeKind",
+    "NodeResumeAuthority",
     "NodeCommit",
     "RepairDirective",
     "RepairTargetRef",

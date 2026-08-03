@@ -534,10 +534,36 @@ def test_direct_run_cli_exposes_offline_progress_inspection() -> None:
     assert parsed.run_command == "inspect"
     assert parsed.request_id == "request:abc"
 
-    resumed = build_parser().parse_args(["run", "resume", "request:abc"])
+    resumed = build_parser().parse_args(
+        [
+            "run",
+            "resume",
+            "request:abc",
+            "--from-frozen-epoch",
+            "epoch:world:abc",
+            "--from-coordinate",
+            "design.world_rules.world_rules_source",
+            "--adopt-config-budget",
+        ]
+    )
     assert resumed.command == "run"
     assert resumed.run_command == "resume"
     assert resumed.request_id == "request:abc"
+    assert resumed.from_frozen_epoch == "epoch:world:abc"
+    assert resumed.from_coordinate == "design.world_rules.world_rules_source"
+    assert resumed.adopt_config_budget is True
+
+    frontier = build_parser().parse_args(
+        [
+            "run",
+            "resume",
+            "request:abc",
+            "--from-frozen-epoch",
+            "epoch:world:abc",
+        ]
+    )
+    assert frontier.from_frozen_epoch == "epoch:world:abc"
+    assert frontier.from_coordinate is None
 
 
 def test_observe_cli_exposes_phase_four_query_syntax() -> None:

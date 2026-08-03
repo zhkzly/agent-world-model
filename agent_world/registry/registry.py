@@ -1163,7 +1163,7 @@ class EnvironmentRegistry:
             integration.status != "ready"
             or integration.candidate_ref != manifest.candidate_ref
             or integration.candidate_source_tree_digest != manifest.candidate_source_tree_digest
-            or any(item.status != "pass" for item in integration.gate_results)
+            or any(item.hard and item.status != "pass" for item in integration.gate_results)
             or any(item.blocks_release for item in integration.findings)
         ):
             raise ReleaseRejectedError("IntegrationReport is not ready for the exact Candidate")
@@ -1174,7 +1174,7 @@ class EnvironmentRegistry:
         ):
             raise ReleaseRejectedError("telemetry is not a valid pre-publish commitment")
         gates = {item.gate_id: item for item in report.gate_results}
-        required = tuple(sorted(release_profile.required_hard_gates))
+        required = tuple(sorted(release_profile.effective_required_hard_gates))
         if not required or any(
             gate_id not in gates or not gates[gate_id].hard or gates[gate_id].status != "pass"
             for gate_id in required
@@ -1532,8 +1532,8 @@ class EnvironmentRegistry:
             or set(integration_gate_ids) != _REQUIRED_INTEGRATION_GATES
         ):
             raise ReleaseRejectedError("IntegrationReport gate closure is not canonical")
-        if any(item.status != "pass" for item in integration.gate_results):
-            raise ReleaseRejectedError("IntegrationReport contains a non-passing gate")
+        if any(item.hard and item.status != "pass" for item in integration.gate_results):
+            raise ReleaseRejectedError("IntegrationReport contains a non-passing hard gate")
         if any(item.blocks_release for item in integration.findings):
             raise ReleaseRejectedError("IntegrationReport contains a release-blocking Finding")
         claims = {item.claim_id: item for item in claim_vector.claims}
@@ -1737,7 +1737,7 @@ class EnvironmentRegistry:
             if gate.gate_id in gates:
                 raise ReleaseRejectedError(f"duplicate gate result: {gate.gate_id}")
             gates[gate.gate_id] = gate
-        required = release_profile.required_hard_gates
+        required = release_profile.effective_required_hard_gates
         if not required or len(set(required)) != len(required):
             raise ReleaseRejectedError("release profile must define unique required hard gates")
         for gate_id in required:
@@ -2294,7 +2294,7 @@ class EnvironmentRegistry:
             raise RegistryIntegrityError(
                 f"release Judge evidence closure is invalid: {record.release_id}"
             ) from exc
-        if passed_gates != tuple(sorted(record.release_profile.required_hard_gates)):
+        if passed_gates != tuple(sorted(record.release_profile.effective_required_hard_gates)):
             raise RegistryIntegrityError(f"release hard-gate closure changed: {record.release_id}")
         if self._package_digest(manifest) != record.coordinate.package_digest:
             raise RegistryIntegrityError(f"release digest mismatch: {record.release_id}")
@@ -2318,7 +2318,7 @@ class EnvironmentRegistry:
             telemetry_summary_ref=record.telemetry_summary_ref,
             candidate_ref=record.candidate_ref,
             release_profile=record.release_profile,
-            passed_hard_gates=tuple(sorted(record.release_profile.required_hard_gates)),
+            passed_hard_gates=tuple(sorted(record.release_profile.effective_required_hard_gates)),
             file_count=record.file_count,
             payload_size_bytes=record.payload_size_bytes,
             published_at=record.published_at,

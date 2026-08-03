@@ -46,7 +46,6 @@ class ReleaseProfile(V2Contract):
         "schema",
         "supply_chain",
         "static_assurance",
-        "public_self_check",
         "runtime_protocol",
         "task_materialization",
         "task_reachability",
@@ -61,6 +60,24 @@ class ReleaseProfile(V2Contract):
     require_clean_install: bool = True
     require_package_relative_paths: bool = True
     allow_unresolved_assumptions: bool = False
+
+    @property
+    def effective_required_hard_gates(self) -> tuple[Identifier, ...]:
+        """Return framework-authoritative gates without rewriting frozen data.
+
+        Older durable profiles may still name Candidate-authored public
+        self-checks as hard gates.  They remain readable provenance, but they
+        cannot grant a generated test authority to block or authorize a
+        release.  Keeping this as a view rather than a model normalisation is
+        important: normalising on deserialisation would change the bytes of a
+        historical ``GenerationContext`` and break its exact artifact closure.
+        """
+
+        return tuple(
+            gate_id
+            for gate_id in self.required_hard_gates
+            if gate_id != "public_self_check"
+        )
 
 
 class EnvironmentRequest(V2Contract):

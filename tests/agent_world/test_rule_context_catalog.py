@@ -30,7 +30,7 @@ _BOOKING_SCHEMA = {
     "type": "object",
     "properties": {
         "booking_id": {"type": "string"},
-        "status": {"type": "string"},
+        "status": {"type": "string", "enum": ["confirmed", "cancelled"]},
         "total_price": {"type": "number"},
     },
     "required": ["booking_id", "status", "total_price"],
@@ -197,6 +197,50 @@ def test_lookup_by_key_closes_collection_key_value_and_result_types() -> None:
     assert issues == ()
 
 
+def test_rule_constant_must_fit_the_frozen_referenced_schema() -> None:
+    rule = _rule(
+        RuleLookupByKey(
+            source="post_state",
+            collection_pointer="/bookings",
+            key_field="booking_id",
+            key=RuleValueRef(
+                source="args",
+                pointer="/booking_id",
+                value_type="string",
+            ),
+            value_pointer="/status",
+            value_type="string",
+        )
+    ).model_copy(
+        update={
+            "clauses": (
+                RuleClause(
+                    clause_id="status_outside_domain",
+                    left=RuleLookupByKey(
+                        source="post_state",
+                        collection_pointer="/bookings",
+                        key_field="booking_id",
+                        key=RuleValueRef(
+                            source="args",
+                            pointer="/booking_id",
+                            value_type="string",
+                        ),
+                        value_pointer="/status",
+                        value_type="string",
+                    ),
+                    operator="equal",
+                    right=RuleConstant(value_type="string", value="ready"),
+                ),
+            )
+        }
+    )
+
+    issues = validate_rule_context(rule, catalog=_catalog())
+
+    assert [issue.code for issue in issues] == ["rule_constant_schema_mismatch"]
+    assert issues[0].location == ("clauses", 0, "right", "value")
+
+
 def test_local_defs_are_resolved_for_catalog_prompt_and_lookup_validation() -> None:
     catalog = _catalog_with_local_entity_refs()
 
@@ -340,6 +384,25 @@ def test_prompt_projection_uses_compact_aliases_without_losing_frozen_bindings()
         for binding in sorted(catalog.lookup_bindings.values(), key=lambda item: item.binding_id)
     ]
     assert len(json.dumps(groups, sort_keys=True)) < len(json.dumps(legacy, sort_keys=True))
+
+
+def test_prompt_projection_discloses_small_closed_literal_domains() -> None:
+    """A Direct ToolSemantics call must see lifecycle/status choices, not just `string`."""
+
+    projection = _catalog().prompt_projection()
+    groups = projection["lookup_binding_groups"]
+    assert isinstance(groups, list)
+    status_binding = next(
+        value
+        for group in groups
+        if isinstance(group, dict)
+        and group["source"] == "post_state"
+        and group["collection_pointer"] == "/bookings"
+        for value in group["value_bindings"]
+        if isinstance(value, dict) and value["value_pointer"] == "/status"
+    )
+
+    assert status_binding["enum_values"] == ["confirmed", "cancelled"]
 
 
 def test_source_filtered_prompt_projection_preserves_full_catalog_aliases() -> None:
@@ -549,6 +612,11 @@ def test_lookup_by_key_rejects_non_primary_key_and_schema_type_drift() -> None:
     assert {issue.code for issue in issues} == {
         "rule_lookup_key_not_primary",
         "rule_reference_type_mismatch",
+        # The comparison literal is independently impossible for the selected
+        # numeric field.  Keep the full diagnostic set: repairing only the
+        # selector/type declaration would otherwise leave an unsatisfiable
+        # Rule behind.
+        "rule_constant_schema_mismatch",
     }
     assert all(issue.violated_condition for issue in issues)
     assert all(issue.expected_category for issue in issues)

@@ -706,7 +706,19 @@ class ArtifactStore:
     def get_json(self, ref: ArtifactRef, model: None = None) -> Any: ...
 
     def get_json(self, ref: ArtifactRef, model: type[TModel] | None = None) -> TModel | Any:
-        return self.open_read_view().get_json(ref, model)
+        # A public read normally starts a new integrity audit.  A caller that
+        # deliberately opened ``verified_closure()``, however, is performing
+        # one bounded framework operation over one immutable DAG (for example
+        # a Scheduler readiness snapshot).  Reopening an ArtifactReadView here
+        # used to discard that operation-scoped cache on every ``get_json``;
+        # a graph with many committed ancestors then re-verified the same
+        # transitive closure once per node and could spend minutes in local I/O
+        # before dispatching the next real Agent call.
+        verified = self._verified_closure.get()
+        if verified is None:
+            return self.open_read_view().get_json(ref, model)
+        revision = self._get_revision(ref, set(), verified)
+        return self._decode_json_revision(revision, model)
 
     def open_read_view(self) -> ArtifactReadView:
         """Start one bounded immutable-closure audit for a framework operation."""
@@ -755,6 +767,8 @@ class ArtifactStore:
     ) -> tuple[TModel, ...]:
         """Read a known immutable JSON set with one shared dependency audit."""
 
+        if self._verified_closure.get() is not None:
+            return tuple(self.get_json(ref, model) for ref in refs)
         return self.open_read_view().get_json_many(refs, model)
 
     def get_blob(self, ref: ArtifactRef) -> bytes:

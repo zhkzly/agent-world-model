@@ -85,10 +85,10 @@ class IntegrationReport(V2Contract):
 
     @model_validator(mode="after")
     def validate_integration_status(self) -> IntegrationReport:
-        failures = [item for item in self.gate_results if item.status != "pass"]
+        failures = [item for item in self.gate_results if item.hard and item.status != "pass"]
         blockers = [item for item in self.findings if item.blocks_release]
         if self.status == "ready" and (failures or blockers):
-            raise ValueError("ready IntegrationReport requires every integration gate to pass")
+            raise ValueError("ready IntegrationReport requires every hard integration gate to pass")
         if self.status == "ready" and self.candidate_source_tree_digest is None:
             raise ValueError("ready IntegrationReport must bind the verified source tree")
         if self.status == "failed" and not (failures or blockers):

@@ -93,7 +93,11 @@ def release_without_interactive_budget_requirements(
 
     call_counts = task_materializer_call_counts(design.curriculum)
     task_calls = sum(call_counts.values())
-    paired_verifier_cases = 2 * sum(item.semantic_case_limit for item in verifier_plan.batches)
+    # The final graph is frozen before batch drafts reveal the exact VerifierIR.
+    # It must therefore reserve the maximum number of cases the committed plan
+    # permits, rather than treating the eventual number of cases as known.
+    maximum_verifier_cases = sum(item.semantic_case_limit for item in verifier_plan.batches)
+    paired_verifier_cases = 2 * maximum_verifier_cases
     recipe_tool_calls = sum(
         call_counts[requirement.task_type]
         * requirement.reachability_policy.maximum_steps_per_attempt
@@ -108,10 +112,15 @@ def release_without_interactive_budget_requirements(
             + 2
         ),
         evaluation_episodes=(
+            # ``EnvironmentJudge.required_evaluation_episodes`` counts the
+            # materialization pass itself and one possible additional recipe
+            # attempt for every materialized task when a task allows two or
+            # more solver attempts.  A no-hidden-Agent release graph cannot
+            # know which batches will supply recipes, so freeze that maximum.
             task_calls
             + (design.verification.minimum_unknown_seed_episodes + 1)
-            + task_calls
-            + paired_verifier_cases
+            + 2 * task_calls
+            + maximum_verifier_cases
             + 2
         ),
     )

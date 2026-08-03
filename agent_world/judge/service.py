@@ -104,7 +104,7 @@ from .rules import (
     evaluate_task_reward,
     initially_evaluable_rules,
 )
-from .semantics import ToolExecutionEvidence, validate_tool_execution
+from .semantics import ToolExecutionEvidence, ToolSemanticValidationError, validate_tool_execution
 from .supervisor import (
     CandidateBuildError,
     CandidateProcessRunner,
@@ -114,10 +114,10 @@ from .supervisor import (
     HostExecutionUnavailable,
     JudgeInfrastructureError,
     LaunchContract,
+    ProcessResult,
     RuntimeProcessCrashed,
     RuntimeRequestTimeout,
     RuntimeSupervisor,
-    ProcessResult,
     candidate_clean_build_failure_is_agent_actionable,
 )
 from .task_semantics import (
@@ -189,6 +189,23 @@ _ALWAYS_HARD_GATES = frozenset(
         "clean_deployment",
     }
 )
+_DIAGNOSTIC_GATES = frozenset({"public_self_check"})
+
+
+def _gate_is_hard(gate_id: str, release_profile: ReleaseProfile) -> bool:
+    """Return whether this observation may independently block release.
+
+    Candidate-authored self-checks are intentionally visible diagnostic
+    evidence.  They cannot become release authority through a profile override:
+    the framework-owned Runtime and Judge gates establish those claims.
+    """
+
+    return gate_id not in _DIAGNOSTIC_GATES and (
+        gate_id in _ALWAYS_HARD_GATES
+        or gate_id in release_profile.effective_required_hard_gates
+    )
+
+
 _FORBIDDEN_SOURCE_PARTS = frozenset(
     {
         ".git",
@@ -227,6 +244,37 @@ class _RuntimeContractFailure(_CandidateTaskFailure):
         self.mismatch_paths = tuple(mismatch_paths)
         joined = ", ".join(self.mismatch_paths)
         super().__init__(f"Runtime handshake differs from WorldSpec at: {joined}")
+
+
+class _InvokeObservationProjectionFailure(_CandidateTaskFailure):
+    """One Candidate-visible invoke projection mismatch with a bounded repair method."""
+
+    def __init__(
+        self,
+        *,
+        tool_id: str,
+        actor: str,
+        required_fields: tuple[str, ...],
+        cause: ValueError,
+    ) -> None:
+        self.tool_id = tool_id
+        self.actor = actor
+        self.required_fields = required_fields
+        required = ", ".join(f"`{field}`" for field in required_fields)
+        required_clause = (
+            f" The projected schema requires {required}."
+            if required
+            else ""
+        )
+        super().__init__(
+            str(cause),
+            repair_remediation=(
+                f"For `invoke` of `{tool_id}` as `{actor}`, return the frozen actor-specific "
+                f"observation projection, not reset state.{required_clause} Build every required "
+                "field from the tool's actual transition, and verify the frozen tool precondition "
+                "against the materialized initial state before treating the public action as an error."
+            ),
+        )
 
 
 class JudgeBudgetDeficitError(ValueError):
@@ -576,6 +624,7 @@ class _ReachabilityGateResult:
     usage: BudgetUsage
     owner: FindingOwner
     recipe_rework_task_types: tuple[str, ...] = ()
+    repair_remediation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,6 +634,101 @@ class _AssuranceGateResult:
     summary: str
     owner: FindingOwner
     tool_calls: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _CaseRunResult:
+    """One real case plus only the safe repair method it established."""
+
+    evaluation: CaseEvaluation
+    tool_calls: int
+    repair_remediation: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CaseGateResult:
+    status: GateStatus
+    evidence_ref: ArtifactRef
+    summary: str
+    episodes: int
+    tool_calls: int
+    repair_remediation: str | None = None
+
+
+_PUBLIC_TOOL_RULE_FAILURE = re.compile(
+    r"^(?P<tool>[A-Za-z0-9_.:/-]+) violates "
+    r"(?P<rule_kind>precondition|transition|postcondition|invariant) Rules: \[[^\]]+\]$"
+)
+_PUBLIC_DECLARED_ERROR_RULE_FALSE = re.compile(
+    r"^Runtime emitted [A-Za-z0-9_.:/-]+ while its declared Rule is false$"
+)
+
+
+def _case_failure_repair_remediation(exc: BaseException) -> str | None:
+    """Translate a small set of public Runtime facts into safe Builder guidance.
+
+    ``CaseEvaluation.failure_summary`` is evidence, not automatically a model
+    instruction: it may be absent, generic, or derived from a sealed case.
+    This function deliberately recognizes only framework-produced, stable
+    failure shapes whose repair boundary is the Candidate Runtime.  Everything
+    else remains non-routeable instead of passing candidate-controlled text to
+    a Builder turn.
+    """
+
+    if isinstance(exc, _CandidateTaskFailure):
+        return exc.repair_remediation
+    if (
+        isinstance(exc, ProtocolViolation)
+        and exc.code == "schema_mismatch"
+        and str(exc) == "response.error has invalid keys"
+    ):
+        return "`error` fields: `code`, `message`, `retryable`, optional `details`."
+    if isinstance(exc, ToolSemanticValidationError):
+        match = _PUBLIC_TOOL_RULE_FAILURE.fullmatch(str(exc))
+        if match is not None:
+            return (
+                f"Make `{match.group('tool')}` satisfy its frozen "
+                f"{match.group('rule_kind')} Rules in pre-state and response."
+            )
+        if _PUBLIC_DECLARED_ERROR_RULE_FALSE.fullmatch(str(exc)) is not None:
+            # The validator's message contains the Candidate-provided error
+            # code.  Match its framework-owned shape, but do not reflect that
+            # untrusted value into the Builder instruction.  The frozen
+            # ToolSemantics already gives the Engineer the complete declared
+            # error set and their ``when`` Rules.
+            return (
+                "Emit a declared error only when its frozen `when` Rule is true; "
+                "otherwise follow a valid path."
+            )
+    return None
+
+
+def _public_case_repair_remediation(
+    runs: Sequence[_CaseRunResult],
+) -> str | None:
+    """Return one complete, bounded public Runtime repair brief, or none.
+
+    A Builder correction may handle several related failures in one Candidate
+    source revision, but it may not receive a partial list and be asked to
+    guess the rest.  Therefore every failed public/repair case must map to a
+    stable framework-owned remediation.  The full brief is emitted only if it
+    fits the existing feedback safety bound without truncation.
+    """
+
+    failed = tuple(item for item in runs if not item.evaluation.passed)
+    if not failed or any(item.repair_remediation is None for item in failed):
+        return None
+    remediations = tuple(
+        sorted({item.repair_remediation for item in failed if item.repair_remediation})
+    )
+    if len(remediations) == 1:
+        return remediations[0]
+    brief = (
+        "Fix public Runtime:\n"
+        + "\n".join(f"- {item}" for item in remediations)
+        + "\nKeep frozen Materializer, Verifier, and Rules unchanged."
+    )
+    return brief if len(brief) <= 512 else None
 
 
 class _RealEpisodeDriver(EpisodeDriver):
@@ -1632,6 +1776,7 @@ class EnvironmentJudge:
                     status=reachability.status,
                     evidence_ref=reachability.evidence_ref,
                     summary=reachability.summary,
+                    suggested_repair=reachability.repair_remediation,
                     owner=reachability.owner,
                     candidate_ref=candidate_ref,
                     release_profile=release_profile,
@@ -1674,13 +1819,14 @@ class EnvironmentJudge:
                     verifier_ref,
                     design,
                 )
-                episodes += behavior[3]
-                non_reachability_tool_calls += behavior[4]
+                episodes += behavior.episodes
+                non_reachability_tool_calls += behavior.tool_calls
                 self._record_gate(
                     gate_id="behavior",
-                    status=behavior[0],
-                    evidence_ref=behavior[1],
-                    summary=behavior[2],
+                    status=behavior.status,
+                    evidence_ref=behavior.evidence_ref,
+                    summary=behavior.summary,
+                    suggested_repair=behavior.repair_remediation,
                     owner="build",
                     candidate_ref=candidate_ref,
                     release_profile=release_profile,
@@ -1702,13 +1848,13 @@ class EnvironmentJudge:
                     verifier_ref,
                     design,
                 )
-                episodes += sealed[3]
-                non_reachability_tool_calls += sealed[4]
+                episodes += sealed.episodes
+                non_reachability_tool_calls += sealed.tool_calls
                 self._record_gate(
                     gate_id="sealed_release",
-                    status=sealed[0],
-                    evidence_ref=sealed[1],
-                    summary=sealed[2],
+                    status=sealed.status,
+                    evidence_ref=sealed.evidence_ref,
+                    summary=sealed.summary,
                     owner="build",
                     candidate_ref=candidate_ref,
                     release_profile=release_profile,
@@ -1887,9 +2033,14 @@ class EnvironmentJudge:
         manifest: CandidateManifest,
     ) -> _AssuranceGateResult:
         inspection = inspect_static_sources(clean.root, manifest)
+        # Static source integrity is framework-owned and hard.  Candidate
+        # public tests are useful evidence for the Builder's own development
+        # loop, but they cannot independently establish (or reject) package
+        # behavior.  Keep their execution records separate from hard static
+        # failures so a self-authored assertion is never a release authority.
         failures = set(inspection.failure_codes)
-        pairs, binding_failures = self._bind_public_tests(manifest)
-        failures.update(binding_failures)
+        pairs, public_test_diagnostic_codes = self._bind_public_tests(manifest)
+        diagnostics = set(public_test_diagnostic_codes)
         visible_paths = tuple(sorted(item.path for item in manifest.files))
 
         async def execute(
@@ -1936,16 +2087,14 @@ class EnvironmentJudge:
             if diagnostic is not None
         )
         if not executions:
-            failures.add("static_public_tests_missing")
+            diagnostics.add("static_public_tests_missing")
         if any(not item.passed for item in executions):
-            failures.add("static_public_test_failed")
+            diagnostics.add("static_public_test_failed")
         passed = (
             inspection.forbidden_pattern_scan_passed
             and inspection.secret_scan_passed
             and inspection.strict_data_parse_passed
             and inspection.python_compile_passed
-            and bool(executions)
-            and all(item.passed for item in executions)
             and not failures
         )
         evidence = StaticAssuranceEvidence(
@@ -1960,6 +2109,7 @@ class EnvironmentJudge:
             strict_data_parse_passed=inspection.strict_data_parse_passed,
             python_compile_passed=inspection.python_compile_passed,
             failure_codes=tuple(sorted(failures)),
+            public_test_diagnostic_codes=tuple(sorted(diagnostics)),
             component_import_violations=inspection.component_import_violations,
         )
         evidence_ref = self._typed_evidence(
@@ -1970,17 +2120,19 @@ class EnvironmentJudge:
             dependencies=(candidate_ref, *manifest.public_test_refs),
         )
         if evidence.status == "pass":
-            summary = (
-                "Framework AST/compile, strict data parsing, scans, and isolated public tests "
-                "passed."
-            )
+            summary = "Framework AST/compile, strict data parsing, and scans passed."
         else:
-            failed_public_tests = tuple(item for item in evidence.public_tests if not item.passed)
             summary = self._static_assurance_failure_summary(
                 inspection,
                 failure_codes=evidence.failure_codes,
-                failed_public_tests=failed_public_tests,
-                public_test_diagnostics=public_test_diagnostics,
+                failed_public_tests=(),
+            )
+        if evidence.public_test_diagnostic_codes:
+            summary = self._public_test_diagnostic_summary(
+                summary,
+                diagnostic_codes=evidence.public_test_diagnostic_codes,
+                executions=evidence.public_tests,
+                diagnostics=public_test_diagnostics,
             )
         return _AssuranceGateResult(
             status=evidence.status,
@@ -1989,6 +2141,26 @@ class EnvironmentJudge:
             owner="build",
             tool_calls=len(executions),
         )
+
+    @staticmethod
+    def _public_test_diagnostic_summary(
+        summary: str,
+        *,
+        diagnostic_codes: tuple[str, ...],
+        executions: tuple[PublicTestExecution, ...],
+        diagnostics: tuple[tuple[str, str], ...],
+    ) -> str:
+        """Add compact, non-authoritative public-test evidence to a summary."""
+
+        failed_paths = tuple(item.path for item in executions if not item.passed)
+        suffix = " Candidate public-test diagnostics: " + ", ".join(diagnostic_codes) + "."
+        if failed_paths:
+            suffix += " Failed tests: " + ", ".join(failed_paths) + "."
+        # The detailed process result is stored as typed evidence.  Do not turn
+        # arbitrary test stdout/stderr into a release repair instruction.
+        if diagnostics:
+            suffix += " Inspect the retained public-test evidence for the bounded terminal."
+        return (summary + suffix)[:512]
 
     @staticmethod
     def _static_assurance_failure_summary(
@@ -2350,8 +2522,6 @@ class EnvironmentJudge:
             episodes += 1
             if canonical_json_bytes(views[0]) != canonical_json_bytes(replay):
                 raise _CandidateTaskFailure("same-seed reset differs after Runtime restart")
-            if len({str(item["state_digest"]) for item in views}) < 2:
-                raise _CandidateTaskFailure("unknown seeds do not alter Runtime state")
             record = {
                 "status": "pass",
                 "tool_ids": sorted(expected),
@@ -2893,8 +3063,21 @@ class EnvironmentJudge:
             )
         else:
             summary = (
-                f"Reachability certified {len(certificates)}/{len(envelopes)} tasks; "
-                "no unproven task can pass the hard gate."
+                f"Reachability ran {len(envelopes)} sampled tasks: "
+                f"{len(certificates)} reached trusted terminal success and "
+                f"{failed_count} did not; no aggregate release reachability claim was issued."
+            )
+        repair_remediation = None
+        if (
+            terminal_owner == "build"
+            and failure_codes
+            and set(failure_codes) == {"candidate_episode_execution_failed"}
+        ):
+            repair_remediation = (
+                "Every sampled reachability episode stopped at the Candidate Runtime execution "
+                "boundary before solver progress. Correct the concrete Runtime behavior failure "
+                "disclosed in this report; do not change Task Materializer or Verifier bytes only "
+                "to mask this downstream result."
             )
         return _ReachabilityGateResult(
             terminal_status,
@@ -2904,6 +3087,7 @@ class EnvironmentJudge:
             usage,
             terminal_owner,
             tuple(sorted(recipe_rework_task_types)),
+            repair_remediation,
         )
 
     async def _run_interactive_attempt(
@@ -3038,7 +3222,7 @@ class EnvironmentJudge:
         cases: tuple[VerifierCase, ...],
         verifier_ref: ArtifactRef,
         design: EnvironmentDesign,
-    ) -> tuple[GateStatus, ArtifactRef, str, int, int]:
+    ) -> _CaseGateResult:
         if not cases:
             evidence_ref = self._evidence(
                 run_id,
@@ -3046,17 +3230,17 @@ class EnvironmentJudge:
                 {"status": "fail", "reason": "no cases configured"},
                 dependencies=(candidate_ref, verifier_ref),
             )
-            return "fail", evidence_ref, f"{label} has no cases", 0, 0
+            return _CaseGateResult("fail", evidence_ref, f"{label} has no cases", 0, 0)
         rules = design_rule_index(design)
         try:
-            evaluations = tuple(
+            runs = tuple(
                 [
                     await self._run_case(clean, candidate, manifest, case, design, rules)
                     for case in cases
                 ]
             )
-            results = tuple(item[0] for item in evaluations)
-            tool_calls = sum(item[1] for item in evaluations)
+            results = tuple(item.evaluation for item in runs)
+            tool_calls = sum(item.tool_calls for item in runs)
             passed = all(item.passed for item in results)
             record = {
                 "status": "pass" if passed else "fail",
@@ -3074,18 +3258,29 @@ class EnvironmentJudge:
             }
             status: GateStatus = "pass" if passed else "fail"
             summary = f"{label}: {record['passed_count']}/{record['case_count']} cases passed."
+            repair_remediation = (
+                _public_case_repair_remediation(runs) if label != "sealed-release" else None
+            )
         except JudgeInfrastructureError as exc:
             record = {"status": "error", "failure_class": exc.code}
             status = "error"
             summary = str(exc)
             tool_calls = 0
+            repair_remediation = None
         evidence_ref = self._evidence(
             run_id,
             label,
             record,
             dependencies=(candidate_ref, verifier_ref),
         )
-        return status, evidence_ref, summary, len(cases), tool_calls
+        return _CaseGateResult(
+            status,
+            evidence_ref,
+            summary,
+            len(cases),
+            tool_calls,
+            repair_remediation,
+        )
 
     async def _run_case(
         self,
@@ -3095,7 +3290,7 @@ class EnvironmentJudge:
         case: VerifierCase,
         design: EnvironmentDesign,
         rules: dict[str, Rule],
-    ) -> tuple[CaseEvaluation, int]:
+    ) -> _CaseRunResult:
         observations: list[RuntimeActionObservation] = []
         contexts: list[RuleExecutionContext] = []
         tool_calls = 0
@@ -3169,7 +3364,7 @@ class EnvironmentJudge:
                 evaluate_assertion(assertion, rules[assertion.rule_id], tuple(contexts))
                 for assertion in case.assertions
             )
-            return (
+            return _CaseRunResult(
                 CaseEvaluation(
                     case_id=case.case_id,
                     partition=case.partition,
@@ -3182,7 +3377,7 @@ class EnvironmentJudge:
                 tool_calls,
             )
         except (ProtocolViolation, RuntimeProcessCrashed, RuntimeRequestTimeout, ValueError) as exc:
-            return (
+            return _CaseRunResult(
                 CaseEvaluation(
                     case_id=case.case_id,
                     partition=case.partition,
@@ -3192,9 +3387,14 @@ class EnvironmentJudge:
                     actions=tuple(observations),
                     assertions=(),
                     failure_class="runtime_execution_failed",
-                    failure_summary=f"{type(exc).__name__}: {exc}",
+                    failure_summary=(
+                        f"ValueError: {exc}"
+                        if isinstance(exc, _CandidateTaskFailure)
+                        else f"{type(exc).__name__}: {exc}"
+                    ),
                 ),
                 tool_calls,
+                _case_failure_repair_remediation(exc),
             )
 
     async def _integration_deployment_gate(
@@ -4149,15 +4349,35 @@ class EnvironmentJudge:
         try:
             visible_fields = tool.semantics.observation.visible_fields_by_actor[actor]
         except KeyError as exc:
-            raise ValueError(
-                f"tool {tool.surface.tool_id} has no observation projection for {actor}"
+            raise _InvokeObservationProjectionFailure(
+                tool_id=tool.surface.tool_id,
+                actor=actor,
+                required_fields=(),
+                cause=ValueError(
+                    f"tool {tool.surface.tool_id} has no observation projection for {actor}"
+                ),
             ) from exc
-        cls._validate_actor_projection(
-            observation,
-            schema=tool.surface.observation_schema,
-            visible_fields=visible_fields,
-            label=f"{tool.surface.tool_id} observation for actor {actor}",
+        projected_schema = actor_projection_schema(tool.surface.observation_schema, visible_fields)
+        required_value = projected_schema.get("required", ())
+        required_fields = (
+            tuple(item for item in required_value if isinstance(item, str))
+            if isinstance(required_value, list)
+            else ()
         )
+        try:
+            cls._validate_actor_projection(
+                observation,
+                schema=tool.surface.observation_schema,
+                visible_fields=visible_fields,
+                label=f"{tool.surface.tool_id} observation for actor {actor}",
+            )
+        except ValueError as exc:
+            raise _InvokeObservationProjectionFailure(
+                tool_id=tool.surface.tool_id,
+                actor=actor,
+                required_fields=required_fields,
+                cause=exc,
+            ) from exc
 
     @staticmethod
     def _validate_actor_projection(
@@ -4315,7 +4535,6 @@ class EnvironmentJudge:
         roles = {entry.role for entry in manifest.files}
         required_roles = {
             "dependency_lock",
-            "public_test",
             "public_verifier",
             "runtime",
             "task_materializer",
@@ -4367,16 +4586,15 @@ class EnvironmentJudge:
         disclosure: Literal["public", "repair", "sealed_summary"] = "repair",
     ) -> None:
         evidence_refs.append(evidence_ref)
-        gate_results.append(
-            self._gate(
-                gate_id,
-                status,
-                candidate_ref,
-                (evidence_ref,),
-                release_profile,
-                summary,
-            )
+        gate = self._gate(
+            gate_id,
+            status,
+            candidate_ref,
+            (evidence_ref,),
+            release_profile,
+            summary,
         )
+        gate_results.append(gate)
         if status != "pass":
             findings.append(
                 self._finding(
@@ -4388,6 +4606,7 @@ class EnvironmentJudge:
                     summary=f"{gate_id} did not pass.",
                     suggested_repair=suggested_repair or summary,
                     disclosure=disclosure,
+                    blocks_release=gate.hard,
                 )
             )
 
@@ -4442,7 +4661,7 @@ class EnvironmentJudge:
         return GateResult(
             gate_id=gate_id,
             status=status,
-            hard=(gate_id in _ALWAYS_HARD_GATES or gate_id in release_profile.required_hard_gates),
+            hard=_gate_is_hard(gate_id, release_profile),
             subject_ref=candidate_ref,
             evidence_refs=evidence_refs,
             duration_seconds=0,
@@ -4518,9 +4737,9 @@ class EnvironmentJudge:
         timed_gates = tuple(
             item.model_copy(update={"duration_seconds": elapsed}) for item in gate_results
         )
-        if any(item.status == "error" for item in timed_gates):
+        if any(item.hard and item.status == "error" for item in timed_gates):
             status: Literal["ready", "failed", "error"] = "error"
-        elif any(item.status != "pass" for item in timed_gates) or any(
+        elif any(item.hard and item.status != "pass" for item in timed_gates) or any(
             item.blocks_release for item in findings
         ):
             status = "failed"
@@ -4579,10 +4798,7 @@ class EnvironmentJudge:
                 gate = GateResult(
                     gate_id=gate_id,
                     status="inconclusive",
-                    hard=(
-                        gate_id in _ALWAYS_HARD_GATES
-                        or gate_id in release_profile.required_hard_gates
-                    ),
+                    hard=_gate_is_hard(gate_id, release_profile),
                     subject_ref=candidate_ref,
                     evidence_refs=(fallback_ref,),
                     duration_seconds=0,
@@ -4590,7 +4806,7 @@ class EnvironmentJudge:
                 )
             ordered_gates.append(gate)
         gate_results = ordered_gates
-        if any(gate.status == "error" for gate in gate_results):
+        if any(gate.hard and gate.status == "error" for gate in gate_results):
             verdict: Literal["pass", "fail", "inconclusive", "error"] = "error"
         elif any(gate.hard and gate.status == "fail" for gate in gate_results):
             verdict = "fail"

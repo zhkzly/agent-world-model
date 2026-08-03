@@ -392,6 +392,56 @@ class WorkControlStore:
         )
         return next_head
 
+    def resume_terminal_by_authority(
+        self,
+        lock: WorkControlLock,
+        *,
+        expected_head: WorkControlHead,
+        next_head: WorkControlHead,
+        authority_ref: ArtifactRef,
+    ) -> WorkControlHead:
+        """Reopen one terminal coordinate under an explicit operator authority.
+
+        This is deliberately neither stale supersession nor semantic repair.
+        The immutable WorkDefinition and input closure are unchanged, so a
+        regular ``failed -> running`` transition would be an unsafe replay.
+        A separate immutable ``control.node_resume_authority`` binds the exact
+        stopped attempt before this narrow control-plane transition is allowed.
+        """
+
+        if authority_ref.artifact_type != "control.node_resume_authority":
+            raise WorkHeadConflictError("terminal resume requires NodeResumeAuthority")
+        next_head = WorkControlHead.model_validate(next_head.model_dump(mode="python"))
+        self._validate_lock(lock, next_head.coordinate)
+        current = self.read_head(next_head.coordinate)
+        if current != expected_head:
+            raise WorkHeadConflictError("WorkGraph head changed before operator resume")
+        if current.status not in {"failed", "needs_human", "interrupted"}:
+            raise WorkHeadConflictError("operator resume target is not a terminal Work head")
+        if (
+            next_head.scope_id != current.scope_id
+            or next_head.coordinate != current.coordinate
+            or next_head.work_id != current.work_id
+            or next_head.definition_digest != current.definition_digest
+            or next_head.acceptance_digest != current.acceptance_digest
+            or next_head.input_fingerprint != current.input_fingerprint
+            or next_head.revision != current.revision + 1
+            or next_head.status != "running"
+            or next_head.attempt_ref == current.attempt_ref
+            or next_head.active_operation_ref is not None
+            or next_head.evaluation_ref is not None
+            or next_head.repair_action_ref is not None
+            or next_head.commit_ref is not None
+            or authority_ref not in next_head.invalidated_by_refs
+            or current.attempt_ref not in next_head.invalidated_by_refs
+        ):
+            raise WorkHeadConflictError("invalid operator resume transition")
+        self._atomic_write(
+            self._head_path(next_head.scope_id, next_head.coordinate.coordinate_key),
+            next_head.stable_json_bytes(),
+        )
+        return next_head
+
     def archive_terminal_head_for_diagnostic(
         self,
         lock: WorkControlLock,

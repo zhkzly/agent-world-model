@@ -336,6 +336,39 @@ def test_artifact_writer_verified_closure_reuses_ancestor_audit_for_writes(
     assert revision_read_counts[leaf.revision_id.removeprefix("sha256:")] == 1
 
 
+def test_artifact_writer_verified_closure_reuses_ancestor_audit_for_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bounded reader scope must not reopen one shared immutable ancestor."""
+
+    store = ArtifactStore(tmp_path / "artifacts")
+    writer = _test_writer(store)
+    leaf, left, right, _ = _diamond_artifact_refs(writer)
+    revision_read_counts: Counter[str] = Counter()
+    original_read_file = store._read_file
+
+    def counting_read_file(path: Path, *, missing_message: str) -> bytes:
+        relative = path.relative_to(store.root)
+        if relative.parts[:2] == ("revisions", "sha256"):
+            revision_read_counts[path.stem] += 1
+        return original_read_file(path, missing_message=missing_message)
+
+    monkeypatch.setattr(store, "_read_file", counting_read_file)
+
+    with writer.verified_closure():
+        assert writer.get_json(left, _ArtifactNode) == _ArtifactNode(node="left")
+        assert writer.get_json_many((right,), _ArtifactNode) == (_ArtifactNode(node="right"),)
+
+    assert revision_read_counts == Counter(
+        {
+            leaf.revision_id.removeprefix("sha256:"): 1,
+            left.revision_id.removeprefix("sha256:"): 1,
+            right.revision_id.removeprefix("sha256:"): 1,
+        }
+    )
+
+
 @pytest.mark.parametrize("tamper_target", ["revision", "blob"])
 def test_artifact_store_reverifies_shared_dependency_across_public_reads(
     tmp_path: Path,
@@ -602,7 +635,6 @@ def test_task_materializer_and_public_check_contracts_are_fixed_protocols(tmp_pa
         "supply_chain",
         "task_materialization",
         "task_reachability",
-        "public_self_check",
     } <= set(release.required_hard_gates)
 
 

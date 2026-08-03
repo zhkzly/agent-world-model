@@ -619,6 +619,8 @@ def test_python_launch_contract_is_visible_to_the_engineer() -> None:
     assert "Load detail progressively" in skill
     assert "Build and debug as a Code Agent" in skill
     assert "These checks are the Code Agent's own development loop" in skill
+    assert "prove one cross-component path for every materialized task" in normalized_skill
+    assert "rather than inventing a Candidate-only lifecycle" in normalized_skill
     assert "strict transport envelope needs all top-level fields" in normalized_skill
 
     completion_reference = (skill_root / "references" / "completion-contract.md").read_text(
@@ -649,6 +651,9 @@ def test_python_launch_contract_is_visible_to_the_engineer() -> None:
     assert "Reset and snapshot state projections" in runtime_reference
     assert "not permission to return `{}`" in runtime_reference
     assert "complete `world-spec.state.root_state_schema`" in normalized_runtime
+    assert "semantics.observation.visible_fields_by_actor[actor]" in normalized_runtime
+    assert "do not reuse `ActorBoundary.visibility`" in normalized_runtime
+    assert "Candidate-owned Runtime checks for every declared tool/actor" in normalized_runtime
     assert (skill_root / "scripts" / "check_candidate_tree.py").is_file()
     assert (skill_root / "scripts" / "candidate_contract_map.py").is_file()
     assert (skill_root / "scripts" / "check_materializer_campaign.py").is_file()
@@ -896,6 +901,7 @@ def test_runtime_contract_uses_declared_schema_and_repair_feedback_allows_domain
         encoding="utf-8"
     )
     assert "`state_digest` is exactly `sha256:` followed by" in runtime_reference
+    assert "semantics.observation.visible_fields_by_actor[actor]" in runtime_reference
     completion_reference = (skill_root / "references" / "completion-contract.md").read_text(
         encoding="utf-8"
     )
@@ -3550,7 +3556,9 @@ def test_builder_completion_feedback_names_required_path_and_role() -> None:
 
     assert diagnostic.validation_phase == "completion_manifest_binding"
     assert diagnostic.frontier_ordinal == 25
-    assert diagnostic.issue_codes == ("completion_required_role_missing@completion_manifest_binding",)
+    assert diagnostic.issue_codes == (
+        "completion_required_role_missing@completion_manifest_binding",
+    )
     issue = diagnostic.issues[0]
     assert issue.violated_condition == (
         "CandidateCompletion.files must declare required component path "

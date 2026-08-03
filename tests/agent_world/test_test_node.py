@@ -488,9 +488,7 @@ def test_final_graph_reconciliation_reuses_committed_definition_and_keeps_overri
 
     captured = _capture_scope(tmp_path, monkeypatch)
     app = build_application(captured.config)
-    committed_head = app.controller.work_control.read_head(
-        captured.target_definition.coordinate
-    )
+    committed_head = app.controller.work_control.read_head(captured.target_definition.coordinate)
     assert committed_head is not None and committed_head.status == "committed"
 
     # Mimic the live-compiler divergence: the same coordinate/work_id, but a
@@ -546,9 +544,7 @@ def test_final_graph_reconciliation_reuses_committed_definition_and_keeps_overri
         exclude_coordinates=(captured.target_definition.coordinate,),
     )
     assert (
-        reconciled_override.require(
-            captured.target_definition.coordinate
-        ).definition_digest
+        reconciled_override.require(captured.target_definition.coordinate).definition_digest
         == divergent_target.definition_digest
     )
     app.telemetry.close()
@@ -894,6 +890,40 @@ def test_test_node_reconstructs_legacy_definition_without_implicit_model_fallbac
     recovered = reconstructed.require(captured.target_definition.coordinate)
     assert recovered.definition_digest == legacy_ref.content_hash
     assert recovered.repair_policy.maximum_model_fallbacks == 0
+
+
+def test_frozen_definition_catalog_preserves_exact_manifest_reconstruction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One cached catalog is equivalent to per-binding immutable lookup."""
+
+    captured = _capture_scope(tmp_path, monkeypatch)
+    app = build_application(captured.config)
+    artifacts = app.controller.artifacts
+    manifest_ref = next(
+        ref
+        for ref in artifacts.list_revisions()
+        if ref.artifact_type == "control.work_graph_manifest"
+    )
+    manifest = artifacts.get_json(manifest_ref, WorkGraphManifest)
+
+    catalog = NodeRunner._definition_catalog(artifacts)  # noqa: SLF001 - exact lookup cache
+    reconstructed = NodeRunner._reconstruct_graph(  # noqa: SLF001 - frozen closure proof
+        artifacts,
+        manifest,
+        definition_catalog=catalog,
+    )
+
+    recovered = reconstructed.require(captured.target_definition.coordinate)
+    assert recovered == captured.target_definition
+    assert catalog[
+        (
+            recovered.coordinate.coordinate_key,
+            recovered.work_id,
+            recovered.definition_digest,
+        )
+    ] == (captured.target_definition,)
 
 
 def test_runtime_profile_overlay_freezes_one_model_only_change(
@@ -1611,9 +1641,15 @@ async def test_diagnostic_descendant_runtime_refresh_reauthorizes_settled_causal
         regenerated.authorized_repair_action_ref,
         RepairAction,
     )
+    regenerated_head = WorkControlStore(
+        Path(regenerated.diagnostic_state_root) / "work-control"
+    ).read_head(repair_successor.coordinate)
     old_action = committed_artifacts.get_json(old_repair_action_ref, RepairAction)
     assert regenerated_attempt.parent_attempt_id == executed_attempt.attempt_id
     assert regenerated_attempt.repair_action_ref == regenerated.authorized_repair_action_ref
+    assert regenerated_attempt.definition_digest == refreshed_action.definition_digest
+    assert regenerated_head is not None
+    assert regenerated_head.definition_digest == refreshed_action.definition_digest
     assert refreshed_action.definition_digest != old_action.definition_digest
     assert refreshed_action.causal_evidence_refs == (
         source_evaluation_ref,

@@ -530,10 +530,22 @@ def test_task_curriculum_prompts_and_view_keep_semantics_bounded(tmp_path: Path)
     assert set(active_plan_context) == {
         "claims",
         "coverage_rule_catalog",
+        "task_authoring_access",
         "task_dimension_catalog",
         "world",
     }
     assert tuple(active_plan_context["task_dimension_catalog"]) == world.task_dimensions
+    assert active_plan_context["task_authoring_access"] == [
+        {
+            "actor_id": actor.actor,
+            "permitted_tool_ids": [
+                tool.surface.tool_id
+                for tool in world.tools
+                if actor.actor in tool.semantics.permission.allowed_actors
+            ],
+        }
+        for actor in world.boundary.actors_and_authority
+    ]
     assert tuple(
         (item["rule_id"], item["family"]) for item in active_context["coverage_rule_catalog"]
     ) == tuple(
@@ -583,7 +595,14 @@ def test_task_curriculum_prompts_and_view_keep_semantics_bounded(tmp_path: Path)
 
     assert "Produce exactly one `CurriculumPlanSourceDraft`" in active_plan
     assert "one independent TaskRequirement call" in active_plan
+    assert "alternative task callers, not a roster" in active_plan
+    assert "every listed actor must be allowed to invoke every listed required tool" in active_plan
+    assert "`task_authoring_access`" in active_plan
     assert "Do not emit TaskRequirement fields" in active_plan
+    source_schema = CurriculumPlanSourceDraft.model_json_schema(mode="validation")
+    task_properties = source_schema["$defs"]["CurriculumTaskPlanSourceDraft"]["properties"]
+    assert "Alternative task callers" in task_properties["allowed_actor_ids"]["description"]
+    assert "eligible task caller" in task_properties["required_tool_ids"]["description"]
     assert "success_conditions" not in active_plan_context
     assert set(active_task_context) == {
         "claims",

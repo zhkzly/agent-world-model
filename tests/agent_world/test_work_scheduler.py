@@ -13,6 +13,7 @@ from agent_world.control import (
     GenerationWorkGraph,
     JoinPolicy,
     LeaseBudgetLedger,
+    NodeResumeAuthority,
     WorkAttempt,
     WorkControlRuntime,
     WorkControlStore,
@@ -23,7 +24,9 @@ from agent_world.control import (
     WorkScheduler,
     deterministic_boundary_work_definition,
 )
+from agent_world.control.direct_runner import DirectWorkRunner
 from agent_world.control.telemetry import TelemetryStore
+from agent_world.control.work_graph import WorkGraphEpoch
 from agent_world.control.work_runtime import WorkRuntimeError
 from agent_world.control.work_store import WorkResumeError
 
@@ -1503,6 +1506,216 @@ def test_resume_uncommenced_running_rejects_active_operation_and_changed_definit
             )
 
 
+def test_resume_terminal_by_authority_reopens_only_the_exact_failed_node(
+    tmp_path: Path,
+) -> None:
+    """A frozen-node recovery creates a new real attempt, not a graph reset."""
+
+    (
+        _scope_id,
+        coordinate,
+        definition,
+        _graph,
+        manifest,
+        manifest_ref,
+        heads,
+        artifacts,
+        runtime,
+        root_ref,
+    ) = _orphan_scope(tmp_path)
+
+    with heads.exclusive(coordinate) as lock:
+        failed = runtime.terminate_budget_exhausted(
+            lock,
+            definition=definition,
+            dimensions=("process_calls",),
+            requested=Budget(process_calls=21),
+            available=Budget(process_calls=20),
+        )
+    failed_attempt = artifacts.get_json(failed.attempt_ref, WorkAttempt)
+    assert failed.status == "failed"
+    assert failed_attempt.status == "budget_exhausted"
+    assert not failed_attempt.operation_run_refs
+
+    snapshot_ref = artifacts.put_json(
+        artifact_id="snapshot:resume-terminal",
+        artifact_type="control.job_run_snapshot",
+        value={"frozen": "test"},
+    )
+    epoch = WorkGraphEpoch(
+        epoch_id="epoch:bootstrap:resume-terminal",
+        scope_id=coordinate.scope_id,
+        epoch_kind="bootstrap",
+        context_ref=root_ref,
+        manifest_ref=manifest_ref,
+    )
+    epoch_ref = artifacts.put_json(
+        artifact_id=epoch.epoch_id,
+        artifact_type="control.work_graph_epoch",
+        value=epoch,
+        dependencies=(root_ref, manifest_ref),
+    )
+    authority = NodeResumeAuthority(
+        authority_id="node-resume-authority:resume-terminal",
+        source_snapshot_ref=snapshot_ref,
+        source_context_ref=root_ref,
+        source_epoch_ref=epoch_ref,
+        source_attempt_ref=failed.attempt_ref,
+        coordinate=coordinate,
+        source_definition_digest=definition.definition_digest,
+        source_input_fingerprint=heads.input_fingerprint((root_ref,)),
+    )
+    authority_ref = artifacts.put_json(
+        artifact_id=authority.authority_id,
+        artifact_type="control.node_resume_authority",
+        value=authority,
+        dependencies=(snapshot_ref, root_ref, epoch_ref, failed.attempt_ref),
+    )
+
+    with heads.exclusive(coordinate) as lock:
+        resumed = runtime.resume_terminal_by_authority(
+            lock,
+            definition=definition,
+            input_refs=(root_ref,),
+            authority_ref=authority_ref,
+        )
+
+    assert resumed.status == "running"
+    assert resumed.attempt_ref != failed.attempt_ref
+    resumed_attempt = artifacts.get_json(resumed.attempt_ref, WorkAttempt)
+    assert resumed_attempt.ordinal == failed_attempt.ordinal + 1
+    assert resumed_attempt.parent_attempt_id == failed_attempt.attempt_id
+    assert resumed_attempt.resume_authority_ref == authority_ref
+
+    output_ref = artifacts.put_json(
+        artifact_id="output:resume-terminal",
+        artifact_type="release.package",
+        value={"recovered": True},
+        dependencies=(root_ref,),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=definition,
+        input_refs=(root_ref,),
+        subject_ref=output_ref,
+        output_refs=(output_ref,),
+    )
+    committed = heads.read_head(coordinate)
+    assert committed is not None and committed.status == "committed"
+
+
+@pytest.mark.asyncio
+async def test_guarded_direct_graph_never_redispatches_a_committed_ancestor(
+    tmp_path: Path,
+) -> None:
+    """A node-level recovery executes the target suffix, never its input producer."""
+
+    scope_id = "job:guarded-resume"
+    parent_coordinate = WorkCoordinate(
+        scope_id=scope_id,
+        component="design",
+        stage="parent",
+        artifact_slot="parent",
+    )
+    child_coordinate = WorkCoordinate(
+        scope_id=scope_id,
+        component="release",
+        stage="child",
+        artifact_slot="child",
+    )
+    parent = _definition(
+        scope_id=scope_id,
+        component="design",
+        stage="parent",
+        coordinate=parent_coordinate,
+        dependencies=(),
+    )
+    child = _definition(
+        scope_id=scope_id,
+        component="release",
+        stage="child",
+        coordinate=child_coordinate,
+        dependencies=(parent_coordinate,),
+    )
+    graph = GenerationWorkGraph.compile((parent, child), mode="diagnostic")
+    artifacts = ArtifactStore(tmp_path / "artifacts").issue_writer(
+        producer="work-controller",
+        allowed_artifact_type_prefixes=("control.", "release."),
+    )
+    root_ref = artifacts.put_json(
+        artifact_id="context:guarded-resume",
+        artifact_type="control.generation_context",
+        value={"request": "guarded"},
+    )
+    manifest = graph.manifest(
+        topology_id="topology:guarded-resume",
+        external_root_refs=(root_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(root_ref,),
+    )
+    heads = WorkControlStore(tmp_path / "heads")
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(Budget(wall_seconds=1_000, process_calls=20)),
+    )
+    parent_output = artifacts.put_json(
+        artifact_id="output:guarded-parent",
+        artifact_type="release.parent",
+        value={"parent": True},
+        dependencies=(root_ref,),
+    )
+    runtime.execute_deterministic_boundary(
+        definition=parent,
+        input_refs=(root_ref,),
+        subject_ref=parent_output,
+        output_refs=(parent_output,),
+    )
+    committed_parent = heads.read_head(parent_coordinate)
+    assert committed_parent is not None and committed_parent.status == "committed"
+
+    calls: list[str] = []
+
+    async def child_executor(context: WorkExecutionContext) -> None:
+        calls.append("child")
+        output_ref = artifacts.put_json(
+            artifact_id="output:guarded-child",
+            artifact_type="release.child",
+            value={"child": True},
+            dependencies=context.parent_output_refs,
+        )
+        runtime.execute_deterministic_boundary(
+            definition=child,
+            input_refs=tuple(
+                dict.fromkeys((*context.external_input_refs, *context.parent_output_refs))
+            ),
+            subject_ref=output_ref,
+            output_refs=(output_ref,),
+        )
+
+    runner = object.__new__(DirectWorkRunner)
+    runner.artifacts = artifacts
+    runner.heads = heads
+    runner.maximum_concurrency = 1
+    snapshot = await runner._run_graph(  # noqa: SLF001 - recovery fence proof
+        graph=graph,
+        manifest=manifest,
+        manifest_ref=manifest_ref,
+        runtime=runtime,
+        executors={child.work_id: child_executor},
+        protected_coordinate_keys=frozenset({parent_coordinate.coordinate_key}),
+    )
+
+    assert calls == ["child"]
+    assert all(item.state == "committed" for item in snapshot.work)
+    after_parent = heads.read_head(parent_coordinate)
+    assert after_parent is not None
+    assert after_parent.attempt_ref == committed_parent.attempt_ref
+
+
 @pytest.mark.asyncio
 async def test_orphaned_running_head_recovers_and_reaches_committed(
     tmp_path: Path,
@@ -1623,7 +1836,7 @@ def test_begin_after_head_reset_continues_at_first_free_ordinal(
         topology_id="topology:begin-ordinal-test",
         external_root_refs=(root_ref,),
     )
-    manifest_ref = artifacts.put_json(
+    _manifest_ref = artifacts.put_json(
         artifact_id=manifest.graph_id,
         artifact_type="control.work_graph_manifest",
         value=manifest,

@@ -95,6 +95,12 @@ class StaticAssuranceEvidence(V2Contract):
     strict_data_parse_passed: bool
     python_compile_passed: bool
     failure_codes: tuple[Identifier, ...] = ()
+    # Candidate-authored tests are deliberately retained as useful public
+    # diagnostics, but their outcome cannot turn a framework static check into
+    # a release decision.  The Agent already executes them in its own
+    # pre-commit loop; the independent Judge keeps this second observation for
+    # debugging only.
+    public_test_diagnostic_codes: tuple[Identifier, ...] = ()
     # These are source-path relationships only.  They deliberately retain no
     # Candidate text, but make a component-visibility failure independently
     # actionable for an authorized Builder correction.
@@ -107,8 +113,6 @@ class StaticAssuranceEvidence(V2Contract):
             and self.secret_scan_passed
             and self.strict_data_parse_passed
             and self.python_compile_passed
-            and bool(self.public_tests)
-            and all(item.passed for item in self.public_tests)
             and not self.failure_codes
         )
         if (self.status == "pass") != passed:

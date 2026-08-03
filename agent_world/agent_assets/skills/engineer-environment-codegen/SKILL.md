@@ -96,15 +96,26 @@ or another development tool exists merely because it was available while you
 were writing. A check that passed before the last relevant edit is stale.
 
 Public tests alone are not sufficient. In this same workspace, also run the
-declared public self-check module, a Runtime handshake/error-path probe, and
-representative Task Materializer calls for every task type against the frozen
-output schema. Use the Candidate's physical relative import root (for example
-`candidate/src` for a `src/` layout, otherwise `candidate`); never encode or
-try to discover a later Judge mount, host path, or deployment layout. See
+declared public self-check module, a Runtime handshake/error-path and
+tool-specific invoke-observation probe, and representative Task Materializer
+calls for every task type against the frozen output schema. Use the Candidate's
+physical relative import root (for example `candidate/src` for a `src/` layout,
+otherwise `candidate`); never encode or try to discover a later Judge mount,
+host path, or deployment layout. See
 [references/runtime-and-materializer.md](references/runtime-and-materializer.md)
 for the component-specific acceptance method and the Candidate-owned complete
 materializer campaign. The map's campaign is a required local check, not a
 future-Judge guess.
+
+Before completion, prove one cross-component path for every materialized task
+type and allowed actor: reset the real Runtime with that task's initial config,
+then invoke every task-required tool using legitimate sample arguments derived
+from the frozen task/domain data. Check the initial state against the tool
+preconditions you rely on before blaming Candidate code. If an allowed state
+domain cannot contain a required precondition literal, or no legitimate
+materialized state can reach a required tool, the frozen inputs are mutually
+inconsistent: return an honest blocked completion with the smallest input
+paths, rather than inventing a Candidate-only lifecycle or weakening a test.
 
 Run the acceptance map and project-mechanics preflight from the mounted Skill
 bundle with the normal host Python:

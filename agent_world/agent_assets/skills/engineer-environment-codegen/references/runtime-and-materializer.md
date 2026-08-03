@@ -26,10 +26,12 @@ more, no less:
 
 - `tool_result`: any JSON value — the tool's returned payload (an object, a
   scalar, or null). This is the value the caller sees as the tool outcome.
-- `observation`: an object — the actor's visible observation after the action.
-  Build it from the same ActorBoundary.visibility rules as reset: include every
-  visible root-state field and make it satisfy the actor's projection of
-  `world-spec.state.root_state_schema` with every required field.
+- `observation`: an object — the actor's visible observation for this invoked
+  tool after the action. Build it from the invoked tool's
+  `semantics.observation.visible_fields_by_actor[actor]`, then make it satisfy
+  that tool's `surface.observation_schema`. This is **not** the reset/root-state
+  projection: do not reuse `ActorBoundary.visibility` or
+  `world-spec.state.root_state_schema` for `invoke`.
 - `events`: an empty JSON array `[]`. The closed agent-facing ABI requires
   invoke `events` to be empty; do not populate it.
 - `state_digest`: exactly `sha256:` followed by 64 lowercase hex characters of
@@ -65,6 +67,15 @@ with its required fields, and that snapshot returns a complete valid root
 state. Keep this check separate from per-tool observation schemas: an empty
 tool observation schema does not make reset or snapshot state observations
 empty.
+
+Also write and run Candidate-owned Runtime checks for every declared tool/actor
+pair that the Candidate makes callable. After a valid `invoke`, assert that
+`observation` contains only that tool's
+`semantics.observation.visible_fields_by_actor[actor]` fields and validates
+against that tool's `surface.observation_schema`. Exercise this separately from
+reset and snapshot; a root-state helper is not a valid `invoke` observation
+helper. Keep the test's valid arguments and state setup inside the Candidate's
+own declared semantics—do not guess a future Judge path or hidden case.
 
 Exercise the full response boundary in the Agent's own workspace, not only a
 successful ToolError path. For each declared operation, make one request and

@@ -501,9 +501,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_resume = run_commands.add_parser(
         "resume",
-        help="resume a failed Direct Generation from its last verified phase checkpoint",
+        help=(
+            "continue one exact stopped Direct Generation coordinate in the same durable job; "
+            "committed ancestors are reused, never regenerated"
+        ),
     )
     run_resume.add_argument("request_id")
+    run_resume.add_argument(
+        "--from-frozen-epoch",
+        help=(
+            "exact frozen epoch artifact id or revision id when a request has more than one "
+            "historical graph closure; without --from-coordinate, continue from that fully "
+            "committed frontier into its causal successor without re-running the frontier"
+        ),
+    )
+    run_resume.add_argument(
+        "--from-coordinate",
+        help=(
+            "stopped coordinate to continue: sha256 coordinate key or "
+            "component.stage.artifact_slot; an existing repair_authorized node keeps its "
+            "original repair authority"
+        ),
+    )
+    run_resume.add_argument(
+        "--adopt-config-budget",
+        action="store_true",
+        help=(
+            "explicitly record a monotonic [generation_budget] amendment for one unstarted "
+            "budget-admission failure"
+        ),
+    )
 
     observe = commands.add_parser(
         "observe",
@@ -1011,7 +1038,12 @@ async def _dispatch(args: argparse.Namespace) -> int:
             return EXIT_OK
         if args.run_command == "resume":
             app = build_application(config)
-            resume_result = await app.controller.resume_generation(args.request_id)
+            resume_result = await app.controller.resume_generation(
+                args.request_id,
+                adopt_config_budget=args.adopt_config_budget,
+                from_frozen_epoch=args.from_frozen_epoch,
+                from_coordinate=args.from_coordinate,
+            )
             _write_json(resume_result)
             return EXIT_OK if resume_result.status == "released" else EXIT_NOT_RELEASED
         raise RuntimeError("unreachable run command")

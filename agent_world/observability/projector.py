@@ -41,6 +41,7 @@ from .render import render_coordinate, render_scene
 from .scene import (
     MAX_WATERMARK_COORDINATES,
     ActiveWorkPointer,
+    BudgetAdmissionDimension,
     BudgetExhaustion,
     CandidateWorkspaceLiveness,
     CodexTerminalEnvelope,
@@ -1002,8 +1003,23 @@ class SceneProjector:
         normalized_dimensions = tuple(sorted(set(dimensions)))
         if tuple(dimensions) != normalized_dimensions:
             return None
+        raw_admission = evidence.get("admission")
+        if raw_admission is None:
+            admission: tuple[BudgetAdmissionDimension, ...] = ()
+        elif not isinstance(raw_admission, list):
+            return None
+        else:
+            try:
+                admission = tuple(
+                    BudgetAdmissionDimension.model_validate(item) for item in raw_admission
+                )
+            except ValueError:
+                return None
+            if tuple(item.dimension for item in admission) != normalized_dimensions:
+                return None
         return BudgetExhaustion(
             exhausted_dimensions=normalized_dimensions,
+            admission=admission,
             during_authorized_repair=attempt.repair_action_ref is not None,
             operation_not_started=not attempt.operation_run_refs,
         )

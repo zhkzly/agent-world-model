@@ -382,3 +382,65 @@ async def test_direct_runner_semantic_prefix_never_enters_final_executors(
 
     assert result == outcome
     assert finished == ["passed"]
+
+
+@pytest.mark.asyncio
+async def test_direct_runner_routes_committed_frontier_without_rebuilding_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit completed epoch enters only the causal-suffix path."""
+
+    runner = DirectWorkRunner(
+        artifacts=object(),  # type: ignore[arg-type]
+        heads=object(),  # type: ignore[arg-type]
+        designer=object(),  # type: ignore[arg-type]
+        builder=object(),  # type: ignore[arg-type]
+        verifier_compiler=object(),  # type: ignore[arg-type]
+        judge=object(),  # type: ignore[arg-type]
+        registry=object(),  # type: ignore[arg-type]
+        telemetry=object(),  # type: ignore[arg-type]
+        workspace_root=tmp_path,
+        structured_turn_token_limit=32_768,
+        structured_turn_wall_seconds=30,
+        environment_codegen_session_token_limit=5_000_000,
+        environment_codegen_session_wall_seconds=28_800,
+        environment_codegen_physical_turn_token_limit=128_000,
+    )
+    context_ref = _ref("context:committed-frontier", "control.generation_context")
+    snapshot_ref = _ref("snapshot:committed-frontier", "control.job_run_snapshot")
+    epoch_ref = _ref("epoch:world:committed-frontier", "control.work_graph_epoch")
+    captured: dict[str, object] = {}
+    expected = object()
+
+    async def fake_frontier(_self: object, **kwargs: object) -> object:
+        captured.update(kwargs)
+        return expected
+
+    async def fail_prefix(**_kwargs: object) -> object:
+        pytest.fail("committed-frontier recovery must not rebuild the root prefix")
+
+    monkeypatch.setattr(
+        DirectWorkRunner,
+        "_run_from_committed_frozen_frontier",
+        fake_frontier,
+    )
+    monkeypatch.setattr(DirectWorkRunner, "_run_semantic_prefix_under_trace", fail_prefix)
+
+    result = await runner._run_under_trace(  # noqa: SLF001 - control-flow boundary
+        context_ref=context_ref,
+        context=SimpleNamespace(job_ref=_ref("job:committed-frontier")),
+        job=SimpleNamespace(job_id="generate-job:committed-frontier"),
+        request=object(),
+        run_id="run:committed-frontier",
+        trace_id="run:committed-frontier",
+        recovery_snapshot=SimpleNamespace(),
+        recovery_snapshot_ref=snapshot_ref,
+        recovery_epoch_ref=epoch_ref,
+        recovery_frontier=True,
+    )
+
+    assert result is expected
+    assert captured["context_ref"] == context_ref
+    assert captured["snapshot_ref"] == snapshot_ref
+    assert captured["epoch_ref"] == epoch_ref

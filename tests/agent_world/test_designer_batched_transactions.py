@@ -439,6 +439,158 @@ def test_tool_batch_prompt_discloses_only_the_target_tool_state_footprint() -> N
     )
 
 
+def test_tool_batch_prompt_projects_required_shared_error_and_reliability_fields() -> None:
+    """A singleton batch sees its exact shared obligations as local work."""
+
+    tool_ids = ("hotel.booking.get",)
+    member_tool_ids = ("hotel.booking.get", "hotel.booking.cancel")
+    contract = SharedToolSemanticsContract(
+        contract_id="shared-contract:hotel-booking",
+        group_id="group:hotel-booking",
+        member_tool_ids=member_tool_ids,
+        source=SharedToolSemanticsSourceDraft(
+            atomicity_domains=(
+                SharedAtomicityDomainSourceDraft(
+                    domain_id="atomicity:hotel-booking",
+                    member_tool_ids=member_tool_ids,
+                    atomicity="atomic",
+                    rationale="Booking reads and changes use the same domain.",
+                ),
+            ),
+            concurrency_domains=(
+                SharedConcurrencyDomainSourceDraft(
+                    domain_id="concurrency:hotel-booking",
+                    member_tool_ids=member_tool_ids,
+                    isolation="serializable",
+                    rationale="Concurrent booking updates must serialize.",
+                ),
+            ),
+            idempotency_domains=(
+                SharedIdempotencyDomainSourceDraft(
+                    domain_id="idempotency:hotel-booking",
+                    member_tool_ids=member_tool_ids,
+                    mode="natural",
+                    rationale="Repeated reads are naturally idempotent.",
+                ),
+            ),
+            error_policies=(
+                SharedErrorPolicySourceDraft(
+                    policy_id="shared-error:booking",
+                    member_tool_ids=("hotel.booking.get",),
+                    required_error_suffix="shared_tool_error",
+                    retryable=False,
+                    rationale="The cross-tool error is terminal.",
+                ),
+            ),
+            compensation_edges=(
+                SharedCompensationEdgeSourceDraft(
+                    failure_tool_id="hotel.booking.get",
+                    compensation_tool_id="hotel.booking.cancel",
+                    rationale="Cancel a failed booking transition.",
+                ),
+            ),
+        ),
+    )
+    architecture = SimpleNamespace(
+        boundary=SimpleNamespace(
+            primary_domain="hotel",
+            actors_and_authority=(),
+            systems_of_record=("hotel",),
+            transition_authorities=("hotel",),
+            core_invariants=(),
+        ),
+        state_entities=(),
+        tool_inventory=SimpleNamespace(
+            tools=(
+                SimpleNamespace(
+                    tool_id="hotel.booking.get",
+                    reads_state_entities=(),
+                    writes_state_entities=(),
+                ),
+            )
+        ),
+    )
+    surface = ToolSurface(
+        tool_id="hotel.booking.get",
+        namespace="hotel.booking",
+        name="get",
+        description="Get one booking.",
+        transport="runtime",
+        input_schema={"type": "object", "additionalProperties": False},
+        output_schema={"type": "object", "additionalProperties": False},
+        observation_schema={"type": "object", "additionalProperties": False},
+    )
+    skeleton = SimpleNamespace(
+        state=StateSchema(
+            entities=(
+                StateEntitySchema(
+                    entity="booking",
+                    json_schema={
+                        "type": "object",
+                        "properties": {"booking_id": {"type": "string"}},
+                        "required": ["booking_id"],
+                        "additionalProperties": False,
+                    },
+                    primary_key_fields=("booking_id",),
+                ),
+            ),
+            root_state_schema={
+                "type": "object",
+                "properties": {
+                    "bookings": {
+                        "type": "array",
+                        "items": {"$ref": "#/$defs/booking"},
+                    },
+                },
+                "required": ["bookings"],
+                "additionalProperties": False,
+                "$defs": {
+                    "booking": {
+                        "type": "object",
+                        "properties": {"booking_id": {"type": "string"}},
+                        "required": ["booking_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ),
+        tool_surfaces=(SimpleNamespace(surface=surface),),
+    )
+    contexts = _tool_batch_rule_contexts(cast(Any, architecture), cast(Any, skeleton), tool_ids)
+
+    prompt = _tool_batch_prompt(
+        cast(Any, SimpleNamespace(request=SimpleNamespace(need="retrieve a booking"))),
+        cast(Any, architecture),
+        cast(Any, skeleton),
+        tool_ids,
+        (contract,),
+        EvidenceGraph(graph_id="evidence:hotel", revision=1),
+        contexts,
+    )
+    instruction, _separator, raw_context = prompt.partition("Frozen context:\n")
+    frozen = json.loads(raw_context)
+
+    assert "shared_requirements_by_tool is not optional background" in instruction
+    assert frozen["shared_requirements_by_tool"] == {
+        "hotel.booking.get": {
+            "contract_id": "shared-contract:hotel-booking",
+            "reliability": {
+                "transaction_atomicity": "atomic",
+                "concurrency_isolation": "serializable",
+                "idempotency_mode": "natural",
+            },
+            "required_errors": [
+                {
+                    "policy_id": "shared-error:booking",
+                    "error_code_final_identifier_segment": "shared_tool_error",
+                    "retryable": False,
+                }
+            ],
+            "required_rollback_compensation_tools": ["hotel.booking.cancel"],
+        }
+    }
+
+
 def test_restricted_rule_catalog_keeps_tool_io_but_removes_unowned_state_bindings() -> None:
     state = StateSchema(
         entities=(

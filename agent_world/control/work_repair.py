@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import cast
+from typing import Literal, cast
 
 from agent_world.artifact_store import ArtifactWriter
 from agent_world.contracts import ArtifactRef, BudgetUsage
@@ -26,6 +27,14 @@ from .work import (
 
 class WorkRepairDenied(RuntimeError):
     """The unique WorkGraph repair policy denied another executing attempt."""
+
+    _SAFE_CODE = re.compile(r"[a-z][a-z0-9_]{0,119}")
+
+    def __init__(self, code: str) -> None:
+        if self._SAFE_CODE.fullmatch(code) is None:
+            raise ValueError("WorkRepairDenied requires one safe stable code")
+        self.code = code
+        super().__init__(code)
 
 
 def _add_usage(left: BudgetUsage, right: BudgetUsage) -> BudgetUsage:
@@ -141,6 +150,7 @@ class WorkRepairLedger:
         report: ValidationReport,
         report_ref: ArtifactRef,
         causal_strict_progress: bool = False,
+        causal_feedback_refresh: bool = False,
     ) -> WorkRepairLedgerEntry:
         definition = WorkDefinition.model_validate(definition.model_dump(mode="python"))
         action = RepairAction.model_validate(action.model_dump(mode="python"))
@@ -226,6 +236,7 @@ class WorkRepairLedger:
         ):
             raise WorkRepairDenied("workspace_recovery_authority_mismatch")
 
+        correction_basis: Literal["ordinary", "strict_progress", "feedback_refresh"] = "ordinary"
         if action.decision == "session_continuation":
             if (
                 definition.proposal_policy.executor != "agent"
@@ -278,25 +289,46 @@ class WorkRepairLedger:
             ):
                 raise WorkRepairDenied("repair_mutation_authority_mismatch")
             local_prior = tuple(entry for entry in prior if entry.decision == "local_correction")
-            local_ordinal = len(local_prior) + 1
-            normal = policy.maximum_local_corrections
-            if local_ordinal > normal + policy.strict_progress_bonus_corrections:
-                raise WorkRepairDenied("repair_local_exhausted")
-            if local_ordinal > normal:
-                if not local_prior:
-                    raise WorkRepairDenied("repair_progress_bonus_denied")
-                previous = local_prior[-1]
-                durable_progress = previous.outcome == "progressed"
+            ordinary_count = sum(entry.correction_basis == "ordinary" for entry in local_prior)
+            progress_count = sum(
+                entry.correction_basis == "strict_progress" for entry in local_prior
+            )
+            feedback_count = sum(
+                entry.correction_basis == "feedback_refresh" for entry in local_prior
+            )
+            if ordinary_count < policy.maximum_local_corrections:
+                # The first repair uses the normal local allowance even if it
+                # arrived through a causal route. A bonus cannot be spent
+                # before one Agent has received the original safe brief.
+                if causal_strict_progress:
+                    raise WorkRepairDenied("repair_progress_bonus_not_required")
+                if causal_feedback_refresh:
+                    raise WorkRepairDenied("repair_feedback_refresh_not_required")
+            else:
+                previous = local_prior[-1] if local_prior else None
+                durable_progress = previous is not None and previous.outcome == "progressed"
                 downstream_progress = (
                     causal_strict_progress
+                    and previous is not None
                     and action.reason_code == "causal_downstream_failure"
                     and previous.reason_code == "causal_downstream_failure"
                     and previous.outcome == "resolved"
                 )
-                if not durable_progress and not downstream_progress:
-                    raise WorkRepairDenied("repair_progress_bonus_denied")
-            elif causal_strict_progress:
-                raise WorkRepairDenied("repair_progress_bonus_not_required")
+                if durable_progress or downstream_progress:
+                    if progress_count < policy.strict_progress_bonus_corrections:
+                        correction_basis = "strict_progress"
+                    elif causal_feedback_refresh and (
+                        feedback_count < policy.maximum_feedback_refresh_corrections
+                    ):
+                        correction_basis = "feedback_refresh"
+                    else:
+                        raise WorkRepairDenied("repair_progress_bonus_exhausted")
+                elif causal_feedback_refresh:
+                    if feedback_count >= policy.maximum_feedback_refresh_corrections:
+                        raise WorkRepairDenied("repair_feedback_refresh_exhausted")
+                    correction_basis = "feedback_refresh"
+                else:
+                    raise WorkRepairDenied("repair_local_exhausted")
         elif action.decision in {"infrastructure_retry", "model_fallback"}:
             if report.status != "error" and (
                 action.reason_code != "semantic_no_progress_model_fallback"
@@ -345,8 +377,7 @@ class WorkRepairLedger:
                         entry.decision in {"infrastructure_retry", "session_continuation"}
                         and entry.reason_code != "provider_output_ceiling"
                         and entry.route_model == action.route_model
-                        and entry.semantic_repair_context_ref
-                        == action.semantic_repair_context_ref
+                        and entry.semantic_repair_context_ref == action.semantic_repair_context_ref
                         for entry in prior
                     )
                 ):
@@ -410,6 +441,7 @@ class WorkRepairLedger:
             report_ref=report_ref,
             epoch=epoch,
             ordinal=ordinal,
+            correction_basis=correction_basis,
         )
 
     def _append_authorized(
@@ -423,6 +455,7 @@ class WorkRepairLedger:
         report_ref: ArtifactRef,
         epoch: str,
         ordinal: int,
+        correction_basis: Literal["ordinary", "strict_progress", "feedback_refresh"] = "ordinary",
     ) -> WorkRepairLedgerEntry:
         digest = hashlib.sha256(
             f"{action_ref.revision_id}\0{definition.work_id}\0{ordinal}".encode()
@@ -437,6 +470,7 @@ class WorkRepairLedger:
             repair_policy_digest=policy.content_digest(),
             repair_action_ref=action_ref,
             decision=cast(ExecutingRepairDecision, action.decision),
+            correction_basis=correction_basis,
             reason_code=action.reason_code,
             route_model=action.route_model,
             semantic_repair_context_ref=action.semantic_repair_context_ref,

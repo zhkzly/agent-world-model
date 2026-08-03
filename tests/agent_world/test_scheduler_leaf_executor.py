@@ -14,6 +14,7 @@ from agent_world.contracts import Budget, BudgetUsage, canonical_json_bytes, sha
 from agent_world.control import (
     AgentExecutionProvenance,
     ArtifactSlotContract,
+    BudgetExceeded,
     ContinuationStoreError,
     GenerationWorkGraph,
     LeafExecutionFailure,
@@ -3393,6 +3394,130 @@ async def test_scheduler_rejects_an_impossible_validation_envelope_before_agent_
 
 
 @pytest.mark.asyncio
+async def test_scheduler_projects_exact_remaining_budget_at_envelope_admission(
+    tmp_path: Path,
+) -> None:
+    """The project Agent sees the actual reserve deficit, not just its dimension.
+
+    This is the ReleaseAssurance bad-case shape: a prior settled lease leaves
+    3,151 tool calls, while the frozen full operation envelope needs 3,587.
+    The Scheduler must reject before any executor crosses a real boundary and
+    the scene must expose only that exact deterministic comparison.
+    """
+
+    base = deterministic_boundary_work_definition(
+        scope_id="job:release-assurance-budget",
+        component="release",
+        stage="release_assurance",
+        artifact_slot="release_assurance",
+        dependency_coordinates=(),
+        claim_id="release.assurance.closes",
+        claim="One release assurance operation closes the frozen release evidence.",
+        timing_reason="The complete assurance envelope must fit before any proposal runs.",
+        effect="block_release",
+        success_maturity="release_assurance_closed",
+    )
+    definition = base.model_copy(
+        update={
+            "validation_policy": base.validation_policy.model_copy(
+                update={"budget": OperationBudget(wall_seconds=30, tool_calls=3_587)}
+            )
+        }
+    )
+    artifacts, _definition, heads, runtime, scheduler = _setup(
+        tmp_path,
+        definition=definition,
+        budget=Budget(
+            tool_calls=3_200,
+            wall_seconds=300,
+        ),
+    )
+    runtime.budget_coordinator.initialize(
+        scope_id=definition.coordinate.scope_id,
+        reserved=runtime.budget.reserved,
+        leases=runtime.budget.leases,
+    )
+    settled = runtime.budget_coordinator.reserve(
+        scope_id=definition.coordinate.scope_id,
+        lease_id="lease:already-settled-tool-calls",
+        owner_id="operation:already-settled-tool-calls",
+        requested=Budget(tool_calls=49),
+        elapsed_wall_seconds=0,
+    )
+    runtime.budget_coordinator.settle(
+        scope_id=definition.coordinate.scope_id,
+        lease_id=settled.lease_id,
+        observed_actual=BudgetUsage(tool_calls=49),
+    )
+    root = ObservabilityRoot(tmp_path / "observability")
+    runtime.projector = SceneProjector(root=root, artifacts=artifacts, heads=heads)
+    dispatched: list[str] = []
+
+    async def execute(_context) -> None:
+        dispatched.append("executor")
+        raise AssertionError("the complete envelope must reject before dispatch")
+
+    result = await scheduler.dispatch_one(
+        definition.coordinate,
+        executors={definition.work_id: execute},
+    )
+
+    assert result.after_state == "blocked"
+    assert dispatched == []
+    head = heads.read_head(definition.coordinate)
+    assert head is not None and head.status == "failed"
+    attempt = artifacts.get_json(head.attempt_ref, WorkAttempt)
+    report = artifacts.get_json(attempt.validation_report_ref, ValidationReport)
+    evidence = artifacts.get_json(report.evidence_refs[0])
+    assert evidence["exhausted_dimensions"] == ["tool_calls"]
+    assert evidence["admission"] == [
+        {
+            "dimension": "tool_calls",
+            "requested": 3_587,
+            "available": 3_151,
+        }
+    ]
+    scene_scope_id = runtime.projector.safe_scope_id(definition.coordinate.scope_id)
+    coordinate = CoordinateScene.model_validate_json(
+        root.coordinate_json_path(
+            scene_scope_id,
+            definition.coordinate.coordinate_key,
+        ).read_bytes()
+    )
+    assert coordinate.budget_exhaustion is not None
+    assert coordinate.budget_exhaustion.operation_not_started is True
+    assert coordinate.budget_exhaustion.admission[0].dimension == "tool_calls"
+    assert coordinate.budget_exhaustion.admission[0].requested == 3_587
+    assert coordinate.budget_exhaustion.admission[0].available == 3_151
+    assert (
+        "Budget admission: tool_calls requested 3587, available 3151 (deficit 436)."
+        in root.coordinate_markdown_path(
+            scene_scope_id,
+            definition.coordinate.coordinate_key,
+        ).read_text()
+    )
+
+
+def test_settlement_overshoot_carries_no_pre_dispatch_admission_comparison() -> None:
+    """A real operation overshoot is not falsely labelled as a reserve rejection."""
+
+    ledger = LeaseBudgetLedger(Budget(tool_calls=10, wall_seconds=30))
+    lease = ledger.reserve(
+        lease_id="lease:settlement-overshoot",
+        owner_id="operation:settlement-overshoot",
+        requested=Budget(tool_calls=2),
+        elapsed_wall_seconds=0,
+    )
+
+    with pytest.raises(BudgetExceeded) as captured:
+        ledger.settle(lease.lease_id, BudgetUsage(tool_calls=3))
+
+    assert captured.value.dimensions == ("tool_calls",)
+    assert captured.value.requested is None
+    assert captured.value.available is None
+
+
+@pytest.mark.asyncio
 async def test_leaf_kernel_turns_safe_validation_failure_into_actionable_report(
     tmp_path: Path,
 ) -> None:
@@ -4088,6 +4213,16 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
         agent_wall_seconds=30,
         agent_token_limit=1_000,
     )
+    # The second downstream result both shrinks the prior causal issue set and
+    # discloses a new safe feedback digest. Both proofs refer to the same prior
+    # RepairAction and must be persisted once.
+    target = target.model_copy(
+        update={
+            "repair_policy": target.repair_policy.model_copy(
+                update={"maximum_feedback_refresh_corrections": 1}
+            )
+        }
+    )
     source_base = deterministic_boundary_work_definition(
         scope_id=scope_id,
         component="integration",
@@ -4300,6 +4435,205 @@ async def test_scheduler_routes_one_validated_downstream_failure_to_its_causal_o
     assert seed_attempt.status == "succeeded"
     assert action.repair_seed_output_refs == seed_attempt.output_refs
     assert [entry.outcome for entry in runtime.repairs.entries] == ["resolved", "resolved"]
+
+
+@pytest.mark.asyncio
+async def test_frozen_recovery_executes_an_authorized_parent_repair_before_returning(
+    tmp_path: Path,
+) -> None:
+    """A frozen Release-like retry may backjump to its committed Candidate owner.
+
+    This covers the real r9 incident: the downstream gate is the selected
+    frozen suffix, so its failed result is initially ``blocked``.  Its exact
+    Scheduler route authorizes a Candidate-local correction, which must run
+    before the runner decides that the frozen recovery is terminal.  An
+    unrelated protected prerequisite would still fail the normal protection
+    guard; only this graph-declared causal route opens the mutable cone.
+    """
+
+    artifacts, _definition, heads, _runtime, _scheduler = _setup(tmp_path)
+    scope_id = "job:frozen-causal-recovery"
+    candidate = structured_agent_work_definition(
+        scope_id=scope_id,
+        component="design",
+        stage="candidate",
+        artifact_slot="candidate_source",
+        dependency_coordinates=(),
+        claim_id="build.candidate.completes",
+        claim="The mutable Candidate source completes its local contract.",
+        timing_reason="A downstream gate can request one bounded Candidate correction.",
+        output_contract_id="contract:frozen-causal-candidate.v1",
+        agent_role="environment_engineer",
+        allowed_mutation_roots=("/candidate",),
+        agent_wall_seconds=30,
+        agent_token_limit=1_000,
+        maximum_local_corrections=1,
+        strict_progress_bonus_corrections=0,
+        maximum_infrastructure_retries=0,
+        maximum_total_repair_attempts=1,
+    )
+    release_base = deterministic_boundary_work_definition(
+        scope_id=scope_id,
+        component="integration",
+        stage="release_gate",
+        artifact_slot="release_gate_report",
+        dependency_coordinates=(candidate.coordinate,),
+        claim_id="judge.release.passes",
+        claim="The current Candidate passes the selected downstream gate.",
+        timing_reason="The gate supplies causal evidence for Candidate repair.",
+        effect="block_release",
+        success_maturity="release_gate_passed",
+    )
+    release = release_base.model_copy(
+        update={
+            "repair_target_coordinates": (candidate.coordinate,),
+            "repair_policy": release_base.repair_policy.model_copy(
+                update={
+                    "maximum_automatic_backjump": 1,
+                    "maximum_total_repair_attempts": 1,
+                }
+            ),
+            "allowed_mutation_roots": ("/release",),
+        }
+    )
+    graph = GenerationWorkGraph.compile((candidate, release), mode="diagnostic")
+    root_ref = artifacts.put_json(
+        artifact_id="context:frozen-causal-recovery",
+        artifact_type="control.generation_context",
+        value={"context": "frozen-causal-recovery"},
+    )
+    manifest = graph.manifest(
+        topology_id="topology:frozen-causal-recovery",
+        external_root_refs=(root_ref,),
+    )
+    manifest_ref = artifacts.put_json(
+        artifact_id=manifest.graph_id,
+        artifact_type="control.work_graph_manifest",
+        value=manifest,
+        dependencies=(root_ref,),
+    )
+    runtime = WorkControlRuntime(
+        artifacts=artifacts,
+        heads=heads,
+        budget=LeaseBudgetLedger(
+            Budget(llm_tokens=2_000, agent_turns=2, repair_attempts=1, wall_seconds=300)
+        ),
+    )
+    scheduler = WorkScheduler(
+        graph=graph,
+        manifest=manifest,
+        manifest_ref=manifest_ref,
+        heads=heads,
+        artifacts=artifacts,
+        runtime=runtime,
+    )
+    kernel = SchedulerLeafExecutor(runtime=runtime)
+    candidate_turns: list[int] = []
+    release_turns: list[int] = []
+    correction_issues: list[tuple[ValidationIssue, ...]] = []
+
+    async def candidate_proposal(context, attempt: WorkAttempt, dispatch_id: str) -> LeafProposal:
+        candidate_turns.append(attempt.ordinal)
+        if attempt.ordinal == 2:
+            brief = kernel.agent_correction_brief(context, definition=candidate)
+            assert brief is not None
+            correction_issues.append(brief.issues)
+        output_ref = artifacts.put_json(
+            artifact_id=f"candidate:frozen-causal-recovery:{attempt.ordinal}",
+            artifact_type="design.world_architecture_source",
+            value={"candidate_revision": attempt.ordinal},
+            dependencies=context.external_input_refs,
+        )
+        return LeafProposal(
+            output_refs=(output_ref,),
+            subject_refs=(output_ref,),
+            agent=AgentExecutionProvenance(
+                invocation_id=dispatch_id,
+                provider="test-provider",
+                model="test-model",
+                profile_digest=sha256_digest(canonical_json_bytes({"profile": "engineer"})),
+                output_schema_digest=sha256_digest(
+                    canonical_json_bytes({"schema": "candidate"})
+                ),
+            ),
+        )
+
+    async def release_proposal(context, attempt: WorkAttempt, _dispatch_id: str) -> LeafProposal:
+        release_turns.append(attempt.ordinal)
+        if attempt.ordinal == 1:
+            raise LeafValidationFailure(
+                issues=(
+                    ValidationIssue(
+                        code="release_rejects_candidate",
+                        path=("behavior",),
+                        violated_condition="The downstream release gate rejected this Candidate.",
+                        expected_category="Candidate source that passes the release gate",
+                        remediation="Repair the Candidate behavior required by the gate.",
+                    ),
+                ),
+                output_commitment=sha256_digest(b"frozen-causal-release-failure"),
+                category="release_behavior",
+                parent_repair_target=candidate.coordinate,
+            )
+        output_ref = artifacts.put_json(
+            artifact_id="release:frozen-causal-recovery",
+            artifact_type="release.final_telemetry_summary",
+            value={"candidate_commit": context.parent_commit_refs[0].revision_id},
+            dependencies=context.parent_output_refs,
+        )
+        return LeafProposal(output_refs=(output_ref,), subject_refs=(output_ref,))
+
+    async def execute_candidate(context) -> None:
+        await kernel.execute(context, definition=candidate, proposal_runner=candidate_proposal)
+
+    async def execute_release(context) -> None:
+        await kernel.execute(context, definition=release, proposal_runner=release_proposal)
+
+    # This is the pre-existing committed frozen prefix.  The recovery must not
+    # redispatch it until the downstream gate gives a valid causal route.
+    initial = await scheduler.dispatch_one(
+        candidate.coordinate,
+        executors={candidate.work_id: execute_candidate, release.work_id: execute_release},
+    )
+    assert initial.after_state == "committed"
+
+    runner = object.__new__(DirectWorkRunner)
+    runner.artifacts = artifacts
+    runner.heads = heads
+    runner.maximum_concurrency = 1
+    protected = frozenset({candidate.coordinate.coordinate_key})
+    snapshot = await runner._run_graph(  # noqa: SLF001 - frozen recovery boundary
+        graph=graph,
+        manifest=manifest,
+        manifest_ref=manifest_ref,
+        runtime=runtime,
+        executors={candidate.work_id: execute_candidate, release.work_id: execute_release},
+        protected_coordinate_keys=protected,
+        frozen_recovery_protection=runner._frozen_recovery_protection(
+            graph=graph,
+            coordinate=release.coordinate,
+            protected_coordinate_keys=protected,
+        ),
+    )
+
+    assert candidate_turns == [1, 2]
+    assert release_turns == [1, 2]
+    assert correction_issues == [
+        (
+            ValidationIssue(
+                code="causal_release_rejects_candidate",
+                path=("causal_feedback", "integration", "release_gate", "behavior"),
+                violated_condition="The downstream release gate rejected this Candidate.",
+                expected_category="Candidate source that passes the release gate",
+                remediation="Repair the Candidate behavior required by the gate.",
+            ),
+        ),
+    ]
+    assert all(item.state == "committed" for item in snapshot.work)
+    repaired_candidate = heads.read_head(candidate.coordinate)
+    repaired_release = heads.read_head(release.coordinate)
+    assert repaired_candidate is not None and repaired_candidate.status == "committed"
+    assert repaired_release is not None and repaired_release.status == "committed"
 
 
 def test_verifier_group_leases_restore_a_full_turn_per_batch() -> None:

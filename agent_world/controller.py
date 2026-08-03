@@ -88,6 +88,7 @@ from agent_world.control import (
     DirectJobStore,
     DirectJobStoreError,
     DirectRequestConflictError,
+    DurableLeaseBudgetCoordinator,
     ErrorAuditPolicy,
     ExpansionCandidateAttempt,
     FeedbackResult,
@@ -97,6 +98,7 @@ from agent_world.control import (
     NodeAttempt,
     NodeCommit,
     NodeKind,
+    NodeResumeAuthority,
     QuarantineReviewBundle,
     QuarantineReviewPolicy,
     RepairDirective,
@@ -105,16 +107,24 @@ from agent_world.control import (
     RepairRouter,
     RepairTargetRef,
     ResearchCheckpointReuseEvidence,
+    ScopeBudgetAmendment,
     StructuredRepairAuthority,
     StructuredRepairDenied,
     StructuredRepairMode,
     TelemetryReleaseSummary,
     TelemetryStore,
     ValidationDiagnostic,
+    WorkAttempt,
     WorkControlStore,
+    WorkCoordinate,
+    WorkDefinition,
     WorkDependencyUnavailableError,
     WorkExecutorMissingError,
+    WorkGraphEpoch,
+    WorkGraphManifest,
     WorkReadinessSnapshot,
+    WorkRepairDenied,
+    WorkRuntimeError,
     WorkSpan,
     claim,
     new_direct_job_head,
@@ -123,8 +133,15 @@ from agent_world.control import (
 from agent_world.control.direct_runner import (
     DirectWorkRun,
     DirectWorkRunner,
+    DirectWorkRunnerError,
     SemanticPrefixRun,
 )
+from agent_world.control.work_graph import (
+    GenerationWorkGraph,
+    WorkGraphMilestone,
+    WorkGroupDefinition,
+)
+from agent_world.control.work_scheduler import WorkScheduler
 from agent_world.designer import (
     AdmissionBundle,
     DesignBundle,
@@ -175,6 +192,7 @@ type GenerateStatus = Literal[
     "needs_human",
     "budget_exhausted",
 ]
+type FrozenResumeState = Literal["stale", "repair_ready", "running", "blocked"]
 type ExecutableDesignBundle = DesignBundle | ExpansionDesignBundle
 type CandidateTerminalStatus = Literal[
     "research_failed",
@@ -847,37 +865,44 @@ class FoundryController:
         )
         return outcome
 
-    async def resume_generation(self, request_id: str) -> GenerateResult:
-        """Explicitly restart one failed Direct run from its last verified phase."""
+    async def resume_generation(
+        self,
+        request_id: str,
+        *,
+        adopt_config_budget: bool = False,
+        from_frozen_epoch: str | None = None,
+        from_coordinate: str | None = None,
+    ) -> GenerateResult:
+        """Resume one selected stopped node from an immutable graph epoch.
+
+        The selected node consumes the exact committed output closure of its
+        frozen ancestors. It receives a fresh physical attempt only when an
+        explicit control authority binds the old terminal attempt; downstream
+        work is then scheduled normally. This is deliberately not an entry
+        point for rerunning a whole pipeline.
+        """
+
+        return await self._resume_generation_from_frozen_node(
+            request_id,
+            adopt_config_budget=adopt_config_budget,
+            from_frozen_epoch=from_frozen_epoch,
+            from_coordinate=from_coordinate,
+        )
+
+    async def _resume_generation_from_frozen_node(
+        self,
+        request_id: str,
+        *,
+        adopt_config_budget: bool,
+        from_frozen_epoch: str | None,
+        from_coordinate: str | None,
+    ) -> GenerateResult:
+        """Resume one exact stopped coordinate without replaying its prefix."""
 
         with self.direct_jobs.exclusive(request_id) as direct_lock:
             head = self.direct_jobs.read_head(request_id)
             if head is None:
                 raise DirectJobStoreError("Direct Generation request does not exist")
-            if head.status == "released":
-                request = self.artifacts.get_json(head.request_ref, EnvironmentRequest)
-                return await self._load_or_recover_direct_result(
-                    head=head,
-                    request=request,
-                    direct_lock=direct_lock,
-                )
-            if head.status not in {"failed", "needs_human", "budget_exhausted"}:
-                raise DirectJobResumeRequiredError(
-                    "Direct Generation can resume only from an explicit terminal failure"
-                )
-            if head.result_ref is None:
-                request = self.artifacts.get_json(head.request_ref, EnvironmentRequest)
-                await self._load_or_recover_direct_result(
-                    head=head,
-                    request=request,
-                    direct_lock=direct_lock,
-                )
-                recovered_head = self.direct_jobs.read_head(request_id)
-                if recovered_head is None or recovered_head.result_ref is None:
-                    raise DirectJobStoreError(
-                        "terminal Direct Generation result recovery did not finalize its head"
-                    )
-                head = recovered_head
             request = self.artifacts.get_json(head.request_ref, EnvironmentRequest)
             job = self.artifacts.get_json(head.job_ref, EnvironmentJob)
             self.artifacts.require_exact_json(
@@ -892,22 +917,208 @@ class FoundryController:
             )
             if request.request_id != request_id or job.request_ref != head.request_ref:
                 raise DirectJobStoreError("Direct head does not bind its resumable request/job")
+            if head.status == "released":
+                return await self._load_or_recover_direct_result(
+                    head=head,
+                    request=request,
+                    direct_lock=direct_lock,
+                )
+
+            if head.status == "running":
+                # Holding the writer lock proves the previous Controller is no
+                # longer live. Make the interruption durable before selecting
+                # a recovery source so later recovery never guesses from an
+                # orphaned mutable head.
+                await self._terminalize_abandoned_direct_head(
+                    head=head,
+                    request=request,
+                    direct_lock=direct_lock,
+                )
+                head = self.direct_jobs.read_head(request_id)
+                if head is None:
+                    raise DirectJobStoreError("abandoned Direct head disappeared during recovery")
+            if head.status not in {"failed", "needs_human", "budget_exhausted"}:
+                raise DirectJobResumeRequiredError(
+                    "Direct Generation must be terminal before node-level recovery"
+                )
             if head.result_ref is None:
-                raise DirectJobStoreError("resumable Direct head has no terminal result")
-            previous_snapshot = self.artifacts.get_json(
-                head.snapshot_ref,
-                JobRunSnapshot,
+                await self._load_or_recover_direct_result(
+                    head=head,
+                    request=request,
+                    direct_lock=direct_lock,
+                )
+                head = self.direct_jobs.read_head(request_id)
+                if head is None or head.result_ref is None:
+                    raise DirectJobStoreError("terminal Direct head lacks a persisted result")
+
+            # An explicit epoch without a stopped coordinate means something
+            # materially different from retry: the caller is selecting a
+            # fully committed checkpoint and asks us to derive *only* its next
+            # causal epoch.  This is the durable escape hatch after fixing a
+            # framework bug which made a later historical epoch incoherent.
+            # It never guesses a chronological frontier and never replays the
+            # selected epoch's own nodes.
+            if from_frozen_epoch is not None and from_coordinate is None:
+                if adopt_config_budget:
+                    raise DirectJobResumeRequiredError(
+                        "a committed-frontier continuation cannot amend a budget; "
+                        "budget amendments bind one unstarted stopped node"
+                    )
+                (
+                    snapshot_ref,
+                    snapshot,
+                    context_ref,
+                    epoch_ref,
+                ) = self._select_frozen_resume_frontier(
+                    head=head,
+                    from_frozen_epoch=from_frozen_epoch,
+                )
+                self.artifacts.record_event(
+                    event_type="generation_resume_requested",
+                    subject_ref=head.job_ref,
+                    related_refs=(
+                        head.job_ref,
+                        head.result_ref,
+                        snapshot_ref,
+                        context_ref,
+                        epoch_ref,
+                    ),
+                    details=(
+                        KeyValue(key="previous_run_id", value=snapshot.run_id),
+                        KeyValue(key="recovery_epoch", value=epoch_ref.artifact_id),
+                        KeyValue(key="recovery_mode", value="committed_frontier_successor"),
+                        KeyValue(key="budget_amended", value="false"),
+                    ),
+                )
+                return await self._execute_direct_locked(
+                    request=request,
+                    request_fingerprint=head.request_fingerprint,
+                    selected_discovery_budget=self.config.discovery_budget,
+                    enable_discovery=False,
+                    direct_lock=direct_lock,
+                    job=job,
+                    job_ref=head.job_ref,
+                    request_ref=head.request_ref,
+                    prior_head=head,
+                    recovery_snapshot=snapshot,
+                    recovery_snapshot_ref=snapshot_ref,
+                    recovery_context_ref=context_ref,
+                    recovery_epoch_ref=epoch_ref,
+                    recovery_frontier=True,
+                    effective_budget=snapshot.reserved_budget,
+                )
+
+            (
+                snapshot_ref,
+                snapshot,
+                context_ref,
+                epoch_ref,
+                coordinate,
+                definition,
+            ) = self._select_frozen_resume_target(
+                head=head,
+                from_frozen_epoch=from_frozen_epoch,
+                from_coordinate=from_coordinate,
             )
-            self.artifacts.require_exact_json(
-                head.snapshot_ref,
-                previous_snapshot,
-                artifact_types=("control.job_run_snapshot",),
+            work_head = self.work_control.read_head(coordinate)
+            if (
+                work_head is None
+                or work_head.work_id != definition.work_id
+                or work_head.definition_digest != definition.definition_digest
+                or work_head.acceptance_digest != definition.acceptance_digest
+            ):
+                raise DirectJobResumeRequiredError(
+                    "selected node no longer has the exact frozen definition closure"
+                )
+            resume_state = self._frozen_resume_state(
+                context_ref=context_ref,
+                epoch_ref=epoch_ref,
+                coordinate=coordinate,
             )
+            if resume_state is None:
+                raise DirectJobResumeRequiredError(
+                    "selected node is no longer a resumable frozen frontier"
+                )
+
+            amendment_ref: ArtifactRef | None = None
+            effective_budget = snapshot.reserved_budget
+            if adopt_config_budget:
+                if resume_state == "stale":
+                    raise DirectJobResumeRequiredError(
+                        "a stale descendant already has a valid parent revision; "
+                        "it must be re-derived, not treated as a budget-admission retry"
+                    )
+                amendment_ref = self._authorize_scope_budget_amendment_for_target(
+                    job=job,
+                    source_snapshot_ref=snapshot_ref,
+                    source_snapshot=snapshot,
+                    source_epoch_ref=epoch_ref,
+                    definition=definition,
+                    amended_budget=self.config.generation_budget,
+                )
+                amendment = self.artifacts.get_json(amendment_ref, ScopeBudgetAmendment)
+                effective_budget = amendment.amended_reserved
+
+            authority_ref: ArtifactRef | None = None
+            recovery_mode: str
+            if resume_state == "stale":
+                # The node has a durable terminal head, but its exact
+                # parent-output closure has changed.  This is not an operator
+                # retry of the old attempt: Scheduler owns the supersession
+                # and opens a new attempt with the current parent Artifact.
+                recovery_mode = "causal_descendant_refresh"
+            elif work_head.status == "repair_authorized":
+                if amendment_ref is not None:
+                    raise DirectJobResumeRequiredError(
+                        "a semantic repair already has its own authority; "
+                        "budget amendment is not a retry"
+                    )
+                recovery_mode = "scheduler_owned_repair"
+            elif work_head.status == "running":
+                # The Direct writer lock is held and the Direct head has
+                # already been terminalized above, so this is not a second
+                # live Scheduler.  The Work head is the exact crash boundary:
+                # let DirectWorkRunner reconcile its unfinished OperationRun
+                # under the frozen definition before it schedules anything.
+                # In particular, do not manufacture a terminal-retry
+                # authority for an attempt that never reached a terminal
+                # decision.
+                recovery_mode = "abandoned_operation_reconciliation"
+            else:
+                authority_ref = self._authorize_node_resume(
+                    snapshot_ref=snapshot_ref,
+                    context_ref=context_ref,
+                    epoch_ref=epoch_ref,
+                    definition=definition,
+                    source_attempt_ref=work_head.attempt_ref,
+                    source_input_fingerprint=work_head.input_fingerprint,
+                    budget_amendment_ref=amendment_ref,
+                )
+                recovery_mode = "terminal_node_retry"
+
             self.artifacts.record_event(
                 event_type="generation_resume_requested",
                 subject_ref=head.job_ref,
-                related_refs=(head.job_ref, head.result_ref),
-                details=(KeyValue(key="previous_run_id", value=head.run_id),),
+                related_refs=tuple(
+                    ref
+                    for ref in (
+                        head.job_ref,
+                        head.result_ref,
+                        snapshot_ref,
+                        context_ref,
+                        epoch_ref,
+                        amendment_ref,
+                        authority_ref,
+                    )
+                    if ref is not None
+                ),
+                details=(
+                    KeyValue(key="previous_run_id", value=snapshot.run_id),
+                    KeyValue(key="recovery_coordinate", value=coordinate.coordinate_key),
+                    KeyValue(key="recovery_epoch", value=epoch_ref.artifact_id),
+                    KeyValue(key="recovery_mode", value=recovery_mode),
+                    KeyValue(key="budget_amended", value=str(amendment_ref is not None).lower()),
+                ),
             )
             return await self._execute_direct_locked(
                 request=request,
@@ -919,7 +1130,767 @@ class FoundryController:
                 job_ref=head.job_ref,
                 request_ref=head.request_ref,
                 prior_head=head,
+                recovery_snapshot=snapshot,
+                recovery_snapshot_ref=snapshot_ref,
+                recovery_context_ref=context_ref,
+                recovery_epoch_ref=epoch_ref,
+                recovery_coordinate=coordinate,
+                resume_authority_ref=authority_ref,
+                effective_budget=effective_budget,
             )
+
+    def _select_frozen_resume_frontier(
+        self,
+        *,
+        head: DirectJobHead,
+        from_frozen_epoch: str,
+    ) -> tuple[ArtifactRef, JobRunSnapshot, ArtifactRef, ArtifactRef]:
+        """Resolve one caller-pinned completed epoch without chronology guesses.
+
+        The Controller proves the selected epoch belongs to the current Direct
+        job and retains an immutable definition closure.  The Runner then
+        proves that every one of those definitions still has an active commit
+        immediately before it advances the causal suffix.  Keeping that second
+        proof at the execution boundary closes the race between selection and
+        scheduling without treating a stale epoch as a new root run.
+        """
+
+        snapshot_ref = head.snapshot_ref
+        snapshot = self.artifacts.get_json(snapshot_ref, JobRunSnapshot)
+        self.artifacts.require_exact_json(
+            snapshot_ref,
+            snapshot,
+            artifact_types=("control.job_run_snapshot",),
+        )
+        if (
+            snapshot.job_ref != head.job_ref
+            or snapshot.run_id != head.run_id
+            or snapshot.revision != head.snapshot_revision
+        ):
+            raise DirectJobResumeRequiredError(
+                "current Direct head does not bind its exact recovery snapshot"
+            )
+
+        context_refs = tuple(
+            dict.fromkeys(
+                ref
+                for ref in snapshot.latest_artifact_refs
+                if ref.artifact_type == "control.generation_context"
+            )
+        )
+        if len(context_refs) > 1:
+            raise DirectJobResumeRequiredError(
+                "current Direct snapshot has multiple GenerationContext roots"
+            )
+        if not context_refs:
+            # Old compact snapshots can omit the context/epoch projection. A
+            # same-job lookup is still exact because the immutable context
+            # binds the DirectJob Artifact, rather than wall time or a latest
+            # state entry.
+            context_refs = tuple(
+                ref
+                for ref in self.artifacts.list_revisions()
+                if ref.artifact_type == "control.generation_context"
+                and self.artifacts.get_json(ref, GenerationContext).job_ref == head.job_ref
+            )
+        if not context_refs:
+            raise DirectJobResumeRequiredError(
+                "no exact GenerationContext is available for committed-frontier recovery"
+            )
+
+        candidates: list[tuple[ArtifactRef, ArtifactRef]] = []
+        for context_ref in context_refs:
+            context = self.artifacts.get_json(context_ref, GenerationContext)
+            self.artifacts.require_exact_json(
+                context_ref,
+                context,
+                artifact_types=("control.generation_context",),
+            )
+            if context.job_ref != head.job_ref:
+                continue
+            for epoch_ref in self.artifacts.list_revisions():
+                matches_epoch = from_frozen_epoch in {
+                    epoch_ref.artifact_id,
+                    epoch_ref.revision_id,
+                }
+                if epoch_ref.artifact_type != "control.work_graph_epoch" or not matches_epoch:
+                    continue
+                epoch = self.artifacts.get_json(epoch_ref, WorkGraphEpoch)
+                self.artifacts.require_exact_json(
+                    epoch_ref,
+                    epoch,
+                    artifact_types=("control.work_graph_epoch",),
+                )
+                if epoch.context_ref != context_ref:
+                    continue
+                manifest = self.artifacts.get_json(epoch.manifest_ref, WorkGraphManifest)
+                # This is a selection-time topology proof only.  Current
+                # WorkHead/Commit activeness is intentionally rechecked in the
+                # Runner just before suffix dispatch.
+                for binding in manifest.node_bindings:
+                    self._frozen_work_definition(
+                        coordinate=binding.coordinate,
+                        work_id=binding.work_id,
+                        definition_digest=binding.definition_digest,
+                    )
+                candidates.append((context_ref, epoch_ref))
+
+        unique = tuple(dict.fromkeys(candidates))
+        if len(unique) == 1:
+            context_ref, epoch_ref = unique[0]
+            return snapshot_ref, snapshot, context_ref, epoch_ref
+        if not unique:
+            raise DirectJobResumeRequiredError(
+                "no exact frozen epoch belongs to this Direct job; "
+                "inspect the same run before selecting a committed frontier"
+            )
+        raise DirectJobResumeRequiredError(
+            "frozen epoch artifact id has multiple revisions; "
+            "select its exact revision id for committed-frontier recovery"
+        )
+
+    def _select_frozen_resume_target(
+        self,
+        *,
+        head: DirectJobHead,
+        from_frozen_epoch: str | None,
+        from_coordinate: str | None,
+    ) -> tuple[
+        ArtifactRef,
+        JobRunSnapshot,
+        ArtifactRef,
+        ArtifactRef,
+        WorkCoordinate,
+        WorkDefinition,
+    ]:
+        """Select one exact Context/Epoch/WorkHead recovery closure.
+
+        A ``JobRunSnapshot`` is a terminal/run summary.  It is useful to bind
+        the Direct restart to its current job, but it must not become the
+        authority that decides whether a durable ``WorkGraphEpoch`` exists:
+        a controller crash between epoch persistence and snapshot projection
+        used to make a perfectly intact node unrecoverable.  The immutable
+        GenerationContext, epoch, manifest, active WorkCommit closure and
+        stopped WorkHead are the recovery proof; no candidate is adopted by
+        timestamp or artifact iteration order.
+        """
+
+        snapshot_ref = head.snapshot_ref
+        snapshot = self.artifacts.get_json(snapshot_ref, JobRunSnapshot)
+        self.artifacts.require_exact_json(
+            snapshot_ref,
+            snapshot,
+            artifact_types=("control.job_run_snapshot",),
+        )
+        if (
+            snapshot.job_ref != head.job_ref
+            or snapshot.run_id != head.run_id
+            or snapshot.revision != head.snapshot_revision
+        ):
+            raise DirectJobResumeRequiredError(
+                "current Direct head does not bind its exact recovery snapshot"
+            )
+
+        context_refs: list[ArtifactRef] = []
+        snapshot_contexts = tuple(
+            ref
+            for ref in snapshot.latest_artifact_refs
+            if ref.artifact_type == "control.generation_context"
+        )
+        if len(snapshot_contexts) > 1:
+            raise DirectJobResumeRequiredError(
+                "current Direct snapshot has multiple GenerationContext roots"
+            )
+        if snapshot_contexts:
+            context_refs.extend(snapshot_contexts)
+        else:
+            # Older terminal wrappers may have lost their compact snapshot
+            # projection.  Discover a root only by exact immutable job
+            # binding, never by the latest Artifact or by wall-clock order.
+            for candidate_ref in self.artifacts.list_revisions():
+                if candidate_ref.artifact_type != "control.generation_context":
+                    continue
+                candidate_context = self.artifacts.get_json(candidate_ref, GenerationContext)
+                if candidate_context.job_ref == head.job_ref:
+                    context_refs.append(candidate_ref)
+        context_refs = list(dict.fromkeys(context_refs))
+        if not context_refs:
+            raise DirectJobResumeRequiredError(
+                "no exact GenerationContext is available for frozen-node recovery"
+            )
+
+        candidates: list[
+            tuple[
+                ArtifactRef,
+                JobRunSnapshot,
+                ArtifactRef,
+                ArtifactRef,
+                WorkCoordinate,
+                WorkDefinition,
+                FrozenResumeState,
+            ]
+        ] = []
+        evidence_counts = {
+            "contexts": 0,
+            "epochs": 0,
+            "selector_matches": 0,
+            "definition_matches": 0,
+            "resumable_frontiers": 0,
+        }
+        epoch_refs = tuple(
+            ref
+            for ref in self.artifacts.list_revisions()
+            if ref.artifact_type == "control.work_graph_epoch"
+        )
+        for context_ref in context_refs:
+            context = self.artifacts.get_json(context_ref, GenerationContext)
+            self.artifacts.require_exact_json(
+                context_ref,
+                context,
+                artifact_types=("control.generation_context",),
+            )
+            if context.job_ref != head.job_ref:
+                continue
+            evidence_counts["contexts"] += 1
+            for epoch_ref in epoch_refs:
+                epoch = self.artifacts.get_json(epoch_ref, WorkGraphEpoch)
+                if epoch.context_ref != context_ref:
+                    continue
+                self.artifacts.require_exact_json(
+                    epoch_ref,
+                    epoch,
+                    artifact_types=("control.work_graph_epoch",),
+                )
+                if from_frozen_epoch is not None and from_frozen_epoch not in {
+                    epoch_ref.artifact_id,
+                    epoch_ref.revision_id,
+                }:
+                    continue
+                evidence_counts["epochs"] += 1
+                manifest = self.artifacts.get_json(epoch.manifest_ref, WorkGraphManifest)
+                states = self._frozen_epoch_schedule_states(
+                    context_ref=context_ref,
+                    epoch_ref=epoch_ref,
+                    epoch=epoch,
+                    manifest=manifest,
+                )
+                for binding in manifest.node_bindings:
+                    if from_coordinate is not None and not self._coordinate_selector_matches(
+                        binding.coordinate,
+                        from_coordinate,
+                    ):
+                        continue
+                    evidence_counts["selector_matches"] += 1
+                    definition = self._frozen_work_definition(
+                        coordinate=binding.coordinate,
+                        work_id=binding.work_id,
+                        definition_digest=binding.definition_digest,
+                    )
+                    work_head = self.work_control.read_head(binding.coordinate)
+                    if (
+                        work_head is None
+                        or work_head.work_id != definition.work_id
+                        or work_head.definition_digest != definition.definition_digest
+                        or work_head.acceptance_digest != definition.acceptance_digest
+                    ):
+                        continue
+                    evidence_counts["definition_matches"] += 1
+                    scheduled_state = states.get(binding.coordinate.coordinate_key)
+                    if scheduled_state not in {
+                        "stale",
+                        "repair_ready",
+                        "running",
+                        "blocked",
+                    }:
+                        continue
+                    # A committed child whose parent has a newer accepted
+                    # revision is logically ``stale``.  Its physical head is
+                    # still committed by design, so status-only recovery used
+                    # to skip it and leave later gates consuming historic
+                    # Candidate evidence.  The frozen Scheduler snapshot is
+                    # the authority for this causal-frontier classification.
+                    resume_state = cast(FrozenResumeState, scheduled_state)
+                    evidence_counts["resumable_frontiers"] += 1
+                    candidates.append(
+                        (
+                            snapshot_ref,
+                            snapshot,
+                            context_ref,
+                            epoch_ref,
+                            binding.coordinate,
+                            definition,
+                            resume_state,
+                        )
+                    )
+
+        # A coordinate retained by a later epoch is one logical candidate. If
+        # the user did not explicitly pin an epoch, use its first topology
+        # boundary so recovery starts from the smallest valid graph. Different
+        # epoch revisions at that same boundary are semantic alternatives, so
+        # fail closed rather than selecting by file/list order.
+        ResumeCandidate = tuple[
+            ArtifactRef,
+            JobRunSnapshot,
+            ArtifactRef,
+            ArtifactRef,
+            WorkCoordinate,
+            WorkDefinition,
+            FrozenResumeState,
+        ]
+        by_binding: dict[tuple[str, str], ResumeCandidate] = {}
+        for resume_candidate in candidates:
+            binding_key = (
+                resume_candidate[4].coordinate_key,
+                resume_candidate[3].revision_id,
+            )
+            prior = by_binding.get(binding_key)
+            if prior is not None and prior != resume_candidate:
+                raise DirectJobResumeRequiredError(
+                    "one frozen epoch has conflicting recovery bindings"
+                )
+            by_binding[binding_key] = resume_candidate
+        by_coordinate: dict[str, tuple[ResumeCandidate, ...]] = {}
+        for resume_candidate in by_binding.values():
+            coordinate_key = resume_candidate[4].coordinate_key
+            by_coordinate[coordinate_key] = (
+                *by_coordinate.get(coordinate_key, ()),
+                resume_candidate,
+            )
+
+        selected: list[ResumeCandidate] = []
+        ambiguous_epoch_keys: list[str] = []
+        for coordinate_key, bindings in by_coordinate.items():
+            earliest_rank = min(self._epoch_rank(item[3]) for item in bindings)
+            earliest = tuple(
+                item for item in bindings if self._epoch_rank(item[3]) == earliest_rank
+            )
+            if len(earliest) != 1:
+                ambiguous_epoch_keys.append(coordinate_key)
+                continue
+            selected.append(earliest[0])
+        if ambiguous_epoch_keys:
+            raise DirectJobResumeRequiredError(
+                "multiple frozen revisions contain the selected stopped coordinate; "
+                "resume requires --from-frozen-epoch. Coordinates: "
+                + ", ".join(sorted(ambiguous_epoch_keys))
+            )
+        # A stale/repair/running coordinate is a closer causal frontier than
+        # an old blocked descendant.  Prefer it so a resume never asks the
+        # operator to retry a Release result that was produced from a
+        # superseded Candidate.  Independent frontiers at the same priority
+        # still require an explicit coordinate rather than guessing.
+        state_priority = {
+            "stale": 0,
+            "repair_ready": 1,
+            "running": 2,
+            "blocked": 3,
+        }
+        if selected:
+            best_priority = min(state_priority[item[6]] for item in selected)
+            selected = [
+                item for item in selected if state_priority[item[6]] == best_priority
+            ]
+        selected.sort(key=lambda item: (item[4].coordinate_key, item[3].revision_id))
+        if len(selected) == 1:
+            (
+                selected_snapshot_ref,
+                selected_snapshot,
+                selected_context_ref,
+                selected_epoch_ref,
+                selected_coordinate,
+                selected_definition,
+                _selected_state,
+            ) = selected[0]
+            return (
+                selected_snapshot_ref,
+                selected_snapshot,
+                selected_context_ref,
+                selected_epoch_ref,
+                selected_coordinate,
+                selected_definition,
+            )
+        if not selected:
+            selector = from_coordinate or from_frozen_epoch or "current causal frontier"
+            raise DirectJobResumeRequiredError(
+                f"no exact resumable frozen frontier matches {selector!r}; "
+                "recovery evidence="
+                + ", ".join(f"{key}={value}" for key, value in sorted(evidence_counts.items()))
+                + "; inspect observe scene first"
+            )
+        options = ", ".join(item[4].coordinate_key for item in selected)
+        raise DirectJobResumeRequiredError(
+            "multiple causal frontiers are eligible; resume requires --from-coordinate. "
+            f"Canonical coordinates: {options}"
+        )
+
+    def _frozen_resume_state(
+        self,
+        *,
+        context_ref: ArtifactRef,
+        epoch_ref: ArtifactRef,
+        coordinate: WorkCoordinate,
+    ) -> FrozenResumeState | None:
+        """Return the Scheduler-owned state for one selected recovery coordinate."""
+
+        states = self._frozen_epoch_schedule_states(
+            context_ref=context_ref,
+            epoch_ref=epoch_ref,
+        )
+        state = states.get(coordinate.coordinate_key)
+        if state in {"stale", "repair_ready", "running", "blocked"}:
+            return cast(FrozenResumeState, state)
+        return None
+
+    def _frozen_epoch_schedule_states(
+        self,
+        *,
+        context_ref: ArtifactRef,
+        epoch_ref: ArtifactRef,
+        epoch: WorkGraphEpoch | None = None,
+        manifest: WorkGraphManifest | None = None,
+    ) -> dict[str, str]:
+        """Reconstruct one frozen graph and classify its current causal frontier.
+
+        Work heads persist physical status only.  The Scheduler additionally
+        proves whether each head still binds the current parent-output closure;
+        that is the sole safe way to discover a committed-but-stale consumer
+        after an upstream Candidate revision.
+        """
+
+        loaded_epoch = epoch or self.artifacts.get_json(epoch_ref, WorkGraphEpoch)
+        self.artifacts.require_exact_json(
+            epoch_ref,
+            loaded_epoch,
+            artifact_types=("control.work_graph_epoch",),
+        )
+        if loaded_epoch.context_ref != context_ref:
+            raise DirectJobResumeRequiredError(
+                "frozen epoch does not bind the selected GenerationContext"
+            )
+        loaded_manifest = manifest or self.artifacts.get_json(
+            loaded_epoch.manifest_ref,
+            WorkGraphManifest,
+        )
+        self.artifacts.require_exact_json(
+            loaded_epoch.manifest_ref,
+            loaded_manifest,
+            artifact_types=("control.work_graph_manifest",),
+        )
+        definitions = tuple(
+            self._frozen_work_definition(
+                coordinate=binding.coordinate,
+                work_id=binding.work_id,
+                definition_digest=binding.definition_digest,
+            )
+            for binding in loaded_manifest.node_bindings
+        )
+        groups = tuple(
+            WorkGroupDefinition(
+                group_id=binding.group_id,
+                scope_id=loaded_manifest.scope_id,
+                member_coordinates=binding.member_coordinates,
+                aggregate_coordinate=binding.aggregate_coordinate,
+            )
+            for binding in loaded_manifest.group_bindings
+        )
+        if any(
+            group.content_digest() != binding.group_digest
+            for group, binding in zip(groups, loaded_manifest.group_bindings, strict=True)
+        ):
+            raise DirectJobResumeRequiredError("frozen WorkGraph group binding is inconsistent")
+        milestones = tuple(
+            WorkGraphMilestone(
+                milestone_id=binding.milestone_id,
+                kind=binding.kind,
+                required_coordinates=binding.required_coordinates,
+                establishes=binding.establishes,
+            )
+            for binding in loaded_manifest.milestone_bindings
+        )
+        if any(
+            milestone.content_digest() != binding.milestone_digest
+            for milestone, binding in zip(
+                milestones,
+                loaded_manifest.milestone_bindings,
+                strict=True,
+            )
+        ):
+            raise DirectJobResumeRequiredError("frozen WorkGraph milestone binding is inconsistent")
+        graph = GenerationWorkGraph.compile(
+            definitions,
+            mode=loaded_manifest.mode,
+            required_terminal_coordinates=loaded_manifest.required_terminal_coordinates,
+            groups=groups,
+            milestones=milestones,
+        )
+        # A process can die after ``begin`` but before it writes the terminal
+        # FeedbackEvaluation.  That historical crash boundary must remain
+        # resumable, but it cannot participate in normal stale analysis: the
+        # Scheduler rightly rejects a terminal head without its boundary
+        # evaluation.  Prefer that raw interruption first; once it is
+        # reconciled, the next recovery obtains the full causal snapshot.
+        missing_boundary = any(
+            (work_head := self.work_control.read_head(definition.coordinate)) is not None
+            and work_head.status in {"failed", "needs_human", "interrupted"}
+            and work_head.evaluation_ref is None
+            for definition in definitions
+        )
+        if missing_boundary:
+            physical_states: dict[str, str] = {}
+            for definition in definitions:
+                work_head = self.work_control.read_head(definition.coordinate)
+                if work_head is None:
+                    continue
+                if work_head.status == "repair_authorized":
+                    physical_states[definition.coordinate.coordinate_key] = "repair_ready"
+                elif work_head.status == "running":
+                    physical_states[definition.coordinate.coordinate_key] = "running"
+                elif work_head.status in {"failed", "needs_human", "interrupted"}:
+                    physical_states[definition.coordinate.coordinate_key] = "blocked"
+                elif work_head.status == "committed":
+                    physical_states[definition.coordinate.coordinate_key] = "committed"
+            return physical_states
+        scheduler = WorkScheduler(
+            graph=graph,
+            manifest=loaded_manifest,
+            manifest_ref=loaded_epoch.manifest_ref,
+            heads=self.work_control,
+            artifacts=self.artifacts,
+        )
+        states: dict[str, str] = {}
+        for item in scheduler.snapshot().work:
+            state = item.state
+            work_head = self.work_control.read_head(item.coordinate)
+            if (
+                state == "ready"
+                and work_head is not None
+                and work_head.status == "running"
+            ):
+                # Scheduler uses ``ready`` for the narrow begin-before-first-
+                # operation crash window so it can dispatch the node again.
+                # Frozen recovery must retain its physical running identity:
+                # DirectWorkRunner first reconciles that abandoned attempt;
+                # treating it as an arbitrary fresh node would bypass that
+                # durable crash boundary.
+                state = "running"
+            states[item.coordinate.coordinate_key] = state
+        return states
+
+    def _epoch_rank(self, epoch_ref: ArtifactRef) -> tuple[int, str]:
+        epoch = self.artifacts.get_json(epoch_ref, WorkGraphEpoch)
+        rank = {"bootstrap": 0, "world": 1, "design": 2, "final": 3}.get(epoch.epoch_kind)
+        if rank is None:
+            raise DirectJobResumeRequiredError("unknown frozen WorkGraph epoch kind")
+        return rank, epoch_ref.revision_id
+
+    @staticmethod
+    def _coordinate_selector_matches(coordinate: WorkCoordinate, selector: str) -> bool:
+        parts = (coordinate.component, coordinate.stage, coordinate.artifact_slot)
+        base = ".".join(parts)
+        extended = ".".join(
+            item for item in (*parts, coordinate.group_id, coordinate.shard_id) if item is not None
+        )
+        return selector in {coordinate.coordinate_key, base, extended}
+
+    def _authorize_node_resume(
+        self,
+        *,
+        snapshot_ref: ArtifactRef,
+        context_ref: ArtifactRef,
+        epoch_ref: ArtifactRef,
+        definition: WorkDefinition,
+        source_attempt_ref: ArtifactRef,
+        source_input_fingerprint: str,
+        budget_amendment_ref: ArtifactRef | None,
+    ) -> ArtifactRef:
+        source_attempt = self.artifacts.get_json(source_attempt_ref, WorkAttempt)
+        if (
+            source_attempt.coordinate != definition.coordinate
+            or source_attempt.definition_digest != definition.definition_digest
+            or source_attempt.status
+            not in {"failed", "budget_exhausted", "needs_human", "interrupted"}
+        ):
+            raise DirectJobResumeRequiredError(
+                "selected node does not expose an exact terminal execution attempt"
+            )
+        authority = NodeResumeAuthority(
+            authority_id=self._stable_id(
+                "node-resume-authority",
+                snapshot_ref.revision_id,
+                context_ref.revision_id,
+                epoch_ref.revision_id,
+                source_attempt_ref.revision_id,
+                definition.coordinate.coordinate_key,
+                budget_amendment_ref.revision_id if budget_amendment_ref is not None else "retry",
+            ),
+            source_snapshot_ref=snapshot_ref,
+            source_context_ref=context_ref,
+            source_epoch_ref=epoch_ref,
+            source_attempt_ref=source_attempt_ref,
+            coordinate=definition.coordinate,
+            source_definition_digest=definition.definition_digest,
+            source_input_fingerprint=source_input_fingerprint,
+            reason="budget_amendment" if budget_amendment_ref is not None else "operator_retry",
+            budget_amendment_ref=budget_amendment_ref,
+        )
+        return self.artifacts.put_json(
+            artifact_id=authority.authority_id,
+            artifact_type="control.node_resume_authority",
+            value=authority,
+            dependencies=tuple(
+                ref
+                for ref in (
+                    snapshot_ref,
+                    context_ref,
+                    epoch_ref,
+                    source_attempt_ref,
+                    budget_amendment_ref,
+                )
+                if ref is not None
+            ),
+        )
+
+    def _authorize_scope_budget_amendment_for_target(
+        self,
+        *,
+        job: EnvironmentJob,
+        source_snapshot_ref: ArtifactRef,
+        source_snapshot: JobRunSnapshot,
+        source_epoch_ref: ArtifactRef,
+        definition: WorkDefinition,
+        amended_budget: Budget,
+    ) -> ArtifactRef:
+        """Amend one unstarted admission failure at any frozen coordinate."""
+
+        work_head = self.work_control.read_head(definition.coordinate)
+        if work_head is None or work_head.attempt_ref is None:
+            raise DirectJobResumeRequiredError("budget amendment target has no durable WorkAttempt")
+        attempt = self.artifacts.get_json(work_head.attempt_ref, WorkAttempt)
+        if (
+            work_head.status != "failed"
+            or attempt.coordinate != definition.coordinate
+            or attempt.definition_digest != definition.definition_digest
+            or attempt.status != "budget_exhausted"
+            or attempt.failure_code != "budget_exhausted"
+            or attempt.operation_run_refs
+        ):
+            raise DirectJobResumeRequiredError(
+                "scope budget may be amended only for an unstarted budget-admission rejection"
+            )
+        coordinator = DurableLeaseBudgetCoordinator(self.work_control.root / "scope-budgets")
+        try:
+            current = coordinator.snapshot(scope_id=job.job_id)
+        except ValueError:
+            current = coordinator.initialize(
+                scope_id=job.job_id,
+                reserved=source_snapshot.reserved_budget,
+            )
+        if current.reserved == amended_budget:
+            raise DirectJobResumeRequiredError(
+                "configured budget already matches the active scope budget; "
+                "no amendment is available"
+            )
+        amendment = ScopeBudgetAmendment(
+            amendment_id=self._stable_id(
+                "scope-budget-amendment",
+                job.job_id,
+                source_snapshot_ref.revision_id,
+                source_epoch_ref.revision_id,
+                work_head.attempt_ref.revision_id,
+                amended_budget.content_digest(),
+            ),
+            scope_id=job.job_id,
+            source_snapshot_ref=source_snapshot_ref,
+            source_epoch_ref=source_epoch_ref,
+            source_attempt_ref=work_head.attempt_ref,
+            target_coordinate_key=definition.coordinate.coordinate_key,
+            source_definition_digest=definition.definition_digest,
+            prior_reserved=current.reserved,
+            amended_reserved=amended_budget,
+        )
+        amendment_ref = self.artifacts.put_json(
+            artifact_id=amendment.amendment_id,
+            artifact_type="control.scope_budget_amendment",
+            value=amendment,
+            dependencies=tuple(
+                ref
+                for ref in (
+                    source_snapshot_ref,
+                    source_epoch_ref,
+                    work_head.attempt_ref,
+                    attempt.validation_report_ref,
+                )
+                if ref is not None
+            ),
+        )
+        coordinator.amend(
+            scope_id=job.job_id,
+            amendment_id=amendment.amendment_id,
+            reserved=amendment.amended_reserved,
+        )
+        return amendment_ref
+
+    async def _terminalize_abandoned_direct_head(
+        self,
+        *,
+        head: DirectJobHead,
+        request: EnvironmentRequest,
+        direct_lock: DirectJobLock,
+    ) -> None:
+        snapshot = self.artifacts.get_json(head.snapshot_ref, JobRunSnapshot)
+        if snapshot.status != "running" or snapshot.run_id != head.run_id:
+            raise DirectJobStoreError("running Direct head does not bind its running snapshot")
+        run = self._restore_direct_run(head, snapshot, direct_lock)
+        final_snapshot_ref = await self._persist_snapshot(
+            run,
+            status="failed",
+            failure_code="scheduler_direct_owner_lost",
+            failure_summary=(
+                "The Direct owner lock was recovered without a live Controller owner; "
+                "the stopped run requires explicit frozen-node recovery."
+            ),
+        )
+        result = GenerateResult(
+            run_id=run.run_id,
+            status="failed",
+            request_ref=head.request_ref,
+            job_ref=head.job_ref,
+            final_snapshot_ref=final_snapshot_ref,
+            failure_code="scheduler_direct_owner_lost",
+            failure_summary=(
+                "The Direct owner lock was recovered without a live Controller owner; "
+                "the stopped run requires explicit frozen-node recovery."
+            ),
+        )
+        self._complete_direct_result(run, result)
+
+    def _frozen_work_definition(
+        self,
+        *,
+        coordinate: WorkCoordinate,
+        work_id: str,
+        definition_digest: str,
+    ) -> WorkDefinition:
+        candidates: list[WorkDefinition] = []
+        for ref in self.artifacts.list_revisions():
+            if (
+                ref.artifact_type != "control.work_definition"
+                or ref.content_hash != definition_digest
+            ):
+                continue
+            try:
+                definition = self.artifacts.get_json(ref, WorkDefinition)
+            except ValueError:
+                continue
+            if (
+                definition.work_id == work_id
+                and definition.coordinate == coordinate
+                and definition.definition_digest == definition_digest
+            ):
+                candidates.append(definition)
+        if not candidates or any(item != candidates[0] for item in candidates[1:]):
+            raise DirectJobStoreError("frozen final graph lacks one exact WorkDefinition")
+        return candidates[0]
 
     async def _generate_new_locked(
         self,
@@ -984,6 +1955,14 @@ class FoundryController:
         job_ref: ArtifactRef,
         request_ref: ArtifactRef,
         prior_head: DirectJobHead | None,
+        recovery_snapshot: JobRunSnapshot | None = None,
+        recovery_snapshot_ref: ArtifactRef | None = None,
+        recovery_context_ref: ArtifactRef | None = None,
+        recovery_epoch_ref: ArtifactRef | None = None,
+        recovery_coordinate: WorkCoordinate | None = None,
+        resume_authority_ref: ArtifactRef | None = None,
+        recovery_frontier: bool = False,
+        effective_budget: Budget | None = None,
     ) -> GenerateResult:
         # Direct Generation has one executable success path: the durable
         # four-epoch WorkGraph runner.  DirectJobStore is only its idempotent
@@ -996,6 +1975,14 @@ class FoundryController:
             job_ref=job_ref,
             request_ref=request_ref,
             prior_head=prior_head,
+            recovery_snapshot=recovery_snapshot,
+            recovery_snapshot_ref=recovery_snapshot_ref,
+            recovery_context_ref=recovery_context_ref,
+            recovery_epoch_ref=recovery_epoch_ref,
+            recovery_coordinate=recovery_coordinate,
+            resume_authority_ref=resume_authority_ref,
+            recovery_frontier=recovery_frontier,
+            effective_budget=effective_budget,
         )
 
     async def _execute_scheduler_direct_locked(
@@ -1008,6 +1995,14 @@ class FoundryController:
         job_ref: ArtifactRef,
         request_ref: ArtifactRef,
         prior_head: DirectJobHead | None,
+        recovery_snapshot: JobRunSnapshot | None = None,
+        recovery_snapshot_ref: ArtifactRef | None = None,
+        recovery_context_ref: ArtifactRef | None = None,
+        recovery_epoch_ref: ArtifactRef | None = None,
+        recovery_coordinate: WorkCoordinate | None = None,
+        resume_authority_ref: ArtifactRef | None = None,
+        recovery_frontier: bool = False,
+        effective_budget: Budget | None = None,
     ) -> GenerateResult:
         """Project the Scheduler terminal state into the durable public result.
 
@@ -1021,12 +2016,13 @@ class FoundryController:
         # terminal result before requiring telemetry, a Runner, or any Agent
         # capability.  It prevents a misconfigured executor from obscuring
         # the more fundamental guarantee that no model/tool work was started.
-        if request.budget.wall_seconds <= 0:
+        selected_budget = effective_budget or request.budget
+        if selected_budget.wall_seconds <= 0:
             run = _RunState(
                 run_id=f"run:{uuid.uuid4().hex}",
                 job_ref=job_ref,
                 scope_id=job.job_id,
-                ledger=BudgetLedger(request.budget),
+                ledger=BudgetLedger(selected_budget),
                 direct_request_id=request.request_id,
                 direct_request_fingerprint=request_fingerprint,
                 direct_request_ref=request_ref,
@@ -1068,7 +2064,7 @@ class FoundryController:
             run_id=f"run:{uuid.uuid4().hex}",
             job_ref=job_ref,
             scope_id=job.job_id,
-            ledger=BudgetLedger(request.budget),
+            ledger=BudgetLedger(selected_budget),
             direct_request_id=request.request_id,
             direct_request_fingerprint=request_fingerprint,
             direct_request_ref=request_ref,
@@ -1077,12 +2073,24 @@ class FoundryController:
             allow_direct_restart=prior_head is not None,
         )
         run.remember(request_ref, job_ref)
+        if recovery_snapshot is not None:
+            run.remember(*recovery_snapshot.latest_artifact_refs)
+        if recovery_snapshot_ref is not None:
+            run.remember(recovery_snapshot_ref)
+        if recovery_context_ref is not None:
+            run.remember(recovery_context_ref)
+        if recovery_epoch_ref is not None:
+            run.remember(recovery_epoch_ref)
+        if resume_authority_ref is not None:
+            run.remember(resume_authority_ref)
         context_ref = self._scheduler_context_for(
             job=job,
             job_ref=job_ref,
             request=request,
             request_ref=request_ref,
             prior_head=prior_head,
+            recovery_snapshot=recovery_snapshot,
+            recovery_context_ref=recovery_context_ref,
         )
         run.remember(context_ref)
         await self._persist_snapshot(run, status="running")
@@ -1096,6 +2104,12 @@ class FoundryController:
             outcome = await self.direct_work_runner.run(
                 context_ref=context_ref,
                 run_id=run.run_id,
+                recovery_snapshot=recovery_snapshot,
+                recovery_snapshot_ref=recovery_snapshot_ref,
+                recovery_epoch_ref=recovery_epoch_ref,
+                recovery_coordinate=recovery_coordinate,
+                resume_authority_ref=resume_authority_ref,
+                recovery_frontier=recovery_frontier,
             )
         except Exception as exc:
             return await self._project_scheduler_execution_error(
@@ -1128,6 +2142,15 @@ class FoundryController:
         snapshot-only cancellation path: the WorkGraph owns operation cost,
         replay authority, and the resulting terminal coordinate.
         """
+
+        # A generic ``generate`` idempotency lookup must never turn owner loss
+        # into a fresh bootstrap. Earlier code called ``DirectWorkRunner.run``
+        # here, whose normal entry re-derived Research through final topology.
+        # Keep the checkpoint immutable and require the explicit recovery API.
+        raise DirectJobResumeRequiredError(
+            "abandoned Direct runs require explicit `run resume` frozen-epoch recovery; "
+            "the framework will not replay upstream work through automatic generate retry"
+        )
 
         if self.direct_work_runner is None:
             # A historical snapshot can prove that an Agent already ran but
@@ -1286,6 +2309,27 @@ class FoundryController:
                         "reason_code": self._safe_identifier(error.reason_code),
                     },
                 )
+            if isinstance(error, DirectWorkRunnerError) and error.safe_code is not None:
+                evidence["direct_runner_invariant"] = cast(
+                    JsonValue,
+                    {
+                        "code": self._safe_identifier(error.safe_code),
+                        "coordinate_keys": tuple(
+                            self._safe_identifier(item) for item in error.safe_coordinate_keys[:32]
+                        ),
+                    },
+                )
+            if isinstance(error, WorkRuntimeError) and isinstance(
+                error.__cause__, WorkRepairDenied
+            ):
+                # WorkRepairDenied accepts only a framework-declared stable
+                # code. Exposing that code fixes the project-execution Agent
+                # view without leaking the wrapped exception text, model
+                # output, workspace details, or a Provider payload.
+                evidence["work_repair_denial"] = cast(
+                    JsonValue,
+                    {"code": self._safe_identifier(error.__cause__.code)},
+                )
             ref = self.artifacts.put_json(
                 artifact_id=self._stable_id(
                     "scheduler-direct-diagnostic",
@@ -1330,6 +2374,7 @@ class FoundryController:
             release = self.artifacts.get_json(outcome.release_ref, ReleaseRecord)
             run.remember(
                 outcome.bootstrap_epoch_ref,
+                *((outcome.world_epoch_ref,) if outcome.world_epoch_ref is not None else ()),
                 *((outcome.design_epoch_ref,) if outcome.design_epoch_ref is not None else ()),
                 *((outcome.final_epoch_ref,) if outcome.final_epoch_ref is not None else ()),
                 outcome.package_manifest_ref,
@@ -1355,6 +2400,7 @@ class FoundryController:
         blocked = ", ".join(outcome.blocked_coordinates) or "unknown scheduler coordinate"
         run.remember(
             outcome.bootstrap_epoch_ref,
+            *((outcome.world_epoch_ref,) if outcome.world_epoch_ref is not None else ()),
             *((outcome.design_epoch_ref,) if outcome.design_epoch_ref is not None else ()),
             *((outcome.final_epoch_ref,) if outcome.final_epoch_ref is not None else ()),
         )
@@ -1384,11 +2430,33 @@ class FoundryController:
         request: EnvironmentRequest,
         request_ref: ArtifactRef,
         prior_head: DirectJobHead | None,
+        recovery_snapshot: JobRunSnapshot | None = None,
+        recovery_context_ref: ArtifactRef | None = None,
     ) -> ArtifactRef:
         """Reuse the exact Scheduler root on resume; never fork a shadow graph."""
 
-        if prior_head is not None:
-            snapshot = self.artifacts.get_json(prior_head.snapshot_ref, JobRunSnapshot)
+        if recovery_context_ref is not None:
+            context = self.artifacts.get_json(recovery_context_ref, GenerationContext)
+            self.artifacts.require_exact_json(
+                recovery_context_ref,
+                context,
+                artifact_types=("control.generation_context",),
+            )
+            if (
+                context.job_ref != job_ref
+                or context.request_ref != request_ref
+                or context.permissions != request.permissions
+                or context.budget != request.budget
+                or context.release_profile != request.release_profile
+            ):
+                raise DirectJobStoreError("frozen recovery has an incompatible Scheduler root")
+            return recovery_context_ref
+
+        if recovery_snapshot is not None or prior_head is not None:
+            snapshot = recovery_snapshot
+            if snapshot is None:
+                assert prior_head is not None
+                snapshot = self.artifacts.get_json(prior_head.snapshot_ref, JobRunSnapshot)
             contexts = tuple(
                 ref
                 for ref in snapshot.latest_artifact_refs
@@ -9159,8 +10227,7 @@ class FoundryController:
             run_id=head.run_id,
             job_ref=head.job_ref,
             scope_id=(
-                head.scope_id
-                or self.artifacts.get_json(head.job_ref, EnvironmentJob).job_id
+                head.scope_id or self.artifacts.get_json(head.job_ref, EnvironmentJob).job_id
             ),
             ledger=ledger,
             attempts=list(snapshot.attempts),

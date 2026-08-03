@@ -384,6 +384,82 @@ def test_strict_progress_grants_one_bonus_then_unchanged_is_terminal() -> None:
         _authorize(ledger, second_report, 3)
 
 
+def test_feedback_refresh_grants_one_new_safe_brief_without_blind_retry() -> None:
+    """A repaired Agent may see one newly framework-authored feedback state."""
+
+    ledger = WorkRepairLedger()
+    base = _definition()
+    definition = base.model_copy(
+        update={
+            "repair_policy": base.repair_policy.model_copy(
+                update={
+                    "policy_revision_id": "framework.repair-authority.feedback-refresh-test",
+                    "maximum_feedback_refresh_corrections": 1,
+                }
+            )
+        }
+    )
+    original_issue = _issue("runtime_behavior_failure")
+    original = _report("original-safe-brief", (original_issue,))
+    first = _authorize(ledger, original, 1, definition=definition)
+    ledger.complete(
+        first.entry_id,
+        report_before=original,
+        report_after=_report("candidate-local-pass", (), status="passed"),
+        report_after_ref=_ref("report:candidate-local-pass", "control.validation_report"),
+    )
+
+    upgraded_issue = original_issue.model_copy(
+        update={
+            "remediation": "Exercise the actor-specific observation boundary before commit.",
+        }
+    )
+    upgraded = _report("upgraded-safe-brief", (upgraded_issue,))
+    assert upgraded.blocking_issue_ids == original.blocking_issue_ids
+    assert upgraded.repair_feedback_digest != original.repair_feedback_digest
+    action, action_ref, evaluation_ref, report_ref, _budget_ref = _authorization(
+        ordinal=2,
+        report=upgraded,
+        definition=definition,
+    )
+    refreshed = ledger.authorize(
+        definition=definition,
+        action=action,
+        action_ref=action_ref,
+        evaluation_ref=evaluation_ref,
+        report=upgraded,
+        report_ref=report_ref,
+        causal_feedback_refresh=True,
+    )
+    assert refreshed.correction_basis == "feedback_refresh"
+    ledger.complete(
+        refreshed.entry_id,
+        report_before=upgraded,
+        report_after=_report("candidate-local-pass-again", (), status="passed"),
+        report_after_ref=_ref("report:candidate-local-pass-again", "control.validation_report"),
+    )
+
+    later_issue = upgraded_issue.model_copy(
+        update={"remediation": "A third differently worded brief must not reopen the loop."}
+    )
+    later = _report("later-safe-brief", (later_issue,))
+    action, action_ref, evaluation_ref, report_ref, _budget_ref = _authorization(
+        ordinal=3,
+        report=later,
+        definition=definition,
+    )
+    with pytest.raises(WorkRepairDenied, match="repair_feedback_refresh_exhausted"):
+        ledger.authorize(
+            definition=definition,
+            action=action,
+            action_ref=action_ref,
+            evaluation_ref=evaluation_ref,
+            report=later,
+            report_ref=report_ref,
+            causal_feedback_refresh=True,
+        )
+
+
 def test_a_to_b_to_a_is_oscillation_and_never_authorizes_a_third_turn() -> None:
     ledger = WorkRepairLedger()
     issue_a = _issue("reference_missing")

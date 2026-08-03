@@ -54,5 +54,12 @@ standalone, deterministic, offline, and read-only-source compatible. Test at min
 - Task Materializer echo/schema behavior;
 - one realistic state-changing workflow and one denied/invalid action.
 
+For every task type/allowed actor, also trace one real materialized initial
+state through each required tool before completion. Compare the state schema,
+the materialized values, and the frozen tool precondition first. If they have
+no common valid state, report the frozen paths as a blocked input conflict;
+do not make Candidate code invent an undeclared lifecycle merely to satisfy a
+local test.
+
 Do not weaken a frozen schema or change a test merely to silence a failure. Repair implementation
 and tests together only when the test encoded an obsolete candidate-local assumption.

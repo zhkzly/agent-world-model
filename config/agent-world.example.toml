@@ -162,7 +162,6 @@ required_hard_gates = [
   "schema",
   "supply_chain",
   "static_assurance",
-  "public_self_check",
   "runtime_protocol",
   "task_materialization",
   "task_reachability",

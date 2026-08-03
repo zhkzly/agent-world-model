@@ -680,7 +680,9 @@ class IntegrationLeaf:
         """
 
         gates = {gate.gate_id: gate for gate in report.gate_results}
-        failed_gates = tuple(gate for gate in report.gate_results if gate.status == "fail")
+        failed_gates = tuple(
+            gate for gate in report.gate_results if gate.hard and gate.status == "fail"
+        )
         blocking = tuple(item for item in report.findings if item.blocks_release)
         by_category: dict[str, tuple[Finding, ...]] = {
             gate.gate_id: tuple(
@@ -768,7 +770,9 @@ class IntegrationLeaf:
         stage: str,
     ) -> tuple[ValidationIssue, ...]:
         issues: list[ValidationIssue] = []
-        for index, gate in enumerate(item for item in report.gate_results if item.status != "pass"):
+        for index, gate in enumerate(
+            item for item in report.gate_results if item.hard and item.status != "pass"
+        ):
             issues.append(
                 ValidationIssue(
                     code=f"{stage}_gate_{gate.gate_id}_{gate.status}"[:120],
@@ -803,6 +807,116 @@ class IntegrationLeaf:
                 expected_category="a passing independent report",
                 retryable=False,
             ),
+        )
+
+    @staticmethod
+    def _release_repair_feedback(
+        report: JudgeReport,
+    ) -> tuple[tuple[ValidationIssue, ...], bool]:
+        """Project only safe, causal Release failures into one Builder repair brief.
+
+        A Release report intentionally retains every hard-gate outcome, including
+        sealed and downstream evidence.  Those are not all independent source
+        edits.  A Candidate correction may receive only a build-owned failed
+        gate whose Finding supplies a non-generic repair disclosure.  Sealed
+        failures stay auditable but never become model input.  Reachability is
+        Candidate-actionable only when the same report also identifies the
+        concrete Runtime behavior boundary that it could not reach.
+        """
+
+        gates = {gate.gate_id: gate for gate in report.gate_results}
+        blocking = tuple(item for item in report.findings if item.blocks_release)
+        non_passing = tuple(
+            gate for gate in report.gate_results if gate.hard and gate.status != "pass"
+        )
+        failed_gates = tuple(gate for gate in non_passing if gate.status == "fail")
+        by_category: dict[str, tuple[Finding, ...]] = {
+            gate.gate_id: tuple(
+                finding
+                for finding in blocking
+                if finding.category == gate.gate_id and finding.owner == "build"
+            )
+            for gate in failed_gates
+        }
+
+        def actionable_remediation(gate_id: str) -> str | None:
+            gate = gates[gate_id]
+            normalized_summary = " ".join(gate.summary.split())
+            for finding in by_category.get(gate_id, ()):
+                remediation = IntegrationLeaf._safe_repair_remediation(finding)
+                if remediation is not None and remediation != normalized_summary:
+                    return remediation
+            return None
+
+        behavior_remediation = actionable_remediation("behavior") if "behavior" in gates else None
+        routeable = bool(failed_gates) and not any(
+            gate.status in {"error", "inconclusive"} for gate in non_passing
+        )
+        issues: list[ValidationIssue] = []
+        emitted_gate_ids: set[str] = set()
+        dependent_gate_ids: set[str] = set()
+
+        for gate in failed_gates:
+            if gate.gate_id == "sealed_release":
+                # The report keeps its sealed summary; no repair brief may turn
+                # it into an instruction to guess a hidden case.
+                continue
+            remediation = actionable_remediation(gate.gate_id)
+            if gate.gate_id == "task_reachability" and behavior_remediation is not None:
+                # The full report still retains this hard failure, but its own
+                # safe remediation explicitly identifies it as a downstream
+                # consequence of the public Runtime behavior root.  Sending
+                # both items to one Builder correction makes the Agent chase
+                # the same cause twice.
+                dependent_gate_ids.add(gate.gate_id)
+                continue
+            if remediation is None:
+                routeable = False
+                continue
+            issues.append(
+                ValidationIssue(
+                    code=f"release_gate_{gate.gate_id}_fail"[:120],
+                    path=("release", "gate", len(issues)),
+                    violated_condition=gate.summary[:512],
+                    expected_category="the exact independent execution gate to pass",
+                    remediation=remediation,
+                )
+            )
+            emitted_gate_ids.add(gate.gate_id)
+
+        for finding in blocking:
+            related_gate = gates.get(finding.category)
+            if finding.disclosure == "sealed_summary" and finding.category == "sealed_release":
+                continue
+            if related_gate is not None and related_gate.gate_id in dependent_gate_ids:
+                continue
+            if (
+                related_gate is None
+                or related_gate.status != "fail"
+                or finding.owner != "build"
+                or related_gate.gate_id not in emitted_gate_ids
+            ):
+                routeable = False
+
+        if issues:
+            return tuple(issues), routeable
+        return (
+            (
+                ValidationIssue(
+                    code="release_report_root_cause_insufficient",
+                    path=("release", "report"),
+                    violated_condition=(
+                        "The independent Release report did not identify one concrete failed "
+                        "build gate with a safe, non-generic repair disclosure."
+                    ),
+                    expected_category=(
+                        "a report with one observable Candidate repair boundary before another "
+                        "Builder turn"
+                    ),
+                    retryable=False,
+                ),
+            ),
+            False,
         )
 
     @staticmethod
@@ -897,9 +1011,7 @@ class ReleaseAssuranceLeaf(IntegrationLeaf):
             # explicit ownership before it crosses InvocationBackend.
             candidate_ref, candidate = self._candidate_from_context(current_context)
             _design, world_spec_ref, world_spec = self._design_world(candidate, candidate_ref)
-            verifier_ref, verifier = self._verifier_from_context(
-                current_context, design=_design
-            )
+            verifier_ref, verifier = self._verifier_from_context(current_context, design=_design)
             integration_ref, integration = self._integration_from_context(current_context)
             if (
                 integration.status != "ready"
@@ -1074,17 +1186,16 @@ class ReleaseAssuranceLeaf(IntegrationLeaf):
                 category="independent release infrastructure failed",
                 observed_actual=usage,
             )
+        repair_issues, route_build_repair = self._release_repair_feedback(report)
         raise LeafValidationFailure(
-            issues=self._report_issues(report, stage="release"),
+            issues=repair_issues,
             output_commitment=bundle.report_ref.content_hash,
             category="independent_release_assurance_failed",
             observed_actual=usage,
             evidence_refs=(bundle.report_ref,),
-            parent_repair_target=(
-                self._unique_build_target(definition)
-                if self._all_blocking_findings_owned_by(report, owner="build")
-                else None
-            ),
+            parent_repair_target=self._unique_build_target(definition)
+            if route_build_repair
+            else None,
         )
 
 

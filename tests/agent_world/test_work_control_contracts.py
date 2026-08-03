@@ -269,6 +269,8 @@ def test_leaf_code_revision_changes_with_source_model_and_runtime_asset(tmp_path
         leaf_code_revision()  # at least one module required
     with pytest.raises(ValueError):
         leaf_code_revision("agent_world.this_module_does_not_exist")
+    with pytest.raises(ValueError, match="scheduler-control"):
+        leaf_code_revision("agent_world.control.work_scheduler")
 
 
 def test_artifact_slots_reject_ambiguous_types_and_wrong_output_owner() -> None:

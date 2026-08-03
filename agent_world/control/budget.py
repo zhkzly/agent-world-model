@@ -14,7 +14,14 @@ from typing import Annotated
 
 from pydantic import AwareDatetime, Field, model_validator
 
-from agent_world.contracts import Budget, BudgetUsage, Identifier, V2Contract
+from agent_world.contracts import (
+    ArtifactRef,
+    Budget,
+    BudgetUsage,
+    ContentHash,
+    Identifier,
+    V2Contract,
+)
 
 from .models import BudgetLease
 
@@ -22,9 +29,27 @@ _FIELDS = tuple(field for field in Budget.model_fields if field != "schema_versi
 
 
 class BudgetExceeded(RuntimeError):
-    def __init__(self, dimensions: tuple[str, ...]) -> None:
+    """A vector-budget rejection, with optional exact admission facts.
+
+    ``requested`` and ``available`` are populated only by a lease *reserve*
+    rejection.  They must stay absent for settlement overshoots: in that case
+    the operation already ran and its ``OperationRun`` is the authoritative
+    record of what was consumed, not an admission comparison.
+    """
+
+    def __init__(
+        self,
+        dimensions: tuple[str, ...],
+        *,
+        requested: Budget | None = None,
+        available: Budget | None = None,
+    ) -> None:
+        if (requested is None) != (available is None):
+            raise ValueError("budget admission facts require requested and available together")
         super().__init__(f"budget exhausted: {', '.join(dimensions)}")
         self.dimensions = dimensions
+        self.requested = requested
+        self.available = available
 
 
 @dataclass(slots=True)
@@ -190,7 +215,11 @@ class LeaseBudgetLedger:
             if Decimal(str(getattr(requested, field))) > Decimal(str(getattr(available, field)))
         )
         if exceeded:
-            raise BudgetExceeded(exceeded)
+            raise BudgetExceeded(
+                exceeded,
+                requested=requested,
+                available=available,
+            )
         lease = BudgetLease(
             lease_id=lease_id,
             owner_id=owner_id,
@@ -270,13 +299,56 @@ class ScopeBudgetSnapshot(V2Contract):
     reserved: Budget
     revision: Annotated[int, Field(ge=0)] = 0
     leases: tuple[BudgetLease, ...] = ()
+    # Budget authority is normally immutable.  A user-authorized amendment is
+    # recorded by its immutable control Artifact id before this mutable
+    # snapshot moves to the larger vector.  Keeping the ids here makes a
+    # resumed runner's use of a larger snapshot auditable without changing an
+    # old EnvironmentRequest or erasing the original limit.
+    budget_amendment_ids: tuple[Identifier, ...] = ()
     updated_at: AwareDatetime
 
     @model_validator(mode="after")
     def validate_capacity(self) -> ScopeBudgetSnapshot:
         if len({item.lease_id for item in self.leases}) != len(self.leases):
             raise ValueError("scope budget lease ids must be unique")
+        if len(set(self.budget_amendment_ids)) != len(self.budget_amendment_ids):
+            raise ValueError("scope budget amendment ids must be unique")
         LeaseBudgetLedger(self.reserved, leases=self.leases)
+        return self
+
+
+class ScopeBudgetAmendment(V2Contract):
+    """One operator-authorized, monotonic recovery of a scope budget.
+
+    The immutable request remains the record of the original authority.  This
+    separate Artifact binds a later, explicit authority decision to the exact
+    frozen checkpoint and the *unstarted* WorkAttempt it is allowed to reopen.
+    It is not a generic retry token and cannot be used to exchange or reduce
+    budget dimensions.
+    """
+
+    amendment_id: Identifier
+    scope_id: Identifier
+    source_snapshot_ref: ArtifactRef
+    source_epoch_ref: ArtifactRef
+    source_attempt_ref: ArtifactRef
+    target_coordinate_key: ContentHash
+    source_definition_digest: ContentHash
+    prior_reserved: Budget
+    amended_reserved: Budget
+
+    @model_validator(mode="after")
+    def validate_authority(self) -> ScopeBudgetAmendment:
+        if self.source_snapshot_ref.artifact_type != "control.job_run_snapshot":
+            raise ValueError("budget amendment must bind a JobRunSnapshot")
+        if self.source_epoch_ref.artifact_type != "control.work_graph_epoch":
+            raise ValueError("budget amendment must bind a frozen WorkGraphEpoch")
+        if self.source_attempt_ref.artifact_type != "control.work_attempt":
+            raise ValueError("budget amendment must bind the rejected WorkAttempt")
+        if not _budget_dominates(self.amended_reserved, self.prior_reserved):
+            raise ValueError("budget amendment cannot decrease a scope dimension")
+        if self.amended_reserved == self.prior_reserved:
+            raise ValueError("budget amendment must increase at least one scope dimension")
         return self
 
 
@@ -312,6 +384,16 @@ class DurableLeaseBudgetCoordinator:
             current = self._read(scope_id)
             if current is not None:
                 if current.reserved != reserved:
+                    # A resumed legacy GenerationContext still carries its
+                    # original immutable request budget.  It may execute
+                    # against a *larger* durable scope only after amend()
+                    # recorded explicit authority.  Never accept a smaller
+                    # or incomparable caller budget: that would hide a
+                    # configuration drift rather than prove an amendment.
+                    if current.budget_amendment_ids and _budget_dominates(
+                        current.reserved, reserved
+                    ):
+                        return current
                     raise ValueError("scope budget cannot change after initialization")
                 return current
             snapshot = ScopeBudgetSnapshot(
@@ -322,6 +404,46 @@ class DurableLeaseBudgetCoordinator:
             )
             self._write(snapshot)
             return snapshot
+
+    def amend(
+        self,
+        *,
+        scope_id: str,
+        amendment_id: str,
+        reserved: Budget,
+    ) -> ScopeBudgetSnapshot:
+        """Apply one explicit, monotonic scope-budget authority revision.
+
+        This is intentionally not a generic mutable-budget setter.  A caller
+        must first persist its immutable amendment Artifact, then pass that
+        Artifact id here while no physical operation lease is active.  The
+        original snapshot remains an immutable history entry through its prior
+        on-disk revision; settled work stays charged and no vector dimension
+        may shrink or be exchanged for another.
+        """
+
+        with self._exclusive(scope_id):
+            current = self._require(scope_id)
+            if amendment_id in current.budget_amendment_ids:
+                if current.reserved != reserved:
+                    raise ValueError("budget amendment id is bound to a different budget")
+                return current
+            if any(lease.status == "active" for lease in current.leases):
+                raise ValueError("scope budget cannot change with an active operation lease")
+            if not _budget_dominates(reserved, current.reserved):
+                raise ValueError("budget amendment cannot decrease a scope dimension")
+            if reserved == current.reserved:
+                raise ValueError("budget amendment must increase at least one scope dimension")
+            next_snapshot = current.model_copy(
+                update={
+                    "reserved": reserved,
+                    "revision": current.revision + 1,
+                    "budget_amendment_ids": (*current.budget_amendment_ids, amendment_id),
+                    "updated_at": datetime.now(UTC),
+                }
+            )
+            self._write(next_snapshot)
+            return next_snapshot
 
     def snapshot(self, *, scope_id: str) -> ScopeBudgetSnapshot:
         current = self._read(scope_id)
@@ -551,4 +673,20 @@ def _bounded_elapsed(value: float, maximum: float) -> float:
     return min(float(value), maximum)
 
 
-__all__ = ["BudgetExceeded", "BudgetLedger", "LeaseBudgetLedger"]
+def _budget_dominates(left: Budget, right: Budget) -> bool:
+    """Return whether every vector dimension in ``left`` is at least ``right``."""
+
+    return all(
+        Decimal(str(getattr(left, field))) >= Decimal(str(getattr(right, field)))
+        for field in _FIELDS
+    )
+
+
+__all__ = [
+    "BudgetExceeded",
+    "BudgetLedger",
+    "DurableLeaseBudgetCoordinator",
+    "LeaseBudgetLedger",
+    "ScopeBudgetAmendment",
+    "ScopeBudgetSnapshot",
+]

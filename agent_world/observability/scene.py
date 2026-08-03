@@ -336,17 +336,32 @@ class CandidateWorkspaceLiveness(V2Contract):
         return self
 
 
+class BudgetAdmissionDimension(V2Contract):
+    """One exact reserve comparison, safe to expose in a project Agent view."""
+
+    dimension: NonEmptyStr
+    requested: Annotated[int | float, Field(ge=0)]
+    available: Annotated[int | float, Field(ge=0)]
+
+    @model_validator(mode="after")
+    def validate_rejection(self) -> BudgetAdmissionDimension:
+        if self.requested <= self.available:
+            raise ValueError("budget admission dimension must show a positive deficit")
+        return self
+
+
 class BudgetExhaustion(V2Contract):
-    """Safe admission facts for an attempt the Scheduler never dispatched.
+    """Safe budget facts for a terminal Scheduler attempt.
 
     This is a read-side projection of the framework-owned
-    ``control.budget_exhaustion_evidence`` artifact.  It deliberately carries
-    no provider, prompt, cost, or repair-policy details: a project-execution
-    Agent only needs to know which finite ledger dimension rejected admission
-    and whether a fresh operation actually began.
+    ``control.budget_exhaustion_evidence`` artifact.  Exact requested and
+    available values are included only when a reserve admission rejected an
+    operation before it began; settlement overshoots carry no invented
+    admission comparison because their ``OperationRun`` is authoritative.
     """
 
     exhausted_dimensions: Annotated[tuple[NonEmptyStr, ...], Field(min_length=1, max_length=16)]
+    admission: tuple[BudgetAdmissionDimension, ...] = ()
     during_authorized_repair: bool
     operation_not_started: bool
 
@@ -354,6 +369,11 @@ class BudgetExhaustion(V2Contract):
     def validate_dimensions(self) -> BudgetExhaustion:
         if len(set(self.exhausted_dimensions)) != len(self.exhausted_dimensions):
             raise ValueError("budget exhaustion dimensions must be unique")
+        admission_dimensions = tuple(item.dimension for item in self.admission)
+        if admission_dimensions and admission_dimensions != self.exhausted_dimensions:
+            raise ValueError(
+                "budget admission facts must cover exactly the exhausted dimensions"
+            )
         return self
 
 

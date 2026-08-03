@@ -16,7 +16,7 @@ import math
 import os
 import shutil
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -182,6 +182,7 @@ def _diagnostic_work_runtime(
             else None
         ),
         continuation_workspace_root=continuation_workspace_root,
+        diagnostic_workspace_recovery_capture_root=(diagnostic_workspace_recovery_capture_root),
         model_routes=app.config.agent.model_routes,
         route_liveness_checker=app.controller.route_liveness_checker,
         require_route_liveness_gate=app.controller.route_liveness_checker is not None,
@@ -812,11 +813,7 @@ def _prepare_diagnostic_clone(
         if config is not None:
             ancestors.extend(config.state_root.parents)
         parent = next(
-            (
-                candidate
-                for candidate in ancestors
-                if candidate.name == ".agent-world-live"
-            ),
+            (candidate for candidate in ancestors if candidate.name == ".agent-world-live"),
             Path.cwd() / ".agent-world-live",
         )
     if parent.exists() and parent.is_symlink():
@@ -841,9 +838,7 @@ def _prepare_diagnostic_clone(
         relative = Path(directory).resolve().relative_to(source_root)
         ignored: set[str] = set()
         if relative == Path("."):
-            ignored.update(
-                name for name in names if name in _NON_DURABLE_STATE_DIRECTORIES
-            )
+            ignored.update(name for name in names if name in _NON_DURABLE_STATE_DIRECTORIES)
         if relative == Path("work-control"):
             ignored.update(name for name in names if name in {"scope-budgets", "locks", "tmp"})
         return ignored
@@ -1263,6 +1258,7 @@ class TestNodeRunner:
                 return candidate
         return Path.cwd() / ".agent-world-live"
 
+    @staticmethod
     def _assert_no_symlinks(source_root: Path) -> None:
         for directory, directories, files in os.walk(source_root, followlinks=False):
             relative = Path(directory).resolve().relative_to(source_root)
@@ -1358,6 +1354,16 @@ class TestNodeRunner:
                 "target must be terminal before it can be isolated",
             )
         source_attempt = app.artifacts.get_json(source_head.attempt_ref, WorkAttempt)
+        # A captured state may retain many historical epoch manifests.  Each
+        # manifest contains only compact definition digests, so the old loop
+        # reconstructed every candidate by rescanning *all* WorkDefinition
+        # artifacts for every node.  On a real E2E history that turns one
+        # diagnostic selection into an O(manifests × nodes × definitions)
+        # authenticated read before the target can even open its first
+        # Provider operation.  Build one read-only exact-definition catalog
+        # up front; every use below still validates the binding identity and
+        # the graph is reconstructed byte-for-byte as before.
+        definition_catalog = self._definition_catalog(app.controller.artifacts)
         candidates: list[_FrozenTarget] = []
         saw_matching_manifest = False
         saw_incomplete_definition_closure = False
@@ -1380,7 +1386,11 @@ class TestNodeRunner:
                 continue
             saw_matching_manifest = True
             try:
-                graph = self._reconstruct_graph(app.controller.artifacts, manifest)
+                graph = self._reconstruct_graph(
+                    app.controller.artifacts,
+                    manifest,
+                    definition_catalog=definition_catalog,
+                )
                 rendered = graph.manifest(
                     topology_id=manifest.topology_id,
                     external_root_refs=manifest.external_root_refs,
@@ -1489,9 +1499,15 @@ class TestNodeRunner:
     def _reconstruct_graph(
         artifacts: ArtifactWriter,
         manifest: WorkGraphManifest,
+        *,
+        definition_catalog: Mapping[tuple[str, str, str], tuple[WorkDefinition, ...]] | None = None,
     ) -> GenerationWorkGraph:
         definitions = tuple(
-            TestNodeRunner._definition_for_binding(artifacts, binding)
+            TestNodeRunner._definition_for_binding(
+                artifacts,
+                binding,
+                definition_catalog=definition_catalog,
+            )
             for binding in manifest.node_bindings
         )
         groups = tuple(
@@ -1534,6 +1550,8 @@ class TestNodeRunner:
     def _definition_for_binding(
         artifacts: ArtifactWriter,
         binding: WorkGraphNodeBinding,
+        *,
+        definition_catalog: Mapping[tuple[str, str, str], tuple[WorkDefinition, ...]] | None = None,
     ) -> WorkDefinition:
         # ``WorkGraphNodeBinding`` is intentionally compact; the immutable
         # WorkDefinition revision is the executable contract.  Recover only a
@@ -1541,26 +1559,59 @@ class TestNodeRunner:
         definition_digest = binding.definition_digest
         coordinate = binding.coordinate
         work_id = binding.work_id
-        candidates: list[WorkDefinition] = []
+        key = (coordinate.coordinate_key, work_id, definition_digest)
+        if definition_catalog is not None:
+            candidates = list(definition_catalog.get(key, ()))
+        else:
+            candidates = []
+            for ref in artifacts.list_revisions():
+                if (
+                    ref.artifact_type != "control.work_definition"
+                    or ref.content_hash != definition_digest
+                ):
+                    continue
+                try:
+                    definition = artifacts.get_json(ref, WorkDefinition)
+                except ValueError:
+                    continue
+                if (
+                    definition.work_id == work_id
+                    and definition.coordinate == coordinate
+                    and definition.definition_digest == definition_digest
+                ):
+                    candidates.append(definition)
+        if not candidates or any(item != candidates[0] for item in candidates[1:]):
+            raise WorkResumeError("frozen WorkGraph node lacks one exact WorkDefinition")
+        return candidates[0]
+
+    @staticmethod
+    def _definition_catalog(
+        artifacts: ArtifactWriter,
+    ) -> dict[tuple[str, str, str], tuple[WorkDefinition, ...]]:
+        """Index each authenticated WorkDefinition once for diagnostic selection.
+
+        The catalog is an in-memory read optimization only.  It retains every
+        exact matching definition rather than silently choosing one, so the
+        existing ambiguity failure remains intact at the binding boundary.
+        """
+
+        indexed: dict[tuple[str, str, str], list[WorkDefinition]] = {}
         for ref in artifacts.list_revisions():
-            if (
-                ref.artifact_type != "control.work_definition"
-                or ref.content_hash != definition_digest
-            ):
+            if ref.artifact_type != "control.work_definition":
                 continue
             try:
                 definition = artifacts.get_json(ref, WorkDefinition)
             except ValueError:
                 continue
-            if (
-                definition.work_id == work_id
-                and definition.coordinate == coordinate
-                and definition.definition_digest == definition_digest
-            ):
-                candidates.append(definition)
-        if not candidates or any(item != candidates[0] for item in candidates[1:]):
-            raise WorkResumeError("frozen WorkGraph node lacks one exact WorkDefinition")
-        return candidates[0]
+            key = (
+                definition.coordinate.coordinate_key,
+                definition.work_id,
+                definition.definition_digest,
+            )
+            bucket = indexed.setdefault(key, [])
+            if definition not in bucket:
+                bucket.append(definition)
+        return {key: tuple(values) for key, values in indexed.items()}
 
     @staticmethod
     def _assert_complete_ancestor_closure(
@@ -2898,9 +2949,7 @@ class DiagnosticDescendantNodeRunner:
         )
 
     def _resolve_diagnostic_root(self) -> Path:
-        return _resolve_marked_diagnostic_root(
-            self.diagnostic_state_root, prefix="test_descendant"
-        )
+        return _resolve_marked_diagnostic_root(self.diagnostic_state_root, prefix="test_descendant")
 
     @staticmethod
     def _resolve_manifest_revision(
@@ -5083,9 +5132,7 @@ class DiagnosticWorldPlanNodeRunner:
         )
 
     def _resolve_diagnostic_root(self) -> Path:
-        return _resolve_marked_diagnostic_root(
-            self.diagnostic_state_root, prefix="test_world_plan"
-        )
+        return _resolve_marked_diagnostic_root(self.diagnostic_state_root, prefix="test_world_plan")
 
 
 @dataclass(frozen=True, slots=True)
@@ -6532,10 +6579,7 @@ class DiagnosticFinalNodeRunner:
         if head.commit_ref is None:
             raise TestNodeError(
                 "test_final_node_committed_definition_reuse_failed",
-                (
-                    "committed head "
-                    f"{head.coordinate.coordinate_key} lacks a commit reference"
-                ),
+                (f"committed head {head.coordinate.coordinate_key} lacks a commit reference"),
             )
         try:
             commit = app.artifacts.get_json(head.commit_ref, WorkCommit)
@@ -6721,9 +6765,7 @@ class DiagnosticFinalNodeRunner:
         return policy.budget.llm_tokens, policy.budget.wall_seconds
 
     def _resolve_diagnostic_root(self) -> Path:
-        return _resolve_marked_diagnostic_root(
-            self.diagnostic_state_root, prefix="test_final_node"
-        )
+        return _resolve_marked_diagnostic_root(self.diagnostic_state_root, prefix="test_final_node")
 
     @staticmethod
     def _one_consumer_ref(commit: WorkCommit, *, artifact_type: str) -> ArtifactRef:
@@ -6862,7 +6904,9 @@ class DiagnosticSuccessorNodeRunner:
         source_diagnostic_root = self._resolve_diagnostic_root()
         diagnostic_root = _prepare_diagnostic_clone(
             source_root=source_diagnostic_root,
-            diagnostic_parent=TestNodeRunner(config=self.config)._diagnostic_parent(source_diagnostic_root),
+            diagnostic_parent=TestNodeRunner(config=self.config)._diagnostic_parent(
+                source_diagnostic_root
+            ),
             marker_error_code="test_successor_diagnostic_marker_failed",
             marker_message="fresh diagnostic successor state could not be marked",
         )
@@ -7123,9 +7167,7 @@ class DiagnosticSuccessorNodeRunner:
         )
 
     def _resolve_diagnostic_root(self) -> Path:
-        return _resolve_marked_diagnostic_root(
-            self.diagnostic_state_root, prefix="test_successor"
-        )
+        return _resolve_marked_diagnostic_root(self.diagnostic_state_root, prefix="test_successor")
 
     @staticmethod
     def _architecture_coordinate(heads: tuple[WorkControlHead, ...]) -> WorkCoordinate:

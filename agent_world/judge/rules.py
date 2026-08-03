@@ -236,7 +236,14 @@ def _evaluate_clause(clause: Any, context: RuleExecutionContext) -> bool:
         result = left is _MISSING
     else:
         if left is _MISSING:
-            raise RuleEvaluationError(f"clause {clause.clause_id} left value is absent")
+            # A Rule can be evaluated after an action unrelated to the task it
+            # ultimately describes.  In that ordinary case a dynamic selector
+            # (for example args.task_id after catalog.list_tasks) has no value.
+            # That is a false predicate, not a malformed Candidate state.  The
+            # compiler owns rejecting structurally unreachable references; the
+            # runtime interpreter must not turn a missing optional action value
+            # into a spurious Candidate failure or repair instruction.
+            return False
         if operator == "schema_valid":
             assert clause.json_schema is not None
             result = not tuple(Draft202012Validator(clause.json_schema).iter_errors(left))
@@ -244,7 +251,7 @@ def _evaluate_clause(clause: Any, context: RuleExecutionContext) -> bool:
             assert clause.right is not None
             right = _resolve_term(clause.right, context)
             if right is _MISSING:
-                raise RuleEvaluationError(f"clause {clause.clause_id} right value is absent")
+                return False
             result = _compare(operator, left, right, ordering=clause.ordering)
     return not result if clause.negate else result
 
@@ -269,7 +276,7 @@ def _resolve_term(term: RuleTerm, context: RuleExecutionContext) -> Any:
             raise RuleEvaluationError("lookup_by_key collection exceeds framework limits")
         key = _resolve_term(term.key, context)
         if key is _MISSING:
-            raise RuleEvaluationError("lookup_by_key key is absent")
+            return _MISSING
         matches = [
             item
             for item in collection

@@ -171,6 +171,7 @@ def _design(
     *,
     transition_sensitivity: str = "positive_only",
     error_sensitivity: str = "positive_and_negative",
+    extra_error: bool = False,
 ) -> EnvironmentDesign:
     artifact = _ref("evidence")
     transition = _rule(
@@ -207,6 +208,14 @@ def _design(
         "less_or_equal",
         _constant(0),
         sensitivity=error_sensitivity,
+    )
+    upper_bound_error = _rule(
+        "rule:error:upper_bound",
+        "error_condition",
+        _ref_value("args", "/amount"),
+        "greater_than",
+        _constant(7),
+        sensitivity="positive_only",
     )
     invariant = _rule(
         "rule:invariant",
@@ -265,6 +274,19 @@ def _design(
                 observation="The amount is invalid.",
                 state_effect="none",
                 retryable=False,
+            ),
+            *(
+                (
+                    ToolError(
+                        error_code="amount_too_large",
+                        when=upper_bound_error,
+                        observation="The amount exceeds the bounded counter range.",
+                        state_effect="none",
+                        retryable=False,
+                    ),
+                )
+                if extra_error
+                else ()
             ),
         ),
         permission=PermissionRule(
@@ -425,6 +447,7 @@ def _design(
                 transition.rule_id,
                 postcondition.rule_id,
                 error_condition.rule_id,
+                *((upper_bound_error.rule_id,) if extra_error else ()),
                 success.rule_id,
                 terminal.rule_id,
             ),
@@ -554,7 +577,7 @@ def test_challenger_context_is_deduplicated_and_omits_rule_expressions() -> None
     context = VerifierCompiler._challenger_context(design)
     serialized = json.dumps(context, sort_keys=True)
 
-    assert context["schema_version"] == "agent-world.challenger-context.v5"
+    assert context["schema_version"] == "agent-world.challenger-context.v7"
     reset_config_schemas = context["reset_config_schemas"]
     assert isinstance(reset_config_schemas, list)
     assert len(reset_config_schemas) == 1
@@ -590,12 +613,15 @@ def test_challenger_context_is_deduplicated_and_omits_rule_expressions() -> None
     assert "positive means an `expectations` item" in prompt
     assert "`expected=true`" in prompt
     assert "merely including that tool elsewhere" in prompt
-    assert "One expectation item may satisfy every compatible coverage row" in prompt
+    assert "One expectation item may satisfy compatible coverage rows" in prompt
     assert "never put both polarities" in prompt
     assert "Within one case, emit each" in prompt
     assert "`(kind, after_action_ordinal)` at most once" in prompt
     assert "Action-input schema audit is mandatory" in prompt
     assert "additionalProperties=false" in prompt
+    assert "precondition_summaries" in prompt
+    assert "error_paths" in prompt
+    assert "different\nerror_code values" in prompt
     assert "Solve-recipe binding audit is mandatory" in prompt
     assert "A matching field name is not proof" in prompt
     assert "`solve_recipe_binding_guide`" in prompt
@@ -654,6 +680,102 @@ def test_compact_intent_expands_to_complete_rule_bound_verifier() -> None:
         design.verification.required_rule_ids
     )
     VerifierCompiler._validate_draft(compiled, design)
+
+
+def test_multi_error_intent_selects_one_declared_error_path() -> None:
+    """A family label cannot silently bind several mutually exclusive errors."""
+
+    design = _design(extra_error=True)
+    draft = _draft(design)
+    rules = design_rule_index(design)
+    generic_intent = VerifierIntent(
+        cases=tuple(
+            VerifierCaseIntent(
+                task_type=case.task_type,
+                evaluator_goal=case.evaluator_goal,
+                actor=case.actor,
+                reset_config=case.reset_config,
+                actions=case.actions,
+                expectations=tuple(
+                    PropertyExpectationIntent(
+                        kind={"error_condition": "error_semantics"}.get(
+                            rules[item.rule_id].family,
+                            rules[item.rule_id].family,
+                        ),  # type: ignore[arg-type]
+                        after_action_ordinal=item.action_index + 1,
+                        expected=item.expected,
+                    )
+                    for item in case.assertions
+                ),
+            )
+            for case in draft.cases
+        ),
+        solve_recipes=draft.solve_recipes,
+    )
+
+    with pytest.raises(StructuredValidationError) as captured:
+        VerifierCompiler._validate_intent(  # noqa: SLF001 - true intent boundary
+            generic_intent,
+            design,
+            allowed_task_types=("increase",),
+            required_rule_ids=design.verification.required_rule_ids,
+            required_property_families=design.verification.required_property_families,
+            require_metamorphic=False,
+        )
+
+    assert {issue.code for issue in captured.value.diagnostic.issues} == {
+        "intent_error_code_required"
+    }
+    context = VerifierCompiler._challenger_context(design)
+    tool = next(item for item in context["tools"] if item["tool_id"] == "counter.increment")
+    assert tool["error_codes"] == ["invalid_amount", "amount_too_large"]
+    assert [item["error_code"] for item in tool["error_paths"]] == [
+        "invalid_amount",
+        "amount_too_large",
+    ]
+    assert tool["precondition_summaries"] == ["Executable precondition rule."]
+    error_rows = [
+        item
+        for item in context["coverage_requirements"]
+        if item["property_kind"] == "error_semantics"
+    ]
+    assert {item["error_code"] for item in error_rows} == {
+        "invalid_amount",
+        "amount_too_large",
+    }
+
+    selected_intent = generic_intent.model_copy(
+        update={
+            "cases": tuple(
+                case.model_copy(
+                    update={
+                        "expectations": tuple(
+                            item.model_copy(update={"error_code": "invalid_amount"})
+                            if item.kind == "error_semantics"
+                            else item
+                            for item in case.expectations
+                        )
+                    }
+                )
+                for case in generic_intent.cases
+            )
+        }
+    )
+    with pytest.raises(StructuredValidationError) as binding:
+        VerifierCompiler._compile_intent(  # noqa: SLF001 - true rule-binding boundary
+            selected_intent,
+            design,
+            allowed_task_types=("increase",),
+            required_rule_ids=design.verification.required_rule_ids,
+            required_property_families=design.verification.required_property_families,
+            require_metamorphic=False,
+        )
+
+    assert any(
+        item.code == "rule_positive_partition_coverage"
+        and item.location[0] == "coverage_requirements"
+        for item in binding.value.diagnostic.issues
+    )
 
 
 def test_verifier_requires_preferred_recipe_for_release_without_hidden_solver() -> None:
@@ -1400,6 +1522,7 @@ def test_verifier_intent_compiles_one_based_ordinal_to_zero_based_index() -> Non
     assert expectation.model_dump() == {
         "schema_version": "v2",
         "kind": "transition",
+        "error_code": None,
         "after_action_ordinal": 1,
         "expected": True,
     }

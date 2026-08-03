@@ -162,6 +162,12 @@ def _issue_line(issue: TopIssue) -> str:
     return line
 
 
+def _number(value: int | float) -> str:
+    """Render safe finite budget values without cosmetic trailing zeroes."""
+
+    return str(value) if isinstance(value, int) else format(value, "g")
+
+
 def _append_timing(lines: list[str], scene: CoordinateScene) -> None:
     """Render the safe durable timing facts without introducing live state."""
 
@@ -185,6 +191,14 @@ def _append_timing(lines: list[str], scene: CoordinateScene) -> None:
         if budget_exhaustion.operation_not_started:
             details.append("no operation ran in this attempt")
         lines.append("; ".join(details) + ".")
+        for admission in budget_exhaustion.admission:
+            deficit = admission.requested - admission.available
+            lines.append(
+                "Budget admission: "
+                f"{admission.dimension} requested {_number(admission.requested)}, "
+                f"available {_number(admission.available)} "
+                f"(deficit {_number(deficit)})."
+            )
         if budget_exhaustion.operation_not_started:
             lines.append(
                 "Next permitted action: reconcile the finite run budget for a fresh request; "

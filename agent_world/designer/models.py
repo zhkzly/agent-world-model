@@ -1455,9 +1455,26 @@ class CurriculumTaskPlanSourceDraft(AgentOutput):
     objective: Annotated[str, Field(min_length=1)]
     allowed_actor_ids: Annotated[
         tuple[Identifier, ...],
-        Field(min_length=1, max_length=MAX_ACTORS_PER_TASK),
+        Field(
+            min_length=1,
+            max_length=MAX_ACTORS_PER_TASK,
+            description=(
+                "Alternative task callers, not a roster of every workflow participant. "
+                "Every listed actor must independently be permitted to invoke every "
+                "required_tool_id."
+            ),
+        ),
     ]
-    required_tool_ids: Annotated[tuple[Identifier, ...], Field(min_length=1)]
+    required_tool_ids: Annotated[
+        tuple[Identifier, ...],
+        Field(
+            min_length=1,
+            description=(
+                "Tools the eligible task caller must invoke. Do not list verifier-only "
+                "tools or calls made solely by a different workflow participant."
+            ),
+        ),
+    ]
     difficulty_dimensions: Annotated[
         tuple[Identifier, ...],
         Field(min_length=1, max_length=MAX_DIFFICULTY_DIMENSIONS),

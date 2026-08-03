@@ -150,7 +150,14 @@ class VerifierBatchDraft(V2Contract):
 
 
 class PropertyExpectationIntent(V2Contract):
-    """Compact semantic label expanded to exact Rule obligations by the framework."""
+    """Compact semantic label expanded to exact Rule obligations by the framework.
+
+    ``error_code`` is intentionally a public semantic selector rather than a
+    Rule identifier.  A tool may declare several error conditions, while one
+    Runtime action can only emit one error response.  The Challenger therefore
+    has to identify the error path it means to exercise before the framework
+    binds the corresponding private Rule.
+    """
 
     kind: Literal[
         "invariant",
@@ -169,6 +176,13 @@ class PropertyExpectationIntent(V2Contract):
         "task_terminal",
         "sampling",
     ]
+    error_code: Identifier | None = Field(
+        default=None,
+        description=(
+            "For error_semantics only: one declared error code for the action tool. "
+            "It is required when that tool declares more than one error code."
+        ),
+    )
     after_action_ordinal: Annotated[
         int,
         Field(
@@ -210,9 +224,10 @@ class VerifierCaseIntent(V2Contract):
     ]
 
     @property
-    def expectation_keys(self) -> frozenset[tuple[str, int, bool]]:
+    def expectation_keys(self) -> frozenset[tuple[str, str | None, int, bool]]:
         return frozenset(
-            (item.kind, item.action_index, item.expected) for item in self.expectations
+            (item.kind, item.error_code, item.action_index, item.expected)
+            for item in self.expectations
         )
 
 

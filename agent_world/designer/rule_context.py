@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal, cast
 
+from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from pydantic import JsonValue, TypeAdapter
 
 from agent_world.contracts import (
@@ -267,6 +268,49 @@ class RuleContextCatalog:
     ) -> dict[str, object]:
         """Render a compact projection from aliases owned by this catalog."""
 
+        def reference_value_domain(
+            binding: FrozenRuleReferenceBinding,
+        ) -> dict[str, list[JsonValue]]:
+            schema = self.schemas.get(binding.source)
+            if schema is None:
+                return {}
+            resolution = _resolve_schema_pointer(
+                schema,
+                binding.pointer,
+                document=schema,
+            )
+            return _compact_prompt_value_domain(
+                resolution.schema if resolution.failure is None else None
+            )
+
+        def lookup_value_domain(
+            binding: FrozenRuleLookupBinding,
+        ) -> dict[str, list[JsonValue]]:
+            schema = self.schemas.get(binding.source)
+            if schema is None:
+                return {}
+            collection = _resolve_schema_pointer(
+                schema,
+                binding.collection_pointer,
+                document=schema,
+            )
+            if collection.failure is not None or collection.schema is None:
+                return {}
+            raw_items = collection.schema.get("items")
+            if not isinstance(raw_items, dict):
+                return {}
+            item = _dereference_schema(raw_items, document=schema)
+            if item.failure is not None or item.schema is None:
+                return {}
+            value = _resolve_schema_pointer(
+                item.schema,
+                binding.value_pointer,
+                document=schema,
+            )
+            return _compact_prompt_value_domain(
+                value.schema if value.failure is None else None
+            )
+
         def ordered_aliases(*, value_types: frozenset[RuleValueType]) -> dict[str, list[str]]:
             return {
                 "bound_reference": [
@@ -342,6 +386,7 @@ class RuleContextCatalog:
                     "source": binding.source,
                     "pointer": binding.pointer,
                     "value_type": binding.value_type,
+                    **reference_value_domain(binding),
                 }
                 for alias, binding in reference_bindings.items()
             ],
@@ -356,6 +401,7 @@ class RuleContextCatalog:
                             "binding_id": alias,
                             "value_pointer": binding.value_pointer,
                             "value_type": binding.value_type,
+                            **lookup_value_domain(binding),
                         }
                         for alias, binding in group
                     ],
@@ -375,6 +421,7 @@ class RuleContextCatalog:
                     "key_value_type": key_value_type,
                     "value_pointer": value_pointer,
                     "value_type": value_type,
+                    **lookup_value_domain(group[0][1].lookup_binding),
                     "reference_key_bindings": [
                         {
                             "binding_id": alias,
@@ -1180,6 +1227,34 @@ class _Resolution:
     failure: Literal["missing", "selector_required", "invalid_schema"] | None = None
 
 
+def _compact_prompt_value_domain(
+    schema: dict[str, JsonValue] | None,
+) -> dict[str, list[JsonValue]]:
+    """Expose a small finite literal domain without copying a full JSON Schema.
+
+    ToolSemantics Agents choose a binding and then author a typed literal.  A
+    binding's ``value_type`` alone is insufficient for a closed lifecycle or
+    status field: it says ``string`` but not which strings can occur.  This
+    compact disclosure is an Agent-view aid, not a new Rule vocabulary or a
+    substitute for deterministic schema validation.  Keep it bounded so a
+    broad enum cannot dominate every batch prompt.
+    """
+
+    if schema is None:
+        return {}
+    raw_values = schema.get("enum")
+    if raw_values is None and "const" in schema:
+        raw_values = [schema["const"]]
+    if not isinstance(raw_values, list) or not 0 < len(raw_values) <= 32:
+        return {}
+    values: list[JsonValue] = []
+    for value in raw_values:
+        if value is not None and not isinstance(value, str | int | float | bool):
+            return {}
+        values.append(cast(JsonValue, value))
+    return {"enum_values": values}
+
+
 def validate_rule_context(
     rule: Rule,
     *,
@@ -1188,6 +1263,83 @@ def validate_rule_context(
     """Return every safe reference/selector closure issue in one Rule."""
 
     issues: list[SafeValidationIssue] = []
+
+    def schema_for_term(term: RuleTerm) -> dict[str, JsonValue] | None:
+        """Return the closed JSON Schema domain of one non-constant term.
+
+        The first pass below still reports every bad pointer and selector.  This
+        helper is deliberately narrower: it lets the compiler reject a literal
+        that cannot occur in the frozen domain of an otherwise valid reference.
+        Without this check a ToolSemantics Agent can author e.g. a lifecycle
+        precondition for a value that the State schema itself forbids, leaving
+        Builder and Verifier to discover an unsatisfiable world much later.
+        """
+
+        if isinstance(term, RuleConstant):
+            return None
+        if isinstance(term, RuleValueRef):
+            source_schema = catalog.schemas.get(term.source)
+            if source_schema is None:
+                return None
+            resolution = _resolve_schema_pointer(
+                source_schema,
+                term.pointer,
+                document=source_schema,
+            )
+            return resolution.schema if resolution.failure is None else None
+        if isinstance(term, RuleLookupByKey):
+            source_schema = catalog.schemas.get(term.source)
+            if source_schema is None:
+                return None
+            collection = _resolve_schema_pointer(
+                source_schema,
+                term.collection_pointer,
+                document=source_schema,
+            )
+            if collection.failure is not None or collection.schema is None:
+                return None
+            raw_items = collection.schema.get("items")
+            if not isinstance(raw_items, dict):
+                return None
+            item = _dereference_schema(raw_items, document=source_schema)
+            if item.failure is not None or item.schema is None:
+                return None
+            value = _resolve_schema_pointer(
+                item.schema,
+                term.value_pointer,
+                document=source_schema,
+            )
+            return value.schema if value.failure is None else None
+        if isinstance(term, RuleArithmetic):
+            return {"type": "number"}
+        raise TypeError(f"unsupported Rule term: {type(term).__name__}")
+
+    def validate_constant(
+        constant: RuleConstant,
+        *,
+        schema: dict[str, JsonValue] | None,
+        path: tuple[str | int, ...],
+    ) -> None:
+        """Reject values that a frozen referenced schema can never contain."""
+
+        if schema is None:
+            return
+        if not tuple(Draft202012Validator(schema).iter_errors(constant.value)):
+            return
+        issues.append(
+            SafeValidationIssue(
+                code="rule_constant_schema_mismatch",
+                location=(*path, "value"),
+                message=(
+                    "A Rule constant must be accepted by the frozen schema of the "
+                    "referenced value."
+                ),
+                violated_condition=(
+                    "the literal can occur in the closed domain selected by the Rule"
+                ),
+                expected_category="a literal allowed by the frozen referenced JSON Schema",
+            )
+        )
 
     def validate_term(term: RuleTerm, path: tuple[str | int, ...]) -> None:
         if isinstance(term, RuleConstant):
@@ -1357,6 +1509,12 @@ def validate_rule_context(
                         path=(*path, "key", "value_type"),
                         issues=issues,
                     )
+                if isinstance(term.key, RuleConstant):
+                    validate_constant(
+                        term.key,
+                        schema=key_schema,
+                        path=(*path, "key"),
+                    )
             return
         if isinstance(term, RuleArithmetic):
             validate_term(term.left, (*path, "left"))
@@ -1365,9 +1523,23 @@ def validate_rule_context(
         raise TypeError(f"unsupported Rule term: {type(term).__name__}")
 
     for clause_index, clause in enumerate(rule.clauses):
-        validate_term(clause.left, ("clauses", clause_index, "left"))
+        left_path = ("clauses", clause_index, "left")
+        validate_term(clause.left, left_path)
         if clause.right is not None:
-            validate_term(clause.right, ("clauses", clause_index, "right"))
+            right_path = ("clauses", clause_index, "right")
+            validate_term(clause.right, right_path)
+            if isinstance(clause.left, RuleConstant):
+                validate_constant(
+                    clause.left,
+                    schema=schema_for_term(clause.right),
+                    path=left_path,
+                )
+            if isinstance(clause.right, RuleConstant):
+                validate_constant(
+                    clause.right,
+                    schema=schema_for_term(clause.left),
+                    path=right_path,
+                )
     return tuple(dict.fromkeys(issues))
 
 

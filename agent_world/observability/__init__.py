@@ -15,6 +15,7 @@ from .projector import SceneProjector
 from .query import ObservabilityReader, SceneRead
 from .scene import (
     ActiveWorkPointer,
+    BudgetAdmissionDimension,
     BudgetExhaustion,
     CandidateWorkspaceLiveness,
     CodexTerminalEnvelope,
@@ -46,6 +47,7 @@ from .subprocess_scene import (
 
 __all__ = [
     "ActiveWorkPointer",
+    "BudgetAdmissionDimension",
     "BudgetExhaustion",
     "CandidateWorkspaceLiveness",
     "CodexTerminalEnvelope",

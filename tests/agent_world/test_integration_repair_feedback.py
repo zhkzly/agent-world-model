@@ -16,15 +16,24 @@ from agent_world.contracts import (
     Finding,
     GateResult,
     IntegrationReport,
+    JudgeReport,
+    ReleaseProfile,
     sha256_digest,
 )
-from agent_world.judge import IntegrationLeaf
+from agent_world.judge import IntegrationLeaf, ReleaseAssuranceLeaf
+from agent_world.judge.models import CaseEvaluation
+from agent_world.judge.protocol import ProtocolViolation
+from agent_world.judge.semantics import ToolSemanticValidationError
 from agent_world.judge.service import (
     EnvironmentJudge,
     _candidate_failure_summary,
+    _case_failure_repair_remediation,
+    _CaseRunResult,
+    _InvokeObservationProjectionFailure,
+    _public_case_repair_remediation,
     _RuntimeInitialStateCheck,
 )
-from agent_world.judge.supervisor import RuntimeProcessCrashed, ProcessResult
+from agent_world.judge.supervisor import ProcessResult, RuntimeProcessCrashed
 
 
 def _ref(label: str, artifact_type: str) -> ArtifactRef:
@@ -87,6 +96,28 @@ def _finding(
         disclosure="repair",
         suggested_repair=remediation,
     )
+
+
+def test_public_self_check_stays_diagnostic_for_a_legacy_profile() -> None:
+    """Old frozen profiles remain readable but cannot promote self-checks."""
+
+    candidate_ref = _ref("candidate", "build.environment_candidate")
+    evidence_ref = _ref("self-check", "judge.evaluation_evidence")
+    profile = ReleaseProfile(
+        profile_id="legacy-public-self-check",
+        required_hard_gates=("schema", "public_self_check"),
+    )
+
+    gate = EnvironmentJudge._gate(  # noqa: SLF001
+        "public_self_check",
+        "fail",
+        candidate_ref,
+        (evidence_ref,),
+        profile,
+        "Public self-check failed in the clean sandbox.",
+    )
+
+    assert not gate.hard
 
 
 def test_integration_repair_feedback_excludes_skipped_downstream_gate_noise() -> None:
@@ -155,6 +186,268 @@ def test_integration_repair_feedback_excludes_skipped_downstream_gate_noise() ->
     ]
     assert all("Deployment probe" not in issue.violated_condition for issue in issues)
     assert issues[0].remediation == "Return the exact handshake operations string array."
+
+
+def test_release_repair_feedback_projects_only_actionable_runtime_roots() -> None:
+    candidate_ref = _ref("candidate", "build.environment_candidate")
+    evidence_ref = _ref("release", "judge.evaluation_evidence")
+    behavior_remediation = (
+        "For Runtime `invoke`, build `observation` from the invoked tool's projection and "
+        "validate it against that tool's observation schema; do not reuse reset state."
+    )
+    reachability_remediation = (
+        "Every sampled reachability episode stopped at the Candidate Runtime execution boundary. "
+        "Correct the disclosed Runtime behavior failure before changing Task Materializer "
+        "or Verifier."
+    )
+    report = JudgeReport(
+        report_id="report:release-root-cause-only",
+        revision=1,
+        candidate_ref=candidate_ref,
+        verdict="fail",
+        gate_results=(
+            _gate(candidate_ref, evidence_ref, "behavior", "fail", "behavior: 0/5 cases passed."),
+            _gate(
+                candidate_ref,
+                evidence_ref,
+                "task_reachability",
+                "fail",
+                (
+                    "Reachability ran 80 sampled tasks: 0 reached trusted terminal success and "
+                    "80 did not; no aggregate release reachability claim was issued."
+                ),
+            ),
+            _gate(
+                candidate_ref,
+                evidence_ref,
+                "sealed_release",
+                "fail",
+                "sealed-release: 0/5 cases passed.",
+            ),
+        ),
+        findings=(
+            _finding(
+                candidate_ref,
+                evidence_ref,
+                "behavior",
+                "behavior did not pass.",
+                behavior_remediation,
+            ),
+            _finding(
+                candidate_ref,
+                evidence_ref,
+                "task_reachability",
+                "task_reachability did not pass.",
+                reachability_remediation,
+            ),
+            Finding(
+                finding_id="finding:sealed-release",
+                category="sealed_release",
+                severity="high",
+                owner="build",
+                subject_ref=candidate_ref,
+                summary="sealed_release did not pass.",
+                evidence_refs=(evidence_ref,),
+                fingerprint=sha256_digest(b"finding:sealed-release"),
+                disclosure="sealed_summary",
+                suggested_repair="sealed-release: 0/5 cases passed.",
+            ),
+        ),
+        evaluation_evidence_refs=(evidence_ref,),
+    )
+
+    issues, routeable = ReleaseAssuranceLeaf._release_repair_feedback(report)  # noqa: SLF001
+
+    assert routeable is True
+    assert [issue.code for issue in issues] == ["release_gate_behavior_fail"]
+    assert issues[0].remediation == behavior_remediation
+    assert all("reachability" not in issue.code for issue in issues)
+    assert all("sealed" not in issue.code for issue in issues)
+
+
+def test_release_repair_feedback_keeps_an_independent_reachability_root() -> None:
+    candidate_ref = _ref("candidate", "build.environment_candidate")
+    evidence_ref = _ref("release", "judge.evaluation_evidence")
+    remediation = "Repair the public solve path that prevents trusted terminal success."
+    report = JudgeReport(
+        report_id="report:release-reachability-root",
+        revision=1,
+        candidate_ref=candidate_ref,
+        verdict="fail",
+        gate_results=(
+            _gate(
+                candidate_ref,
+                evidence_ref,
+                "task_reachability",
+                "fail",
+                "Reachability ran 8 sampled tasks: none reached trusted terminal success.",
+            ),
+        ),
+        findings=(
+            _finding(
+                candidate_ref,
+                evidence_ref,
+                "task_reachability",
+                "task_reachability did not pass.",
+                remediation,
+            ),
+        ),
+        evaluation_evidence_refs=(evidence_ref,),
+    )
+
+    issues, routeable = ReleaseAssuranceLeaf._release_repair_feedback(report)  # noqa: SLF001
+
+    assert routeable is True
+    assert [issue.code for issue in issues] == ["release_gate_task_reachability_fail"]
+    assert issues[0].remediation == remediation
+
+
+def test_release_repair_feedback_refuses_generic_or_sealed_only_repair() -> None:
+    candidate_ref = _ref("candidate", "build.environment_candidate")
+    evidence_ref = _ref("release", "judge.evaluation_evidence")
+    report = JudgeReport(
+        report_id="report:release-feedback-insufficient",
+        revision=1,
+        candidate_ref=candidate_ref,
+        verdict="fail",
+        gate_results=(
+            _gate(
+                candidate_ref,
+                evidence_ref,
+                "runtime_protocol",
+                "fail",
+                "Runtime protocol did not pass.",
+            ),
+            _gate(
+                candidate_ref,
+                evidence_ref,
+                "sealed_release",
+                "fail",
+                "sealed-release: 0/5 cases passed.",
+            ),
+        ),
+        findings=(
+            _finding(
+                candidate_ref,
+                evidence_ref,
+                "runtime_protocol",
+                "runtime_protocol did not pass.",
+                "Runtime protocol did not pass.",
+            ),
+            Finding(
+                finding_id="finding:sealed-only",
+                category="sealed_release",
+                severity="high",
+                owner="build",
+                subject_ref=candidate_ref,
+                summary="sealed_release did not pass.",
+                evidence_refs=(evidence_ref,),
+                fingerprint=sha256_digest(b"finding:sealed-only"),
+                disclosure="sealed_summary",
+                suggested_repair="sealed-release: 0/5 cases passed.",
+            ),
+        ),
+        evaluation_evidence_refs=(evidence_ref,),
+    )
+
+    issues, routeable = ReleaseAssuranceLeaf._release_repair_feedback(report)  # noqa: SLF001
+
+    assert routeable is False
+    assert [issue.code for issue in issues] == ["release_report_root_cause_insufficient"]
+
+
+def test_public_runtime_failure_signatures_become_one_complete_repair_brief() -> None:
+    """Public evidence may repair a Runtime; sealed or partial evidence may not."""
+
+    failures = (
+        ProtocolViolation("schema_mismatch", "response.error has invalid keys"),
+        ToolSemanticValidationError(
+            "execution.start_or_resume_task violates precondition Rules: ['rule:precondition:0']"
+        ),
+        _InvokeObservationProjectionFailure(
+            tool_id="human.record_approval",
+            actor="human_operator",
+            required_fields=("approval_event_id",),
+            cause=ValueError("observation projection is missing a required field"),
+        ),
+        ToolSemanticValidationError(
+            "Runtime emitted task_not_resumable while its declared Rule is false"
+        ),
+    )
+    runs = tuple(
+        _CaseRunResult(
+            evaluation=CaseEvaluation(
+                case_id=f"case:public:{index}",
+                partition="public",
+                seed=index,
+                passed=False,
+                reset_ok=False,
+                actions=(),
+                assertions=(),
+                failure_class="runtime_execution_failed",
+                failure_summary=f"{type(exc).__name__}: {exc}",
+            ),
+            tool_calls=0,
+            repair_remediation=_case_failure_repair_remediation(exc),
+        )
+        for index, exc in enumerate(failures)
+    )
+
+    brief = _public_case_repair_remediation(runs)
+
+    assert brief is not None
+    assert len(brief) <= 512
+    assert "`error` fields: `code`, `message`, `retryable`, optional `details`" in brief
+    assert "`execution.start_or_resume_task`" in brief
+    assert "tool's per-actor observation projection" in brief
+    assert "`approval_event_id`" in brief
+    assert "frozen `when` Rule is true" in brief
+    assert "task_not_resumable" not in brief
+    assert "Verifier" in brief
+
+
+def test_invoke_projection_feedback_discloses_only_framework_owned_fields() -> None:
+    """A repair brief may name frozen schema fields, never dynamic failure text."""
+
+    failure = _InvokeObservationProjectionFailure(
+        tool_id="execution.start_or_resume_task",
+        actor="agent_runtime",
+        required_fields=("execution_event_id",),
+        cause=ValueError("candidate supplied secret-like detail: token=not-for-feedback"),
+    )
+
+    remediation = _case_failure_repair_remediation(failure)
+
+    assert remediation is not None
+    assert "`execution.start_or_resume_task`" in remediation
+    assert "`agent_runtime`" in remediation
+    assert "`execution_event_id`" in remediation
+    assert "token=not-for-feedback" not in remediation
+
+
+def test_public_runtime_feedback_refuses_a_partial_failure_list() -> None:
+    known = ProtocolViolation("schema_mismatch", "response.error has invalid keys")
+    unknown = ValueError("candidate-controlled detail must not become feedback")
+    runs = tuple(
+        _CaseRunResult(
+            evaluation=CaseEvaluation(
+                case_id=f"case:public:{index}",
+                partition="public",
+                seed=index,
+                passed=False,
+                reset_ok=False,
+                actions=(),
+                assertions=(),
+                failure_class="runtime_execution_failed",
+                failure_summary=f"{type(exc).__name__}: {exc}",
+            ),
+            tool_calls=0,
+            repair_remediation=_case_failure_repair_remediation(exc),
+        )
+        for index, exc in enumerate((known, unknown))
+    )
+
+    assert _public_case_repair_remediation(runs) is None
 
 
 def test_sandbox_failure_feedback_exposes_safe_missing_module_coordinate() -> None:
