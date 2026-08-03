@@ -1063,7 +1063,7 @@ def test_final_design_suffix_is_derived_only_from_frozen_tool_coupling_plan() ->
             item.repair_policy.maximum_infrastructure_retries,
             item.repair_policy.maximum_total_repair_attempts,
         )
-        == (1, 1, 1, 3)
+        == (1, 1, 1, 8)
         for item in batches
     )
     assert all(
@@ -1457,7 +1457,7 @@ def test_model_route_recovery_binding_reaches_every_configured_fallback() -> Non
     )
 
     assert agent_definition.repair_policy.maximum_model_fallbacks == 1
-    assert agent_definition.repair_policy.maximum_total_repair_attempts == 3
+    assert agent_definition.repair_policy.maximum_total_repair_attempts == 8
     assert bound_agent.repair_policy.maximum_infrastructure_retries == 2
     assert bound_agent.repair_policy.maximum_model_fallbacks == 2
     # Two semantic corrections, two infrastructure retries per model, and two
