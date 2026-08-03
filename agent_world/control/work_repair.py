@@ -298,7 +298,13 @@ class WorkRepairLedger:
             elif causal_strict_progress:
                 raise WorkRepairDenied("repair_progress_bonus_not_required")
         elif action.decision in {"infrastructure_retry", "model_fallback"}:
-            if report.status != "error":
+            if report.status != "error" and (
+                action.reason_code != "semantic_no_progress_model_fallback"
+            ):
+                # The exhausted-semantic-chain fallback is the one case that
+                # legitimately carries a status="failed" (actionable) report:
+                # the correction loop converged out on this model, so the next
+                # model replays the same repair context on a fresh session.
                 raise WorkRepairDenied("transport_recovery_requires_error_report")
             if action.decision == "model_fallback":
                 if action.model_override is None:
