@@ -12719,6 +12719,13 @@ operands remain typed JSON strings. Do not emit successful
 transition rules, permissions, observation projection, reliability policy, another tool,
 invariants, tasks, reward, verifier, code, or expected answers.
 
+Treat the error inventory as executable coverage, not a list of examples. A Runtime may emit an
+error code only when that code's `when` Rule is true. If a frozen success precondition excludes
+multiple schema-valid finite lifecycle or enum states, inspect those remaining states: do not use
+one `not_*` error condition for several different states unless its Rule actually covers each of
+them. Do not leave an ordinary reachable pre-state with neither a successful path nor a compatible
+declared error path.
+
 Original need:
 {request.need}
 """

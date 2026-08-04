@@ -356,6 +356,64 @@ def test_release_repair_feedback_refuses_generic_or_sealed_only_repair() -> None
     assert [issue.code for issue in issues] == ["release_report_root_cause_insufficient"]
 
 
+def test_release_assertion_mismatch_stays_with_verifier_not_builder(tmp_path: Path) -> None:
+    """A failed assertion without Candidate-facing evidence must not open a Builder repair."""
+
+    candidate_ref = _ref("candidate", "build.environment_candidate")
+    verifier_ref = _ref("verifier", "judge.verifier_ir_projection")
+    evidence_ref = _ref("release", "judge.evaluation_evidence")
+    report = JudgeReport(
+        report_id="report:release-verifier-mismatch",
+        revision=1,
+        candidate_ref=candidate_ref,
+        verdict="fail",
+        gate_results=(
+            _gate(candidate_ref, evidence_ref, "behavior", "fail", "behavior: 0/2 cases passed."),
+        ),
+        findings=(
+            Finding(
+                finding_id="finding:verifier-mismatch",
+                category="behavior",
+                severity="high",
+                owner="verifier",
+                subject_ref=verifier_ref,
+                summary="behavior did not pass.",
+                evidence_refs=(evidence_ref,),
+                fingerprint=sha256_digest(b"finding:verifier-mismatch"),
+                disclosure="repair",
+                suggested_repair=None,
+            ),
+        ),
+        evaluation_evidence_refs=(evidence_ref,),
+    )
+
+    issues, routeable = ReleaseAssuranceLeaf._release_repair_feedback(report)  # noqa: SLF001
+
+    assert routeable is False
+    assert [issue.code for issue in issues] == ["release_report_root_cause_insufficient"]
+
+    judge = _judge(tmp_path)
+    gates: list[GateResult] = []
+    evidence_refs: list[ArtifactRef] = []
+    findings: list[Finding] = []
+    judge._record_gate(  # noqa: SLF001 - finding ownership is a true release boundary
+        gate_id="behavior",
+        status="fail",
+        evidence_ref=evidence_ref,
+        summary="behavior: 0/2 cases passed.",
+        owner="verifier",
+        candidate_ref=candidate_ref,
+        finding_subject_ref=verifier_ref,
+        release_profile=ReleaseProfile(profile_id="release:verifier-mismatch"),
+        gate_results=gates,
+        evidence_refs=evidence_refs,
+        findings=findings,
+        run_id="judge:verifier-mismatch",
+    )
+    assert findings[0].owner == "verifier"
+    assert findings[0].subject_ref == verifier_ref
+
+
 def test_public_runtime_failure_signatures_become_one_complete_repair_brief() -> None:
     """Public evidence may repair a Runtime; sealed or partial evidence may not."""
 
@@ -399,7 +457,7 @@ def test_public_runtime_failure_signatures_become_one_complete_repair_brief() ->
     assert len(brief) <= 512
     assert "`error` fields: `code`, `message`, `retryable`, optional `details`" in brief
     assert "`execution.start_or_resume_task`" in brief
-    assert "tool's per-actor observation projection" in brief
+    assert "frozen per-actor observation" in brief
     assert "`approval_event_id`" in brief
     assert "frozen `when` Rule is true" in brief
     assert "task_not_resumable" not in brief

@@ -167,6 +167,12 @@ def _rule(
     )
 
 
+def _requirement_id(rule_id: str) -> str:
+    """Return the opaque selector a Challenger receives for this test Rule."""
+
+    return verifier_compiler_module._semantic_requirement_id(rule_id)  # noqa: SLF001
+
+
 def _design(
     *,
     transition_sensitivity: str = "positive_only",
@@ -577,7 +583,7 @@ def test_challenger_context_is_deduplicated_and_omits_rule_expressions() -> None
     context = VerifierCompiler._challenger_context(design)
     serialized = json.dumps(context, sort_keys=True)
 
-    assert context["schema_version"] == "agent-world.challenger-context.v7"
+    assert context["schema_version"] == "agent-world.challenger-context.v8"
     reset_config_schemas = context["reset_config_schemas"]
     assert isinstance(reset_config_schemas, list)
     assert len(reset_config_schemas) == 1
@@ -587,19 +593,21 @@ def test_challenger_context_is_deduplicated_and_omits_rule_expressions() -> None
     assert '"initial_rule_ids"' not in serialized
     assert '"success_rule_ids"' not in serialized
     assert '"property_kind": "transition"' in serialized
-    assert '"rule_count"' in serialized
-    coverage_requirements = context["coverage_requirements"]
-    assert isinstance(coverage_requirements, list)
-    coverage_entries = [item for item in coverage_requirements if isinstance(item, dict)]
-    assert len(coverage_entries) == len(coverage_requirements)
-    coverage_ids: list[str] = []
-    for item in coverage_entries:
-        coverage_id = item.get("coverage_id")
-        assert isinstance(coverage_id, str)
-        coverage_ids.append(coverage_id)
-    assert all(item.startswith("coverage:") for item in coverage_ids)
-    assert len(coverage_ids) == len(set(coverage_ids))
-    shared_requirements = [item for item in coverage_entries if item.get("scope") == "world_shared"]
+    semantic_requirements = context["semantic_requirements"]
+    assert isinstance(semantic_requirements, list)
+    requirement_entries = [item for item in semantic_requirements if isinstance(item, dict)]
+    assert len(requirement_entries) == len(semantic_requirements)
+    requirement_ids: list[str] = []
+    for item in requirement_entries:
+        requirement_id = item.get("requirement_id")
+        assert isinstance(requirement_id, str)
+        assert isinstance(item.get("summary"), str)
+        requirement_ids.append(requirement_id)
+    assert all(item.startswith("requirement:") for item in requirement_ids)
+    assert len(requirement_ids) == len(set(requirement_ids))
+    shared_requirements = [
+        item for item in requirement_entries if item.get("scope") == "world_shared"
+    ]
     assert shared_requirements
     assert all(item.get("task_type") is None for item in shared_requirements)
     assert '"task_type": "shared"' not in serialized
@@ -607,24 +615,150 @@ def test_challenger_context_is_deduplicated_and_omits_rule_expressions() -> None
     assert "You have no tools" in prompt
     assert "syntactically valid RFC\n8259 JSON object only" in prompt
     assert "`NaN`, `Infinity`, or `-Infinity` literals" in prompt
-    assert "two-pass coverage audit" in prompt
-    assert "`rule_count` counts the framework's private Rules" in prompt
-    assert "`positive_only` error_semantics" in prompt
-    assert "positive means an `expectations` item" in prompt
+    assert "two-pass feasibility and coverage audit" in prompt
+    assert "`semantic_requirements`" in prompt
+    assert "`requirement_id`" in prompt
+    assert "`positive_and_negative`" in prompt
     assert "`expected=true`" in prompt
-    assert "merely including that tool elsewhere" in prompt
-    assert "One expectation item may satisfy compatible coverage rows" in prompt
-    assert "never put both polarities" in prompt
-    assert "Within one case, emit each" in prompt
-    assert "`(kind, after_action_ordinal)` at most once" in prompt
+    assert "merely\nincluding the tool elsewhere in the trajectory" in prompt
+    assert "Do not put both\npolarities" in prompt
+    assert "Each expectation selects\nexactly one requirement_id" in prompt
+    assert "`(requirement_id, after_action_ordinal)`" in prompt
     assert "Action-input schema audit is mandatory" in prompt
     assert "additionalProperties=false" in prompt
     assert "precondition_summaries" in prompt
     assert "error_paths" in prompt
-    assert "different\nerror_code values" in prompt
+    assert "requirement's `error_code` exactly" in prompt
     assert "Solve-recipe binding audit is mandatory" in prompt
     assert "A matching field name is not proof" in prompt
     assert "`solve_recipe_binding_guide`" in prompt
+
+
+def test_semantic_requirement_selector_prevents_terminal_rule_fanout() -> None:
+    """Two same-kind task terminals stay separately selectable and bind separately."""
+
+    design = _design()
+    approved = _rule(
+        "rule:terminal:approved",
+        "task_terminal",
+        _ref_value("post_state", "/counter/value"),
+        "greater_or_equal",
+        _ref_value("task_goal", "/target"),
+    ).model_copy(update={"description": "The approval path is terminal only after approval."})
+    rejected = _rule(
+        "rule:terminal:rejected",
+        "task_terminal",
+        _ref_value("post_state", "/counter/value"),
+        "less_than",
+        _ref_value("task_goal", "/target"),
+    ).model_copy(update={"description": "The rejection path is terminal only after rejection."})
+    task = design.curriculum.task_types[0].model_copy(
+        update={"terminal_conditions": (approved, rejected)}
+    )
+    selector_design = design.model_copy(
+        update={
+            "curriculum": design.curriculum.model_copy(update={"task_types": (task,)}),
+            "verification": design.verification.model_copy(
+                update={
+                    "required_rule_ids": (approved.rule_id, rejected.rule_id),
+                    "required_property_families": ("task_terminal",),
+                }
+            ),
+        }
+    )
+
+    context = VerifierCompiler._challenger_context(selector_design)  # noqa: SLF001
+    terminals = [
+        item
+        for item in context["semantic_requirements"]
+        if item["property_kind"] == "task_terminal"
+    ]
+    assert {item["summary"] for item in terminals} == {
+        approved.description,
+        rejected.description,
+    }
+    assert len({item["requirement_id"] for item in terminals}) == 2
+    assert approved.rule_id not in json.dumps(context, sort_keys=True)
+    assert rejected.rule_id not in json.dumps(context, sort_keys=True)
+
+    def case_for(rule: Rule, initial: int) -> VerifierCaseIntent:
+        return VerifierCaseIntent(
+            task_type="increase",
+            evaluator_goal={"target": 5},
+            actor="user",
+            reset_config={"initial": initial},
+            actions=(RuntimeAction(tool_id="counter.increment", arguments={"amount": 3}),),
+            expectations=(
+                PropertyExpectationIntent(
+                    requirement_id=_requirement_id(rule.rule_id),
+                    kind="task_terminal",
+                    after_action_ordinal=1,
+                    expected=True,
+                ),
+            ),
+        )
+
+    compiled = VerifierCompiler._compile_intent(  # noqa: SLF001 - real binding boundary
+        VerifierIntent(cases=(case_for(approved, 2), case_for(rejected, 1))),
+        selector_design,
+        allowed_task_types=("increase",),
+        required_rule_ids=(approved.rule_id, rejected.rule_id),
+        required_property_families=("task_terminal",),
+        require_metamorphic=False,
+    )
+
+    assert all(len(case.assertions) == 1 for case in compiled.cases)
+    assert {assertion.rule_id for case in compiled.cases for assertion in case.assertions} == {
+        approved.rule_id,
+        rejected.rule_id,
+    }
+    assert all(
+        {assertion.rule_id for assertion in case.assertions}
+        in ({approved.rule_id}, {rejected.rule_id})
+        for case in compiled.cases
+    )
+
+
+def test_verifier_intent_rejects_action_actor_not_permitted_by_the_tool() -> None:
+    """The Challenger cannot create a one-actor case that invokes another role's tool."""
+
+    design = _design()
+    task = design.curriculum.task_types[0].model_copy(
+        update={"allowed_actor_ids": ("user", "auditor")}
+    )
+    actor_design = design.model_copy(
+        update={"curriculum": design.curriculum.model_copy(update={"task_types": (task,)})}
+    )
+    auditor_case = VerifierCaseIntent(
+        task_type="increase",
+        evaluator_goal={"target": 5},
+        actor="auditor",
+        reset_config={"initial": 2},
+        actions=(RuntimeAction(tool_id="counter.increment", arguments={"amount": 3}),),
+        expectations=(
+            PropertyExpectationIntent(
+                requirement_id=_requirement_id("rule:transition"),
+                kind="transition",
+                after_action_ordinal=1,
+                expected=True,
+            ),
+        ),
+    )
+
+    with pytest.raises(StructuredValidationError) as captured:
+        VerifierCompiler._validate_intent(  # noqa: SLF001 - true preflight boundary
+            VerifierIntent(cases=(auditor_case, auditor_case)),
+            actor_design,
+            allowed_task_types=("increase",),
+            required_rule_ids=("rule:transition",),
+            required_property_families=("transition",),
+            require_metamorphic=False,
+        )
+
+    diagnostic = captured.value.diagnostic
+    assert diagnostic.validation_phase == "intent_requirement_binding"
+    assert {item.code for item in diagnostic.issues} == {"intent_action_actor_permission_denied"}
+    assert all(item.location[-1] == "tool_id" for item in diagnostic.issues)
 
 
 def test_compact_intent_expands_to_complete_rule_bound_verifier() -> None:
@@ -640,6 +774,7 @@ def test_compact_intent_expands_to_complete_rule_bound_verifier() -> None:
             actions=case.actions,
             expectations=tuple(
                 PropertyExpectationIntent(
+                    requirement_id=_requirement_id(item.rule_id),
                     kind={
                         "error_condition": "error_semantics",
                     }.get(rules[item.rule_id].family, rules[item.rule_id].family),  # type: ignore[arg-type]
@@ -698,6 +833,7 @@ def test_multi_error_intent_selects_one_declared_error_path() -> None:
                 actions=case.actions,
                 expectations=tuple(
                     PropertyExpectationIntent(
+                        requirement_id=_requirement_id(item.rule_id),
                         kind={"error_condition": "error_semantics"}.get(
                             rules[item.rule_id].family,
                             rules[item.rule_id].family,
@@ -734,12 +870,12 @@ def test_multi_error_intent_selects_one_declared_error_path() -> None:
         "amount_too_large",
     ]
     assert tool["precondition_summaries"] == ["Executable precondition rule."]
-    error_rows = [
+    error_requirements = [
         item
-        for item in context["coverage_requirements"]
+        for item in context["semantic_requirements"]
         if item["property_kind"] == "error_semantics"
     ]
-    assert {item["error_code"] for item in error_rows} == {
+    assert {item["error_code"] for item in error_requirements} == {
         "invalid_amount",
         "amount_too_large",
     }
@@ -773,7 +909,7 @@ def test_multi_error_intent_selects_one_declared_error_path() -> None:
 
     assert any(
         item.code == "rule_positive_partition_coverage"
-        and item.location[0] == "coverage_requirements"
+        and item.location[0] == "semantic_requirements"
         for item in binding.value.diagnostic.issues
     )
 
@@ -792,6 +928,7 @@ def test_verifier_requires_preferred_recipe_for_release_without_hidden_solver() 
                 actions=case.actions,
                 expectations=tuple(
                     PropertyExpectationIntent(
+                        requirement_id=_requirement_id(item.rule_id),
                         kind={
                             "error_condition": "error_semantics",
                         }.get(rules[item.rule_id].family, rules[item.rule_id].family),  # type: ignore[arg-type]
@@ -899,6 +1036,7 @@ def test_solve_recipe_feedback_is_exact_safe_and_shared_by_intent_and_draft() ->
             actions=case.actions,
             expectations=tuple(
                 PropertyExpectationIntent(
+                    requirement_id=_requirement_id(item.rule_id),
                     kind={
                         "error_condition": "error_semantics",
                     }.get(rules[item.rule_id].family, rules[item.rule_id].family),  # type: ignore[arg-type]
@@ -957,11 +1095,7 @@ def test_solve_recipe_type_feedback_and_agent_view_expose_compatible_bindings() 
     }
     numeric_task = task.model_copy(update={"public_goal_schema": numeric_goal})
     numeric_design = design.model_copy(
-        update={
-            "curriculum": design.curriculum.model_copy(
-                update={"task_types": (numeric_task,)}
-            )
-        }
+        update={"curriculum": design.curriculum.model_copy(update={"task_types": (numeric_task,)})}
     )
     recipe = _draft(numeric_design).solve_recipes[0]
 
@@ -1012,6 +1146,7 @@ def test_verifier_rule_binding_reports_all_independent_missing_obligations() -> 
             actions=case.actions,
             expectations=(
                 PropertyExpectationIntent(
+                    requirement_id=_requirement_id("rule:transition"),
                     kind="transition",
                     after_action_ordinal=1,
                     expected=True,
@@ -1037,17 +1172,17 @@ def test_verifier_rule_binding_reports_all_independent_missing_obligations() -> 
     assert len(diagnostic.issue_codes) > 2
     assert all("rule:" not in issue for issue in diagnostic.issue_codes)
     context = VerifierCompiler._challenger_context(design)
-    coverage_requirements = context["coverage_requirements"]
-    assert isinstance(coverage_requirements, list)
-    coverage_ids: set[str] = set()
-    for item in coverage_requirements:
+    semantic_requirements = context["semantic_requirements"]
+    assert isinstance(semantic_requirements, list)
+    requirement_ids: set[str] = set()
+    for item in semantic_requirements:
         if not isinstance(item, dict):
             continue
-        coverage_id = item.get("coverage_id")
-        if isinstance(coverage_id, str):
-            coverage_ids.add(coverage_id)
-    assert all(issue.location[0] == "coverage_requirements" for issue in diagnostic.issues)
-    assert all(issue.location[1] in coverage_ids for issue in diagnostic.issues)
+        requirement_id = item.get("requirement_id")
+        if isinstance(requirement_id, str):
+            requirement_ids.add(requirement_id)
+    assert all(issue.location[0] == "semantic_requirements" for issue in diagnostic.issues)
+    assert all(issue.location[1] in requirement_ids for issue in diagnostic.issues)
     assert all("required_rules" not in issue.feedback for issue in diagnostic.issues)
     assert all(issue.expected_category is not None for issue in diagnostic.issues)
     assert all(issue.remediation is not None for issue in diagnostic.issues)
@@ -1077,6 +1212,7 @@ def test_positive_only_error_coverage_has_one_safe_row_level_remediation() -> No
             actions=case.actions,
             expectations=tuple(
                 PropertyExpectationIntent(
+                    requirement_id=_requirement_id(item.rule_id),
                     kind={
                         "error_condition": "error_semantics",
                     }.get(rules[item.rule_id].family, rules[item.rule_id].family),  # type: ignore[arg-type]
@@ -1102,7 +1238,7 @@ def test_positive_only_error_coverage_has_one_safe_row_level_remediation() -> No
         )
 
     context = VerifierCompiler._challenger_context(design)
-    rows = context["coverage_requirements"]
+    rows = context["semantic_requirements"]
     assert isinstance(rows, list)
     error_rows = [
         item
@@ -1112,23 +1248,23 @@ def test_positive_only_error_coverage_has_one_safe_row_level_remediation() -> No
         and item.get("positive_and_negative") is False
     ]
     assert len(error_rows) == 1
-    coverage_id = error_rows[0]["coverage_id"]
-    assert isinstance(coverage_id, str)
+    requirement_id = error_rows[0]["requirement_id"]
+    assert isinstance(requirement_id, str)
 
     diagnostic = captured.value.diagnostic
     issue = next(
         item
         for item in diagnostic.issues
         if item.code == "rule_positive_partition_coverage"
-        and item.location == ("coverage_requirements", coverage_id)
+        and item.location == ("semantic_requirements", requirement_id)
     )
     assert issue.expected_category == (
-        "an expectations entry with the row property_kind, expected=true, "
-        "and after_action_ordinal pointing to a compatible row tool"
+        "an expectations entry with this requirement_id, expected=true, and "
+        "after_action_ordinal pointing to a compatible requirement tool"
     )
     assert issue.remediation == (
-        "Add a compatible expectation with expected=true; when this row lists tool_ids, "
-        "point its ordinal at one of those tool actions."
+        "Add an expectation that copies this requirement_id with expected=true; when it lists "
+        "tool_ids, point its ordinal at one of those tool actions."
     )
     assert "counter.increment" in issue.feedback
     assert "rule:error" not in issue.feedback
@@ -1173,6 +1309,7 @@ def test_verifier_case_pairing_reserves_global_capacity_before_checkpoint() -> N
         actions=source.actions,
         expectations=tuple(
             PropertyExpectationIntent(
+                requirement_id=_requirement_id(item.rule_id),
                 kind={"error_condition": "error_semantics"}.get(
                     rules[item.rule_id].family,
                     rules[item.rule_id].family,
@@ -1222,6 +1359,7 @@ def test_verifier_intent_schema_feedback_reports_exact_safe_field_paths() -> Non
                 ),
                 expectations=(
                     PropertyExpectationIntent(
+                        requirement_id=_requirement_id("rule:transition"),
                         kind="transition",
                         after_action_ordinal=1,
                         expected=True,
@@ -1236,6 +1374,7 @@ def test_verifier_intent_schema_feedback_reports_exact_safe_field_paths() -> Non
                 actions=(source.actions[0],),
                 expectations=(
                     PropertyExpectationIntent(
+                        requirement_id=_requirement_id("rule:transition"),
                         kind="transition",
                         after_action_ordinal=1,
                         expected=True,
@@ -1255,6 +1394,7 @@ def test_verifier_intent_schema_feedback_reports_exact_safe_field_paths() -> Non
                 ),
                 expectations=(
                     PropertyExpectationIntent(
+                        requirement_id=_requirement_id("rule:transition"),
                         kind="transition",
                         after_action_ordinal=1,
                         expected=True,
@@ -1332,6 +1472,7 @@ def test_verifier_intent_uses_one_based_ordinals_and_reports_all_bad_references(
             actions=case.actions,
             expectations=(
                 PropertyExpectationIntent(
+                    requirement_id=_requirement_id("rule:transition"),
                     kind="transition",
                     after_action_ordinal=len(case.actions) + 1,
                     expected=True,
@@ -1376,7 +1517,7 @@ def test_verifier_intent_uses_one_based_ordinals_and_reports_all_bad_references(
     assert "The verifier context and requested output are different schemas" in prompt
     assert "no hidden interactive solver" in prompt
     assert "`solve_recipes` is therefore" in prompt
-    assert "separate semantically distinct trajectory" in prompt
+    assert "semantically distinct trajectory" in prompt
     assert 'literal `"v2"`' in prompt
     schema = VerifierIntent.model_json_schema(mode="validation")
     definitions = schema["$defs"]
@@ -1402,11 +1543,13 @@ def test_verifier_intent_duplicate_expectation_has_one_safe_actionable_diagnosti
         actions=(RuntimeAction(tool_id="counter.increment", arguments={"amount": 3}),),
         expectations=(
             PropertyExpectationIntent(
+                requirement_id=_requirement_id("rule:transition"),
                 kind="transition",
                 after_action_ordinal=1,
                 expected=True,
             ),
             PropertyExpectationIntent(
+                requirement_id=_requirement_id("rule:transition"),
                 kind="transition",
                 after_action_ordinal=1,
                 expected=True,
@@ -1417,6 +1560,7 @@ def test_verifier_intent_duplicate_expectation_has_one_safe_actionable_diagnosti
         update={
             "expectations": (
                 PropertyExpectationIntent(
+                    requirement_id=_requirement_id("rule:precondition"),
                     kind="precondition",
                     after_action_ordinal=1,
                     expected=True,
@@ -1443,16 +1587,15 @@ def test_verifier_intent_duplicate_expectation_has_one_safe_actionable_diagnosti
     )
     issue = diagnostic.issues[0]
     assert issue.violated_condition == (
-        "each case must contain at most one expectation with the same kind, "
+        "each case must contain at most one expectation with the same requirement_id, "
         "after_action_ordinal, and expected value"
     )
     assert issue.expected_category == (
-        "one expectation for each unique (kind, after_action_ordinal, expected) combination; "
-        "compatible coverage rows may reuse it"
+        "one expectation for each unique (requirement_id, after_action_ordinal, expected) "
+        "combination"
     )
     assert issue.remediation == (
-        "Merge duplicate expectation entries and keep the one compatible expectation that covers "
-        "every matching row."
+        "Remove the duplicate expectation or target another requirement_id."
     )
 
 
@@ -1468,11 +1611,13 @@ def test_verifier_intent_rejects_opposite_polarities_on_one_action() -> None:
         actions=(RuntimeAction(tool_id="counter.increment", arguments={"amount": 3}),),
         expectations=(
             PropertyExpectationIntent(
+                requirement_id=_requirement_id("rule:transition"),
                 kind="transition",
                 after_action_ordinal=1,
                 expected=True,
             ),
             PropertyExpectationIntent(
+                requirement_id=_requirement_id("rule:transition"),
                 kind="transition",
                 after_action_ordinal=1,
                 expected=False,
@@ -1483,6 +1628,7 @@ def test_verifier_intent_rejects_opposite_polarities_on_one_action() -> None:
         update={
             "expectations": (
                 PropertyExpectationIntent(
+                    requirement_id=_requirement_id("rule:precondition"),
                     kind="precondition",
                     after_action_ordinal=1,
                     expected=True,
@@ -1513,6 +1659,7 @@ def test_verifier_intent_rejects_opposite_polarities_on_one_action() -> None:
 
 def test_verifier_intent_compiles_one_based_ordinal_to_zero_based_index() -> None:
     expectation = PropertyExpectationIntent(
+        requirement_id="requirement:test-transition",
         kind="transition",
         after_action_ordinal=1,
         expected=True,
@@ -1521,6 +1668,7 @@ def test_verifier_intent_compiles_one_based_ordinal_to_zero_based_index() -> Non
     assert expectation.action_index == 0
     assert expectation.model_dump() == {
         "schema_version": "v2",
+        "requirement_id": "requirement:test-transition",
         "kind": "transition",
         "error_code": None,
         "after_action_ordinal": 1,
@@ -1689,6 +1837,7 @@ async def test_one_shot_verifier_batch_uses_the_scheduler_dispatch_and_never_ret
                 actions=case.actions,
                 expectations=tuple(
                     PropertyExpectationIntent(
+                        requirement_id=_requirement_id(assertion.rule_id),
                         kind={"error_condition": "error_semantics"}.get(
                             rules[assertion.rule_id].family,
                             rules[assertion.rule_id].family,
@@ -2079,6 +2228,7 @@ async def test_scheduler_verifier_leaf_repairs_a_parsed_direct_candidate_with_fe
                 actions=case.actions,
                 expectations=tuple(
                     PropertyExpectationIntent(
+                        requirement_id=_requirement_id(assertion.rule_id),
                         kind={"error_condition": "error_semantics"}.get(
                             rules[assertion.rule_id].family,
                             rules[assertion.rule_id].family,
@@ -2221,7 +2371,7 @@ async def test_scheduler_verifier_leaf_repairs_a_parsed_direct_candidate_with_fe
     assert backend.requests[1].session is None  # type: ignore[attr-defined]
     assert "<prior_candidate_json>" not in backend.requests[0].prompt  # type: ignore[attr-defined]
     assert "<prior_candidate_json>" in backend.requests[1].prompt  # type: ignore[attr-defined]
-    assert "coverage:" in backend.requests[1].prompt  # type: ignore[attr-defined]
+    assert "requirement:" in backend.requests[1].prompt  # type: ignore[attr-defined]
     assert "repair_action_ref" not in backend.requests[1].prompt  # type: ignore[attr-defined]
     batch_head = heads.read_head(batch_coordinate)
     assert batch_head is not None and batch_head.commit_ref is not None

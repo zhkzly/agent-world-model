@@ -201,8 +201,7 @@ def _gate_is_hard(gate_id: str, release_profile: ReleaseProfile) -> bool:
     """
 
     return gate_id not in _DIAGNOSTIC_GATES and (
-        gate_id in _ALWAYS_HARD_GATES
-        or gate_id in release_profile.effective_required_hard_gates
+        gate_id in _ALWAYS_HARD_GATES or gate_id in release_profile.effective_required_hard_gates
     )
 
 
@@ -261,18 +260,13 @@ class _InvokeObservationProjectionFailure(_CandidateTaskFailure):
         self.actor = actor
         self.required_fields = required_fields
         required = ", ".join(f"`{field}`" for field in required_fields)
-        required_clause = (
-            f" The projected schema requires {required}."
-            if required
-            else ""
-        )
+        required_clause = f", including {required}" if required else ""
         super().__init__(
             str(cause),
             repair_remediation=(
-                f"For `invoke` of `{tool_id}` as `{actor}`, return the frozen actor-specific "
-                f"observation projection, not reset state.{required_clause} Build every required "
-                "field from the tool's actual transition, and verify the frozen tool precondition "
-                "against the materialized initial state before treating the public action as an error."
+                f"`invoke` `{tool_id}` as `{actor}`: return frozen per-actor observation"
+                f"{required_clause}, not reset state. Use actual transition/error state; never "
+                "invent events."
             ),
         )
 
@@ -652,6 +646,7 @@ class _CaseGateResult:
     summary: str
     episodes: int
     tool_calls: int
+    owner: FindingOwner
     repair_remediation: str | None = None
 
 
@@ -724,9 +719,9 @@ def _public_case_repair_remediation(
     if len(remediations) == 1:
         return remediations[0]
     brief = (
-        "Fix public Runtime:\n"
+        "Fix Runtime:\n"
         + "\n".join(f"- {item}" for item in remediations)
-        + "\nKeep frozen Materializer, Verifier, and Rules unchanged."
+        + "\nKeep Verifier/Rules frozen."
     )
     return brief if len(brief) <= 512 else None
 
@@ -1827,8 +1822,9 @@ class EnvironmentJudge:
                     evidence_ref=behavior.evidence_ref,
                     summary=behavior.summary,
                     suggested_repair=behavior.repair_remediation,
-                    owner="build",
+                    owner=behavior.owner,
                     candidate_ref=candidate_ref,
+                    finding_subject_ref=verifier_ref,
                     release_profile=release_profile,
                     gate_results=gate_results,
                     evidence_refs=evidence_refs,
@@ -1855,8 +1851,9 @@ class EnvironmentJudge:
                     status=sealed.status,
                     evidence_ref=sealed.evidence_ref,
                     summary=sealed.summary,
-                    owner="build",
+                    owner=sealed.owner,
                     candidate_ref=candidate_ref,
+                    finding_subject_ref=verifier_ref,
                     release_profile=release_profile,
                     gate_results=gate_results,
                     evidence_refs=evidence_refs,
@@ -3230,7 +3227,14 @@ class EnvironmentJudge:
                 {"status": "fail", "reason": "no cases configured"},
                 dependencies=(candidate_ref, verifier_ref),
             )
-            return _CaseGateResult("fail", evidence_ref, f"{label} has no cases", 0, 0)
+            return _CaseGateResult(
+                "fail",
+                evidence_ref,
+                f"{label} has no cases",
+                0,
+                0,
+                "verifier",
+            )
         rules = design_rule_index(design)
         try:
             runs = tuple(
@@ -3261,12 +3265,18 @@ class EnvironmentJudge:
             repair_remediation = (
                 _public_case_repair_remediation(runs) if label != "sealed-release" else None
             )
+            # An assertion mismatch alone proves only that the Verifier trajectory
+            # and the Runtime disagree.  It is not safe Builder feedback unless
+            # the real Runtime boundary emitted a stable Candidate-facing repair
+            # fact.  Otherwise the Challenger/Verifier owns the next diagnosis.
+            owner: FindingOwner = "build" if repair_remediation is not None else "verifier"
         except JudgeInfrastructureError as exc:
             record = {"status": "error", "failure_class": exc.code}
             status = "error"
             summary = str(exc)
             tool_calls = 0
             repair_remediation = None
+            owner = "judge_infrastructure"
         evidence_ref = self._evidence(
             run_id,
             label,
@@ -3279,6 +3289,7 @@ class EnvironmentJudge:
             summary,
             len(cases),
             tool_calls,
+            owner,
             repair_remediation,
         )
 
@@ -4578,6 +4589,7 @@ class EnvironmentJudge:
         suggested_repair: str | None = None,
         owner: FindingOwner,
         candidate_ref: ArtifactRef,
+        finding_subject_ref: ArtifactRef | None = None,
         release_profile: ReleaseProfile,
         gate_results: list[GateResult],
         evidence_refs: list[ArtifactRef],
@@ -4600,7 +4612,7 @@ class EnvironmentJudge:
                 self._finding(
                     run_id,
                     gate_id,
-                    candidate_ref,
+                    finding_subject_ref or candidate_ref,
                     evidence_ref,
                     owner=owner,
                     summary=f"{gate_id} did not pass.",

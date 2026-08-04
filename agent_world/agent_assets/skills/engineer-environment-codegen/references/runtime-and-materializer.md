@@ -42,6 +42,15 @@ more, no less:
 - `info`: an empty JSON object `{}`. The closed ABI requires invoke `info` to be
   empty.
 
+This complete result shape applies to a declared error response too. An error
+does not authorize `{}` when the frozen tool observation schema requires a
+visible field. For a successful path, derive that field from the actual
+transition; for an error path, derive only a truthful schema-valid value from
+the declared error/state path. If the frozen error path has no honest way to
+produce a field that its all-path observation schema requires, report the
+specific frozen schema/error contradiction instead of inventing an event or
+silently weakening the check.
+
 Do not return a partial result (e.g. only a `call_id`) — every invoke response
 must carry all eight keys. `snapshot` and `reset` have their own separate shapes;
 see below.

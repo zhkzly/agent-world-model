@@ -6,7 +6,7 @@ import asyncio
 import json
 import uuid
 from collections import Counter
-from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -100,81 +100,74 @@ _AUXILIARY_PROPERTY_RULE_FAMILIES = {
     "concurrency": {"transition", "error_condition", "invariant"},
     "metamorphic": set(_CANONICAL_PROPERTY_KIND),
 }
-type _CoverageRequirementKey = tuple[str, str, str, tuple[str, ...], bool, str | None]
 
 
-def _coverage_requirement_key(
-    *,
-    task_type: str | None,
-    property_kind: str,
-    tool_ids: Iterable[str],
-    positive_and_negative: bool,
-    error_code: str | None = None,
-) -> _CoverageRequirementKey:
-    """Return the public tuple that identifies one Challenger coverage group."""
+@dataclass(frozen=True, slots=True)
+class _SemanticRequirement:
+    """One model-visible selector bound to exactly one frozen Rule.
 
-    return (
-        "task" if task_type is not None else "world_shared",
-        task_type or "",
-        property_kind,
-        tuple(sorted(tool_ids)),
-        positive_and_negative,
-        error_code,
-    )
+    The selector is opaque to the Challenger.  It preserves framework ownership
+    of private Rule identities while keeping distinct semantic conditions from
+    being collapsed into one generic property-family label.
+    """
+
+    requirement_id: str
+    rule_id: str
+    scope: str
+    task_type: str | None
+    property_kind: str
+    tool_ids: tuple[str, ...]
+    positive_and_negative: bool
+    error_code: str | None
+    summary: str
 
 
-def _coverage_requirement_id(key: _CoverageRequirementKey) -> str:
-    """Derive a stable model-visible id without revealing framework Rule ids."""
+def _semantic_requirement_id(rule_id: str) -> str:
+    """Derive one stable opaque selector for an exact frozen Rule."""
 
-    scope, task_type, property_kind, tool_ids, positive_and_negative, error_code = key
     digest = sha256_digest(
         canonical_json_bytes(
             {
-                "scope": scope,
-                "task_type": task_type or None,
-                "property_kind": property_kind,
-                "tool_ids": list(tool_ids),
-                "positive_and_negative": positive_and_negative,
-                "error_code": error_code,
+                "binding_version": "agent-world.semantic-requirement.v1",
+                "rule_id": rule_id,
             }
         )
     ).removeprefix("sha256:")
-    return f"coverage:{digest[:24]}"
+    return f"requirement:{digest[:24]}"
 
 
-def _coverage_requirement_projection(
-    key: _CoverageRequirementKey,
-    *,
-    rule_count: int,
+def _semantic_requirement_projection(
+    requirement: _SemanticRequirement,
 ) -> dict[str, JsonValue]:
-    """Render one public coverage ledger entry for the Challenger prompt."""
+    """Render the complete, safe semantic requirement visible to Challenger."""
 
-    scope, task_type, property_kind, tool_ids, positive_and_negative, error_code = key
     projection: dict[str, JsonValue] = {
-        "coverage_id": _coverage_requirement_id(key),
-        "scope": scope,
-        "task_type": task_type or None,
-        "property_kind": property_kind,
-        "tool_ids": list(tool_ids),
-        "positive_and_negative": positive_and_negative,
-        "rule_count": rule_count,
+        "requirement_id": requirement.requirement_id,
+        "scope": requirement.scope,
+        "task_type": requirement.task_type,
+        "property_kind": requirement.property_kind,
+        "tool_ids": list(requirement.tool_ids),
+        "positive_and_negative": requirement.positive_and_negative,
+        "summary": requirement.summary,
     }
-    if error_code is not None:
-        projection["error_code"] = error_code
+    if requirement.error_code is not None:
+        projection["error_code"] = requirement.error_code
     return projection
 
 
-def _coverage_requirement_summary(key: _CoverageRequirementKey) -> str:
-    """Describe only fields that already appear in the Challenger context."""
+def _semantic_requirement_summary(requirement: _SemanticRequirement) -> str:
+    """Return only values already disclosed in the requirement catalog."""
 
-    scope, task_type, property_kind, tool_ids, positive_and_negative, error_code = key
-    task_label = task_type if scope == "task" else "world_shared"
-    tools_label = ", ".join(tool_ids) if tool_ids else "any compatible task tool"
-    polarity_label = "positive_and_negative" if positive_and_negative else "positive_only"
-    error_label = f", error_code={error_code}" if error_code is not None else ""
+    task_label = requirement.task_type or "world_shared"
+    tools_label = ", ".join(requirement.tool_ids) or "any compatible task tool"
+    polarity_label = (
+        "positive_and_negative" if requirement.positive_and_negative else "positive_only"
+    )
+    error_label = f", error_code={requirement.error_code}" if requirement.error_code else ""
     return (
-        f"scope={scope}, task_type={task_label}, property_kind={property_kind}, "
-        f"tool_ids=[{tools_label}], polarity={polarity_label}{error_label}"
+        f"scope={requirement.scope}, task_type={task_label}, "
+        f"property_kind={requirement.property_kind}, tool_ids=[{tools_label}], "
+        f"polarity={polarity_label}{error_label}: {requirement.summary}"
     )
 
 
@@ -1758,6 +1751,10 @@ class VerifierCompiler:
         }
         if len(tasks) != len(set(allowed_task_types)):
             raise ValueError("VerifierIntent task scope is unknown")
+        requirements_by_id = {
+            item.requirement_id: item
+            for item in VerifierCompiler._semantic_requirements(design, required_rule_ids)
+        }
         reference_issues: list[SafeValidationIssue] = []
         for case_index, case in enumerate(intent.cases):
             seen_expectations: dict[tuple[str, int], bool] = {}
@@ -1788,26 +1785,25 @@ class VerifierCompiler:
                             ),
                         )
                     )
-                key = (str(expectation.kind), expectation.after_action_ordinal)
+                key = (expectation.requirement_id, expectation.after_action_ordinal)
                 previous_expected = seen_expectations.get(key)
                 if key in seen_expectations and previous_expected == expectation.expected:
                     reference_issues.append(
                         SafeValidationIssue(
                             "intent_expectation_duplicate",
                             location,
-                            "Each (kind, after_action_ordinal, expected) combination may "
+                            "Each (requirement_id, after_action_ordinal, expected) combination may "
                             "appear only once in a case.",
                             violated_condition=(
                                 "each case must contain at most one expectation with the same "
-                                "kind, after_action_ordinal, and expected value"
+                                "requirement_id, after_action_ordinal, and expected value"
                             ),
                             expected_category=(
-                                "one expectation for each unique (kind, after_action_ordinal, "
-                                "expected) combination; compatible coverage rows may reuse it"
+                                "one expectation for each unique (requirement_id, "
+                                "after_action_ordinal, expected) combination"
                             ),
                             remediation=(
-                                "Merge duplicate expectation entries and keep the one compatible "
-                                "expectation that covers every matching row."
+                                "Remove the duplicate expectation or target another requirement_id."
                             ),
                         )
                     )
@@ -1823,13 +1819,13 @@ class VerifierCompiler:
                                 "expected",
                             ),
                             "One action point cannot be expected to both satisfy and violate "
-                            "the same property kind.",
+                            "the same selected semantic requirement.",
                             violated_condition=(
                                 "each semantic trajectory has one expected polarity for each "
-                                "kind and after_action_ordinal"
+                                "requirement_id and after_action_ordinal"
                             ),
                             expected_category=(
-                                "one expected polarity per kind/action ordinal; an opposite "
+                                "one expected polarity per requirement/action ordinal; an opposite "
                                 "polarity must use a separate negative trajectory"
                             ),
                             remediation=(
@@ -1854,6 +1850,7 @@ class VerifierCompiler:
         observed_kinds: set[str] = set()
         value_schema_issues: list[SafeValidationIssue] = []
         error_selector_issues: list[SafeValidationIssue] = []
+        requirement_binding_issues: list[SafeValidationIssue] = []
         for case_index, case in enumerate(intent.cases):
             requirement = tasks.get(case.task_type)
             if requirement is None:
@@ -1884,9 +1881,30 @@ class VerifierCompiler:
                     f"{sorted(unknown_tools)}"
                 )
             for action_index, action in enumerate(case.actions):
+                tool = tools[action.tool_id]
+                if case.actor not in tool.semantics.permission.allowed_actors:
+                    requirement_binding_issues.append(
+                        SafeValidationIssue(
+                            "intent_action_actor_permission_denied",
+                            ("cases", case_index, "actions", action_index, "tool_id"),
+                            "The case actor is not permitted to invoke this frozen tool.",
+                            violated_condition=(
+                                "every action in a one-actor verifier case must be permitted "
+                                "to that case actor"
+                            ),
+                            expected_category=(
+                                "a tool permitted to the case actor, or a separate case for "
+                                "another permitted actor"
+                            ),
+                            remediation=(
+                                "Use only tools whose allowed_actor_ids include this case actor; "
+                                "split a cross-role workflow into separate actor-bound cases."
+                            ),
+                        )
+                    )
                 value_schema_issues.extend(
                     VerifierCompiler._json_schema_issues(
-                        schema=tools[action.tool_id].surface.input_schema,
+                        schema=tool.surface.input_schema,
                         value=action.arguments,
                         location=("cases", case_index, "actions", action_index, "arguments"),
                         code="intent_action_input_schema_mismatch",
@@ -1894,6 +1912,111 @@ class VerifierCompiler:
                     )
                 )
             for expectation_index, expectation in enumerate(case.expectations):
+                requirement_location = (
+                    "cases",
+                    case_index,
+                    "expectations",
+                    expectation_index,
+                    "requirement_id",
+                )
+                semantic_requirement = requirements_by_id.get(expectation.requirement_id)
+                # The reference pass has already emitted the actionable ordinal
+                # diagnostic.  Do not turn that model-visible error into an
+                # internal IndexError while collecting the other safe issues.
+                if expectation.action_index >= len(case.actions):
+                    continue
+                action = case.actions[expectation.action_index]
+                if semantic_requirement is None:
+                    requirement_binding_issues.append(
+                        SafeValidationIssue(
+                            "intent_requirement_unknown",
+                            requirement_location,
+                            "requirement_id is not present in this frozen "
+                            "semantic_requirements catalog.",
+                            violated_condition=(
+                                "every expectation must select one requirement_id from the current "
+                                "frozen batch catalog"
+                            ),
+                            expected_category=(
+                                "one requirement_id copied exactly from semantic_requirements"
+                            ),
+                            remediation=(
+                                "Replace it with the matching requirement_id shown in the current "
+                                "semantic_requirements catalog; do not invent selectors."
+                            ),
+                        )
+                    )
+                else:
+                    if semantic_requirement.property_kind != expectation.kind:
+                        requirement_binding_issues.append(
+                            SafeValidationIssue(
+                                "intent_requirement_kind_mismatch",
+                                requirement_location,
+                                "The selected requirement_id has a different property_kind.",
+                                violated_condition=(
+                                    "an expectation kind must equal its selected requirement's "
+                                    "property_kind"
+                                ),
+                                expected_category=(
+                                    f"kind={semantic_requirement.property_kind} for the selected "
+                                    "requirement_id"
+                                ),
+                                remediation=(
+                                    "Keep the selected requirement_id and use its property_kind, "
+                                    "or "
+                                    "select the requirement_id for this expectation kind."
+                                ),
+                            )
+                        )
+                    if (
+                        semantic_requirement.task_type is not None
+                        and semantic_requirement.task_type != case.task_type
+                    ):
+                        requirement_binding_issues.append(
+                            SafeValidationIssue(
+                                "intent_requirement_task_mismatch",
+                                requirement_location,
+                                "The selected requirement belongs to a different task type.",
+                                violated_condition=(
+                                    "a task-scoped requirement must be exercised by a case for its "
+                                    "own task_type"
+                                ),
+                                expected_category=(
+                                    f"task_type={semantic_requirement.task_type} for the selected "
+                                    "requirement_id"
+                                ),
+                                remediation=(
+                                    "Move this expectation to that task type or select a "
+                                    "requirement "
+                                    "from this case's task_type."
+                                ),
+                            )
+                        )
+                    if (
+                        semantic_requirement.tool_ids
+                        and action.tool_id not in semantic_requirement.tool_ids
+                    ):
+                        requirement_binding_issues.append(
+                            SafeValidationIssue(
+                                "intent_requirement_action_tool_mismatch",
+                                requirement_location,
+                                "The selected requirement is not evaluated at this action tool.",
+                                violated_condition=(
+                                    "an expectation's action must use one of the selected "
+                                    "requirement's "
+                                    "tool_ids"
+                                ),
+                                expected_category=(
+                                    "an action using one of: "
+                                    + ", ".join(semantic_requirement.tool_ids)
+                                ),
+                                remediation=(
+                                    "Point after_action_ordinal at the compatible tool action, "
+                                    "or select "
+                                    "the requirement_id for this action tool."
+                                ),
+                            )
+                        )
                 selector_location = (
                     "cases",
                     case_index,
@@ -1909,8 +2032,8 @@ class VerifierCompiler:
                                 selector_location,
                                 "error_code is allowed only for an error_semantics expectation.",
                                 violated_condition=(
-                                "only an error_semantics expectation selects a Runtime "
-                                "error path"
+                                    "only an error_semantics expectation selects a Runtime "
+                                    "error path"
                                 ),
                                 expected_category=(
                                     "no error_code for a non-error_semantics expectation"
@@ -1922,7 +2045,6 @@ class VerifierCompiler:
                             )
                         )
                     continue
-                action = case.actions[expectation.action_index]
                 declared_codes = error_codes_by_tool[action.tool_id]
                 if not declared_codes:
                     error_selector_issues.append(
@@ -1986,6 +2108,32 @@ class VerifierCompiler:
                             ),
                         )
                     )
+                if (
+                    semantic_requirement is not None
+                    and expectation.error_code is not None
+                    and semantic_requirement.error_code != expectation.error_code
+                ):
+                    expected_error = semantic_requirement.error_code or "(no error code)"
+                    requirement_binding_issues.append(
+                        SafeValidationIssue(
+                            "intent_requirement_error_code_mismatch",
+                            requirement_location,
+                            "The selected error requirement does not match error_code.",
+                            violated_condition=(
+                                "an error_semantics expectation must select the error_code "
+                                "bound to its "
+                                "requirement_id"
+                            ),
+                            expected_category=(
+                                f"error_code={expected_error} for the selected requirement_id"
+                            ),
+                            remediation=(
+                                "Use the selected requirement's error_code, or select the "
+                                "requirement_id "
+                                "for the error path this trajectory exercises."
+                            ),
+                        )
+                    )
             canonical = {
                 item.kind
                 for item in case.expectations
@@ -2014,6 +2162,16 @@ class VerifierCompiler:
                     validation_phase="intent_error_semantics",
                     frontier_ordinal=20,
                     issues=tuple(error_selector_issues),
+                )
+            )
+
+        if requirement_binding_issues:
+            raise StructuredValidationError(
+                ValidationDiagnostic(
+                    owner_component="verifier",
+                    validation_phase="intent_requirement_binding",
+                    frontier_ordinal=22,
+                    issues=tuple(requirement_binding_issues),
                 )
             )
 
@@ -2202,7 +2360,7 @@ class VerifierCompiler:
         required_property_families: Sequence[str],
         require_metamorphic: bool,
     ) -> VerifierDraft:
-        """Expand family-level trajectory labels into exact trusted Rule closure."""
+        """Bind selected semantic requirements into the exact trusted Rule closure."""
 
         bound_cases = VerifierCompiler._bind_intent_cases(intent)
         rules = design_rule_index(design)
@@ -2213,49 +2371,12 @@ class VerifierCompiler:
         if not set(required) <= set(rules):
             raise ValueError("VerifierIntent compiler received an unknown Rule")
         allowed_tasks = set(allowed_task_types)
-        task_rule_owners = {
-            rule.rule_id: task.task_type
-            for task in design.curriculum.task_types
-            for rule in (
-                *task.initial_state_constraints,
-                *task.success_conditions,
-                *task.failure_conditions,
-                *task.terminal_conditions,
-            )
+        semantic_requirements = VerifierCompiler._semantic_requirements(design, required)
+        requirements_by_rule = {
+            requirement.rule_id: requirement for requirement in semantic_requirements
         }
-        rule_tools: dict[str, set[str]] = {rule_id: set() for rule_id in rules}
-        error_code_by_rule: dict[str, str] = {}
-        error_codes_by_tool: dict[str, tuple[str, ...]] = {}
-        for tool in design.world_spec.tools:
-            semantics = tool.semantics
-            error_codes_by_tool[tool.surface.tool_id] = tuple(
-                error.error_code for error in semantics.errors
-            )
-            for rule in (
-                *semantics.preconditions,
-                *semantics.transition,
-                *semantics.postconditions,
-            ):
-                rule_tools[rule.rule_id].add(tool.surface.tool_id)
-            for error in semantics.errors:
-                rule_tools[error.when.rule_id].add(tool.surface.tool_id)
-                error_code_by_rule[error.when.rule_id] = error.error_code
-            if semantics.permission.condition is not None:
-                rule_tools[semantics.permission.condition.rule_id].add(tool.surface.tool_id)
-
-        def coverage_key_for(rule_id: str) -> _CoverageRequirementKey:
-            rule = rules[rule_id]
-            return _coverage_requirement_key(
-                task_type=task_rule_owners.get(rule_id),
-                property_kind=str(_CANONICAL_PROPERTY_KIND[rule.family]),
-                tool_ids=rule_tools[rule_id],
-                positive_and_negative=(rule.case_sensitivity == "positive_and_negative"),
-                error_code=(
-                    error_code_by_rule.get(rule_id)
-                    if rule.family == "error_condition"
-                    else None
-                ),
-            )
+        if set(requirements_by_rule) != set(required):
+            raise ValueError("VerifierIntent compiler could not bind every required Rule")
 
         case_assertions: dict[str, list[VerifierAssertion]] = {
             item.case_id: [] for item in bound_cases
@@ -2264,19 +2385,16 @@ class VerifierCompiler:
         binding_issues: list[SafeValidationIssue] = []
         for rule_id in required:
             rule = rules[rule_id]
-            canonical_kind = _CANONICAL_PROPERTY_KIND[rule.family]
-            owner = task_rule_owners.get(rule_id)
-            coverage_key = coverage_key_for(rule_id)
-            coverage_id = _coverage_requirement_id(coverage_key)
-            coverage_summary = _coverage_requirement_summary(coverage_key)
-            if owner is not None and owner not in allowed_tasks:
+            requirement = requirements_by_rule[rule_id]
+            requirement_summary = _semantic_requirement_summary(requirement)
+            if requirement.task_type is not None and requirement.task_type not in allowed_tasks:
                 binding_issues.append(
                     SafeValidationIssue(
                         "rule_outside_task_batch",
-                        ("coverage_requirements", coverage_id),
+                        ("semantic_requirements", requirement.requirement_id),
                         (
-                            f"Framework batch assignment is inconsistent for coverage requirement "
-                            f"{coverage_id} ({coverage_summary}); do not retry the Challenger "
+                            "Framework batch assignment is inconsistent for this semantic "
+                            f"requirement ({requirement_summary}); do not retry the Challenger "
                             "until the frozen batch plan is repaired."
                         ),
                         retryable=False,
@@ -2285,42 +2403,45 @@ class VerifierCompiler:
                 continue
             matches: list[tuple[BoundVerifierCaseIntent, int, bool]] = []
             for case in bound_cases:
-                if owner is not None and case.task_type != owner:
+                if requirement.task_type is not None and case.task_type != requirement.task_type:
                     continue
                 for expectation in case.expectations:
-                    if expectation.kind != canonical_kind:
+                    if expectation.requirement_id != requirement.requirement_id:
+                        continue
+                    if expectation.kind != requirement.property_kind:
+                        continue
+                    if expectation.action_index >= len(case.actions):
                         continue
                     action_tool = case.actions[expectation.action_index].tool_id
-                    if rule_tools[rule_id] and action_tool not in rule_tools[rule_id]:
+                    if requirement.tool_ids and action_tool not in requirement.tool_ids:
                         continue
-                    if canonical_kind == "error_semantics":
-                        expected_error_code = error_code_by_rule.get(rule_id)
-                        action_error_codes = error_codes_by_tool.get(action_tool, ())
-                        if expectation.error_code is None:
-                            if len(action_error_codes) != 1:
-                                continue
-                        elif expectation.error_code != expected_error_code:
-                            continue
+                    if (
+                        requirement.property_kind == "error_semantics"
+                        and expectation.error_code is not None
+                        and expectation.error_code != requirement.error_code
+                    ):
+                        continue
                     matches.append((case, expectation.action_index, expectation.expected))
             partitions = {case.partition for case, _index, expected in matches if expected}
             if "sealed" not in partitions or not partitions & {"public", "repair"}:
                 binding_issues.append(
                     SafeValidationIssue(
                         "rule_positive_partition_coverage",
-                        ("coverage_requirements", coverage_id),
+                        ("semantic_requirements", requirement.requirement_id),
                         (
-                            f"Coverage requirement {coverage_id} ({coverage_summary}) needs a "
-                            "positive expectation in a compatible semantic trajectory. The "
+                            "This semantic requirement needs a positive expectation in a "
+                            f"compatible semantic trajectory ({requirement_summary}). The "
                             "framework will pair that trajectory into sealed and public "
                             "obligations."
                         ),
                         expected_category=(
-                            "an expectations entry with the row property_kind, expected=true, "
-                            "and after_action_ordinal pointing to a compatible row tool"
+                            "an expectations entry with this requirement_id, expected=true, and "
+                            "after_action_ordinal pointing to a compatible requirement tool"
                         ),
                         remediation=(
-                            "Add a compatible expectation with expected=true; when this row "
-                            "lists tool_ids, point its ordinal at one of those tool actions."
+                            "Add an expectation that copies this requirement_id with "
+                            "expected=true; when it lists tool_ids, point its ordinal at one "
+                            "of those tool actions."
                         ),
                     )
                 )
@@ -2330,19 +2451,21 @@ class VerifierCompiler:
                 binding_issues.append(
                     SafeValidationIssue(
                         "rule_negative_obligation_missing",
-                        ("coverage_requirements", coverage_id),
+                        ("semantic_requirements", requirement.requirement_id),
                         (
-                            f"Coverage requirement {coverage_id} ({coverage_summary}) also "
-                            "needs at least one compatible negative expectation."
+                            "This semantic requirement also needs at least one compatible negative "
+                            f"expectation ({requirement_summary})."
                         ),
                         expected_category=(
-                            "an expectations entry with the row property_kind, expected=false, "
-                            "and after_action_ordinal pointing to a compatible row tool"
+                            "an expectations entry with this requirement_id, expected=false, and "
+                            "after_action_ordinal pointing to a compatible requirement tool"
                         ),
                         remediation=(
-                            "Add the expected=false coverage in a separate negative semantic "
-                            "trajectory whose action or reset input can really produce the "
-                            "opposite outcome; when this row lists tool_ids, point its ordinal "
+                            "Add an expected=false expectation for this requirement_id in a "
+                            "separate "
+                            "negative semantic trajectory whose action or reset input can really "
+                            "produce the opposite outcome; when it lists tool_ids, point its "
+                            "ordinal "
                             "at one of those tool actions."
                         ),
                     )
@@ -2657,6 +2780,11 @@ class VerifierCompiler:
                     f"case {case.case_id} invokes unknown tools: {sorted(unknown_tools)}"
                 )
             for action in case.actions:
+                if case.actor not in tools[action.tool_id].semantics.permission.allowed_actors:
+                    raise ValueError(
+                        f"case {case.case_id} invokes {action.tool_id} with actor {case.actor} "
+                        "without frozen tool permission"
+                    )
                 errors = tuple(
                     Draft202012Validator(tools[action.tool_id].surface.input_schema).iter_errors(
                         action.arguments
@@ -2906,7 +3034,8 @@ class VerifierCompiler:
     def _prompt(context: Mapping[str, JsonValue]) -> str:
         context_json = canonical_json_bytes(context).decode("utf-8")
         return (
-            """You are the Challenger inside Agent World Foundry.
+            """  # noqa: S608 - static model instruction, not a database query.
+You are the Challenger inside Agent World Foundry.
 Project purpose: prove that an untrusted generated Runtime implements the evidence-backed
 WorldSpec with real programmatic state transitions, without sharing expected answers with it.
 
@@ -2914,56 +3043,48 @@ The framework has already compiled the only information you need into the compac
 below. You have no tools and must not request files, shell commands, source code, or more context.
 Produce exactly one compact VerifierIntent structured output. Return one syntactically valid RFC
 8259 JSON object only: no Markdown, prose, `NaN`, `Infinity`, or `-Infinity` literals.
-You propose only domain reset configs, tool-action trajectories, and family-level expectations.
-For example: "transition after action N should be true". Never enumerate Rule ids or properties:
-framework code expands each family
-expectation to the complete frozen Rule closure and rejects uncovered rules deterministically.
+You propose only domain reset configs, tool-action trajectories, and expectations that select one
+published semantic requirement. Never enumerate framework Rule ids or properties. Framework code
+uses the selected opaque requirement_id to bind each expectation to exactly one frozen Rule and
+rejects any uncovered requirement deterministically.
 The verifier context and requested output are different schemas. The context's `schema_version`
 is context data only: never copy it into VerifierIntent. The top-level VerifierIntent v2
 `schema_version` may be omitted when the output schema permits its default; if emitted, it must be
 the literal `"v2"`.
 Each item in `cases` must use the literal `expectations` field, never aliases such as `checks`,
-`assertions`, or `properties`. Its expectation items describe `kind`, one-based
-`after_action_ordinal`, and boolean `expected` according to the supplied logical output schema.
+`assertions`, or `properties`. Each expectation item must copy exactly one `requirement_id` from
+`semantic_requirements`, then supply its matching `kind`, one-based `after_action_ordinal`, and
+boolean `expected` according to the supplied logical output schema. `requirement_id` is an opaque
+selector, not a Rule id: do not invent, omit, or transform it.
 For `error_semantics`, select the path using `error_code`: when the selected tool has more than
 one entry in `tools[].error_codes`, it is required; otherwise it may be omitted. Never emit
 `error_code` for another kind, and do not add unrecognized case fields.
 Each tool's `precondition_summaries` and `error_paths` are the public semantic guide for choosing
 a legitimate reset/action path. For an error trajectory, choose its `error_code` and make the
 reset/action match that path's `trigger`; do not label a normal successful transition as an error
-just to cover a row.
-Before answering, perform a two-pass coverage audit over every
-`coverage_requirements[].coverage_id`.
-`coverage_id` is a stable planning label, not an output field: use its visible scope, task_type,
-property_kind, tool_ids, and polarity to choose compatible trajectories and expectations, but never
-emit the id itself. One compatible semantic trajectory may satisfy several coverage entries. For
-each coverage requirement provide a positive semantic expectation; when positive_and_negative is
-true, also provide a negative expectation in a separate semantically distinct trajectory. A negative
-trajectory must change a legitimate domain reset input or action so the opposite outcome can really
-occur; it is not a second expectation item on the same action. Framework code pairs every semantic
-trajectory into public and sealed cases and assigns both case ids and independent uint64 seeds. You
-must not propose or infer disclosure partitions, ids, or seeds.
-In pass one, choose a concrete `(kind, error_code when supplied by the coverage row, expected,
-after_action_ordinal, action tool_id)` mapping for each row before composing the final cases.
-`rule_count` counts the framework's private Rules in a
-row; it never removes that row's own expectation obligation. In pass two, scan the completed
-`cases` against every row again. For this ledger, positive means an `expectations` item with
-`expected=true`; negative means a separate compatible item with `expected=false`. Its `kind` must
-equal the row's property_kind. If a row lists tool_ids, the expectation's after_action_ordinal must
-point to an action whose tool_id is one of those values: merely including that tool elsewhere in the
-same trajectory does not cover the row. For an `error_semantics` row with `error_code`, copy that
-code to the expectation: one action can exercise one declared error path, so use a separate
-trajectory for another code. This applies equally to `positive_only` error_semantics rows. For a
-row with positive_and_negative=true, check that both boolean expectation entries exist
-before returning, but never put both polarities at the same `(kind, after_action_ordinal)` in one
-case. One expectation item may satisfy compatible coverage rows, but never two rows with different
-error_code values. Within one case, emit each
-`(kind, after_action_ordinal)` at most once: merge overlapping row mappings onto that one item
-instead of adding duplicates or an opposite polarity. For a row with no tool_ids, use a
-compatible action in the selected task. Do not return while any ledger row lacks its mapped
-expectation.
-Coverage requirements with `scope="world_shared"` and `task_type=null` apply across the assigned
-real tasks; `world_shared` is never a case task_type. Choose case task_type only from `tasks`.
+just to cover a requirement.
+Before answering, perform a two-pass feasibility and coverage audit over every item in
+`semantic_requirements`. This is the complete requirement ledger. In pass one, choose a concrete
+`(requirement_id, kind, error_code when supplied, expected, after_action_ordinal, action tool_id)`
+mapping for each requirement before composing cases. Use its `summary` as the semantic condition
+that must really hold (or fail) after the selected action; do not treat a matching property kind as
+proof that distinct terminal, success, or error conditions are interchangeable.
+
+In pass two, scan the completed `cases` against every requirement again. Each expectation selects
+exactly one requirement_id; do not merge different requirement_ids merely because their kind or
+tool is alike. Every requirement needs a compatible positive (`expected=true`) expectation. When
+`positive_and_negative` is true, it also needs an `expected=false` expectation in a separate,
+semantically distinct trajectory whose reset/action can really produce the opposite outcome. If a
+requirement lists tool_ids, its expectation ordinal must point to one of those tool actions; merely
+including the tool elsewhere in the trajectory does not cover it. For `error_semantics`, copy the
+requirement's `error_code` exactly and make reset/action satisfy the matching error-path trigger.
+For a requirement with no tool_ids, use a compatible action in the selected task. Do not put both
+polarities of the same `(requirement_id, after_action_ordinal)` in one case. Framework code pairs
+every semantic trajectory into public and sealed cases and assigns private case ids and seeds; you
+must not propose or infer those values. Requirements with `scope="world_shared"` and
+`task_type=null` apply across the assigned real tasks; `world_shared` is never a case task_type.
+Choose case task_type only from `tasks`. Do not return while any requirement lacks its mapped,
+feasible expectation.
 Use meaningful multi-action trajectories, error paths, idempotency, permissions, rollback, and
 ordering/concurrency where applicable. Obligations stay Judge-side, while actions/reset_config
 contain only legitimate domain input. Never put expected values, verifier metadata, release
@@ -2979,6 +3100,16 @@ Each case must declare a real task_type and evaluator_goal satisfying that task'
 evaluator_goal_schema, plus one actor from that task's allowed_actor_ids. Actor is bound once by
 reset and cannot appear in an action's arguments. Never include evaluator_goal in reset_config or
 action arguments.
+
+Actor/action audit is mandatory before returning: every action in a case must use a tool whose
+`allowed_actor_ids` includes that case's single bound actor. A workflow that needs another actor
+is not one mixed-actor trajectory: split it into separate actor-bound cases. Feasibility audit is
+also mandatory: when a first action has a positive `precondition`, make its reset_config and
+arguments satisfy that tool's `precondition_summaries`; when a first action has positive
+`error_semantics`, make them satisfy the selected `error_paths` trigger. Do not call a `planned`,
+`running`, or other lifecycle equivalent to a stated `ready`/`interrupted` requirement. For later
+actions, choose a preceding real transition that establishes the needed state; do not merely label
+an expectation as true.
 
 Action-input schema audit is mandatory before returning: for every
 `cases[].actions[]`, find its selected `tool_id` in `tools` and make `arguments` validate against
@@ -3020,8 +3151,8 @@ Rule IR, snapshots, source code, or release policy. Use at most one preferred re
 every recipe must use only tools available to every allowed task actor and satisfy tool input
 schemas.
 
-`reset_config_schema_id` selects a schema from `reset_config_schemas`; it is a context reference,
-not a Runtime field. Never copy it into reset_config. Keep trajectories on their exact task type.
+`reset_config_schema_id` is a context reference to one item in `reset_config_schemas`, not a
+Runtime field. Never copy it into reset_config. Keep trajectories on their exact task type.
 
 <verifier_context_json>
 """
@@ -3048,7 +3179,6 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
         domain inputs plus model-visible coverage metadata; framework Rule ids stay Judge-side.
         """
 
-        rules = design_rule_index(design)
         selected_task_types = (
             {task.task_type for task in design.curriculum.task_types}
             if task_types is None
@@ -3059,44 +3189,25 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
         )
         if len(selected_tasks) != len(selected_task_types):
             raise ValueError("Challenger context references an unknown task type")
-        selected_rule_ids = set(
-            VerifierCompiler._runtime_case_rule_ids(
-                design,
-                (
-                    design.verification.required_rule_ids
-                    if required_rule_ids is None
-                    else required_rule_ids
-                ),
-            )
+        selected_rule_ids = VerifierCompiler._runtime_case_rule_ids(
+            design,
+            (
+                design.verification.required_rule_ids
+                if required_rule_ids is None
+                else required_rule_ids
+            ),
         )
-        if not selected_rule_ids <= set(rules):
-            raise ValueError("Challenger context references an unknown Rule")
-        rule_tools: dict[str, set[str]] = {rule_id: set() for rule_id in rules}
-        error_code_by_rule: dict[str, str] = {}
-        for tool in design.world_spec.tools:
-            semantics = tool.semantics
-            for rule in (
-                *semantics.preconditions,
-                *semantics.transition,
-                *semantics.postconditions,
-            ):
-                rule_tools[rule.rule_id].add(tool.surface.tool_id)
-            for error in semantics.errors:
-                rule_tools[error.when.rule_id].add(tool.surface.tool_id)
-                error_code_by_rule[error.when.rule_id] = error.error_code
-            if semantics.permission.condition is not None:
-                rule_tools[semantics.permission.condition.rule_id].add(tool.surface.tool_id)
-
-        task_rule_owners = {
-            rule.rule_id: task.task_type
-            for task in design.curriculum.task_types
-            for rule in (
-                *task.initial_state_constraints,
-                *task.success_conditions,
-                *task.failure_conditions,
-                *task.terminal_conditions,
-            )
-        }
+        semantic_requirements = VerifierCompiler._semantic_requirements(
+            design,
+            selected_rule_ids,
+        )
+        out_of_scope_requirements = tuple(
+            item
+            for item in semantic_requirements
+            if item.task_type is not None and item.task_type not in selected_task_types
+        )
+        if out_of_scope_requirements:
+            raise ValueError("Challenger context assigns a task Rule outside this batch")
         reset_schemas: dict[str, JsonValue] = {}
         task_schema_ids: dict[str, str] = {}
         for task in selected_tasks:
@@ -3108,27 +3219,11 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
             tool_id for task in selected_tasks for tool_id in task.required_tool_ids
         }
         relevant_tool_ids.update(
-            tool_id for rule_id in selected_rule_ids for tool_id in rule_tools[rule_id]
+            tool_id for requirement in semantic_requirements for tool_id in requirement.tool_ids
         )
-        coverage_groups: dict[_CoverageRequirementKey, int] = {}
-        for rule_id in sorted(selected_rule_ids):
-            rule = rules[rule_id]
-            task_owner = task_rule_owners.get(rule_id)
-            key = _coverage_requirement_key(
-                task_type=task_owner,
-                property_kind=str(_CANONICAL_PROPERTY_KIND[rule.family]),
-                tool_ids=rule_tools[rule_id],
-                positive_and_negative=(rule.case_sensitivity == "positive_and_negative"),
-                error_code=(
-                    error_code_by_rule.get(rule_id)
-                    if rule.family == "error_condition"
-                    else None
-                ),
-            )
-            coverage_groups[key] = coverage_groups.get(key, 0) + 1
 
         return {
-            "schema_version": "agent-world.challenger-context.v7",
+            "schema_version": "agent-world.challenger-context.v8",
             "reset_config_schemas": [
                 {"schema_id": schema_id, "schema": schema}
                 for schema_id, schema in sorted(reset_schemas.items())
@@ -3172,9 +3267,12 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
                 }
                 for task in selected_tasks
             ],
-            "coverage_requirements": [
-                _coverage_requirement_projection(key, rule_count=count)
-                for key, count in sorted(coverage_groups.items())
+            "semantic_requirements": [
+                _semantic_requirement_projection(item)
+                for item in sorted(
+                    semantic_requirements,
+                    key=lambda item: item.requirement_id,
+                )
             ],
             "required_property_families": [
                 cast(JsonValue, str(item))
@@ -3296,6 +3394,65 @@ not a Runtime field. Never copy it into reset_config. Keep trajectories on their
         if unknown:
             raise ValueError(f"Verifier runtime case scope has unknown Rules: {sorted(unknown)}")
         return tuple(rule_id for rule_id in rule_ids if rules[rule_id].family != "sampling")
+
+    @staticmethod
+    def _semantic_requirements(
+        design: EnvironmentDesign,
+        rule_ids: Sequence[str],
+    ) -> tuple[_SemanticRequirement, ...]:
+        """Project exact frozen Rules into opaque Challenger-selectable requirements.
+
+        A property-family label is not enough to bind a trajectory when several
+        Rules share that label but have incompatible conditions.  The
+        ``requirement_id`` is a framework-derived selector copied from the
+        current context, never a Rule id the model has to invent.
+        """
+
+        rules = design_rule_index(design)
+        runtime_rule_ids = VerifierCompiler._runtime_case_rule_ids(design, rule_ids)
+        task_rule_owners = {
+            rule.rule_id: task.task_type
+            for task in design.curriculum.task_types
+            for rule in (
+                *task.initial_state_constraints,
+                *task.success_conditions,
+                *task.failure_conditions,
+                *task.terminal_conditions,
+            )
+        }
+        rule_tools: dict[str, set[str]] = {rule_id: set() for rule_id in rules}
+        error_code_by_rule: dict[str, str] = {}
+        for tool in design.world_spec.tools:
+            semantics = tool.semantics
+            for rule in (
+                *semantics.preconditions,
+                *semantics.transition,
+                *semantics.postconditions,
+            ):
+                rule_tools[rule.rule_id].add(tool.surface.tool_id)
+            for error in semantics.errors:
+                rule_tools[error.when.rule_id].add(tool.surface.tool_id)
+                error_code_by_rule[error.when.rule_id] = error.error_code
+            if semantics.permission.condition is not None:
+                rule_tools[semantics.permission.condition.rule_id].add(tool.surface.tool_id)
+        return tuple(
+            _SemanticRequirement(
+                requirement_id=_semantic_requirement_id(rule_id),
+                rule_id=rule_id,
+                scope="task" if task_rule_owners.get(rule_id) is not None else "world_shared",
+                task_type=task_rule_owners.get(rule_id),
+                property_kind=str(_CANONICAL_PROPERTY_KIND[rules[rule_id].family]),
+                tool_ids=tuple(sorted(rule_tools[rule_id])),
+                positive_and_negative=(rules[rule_id].case_sensitivity == "positive_and_negative"),
+                error_code=(
+                    error_code_by_rule.get(rule_id)
+                    if rules[rule_id].family == "error_condition"
+                    else None
+                ),
+                summary=rules[rule_id].description,
+            )
+            for rule_id in runtime_rule_ids
+        )
 
     def _batch_budgets(self, budget: Budget, batch_count: int) -> tuple[Budget, ...]:
         if batch_count < 1 or batch_count > self.maximum_task_shards:
@@ -3566,8 +3723,7 @@ def _validate_solve_recipe(
                     ),
                     violated_condition="a pointer source type must fit its selected argument type",
                     expected_category=(
-                        "a pointer whose resolved source type fits the selected tool argument "
-                        "type"
+                        "a pointer whose resolved source type fits the selected tool argument type"
                     ),
                     remediation=(
                         "Use a compatible pointer source, or replace this binding with a "

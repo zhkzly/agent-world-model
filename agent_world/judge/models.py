@@ -150,15 +150,22 @@ class VerifierBatchDraft(V2Contract):
 
 
 class PropertyExpectationIntent(V2Contract):
-    """Compact semantic label expanded to exact Rule obligations by the framework.
+    """One selected public semantic requirement for a Challenger trajectory.
 
-    ``error_code`` is intentionally a public semantic selector rather than a
-    Rule identifier.  A tool may declare several error conditions, while one
-    Runtime action can only emit one error response.  The Challenger therefore
-    has to identify the error path it means to exercise before the framework
-    binds the corresponding private Rule.
+    ``requirement_id`` is an opaque selector copied from the current
+    ``semantic_requirements`` catalog.  It is not a private Rule id and the
+    Challenger must not invent it.  Selecting it lets framework code bind this
+    one expectation to one frozen Rule rather than fan a generic family label
+    out across semantically distinct Rules (for example, approved versus
+    rejected terminal states).
     """
 
+    requirement_id: Identifier = Field(
+        description=(
+            "One opaque requirement_id copied exactly from the current semantic_requirements "
+            "catalog; never invent or omit it."
+        )
+    )
     kind: Literal[
         "invariant",
         "initial_state",
@@ -224,9 +231,15 @@ class VerifierCaseIntent(V2Contract):
     ]
 
     @property
-    def expectation_keys(self) -> frozenset[tuple[str, str | None, int, bool]]:
+    def expectation_keys(self) -> frozenset[tuple[str, str, str | None, int, bool]]:
         return frozenset(
-            (item.kind, item.error_code, item.action_index, item.expected)
+            (
+                item.requirement_id,
+                item.kind,
+                item.error_code,
+                item.action_index,
+                item.expected,
+            )
             for item in self.expectations
         )
 
