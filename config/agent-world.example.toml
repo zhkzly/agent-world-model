@@ -1,177 +1,27 @@
-# Copy this file to a private location and replace paths/model names.
-# Credential values never belong in TOML; only explicit handles do.
-state_root = "/home/me/.local/state/agent-world"
+[foundry]
+state_root = ".agent-world-runs"
 
-[agent]
-model = "YOUR_CODEX_MODEL"
-# Explicit only: these are eligible after one closed same-model transient retry,
-# never a silent replacement for a failed semantic proposal.  Order encodes the
-# user-approved preference among routes compatible with this deployment.
-fallback_models = ["grok-4.5", "gpt-5.3-codex-spark", "gpt-5.4-mini"]
-codex_bin = "/absolute/path/to/a/current/codex"
-# Names only. The values must be injected into the Foundry process environment.
-api_key_environment = "OPENAI_API_KEY"
-openai_base_url_environment = "OPENAI_BASE_URL"
-reasoning_researcher = "high"
-reasoning_engineer = "xhigh"
-reasoning_challenger = "xhigh"
-engineer_network_domain_ceiling = ["pypi.org", "files.pythonhosted.org"]
-# Empty keeps the Builder Agent offline. List only domains it must use for uv lock/build work.
-engineer_dependency_network_domains = []
-invocation_timeout_seconds = 2700
-# Hard per-tool context cap; full source bytes remain in artifacts even when Agent-visible output
-# is truncated.
-tool_output_token_limit = 2048
-# Hard Codex rollout envelopes. The Controller reserves one complete envelope
-# for every authorized semantic turn before crossing the backend boundary.
-structured_turn_token_limit = 65536
-environment_codegen_turn_token_limit = 262144
+[direct.primary]
+model = "deepseek-v4-flash"
+base_url = "https://opencode.ai/zen/go/v1/chat/completions"
+api_key_env = "OPENCODE_API_KEY"
+
+[direct.fallback]
+model = "gpt-5.6-luna"
+base_url = "http://localhost:8317/v1/chat/completions"
+api_key_env = "OPENAI_API_KEY"
+
+[agent.primary]
+model = "gpt-5.6-luna"
+base_url = "http://localhost:8317/v1"
+api_key_env = "OPENAI_API_KEY"
+
+[agent.fallback]
+model = "gpt-5.3-codex-spark"
+base_url = "http://localhost:8317/v1"
+api_key_env = "OPENAI_API_KEY"
 
 [research]
-provider = "searxng"
-searxng_base_url = "http://127.0.0.1:8080"
-searxng_allow_private_endpoint = true
-# Only for controlled sandboxes whose public egress is represented by RFC 2544 addresses.
-# Default false; never enable on an ordinary host or server network.
-allow_rfc2544_synthetic_egress = false
-use_jina_reader_fallback = false
-request_timeout_seconds = 30
-max_response_bytes = 8388608
-max_parallel_fetches = 4
-
-[judge]
-clean_build_timeout_seconds = 600
-uv_cache_dir = "/home/me/.cache/uv"
-
-[expansion]
-policy = "evolutionary-archive"
-default_source_ids = [
-  "source:tool-ecosystem",
-  "source:pool-neighborhood",
-  "source:random-theme",
-]
-maximum_intents_per_iteration = 2
-maximum_iterations = 5
-maximum_no_release_iterations = 3
-maximum_infrastructure_error_iterations = 3
-max_in_flight = 2
-external_injection_rate = 0.25
-version_reservation_ttl_seconds = 86400
-
-# Replace, add, or remove Source entries without changing Campaign/Policy code.
-# Source proposes evidence-backed clues only; it never builds or releases a candidate.
-# The currently registered production route is evidence-backed-web@1 and accepts no parameters.
-# tool_calls counts all search/fetch/reader operations; search_calls is the search-only subset.
-[[expansion.sources]]
-source_id = "source:tool-ecosystem"
-engine = "evidence-backed-web"
-version = "1"
-kind = "tool_ecosystem"
-maximum_hypotheses = 4
-maximum_clues = 4
-maximum_parents = 8
-maximum_context_bytes = 524288
-
-[expansion.sources.budget]
-llm_tokens = 80000
-agent_turns = 4
-search_calls = 3
-tool_calls = 12
-wall_seconds = 900
-
-[[expansion.sources]]
-source_id = "source:pool-neighborhood"
-engine = "evidence-backed-web"
-version = "1"
-kind = "pool_neighborhood"
-maximum_hypotheses = 4
-maximum_clues = 4
-maximum_parents = 8
-maximum_context_bytes = 524288
-
-[expansion.sources.budget]
-llm_tokens = 80000
-agent_turns = 4
-search_calls = 3
-tool_calls = 12
-wall_seconds = 900
-
-[[expansion.sources]]
-source_id = "source:random-theme"
-engine = "evidence-backed-web"
-version = "1"
-kind = "random_theme"
-maximum_hypotheses = 4
-maximum_clues = 4
-maximum_parents = 8
-maximum_context_bytes = 524288
-
-[expansion.sources.budget]
-llm_tokens = 80000
-agent_turns = 4
-search_calls = 3
-tool_calls = 12
-wall_seconds = 900
-
-[expansion.campaign_budget]
-llm_tokens = 6000000
-agent_turns = 640
-search_calls = 30
-tool_calls = 2560
-process_calls = 2560
-build_seconds = 4500
-evaluation_episodes = 640
-container_seconds = 18000
-repair_attempts = 15
-wall_seconds = 36000
-
-[expansion.candidate_budget]
-llm_tokens = 1200000
-agent_turns = 128
-search_calls = 6
-tool_calls = 512
-process_calls = 512
-build_seconds = 900
-evaluation_episodes = 128
-container_seconds = 3600
-repair_attempts = 3
-wall_seconds = 7200
-
-[generation_budget]
-llm_tokens = 10000000
-agent_turns = 128
-search_calls = 6
-tool_calls = 512
-process_calls = 512
-build_seconds = 900
-evaluation_episodes = 128
-container_seconds = 3600
-repair_attempts = 15
-wall_seconds = 28800
-
-[discovery_budget]
-llm_tokens = 80000
-agent_turns = 4
-search_calls = 3
-tool_calls = 12
-wall_seconds = 900
-
-[release_profile]
-profile_id = "default-release"
-required_hard_gates = [
-  "schema",
-  "supply_chain",
-  "static_assurance",
-  "runtime_protocol",
-  "task_materialization",
-  "task_reachability",
-  "behavior",
-  "sealed_release",
-  "clean_deployment",
-]
-maximum_risk = "medium"
-require_reproducible_reset = true
-require_unknown_seed_testing = true
-require_clean_install = true
-require_package_relative_paths = true
-allow_unresolved_assumptions = false
+search_url = "https://s.jina.ai"
+reader_url = "https://r.jina.ai"
+api_key_env = "JINA_API_KEY"

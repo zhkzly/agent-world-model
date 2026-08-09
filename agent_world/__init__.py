@@ -1,10 +1,7 @@
-"""Agent World Foundry.
+"""Clean-break Direct environment foundry package.
 
-The package turns a natural-language need into a real executable environment.
-Program code owns workflow, evidence, gates, repair, and release; model calls
-remain behind invocation adapters and generated runtimes remain untrusted.
+Runtime behavior is intentionally absent during D0 bootstrap.  The module exists
+only to establish a new import boundary before Direct implementation begins.
 """
 
-__version__ = "0.2.0"
-
-__all__ = ["__version__"]
+__version__ = "0.3.0"
