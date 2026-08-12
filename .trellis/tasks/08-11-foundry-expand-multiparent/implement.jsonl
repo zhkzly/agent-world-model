@@ -1,0 +1,11 @@
+{"file":"docs/agent-world-environment-generation.zh.md","reason":"Canonical Evolve, package identity, parent, Campaign and release contracts."}
+{"file":"docs/direct-rewrite-execution-map.zh.md","reason":"Shared graph and execution boundaries that Expand must reuse."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/prd.md","reason":"Parent shared contracts and real multi-parent acceptance."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/design.md","reason":"Parent Campaign, lineage, parent-source and Consumer seams."}
+{"file":".trellis/tasks/08-11-foundry-expand-multiparent/prd.md","reason":"Expand child requirements, dependencies and proof criteria."}
+{"file":".trellis/tasks/08-11-foundry-expand-multiparent/design.md","reason":"Closed Campaign, policy, operator, multi-parent and Observe design."}
+{"file":".trellis/tasks/08-11-foundry-expand-multiparent/implement.md","reason":"Ordered single-parent and useful multi-parent implementation/proof plan."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/node-contracts.md","reason":"Upstream DesignGraph/CandidateGraph/package contracts reused by Expand."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/research/evolve-input-output-contract.md","reason":"Prior detailed Expand research reconciled into this binding child plan."}
+{"file":".trellis/spec/guides/foundry-product-alignment.md","reason":"Checkpoint requirements for Campaign and release boundaries."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/research/cross-layer-review-b34be669.md","reason":"Current parent allow for package-use admission, split outcomes and cross-graph Expand handoffs."}

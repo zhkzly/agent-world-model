@@ -210,9 +210,10 @@ Inline mode: skip jsonl curation; Phase 2 reads artifacts/specs via `trellis-bef
 [/workflow-state:planning-inline]
 
 ### Phase 2: Execute
-- 2.1 Implement `[required · repeatable]`
-- 2.2 Quality check `[required · repeatable]`
-- 2.3 Rollback `[on demand]`
+- 2.1 Diagnose / plan / cross-layer critic `[required before each logical change]`
+- 2.2 Implement `[required · repeatable]`
+- 2.3 Quality check `[required · repeatable]`
+- 2.4 Rollback `[on demand]`
 
 <!-- Per-turn breadcrumb: shown while status='in_progress'.
      Scope: all of Phase 2 + Phase 3.2-3.4 (status stays 'in_progress' from
@@ -224,7 +225,10 @@ Sub-agent dispatch protocol applies to all platforms and all sub-agents, includi
 
 [workflow-state:in_progress]
 Tools: `trellis-implement` / `trellis-research` are sub-agent types only (Task/Agent tool, NOT Skill; there is no skill by these names). `trellis-update-spec` is a skill. `trellis-check` exists as both; prefer the Agent form when verifying after code changes.
-Flow: `trellis-implement` -> `trellis-check` -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
+Pre-change gate: a semantic, permission, route, persistence, public-entry, validation, or control-plane behavior change needs a written plan and matching critic `allow`. For a real proof terminal use `Observe -> agent-world-debugging -> Diagnosis Record -> repair-plan revision -> agent-world-cross-layer-critic`. Never invent an Observe scene for a pure static check failure.
+`block` returns to plan revision (at most two for one diagnosis/plan lineage); `needs_human` stops. The allow expires when the plan digest, trust boundary, or relevant real scene changes. Add the allow record to task JSONL before dispatch.
+For the critic trust-boundary triggers, dispatch a fresh read-only `trellis-research` reviewer; otherwise the main session may review an actually local plan. The critic is not a runtime node.
+Flow after allow: `trellis-implement` -> `trellis-check` -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`. Read Observe after every real proof terminal.
 Main-session default: dispatch implement/check sub-agents. Sub-agent self-exemption: if already running as `trellis-implement`, do NOT spawn another `trellis-implement` or `trellis-check`; if already running as `trellis-check`, do NOT spawn another `trellis-check` or `trellis-implement`. Dispatch is main session only.
 Dispatch prompt starts with `Active task: <task path from task.py current>`. Read context: jsonl entries -> `prd.md` -> `design.md if present` -> `implement.md if present`.
 [/workflow-state:in_progress]
@@ -235,7 +239,8 @@ Dispatch prompt starts with `Active task: <task path from task.py current>`. Rea
      instead of dispatching sub-agents. -->
 
 [workflow-state:in_progress-inline]
-Flow: `trellis-before-dev` -> edit -> `trellis-check` -> validation -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`.
+Pre-change gate: for a real proof terminal use `Observe -> agent-world-debugging -> Diagnosis Record -> repair plan -> agent-world-cross-layer-critic`; otherwise review the written plan. A matching critic `allow` is required for every semantic, permission, route, persistence, public-entry, validation, or control-plane behavior change. Revise a blocked plan at most twice; stop on `needs_human`.
+Flow after allow: `trellis-before-dev` -> edit -> `trellis-check` -> validation -> `trellis-update-spec` -> commit (Phase 3.4) -> `/trellis:finish-work`. Read Observe after every real proof terminal.
 Do not dispatch implement/check sub-agents in inline mode.
 Read context: `prd.md` -> `design.md if present` -> `implement.md if present`, plus relevant spec/research loaded by skills.
 [/workflow-state:in_progress-inline]
@@ -246,7 +251,7 @@ Read context: `prd.md` -> `design.md if present` -> `implement.md if present`, p
 - 3.4 Commit changes `[required · once]`
 - 3.5 Wrap-up reminder
 
-> Note: step 3.1 was folded into 2.2 (last-iteration full-scope check) and 3.4 (commit preamble). Numbering kept stable to avoid breaking external references.
+> Note: step 3.1 was folded into 2.3 (last-iteration full-scope check) and 3.4 (commit preamble). Numbering kept stable to avoid breaking external references.
 
 <!-- Per-turn breadcrumb: shown while status='completed'.
      Currently DEAD in normal flow: cmd_archive writes status='completed' in
@@ -275,7 +280,8 @@ When a user request matches one of these intents inside an active task, route fi
 [Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Pi, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
 
 - Planning or unclear requirements -> `trellis-brainstorm`.
-- `in_progress` implementation/check -> dispatch `trellis-implement` / `trellis-check`.
+- Real proof failure -> Observe, `agent-world-debugging`, repair-plan revision, then `agent-world-cross-layer-critic`.
+- `in_progress` implementation/check -> run the critic gate, then dispatch `trellis-implement` / `trellis-check` only after matching `allow`.
 - Repeated debugging -> `trellis-break-loop`; spec updates -> `trellis-update-spec`.
 
 [/Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Pi, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
@@ -283,7 +289,8 @@ When a user request matches one of these intents inside an active task, route fi
 [codex-inline, Kilo, Antigravity, Devin]
 
 - Planning or unclear requirements -> `trellis-brainstorm`.
-- Before editing -> `trellis-before-dev`; after editing -> `trellis-check`.
+- Real proof failure -> Observe, `agent-world-debugging`, repair-plan revision, then `agent-world-cross-layer-critic`.
+- Before editing -> matching critic `allow` then `trellis-before-dev`; after editing -> `trellis-check`.
 - Repeated debugging -> `trellis-break-loop`; spec updates -> `trellis-update-spec`.
 
 [/codex-inline, Kilo, Antigravity, Devin]
@@ -470,7 +477,25 @@ If `task.py start` errors with a session-identity message (no context key from h
 
 Goal: turn reviewed planning artifacts into code that passes quality checks.
 
-#### 2.1 Implement `[required · repeatable]`
+#### 2.1 Diagnose / plan / cross-layer critic `[required before each logical change]`
+
+For a real proof terminal, read Observe and use agent-world-debugging to
+persist a Diagnosis Record. Turn that record into a repair-plan revision; do
+not patch or retry directly. For a requested behavior change without a real
+terminal, write/update the plan first.
+
+Use agent-world-cross-layer-critic after the plan exists. It classifies the
+smallest coherent scope and returns allow, block, or needs_human. A matching
+allow record must name the plan digest, scope, trust boundary, and current
+scene when applicable; add it to both task JSONL manifests. A blocked
+diagnosis/plan lineage gets at most two revisions. Use a fresh read-only
+trellis-research reviewer at the critic trust-boundary triggers.
+
+#### 2.2 Implement `[required · repeatable]`
+
+Only dispatch/perform implementation after the matching allow record is
+present. If a new producer/consumer effect expands the scope, stop and return
+to 2.1 before editing further.
 
 [Claude Code, Cursor, OpenCode, codex-sub-agent, CodeBuddy, Droid, Pi, ZCode, Snow, Oh My Pi]
 
@@ -525,20 +550,21 @@ The platform prelude auto-handles the context load requirement:
 
 [/codex-inline, Kilo, Antigravity, Devin]
 
-#### 2.2 Quality check `[required · repeatable]`
+#### 2.3 Quality check `[required · repeatable]`
 
 [Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Pi, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
 
 Spawn the check sub-agent:
 
 - **Agent type**: `trellis-check`
-- **Task description**: Review all code changes against specs and task artifacts; fix any findings directly; ensure lint and type-check pass
+- **Task description**: Review all code changes against specs and task artifacts; fix only mechanical quality issues inside the approved scope; ensure lint and type-check pass
 - **Dispatch prompt guard**: The prompt MUST start with `Active task: <task path>`, then tell the spawned agent it is already the `trellis-check` sub-agent and must review/fix directly, not spawn another `trellis-check` / `trellis-implement`.
 
 The check agent's job:
 - Review code changes against specs
 - Review code changes against `prd.md`, `design.md` if present, and `implement.md` if present
-- Auto-fix issues it finds
+- Stop and return to 2.1 for behavioral, contract, owner, consumer, validation, or scope-expansion findings
+- Auto-fix only mechanical quality issues inside the approved scope
 - Run lint and typecheck to verify
 
 [/Claude Code, Cursor, OpenCode, codex-sub-agent, Kiro, Gemini, Qoder, CodeBuddy, Copilot, Droid, Pi, Oh My Pi, ZCode, Snow, Reasonix, Trae, Grok, Kimi Code]
@@ -550,17 +576,18 @@ Load the `trellis-check` skill and verify the code per its guidance:
 - lint / type-check / tests
 - Cross-layer consistency (when changes span layers)
 
-If issues are found → fix → re-check, until green.
+If a mechanical quality issue is found -> fix -> re-check. If a behavioral or
+scope issue is found -> return to 2.1 for a revised plan and critic review.
 
 [/codex-inline, Kilo, Antigravity, Devin]
 
-**Final pass (before Phase 3.4 commit)**: the last 2.2 of a task must run full-scope, not just on the latest implement chunk. List all affected packages with `python3 ./.trellis/scripts/get_context.py --mode packages`, then load each package's spec index Quality Check section. This catches cross-layer / multi-package issues a mid-iteration local 2.2 cannot.
+**Final pass (before Phase 3.4 commit)**: the last 2.3 of a task must run full-scope, not just on the latest implement chunk. List all affected packages with `python3 ./.trellis/scripts/get_context.py --mode packages`, then load each package's spec index Quality Check section. This catches cross-layer / multi-package issues a mid-iteration local 2.3 cannot.
 
-#### 2.3 Rollback `[on demand]`
+#### 2.4 Rollback `[on demand]`
 
-- `check` reveals a prd defect → return to Phase 1, fix `prd.md`, then redo 2.1
-- Implementation went wrong → revert code, redo 2.1
-- Need more research → research (same as Phase 1.2), write findings into `research/`
+- `check` reveals a prd defect -> return to Phase 1, fix `prd.md`, then redo 2.1
+- Implementation went wrong -> revert code, return to 2.1
+- Need more research -> research (same as Phase 1.2), write findings into `research/`
 
 ---
 

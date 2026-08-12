@@ -16,10 +16,17 @@ Use whichever real handoffs exist in the case.
 ## State the expected behavior from project authority first
 
 For this repository, derive the Expected Behavior Sheet from the source-of-
-truth document, the relevant frozen WorkDefinition/input contract, and the
-actual validator/gate policy. State the intended next outcome and observable
-milestones before reading the failure backwards. A commit, repair, or downstream
-consumer belongs in that sheet only when the selected path actually defines it.
+truth document, the relevant frozen node/run contract and input closure, and
+the actual validator/gate policy. A historical `WorkDefinition` is evidence
+only when tracing that historical path; it is not a required cleanroom object.
+State the intended next outcome and observable milestones before reading the
+failure backwards. A commit, repair, or downstream consumer belongs in that
+sheet only when the selected path actually defines it.
+
+For a cleanroom trace, first establish that the route did not cross forbidden
+legacy control authority. If it did, the first deviation is a hybrid/cutover
+failure; stop there rather than inventing a Direct, Agent, or validator
+semantic deviation.
 
 ## Map the execution view correctly
 

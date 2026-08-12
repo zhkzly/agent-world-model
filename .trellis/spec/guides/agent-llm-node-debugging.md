@@ -9,6 +9,55 @@ The goal is to advance a trustworthy stage from natural-language need to a real
 programmatic environment, independent validation, and eventual Registry
 release—not to make a mocked test or one model sample pass.
 
+## Feedback means the next user wish
+
+For every LLM/Agent correction, restate this before changing Prompt, Skill,
+validator, or retry behavior:
+
+> Feedback is a framework-authored next `user` message in the same node
+> conversation. It keeps the original objective, frozen inputs, and output
+> contract unchanged; names the safe observable problems and expected change;
+> asks for one complete replacement rather than a patch or explanation; and
+> requires a whole-result self-check.
+
+Keep the rejected answer only as the previous ephemeral `assistant` turn. Do
+not copy it into the Feedback or persist it in Artifact, Observe, Skill, or
+memory. This is a bounded user-required exception to the safer general default
+of omitting raw rejected output; retain only the immediately preceding final
+proposal, use one declared continuation method, and make no efficacy claim
+before a real-boundary proof.
+
+"Same conversation" means the logical sequence `initial user -> rejected
+ephemeral assistant -> Feedback user`. It does not authorize a Direct Provider
+`instructions`/developer field, hidden server continuation, reused Agent
+workspace/session state, or durable transcript. A stateless Direct route
+reconstructs only the approved logical turns through its existing Prompt/input
+surface. Tool results remain typed Agent-loop observations, not Feedback.
+Framework code, not the LLM/Agent, owns whether another turn is authorized and
+validates the complete replacement again.
+
+Do not confuse four different loops: an Agent tool result is an in-session
+observation; node-local correction is a same-contract user Feedback turn;
+transport replay is the same request with no semantic Feedback; workflow Repair
+creates a new Artifact revision after terminal failure. The default local
+budget is one correction; any second correction requires explicit policy and
+code-proven strict progress. The same normalized issue set stops.
+
+An explicitly two-correction Direct node may spend its final bounded Feedback
+after a format-first path, but proposal three is terminal and semantic-to-format
+regression never unlocks it; this is bounded self-revision, not generic retry.
+
+Feedback is compiled from actual validator/tool/runtime facts for one
+recipient. Include continuity, all safely known same-frontier issues, the
+complete-replacement action, and a self-check. Exclude raw exceptions, secrets,
+hidden tests, policy, budget, owner, route, Gate, Judge, and release fields.
+A safe parser subtype must be translated into a recipient-executable replacement or deletion action.
+Observe remains a read-only safe account of what happened; it is not itself a
+model prompt or control plane.
+
+Full rationale and sources:
+`.trellis/tasks/08-10-direct-foundry-minimal-dag/research/prompt-feedback-observe-retry-principles.md`.
+
 ## Keep the two Agent contexts distinct
 
 The **project-execution Agent view** is for the Code Agent changing this

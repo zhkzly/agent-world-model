@@ -20,12 +20,23 @@ Name the boundary, frozen-input provenance, and effective model/profile when
 relevant. Preserve the smallest credible closure; do not hand-edit a proposal
 into state merely to reach a later node.
 
+For a cleanroom Direct, Observe, or product claim, first prove that the chosen
+public route and launched process do not load or call forbidden legacy control
+authority. A hybrid trace is a cutover failure, not a true proof boundary; stop
+there and do not attribute it to a model, Prompt, Skill, or Candidate.
+
 ## Select the actual boundary
 
 Read [references/proof-selection.md](references/proof-selection.md) for the
 changed surface. It distinguishes deterministic boundaries, Direct LLM,
 tool-enabled Codex Agent, repair, project Agent view, Integration, and E2E.
 A Direct probe never proves a Codex Agent path.
+
+For a repair that changed code, Prompt, Runtime Skill, profile, configuration,
+contract, or retry policy, run only the proof named by the current
+cross-layer-critic `allow` record. A new terminal scene ends that proof and
+returns to agent-world-debugging; it is not permission for an unplanned second
+repair attempt.
 
 ## Observe real calls without inventing a short death clock
 

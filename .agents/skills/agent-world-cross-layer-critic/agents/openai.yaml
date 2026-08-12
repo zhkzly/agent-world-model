@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent World Cross-Layer Critic"
+  short_description: "Review plans across Foundry boundaries"
+  default_prompt: "Use $agent-world-cross-layer-critic to review this Agent World plan before implementation."

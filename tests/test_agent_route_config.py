@@ -9,14 +9,17 @@ from types import SimpleNamespace
 import pytest
 from openai_codex import AsyncCodex, CodexConfig
 
-from agent_world.config import AgentRoute, ConfigurationError, load_settings
+from agent_world.config import AgentRoute, ChatRoute, ConfigurationError, load_settings
 from agent_world.contracts import SafeFailure
 from agent_world.invocation import (
     CodexAgentBackend,
+    DirectChatBackend,
     InvocationError,
     InvocationResult,
     Sandbox,
+    _DirectFormatFailure,
     _private_provider_overrides,
+    runtime_skill_digest,
 )
 
 
@@ -87,6 +90,287 @@ def test_agent_routes_match_the_strict_chat_route_shape(
     assert credential not in repr(settings)
 
 
+def test_checked_in_example_selects_the_direct_luna_spark_routes() -> None:
+    settings = load_settings(Path("config/agent-world.example.toml"))
+
+    expected = ChatRoute(
+        model="gpt-5.6-luna",
+        base_url="http://localhost:8317/v1",
+        api_key_env="OPENAI_API_KEY",
+    )
+    assert settings.direct_primary == expected
+    assert settings.direct_fallback == ChatRoute(
+        model="gpt-5.3-codex-spark",
+        base_url="http://localhost:8317/v1",
+        api_key_env="OPENAI_API_KEY",
+    )
+
+
+def test_direct_routes_require_an_openai_api_root(tmp_path: Path) -> None:
+    settings_path = tmp_path / "settings.toml"
+    settings_path.write_text(
+        _settings_text(
+            primary=_valid_agent_route("agent-primary"),
+            fallback=_valid_agent_route("agent-fallback"),
+        ).replace(
+            "https://direct-primary.invalid/v1",
+            "https://direct-primary.invalid/v1/chat/completions",
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ConfigurationError, match="config_direct_primary_base_url_api_root_required"
+    ):
+        load_settings(settings_path)
+
+
+def _direct_completion(
+    content: str,
+    usage: object,
+    *,
+    finish_reason: str = "stop",
+    refusal: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason=finish_reason,
+                message=SimpleNamespace(content=content, refusal=refusal),
+            )
+        ],
+        usage=usage,
+    )
+
+
+def _install_direct_client(
+    monkeypatch: pytest.MonkeyPatch, response: object, captured: dict[str, object]
+) -> None:
+    class FakeOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured["client"] = kwargs
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def __enter__(self) -> FakeOpenAI:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            captured["closed"] = True
+
+        def create(self, **kwargs: object) -> object:
+            captured["request"] = kwargs
+            return response
+
+    monkeypatch.setattr("agent_world.invocation.OpenAI", FakeOpenAI)
+
+
+@pytest.mark.parametrize(
+    ("raw_usage", "expected_usage"),
+    [
+        (
+            {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18, "ignored": 99},
+            {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18},
+        ),
+        ({"prompt_tokens": -1, "completion_tokens": True, "total_tokens": "18"}, None),
+    ],
+)
+def test_direct_chat_normalizes_only_valid_provider_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_usage: dict[str, object],
+    expected_usage: dict[str, int] | None,
+) -> None:
+    route = ChatRoute("direct-test", "http://direct.invalid/v1", "")
+    backend = DirectChatBackend(route, route)
+    captured: dict[str, object] = {}
+    _install_direct_client(
+        monkeypatch,
+        _direct_completion('{"ok": true}', raw_usage),
+        captured,
+    )
+
+    assert backend.invoke_json(system="safe", user="safe") == InvocationResult(
+        {"ok": True}, route.model, expected_usage
+    )
+    assert captured["closed"] is True
+
+
+def test_direct_chat_requests_the_fixed_json_object_response_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route = ChatRoute("direct-test", "http://direct.invalid/v1", "")
+    backend = DirectChatBackend(route, route)
+    captured: dict[str, object] = {}
+    _install_direct_client(monkeypatch, _direct_completion('{"ok": true}', None), captured)
+
+    assert backend.invoke_json(system="system", user="user").value == {"ok": True}
+    assert captured["client"] == {
+        "base_url": route.base_url,
+        "api_key": "",
+        "timeout": 300,
+        "max_retries": 0,
+    }
+    assert captured["request"] == {
+        "model": route.model,
+        "messages": [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "user"},
+        ],
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+    }
+    assert captured["closed"] is True
+
+
+def test_direct_chat_reconstructs_only_the_format_feedback_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route = ChatRoute("direct-test", "http://direct.invalid/v1", "")
+    backend = DirectChatBackend(route, route)
+    captured: dict[str, object] = {}
+    _install_direct_client(monkeypatch, _direct_completion('{"ok": true}', None), captured)
+
+    assert backend.invoke_json(
+        system="system",
+        user="original-user",
+        previous_assistant="not a JSON object",
+        feedback="format-feedback",
+    ).value == {"ok": True}
+    request = captured["request"]
+    assert isinstance(request, dict)
+    assert request["messages"] == [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "original-user"},
+        {"role": "assistant", "content": "not a JSON object"},
+        {"role": "user", "content": "format-feedback"},
+    ]
+    assert "max_tokens" not in request
+    assert "max_completion_tokens" not in request
+
+
+@pytest.mark.parametrize(
+    ("content", "kind", "condition"),
+    [
+        (
+            '```json\n{"ok": true}\n```',
+            "markdown_fence",
+            "response is wrapped in a Markdown code fence",
+        ),
+        (
+            'Here is {"ok": true}',
+            "outer_content",
+            "response has non-JSON leading or trailing content, or extra JSON data",
+        ),
+        (
+            '{"ok": true} and another explanation',
+            "outer_content",
+            "response has non-JSON leading or trailing content, or extra JSON data",
+        ),
+        (
+            '["not", "an", "object"]',
+            "non_object_root",
+            "top-level JSON value is not an object",
+        ),
+        (
+            '{"ok":',
+            "invalid_json_syntax",
+            "response has invalid JSON syntax at line 1, column 7",
+        ),
+    ],
+)
+def test_direct_chat_rejects_every_safe_format_category(
+    monkeypatch: pytest.MonkeyPatch, content: str, kind: str, condition: str
+) -> None:
+    route = ChatRoute("direct-test", "http://direct.invalid/v1", "")
+    backend = DirectChatBackend(route, route)
+    captured: dict[str, object] = {}
+    _install_direct_client(monkeypatch, _direct_completion(content, {"total_tokens": 4}), captured)
+
+    result = backend.invoke_json(system="system", user="user")
+
+    assert isinstance(result, _DirectFormatFailure)
+    assert result.route_model == route.model
+    assert result.usage == {"total_tokens": 4}
+    assert result.condition.kind == kind
+    assert result.condition.violated_condition() == condition
+    assert captured["closed"] is True
+
+
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (
+            _direct_completion('{"ok": true}', None, finish_reason="length"),
+            "direct_response_truncated",
+        ),
+        (_direct_completion("", None), "direct_response_empty"),
+        (_direct_completion('{"ok": true}', None, refusal="refused"), "direct_response_refusal"),
+    ],
+)
+def test_direct_chat_rejects_non_format_terminals_without_feedback(
+    monkeypatch: pytest.MonkeyPatch, response: object, expected: str
+) -> None:
+    route = ChatRoute("direct-test", "http://direct.invalid/v1", "")
+    backend = DirectChatBackend(route, route)
+    captured: dict[str, object] = {}
+    _install_direct_client(monkeypatch, response, captured)
+
+    with pytest.raises(InvocationError) as raised:
+        backend.invoke_json(system="system", user="user")
+
+    assert raised.value.failure == SafeFailure(expected, "rejected")
+    assert captured["closed"] is True
+
+
+def test_direct_chat_uses_only_the_configured_credential_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    route = ChatRoute("direct-test", "http://direct.invalid/v1", "DIRECT_TEST_KEY")
+    backend = DirectChatBackend(route, route)
+    captured: dict[str, object] = {}
+    monkeypatch.setenv("DIRECT_TEST_KEY", "configured-direct-credential")
+    monkeypatch.setenv("OPENAI_API_KEY", "ambient-direct-credential")
+    _install_direct_client(monkeypatch, _direct_completion('{"ok": true}', None), captured)
+
+    assert backend.invoke_json(system="system", user="user").value == {"ok": True}
+    client = captured["client"]
+    assert isinstance(client, dict)
+    assert client["api_key"] == "configured-direct-credential"
+
+    monkeypatch.delenv("DIRECT_TEST_KEY")
+    with pytest.raises(InvocationError) as raised:
+        backend.invoke_json(system="system", user="user")
+
+    assert raised.value.failure == SafeFailure("credential_missing", "needs_human")
+
+
+def test_direct_chat_maps_retryable_transport_failure_without_provider_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = ChatRoute("direct-primary", "http://primary.invalid/v1", "")
+    fallback = ChatRoute("direct-fallback", "http://fallback.invalid/v1", "")
+    backend = DirectChatBackend(primary, fallback)
+    client_calls: list[dict[str, object]] = []
+
+    class BrokenOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            client_calls.append(kwargs)
+
+        def __enter__(self) -> BrokenOpenAI:
+            raise OSError("private provider transport detail")
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr("agent_world.invocation.OpenAI", BrokenOpenAI)
+
+    with pytest.raises(InvocationError) as raised:
+        backend.invoke_json(system="system", user="user")
+
+    assert raised.value.failure == SafeFailure("direct_transport_failure", "error", True)
+    assert [call["base_url"] for call in client_calls] == [primary.base_url, fallback.base_url]
+    assert "private provider transport detail" not in str(raised.value)
+
+
 @pytest.mark.parametrize(
     ("primary", "fallback", "error"),
     [
@@ -134,12 +418,25 @@ def test_codex_agent_sdk_session_is_isolated_and_not_persisted(
     monkeypatch.setenv("OPENAI_BASE_URL", "http://ambient-agent.invalid/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "ambient-agent-credential")
     monkeypatch.setenv("CODEX_HOME", "/ambient-codex-home")
+    monkeypatch.setenv("HOME", "/ambient-user-home")
 
     class FakeThread:
         async def run(self, prompt: str, **kwargs: object) -> SimpleNamespace:
             captured["prompt"] = prompt
             captured["run_kwargs"] = kwargs
-            return SimpleNamespace(status="completed", final_response='{"ok": true}')
+            return SimpleNamespace(
+                status="completed",
+                final_response='{"ok": true}',
+                usage=SimpleNamespace(
+                    total=SimpleNamespace(
+                        cached_input_tokens=3,
+                        input_tokens=11,
+                        output_tokens=7,
+                        reasoning_output_tokens=5,
+                        total_tokens=23,
+                    )
+                ),
+            )
 
     class FakeAsyncCodex:
         def __init__(self, config: CodexConfig) -> None:
@@ -170,7 +467,6 @@ def test_codex_agent_sdk_session_is_isolated_and_not_persisted(
     result = backend.invoke_json(
         work="researcher",
         skill_name="research-world-evidence",
-        skill_body="# runtime skill\n",
         workspace=workspace,
         instruction="Return a safe test object.",
         writable=False,
@@ -184,6 +480,13 @@ def test_codex_agent_sdk_session_is_isolated_and_not_persisted(
     assert isinstance(run_kwargs, dict)
     assert result.value == {"ok": True}
     assert result.route_model == route.model
+    assert result.usage == {
+        "cached_input_tokens": 3,
+        "input_tokens": 11,
+        "output_tokens": 7,
+        "reasoning_output_tokens": 5,
+        "total_tokens": 23,
+    }
     assert config.cwd == str(workspace)
     assert config.config_overrides == (
         'model_providers.foundry_private.name = "Foundry private"',
@@ -192,9 +495,13 @@ def test_codex_agent_sdk_session_is_isolated_and_not_persisted(
         'model_providers.foundry_private.wire_api = "responses"',
         "request_max_retries = 0",
         "stream_max_retries = 0",
+        "skills.bundled.enabled = false",
+        "features.plugins = false",
     )
     assert config.env is not None
-    assert set(config.env) == {"CODEX_HOME", "TEST_AGENT_KEY"}
+    assert set(config.env) == {"CODEX_HOME", "HOME", "TEST_AGENT_KEY"}
+    assert config.env["HOME"] == config.env["CODEX_HOME"]
+    assert config.env["HOME"] != "/ambient-user-home"
     assert config.env["TEST_AGENT_KEY"] == credential
     assert "OPENAI_BASE_URL" not in config.env
     assert "OPENAI_API_KEY" not in config.env
@@ -211,8 +518,10 @@ def test_codex_agent_sdk_session_is_isolated_and_not_persisted(
         "sandbox": Sandbox.full_access,
     }
     assert captured["skill_names"] == ["research-world-evidence"]
-    assert captured["skill_body"] == "# runtime skill\n"
+    assert isinstance(captured["skill_body"], str)
+    assert "Synthesize only citation-backed evidence" in captured["skill_body"]
     assert captured["closed"] == 1
+    assert result.skill_digest == runtime_skill_digest("research-world-evidence")
 
     codex_home = captured["codex_home"]
     assert isinstance(codex_home, Path)
@@ -243,7 +552,6 @@ def test_codex_agent_uses_only_the_configured_credential_handle(
         backend.invoke_json(
             work="researcher",
             skill_name="research-world-evidence",
-            skill_body="# runtime skill\n",
             workspace=workspace,
             instruction="Return a safe test object.",
         )
@@ -273,7 +581,6 @@ def test_codex_agent_reports_missing_bundled_sdk_command(
         backend.invoke_json(
             work="researcher",
             skill_name="research-world-evidence",
-            skill_body="# runtime skill\n",
             workspace=tmp_path / "workspace",
             instruction="Return a safe test object.",
         )
@@ -330,7 +637,6 @@ def test_codex_agent_sdk_terminal_mapping(
         backend.invoke_json(
             work="researcher",
             skill_name="research-world-evidence",
-            skill_body="# runtime skill\n",
             workspace=tmp_path / "workspace",
             instruction="Return a safe test object.",
         )
@@ -370,7 +676,6 @@ def test_codex_agent_rejects_invalid_json_without_fallback(
         backend.invoke_json(
             work="researcher",
             skill_name="research-world-evidence",
-            skill_body="# runtime skill\n",
             workspace=tmp_path / "workspace",
             instruction="Return a safe test object.",
         )
@@ -405,14 +710,52 @@ def test_codex_agent_preserves_require_json_false_behavior(
     result = backend.invoke_json(
         work="candidate_build",
         skill_name="engineer-environment-codegen",
-        skill_body="# runtime skill\n",
         workspace=tmp_path / "workspace",
         instruction="Write the requested files.",
         writable=True,
         require_json=False,
     )
 
-    assert result == InvocationResult({}, route.model)
+    assert result == InvocationResult(
+        {}, route.model, None, runtime_skill_digest("engineer-environment-codegen")
+    )
+
+
+def test_codex_agent_rejects_an_unbounded_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route = AgentRoute("primary", "http://primary.invalid/v1", "PRIMARY_KEY")
+    backend = CodexAgentBackend(route, route)
+    monkeypatch.setenv("PRIMARY_KEY", "primary-credential")
+
+    class FakeThread:
+        async def run(self, _prompt: str, **_kwargs: object) -> SimpleNamespace:
+            return SimpleNamespace(status="completed", final_response="x" * 8_193)
+
+    class FakeAsyncCodex:
+        def __init__(self, _config: CodexConfig) -> None:
+            pass
+
+        async def thread_start(self, **_kwargs: object) -> FakeThread:
+            return FakeThread()
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("agent_world.invocation.AsyncCodex", FakeAsyncCodex)
+
+    with pytest.raises(InvocationError) as raised:
+        backend.invoke_json(
+            work="candidate_build",
+            skill_name="engineer-environment-codegen",
+            workspace=tmp_path / "workspace",
+            instruction="Write the requested files.",
+            writable=True,
+            require_json=False,
+        )
+
+    assert raised.value.failure == SafeFailure("agent_output_too_large", "rejected")
+    assert not list(tmp_path.glob(".foundry-codex-home-*"))
 
 
 def test_codex_agent_does_not_fallback_after_a_non_retryable_failure(
@@ -433,7 +776,6 @@ def test_codex_agent_does_not_fallback_after_a_non_retryable_failure(
         backend.invoke_json(
             work="researcher",
             skill_name="research-world-evidence",
-            skill_body="# runtime skill\n",
             workspace=tmp_path / "workspace",
             instruction="Return a safe test object.",
         )
@@ -460,7 +802,6 @@ def test_codex_agent_falls_back_once_after_a_retryable_failure(
     result = backend.invoke_json(
         work="researcher",
         skill_name="research-world-evidence",
-        skill_body="# runtime skill\n",
         workspace=tmp_path / "workspace",
         instruction="Return a safe test object.",
     )

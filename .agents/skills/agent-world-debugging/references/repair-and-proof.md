@@ -12,8 +12,8 @@ Use evidence, not a symptom table:
   Runtime Skill bundle, then run a real Agent boundary.
 - Coherent parsed candidate with localized precise rejection and repair
   authority → bounded correction turn, preserving valid work.
-- Route/response mode/profile/adapter/parser/compiler/validator/scheduler bug →
-  deterministic code repair.
+- Route/response mode/profile/adapter/parser/compiler/validator/current graph
+  coordinator bug → deterministic code repair.
 - Explicit closed transient Provider/transport fact → recorded bounded retry
   or model fallback according to policy.
 
@@ -33,7 +33,7 @@ Once the cause is credible, inspect every live sibling using the mechanism:
 - mounted Agent Skill versions and full bundle identities;
 - Direct no-Skill request shapes;
 - profiles and model/route/response mode;
-- parser/compiler/validator/scheduler paths;
+- parser/compiler/validator/current graph-coordinator paths;
 - Feedback renderers and project Agent view pointers.
 
 One observed omission often means the same omission exists elsewhere. Complete
@@ -53,7 +53,10 @@ Then:
 2. Run the real local boundary before/after deterministic changes.
 3. Run one real isolated model/Agent node when Prompt, Skill, profile, route, or
    model behavior changed.
-4. Run the normal Scheduler for repair-authority or multi-turn claims.
+4. Run the current authoritative graph route for repair-authority or multi-turn
+   claims. For a cleanroom claim, prove its RunState/Router path has already
+   passed the no-hybrid authority firewall; a legacy control route proves
+   neither repair nor product behavior.
 5. Run immediate Integration only after the changed point passes.
 6. Run broader downstream and E2E only after Integration passes.
 

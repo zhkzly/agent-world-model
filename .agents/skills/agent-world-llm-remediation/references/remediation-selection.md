@@ -10,7 +10,7 @@ timeout, or failed test can be caused by:
   Skill on a Direct route;
 - missing/misleading runtime context;
 - unsuitable model/profile/route/response mode/budget;
-- parser, schema, validator, scheduler, adapter, or upstream input;
+- parser, schema, validator, current graph coordinator, adapter, or upstream input;
 - correction feedback that lacks an actionable bounded story.
 
 Do not call one surface defective because of one model result. Select a small

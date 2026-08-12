@@ -1,0 +1,3040 @@
+"""CandidateGraph: isolated build, assurance, package and Registry publication."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import tempfile
+import tomllib
+import zipfile
+from dataclasses import dataclass, replace
+from hashlib import sha256
+from io import BytesIO
+from pathlib import Path
+from typing import Any, cast
+
+from agent_world.artifacts import ArtifactIntegrityError, ArtifactStore
+from agent_world.config import FoundrySettings
+from agent_world.contracts import (
+    ArtifactRef,
+    CandidateManifest,
+    CorrectionPacket,
+    DesignContract,
+    EnvironmentPackageRef,
+    ExpectedOutputCategory,
+    GateResult,
+    JudgeReport,
+    OperationEvidence,
+    RegistryReceipt,
+    TerminalStatus,
+    VerifierCommitment,
+    digest_value,
+    json_value,
+    utc_now,
+)
+from agent_world.graph import GraphRunner, NodeExecutionError, NodeResult
+from agent_world.invocation import CodexAgentBackend, InvocationError, InvocationResult
+from agent_world.runtime import MaterializationRequest, PrivateVerifierCase, integrate, judge
+from agent_world.supply_chain import (
+    SupplyChainError,
+    admitted_lock_closure_value,
+    compile_sbom,
+    compile_sbom_from_metadata,
+    prepare_candidate,
+)
+
+
+class CandidateError(RuntimeError):
+    def __init__(
+        self, code: str, status: TerminalStatus = "rejected", retryable: bool = False
+    ) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status = status
+        self.retryable = retryable
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateResult:
+    manifest: CandidateManifest
+    integration: ArtifactRef
+    verifier: ArtifactRef
+    judge: JudgeReport
+    receipt: RegistryReceipt
+    package_ref: EnvironmentPackageRef
+    artifact_refs: tuple[ArtifactRef, ...]
+    work_refs: tuple[ArtifactRef, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _AgentProposal:
+    value: dict[str, Any]
+    evidence: OperationEvidence
+
+
+@dataclass(frozen=True, slots=True)
+class _CompiledVerifier:
+    commitments: tuple[VerifierCommitment, ...]
+    private_cases: tuple[PrivateVerifierCase, ...]
+
+
+def _canonical(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+
+
+def _local_rule_digest(tool: dict[str, Any]) -> str:
+    required = {
+        "tool_index",
+        "surface",
+        "bindings",
+        "preconditions",
+        "transitions",
+        "postconditions",
+        "errors",
+        "shared_contract_digest",
+        "local_rules_digest",
+    }
+    if not isinstance(tool, dict) or set(tool) != required:
+        raise CandidateError("registry_local_tool_semantics_invalid")
+    value = {
+        key: tool[key]
+        for key in (
+            "tool_index",
+            "bindings",
+            "preconditions",
+            "transitions",
+            "postconditions",
+            "errors",
+            "shared_contract_digest",
+        )
+    }
+    digest = f"sha256:{sha256(_canonical(value)).hexdigest()}"
+    if tool["local_rules_digest"] != digest:
+        raise CandidateError("registry_local_tool_semantics_digest_mismatch")
+    return digest
+
+
+def _ref(ref: ArtifactRef) -> dict[str, str]:
+    return {
+        "artifact_id": ref.artifact_id,
+        "kind": ref.kind,
+        "digest": ref.digest,
+        "path": ref.path,
+        "media_type": ref.media_type,
+    }
+
+
+def _node_error(error: CandidateError) -> NodeExecutionError:
+    return NodeExecutionError(error.code, error.status, error.retryable)
+
+
+_CONTRACT_SECTIONS = (
+    "source_closure",
+    "materializer",
+    "runtime",
+    "tool_obligations",
+    "tool_semantics",
+    "difficulty",
+    "idempotency",
+    "shutdown",
+    "dependency_policy",
+)
+
+
+def _field_value(field: Any) -> object:
+    if field.category == "boolean":
+        return False
+    if field.category == "integer":
+        return 0
+    if field.category == "number":
+        return 0.0
+    if field.category == "list":
+        return []
+    if field.category == "enum":
+        return field.values[0]
+    if field.category == "identifier":
+        return "public-id"
+    if field.category == "timestamp":
+        return "1970-01-01T00:00:00Z"
+    return ""
+
+
+def _builder_task(task: Any) -> dict[str, Any]:
+    return {
+        "task_family_index": task.task_family_index,
+        "task_requirement": json_value(task.task_requirement),
+        "public_goal_schema": json_value(task.public_goal_schema),
+        "initial_config_schema": json_value(task.initial_config_schema),
+        "evaluator_goal_bindings": json_value(task.evaluator_goal_bindings),
+        "instruction_template_digest": task.instruction_template_digest,
+    }
+
+
+def compile_implementation_contract(design: DesignContract) -> dict[str, Any]:
+    """Project the complete public implementation closure, never verifier data."""
+    families = [json_value(item) for item in design.curriculum.families]
+    tasks = [_builder_task(item) for item in design.executable_tasks]
+    return {
+        "schema_version": "implementation-contract@1",
+        "sections": list(_CONTRACT_SECTIONS),
+        "source_closure": {
+            "required_files": [
+                "materializer.py",
+                "runtime.py",
+                "pyproject.toml",
+                "uv.lock",
+                "LICENSE",
+            ],
+            "allowed_suffixes": ["", ".lock", ".py", ".toml"],
+            "max_files": 10,
+            "max_total_bytes": 160000,
+            "manifest_includes_stable_mode": True,
+        },
+        "materializer": {
+            "entrypoint": "materializer.py",
+            "request": {
+                "ordered_fields": ["op", "seed", "task_type", "actor", "difficulty"],
+                "literal": {"op": "materialize"},
+                "field_types": {
+                    "seed": "uint64",
+                    "task_type": "string",
+                    "actor": "string",
+                    "difficulty": "ordered-string-map",
+                },
+            },
+            "response": {
+                "ordered_fields": [
+                    "seed",
+                    "task_type",
+                    "actor",
+                    "difficulty",
+                    "public_goal",
+                    "initial_config",
+                ],
+                "exact_echo_fields": ["seed", "task_type", "actor", "difficulty"],
+                "public_fields": ["public_goal", "initial_config"],
+                "forbidden_fields": [
+                    "instruction",
+                    "evaluator_goal",
+                    "expected_result",
+                    "reward",
+                    "termination",
+                    "verifier",
+                ],
+            },
+        },
+        "runtime": {
+            "entrypoint": "runtime.py",
+            "operations": [
+                {
+                    "name": "handshake",
+                    "request": {"ordered_fields": ["op"], "literal": {"op": "handshake"}},
+                    "response": {
+                        "ordered_fields": ["operations"],
+                        "literal": {
+                            "operations": ["handshake", "reset", "invoke", "snapshot", "close"]
+                        },
+                    },
+                },
+                {
+                    "name": "reset",
+                    "request": {
+                        "ordered_fields": ["op", "seed", "actor", "initial_config"],
+                        "literal": {"op": "reset"},
+                    },
+                    "response": {
+                        "ordered_fields": ["status"],
+                        "literal": {"status": "ok"},
+                    },
+                },
+                {
+                    "name": "invoke",
+                    "request": {
+                        "ordered_fields": ["op", "tool_id", "arguments", "idempotency_key"],
+                        "literal": {"op": "invoke"},
+                        "tool_catalog": [
+                            {
+                                "tool_index": tool.tool_index,
+                                "tool_id": tool.surface.name,
+                                "argument_fields": [
+                                    json_value(field) for field in tool.surface.argument_fields
+                                ],
+                                "result_fields": [
+                                    json_value(field) for field in tool.surface.result_fields
+                                ],
+                            }
+                            for tool in design.tools
+                        ],
+                    },
+                    "response": {
+                        "ordered_fields": ["status", "result"],
+                        "literal": {"status": "ok"},
+                        "result_matches_declared_tool_schema": True,
+                    },
+                },
+                {
+                    "name": "snapshot",
+                    "request": {"ordered_fields": ["op"], "literal": {"op": "snapshot"}},
+                    "response": {
+                        "ordered_fields": ["state"],
+                        "state_type": "safe-json-object",
+                        "private_framework_only": True,
+                    },
+                },
+                {
+                    "name": "close",
+                    "request": {"ordered_fields": ["op"], "literal": {"op": "close"}},
+                    "response": {
+                        "ordered_fields": ["status"],
+                        "literal": {"status": "ok"},
+                    },
+                },
+            ],
+        },
+        "tool_obligations": {
+            "families": families,
+            "assurance_recipes": [json_value(recipe) for recipe in design.assurance_recipes],
+            "result_must_have_exact_declared_keys": True,
+            "result_values_must_match_declared_types": True,
+            "result_must_exclude_authority_fields": True,
+        },
+        "tool_semantics": {
+            "world_architecture": json_value(design.architecture),
+            "shared_tool_contracts": [json_value(item) for item in design.shared_tool_contracts],
+            "tools": [json_value(tool) for tool in design.tools],
+            "world_rules": json_value(design.world_rules),
+            "snapshot_projection": {
+                "state_shape": "exact-tools-result-fields-json-value",
+                "lifecycle": [
+                    "reset",
+                    "snapshot_pre",
+                    "invoke",
+                    "result",
+                    "snapshot_post",
+                    "close",
+                ],
+                "private_framework_only": True,
+            },
+            "executable_tasks": tasks,
+        },
+        "difficulty": {
+            "schemas": [json_value(item.difficulty_schema) for item in design.curriculum.families],
+            "exact_ordered_echo": True,
+            "all_dimensions_required": True,
+        },
+        "idempotency": {
+            "same_key_repeats_identical_response": True,
+            "key_is_framework_provided": True,
+        },
+        "shutdown": {
+            "runtime_close_acknowledges_status_ok": True,
+            "materializer_is_one_request": True,
+        },
+        "dependency_policy": {
+            "stdlib_preferred": True,
+            "registry_wheels_only_when_exact_pyproject_and_uv_lock": True,
+            "framework_admission_required": True,
+            "agent_must_not_install_download_or_choose_hashes": True,
+            "forbidden": ["build_backend", "index", "url", "path", "editable", "git", "sdist"],
+        },
+    }
+
+
+def _bounded_text(value: object, *, maximum: int) -> str | None:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
+        return None
+    return value.strip()
+
+
+def _model_rejection(
+    code: str, path: str, violated_condition: str, expected_category: ExpectedOutputCategory
+) -> NodeExecutionError:
+    return NodeExecutionError(
+        code,
+        correction=CorrectionPacket(code, path, violated_condition, expected_category),
+    )
+
+
+def validate_build_plan(value: object, contract: dict[str, Any]) -> dict[str, Any]:
+    """Compile the advisory plan without granting it source or manifest authority."""
+
+    if not isinstance(value, dict) or set(value) != {"steps", "risks"}:
+        raise _model_rejection(
+            "build_plan_invalid", "$", "plan must be the closed BuildPlanDraft object", "object"
+        )
+    steps = value.get("steps")
+    risks = value.get("risks")
+    sections = contract.get("sections")
+    if (
+        not isinstance(steps, list)
+        or not 1 <= len(steps) <= 12
+        or not isinstance(risks, list)
+        or len(risks) > 8
+        or not isinstance(sections, list)
+        or not all(isinstance(section, str) for section in sections)
+    ):
+        path = "$.steps" if not isinstance(steps, list) or not 1 <= len(steps) <= 12 else "$.risks"
+        raise _model_rejection(
+            "build_plan_invalid",
+            path,
+            "field must satisfy the declared bounded collection",
+            "array",
+        )
+    compiled_steps: list[dict[str, Any]] = []
+    for index, item in enumerate(steps):
+        path = f"$.steps[{index}]"
+        if not isinstance(item, dict) or set(item) != {
+            "goal",
+            "suggested_paths",
+            "contract_sections",
+            "self_check",
+        }:
+            raise _model_rejection(
+                "build_plan_invalid", path, "step must be the closed plan-step object", "object"
+            )
+        goal = _bounded_text(item.get("goal"), maximum=280)
+        self_check = _bounded_text(item.get("self_check"), maximum=280)
+        paths = item.get("suggested_paths")
+        refs = item.get("contract_sections")
+        if (
+            goal is None
+            or self_check is None
+            or not isinstance(paths, list)
+            or not paths
+            or len(paths) > 8
+            or not isinstance(refs, list)
+            or not refs
+            or len(refs) > len(sections)
+        ):
+            raise _model_rejection(
+                "build_plan_invalid",
+                path,
+                "step fields must satisfy their declared bounds",
+                "object",
+            )
+        cleaned_paths: list[str] = []
+        for path_index, candidate_path in enumerate(paths):
+            if (
+                not isinstance(candidate_path, str)
+                or not candidate_path
+                or len(candidate_path) > 160
+                or candidate_path.startswith("/")
+                or "\\" in candidate_path
+                or any(
+                    part in {"", ".", ".."} or part.startswith(".")
+                    for part in candidate_path.split("/")
+                )
+            ):
+                raise _model_rejection(
+                    "build_plan_invalid",
+                    f"$.steps[{index}].suggested_paths[{path_index}]",
+                    "path must be a safe relative candidate path",
+                    "string",
+                )
+            cleaned_paths.append(candidate_path)
+        if (
+            len(set(cleaned_paths)) != len(cleaned_paths)
+            or not all(isinstance(ref, str) and ref in sections for ref in refs)
+            or len(set(refs)) != len(refs)
+        ):
+            raise _model_rejection(
+                "build_plan_invalid",
+                f"$.steps[{index}].contract_sections",
+                "sections must be unique declared contract sections",
+                "array",
+            )
+        compiled_steps.append(
+            {
+                "goal": goal,
+                "suggested_paths": cleaned_paths,
+                "contract_sections": refs,
+                "self_check": self_check,
+            }
+        )
+    compiled_risks = [_bounded_text(risk, maximum=280) for risk in risks]
+    if any(risk is None for risk in compiled_risks):
+        index = next(index for index, risk in enumerate(compiled_risks) if risk is None)
+        raise _model_rejection(
+            "build_plan_invalid",
+            f"$.risks[{index}]",
+            "risk must be bounded nonempty text",
+            "string",
+        )
+    return {"steps": compiled_steps, "risks": compiled_risks}
+
+
+def validate_candidate_completion(value: object) -> dict[str, Any]:
+    """Bound the Agent's advisory completion without trusting it for admission."""
+
+    if not isinstance(value, dict) or set(value) != {"summary", "self_checks", "known_limits"}:
+        raise _model_rejection(
+            "candidate_completion_invalid",
+            "$",
+            "completion must be the closed CandidateCompletionDraft object",
+            "object",
+        )
+    summary = _bounded_text(value.get("summary"), maximum=800)
+    checks = value.get("self_checks")
+    limits = value.get("known_limits")
+    if (
+        summary is None
+        or not isinstance(checks, list)
+        or len(checks) > 12
+        or not isinstance(limits, list)
+        or len(limits) > 8
+    ):
+        path = (
+            "$.summary"
+            if summary is None
+            else "$.self_checks"
+            if not isinstance(checks, list) or len(checks) > 12
+            else "$.known_limits"
+        )
+        raise _model_rejection(
+            "candidate_completion_invalid",
+            path,
+            "field must satisfy its declared bounds",
+            "string" if path == "$.summary" else "array",
+        )
+    compiled_checks: list[dict[str, str]] = []
+    for index, check in enumerate(checks):
+        if not isinstance(check, dict) or set(check) != {"name", "observed", "note"}:
+            raise _model_rejection(
+                "candidate_completion_invalid",
+                f"$.self_checks[{index}]",
+                "self check must be the closed self-check object",
+                "object",
+            )
+        name = _bounded_text(check.get("name"), maximum=120)
+        note = _bounded_text(check.get("note"), maximum=280)
+        observed = check.get("observed")
+        if name is None or note is None or observed not in {"passed", "failed", "not_run"}:
+            path = (
+                f"$.self_checks[{index}].name"
+                if name is None
+                else f"$.self_checks[{index}].note"
+                if note is None
+                else f"$.self_checks[{index}].observed"
+            )
+            raise _model_rejection(
+                "candidate_completion_invalid",
+                path,
+                "field must use its closed text or status form",
+                "string",
+            )
+        compiled_checks.append({"name": name, "observed": observed, "note": note})
+    compiled_limits = [_bounded_text(limit, maximum=280) for limit in limits]
+    if any(limit is None for limit in compiled_limits):
+        index = next(index for index, limit in enumerate(compiled_limits) if limit is None)
+        raise _model_rejection(
+            "candidate_completion_invalid",
+            f"$.known_limits[{index}]",
+            "limit must be bounded nonempty text",
+            "string",
+        )
+    return {"summary": summary, "self_checks": compiled_checks, "known_limits": compiled_limits}
+
+
+class CandidateExecutor:
+    """Execute only the fixed CandidateGraph; no release policy is delegated."""
+
+    def __init__(
+        self,
+        settings: FoundrySettings,
+        agent: CodexAgentBackend,
+        trusted_wheel_store: Path | None = None,
+    ) -> None:
+        self.settings = settings
+        self.agent = agent
+        self.trusted_wheel_store = trusted_wheel_store or settings.trusted_wheel_store
+
+    def run(
+        self, design: DesignContract, store: ArtifactStore, graph: GraphRunner, run_id: str
+    ) -> CandidateResult:
+        work_refs: list[ArtifactRef] = []
+        with tempfile.TemporaryDirectory(prefix="foundry-candidate-") as temporary:
+            root = Path(temporary) / "candidate"
+            root.mkdir()
+            try:
+                plan_node = self._build_plan(design, root.parent, store, graph, run_id)
+                work_refs.append(plan_node.work)
+                manifest, candidate_node = self._candidate_build(
+                    design, plan_node, root, store, graph, run_id
+                )
+                work_refs.append(candidate_node.work)
+                integration_node = self._integration(design, manifest, root, store, graph, run_id)
+                work_refs.append(integration_node.work)
+            except NodeExecutionError as exc:
+                work_refs.extend(
+                    ref for ref in exc.artifact_refs if ref.kind == "control.work_record"
+                )
+                work_refs.extend(
+                    self._not_run(
+                        graph,
+                        store,
+                        run_id,
+                        ("verifier_intent", "judge", "package", "registry"),
+                        exc.code,
+                    )
+                )
+                raise CandidateError(exc.code, exc.status, exc.retryable) from exc
+
+            try:
+                verifier_node = self._verifier_bundle(design, store, graph, run_id)
+                work_refs.append(verifier_node.work)
+            except NodeExecutionError as exc:
+                work_refs.extend(
+                    ref for ref in exc.artifact_refs if ref.kind == "control.work_record"
+                )
+                work_refs.extend(
+                    self._not_run(graph, store, run_id, ("judge", "package", "registry"), exc.code)
+                )
+                raise CandidateError(exc.code, exc.status, exc.retryable) from exc
+
+            try:
+                report, judge_node = self._judge_node(
+                    design,
+                    manifest,
+                    integration_node.artifact,
+                    verifier_node.artifact,
+                    verifier_node.value.private_cases,
+                    root,
+                    store,
+                    graph,
+                    run_id,
+                )
+                work_refs.append(judge_node.work)
+            except NodeExecutionError as exc:
+                work_refs.extend(
+                    ref for ref in exc.artifact_refs if ref.kind == "control.work_record"
+                )
+                work_refs.extend(
+                    self._not_run(graph, store, run_id, ("package", "registry"), exc.code)
+                )
+                raise CandidateError(exc.code, exc.status, exc.retryable) from exc
+
+            if not report.passed:
+                work_refs.extend(
+                    self._not_run(
+                        graph, store, run_id, ("package", "registry"), "judge_required_gate_failed"
+                    )
+                )
+                raise CandidateError("judge_required_gate_failed")
+
+            try:
+                manifest = replace(
+                    manifest,
+                    work_refs=(
+                        plan_node.work,
+                        candidate_node.work,
+                        integration_node.work,
+                        verifier_node.work,
+                        judge_node.work,
+                    ),
+                )
+                semantic_lineage, implementation_lineage = self._lineages(design, manifest, store)
+                package_node, physical_package, dossier, telemetry = self._package(
+                    design,
+                    manifest,
+                    integration_node.artifact,
+                    verifier_node.artifact,
+                    report,
+                    semantic_lineage,
+                    implementation_lineage,
+                    root,
+                    store,
+                    graph,
+                    run_id,
+                )
+                work_refs.append(package_node.work)
+                receipt, package_ref, registry_node = self._registry(
+                    design,
+                    manifest,
+                    integration_node.artifact,
+                    verifier_node.artifact,
+                    report,
+                    package_node.artifact,
+                    physical_package,
+                    dossier,
+                    telemetry,
+                    semantic_lineage,
+                    implementation_lineage,
+                    store,
+                    graph,
+                    run_id,
+                )
+                work_refs.append(registry_node.work)
+            except NodeExecutionError as exc:
+                work_refs.extend(
+                    ref for ref in exc.artifact_refs if ref.kind == "control.work_record"
+                )
+                if exc.node_id == "package":
+                    work_refs.extend(self._not_run(graph, store, run_id, ("registry",), exc.code))
+                raise CandidateError(exc.code, exc.status, exc.retryable) from exc
+
+            return CandidateResult(
+                manifest,
+                integration_node.artifact,
+                verifier_node.artifact,
+                report,
+                receipt,
+                package_ref,
+                (
+                    plan_node.artifact,
+                    candidate_node.artifact,
+                    integration_node.artifact,
+                    verifier_node.artifact,
+                    report.artifact,
+                    dossier,
+                    telemetry,
+                    physical_package,
+                    package_node.artifact,
+                    semantic_lineage,
+                    implementation_lineage,
+                    registry_node.artifact,
+                ),
+                tuple(work_refs),
+            )
+
+    @staticmethod
+    def _not_run(
+        graph: GraphRunner, store: ArtifactStore, run_id: str, node_ids: tuple[str, ...], code: str
+    ) -> list[ArtifactRef]:
+        return [graph.not_run(store, run_id, node_id, code=code) for node_id in node_ids]
+
+    def _agent_json(
+        self,
+        work: str,
+        skill: str,
+        workspace: Path,
+        instruction: str,
+        *,
+        correction: CorrectionPacket | None = None,
+        writable: bool = False,
+        require_json: bool = True,
+    ) -> _AgentProposal:
+        try:
+            if correction is not None:
+                instruction += (
+                    "\nAuthorized correction packet: " + _canonical(json_value(correction)).decode()
+                )
+            result = self.agent.invoke_json(
+                work=work,
+                skill_name=skill,
+                workspace=workspace,
+                instruction=instruction,
+                writable=writable,
+                require_json=require_json,
+            )
+            if not isinstance(result, InvocationResult):
+                raise CandidateError("agent_response_invalid")
+            if not isinstance(result.value, dict):
+                raise _model_rejection(
+                    "agent_response_invalid",
+                    "$",
+                    "agent response must be the declared JSON object",
+                    "object",
+                )
+            return _AgentProposal(
+                result.value,
+                OperationEvidence(
+                    "agent", work, result.route_model, result.usage, result.skill_digest
+                ),
+            )
+        except InvocationError as exc:
+            raise CandidateError(
+                exc.failure.code, exc.failure.status, exc.failure.retryable
+            ) from exc
+
+    @staticmethod
+    def _projection(design: DesignContract) -> dict[str, Any]:
+        return {
+            "architecture": json_value(design.architecture),
+            "shared_tool_contracts": [json_value(item) for item in design.shared_tool_contracts],
+            "tools": [json_value(tool) for tool in design.tools],
+            "world_rules": json_value(design.world_rules),
+            "curriculum": json_value(design.curriculum),
+            "executable_tasks": [_builder_task(item) for item in design.executable_tasks],
+            "assurance_recipes": [json_value(item) for item in design.assurance_recipes],
+            "runtime_protocol": ["handshake", "reset", "invoke", "snapshot", "close"],
+        }
+
+    @staticmethod
+    def _verifier_catalog(design: DesignContract) -> dict[str, Any]:
+        def summaries(rules: tuple[Any, ...]) -> list[dict[str, Any]]:
+            return [
+                {
+                    "rationale": rule.rationale,
+                    "citation_indexes": list(rule.citation_indexes),
+                }
+                for rule in rules
+            ]
+
+        return {
+            "families": [json_value(item) for item in design.curriculum.families],
+            "tools": [
+                {
+                    "tool_index": tool.tool_index,
+                    "surface": json_value(tool.surface),
+                    "local_rules_digest": tool.local_rules_digest,
+                }
+                for tool in design.tools
+            ],
+            "assurance_recipes": [json_value(item) for item in design.assurance_recipes],
+            "task_rule_summaries": [
+                {
+                    "task_family_index": task.task_family_index,
+                    "public_goal_fields": list(task.task_requirement.public_goal_fields),
+                    "initial_rules": summaries(task.task_requirement.initial_rules),
+                    "success_rules": summaries(task.task_requirement.success_rules),
+                    "failure_rules": summaries(task.task_requirement.failure_rules),
+                    "terminal_rules": summaries(task.task_requirement.terminal_rules),
+                }
+                for task in design.executable_tasks
+            ],
+        }
+
+    def _build_plan(
+        self,
+        design: DesignContract,
+        parent: Path,
+        store: ArtifactStore,
+        graph: GraphRunner,
+        run_id: str,
+    ) -> NodeResult[dict[str, Any]]:
+        workspace = parent / "build-plan"
+        workspace.mkdir()
+        projection = self._projection(design)
+        contract = compile_implementation_contract(design)
+        (workspace / "design.json").write_bytes(_canonical(projection))
+        (workspace / "implementation-contract.json").write_bytes(_canonical(contract))
+
+        def operation(correction: CorrectionPacket | None) -> _AgentProposal:
+            try:
+                return self._agent_json(
+                    "build_plan",
+                    "engineer-build-planning",
+                    workspace,
+                    "Read design.json and implementation-contract.json. Return exactly a "
+                    "BuildPlanDraft with structured steps and risks; do not write "
+                    "candidate source.",
+                    correction=correction,
+                )
+            except CandidateError as exc:
+                raise _node_error(exc) from exc
+
+        def compile_plan(value: _AgentProposal) -> dict[str, Any]:
+            return validate_build_plan(value.value, contract)
+
+        return graph.execute(
+            store,
+            run_id,
+            "build_plan",
+            {"design": (design.artifact,)},
+            "candidate.build_plan",
+            operation,
+            compile_plan,
+            {
+                "design": design.artifact.digest,
+                "projection": projection,
+                "implementation_contract": contract,
+            },
+            operation_evidence=lambda proposal: (proposal.evidence,),
+        )
+
+    def _candidate_build(
+        self,
+        design: DesignContract,
+        plan: NodeResult[dict[str, Any]],
+        root: Path,
+        store: ArtifactStore,
+        graph: GraphRunner,
+        run_id: str,
+    ) -> tuple[CandidateManifest, NodeResult[dict[str, Any]]]:
+        inputs = root / "inputs"
+        inputs.mkdir()
+        projection = self._projection(design)
+        contract = compile_implementation_contract(design)
+        (inputs / "design.json").write_bytes(_canonical(projection))
+        (inputs / "implementation-contract.json").write_bytes(_canonical(contract))
+        (inputs / "build-plan.json").write_bytes(_canonical(plan.value))
+
+        def operation(correction: CorrectionPacket | None) -> _AgentProposal:
+            try:
+                return self._agent_json(
+                    "candidate_build",
+                    "engineer-environment-codegen",
+                    root,
+                    "Implement only the requested candidate source from inputs/design.json, "
+                    "inputs/implementation-contract.json, and inputs/build-plan.json. Return "
+                    "only CandidateCompletionDraft JSON; framework owns scan, admission, "
+                    "manifest, verifier, Judge, and release.",
+                    correction=correction,
+                    writable=True,
+                )
+            except CandidateError as exc:
+                raise _node_error(exc) from exc
+
+        def compile_candidate(value: _AgentProposal) -> dict[str, Any]:
+            completion = validate_candidate_completion(value.value)
+            for path in inputs.iterdir():
+                path.unlink()
+            inputs.rmdir()
+            return {"completion": completion, "manifest": self._scan(root)}
+
+        node = graph.execute(
+            store,
+            run_id,
+            "candidate_build",
+            {"design": (design.artifact,), "build_plan": (plan.artifact,)},
+            "build.environment_candidate",
+            operation,
+            compile_candidate,
+            {
+                "design": design.artifact.digest,
+                "build_plan": plan.artifact.digest,
+                "projection": projection,
+                "implementation_contract": contract,
+            },
+            artifact_projection=lambda value: value,
+            operation_evidence=lambda proposal: (proposal.evidence,),
+        )
+        payload = node.value["manifest"]
+        return CandidateManifest(
+            payload["entrypoint"], payload["source_digest"], tuple(payload["files"]), node.artifact
+        ), node
+
+    @staticmethod
+    def _scan(root: Path) -> dict[str, Any]:
+        files: list[dict[str, Any]] = []
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(root)
+            if any(part.startswith(".") for part in relative.parts):
+                raise NodeExecutionError("candidate_source_hidden_path")
+            try:
+                mode = path.lstat().st_mode
+            except OSError as exc:
+                raise NodeExecutionError("candidate_source_unreadable") from exc
+            if stat.S_ISLNK(mode):
+                raise NodeExecutionError("candidate_source_symlink")
+            if stat.S_ISDIR(mode):
+                continue
+            if not stat.S_ISREG(mode):
+                raise NodeExecutionError("candidate_source_non_regular")
+            if path.suffix not in {".py", ".toml", ".lock", ""}:
+                raise NodeExecutionError("candidate_source_unsupported_file")
+            try:
+                body = path.read_bytes()
+            except OSError as exc:
+                raise NodeExecutionError("candidate_source_unreadable") from exc
+            files.append(
+                {
+                    "path": relative.as_posix(),
+                    "digest": f"sha256:{sha256(body).hexdigest()}",
+                    "size": len(body),
+                    "mode": f"{stat.S_IMODE(mode):04o}",
+                }
+            )
+        required = {"runtime.py", "materializer.py", "pyproject.toml", "uv.lock", "LICENSE"}
+        if (
+            not required.issubset({item["path"] for item in files})
+            or len(files) > 10
+            or sum(item["size"] for item in files) > 160_000
+        ):
+            raise NodeExecutionError("candidate_source_closure_invalid")
+        return {
+            "entrypoint": "runtime.py",
+            "materializer_entrypoint": "materializer.py",
+            "source_digest": f"sha256:{sha256(_canonical(files)).hexdigest()}",
+            "files": files,
+        }
+
+    def _integration(
+        self,
+        design: DesignContract,
+        manifest: CandidateManifest,
+        root: Path,
+        store: ArtifactStore,
+        graph: GraphRunner,
+        run_id: str,
+    ) -> NodeResult[dict[str, Any]]:
+        def operation(_correction: object) -> dict[str, Any]:
+            try:
+                with prepare_candidate(root, self.trusted_wheel_store) as prepared:
+                    result = integrate(
+                        root,
+                        design.assurance_recipes,
+                        design.executable_tasks,
+                        tuple(family.difficulty_schema for family in design.curriculum.families),
+                        design.tools,
+                        prepared.python,
+                    )
+                    return {
+                        **result,
+                        "admitted_lock_closure": admitted_lock_closure_value(
+                            prepared.admitted_lock_closure
+                        ),
+                    }
+            except SupplyChainError as exc:
+                return {"status": "failed", "code": str(exc)}
+
+        def compile_integration(value: dict[str, Any]) -> dict[str, Any]:
+            if not isinstance(value, dict) or value.get("status") != "passed":
+                code = (
+                    value.get("code", "integration_failed")
+                    if isinstance(value, dict)
+                    else "integration_failed"
+                )
+                raise NodeExecutionError(str(code), evidence={"integration": value})
+            if not isinstance(value.get("admitted_lock_closure"), dict):
+                raise NodeExecutionError("integration_admitted_lock_closure_invalid")
+            expected = [
+                {
+                    "task_family_index": recipe.task_family_index,
+                    "tool_index": recipe.tool_index,
+                    "recipe_digest": recipe.recipe_digest,
+                }
+                for recipe in design.assurance_recipes
+            ]
+            if value.get("baseline_coverage") != expected:
+                raise NodeExecutionError("integration_baseline_coverage_invalid")
+            return value
+
+        return graph.execute(
+            store,
+            run_id,
+            "integration",
+            {"design": (design.artifact,), "candidate": (manifest.artifact,)},
+            "candidate.integration",
+            operation,
+            compile_integration,
+            {
+                "design": design.artifact.digest,
+                "candidate": manifest.artifact.digest,
+                "candidate_digest": manifest.source_digest,
+            },
+            failure_subject=manifest.artifact,
+        )
+
+    def _verifier_bundle(
+        self, design: DesignContract, store: ArtifactStore, graph: GraphRunner, run_id: str
+    ) -> NodeResult[_CompiledVerifier]:
+        catalog = self._verifier_catalog(design)
+        with tempfile.TemporaryDirectory(prefix="foundry-verifier-") as temporary:
+            workspace = Path(temporary)
+            (workspace / "public-design.json").write_bytes(_canonical(catalog))
+
+            def operation(correction: CorrectionPacket | None) -> _AgentProposal:
+                try:
+                    return self._agent_json(
+                        "verifier_intent",
+                        "challenge-agent-world",
+                        workspace,
+                        "Read public-design.json. Return exactly VerifierIntentDraft.checks "
+                        "for the declared public task/tool indices and four closed verifier "
+                        "families. Do not request candidate source or private data.",
+                        correction=correction,
+                    )
+                except CandidateError as exc:
+                    raise _node_error(exc) from exc
+
+            def compile_bundle(value: _AgentProposal) -> _CompiledVerifier:
+                checks = value.value.get("checks") if isinstance(value.value, dict) else None
+                if not isinstance(checks, list) or not 1 <= len(checks) <= 8:
+                    raise _model_rejection(
+                        "verifier_intent_invalid",
+                        "$.checks",
+                        "checks must be a nonempty bounded array",
+                        "array",
+                    )
+                recipes = {
+                    (recipe.task_family_index, recipe.tool_index): recipe
+                    for recipe in design.assurance_recipes
+                }
+                commitments: list[VerifierCommitment] = []
+                for index, check in enumerate(checks):
+                    if not isinstance(check, dict) or set(check) != {
+                        "task_family_index",
+                        "tool_index",
+                        "family",
+                        "argument_index",
+                        "risk",
+                    }:
+                        raise _model_rejection(
+                            "verifier_intent_invalid",
+                            f"$.checks[{index}]",
+                            "check must be the closed verifier-check object",
+                            "object",
+                        )
+                    family = check.get("family")
+                    risk = _bounded_text(check.get("risk"), maximum=280)
+                    task_family_index = check.get("task_family_index")
+                    tool_index = check.get("tool_index")
+                    argument_index = check.get("argument_index")
+                    if (
+                        family
+                        not in {
+                            "unknown_seed",
+                            "alternate_difficulty",
+                            "idempotency_key_variation",
+                            "argument_variation",
+                        }
+                        or type(task_family_index) is not int
+                        or type(tool_index) is not int
+                        or (task_family_index, tool_index) not in recipes
+                        or risk is None
+                    ):
+                        path = f"$.checks[{index}].family"
+                        if type(task_family_index) is not int:
+                            path = f"$.checks[{index}].task_family_index"
+                        elif (
+                            type(tool_index) is not int
+                            or (task_family_index, tool_index) not in recipes
+                        ):
+                            path = f"$.checks[{index}].tool_index"
+                        elif risk is None:
+                            path = f"$.checks[{index}].risk"
+                        raise _model_rejection(
+                            "verifier_intent_invalid",
+                            path,
+                            "field must match the frozen verifier contract",
+                            "string" if path.endswith(("family", "risk")) else "number",
+                        )
+                    if family == "argument_variation":
+                        if (
+                            type(argument_index) is not int
+                            or not 1
+                            <= argument_index
+                            <= len(design.tools[tool_index - 1].surface.argument_fields)
+                            or design.tools[tool_index - 1]
+                            .surface.argument_fields[argument_index - 1]
+                            .category
+                            == "list"
+                        ):
+                            raise _model_rejection(
+                                "verifier_intent_invalid",
+                                f"$.checks[{index}].argument_index",
+                                "argument index must select a supported frozen scalar argument",
+                                "number",
+                            )
+                    elif argument_index is not None:
+                        raise _model_rejection(
+                            "verifier_intent_invalid",
+                            f"$.checks[{index}].argument_index",
+                            "argument index is allowed only for argument variation",
+                            "number",
+                        )
+                    digest = sha256(
+                        f"{design.artifact.digest}:{index}:{family}:{risk}".encode()
+                    ).hexdigest()[:16]
+                    commitments.append(
+                        VerifierCommitment(
+                            f"verifier-{index + 1}-{digest}",
+                            task_family_index,
+                            tool_index,
+                            family,
+                            argument_index,
+                            risk,
+                            recipes[(task_family_index, tool_index)].recipe_digest,
+                        )
+                    )
+                if len({item.commitment_id for item in commitments}) != len(commitments):
+                    raise _model_rejection(
+                        "verifier_intent_invalid",
+                        "$.checks",
+                        "checks must produce unique verifier commitments",
+                        "array",
+                    )
+                return _CompiledVerifier(
+                    tuple(commitments),
+                    self._private_verifier_cases(design, tuple(commitments)),
+                )
+
+            node = graph.execute(
+                store,
+                run_id,
+                "verifier_intent",
+                {"design": (design.artifact,)},
+                "judge.verifier_bundle",
+                operation,
+                compile_bundle,
+                {
+                    "design": design.artifact.digest,
+                    "catalog": catalog,
+                },
+                artifact_projection=lambda value: {
+                    "commitments": [json_value(item) for item in value.commitments],
+                    "commitment_count": len(value.commitments),
+                },
+                operation_evidence=lambda proposal: (proposal.evidence,),
+            )
+        return node
+
+    @staticmethod
+    def _private_verifier_cases(
+        design: DesignContract, commitments: tuple[VerifierCommitment, ...]
+    ) -> tuple[PrivateVerifierCase, ...]:
+        """Expand public commitments into same-run values that never enter ArtifactStore."""
+
+        cases: list[PrivateVerifierCase] = []
+        for commitment in commitments:
+            recipe = next(
+                item
+                for item in design.assurance_recipes
+                if item.task_family_index == commitment.task_family_index
+                and item.tool_index == commitment.tool_index
+            )
+            tool = design.tools[commitment.tool_index - 1]
+            family = design.curriculum.families[commitment.task_family_index - 1]
+            digest = sha256(
+                f"{design.artifact.digest}:{commitment.commitment_id}".encode()
+            ).hexdigest()
+            request = MaterializationRequest(
+                recipe.task_family_index * 1000 + recipe.tool_index,
+                family.task_family_id,
+                recipe.actor,
+                recipe.primary_difficulty,
+            )
+            arguments = {field.name: _field_value(field) for field in tool.surface.argument_fields}
+            if commitment.variation_kind == "unknown_seed":
+                seed = int(digest[:16], 16)
+                if seed == request.seed:
+                    seed = (seed + 1) % 2**64
+                request = replace(request, seed=seed)
+            elif commitment.variation_kind == "alternate_difficulty":
+                request = replace(request, difficulty_pairs=recipe.alternate_difficulty)
+            elif commitment.variation_kind == "argument_variation":
+                assert commitment.argument_index is not None  # validated at compilation.
+                name = tuple(arguments)[commitment.argument_index - 1]
+                arguments[name] = CandidateExecutor._scalar_variant(arguments[name])
+            keys: tuple[str, ...] = (f"judge-{digest[:24]}-a",)
+            if commitment.variation_kind == "idempotency_key_variation":
+                keys = (*keys, f"judge-{digest[24:48]}-b")
+            cases.append(
+                PrivateVerifierCase(
+                    commitment.commitment_id,
+                    commitment.task_family_index,
+                    commitment.tool_index,
+                    commitment.variation_kind,
+                    commitment.baseline_recipe_digest,
+                    request,
+                    arguments,
+                    keys,
+                )
+            )
+        return tuple(cases)
+
+    @staticmethod
+    def _scalar_variant(value: object) -> object:
+        if type(value) is bool:
+            return not value
+        if type(value) is int:
+            return value + 1
+        if type(value) is float:
+            return value + 1.0
+        if type(value) is str:
+            return value + "-variant"
+        raise NodeExecutionError("verifier_intent_invalid")
+
+    def _judge_node(
+        self,
+        design: DesignContract,
+        manifest: CandidateManifest,
+        integration_ref: ArtifactRef,
+        verifier_ref: ArtifactRef,
+        private_cases: tuple[PrivateVerifierCase, ...],
+        root: Path,
+        store: ArtifactStore,
+        graph: GraphRunner,
+        run_id: str,
+    ) -> tuple[JudgeReport, NodeResult[dict[str, Any]]]:
+
+        def operation(_correction: object) -> tuple[GateResult, ...]:
+            bundle = self._cold_bundle(store, verifier_ref)
+            self._validate_private_bindings(design, bundle, private_cases)
+            try:
+                integration = store.read_envelope(integration_ref)["payload"]
+                admitted = integration.get("admitted_lock_closure")
+                with prepare_candidate(root, self.trusted_wheel_store) as prepared:
+                    if admitted != admitted_lock_closure_value(prepared.admitted_lock_closure):
+                        raise NodeExecutionError("judge_admitted_lock_closure_mismatch")
+                    outcomes = judge(
+                        root,
+                        design.assurance_recipes,
+                        design.executable_tasks,
+                        tuple(family.difficulty_schema for family in design.curriculum.families),
+                        design.tools,
+                        private_cases,
+                        prepared.python,
+                    )
+            except SupplyChainError as exc:
+                raise NodeExecutionError(str(exc)) from exc
+            gates: list[GateResult] = []
+            for outcome in outcomes:
+                binding = outcome.get("binding")
+                if not isinstance(binding, dict) or set(binding) != {
+                    "task_family_index",
+                    "tool_index",
+                    "recipe_digest",
+                }:
+                    raise NodeExecutionError("judge_coverage_evidence_invalid")
+                evidence = store.put_json(
+                    "judge.gate_evidence",
+                    {
+                        "gate_id": outcome["gate_id"],
+                        "status": outcome["status"],
+                        "code": outcome["code"],
+                        "candidate_digest": manifest.source_digest,
+                        "binding": binding,
+                    },
+                )
+                gates.append(
+                    GateResult(outcome["gate_id"], outcome["status"], outcome["code"], evidence)
+                )
+            return tuple(gates)
+
+        def compile_report(gates: tuple[GateResult, ...]) -> dict[str, Any]:
+            expected_ids = tuple(
+                gate_id
+                for recipe in design.assurance_recipes
+                for gate_id in (
+                    f"task_materialization:{recipe.task_family_index}:{recipe.tool_index}",
+                    f"task_reachability:{recipe.task_family_index}:{recipe.tool_index}",
+                )
+            ) + tuple(case.commitment_id for case in private_cases)
+            if tuple(gate.gate_id for gate in gates) != expected_ids or any(
+                gate.status != "passed" for gate in gates
+            ):
+                raise NodeExecutionError(
+                    "judge_required_gate_failed", evidence={"gate_count": len(gates)}
+                )
+            return {
+                "candidate_digest": manifest.source_digest,
+                "integration_ref": _ref(integration_ref),
+                "verifier_ref": _ref(verifier_ref),
+                "gates": [json_value(gate) for gate in gates],
+            }
+
+        node = graph.execute(
+            store,
+            run_id,
+            "judge",
+            {
+                "design": (design.artifact,),
+                "candidate": (manifest.artifact,),
+                "integration": (integration_ref,),
+                "verifier": (verifier_ref,),
+            },
+            "judge.report",
+            operation,
+            compile_report,
+            {
+                "design": design.artifact.digest,
+                "candidate": manifest.artifact.digest,
+                "integration": integration_ref.digest,
+                "verifier": verifier_ref.digest,
+            },
+            failure_subject=manifest.artifact,
+        )
+        gates = tuple(
+            GateResult(
+                item["gate_id"], item["status"], item["code"], ArtifactRef(**item["evidence"])
+            )
+            for item in node.value["gates"]
+        )
+        return JudgeReport(
+            manifest.source_digest, gates, node.artifact, integration_ref, verifier_ref
+        ), node
+
+    @staticmethod
+    def _validate_private_bindings(
+        design: DesignContract,
+        bundle: dict[str, Any],
+        private_cases: tuple[PrivateVerifierCase, ...],
+    ) -> None:
+        commitments = bundle["commitments"]
+        if len(commitments) != len(private_cases):
+            raise NodeExecutionError("verifier_private_binding_missing")
+        public_bindings = [
+            (
+                item["task_family_index"],
+                item["tool_index"],
+                item["variation_kind"],
+                item["baseline_recipe_digest"],
+            )
+            for item in commitments
+        ]
+        private_bindings = [
+            (
+                case.task_family_index,
+                case.tool_index,
+                case.variation_kind,
+                case.baseline_recipe_digest,
+            )
+            for case in private_cases
+        ]
+        if (
+            len(set(public_bindings)) != len(public_bindings)
+            or len(set(private_bindings)) != len(private_bindings)
+            or len({case.commitment_id for case in private_cases}) != len(private_cases)
+        ):
+            raise NodeExecutionError("verifier_private_binding_duplicate")
+        recipes = {
+            (recipe.task_family_index, recipe.tool_index): recipe
+            for recipe in design.assurance_recipes
+        }
+        expected_cases = CandidateExecutor._private_verifier_cases(
+            design, tuple(VerifierCommitment(**item) for item in commitments)
+        )
+        for commitment, expected_case, case in zip(
+            commitments, expected_cases, private_cases, strict=True
+        ):
+            expected = (
+                commitment["commitment_id"],
+                commitment["task_family_index"],
+                commitment["tool_index"],
+                commitment["variation_kind"],
+                commitment["baseline_recipe_digest"],
+            )
+            actual = (
+                case.commitment_id,
+                case.task_family_index,
+                case.tool_index,
+                case.variation_kind,
+                case.baseline_recipe_digest,
+            )
+            if expected != actual:
+                raise NodeExecutionError("verifier_private_binding_mismatch")
+            recipe = recipes.get((case.task_family_index, case.tool_index))
+            if recipe is None or recipe.recipe_digest != case.baseline_recipe_digest:
+                raise NodeExecutionError("verifier_recipe_binding_mismatch")
+            if case != expected_case:
+                raise NodeExecutionError("verifier_private_variation_mismatch")
+
+    @staticmethod
+    def _cold_bundle(store: ArtifactStore, verifier_ref: ArtifactRef) -> dict[str, Any]:
+        envelope = store.read_envelope(verifier_ref)
+        payload = envelope["payload"]
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"commitments", "commitment_count"}
+            or not isinstance(payload["commitments"], list)
+            or not payload["commitments"]
+            or payload["commitment_count"] != len(payload["commitments"])
+        ):
+            raise NodeExecutionError("verifier_bundle_invalid")
+        for commitment in payload["commitments"]:
+            if not isinstance(commitment, dict) or set(commitment) != {
+                "commitment_id",
+                "task_family_index",
+                "tool_index",
+                "variation_kind",
+                "argument_index",
+                "risk",
+                "baseline_recipe_digest",
+            }:
+                raise NodeExecutionError("verifier_bundle_invalid")
+            try:
+                VerifierCommitment(**commitment)
+            except (TypeError, ValueError) as exc:
+                raise NodeExecutionError("verifier_bundle_invalid") from exc
+        if len({item["commitment_id"] for item in payload["commitments"]}) != len(
+            payload["commitments"]
+        ):
+            raise NodeExecutionError("verifier_bundle_invalid")
+        return payload
+
+    def _lineages(
+        self, design: DesignContract, manifest: CandidateManifest, store: ArtifactStore
+    ) -> tuple[ArtifactRef, ArtifactRef]:
+        """Create immutable Direct lineage before Package binds it into bytes."""
+
+        store.read_json(design.artifact)
+        store.read_envelope(manifest.artifact)
+        return (
+            store.put_json(
+                "lineage.semantic",
+                {
+                    "origin": "direct",
+                    "parent_package_refs": [],
+                    "design_ref": _ref(design.artifact),
+                },
+            ),
+            store.put_json(
+                "lineage.implementation",
+                {
+                    "candidate_manifest_ref": _ref(manifest.artifact),
+                    "source_digest": manifest.source_digest,
+                },
+            ),
+        )
+
+    def _package(
+        self,
+        design: DesignContract,
+        manifest: CandidateManifest,
+        integration_ref: ArtifactRef,
+        verifier_ref: ArtifactRef,
+        report: JudgeReport,
+        semantic_lineage: ArtifactRef,
+        implementation_lineage: ArtifactRef,
+        root: Path,
+        store: ArtifactStore,
+        graph: GraphRunner,
+        run_id: str,
+    ) -> tuple[NodeResult[dict[str, Any]], ArtifactRef, ArtifactRef, ArtifactRef]:
+        def operation(_correction: object) -> dict[str, Any]:
+            integration = store.read_envelope(integration_ref)["payload"]
+            closure = _admitted_closure(integration.get("admitted_lock_closure"))
+            verifier_bundle = self._cold_bundle(store, verifier_ref)
+            sbom = compile_sbom(root)
+            if sbom["admitted_lock_closure"] != closure:
+                raise NodeExecutionError("package_admitted_lock_closure_mismatch")
+            telemetry_value = _compile_telemetry(store, design.work_refs, manifest.work_refs)
+            telemetry = store.put_json("release.telemetry_summary", telemetry_value)
+            gates = _judge_gates(report)
+            refs = _package_refs(
+                design,
+                manifest,
+                integration_ref,
+                verifier_ref,
+                report,
+                telemetry,
+                semantic_lineage,
+                implementation_lineage,
+            )
+            dossier = store.put_json(
+                "release.dossier",
+                {
+                    "schema_version": "release-dossier@1",
+                    "artifact_refs": {name: _ref(ref) for name, ref in refs.items()},
+                    "integration_status": "passed",
+                    "judge_gates": gates,
+                },
+            )
+            metadata = _package_metadata(
+                design,
+                manifest,
+                integration_ref,
+                verifier_ref,
+                report,
+                dossier,
+                telemetry,
+                semantic_lineage,
+                implementation_lineage,
+                sbom,
+                telemetry_value,
+                f"sha256:{sha256((root / 'uv.lock').read_bytes()).hexdigest()}",
+                integration,
+                verifier_bundle,
+            )
+            manifest_value = self._package_manifest(
+                design,
+                manifest,
+                integration_ref,
+                verifier_ref,
+                report,
+                dossier,
+                telemetry,
+                semantic_lineage,
+                implementation_lineage,
+                closure,
+                metadata,
+            )
+            package = store.put_bytes(
+                "registry.package",
+                _package_bytes(manifest_value, root, metadata),
+                media_type="application/zip",
+            )
+            return {
+                "physical_package_ref": _ref(package),
+                "manifest": manifest_value,
+                "dossier_ref": _ref(dossier),
+                "telemetry_ref": _ref(telemetry),
+            }
+
+        node = graph.execute(
+            store,
+            run_id,
+            "package",
+            {
+                "design": (design.artifact,),
+                "candidate": (manifest.artifact,),
+                "integration": (integration_ref,),
+                "judge": (report.artifact,),
+                "verifier": (verifier_ref,),
+                "semantic_lineage": (semantic_lineage,),
+                "implementation_lineage": (implementation_lineage,),
+                "design_work_records": design.work_refs,
+                "candidate_work_records": manifest.work_refs,
+            },
+            "release.package",
+            operation,
+            lambda value: value,
+            {
+                "design": design.artifact.digest,
+                "candidate": manifest.artifact.digest,
+                "integration": integration_ref.digest,
+                "judge": report.artifact.digest,
+                "verifier": verifier_ref.digest,
+                "semantic_lineage": semantic_lineage.digest,
+                "implementation_lineage": implementation_lineage.digest,
+                "design_work_record_digests": tuple(ref.digest for ref in design.work_refs),
+                "candidate_work_record_digests": tuple(ref.digest for ref in manifest.work_refs),
+            },
+        )
+        return (
+            node,
+            ArtifactRef(**node.value["physical_package_ref"]),
+            ArtifactRef(**node.value["dossier_ref"]),
+            ArtifactRef(**node.value["telemetry_ref"]),
+        )
+
+    def _registry(
+        self,
+        design: DesignContract,
+        manifest: CandidateManifest,
+        integration_ref: ArtifactRef,
+        verifier_ref: ArtifactRef,
+        report: JudgeReport,
+        package_ref: ArtifactRef,
+        physical_package: ArtifactRef,
+        dossier: ArtifactRef,
+        telemetry: ArtifactRef,
+        semantic_lineage: ArtifactRef,
+        implementation_lineage: ArtifactRef,
+        store: ArtifactStore,
+        graph: GraphRunner,
+        run_id: str,
+    ) -> tuple[RegistryReceipt, EnvironmentPackageRef, NodeResult[dict[str, Any]]]:
+        def operation(_correction: object) -> dict[str, Any]:
+            package_payload = store.read_envelope(package_ref)["payload"]
+            if package_payload.get("physical_package_ref") != _ref(physical_package):
+                raise NodeExecutionError("registry_physical_package_mismatch")
+            if package_payload.get("dossier_ref") != _ref(dossier) or package_payload.get(
+                "telemetry_ref"
+            ) != _ref(telemetry):
+                raise NodeExecutionError("registry_dossier_mismatch")
+            manifest_value = package_payload.get("manifest")
+            if not isinstance(manifest_value, dict):
+                raise NodeExecutionError("registry_manifest_mismatch")
+            body = store.read_bytes(physical_package)
+            digest = f"sha256:{sha256(body).hexdigest()}"
+            closure = _cold_read_package(body, digest, manifest_value)
+            _cold_verify(
+                store,
+                design,
+                manifest,
+                integration_ref,
+                verifier_ref,
+                report,
+                dossier,
+                telemetry,
+                semantic_lineage,
+                implementation_lineage,
+                closure,
+            )
+            package_id = manifest_value["package_id"]
+            version = f"v-{digest[7:23]}"
+            receipt_value = _publish(
+                self.settings.state_root,
+                package_id,
+                version,
+                digest,
+                closure["manifest_digest"],
+                body,
+                manifest_value,
+            )
+            return {
+                "receipt": receipt_value,
+                "manifest_digest": closure["manifest_digest"],
+                "physical_package_ref": _ref(physical_package),
+            }
+
+        node = graph.execute(
+            store,
+            run_id,
+            "registry",
+            {
+                "package": (package_ref,),
+                "design": (design.artifact,),
+                "candidate": (manifest.artifact,),
+                "integration": (integration_ref,),
+                "judge": (report.artifact,),
+                "verifier": (verifier_ref,),
+                "physical_package": (physical_package,),
+                "dossier": (dossier,),
+                "telemetry": (telemetry,),
+                "semantic_lineage": (semantic_lineage,),
+                "implementation_lineage": (implementation_lineage,),
+                "design_work_records": design.work_refs,
+                "candidate_work_records": manifest.work_refs,
+            },
+            "registry.receipt",
+            operation,
+            lambda value: value,
+            {
+                "package": package_ref.digest,
+                "design": design.artifact.digest,
+                "candidate": manifest.artifact.digest,
+                "dossier": dossier.digest,
+                "integration": integration_ref.digest,
+                "judge": report.artifact.digest,
+                "verifier": verifier_ref.digest,
+                "physical_package": physical_package.digest,
+                "telemetry": telemetry.digest,
+                "semantic_lineage": semantic_lineage.digest,
+                "implementation_lineage": implementation_lineage.digest,
+                "design_work_record_digests": tuple(ref.digest for ref in design.work_refs),
+                "candidate_work_record_digests": tuple(ref.digest for ref in manifest.work_refs),
+                "registry_acceptance_revision": "physical-package-ref-equality@1",
+            },
+        )
+        receipt_value = node.value["receipt"]
+        receipt = RegistryReceipt(
+            receipt_value["package_id"],
+            receipt_value["version"],
+            receipt_value["package_digest"],
+            receipt_value["manifest_digest"],
+            receipt_value["registry_revision"],
+            receipt_value["published_at"],
+        )
+        return (
+            receipt,
+            EnvironmentPackageRef(
+                receipt.package_id,
+                receipt.version,
+                receipt.package_digest,
+                receipt.manifest_digest,
+                node.artifact,
+                design.artifact,
+                manifest.artifact,
+                integration_ref,
+                report.artifact,
+                semantic_lineage,
+                implementation_lineage,
+            ),
+            node,
+        )
+
+    @staticmethod
+    def _package_manifest(
+        design: DesignContract,
+        manifest: CandidateManifest,
+        integration_ref: ArtifactRef,
+        verifier_ref: ArtifactRef,
+        report: JudgeReport,
+        dossier: ArtifactRef,
+        telemetry: ArtifactRef,
+        semantic_lineage: ArtifactRef,
+        implementation_lineage: ArtifactRef,
+        dependency_closure: dict[str, Any],
+        metadata: dict[str, bytes],
+    ) -> dict[str, Any]:
+        refs = _package_refs(
+            design,
+            manifest,
+            integration_ref,
+            verifier_ref,
+            report,
+            telemetry,
+            semantic_lineage,
+            implementation_lineage,
+        )
+        refs["dossier"] = dossier
+        source_files = list(manifest.files)
+        metadata_entries = [_entry(path, body, "0644") for path, body in metadata.items()]
+        entries = sorted([*source_files, *metadata_entries], key=lambda item: str(item["path"]))
+        return {
+            "schema_version": "envpkg-manifest@1",
+            "package_id": f"direct-{design.architecture.boundary.name}",
+            "origin": "direct",
+            "parent_package_refs": [],
+            "entrypoint": manifest.entrypoint,
+            "materializer_entrypoint": manifest.materializer_entrypoint,
+            "source_digest": manifest.source_digest,
+            "source_files": source_files,
+            "physical_entries": entries,
+            "metadata_digests": {
+                path: f"sha256:{sha256(body).hexdigest()}" for path, body in metadata.items()
+            },
+            "curriculum_digest": design.curriculum.artifact.digest,
+            "dependency_closure": dependency_closure,
+            "artifact_refs": {name: _ref(ref) for name, ref in refs.items()},
+            "contract_digests": {name: ref.digest for name, ref in refs.items()},
+        }
+
+
+_METADATA_PATHS = (
+    "envpkg.toml",
+    "world/world_spec.json",
+    "world/rule_ir.json",
+    "tasks/curriculum.json",
+    "tasks/materializer_protocol.json",
+    "evidence/provenance.json",
+    "evidence/assurance.json",
+    "evidence/fidelity.json",
+    "evidence/telemetry.json",
+    "sbom/sbom.json",
+)
+_PACKAGE_REF_NAMES = (
+    "design",
+    "candidate",
+    "integration",
+    "judge",
+    "verifier",
+    "dossier",
+    "telemetry",
+    "semantic_lineage",
+    "implementation_lineage",
+)
+_ENVPKG_FIELDS = (
+    "schema_version",
+    "coordinate",
+    "origin",
+    "parent_package_refs",
+    "entrypoint",
+    "materializer_entrypoint",
+    "source_digest",
+    "lock_digest",
+    "design_digest",
+    "candidate_digest",
+    "integration_digest",
+    "judge_digest",
+    "verifier_digest",
+    "dossier_digest",
+    "telemetry_digest",
+    "semantic_lineage_digest",
+    "implementation_lineage_digest",
+    "world_spec_digest",
+    "rule_ir_digest",
+    "curriculum_digest",
+    "materializer_protocol_digest",
+    "provenance_digest",
+    "assurance_digest",
+    "fidelity_digest",
+    "sbom_digest",
+)
+
+
+def _entry(path: str, body: bytes, mode: str) -> dict[str, Any]:
+    return {
+        "path": path,
+        "digest": f"sha256:{sha256(body).hexdigest()}",
+        "size": len(body),
+        "mode": mode,
+    }
+
+
+def _admitted_closure(value: object) -> dict[str, Any]:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"entries"}
+        or not isinstance(value["entries"], list)
+    ):
+        raise NodeExecutionError("admitted_lock_closure_invalid")
+    entries = value["entries"]
+    names: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"name", "version", "wheels"}:
+            raise NodeExecutionError("admitted_lock_closure_invalid")
+        if not isinstance(entry["name"], str) or not isinstance(entry["version"], str):
+            raise NodeExecutionError("admitted_lock_closure_invalid")
+        wheels = entry["wheels"]
+        if not isinstance(wheels, list) or not wheels:
+            raise NodeExecutionError("admitted_lock_closure_invalid")
+        for wheel in wheels:
+            if (
+                not isinstance(wheel, dict)
+                or set(wheel) != {"filename", "digest", "size"}
+                or not isinstance(wheel["filename"], str)
+                or not isinstance(wheel["digest"], str)
+                or not isinstance(wheel["size"], int)
+                or wheel["size"] < 1
+            ):
+                raise NodeExecutionError("admitted_lock_closure_invalid")
+        names.append(entry["name"])
+    if names != sorted(names) or len(set(names)) != len(names):
+        raise NodeExecutionError("admitted_lock_closure_invalid")
+    return value
+
+
+def _work_record(store: ArtifactStore, ref: ArtifactRef, expected_graph: str) -> dict[str, Any]:
+    if ref.kind != "control.work_record":
+        raise NodeExecutionError("telemetry_work_record_invalid")
+    value = store.read_json(ref)
+    coordinate = value.get("coordinate") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or value.get("status") != "passed"
+        or not isinstance(coordinate, dict)
+        or coordinate.get("graph_id") != expected_graph
+        or not isinstance(value.get("assurance_refs"), list)
+    ):
+        raise NodeExecutionError("telemetry_work_record_invalid")
+    return value
+
+
+def _compile_telemetry(
+    store: ArtifactStore,
+    design_work_refs: tuple[ArtifactRef, ...],
+    candidate_work_refs: tuple[ArtifactRef, ...],
+) -> dict[str, Any]:
+    """Project only attested operation evidence from exact passed work records."""
+
+    if not design_work_refs or not candidate_work_refs:
+        raise NodeExecutionError("telemetry_work_record_missing")
+    seen_work: set[str] = set()
+    operations: list[dict[str, Any]] = []
+    seen_operations: set[str] = set()
+    for graph_id, refs in (("design", design_work_refs), ("candidate", candidate_work_refs)):
+        for ref in refs:
+            if ref.digest in seen_work:
+                raise NodeExecutionError("telemetry_work_record_duplicate")
+            seen_work.add(ref.digest)
+            record = _work_record(store, ref, graph_id)
+            for raw_ref in record["assurance_refs"]:
+                try:
+                    assurance_ref = ArtifactRef(**raw_ref)
+                except (TypeError, ValueError) as exc:
+                    raise NodeExecutionError("telemetry_operation_ref_invalid") from exc
+                if assurance_ref.kind != "assurance.operation":
+                    continue
+                if assurance_ref.digest in seen_operations:
+                    raise NodeExecutionError("telemetry_operation_duplicate")
+                seen_operations.add(assurance_ref.digest)
+                try:
+                    value = store.read_json(assurance_ref)
+                    evidence = OperationEvidence(**value)
+                except (TypeError, ValueError) as exc:
+                    raise NodeExecutionError("telemetry_operation_invalid") from exc
+                if evidence.category not in {"direct_llm", "agent", "search", "fetch", "extract"}:
+                    raise NodeExecutionError("telemetry_operation_invalid")
+                operations.append(
+                    {
+                        "operation_ref": _ref(assurance_ref),
+                        "category": evidence.category,
+                        "node_id": evidence.node_id,
+                        "model": evidence.model,
+                        "skill_digest": evidence.skill_digest,
+                        "usage": evidence.usage if evidence.usage is not None else "unknown",
+                    }
+                )
+    if not operations:
+        raise NodeExecutionError("telemetry_operation_missing")
+    category_counts = [
+        {"category": category, "count": sum(item["category"] == category for item in operations)}
+        for category in ("direct_llm", "agent", "search", "fetch", "extract")
+        if any(item["category"] == category for item in operations)
+    ]
+    model_counts = [
+        {
+            "category": category,
+            "model": model,
+            "count": sum(
+                item["category"] == category and item["model"] == model for item in operations
+            ),
+        }
+        for category, model in sorted(
+            {(str(item["category"]), item["model"]) for item in operations},
+            key=lambda item: (item[0], "" if item[1] is None else str(item[1])),
+        )
+    ]
+    return {
+        "schema_version": "telemetry-release-summary@1",
+        "category_counts": category_counts,
+        "model_counts": model_counts,
+        "operations": operations,
+    }
+
+
+def _judge_gates(report: JudgeReport) -> list[dict[str, Any]]:
+    if not report.gates:
+        raise NodeExecutionError("package_judge_evidence_invalid")
+    values: list[dict[str, Any]] = []
+    for gate in report.gates:
+        if gate.status != "passed" or gate.evidence is None:
+            raise NodeExecutionError("package_judge_evidence_invalid")
+        values.append(
+            {
+                "gate_id": gate.gate_id,
+                "status": gate.status,
+                "code": gate.code,
+                "evidence_ref": _ref(gate.evidence),
+            }
+        )
+    return values
+
+
+def _package_refs(
+    design: DesignContract,
+    manifest: CandidateManifest,
+    integration_ref: ArtifactRef,
+    verifier_ref: ArtifactRef,
+    report: JudgeReport,
+    telemetry: ArtifactRef,
+    semantic_lineage: ArtifactRef,
+    implementation_lineage: ArtifactRef,
+) -> dict[str, ArtifactRef]:
+    return {
+        "design": design.artifact,
+        "candidate": manifest.artifact,
+        "integration": integration_ref,
+        "judge": report.artifact,
+        "verifier": verifier_ref,
+        "telemetry": telemetry,
+        "semantic_lineage": semantic_lineage,
+        "implementation_lineage": implementation_lineage,
+    }
+
+
+def _recipe_binding(recipe: object) -> dict[str, Any]:
+    value = json_value(recipe)
+    if not isinstance(value, dict):
+        raise CandidateError("package_recipe_invalid")
+    return value
+
+
+def _task_rule_ir(design: DesignContract) -> list[dict[str, Any]]:
+    return [
+        {
+            "task_family_index": task.task_family_index,
+            "task_requirement": json_value(task.task_requirement),
+            "reward_spec": json_value(task.reward_spec),
+            "reward_digest": task.reward_digest,
+            "termination_spec": json_value(task.termination_spec),
+            "termination_digest": task.termination_digest,
+        }
+        for task in design.executable_tasks
+    ]
+
+
+def _materializer_tasks(design: DesignContract) -> list[dict[str, Any]]:
+    return [
+        {
+            "task_family_index": task.task_family_index,
+            "public_goal_schema": json_value(task.public_goal_schema),
+            "initial_config_schema": json_value(task.initial_config_schema),
+            "evaluator_goal_bindings": json_value(task.evaluator_goal_bindings),
+            "instruction_template_digest": task.instruction_template_digest,
+            "assurance_recipes": [
+                _recipe_binding(recipe)
+                for recipe in design.assurance_recipes
+                if recipe.task_family_index == task.task_family_index
+            ],
+            "verification_requirements": json_value(task.verification_requirements),
+            "verification_digest": task.verification_digest,
+        }
+        for task in design.executable_tasks
+    ]
+
+
+def _package_metadata(
+    design: DesignContract,
+    manifest: CandidateManifest,
+    integration_ref: ArtifactRef,
+    verifier_ref: ArtifactRef,
+    report: JudgeReport,
+    dossier: ArtifactRef,
+    telemetry: ArtifactRef,
+    semantic_lineage: ArtifactRef,
+    implementation_lineage: ArtifactRef,
+    sbom: dict[str, object],
+    telemetry_value: dict[str, Any],
+    lock_digest: str,
+    integration_value: dict[str, Any],
+    verifier_bundle: dict[str, Any],
+) -> dict[str, bytes]:
+    tools = [json_value(tool) for tool in design.tools]
+    refs = _package_refs(
+        design,
+        manifest,
+        integration_ref,
+        verifier_ref,
+        report,
+        telemetry,
+        semantic_lineage,
+        implementation_lineage,
+    )
+    refs["dossier"] = dossier
+    provenance = {
+        "schema_version": "provenance@1",
+        "input_refs": {name: _ref(ref) for name, ref in refs.items()},
+        "semantic_lineage_ref": _ref(semantic_lineage),
+        "implementation_lineage_ref": _ref(implementation_lineage),
+    }
+    assurance = {
+        "schema_version": "assurance@1",
+        "passed_integration_ref": _ref(integration_ref),
+        "judge_report_ref": _ref(report.artifact),
+        "release_dossier_ref": _ref(dossier),
+        "judge_gates": _judge_gates(report),
+        "integration_coverage": integration_value["baseline_coverage"],
+        "judge_coverage": [
+            {
+                "gate_id": gate.gate_id,
+                "evidence_ref": _ref(gate.evidence) if gate.evidence is not None else None,
+            }
+            for gate in report.gates
+        ],
+        "public_commitment_bindings": verifier_bundle["commitments"],
+    }
+    metadata: dict[str, bytes] = {
+        "world/world_spec.json": _canonical(
+            {
+                "schema_version": "world-spec@1",
+                "architecture": json_value(design.architecture),
+            }
+        ),
+        "world/rule_ir.json": _canonical(
+            {
+                "schema_version": "rule-ir@1",
+                "shared_tool_contracts": json_value(design.shared_tool_contracts),
+                "tools": tools,
+                "world_rules": json_value(design.world_rules),
+                "tasks": _task_rule_ir(design),
+            }
+        ),
+        "tasks/curriculum.json": _canonical(
+            {
+                "schema_version": "curriculum@1",
+                "families": json_value(design.curriculum.families),
+            }
+        ),
+        "tasks/materializer_protocol.json": _canonical(
+            {
+                "schema_version": "materializer-protocol@1",
+                "operation": "materialize",
+                "request_order": ["op", "seed", "task_type", "actor", "difficulty"],
+                "response_order": [
+                    "seed",
+                    "task_type",
+                    "actor",
+                    "difficulty",
+                    "public_goal",
+                    "initial_config",
+                ],
+                "tasks": _materializer_tasks(design),
+            }
+        ),
+        "evidence/provenance.json": _canonical(provenance),
+        "evidence/assurance.json": _canonical(assurance),
+        "evidence/fidelity.json": _canonical(
+            {
+                "schema_version": "fidelity@1",
+                "claim": "bounded_simulation",
+                "reality_equivalence": "not_claimed",
+                "evidence_refs": [_ref(design.evidence.artifact)],
+                "known_divergences": json_value(design.architecture.known_divergences),
+                "coverage_gaps": list(design.evidence.gaps),
+                "assurance_classes": [
+                    "compiled",
+                    "locally_executed",
+                    "task_executed",
+                    "builder_required_unverified",
+                    "known_limit",
+                ],
+                "known_limits": [
+                    "no reality-equivalence claim",
+                    "shared prose, unselected local rules, and global rules are "
+                    "builder-required-unverified",
+                ],
+            }
+        ),
+        "evidence/telemetry.json": _canonical(telemetry_value),
+        "sbom/sbom.json": _canonical(sbom),
+    }
+    metadata["envpkg.toml"] = _canonical_envpkg(
+        {
+            "schema_version": "envpkg@1",
+            "coordinate": f"direct-{design.architecture.boundary.name}",
+            "origin": "direct",
+            "parent_package_refs": [],
+            "entrypoint": manifest.entrypoint,
+            "materializer_entrypoint": manifest.materializer_entrypoint,
+            "source_digest": manifest.source_digest,
+            "lock_digest": lock_digest,
+            "design_digest": design.artifact.digest,
+            "candidate_digest": manifest.artifact.digest,
+            "integration_digest": integration_ref.digest,
+            "judge_digest": report.artifact.digest,
+            "verifier_digest": verifier_ref.digest,
+            "dossier_digest": dossier.digest,
+            "telemetry_digest": telemetry.digest,
+            "semantic_lineage_digest": semantic_lineage.digest,
+            "implementation_lineage_digest": implementation_lineage.digest,
+            "world_spec_digest": f"sha256:{sha256(metadata['world/world_spec.json']).hexdigest()}",
+            "rule_ir_digest": f"sha256:{sha256(metadata['world/rule_ir.json']).hexdigest()}",
+            "curriculum_digest": f"sha256:{sha256(metadata['tasks/curriculum.json']).hexdigest()}",
+            "materializer_protocol_digest": (
+                f"sha256:{sha256(metadata['tasks/materializer_protocol.json']).hexdigest()}"
+            ),
+            "provenance_digest": (
+                f"sha256:{sha256(metadata['evidence/provenance.json']).hexdigest()}"
+            ),
+            "assurance_digest": f"sha256:{sha256(metadata['evidence/assurance.json']).hexdigest()}",
+            "fidelity_digest": f"sha256:{sha256(metadata['evidence/fidelity.json']).hexdigest()}",
+            "sbom_digest": f"sha256:{sha256(metadata['sbom/sbom.json']).hexdigest()}",
+        }
+    )
+    return {path: metadata[path] for path in _METADATA_PATHS}
+
+
+def _canonical_envpkg(value: dict[str, Any]) -> bytes:
+    if set(value) != set(_ENVPKG_FIELDS):
+        raise CandidateError("registry_envpkg_invalid")
+    lines: list[str] = []
+    for field in _ENVPKG_FIELDS:
+        item = value[field]
+        if field == "parent_package_refs":
+            if item != []:
+                raise CandidateError("registry_envpkg_invalid")
+            lines.append(f"{field} = []\n")
+        elif isinstance(item, str) and item:
+            lines.append(f"{field} = {json.dumps(item, ensure_ascii=False)}\n")
+        else:
+            raise CandidateError("registry_envpkg_invalid")
+    return "".join(lines).encode("utf-8")
+
+
+def _mode(mode: object) -> int:
+    if (
+        not isinstance(mode, str)
+        or len(mode) != 4
+        or any(character not in "01234567" for character in mode)
+    ):
+        raise CandidateError("registry_mode_invalid")
+    result = int(mode, 8)
+    if result > 0o777:
+        raise CandidateError("registry_mode_invalid")
+    return result
+
+
+def _source_bodies(root: Path, source_files: object) -> dict[str, bytes]:
+    if not isinstance(source_files, list):
+        raise CandidateError("registry_source_closure_invalid")
+    scan = CandidateExecutor._scan(root)
+    if scan["files"] != source_files:
+        raise CandidateError("registry_source_closure_invalid")
+    bodies: dict[str, bytes] = {}
+    for item in source_files:
+        if not isinstance(item, dict) or set(item) != {"path", "digest", "size", "mode"}:
+            raise CandidateError("registry_source_closure_invalid")
+        path = item["path"]
+        _safe_package_path(path)
+        body = (root / path).read_bytes()
+        if _entry(path, body, item["mode"]) != item:
+            raise CandidateError("registry_source_closure_invalid")
+        bodies[path] = body
+    return bodies
+
+
+def _package_bytes(manifest: dict[str, Any], root: Path, metadata: dict[str, bytes]) -> bytes:
+    source = _source_bodies(root, manifest.get("source_files"))
+    entries = {**source, **metadata}
+    if len(entries) != len(source) + len(metadata) or set(metadata) != set(_METADATA_PATHS):
+        raise CandidateError("registry_package_invalid")
+    actual = sorted(
+        [
+            _entry(
+                path,
+                body,
+                next(item["mode"] for item in manifest["physical_entries"] if item["path"] == path),
+            )
+            for path, body in entries.items()
+        ],
+        key=lambda item: item["path"],
+    )
+    if actual != manifest.get("physical_entries"):
+        raise CandidateError("registry_manifest_mismatch")
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temporary:
+        path = Path(temporary.name)
+    try:
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            entries["manifest.json"] = _canonical(manifest)
+            for name in sorted(entries):
+                mode = (
+                    "0644"
+                    if name == "manifest.json"
+                    else next(
+                        item["mode"]
+                        for item in manifest["physical_entries"]
+                        if item["path"] == name
+                    )
+                )
+                info = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
+                info.create_system = 3
+                info.external_attr = (stat.S_IFREG | _mode(mode)) << 16
+                info.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(info, entries[name])
+        return path.read_bytes()
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _safe_package_path(name: object) -> None:
+    if (
+        not isinstance(name, str)
+        or not name
+        or name.startswith("/")
+        or "\\" in name
+        or name.endswith("/")
+        or any(part in {"", ".", ".."} or part.startswith(".") for part in name.split("/"))
+    ):
+        raise CandidateError("registry_package_path_invalid")
+
+
+def _canonical_json_entry(archive: zipfile.ZipFile, name: str) -> Any:
+    try:
+        body = archive.read(name)
+        value = json.loads(body)
+    except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CandidateError("registry_metadata_invalid") from exc
+    if _canonical(value) != body:
+        raise CandidateError("registry_metadata_noncanonical")
+    return value
+
+
+def _parse_envpkg(archive: zipfile.ZipFile) -> dict[str, Any]:
+    try:
+        body = archive.read("envpkg.toml")
+        value = tomllib.loads(body.decode("utf-8"))
+    except (KeyError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise CandidateError("registry_envpkg_invalid") from exc
+    if not isinstance(value, dict) or _canonical_envpkg(value) != body:
+        raise CandidateError("registry_envpkg_noncanonical")
+    return value
+
+
+def _manifest_entries(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not value:
+        raise CandidateError("registry_manifest_mismatch")
+    entries: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"path", "digest", "size", "mode"}:
+            raise CandidateError("registry_manifest_mismatch")
+        _safe_package_path(item["path"])
+        if (
+            not isinstance(item["digest"], str)
+            or not item["digest"].startswith("sha256:")
+            or not isinstance(item["size"], int)
+            or item["size"] < 0
+        ):
+            raise CandidateError("registry_manifest_mismatch")
+        _mode(item["mode"])
+        entries.append(item)
+    if entries != sorted(entries, key=lambda item: item["path"]) or len(
+        {item["path"] for item in entries}
+    ) != len(entries):
+        raise CandidateError("registry_manifest_mismatch")
+    return entries
+
+
+def _manifest_shape(manifest: object) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "package_id",
+        "origin",
+        "parent_package_refs",
+        "entrypoint",
+        "materializer_entrypoint",
+        "source_digest",
+        "source_files",
+        "physical_entries",
+        "metadata_digests",
+        "curriculum_digest",
+        "dependency_closure",
+        "artifact_refs",
+        "contract_digests",
+    }
+    if not isinstance(manifest, dict) or set(manifest) != required:
+        raise CandidateError("registry_manifest_mismatch")
+    if (
+        manifest["schema_version"] != "envpkg-manifest@1"
+        or not isinstance(manifest["package_id"], str)
+        or manifest["origin"] != "direct"
+        or manifest["parent_package_refs"] != []
+        or not isinstance(manifest["entrypoint"], str)
+        or not isinstance(manifest["materializer_entrypoint"], str)
+        or not isinstance(manifest["source_digest"], str)
+        or not isinstance(manifest["curriculum_digest"], str)
+        or not manifest["curriculum_digest"].startswith("sha256:")
+    ):
+        raise CandidateError("registry_manifest_mismatch")
+    source_files = _manifest_entries(manifest["source_files"])
+    entries = _manifest_entries(manifest["physical_entries"])
+    if not set(item["path"] for item in source_files).issubset({item["path"] for item in entries}):
+        raise CandidateError("registry_manifest_mismatch")
+    metadata = manifest["metadata_digests"]
+    refs = manifest["artifact_refs"]
+    digests = manifest["contract_digests"]
+    if (
+        not isinstance(metadata, dict)
+        or set(metadata) != set(_METADATA_PATHS)
+        or not isinstance(refs, dict)
+        or set(refs) != set(_PACKAGE_REF_NAMES)
+        or not isinstance(digests, dict)
+        or set(digests) != set(_PACKAGE_REF_NAMES)
+    ):
+        raise CandidateError("registry_manifest_mismatch")
+    try:
+        for name in _PACKAGE_REF_NAMES:
+            ref = ArtifactRef(**refs[name])
+            if ref.digest != digests[name]:
+                raise CandidateError("registry_manifest_mismatch")
+        _admitted_closure(manifest["dependency_closure"])
+    except (TypeError, ValueError, NodeExecutionError) as exc:
+        raise CandidateError("registry_manifest_mismatch") from exc
+    return manifest
+
+
+def _zip_mode(info: zipfile.ZipInfo) -> str:
+    mode = (info.external_attr >> 16) & 0o777
+    return f"{mode:04o}"
+
+
+def _cold_read_package(
+    body: bytes, expected_digest: str, expected_manifest: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Verify the entire portable closure without trusting a prior manifest claim."""
+
+    if f"sha256:{sha256(body).hexdigest()}" != expected_digest:
+        raise CandidateError("registry_package_digest_invalid")
+    try:
+        with zipfile.ZipFile(BytesIO(body)) as archive:
+            infos = archive.infolist()
+            names = [info.filename for info in infos]
+            if len(names) != len(set(names)):
+                raise CandidateError("registry_package_duplicate_entry")
+            for name in names:
+                _safe_package_path(name)
+            manifest = _manifest_shape(_canonical_json_entry(archive, "manifest.json"))
+            if expected_manifest is not None and manifest != expected_manifest:
+                raise CandidateError("registry_manifest_mismatch")
+            expected_entries = _manifest_entries(manifest["physical_entries"])
+            expected_names = {item["path"] for item in expected_entries} | {"manifest.json"}
+            if set(names) != expected_names:
+                raise CandidateError("registry_package_entry_set_mismatch")
+            infos_by_name = {info.filename: info for info in infos}
+            if _zip_mode(infos_by_name["manifest.json"]) != "0644":
+                raise CandidateError("registry_mode_mismatch")
+            entries: dict[str, bytes] = {}
+            for item in expected_entries:
+                name = item["path"]
+                entry_body = archive.read(name)
+                if _entry(name, entry_body, _zip_mode(infos_by_name[name])) != item:
+                    raise CandidateError("registry_entry_mismatch")
+                entries[name] = entry_body
+            if set(manifest["metadata_digests"]) != set(_METADATA_PATHS):
+                raise CandidateError("registry_metadata_mismatch")
+            metadata: dict[str, Any] = {}
+            for name in _METADATA_PATHS:
+                if (
+                    name not in entries
+                    or f"sha256:{sha256(entries[name]).hexdigest()}"
+                    != manifest["metadata_digests"][name]
+                ):
+                    raise CandidateError("registry_metadata_mismatch")
+                metadata[name] = (
+                    _parse_envpkg(archive)
+                    if name == "envpkg.toml"
+                    else _canonical_json_entry(archive, name)
+                )
+            source_files = manifest["source_files"]
+            if source_files != [
+                item for item in expected_entries if item["path"] not in set(_METADATA_PATHS)
+            ]:
+                raise CandidateError("registry_source_closure_invalid")
+            if (
+                manifest["source_digest"]
+                != f"sha256:{sha256(_canonical(source_files)).hexdigest()}"
+            ):
+                raise CandidateError("registry_source_closure_invalid")
+            if metadata["envpkg.toml"]["lock_digest"] != next(
+                item["digest"] for item in source_files if item["path"] == "uv.lock"
+            ):
+                raise CandidateError("registry_source_closure_invalid")
+            sbom = compile_sbom_from_metadata(entries["pyproject.toml"], entries["uv.lock"])
+            if (
+                metadata["sbom/sbom.json"] != sbom
+                or manifest["dependency_closure"] != sbom["admitted_lock_closure"]
+            ):
+                raise CandidateError("registry_sbom_mismatch")
+            _verify_package_metadata(manifest, metadata)
+    except (KeyError, OSError, zipfile.BadZipFile, SupplyChainError) as exc:
+        raise CandidateError("registry_package_invalid") from exc
+    return {
+        "manifest": manifest,
+        "manifest_digest": f"sha256:{sha256(_canonical(manifest)).hexdigest()}",
+        "metadata": metadata,
+    }
+
+
+def _verify_package_metadata(manifest: dict[str, Any], metadata: dict[str, Any]) -> None:
+    world = metadata["world/world_spec.json"]
+    rule_ir = metadata["world/rule_ir.json"]
+    curriculum = metadata["tasks/curriculum.json"]
+    protocol = metadata["tasks/materializer_protocol.json"]
+    if (
+        not isinstance(world, dict)
+        or set(world) != {"schema_version", "architecture"}
+        or world["schema_version"] != "world-spec@1"
+        or not isinstance(world["architecture"], dict)
+        or not isinstance(rule_ir, dict)
+        or set(rule_ir)
+        != {
+            "schema_version",
+            "shared_tool_contracts",
+            "tools",
+            "world_rules",
+            "tasks",
+        }
+        or rule_ir["schema_version"] != "rule-ir@1"
+        or not isinstance(rule_ir["shared_tool_contracts"], list)
+        or not isinstance(rule_ir["tools"], list)
+        or not isinstance(rule_ir["world_rules"], dict)
+        or not isinstance(rule_ir["tasks"], list)
+        or not isinstance(curriculum, dict)
+        or set(curriculum) != {"schema_version", "families"}
+        or curriculum["schema_version"] != "curriculum@1"
+        or not isinstance(curriculum["families"], list)
+        or not isinstance(protocol, dict)
+        or set(protocol)
+        != {
+            "schema_version",
+            "operation",
+            "request_order",
+            "response_order",
+            "tasks",
+        }
+        or protocol["schema_version"] != "materializer-protocol@1"
+        or protocol["operation"] != "materialize"
+        or protocol["request_order"] != ["op", "seed", "task_type", "actor", "difficulty"]
+        or protocol["response_order"]
+        != ["seed", "task_type", "actor", "difficulty", "public_goal", "initial_config"]
+        or not isinstance(protocol["tasks"], list)
+    ):
+        raise CandidateError("registry_design_metadata_invalid")
+    try:
+        architecture_tools = world["architecture"]["tools"]
+        families = curriculum["families"]
+        tasks = rule_ir["tasks"]
+        protocol_tasks = protocol["tasks"]
+        if (
+            [tool["surface"] for tool in rule_ir["tools"]] != architecture_tools
+            or [family["task_family_index"] for family in families]
+            != list(range(1, len(families) + 1))
+            or [task["task_family_index"] for task in tasks]
+            != [family["task_family_index"] for family in families]
+            or [task["task_family_index"] for task in protocol_tasks]
+            != [family["task_family_index"] for family in families]
+        ):
+            raise CandidateError("registry_design_order_mismatch")
+        for shared in rule_ir["shared_tool_contracts"]:
+            if set(shared) != {
+                "tool_indexes",
+                "atomicity",
+                "concurrency",
+                "idempotency",
+                "ordering",
+                "compensation",
+                "error_policy",
+                "digest",
+                "artifact",
+            }:
+                raise CandidateError("registry_shared_tool_invalid")
+            payload = {
+                key: shared[key]
+                for key in (
+                    "tool_indexes",
+                    "atomicity",
+                    "concurrency",
+                    "idempotency",
+                    "ordering",
+                    "compensation",
+                )
+            }
+            payload["error_policy"] = [
+                {"tool_index": item[0], "policy": item[1]} for item in shared["error_policy"]
+            ]
+            if digest_value(payload) != shared["digest"]:
+                raise CandidateError("registry_shared_tool_digest_mismatch")
+        for tool in rule_ir["tools"]:
+            _local_rule_digest(tool)
+        world_rules = rule_ir["world_rules"]
+        if set(world_rules) != {"initial_rules", "invariants", "digest", "artifact"}:
+            raise CandidateError("registry_world_rule_invalid")
+        if (
+            digest_value(
+                {
+                    "initial_rules": world_rules["initial_rules"],
+                    "invariants": world_rules["invariants"],
+                }
+            )
+            != world_rules["digest"]
+        ):
+            raise CandidateError("registry_world_rule_digest_mismatch")
+        for family in families:
+            if set(family) != {
+                "task_family_index",
+                "task_family_id",
+                "objective",
+                "actor_index",
+                "tool_indexes",
+                "difficulty_schema",
+                "sampling_intent",
+                "citation_indexes",
+            }:
+                raise CandidateError("registry_curriculum_family_invalid")
+            schema = family["difficulty_schema"]
+            dimensions = schema["dimensions"]
+            if (
+                set(schema) != {"task_family_id", "dimensions", "key_order", "schema_digest"}
+                or schema["task_family_id"] != family["task_family_id"]
+                or schema["key_order"] != [dimension["name"] for dimension in dimensions]
+                or any(
+                    set(dimension) != {"name", "meaning", "levels"}
+                    or any(set(level) != {"name", "meaning"} for level in dimension["levels"])
+                    for dimension in dimensions
+                )
+                or digest_value(
+                    {
+                        "task_family_id": schema["task_family_id"],
+                        "dimensions": dimensions,
+                    }
+                )
+                != schema["schema_digest"]
+            ):
+                raise CandidateError("registry_difficulty_digest_mismatch")
+        recipes: dict[tuple[int, int], dict[str, Any]] = {}
+        for task, materializer, family in zip(tasks, protocol_tasks, families, strict=True):
+            if set(task) != {
+                "task_family_index",
+                "task_requirement",
+                "reward_spec",
+                "reward_digest",
+                "termination_spec",
+                "termination_digest",
+            } or set(materializer) != {
+                "task_family_index",
+                "public_goal_schema",
+                "initial_config_schema",
+                "evaluator_goal_bindings",
+                "instruction_template_digest",
+                "assurance_recipes",
+                "verification_requirements",
+                "verification_digest",
+            }:
+                raise CandidateError("registry_task_contract_invalid")
+            requirement = task["task_requirement"]
+            if (
+                set(requirement)
+                != {
+                    "task_family_index",
+                    "public_goal_fields",
+                    "initial_rules",
+                    "success_rules",
+                    "failure_rules",
+                    "terminal_rules",
+                    "artifact",
+                }
+                or requirement["task_family_index"] != family["task_family_index"]
+            ):
+                raise CandidateError("registry_task_contract_invalid")
+            expected_bindings = [
+                {"public_goal_path": path, "evaluator_goal_path": path}
+                for path, _ in materializer["public_goal_schema"]
+            ]
+            if materializer["evaluator_goal_bindings"] != expected_bindings:
+                raise CandidateError("registry_evaluator_goal_binding_mismatch")
+            if materializer["instruction_template_digest"] != digest_value(
+                {
+                    "objective": family["objective"],
+                    "public_goal_schema": materializer["public_goal_schema"],
+                }
+            ):
+                raise CandidateError("registry_instruction_template_digest_mismatch")
+            for key, digest_key in (
+                ("reward_spec", "reward_digest"),
+                ("termination_spec", "termination_digest"),
+            ):
+                if digest_value(task[key]) != task[digest_key]:
+                    raise CandidateError(f"registry_{digest_key}_mismatch")
+            if task["reward_spec"] != {
+                "failure": -1,
+                "success": 1,
+                "otherwise": 0,
+                "precedence": ["failure", "success", "otherwise"],
+            }:
+                raise CandidateError("registry_reward_spec_mismatch")
+            if task["termination_spec"] != {
+                "terminate_on": ["terminal", "success", "failure"],
+                "otherwise": "continue",
+            }:
+                raise CandidateError("registry_termination_spec_mismatch")
+            if (
+                digest_value(materializer["verification_requirements"])
+                != materializer["verification_digest"]
+            ):
+                raise CandidateError("registry_verification_digest_mismatch")
+            family_recipes = materializer["assurance_recipes"]
+            if [
+                (recipe["task_family_index"], recipe["tool_index"]) for recipe in family_recipes
+            ] != [
+                (family["task_family_index"], tool_index) for tool_index in family["tool_indexes"]
+            ]:
+                raise CandidateError("registry_design_order_mismatch")
+            dimensions = family["difficulty_schema"]["dimensions"]
+            primary = [
+                [dimension["name"], dimension["levels"][0]["name"]] for dimension in dimensions
+            ]
+            alternate = [
+                [dimension["name"], dimension["levels"][1 if index == 0 else 0]["name"]]
+                for index, dimension in enumerate(dimensions)
+            ]
+            actor = world["architecture"]["boundary"]["actors"][family["actor_index"] - 1]
+            for recipe in family_recipes:
+                if set(recipe) != {
+                    "task_family_index",
+                    "tool_index",
+                    "task_digest",
+                    "difficulty_digest",
+                    "tool_digest",
+                    "actor",
+                    "primary_difficulty",
+                    "alternate_difficulty",
+                    "action_tool_indexes",
+                    "recipe_digest",
+                }:
+                    raise CandidateError("registry_recipe_invalid")
+                payload = {key: value for key, value in recipe.items() if key != "recipe_digest"}
+                pair = (recipe["task_family_index"], recipe["tool_index"])
+                if pair in recipes or digest_value(payload) != recipe["recipe_digest"]:
+                    raise CandidateError("registry_recipe_digest_mismatch")
+                if (
+                    recipe["task_digest"]
+                    != digest_value(
+                        {
+                            "task_requirement": task["task_requirement"],
+                            "family": family,
+                        }
+                    )
+                    or recipe["difficulty_digest"] != family["difficulty_schema"]["schema_digest"]
+                    or recipe["tool_digest"]
+                    != rule_ir["tools"][recipe["tool_index"] - 1]["local_rules_digest"]
+                    or recipe["actor"] != actor
+                    or recipe["primary_difficulty"] != primary
+                    or recipe["alternate_difficulty"] != alternate
+                    or recipe["action_tool_indexes"] != family["tool_indexes"]
+                ):
+                    raise CandidateError("registry_recipe_binding_mismatch")
+                recipes[pair] = recipe
+            expected = [
+                recipes[(family["task_family_index"], tool_index)]["recipe_digest"]
+                for tool_index in family["tool_indexes"]
+            ]
+            verification = materializer["verification_requirements"]
+            if (
+                set(verification)
+                != {
+                    "task_family_index",
+                    "require_materialization",
+                    "required_recipe_digests",
+                    "required_gates",
+                }
+                or verification["task_family_index"] != family["task_family_index"]
+                or verification["require_materialization"] is not True
+                or verification["required_recipe_digests"] != expected
+                or verification["required_gates"] != ["task_materialization", "task_reachability"]
+            ):
+                raise CandidateError("registry_verification_requirements_mismatch")
+    except (IndexError, KeyError, TypeError, ValueError):
+        raise CandidateError("registry_design_metadata_invalid") from None
+    assurance = metadata["evidence/assurance.json"]
+    if (
+        not isinstance(assurance, dict)
+        or set(assurance)
+        != {
+            "schema_version",
+            "passed_integration_ref",
+            "judge_report_ref",
+            "release_dossier_ref",
+            "judge_gates",
+            "integration_coverage",
+            "judge_coverage",
+            "public_commitment_bindings",
+        }
+        or assurance["schema_version"] != "assurance@1"
+        or assurance["integration_coverage"]
+        != [
+            {
+                "task_family_index": family,
+                "tool_index": tool,
+                "recipe_digest": recipe["recipe_digest"],
+            }
+            for (family, tool), recipe in recipes.items()
+        ]
+        or len({item["commitment_id"] for item in assurance["public_commitment_bindings"]})
+        != len(assurance["public_commitment_bindings"])
+    ):
+        raise CandidateError("registry_assurance_mismatch")
+    expected_gate_ids = [
+        gate_id
+        for family, tool in recipes
+        for gate_id in (
+            f"task_materialization:{family}:{tool}",
+            f"task_reachability:{family}:{tool}",
+        )
+    ] + [item["commitment_id"] for item in assurance["public_commitment_bindings"]]
+    if (
+        [item.get("gate_id") for item in assurance["judge_coverage"]] != expected_gate_ids
+        or [item.get("gate_id") for item in assurance["judge_gates"]] != expected_gate_ids
+        or any(item.get("status") != "passed" for item in assurance["judge_gates"])
+    ):
+        raise CandidateError("registry_assurance_coverage_mismatch")
+    for commitment in assurance["public_commitment_bindings"]:
+        if set(commitment) != {
+            "commitment_id",
+            "task_family_index",
+            "tool_index",
+            "variation_kind",
+            "argument_index",
+            "risk",
+            "baseline_recipe_digest",
+        }:
+            raise CandidateError("registry_assurance_binding_invalid")
+        pair = (commitment["task_family_index"], commitment["tool_index"])
+        if recipes.get(pair, {}).get("recipe_digest") != commitment.get("baseline_recipe_digest"):
+            raise CandidateError("registry_assurance_binding_mismatch")
+    envpkg = metadata["envpkg.toml"]
+    envpkg_expected = {
+        "coordinate": manifest["package_id"],
+        "origin": "direct",
+        "parent_package_refs": [],
+        "entrypoint": manifest["entrypoint"],
+        "materializer_entrypoint": manifest["materializer_entrypoint"],
+        "source_digest": manifest["source_digest"],
+        **{f"{name}_digest": manifest["contract_digests"][name] for name in _PACKAGE_REF_NAMES},
+        "world_spec_digest": manifest["metadata_digests"]["world/world_spec.json"],
+        "rule_ir_digest": manifest["metadata_digests"]["world/rule_ir.json"],
+        "curriculum_digest": manifest["metadata_digests"]["tasks/curriculum.json"],
+        "materializer_protocol_digest": manifest["metadata_digests"][
+            "tasks/materializer_protocol.json"
+        ],
+        "provenance_digest": manifest["metadata_digests"]["evidence/provenance.json"],
+        "assurance_digest": manifest["metadata_digests"]["evidence/assurance.json"],
+        "fidelity_digest": manifest["metadata_digests"]["evidence/fidelity.json"],
+        "sbom_digest": manifest["metadata_digests"]["sbom/sbom.json"],
+    }
+    envpkg_expected["schema_version"] = "envpkg@1"
+    if not isinstance(envpkg, dict) or any(
+        envpkg.get(key) != value for key, value in envpkg_expected.items()
+    ):
+        raise CandidateError("registry_envpkg_mismatch")
+    telemetry = metadata["evidence/telemetry.json"]
+    if (
+        not isinstance(telemetry, dict)
+        or set(telemetry) != {"schema_version", "category_counts", "model_counts", "operations"}
+        or telemetry["schema_version"] != "telemetry-release-summary@1"
+        or not isinstance(telemetry["operations"], list)
+        or not telemetry["operations"]
+    ):
+        raise CandidateError("registry_telemetry_mismatch")
+    for operation in telemetry["operations"]:
+        if (
+            not isinstance(operation, dict)
+            or set(operation)
+            != {"operation_ref", "category", "node_id", "model", "skill_digest", "usage"}
+            or operation["category"] not in {"direct_llm", "agent", "search", "fetch", "extract"}
+            or operation["usage"] != "unknown"
+            and not isinstance(operation["usage"], dict)
+        ):
+            raise CandidateError("registry_telemetry_mismatch")
+    fidelity = metadata["evidence/fidelity.json"]
+    if (
+        not isinstance(fidelity, dict)
+        or fidelity.get("reality_equivalence") != "not_claimed"
+        or "builder_required_unverified" not in fidelity.get("assurance_classes", [])
+    ):
+        raise CandidateError("registry_fidelity_mismatch")
+
+
+def _cold_verify(
+    store: ArtifactStore,
+    design: DesignContract,
+    manifest: CandidateManifest,
+    integration_ref: ArtifactRef,
+    verifier_ref: ArtifactRef,
+    report: JudgeReport,
+    dossier: ArtifactRef,
+    telemetry: ArtifactRef,
+    semantic_lineage: ArtifactRef,
+    implementation_lineage: ArtifactRef,
+    closure: dict[str, Any],
+) -> None:
+    package_manifest = closure["manifest"]
+    metadata = closure["metadata"]
+    refs = _package_refs(
+        design,
+        manifest,
+        integration_ref,
+        verifier_ref,
+        report,
+        telemetry,
+        semantic_lineage,
+        implementation_lineage,
+    )
+    refs["dossier"] = dossier
+    try:
+        for ref in refs.values():
+            store.read_json(ref)
+        integration = store.read_envelope(integration_ref)["payload"]
+        judge_report = store.read_envelope(report.artifact)["payload"]
+        bundle = CandidateExecutor._cold_bundle(store, verifier_ref)
+        telemetry_value = store.read_json(telemetry)
+        dossier_value = store.read_json(dossier)
+        semantic_value = store.read_json(semantic_lineage)
+        implementation_value = store.read_json(implementation_lineage)
+        gate_evidence = [
+            store.read_json(gate.evidence) for gate in report.gates if gate.evidence is not None
+        ]
+    except (ArtifactIntegrityError, ValueError, KeyError) as exc:
+        raise NodeExecutionError("registry_artifact_closure_invalid") from exc
+    expected_metadata = _package_metadata(
+        design,
+        manifest,
+        integration_ref,
+        verifier_ref,
+        report,
+        dossier,
+        telemetry,
+        semantic_lineage,
+        implementation_lineage,
+        metadata["sbom/sbom.json"],
+        telemetry_value,
+        metadata["envpkg.toml"]["lock_digest"],
+        integration,
+        bundle,
+    )
+    expected_values = {
+        path: (tomllib.loads(body.decode("utf-8")) if path == "envpkg.toml" else json.loads(body))
+        for path, body in expected_metadata.items()
+    }
+    recipe_digests = {
+        (recipe.task_family_index, recipe.tool_index): recipe.recipe_digest
+        for recipe in design.assurance_recipes
+    }
+    if (
+        integration.get("status") != "passed"
+        or _admitted_closure(integration.get("admitted_lock_closure"))
+        != package_manifest["dependency_closure"]
+        or judge_report.get("integration_ref") != _ref(integration_ref)
+        or judge_report.get("verifier_ref") != _ref(verifier_ref)
+        or not bundle["commitments"]
+        or telemetry_value != metadata["evidence/telemetry.json"]
+        or telemetry_value != _compile_telemetry(store, design.work_refs, manifest.work_refs)
+        or package_manifest["artifact_refs"] != {name: _ref(ref) for name, ref in refs.items()}
+        or package_manifest["contract_digests"] != {name: ref.digest for name, ref in refs.items()}
+        or package_manifest["source_files"] != list(manifest.files)
+        or package_manifest["source_digest"] != manifest.source_digest
+        or package_manifest["origin"] != "direct"
+        or package_manifest["parent_package_refs"] != []
+        or package_manifest["curriculum_digest"] != design.curriculum.artifact.digest
+        or semantic_value
+        != {
+            "origin": "direct",
+            "parent_package_refs": [],
+            "design_ref": _ref(design.artifact),
+        }
+        or implementation_value
+        != {
+            "candidate_manifest_ref": _ref(manifest.artifact),
+            "source_digest": manifest.source_digest,
+        }
+        or len(gate_evidence) != len(report.gates)
+        or any(
+            not isinstance(evidence, dict)
+            or set(evidence) != {"gate_id", "status", "code", "candidate_digest", "binding"}
+            or evidence["gate_id"] != gate.gate_id
+            or evidence["status"] != "passed"
+            or evidence["code"] != gate.code
+            or evidence["candidate_digest"] != manifest.source_digest
+            or not isinstance(evidence["binding"], dict)
+            or type(evidence["binding"].get("task_family_index")) is not int
+            or type(evidence["binding"].get("tool_index")) is not int
+            or recipe_digests.get(
+                (
+                    cast(int, evidence["binding"].get("task_family_index")),
+                    cast(int, evidence["binding"].get("tool_index")),
+                )
+            )
+            != evidence["binding"].get("recipe_digest")
+            for gate, evidence in zip(report.gates, gate_evidence, strict=True)
+        )
+        or metadata != expected_values
+    ):
+        raise NodeExecutionError("registry_lineage_mismatch")
+    if dossier_value != {
+        "schema_version": "release-dossier@1",
+        "artifact_refs": {name: _ref(ref) for name, ref in refs.items() if name != "dossier"},
+        "integration_status": "passed",
+        "judge_gates": _judge_gates(report),
+    }:
+        raise NodeExecutionError("registry_evidence_mismatch")
+
+
+def _publish(
+    state_root: Path,
+    package_id: str,
+    version: str,
+    digest: str,
+    manifest_digest: str,
+    body: bytes,
+    manifest: dict[str, Any],
+) -> dict[str, str]:
+    package_dir = state_root / "registry" / "packages"
+    receipt_dir = state_root / "registry" / "receipts"
+    staging_dir = state_root / "registry" / "staging"
+    package_path = package_dir / f"{digest[7:]}.zip"
+    staged = staging_dir / f"{digest[7:]}.zip"
+    if package_path.exists() and package_path.read_bytes() != body:
+        raise NodeExecutionError("registry_version_conflict")
+    if not package_path.exists():
+        _atomic(staged, body)
+        try:
+            _verify_package(staged, digest, manifest)
+            package_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(staged, package_path)
+        finally:
+            staged.unlink(missing_ok=True)
+    else:
+        _verify_package(package_path, digest, manifest)
+    receipt = {
+        "package_id": package_id,
+        "version": version,
+        "package_digest": digest,
+        "manifest_digest": manifest_digest,
+        "registry_revision": f"registry-{digest[7:23]}",
+        "published_at": utc_now(),
+    }
+    receipt_body = _canonical(receipt)
+    receipt_path = receipt_dir / f"{sha256(receipt_body).hexdigest()}.json"
+    if receipt_path.exists() and receipt_path.read_bytes() != receipt_body:
+        raise NodeExecutionError("registry_receipt_conflict")
+    if not receipt_path.exists():
+        _atomic(receipt_path, receipt_body)
+    return receipt
+
+
+def _atomic(path: Path, body: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_bytes(body)
+    os.replace(temporary, path)
+
+
+def _verify_package(path: Path, expected_digest: str, manifest: dict[str, Any]) -> None:
+    _cold_read_package(path.read_bytes(), expected_digest, manifest)

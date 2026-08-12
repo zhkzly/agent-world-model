@@ -1,0 +1,9 @@
+{"file":"docs/agent-world-environment-generation.zh.md","reason":"Audit bounded repair against canonical authority and evidence rules."}
+{"file":"docs/direct-rewrite-execution-map.zh.md","reason":"Check Judge remains route-free and framework retains routing authority."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/prd.md","reason":"Check parent contract compatibility and non-claims."}
+{"file":".trellis/tasks/08-11-foundry-bounded-repair/prd.md","reason":"Check repair acceptance and exclusions."}
+{"file":".trellis/tasks/08-11-foundry-bounded-repair/design.md","reason":"Check target resolution, budget, invalidation and Observe semantics."}
+{"file":".trellis/tasks/08-11-foundry-bounded-repair/implement.md","reason":"Check exact implementation and proof scope."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/node-contracts.md","reason":"Check upstream and downstream contract compatibility."}
+{"file":".trellis/spec/guides/foundry-product-alignment.md","reason":"Prevent a repaired local node from being claimed as full product success."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/research/cross-layer-review-b34be669.md","reason":"Check Repair against the current parent compatibility allow and non-claims."}

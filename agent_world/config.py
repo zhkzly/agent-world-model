@@ -42,6 +42,7 @@ class FoundrySettings:
     agent_primary: AgentRoute
     agent_fallback: AgentRoute
     research: ResearchSettings
+    trusted_wheel_store: Path | None = None
 
 
 def _mapping(value: object, name: str) -> dict[str, Any]:
@@ -71,9 +72,12 @@ def _url(value: object, name: str) -> str:
 def _chat_route(value: object, name: str) -> ChatRoute:
     data = _mapping(value, name)
     _only(data, {"model", "base_url", "api_key_env"}, name)
+    base_url = _url(data.get("base_url"), f"{name}_base_url")
+    if base_url.endswith("/chat/completions"):
+        raise ConfigurationError(f"config_{name}_base_url_api_root_required")
     return ChatRoute(
         model=_text(data.get("model"), f"{name}_model"),
-        base_url=_url(data.get("base_url"), f"{name}_base_url"),
+        base_url=base_url,
         api_key_env=_text(data.get("api_key_env"), f"{name}_api_key_env", empty=True),
     )
 
@@ -99,10 +103,18 @@ def load_settings(source: Path | str) -> FoundrySettings:
     _only(data, {"foundry", "direct", "agent", "research"}, "top_level")
 
     foundry = _mapping(data.get("foundry"), "foundry")
-    _only(foundry, {"state_root"}, "foundry")
+    _only(foundry, {"state_root", "trusted_wheel_store"}, "foundry")
     state_root = Path(_text(foundry.get("state_root"), "foundry_state_root"))
     if not state_root.is_absolute():
         state_root = path.parent / state_root
+    trusted_wheel_store_value = foundry.get("trusted_wheel_store")
+    trusted_wheel_store = (
+        None
+        if trusted_wheel_store_value is None
+        else Path(_text(trusted_wheel_store_value, "foundry_trusted_wheel_store"))
+    )
+    if trusted_wheel_store is not None and not trusted_wheel_store.is_absolute():
+        trusted_wheel_store = path.parent / trusted_wheel_store
 
     direct = _mapping(data.get("direct"), "direct")
     _only(direct, {"primary", "fallback"}, "direct")
@@ -122,6 +134,7 @@ def load_settings(source: Path | str) -> FoundrySettings:
             reader_url=_url(research.get("reader_url"), "research_reader_url"),
             api_key_env=_text(research.get("api_key_env"), "research_api_key_env", empty=True),
         ),
+        trusted_wheel_store=trusted_wheel_store,
     )
 
 

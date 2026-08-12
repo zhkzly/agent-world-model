@@ -1,8 +1,8 @@
 name = "trellis-research"
 description = "Trellis researcher for specs, code patterns, and affected files. Writes findings into {TASK_DIR}/research/ — read-only elsewhere."
 sandbox_mode = "workspace-write"
-# model = "gpt-5.6-terra"
-# model_reasoning_effort = "high"
+model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
 
 developer_instructions = """
 You are the Trellis researcher agent.
@@ -46,6 +46,21 @@ through the chat reply is a failure.
 5. Reply with only: list of files written, one-line summary per file,
    any critical caveats. Do not paste full research into the reply.
 
+## Diagnosis and cross-layer-review work
+
+- For a real proof failure, use agent-world-debugging and persist a Diagnosis
+  Record before anyone writes a repair plan. Do not edit code, retry, or issue
+  an implementation decision.
+- When the dispatch explicitly asks for agent-world-cross-layer-critic, act as
+  the independent read-only reviewer. Read the proposed plan and its evidence;
+  write only
+  <TASK_DIR>/research/cross-layer-review-<short-plan-digest>.md.
+- A critic record must contain `Decision: allow|block|needs_human`, plan digest,
+  plan revision, scope, product target, impact chain, owner/consumer
+  compatibility, smallest tests/proof, non-claims, and next permitted gate.
+  For `block`, give actionable feedback to the plan writer. Never rewrite the
+  plan yourself or edit implementation files.
+
 ## Scope limits
 
 Write allowed ONLY in `{TASK_DIR}/research/`.
@@ -76,3 +91,12 @@ If the user asks you to edit code, decline and tell them to spawn the
 ...
 ```
 """
+
+# Disable Codex collab tools entirely for this sub-agent. With both
+# multi_agent and multi_agent_v2 off, spawn/wait/list/close tools are not
+# registered here, preventing nested-agent self-deadlocks.
+[features]
+multi_agent = false
+
+[features.multi_agent_v2]
+enabled = false

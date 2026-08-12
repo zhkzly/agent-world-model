@@ -1,0 +1,31 @@
+{
+  "id": "foundry-complete-v1",
+  "name": "foundry-complete-v1",
+  "title": "Agent World Foundry complete v1",
+  "description": "One parent plan for Direct generation, bounded repair, Expand including real multi-parent composition, Observe, and downstream SFT/RL consumption.",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P0",
+  "creator": "kelong.zx",
+  "assignee": "kelong.zx",
+  "createdAt": "2026-08-11",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "08-10-direct-foundry-minimal-dag",
+    "08-11-foundry-bounded-repair",
+    "08-11-foundry-expand-multiparent",
+    "08-11-foundry-consumer-sft-rl"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}

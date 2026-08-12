@@ -420,6 +420,12 @@ commit set。把 N 个真实 invocation 塞进单个 `ProposalExecution` 会破�
 
 Generic root schema error、没有 exact path 的机械错误、相同 validator frontier + issue set 的
 重复错误不得继续消耗 LLM correction。它们必须被判为 output-contract/framework defect。
+唯一例外是 Direct LLM 调用中已完成、非空且 `finish_reason=stop` 的回答仅因严格 JSON object
+解析失败；framework 只能把该回答短暂保留为上一条 assistant turn，并追加格式专用 user Feedback。
+默认节点仍只有这一次 correction；只有明确声明两次 local correction 的 Direct 节点，才可在
+format-first 后把剩余额度用于另一次格式修订，或用于格式已经修好后新出现的精确语义修订。
+semantic-first 后退化为格式错误不算进展；第三份 proposal 失败必须终止，不得授权第四次调用。
+每次 rejected 原文都只可作为紧邻的上一条 assistant turn，不能持久化、改变输出合同或进入 Observe。
 错误 A 变成字段可定位的错误 B 是进展而不是解决；只有 Contract 仍有同一 RepairTarget 的
 第二次额度时才可继续；默认每个 logical Artifact 一次 local correction，只有 code 证明
 strict progress 才允许第二次，同时仍受全 run 的硬 Budget ceiling 约束。LLM 永远不能决定

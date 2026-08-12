@@ -10,7 +10,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
-from agent_world.contracts import ArtifactRef, json_value
+from agent_world.contracts import ArtifactEnvelope, ArtifactRef, WorkRecord, json_value
 
 _FORBIDDEN_KEYS = frozenset(
     {
@@ -162,6 +162,38 @@ def _validate_ref_mapping(value: object, *, error: type[ValueError]) -> None:
     )
 
 
+def _validate_environment_package_ref(value: object, *, error: type[ValueError]) -> None:
+    required = {
+        "package_id",
+        "version",
+        "package_digest",
+        "manifest_digest",
+        "registry_receipt_ref",
+        "design_ref",
+        "candidate_manifest_ref",
+        "integration_ref",
+        "judge_report_ref",
+        "semantic_lineage_ref",
+        "implementation_lineage_ref",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise error("environment_package_ref_invalid")
+    if not _safe_token(value["package_id"]) or not _safe_token(value["version"]):
+        raise error("environment_package_ref_invalid")
+    _digest_hex(value["package_digest"], error=error)
+    _digest_hex(value["manifest_digest"], error=error)
+    for key in (
+        "registry_receipt_ref",
+        "design_ref",
+        "candidate_manifest_ref",
+        "integration_ref",
+        "judge_report_ref",
+        "semantic_lineage_ref",
+        "implementation_lineage_ref",
+    ):
+        _validate_ref_mapping(value[key], error=error)
+
+
 def _safe_token(value: object) -> bool:
     return isinstance(value, str) and _TOKEN_PATTERN.fullmatch(value) is not None
 
@@ -176,6 +208,7 @@ def _validate_run_fact(value: object, *, error: type[ValueError]) -> None:
         "ended_at",
         "events",
         "artifacts",
+        "work_records",
         "release",
     }:
         raise error("run_invalid")
@@ -216,29 +249,22 @@ def _validate_run_fact(value: object, *, error: type[ValueError]) -> None:
     for artifact in artifacts:
         _validate_ref_mapping(artifact, error=error)
 
+    work_records = value["work_records"]
+    if not isinstance(work_records, list):
+        raise error("run_invalid")
+    for work in work_records:
+        _validate_ref_mapping(work, error=error)
+        if work["kind"] != "control.work_record":
+            raise error("run_invalid")
+
     release = value["release"]
     if release is None:
         if value["status"] == "released":
-            raise error("released_receipt_required")
+            raise error("released_package_ref_required")
         return
-    if (
-        value["status"] != "released"
-        or not isinstance(release, dict)
-        or set(release)
-        != {
-            "package_id",
-            "version",
-            "package_digest",
-            "receipt_digest",
-            "artifact",
-        }
-    ):
+    if value["status"] != "released":
         raise error("run_invalid")
-    if not _safe_token(release["package_id"]) or not _safe_token(release["version"]):
-        raise error("run_invalid")
-    _digest_hex(release["package_digest"], error=error)
-    _digest_hex(release["receipt_digest"], error=error)
-    _validate_ref_mapping(release["artifact"], error=error)
+    _validate_environment_package_ref(release, error=error)
 
 
 class ArtifactStore:
@@ -266,6 +292,80 @@ class ArtifactStore:
             digest=digest,
             path=str(Path("artifacts") / filename),
         )
+
+    def put_envelope(self, envelope: ArtifactEnvelope) -> ArtifactRef:
+        """Persist a closed graph Artifact without allowing a caller-owned wrapper."""
+
+        return self.put_json(
+            envelope.kind,
+            {
+                "schema_version": envelope.schema_version,
+                "producer": json_value(envelope.producer),
+                "semantic_revision_digest": envelope.semantic_revision_digest,
+                "dependencies": [json_value(ref) for ref in envelope.dependencies],
+                "output_ports": list(envelope.output_ports),
+                "payload": envelope.payload,
+            },
+        )
+
+    def put_work_record(self, record: WorkRecord) -> ArtifactRef:
+        return self.put_json("control.work_record", json_value(record))
+
+    def read_envelope(self, ref: ArtifactRef) -> dict[str, Any]:
+        """Cold-read one graph envelope and verify its closed provenance shape.
+
+        This deliberately does not grow into a second Artifact API: graph
+        transactions are the only consumer that needs an envelope read.
+        """
+
+        value = self.read_json(ref)
+        if not isinstance(value, dict) or set(value) != {
+            "schema_version",
+            "producer",
+            "semantic_revision_digest",
+            "dependencies",
+            "output_ports",
+            "payload",
+        }:
+            raise ArtifactIntegrityError("artifact_envelope_invalid")
+        if not isinstance(value["schema_version"], int) or value["schema_version"] < 1:
+            raise ArtifactIntegrityError("artifact_envelope_invalid")
+        producer = value["producer"]
+        if not isinstance(producer, dict) or set(producer) != {
+            "run_id",
+            "graph_id",
+            "node_id",
+            "shard_key",
+            "revision",
+        }:
+            raise ArtifactIntegrityError("artifact_envelope_invalid")
+        if (
+            not _safe_token(producer["run_id"])
+            or producer["graph_id"] not in {"design", "candidate"}
+            or not _safe_token(producer["node_id"])
+            or not isinstance(producer["shard_key"], (str, type(None)))
+            or not isinstance(producer["revision"], int)
+            or producer["revision"] < 1
+        ):
+            raise ArtifactIntegrityError("artifact_envelope_invalid")
+        if not isinstance(value["semantic_revision_digest"], str) or not _DIGEST_PATTERN.fullmatch(
+            value["semantic_revision_digest"]
+        ):
+            raise ArtifactIntegrityError("artifact_envelope_invalid")
+        dependencies = value["dependencies"]
+        if not isinstance(dependencies, list):
+            raise ArtifactIntegrityError("artifact_envelope_invalid")
+        for dependency in dependencies:
+            _validate_ref_mapping(dependency, error=ArtifactIntegrityError)
+        output_ports = value["output_ports"]
+        if (
+            not isinstance(output_ports, list)
+            or not output_ports
+            or len(set(output_ports)) != len(output_ports)
+            or any(not isinstance(port, str) or not port for port in output_ports)
+        ):
+            raise ArtifactIntegrityError("artifact_envelope_invalid")
+        return value
 
     def put_bytes(self, kind: str, body: bytes, *, media_type: str) -> ArtifactRef:
         if _KIND_PATTERN.fullmatch(kind) is None:

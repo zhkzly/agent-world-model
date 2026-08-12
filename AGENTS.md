@@ -19,13 +19,36 @@ Background only:
 
 ## Working Rules
 
-- Read the source-of-truth document before changing code.
+- Read the source-of-truth document before changing code. Then read
+  `docs/direct-rewrite-execution-map.zh.md` for the binding distinction between
+  component authority, logical Work, Direct LLM, tool-enabled Codex Agent, and
+  untrusted candidate process. The execution map is a derived index, not a
+  second source of truth; the source-of-truth document wins on any conflict.
+- Before a semantic, permission, route, persistence, public-entry, validation,
+  or control-plane behavior change, write/update a plan and pass it through
+  .agents/skills/agent-world-cross-layer-critic/SKILL.md. For a real failure
+  use Observe -> agent-world-debugging -> Diagnosis Record -> repair plan ->
+  cross-layer critic -> implementation -> real-execution proof -> Observe.
+  This is a development gate, not a runtime node or second Judge. A `block`
+  returns actionable plan feedback and permits at most two revisions; only
+  `allow` permits implementation.
+- Use an independent read-only trellis-research critic for the trust-boundary
+  triggers defined by that skill. Add its current matching `allow` record to
+  the task JSONL context before dispatching implement/check.
 - Keep implementation under the current `agent_world/` slice unless the user explicitly expands scope.
 - Use real llm/agent invocation through `InvocationBackend`; do not fake codegen with templates or generic shell runners.
 - Codex SDK integration should be a real backend adapter, not scattered SDK calls in pipeline core.
 - Do not reintroduce fixed environments, fixed task ids, fixed replay cases, fixture registries, or environment-id verifier branches as normal success paths.
 - Do not write secrets into artifacts, traces, manifests, or release packages.
 - For any failed run, read `observe scene` before acting.
+- At the entry and exit of every key graph node family, child-task boundary,
+  real-execution proof, release decision, or legacy-disposition decision, write
+  a Product Alignment Checkpoint in the active task. It must restate the
+  canonical goal (natural-language need -> executable, independently verified,
+  publishable EnvironmentPackage), name the affected trust boundary and
+  evidence, state what is still unproven, and confirm that graph/test progress
+  alone is not being claimed as product completion. See
+  `.trellis/spec/guides/foundry-product-alignment.md`.
 - Use `uv` for Python commands.
 - Do not preserve the old `awm` CLI, runtime ABI v1, or replay compatibility path; the user explicitly approved a clean-break redesign.
 

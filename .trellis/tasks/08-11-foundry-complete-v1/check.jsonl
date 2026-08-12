@@ -1,0 +1,40 @@
+{"file":"docs/agent-world-environment-generation.zh.md","reason":"Canonical complete-v1 acceptance and trust/release contract; read completely."}
+{"file":"docs/direct-rewrite-execution-map.zh.md","reason":"Binding execution-kind and owner map."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/prd.md","reason":"Sole current parent acceptance and child dependency map."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/design.md","reason":"Sole current parent shared architecture."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/implement.md","reason":"Ordered aggregate verification plan."}
+{"file":".trellis/spec/guides/foundry-product-alignment.md","reason":"Parent completion evidence and non-claim checks."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/prd.md","reason":"Direct child acceptance."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/design.md","reason":"Direct graph and boundary acceptance."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/node-contracts.md","reason":"Direct per-node and package acceptance."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/research/diagnosis-design-semantic-consumer-gap.md","reason":"Direct current causal diagnosis."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-design-semantic-closure-plan.md","reason":"Direct current approved implementation plan."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-abbab652-design-semantic-r2.md","reason":"Direct current allow; verify implementation and proof separately."}
+{"file":".trellis/tasks/08-11-foundry-bounded-repair/prd.md","reason":"Repair child acceptance after Direct."}
+{"file":".trellis/tasks/08-11-foundry-bounded-repair/design.md","reason":"Repair boundary and non-duplication checks."}
+{"file":".trellis/tasks/08-11-foundry-expand-multiparent/prd.md","reason":"Expand/multi-parent child acceptance after Repair."}
+{"file":".trellis/tasks/08-11-foundry-expand-multiparent/design.md","reason":"Expand diversity and parent-lineage checks."}
+{"file":".trellis/tasks/08-11-foundry-consumer-sft-rl/prd.md","reason":"Consumer/SFT/RL child acceptance after Expand."}
+{"file":".trellis/tasks/08-11-foundry-consumer-sft-rl/design.md","reason":"Training decoupling and Registry-only dependency checks."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-design-semantic-closure-whole-diff-check.md", "reason": "Direct child current block and nonclaim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-design-input-provenance-plan.md", "reason": "Verify parent handoff only after Direct provenance closure."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-5df3243e-design-input-provenance.md", "reason": "Direct child current exact allow and parent nonclaim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-design-provenance-whole-diff-recheck.md", "reason": "Direct child exact recheck block and parent nonclaim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-e9f664ba-design-input-provenance-r2.md", "reason": "Direct child exact shared dependency allow; no parent completion claim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-design-provenance-whole-diff-final-check.md", "reason": "Direct child whole-diff block; no parent/later-child claim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/diagnosis-semantic-identity-release-closure.md", "reason": "Direct child current static blocker; no parent completion claim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-semantic-identity-release-closure-plan.md", "reason": "Verify Direct handoff only after matching allow and proof."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-3019039b-semantic-release.md", "reason": "Direct child block criteria only; no later-child change."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-ba30e6d9-semantic-release-r2.md", "reason": "Direct child bounded allow and parent nonclaim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/diagnosis-graph-fail-zip-dependency.md", "reason": "Direct child static blocker; no parent completion claim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/graph-fail-media-type-plan.md", "reason": "Verify Direct only after matching allow."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-fc89e935-graph-fail-zip.md", "reason": "Direct child fail-path allow and parent nonclaim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-final-whole-diff-check.md", "reason": "Direct child current block and parent nonclaim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/world-rule-predicate-right-plan.md", "reason": "Verify Direct only after matching allow."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-8f4f8ef2-world-rule-right.md", "reason": "Direct child final validation criteria only."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-f1c972c6-world-rule-right-r2.md", "reason": "Direct child validator allow and parent nonclaim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-final-whole-diff-check-r3.md", "reason": "Direct child may enter live proof; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/diagnosis-world-architecture-visible-field-contract.md", "reason": "Direct child real scene and parent nonclaim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/world-architecture-visible-field-contract-plan.md", "reason": "Verify Direct only after matching allow."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-9c95eb3f-world-architecture-field.md", "reason": "Direct child block and parent nonclaim."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-322bfa3a-world-architecture-field-r2.md", "reason": "Direct child repair allow and parent nonclaim."}

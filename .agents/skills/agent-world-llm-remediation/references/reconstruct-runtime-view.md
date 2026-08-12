@@ -28,4 +28,4 @@ omit base/developer instruction fields rather than sending empty or generic
 replacement text. If the normal phase cannot identify startup cause, use an
 opt-in bounded redacted local diagnostic sidecar. Never place raw provider
 text, credential, endpoint, private session state, or opaque startup material
-in normal scene, Artifact, Scheduler feedback, or runtime correction.
+in normal scene, Artifact, graph/Observe feedback, or runtime correction.

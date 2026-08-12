@@ -1,0 +1,40 @@
+{"file":"docs/agent-world-environment-generation.zh.md","reason":"Canonical complete-v1 product, trust, Expand, Consumer and release contract; read completely."}
+{"file":"docs/direct-rewrite-execution-map.zh.md","reason":"Binding component and execution-kind map."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/prd.md","reason":"Sole current parent requirements and ordered child lineage."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/design.md","reason":"Sole current parent architecture and child handoffs."}
+{"file":".trellis/tasks/08-11-foundry-complete-v1/implement.md","reason":"Parent sequence: Direct, Repair, Expand, Consumer, then aggregate acceptance."}
+{"file":".trellis/spec/guides/foundry-product-alignment.md","reason":"Required checkpoints and prohibition on treating one child as product completion."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/prd.md","reason":"Current Direct child scope."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/design.md","reason":"Current Direct two-graph design."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/node-contracts.md","reason":"Current Direct binding node and package contracts."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/research/diagnosis-design-semantic-consumer-gap.md","reason":"Current Direct causal diagnosis."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-design-semantic-closure-plan.md","reason":"Current Direct sole implementation plan, digest abbab652."}
+{"file":".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-abbab652-design-semantic-r2.md","reason":"Current Direct exact-digest allow; Direct implementation/proof still pending."}
+{"file":".trellis/tasks/08-11-foundry-bounded-repair/prd.md","reason":"Later Repair child requirements; not active until Direct handoff."}
+{"file":".trellis/tasks/08-11-foundry-bounded-repair/design.md","reason":"Later Repair child design boundary only."}
+{"file":".trellis/tasks/08-11-foundry-expand-multiparent/prd.md","reason":"Later Expand/multi-parent child requirements; not active until preceding handoff."}
+{"file":".trellis/tasks/08-11-foundry-expand-multiparent/design.md","reason":"Later Expand design and released-package parent boundary only."}
+{"file":".trellis/tasks/08-11-foundry-consumer-sft-rl/prd.md","reason":"Later Consumer/SFT/RL child requirements; training remains downstream."}
+{"file":".trellis/tasks/08-11-foundry-consumer-sft-rl/design.md","reason":"Later Consumer design and one-way Registry dependency only."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-design-semantic-closure-whole-diff-check.md", "reason": "Direct child whole-diff block; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-design-input-provenance-plan.md", "reason": "Direct child current minimal provenance plan; requires allow."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-5df3243e-design-input-provenance.md", "reason": "Direct child current provenance repair allow; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-design-provenance-whole-diff-recheck.md", "reason": "Direct child recheck block; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-e9f664ba-design-input-provenance-r2.md", "reason": "Direct child final provenance allow; parent and later children remain unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-design-provenance-whole-diff-final-check.md", "reason": "Direct child static semantic-identity blocker; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/diagnosis-semantic-identity-release-closure.md", "reason": "Direct child static release-lineage diagnosis; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-semantic-identity-release-closure-plan.md", "reason": "Direct child bounded plan; later children unchanged."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-3019039b-semantic-release.md", "reason": "Direct child revision-1 block; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-ba30e6d9-semantic-release-r2.md", "reason": "Direct child current allow; parent/later children remain unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/diagnosis-graph-fail-zip-dependency.md", "reason": "Direct child Registry failure-record blocker; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/graph-fail-media-type-plan.md", "reason": "Direct child local fail-path plan; later children unchanged."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-fc89e935-graph-fail-zip.md", "reason": "Direct child local persistence allow; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-final-whole-diff-check.md", "reason": "Direct child WorldRules validator block; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/world-rule-predicate-right-plan.md", "reason": "Direct child one-line validation plan; later children unchanged."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-8f4f8ef2-world-rule-right.md", "reason": "Direct child revision-1 validation block; parent unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-f1c972c6-world-rule-right-r2.md", "reason": "Direct child final local validator allow; later children remain unchanged."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/direct-final-whole-diff-check-r3.md", "reason": "Direct child final whole-diff allow; parent and later children remain unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/diagnosis-world-architecture-visible-field-contract.md", "reason": "Direct child real node diagnosis; parent remains unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/world-architecture-visible-field-contract-plan.md", "reason": "Direct child local Prompt plan; later children unchanged."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-9c95eb3f-world-architecture-field.md", "reason": "Direct child revision-1 Prompt/compiler block; parent unproved."}
+{"file": ".trellis/tasks/08-10-direct-foundry-minimal-dag/research/cross-layer-review-322bfa3a-world-architecture-field-r2.md", "reason": "Direct child local WorldArchitecture allow; later children unchanged."}

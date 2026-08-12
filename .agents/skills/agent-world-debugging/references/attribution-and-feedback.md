@@ -14,7 +14,9 @@ For every lens, record an exact coordinate plus a path/profile/projection:
    Direct, are Skill/Hook/tool/profile instruction surfaces absent?
 4. **Code/execution** — Name the live sub-lane: CLI/execution safety,
    verifier/gate, replay/resume/state, Runtime/Judge isolation, legacy path,
-   parser/compiler/validator/scheduler, or provider/transport.
+   parser/compiler/validator/current graph coordinator, or provider/transport.
+   A cleanroom path that reaches legacy authority is a cutover failure before
+   it is any other execution diagnosis.
 5. **Feedback/observability** — Can the intended recipient act without reading
    private Provider text or broadly searching source?
 

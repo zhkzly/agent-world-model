@@ -9,7 +9,6 @@ RETIRED_DIRECTORIES = {
     "consumer",
     "control",
     "designer",
-    "graph",
     "invocation",
     "judge",
     "observability",

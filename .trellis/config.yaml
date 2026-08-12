@@ -120,14 +120,18 @@ channel:
 # Invalid explicit values safely use inline mode.
 #
 # In "auto" mode, dispatched sub-agents inherit the main session's model
-# unless you pin one. To use a cheaper/faster model for implement/check/
-# research sub-agent work, edit `model` / `model_reasoning_effort` directly
-# on the generated `.codex/agents/trellis-*.toml` files (see the commented
-# hint lines in those files) — there is no config.yaml knob for this,
-# `trellis update` preserves your edits across regeneration.
+# unless you pin one. This project pins `model` / `model_reasoning_effort` in
+# the generated `.codex/agents/trellis-*.toml` files and still passes an
+# explicit model on every complete-v1 dispatch. There is no config.yaml model
+# knob; `trellis update` preserves agent-profile edits across regeneration.
 #
 # codex:
 #   dispatch_mode: auto  # or "inline"; legacy alias: "sub-agent"
+
+# This project opts into Trellis' independent implement/check/research agents.
+# The explicit value keeps the choice stable even when Trellis defaults change.
+codex:
+  dispatch_mode: sub-agent
 
 #-------------------------------------------------------------------------------
 # Sub-agent context injection limits

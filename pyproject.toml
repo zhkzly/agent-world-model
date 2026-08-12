@@ -4,7 +4,7 @@ version = "0.3.0"
 description = "Clean-break Direct environment foundry"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = ["openai-codex==0.144.4"]
+dependencies = ["openai==2.54.0", "openai-codex==0.144.4"]
 
 [dependency-groups]
 dev = [

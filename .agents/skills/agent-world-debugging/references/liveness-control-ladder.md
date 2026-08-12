@@ -69,5 +69,5 @@ diagnostics first.
 
 If the normal phase cannot identify the startup cause, use an opt-in bounded
 redacted local sidecar. Never put its raw stderr, Provider message, endpoint,
-credential, or private path into normal scene, Artifact, Scheduler feedback, or
-runtime correction.
+credential, or private path into normal scene, Artifact, graph/Observe
+feedback, or runtime correction.

@@ -36,16 +36,30 @@ adapter/parser/validator/upstream input, and weak correction feedback as
 competing explanations. A malformed object, missing field, refusal, timeout,
 or failed test does not choose one automatically.
 
+First exclude a cleanroom authority-firewall failure. If the observed path
+loads or calls forbidden legacy control authority, it is a hybrid/cutover
+defect, not an Agent/LLM remediation hypothesis.
+
 Read [references/remediation-selection.md](references/remediation-selection.md)
 before selecting regeneration, bounded correction, deterministic mechanics,
 model/profile change, or retry. It also defines the recipient-safe feedback
 route. Never ask a runtime model to repair path, route, timeout, adapter, or
 authorization facts it cannot own.
 
+## Submit remediation as a plan
+
+This skill may turn a supported Agent/LLM hypothesis into a bounded remediation
+proposal, but it does not execute a retry or edit a model-facing surface by
+itself. Link the Diagnosis Record, target recipient view, selected mechanism,
+rejected alternatives, retry bound, and expected proof in a repair-plan
+revision. agent-world-cross-layer-critic must allow that plan before changing
+Prompt, Runtime Skill, feedback, profile, adapter, retry policy, or code.
+
 ## Prove the selected change
 
 Use agent-world-real-execution-proof: a real isolated Direct node for a Direct
 claim; a real isolated Codex Agent node with the mounted bundle and tools for
-an Agent claim; and the normal Scheduler with authority for repair-loop claims.
+an Agent claim; and the current authoritative graph route for repair-loop
+claims.
 Read the new scene after every real attempt. If the evidence changes, return to
 agent-world-debugging rather than continuing the old hypothesis.
