@@ -1,0 +1,2 @@
+version = 1
+package = [{name = "foundry_candidate", version = "0.1.0", source = {virtual = "."}, dependencies = []}]

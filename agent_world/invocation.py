@@ -26,7 +26,6 @@ from agent_world.contracts import SafeFailure
 
 DIRECT_TIMEOUT_SECONDS = 300
 AGENT_TIMEOUT_SECONDS = 600
-AGENT_COMPLETION_MAX_CHARS = 8_192
 _PRIVATE_PROVIDER_ID = "foundry_private"
 _PRIVATE_PROVIDER_NAME = "Foundry private"
 _RUNTIME_SKILLS = Path(__file__).with_name("runtime_skills")
@@ -95,16 +94,6 @@ def _json_object(text: str, code: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise InvocationError(SafeFailure(code, "rejected"))
     return value
-
-
-def _direct_json_object(text: str) -> dict[str, Any] | None:
-    """Parse only an unwrapped JSON object; Direct format Feedback stays local."""
-
-    try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    return value if isinstance(value, dict) else None
 
 
 def _direct_format_condition(text: str) -> _DirectFormatCondition:
@@ -258,10 +247,13 @@ class DirectChatBackend:
         if not isinstance(content, str) or not content.strip():
             raise InvocationError(SafeFailure("direct_response_empty", "rejected"))
         usage = _direct_usage(getattr(response, "usage", None))
-        value = _direct_json_object(content)
-        if value is None:
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            parsed = None
+        if not isinstance(parsed, dict):
             return _DirectFormatFailure(content, route.model, usage)
-        return InvocationResult(value, route.model, usage)
+        return InvocationResult(parsed, route.model, usage)
 
 
 class CodexAgentBackend:
@@ -376,8 +368,6 @@ class CodexAgentBackend:
                 shutil.rmtree(codex_home, ignore_errors=True)
         if not isinstance(output, str) or not output.strip():
             raise InvocationError(SafeFailure("agent_output_missing", "error", True))
-        if len(output) > AGENT_COMPLETION_MAX_CHARS:
-            raise InvocationError(SafeFailure("agent_output_too_large", "rejected"))
         value = _json_object(output, "agent_response_not_json") if require_json else {}
         return InvocationResult(value, route.model, usage, f"sha256:{after}")
 

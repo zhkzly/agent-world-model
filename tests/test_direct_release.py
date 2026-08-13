@@ -1262,29 +1262,21 @@ def test_judge_requires_exact_independently_readmitted_lock_closure(
     assert not called
 
 
-def test_candidate_scan_rejects_hidden_symlink_nonregular_and_unsupported_entries(
-    tmp_path: Path,
-) -> None:
+def test_candidate_scan_enumerates_all_files_into_manifest(tmp_path: Path) -> None:
     root = tmp_path / "candidate"
     root.mkdir()
     _candidate_files(root)
     os.chmod(root / "runtime.py", 0o640)
+    # _scan only enumerates the closure into a manifest; it does not police file
+    # types. A dotfile, a non-source doc, and a symlink-to-source are all admitted.
+    (root / ".hidden.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "README.md").write_text("not source\n", encoding="utf-8")
+    (root / "link.py").symlink_to(root / "runtime.py")
     scanned = CandidateExecutor._scan(root)
+    paths = {item["path"] for item in scanned["files"]}
+    assert scanned["entrypoint"] == "runtime.py"
+    assert scanned["materializer_entrypoint"] == "materializer.py"
+    assert "source_digest" in scanned
+    assert {"runtime.py", "materializer.py", ".hidden.py", "README.md", "link.py"} <= paths
     runtime = next(item for item in scanned["files"] if item["path"] == "runtime.py")
     assert runtime["mode"] == "0640"
-    (root / ".hidden.py").write_text("x = 1\n", encoding="utf-8")
-    with pytest.raises(NodeExecutionError, match="candidate_source_hidden_path"):
-        CandidateExecutor._scan(root)
-    (root / ".hidden.py").unlink()
-    (root / "README.md").write_text("not source\n", encoding="utf-8")
-    with pytest.raises(NodeExecutionError, match="candidate_source_unsupported_file"):
-        CandidateExecutor._scan(root)
-    (root / "README.md").unlink()
-    (root / "link.py").symlink_to(root / "runtime.py")
-    with pytest.raises(NodeExecutionError, match="candidate_source_symlink"):
-        CandidateExecutor._scan(root)
-    (root / "link.py").unlink()
-    if hasattr(os, "mkfifo"):
-        os.mkfifo(root / "candidate.pipe")
-        with pytest.raises(NodeExecutionError, match="candidate_source_non_regular"):
-            CandidateExecutor._scan(root)

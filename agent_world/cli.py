@@ -23,6 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
     make = commands.add_parser("generate", help="run one Direct environment request")
     make.add_argument("--config", type=Path, required=True)
     make.add_argument("--need", required=True)
+    make.add_argument("--resume", dest="resume_run_id", help="resume an existing run by run_id")
+    make.add_argument(
+        "--from",
+        dest="restart_from",
+        help="re-run starting at this node (requires --resume)",
+    )
 
     scene = commands.add_parser("observe", help="read one safe run scene")
     scene.add_argument("--config", type=Path, required=True)
@@ -37,7 +43,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command == "generate":
-            result = generate(args.need, args.config)
+            result = generate(
+                args.need,
+                args.config,
+                resume_run_id=args.resume_run_id,
+                restart_from=args.restart_from,
+            )
         elif args.command == "observe":
             from agent_world.config import load_settings
 

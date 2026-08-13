@@ -398,7 +398,7 @@ def test_runtime_rejects_missing_or_extra_protocol_fields(
         contracts.tools,
     )
 
-    assert result == {"status": "failed", "code": code}
+    assert result["status"] == "failed" and result["code"] == code
 
 
 @pytest.mark.parametrize(
@@ -424,7 +424,7 @@ def test_materializer_outputs_are_closed_and_typed(
         contracts.tools,
     )
 
-    assert result == {"status": "failed", "code": code}
+    assert result["status"] == "failed" and result["code"] == code
 
 
 @pytest.mark.parametrize(
@@ -450,7 +450,7 @@ def test_materializer_requires_complete_identity_goal_bindings(
         contracts.tools,
     )
 
-    assert result == {"status": "failed", "code": "evaluator_goal_binding_invalid"}
+    assert result["status"] == "failed" and result["code"] == "evaluator_goal_binding_invalid"
 
 
 def test_executable_task_rejects_duplicate_goal_bindings() -> None:
@@ -805,4 +805,4 @@ def test_runtime_requires_clean_teardown_after_close_ack(tmp_path: Path) -> None
         contracts.tools,
     )
 
-    assert result == {"status": "failed", "code": "candidate_teardown_failed"}
+    assert result["status"] == "failed" and result["code"] == "candidate_teardown_failed"

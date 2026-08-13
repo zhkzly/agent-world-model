@@ -785,6 +785,7 @@ def test_two_correction_declarations_are_explicit_and_direct_only() -> None:
     assert {node.id for node in graph.nodes if node.local_corrections == 2} == {
         "tool_semantics",
         "curriculum_plan",
+        "task_requirement",
     }
     assert {node.id: node.local_corrections for node in (*DESIGN_NODES, *CANDIDATE_NODES)} == {
         "research_plan": 1,
@@ -795,7 +796,7 @@ def test_two_correction_declarations_are_explicit_and_direct_only() -> None:
         "tool_semantics": 2,
         "world_rules": 1,
         "curriculum_plan": 2,
-        "task_requirement": 1,
+        "task_requirement": 2,
         "modeling_gate": 0,
         "build_plan": 1,
         "verifier_intent": 1,
@@ -1619,7 +1620,7 @@ def test_design_model_helpers_attach_only_the_safe_correction_packet() -> None:
     assert "path $.field" in feedback
     assert "condition field must satisfy the closed contract" in feedback
     assert "expected category string" in feedback
-    assert "Change the response at that path" in feedback
+    assert "correct the response at the flagged path" in feedback
     assert "one complete replacement as exactly one JSON object" in feedback
     assert "self-check the whole replacement object" in feedback
     assert "release authority" in captured_direct[0]["system"]

@@ -59,7 +59,7 @@ from agent_world.contracts import (
     digest_value,
     json_value,
 )
-from agent_world.graph import GraphRunner, NodeExecutionError
+from agent_world.graph import GraphRunner, NodeExecutionError, ResumeContext
 from agent_world.invocation import (
     CodexAgentBackend,
     DirectChatBackend,
@@ -114,26 +114,30 @@ def _direct_feedback(correction: CorrectionPacket) -> str:
         "The immediately preceding complete proposal was rejected for one safe framework-observed "
         f"issue: code {correction.code}; path {correction.path}; "
         f"condition {correction.violated_condition}; expected category "
-        f"{correction.expected_category}. "
+        f"{correction.expected_category}."
     )
     if correction.code == "direct_response_not_json":
         repair = (
-            "Replace the entire immediately preceding answer with one parseable JSON object. "
-            "Delete all prose, labels, Markdown fences, and second JSON values. "
-            "Its first and last non-whitespace characters must be { and }. "
+            "\n\nREJECTED: the answer was not one parseable JSON object.\n\n"
+            "FIX: replace the entire immediately preceding answer with one parseable JSON "
+            "object. Delete all prose, labels, Markdown fences, and second JSON values. "
+            "Its first and last non-whitespace characters must be { and }."
         )
     else:
         repair = (
-            "The path identifies exactly one framework-observed occurrence. "
-            "Change the response at that path to correct that occurrence, then inspect "
-            "the complete immediately preceding proposal and correct every occurrence "
-            "governed by the same condition and expected category. "
-            "Do not treat this as evidence that the framework observed any other occurrence. "
+            "\n\nREJECTED: the framework validates one field at a time and stops at the "
+            "FIRST violation. The flagged path is the first problem found, not necessarily "
+            "the only one.\n\n"
+            "FIX: correct the response at the flagged path, then recheck EVERY field in "
+            "the complete immediately preceding proposal and fix all same-kind violations "
+            "before resubmitting."
         )
     return (
-        context + repair + "Return one complete replacement as exactly one JSON "
-        "object, not a patch, explanation, or Markdown. Before answering, self-check the whole "
-        "replacement object against the complete output contract."
+        context
+        + repair
+        + "\n\nRESUBMIT: return one complete replacement as exactly one JSON object, not a "
+        "patch, explanation, or Markdown. Before answering, self-check the whole replacement "
+        "object against the complete output contract."
     )
 
 
@@ -157,7 +161,7 @@ def _text(value: object, code: str, limit: int = 500, *, path: str = "$") -> str
         raise DesignError(
             code,
             path=path,
-            violated_condition=f"value must use at most {limit} code points",
+            violated_condition=f"value must use at most {limit} code points; got {len(stripped)}",
             expected_category="string",
         )
     return stripped
@@ -177,11 +181,19 @@ def _object(value: object, keys: set[str], code: str, *, path: str = "$") -> dic
 
 
 def _array(value: object, minimum: int, maximum: int, code: str, *, path: str = "$") -> list[Any]:
+    actual = len(value) if isinstance(value, list) else None
     if not isinstance(value, list) or not minimum <= len(value) <= maximum:
+        detail = (
+            f"; the rejected value had {actual} items"
+            if isinstance(value, list)
+            else "; the rejected value was not an array"
+        )
         raise DesignError(
             code,
             path=path,
-            violated_condition="array must use the declared cardinality",
+            violated_condition=(
+                f"array must contain between {minimum} and {maximum} items inclusive{detail}"
+            ),
             expected_category="array",
         )
     return value
@@ -343,8 +355,45 @@ def _local_rules_digest(
     )
 
 
-_RULE_DRAFT_SHAPE = 'RuleDraft={when[0..6] PredicateDraft={left_semantic_index:frozen SemanticCatalog index,operator:"eq"|"ne"|"lt"|"le"|"gt"|"ge"|"contains"|"not_contains"|"exists"|"not_exists",right:{kind:"literal",value:finite JSON scalar or finite JSON scalar list[0..32]}|{kind:"semantic_ref",semantic_index:frozen SemanticCatalog index};exists|not_exists=>literal null},effects[1..6] EffectDraft={target_semantic_index:frozen SemanticCatalog index,operation:"set"|"increment"|"decrement"|"add"|"remove"|"preserve"|"reject",value:finite JSON scalar or finite JSON scalar list[0..32]|{kind:"semantic_ref",semantic_index:frozen SemanticCatalog index};preserve|reject=>null},error_kind:null in non-error sections|[a-z][a-z0-9_]{0,63} in errors only (1..64 code points),rationale:stripped nonempty text<=300 code points,citation_indexes:0..8 unique frozen CitationCatalog indexes;[] when no CitationCatalog is supplied}'  # noqa: E501
-_TASK_RULE_DRAFT_SHAPE = 'TaskRequirementRuleDraft={when[0..6] PredicateDraft={left_semantic_index:frozen SemanticCatalog index,operator:"eq"|"ne"|"lt"|"le"|"gt"|"ge"|"contains"|"not_contains"|"exists"|"not_exists",right:{kind:"literal",value:finite JSON scalar or finite JSON scalar list[0..32]}|{kind:"semantic_ref",semantic_index:frozen SemanticCatalog index};exists|not_exists=>literal null},effects[1..6] EffectDraft={target_semantic_index:frozen SemanticCatalog index,operation:"set"|"increment"|"decrement"|"add"|"remove"|"preserve"|"reject",value:finite JSON scalar or finite JSON scalar list[0..32]|{kind:"semantic_ref",semantic_index:frozen SemanticCatalog index};preserve|reject=>null},rationale:stripped nonempty text<=300 code points,citation_indexes:0..8 unique frozen CitationCatalog indexes}'  # noqa: E501
+_PREDICATE_EFFECT_SHAPE = (
+    "PredicateDraft = {left_semantic_index, operator, right}\n"
+    "  left_semantic_index : int, one-based frozen SemanticCatalog index\n"
+    "  operator            : one of eq|ne|lt|le|gt|ge|contains|not_contains|exists|not_exists\n"
+    "  right               : {kind:\"literal\", value: finite JSON scalar or scalar-list[0..32]} OR\n"  # noqa: E501
+    "                        {kind:\"semantic_ref\", semantic_index: one-based frozen index}\n"
+    "                        exists/not_exists require right = {kind:\"literal\", value: null}\n"
+    "EffectDraft = {target_semantic_index, operation, value}\n"
+    "  target_semantic_index : int, one-based frozen SemanticCatalog index\n"
+    "  operation             : one of set|increment|decrement|add|remove|preserve|reject\n"
+    "  value                 : finite JSON scalar or scalar-list[0..32] OR\n"
+    "                          {kind:\"semantic_ref\", semantic_index: one-based frozen index}\n"
+    "                          preserve/reject require value = null\n"
+)
+_RULE_DRAFT_SHAPE = (
+    "RuleDraft (exactly these keys, no others):\n"
+    "  when             : array[0..6] of PredicateDraft (may be empty)\n"
+    "  effects          : array[1..6] of EffectDraft (at least one)\n"
+    "  error_kind       : null in non-error sections; snake_case [a-z][a-z0-9_]{0,63} in errors-only sections\n"  # noqa: E501
+    "  rationale        : nonempty stripped text <=300 code points\n"
+    "  citation_indexes : array[0..8] of unique frozen CitationCatalog one-based indexes; [] when no catalog is supplied\n"  # noqa: E501
+    + _PREDICATE_EFFECT_SHAPE
+    + "Example RuleDraft (non-error): "
+    '{"when":[{"left_semantic_index":1,"operator":"eq","right":{"kind":"literal","value":"open"}}],'
+    '"effects":[{"target_semantic_index":2,"operation":"set","value":"assigned"}],'
+    '"error_kind":null,"rationale":"assign open ticket","citation_indexes":[1]}'
+)
+_TASK_RULE_DRAFT_SHAPE = (
+    "TaskRequirementRuleDraft (exactly these keys, no others):\n"
+    "  when             : array[0..6] of PredicateDraft (may be empty)\n"
+    "  effects          : array[1..6] of EffectDraft (at least one)\n"
+    "  rationale        : nonempty stripped text <=300 code points\n"
+    "  citation_indexes : array[0..8] of unique frozen CitationCatalog one-based indexes\n"
+    + _PREDICATE_EFFECT_SHAPE
+    + "Example TaskRequirementRuleDraft: "
+    '{"when":[{"left_semantic_index":1,"operator":"eq","right":{"kind":"literal","value":"open"}}],'
+    '"effects":[{"target_semantic_index":2,"operation":"set","value":"resolved"}],'
+    '"rationale":"mark task resolved","citation_indexes":[1]}'
+)
 _TASK_RULE_SOURCE_FIELDS = {"when", "effects", "rationale", "citation_indexes"}
 
 
@@ -699,6 +748,7 @@ class DesignExecutor:
         run_id: str,
         *,
         shard_key: str | None = None,
+        output_type: Any = None,
     ) -> tuple[Any, ArtifactRef, ArtifactRef]:
         visible_projection = _model_value(projection)
         previous_output: str | None = None
@@ -753,6 +803,7 @@ class DesignExecutor:
             artifact_projection=json_value,
             operation_evidence=lambda result: self._model_evidence("direct_llm", node, result),
             shard_key=shard_key,
+            output_type=output_type,
         )
         return node_result.value, node_result.artifact, node_result.work
 
@@ -816,6 +867,7 @@ class DesignExecutor:
             operation_evidence=lambda result: self._model_evidence(
                 "agent", "research_plan", result
             ),
+            output_type=ResearchPlan,
         )
         return replace(node.value, artifact=node.artifact), node.artifact, node.work
 
@@ -910,6 +962,7 @@ class DesignExecutor:
                 ],
             },
             operation_evidence=lambda value: value[2],
+            output_type=tuple[list[dict[str, Any]], list[str], tuple[OperationEvidence, ...]],
         )
         return (
             tuple(
@@ -1055,6 +1108,7 @@ class DesignExecutor:
             operation_evidence=lambda result: self._model_evidence(
                 "agent", "research_synthesis", result
             ),
+            output_type=EvidenceGraph,
         )
         return replace(node.value, artifact=node.artifact), node.artifact, node.work
 
@@ -1265,33 +1319,15 @@ class DesignExecutor:
             divergences = tuple(
                 EvidenceClaim(
                     _text(
-                        _object(
-                            item,
-                            {"statement", "kind", "citation_indexes"},
-                            "world_architecture_invalid",
-                            path=f"$.known_divergences[{index}]",
-                        )["statement"],
+                        obj["statement"],
                         "world_architecture_invalid",
                         500,
                         path=f"$.known_divergences[{index}].statement",
                     ),
-                    cast(
-                        Any,
-                        _object(
-                            item,
-                            {"statement", "kind", "citation_indexes"},
-                            "world_architecture_invalid",
-                            path=f"$.known_divergences[{index}]",
-                        )["kind"],
-                    ),
+                    cast(Any, obj["kind"]),
                     tuple(
                         _array(
-                            _object(
-                                item,
-                                {"statement", "kind", "citation_indexes"},
-                                "world_architecture_invalid",
-                                path=f"$.known_divergences[{index}]",
-                            )["citation_indexes"],
+                            obj["citation_indexes"],
                             1,
                             6,
                             "world_architecture_invalid",
@@ -1307,6 +1343,14 @@ class DesignExecutor:
                         "world_architecture_invalid",
                         path="$.known_divergences",
                     )
+                )
+                for obj in (
+                    _object(
+                        item,
+                        {"statement", "kind", "citation_indexes"},
+                        "world_architecture_invalid",
+                        path=f"$.known_divergences[{index}]",
+                    ),
                 )
             )
             if any(
@@ -1331,12 +1375,55 @@ class DesignExecutor:
             )
             return replace(provisional, catalog=SemanticCatalog(_catalog(provisional)))
 
-        field_shape = "Field={name:stripped_snake[1..64],category:text|integer|number|boolean|timestamp|identifier|enum|list,required:boolean,values:enum|list=>unique_nonempty_text[1..16];otherwise=>omit,values_char_limit:none,entity_ref:actual_relation=>untrimmed_snake[1..64];otherwise=>omit}"  # noqa: E501
+        field_shape = (
+            "Field (exactly these keys, no others):\n"
+            "    name      : snake_case [a-z][a-z0-9_]{0,63} (1..64 code points)\n"
+            "    category  : one of text|integer|number|boolean|timestamp|identifier|enum|list\n"
+            "    required  : boolean\n"
+            "    values    : array[1..16] of unique nonempty strings — REQUIRED when category is enum|list, OMITTED otherwise\n"  # noqa: E501
+            "    entity_ref: optional snake_case [a-z][a-z0-9_]{0,63} — name of a declared entity"
+        )
         shape = (
-            f"{field_shape};objective: return one coherent minimal JSON object; tools must be one coherent minimal JSON array[1..8]; combine related workflow actions when needed; before returning and after any correction, recheck the complete object against every disclosed field, cardinality, uniqueness, reference, actor, and citation rule; output={{boundary:{{name|system_of_record|authority:stripped_text[1..160],purpose:stripped_text[1..4096_unicode_code_points],actors[1..8]:stripped_text[1..80]:unique_after_stripping}}}},"  # noqa: E501
-            "entities[1..16]{name:stripped_text[1..64]:unique_in_entities,purpose:stripped_text[1..300],fields[1..24]:unique_names<Field;entity_ref=emitted_entity_name_in_this_object_when_present>},"
-            "tools[1..8]{name:stripped_text[1..64]:unique_in_tools,purpose:stripped_text[1..300],actor_names[1..frozen_actor_count]:unique_exact_declared_names,argument_fields[0..24]:unique_names<Field;entity_ref=optional_actual_relation_snake_name;external_relation_label_allowed>,result_fields[1..24]:unique_names<Field;entity_ref=optional_actual_relation_snake_name;external_relation_label_allowed>},"  # noqa: E501
-            "known_divergences[0..16]{statement:stripped_text[1..500],kind:observed|bounded_inference,citation_indexes:frozen_one_based[1..6]}}"
+            f"{field_shape}\n\n"
+            "Objective: return one coherent minimal JSON object. Combine related workflow "
+            "actions into the fewest coherent tools (1..8). Before returning — and after any "
+            "correction — recheck the complete object against every field, cardinality, "
+            "uniqueness, reference, actor, and citation rule.\n\n"
+            "output (exactly these top-level keys):\n\n"
+            "boundary:\n"
+            "    name             : stripped text [1..160]\n"
+            "    system_of_record : stripped text [1..160]\n"
+            "    authority        : stripped text [1..160]\n"
+            "    purpose          : stripped text [1..4096 Unicode code points]\n"
+            "    actors           : array[1..8] of stripped text [1..80], unique after stripping\n\n"  # noqa: E501
+            "entities: array[1..16] of:\n"
+            "    name   : stripped text [1..64], unique among entities\n"
+            "    purpose: stripped text [1..300]\n"
+            "    fields : array[1..24] of Field (unique names; entity_ref must name a declared entity in this object when present)\n\n"  # noqa: E501
+            "tools: array[1..8] of:\n"
+            "    name            : stripped text [1..64], unique among tools\n"
+            "    purpose         : stripped text [1..300]\n"
+            "    actor_names     : array[1..N] of exact declared actor names (unique)\n"
+            "    argument_fields : array[0..24] of Field (unique names; may be empty)\n"
+            "    result_fields   : array[1..24] of Field (unique names)\n\n"
+            "known_divergences: array[0..16] of:\n"
+            "    statement       : stripped text [1..500]\n"
+            "    kind            : \"observed\" or \"bounded_inference\"\n"
+            "    citation_indexes: array[1..6] of frozen one-based CitationCatalog indexes\n\n"
+            "Example (abbreviated — yours must be complete):\n"
+            "{\"boundary\":{\"name\":\"ticket_system\",\"system_of_record\":\"helpdesk_db\","
+            "\"authority\":\"support_lead\",\"purpose\":\"Route and resolve support tickets.\","
+            "\"actors\":[\"agent\",\"supervisor\"]},"
+            "\"entities\":[{\"name\":\"ticket\",\"purpose\":\"A support request.\","
+            "\"fields\":[{\"name\":\"status\",\"category\":\"enum\",\"required\":true,"
+            "\"values\":[\"open\",\"closed\"]}]}],"
+            "\"tools\":[{\"name\":\"assign_ticket\",\"purpose\":\"Assign a ticket to an agent.\","
+            "\"actor_names\":[\"agent\"],"
+            "\"argument_fields\":[{\"name\":\"ticket_id\",\"category\":\"identifier\",\"required\":true}],"
+            "\"result_fields\":[{\"name\":\"assigned_to\",\"category\":\"text\",\"required\":true}]}],"
+            "\"known_divergences\":[{\"statement\":\"API may delay updates.\","
+            "\"kind\":\"bounded_inference\",\"citation_indexes\":[1]}]}\n\n"
+            "Do not return IDs, indexes, digests, Artifact refs, schemas, gates, Judge, or release facts."  # noqa: E501
         )
         value, ref, work = self._direct_commit(
             "world_architecture",
@@ -1354,6 +1441,7 @@ class DesignExecutor:
             store,
             graph,
             run_id,
+            output_type=WorldArchitecture,
         )
         return replace(value, artifact=ref), ref, work
 
@@ -1484,7 +1572,23 @@ class DesignExecutor:
             value, ref, work = self._direct_commit(
                 "shared_tool_semantics",
                 projection,
-                "output={atomicity|concurrency|idempotency:1..group_size arrays of nonempty frozen-index arrays partitioning input.tool_indexes exactly once;unless evidence requires a finer split,use one domain containing the complete ordered input.tool_indexes (example input [1,2,3] -> [[1,2,3]]);ordering:0..8 stripped nonempty text items<=500 code points;compensation:0..8 stripped nonempty text items<=160 code points;error_policy:one stripped nonempty shared-policy string<=500 code points applying to the complete group}. Objective:return compact complete semantics for the frozen group,cover every member exactly once in each shared dimension,and recheck the whole object after correction. Do not return IDs,indexes outside the disclosed group,digests,Artifact refs,schemas,gates,Judge,or release facts.",  # noqa: E501
+                "output (exactly these keys, no others):\n\n"
+                "atomicity    : array[1..group_size] of sub-arrays of one-based tool indexes (int) partitioning input.tool_indexes exactly once; unless evidence requires a finer split, use one domain containing the complete ordered group\n"  # noqa: E501
+                "concurrency  : same partition shape as atomicity\n"
+                "idempotency  : same partition shape as atomicity\n"
+                "  Example: input tool_indexes [1,2,3] -> [[1,2,3]] for each of atomicity/concurrency/idempotency\n"  # noqa: E501
+                "ordering     : array[0..8] of STRINGS (not numbers); each stripped nonempty text <=500 code points\n"  # noqa: E501
+                "compensation : array[0..8] of STRINGS (not numbers); each stripped nonempty text <=160 code points\n"  # noqa: E501
+                "error_policy : one stripped nonempty shared-policy string <=500 code points applying to the complete group\n\n"  # noqa: E501
+                "Objective: return compact complete semantics for the frozen group, cover every "
+                "member exactly once in each shared dimension, and recheck the whole object after "
+                "correction.\n\n"
+                "Example (for input tool_indexes [1,2]):\n"
+                "{\"atomicity\":[[1,2]],\"concurrency\":[[1,2]],\"idempotency\":[[1,2]],"
+                "\"ordering\":[\"assign before resolve\"],\"compensation\":[\"revert assignment\"],"
+                "\"error_policy\":\"reject invalid requests\"}\n\n"
+                "Do not return IDs, indexes outside the disclosed group, digests, Artifact refs, "
+                "schemas, gates, Judge, or release facts.",  # noqa: E501
                 "design.shared_tool_semantics",
                 compile,
                 {"architecture": (architecture_ref,), "evidence": (evidence_ref,)},
@@ -1492,6 +1596,7 @@ class DesignExecutor:
                 graph,
                 run_id,
                 shard_key="-".join(map(str, group)),
+                output_type=SharedToolContract,
             )
             contracts.append(replace(value, artifact=ref))
             refs.append(ref)
@@ -1616,7 +1721,15 @@ class DesignExecutor:
             value, ref, work = self._direct_commit(
                 "tool_semantics",
                 projection,
-                f"{{preconditions[1..6] {_RULE_DRAFT_SHAPE} (non-error),transitions[1..6] {_RULE_DRAFT_SHAPE} (non-error;at least one state-changing effect),postconditions[0..6] {_RULE_DRAFT_SHAPE} (non-error),errors[0..6] {_RULE_DRAFT_SHAPE} (errors-only)}}. Objective:return compact complete semantics for the frozen tool and recheck every section after correction. Do not return tool indexes,shared contracts,IDs,digests,schemas,gates,Judge,or release facts.",  # noqa: E501
+                f"output (exactly these top-level keys):\n\n"
+                f"preconditions  : array[1..6] of {_RULE_DRAFT_SHAPE} (non-error: error_kind must be null)\n\n"  # noqa: E501
+                f"transitions    : array[1..6] of {_RULE_DRAFT_SHAPE} (non-error; at least one effect must be state-changing — i.e. not preserve or reject)\n\n"  # noqa: E501
+                f"postconditions : array[0..6] of {_RULE_DRAFT_SHAPE} (non-error)\n\n"
+                f"errors         : array[0..6] of {_RULE_DRAFT_SHAPE} (errors-only: error_kind must be a snake_case string)\n\n"  # noqa: E501
+                "Objective: return compact complete semantics for the frozen tool and recheck "
+                "every section after correction.\n\n"
+                "Do not return tool indexes, shared contracts, IDs, digests, schemas, gates, "
+                "Judge, or release facts.",  # noqa: E501
                 "design.tool_semantics",
                 compile,
                 {
@@ -1628,6 +1741,7 @@ class DesignExecutor:
                 graph,
                 run_id,
                 shard_key=surface.name,
+                output_type=ToolDraft,
             )
             tools.append(value)
             refs.append(ref)
@@ -1697,13 +1811,20 @@ class DesignExecutor:
         value, ref, work = self._direct_commit(
             "world_rules",
             {"architecture": json_value(architecture), "tools": json_value(tools)},
-            f"{{initial_rules[0..8] {_RULE_DRAFT_SHAPE} (non-error;citation_indexes=[]),invariants[0..16] {_RULE_DRAFT_SHAPE} (non-error;citation_indexes=[])}}. Objective:return only necessary initial and cross-tool rules not duplicated by local tool rules;empty invariants are valid. Recheck the complete object after correction and do not return IDs,digests,schemas,gates,Judge,or release facts.",  # noqa: E501
+            "output (exactly these top-level keys):\n\n"
+            f"initial_rules : array[0..8] of {_RULE_DRAFT_SHAPE} (non-error; citation_indexes MUST be [] — no CitationCatalog is supplied to this node)\n\n"  # noqa: E501
+            f"invariants    : array[0..16] of {_RULE_DRAFT_SHAPE} (non-error; citation_indexes MUST be [] — no CitationCatalog is supplied to this node)\n\n"  # noqa: E501
+            "Objective: return only necessary initial and cross-tool rules not duplicated by "
+            "local tool rules; empty arrays are valid. Recheck the complete object after "
+            "correction.\n\n"
+            "Do not return IDs, digests, schemas, gates, Judge, or release facts.",  # noqa: E501
             "design.world_rules",
             compile,
             {"architecture": (architecture_ref,), "tool_semantics": tool_refs},
             store,
             graph,
             run_id,
+            output_type=WorldRuleSet,
         )
         return replace(value, artifact=ref), ref, work
 
@@ -1940,7 +2061,33 @@ class DesignExecutor:
                 "world_rules": json_value(rules),
                 "citation_catalog": json_value(evidence.catalog),
             },
-            "{families[1..8]{task_family_id:[a-z][a-z0-9_]{0,63} (1..64 code points),objective:stripped nonempty text<=500,actor_index:one frozen actor index,tool_indexes:1..tool_count unique frozen indexes,dimensions[1..6]{name:[a-z][a-z0-9_-]{0,39} (1..40 code points),meaning:stripped nonempty text<=300,levels[2..5]{name:[a-z][a-z0-9_-]{0,39} (1..40 code points),meaning:stripped nonempty text<=300}:unique names},sampling_intent:stripped nonempty text<=300,citation_indexes:1..6 unique frozen indexes}}. Objective:define compact parameterized task families using the frozen catalog;retain the accepted hyphenated dimension and level names without normalization,and recheck the complete object after correction. Do not return family indexes,difficulty schema keys,digests,IDs,seeds,rewards,verifier cases,gates,Judge,or release facts.",  # noqa: E501
+            "output (exactly one top-level key \"families\"):\n\n"
+            "families: array[1..8] of:\n"
+            "    task_family_id  : snake_case [a-z][a-z0-9_]{0,63} (1..64 code points)\n"
+            "    objective       : stripped nonempty text <=500 code points\n"
+            "    actor_index     : int, one-based frozen actor index into input.architecture.boundary.actors\n"  # noqa: E501
+            "    tool_indexes    : array[1..tool_count] of unique one-based frozen indexes into input.architecture.tools\n"  # noqa: E501
+            "    dimensions      : array[1..6] of (unique names):\n"
+            "        name   : [a-z][a-z0-9_-]{0,39} (1..40 code points)\n"
+            "        meaning: stripped nonempty text <=300 code points\n"
+            "        levels  : array[2..5] of:\n"
+            "            name   : [a-z][a-z0-9_-]{0,39} (1..40 code points)\n"
+            "            meaning: stripped nonempty text <=300 code points\n"
+            "    sampling_intent : stripped nonempty text <=300 code points\n"
+            "    citation_indexes: array[1..6] of unique frozen one-based CitationCatalog indexes\n\n"  # noqa: E501
+            "Example (abbreviated — yours must be complete):\n"
+            "{\"families\":[{\"task_family_id\":\"resolve_ticket\","
+            "\"objective\":\"Resolve a support ticket.\","
+            "\"actor_index\":1,\"tool_indexes\":[1],"
+            "\"dimensions\":[{\"name\":\"urgency\",\"meaning\":\"How urgent the ticket is.\","
+            "\"levels\":[{\"name\":\"low\",\"meaning\":\"Low urgency.\"},"
+            "{\"name\":\"high\",\"meaning\":\"High urgency.\"}]}],"
+            "\"sampling_intent\":\"favor high urgency.\",\"citation_indexes\":[1]}]}\n\n"
+            "Objective: define compact parameterized task families using the frozen catalog; "
+            "retain the accepted hyphenated dimension and level names without normalization, "
+            "and recheck the complete object after correction.\n\n"
+            "Do not return family indexes, difficulty schema keys, digests, IDs, seeds, "
+            "rewards, verifier cases, gates, Judge, or release facts.",  # noqa: E501
             "design.curriculum_plan",
             compile,
             {
@@ -1951,6 +2098,7 @@ class DesignExecutor:
             store,
             graph,
             run_id,
+            output_type=CurriculumPlan,
         )
         return replace(value, artifact=ref), ref, work
 
@@ -2079,7 +2227,17 @@ class DesignExecutor:
             value, ref, work = self._direct_commit(
                 "task_requirement",
                 projection,
-                f"{{public_goal_fields[1..12] unique frozen SemanticCatalog indexes,initial_rules[0..8] {_TASK_RULE_DRAFT_SHAPE},success_rules[1..8] {_TASK_RULE_DRAFT_SHAPE},failure_rules[0..8] {_TASK_RULE_DRAFT_SHAPE},terminal_rules[1..8] {_TASK_RULE_DRAFT_SHAPE}}}. Objective:return compact complete reset,success,failure,and terminal semantics for the frozen task family;its DifficultySchema is read-only. Recheck every section after correction and do not return task-family indexes,IDs,digests,schemas,rewards,gates,Judge,or release facts.",  # noqa: E501
+                "output (exactly these top-level keys):\n\n"
+                "public_goal_fields : array[1..12] of unique one-based frozen SemanticCatalog indexes (into input.semantic_catalog.bindings)\n\n"  # noqa: E501
+                f"initial_rules      : array[0..8] of {_TASK_RULE_DRAFT_SHAPE}\n\n"
+                f"success_rules      : array[1..8] of {_TASK_RULE_DRAFT_SHAPE} (MANDATORY: at least one)\n\n"  # noqa: E501
+                f"failure_rules      : array[0..8] of {_TASK_RULE_DRAFT_SHAPE}\n\n"
+                f"terminal_rules     : array[1..8] of {_TASK_RULE_DRAFT_SHAPE} (MANDATORY: at least one)\n\n"  # noqa: E501
+                "Objective: return compact complete reset, success, failure, and terminal "
+                "semantics for the frozen task family; its DifficultySchema is read-only. "
+                "Recheck every section after correction.\n\n"
+                "Do not return task-family indexes, IDs, digests, schemas, rewards, gates, "
+                "Judge, or release facts.",  # noqa: E501
                 "design.task_requirement",
                 compile,
                 {
@@ -2093,6 +2251,7 @@ class DesignExecutor:
                 graph,
                 run_id,
                 shard_key=family.task_family_id,
+                output_type=TaskRequirement,
             )
             result.append(replace(value, artifact=ref))
             refs.append(ref)
@@ -2248,6 +2407,7 @@ class DesignExecutor:
                 "output_shape": "EnvironmentDesign@1",
             },
             artifact_projection=_design_artifact_value,
+            output_type=DesignContract,
         )
         return (
             replace(node.value, artifact=node.artifact, work_refs=(node.work,)),
@@ -2256,7 +2416,13 @@ class DesignExecutor:
         )
 
     def run(
-        self, request: EnvironmentRequest, store: ArtifactStore, graph: GraphRunner, run_id: str
+        self,
+        request: EnvironmentRequest,
+        store: ArtifactStore,
+        graph: GraphRunner,
+        run_id: str,
+        *,
+        resume: ResumeContext | None = None,
     ) -> DesignResult:
         request_ref = store.put_json("control.design_request", {"need_digest": request.need_digest})
         plan, plan_ref, plan_work = self._research_plan(request, store, graph, run_id, request_ref)

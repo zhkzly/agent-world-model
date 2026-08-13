@@ -8,9 +8,11 @@ output never crosses an edge.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
+from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from agent_world.artifacts import ArtifactStore, canonical_json
@@ -27,6 +29,7 @@ from agent_world.contracts import (
     WorkCoordinate,
     WorkRecord,
     digest_text,
+    from_value,
     json_value,
 )
 from agent_world.invocation import runtime_skill_digest
@@ -97,6 +100,145 @@ class NodeResult[T]:
     artifact: ArtifactRef
     work: ArtifactRef
     semantic_revision_digest: str
+
+
+# ---------------------------------------------------------------------------
+# Resume infrastructure
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class HeadEntry:
+    """One committed node output, cached for resume/restart-from-node."""
+
+    artifact_ref: ArtifactRef
+    work_ref: ArtifactRef
+    semantic_revision_digest: str
+    compiled_json: Any  # json_value(compiled) at commit time
+
+
+def _head_key(graph_id: str, node_id: str, shard_key: str | None) -> str:
+    return f"{graph_id}:{node_id}:{shard_key or ''}"
+
+
+def _ancestors(node_id: str, edges: tuple[EdgeSpec, ...]) -> set[str]:
+    """Return all strictly-upstream node ids of *node_id* within one graph."""
+    parents = {edge.source for edge in edges if edge.target == node_id}
+    result: set[str] = set()
+    for parent in parents:
+        result.add(parent)
+        result |= _ancestors(parent, edges)
+    return result
+
+
+def compute_upstream(
+    restart_from: str,
+    design_nodes: tuple[NodeSpec, ...],
+    design_edges: tuple[EdgeSpec, ...],
+    candidate_nodes: tuple[NodeSpec, ...],
+    candidate_edges: tuple[EdgeSpec, ...],
+) -> set[str]:
+    """Nodes strictly upstream of *restart_from* across both graphs.
+
+    Candidate nodes are all downstream of design nodes (the design output
+    feeds the candidate graph).
+    """
+    design_ids = {n.id for n in design_nodes}
+    candidate_ids = {n.id for n in candidate_nodes}
+    if restart_from in design_ids:
+        return _ancestors(restart_from, design_edges)
+    if restart_from in candidate_ids:
+        return design_ids | _ancestors(restart_from, candidate_edges)
+    raise ValueError(f"resume_unknown_node:{restart_from}")
+
+
+class ResumeContext:
+    """Carries resume state through the pipeline.
+
+    ``restart_from`` (``--from``) re-runs that node and everything downstream,
+    skipping strictly-upstream nodes that have cached heads.  Without
+    ``restart_from`` (pure ``--resume``), every node with a committed head
+    whose ``semantic_revision`` still matches is skipped.
+    """
+
+    def __init__(
+        self,
+        *,
+        restart_from: str | None = None,
+        skip_node_ids: set[str] | None = None,
+    ) -> None:
+        self.restart_from = restart_from
+        self.skip_node_ids = skip_node_ids or set()
+        self.heads: dict[str, HeadEntry] = {}
+
+    # -- head access --------------------------------------------------------
+
+    def get_head(
+        self, graph_id: str, node_id: str, shard_key: str | None
+    ) -> HeadEntry | None:
+        return self.heads.get(_head_key(graph_id, node_id, shard_key))
+
+    def should_skip(
+        self,
+        graph_id: str,
+        node_id: str,
+        shard_key: str | None,
+        semantic_revision: str,
+    ) -> bool:
+        head = self.get_head(graph_id, node_id, shard_key)
+        if head is None:
+            return False
+        if self.restart_from is not None:
+            return node_id in self.skip_node_ids
+        return head.semantic_revision_digest == semantic_revision
+
+    def record(
+        self,
+        graph_id: str,
+        node_id: str,
+        shard_key: str | None,
+        *,
+        compiled_json: Any,
+        artifact_ref: ArtifactRef,
+        work_ref: ArtifactRef,
+        semantic_revision_digest: str,
+    ) -> None:
+        self.heads[_head_key(graph_id, node_id, shard_key)] = HeadEntry(
+            artifact_ref, work_ref, semantic_revision_digest, compiled_json
+        )
+
+    # -- persistence --------------------------------------------------------
+
+    def save(self, path: Path) -> None:
+        data: dict[str, Any] = {
+            "restart_from": self.restart_from,
+            "heads": {
+                key: {
+                    "artifact_ref": json_value(entry.artifact_ref),
+                    "work_ref": json_value(entry.work_ref),
+                    "semantic_revision_digest": entry.semantic_revision_digest,
+                    "compiled_json": entry.compiled_json,
+                }
+                for key, entry in self.heads.items()
+            },
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(
+            json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        )
+
+    @classmethod
+    def load(cls, path: Path) -> ResumeContext:
+        data = json.loads(path.read_bytes())
+        ctx = cls(restart_from=data.get("restart_from"))
+        for key, raw in data.get("heads", {}).items():
+            ctx.heads[key] = HeadEntry(
+                ArtifactRef(**raw["artifact_ref"]),
+                ArtifactRef(**raw["work_ref"]),
+                raw["semantic_revision_digest"],
+                raw["compiled_json"],
+            )
+        return ctx
 
 
 class NodeExecutionError(RuntimeError):
@@ -215,6 +357,7 @@ DESIGN_NODES = (
         "TaskRequirementSourceDraft@1",
         "task-requirement@1",
         route="direct",
+        local_corrections=2,
     ),
     NodeSpec(
         "modeling_gate",
@@ -396,6 +539,7 @@ class GraphRunner:
         self.nodes = nodes
         self.edges = edges
         self._by_id = {node.id: node for node in nodes}
+        self.resume: ResumeContext | None = None
         self._validate()
 
     def node(self, node_id: str) -> NodeSpec:
@@ -482,12 +626,24 @@ class GraphRunner:
         operation_evidence: Callable[[P], tuple[OperationEvidence, ...]] | None = None,
         failure_subject: ArtifactRef | None = None,
         shard_key: str | None = None,
+        output_type: Any = None,
     ) -> NodeResult[T]:
         """Execute and commit exactly one node proposal/validation transaction."""
 
         node = self.node(node_id)
-        dependencies = self._resolve_inputs(store, node, inputs)
         semantic = self.semantic_revision(node, semantic_material)
+
+        # Resume short-circuit: skip upstream / committed-matching nodes.
+        if self.resume is not None and output_type is not None:
+            if self.resume.should_skip(self.graph_id, node_id, shard_key, semantic):
+                head = self.resume.get_head(self.graph_id, node_id, shard_key)
+                if head is not None:
+                    compiled = from_value(head.compiled_json, output_type)
+                    return NodeResult(
+                        compiled, head.artifact_ref, head.work_ref, head.semantic_revision_digest
+                    )
+
+        dependencies = self._resolve_inputs(store, node, inputs)
         attempts: list[ArtifactRef] = []
         assurance_refs: list[ArtifactRef] = []
         correction: CorrectionPacket | None = None
@@ -604,6 +760,16 @@ class GraphRunner:
                 "passed",
             )
         )
+        if self.resume is not None:
+            self.resume.record(
+                self.graph_id,
+                node_id,
+                shard_key,
+                compiled_json=json_value(compiled),
+                artifact_ref=output,
+                work_ref=record,
+                semantic_revision_digest=semantic,
+            )
         return NodeResult(compiled, output, record, semantic)
 
     def _resolve_inputs(

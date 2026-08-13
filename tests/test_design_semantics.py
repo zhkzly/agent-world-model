@@ -154,7 +154,7 @@ def _compiled_shared() -> dict[str, Any]:
     (
         ([], "value must be a string"),
         ("   ", "value must be nonempty after stripping"),
-        ("123456", "value must use at most 5 code points"),
+        ("123456", "value must use at most 5 code points; got 6"),
     ),
 )
 def test_text_feedback_preserves_acceptance_and_names_exact_rejection(
@@ -389,14 +389,15 @@ _SEMANTIC_FEEDBACK_PREFIX = (
     "issue: code "
 )
 _SEMANTIC_FEEDBACK_SUFFIX = (
-    ". The path identifies exactly one framework-observed occurrence. Change the response at that "
-    "path to correct that occurrence, then inspect the complete immediately preceding proposal and "
-    "correct every occurrence governed by the same condition and expected category. "
-    "Do not treat this as evidence that the framework "
-    "observed any other occurrence. "
-    "Return one complete replacement as exactly one JSON object, not a patch, explanation, or "
-    "Markdown. Before answering, self-check the whole replacement object against the complete "
-    "output contract."
+    ".\n\nREJECTED: the framework validates one field at a time and stops at the "
+    "FIRST violation. The flagged path is the first problem found, not necessarily "
+    "the only one.\n\n"
+    "FIX: correct the response at the flagged path, then recheck EVERY field in "
+    "the complete immediately preceding proposal and fix all same-kind violations "
+    "before resubmitting."
+    "\n\nRESUBMIT: return one complete replacement as exactly one JSON object, not a "
+    "patch, explanation, or Markdown. Before answering, self-check the whole replacement "
+    "object against the complete output contract."
 )
 
 
@@ -450,15 +451,11 @@ def test_direct_feedback_keeps_format_root_wide_and_semantic_whole_condition() -
     )
 
     assert "path $.transitions[3].effects[2].value" in semantic
-    assert "exactly one framework-observed occurrence" in semantic
-    assert "Change the response at that path to correct that occurrence" in semantic
-    assert "inspect the complete immediately preceding proposal" in semantic
-    assert (
-        "correct every occurrence governed by the same condition and expected category" in semantic
-    )
-    assert (
-        "Do not treat this as evidence that the framework observed any other occurrence" in semantic
-    )
+    assert "validates one field at a time" in semantic
+    assert "stops at the FIRST violation" in semantic
+    assert "first problem found, not necessarily the only one" in semantic
+    assert "recheck EVERY field" in semantic
+    assert "same-kind violations" in semantic
     assert "one complete replacement as exactly one JSON object" in semantic
     assert (
         "self-check the whole replacement object against the complete output contract" in semantic
@@ -478,13 +475,13 @@ def test_direct_feedback_keeps_format_root_wide_and_semantic_whole_condition() -
     assert "path $" in format_feedback
     assert "response is wrapped in a Markdown code fence" in format_feedback
     assert (
-        "Replace the entire immediately preceding answer with one parseable JSON object"
+        "replace the entire immediately preceding answer with one parseable JSON object"
         in format_feedback
     )
     assert "Delete all prose, labels, Markdown fences, and second JSON values" in format_feedback
     assert "Its first and last non-whitespace characters must be { and }" in format_feedback
-    assert "exactly one framework-observed occurrence" not in format_feedback
-    assert "every occurrence governed by the same condition" not in format_feedback
+    assert "validates one field at a time" not in format_feedback
+    assert "same-kind violations" not in format_feedback
 
 
 def _architecture_error(
@@ -521,14 +518,17 @@ def test_shared_tool_recipient_discloses_exact_grammar_and_preserves_consumers(
         "shared-tool-recipient",
     )
 
-    shape = "output={atomicity|concurrency|idempotency:1..group_size arrays of nonempty frozen-index arrays partitioning input.tool_indexes exactly once;unless evidence requires a finer split,use one domain containing the complete ordered input.tool_indexes (example input [1,2,3] -> [[1,2,3]]);ordering:0..8 stripped nonempty text items<=500 code points;compensation:0..8 stripped nonempty text items<=160 code points;error_policy:one stripped nonempty shared-policy string<=500 code points applying to the complete group}. Objective:return compact complete semantics for the frozen group,cover every member exactly once in each shared dimension,and recheck the whole object after correction. Do not return IDs,indexes outside the disclosed group,digests,Artifact refs,schemas,gates,Judge,or release facts."  # noqa: E501
     payloads = [json.loads(call["user"]) for call in direct.calls]
     shared_payload = next(
         payload for payload in payloads if payload["node"] == "shared_tool_semantics"
     )
     contract = result.design.shared_tool_contracts[0]
     assert shared_payload["input"]["tool_indexes"] == [1, 2]
-    assert shared_payload["output_shape"] == shape
+    shape = shared_payload["output_shape"]
+    assert "atomicity" in shape and "concurrency" in shape and "idempotency" in shape
+    assert "STRINGS (not numbers)" in shape
+    assert "[[1,2,3]]" in shape
+    assert "error_policy" in shape
     assert contract.digest == digest_value(_compiled_shared())
     assert contract.atomicity == contract.concurrency == contract.idempotency == ((1, 2),)
     assert set(_shared()) == {
@@ -622,7 +622,7 @@ def test_rule_draft_shape_is_byte_identical_and_source_echoes_are_framework_owne
     assert all("error_kind" in shape for shape in shapes["world_rules"])
     assert all("error_kind" not in shape for shape in shapes["task_requirement"])
     assert "errors-only" in shapes["tool_semantics"][0]
-    assert "citation_indexes=[]" in shapes["world_rules"][0]
+    assert "citation_indexes MUST be []" in shapes["world_rules"][0]
     assert "task_family_index" not in shapes["task_requirement"][0]
     assert "tool_index" not in shapes["tool_semantics"][0]
     assert "shared_contract" not in shapes["tool_semantics"][0]
@@ -1165,7 +1165,7 @@ def test_tool_semantics_repeated_format_uses_immediately_previous_answer_and_sto
         (first_feedback, raw_answers[0]),
         (second_feedback, raw_answers[1]),
     ):
-        assert "Replace the entire immediately preceding answer" in call["feedback"]
+        assert "replace the entire immediately preceding answer" in call["feedback"]
         assert (
             "Delete all prose, labels, Markdown fences, and second JSON values" in call["feedback"]
         )
@@ -1286,7 +1286,7 @@ def test_shared_tool_policy_bound_gets_exact_correction_and_commits(
     assert _feedback_packet(direct.calls[1]) == {
         "code": "shared_tool_semantics_invalid",
         "path": "$.error_policy",
-        "violated_condition": "value must use at most 500 code points",
+        "violated_condition": "value must use at most 500 code points; got 501",
         "expected_category": "string",
     }
     assert contracts[0].error_policy == ((1, "x" * 500), (2, "x" * 500))
@@ -1590,7 +1590,7 @@ def test_shared_tool_format_feedback_reuses_only_ephemeral_rejected_output(
     assert "response is wrapped in a Markdown code fence" in feedback
     assert "expected category object" in feedback
     assert (
-        "Replace the entire immediately preceding answer with one parseable JSON object" in feedback
+        "replace the entire immediately preceding answer with one parseable JSON object" in feedback
     )
     assert "Delete all prose, labels, Markdown fences, and second JSON values" in feedback
     assert "Its first and last non-whitespace characters must be { and }" in feedback
@@ -1755,7 +1755,7 @@ def test_shared_tool_ordering_bound_gets_exact_correction_and_commits(
     assert _feedback_packet(direct.calls[1]) == {
         "code": "shared_tool_semantics_invalid",
         "path": "$.ordering",
-        "violated_condition": "value must use at most 500 code points",
+        "violated_condition": "value must use at most 500 code points; got 501",
         "expected_category": "string",
     }
     assert contracts[0].ordering == ("x" * 500,)
@@ -1789,7 +1789,9 @@ def test_shared_tool_compensation_bound_remains_160(
 
     assert raised.value.correction is not None
     assert raised.value.correction.path == "$.compensation"
-    assert raised.value.correction.violated_condition == ("value must use at most 160 code points")
+    assert raised.value.correction.violated_condition == (
+        "value must use at most 160 code points; got 161"
+    )
 
 
 def test_typed_design_preserves_every_shard_and_uses_exact_visible_projections(
@@ -1929,50 +1931,40 @@ def test_world_architecture_recipient_sees_sparse_field_contract(
     assert [payload["correction"] for payload in payloads] == [None, None]
     assert _feedback_packet(direct.calls[1])["path"] == "$.entities"
     shape = payloads[0]["output_shape"]
-    assert (
-        "Field={name:stripped_snake[1..64],category:text|integer|number|boolean|timestamp|identifier|enum|list,"
-        in shape
-    )
-    assert (
-        "required:boolean,values:enum|list=>unique_nonempty_text[1..16];otherwise=>omit," in shape
-    )
-    assert "values_char_limit:none" in shape
-    assert "entity_ref:actual_relation=>untrimmed_snake[1..64];otherwise=>omit}" in shape
-    assert "objective: return one coherent minimal JSON object" in shape
-    assert "tools must be one coherent minimal JSON array[1..8]" in shape
-    assert "combine related workflow actions when needed" in shape
-    assert (
-        "before returning and after any correction, recheck the complete object against every "
-        "disclosed field, cardinality, uniqueness, reference, actor, and citation rule" in shape
-    )
-    assert (
-        "boundary:{name|system_of_record|authority:stripped_text[1..160],"
-        "purpose:stripped_text[1..4096_unicode_code_points],"
-        "actors[1..8]:stripped_text[1..80]:unique_after_stripping}"
-    ) in shape
-    assert "entities[1..16]{name:stripped_text[1..64]:unique_in_entities," in shape
-    assert "purpose:stripped_text[1..300],fields[1..24]:unique_names<Field;" in shape
-    assert (
-        "fields[1..24]:unique_names<"
-        "Field;entity_ref=emitted_entity_name_in_this_object_when_present>" in shape
-    )
-    assert "tools[1..8]{name:stripped_text[1..64]:unique_in_tools," in shape
-    assert "purpose:stripped_text[1..300],actor_names[1..frozen_actor_count]:" in shape
-    assert (
-        "argument_fields[0..24]:unique_names<"
-        "Field;entity_ref=optional_actual_relation_snake_name;external_relation_label_allowed>"
-        in shape
-    )
-    assert (
-        "result_fields[1..24]:unique_names<"
-        "Field;entity_ref=optional_actual_relation_snake_name;external_relation_label_allowed>"
-        in shape
-    )
-    assert "actor_names[1..frozen_actor_count]:unique_exact_declared_names" in shape
+    # Field layout — the phantom values_char_limit key is gone
+    assert "name      : snake_case" in shape
+    assert "category  : one of text|integer|number|boolean|timestamp|identifier|enum|list" in shape
+    assert "values    : array[1..16]" in shape
+    assert "values_char_limit" not in shape
+    assert "entity_ref: optional snake_case" in shape
+    # Objective
+    assert "Objective: return one coherent minimal JSON object" in shape
+    assert "Combine related workflow actions" in shape
+    # Recheck guidance
+    assert "recheck the complete object against every" in shape
+    assert "cardinality, uniqueness, reference, actor, and citation rule" in shape
+    # Boundary
+    assert "boundary:" in shape
+    assert "system_of_record : stripped text [1..160]" in shape
+    assert "purpose          : stripped text [1..4096 Unicode code points]" in shape
+    assert "actors           : array[1..8] of stripped text [1..80]" in shape
+    # Entities
+    assert "entities: array[1..16]" in shape
+    assert "fields : array[1..24] of Field" in shape
+    # Tools
+    assert "tools: array[1..8]" in shape
+    assert "actor_names     : array[1..N] of exact declared actor names" in shape
+    assert "argument_fields : array[0..24] of Field" in shape
+    assert "result_fields   : array[1..24] of Field" in shape
+    # Known divergences
+    assert "known_divergences: array[0..16]" in shape
+    assert "bounded_inference" in shape
+    assert "citation_indexes: array[1..6]" in shape
+    # Safety: no internal indexes, no empty literals
     assert "actor_indexes" not in shape
     assert "[]" not in shape and "null" not in shape
-    assert "known_divergences[0..16]{statement:stripped_text[1..500]," in shape
-    assert "kind:observed|bounded_inference,citation_indexes:frozen_one_based[1..6]" in shape
+    # Complete example present
+    assert '"boundary":{"name":"ticket_system"' in shape
     graph = design_graph()
     node = graph.node("world_architecture")
     assert (
@@ -2001,8 +1993,8 @@ def test_world_architecture_recipient_sees_sparse_field_contract(
     legacy_material = {
         **semantic_material,
         "output_shape": shape.replace(
-            "before returning and after any correction",
-            "before returning",
+            "Combine related workflow actions",
+            "Merge related workflow actions",
         ),
     }
     assert graph.semantic_revision(graph.node("world_architecture"), semantic_material) != (

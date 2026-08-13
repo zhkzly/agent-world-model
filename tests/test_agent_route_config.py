@@ -519,7 +519,7 @@ def test_codex_agent_sdk_session_is_isolated_and_not_persisted(
     }
     assert captured["skill_names"] == ["research-world-evidence"]
     assert isinstance(captured["skill_body"], str)
-    assert "Synthesize only citation-backed evidence" in captured["skill_body"]
+    assert "citation-backed research" in captured["skill_body"]
     assert captured["closed"] == 1
     assert result.skill_digest == runtime_skill_digest("research-world-evidence")
 
@@ -719,43 +719,6 @@ def test_codex_agent_preserves_require_json_false_behavior(
     assert result == InvocationResult(
         {}, route.model, None, runtime_skill_digest("engineer-environment-codegen")
     )
-
-
-def test_codex_agent_rejects_an_unbounded_completion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    route = AgentRoute("primary", "http://primary.invalid/v1", "PRIMARY_KEY")
-    backend = CodexAgentBackend(route, route)
-    monkeypatch.setenv("PRIMARY_KEY", "primary-credential")
-
-    class FakeThread:
-        async def run(self, _prompt: str, **_kwargs: object) -> SimpleNamespace:
-            return SimpleNamespace(status="completed", final_response="x" * 8_193)
-
-    class FakeAsyncCodex:
-        def __init__(self, _config: CodexConfig) -> None:
-            pass
-
-        async def thread_start(self, **_kwargs: object) -> FakeThread:
-            return FakeThread()
-
-        async def close(self) -> None:
-            return None
-
-    monkeypatch.setattr("agent_world.invocation.AsyncCodex", FakeAsyncCodex)
-
-    with pytest.raises(InvocationError) as raised:
-        backend.invoke_json(
-            work="candidate_build",
-            skill_name="engineer-environment-codegen",
-            workspace=tmp_path / "workspace",
-            instruction="Write the requested files.",
-            writable=True,
-            require_json=False,
-        )
-
-    assert raised.value.failure == SafeFailure("agent_output_too_large", "rejected")
-    assert not list(tmp_path.glob(".foundry-codex-home-*"))
 
 
 def test_codex_agent_does_not_fallback_after_a_non_retryable_failure(

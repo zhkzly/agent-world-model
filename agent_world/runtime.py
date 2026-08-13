@@ -34,6 +34,11 @@ _AUTHORITY_FIELDS = frozenset(
 class CandidateRuntimeError(RuntimeError):
     """Safe code for an untrusted-process contract failure."""
 
+    def __init__(self, code: str, detail: Any = None) -> None:
+        super().__init__(code)
+        self.code = code
+        self.detail = detail
+
 
 @dataclass(frozen=True, slots=True)
 class MaterializationRequest:
@@ -237,6 +242,28 @@ def _leaf_paths(value: object, prefix: str = "") -> set[str]:
         escaped = key.replace("~", "~0").replace("/", "~1")
         leaves.update(_leaf_paths(child, f"{prefix}/{escaped}"))
     return leaves
+
+
+def schema_shape(schema: tuple[tuple[str, str], ...]) -> dict[str, object]:
+    """Inverse of _leaf_paths for a (path, category) schema: the nested dict
+    whose leaf paths equal the schema paths, each leaf labelled with its value
+    category. A self-describing template for the materializer agent — leaves are
+    type labels, not real values, so it is provably shape-correct and cannot be
+    copied verbatim into a valid (but semantically broken) output."""
+    shape: dict[str, object] = {}
+    for path, category in schema:
+        if not path.startswith("/"):
+            continue
+        parts = [raw.replace("~1", "/").replace("~0", "~") for raw in path[1:].split("/")]
+        node: dict[str, object] = shape
+        for key in parts[:-1]:
+            nxt = node.get(key)
+            if not isinstance(nxt, dict):
+                nxt = {}
+                node[key] = nxt
+            node = nxt
+        node[parts[-1]] = category
+    return shape
 
 
 def _validate_schema(value: object, schema: tuple[tuple[str, str], ...], code: str) -> None:
@@ -460,7 +487,15 @@ def _rule_matches(
 
 def _snapshot(response: object, tools: tuple[ToolDraft, ...]) -> dict[str, Any]:
     if not isinstance(response, dict) or set(response) != {"state"}:
-        raise CandidateRuntimeError("candidate_snapshot_rejected")
+        raise CandidateRuntimeError(
+            "candidate_snapshot_rejected",
+            detail={
+                "reason": "snapshot response must be exactly {'state': ...}",
+                "actual_top_level_keys": (
+                    sorted(response) if isinstance(response, dict) else type(response).__name__
+                ),
+            },
+        )
     _safe(response["state"], "candidate_snapshot_rejected")
     state = response["state"]
     if (
@@ -468,16 +503,49 @@ def _snapshot(response: object, tools: tuple[ToolDraft, ...]) -> dict[str, Any]:
         or set(state) != {"tools"}
         or not isinstance(state["tools"], dict)
     ):
-        raise CandidateRuntimeError("candidate_snapshot_projection_mismatch")
+        raise CandidateRuntimeError(
+            "candidate_snapshot_projection_mismatch",
+            detail={
+                "reason": "state must be {'tools': {tool_name: {field: value}}}",
+                "actual_state_keys": (
+                    sorted(state) if isinstance(state, dict) else type(state).__name__
+                ),
+            },
+        )
     expected = {tool.surface.name: tool.surface.result_fields for tool in tools}
     if set(state["tools"]) != set(expected):
-        raise CandidateRuntimeError("candidate_snapshot_projection_mismatch")
+        raise CandidateRuntimeError(
+            "candidate_snapshot_projection_mismatch",
+            detail={
+                "reason": "state.tools keys must equal the declared tool names",
+                "expected_tools": sorted(expected),
+                "actual_tools": sorted(set(state["tools"])),
+            },
+        )
     for tool_name, fields in expected.items():
         values = state["tools"][tool_name]
         if not isinstance(values, dict) or set(values) != {field.name for field in fields}:
-            raise CandidateRuntimeError("candidate_snapshot_projection_mismatch")
-        if any(not _category(values[field.name], field.category) for field in fields):
-            raise CandidateRuntimeError("candidate_snapshot_projection_mismatch")
+            raise CandidateRuntimeError(
+                "candidate_snapshot_projection_mismatch",
+                detail={
+                    "reason": "each tool value must be {field_name: value} for every result_field",
+                    "tool": tool_name,
+                    "expected_fields": sorted({f.name for f in fields}),
+                    "actual_fields": (
+                        sorted(set(values)) if isinstance(values, dict) else type(values).__name__
+                    ),
+                },
+            )
+        bad = {f.name: f.category for f in fields if not _category(values[f.name], f.category)}
+        if bad:
+            raise CandidateRuntimeError(
+                "candidate_snapshot_projection_mismatch",
+                detail={
+                    "reason": "a result_field value has the wrong category",
+                    "tool": tool_name,
+                    "wrong_category_fields": bad,
+                },
+            )
     return state
 
 
@@ -709,7 +777,11 @@ def integrate(
                 }
             )
     except (CandidateRuntimeError, ValueError) as exc:
-        return {"status": "failed", "code": str(exc)}
+        return {
+            "status": "failed",
+            "code": str(exc),
+            "detail": getattr(exc, "detail", None),
+        }
     return {"status": "passed", "code": "ok", "baseline_coverage": coverage}
 
 

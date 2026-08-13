@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import json
 import re
+import typing
 from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import fields as dataclass_fields
 from datetime import UTC, datetime
 from hashlib import sha256
+from types import UnionType
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -75,6 +78,66 @@ def digest_value(value: Any) -> str:
     return digest_text(
         json.dumps(json_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
+
+
+def from_value(value: Any, type_hint: Any) -> Any:
+    """Inverse of *json_value*: reconstruct a typed value from JSON-ready data.
+
+    Type-hint driven: dataclasses are rebuilt (re-running ``__post_init__``),
+    JSON lists become tuples when the hint says *tuple*, and ``Optional``/
+    ``X | None`` are unwrapped.  Basic types pass through unchanged.
+    """
+
+    origin = typing.get_origin(type_hint)
+
+    # Union / Optional / X | None ---------------------------------------------------
+    if origin is typing.Union or origin is UnionType:
+        args = typing.get_args(type_hint)
+        if len(args) == 2 and type(None) in args:
+            if value is None:
+                return None
+            non_none = next(a for a in args if a is not type(None))
+            return from_value(value, non_none)
+        return value
+
+    # Literal -----------------------------------------------------------------------
+    if origin is typing.Literal:
+        return value
+
+    # tuple -------------------------------------------------------------------------
+    if origin is tuple:
+        args = typing.get_args(type_hint)
+        if len(args) == 2 and args[1] is Ellipsis:
+            return tuple(from_value(item, args[0]) for item in value)
+        return tuple(from_value(item, arg) for item, arg in zip(value, args, strict=True))
+
+    # list --------------------------------------------------------------------------
+    if origin is list:
+        args = typing.get_args(type_hint)
+        if args:
+            return [from_value(item, args[0]) for item in value]
+        return list(value)
+
+    # dict ---------------------------------------------------------------------------
+    if origin is dict:
+        args = typing.get_args(type_hint)
+        if len(args) == 2:
+            return {k: from_value(v, args[1]) for k, v in value.items()}
+        return dict(value)
+
+    # dataclass ----------------------------------------------------------------------
+    if isinstance(type_hint, type) and is_dataclass(type_hint):
+        hints = typing.get_type_hints(type_hint)
+        field_names = {f.name for f in dataclass_fields(type_hint)}
+        kwargs = {
+            name: from_value(value[name], hints.get(name, Any))
+            for name in field_names
+            if name in value
+        }
+        return type_hint(**kwargs)
+
+    # basic types (str, int, float, bool, None, Any) --------------------------------
+    return value
 
 
 def _digest(value: str, code: str) -> None:

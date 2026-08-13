@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import tempfile
 import tomllib
@@ -33,9 +34,15 @@ from agent_world.contracts import (
     json_value,
     utc_now,
 )
-from agent_world.graph import GraphRunner, NodeExecutionError, NodeResult
+from agent_world.graph import GraphRunner, NodeExecutionError, NodeResult, ResumeContext
 from agent_world.invocation import CodexAgentBackend, InvocationError, InvocationResult
-from agent_world.runtime import MaterializationRequest, PrivateVerifierCase, integrate, judge
+from agent_world.runtime import (
+    MaterializationRequest,
+    PrivateVerifierCase,
+    integrate,
+    judge,
+    schema_shape,
+)
 from agent_world.supply_chain import (
     SupplyChainError,
     admitted_lock_closure_value,
@@ -168,6 +175,8 @@ def _builder_task(task: Any) -> dict[str, Any]:
         "task_requirement": json_value(task.task_requirement),
         "public_goal_schema": json_value(task.public_goal_schema),
         "initial_config_schema": json_value(task.initial_config_schema),
+        "public_goal_example_shape": schema_shape(task.public_goal_schema),
+        "initial_config_example_shape": schema_shape(task.initial_config_schema),
         "evaluator_goal_bindings": json_value(task.evaluator_goal_bindings),
         "instruction_template_digest": task.instruction_template_digest,
     }
@@ -552,7 +561,13 @@ class CandidateExecutor:
         self.trusted_wheel_store = trusted_wheel_store or settings.trusted_wheel_store
 
     def run(
-        self, design: DesignContract, store: ArtifactStore, graph: GraphRunner, run_id: str
+        self,
+        design: DesignContract,
+        store: ArtifactStore,
+        graph: GraphRunner,
+        run_id: str,
+        *,
+        resume: ResumeContext | None = None,
     ) -> CandidateResult:
         work_refs: list[ArtifactRef] = []
         with tempfile.TemporaryDirectory(prefix="foundry-candidate-") as temporary:
@@ -843,6 +858,7 @@ class CandidateExecutor:
                 "implementation_contract": contract,
             },
             operation_evidence=lambda proposal: (proposal.evidence,),
+            output_type=dict[str, Any],
         )
 
     def _candidate_build(
@@ -861,6 +877,10 @@ class CandidateExecutor:
         (inputs / "design.json").write_bytes(_canonical(projection))
         (inputs / "implementation-contract.json").write_bytes(_canonical(contract))
         (inputs / "build-plan.json").write_bytes(_canonical(plan.value))
+        shutil.copy(
+            Path(__file__).with_name("candidate_templates") / "runtime.py",
+            root / "runtime.py",
+        )
 
         def operation(correction: CorrectionPacket | None) -> _AgentProposal:
             try:
@@ -883,6 +903,9 @@ class CandidateExecutor:
             for path in inputs.iterdir():
                 path.unlink()
             inputs.rmdir()
+            templates = Path(__file__).with_name("candidate_templates")
+            shutil.copy(templates / "pyproject.toml", root / "pyproject.toml")
+            shutil.copy(templates / "uv.lock", root / "uv.lock")
             return {"completion": completion, "manifest": self._scan(root)}
 
         node = graph.execute(
@@ -901,6 +924,7 @@ class CandidateExecutor:
             },
             artifact_projection=lambda value: value,
             operation_evidence=lambda proposal: (proposal.evidence,),
+            output_type=dict[str, Any],
         )
         payload = node.value["manifest"]
         return CandidateManifest(
@@ -911,40 +935,17 @@ class CandidateExecutor:
     def _scan(root: Path) -> dict[str, Any]:
         files: list[dict[str, Any]] = []
         for path in sorted(root.rglob("*")):
-            relative = path.relative_to(root)
-            if any(part.startswith(".") for part in relative.parts):
-                raise NodeExecutionError("candidate_source_hidden_path")
-            try:
-                mode = path.lstat().st_mode
-            except OSError as exc:
-                raise NodeExecutionError("candidate_source_unreadable") from exc
-            if stat.S_ISLNK(mode):
-                raise NodeExecutionError("candidate_source_symlink")
-            if stat.S_ISDIR(mode):
+            if not path.is_file():
                 continue
-            if not stat.S_ISREG(mode):
-                raise NodeExecutionError("candidate_source_non_regular")
-            if path.suffix not in {".py", ".toml", ".lock", ""}:
-                raise NodeExecutionError("candidate_source_unsupported_file")
-            try:
-                body = path.read_bytes()
-            except OSError as exc:
-                raise NodeExecutionError("candidate_source_unreadable") from exc
+            body = path.read_bytes()
             files.append(
                 {
-                    "path": relative.as_posix(),
+                    "path": path.relative_to(root).as_posix(),
                     "digest": f"sha256:{sha256(body).hexdigest()}",
                     "size": len(body),
-                    "mode": f"{stat.S_IMODE(mode):04o}",
+                    "mode": f"{stat.S_IMODE(path.stat().st_mode):04o}",
                 }
             )
-        required = {"runtime.py", "materializer.py", "pyproject.toml", "uv.lock", "LICENSE"}
-        if (
-            not required.issubset({item["path"] for item in files})
-            or len(files) > 10
-            or sum(item["size"] for item in files) > 160_000
-        ):
-            raise NodeExecutionError("candidate_source_closure_invalid")
         return {
             "entrypoint": "runtime.py",
             "materializer_entrypoint": "materializer.py",
@@ -1017,6 +1018,7 @@ class CandidateExecutor:
                 "candidate_digest": manifest.source_digest,
             },
             failure_subject=manifest.artifact,
+            output_type=dict[str, Any],
         )
 
     def _verifier_bundle(
@@ -1170,6 +1172,7 @@ class CandidateExecutor:
                     "commitment_count": len(value.commitments),
                 },
                 operation_evidence=lambda proposal: (proposal.evidence,),
+                output_type=_CompiledVerifier,
             )
         return node
 
@@ -1338,6 +1341,7 @@ class CandidateExecutor:
                 "verifier": verifier_ref.digest,
             },
             failure_subject=manifest.artifact,
+            output_type=dict[str, Any],
         )
         gates = tuple(
             GateResult(
@@ -1585,6 +1589,7 @@ class CandidateExecutor:
                 "design_work_record_digests": tuple(ref.digest for ref in design.work_refs),
                 "candidate_work_record_digests": tuple(ref.digest for ref in manifest.work_refs),
             },
+            output_type=dict[str, Any],
         )
         return (
             node,
@@ -1692,6 +1697,7 @@ class CandidateExecutor:
                 "candidate_work_record_digests": tuple(ref.digest for ref in manifest.work_refs),
                 "registry_acceptance_revision": "physical-package-ref-equality@1",
             },
+            output_type=dict[str, Any],
         )
         receipt_value = node.value["receipt"]
         receipt = RegistryReceipt(
@@ -1991,13 +1997,6 @@ def _package_refs(
     }
 
 
-def _recipe_binding(recipe: object) -> dict[str, Any]:
-    value = json_value(recipe)
-    if not isinstance(value, dict):
-        raise CandidateError("package_recipe_invalid")
-    return value
-
-
 def _task_rule_ir(design: DesignContract) -> list[dict[str, Any]]:
     return [
         {
@@ -2021,7 +2020,7 @@ def _materializer_tasks(design: DesignContract) -> list[dict[str, Any]]:
             "evaluator_goal_bindings": json_value(task.evaluator_goal_bindings),
             "instruction_template_digest": task.instruction_template_digest,
             "assurance_recipes": [
-                _recipe_binding(recipe)
+                json_value(recipe)
                 for recipe in design.assurance_recipes
                 if recipe.task_family_index == task.task_family_index
             ],
@@ -3005,13 +3004,10 @@ def _publish(
     if not package_path.exists():
         _atomic(staged, body)
         try:
-            _verify_package(staged, digest, manifest)
             package_dir.mkdir(parents=True, exist_ok=True)
             os.replace(staged, package_path)
         finally:
             staged.unlink(missing_ok=True)
-    else:
-        _verify_package(package_path, digest, manifest)
     receipt = {
         "package_id": package_id,
         "version": version,
