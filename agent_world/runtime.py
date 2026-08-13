@@ -637,22 +637,35 @@ def _run_recipe(
                 result = _result(first, tool)
             assert result is not None
             post_state = _snapshot(process.call({"op": "snapshot"}), tools)
-            local_trace = {
-                "arguments": arguments,
-                "result": result,
-                "pre_state": pre_state,
-                "post_state": post_state,
-            }
-            selected_rules = (*tool.preconditions[:1], *tool.transitions[:1])
-            if len(selected_rules) != 2 or any(
-                not _rule_matches(rule, tool.bindings, local_trace) for rule in selected_rules
-            ):
-                raise CandidateRuntimeError("local_tool_semantics_mismatch")
             index = str(tool.tool_index)
             task_trace["argument"][index] = arguments
             task_trace["tool_result"][index] = result
             task_trace["pre_state"][index] = pre_state["tools"][tool.surface.name]
             task_trace["post_state"][index] = post_state["tools"][tool.surface.name]
+            selected_rules = (*tool.preconditions[:1], *tool.transitions[:1])
+            if len(selected_rules) != 2:
+                raise CandidateRuntimeError(
+                    "local_tool_semantics_mismatch",
+                    detail={"reason": "tool must have >=1 precondition and >=1 transition",
+                            "preconditions_count": len(tool.preconditions),
+                            "transitions_count": len(tool.transitions)},
+                )
+            for rule_type, rule in (("precondition", tool.preconditions[0]),
+                                     ("transition", tool.transitions[0])):
+                if not _predicates(rule, tool.bindings, task_trace):
+                    raise CandidateRuntimeError(
+                        "local_tool_semantics_mismatch",
+                        detail={"failed": "predicates", "rule_type": rule_type,
+                                "rationale": rule.rationale,
+                                "bindings": [(b.index, b.source, b.name) for b in tool.bindings]},
+                    )
+                if not _effects(rule, tool.bindings, task_trace):
+                    raise CandidateRuntimeError(
+                        "local_tool_semantics_mismatch",
+                        detail={"failed": "effects", "rule_type": rule_type,
+                                "rationale": rule.rationale,
+                                "bindings": [(b.index, b.source, b.name) for b in tool.bindings]},
+                    )
             if action_index == recipe.tool_index:
                 covered = True
                 break

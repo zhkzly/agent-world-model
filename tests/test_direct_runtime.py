@@ -63,21 +63,12 @@ def _ref(name: str) -> ArtifactRef:
 
 
 def _tool(surface: ToolSurface, shared_digest: str) -> ToolDraft:
+    index = str(surface.tool_index)
     bindings = (
-        SemanticBinding(1, "argument", "request_id", ("arguments", "request_id")),
-        SemanticBinding(2, "tool_result", "status", ("result", "status")),
-        SemanticBinding(
-            3,
-            "pre_state",
-            "status",
-            ("pre_state", "tools", surface.name, "status"),
-        ),
-        SemanticBinding(
-            4,
-            "post_state",
-            "status",
-            ("post_state", "tools", surface.name, "status"),
-        ),
+        SemanticBinding(1, "argument", "request_id", ("argument", index, "request_id")),
+        SemanticBinding(2, "tool_result", "status", ("tool_result", index, "status")),
+        SemanticBinding(3, "pre_state", "status", ("pre_state", index, "status")),
+        SemanticBinding(4, "post_state", "status", ("post_state", index, "status")),
     )
     preconditions = (RuleDraft((), (EffectDraft(2, "set", "ok"),), None, "result exists", (1,)),)
     transitions = (RuleDraft((), (EffectDraft(4, "set", "ok"),), None, "state updates", (1,)),)
