@@ -7,6 +7,7 @@ environment's actual logic. Use only the Python standard library.
 """
 import json
 import sys
+import traceback
 
 OPERATIONS = ("handshake", "reset", "invoke", "snapshot", "close")
 
@@ -21,22 +22,33 @@ _state: dict = {}
 # ---------------------------------------------------------------------------
 def main() -> None:
     for line in sys.stdin:
-        request = json.loads(line)
-        op = request.get("op")
-        if op == "handshake":
-            response = {"operations": list(OPERATIONS)}
-        elif op == "reset":
-            response = do_reset(request)
-        elif op == "invoke":
-            response = do_invoke(request)
-        elif op == "snapshot":
-            response = do_snapshot()
-        elif op == "close":
-            response = do_close()
-        else:
-            response = {"status": "error", "error": f"unknown op: {op}"}
+        closing = False
+        try:
+            request = json.loads(line)
+            op = request.get("op")
+            if op == "handshake":
+                response = {"operations": list(OPERATIONS)}
+            elif op == "reset":
+                response = do_reset(request)
+            elif op == "invoke":
+                response = do_invoke(request)
+            elif op == "snapshot":
+                response = do_snapshot()
+            elif op == "close":
+                closing = True
+                response = do_close()
+            else:
+                response = {"status": "error", "error": f"unknown op: {op}"}
+        except Exception as exc:  # noqa: BLE001 - never crash the protocol; report as JSON
+            response = {
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc()[-2000:],
+            }
         sys.stdout.write(json.dumps(response) + "\n")
         sys.stdout.flush()
+        if closing:
+            break
 
 
 # ---------------------------------------------------------------------------

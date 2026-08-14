@@ -96,7 +96,7 @@ def _tool(surface: ToolSurface, shared_digest: str) -> ToolDraft:
 
 def _task_rule(binding_index: int, value: str = "ok") -> RuleDraft:
     return RuleDraft(
-        (PredicateDraft(binding_index, "eq", {"kind": "literal", "value": value}),),
+        (PredicateDraft(binding_index, "eq", value),),
         (),
         None,
         "the scoped tool completed",
@@ -159,7 +159,7 @@ def _runtime_contracts() -> RuntimeContracts:
     )
     requirements = (
         TaskRequirement(1, (1,), (), (_task_rule(2),), (), (_task_rule(2),), _ref("task-1")),
-        TaskRequirement(2, (5,), (), (_task_rule(6),), (), (_task_rule(6),), _ref("task-2")),
+        TaskRequirement(2, (6,), (), (_task_rule(7),), (), (_task_rule(7),), _ref("task-2")),
     )
     recipes: list[AssuranceRecipe] = []
     for family, requirement in zip(families, requirements, strict=True):
@@ -300,6 +300,45 @@ def _replace_source(path: Path, old: str, new: str) -> None:
     body = path.read_text(encoding="utf-8")
     assert old in body
     path.write_text(body.replace(old, new), encoding="utf-8")
+
+
+
+
+def test_materialize_serves_a_non_flushing_materializer(tmp_path: Path) -> None:
+    (tmp_path / "runtime.py").write_text(
+        "import json,sys\nfor line in sys.stdin:\n    print(json.dumps({'status':'ok'}))\n",
+        encoding="utf-8",
+    )
+    # A materializer that never flushes stdout: print() without flush.
+    materializer_body = (
+        "import json,sys\n"
+        "def main():\n"
+        "    for line in sys.stdin:\n"
+        "        request = json.loads(line)\n"
+        "        print(json.dumps({\n"
+        "            'seed': request['seed'],\n"
+        "            'task_type': request['task_type'],\n"
+        "            'actor': request['actor'],\n"
+        "            'difficulty': request['difficulty'],\n"
+        "            'public_goal': {'goal': 'g'},\n"
+        "            'initial_config': {'tools': {}},\n"
+        "        }))\n"
+        "main()\n"
+    )
+    (tmp_path / "materializer.py").write_text(
+        materializer_body,
+        encoding="utf-8",
+    )
+    contracts = _runtime_contracts()
+    schema = contracts.schemas[0]
+    result = materialize(
+        tmp_path,
+        MaterializationRequest(
+            1, schema.task_family_id, "operator", (("urgency", "low"),)
+        ),
+        schema,
+    )
+    assert result["public_goal"] == {"goal": "g"}
 
 
 def test_integration_and_judge_execute_every_typed_recipe(tmp_path: Path) -> None:
@@ -625,16 +664,16 @@ def _rule_trace() -> dict[str, Any]:
 @pytest.mark.parametrize(
     ("operator", "left", "right"),
     [
-        ("eq", 1, {"kind": "literal", "value": 5}),
-        ("ne", 1, {"kind": "literal", "value": 6}),
-        ("lt", 1, {"kind": "literal", "value": 6}),
-        ("le", 1, {"kind": "literal", "value": 5}),
-        ("gt", 1, {"kind": "literal", "value": 4}),
-        ("ge", 1, {"kind": "literal", "value": 5}),
-        ("contains", 2, {"kind": "literal", "value": "ell"}),
-        ("not_contains", 3, {"kind": "literal", "value": "b"}),
-        ("exists", 1, {"kind": "literal", "value": None}),
-        ("not_exists", 4, {"kind": "literal", "value": None}),
+        ("eq", 1, 5),
+        ("ne", 1, 6),
+        ("lt", 1, 6),
+        ("le", 1, 5),
+        ("gt", 1, 4),
+        ("ge", 1, 5),
+        ("contains", 2, "ell"),
+        ("not_contains", 3, "b"),
+        ("exists", 1, None),
+        ("not_exists", 4, None),
     ],
 )
 def test_rule_ir_supports_every_predicate(
@@ -642,7 +681,7 @@ def test_rule_ir_supports_every_predicate(
         "eq", "ne", "lt", "le", "gt", "ge", "contains", "not_contains", "exists", "not_exists"
     ],
     left: int,
-    right: dict[str, object],
+    right: object,
 ) -> None:
     rule = RuleDraft(
         (PredicateDraft(left, operator, right),),
@@ -678,7 +717,7 @@ def test_rule_ir_supports_every_effect(effect: EffectDraft) -> None:
 
 def test_rule_ir_fails_closed_for_category_mismatch_and_reject() -> None:
     category = RuleDraft(
-        (PredicateDraft(2, "contains", {"kind": "literal", "value": 1}),),
+        (PredicateDraft(2, "contains", 1),),
         (),
         None,
         "category mismatch",
@@ -708,11 +747,30 @@ def test_task_evaluator_uses_failure_precedence_and_exact_termination() -> None:
     assert _task_outcome(task, contracts.tools, trace) == (1, True)
     failed_requirement = replace(
         task.task_requirement,
-        failure_rules=task.task_requirement.success_rules,
+        success_rules=(_task_rule(2, "ok"),),
+        failure_rules=(_task_rule(2, "failed"),),
     )
+    failed_trace = {
+        **trace,
+        "post_state": {"1": {"status": "failed"}},
+        "tool_result": {"1": {"status": "failed"}},
+    }
     assert _task_outcome(
-        replace(task, task_requirement=failed_requirement), contracts.tools, trace
+        replace(task, task_requirement=failed_requirement), contracts.tools, failed_trace
     ) == (-1, True)
+    # Overlapping success/failure is a design defect, not a precedence case.
+    with pytest.raises(CandidateRuntimeError, match="task_rule_ambiguous"):
+        _task_outcome(
+            replace(
+                task,
+                task_requirement=replace(
+                    task.task_requirement,
+                    failure_rules=task.task_requirement.success_rules,
+                ),
+            ),
+            contracts.tools,
+            trace,
+        )
     unreachable_requirement = replace(
         task.task_requirement,
         success_rules=(_task_rule(2, "never"),),

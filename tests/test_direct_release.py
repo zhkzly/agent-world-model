@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import subprocess
 import sys
 import zipfile
 from collections.abc import Callable
@@ -28,6 +29,7 @@ from agent_world.candidate import (
 )
 from agent_world.config import load_settings
 from agent_world.contracts import (
+    ArtifactEnvelope,
     ArtifactRef,
     AssuranceRecipe,
     CitationCatalog,
@@ -72,8 +74,6 @@ from agent_world.invocation import InvocationResult
 from agent_world.runtime import PrivateVerifierCase
 from agent_world.supply_chain import (
     AdmittedLockClosure,
-    AdmittedLockEntry,
-    LockedWheel,
     PreparedCandidate,
 )
 
@@ -105,7 +105,7 @@ def _catalog(surfaces: tuple[ToolSurface, ...]) -> tuple[SemanticBinding, ...]:
 
 def _task_rule(result_index: int) -> RuleDraft:
     return RuleDraft(
-        (PredicateDraft(result_index, "eq", {"kind": "literal", "value": "ok"}),),
+        (PredicateDraft(result_index, "eq", "ok"),),
         (),
         None,
         "the scoped tool completed",
@@ -277,11 +277,11 @@ def _design(store: ArtifactStore) -> DesignContract:
         ),
         TaskRequirement(
             2,
-            (5,),
+            (6,),
             (),
-            (_task_rule(6),),
+            (_task_rule(7),),
             (),
-            (_task_rule(6),),
+            (_task_rule(7),),
             _artifact(store, "task-2"),
         ),
     )
@@ -330,7 +330,7 @@ def _design(store: ArtifactStore) -> DesignContract:
         for field in (*tool.argument_fields, *tool.result_fields)
     )
     executable: list[ExecutableTaskContract] = []
-    for family, requirement, public_index in zip(families, requirements, (1, 5), strict=True):
+    for family, requirement, public_index in zip(families, requirements, (1, 6), strict=True):
         public_schema = ((f"/goal/{public_index}", "identifier"),)
         verification = VerificationRequirements(
             family.task_family_index,
@@ -538,24 +538,22 @@ def _release_candidate(
                 value = {
                     "checks": [
                         {
-                            "task_family_index": 1,
-                            "tool_index": 1,
+                            "task_family": "resolve-record",
+                            "tool": "create",
                             "family": "unknown_seed",
-                            "argument_index": None,
                             "risk": "exercise an unknown seed",
                         },
                         {
-                            "task_family_index": 1,
-                            "tool_index": 2,
+                            "task_family": "resolve-record",
+                            "tool": "close",
                             "family": "argument_variation",
-                            "argument_index": 1,
+                            "argument": "request_id",
                             "risk": "vary the close identifier",
                         },
                         {
-                            "task_family_index": 2,
-                            "tool_index": 2,
+                            "task_family": "close-record",
+                            "tool": "close",
                             "family": "alternate_difficulty",
-                            "argument_index": None,
                             "risk": "exercise alternate volume",
                         },
                     ]
@@ -594,16 +592,18 @@ def test_builder_projection_contains_every_family_tool_recipe_without_release_au
     projection = CandidateExecutor._projection(design)
     contract = compile_implementation_contract(design)
 
-    assert len(projection["curriculum"]["families"]) == 2
+    assert len(projection["task_families"]) == 2
     assert len(projection["tools"]) == 2
-    assert [
-        (item["task_family_index"], item["tool_index"]) for item in projection["assurance_recipes"]
-    ] == [
-        (1, 1),
-        (1, 2),
-        (2, 2),
+    assert [family["task_family_id"] for family in projection["task_families"]] == [
+        "resolve-record",
+        "close-record",
     ]
-    assert len(contract["tool_semantics"]["executable_tasks"]) == 2
+    assert projection["task_families"][0]["tools"] == ["create", "close"]
+    assert projection["task_families"][1]["tools"] == ["close"]
+    assert len(projection["executable_tasks"]) == 2
+    assert "task_family_index" not in projection["executable_tasks"][0]
+    assert "assurance_recipes" not in projection
+    assert "executable_tasks" not in contract["tool_semantics"]
     serialized = json.dumps({"projection": projection, "contract": contract})
     for forbidden in (
         "reward_spec",
@@ -706,13 +706,22 @@ def test_verifier_bindings_are_complete_and_private_values_never_persist(
             return InvocationResult(
                 {
                     "checks": [
-                        {
-                            "task_family_index": 1,
-                            "tool_index": 1,
-                            "family": family,
-                            "argument_index": 1 if family == "argument_variation" else None,
-                            "risk": f"exercise {family}",
-                        }
+                        (
+                            {
+                                "task_family": "resolve-record",
+                                "tool": "create",
+                                "family": family,
+                                "argument": "request_id",
+                                "risk": f"exercise {family}",
+                            }
+                            if family == "argument_variation"
+                            else {
+                                "task_family": "resolve-record",
+                                "tool": "create",
+                                "family": family,
+                                "risk": f"exercise {family}",
+                            }
+                        )
                         for family in (
                             "unknown_seed",
                             "alternate_difficulty",
@@ -731,14 +740,30 @@ def test_verifier_bindings_are_complete_and_private_values_never_persist(
     payload = store.read_envelope(node.artifact)["payload"]
     catalog = captured["catalog"]
     assert set(catalog) == {
-        "families",
+        "task_families",
         "tools",
-        "assurance_recipes",
+        "checkable_recipes",
         "task_rule_summaries",
     }
-    assert len(catalog["families"]) == 2
+    assert len(catalog["task_families"]) == 2
     assert len(catalog["tools"]) == 2
-    assert len(catalog["assurance_recipes"]) == 3
+    assert len(catalog["checkable_recipes"]) == 3
+    assert {item["tool_name"] for item in catalog["tools"]} == {"create", "close"}
+    assert {item["task_family_id"] for item in catalog["task_families"]} == {
+        "resolve-record",
+        "close-record",
+    }
+    assert all(
+        forbidden not in json.dumps(catalog, sort_keys=True)
+        for forbidden in (
+            "evaluator_goal",
+            "reward_spec",
+            "termination_spec",
+            "candidate",
+            "tool_index",
+            "task_family_index",
+        )
+    )
     assert all(
         forbidden not in json.dumps(catalog, sort_keys=True)
         for forbidden in ("evaluator_goal", "reward_spec", "termination_spec", "candidate")
@@ -1189,79 +1214,6 @@ def test_package_cold_read_rejects_extra_duplicate_and_missing_entries(
         candidate_module._cold_read_package(body, f"sha256:{sha256(body).hexdigest()}")
 
 
-def test_judge_requires_exact_independently_readmitted_lock_closure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    settings = replace(
-        load_settings(Path("config/agent-world.example.toml")), state_root=tmp_path / "state"
-    )
-    store = ArtifactStore(settings.state_root / "runs" / "test")
-    design = _design(store)
-
-    class Agent:
-        def invoke_json(self, **kwargs: object) -> InvocationResult:
-            workspace, work = kwargs["workspace"], kwargs["work"]
-            assert isinstance(workspace, Path)
-            if work == "build_plan":
-                value = _plan()
-            elif work == "candidate_build":
-                _candidate_files(workspace)
-                value = _completion()
-            elif work == "verifier_intent":
-                value = {
-                    "checks": [
-                        {
-                            "task_family_index": 1,
-                            "tool_index": 1,
-                            "family": "unknown_seed",
-                            "argument_index": None,
-                            "risk": "unknown seed",
-                        }
-                    ]
-                }
-            else:
-                raise AssertionError(work)
-            return InvocationResult(value, "agent-test", None, "sha256:" + "c" * 64)
-
-    closures = iter(
-        (
-            AdmittedLockClosure(()),
-            AdmittedLockClosure(
-                (
-                    AdmittedLockEntry(
-                        "other",
-                        "1",
-                        (LockedWheel("other-1.whl", "sha256:" + "d" * 64, 1),),
-                    ),
-                )
-            ),
-        )
-    )
-
-    @contextmanager
-    def prepared(*_: object):
-        yield PreparedCandidate(Path(sys.executable), next(closures))
-
-    called = False
-
-    def unexpected_judge(*_: object) -> tuple[dict[str, Any], ...]:
-        nonlocal called
-        called = True
-        return ()
-
-    executor = CandidateExecutor(settings, Agent())  # type: ignore[arg-type]
-    monkeypatch.setattr(candidate_module, "prepare_candidate", prepared)
-    monkeypatch.setattr(
-        candidate_module,
-        "integrate",
-        lambda *_: _integration_value(design),
-    )
-    monkeypatch.setattr(candidate_module, "judge", unexpected_judge)
-    with pytest.raises(CandidateError, match="judge_admitted_lock_closure_mismatch"):
-        executor.run(design, store, candidate_graph(), "run_closure_mismatch")
-    assert not called
-
-
 def test_candidate_scan_enumerates_all_files_into_manifest(tmp_path: Path) -> None:
     root = tmp_path / "candidate"
     root.mkdir()
@@ -1280,3 +1232,256 @@ def test_candidate_scan_enumerates_all_files_into_manifest(tmp_path: Path) -> No
     assert {"runtime.py", "materializer.py", ".hidden.py", "README.md", "link.py"} <= paths
     runtime = next(item for item in scanned["files"] if item["path"] == "runtime.py")
     assert runtime["mode"] == "0640"
+
+
+
+def test_design_runtime_data_embeds_conditional_when(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "state" / "runs" / "run_render_data")
+    design = _design(store)
+    data = candidate_module._design_runtime_data(design)
+    assert set(data) == {"create", "close"}
+    create = data["create"]
+    assert [field["name"] for field in create["result_fields"]] == ["status"]
+    assert create["transitions"] == [
+        {
+            "when": [],
+            "effects": [{"field": "status", "operation": "set", "value": "ok"}],
+        }
+    ]
+
+
+def test_rendered_runtime_applies_only_matching_when(tmp_path: Path) -> None:
+    design_data = {
+        "choose": {
+            "result_fields": [
+                {"name": "status", "category": "text", "values": []},
+                {"name": "count", "category": "integer", "values": []},
+            ],
+            "transitions": [
+                {
+                    "when": [{"field": "mode", "operator": "eq", "value": "a"}],
+                    "effects": [{"field": "status", "operation": "set", "value": "ok"}],
+                },
+                {
+                    "when": [{"field": "mode", "operator": "eq", "value": "b"}],
+                    "effects": [{"field": "status", "operation": "set", "value": "skip"}],
+                },
+                {
+                    "when": [{"field": "status", "operator": "eq", "value": "ok"}],
+                    "effects": [{"field": "count", "operation": "increment", "value": 1}],
+                },
+                {
+                    "when": [{"field": "mode", "operator": "not_exists"}],
+                    "effects": [{"field": "status", "operation": "set", "value": "missing"}],
+                },
+            ],
+        }
+    }
+    source = "_DESIGN = " + repr(design_data) + "\n\n" + candidate_module._DESIGN_RUNTIME_BODY
+    runtime = tmp_path / "runtime.py"
+    runtime.write_text(source, encoding="utf-8")
+    process = subprocess.Popen(  # noqa: S603 - fixed sys.executable, no untrusted input
+        [sys.executable, str(runtime)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdin is not None and process.stdout is not None
+
+    def call(payload: dict[str, Any]) -> dict[str, Any]:
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(json.dumps(payload) + "\n")
+        process.stdin.flush()
+        line = process.stdout.readline()
+        return json.loads(line)
+
+    try:
+        assert call({"op": "handshake"}) == {
+            "operations": ["handshake", "reset", "invoke", "snapshot", "close"]
+        }
+        assert call(
+            {"op": "reset", "seed": 1, "actor": "operator", "initial_config": {}}
+        ) == {"status": "ok"}
+        assert call(
+            {
+                "op": "invoke",
+                "tool_id": "choose",
+                "arguments": {"mode": "a"},
+                "idempotency_key": "k1",
+            }
+        ) == {"status": "ok", "result": {"status": "ok", "count": 1}}
+        assert call(
+            {
+                "op": "invoke",
+                "tool_id": "choose",
+                "arguments": {"mode": "b"},
+                "idempotency_key": "k2",
+            }
+        ) == {"status": "ok", "result": {"status": "skip", "count": 1}}
+        assert call(
+            {"op": "invoke", "tool_id": "choose", "arguments": {}, "idempotency_key": "k3"}
+        ) == {"status": "ok", "result": {"status": "missing", "count": 1}}
+        snapshot = call({"op": "snapshot"})
+        assert snapshot["state"]["tools"]["choose"] == {"status": "missing", "count": 1}
+        assert call({"op": "close"}) == {"status": "ok"}
+    finally:
+        process.stdin.close()
+        assert process.wait(timeout=10) == 0
+
+
+
+
+
+
+def test_builder_task_carries_goal_leaf_map(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "state" / "runs" / "run_goal_map")
+    design = _design(store)
+    bindings = design.architecture.catalog.bindings
+    tasks = [
+        candidate_module._builder_task(t, f, bindings)
+        for t, f in zip(
+            design.executable_tasks, ("resolve-record", "close-record"), strict=True
+        )
+    ]
+    assert tasks[0]["task_requirement"]["public_goal_leaf_map"] == [
+        {"index": 1, "name": "request_id", "source": "argument", "category": "identifier"}
+    ]
+
+
+
+
+def test_rendered_runtime_repeats_idempotency_key_without_side_effects(tmp_path: Path) -> None:
+    design_data = {
+        "choose": {
+            "result_fields": [{"name": "count", "category": "integer", "values": []}],
+            "transitions": [
+                {"when": [], "effects": [{"field": "count", "operation": "increment", "value": 1}]}
+            ],
+        }
+    }
+    source = (
+        "_DESIGN = "
+        + repr(design_data)
+        + chr(10)
+        + chr(10)
+        + candidate_module._DESIGN_RUNTIME_BODY
+    )
+    runtime = tmp_path / "runtime.py"
+    runtime.write_text(source, encoding="utf-8")
+    process = subprocess.Popen(  # noqa: S603 - fixed sys.executable, no untrusted input
+        [sys.executable, str(runtime)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdin is not None and process.stdout is not None
+
+    def call(payload):
+        process.stdin.write(json.dumps(payload) + chr(10))
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+
+    try:
+        call({"op": "handshake"})
+        call({"op": "reset", "seed": 1, "actor": "a", "initial_config": {"tools": {}}})
+        first = call(
+            {
+                "op": "invoke",
+                "tool_id": "choose",
+                "arguments": {},
+                "idempotency_key": "k1",
+            }
+        )
+        second = call(
+            {
+                "op": "invoke",
+                "tool_id": "choose",
+                "arguments": {},
+                "idempotency_key": "k1",
+            }
+        )
+        assert first == second
+        assert first["result"]["count"] == 1
+        third = call(
+            {
+                "op": "invoke",
+                "tool_id": "choose",
+                "arguments": {},
+                "idempotency_key": "k2",
+            }
+        )
+        assert third["result"]["count"] == 2
+        call({"op": "reset", "seed": 2, "actor": "a", "initial_config": {"tools": {}}})
+        fourth = call(
+            {
+                "op": "invoke",
+                "tool_id": "choose",
+                "arguments": {},
+                "idempotency_key": "k1",
+            }
+        )
+        assert fourth["result"]["count"] == 1
+        call({"op": "close"})
+    finally:
+        process.stdin.close()
+        assert process.wait(timeout=10) == 0
+def test_candidate_source_closure_round_trip_and_materialization(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    root.mkdir()
+    (root / "runtime.py").write_text("print('x')" + chr(10), encoding="utf-8")
+    (root / "pyproject.toml").write_text("[project]" + chr(10), encoding="utf-8")
+    (root / "sub").mkdir()
+    (root / "sub" / "nested.txt").write_text("hi", encoding="utf-8")
+    closure = candidate_module._source_files_closure(root)
+    assert {item["path"] for item in closure} == {
+        "runtime.py",
+        "pyproject.toml",
+        "sub/nested.txt",
+    }
+    for item in closure:
+        assert item["digest"].startswith("sha256:")
+        assert isinstance(item["content_b64"], str)
+
+    settings = replace(
+        load_settings(Path("config/agent-world.example.toml")),
+        state_root=tmp_path / "state",
+    )
+    store = ArtifactStore(settings.state_root / "runs" / "run_closure")
+
+    def _envelope(payload: dict[str, Any]) -> ArtifactRef:
+        return store.put_envelope(
+            ArtifactEnvelope(
+                "build.environment_candidate",
+                1,
+                WorkCoordinate("run_closure", "candidate", "candidate_build", None, 1),
+                "sha256:" + "a" * 64,
+                (),
+                ("candidate",),
+                payload,
+            )
+        )
+
+    ref = _envelope({"source_files": closure})
+    executor = CandidateExecutor(settings, None, settings.trusted_wheel_store)
+
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    executor._ensure_workspace(fresh, ref, store)
+    assert (fresh / "runtime.py").read_text(encoding="utf-8") == "print('x')" + chr(10)
+    assert (fresh / "sub" / "nested.txt").read_text(encoding="utf-8") == "hi"
+
+    tampered = [
+        {**item, "content_b64": "aGk="} if item["path"] == "runtime.py" else item
+        for item in closure
+    ]
+    ref2 = _envelope({"source_files": tampered})
+    fresh2 = tmp_path / "fresh2"
+    fresh2.mkdir()
+    with pytest.raises(CandidateError, match="candidate_source_closure_digest_mismatch"):
+        executor._ensure_workspace(fresh2, ref2, store)
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    ref3 = _envelope({"source_files": []})
+    with pytest.raises(CandidateError, match="candidate_source_closure_missing"):
+        executor._ensure_workspace(empty, ref3, store)

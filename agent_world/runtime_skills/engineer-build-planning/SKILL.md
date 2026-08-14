@@ -10,9 +10,14 @@ Judge, or release authority.
 
 ## 1. Inputs (read-only, in the workspace)
 
-- `design.json` — the compiled public World/Tool closure: declared tools, their
-  ordered input/output/observation schemas, namespaces, shared and local rules,
-  curriculum task families with public goal fields and rule summaries.
+- `design.json` — the compiled public World/Tool closure in a **name-based**
+  format: `boundary` (name, purpose, actors), `entities`, `fields` (semantic
+  field rows by NAME), `tools` (each tool's argument/result fields and its
+  preconditions/transitions/postconditions/errors as name-based
+  `{field, operator, value}` / `{field, operation, value}` dicts), shared tool
+  contracts, world rules, and `task_families` (each by `task_family_id`, with
+  named actor/tools and difficulty dimensions). No positional indexes, no
+  observation schemas, no namespaces.
 - `implementation-contract.json` — the frozen implementation closure. It
   contains a top-level `sections` array naming every valid contract section
   (the only legal values for each step's `contract_sections`): `source_closure`,
@@ -40,14 +45,14 @@ Validator-enforced bounds (the framework rejects anything outside these):
 - Top object: exactly `{steps, risks}`.
 - `steps`: 1..12 items. Each step is exactly
   `{goal, suggested_paths, contract_sections, self_check}`:
-  - `goal`: nonempty text, ≤280 chars.
-  - `self_check`: nonempty text, ≤280 chars.
+  - `goal`: nonempty text, ≤500 chars.
+  - `self_check`: nonempty text, ≤500 chars.
   - `suggested_paths`: 1..8 items, unique within the step. Each is a nonempty
     string ≤160 chars and a safe relative path: no leading `/`, no `\`, and no
     `/`-split part that is empty, `.`, `..`, or starts with `.`.
   - `contract_sections`: 1..9 items, unique within the step; every item is a
     string present in `implementation-contract.json` `sections`.
-- `risks`: 0..8 items; each is nonempty text ≤280 chars.
+- `risks`: 0..8 items; each is nonempty text ≤500 chars.
 
 ## 3. Self-verify (required before returning)
 
@@ -71,12 +76,12 @@ source or any other file.
 {
   "steps": [
     {
-      "goal": "Implement the five-operation Runtime handshake/reset/invoke/snapshot/close shell. (<=280 chars)",
+      "goal": "Implement the five-operation Runtime handshake/reset/invoke/snapshot/close shell. (<=500 chars)",
       "suggested_paths": ["runtime.py"],
       "contract_sections": ["runtime", "shutdown"],
-      "self_check": "python runtime.py emits a handshake naming exactly the tool IDs in design.json. (<=280 chars)"
+      "self_check": "echo handshake JSONL to runtime.py and it replies with the operations list. (<=500 chars)"
     }
   ],
-  "risks": ["tool_semantics may require per-tool permission gating beyond the shared rules. (<=280 chars)"]
+  "risks": ["tool_semantics may require per-tool permission gating beyond the shared rules. (<=500 chars)"]
 }
 ```

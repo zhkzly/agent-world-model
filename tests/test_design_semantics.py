@@ -24,7 +24,9 @@ from agent_world.contracts import (
     EvidenceGraph,
     GateResult,
     JudgeReport,
+    PredicateDraft,
     ResearchPlan,
+    RuleDraft,
     SafeFailure,
     WorkCoordinate,
     digest_value,
@@ -35,9 +37,14 @@ from agent_world.design import (
     _TASK_RULE_DRAFT_SHAPE,
     DesignError,
     DesignExecutor,
+    _binding_fields_for_llm,
     _compile_rules,
     _direct_feedback,
+    _reject_guard_conflicts,
+    _rules_for_llm,
+    _task_semantic_fields,
     _text,
+    _tools_rules_for_llm,
 )
 from agent_world.graph import design_graph
 from agent_world.invocation import (
@@ -53,29 +60,68 @@ def _digest() -> str:
     return "sha256:" + "a" * 64
 
 
-def _rule(target: int, *, citation: bool = True) -> dict[str, Any]:
+def _rule(field: str, *, citation: bool = True) -> dict[str, Any]:
     return {
         "when": [],
-        "effects": [{"target_semantic_index": target, "operation": "set", "value": "ok"}],
+        "effects": [{"field": field, "operation": "set", "value": "ok"}],
         "error_kind": None,
         "rationale": "bounded business rule",
         "citation_indexes": [1] if citation else [],
     }
 
 
-def _task_rule(target: int, *, citation: bool = True) -> dict[str, Any]:
-    rule = _rule(target, citation=citation)
+def _guard(field: str, *, citation: bool = True) -> dict[str, Any]:
+    """A precondition guard rule: required input/state exists, no effects."""
+    return {
+        "when": [{"field": field, "operator": "exists"}],
+        "effects": [],
+        "error_kind": None,
+        "rationale": "required input or state must exist",
+        "citation_indexes": [1] if citation else [],
+    }
+
+
+def _task_rule(field: str, *, citation: bool = True) -> dict[str, Any]:
+    rule = _rule(field, citation=citation)
     rule.pop("error_kind")
     return rule
 
 
-def _task_requirement_source(target: int = 1) -> dict[str, Any]:
+def _task_pattern(
+    field: str,
+    *,
+    citation: bool = True,
+    operator: str = "exists",
+    value: object = None,
+) -> dict[str, Any]:
+    """A when-only task outcome pattern (success/failure/terminal sections)."""
+    predicate = {"field": field, "operator": operator}
+    if operator != "exists":
+        predicate["value"] = value
     return {
-        "public_goal_fields": [target],
-        "initial_rules": [_task_rule(target)],
-        "success_rules": [_task_rule(target)],
-        "failure_rules": [_task_rule(target)],
-        "terminal_rules": [_task_rule(target)],
+        "when": [predicate],
+        "effects": [],
+        "rationale": "task outcome pattern",
+        "citation_indexes": [1] if citation else [],
+    }
+
+
+def _task_requirement_source(field: str = "request_1") -> dict[str, Any]:
+    return {
+        "public_goal_fields": [field],
+        "initial_rules": [
+            {
+                "when": [],
+                "effects": [{"field": "status_1", "operation": "set", "value": ""}],
+                "rationale": "reset state",
+                "citation_indexes": [],
+            }
+        ],
+        "success_rules": [_task_pattern(field)],
+        # A failure pattern that never holds on the fixture trace (transitions
+        # set status_2 to "ok"); success and failure must not hold together.
+        "failure_rules": [_task_pattern("status_2", operator="ne", value="ok")],
+        "terminal_rules": [_task_pattern(field)],
     }
 
 
@@ -129,9 +175,9 @@ def _architecture(tools: int = 2) -> dict[str, Any]:
 
 def _shared() -> dict[str, Any]:
     return {
-        "atomicity": [[1, 2]],
-        "concurrency": [[1, 2]],
-        "idempotency": [[1, 2]],
+        "atomicity": [["tool_1", "tool_2"]],
+        "concurrency": [["tool_1", "tool_2"]],
+        "idempotency": [["tool_1", "tool_2"]],
         "ordering": [],
         "compensation": [],
         "error_policy": "reject invalid requests",
@@ -141,7 +187,11 @@ def _shared() -> dict[str, Any]:
 def _compiled_shared() -> dict[str, Any]:
     return {
         "tool_indexes": [1, 2],
-        **_shared(),
+        "atomicity": [[1, 2]],
+        "concurrency": [[1, 2]],
+        "idempotency": [[1, 2]],
+        "ordering": [],
+        "compensation": [],
         "error_policy": [
             {"tool_index": 1, "policy": "reject invalid requests"},
             {"tool_index": 2, "policy": "reject invalid requests"},
@@ -170,19 +220,22 @@ def test_text_feedback_preserves_acceptance_and_names_exact_rejection(
     assert _text(" value ", "example_invalid", 5, path="$.field") == "value"
 
 
-def _curriculum_source(value: Any) -> dict[str, Any]:
+def _curriculum_source(value: Any, architecture: Any) -> dict[str, Any]:
+    raw = json_value(value)
+    tool_name = {tool.tool_index: tool.name for tool in architecture.tools}
+    actors = architecture.boundary.actors
     return {
         "families": [
             {
                 "task_family_id": family["task_family_id"],
                 "objective": family["objective"],
-                "actor_index": family["actor_index"],
-                "tool_indexes": family["tool_indexes"],
+                "actor": actors[family["actor_index"] - 1],
+                "tools": [tool_name[index] for index in family["tool_indexes"]],
                 "dimensions": family["difficulty_schema"]["dimensions"],
                 "sampling_intent": family["sampling_intent"],
                 "citation_indexes": family["citation_indexes"],
             }
-            for family in json_value(value)["families"]
+            for family in raw["families"]
         ]
     }
 
@@ -228,11 +281,11 @@ class _Direct:
         if tool_count > 1:
             proposals.append(_shared())
         for index in range(1, tool_count + 1):
-            result_index = 4 * (index - 1) + 4
+            field_name = f"status_{index}"
             proposals.append(
                 {
-                    "preconditions": [_rule(result_index)],
-                    "transitions": [_rule(result_index)],
+                    "preconditions": [_guard(field_name)],
+                    "transitions": [_rule(field_name)],
                     "postconditions": [],
                     "errors": [],
                 }
@@ -245,8 +298,10 @@ class _Direct:
                         {
                             "task_family_id": "primary",
                             "objective": "complete a handoff",
-                            "actor_index": 1,
-                            "tool_indexes": list(range(tool_count, 0, -1)),
+                            "actor": "operator",
+                            "tools": [
+                                f"tool_{index}" for index in range(tool_count, 0, -1)
+                            ],
                             "dimensions": [
                                 {
                                     "name": "urgency",
@@ -263,8 +318,8 @@ class _Direct:
                         {
                             "task_family_id": "secondary",
                             "objective": "verify a handoff",
-                            "actor_index": 1,
-                            "tool_indexes": [tool_count],
+                            "actor": "operator",
+                            "tools": [f"tool_{tool_count}"],
                             "dimensions": [
                                 {
                                     "name": "urgency_secondary",
@@ -282,16 +337,28 @@ class _Direct:
                 },
             )
         )
-        for _ in range(2):
-            proposals.append(
-                {
-                    "public_goal_fields": [1],
-                    "initial_rules": [],
-                    "success_rules": [_task_rule(1)],
-                    "failure_rules": [],
-                    "terminal_rules": [_task_rule(1)],
-                }
-            )
+        # Family 1 (primary, tools [tool_2, tool_1]) and family 2 (secondary,
+        # tools [tool_2]): each family's success pattern must reference a field
+        # its own action sequence can reach — the design-time outcome simulation
+        # rejects cross-tool success patterns.
+        proposals.append(
+            {
+                "public_goal_fields": ["request_1"],
+                "initial_rules": [],
+                "success_rules": [_task_pattern("request_1")],
+                "failure_rules": [],
+                "terminal_rules": [_task_pattern("request_1")],
+            }
+        )
+        proposals.append(
+            {
+                "public_goal_fields": [f"request_{tool_count}"],
+                "initial_rules": [],
+                "success_rules": [_task_pattern(f"request_{tool_count}")],
+                "failure_rules": [],
+                "terminal_rules": [_task_pattern(f"request_{tool_count}")],
+            }
+        )
         self.proposals = iter(proposals)
 
     def invoke_json(self, **kwargs: str) -> InvocationResult:
@@ -523,11 +590,11 @@ def test_shared_tool_recipient_discloses_exact_grammar_and_preserves_consumers(
         payload for payload in payloads if payload["node"] == "shared_tool_semantics"
     )
     contract = result.design.shared_tool_contracts[0]
-    assert shared_payload["input"]["tool_indexes"] == [1, 2]
+    assert shared_payload["input"]["tool_names"] == ["tool_1", "tool_2"]
     shape = shared_payload["output_shape"]
     assert "atomicity" in shape and "concurrency" in shape and "idempotency" in shape
     assert "STRINGS (not numbers)" in shape
-    assert "[[1,2,3]]" in shape
+    assert '[["create","close"]]' in shape
     assert "error_policy" in shape
     assert contract.digest == digest_value(_compiled_shared())
     assert contract.atomicity == contract.concurrency == contract.idempotency == ((1, 2),)
@@ -633,7 +700,7 @@ def test_rule_draft_shape_is_byte_identical_and_source_echoes_are_framework_owne
     )
     assert tuple(task.task_family_index for task in design.task_requirements) == (1, 2)
 
-    generic_rule = _task_rule(1)
+    generic_rule = _task_rule("request_1")
     for code, path in (
         ("tool_semantics_invalid", "$.preconditions[0]"),
         ("world_rules_invalid", "$.initial_rules[0]"),
@@ -654,9 +721,10 @@ def test_rule_draft_shape_is_byte_identical_and_source_echoes_are_framework_owne
         assert raised.value.correction.violated_condition == (
             "object must contain exactly these fields and no others: "
             "citation_indexes, effects, error_kind, rationale, when"
+            "; rejected object missing keys: error_kind"
         )
 
-    error_rule = _rule(1)
+    error_rule = _rule("request_1")
     error_rule["error_kind"] = "invalid_request"
     assert (
         _compile_rules(
@@ -690,7 +758,8 @@ def test_task_requirement_rules_omit_error_kind_and_compile_framework_none_in_al
         if store.read_json(work)["coordinate"]["node_id"] == "tool_semantics"
     )
     source = _task_requirement_source()
-    direct.proposals = iter((source, source))
+    source_secondary = _task_requirement_source("request_2")
+    direct.proposals = iter((source, source_secondary))
 
     requirements, _, _ = executor._direct_tasks(
         result.design.architecture,
@@ -769,6 +838,7 @@ def test_task_requirement_rejects_any_model_supplied_error_kind(
     assert raised.value.correction.violated_condition == (
         "object must contain exactly these fields and no others: "
         "citation_indexes, effects, rationale, when"
+        "; rejected object extra keys: error_kind"
     )
 
 
@@ -793,8 +863,10 @@ def test_task_requirement_projection_is_one_copy_semantic_and_revision_bound(
     family = design.curriculum.families[0]
     expected_family = {
         "objective": family.objective,
-        "actor_index": family.actor_index,
-        "tool_indexes": list(family.tool_indexes),
+        "actor": design.architecture.boundary.actors[family.actor_index - 1],
+        "tools": [
+            design.architecture.tools[index - 1].name for index in family.tool_indexes
+        ],
         "difficulty_schema": {
             "dimensions": json_value(family.difficulty_schema.dimensions),
         },
@@ -803,21 +875,16 @@ def test_task_requirement_projection_is_one_copy_semantic_and_revision_bound(
     }
     assert projection["family"] == expected_family
     assert projection["semantic_catalog"] == {
-        "bindings": json_value(design.architecture.catalog.bindings),
+        "fields": _task_semantic_fields(design.architecture),
     }
-    assert projection["tools"] == [
-        {
-            "surface": json_value(design.tools[index - 1].surface),
-            "preconditions": json_value(design.tools[index - 1].preconditions),
-            "transitions": json_value(design.tools[index - 1].transitions),
-            "postconditions": json_value(design.tools[index - 1].postconditions),
-            "errors": json_value(design.tools[index - 1].errors),
-        }
-        for index in family.tool_indexes
-    ]
+    assert projection["tools"] == _tools_rules_for_llm(design.tools, family.tool_indexes)
     assert projection["world_rules"] == {
-        "initial_rules": json_value(design.world_rules.initial_rules),
-        "invariants": json_value(design.world_rules.invariants),
+        "initial_rules": _rules_for_llm(
+            design.world_rules.initial_rules, design.architecture.catalog.bindings
+        ),
+        "invariants": _rules_for_llm(
+            design.world_rules.invariants, design.architecture.catalog.bindings
+        ),
     }
     assert projection["citation_catalog"] == json_value(design.evidence.catalog)
     assert projection["reachability_policy"] == {
@@ -832,7 +899,7 @@ def test_task_requirement_projection_is_one_copy_semantic_and_revision_bound(
         return []
 
     projection_keys = keys(projection)
-    assert projection_keys.count("bindings") == 1
+    assert projection_keys.count("fields") == 1
     assert projection_keys.count("difficulty_schema") == 1
     assert not {
         key
@@ -875,7 +942,16 @@ def test_tool_semantics_rule_root_correction_commits_bounded_error_kind(
     architecture, architecture_ref, _ = executor._direct_architecture(
         request, evidence, store, graph, "tool-rule-correction", request_ref, evidence_ref
     )
-    direct.proposals = iter((_shared(),))
+    direct.proposals = iter(
+        (
+            {
+                **_shared(),
+                "atomicity": [["register_member", "tool_2"]],
+                "concurrency": [["register_member", "tool_2"]],
+                "idempotency": [["register_member", "tool_2"]],
+            },
+        )
+    )
     shared, shared_refs, _ = executor._shared_tool_shards(
         architecture,
         evidence,
@@ -888,26 +964,26 @@ def test_tool_semantics_rule_root_correction_commits_bounded_error_kind(
 
     malformed = {
         "preconditions": [{"when": []}],
-        "transitions": [_rule(4)],
+        "transitions": [_rule("status_1")],
         "postconditions": [],
         "errors": [],
     }
     bounded_error_kind = "a" + "b" * 63
     repaired = {
-        "preconditions": [_rule(4)],
-        "transitions": [_rule(4)],
+        "preconditions": [_guard("status_1")],
+        "transitions": [_rule("status_1")],
         "postconditions": [],
         "errors": [
             {
-                **_rule(4),
-                "effects": [{"target_semantic_index": 4, "operation": "reject", "value": None}],
+                **_rule("status_1"),
+                "effects": [{"field": "status_1", "operation": "reject"}],
                 "error_kind": bounded_error_kind,
             }
         ],
     }
     second_tool = {
-        "preconditions": [_rule(8)],
-        "transitions": [_rule(8)],
+        "preconditions": [_guard("status_2")],
+        "transitions": [_rule("status_2")],
         "postconditions": [],
         "errors": [],
     }
@@ -940,6 +1016,7 @@ def test_tool_semantics_rule_root_correction_commits_bounded_error_kind(
         "violated_condition": (
             "object must contain exactly these fields and no others: "
             "citation_indexes, effects, error_kind, rationale, when"
+            "; rejected object missing keys: citation_indexes, effects, error_kind …(+1)"
         ),
         "expected_category": "object",
     }
@@ -970,25 +1047,25 @@ def test_tool_semantics_strict_progress_uses_ephemeral_four_message_feedback(
     )
     first_invalid = {
         "preconditions": [{"when": [], "rationale": "REJECTED_TOOL_A"}],
-        "transitions": [_rule(4)],
+        "transitions": [_rule("status_1")],
         "postconditions": [],
         "errors": [],
     }
     second_invalid = {
-        "preconditions": [_rule(4)],
-        "transitions": [_rule(4)],
+        "preconditions": [_guard("status_1")],
+        "transitions": [_rule("status_1")],
         "postconditions": [],
-        "errors": [{**_rule(4), "rationale": "REJECTED_TOOL_B"}],
+        "errors": [{**_rule("status_1"), "rationale": "REJECTED_TOOL_B"}],
     }
     valid = {
-        "preconditions": [_rule(4)],
-        "transitions": [_rule(4)],
+        "preconditions": [_guard("status_1")],
+        "transitions": [_rule("status_1")],
         "postconditions": [],
         "errors": [],
     }
     second_tool = {
-        "preconditions": [_rule(8)],
-        "transitions": [_rule(8)],
+        "preconditions": [_guard("status_2")],
+        "transitions": [_rule("status_2")],
         "postconditions": [],
         "errors": [],
     }
@@ -998,6 +1075,7 @@ def test_tool_semantics_strict_progress_uses_ephemeral_four_message_feedback(
         "violated_condition": (
             "object must contain exactly these fields and no others: "
             "citation_indexes, effects, error_kind, rationale, when"
+            "; rejected object missing keys: citation_indexes, effects, error_kind"
         ),
         "expected_category": "object",
     }
@@ -1091,14 +1169,14 @@ def test_tool_semantics_repeated_format_uses_immediately_previous_answer_and_sto
         evidence_ref,
     )
     valid = {
-        "preconditions": [_rule(4)],
-        "transitions": [_rule(4)],
+        "preconditions": [_guard("status_1")],
+        "transitions": [_rule("status_1")],
         "postconditions": [],
         "errors": [],
     }
     second_tool = {
-        "preconditions": [_rule(8)],
-        "transitions": [_rule(8)],
+        "preconditions": [_guard("status_2")],
+        "transitions": [_rule("status_2")],
         "postconditions": [],
         "errors": [],
     }
@@ -1183,17 +1261,16 @@ def test_tool_semantics_repeated_format_uses_immediately_previous_answer_and_sto
 
 
 @pytest.mark.parametrize(
-    "partition",
+    ("partition", "path"),
     (
-        [[1, []]],
-        [[1, "two"]],
-        [[1, 1], [2]],
-        [[1], [1, 2]],
-        [[1, 3]],
+        ([["tool_1", "bogus"]], "$.atomicity[0][1]"),
+        ([["tool_1", "tool_1"], ["tool_2"]], "$.atomicity"),
+        ([["tool_1"], ["tool_1", "tool_2"]], "$.atomicity"),
+        ([["tool_3"]], "$.atomicity[0][0]"),
     ),
 )
 def test_shared_tool_source_partitions_are_typed_before_set_operations(
-    tmp_path, monkeypatch: pytest.MonkeyPatch, partition: list[list[Any]]
+    tmp_path, monkeypatch: pytest.MonkeyPatch, partition: list[list[Any]], path: str
 ) -> None:
     executor, direct, store, request, evidence, request_ref, evidence_ref = _architecture_context(
         tmp_path, monkeypatch
@@ -1218,7 +1295,7 @@ def test_shared_tool_source_partitions_are_typed_before_set_operations(
         )
 
     assert raised.value.correction is not None
-    assert raised.value.correction.path == "$.atomicity"
+    assert raised.value.correction.path == path
     assert len(direct.calls) == 3
 
 
@@ -1333,7 +1410,7 @@ def test_rule_and_curriculum_validation_feedback_uses_exact_typed_paths(
         graph,
         "index-types",
     )
-    rule = _rule(1, citation=False)
+    rule = _rule("request_1", citation=False)
     rule["citation_indexes"] = [{}]
     with pytest.raises(DesignError) as rule_error:
         _compile_rules(
@@ -1348,7 +1425,7 @@ def test_rule_and_curriculum_validation_feedback_uses_exact_typed_paths(
     assert rule_error.value.correction is not None
     assert rule_error.value.correction.path == "$.initial_rules[0].citation_indexes"
 
-    source = _curriculum_source(result.design.curriculum)
+    source = _curriculum_source(result.design.curriculum, result.design.architecture)
     missing_family_field = {"families": json.loads(json.dumps(source["families"]))}
     missing_family_field["families"][0].pop("sampling_intent")
     direct.proposals = iter((missing_family_field, missing_family_field))
@@ -1367,8 +1444,9 @@ def test_rule_and_curriculum_validation_feedback_uses_exact_typed_paths(
     assert family_error.value.correction is not None
     assert family_error.value.correction.path == "$.families[0]"
     assert family_error.value.correction.violated_condition == (
-        "object must contain exactly these fields and no others: actor_index, citation_indexes, "
-        "dimensions, objective, sampling_intent, task_family_id, tool_indexes"
+        "object must contain exactly these fields and no others: actor, citation_indexes, "
+        "dimensions, objective, sampling_intent, task_family_id, tools"
+        "; rejected object missing keys: sampling_intent"
     )
     assert family_error.value.correction.expected_category == "object"
 
@@ -1381,17 +1459,17 @@ def test_rule_and_curriculum_validation_feedback_uses_exact_typed_paths(
             "string",
         ),
         (
-            "actor_index",
-            2,
-            "$.families[0].actor_index",
-            "actor index must be one frozen actor index",
-            "number",
+            "actor",
+            "bogus_actor",
+            "$.families[0].actor",
+            "actor must name a declared boundary actor; unknown 'bogus_actor'",
+            "string",
         ),
         (
-            "tool_indexes",
-            [[]],
-            "$.families[0].tool_indexes",
-            "family tools must be unique frozen indexes",
+            "tools",
+            ["tool_1", "tool_1"],
+            "$.families[0].tools",
+            "family tools must be unique",
             "array",
         ),
         (
@@ -1425,9 +1503,9 @@ def test_rule_and_curriculum_validation_feedback_uses_exact_typed_paths(
     task = {
         "public_goal_fields": [{}],
         "initial_rules": [],
-        "success_rules": [_task_rule(1)],
+        "success_rules": [_task_rule("request_1")],
         "failure_rules": [],
-        "terminal_rules": [_task_rule(1)],
+        "terminal_rules": [_task_rule("request_1")],
     }
     tool_refs = tuple(
         ArtifactRef(**store.read_json(work)["output_refs"][0])
@@ -1452,7 +1530,7 @@ def test_rule_and_curriculum_validation_feedback_uses_exact_typed_paths(
             result.design.evidence.artifact,
         )
     assert task_error.value.correction is not None
-    assert task_error.value.correction.path == "$.public_goal_fields"
+    assert task_error.value.correction.path == "$.public_goal_fields[0]"
 
 
 def test_curriculum_preserves_current_hyphenated_dimension_and_level_names(
@@ -1466,7 +1544,7 @@ def test_curriculum_preserves_current_hyphenated_dimension_and_level_names(
         graph,
         "hyphen-base",
     )
-    proposal = _curriculum_source(result.design.curriculum)
+    proposal = _curriculum_source(result.design.curriculum, result.design.architecture)
     for family in proposal["families"]:
         family["dimensions"][0]["name"] = "time-window"
         family["dimensions"][0]["levels"][0]["name"] = "same-day"
@@ -1690,7 +1768,7 @@ def test_shared_tool_parsed_invalid_object_gets_one_correction_and_no_third_call
         evidence_ref,
     )
     invalid = _shared()
-    invalid["atomicity"] = [[1]]
+    invalid["atomicity"] = [["tool_1"]]
     direct.calls.clear()
     direct.proposals = iter((invalid, invalid))
 
@@ -1712,7 +1790,7 @@ def test_shared_tool_parsed_invalid_object_gets_one_correction_and_no_third_call
         "code": "shared_tool_semantics_invalid",
         "path": "$.atomicity",
         "violated_condition": (
-            "use every input tool_indexes member exactly once; unless evidence requires a finer "
+            "use every input tool_names member exactly once; unless evidence requires a finer "
             "split, one domain containing the complete ordered group is valid"
         ),
         "expected_category": "array",
@@ -2285,7 +2363,7 @@ def test_world_architecture_purpose_retains_full_ascii_value_for_consumers(
     assert direct_inputs["world_rules"]["architecture"]["boundary"]["purpose"] == purpose
     assert direct_inputs["curriculum_plan"]["architecture"]["boundary"]["purpose"] == purpose
     builder_projection = CandidateExecutor._projection(result.design)
-    assert builder_projection["architecture"]["boundary"]["purpose"] == purpose
+    assert builder_projection["boundary"]["purpose"] == purpose
     placeholder_ref = result.design.artifact
     manifest = CandidateManifest("runtime.py", _digest(), (), placeholder_ref)
     report = JudgeReport(
@@ -2422,7 +2500,7 @@ def test_single_tool_skips_shared_call_and_unknown_output_is_corrected(
     assert feedback["path"] == "$"
 
 
-def test_world_rule_predicate_right_accepts_closed_union_and_rejects_invalid_values(
+def test_world_rule_predicate_accepts_field_name_and_literal_value(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     executor, _, _ = _executor(monkeypatch)
@@ -2430,19 +2508,13 @@ def test_world_rule_predicate_right_accepts_closed_union_and_rejects_invalid_val
         EnvironmentRequest.create("Build a support handoff environment."),
         ArtifactStore(tmp_path),
         design_graph(),
-        "predicate-right",
+        "predicate-field",
     ).design.architecture.catalog.bindings
-    rules = []
-    for right in (
-        {"kind": "literal", "value": "open"},
-        {"kind": "semantic_ref", "semantic_index": 1},
-    ):
-        rule = _rule(1, citation=False)
-        rule["when"] = [{"left_semantic_index": 1, "operator": "eq", "right": right}]
-        rules.append(rule)
 
+    rule = _rule("request_1", citation=False)
+    rule["when"] = [{"field": "status_1", "operator": "eq", "value": "open"}]
     compiled = _compile_rules(
-        rules,
+        [rule],
         bindings,
         set(),
         "world_rules_invalid",
@@ -2450,18 +2522,32 @@ def test_world_rule_predicate_right_accepts_closed_union_and_rejects_invalid_val
         minimum=0,
         maximum=8,
     )
-    assert [rule.when[0].right for rule in compiled] == [
-        {"kind": "literal", "value": "open"},
-        {"kind": "semantic_ref", "semantic_index": 1},
-    ]
+    assert compiled[0].when[0].right == "open"
 
-    invalid_rights: tuple[Any, ...] = ({}, {"kind": "unknown"}, None, ["kind", "value"])
-    for right in invalid_rights:
-        rule = _rule(1, citation=False)
-        rule["when"] = [{"left_semantic_index": 1, "operator": "eq", "right": right}]
+    rule_exists = _rule("request_1", citation=False)
+    rule_exists["when"] = [{"field": "status_1", "operator": "exists"}]
+    compiled_exists = _compile_rules(
+        [rule_exists],
+        bindings,
+        set(),
+        "world_rules_invalid",
+        path="$.initial_rules",
+        minimum=0,
+        maximum=8,
+    )
+    assert compiled_exists[0].when[0].right is None
+
+    for bad_predicate in (
+        {"field": "nonexistent", "operator": "eq", "value": "x"},
+        {"field": "request_1", "operator": "eq"},
+        {"field": "request_1", "operator": "exists", "value": "x"},
+        {"field": "request_1", "operator": "bogus", "value": "x"},
+    ):
+        rule_bad = _rule("request_1", citation=False)
+        rule_bad["when"] = [bad_predicate]
         with pytest.raises(DesignError) as error:
             _compile_rules(
-                [rule],
+                [rule_bad],
                 bindings,
                 set(),
                 "world_rules_invalid",
@@ -2484,8 +2570,8 @@ def test_effect_value_acceptance_and_precise_rejection_conditions(
     ).design.architecture.catalog.bindings
 
     def compile_effect(value: Any, operation: str = "set") -> tuple[Any, ...]:
-        rule = _rule(1, citation=False)
-        rule["effects"] = [{"target_semantic_index": 1, "operation": operation, "value": value}]
+        rule = _rule("request_1", citation=False)
+        rule["effects"] = [{"field": "request_1", "operation": operation, "value": value}]
         return _compile_rules(
             [rule],
             bindings,
@@ -2503,45 +2589,32 @@ def test_effect_value_acceptance_and_precise_rejection_conditions(
         1.5,
         "direct literal",
         list(range(32)),
-        {"kind": "semantic_ref", "semantic_index": 1},
     )
     for value in accepted_values:
         assert compile_effect(value)[0].effects[0].value == value
 
     generic_condition = (
-        "effect value must be a direct JSON scalar "
-        "(null, boolean, integer, finite float, or string) "
-        'or a scalar-list of at most 32 such scalars, not a {kind:"literal",value:...} '
-        "wrapper; or exactly "
-        '{kind:"semantic_ref",semantic_index:<frozen one-based index>} object'
+        "value must be a JSON scalar or scalar-list of at most 32 items"
     )
-    with pytest.raises(DesignError) as literal_wrapper:
-        compile_effect({"kind": "literal", "value": "direct literal"})
-    assert literal_wrapper.value.correction is not None
-    assert literal_wrapper.value.correction.violated_condition == generic_condition
-    assert literal_wrapper.value.correction.expected_category == "semantic_draft"
+    with pytest.raises(DesignError) as dict_value:
+        compile_effect({"key": "value"})
+    assert dict_value.value.correction is not None
+    assert dict_value.value.correction.violated_condition == generic_condition
+    assert dict_value.value.correction.expected_category == "semantic_draft"
 
     with pytest.raises(DesignError) as over_bound:
         compile_effect(list(range(33)))
     assert over_bound.value.correction is not None
     assert over_bound.value.correction.violated_condition == generic_condition
 
-    with pytest.raises(DesignError) as invalid_reference:
-        compile_effect({"kind": "semantic_ref", "semantic_index": len(bindings) + 1})
-    assert invalid_reference.value.correction is not None
-    assert invalid_reference.value.correction.violated_condition == (
-        "semantic effect reference must be frozen"
-    )
-    assert invalid_reference.value.correction.expected_category == "object"
-
     for operation in ("preserve", "reject"):
         with pytest.raises(DesignError) as nonnull_special_operation:
             compile_effect("not null", operation)
         assert nonnull_special_operation.value.correction is not None
         assert nonnull_special_operation.value.correction.violated_condition == (
-            "preserve and reject require null values"
+            "effect must contain exactly these fields and no others: field, operation"
         )
-        assert nonnull_special_operation.value.correction.expected_category == "semantic_draft"
+        assert nonnull_special_operation.value.correction.expected_category == "object"
 
 
 def test_world_rules_two_invalid_proposals_persist_failure_without_output(
@@ -2561,8 +2634,8 @@ def test_world_rules_two_invalid_proposals_persist_failure_without_output(
         outputs.setdefault(work["coordinate"]["node_id"], []).extend(
             ArtifactRef(**ref) for ref in work["output_refs"]
         )
-    invalid_rule = _rule(1, citation=False)
-    invalid_rule["when"] = [{"left_semantic_index": 1, "operator": "eq", "right": None}]
+    invalid_rule = _rule("request_1", citation=False)
+    invalid_rule["when"] = [{"field": "request_1", "operator": "eq"}]
     direct.proposals = iter(({"initial_rules": [invalid_rule], "invariants": []},) * 2)
 
     with pytest.raises(DesignError):
@@ -2591,8 +2664,11 @@ def test_world_rules_two_invalid_proposals_persist_failure_without_output(
     assert _feedback_packet(direct.calls[-1]) == {
         "code": "world_rules_invalid",
         "expected_category": "object",
-        "path": "$.initial_rules[0].when[0].right",
-        "violated_condition": "right side must be a finite literal or frozen binding reference",
+        "path": "$.initial_rules[0].when[0]",
+        "violated_condition": (
+            "predicate must contain exactly these fields and no others: "
+            "field, operator, value"
+        ),
     }
     assert work["status"] == "failed"
     assert work["safe_code"] == "world_rules_invalid"
@@ -2734,3 +2810,19 @@ def test_recipe_digests_are_exact_and_no_first_only_task_or_tool_survives(
         assert contract.verification_digest == digest_value(contract.verification_requirements)
     assert len({contract.task_family_index for contract in design.executable_tasks}) == 2
     assert len({recipe.tool_index for recipe in design.assurance_recipes}) == 2
+
+
+def test_precondition_guard_conflicts_rejected() -> None:
+    conflicting = (
+        RuleDraft((PredicateDraft(3, "eq", "a"),), (), None, "channel a", (1,)),
+        RuleDraft((PredicateDraft(3, "eq", "b"),), (), None, "channel b", (1,)),
+    )
+    with pytest.raises(DesignError, match="tool_semantics_invalid") as raised:
+        _reject_guard_conflicts(conflicting, "tool_semantics_invalid")
+    assert raised.value.correction is not None
+    assert "jointly" in raised.value.correction.violated_condition
+    satisfiable = (
+        RuleDraft((PredicateDraft(3, "eq", "a"),), (), None, "x", (1,)),
+        RuleDraft((PredicateDraft(4, "eq", "b"),), (), None, "y", (1,)),
+    )
+    _reject_guard_conflicts(satisfiable, "tool_semantics_invalid")

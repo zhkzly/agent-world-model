@@ -12,43 +12,49 @@ data.
 
 ## 1. Input (read-only, in the workspace)
 
-- `public-design.json`:
-  - `families` — the declared curriculum task families.
-  - `tools` — each tool carries `tool_index`, its `surface` (input/output/
-    observation schemas and ordered `argument_fields`, where each field has a
-    `category`), and `local_rules_digest`.
-  - `assurance_recipes` — the only legal `(task_family_index, tool_index)`
-    pairs a check may target. A pair not listed here is rejected.
-  - `task_rule_summaries` — per-family public goal fields and rule summaries.
+- `public-design.json` — everything is referenced by NAME, never by index:
+  - `task_families` — each has `task_family_id` (its NAME), `objective`,
+    `actor`, and the `tools` (names) it may exercise.
+  - `tools` — each has `tool_name` (its NAME), `purpose`, its ordered
+    `argument_fields` and `result_fields` (each field has a `category`).
+  - `checkable_recipes` — the ONLY legal `{task_family, tool}` (name) pairs a
+    check may target. A pair not listed here is rejected.
+  - `task_rule_summaries` — per-family `public_goal_fields` (as NAMES) and the
+    declared rule rationales.
 
-Do not assume any singleton family or tool; enumerate the catalog.
+Enumerate the catalog; do not assume a singleton family or tool.
 
 ## 2. What to produce
 
-A closed `VerifierIntentDraft`: `{checks: [...]}` with 1..8 checks. Each check
-is exactly `{task_family_index, tool_index, family, argument_index, risk}`.
+A closed `VerifierIntentDraft`: `{checks: [...]}` with 1..8 checks. Reference
+families, tools, and arguments by their declared NAMES — never by integer index.
+
+Each check is exactly one of two shapes (the framework rejects any other keys):
+
+- For `argument_variation`:
+  `{task_family, tool, family, argument, risk}`
+- For every other family (omit `argument`):
+  `{task_family, tool, family, risk}`
 
 Validator-enforced bounds (the framework rejects anything outside these):
 
-- `checks`: 1..8 items. Every check is exactly the five keys above — no extra
-  or missing keys.
-- `task_family_index` and `tool_index`: ints (booleans are rejected), and the
-  `(task_family_index, tool_index)` pair must exist in `assurance_recipes`.
+- `checks`: 1..8 items.
+- `task_family`: a `task_family_id` NAME from `task_families`.
+- `tool`: a `tool_name` from `tools`. The `{task_family, tool}` pair MUST exist
+  in `checkable_recipes`.
 - `family`: one of `unknown_seed`, `alternate_difficulty`,
   `idempotency_key_variation`, `argument_variation`.
-- `argument_index`:
-  - `null` for `unknown_seed`, `alternate_difficulty`, and
-    `idempotency_key_variation` — these families do not vary a single argument.
-  - For `argument_variation` only: an int, one-based position of a scalar
-    argument field in that tool's `argument_fields` (1..N). The selected
-    field's `category` must not be `list`; any scalar category
+- `argument`:
+  - OMITTED for `unknown_seed`, `alternate_difficulty`, and
+    `idempotency_key_variation`.
+  - For `argument_variation` only: the NAME of one scalar argument field of
+    that tool. The field's `category` must not be `list`; any scalar category
     (`text`, `integer`, `number`, `boolean`, `timestamp`, `identifier`,
-    `enum`) is valid. Out-of-range indexes or a `list`-category field are
-    rejected.
+    `enum`) is valid. An unknown name or a `list`-category field is rejected.
 - `risk`: nonempty text ≤280 chars describing the public semantic risk this
   check exposes.
-- Each check should target a distinct `(task_family_index, tool_index, family,
-  argument_index)` intent — duplicate intents waste a release-gating slot.
+- Each check should target a distinct `{task_family, tool, family, argument}`
+  intent — duplicate intents waste a release-gating slot.
 
 What the four families test:
 
@@ -58,20 +64,21 @@ What the four families test:
   goal or initial state changes materially.
 - `idempotency_key_variation` — issue the same tool call under a different
   idempotency key and verify an independent result.
-- `argument_variation` — vary one scalar argument field (named by
-  `argument_index`) and verify an observable difference.
+- `argument_variation` — vary one scalar argument field (named by `argument`)
+  and verify an observable difference.
 
 ## 3. Self-verify (required before returning)
 
-- 1..8 checks; each has exactly the five keys;
-- every `(task_family_index, tool_index)` is present in `assurance_recipes`,
-  and both indexes are ints;
-- `argument_index` is `null` for every family except `argument_variation`;
-- for each `argument_variation` check, `argument_index` is in range and selects
-  a non-`list` field of the right tool;
+- 1..8 checks; each has exactly the right keys for its family
+  (`argument` present ONLY for `argument_variation`);
+- every `{task_family, tool}` is present in `checkable_recipes`, and both are
+  declared names;
+- `argument` is omitted for every family except `argument_variation`;
+- for each `argument_variation` check, `argument` names a real non-`list`
+  scalar argument field of the right tool;
 - each `risk` is nonempty, ≤280 chars, and states public semantic risk with no
   seed/key/value/verdict leakage;
-- no two checks repeat the same `(family, argument_index)` for the same recipe.
+- no two checks repeat the same `{family, argument}` for the same recipe.
 
 If a check fails this, drop or rewrite it before returning.
 
@@ -83,17 +90,16 @@ Return exactly this shape. Do not write any other file.
 {
   "checks": [
     {
-      "task_family_index": 0,
-      "tool_index": 1,
+      "task_family": "resolve_record",
+      "tool": "create_record",
       "family": "unknown_seed",
-      "argument_index": null,
       "risk": "An unseen seed must produce a distinct, deterministic initial state. (<=280 chars)"
     },
     {
-      "task_family_index": 0,
-      "tool_index": 1,
+      "task_family": "resolve_record",
+      "tool": "create_record",
       "family": "argument_variation",
-      "argument_index": 2,
+      "argument": "request_id",
       "risk": "Changing a scalar argument must observably change the tool result. (<=280 chars)"
     }
   ]

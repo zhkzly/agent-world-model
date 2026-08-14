@@ -553,7 +553,7 @@ class PredicateDraft:
     operator: Literal[
         "eq", "ne", "lt", "le", "gt", "ge", "contains", "not_contains", "exists", "not_exists"
     ]
-    right: dict[str, Any]
+    right: Any
 
 
 @dataclass(frozen=True, slots=True)

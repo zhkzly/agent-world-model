@@ -106,7 +106,7 @@ class CandidateProcess:
                 env={"PATH": os.defpath},
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 text=True,
                 close_fds=True,
             )  # noqa: S603
@@ -126,24 +126,86 @@ class CandidateProcess:
             if exception_type is None:
                 raise
 
+    def _stderr_tail(self, max_lines: int = 40) -> str:
+        process = self.process
+        if process is None or process.stderr is None:
+            return ""
+        lines: list[str] = []
+        while select.select([process.stderr], [], [], 0)[0] and len(lines) < max_lines:
+            line = process.stderr.readline()
+            if not line:
+                break
+            lines.append(line)
+        return "".join(lines).strip()[-2000:]
+
     def call(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.process is None or self.process.stdin is None or self.process.stdout is None:
             raise CandidateRuntimeError("candidate_not_running")
         if self.process.poll() is not None:
-            raise CandidateRuntimeError("candidate_exited_early")
+            raise CandidateRuntimeError(
+                "candidate_exited_early", detail={"stderr": self._stderr_tail()}
+            )
         try:
             self.process.stdin.write(json.dumps(payload, separators=(",", ":")) + "\n")
             self.process.stdin.flush()
         except OSError as exc:
             raise CandidateRuntimeError("candidate_stdin_failed") from exc
         if not select.select([self.process.stdout], [], [], _TIMEOUT)[0]:
-            raise CandidateRuntimeError("candidate_protocol_timeout")
+            raise CandidateRuntimeError(
+                "candidate_protocol_timeout", detail={"stderr": self._stderr_tail()}
+            )
+        raw = self.process.stdout.readline()
         try:
-            value = json.loads(self.process.stdout.readline())
+            value = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise CandidateRuntimeError("candidate_protocol_invalid_json") from exc
+            raise CandidateRuntimeError(
+                "candidate_protocol_invalid_json",
+                detail={"op": payload.get("op"), "line": raw[:500], "stderr": self._stderr_tail()},
+            ) from exc
         if not isinstance(value, dict):
-            raise CandidateRuntimeError("candidate_protocol_invalid_json")
+            raise CandidateRuntimeError(
+                "candidate_protocol_invalid_json",
+                detail={"op": payload.get("op"), "value_type": type(value).__name__},
+            )
+        return value
+
+    def call_once(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """One-shot request: write, close stdin, then read the single response.
+
+        One-shot candidate processes (the Task Materializer) may rely on
+        exit-time stdout flushing; closing stdin after the write gives them
+        EOF, so their response is never stuck in a block buffer.
+        """
+
+        if self.process is None or self.process.stdin is None or self.process.stdout is None:
+            raise CandidateRuntimeError("candidate_not_running")
+        if self.process.poll() is not None:
+            raise CandidateRuntimeError(
+                "candidate_exited_early", detail={"stderr": self._stderr_tail()}
+            )
+        try:
+            self.process.stdin.write(json.dumps(payload, separators=(",", ":")) + chr(10))
+            self.process.stdin.flush()
+            self.process.stdin.close()
+        except OSError as exc:
+            raise CandidateRuntimeError("candidate_stdin_failed") from exc
+        if not select.select([self.process.stdout], [], [], _TIMEOUT)[0]:
+            raise CandidateRuntimeError(
+                "candidate_protocol_timeout", detail={"stderr": self._stderr_tail()}
+            )
+        raw = self.process.stdout.readline()
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CandidateRuntimeError(
+                "candidate_protocol_invalid_json",
+                detail={"op": payload.get("op"), "line": raw[:500], "stderr": self._stderr_tail()},
+            ) from exc
+        if not isinstance(value, dict):
+            raise CandidateRuntimeError(
+                "candidate_protocol_invalid_json",
+                detail={"op": payload.get("op"), "value_type": type(value).__name__},
+            )
         return value
 
     def close(self) -> None:
@@ -169,7 +231,9 @@ class CandidateProcess:
         finally:
             self.process = None
         if self.close_protocol and exit_code != 0 and close_error is None:
-            close_error = CandidateRuntimeError("candidate_teardown_failed")
+            close_error = CandidateRuntimeError(
+                "candidate_teardown_failed", detail={"stderr": self._stderr_tail()}
+            )
         if close_error is not None:
             raise close_error
 
@@ -307,7 +371,7 @@ def materialize(
     with CandidateProcess(
         root, "materializer.py", python_executable, close_protocol=False
     ) as process:
-        value = process.call(
+        value = process.call_once(
             {
                 "op": "materialize",
                 "seed": request.seed,
@@ -350,7 +414,7 @@ def _value(field: FieldDeclaration) -> object:
         return "public-id"
     if category == "timestamp":
         return "1970-01-01T00:00:00Z"
-    return ""
+    return "sample-text"
 
 
 def _resolve(binding: SemanticBinding, trace: dict[str, Any]) -> object:
@@ -360,18 +424,6 @@ def _resolve(binding: SemanticBinding, trace: dict[str, Any]) -> object:
             return _MISSING
         value = value[key]
     return value
-
-
-def _right(
-    value: dict[str, Any], bindings: tuple[SemanticBinding, ...], trace: dict[str, Any]
-) -> object:
-    if value.get("kind") == "literal" and set(value) == {"kind", "value"}:
-        return value["value"]
-    if value.get("kind") == "semantic_ref" and set(value) == {"kind", "semantic_index"}:
-        index = value["semantic_index"]
-        if type(index) is int and 1 <= index <= len(bindings):
-            return _resolve(bindings[index - 1], trace)
-    raise CandidateRuntimeError("rule_ir_invalid")
 
 
 def _predicates(
@@ -386,8 +438,8 @@ def _predicates(
         elif predicate.operator == "not_exists":
             matched = left is _MISSING
         else:
-            right = _right(predicate.right, bindings, trace)
-            if left is _MISSING or right is _MISSING:
+            right = predicate.right
+            if left is _MISSING:
                 return False
             if predicate.operator == "eq":
                 matched = type(left) is type(right) and left == right
@@ -432,20 +484,24 @@ def _pre_value(
     return _MISSING
 
 
-def _effects(rule: RuleDraft, bindings: tuple[SemanticBinding, ...], trace: dict[str, Any]) -> bool:
+def _effects(
+    rule: RuleDraft, bindings: tuple[SemanticBinding, ...], trace: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Return None if every effect holds, else a detail dict for the first mismatch."""
     for effect in rule.effects:
         if not 1 <= effect.target_semantic_index <= len(bindings):
             raise CandidateRuntimeError("rule_ir_invalid")
         binding = bindings[effect.target_semantic_index - 1]
         actual = _resolve(binding, trace)
-        expected = (
-            _right(effect.value, bindings, trace)
-            if isinstance(effect.value, dict) and effect.value.get("kind") == "semantic_ref"
-            else effect.value
-        )
+        expected = effect.value
         previous = _pre_value(binding, bindings, trace)
         if actual is _MISSING or expected is _MISSING:
-            return False
+            return {
+                "field": binding.name,
+                "operation": effect.operation,
+                "reason": "effect target value missing in trace",
+                "actual_present": actual is not _MISSING,
+            }
         if effect.operation == "set":
             matched = type(actual) is type(expected) and actual == expected
         elif effect.operation in {"increment", "decrement"}:
@@ -471,18 +527,28 @@ def _effects(rule: RuleDraft, bindings: tuple[SemanticBinding, ...], trace: dict
         elif effect.operation == "preserve":
             matched = effect.value is None and actual == previous
         elif effect.operation == "reject":
-            return False
+            return {
+                "field": binding.name,
+                "operation": "reject",
+                "reason": "a reject effect was exercised; the transition should not reach here",
+            }
         else:
             raise CandidateRuntimeError("rule_ir_invalid")
         if not matched:
-            return False
-    return True
+            return {
+                "field": binding.name,
+                "operation": effect.operation,
+                "expected": expected,
+                "actual": actual,
+                "previous": previous if previous is not _MISSING else None,
+            }
+    return None
 
 
 def _rule_matches(
     rule: RuleDraft, bindings: tuple[SemanticBinding, ...], trace: dict[str, Any]
 ) -> bool:
-    return _predicates(rule, bindings, trace) and _effects(rule, bindings, trace)
+    return _predicates(rule, bindings, trace) and _effects(rule, bindings, trace) is None
 
 
 def _snapshot(response: object, tools: tuple[ToolDraft, ...]) -> dict[str, Any]:
@@ -550,16 +616,64 @@ def _snapshot(response: object, tools: tuple[ToolDraft, ...]) -> dict[str, Any]:
 
 
 def _result(response: object, tool: ToolDraft) -> dict[str, Any]:
+    if isinstance(response, dict) and response.get("status") == "error":
+        raise CandidateRuntimeError(
+            "candidate_property_mismatch",
+            detail={
+                "reason": "candidate invoke raised an exception (reported by the runtime scaffold)",
+                "tool": tool.surface.name,
+                "candidate_error": response.get("error"),
+                "traceback": response.get("traceback"),
+            },
+        )
     if not isinstance(response, dict) or set(response) != {"status", "result"}:
-        raise CandidateRuntimeError("candidate_property_mismatch")
+        raise CandidateRuntimeError(
+            "candidate_property_mismatch",
+            detail={
+                "reason": "invoke response must be exactly {'status': ..., 'result': ...}",
+                "tool": tool.surface.name,
+                "actual_keys": (
+                    sorted(response) if isinstance(response, dict) else type(response).__name__
+                ),
+            },
+        )
     if response["status"] != "ok" or not isinstance(response["result"], dict):
-        raise CandidateRuntimeError("candidate_property_mismatch")
+        raise CandidateRuntimeError(
+            "candidate_property_mismatch",
+            detail={
+                "reason": "invoke response status must be 'ok' and result must be an object",
+                "tool": tool.surface.name,
+                "status": response["status"],
+                "result_type": type(response["result"]).__name__,
+            },
+        )
     result = response["result"]
     fields = tool.surface.result_fields
-    if set(result) != {field.name for field in fields} or any(
-        not _category(result[field.name], field.category) for field in fields
-    ):
-        raise CandidateRuntimeError("candidate_property_mismatch")
+    expected_fields = {field.name for field in fields}
+    if set(result) != expected_fields:
+        raise CandidateRuntimeError(
+            "candidate_property_mismatch",
+            detail={
+                "reason": "result keys must equal the declared result_field names",
+                "tool": tool.surface.name,
+                "expected_fields": sorted(expected_fields),
+                "actual_fields": sorted(set(result)),
+            },
+        )
+    bad = {
+        f.name: {"expected_category": f.category, "got_type": type(result[f.name]).__name__}
+        for f in fields
+        if not _category(result[f.name], f.category)
+    }
+    if bad:
+        raise CandidateRuntimeError(
+            "candidate_property_mismatch",
+            detail={
+                "reason": "a result_field value has the wrong category",
+                "tool": tool.surface.name,
+                "wrong_category_fields": bad,
+            },
+        )
     _safe(result, "candidate_property_mismatch")
     return result
 
@@ -572,6 +686,7 @@ def _task_bindings(tools: tuple[ToolDraft, ...]) -> tuple[SemanticBinding, ...]:
             ("tool_result", tool.surface.result_fields),
             ("pre_state", tool.surface.result_fields),
             ("post_state", tool.surface.result_fields),
+            ("reset_state", tool.surface.result_fields),
         ):
             for field in fields:
                 values.append(
@@ -583,6 +698,67 @@ def _task_bindings(tools: tuple[ToolDraft, ...]) -> tuple[SemanticBinding, ...]:
                     )
                 )
     return tuple(values)
+
+
+def _guard_arguments(tool: ToolDraft, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Adjust generated arguments to satisfy precondition guards on arguments."""
+
+    adjusted = dict(arguments)
+    for rule in tool.preconditions:
+        for predicate in rule.when:
+            binding = tool.bindings[predicate.left_semantic_index - 1]
+            if binding.source != "argument":
+                continue
+            current = adjusted[binding.name]
+            if predicate.operator == "eq":
+                adjusted[binding.name] = predicate.right
+            elif predicate.operator == "ne":
+                if type(current) is type(predicate.right) and current == predicate.right:
+                    if type(current) is bool:
+                        adjusted[binding.name] = not current
+                    elif type(current) is int:
+                        adjusted[binding.name] = current + 1
+                    elif type(current) is float:
+                        adjusted[binding.name] = current + 1.0
+                    elif type(current) is str:
+                        adjusted[binding.name] = current + "-variant"
+            elif predicate.operator == "ge":
+                if (
+                    type(current) in {int, float}
+                    and isinstance(predicate.right, (int, float))
+                    and current < predicate.right
+                ):
+                    adjusted[binding.name] = predicate.right
+            elif predicate.operator == "gt":
+                if (
+                    type(current) in {int, float}
+                    and isinstance(predicate.right, (int, float))
+                    and current <= predicate.right
+                ):
+                    adjusted[binding.name] = (
+                        predicate.right + 1
+                        if isinstance(predicate.right, int)
+                        else predicate.right + 1.0
+                    )
+            elif predicate.operator == "le":
+                if (
+                    type(current) in {int, float}
+                    and isinstance(predicate.right, (int, float))
+                    and current > predicate.right
+                ):
+                    adjusted[binding.name] = predicate.right
+            elif predicate.operator == "lt":
+                if (
+                    type(current) in {int, float}
+                    and isinstance(predicate.right, (int, float))
+                    and current >= predicate.right
+                ):
+                    adjusted[binding.name] = (
+                        predicate.right - 1
+                        if isinstance(predicate.right, int)
+                        else predicate.right - 1.0
+                    )
+    return adjusted
 
 
 def _run_recipe(
@@ -600,6 +776,7 @@ def _run_recipe(
         "tool_result": {},
         "pre_state": {},
         "post_state": {},
+        "reset_state": {},
     }
     covered = False
     with CandidateProcess(root, "runtime.py", python_executable) as process:
@@ -609,11 +786,17 @@ def _run_recipe(
             {"op": "reset", "seed": request.seed, "actor": request.actor, "initial_config": config}
         ) != {"status": "ok"}:
             raise CandidateRuntimeError("candidate_reset_rejected")
+        reset_state = _snapshot(process.call({"op": "snapshot"}), tools)
+        task_trace["reset_state"] = {
+            str(tool.tool_index): reset_state["tools"][tool.surface.name] for tool in tools
+        }
         for action_index in recipe.action_tool_indexes:
             tool = tools[action_index - 1]
             arguments = {field.name: _value(field) for field in tool.surface.argument_fields}
             if action_index == recipe.tool_index and varied_arguments is not None:
                 arguments = dict(varied_arguments)
+            else:
+                arguments = _guard_arguments(tool, arguments)
             if set(arguments) != {field.name for field in tool.surface.argument_fields} or any(
                 not _category(arguments[field.name], field.category)
                 for field in tool.surface.argument_fields
@@ -642,30 +825,79 @@ def _run_recipe(
             task_trace["tool_result"][index] = result
             task_trace["pre_state"][index] = pre_state["tools"][tool.surface.name]
             task_trace["post_state"][index] = post_state["tools"][tool.surface.name]
-            selected_rules = (*tool.preconditions[:1], *tool.transitions[:1])
-            if len(selected_rules) != 2:
-                raise CandidateRuntimeError(
-                    "local_tool_semantics_mismatch",
-                    detail={"reason": "tool must have >=1 precondition and >=1 transition",
-                            "preconditions_count": len(tool.preconditions),
-                            "transitions_count": len(tool.transitions)},
-                )
-            for rule_type, rule in (("precondition", tool.preconditions[0]),
-                                     ("transition", tool.transitions[0])):
+            # Reference-composition semantics: every precondition guard must hold
+            # on the success trace, and the observed post_state must equal the
+            # deterministic composition of every transition whose when holds.
+            for rule in tool.preconditions:
                 if not _predicates(rule, tool.bindings, task_trace):
                     raise CandidateRuntimeError(
                         "local_tool_semantics_mismatch",
-                        detail={"failed": "predicates", "rule_type": rule_type,
-                                "rationale": rule.rationale,
-                                "bindings": [(b.index, b.source, b.name) for b in tool.bindings]},
+                        detail={
+                            "failed": "precondition_guards",
+                            "tool": tool.surface.name,
+                            "rationale": rule.rationale,
+                        },
                     )
-                if not _effects(rule, tool.bindings, task_trace):
-                    raise CandidateRuntimeError(
-                        "local_tool_semantics_mismatch",
-                        detail={"failed": "effects", "rule_type": rule_type,
+            pre = dict(task_trace["pre_state"][index])
+            composed = dict(pre)
+            fired = False
+            for rule in tool.transitions:
+                view = {
+                    "argument": {index: arguments},
+                    "tool_result": {index: composed},
+                    "pre_state": {index: pre},
+                    "post_state": {index: composed},
+                    "reset_state": {index: task_trace["reset_state"][index]},
+                }
+                if not _predicates(rule, tool.bindings, view):
+                    continue
+                fired = True
+                for effect in rule.effects:
+                    target = tool.bindings[effect.target_semantic_index - 1]
+                    field = target.name
+                    if effect.operation == "reject":
+                        raise CandidateRuntimeError(
+                            "local_tool_semantics_mismatch",
+                            detail={
+                                "failed": "composition",
+                                "reason": "reject effect fired on the success trace",
+                                "tool": tool.surface.name,
                                 "rationale": rule.rationale,
-                                "bindings": [(b.index, b.source, b.name) for b in tool.bindings]},
-                    )
+                            },
+                        )
+                    if effect.operation == "preserve":
+                        continue
+                    if effect.operation == "set":
+                        composed[field] = effect.value
+                    elif effect.operation in {"increment", "decrement"}:
+                        delta = (
+                            effect.value if effect.operation == "increment" else -effect.value
+                        )
+                        composed[field] = composed[field] + delta
+                    elif effect.operation == "add":
+                        composed[field] = composed[field] + [effect.value]
+                    elif effect.operation == "remove":
+                        composed[field] = [item for item in composed[field] if item != effect.value]
+            if not fired:
+                raise CandidateRuntimeError(
+                    "local_tool_semantics_mismatch",
+                    detail={
+                        "failed": "composition",
+                        "reason": "no transition rule fired on the success trace",
+                        "tool": tool.surface.name,
+                    },
+                )
+            actual = task_trace["post_state"][index]
+            if composed != actual:
+                raise CandidateRuntimeError(
+                    "local_tool_semantics_mismatch",
+                    detail={
+                        "failed": "composition",
+                        "tool": tool.surface.name,
+                        "expected_post_state": composed,
+                        "actual_post_state": actual,
+                    },
+                )
             if action_index == recipe.tool_index:
                 covered = True
                 break
@@ -707,11 +939,24 @@ def _task_outcome(
 ) -> tuple[int, bool]:
     bindings = _task_bindings(tools)
     requirement = task.task_requirement
+    # Initial rules describe the RESET state (reset_state view): matching them
+    # against post-action fields is the wrong-view failure the reset-view
+    # bindings prevent. Success/failure/terminal are WHEN-ONLY patterns.
     if any(not _rule_matches(rule, bindings, trace) for rule in requirement.initial_rules):
-        raise CandidateRuntimeError("task_initial_rule_failed")
-    success = any(_rule_matches(rule, bindings, trace) for rule in requirement.success_rules)
-    failure = any(_rule_matches(rule, bindings, trace) for rule in requirement.failure_rules)
-    terminal = any(_rule_matches(rule, bindings, trace) for rule in requirement.terminal_rules)
+        mismatched = [
+            rule.rationale
+            for rule in requirement.initial_rules
+            if not _rule_matches(rule, bindings, trace)
+        ]
+        raise CandidateRuntimeError(
+            "task_initial_rule_failed",
+            detail={"failed": "initial_rules", "mismatched_rationales": mismatched[:4]},
+        )
+    success = any(_predicates(rule, bindings, trace) for rule in requirement.success_rules)
+    failure = any(_predicates(rule, bindings, trace) for rule in requirement.failure_rules)
+    terminal = any(_predicates(rule, bindings, trace) for rule in requirement.terminal_rules)
+    if success and failure:
+        raise CandidateRuntimeError("task_rule_ambiguous")
     reward: int
     if failure:
         reward = task.reward_spec.failure
@@ -860,7 +1105,10 @@ def judge(
             )
             reward, terminated = _task_outcome(task, tools, trace)
             if reward != 1 or not terminated:
-                raise CandidateRuntimeError("task_not_terminal_success_reward_plus_one")
+                raise CandidateRuntimeError(
+                    "task_not_terminal_success_reward_plus_one",
+                    detail={"reward": reward, "terminated": terminated},
+                )
         except (CandidateRuntimeError, ValueError) as exc:
             outcomes.append(
                 {
@@ -868,6 +1116,7 @@ def judge(
                     "status": "failed",
                     "code": str(exc),
                     "binding": binding,
+                    "detail": getattr(exc, "detail", None),
                 }
             )
         else:
@@ -910,7 +1159,10 @@ def judge(
             )
             reward, terminated = _task_outcome(task, tools, trace)
             if reward != 1 or not terminated:
-                raise CandidateRuntimeError("task_not_terminal_success_reward_plus_one")
+                raise CandidateRuntimeError(
+                    "task_not_terminal_success_reward_plus_one",
+                    detail={"reward": reward, "terminated": terminated},
+                )
         except (CandidateRuntimeError, ValueError, StopIteration) as exc:
             outcomes.append(
                 {
@@ -918,6 +1170,7 @@ def judge(
                     "status": "failed",
                     "code": str(exc),
                     "binding": binding,
+                    "detail": getattr(exc, "detail", None),
                 }
             )
         else:
