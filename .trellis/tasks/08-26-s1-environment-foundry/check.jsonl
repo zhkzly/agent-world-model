@@ -1,0 +1,6 @@
+{"file":"PROJECT.md","reason":"Judge implementation evidence against stable semantic product intent."}
+{"file":".trellis/tasks/08-26-foundry-paper-product/prd.md","reason":"Check that S1 remains upstream-only and S2-S4 authority does not leak backward."}
+{"file":".trellis/tasks/08-26-s2-task-foundry/prd.md","reason":"Check every S2 semantic requirement has a compatible S1 producer without leaking S2 implementation into S1."}
+{"file":".trellis/tasks/08-26-s2-task-foundry/design.md","reason":"Audit the exact downstream Graph/Programmatic, verifier and TaskPack consumer flows."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Audit every persisted cross-process and S1-to-S2 contract."}
+{"file":".trellis/spec/harness/index.md","reason":"Apply current independent check and transition boundaries."}

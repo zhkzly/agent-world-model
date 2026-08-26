@@ -1,0 +1,29 @@
+{
+  "id": "foundry-paper-product",
+  "name": "foundry-paper-product",
+  "title": "Paper-grade Foundry product",
+  "description": "Minimal parent for S1-S4 independently verifiable product stages",
+  "status": "planning",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P0",
+  "creator": "kelong",
+  "assignee": "kelong",
+  "createdAt": "2026-08-26",
+  "completedAt": null,
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "08-26-s1-environment-foundry",
+    "08-26-s2-task-foundry"
+  ],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {}
+}
