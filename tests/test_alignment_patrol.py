@@ -356,14 +356,14 @@ class TriggerAndWiringTests(unittest.TestCase):
         closed = re.findall(r"(?m)^\[/workflow-state:([a-z0-9_-]+)\]\s*$", workflow)
         self.assertEqual(opened, closed)
 
-    def test_effective_config_disables_auto_commit_and_codex_auto_dispatch(self):
+    def test_effective_config_disables_auto_commit_and_enables_codex_subagent_dispatch(self):
         scripts_dir = REPO_ROOT / ".trellis/scripts"
         sys.path.insert(0, str(scripts_dir))
         try:
             from common import config as trellis_config
 
             self.assertFalse(trellis_config.get_session_auto_commit(REPO_ROOT))
-            self.assertEqual("inline", trellis_config.get_codex_dispatch_mode(REPO_ROOT))
+            self.assertEqual("auto", trellis_config.get_codex_dispatch_mode(REPO_ROOT))
         finally:
             sys.path.pop(0)
 

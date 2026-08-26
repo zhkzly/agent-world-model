@@ -1,0 +1,56 @@
+[project]
+name = "agent-env-foundry"
+version = "0.1.0"
+description = "Canonical agent environment foundry: environment contract and release loader"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jsonschema>=4.23",
+    "rfc8785>=0.1.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.6",
+    "mypy>=1.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_env_foundry"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+# Platform harness directories (.claude/.codex/.trellis/.agents) are owned by
+# the Trellis tooling, not this package; the alignment-patrol test belongs to
+# the harness task. Quality checks cover this package's code only.
+extend-exclude = [".claude", ".codex", ".trellis", ".agents", "tests/test_alignment_patrol.py"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # bugbear
+    "UP",  # pyupgrade
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+module = ["jsonschema.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
