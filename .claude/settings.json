@@ -31,6 +31,41 @@
             "type": "command",
             "command": "python3 .claude/hooks/session-start.py",
             "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.trellis/scripts/run_alignment_patrol.py\" hook",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/session-start.py",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.trellis/scripts/run_alignment_patrol.py\" hook",
+            "timeout": 15
+          }
+        ]
+      },
+      {
+        "matcher": "fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 .claude/hooks/session-start.py",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$(git rev-parse --show-toplevel)/.trellis/scripts/run_alignment_patrol.py\" hook",
+            "timeout": 15
           }
         ]
       }

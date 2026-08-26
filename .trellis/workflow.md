@@ -11,6 +11,67 @@
 5. **Keep results auditable** — use `trellis channel messages --raw` for worker events; pretty output is an operator dashboard and may truncate progress.
 6. **Persist decisions** — requirements, research, plans, and review conclusions belong in task files.
 
+## Alignment Patrol
+
+`alignment-patrol` is a project-local, fresh, read-only channel worker. It checks
+exactly five historical Agent failures and never edits or spawns. Its `ALLOW`
+permits one supported operation only; `BLOCK` or `ASK` stops that operation.
+
+- Context reset: Claude/Codex SessionStart hooks inject one deterministic,
+  neutral reminder after compact, resume, or fork. They do not run Patrol.
+- Plan-document write: after drafting or updating a PRD, plan, research, or
+  decision change—but before activating or implementing it—use
+  `--trigger plan-document-write`. Execution evidence is not
+  required unless the document claims execution already occurred. A new task
+  remains a candidate proposal and is passed explicitly with
+  `--candidate-task`; it is not treated as active authority.
+
+  ```bash
+  python3 .trellis/scripts/run_alignment_patrol.py check \
+    --trigger plan-document-write \
+    --candidate-task .trellis/tasks/<planning-task> \
+    --transition "persist the reviewed candidate plan"
+  ```
+- Worker boundary: after a controlled write worker returns, run:
+
+  ```bash
+  python3 .trellis/scripts/run_alignment_patrol.py check \
+    --trigger worker-turn \
+    --task <active-task-path> \
+    --transition "<exact next worker turn or checkpoint>"
+  ```
+
+- Transition boundary: before task completion, commit, merge, or release-like
+  actions, run the same command with `--trigger transition` and name only the
+  current task transition. A normal commit does not assert global completion.
+
+For any state-changing transition, make the check and that one exact transition
+one shell condition so a nonzero result cannot be ignored:
+
+```bash
+python3 .trellis/scripts/run_alignment_patrol.py check \
+  --trigger transition \
+  --task <active-task-path> \
+  --transition "<exact-transition-command>" && <exact-transition-command>
+```
+
+Files under `.trellis/.runtime/alignment/` are diagnostic only; a stored
+`ALLOW` never authorizes a later action. Run a fresh check for every transition.
+The runner collects the complete observed change set; workers must not curate
+their own Patrol input.
+
+Pure discussion, explanation, design exploration, and read-only research are
+not transitions. The latest user intent wins over an injected active-task phase;
+do not dispatch, edit, or advance merely because a task is `in_progress`.
+
+The mechanical claim is deliberately narrow: supported operations routed
+through this protocol require a fresh Patrol result. Arbitrary host/shell writes
+and external side effects are outside its enforcement boundary.
+
+If the user explicitly orders one exact action after seeing its `BLOCK` or
+`ASK`, record `OVERRIDDEN(BLOCK)` or `OVERRIDDEN(ASK)` in the turn and perform
+only that action. It is not an `ALLOW` and cannot authorize a later action.
+
 ---
 
 ## Trellis System

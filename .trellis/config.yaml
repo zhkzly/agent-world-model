@@ -30,7 +30,7 @@ max_journal_lines: 2000
 #
 # Accepts: true / false / yes / no / 1 / 0 / on / off (case-insensitive).
 #
-# session_auto_commit: true
+session_auto_commit: false
 
 #-------------------------------------------------------------------------------
 # Task Lifecycle Hooks
@@ -126,8 +126,8 @@ channel:
 # hint lines in those files) — there is no config.yaml knob for this,
 # `trellis update` preserves your edits across regeneration.
 #
-# codex:
-#   dispatch_mode: auto  # or "inline"; legacy alias: "sub-agent"
+codex:
+  dispatch_mode: inline
 
 #-------------------------------------------------------------------------------
 # Sub-agent context injection limits
