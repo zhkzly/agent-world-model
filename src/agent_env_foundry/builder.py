@@ -1,0 +1,452 @@
+"""Real Codex SDK Builder for one accepted S1 BuilderProjection."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+
+import rfc8785
+from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
+
+from agent_env_foundry.errors import EnvironmentContractError
+from agent_env_foundry.release import verify_release
+from agent_env_foundry.research import BuilderProjection
+
+__all__ = [
+    "BuilderConfig",
+    "BuilderFailure",
+    "CandidateBuild",
+    "CommandResult",
+    "PreparedBuilderWorkspace",
+    "compute_candidate_digest",
+    "prepare_builder_workspace",
+    "run_builder",
+    "run_candidate_checks",
+]
+
+PROJECTION_NAME = "BUILDER_PROJECTION.json"
+CONTRACT_NAME = "ENVIRONMENT_CONTRACT.md"
+_CODEX_PROVIDER_ID = "foundry_runtime"
+_EXCLUDED_PARTS = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "dist",
+}
+_EXCLUDED_NAMES = {PROJECTION_NAME, CONTRACT_NAME}
+_AMBIENT_PYTHON_ENV = ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME")
+
+
+class BuilderFailure(RuntimeError):
+    def __init__(self, phase: str, code: str, message: str, **details: Any) -> None:
+        super().__init__(message)
+        self.phase = phase
+        self.code = code
+        self.details = {"phase": phase, **details}
+
+
+@dataclass(frozen=True)
+class BuilderConfig:
+    model: str = "gpt-5.6-luna"
+    max_turns: int = 3
+    uv_cache_dir: Path = Path("/tmp/agent-env-foundry-builder-uv-cache")
+    command_timeout_seconds: float = 300.0
+
+    def __post_init__(self) -> None:
+        if self.max_turns <= 0:
+            raise ValueError("max_turns must be positive")
+        if self.command_timeout_seconds <= 0:
+            raise ValueError("command_timeout_seconds must be positive")
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    phase: str
+    command: tuple[str, ...]
+    exit_code: int
+    stdout: str
+    stderr: str
+
+    @property
+    def passed(self) -> bool:
+        return self.exit_code == 0
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "phase": self.phase,
+            "command": list(self.command),
+            "exit_code": self.exit_code,
+            "stdout": self.stdout,
+            "stderr": self.stderr,
+        }
+
+
+@dataclass(frozen=True)
+class PreparedBuilderWorkspace:
+    root: Path
+    projection_digest: str
+    contract_digest: str
+
+    def verify_inputs(self) -> None:
+        expected = {
+            PROJECTION_NAME: self.projection_digest,
+            CONTRACT_NAME: self.contract_digest,
+        }
+        for name, digest in expected.items():
+            path = self.root / name
+            actual = _file_digest(path) if path.is_file() and not path.is_symlink() else None
+            if actual != digest:
+                raise BuilderFailure(
+                    "builder_input",
+                    "builder_input_modified",
+                    f"Builder input {name} changed after workspace preparation",
+                    path=name,
+                    expected_digest=digest,
+                    actual_digest=actual,
+                )
+
+
+@dataclass(frozen=True)
+class CandidateBuild:
+    workspace: Path
+    thread_id: str
+    candidate_digest: str
+    final_response: str
+    checks: tuple[CommandResult, ...]
+
+
+def _file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _run(
+    command: tuple[str, ...],
+    *,
+    cwd: Path,
+    phase: str,
+    config: BuilderConfig,
+    extra_env: dict[str, str] | None = None,
+) -> CommandResult:
+    env = dict(os.environ)
+    for ambient in _AMBIENT_PYTHON_ENV:
+        env.pop(ambient, None)
+    env["UV_CACHE_DIR"] = str(config.uv_cache_dir)
+    if extra_env:
+        env.update(extra_env)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=config.command_timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return CommandResult(
+            phase,
+            command,
+            124 if isinstance(exc, subprocess.TimeoutExpired) else 127,
+            "",
+            f"{type(exc).__name__}: {exc}",
+        )
+    return CommandResult(phase, command, result.returncode, result.stdout, result.stderr)
+
+
+def prepare_builder_workspace(
+    root: Path,
+    projection: BuilderProjection,
+    *,
+    uv_cache_dir: Path,
+) -> PreparedBuilderWorkspace:
+    workspace = Path(root)
+    if workspace.is_symlink():
+        raise BuilderFailure("workspace", "workspace_symlink", "Builder workspace is a symlink")
+    if workspace.exists() and any(workspace.iterdir()):
+        raise BuilderFailure(
+            "workspace",
+            "workspace_not_empty",
+            "Builder workspace must be empty",
+            path=str(workspace),
+        )
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+    uv_cache_dir.mkdir(parents=True, exist_ok=True)
+    config = BuilderConfig(uv_cache_dir=uv_cache_dir)
+    initialized = _run(
+        (
+            "uv",
+            "init",
+            "--package",
+            "--vcs",
+            "none",
+            "--name",
+            "generated-environment",
+            "--python",
+            "3.12",
+            str(workspace),
+        ),
+        cwd=workspace.parent,
+        phase="workspace_init",
+        config=config,
+    )
+    if not initialized.passed:
+        raise BuilderFailure(
+            initialized.phase,
+            "uv_init_failed",
+            "uv init failed for the Builder workspace",
+            command=initialized.to_document(),
+        )
+
+    placeholder = workspace / "src/generated_environment/__init__.py"
+    if placeholder.exists():
+        placeholder.unlink()
+
+    projection_path = workspace / PROJECTION_NAME
+    projection_path.write_bytes(rfc8785.dumps(projection.to_document()))
+    contract_source = (
+        Path(__file__).parent / "runtime_skills/environment-codegen/ENVIRONMENT_CONTRACT.md"
+    )
+    contract_path = workspace / CONTRACT_NAME
+    shutil.copyfile(contract_source, contract_path)
+    projection_path.chmod(0o444)
+    contract_path.chmod(0o444)
+    return PreparedBuilderWorkspace(
+        root=workspace,
+        projection_digest=_file_digest(projection_path),
+        contract_digest=_file_digest(contract_path),
+    )
+
+
+def _candidate_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if any(part in _EXCLUDED_PARTS for part in relative.parts):
+            continue
+        if path.is_symlink():
+            raise BuilderFailure(
+                "candidate_identity",
+                "candidate_symlink_forbidden",
+                "Candidate identity does not accept symlinks",
+                path=relative.as_posix(),
+            )
+        if not path.is_file():
+            continue
+        if path.name in _EXCLUDED_NAMES:
+            continue
+        files.append(path)
+    return sorted(files, key=lambda item: item.relative_to(root).as_posix())
+
+
+def compute_candidate_digest(root: Path) -> str:
+    records = []
+    for path in _candidate_files(Path(root)):
+        records.append(
+            {
+                "path": path.relative_to(root).as_posix(),
+                "mode": stat.S_IMODE(path.stat().st_mode),
+                "digest": _file_digest(path),
+            }
+        )
+    return hashlib.sha256(rfc8785.dumps(cast(Any, {"files": records}))).hexdigest()
+
+
+def run_candidate_checks(root: Path, config: BuilderConfig) -> tuple[CommandResult, ...]:
+    tests_command = (str(root / ".venv" / "bin" / "python"), "-m", "pytest", "-q")
+    commands: list[tuple[str, tuple[str, ...]]] = [
+        ("lock", ("uv", "lock")),
+        ("sync", ("uv", "sync", "--frozen", "--all-groups")),
+        ("build", ("uv", "build")),
+    ]
+    results: list[CommandResult] = []
+    for phase, command in commands:
+        result = _run(command, cwd=root, phase=phase, config=config)
+        results.append(result)
+        if not result.passed:
+            return tuple(results)
+    if not (root / "tests").is_dir():
+        results.append(CommandResult("tests", tests_command, 2, "", "tests missing"))
+        return tuple(results)
+    tests_result = _run(tests_command, cwd=root, phase="tests", config=config)
+    results.append(tests_result)
+    if not tests_result.passed:
+        return tuple(results)
+    release_result = _verify_release_contract(root)
+    results.append(release_result)
+    if not release_result.passed:
+        return tuple(results)
+    return (*results, _smoke_environment_load(root, config))
+
+
+def _verify_release_contract(root: Path) -> CommandResult:
+    """Loader-contract check on the candidate's own release.json/manifest bytes."""
+    command = ("verify_release", str(root))
+    try:
+        verify_release(root)
+    except EnvironmentContractError as exc:
+        return CommandResult("release_contract", command, 1, "", str(exc))
+    return CommandResult("release_contract", command, 0, "", "")
+
+
+def _smoke_environment_load(root: Path, config: BuilderConfig) -> CommandResult:
+    candidate_python = root / ".venv/bin/python"
+    host_source = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory(
+        prefix="agent-env-foundry-loader-deps-",
+        dir=root.parent,
+    ) as temporary:
+        dependencies = Path(temporary) / "site"
+        install = _run(
+            (
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                str(candidate_python),
+                "--target",
+                str(dependencies),
+                "rfc8785",
+                "jsonschema",
+            ),
+            cwd=root.parent,
+            phase="environment_load",
+            config=config,
+        )
+        if not install.passed:
+            return install
+        return _run(
+            (str(candidate_python), "-m", "agent_env_foundry._smoke", str(root.resolve())),
+            cwd=root.parent,
+            phase="environment_load",
+            config=config,
+            extra_env={"PYTHONPATH": os.pathsep.join((str(host_source), str(dependencies)))},
+        )
+
+
+def _feedback(checks: tuple[CommandResult, ...]) -> str:
+    failed = [item.to_document() for item in checks if not item.passed]
+    return (
+        "The deterministic host checks rejected the current candidate. Repair the same "
+        "workspace without editing BUILDER_PROJECTION.json or ENVIRONMENT_CONTRACT.md. "
+        "Complete factual failures:\n" + json.dumps(failed, ensure_ascii=False, sort_keys=True)
+    )
+
+
+def _codex_provider_overrides() -> tuple[str, ...]:
+    base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
+    if not base_url:
+        raise BuilderFailure(
+            "builder_provider",
+            "provider_base_url_missing",
+            "Builder requires an explicit OPENAI_BASE_URL for its clean Codex runtime",
+            env_var="OPENAI_BASE_URL",
+        )
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise BuilderFailure(
+            "builder_provider",
+            "provider_api_key_missing",
+            "Builder requires OPENAI_API_KEY for its configured Codex provider",
+            env_var="OPENAI_API_KEY",
+        )
+    provider = _CODEX_PROVIDER_ID
+    return (
+        f'model_provider="{provider}"',
+        f'model_providers.{provider}.name="Foundry runtime"',
+        f"model_providers.{provider}.base_url={json.dumps(base_url)}",
+        f'model_providers.{provider}.env_key="OPENAI_API_KEY"',
+        f'model_providers.{provider}.wire_api="responses"',
+        f"model_providers.{provider}.supports_websockets=true",
+    )
+
+
+def run_builder(
+    projection: BuilderProjection,
+    root: Path,
+    *,
+    config: BuilderConfig | None = None,
+) -> CandidateBuild:
+    selected = config or BuilderConfig()
+    prepared = prepare_builder_workspace(
+        root,
+        projection,
+        uv_cache_dir=selected.uv_cache_dir,
+    )
+    skill = (Path(__file__).parent / "runtime_skills/environment-codegen/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    previous_failed_digest: str | None = None
+    prompt = (
+        "Build the complete environment project described by BUILDER_PROJECTION.json and "
+        "ENVIRONMENT_CONTRACT.md. Own all implementation decisions. Run and repair the "
+        "project's real uv commands and diagnostic tests before reporting completion."
+    )
+    provider_overrides = _codex_provider_overrides()
+    with tempfile.TemporaryDirectory(
+        dir=prepared.root.parent,
+        prefix="agent-env-foundry-codex-home-",
+        ignore_cleanup_errors=True,
+    ) as codex_home:
+        sdk_env = {
+            "CODEX_HOME": codex_home,
+            "UV_CACHE_DIR": str(selected.uv_cache_dir),
+        }
+        with Codex(
+            CodexConfig(
+                cwd=str(prepared.root),
+                env=sdk_env,
+                config_overrides=provider_overrides,
+            )
+        ) as codex:
+            thread = codex.thread_start(
+                approval_mode=ApprovalMode.deny_all,
+                base_instructions=skill,
+                cwd=str(prepared.root),
+                model=selected.model,
+                sandbox=Sandbox.full_access,
+            )
+            last_response = ""
+            last_checks: tuple[CommandResult, ...] = ()
+            for _turn in range(selected.max_turns):
+                result = thread.run(prompt)
+                last_response = result.final_response or ""
+                prepared.verify_inputs()
+                last_checks = run_candidate_checks(prepared.root, selected)
+                digest = compute_candidate_digest(prepared.root)
+                if last_checks and all(item.passed for item in last_checks):
+                    return CandidateBuild(
+                        prepared.root,
+                        thread.id,
+                        digest,
+                        last_response,
+                        last_checks,
+                    )
+                if previous_failed_digest == digest:
+                    failed = next(item for item in last_checks if not item.passed)
+                    raise BuilderFailure(
+                        failed.phase,
+                        "builder_stalled",
+                        "Builder produced no byte change after factual failure feedback",
+                        candidate_digest=digest,
+                        failure=failed.to_document(),
+                    )
+                previous_failed_digest = digest
+                prompt = _feedback(last_checks)
+    raise BuilderFailure(
+        "builder",
+        "builder_turns_exhausted",
+        "Builder exhausted its repair turns without passing deterministic checks",
+        final_response=last_response,
+        checks=[item.to_document() for item in last_checks],
+    )

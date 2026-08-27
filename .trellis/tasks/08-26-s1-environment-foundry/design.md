@@ -31,7 +31,7 @@ environment surface.
 
 ```text
 NeedRecord
-  -> ResearchBundle {fetched evidence, Development Brief, review}
+  -> ResearchReady {BuilderProjection, accepted review, audit evidence}
   -> CandidateProject {complete uv project, candidate identity}
   -> QualificationResult {requirement coverage, public/native evidence}
   -> EnvironmentRelease {runtime project, public contract, release identity}
@@ -39,10 +39,10 @@ NeedRecord
 
 | Handoff | Required content | Deliberately absent |
 | --- | --- | --- |
-| Research → Builder | original Need, accepted Brief, compact evidence index | table schema, tool schema, candidate code, Task |
+| Research → Builder | exactly one `BuilderProjection {FrozenNeed, SelectedWorld, Requirements, InitialWorldRelations, CitedEvidence}` | raw draft/history, reviewer/audit records, uncited evidence, table/tool schema, candidate code, Task |
 | Builder → runner | exact generated project | hidden probes, expected native facts |
 | runner → Builder | factual build/call failure and candidate identity | answer-key patch or fallback code |
-| candidate → Qualifier | Need/Brief, public API/docs, candidate source, assigned instance directory | Builder chat, Builder tests as authority |
+| candidate → Qualifier | the same `BuilderProjection`, public API/docs, candidate source, assigned instance directory | Builder chat, Builder tests as authority |
 | Qualifier → Release | passing requirement-to-probe result and native evidence | Task/reward claims |
 | S1 → S2 | exact release, reset/start contract, ToolSpecs, invoke behavior, public docs, trusted instance access | S1-authored Task, graph or verifier |
 
@@ -54,7 +54,7 @@ The product starts as a new uv/src-layout project:
 src/agent_env_foundry/
   api.py             # Need and terminal outcome API
   research.py        # Search/Fetch/Extract and Development Brief
-  agents.py          # thin Python Codex SDK invocation adapter
+  agents.py          # Responses Research adapter; Codex Builder adapter later
   builder.py         # empty workspace, candidate identity and factual repair
   environment.py     # ToolSpec, Environment protocol and release loader
   qualification.py   # independent probes and native inspection runner
@@ -76,26 +76,14 @@ package.
 def generate(request: NeedRequest) -> GenerationOutcome:
     need = freeze_original_request(request)
 
-    research = run_research(need)
-    if research.unsupported:
-        return Unsupported(research.reason)
-
-    brief_review = review_development_brief(
-        need=need,
-        fetched_sources=research.sources,
-        brief=research.brief,
-    )
-    if brief_review.requires_research_revision:
-        research = revise_research(need, research, brief_review)
-    if not brief_review.can_accept:
-        return NotReleased("research_fidelity")
+    research = run_research_until_reviewed(need)
+    if not isinstance(research, ResearchReady):
+        return research  # Unsupported or phase-attributed NotReleased
 
     workspace = create_empty_uv_package_workspace()
     builder = start_codex_builder(
         cwd=workspace,
-        need=need,
-        brief=research.brief,
-        evidence_index=research.index,
+        projection=research.builder_projection,
         environment_contract=CANONICAL_ENVIRONMENT_CONTRACT,
     )
 
@@ -109,11 +97,13 @@ def generate(request: NeedRequest) -> GenerationOutcome:
 
         qualification = independently_qualify(
             candidate=candidate,
-            need=need,
-            brief=research.brief,
+            projection=research.builder_projection,
         )
         if qualification.probe_defect:
-            qualification = reauthor_invalid_probe(candidate, need, research.brief)
+            qualification = reauthor_invalid_probe(
+                candidate,
+                research.builder_projection,
+            )
         if qualification.candidate_defect:
             builder.send_factual_feedback(qualification.public_facts)
             continue
@@ -138,46 +128,150 @@ requirements or authorize a reduced release.
 
 ## 5. Research
 
-### 5.1 What Research must learn
+Research is one Agent on the configured Responses route with one method Skill
+and two visible tools. The Host supplies the complete original Need and stable
+mechanical anchors; the anchors support coverage and feedback but never become
+a replacement semantic contract.
 
-The Research Agent investigates only information needed to describe the world
-Codex must implement:
+```text
+search_sources([{query, focus}])
+  -> ranked candidate handles, URLs, titles, snippets and typed failures
+  -> discovery only
 
-- actors, entities and permissions;
-- normal public interfaces and workflows;
-- successful state transitions and their preconditions;
-- business refusals and prohibited side effects;
-- time, concurrency and persistence behavior when material;
-- realistic initial records/assets and relationships;
-- mature libraries and native formats suitable for implementation;
-- known failure cases and disputed variants.
+read_sources([{source, focus}])
+  -> retained selected-source snapshot plus bounded exact passages
+  -> evidence or a typed blocked/no-match/fetch failure
+```
 
-Search discovers sources. Fetch retains exact response bytes, final URL, media
-type and digest. Extract creates addressable passages from fetched material.
-Search snippets and model recollection do not become evidence.
+The tool implementation is not architectural authority. The current
+SearXNG/HTTP/Extract stack may be replaced by the Wigolo Python SDK or local REST
+surface only after the same queries prove comparable source quality, challenge
+failures remain explicit, evidence can be reopened after restart and the change
+deletes more project code than it adds. The product does not require MCP.
 
-### 5.2 Development Brief
+### 5.1 Run-local Research Agenda
 
-The Research Agent returns a structured draft; host code gives stable
-requirement identifiers and renders a readable Brief containing:
+Before the first `search_sources` call, the Agent derives unresolved questions
+from the Need across these material axes:
 
-- original Need scope;
-- selected coherent synthetic-world interpretation;
-- atomic Need-clause mapping;
-- required capabilities and observable state relations;
-- meaningful initial-world requirements;
-- successful and refused behavior;
-- persistence/time/concurrency invariants where applicable;
-- evidence references, assumptions, alternatives and exclusions;
-- one falsifiable consequence for each core requirement.
+```text
+world:        actors, entities, permissions and state relations
+success:      public actions, preconditions and observable postconditions
+refusal:      invalid actions and state that must not change
+dynamics:     time, concurrency, persistence and exogenous inputs when material
+initial:      meaningful default relations that enable success and refusal
+authority:    facts stated by the Need versus contingent external facts
+scope:        coherent choices, assumptions, exclusions and alternatives
+substrate:    mature libraries/native formats relevant to Builder, without prescribing one
+```
 
-The Brief intentionally omits concrete tools, function names, JSON schemas,
-database tables and module layout. Those are Builder design decisions. It also
-omits Task, verifier, reward and training concepts.
+The Agenda is Agent working state, not another public graph node or universal
+schema. Every query names the unresolved question it serves. Search returns
+candidates; the Agent selects sources using authority, relevance and
+independence, then performs a focused read intended to close one question. A
+read may support, contradict or fail to address the question. The Agent updates
+its gap and contradiction ledgers and searches again only for unresolved
+material questions.
 
-A fresh Brief reviewer checks evidence binding, omissions, contradictions and
-unjustified narrowing. It cannot eliminate ambiguity in an under-specified Need;
-the selected interpretation and residual uncertainty remain public.
+Research is semantically complete only when:
+
+1. every original Need anchor is accepted with mapped Requirements or explicitly
+   proposed unsupported;
+2. every contingent external fact has cited evidence that entails the same
+   event, predicate and scope;
+3. every core success has a precondition and observable postcondition;
+4. every core refusal states its prohibited mutation;
+5. meaningful initial-world relations can exercise success and refusal;
+6. material contradictions are resolved or disclosed;
+7. no open gap can change core behavior.
+
+Request, byte and wall-clock limits are safety ceilings. Reaching one before
+semantic closure produces `NotReleased(resource_exhausted)` rather than a weaker
+Brief, fallback implementation or new product state.
+
+### 5.2 Compiled Brief and Builder projection
+
+The Research Agent proposes content; Host code validates citation closure,
+assigns stable Requirement IDs and compiles one Brief. The semantic Brief is:
+
+```text
+FrozenNeed
+SelectedWorld
+  scope, assumptions, exclusions, residual limitations
+Requirements[]
+  id
+  origin_need_anchors[]
+  authority = need | external_evidence
+  business state relation / capability
+  precondition and postcondition when action-like
+  refusal and prohibited mutation when refusal-like
+  falsifiable consequence
+  evidence_refs[]
+InitialWorldRelations[]
+CitedEvidence[]
+```
+
+One Requirement may originate from several anchors and one anchor may produce
+several Requirements. Need-authorized Requirements carry no web citation;
+external facts require retained passages. Fixed `reset/tools/invoke/close`,
+reconstruction and isolation reach Builder separately from the Host contract.
+
+Builder receives a dedicated projection containing only the frozen Need,
+SelectedWorld, compiled Requirements, InitialWorldRelations and compact cited
+evidence. It never receives the raw Research draft, private history, search
+candidates, reviewer history, uncited evidence, provider IDs, trace events or
+receipt counters. Research never prescribes tool names, schemas, tables,
+dependencies, exact seed identifiers, candidate tests, Tasks, verifiers or
+rewards.
+
+The deterministic Brief compiler and Builder-projection validator own this
+closed allowed-field boundary. They reject or omit raw/audit fields and any
+structural tool, storage, candidate-test or S2 artifact; this is not an extra
+semantic duty delegated to the Evidence Reviewer.
+
+### 5.3 Fresh Evidence Reviewer
+
+The fresh Reviewer receives the original Need, compiled Brief and bounded
+evidence visible to Research, with no producer history. It checks only:
+
+- exact Need coverage or an explicit unsupported proposal;
+- Need/external authority assignment and passage entailment;
+- contradictions and hidden narrowing;
+- coherent observable success/refusal relations;
+- an initial world meaningful enough to realize those relations.
+
+It does not require an exhaustive industry model, unstated jurisdiction,
+stakeholder preference or field/status taxonomy, and does not judge candidate
+code, tools, storage, Qualification probes, Tasks, rewards or release status.
+Its typed output remains exhaustive over supplied Need anchors and Requirements:
+
+```text
+need_findings[]
+requirement_findings[]
+scope_assessment
+residual_limitations[]
+unsupported_findings[]
+```
+
+Host aggregation has four outcomes:
+
+```text
+any blocking finding                                  -> REVISE same producer history
+all supported or disclosed acceptable selection      -> ACCEPT
+matching producer/reviewer unsupported Need anchors  -> UNSUPPORTED
+provider, integrity or resource failure              -> NOT_RELEASED
+```
+
+Every revised Brief receives a new reviewer. Reviewer output-contract errors are
+Reviewer failures, not Research semantic findings. Minimal audit logs may record
+diagnostics, but a full provider trace, acquisition counter and multiple
+correction-budget taxonomy are not ResearchReady product gates.
+
+Before this Reviewer can block Builder, a real-model paired-case bench must show
+it accepts direct Need authority and disclosed choices, rejects event/predicate
+substitution and hidden narrowing, ignores blocked/irrelevant pages as evidence,
+keeps residual limitations non-blocking and confirms unsupported only at high
+burden. Fake clients prove transport and schema mechanics only.
 
 ## 6. Builder and repair
 
@@ -185,11 +279,13 @@ The host performs only domain-free setup:
 
 ```text
 uv init --package <fresh-workspace>
-write NEED.md
-write BRIEF.md
-write compact evidence index
+write BUILDER_PROJECTION.json
 write ENVIRONMENT_CONTRACT.md
 ```
+
+`BUILDER_PROJECTION.json` is the canonical deterministic serialization of the
+single accepted BuilderProjection. Any human-readable Need/Brief/evidence view
+is derived from that file and is never an additional authority.
 
 It writes no source skeleton, tool stub, schema, database model, seed fixture or
 positive environment implementation.
@@ -559,9 +655,9 @@ generate a provisional Task or implement any S2 algorithm.
 
 ```text
 Research:       Need + web/user evidence; no candidate or downstream Task
-Builder:        Need + Brief + evidence index + Environment contract
+Builder:        BuilderProjection + Environment contract
 Runner:         exact candidate public execution
-Qualifier:      Need + Brief + candidate/public surface + native instance;
+Qualifier:      BuilderProjection + candidate/public surface + native instance;
                 no Builder conversation/tests as authority
 Acting Agent:   Task/start context supplied later by S2/S3 + ToolSpecs + public observations
 S2 verifier:    exact release + TaskPack + trusted task-specific native inspection

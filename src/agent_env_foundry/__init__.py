@@ -1,1 +1,3 @@
-"""Canonical agent environment foundry (S1 Slice 1: contract + release loader)."""
+"""Canonical agent environment foundry."""
+
+__all__: list[str] = []

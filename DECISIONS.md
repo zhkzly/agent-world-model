@@ -48,3 +48,9 @@
   Need/Brief and uses independent native readers rather than candidate business
   functions. Mutation is an optional test-sensitivity technique, not a product
   role or public contract.
+- 2026-08-26: S1 Research is one OpenAI Responses SDK Agent with one method
+  Skill and exactly two Agent-visible capabilities: `search_sources` for
+  discovery-only candidates and `read_sources` for Agent-selected retrieval,
+  immutable source capture and Crawl4AI extraction. The Python Codex SDK remains
+  the separate coding-focused Builder transport. Research does not use raw
+  app-server JSON-RPC, MCP, a shell imitation or a fixed framework search loop.

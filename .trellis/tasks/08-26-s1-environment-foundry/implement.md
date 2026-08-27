@@ -81,46 +81,111 @@ package may be described as an S1 release.
 
 Implement:
 
-- a thin Python Codex SDK adapter using real thread start/run, `cwd`, structured
-  output and complete provider result capture;
-- real Search, Fetch and Extract backed by mature clients/parsers;
-- immutable fetched source bytes plus URL/media type/digest index;
+- the complete raw Need plus deterministic coverage anchors that remain
+  addressing aids rather than semantic authority;
+- a thin official Responses adapter using real function calls and the minimum
+  continuation state required by the configured route;
+- exactly two Agent-visible tools: discovery-only `search_sources` and
+  Agent-selected, focused `read_sources`;
+- a physical comparison of the current retrieval implementation with Wigolo's
+  Python SDK/local REST `search` and `fetch`; adopt Wigolo only if challenge
+  failures stay typed, cited content is restart-readable and the repository has
+  a net deletion. The product path does not require MCP;
+- one run-local Research Agenda covering world relations, success transitions,
+  refusals/prohibited mutation, material dynamics, initial-world relations,
+  authority and coherent scope choices;
+- real selected-source snapshots and bounded passages sufficient to close
+  Agenda questions; snippets, blocked pages and no-match reads cannot become
+  evidence;
 - one method-only Research Skill;
-- Development Brief rendering with atomic Need-clause coverage, falsifiable
-  requirements, evidence references, variant/assumption/exclusion disclosure;
-- one independent Brief review invocation.
+- semantic-closure stopping conditions rather than success-by-call-count;
+- one compiled Development Brief plus a dedicated Builder projection containing
+  only FrozenNeed, SelectedWorld, Requirements, InitialWorldRelations and compact
+  cited evidence;
+- a fresh independent Evidence Reviewer that emits only typed clause,
+  requirement and scope findings, residual limitations and high-burden
+  unsupported findings; Host code owns deterministic routing;
+- actionable blocking findings returned to the same producer history followed
+  by a new fresh Reviewer;
+- a real-model paired-case calibration report before the Reviewer becomes a
+  hard Builder gate.
 
-The Research output contains no concrete tool schema, database schema, Task,
-verifier, reward or runtime transport.
+Delete or keep outside the product admission path:
+
+- full provider request/response trace and `provider_responses` retention;
+- acquisition counters as semantic evidence;
+- separate tool/Draft/semantic/reviewer correction-budget product states;
+- duplicate full and reviewer evidence indexes, body-mirror graphs and fields
+  without a Builder, Reviewer or audit consumer;
+- tests that protect only event names, field absence or arbitrary file modes.
+
+The Research/Builder output contains no Research-authored concrete tool schema,
+database schema, exact seed identifier, Task, verifier, reward or transport.
 
 RED/negative evidence:
 
 - search snippet or model prior is cited as evidence;
-- citation points at missing or different fetched bytes;
-- one atomic Need clause disappears from the Brief;
+- blocked/challenge or irrelevant content is counted as supporting evidence;
+- citation cannot be reopened to the retained source snapshot and exact passage;
+- a model is required to author/transcribe host digest values;
+- one original Need span disappears from the compiled Brief;
+- a Need or fixed Environment-contract requirement is rejected only because it
+  lacks a web citation;
+- an invoice-issuance deadline is accepted as evidence for a payment-due claim;
+- a disclosed coherent jurisdiction/workflow selection is classified as an
+  unjustified narrowing;
+- an undisclosed narrowing is classified as an acceptable selection;
+- a residual limitation blocks acceptance, or a blocking finding is hidden as
+  a residual limitation;
 - a required capability is relabeled as a limitation without support;
 - contradictory load-bearing sources are silently merged;
 - Research emits tool/table/Task schemas that belong downstream;
-- an unsupported Need proceeds into Builder.
+- raw Research/reviewer/audit records enter Builder context;
+- an unsupported Need proceeds into Builder;
+- a correctable reviewer finding is terminalized without returning to Research
+  and obtaining a new fresh review;
+- an LLM reviewer directly emits `NOT_RELEASED` or otherwise owns a system
+  terminal verdict;
+- a fake client, manually authored positive Brief or acquisition counter is used
+  as ResearchReady evidence.
 
 Physical checkpoint:
 
-- a real unfamiliar Need performs live Search/Fetch/Extract and yields an
-  independently accepted Brief with retained source bytes. This is Research
-  evidence, not an environment release.
+- a clear unfamiliar Need produces an inspectable Agenda, Agent-authored queries,
+  selected-source focused reads, explicit closed/open gaps and an independently
+  accepted compiled Brief with retained cited evidence;
+- the local Luna route must physically emit a schema-valid function call,
+  consume the host's matching function output through explicit item history,
+  and continue the same Agent loop; a fixed framework search sequence cannot
+  substitute for this proof.
+- the real reviewer route is calibrated against paired semantic cases: direct
+  Need and contract authority without web evidence, issuance-versus-payment
+  predicate mismatch, disclosed versus undisclosed scope narrowing, sufficient
+  evidence despite inaccessible sources, and PASS-equivalent findings with
+  residual limitations. Report false accepts/rejects across repeated fixed
+  trials; one best trace is not calibration.
+- Slice 2 is not accepted as a free-standing product milestone until the real
+  Slice 3 Builder consumes its dedicated projection without requiring an
+  authority/schema expansion.
 
 ## Slice 3 — real Codex Builder and executable candidate
 
 Implement:
 
 - a fresh `uv init --package` workspace with no domain source;
-- Builder context containing only Need, Brief, evidence index and canonical
+- Builder context containing only the dedicated FrozenNeed/SelectedWorld/
+  Requirements/InitialWorldRelations/cited-evidence projection and canonical
   Environment contract;
 - the sole environment-codegen Skill;
 - one resumable Builder thread and byte-derived candidate identities;
 - real `uv lock`, install, build, import and API execution;
 - complete factual repair feedback to the same Builder thread;
 - execution through the Slice 1 release loader/runtime surface.
+
+The first accepted Builder run is also the consumer validation for Slice 2: if
+the Builder needs Research drafts, reviewer records, missing business relations
+or another semantic schema, the defect returns to the Research contract rather
+than being patched into Builder context.
 
 The generated project must supply:
 
@@ -148,16 +213,17 @@ RED/negative evidence:
 
 Physical checkpoint:
 
-- the real accepted Brief causes the real Codex SDK thread to author a complete
-  uv project from the empty workspace and the third-party-shaped loader performs
-  `reset -> tools -> invoke -> invoke -> close`.
+- the real accepted `BuilderProjection` causes the real Codex SDK thread to
+  author a complete uv project from the empty workspace and the
+  third-party-shaped loader performs `reset -> tools -> invoke -> invoke -> close`.
 
 ## Slice 4 — independent native semantic Qualification
 
 Implement:
 
-- an independent Qualifier invocation receiving Need, Brief, candidate source,
-  public API/docs and controlled access to candidate instance directories;
+- an independent Qualifier invocation receiving the same `BuilderProjection`,
+  candidate source, public API/docs and controlled access to candidate instance
+  directories;
 - Brief-derived expected relations frozen before candidate-source access, with
   source inspection limited and logged for native representation decoding;
 - requirement-derived ordinary Python probes in a separate workspace;

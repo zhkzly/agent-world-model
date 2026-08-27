@@ -71,10 +71,10 @@ reward or sampler-specific fields.
 
 | Producer | Allowed input | Required output | Immediate consumer |
 | --- | --- | --- | --- |
-| Research | original Need, supplied material, real Search/Fetch/Extract | fetched evidence and Development Brief | Builder and independent Qualifier |
-| Builder | Need, accepted Brief, evidence index, fixed Environment API, empty workspace | complete executable uv project | runner and Qualifier |
+| Research | original Need, supplied material, real Search/Fetch/Extract | `ResearchReady {BuilderProjection, accepted review, audit evidence}` | coordinator, Builder projection consumer and independent Qualifier |
+| Builder | `BuilderProjection`, fixed Environment API, empty workspace | complete executable uv project | runner and Qualifier |
 | runner | exact candidate project | factual build/runtime observations | Builder repair or Qualifier |
-| Qualifier | Need, Brief, public API/docs, candidate source and native instance state; no Builder chat/tests | independent requirement-linked qualification evidence | release publisher |
+| Qualifier | `BuilderProjection`, public API/docs, candidate source and native instance state; no Builder chat/tests | independent requirement-linked qualification evidence | release publisher |
 | publisher | exact candidate and passing qualification | immutable `EnvironmentRelease` | S2 and third-party users |
 
 No stage receives the private conversation, hidden expected values or downstream
@@ -99,29 +99,78 @@ unstated stakeholder intent.
 
 ### R1. Evidence-grounded Research
 
-- One Research Agent uses real Search, Fetch and Extract to learn the domain's
-  actors, entities, normal workflows, public interfaces, invariants, refusal
-  behavior, time/concurrency concerns, realistic starting data, failure modes
-  and mature implementation libraries.
-- Search results and model prior are discovery aids. Accepted claims cite exact
-  fetched bytes or user-supplied material with stable source identity.
-- Research selects one coherent synthetic interpretation and records material
-  alternatives, assumptions and exclusions.
-- The Development Brief maps each atomic Need clause to an observable, falsifiable
-  requirement. It states required capabilities, state relations, successful and
-  refused behavior, persistence expectations and meaningful initial-world needs.
-- The Brief is human-readable. It does not prescribe tool names, JSON schemas,
-  database tables, Rule IR, Tasks, verifiers or rewards.
-- An independent Brief review checks omitted Need clauses, unsupported claims,
-  contradiction handling and unjustified narrowing. It is Research quality
-  control, not an oracle for unstated user intent.
+- The public authority is the complete original Need plus explicit user
+  constraints and supplied material. Host-created sentence/line anchors are
+  stable locations for coverage and feedback only; they are not a semantic
+  decomposition and never replace the original text.
+- One Research Agent uses real Search and selected-source reading. Its visible
+  tools remain `search_sources`, which returns discovery-only candidates, and
+  `read_sources`, which reads only Agent-selected sources for one narrow
+  Agent-authored question. A mature local retrieval backend such as Wigolo may
+  implement these tools only after a physical comparison proves usable output
+  and net code deletion; MCP is not part of the product contract.
+- Before searching, the Agent derives a run-local Research Agenda from the Need.
+  For every material part of the requested world it identifies unresolved
+  questions about actors/entities/relations, successful workflows and state
+  transitions, preconditions, business refusals and prohibited side effects,
+  time/concurrency/persistence, meaningful initial-world relations, and
+  contingent external facts. The Agenda is working state, not a published
+  product node or universal schema.
+- Each search query must target an unresolved Agenda question. Search snippets
+  and model recollection are discovery aids only. Each selected read names the
+  exact question it is meant to close. Accepted external claims cite a retained
+  source snapshot and exact passage; sources that are blocked, irrelevant or
+  do not entail the claim remain failed/unused evidence rather than success.
+- Research stops by semantic closure, never merely by query count: every Need
+  anchor has an accepted mapping or an explicit unsupported proposal; every
+  accepted external fact has supporting evidence; each core action has an
+  observable precondition and postcondition; each core refusal names prohibited
+  mutation; the initial world can exercise meaningful success and refusal
+  relations; material contradictions are resolved or disclosed; and no open gap
+  can change core behavior. Resource ceilings only cause `NotReleased`.
+- Research selects and discloses one coherent synthetic world when the Need
+  permits several. It records scope, assumptions, exclusions and residual
+  limitations without inventing an unstated jurisdiction, exhaustive field set,
+  status taxonomy or stakeholder preference.
+- The compiled Development Brief contains only the frozen Need reference,
+  selected-world scope, stable Requirements, meaningful initial-world relations
+  and compact cited evidence. Each Requirement binds its Need origins, authority
+  (`need` or `external_evidence`), observable business relation, refusal or
+  invariant when material, falsifiable consequence and evidence references.
+- The Builder projection excludes Research drafts/conversation, search
+  candidates, reviewer conversation, receipts, provider response IDs, trace
+  events and uncited evidence. It also excludes tool names, JSON schemas,
+  database tables, dependencies, exact seed identifiers, Tasks, verifiers and
+  rewards; those belong to Builder, Qualification or S2.
+- A fresh Evidence Reviewer sees the original Need, compiled Brief and bounded
+  evidence made available to Research, but never producer history. It checks
+  exactly: Need coverage, Need-versus-external authority, evidence entailment,
+  hidden narrowing, coherent state/refusal relations and sufficient meaningful
+  initial-world relations. It does not judge code, tools, storage, exhaustive
+  industry completeness, Tasks, rewards or release status.
+- The Reviewer emits one typed finding for every Need anchor and Requirement,
+  one scope assessment, residual limitations and explicit unsupported findings.
+  Host code maps any blocking finding to `REVISE`, all-supported or disclosed
+  acceptable-selection findings to `ACCEPT`, and a matching Research/Reviewer
+  unsupported claim to `UNSUPPORTED`. Provider, integrity or resource failure
+  ends `NotReleased` and is never relabeled as a semantic defect.
+- Before this Reviewer is a hard gate, real-model calibration must demonstrate
+  both acceptance and rejection on paired cases: direct Need authority without
+  web evidence, event/predicate mismatch, disclosed versus hidden narrowing,
+  blocked/irrelevant sources, non-blocking limitations and genuine unsupported
+  claims. Unit/fake-provider tests prove mechanics only.
+- `ResearchReady` binds the original Need, compiled Brief, cited evidence and
+  accepted typed review. A full provider transcript, acquisition counter,
+  multiple evidence indexes or independent correction-budget taxonomy is not a
+  product admission requirement; minimal diagnostic logs may remain audit-only.
 
 ### R2. Real Codex-authored project
 
 - The framework creates an otherwise empty `uv init --package` workspace.
 - The Python Codex SDK starts a real coding thread with that workspace as `cwd`.
-  It receives the Need, accepted Brief, compact evidence index and the small
-  Environment API defined by R3.
+  It receives exactly one `BuilderProjection` from accepted Research plus the
+  small Environment API defined by R3. The projection already contains the
+  FrozenNeed and compact cited evidence; those are not passed a second time.
 - Codex owns all domain code, dependencies, tool design, input/output schemas,
   native storage, initial data/assets, documentation and diagnostic tests.
 - Framework code provides no domain tool stubs, CRUD implementation, database
