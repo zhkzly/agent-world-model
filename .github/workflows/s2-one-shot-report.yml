@@ -1,0 +1,87 @@
+name: S2 one-shot deterministic report
+
+on:
+  push:
+    branches: [s2-task-foundry]
+    paths:
+      - .github/workflows/s2-one-shot-report.yml
+
+permissions:
+  contents: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: s2-task-foundry
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Run deterministic gates and write report
+        id: gates
+        shell: bash
+        run: |
+          set +e
+          mkdir -p .artifacts/s2-ci
+
+          uv sync --frozen --all-groups >.artifacts/s2-ci/sync.log 2>&1
+          sync_status=$?
+          uv run ruff check src tests >.artifacts/s2-ci/ruff-check.log 2>&1
+          ruff_status=$?
+          uv run ruff format --check src tests >.artifacts/s2-ci/ruff-format.log 2>&1
+          format_status=$?
+          uv run mypy src >.artifacts/s2-ci/mypy.log 2>&1
+          mypy_status=$?
+          uv run pytest -q >.artifacts/s2-ci/pytest.log 2>&1
+          pytest_status=$?
+
+          report=.trellis/tasks/08-26-s2-task-foundry/research/deterministic-ci-report.md
+          {
+            echo '# Deterministic S2 CI report'
+            echo
+            echo "Commit tested: \`$(git rev-parse HEAD)\`"
+            echo
+            echo '| Gate | Exit status |'
+            echo '| --- | ---: |'
+            echo "| uv sync --frozen --all-groups | $sync_status |"
+            echo "| ruff check src tests | $ruff_status |"
+            echo "| ruff format --check src tests | $format_status |"
+            echo "| mypy src | $mypy_status |"
+            echo "| pytest -q | $pytest_status |"
+            echo
+            echo 'This report contains no model/provider execution. A nonzero status is a real deterministic failure, not a skipped live-model test.'
+            for item in sync ruff-check ruff-format mypy pytest; do
+              echo
+              echo "## $item"
+              echo
+              echo '```text'
+              tail -n 200 ".artifacts/s2-ci/$item.log"
+              echo '```'
+            done
+          } >"$report"
+
+          echo "sync_status=$sync_status" >>"$GITHUB_OUTPUT"
+          echo "ruff_status=$ruff_status" >>"$GITHUB_OUTPUT"
+          echo "format_status=$format_status" >>"$GITHUB_OUTPUT"
+          echo "mypy_status=$mypy_status" >>"$GITHUB_OUTPUT"
+          echo "pytest_status=$pytest_status" >>"$GITHUB_OUTPUT"
+      - name: Commit report
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .trellis/tasks/08-26-s2-task-foundry/research/deterministic-ci-report.md
+          git commit -m "test: record deterministic S2 CI report"
+          git pull --rebase origin s2-task-foundry
+          git push origin HEAD:s2-task-foundry
+      - name: Enforce gates
+        shell: bash
+        run: |
+          test "${{ steps.gates.outputs.sync_status }}" = 0
+          test "${{ steps.gates.outputs.ruff_status }}" = 0
+          test "${{ steps.gates.outputs.format_status }}" = 0
+          test "${{ steps.gates.outputs.mypy_status }}" = 0
+          test "${{ steps.gates.outputs.pytest_status }}" = 0
