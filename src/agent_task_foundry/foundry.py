@@ -20,6 +20,7 @@ from agent_task_foundry.models import (
     AllGoal,
     AtomGoal,
     ChallengeResult,
+    CheckerMutationResult,
     CorpusManifest,
     ForEachGoal,
     IfGoal,
@@ -257,8 +258,7 @@ def seal_taskpack(
     checker: CompiledTaskChecker,
     witnesses: tuple[WitnessRun, ...],
     challenges: tuple[ChallengeResult, ...],
-    checker_mutations_killed: int,
-    checker_mutations_total: int,
+    checker_mutations: tuple[CheckerMutationResult, ...],
 ) -> TaskPack:
     successful = tuple(run for run in witnesses if run.successful)
     if len(successful) < 2:
@@ -273,8 +273,7 @@ def seal_taskpack(
     report = AdmissionReport(
         tuple(run.evidence_digest for run in successful),
         challenges,
-        checker_mutations_killed,
-        checker_mutations_total,
+        checker_mutations,
     )
     if not report.accepted:
         raise SynthesisError("Task failed challenge or checker-mutation admission")
