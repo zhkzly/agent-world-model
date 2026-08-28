@@ -24,8 +24,10 @@ input file.
    success or maintain load-bearing state only in process memory.
 5. Implement the complete release envelope, public documentation, package data,
    and diagnostic tests. Include tests for native state change, multi-step value
-   reuse, refusal without prohibited mutation, reset, reload, and instance
-   isolation.
+   reuse, refusal without prohibited mutation, reset, and instance isolation. The
+   reload test must create one factory object, reset and mutate, close it, create a
+   second factory object for the same directory, then invoke without another reset
+   and observe the committed state.
 6. Declare and lock every runtime and test dependency yourself in the project's
    `pyproject.toml` and `uv.lock` (test tools such as a test runner belong in a
    dev dependency group). Install and run through the project's own uv

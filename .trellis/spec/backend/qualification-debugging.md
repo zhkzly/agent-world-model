@@ -30,6 +30,11 @@ HostJournal(run_id, ordered events, digest) # Host-created only
 feedback = REJECTED + ALL_FINDINGS + REPAIR + RESUBMIT
 ```
 
+The Host journal records `open` before handle calls, followed by `reset`,
+`tools`, `invoke`, and `close`. A closed wrapper is permanently unusable and
+one instance name may have only one active wrapper, so a fresh factory
+reattachment cannot be confused with a stale handle.
+
 ```python
 freeze_expected_task_semantics(
     projection: BuilderProjection,
@@ -52,11 +57,17 @@ run_semantics_author(
 
 ## 3. Contracts
 
-- Codex owns tool sequences, native-reader queries, business assertions,
-  assertion-to-obligation coverage and semantic near-miss code.
+- Codex owns tool sequences, native-reader queries, business assertions and
+  semantic near-miss code.
 - Framework owns workspaces, IDs, digests, manifests, controlled copies,
-  subprocess execution, journals, evidence enrichment, coverage aggregation,
-  error ownership and verdict.
+  subprocess execution, journals, evidence enrichment, structural topology,
+  error ownership and verdict. Topology proves that a physical check was
+  attempted; independent native evidence proves its business meaning.
+- Evidence assertions contain exactly `assertion_id`, `passed`, `actual` and
+  `expected`. Model-authored coverage labels have no authority.
+- Evidence invoke sequences are unique and strictly increasing. Baseline and
+  negative calls compare in ordered `(instance, open epoch, reset epoch, tool,
+  arguments)` scope; repeated calls are never collapsed into a last-value map.
 - Models never transcribe SHA-256 values, manifest records, relation/predicate
   bindings or complete journal calls. Evidence selects Host invoke events by
   sequence number; Host injects the canonical call bytes.
@@ -126,7 +137,7 @@ run_semantics_author(
 
 - Good: `negative_setup.py` changes an existing source/data member; the copied
   release still loads; the same public call returns a different observation;
-  the same assertion ID/expected/coverage changes from true to false.
+  the same assertion ID and expected fact change from true to false.
 - Base: baseline calls and native state satisfy all frozen relations, and Host
   binds the model-selected call sequences into evidence.
 - Bad: native code writes `passed=false` because a marker/declaration names the
@@ -151,8 +162,11 @@ run_semantics_author(
 - Evidence rows cannot copy digests or calls and must reference real Host invoke
   sequence numbers.
 - Twenty-four simultaneous assertion failures appear in one feedback packet.
-- Negative assertion matches the baseline assertion ID, expected fact and
-  coverage, while actual behavior differs.
+- Negative assertion matches the baseline assertion ID and expected fact, while
+  actual behavior differs.
+- `close -> invoke` on a stale wrapper is a Qualifier defect. Only
+  `close -> fresh open(same instance) -> invoke` can attribute a reattachment
+  failure to the Candidate.
 - Added-marker-only and unchanged-public-behavior negatives are rejected.
 - Baseline exit 20 attributes Candidate; controlled-copy exit 20 attributes
   Qualifier.
