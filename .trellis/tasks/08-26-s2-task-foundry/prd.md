@@ -21,8 +21,8 @@ natural-language Need
 -> S2 deterministic TaskBlueprint generation
 -> freeze TaskChecker
 -> render/audit final canonical instruction
--> public Agent solves that exact instruction on fresh real environments
--> checker/instruction challenges
+-> public Agent solves that exact instruction on two fresh real instances
+-> checker/instruction/provenance challenges
 -> TaskPack
 -> separate TaskAssessment
 -> CorpusManifest
@@ -42,8 +42,9 @@ only for S1 v2 releases that publish and independently qualify:
 3. a protected read-only semantic state inspector;
 4. parameterized user-facing capability contracts anchored to accepted Brief
    Requirements/workflows;
-5. deterministic atomic outcome, collateral, answer and optional process checks;
-6. a deterministic generator of valid reset inputs with meaningful variation.
+5. explicit release-local composition and condition contracts;
+6. deterministic atomic outcome, collateral, answer and optional process checks;
+7. a deterministic generator of valid reset inputs with meaningful variation.
 
 A world that cannot expose deterministic task truth under this contract is
 `Unsupported`. S2 cannot replace missing semantics with an LLM Judge.
@@ -67,8 +68,8 @@ Every admitted Task must be:
 5. **Reproducible.** Repeating the same release and StartCase reconstructs the
    same business predicates even when incidental IDs or bytes differ.
 6. **Need-anchored and natural.** Every atomic capability maps to accepted Brief
-   Requirements. Cross-capability composition requires a qualified shared
-   workflow ID; accidental tool connectivity is insufficient.
+   Requirements. Cross-capability composition requires an explicitly qualified
+   composition rule, not merely tool connectivity or a broad workflow label.
 7. **Path-open.** Outcome Tasks are checked by state/answer/process truth, not by
    equality with the reference trace.
 8. **Training-targeted.** The Task targets named qualified Agent capabilities.
@@ -94,7 +95,7 @@ Parameter substitution and paraphrasing do not create new Task structures.
 Framework code owns:
 
 - release v2 parsing, preparation, process isolation and identities;
-- public/protected projection separation;
+- public/protected projection separation and no-mutation checks;
 - TaskSemantics schema/runtime validation;
 - deterministic StartCase iteration and TaskBlueprint enumeration;
 - GoalProgram and TaskChecker compilation/execution;
@@ -112,7 +113,7 @@ Codex SDK is used only for persistent release-local code authoring:
 1. **Environment Builder:** writes the actor environment project, native storage,
    start schema/data, tools, docs and diagnostic tests.
 2. **Independent Semantics Author:** after Host-frozen expected relations, writes
-   the protected TaskSemantics package that decodes native state and implements
+   the protected TaskSemantics project that decodes native state and implements
    capability/binding/evaluation contracts.
 
 Codex outputs are proposals. Host code owns manifests, execution, native reads,
@@ -143,6 +144,10 @@ invoke(tool_name: str, arguments: JSONObject) -> ToolObservation
 close() -> None
 ```
 
+Any output field used as a load-bearing operand or `public_tool` facet must be
+covered by an explicit ToolSpec output-schema path. A bare object schema does not
+authorize that field.
+
 ### Protected TaskSemantics surface
 
 ```python
@@ -160,7 +165,7 @@ class TaskSemantics(Protocol):
 ```
 
 `evaluate_condition` is required only when a release declares conditional Tasks.
-The protected package is release-specific, unavailable to the acting Agent and
+The protected project is release-specific, unavailable to the acting Agent and
 independently qualified against native state. It is not a universal State IR.
 
 ### StartCase
@@ -184,6 +189,7 @@ class CapabilitySpec:
     capability_id: str
     requirement_ids: tuple[str, ...]
     workflow_ids: tuple[str, ...]
+    composition_rules: tuple[CompositionRule, ...]
     actor_role: str
     task_kind: Literal["query", "state_change", "process"]
     intent_label: str
@@ -200,6 +206,10 @@ class CapabilitySpec:
 
 `workflow_ids`, scopes and supported kinds are release-local symbolic contracts.
 The framework compares them but never interprets domain labels.
+
+`CompositionRule` explicitly licenses a bounded `AllGoal` capability set inside
+a qualified workflow. Sharing a workflow ID alone cannot combine inverse,
+alternative or mutually exclusive actions.
 
 ### BindingCandidate
 
@@ -220,12 +230,32 @@ Ineligible/near-miss candidates support challenge construction.
 
 ### ConditionSpec and answer fields
 
-A `ConditionSpec` names a qualified condition, public wording and how the actor
-can observe it (`reset` or `public_tool`). S1 Qualification proves that
-observability. An accidental refusal in one trace cannot become an `If` condition.
+```python
+@dataclass(frozen=True)
+class ConditionSpec:
+    condition_id: str
+    public_label: str
+    visibility: Literal["reset", "public_tool"]
+    binding_scope: Literal["world", "selected_binding"]
+    true_capability_ids: tuple[str, ...]
+    false_capability_ids: tuple[str, ...]
+    report_field: AnswerFieldSpec | None
+```
+
+S1 Qualification proves public observability and branch licensing. An accidental
+refusal in one trace cannot become an `IfGoal` condition. A branch may contain no
+state goal only when the qualified condition exposes a report field for an
+explicit “otherwise report” instruction.
 
 An `AnswerFieldSpec` names a structured field, schema and public label whose value
-is returned by atomic evaluation only after real execution.
+is returned by atomic/condition evaluation only after real execution.
+
+### Facet visibility
+
+A `public_tool` facet names the exact ToolSpec output-schema pointer from which the
+actor can recover it. S1 Qualification executes that tool and verifies the path.
+`task_literal` facets may be stated in the Task because S1 certified them as
+user-facing descriptors; protected-only values are never renderable.
 
 ### Prepared release runtime
 
@@ -238,10 +268,15 @@ with prepared.open(instance_directory) as session:
     trusted = session.trusted
 ```
 
-Each prepared release runs in an isolated interpreter/process built from exact
-locked bytes. S2/S3 do not depend on a development checkout or same-process import
-cache behavior. The implementation reuses the existing subprocess/journal
-pattern; it does not introduce a Registry, network service, HTTP or MCP protocol.
+Preparation creates separate locked actor and semantics runtimes. `open` launches
+separate child interpreters/proxies: actor calls may mutate the instance;
+semantics calls are read-only and Host tree manifests prove they leave it
+unchanged. The semantics runtime does not install/import the actor package as an
+oracle.
+
+S2/S3 do not depend on a development checkout or same-process import cache
+behavior. The implementation reuses the existing subprocess/journal pattern; it
+does not introduce a Registry, network service, HTTP or MCP protocol.
 
 ## S2 semantic objects
 
@@ -265,13 +300,24 @@ The core AST has four goal nodes:
 
 ```text
 AtomGoal      one qualified capability applied to one binding slot
-AllGoal       all compatible child goals
-IfGoal        one qualified public condition selects exactly one branch
+AllGoal       all explicitly composable child goals
+IfGoal        one qualified public condition selects one branch
 ForEachGoal   one atomic capability applied to the complete selected set
 ```
 
 Selection and reporting are TaskBlueprint attributes, not standalone AST nodes.
-This avoids unnecessary compiler/interpreter nodes.
+
+```python
+@dataclass(frozen=True)
+class IfGoal:
+    condition_id: str
+    binding_slot: str | None
+    then_goal: GoalProgram | None
+    else_goal: GoalProgram | None
+```
+
+At least one branch contains a goal. A goal-less branch is legal only when the
+Blueprint report references the condition's qualified `report_field`.
 
 ```python
 @dataclass(frozen=True)
@@ -281,8 +327,8 @@ class TaskBlueprint:
     report: ReportSpec | None
 ```
 
-`ReportSpec` references only declared `AnswerFieldSpec` values from checked atoms.
-Goal nesting depth, child count and selector count are bounded by corpus policy.
+`ReportSpec` references only declared atom/condition answer fields. Goal nesting
+depth, child count and selector count are bounded by corpus policy.
 
 ### TaskDefinition, TaskPack, TaskAssessment and CorpusManifest
 
@@ -301,13 +347,11 @@ TaskPack
   deterministic challenge/admission evidence
 
 TaskAssessment
-  TaskPack ID
-  model/policy/runner/prompt identities
+  TaskPack ID + model/policy/runner/prompt identities
   pass/failure labels, calls, tokens, latency and empirical difficulty
 
 CorpusManifest
-  selected TaskPack IDs
-  selected TaskAssessment IDs
+  selected TaskPack IDs + selected TaskAssessment IDs
   corpus policy and deterministic selection evidence
 ```
 
@@ -322,6 +366,8 @@ shows an actual wording/observability/checker defect.
 - Every object binds one exact release and TaskSemantics digest.
 - Acting projections cannot deserialize trusted methods, native state, protected
   bindings, checker or admission evidence.
+- Semantics calls cannot mutate instance state and cannot import actor business
+  code as expected-answer oracle.
 - Changing release, semantics, start, Blueprint, checker, instruction or answer
   contract creates a new TaskDefinition identity.
 
@@ -341,13 +387,13 @@ qualified CapabilitySpecs
 × StartCases/BindingCandidates
 × allowed selector operators
 × supported Goal kinds
-× shared workflow IDs and compatible scopes
+× explicit CompositionRules/ConditionSpecs and compatible scopes
 × corpus policy
 ```
 
-- `AllGoal` across different capabilities requires a shared qualified workflow
-  ID and compatible scopes.
-- `IfGoal` references only a qualified `ConditionSpec`.
+- `AllGoal` across different capabilities requires a matching qualified
+  `CompositionRule` and compatible scopes.
+- `IfGoal` references only a qualified `ConditionSpec` and licensed branches.
 - `ForEachGoal` is allowed only when the capability declares that kind.
 - Redundant atoms, vacuous branches, hidden selectors and already-satisfied goals
   are rejected.
@@ -357,7 +403,7 @@ qualified CapabilitySpecs
 
 For each StartCase:
 
-1. reset a fresh isolated instance;
+1. reset a fresh isolated actor instance;
 2. capture public reset observation and protected facts;
 3. enumerate eligible and near-miss bindings;
 4. instantiate selectors/GoalProgram;
@@ -396,9 +442,13 @@ predicates and parsed structured answer without reference-path equality.
 - One Host-owned Responses tool loop receives the exact final instruction and
   public actor surface only.
 - A witness run counts only when real execution satisfies the frozen checker.
-- The Host validates each tool-argument leaf against a typed Task slot, reset
-  observation leaf, ToolSpec enum/const or earlier successful ToolObservation
-  leaf. Prose/error scraping and protected literals are forbidden.
+- The Host validates every load-bearing tool argument against a typed Task slot,
+  reset observation leaf, explicit ToolSpec constant or earlier successful
+  ToolObservation path. `public_tool` operands require the qualified output-schema
+  path.
+- Agent-chosen non-load-bearing values are allowed only when they are not target,
+  answer or Task-constraint operands and do not equal protected-only bindings.
+- Prose/error scraping and protected literals are forbidden.
 - The same Task is solved successfully on at least two fresh equivalent starts.
   The two concrete traces may use different dynamic IDs and routes.
 - The TaskPack stores actual traces and provenance reports. No custom
@@ -416,13 +466,13 @@ S2 additionally runs applicable concrete/composition challenges:
 - one omitted `AllGoal` child;
 - incomplete `ForEachGoal` set;
 - correct target plus collateral public action;
-- malformed/wrong/stale answer;
+- malformed/wrong/stale atom or condition report;
 - valid alternative route;
 - same terminal result with a declared process violation.
 
 Checker-spec mutations (drop child, ignore collateral, ignore answer, change
-selector) must be killed by the challenge suite. Crashing or unreachable mutants
-do not count. Non-applicable categories carry a typed reason.
+selector/condition branch) must be killed by the challenge suite. Crashing or
+unreachable mutants do not count. Non-applicable categories carry a typed reason.
 
 ### R9. TaskAssessment and training utility
 
@@ -435,8 +485,9 @@ do not count. Non-applicable categories carry a typed reason.
 ### R10. Corpus selection
 
 - Structural fingerprint excludes empirical difficulty and model identity.
-- Fingerprint includes capability/workflow IDs, Goal shape, selector operators,
-  relation count, public binding depth, start regimes and answer/process flags.
+- Fingerprint includes capability/workflow/composition IDs, Goal shape, selector
+  operators, relation count, public binding depth, start regimes and
+  answer/process flags.
 - Exact Blueprint/checker duplicates are removed before text similarity.
 - Corpus policy combines structure with separate TaskAssessment evidence.
 - Internal coverage is never reported as complete Task-space coverage.
@@ -447,7 +498,8 @@ Typed non-success outcomes include:
 
 ```text
 InfrastructureFailure
-ReleaseDefect
+EnvironmentDefect
+SemanticsDefect
 UnsupportedCapability
 RejectedBlueprint
 CheckerDefect
@@ -464,15 +516,19 @@ checker or canned Task may convert failure into admission.
 
 ### Code and trust gates
 
-- [ ] EnvironmentRelease v2 binds actor and TaskSemantics packages, exact digests,
-  start schemas and public preparation/open metadata.
+- [ ] EnvironmentRelease v2 binds separate actor and TaskSemantics projects,
+  exact digests, start schemas and public preparation/open metadata.
 - [ ] Environment Builder and Semantics Author use separate Codex SDK workspaces
   and cannot see each other's conversations/tests.
+- [ ] Actor and semantics run in separate prepared child runtimes; semantics
+  calls leave the instance tree unchanged and cannot import actor business code.
 - [ ] Host framework, not prompts, owns all deterministic compilation, execution,
   identity and verdict paths.
+- [ ] Every load-bearing `public_tool` field has an explicit output-schema path
+  and public execution evidence.
 - [ ] Acting/witness/assessment Agents cannot access trusted projections.
 - [ ] Checker digest is frozen before final instruction and witness model calls.
-- [ ] No admitted tool argument lacks public provenance.
+- [ ] No admitted load-bearing tool argument lacks public provenance.
 - [ ] Every applicable checker mutation/challenge is killed, with no material
   false acceptance and no alternative-route false rejection.
 
