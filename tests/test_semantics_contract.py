@@ -268,6 +268,18 @@ def test_capability_binding_and_start_validation_are_closed() -> None:
         validate_start_cases(cases, start_schema=OBJECT, limit=0)
 
 
+def test_query_capability_requires_a_structured_answer_contract() -> None:
+    capability = _capability(capability_id="inspect")
+    with pytest.raises(SemanticsContractError, match="answer_fields"):
+        replace(capability, task_kind="query", answer_fields=())
+    with pytest.raises(SemanticsContractError, match="answer_phrase"):
+        replace(
+            capability,
+            task_kind="query",
+            rendering=RenderingSpec("inspect", "item", None),
+        )
+
+
 def test_atomic_contract_has_no_scalar_reward_and_task_semantics_is_release_local() -> None:
     trace = (
         TraceEvent(

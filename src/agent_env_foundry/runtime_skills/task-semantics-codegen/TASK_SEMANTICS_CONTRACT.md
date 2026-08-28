@@ -100,6 +100,9 @@ answer_ok, process_ok, report_values, failure_codes
 
 `answer_ok` and `process_ok` are boolean or null. A satisfied result cannot have
 failed required effects/collateral/answer/process or non-empty failure codes.
+Every `task_kind="query"` capability declares at least one `answer_fields`
+record and a non-null rendering `answer_phrase`; requiring `final_answer`
+without publishing its answer contract is invalid.
 
 `ConditionCheckResultDocument` has exactly:
 
@@ -120,6 +123,10 @@ ConditionCheckRequest:
 TraceEvent:
   seq, tool_name, arguments, observation
 ```
+
+`start_cases` must include every distinct reset input demonstrated in
+`PUBLIC_SURFACE.json.public_probe_facts`. Case IDs alone do not create different
+world regimes. Repeated `(seed, limit)` calls return identical records.
 
 ## Separation and state rules
 

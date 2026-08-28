@@ -19,7 +19,7 @@ from agent_env_foundry.qualification import (
     CandidateViewManifest,
     PreparedSemanticsAuthorWorkspace,
 )
-from agent_env_foundry.semantics import capability_from_document, validate_catalog
+from agent_env_foundry.semantics import StartCase, capability_from_document, validate_catalog
 from agent_env_foundry.semantics_author import SemanticsAuthorFailure, run_semantics_author
 
 
@@ -248,6 +248,35 @@ def test_runtime_import_probe_requires_own_source_and_rejects_actor(
     rejected = semantics_author_module._import_separation_check(workspace, config)
     assert not rejected.passed
     assert "generated_actor" in rejected.stderr
+
+
+def test_start_cases_cover_real_public_reset_inputs() -> None:
+    public = {
+        "public_probe_facts": [
+            {"operation": "reset", "arguments": {"start": None}},
+            {
+                "operation": "reset",
+                "arguments": {"start": {"now": "2025-01-05T08:30:00Z"}},
+            },
+        ]
+    }
+    with pytest.raises(ValueError, match="public reset inputs"):
+        semantics_author_module._validate_start_case_coverage(
+            (StartCase("baseline", None, ("baseline",)),),
+            public,
+        )
+
+    semantics_author_module._validate_start_case_coverage(
+        (
+            StartCase("baseline", None, ("baseline",)),
+            StartCase(
+                "early",
+                {"now": "2025-01-05T08:30:00Z"},
+                ("early-clock",),
+            ),
+        ),
+        public,
+    )
 
 
 def test_model_completion_text_cannot_override_failed_framework_checks(

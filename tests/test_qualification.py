@@ -1225,6 +1225,8 @@ def test_semantics_author_inputs_reuse_qualification_view_and_host_journal(
         "BindingCandidateDocument",
         "AtomCheckResultDocument",
         "ConditionCheckResultDocument",
+        'task_kind="query"',
+        "distinct reset input",
         "must not import the actor package",
         "must not mutate",
     ):

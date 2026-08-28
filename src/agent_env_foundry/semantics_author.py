@@ -27,6 +27,7 @@ from agent_env_foundry.qualification import (
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
     CapabilitySpec,
+    StartCase,
     capability_from_document,
     start_case_from_document,
     validate_catalog,
@@ -310,19 +311,24 @@ def _contract_check(
             timeout=config.command_timeout_seconds,
             role="semantics",
         )
-        raw_cases = transport.call("start_cases", {"seed": 0, "limit": 4})
+        public = _read_json(prepared.root / PUBLIC_SURFACE_NAME)
+        start_limit = max(4, len(_public_reset_inputs(public)))
+        raw_cases = transport.call("start_cases", {"seed": 0, "limit": start_limit})
+        repeated_cases = transport.call("start_cases", {"seed": 0, "limit": start_limit})
         raw_capabilities = transport.call("capabilities", {})
         if not isinstance(raw_cases, list) or not raw_cases:
             raise ValueError("start_cases must return a non-empty array")
+        if canonical_bytes(raw_cases) != canonical_bytes(repeated_cases):
+            raise ValueError("start_cases are not deterministic for the same seed and limit")
         if not isinstance(raw_capabilities, list):
             raise ValueError("capabilities must return an array")
-        public = _read_json(prepared.root / PUBLIC_SURFACE_NAME)
         cases = tuple(start_case_from_document(item) for item in raw_cases)
         validate_start_cases(
             cases,
             start_schema=cast(dict[str, Any], public["start_schema"]),
-            limit=4,
+            limit=start_limit,
         )
+        _validate_start_case_coverage(cases, public)
         specs = tuple(capability_from_document(item) for item in raw_capabilities)
         catalog = validate_catalog(specs)
         _align_expected_catalog(
@@ -470,6 +476,29 @@ def _align_expected_catalog(
             or report_field_id != item["report_field_id"]
         ):
             raise ValueError(f"condition {condition_id!r} differs from frozen semantics")
+
+
+def _validate_start_case_coverage(
+    cases: tuple[StartCase, ...],
+    public_surface: dict[str, Any],
+) -> None:
+    public_starts = _public_reset_inputs(public_surface)
+    if not public_starts:
+        return
+    case_starts = {canonical_bytes(case.reset_input) for case in cases}
+    if not public_starts <= case_starts:
+        raise ValueError("start_cases omit real public reset inputs")
+
+
+def _public_reset_inputs(public_surface: dict[str, Any]) -> set[bytes]:
+    return {
+        canonical_bytes(fact["arguments"]["start"])
+        for fact in public_surface.get("public_probe_facts", [])
+        if isinstance(fact, dict)
+        and fact.get("operation") == "reset"
+        and isinstance(fact.get("arguments"), dict)
+        and "start" in fact["arguments"]
+    }
 
 
 def _feedback(checks: tuple[CommandResult, ...]) -> str:

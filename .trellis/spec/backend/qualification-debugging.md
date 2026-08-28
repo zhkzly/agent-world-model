@@ -96,6 +96,9 @@ run_semantics_author(
   project and owns source scanning, lock/frozen sync, import separation, build, tests,
   catalog alignment and project digest. Codex owns only native decoding, semantic
   records/evaluators, tests and dependency declarations.
+- Query capabilities require structured answer fields plus rendering wording. StartCases
+  must cover every distinct reset input already demonstrated by Host public facts; case IDs
+  alone are not world diversity, and identical seed/limit calls must be byte-equivalent.
 - Codex runs in a fresh deny-all/full-access thread. Full access is not trust: every
   immutable input is rechecked after each turn, and model prose is discarded.
 
@@ -163,7 +166,8 @@ run_semantics_author(
 - Run at least one real strict-JSON provider turn from accepted S1 relations; a
   fake client proves transport shape only.
 - Semantics Author tests kill full-access, model-self-authorization, actor/Host import,
-  catalog-alignment, fixed-factory, Skill-ownership and API fail-closed mutants.
+  catalog-alignment, query-answer, StartCase-coverage, fixed-factory, Skill-ownership and
+  API fail-closed mutants.
 - A real cross-domain project must pass all seven Framework checks; fake Codex only
   proves orchestration.
 

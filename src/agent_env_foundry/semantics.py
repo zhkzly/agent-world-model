@@ -245,6 +245,10 @@ class CapabilitySpec:
         _text(self.intent_label, "intent_label")
         if self.task_kind not in _TASK_KINDS:
             raise SemanticsContractError("capability task_kind is invalid")
+        if self.task_kind == "query" and not self.answer_fields:
+            raise SemanticsContractError("query capability requires answer_fields")
+        if self.task_kind == "query" and self.rendering.answer_phrase is None:
+            raise SemanticsContractError("query capability requires rendering answer_phrase")
         _object_schema(self.protected_binding_schema, "protected_binding")
         _object_schema(self.public_descriptor_schema, "public_descriptor")
         if "atom" not in self.supported_goal_kinds:

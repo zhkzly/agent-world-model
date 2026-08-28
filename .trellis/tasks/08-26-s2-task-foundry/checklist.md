@@ -54,6 +54,8 @@
 - [x] Are actor/Host imports and author-time candidate-view paths forbidden at runtime?
 - [x] Must generated capability/composition/condition identities equal the frozen expected
   semantics before acceptance?
+- [x] Must every query capability publish answer fields/wording, and must StartCases cover
+  distinct reset inputs already demonstrated by public physical evidence?
 - [x] Can model completion prose never override a failed Framework check?
 - [x] Did a real ocean Codex project pass source, lock, frozen sync, import separation, build,
   tests and factory/catalog checks?
