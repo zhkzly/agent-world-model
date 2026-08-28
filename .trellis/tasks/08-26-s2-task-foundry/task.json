@@ -2,10 +2,10 @@
   "id": "s2-task-foundry",
   "name": "s2-task-foundry",
   "title": "S2 Goal-First Task Foundry",
-  "description": "Design and plan qualified-capability GoalProgram synthesis, checker-before-witness admission, and structurally diverse Task corpora, including the required clean S1 v2 semantics contract",
+  "description": "Implement S1 v2 qualified TaskSemantics and deterministic Goal/checker/instruction compilation, then prove public solvability and admit diverse TaskPacks",
   "status": "planning",
   "dev_type": null,
-  "scope": "Complete S2 redesign plus minimum cross-environment S1 v2 preparation and protected semantics changes; no backward compatibility",
+  "scope": "Complete clean-break S2 implementation plus the minimum cross-environment S1 v2 preparation and TaskSemantics changes; no backward compatibility",
   "package": null,
   "priority": "P0",
   "creator": "kelong",
@@ -29,9 +29,13 @@
     ".trellis/tasks/08-26-s2-task-foundry/implement.md",
     ".trellis/tasks/08-26-s2-task-foundry/research/goal-first-design-audit.md"
   ],
-  "notes": "Old mandatory Graph/Programmatic design superseded on 2026-08-28. Task remains planning until final review, fresh plan-document Patrol, and later explicit implementation approval.",
+  "notes": "Old mandatory Graph/Programmatic design superseded. Final semantic order is capability/start -> checker -> canonical instruction -> two fresh public witnesses -> challenges -> TaskPack. TaskAssessment and CorpusManifest are separate. The user waived plan-document-write Patrol for this planning update.",
   "meta": {
     "compatibility": "clean-break",
-    "semantic_order": "goal-checker-witness-instruction"
+    "semantic_order": "capability-start-checker-instruction-witness-admission",
+    "goal_nodes": ["atom", "all", "if", "foreach"],
+    "codegen": ["environment_builder_codex", "task_semantics_codex"],
+    "acting_policy": "responses_tool_loop",
+    "task_identity_excludes": ["assessment", "difficulty", "corpus_policy"]
   }
 }
