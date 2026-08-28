@@ -212,3 +212,32 @@ def test_private_transport_rejects_sequence_mismatch_and_timeout(tmp_path: Path)
         transport.call("tools", {})
     assert caught.value.code == "child_timeout"
     transport.close()
+
+
+def test_private_transport_close_ignores_a_dead_child_pipe() -> None:
+    class DeadInput:
+        def close(self) -> None:
+            raise BrokenPipeError("child already exited")
+
+    class FinishedProcess:
+        waited = False
+
+        def poll(self) -> int:
+            return 1
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            self.waited = True
+            return 1
+
+    process = FinishedProcess()
+    transport = object.__new__(_ChildTransport)
+    transport._closed = False
+    transport._process = process
+    transport._stdin = DeadInput()
+    transport._timeout = 1.0
+
+    transport.close()
+
+    assert transport._closed is True
+    assert process.waited is True

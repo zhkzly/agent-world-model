@@ -348,7 +348,10 @@ class _ChildTransport:
             except PreparationExecutionError:
                 pass
         self._closed = True
-        self._stdin.close()
+        try:
+            self._stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
         try:
             self._process.wait(timeout=self._timeout)
         except subprocess.TimeoutExpired:
