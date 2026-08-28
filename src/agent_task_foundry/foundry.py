@@ -12,6 +12,7 @@ from agent_env_foundry.semantics import (
     JSONValue,
     StartCase,
     TaskSemantics,
+    TraceEvent,
 )
 from agent_task_foundry.compiler import CompiledTaskChecker, compile_definition
 from agent_task_foundry.models import (
@@ -63,6 +64,18 @@ class CompiledCandidate:
 
 
 @dataclass(frozen=True, slots=True)
+class RejectedBlueprint:
+    blueprint_id: str
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class CompilationBatch:
+    accepted: tuple[CompiledCandidate, ...]
+    rejected: tuple[RejectedBlueprint, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CorpusPolicy:
     max_tasks: int
     max_per_fingerprint: int = 1
@@ -98,29 +111,27 @@ def enumerate_blueprints(
     bindings: Mapping[str, tuple[BindingCandidate, ...]],
     policy: SynthesisPolicy | None = None,
 ) -> tuple[TaskBlueprint, ...]:
-    """Deterministically enumerate bounded Goal-first Task candidates.
-
-    The function never invents a predicate. It uses only qualified facets,
-    CompositionRules, ConditionSpecs and answer fields from CapabilitySpecs.
-    """
+    """Enumerate bounded candidates only from qualified release-local semantics."""
 
     selected = policy or SynthesisPolicy()
-    selectors: dict[str, SelectorSpec] = {}
     atoms: dict[str, list[tuple[SelectorSpec, AtomGoal]]] = {}
     blueprints: list[TaskBlueprint] = []
     start = StartRecipe(release_id, start_case.case_id, start_case.reset_input)
 
     for capability in sorted(capabilities, key=lambda item: item.capability_id):
-        candidates = tuple(value for value in bindings.get(capability.capability_id, ()) if value.eligible)
+        candidates = tuple(
+            value
+            for value in bindings.get(capability.capability_id, ())
+            if value.eligible
+        )
         atom_entries: list[tuple[SelectorSpec, AtomGoal]] = []
         for candidate in sorted(candidates, key=lambda item: item.semantic_key):
             selector = _unique_selector(capability, candidate, candidates)
             if selector is None:
                 continue
-            selectors[selector.selector_id] = selector
             atom = AtomGoal(capability.capability_id, selector.selector_id)
             atom_entries.append((selector, atom))
-            reports = [None]
+            reports: list[ReportSpec | None] = [None]
             if selected.include_reports and capability.answer_fields:
                 reports.append(ReportSpec(tuple(field.name for field in capability.answer_fields)))
             for report in reports:
@@ -129,14 +140,15 @@ def enumerate_blueprints(
                 )
         if selected.include_foreach and "foreach" in capability.supported_goal_kinds and candidates:
             selector = _all_selector(capability)
-            selectors[selector.selector_id] = selector
-            goal = ForEachGoal(selector.selector_id, AtomGoal(capability.capability_id, selector.selector_id))
+            goal = ForEachGoal(
+                selector.selector_id,
+                AtomGoal(capability.capability_id, selector.selector_id),
+            )
             blueprints.append(TaskBlueprint(release_id, semantics_digest, start, (selector,), goal))
         atoms[capability.capability_id] = atom_entries
 
     if selected.include_compositions:
-        rules = _rules(capabilities)
-        for rule in sorted(rules.values(), key=lambda item: item.rule_id):
+        for rule in sorted(_rules(capabilities).values(), key=lambda item: item.rule_id):
             child_options = [atoms.get(capability_id, []) for capability_id in rule.capability_ids]
             if any(not options for options in child_options):
                 continue
@@ -157,14 +169,20 @@ def enumerate_blueprints(
             for condition in capability.conditions:
                 selector_id: str | None = None
                 condition_selectors: tuple[SelectorSpec, ...] = ()
-                if atoms.get(capability.capability_id):
+                if condition.binding_scope == "selected_binding" and atoms.get(
+                    capability.capability_id
+                ):
                     condition_selectors = (atoms[capability.capability_id][0][0],)
                     selector_id = condition_selectors[0].selector_id
                 then_goal = _first_atom(condition.true_capability_ids, atoms)
                 else_goal = _first_atom(condition.false_capability_ids, atoms)
                 if then_goal is None and else_goal is None:
                     continue
-                report = ReportSpec((condition.report_field.name,)) if condition.report_field else None
+                report = (
+                    ReportSpec((condition.report_field.name,))
+                    if condition.report_field
+                    else None
+                )
                 blueprints.append(
                     TaskBlueprint(
                         release_id,
@@ -188,8 +206,9 @@ def compile_candidates(
     bindings: Mapping[str, tuple[BindingCandidate, ...]],
     public_reset_context: JSONValue,
     tool_names: tuple[str, ...],
-) -> tuple[CompiledCandidate, ...]:
+) -> CompilationBatch:
     accepted: list[CompiledCandidate] = []
+    rejected: list[RejectedBlueprint] = []
     for blueprint in blueprints:
         try:
             definition, checker = compile_definition(
@@ -200,10 +219,11 @@ def compile_candidates(
                 public_reset_context=public_reset_context,
                 tool_names=tool_names,
             )
-        except ValueError:
+        except ValueError as exc:
+            rejected.append(RejectedBlueprint(blueprint.blueprint_id, str(exc)))
             continue
         accepted.append(CompiledCandidate(definition, checker))
-    return tuple(accepted)
+    return CompilationBatch(tuple(accepted), tuple(rejected))
 
 
 def base_challenges(
@@ -211,7 +231,7 @@ def base_challenges(
     checker: CompiledTaskChecker,
     before_facts: JSONValue,
     successful_after_facts: JSONValue,
-    successful_trace: tuple,
+    successful_trace: tuple[TraceEvent, ...],
     successful_answer: JSONValue,
 ) -> tuple[ChallengeResult, ...]:
     no_op = checker.evaluate(before_facts, before_facts, (), None)
@@ -234,6 +254,7 @@ def base_challenges(
 def seal_taskpack(
     *,
     definition: TaskDefinition,
+    checker: CompiledTaskChecker,
     witnesses: tuple[WitnessRun, ...],
     challenges: tuple[ChallengeResult, ...],
     checker_mutations_killed: int,
@@ -242,6 +263,13 @@ def seal_taskpack(
     successful = tuple(run for run in witnesses if run.successful)
     if len(successful) < 2:
         raise SynthesisError("Task needs two fresh public-only successful executions")
+    if len({run.materialization_id for run in successful}) < 2:
+        raise SynthesisError("successful witnesses must use distinct fresh materializations")
+    required = _required_challenges(definition)
+    present = {challenge.challenge_id for challenge in challenges if challenge.reachable}
+    missing = required - present
+    if missing:
+        raise SynthesisError(f"missing required challenge categories: {sorted(missing)}")
     report = AdmissionReport(
         tuple(run.evidence_digest for run in successful),
         challenges,
@@ -250,7 +278,19 @@ def seal_taskpack(
     )
     if not report.accepted:
         raise SynthesisError("Task failed challenge or checker-mutation admission")
-    return TaskPack(definition, successful, report)
+    return TaskPack(definition, checker.protected_payload, successful, report)
+
+
+def _required_challenges(definition: TaskDefinition) -> set[str]:
+    required = {"positive", "no_op", "wrong_target", "collateral"}
+    goal = definition.blueprint.goal
+    if isinstance(goal, (AllGoal, ForEachGoal)):
+        required.add("partial")
+    if isinstance(goal, IfGoal):
+        required.add("wrong_branch")
+    if definition.blueprint.report is not None:
+        required.add("wrong_answer")
+    return required
 
 
 def fingerprint_task(
@@ -348,7 +388,10 @@ def _unique_selector(
             continue
         matches = [item for item in candidates if item.facets.get(facet.name) == value]
         if len(matches) == 1:
-            selector_id = f"{capability.capability_id}:{facet.name}:eq:{digest_document(value)[:12]}"
+            selector_id = (
+                f"{capability.capability_id}:{facet.name}:eq:"
+                f"{digest_document(value)[:12]}"
+            )
             return SelectorSpec(
                 selector_id,
                 capability.capability_id,
