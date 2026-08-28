@@ -1,4 +1,4 @@
-"""Deterministic Goal compilation, checker construction and instruction rendering."""
+"""Deterministic Goal compilation, checking, and canonical instruction rendering."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Mapping
 
 from agent_env_foundry.semantics import (
+    AnswerFieldSpec,
     AtomCheckRequest,
     BindingCandidate,
     CapabilitySpec,
@@ -91,13 +92,28 @@ class CompiledTaskChecker:
 
     @property
     def checker_digest(self) -> str:
-        return digest_document(
-            {
-                "blueprint_id": self.blueprint.blueprint_id,
-                "resolved": {key: list(value) for key, value in sorted(self.resolved.items())},
-                "binding_keys": sorted(self.bindings),
-            }
-        )
+        return digest_document(self._payload(include_digest=False))
+
+    @property
+    def protected_payload(self) -> JSONObject:
+        return self._payload(include_digest=True)
+
+    def _payload(self, *, include_digest: bool) -> JSONObject:
+        document: JSONObject = {
+            "blueprint": self.blueprint.to_document(),
+            "resolved": {key: list(value) for key, value in sorted(self.resolved.items())},
+            "bindings": {
+                key: {
+                    "protected": binding.protected_binding,
+                    "public": binding.public_descriptor,
+                    "facets": binding.facets,
+                }
+                for key, binding in sorted(self.bindings.items())
+            },
+        }
+        if include_digest:
+            document["checker_digest"] = self.checker_digest
+        return document
 
     def evaluate(
         self,
@@ -106,18 +122,14 @@ class CompiledTaskChecker:
         trace: tuple[TraceEvent, ...],
         final_answer: JSONValue,
     ) -> TaskCheckResult:
-        result = self._goal(
-            self.blueprint.goal,
-            before_facts=before_facts,
-            after_facts=after_facts,
-            trace=trace,
-            final_answer=final_answer,
-        )
+        result = self._goal(self.blueprint.goal, before_facts, after_facts, trace, final_answer)
         failures = list(result.failures)
         if self.blueprint.report is not None:
-            failures.extend(_check_report(self.blueprint.report, result.answer_values, final_answer))
+            failures.extend(
+                _check_report(self.blueprint.report, result.answer_values, final_answer)
+            )
         if result.status == "abstain":
-            return TaskCheckResult("abstain", tuple(failures), result.answer_values)
+            return TaskCheckResult("abstain", tuple(dict.fromkeys(failures)), result.answer_values)
         if result.status == "failed" or failures:
             return TaskCheckResult("failed", tuple(dict.fromkeys(failures)), result.answer_values)
         return TaskCheckResult("satisfied", (), result.answer_values)
@@ -125,63 +137,36 @@ class CompiledTaskChecker:
     def _goal(
         self,
         goal: GoalProgram,
-        *,
-        before_facts: JSONValue,
-        after_facts: JSONValue,
+        before: JSONValue,
+        after: JSONValue,
         trace: tuple[TraceEvent, ...],
-        final_answer: JSONValue,
+        answer: JSONValue,
     ) -> _GoalResult:
         if isinstance(goal, AtomGoal):
-            return self._atom(
-                goal,
-                before_facts=before_facts,
-                after_facts=after_facts,
-                trace=trace,
-                final_answer=final_answer,
-            )
+            return self._atom(goal, before, after, trace, answer)
         if isinstance(goal, ForEachGoal):
-            children = [
-                self._atom(
-                    AtomGoal(goal.atom.capability_id, goal.selector_id),
-                    before_facts=before_facts,
-                    after_facts=after_facts,
-                    trace=trace,
-                    final_answer=final_answer,
-                    semantic_key=semantic_key,
-                )
-                for semantic_key in self.resolved[goal.selector_id]
-            ]
-            return _combine(children, "foreach")
-        if isinstance(goal, AllGoal):
             return _combine(
                 [
-                    self._goal(
-                        child,
-                        before_facts=before_facts,
-                        after_facts=after_facts,
-                        trace=trace,
-                        final_answer=final_answer,
-                    )
-                    for child in goal.children
+                    self._atom(goal.atom, before, after, trace, answer, semantic_key=key)
+                    for key in self.resolved[goal.selector_id]
                 ],
+                "foreach",
+            )
+        if isinstance(goal, AllGoal):
+            return _combine(
+                [self._goal(child, before, after, trace, answer) for child in goal.children],
                 "all",
             )
-        return self._if(
-            goal,
-            before_facts=before_facts,
-            after_facts=after_facts,
-            trace=trace,
-            final_answer=final_answer,
-        )
+        return self._if(goal, before, after, trace, answer)
 
     def _atom(
         self,
         goal: AtomGoal,
-        *,
-        before_facts: JSONValue,
-        after_facts: JSONValue,
+        before: JSONValue,
+        after: JSONValue,
         trace: tuple[TraceEvent, ...],
-        final_answer: JSONValue,
+        answer: JSONValue,
+        *,
         semantic_key: str | None = None,
     ) -> _GoalResult:
         keys = self.resolved[goal.selector_id]
@@ -189,38 +174,37 @@ class CompiledTaskChecker:
         if not key:
             return _GoalResult("failed", ("atom_target_not_unique",), {})
         binding = self.bindings[key]
-        result = self.catalog.semantics.evaluate_atom(
+        checked = self.catalog.semantics.evaluate_atom(
             AtomCheckRequest(
-                capability_id=goal.capability_id,
-                before_facts=before_facts,
-                after_facts=after_facts,
-                protected_binding=binding.protected_binding,
-                trace=trace,
-                final_answer=final_answer,
+                goal.capability_id,
+                before,
+                after,
+                binding.protected_binding,
+                trace,
+                answer,
             )
         )
-        failures = list(result.failures)
-        if result.initially_satisfied:
+        failures = list(checked.failures)
+        if checked.initially_satisfied:
             failures.append(f"initially_satisfied:{goal.capability_id}:{key}")
-        if not result.required_effects_satisfied:
+        if not checked.required_effects_satisfied:
             failures.append(f"required_effect_missing:{goal.capability_id}:{key}")
-        if not result.collateral_ok:
+        if not checked.collateral_ok:
             failures.append(f"collateral_damage:{goal.capability_id}:{key}")
-        if result.process_ok is False:
+        if checked.process_ok is False:
             failures.append(f"process_violation:{goal.capability_id}:{key}")
-        status: CheckStatus = result.status
+        status = checked.status
         if failures and status == "satisfied":
             status = "failed"
-        return _GoalResult(status, tuple(failures), result.answer_values)
+        return _GoalResult(status, tuple(failures), checked.answer_values)
 
     def _if(
         self,
         goal: IfGoal,
-        *,
-        before_facts: JSONValue,
-        after_facts: JSONValue,
+        before: JSONValue,
+        after: JSONValue,
         trace: tuple[TraceEvent, ...],
-        final_answer: JSONValue,
+        answer: JSONValue,
     ) -> _GoalResult:
         _, condition = self.catalog.conditions[goal.condition_id]
         binding: JSONObject | None = None
@@ -230,22 +214,19 @@ class CompiledTaskChecker:
                 return _GoalResult("failed", ("condition_target_not_unique",), {})
             binding = self.bindings[keys[0]].protected_binding
         checked = self.catalog.semantics.evaluate_condition(
-            ConditionCheckRequest(goal.condition_id, before_facts, binding, trace)
+            ConditionCheckRequest(goal.condition_id, before, binding, trace)
         )
         if checked.status == "abstain":
             return _GoalResult("abstain", checked.failures or ("condition_abstained",), {})
         branch = goal.then_goal if checked.status == "true" else goal.else_goal
         if branch is None:
             return _GoalResult("satisfied", checked.failures, checked.report_values)
-        child = self._goal(
-            branch,
-            before_facts=before_facts,
-            after_facts=after_facts,
-            trace=trace,
-            final_answer=final_answer,
+        child = self._goal(branch, before, after, trace, answer)
+        return _GoalResult(
+            child.status,
+            checked.failures + child.failures,
+            {**checked.report_values, **child.answer_values},
         )
-        answers = {**checked.report_values, **child.answer_values}
-        return _GoalResult(child.status, checked.failures + child.failures, answers)
 
 
 def compile_definition(
@@ -257,7 +238,7 @@ def compile_definition(
     public_reset_context: JSONValue,
     tool_names: tuple[str, ...] = (),
 ) -> tuple[TaskDefinition, CompiledTaskChecker]:
-    """Freeze checker then render the exact instruction later given to the Agent."""
+    """Freeze checker, then render the exact instruction later given to the Agent."""
 
     catalog = SemanticsCatalog(semantics)
     selectors = {selector.selector_id: selector for selector in blueprint.selectors}
@@ -270,34 +251,30 @@ def compile_definition(
             validate_binding(capability, binding)
             previous = flat_bindings.setdefault(binding.semantic_key, binding)
             if previous != binding:
-                raise CompilationError(f"semantic key {binding.semantic_key!r} is not stable")
+                raise CompilationError(f"semantic key {binding.semantic_key!r} is unstable")
         resolved[selector.selector_id] = _resolve_selector(selector, capability, candidates)
     _validate_goal(blueprint.goal, selectors, catalog)
     checker = CompiledTaskChecker(blueprint, resolved, flat_bindings, catalog)
-    no_op = checker.evaluate(before_facts, before_facts, (), None)
-    if no_op.status == "satisfied":
+    if checker.evaluate(before_facts, before_facts, (), None).status == "satisfied":
         raise CompilationError("Task is already satisfied at its initial state")
     instruction = render_instruction(blueprint, catalog, resolved, flat_bindings)
     audit = audit_instruction(instruction, tool_names=tool_names, bindings=flat_bindings)
     if not audit.accepted:
         raise CompilationError("instruction audit failed: " + ", ".join(audit.findings))
-    answer_schema = _answer_schema(blueprint.report, catalog, blueprint.goal)
     artifact = CheckerArtifact(
         blueprint.blueprint_id,
         tuple(ResolvedSelector(key, value) for key, value in sorted(resolved.items())),
         checker.checker_digest,
     )
-    return (
-        TaskDefinition(
-            blueprint,
-            artifact,
-            instruction,
-            answer_schema,
-            public_reset_context,
-            audit,
-        ),
-        checker,
+    definition = TaskDefinition(
+        blueprint,
+        artifact,
+        instruction,
+        _answer_schema(blueprint.report, catalog, blueprint.goal),
+        public_reset_context,
+        audit,
     )
+    return definition, checker
 
 
 def _resolve_selector(
@@ -326,7 +303,9 @@ def _resolve_selector(
 
 
 def _rank(
-    candidates: list[BindingCandidate], rank: RankSpec, facets: Mapping[str, object]
+    candidates: list[BindingCandidate],
+    rank: RankSpec,
+    facets: Mapping[str, object],
 ) -> list[BindingCandidate]:
     if rank.facet not in facets:
         raise CompilationError(f"unknown rank facet {rank.facet!r}")
@@ -344,15 +323,12 @@ def _compare(left: JSONValue, operator: str, right: JSONValue) -> bool:
         return left != right
     if not isinstance(left, (int, float, str)) or not isinstance(right, type(left)):
         return False
-    if operator == "lt":
-        return left < right
-    if operator == "lte":
-        return left <= right
-    if operator == "gt":
-        return left > right
-    if operator == "gte":
-        return left >= right
-    raise CompilationError(f"unknown selector operator {operator!r}")
+    return {
+        "lt": left < right,
+        "lte": left <= right,
+        "gt": left > right,
+        "gte": left >= right,
+    }.get(operator, False)
 
 
 def _validate_goal(
@@ -370,9 +346,9 @@ def _validate_goal(
         return
     if isinstance(goal, ForEachGoal):
         selector = _selector(goal.selector_id, selectors)
-        if selector.cardinality != "all" or selector.capability_id != goal.atom.capability_id:
-            raise CompilationError("ForEach requires an all-cardinality selector for its atom")
         capability = catalog.capability(goal.atom.capability_id)
+        if selector.cardinality != "all" or selector.capability_id != goal.atom.capability_id:
+            raise CompilationError("ForEach requires an all-cardinality selector")
         if "foreach" not in capability.supported_goal_kinds:
             raise CompilationError("capability does not support ForEach")
         return
@@ -385,11 +361,16 @@ def _validate_goal(
         if set(goal_capability_ids(goal)) != set(rule.capability_ids):
             raise CompilationError("AllGoal capability set does not match CompositionRule")
         return
-    condition_owner, condition = catalog.conditions.get(goal.condition_id, (None, None))
-    if condition is None or condition_owner is None:
+    owner, condition = catalog.conditions.get(goal.condition_id, (None, None))
+    if condition is None or owner is None:
         raise CompilationError(f"unknown condition {goal.condition_id!r}")
-    if goal.selector_id is not None:
-        _selector(goal.selector_id, selectors)
+    if condition.binding_scope == "selected_binding":
+        if goal.selector_id is None:
+            raise CompilationError("selected-binding condition requires selector_id")
+        if _selector(goal.selector_id, selectors).capability_id != owner.capability_id:
+            raise CompilationError("condition selector uses the wrong capability")
+    elif goal.selector_id is not None:
+        raise CompilationError("world condition must not carry a binding selector")
     for child, allowed in (
         (goal.then_goal, condition.true_capability_ids),
         (goal.else_goal, condition.false_capability_ids),
@@ -436,33 +417,40 @@ def _render_goal(
         target, constraints = _target(
             selectors[goal.selector_id], capability, resolved, bindings, plural=False
         )
-        suffix = f" that {constraints}" if constraints else ""
-        return f"{capability.rendering.action_phrase} {target}{suffix}"
+        return f"{capability.rendering.action_phrase} {target}" + (
+            f" that {constraints}" if constraints else ""
+        )
     if isinstance(goal, ForEachGoal):
         capability = catalog.capability(goal.atom.capability_id)
         target, constraints = _target(
             selectors[goal.selector_id], capability, resolved, bindings, plural=True
         )
-        suffix = f" that {constraints}" if constraints else ""
-        return f"{capability.rendering.action_phrase} {target}{suffix}"
+        return f"{capability.rendering.action_phrase} {target}" + (
+            f" that {constraints}" if constraints else ""
+        )
     if isinstance(goal, AllGoal):
-        return "; then ".join(
+        return "; also ".join(
             _render_goal(child, blueprint, catalog, resolved, bindings)
             for child in goal.children
         )
     _, condition = catalog.conditions[goal.condition_id]
-    prefix = f"if {condition.public_label}, "
-    then_text = (
-        _render_goal(goal.then_goal, blueprint, catalog, resolved, bindings)
-        if goal.then_goal is not None
-        else f"report {condition.report_field.public_label}"
-    )
-    else_text = (
-        _render_goal(goal.else_goal, blueprint, catalog, resolved, bindings)
-        if goal.else_goal is not None
-        else f"report {condition.report_field.public_label}"
-    )
-    return prefix + then_text + "; otherwise, " + else_text
+    then_text = _branch_text(goal.then_goal, condition, blueprint, catalog, resolved, bindings)
+    else_text = _branch_text(goal.else_goal, condition, blueprint, catalog, resolved, bindings)
+    return f"if {condition.public_label}, {then_text}; otherwise, {else_text}"
+
+
+def _branch_text(
+    goal: GoalProgram | None,
+    condition: ConditionSpec,
+    blueprint: TaskBlueprint,
+    catalog: SemanticsCatalog,
+    resolved: Mapping[str, tuple[str, ...]],
+    bindings: Mapping[str, BindingCandidate],
+) -> str:
+    if goal is not None:
+        return _render_goal(goal, blueprint, catalog, resolved, bindings)
+    assert condition.report_field is not None
+    return f"report {condition.report_field.public_label}"
 
 
 def _target(
@@ -475,22 +463,44 @@ def _target(
 ) -> tuple[str, str]:
     keys = resolved[selector.selector_id]
     label = capability.rendering.target_plural if plural else capability.rendering.target_singular
-    constraints: list[str] = []
     facet_specs = {facet.name: facet for facet in capability.facets}
-    for predicate in selector.filters:
-        public = facet_specs[predicate.facet].public_label
-        constraints.append(f"has {public} {predicate.operator} {predicate.value!r}")
+    constraints = [
+        _predicate_text(
+            facet_specs[predicate.facet].public_label,
+            predicate.operator,
+            predicate.value,
+        )
+        for predicate in selector.filters
+    ]
     if selector.rank is not None:
         public = facet_specs[selector.rank.facet].public_label
         direction = "lowest" if selector.rank.direction == "min" else "highest"
         constraints.append(f"has the {direction} {public}")
     if not constraints and len(keys) == 1:
-        descriptor = bindings[keys[0]].public_descriptor
-        visible = [str(value) for value in descriptor.values() if isinstance(value, (str, int, float))]
+        visible = [
+            str(value)
+            for value in bindings[keys[0]].public_descriptor.values()
+            if isinstance(value, (str, int, float))
+        ]
         if visible:
             constraints.append("is identified as " + ", ".join(visible))
-    article = "all" if plural else "the"
-    return f"{article} {label}", " and ".join(constraints)
+    return f"{'all' if plural else 'the'} {label}", " and ".join(constraints)
+
+
+def _predicate_text(label: str, operator: str, value: JSONValue) -> str:
+    rendered = repr(value)
+    phrases = {
+        "eq": f"has {label} equal to {rendered}",
+        "neq": f"has {label} different from {rendered}",
+        "lt": f"has {label} below {rendered}",
+        "lte": f"has {label} at most {rendered}",
+        "gt": f"has {label} above {rendered}",
+        "gte": f"has {label} at least {rendered}",
+    }
+    try:
+        return phrases[operator]
+    except KeyError as exc:
+        raise CompilationError(f"unsupported public predicate operator {operator!r}") from exc
 
 
 def audit_instruction(
@@ -502,14 +512,20 @@ def audit_instruction(
     findings: list[str] = []
     lowered = instruction.casefold()
     for tool_name in tool_names:
-        if tool_name.casefold() in lowered:
+        normalized = tool_name.casefold()
+        code_like = any(not character.isalpha() for character in tool_name)
+        quoted = f"`{normalized}`" in lowered or f'"{normalized}"' in lowered
+        if quoted or (code_like and normalized in lowered):
             findings.append(f"tool_name_leak:{tool_name}")
-    public_values: set[str] = set()
-    protected_values: set[str] = set()
-    for binding in bindings.values():
-        public_values |= _strings(binding.public_descriptor)
-        public_values |= _strings(binding.facets)
-        protected_values |= _strings(binding.protected_binding)
+    public_values = set().union(
+        *(
+            _strings(value.public_descriptor) | _strings(value.facets)
+            for value in bindings.values()
+        )
+    ) if bindings else set()
+    protected_values = set().union(
+        *(_strings(value.protected_binding) for value in bindings.values())
+    ) if bindings else set()
     for value in sorted(protected_values - public_values):
         if len(value) >= 4 and value.casefold() in lowered:
             findings.append(f"protected_value_leak:{value}")
@@ -539,21 +555,28 @@ def _answer_schema(
     }
 
 
-def _answer_specs(catalog: SemanticsCatalog, goal: GoalProgram) -> dict[str, object]:
-    answer_specs: dict[str, object] = {}
+def _answer_specs(
+    catalog: SemanticsCatalog,
+    goal: GoalProgram,
+) -> dict[str, AnswerFieldSpec]:
+    specs: dict[str, AnswerFieldSpec] = {}
     for capability_id in goal_capability_ids(goal):
         for field in catalog.capability(capability_id).answer_fields:
-            answer_specs[field.name] = field
+            specs[field.name] = field
     if isinstance(goal, IfGoal):
         _, condition = catalog.conditions[goal.condition_id]
         if condition.report_field is not None:
-            answer_specs[condition.report_field.name] = condition.report_field
-    return answer_specs
+            specs[condition.report_field.name] = condition.report_field
+    return specs
 
 
-def _answer_labels(report: ReportSpec, catalog: SemanticsCatalog, goal: GoalProgram) -> list[str]:
+def _answer_labels(
+    report: ReportSpec,
+    catalog: SemanticsCatalog,
+    goal: GoalProgram,
+) -> list[str]:
     specs = _answer_specs(catalog, goal)
-    return [getattr(specs[name], "public_label") for name in report.field_names]
+    return [specs[name].public_label for name in report.field_names]
 
 
 def _check_report(report: ReportSpec, expected: JSONObject, actual: JSONValue) -> list[str]:
