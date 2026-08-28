@@ -2,5 +2,6 @@
 {"file":"DECISIONS.md","reason":"Accepted clean-break S2 and S1-v2 decisions, including checker-before-witness and deletion of mandatory Graph/Programmatic lanes."}
 {"file":".trellis/spec/backend/s1-coordinator.md","reason":"Existing direct imperative S1 coordinator, cold-publication and no-compatibility conventions that the v2 work must preserve."}
 {"file":".trellis/spec/backend/qualification-debugging.md","reason":"Existing independent public/native qualification, physical-negative and causal-debugging contract to extend for taskable semantics."}
+{"file":".trellis/tasks/08-26-s2-task-foundry/research/goal-first-design-audit.md","reason":"Adversarial feasibility audit, explicit workflow-anchor requirement, risk inventory and overdesign deletion boundary for implementation."}
 {"file":".trellis/tasks/08-26-s2-task-foundry/research/external-ai-interface-review-packet.md","reason":"Historical interface inventory and S1 evidence only; current S2 proposal inside it is superseded and must not be implemented as authority."}
 {"file":".trellis/tasks/08-26-s2-task-foundry/research/glm-interface-review-record.md","reason":"Independent review findings on preparation/opening, process isolation, broad schemas, hidden setup and old S2 overdesign."}
