@@ -1,18 +1,18 @@
 {
   "id": "s2-task-foundry",
   "name": "s2-task-foundry",
-  "title": "S2 Task Foundry",
-  "description": "Design grounded Graph-based and Programmatic Task synthesis and admission against exact S1 releases",
+  "title": "S2 Goal-First Task Foundry",
+  "description": "Design and plan qualified-capability GoalProgram synthesis, checker-before-witness admission, and structurally diverse Task corpora, including the required clean S1 v2 semantics contract",
   "status": "planning",
   "dev_type": null,
-  "scope": null,
+  "scope": "Complete S2 redesign plus minimum cross-environment S1 v2 preparation and protected semantics changes; no backward compatibility",
   "package": null,
   "priority": "P0",
   "creator": "kelong",
   "assignee": "kelong",
   "createdAt": "2026-08-26",
   "completedAt": null,
-  "branch": null,
+  "branch": "s2-task-foundry",
   "base_branch": "main",
   "worktree_path": null,
   "commit": null,
@@ -20,7 +20,17 @@
   "subtasks": [],
   "children": [],
   "parent": "08-26-foundry-paper-product",
-  "relatedFiles": [],
-  "notes": "",
-  "meta": {}
+  "relatedFiles": [
+    "PROJECT.md",
+    "DECISIONS.md",
+    ".trellis/tasks/08-26-foundry-paper-product/prd.md",
+    ".trellis/tasks/08-26-s2-task-foundry/prd.md",
+    ".trellis/tasks/08-26-s2-task-foundry/design.md",
+    ".trellis/tasks/08-26-s2-task-foundry/implement.md"
+  ],
+  "notes": "Old mandatory Graph/Programmatic design superseded on 2026-08-28. Task remains planning until final review, fresh plan-document Patrol, and later explicit implementation approval.",
+  "meta": {
+    "compatibility": "clean-break",
+    "semantic_order": "goal-checker-witness-instruction"
+  }
 }
