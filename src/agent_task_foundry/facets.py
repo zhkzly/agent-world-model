@@ -38,9 +38,9 @@ def compare_facet_values(left: JSONValue, operator: str, right: JSONValue) -> bo
         raise FacetValueError(f"unsupported comparison operator {operator!r}")
 
     if _is_numeric(left) and _is_numeric(right):
-        return _apply_order(left, operator, right)
+        return _apply_numeric_order(left, operator, right)
     if isinstance(left, str) and isinstance(right, str):
-        return _apply_order(left, operator, right)
+        return _apply_string_order(left, operator, right)
     raise FacetValueError(
         "ordered facet comparison requires two finite numbers or two strings; "
         f"got {type(left).__name__} and {type(right).__name__}"
@@ -91,7 +91,7 @@ def _is_numeric(value: object) -> TypeGuard[Numeric]:
     return not isinstance(value, float) or math.isfinite(value)
 
 
-def _apply_order(left: Numeric, operator: OrderOperator, right: Numeric) -> bool:
+def _apply_numeric_order(left: Numeric, operator: OrderOperator, right: Numeric) -> bool:
     if operator == "lt":
         return left < right
     if operator == "lte":
@@ -101,7 +101,7 @@ def _apply_order(left: Numeric, operator: OrderOperator, right: Numeric) -> bool
     return left >= right
 
 
-def _apply_order(left: str, operator: OrderOperator, right: str) -> bool:
+def _apply_string_order(left: str, operator: OrderOperator, right: str) -> bool:
     if operator == "lt":
         return left < right
     if operator == "lte":
