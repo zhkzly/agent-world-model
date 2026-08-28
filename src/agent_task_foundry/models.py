@@ -93,7 +93,11 @@ class AtomGoal:
     selector_id: str
 
     def to_document(self) -> JSONObject:
-        return {"kind": "atom", "capability_id": self.capability_id, "selector_id": self.selector_id}
+        return {
+            "kind": "atom",
+            "capability_id": self.capability_id,
+            "selector_id": self.selector_id,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,7 +144,11 @@ class ForEachGoal:
     atom: AtomGoal
 
     def to_document(self) -> JSONObject:
-        return {"kind": "foreach", "selector_id": self.selector_id, "atom": self.atom.to_document()}
+        return {
+            "kind": "foreach",
+            "selector_id": self.selector_id,
+            "atom": self.atom.to_document(),
+        }
 
 
 GoalProgram: TypeAlias = AtomGoal | AllGoal | IfGoal | ForEachGoal
@@ -272,10 +280,13 @@ class ProvenanceReport:
 
     @property
     def complete(self) -> bool:
-        return bool(self.origins) and all(value.source != "unresolved" for value in self.origins)
+        return all(value.source != "unresolved" for value in self.origins)
 
     def to_document(self) -> JSONObject:
-        return {"origins": [item.to_document() for item in self.origins], "complete": self.complete}
+        return {
+            "origins": [item.to_document() for item in self.origins],
+            "complete": self.complete,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +310,7 @@ class PublicTraceEvent:
 @dataclass(frozen=True, slots=True)
 class WitnessRun:
     run_id: str
+    materialization_id: str
     task_definition_id: str
     trace: tuple[PublicTraceEvent, ...]
     final_answer: JSONValue
@@ -307,8 +319,10 @@ class WitnessRun:
 
     @property
     def successful(self) -> bool:
-        return self.checker_status == "satisfied" and all(
-            event.provenance.complete for event in self.trace
+        return (
+            self.checker_status == "satisfied"
+            and bool(self.trace)
+            and all(event.provenance.complete for event in self.trace)
         )
 
     @property
@@ -318,6 +332,7 @@ class WitnessRun:
     def to_document(self) -> JSONObject:
         return {
             "run_id": self.run_id,
+            "materialization_id": self.materialization_id,
             "task_definition_id": self.task_definition_id,
             "trace": [item.to_document() for item in self.trace],
             "final_answer": canonical_document(self.final_answer),
@@ -376,13 +391,19 @@ class AdmissionReport:
 @dataclass(frozen=True, slots=True)
 class TaskPack:
     definition: TaskDefinition
+    checker_payload: JSONObject
     witnesses: tuple[WitnessRun, ...]
     admission: AdmissionReport
 
     def __post_init__(self) -> None:
         if not self.admission.accepted:
             raise TaskModelError("cannot seal a TaskPack with failed admission")
-        if any(run.task_definition_id != self.definition.task_definition_id for run in self.witnesses):
+        if not self.checker_payload:
+            raise TaskModelError("TaskPack requires reconstructable protected checker payload")
+        if any(
+            run.task_definition_id != self.definition.task_definition_id
+            for run in self.witnesses
+        ):
             raise TaskModelError("witness belongs to another TaskDefinition")
 
     @property
@@ -392,8 +413,15 @@ class TaskPack:
     def to_document(self) -> JSONObject:
         return {
             "definition": self.definition.to_document(),
+            "checker_payload": canonical_document(self.checker_payload),
             "witnesses": [item.to_document() for item in self.witnesses],
             "admission": self.admission.to_document(),
+        }
+
+    def public_projection(self) -> JSONObject:
+        return {
+            "taskpack_id": self.taskpack_id,
+            "task": self.definition.public_projection(),
         }
 
 
@@ -477,7 +505,15 @@ def goal_capability_ids(goal: GoalProgram) -> tuple[str, ...]:
     if isinstance(goal, ForEachGoal):
         return (goal.atom.capability_id,)
     if isinstance(goal, AllGoal):
-        return tuple(sorted({item for child in goal.children for item in goal_capability_ids(child)}))
+        return tuple(
+            sorted(
+                {
+                    item
+                    for child in goal.children
+                    for item in goal_capability_ids(child)
+                }
+            )
+        )
     children = tuple(value for value in (goal.then_goal, goal.else_goal) if value is not None)
     return tuple(sorted({item for child in children for item in goal_capability_ids(child)}))
 
@@ -490,5 +526,6 @@ def goal_shape(goal: GoalProgram) -> str:
     if isinstance(goal, AllGoal):
         return "all(" + ",".join(goal_shape(child) for child in goal.children) + ")"
     return "if(" + ",".join(
-        goal_shape(value) if value is not None else "report" for value in (goal.then_goal, goal.else_goal)
+        goal_shape(value) if value is not None else "report"
+        for value in (goal.then_goal, goal.else_goal)
     ) + ")"
