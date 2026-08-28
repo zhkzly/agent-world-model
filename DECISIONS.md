@@ -97,3 +97,5 @@
 `s2-task-foundry-cp3a-wiring|介入2|返工2|real 20-relation Luna+Host journal staging+6 mutation licenses|红线违反1: initially introduced and deleted a duplicate staging subsystem`
 
 `s2-task-foundry-cp3b|介入0|返工2|real Codex SDK+semantic source audit+7 Framework gates+11 mutation licenses|红线违反1: first green gate missed answer and StartCase semantics`
+
+`s2-task-foundry-cp3c-framework|介入1|返工3|real CAP-005 causal trace+4 independent reviews+RED/GREEN+native reconciliation mutations|红线违反0`

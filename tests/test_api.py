@@ -319,6 +319,17 @@ def test_cold_failure_blocks_immutable_publication(
             checks=(),
         ),
     )
+    monkeypatch.setattr(
+        api_module,
+        "qualify_semantic_capabilities",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            semantics_digest="5" * 64,
+            public_episode_digest="6" * 64,
+            native_evidence_digest="8" * 64,
+            evidence_digest="7" * 64,
+            capabilities=(),
+        ),
+    )
     monkeypatch.setattr(api_module, "assemble_environment_release", lambda *_args: assembled)
 
     def write_archive(_root: Path, destination: Path) -> str:
@@ -349,3 +360,75 @@ def test_cold_failure_blocks_immutable_publication(
     assert outcome.code == "cold_qualification_failed"
     assert outcome.details["phase"] == "cold_qualification"
     assert not (tmp_path / "releases").exists()
+
+
+def test_semantic_qualification_failure_blocks_release_assembly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = _research_ready()
+    candidate_root = tmp_path / "candidate"
+    candidate_root.mkdir()
+    candidate = CandidateBuild(candidate_root, "thread", "a" * 64, "done", ())
+    qualification_root = tmp_path / "qualification"
+    qualification_root.mkdir()
+    qualification = QualificationResult(
+        status="passed",
+        candidate_digest=candidate.candidate_digest,
+        expected_relations_digest="b" * 64,
+        evidence_digest="c" * 64,
+        probe_bundle_digest="d" * 64,
+        negative_evidence_count=1,
+        workspace_root=qualification_root,
+        semantics_author_inputs=object(),
+        expected_task_semantics_digest="3" * 64,
+        public_surface_digest="4" * 64,
+    )
+    semantics = SimpleNamespace(
+        root=tmp_path / "semantics",
+        codex_home=tmp_path / "semantics-home",
+        thread_id="semantics-thread",
+        factory="generated_task_semantics.release:make_semantics",
+        project_digest="5" * 64,
+        checks=(),
+    )
+    monkeypatch.setattr(api_module, "run_research", lambda **_kwargs: ready)
+    monkeypatch.setattr(api_module, "run_builder", lambda *_args, **_kwargs: candidate)
+    monkeypatch.setattr(
+        api_module,
+        "generate_expected_task_semantics",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(api_module, "run_qualification", lambda *_args, **_kwargs: qualification)
+    monkeypatch.setattr(api_module, "run_semantics_author", lambda *_args, **_kwargs: semantics)
+    qualification_calls = 0
+
+    def rejected_semantics(*_args: object, **_kwargs: object) -> object:
+        nonlocal qualification_calls
+        qualification_calls += 1
+        raise api_module.SemanticQualificationFailure(
+            "semantic_noop_accepted",
+            "Evaluator accepted a no-op",
+        )
+
+    repair_calls = 0
+
+    def repair(*_args: object, **_kwargs: object) -> object:
+        nonlocal repair_calls
+        repair_calls += 1
+        return semantics
+
+    monkeypatch.setattr(api_module, "qualify_semantic_capabilities", rejected_semantics)
+    monkeypatch.setattr(api_module, "repair_semantics_author", repair)
+    monkeypatch.setattr(
+        api_module,
+        "assemble_environment_release",
+        lambda *_args, **_kwargs: pytest.fail("Assembly must not run"),
+    )
+
+    outcome = generate_environment("Create a real resettable world.", config=_config(tmp_path))
+
+    assert isinstance(outcome, NotReleased)
+    assert outcome.code == "semantic_noop_accepted"
+    assert outcome.details["phase"] == "semantic_qualification"
+    assert qualification_calls == 2
+    assert repair_calls == 1

@@ -7,7 +7,9 @@ and Qualification alone decide whether it is usable.
 ## Immutable inputs
 
 - `EXPECTED_TASK_SEMANTICS.json`: accepted Requirement dispositions and the
-  expected capability/workflow/composition/condition relations.
+  expected capability/workflow/composition/condition relations, including the
+  exact answer field IDs and public labels shared with the independent native
+  oracle.
 - `PUBLIC_SURFACE.json`: public schemas, ToolSpecs, real public probe facts and
   the exact candidate-view manifest.
 - `candidate-view/`: read-only actor source/native format documentation exposed
@@ -80,6 +82,11 @@ conditions set `tool_name` and `output_schema_pointer` to null. A `public_tool`
 record supplies both, and the pointer is an RFC 6901 path (the empty string means
 the output root).
 
+Every generated capability must preserve the exact `field_id`/`public_label`
+pairs frozen in its expected capability record. You author the release-local
+Draft 2020-12 value schema, but the schema does not authorize a new field or a
+different semantic label.
+
 `BindingCandidateDocument` has exactly:
 
 ```text
@@ -90,6 +97,10 @@ protected_binding, public_descriptor, facets
 Eligible bindings have no reason codes. Ineligible bindings have at least one.
 The three projections are JSON objects and must validate against the capability
 schemas/facets.
+Within one StartCase and capability, different semantic keys must not expose the
+same public binding document. Public descriptors/facets must identify the
+intended referent using values available from schema-qualified reset or tool
+observations; protected-only identity cannot resolve a public ambiguity.
 
 `AtomCheckResultDocument` has exactly:
 
@@ -103,6 +114,20 @@ failed required effects/collateral/answer/process or non-empty failure codes.
 Every `task_kind="query"` capability declares at least one `answer_fields`
 record and a non-null rendering `answer_phrase`; requiring `final_answer`
 without publishing its answer contract is invalid.
+
+For every declared answer field, compute the expected value from independently
+decoded native facts and the qualified public trace, put that value under the
+same field ID in `report_values`, and compare the submitted `final_answer`
+exactly. A missing, schema-valid wrong or stale answer must set
+`answer_ok=false` and `satisfied=false`. Never read an undeclared final-answer
+field or treat mere field presence as semantic agreement.
+
+A query capability must be demonstrable through a real public read and must not
+require a successful state-changing call. A process capability must reject the
+same terminal state with an empty trace or a trace that omits its required
+public process. Compute `required_effects_ok`, `collateral_ok`, `answer_ok` and
+`process_ok` from their distinct obligations; do not copy one `satisfied`
+boolean into every field.
 
 `ConditionCheckResultDocument` has exactly:
 
@@ -149,3 +174,6 @@ world regimes. Repeated `(seed, limit)` calls return identical records.
 The project must include `pyproject.toml`, `uv.lock`, source, and diagnostic
 tests. `uv sync --frozen --all-groups`, build, tests, and Host schema/import/
 no-mutation checks must pass. A model-written success message is never evidence.
+Diagnostic tests must include no-op, wrong-target or near-miss, schema-valid
+wrong/stale answer, prohibited collateral and empty/wrong process trace cases
+where the corresponding capability declares those obligations.

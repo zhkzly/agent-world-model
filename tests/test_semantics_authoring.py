@@ -125,6 +125,7 @@ def _document() -> dict[str, Any]:
                 "actor_role": "operator",
                 "task_kind": "state_change",
                 "intent_label": "increment the counter",
+                "answer_fields": [],
             },
             {
                 "capability_id": "read-counter",
@@ -133,6 +134,7 @@ def _document() -> dict[str, Any]:
                 "actor_role": "operator",
                 "task_kind": "query",
                 "intent_label": "read the current counter",
+                "answer_fields": [{"field_id": "current-count", "public_label": "Current count"}],
             },
         ],
         "composition_rules": [
@@ -176,6 +178,9 @@ def test_expected_semantics_freezes_complete_requirement_coverage() -> None:
         if item["disposition"] == "Taskable"
     ] == ["REQ-001", "REQ-002"]
     assert frozen.digest
+    assert frozen_document["capabilities"][1]["answer_fields"] == [
+        {"field_id": "current-count", "public_label": "Current count"}
+    ]
     reordered = _document()
     reordered["requirements"] = list(reversed(reordered["requirements"]))
     reordered["capabilities"] = list(reversed(reordered["capabilities"]))
@@ -199,6 +204,31 @@ def test_expected_semantics_rejects_omission_and_incomplete_taskable_relation() 
     unknown["capabilities"][0]["requirement_ids"] = ["REQ-999"]
     with pytest.raises(ExpectedSemanticsError, match="unknown Requirement"):
         freeze_expected_task_semantics(_projection(), unknown)
+
+    initial_task = _document()
+    initial_task["requirements"][3].update(
+        disposition="Taskable",
+        preconditions=["world can be reset"],
+        outcomes=["initial world exists"],
+    )
+    initial_task["capabilities"].append(
+        {
+            "capability_id": "reset-world",
+            "requirement_ids": ["REQ-004"],
+            "workflow_ids": ["counter-workflow"],
+            "actor_role": "operator",
+            "task_kind": "process",
+            "intent_label": "reset the world",
+            "answer_fields": [],
+        }
+    )
+    with pytest.raises(ExpectedSemanticsError, match="initial-world"):
+        freeze_expected_task_semantics(_projection(), initial_task)
+
+    missing_query_answer = _document()
+    missing_query_answer["capabilities"][1]["answer_fields"] = []
+    with pytest.raises(ExpectedSemanticsError, match="query capability requires answer_fields"):
+        freeze_expected_task_semantics(_projection(), missing_query_answer)
 
 
 def test_expected_semantics_rejects_unanchored_composition_and_condition() -> None:

@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
+from codex_cli_bin import bundled_codex_path
 from openai_codex import ApprovalMode
 
 import agent_env_foundry.builder as builder_module
@@ -304,7 +306,7 @@ def test_sequential_runs_use_distinct_ephemeral_codex_homes(
 
     first_home, second_home = homes
     assert first_home != second_home
-    assert listings == [[], []]
+    assert listings == [["home"], ["home"]]
     assert not first_home.exists()
     assert not second_home.exists()
     assert not first_home.is_relative_to(tmp_path / "one")
@@ -312,6 +314,8 @@ def test_sequential_runs_use_distinct_ephemeral_codex_homes(
     sdk = FakeCodex.instances[-1]
     assert Path(sdk.config.env["CODEX_HOME"]) != inherited
     assert Path(sdk.config.env["CODEX_HOME"]) != Path.home() / ".codex"
+    assert Path(sdk.config.env["HOME"]).parent == Path(sdk.config.env["CODEX_HOME"])
+    assert not Path(sdk.config.env["HOME"]).exists()
     assert sdk.thread_kwargs["sandbox"].value == "full-access"
     assert sdk.thread_kwargs["approval_mode"] == ApprovalMode.deny_all
     assert "OPENAI_API_KEY" not in sdk.config.env
@@ -344,9 +348,49 @@ def test_sdk_uses_explicit_custom_provider_without_copying_key_value(
         'model_providers.foundry_runtime.env_key="OPENAI_API_KEY"',
         'model_providers.foundry_runtime.wire_api="responses"',
         "model_providers.foundry_runtime.supports_websockets=true",
+        "project_root_markers=[]",
+        "features.plugins=false",
+        "features.multi_agent=false",
+        "features.skill_search=false",
     )
     assert "test-provider-key" not in repr(sdk.config.config_overrides)
-    assert set(sdk.config.env) == {"CODEX_HOME", "UV_CACHE_DIR"}
+    assert set(sdk.config.env) == {"CODEX_HOME", "HOME", "UV_CACHE_DIR"}
+    assert Path(sdk.config.env["HOME"]).parent == Path(sdk.config.env["CODEX_HOME"])
+
+
+def test_product_codex_prompt_input_excludes_parent_and_user_guidance(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    workspace = repository / "runs/candidate"
+    workspace.mkdir(parents=True)
+    repository.joinpath(".git").mkdir()
+    repository.joinpath("AGENTS.md").write_text("PARENT_AGENT_SENTINEL")
+    repository.joinpath(".agents/skills/forbidden").mkdir(parents=True)
+    repository.joinpath(".agents/skills/forbidden/SKILL.md").write_text(
+        "---\nname: forbidden\ndescription: PARENT_SKILL_SENTINEL\n---\n"
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    env = dict(os.environ)
+    env.update(builder_module._isolated_codex_env(codex_home, tmp_path / "uv-cache"))
+    command = [str(bundled_codex_path())]
+    for override in builder_module._codex_provider_overrides():
+        command.extend(("--config", override))
+    command.extend(("debug", "prompt-input", "context boundary probe"))
+
+    result = subprocess.run(
+        command,
+        cwd=workspace,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "PARENT_AGENT_SENTINEL" not in result.stdout
+    assert "PARENT_SKILL_SENTINEL" not in result.stdout
+    assert str(Path.home() / ".agents/skills") not in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -570,6 +614,10 @@ _CONTRACT_PATH = (
 def test_contract_document_discloses_the_exact_loader_contract() -> None:
     text = _CONTRACT_PATH.read_text(encoding="utf-8")
     assert "plain mapping" in text
+    assert "Every emitted public leaf" in text
+    assert "reset-only beginning situation" in text
+    assert "every accepted workflow precondition" in text
+    assert "hidden setup" in text
     blocks = re.findall(r"```json\s*\n(.*?)```", text, flags=re.DOTALL)
     assert len(blocks) == 2
     documents = [json.loads(block) for block in blocks]

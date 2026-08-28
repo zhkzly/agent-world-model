@@ -39,7 +39,15 @@ from agent_env_foundry.research import (
     ResearchTools,
     Unsupported,
 )
-from agent_env_foundry.semantics_author import SemanticsAuthorFailure, run_semantics_author
+from agent_env_foundry.semantic_qualification import (
+    SemanticQualificationFailure,
+    qualify_semantic_capabilities,
+)
+from agent_env_foundry.semantics_author import (
+    SemanticsAuthorFailure,
+    repair_semantics_author,
+    run_semantics_author,
+)
 from agent_env_foundry.semantics_authoring import generate_expected_task_semantics
 
 __all__ = [
@@ -82,6 +90,7 @@ class Released:
     research_digest: str
     candidate_digest: str
     qualification_evidence_digest: str
+    semantic_qualification_evidence_digest: str
     cold_evidence_digest: str
     archive_digest: str
 
@@ -234,6 +243,78 @@ def generate_environment(
             "public_surface_digest": qualification.public_surface_digest,
         },
     )
+    semantic_qualification = None
+    for semantic_attempt in range(2):
+        try:
+            semantic_qualification = qualify_semantic_capabilities(
+                semantics,
+                qualification,
+                candidate.workspace,
+                config=selected.qualification,
+                route=selected.route,
+                runtime_root=run_root / f"semantic-qualification-attempt-{semantic_attempt + 1}",
+            )
+            break
+        except SemanticQualificationFailure as exc:
+            if semantic_attempt > 0 or not _semantics_repairable(exc.code):
+                return _finish(
+                    run_root,
+                    NotReleased(exc.code, str(exc), dict(exc.details)),
+                )
+            finding = {
+                "code": exc.code,
+                "message": str(exc),
+                "actual": dict(exc.details),
+                "expected": (
+                    "The generated TaskSemantics contract must agree with the frozen public "
+                    "answer/binding contract and the independent native oracle on every "
+                    "applicable positive and negative result axis."
+                ),
+                "repair": (
+                    "Change only release-local semantic source/tests; preserve immutable "
+                    "inputs and passed capabilities. Do not weaken Host gates or Actor behavior."
+                ),
+            }
+            try:
+                semantics = repair_semantics_author(
+                    qualification.semantics_author_inputs,
+                    semantics,
+                    [finding],
+                    config=selected.builder,
+                )
+            except (SemanticsAuthorFailure, QualificationFailure, BuilderFailure) as repair_exc:
+                return _finish(
+                    run_root,
+                    NotReleased(repair_exc.code, str(repair_exc), dict(repair_exc.details)),
+                )
+            _write_json(
+                run_root / f"semantics-repair-{semantic_attempt + 1}.json",
+                {
+                    "thread_id": semantics.thread_id,
+                    "project_digest": semantics.project_digest,
+                    "trigger": finding,
+                    "checks": [item.to_document() for item in semantics.checks],
+                },
+            )
+    if semantic_qualification is None:
+        return _finish(
+            run_root,
+            NotReleased(
+                "semantic_qualification_missing",
+                "Semantic Qualification produced no terminal result",
+                {"phase": "semantic_qualification"},
+            ),
+        )
+    _write_json(
+        run_root / "semantic-qualification.json",
+        {
+            "semantics_digest": semantic_qualification.semantics_digest,
+            "public_episode_digest": semantic_qualification.public_episode_digest,
+            "native_evidence_digest": semantic_qualification.native_evidence_digest,
+            "evidence_digest": semantic_qualification.evidence_digest,
+            "capabilities": [item.to_document() for item in semantic_qualification.capabilities],
+        },
+    )
 
     try:
         assembled = assemble_environment_release(
@@ -299,6 +380,7 @@ def generate_environment(
         research_digest=research.digest,
         candidate_digest=candidate.candidate_digest,
         qualification_evidence_digest=qualification.evidence_digest,
+        semantic_qualification_evidence_digest=semantic_qualification.evidence_digest,
         cold_evidence_digest=cold.qualification.evidence_digest,
         archive_digest=archive_digest,
     )
@@ -317,6 +399,9 @@ def outcome_document(outcome: GenerationOutcome) -> dict[str, Any]:
             "research_digest": outcome.research_digest,
             "candidate_digest": outcome.candidate_digest,
             "qualification_evidence_digest": outcome.qualification_evidence_digest,
+            "semantic_qualification_evidence_digest": (
+                outcome.semantic_qualification_evidence_digest
+            ),
             "cold_evidence_digest": outcome.cold_evidence_digest,
             "archive_digest": outcome.archive_digest,
             "run_root": str(outcome.run_root),
@@ -338,6 +423,30 @@ def _create_run_root(store: Path) -> Path:
     run = root / f"run-{uuid.uuid4().hex}"
     run.mkdir(mode=0o700)
     return run
+
+
+_REPAIRABLE_SEMANTIC_FAILURES = frozenset(
+    {
+        "semantic_prompted_binding_rejected",
+        "semantic_public_binding_ambiguous",
+        "semantic_public_binding_hidden",
+        "semantic_answer_not_grounded",
+        "semantic_answer_report_missing",
+        "semantic_answer_report_invalid",
+        "semantic_wrong_answer_accepted",
+        "semantic_process_violation_accepted",
+        "semantic_noop_accepted",
+        "semantic_wrong_target_accepted",
+        "semantic_physical_wrong_target_accepted",
+        "semantic_fresh_replay_mismatch",
+        "semantic_fresh_replay_facts_mismatch",
+        "semantic_native_disagreement",
+    }
+)
+
+
+def _semantics_repairable(code: str) -> bool:
+    return code in _REPAIRABLE_SEMANTIC_FAILURES
 
 
 def _qualification_failure(result: QualificationResult) -> NotReleased:

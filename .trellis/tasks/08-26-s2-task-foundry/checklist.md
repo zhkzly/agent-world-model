@@ -59,3 +59,27 @@
 - [x] Can model completion prose never override a failed Framework check?
 - [x] Did a real ocean Codex project pass source, lock, frozen sync, import separation, build,
   tests and factory/catalog checks?
+
+## CP3C Physical Semantic Qualification Checklist
+
+- [ ] Are Environment Builder and TaskSemantics Author the only surviving Codex roles?
+- [ ] Does each Taskable capability begin from a reset-only qualified StartCase with an eligible
+  before-state binding?
+- [ ] Does a Host-owned Responses episode use only public reset context, docs, ToolSpecs and
+  ToolObservations, with no generated semantics/native/checker projection?
+- [ ] Are before and after real equivalent instances, with only after receiving public episode
+  calls and both available to the independent native reader?
+- [ ] Does Framework bind Host journal, independent native evidence, generated semantics,
+  no-op, wrong-target, answer/process/collateral and fresh-replay results?
+- [ ] Does every native-oracle result bind one unique materialization/request/journal/manifest
+  and get compared field-by-field with TaskSemantics rather than merely co-hashed?
+- [ ] Is the independent oracle absent from the public Actor/Consumer surface and isolated from
+  both Builder and Semantics Author conversations/tests?
+- [ ] Is a passing `SemanticQualificationReport` mandatory before release assembly?
+- [ ] Do product Codex launches redirect an empty `HOME` and reject user/project Skill,
+  AGENTS, plugin or hook leakage in the model-visible context?
+- [ ] Are ScenarioPlan, `$ref`, WitnessRecipe, pair/setup protocols and the Codex
+  `semantic_probe.py` production path absent?
+- [ ] Do focused tests and mutations kill missing release gate, context leakage, fake episode,
+  no-op acceptance, wrong-target acceptance and native/semantics disagreement?
+- [ ] Does one real ocean/SQLite run pass before CP4 work resumes?

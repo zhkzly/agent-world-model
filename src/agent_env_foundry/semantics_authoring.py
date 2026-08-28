@@ -68,6 +68,18 @@ EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
                         "enum": ["query", "state_change", "process"],
                     },
                     "intent_label": {"type": "string"},
+                    "answer_fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "field_id": {"type": "string"},
+                                "public_label": {"type": "string"},
+                            },
+                            "required": ["field_id", "public_label"],
+                            "additionalProperties": False,
+                        },
+                    },
                 },
                 "required": [
                     "capability_id",
@@ -76,6 +88,7 @@ EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
                     "actor_role",
                     "task_kind",
                     "intent_label",
+                    "answer_fields",
                 ],
                 "additionalProperties": False,
             },
@@ -184,6 +197,7 @@ def freeze_expected_task_semantics(
     taskable_ids = {
         item["requirement_id"] for item in requirements if item["disposition"] == "Taskable"
     }
+    initial_ids = {cast(str, item.get("id")) for item in projection.initial_world_relations}
     capabilities = [_capability(item) for item in _array(root["capabilities"], "capabilities")]
     capability_index = _unique_index(capabilities, "capability_id", "capability")
     rules = [_composition(item) for item in _array(root["composition_rules"], "composition_rules")]
@@ -196,6 +210,12 @@ def freeze_expected_task_semantics(
         findings.append(
             "$.requirements: Requirement coverage mismatch: "
             f"expected {list(expected_ids)}, got {sorted(by_id)}"
+        )
+    taskable_initial = taskable_ids & initial_ids
+    if taskable_initial:
+        findings.append(
+            "$.requirements: initial-world Requirements define StartCases/setup and cannot be "
+            f"Taskable; got {sorted(taskable_initial)}"
         )
     for index, item in enumerate(requirements):
         findings.extend(_requirement_findings(item, f"$.requirements[{index}]"))
@@ -227,6 +247,8 @@ def freeze_expected_task_semantics(
             findings.append(
                 f"{path}.workflow_ids: unlicensed workflow {sorted(unlicensed_workflows)}"
             )
+        if capability["task_kind"] == "query" and not capability["answer_fields"]:
+            findings.append(f"{path}: query capability requires answer_fields")
     if mapped_taskable != taskable_ids:
         findings.append(
             "$.capabilities: every Taskable Requirement must map to a capability; "
@@ -371,11 +393,15 @@ def generate_expected_task_semantics(
             "rules": [
                 "Disposition every required Requirement exactly once.",
                 "Every Taskable Requirement must be mapped by at least one capability.",
+                "Initial-world Requirements define StartCases/setup and are never Taskable.",
                 "Capabilities may reference only Taskable Requirements and their workflows.",
                 "Composition requires an explicit rule over at least two capabilities that "
                 "all declare its workflow.",
                 "Each condition must cite Requirement and workflow anchors, state the public "
                 "observable relation, and license only known capability branches.",
+                "Every query capability must declare one or more answer field IDs and public "
+                "labels. These names are semantic contracts; do not include native paths or "
+                "reference answers.",
                 "Use empty composition_rules or conditions arrays when none are justified.",
             ],
         },
@@ -388,7 +414,8 @@ def generate_expected_task_semantics(
             "world choice and frozen Requirement relations. Treat the supplied Host contract as "
             "mandatory. Preconditions, outcomes, refusals and collateral constraints describe "
             "business truth, not tool call recipes. A shared workflow alone does not justify "
-            "composition. A condition is legal only when its truth is publicly observable. Do "
+            "composition. Environment reset/reconstruction is StartCase setup, not a user Task "
+            "capability. A condition is legal only when its truth is publicly observable. Do "
             "not assume candidate source, native fields, implementation details, Tasks, traces, "
             "answers or verdicts. Return the complete replacement document in one response."
         ),
@@ -471,6 +498,7 @@ def _capability(value: Any) -> dict[str, Any]:
         "actor_role",
         "task_kind",
         "intent_label",
+        "answer_fields",
     }
     item = _exact(value, keys, "capability")
     _identifier(item["capability_id"], "capability_id")
@@ -481,7 +509,20 @@ def _capability(value: Any) -> dict[str, Any]:
         raise ExpectedSemanticsError("capability task_kind is invalid")
     item["requirement_ids"] = _strings(item["requirement_ids"], "requirement_ids")
     item["workflow_ids"] = _strings(item["workflow_ids"], "workflow_ids")
+    answer_fields = [
+        _answer_field(field) for field in _array(item["answer_fields"], "answer_fields")
+    ]
+    _unique_index(answer_fields, "field_id", "answer field")
+    item["answer_fields"] = sorted(answer_fields, key=lambda field: field["field_id"])
     return item
+
+
+def _answer_field(value: Any) -> dict[str, str]:
+    item = _exact(value, {"field_id", "public_label"}, "answer field")
+    return {
+        "field_id": _identifier(item["field_id"], "answer field_id"),
+        "public_label": _text(item["public_label"], "answer public_label"),
+    }
 
 
 def _composition(value: Any) -> dict[str, Any]:

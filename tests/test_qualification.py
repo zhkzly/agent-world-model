@@ -123,6 +123,12 @@ def _predicate_document(expected_document: dict[str, Any]) -> dict[str, Any]:
 
 
 def _freeze_predicates_and_stage(prepared: Any) -> None:
+    projection = _projection()
+    qualification_module.stage_qualification_oracle_inputs(
+        prepared,
+        projection,
+        _expected_task_semantics(projection),
+    )
     predicate_path = prepared.root / "QUALIFICATION_PREDICATES.json"
     predicate_path.write_text(json.dumps(_predicate_document(prepared.expected.to_document())))
     validate_predicate_carrier(prepared)
@@ -1103,6 +1109,16 @@ def _expected_task_semantics(projection: BuilderProjection) -> Any:
                 "actor_role": "operator",
                 "task_kind": "state_change" if index == 1 else "query",
                 "intent_label": f"exercise relation {index}",
+                "answer_fields": (
+                    []
+                    if index == 1
+                    else [
+                        {
+                            "field_id": f"relation-{index}-answer",
+                            "public_label": f"Relation {index} answer",
+                        }
+                    ]
+                ),
             }
             for index, requirement_id in enumerate(taskable_ids, start=1)
         ],
@@ -1169,17 +1185,28 @@ def test_semantics_author_inputs_reuse_qualification_view_and_host_journal(
         digest,
         tmp_path / "qualification",
     )
+    expected_task_semantics = _expected_task_semantics(projection)
+    qualification_module.stage_qualification_oracle_inputs(
+        prepared,
+        projection,
+        expected_task_semantics,
+    )
+    for name in ("EXPECTED_TASK_SEMANTICS.json", "NATIVE_ORACLE_CONTRACT.md"):
+        path = prepared.root / name
+        assert path.is_file()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o444
+        assert name in prepared.input_digests
     with pytest.raises(QualificationFailure, match="Host-created"):
         qualification_module.prepare_semantics_author_workspace(
             prepared,
             projection,
-            _expected_task_semantics(projection),
+            expected_task_semantics,
             object(),
         )
     workspace = qualification_module.prepare_semantics_author_workspace(
         prepared,
         projection,
-        _expected_task_semantics(projection),
+        expected_task_semantics,
         _semantics_input_journal(tmp_path),
     )
 
@@ -1226,6 +1253,10 @@ def test_semantics_author_inputs_reuse_qualification_view_and_host_journal(
         "AtomCheckResultDocument",
         "ConditionCheckResultDocument",
         'task_kind="query"',
+        "schema-valid wrong or stale answer",
+        "same public binding document",
+        "successful state-changing call",
+        "terminal state with an empty trace",
         "distinct reset input",
         "must not import the actor package",
         "must not mutate",
@@ -1258,12 +1289,16 @@ def test_passing_actor_qualification_stages_semantics_inputs_before_return(
             )
             for relation in prepared.expected.relations
         )
+        codex_home = tmp_path / "qualification-codex-home"
+        codex_home.mkdir(exist_ok=True)
         return (
             qualification_module.ProbeBundle(prepared.root, (), "b" * 64),
             rows,
             tuple({"mechanical": True} for _ in rows),
             (),
             journal,
+            "qualifier-thread",
+            codex_home,
         )
 
     monkeypatch.setattr(qualification_module, "_author_probes", admitted_actor_evidence)
@@ -1277,6 +1312,8 @@ def test_passing_actor_qualification_stages_semantics_inputs_before_return(
     )
 
     assert result.status == "passed"
+    assert result.qualifier_thread_id == "qualifier-thread"
+    assert result.qualifier_codex_home == tmp_path / "qualification-codex-home"
     assert result.semantics_author_inputs is not None
     assert result.semantics_author_inputs.root == (tmp_path / "qualification/semantics-author")
     assert result.expected_task_semantics_digest is not None

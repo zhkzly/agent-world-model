@@ -379,10 +379,16 @@ class _ChildTransport:
 
 
 class ActorProxy:
-    def __init__(self, transport: _ChildTransport, release: ValidatedReleaseV2) -> None:
+    def __init__(
+        self,
+        transport: _ChildTransport,
+        *,
+        start_schema: JSONObject,
+        reset_observation_schema: JSONObject,
+    ) -> None:
         self._transport = transport
-        self._start_schema = release.start_schema
-        self._reset_schema = release.reset_observation_schema
+        self._start_schema = start_schema
+        self._reset_schema = reset_observation_schema
 
     def reset(self, start: JSONObject | None = None) -> JSONValue:
         if start is not None:
@@ -627,7 +633,11 @@ class OpenPreparedRelease:
             actor_transport.close()
             raise
         events: list[TrustedCallEvent] = []
-        actor = ActorProxy(actor_transport, self._release)
+        actor = ActorProxy(
+            actor_transport,
+            start_schema=self._release.start_schema,
+            reset_observation_schema=self._release.reset_observation_schema,
+        )
         trusted = TrustedProxy(semantics_transport, self._release, instance, identity, events)
         return OpenPreparedSession(identity, actor, trusted, events)
 

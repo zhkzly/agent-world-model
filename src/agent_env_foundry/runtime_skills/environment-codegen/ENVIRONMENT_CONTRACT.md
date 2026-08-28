@@ -29,10 +29,23 @@ failure: {"ok": false, "data": null,
 
 Tool outputs must be structured and machine-addressable so a returned value can
 be passed to a later tool. Do not hide identifiers or state facts in prose.
+Every emitted public leaf in a reset result or successful ToolObservation
+`data` must be explicitly described along its complete schema path. A bare
+`{"type":"object"}`, an object property without nested `properties`, or an
+array without an `items` schema cannot authorize its hidden descendants. Use
+self-contained schemas that type the actual identifiers, timestamps, statuses,
+relationships and other values the public Agent may read or reuse.
 
 ## State and reset
 
 - `reset(None)` creates a meaningful package-owned default world.
+- The public start schema and reset implementation provide enough legal
+  reset-only beginning situations for every accepted workflow precondition to
+  be reachable. A workflow that begins from an intermediate business state
+  (for example an already submitted item awaiting review) must be constructible
+  by a declared reset input or coexist in the default world; do not use hidden setup
+  tool calls, native writes, or snapshot restoration. These are reusable world
+  regimes derived from the frozen Requirements, not hard-coded downstream Tasks.
 - `reset` returns that public reset observation directly, never wrapped in the
   invocation `ok`/`data`/`error` record. Every reset result must validate
   against the release's published `reset_observation_schema`.

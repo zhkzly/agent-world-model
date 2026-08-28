@@ -377,7 +377,30 @@ def _codex_provider_overrides() -> tuple[str, ...]:
         f'model_providers.{provider}.env_key="OPENAI_API_KEY"',
         f'model_providers.{provider}.wire_api="responses"',
         f"model_providers.{provider}.supports_websockets=true",
+        "project_root_markers=[]",
+        "features.plugins=false",
+        "features.multi_agent=false",
+        "features.skill_search=false",
     )
+
+
+def _isolated_codex_env(codex_home: str | Path, uv_cache_dir: Path) -> dict[str, str]:
+    """Keep product Codex roles outside the developer's HOME-scoped guidance."""
+    home = Path(codex_home)
+    execution_home = home / "home"
+    if execution_home.is_symlink() or (execution_home.exists() and not execution_home.is_dir()):
+        raise BuilderFailure(
+            "builder",
+            "codex_execution_home_invalid",
+            "Product Codex execution HOME must be a real directory",
+            path=str(execution_home),
+        )
+    execution_home.mkdir(exist_ok=True)
+    return {
+        "CODEX_HOME": str(home),
+        "HOME": str(execution_home),
+        "UV_CACHE_DIR": str(uv_cache_dir),
+    }
 
 
 def run_builder(
@@ -407,10 +430,7 @@ def run_builder(
         prefix="agent-env-foundry-codex-home-",
         ignore_cleanup_errors=True,
     ) as codex_home:
-        sdk_env = {
-            "CODEX_HOME": codex_home,
-            "UV_CACHE_DIR": str(selected.uv_cache_dir),
-        }
+        sdk_env = _isolated_codex_env(codex_home, selected.uv_cache_dir)
         with Codex(
             CodexConfig(
                 cwd=str(prepared.root),

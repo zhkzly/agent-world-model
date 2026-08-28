@@ -596,6 +596,8 @@ def _run_tool_json_loop(
     dispatch: Mapping[str, Callable[..., dict[str, Any]]],
     final_validator: Callable[[dict[str, Any]], Mapping[str, Any] | None] | None = None,
     provider_budget: _ProviderTurnBudget,
+    output_code: str = "research_draft_invalid",
+    strict_output: bool = True,
 ) -> dict[str, Any]:
     for tool in tools:
         parameters = tool.get("parameters")
@@ -635,12 +637,23 @@ def _run_tool_json_loop(
                         "type": "json_schema",
                         "name": schema_name,
                         "schema": dict(schema),
-                        "strict": True,
+                        "strict": strict_output,
                     }
                 },
                 "store": False,
             }
-            response = client.responses.create(**request)
+            try:
+                response = client.responses.create(**request)
+            except Exception as exc:
+                if _retryable_provider_failure(exc):
+                    next_phase = "infrastructure"
+                    next_original_code = type(exc).__name__
+                    next_original_message = str(exc).replace(credential, "[REDACTED]")
+                    continue
+                raise
+            next_phase = "agent"
+            next_original_code = "budget_exhausted"
+            next_original_message = "no provider turns remaining"
             output_items = list(cast(Sequence[Any], _item_value(response, "output") or ()))
             # Preserve every provider item object exactly as returned.  Do not dump,
             # summarize, reorder, or replace it before the next request.
@@ -657,7 +670,9 @@ def _run_tool_json_loop(
                         raise ResearchFailure(
                             phase="agent",
                             code="unknown_function_call",
-                            message="provider requested a function outside the two-tool surface",
+                            message=(
+                                "provider requested a function outside the allowed tool surface"
+                            ),
                             details={
                                 "original_code": "unknown_function",
                                 "original_message": str(name),
@@ -723,7 +738,7 @@ def _run_tool_json_loop(
                     },
                 )
             document = _parse_and_validate_json(
-                output_text, schema=schema, phase="agent", code="research_draft_invalid"
+                output_text, schema=schema, phase="agent", code=output_code
             )
             if final_validator is not None:
                 try:
@@ -786,7 +801,7 @@ def _run_tool_json_loop(
         raise ResearchFailure(
             phase="agent",
             code="responses_request_failed",
-            message="OpenAI Responses Research turn failed with no provider fallback",
+            message="OpenAI Responses tool turn failed with no provider fallback",
             details={
                 "original_code": type(exc).__name__,
                 "original_message": safe_message,
@@ -892,6 +907,18 @@ def _run_fresh_json_turn(
                 "original_message": str(exc).replace(credential, "[REDACTED]"),
             },
         ) from exc
+
+
+def _retryable_provider_failure(exc: Exception) -> bool:
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in {408, 409, 429, 500, 502, 503, 504}:
+        return True
+    return type(exc).__name__ in {
+        "APIConnectionError",
+        "APITimeoutError",
+        "ConnectError",
+        "ReadTimeout",
+    }
 
 
 def _parse_and_validate_json(

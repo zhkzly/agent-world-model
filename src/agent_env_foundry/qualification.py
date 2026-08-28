@@ -10,7 +10,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 import threading
 import uuid
 from collections.abc import Mapping
@@ -39,7 +38,7 @@ from agent_env_foundry.agents import (
     _ProviderTurnBudget,
     _run_fresh_json_turn,
 )
-from agent_env_foundry.builder import compute_candidate_digest
+from agent_env_foundry.builder import _isolated_codex_env, compute_candidate_digest
 from agent_env_foundry.environment import validate_tool_catalog
 from agent_env_foundry.release import verify_release
 from agent_env_foundry.research import BuilderProjection, ResearchFailure
@@ -60,6 +59,7 @@ SEMANTICS_AUTHOR_DIR = "semantics-author"
 EXPECTED_TASK_SEMANTICS_NAME = "EXPECTED_TASK_SEMANTICS.json"
 PUBLIC_SURFACE_NAME = "PUBLIC_SURFACE.json"
 TASK_SEMANTICS_CONTRACT_NAME = "TASK_SEMANTICS_CONTRACT.md"
+NATIVE_ORACLE_CONTRACT_NAME = "NATIVE_ORACLE_CONTRACT.md"
 CHECK_CLASSES = frozenset(
     {
         "reset_reconstruction",
@@ -301,6 +301,8 @@ class QualificationResult:
     semantics_author_inputs: PreparedSemanticsAuthorWorkspace | None = None
     expected_task_semantics_digest: str | None = None
     public_surface_digest: str | None = None
+    qualifier_thread_id: str | None = None
+    qualifier_codex_home: Path | None = None
     failure_code: str | None = None
     details: Mapping[str, Any] | None = None
 
@@ -419,31 +421,13 @@ def prepare_semantics_author_workspace(
             "public_journal_invalid",
             "Semantics Author inputs require a Host-created public journal",
         )
-    expected_document = expected_task_semantics.to_document()
-    if expected_document.pop("format", None) != "expected-task-semantics/1":
-        raise QualificationFailure(
-            "semantics_input",
-            "expected_task_semantics_invalid",
-            "Expected TaskSemantics has an invalid Host format",
-        )
-    try:
-        refrozen = freeze_expected_task_semantics(projection, expected_document)
-    except (ExpectedSemanticsError, ValueError) as exc:
-        raise QualificationFailure(
-            "semantics_input",
-            "expected_task_semantics_invalid",
-            "Expected TaskSemantics no longer matches the accepted projection",
-            original_message=str(exc),
-        ) from exc
-    if (
-        refrozen.digest != expected_task_semantics.digest
-        or refrozen.canonical_payload != expected_task_semantics.canonical_payload
-    ):
-        raise QualificationFailure(
-            "semantics_input",
-            "expected_task_semantics_invalid",
-            "Expected TaskSemantics bytes do not match their Host validation",
-        )
+    _validate_expected_task_semantics(projection, expected_task_semantics)
+    oracle_expected = prepared.root / EXPECTED_TASK_SEMANTICS_NAME
+    _verify_readonly(
+        oracle_expected,
+        expected_task_semantics.digest,
+        "Qualification oracle ExpectedTaskSemantics input",
+    )
 
     root = prepared.root / SEMANTICS_AUTHOR_DIR
     if root.is_symlink() or (root.exists() and any(root.iterdir())):
@@ -504,7 +488,7 @@ def prepare_semantics_author_workspace(
         TASK_SEMANTICS_CONTRACT_NAME: root / TASK_SEMANTICS_CONTRACT_NAME,
         VIEW_MANIFEST_NAME: view_manifest_path,
     }
-    paths[EXPECTED_TASK_SEMANTICS_NAME].write_bytes(expected_task_semantics.canonical_payload)
+    shutil.copyfile(oracle_expected, paths[EXPECTED_TASK_SEMANTICS_NAME])
     paths[PUBLIC_SURFACE_NAME].write_bytes(_canonical(public_surface))
     contract_source = (
         Path(__file__).parent
@@ -532,6 +516,70 @@ def prepare_semantics_author_workspace(
     workspace.verify_inputs()
     prepared.verify_candidate_unchanged()
     return workspace
+
+
+def stage_qualification_oracle_inputs(
+    prepared: PreparedQualificationWorkspace,
+    projection: BuilderProjection,
+    expected_task_semantics: ExpectedTaskSemantics,
+) -> None:
+    """Freeze the candidate-blind semantic contract before Qualifier source access."""
+    prepared.verify_inputs()
+    prepared.verify_candidate_unchanged()
+    _validate_expected_task_semantics(projection, expected_task_semantics)
+    sources = {
+        EXPECTED_TASK_SEMANTICS_NAME: expected_task_semantics.canonical_payload,
+        NATIVE_ORACLE_CONTRACT_NAME: (
+            Path(__file__).parent
+            / "runtime_skills"
+            / "qualification-native-oracle"
+            / NATIVE_ORACLE_CONTRACT_NAME
+        ).read_bytes(),
+    }
+    for name, payload in sources.items():
+        path = prepared.root / name
+        if path.exists() or path.is_symlink():
+            raise QualificationFailure(
+                "qualification_input",
+                "oracle_input_already_exists",
+                "Qualification oracle input already exists",
+                path=str(path),
+            )
+        path.write_bytes(payload)
+        path.chmod(0o444)
+        prepared.input_digests[name] = _digest(payload)
+    prepared.verify_inputs()
+
+
+def _validate_expected_task_semantics(
+    projection: BuilderProjection,
+    expected_task_semantics: ExpectedTaskSemantics,
+) -> None:
+    expected_document = expected_task_semantics.to_document()
+    if expected_document.pop("format", None) != "expected-task-semantics/1":
+        raise QualificationFailure(
+            "semantics_input",
+            "expected_task_semantics_invalid",
+            "Expected TaskSemantics has an invalid Host format",
+        )
+    try:
+        refrozen = freeze_expected_task_semantics(projection, expected_document)
+    except (ExpectedSemanticsError, ValueError) as exc:
+        raise QualificationFailure(
+            "semantics_input",
+            "expected_task_semantics_invalid",
+            "Expected TaskSemantics no longer matches the accepted projection",
+            original_message=str(exc),
+        ) from exc
+    if (
+        refrozen.digest != expected_task_semantics.digest
+        or refrozen.canonical_payload != expected_task_semantics.canonical_payload
+    ):
+        raise QualificationFailure(
+            "semantics_input",
+            "expected_task_semantics_invalid",
+            "Expected TaskSemantics bytes do not match their Host validation",
+        )
 
 
 def _journal_tool_specs(journal: HostJournal) -> list[dict[str, Any]]:
@@ -578,7 +626,13 @@ def _journal_tool_specs(journal: HostJournal) -> list[dict[str, Any]]:
 
 
 def validate_predicate_carrier(prepared: PreparedQualificationWorkspace) -> str:
-    expected_members = {EXPECTED_NAME, CONTRACT_NAME, PREDICATE_NAME}
+    expected_members = {
+        EXPECTED_NAME,
+        EXPECTED_TASK_SEMANTICS_NAME,
+        CONTRACT_NAME,
+        NATIVE_ORACLE_CONTRACT_NAME,
+        PREDICATE_NAME,
+    }
     actual_members = {path.name for path in prepared.root.iterdir()}
     if actual_members != expected_members:
         _fail(
@@ -771,6 +825,8 @@ def validate_probe_bundle(
         VIEW_NAME,
         VIEW_MANIFEST_NAME,
         CONTRACT_NAME,
+        EXPECTED_TASK_SEMANTICS_NAME,
+        NATIVE_ORACLE_CONTRACT_NAME,
         *PROBE_SCRIPTS,
     }
     extras = {path.name for path in workspace.iterdir()} - allowed
@@ -891,6 +947,8 @@ def validate_evidence_rows(
     rows: Any,
     expected: ExpectedRelations,
     journal: HostJournal,
+    *,
+    require_full_check_coverage: bool = True,
 ) -> tuple[EvidenceRow, ...]:
     if not isinstance(rows, list):
         _fail("evidence", "evidence_invalid", "Evidence must be JSONL rows")
@@ -1089,7 +1147,7 @@ def validate_evidence_rows(
             missing=sorted(missing),
         )
     missing_checks = CHECK_CLASSES - covered_checks
-    if missing_checks:
+    if require_full_check_coverage and missing_checks:
         issue(
             "missing_physical_check_coverage",
             "Semantic assertions do not cover every required physical obligation",
@@ -1548,7 +1606,14 @@ _PROBE_PROMPT = (
     "a marker or declaration file. Each negative row must read the matching "
     "negative-runs directory selected by its declarations.json; never reuse one run for all "
     "requirements. source_use is a structured object describing any source read solely to "
-    "decode native state. Once the three programs are complete, end the turn immediately "
+    "decode native state. "
+    "Additionally read EXPECTED_TASK_SEMANTICS.json and NATIVE_ORACLE_CONTRACT.md. The same "
+    "native_probe.py must implement the disclosed semantic-check argv mode for arbitrary "
+    "Host-named before/after materializations. In that mode derive an independent typed atom "
+    "or condition result from exact native paths, the frozen capability/answer labels and the "
+    "public trace/final answer. Never read TaskSemantics source/results, protected bindings, "
+    "expected verdicts, or assume legacy instance/tool/Requirement numbering. "
+    "Once the three programs are complete, end the turn immediately "
     "without additional analysis or narrative."
 )
 
@@ -1567,7 +1632,16 @@ def run_qualification(
         prepared = prepare_qualification_workspace(
             projection, candidate_root, candidate_digest, workspace_root
         )
-        bundle, rows, negative, carriers, public_journal = _author_probes(prepared, config)
+        stage_qualification_oracle_inputs(prepared, projection, expected_task_semantics)
+        (
+            bundle,
+            rows,
+            negative,
+            carriers,
+            public_journal,
+            qualifier_thread_id,
+            qualifier_codex_home,
+        ) = _author_probes(prepared, config)
         semantics_workspace = prepare_semantics_author_workspace(
             prepared,
             projection,
@@ -1598,6 +1672,8 @@ def run_qualification(
             semantics_author_inputs=semantics_workspace,
             expected_task_semantics_digest=expected_task_semantics.digest,
             public_surface_digest=semantics_workspace.input_digests[PUBLIC_SURFACE_NAME],
+            qualifier_thread_id=qualifier_thread_id,
+            qualifier_codex_home=qualifier_codex_home,
         )
     except QualificationFailure as exc:
         status: QualificationStatus = (
@@ -1642,7 +1718,12 @@ def replay_qualification(
             projection, candidate_root, candidate_digest, workspace_root
         )
         source = Path(probe_source_root)
-        for name in (PREDICATE_NAME, *PROBE_SCRIPTS):
+        for name in (
+            PREDICATE_NAME,
+            EXPECTED_TASK_SEMANTICS_NAME,
+            NATIVE_ORACLE_CONTRACT_NAME,
+            *PROBE_SCRIPTS,
+        ):
             path = source / name
             if not path.is_file() or path.is_symlink():
                 raise QualificationFailure(
@@ -1651,6 +1732,11 @@ def replay_qualification(
                     "Cold replay source is missing an admitted regular file",
                     path=str(path),
                 )
+        for name in (EXPECTED_TASK_SEMANTICS_NAME, NATIVE_ORACLE_CONTRACT_NAME):
+            target = prepared.root / name
+            shutil.copyfile(source / name, target)
+            target.chmod(0o444)
+            prepared.input_digests[name] = _digest(target.read_bytes())
         shutil.copyfile(source / PREDICATE_NAME, prepared.root / PREDICATE_NAME)
         validate_predicate_carrier(prepared)
         prepared.stage_candidate_view()
@@ -1820,74 +1906,86 @@ def _author_probes(
     tuple[dict[str, Any], ...],
     tuple[ControlledRunCarrier, ...],
     HostJournal,
+    str,
+    Path,
 ]:
     previous: str | None = None
     _author_predicates(prepared, config)
     prepared.stage_candidate_view()
-    with tempfile.TemporaryDirectory(
-        prefix="agent-env-foundry-qualifier-home-",
-        dir=prepared.root.parent,
-        ignore_cleanup_errors=True,
-    ) as codex_home:
-        sdk_config = CodexConfig(
-            cwd=str(prepared.root),
-            env={"CODEX_HOME": codex_home, "UV_CACHE_DIR": str(config.uv_cache_dir)},
-            config_overrides=_provider_overrides(),
+    codex_home = prepared.root.parent / "qualification-codex-home"
+    if codex_home.is_symlink() or codex_home.exists():
+        raise QualificationFailure(
+            "qualification_workspace",
+            "qualifier_codex_home_not_fresh",
+            "Qualifier Codex home must be absent before authoring",
+            path=str(codex_home),
         )
-        with Codex(sdk_config) as codex:
-            thread = codex.thread_start(
-                approval_mode=ApprovalMode.deny_all,
-                base_instructions=_BASE_INSTRUCTIONS,
-                cwd=str(prepared.root),
-                model=config.model,
-                sandbox=Sandbox.workspace_write,
-            )
-            prompt = _PROBE_PROMPT
-            for turn in range(config.max_turns):
-                _run_codex_turn(thread, prompt, config.turn_timeout_seconds)
-                prepared.verify_inputs()
-                prepared.verify_candidate_unchanged()
-                bundle: ProbeBundle | None = None
-                try:
-                    bundle = validate_probe_bundle(
-                        prepared.root, prepared.expected, prepared.predicates
-                    )
-                    outputs = _execute_probes(prepared, bundle, config)
-                    positive_journal, carriers = _require_host_outputs(outputs)
-                    rows = validate_evidence_rows(
-                        outputs["rows"], prepared.expected, positive_journal
-                    )
-                    negative = validate_negative_discrimination(
-                        bundle,
-                        outputs["negative_rows"],
-                        rows,
-                        prepared.expected,
-                        prepared.predicates,
-                        carriers,
-                        prepared.candidate_digest,
-                    )
-                    return bundle, rows, negative, carriers, positive_journal
-                except QualificationFailure as exc:
-                    if exc.code in _CANDIDATE_FAILURE_CODES or exc.phase in {
-                        "candidate_execution",
-                        "provider",
-                        "infrastructure",
-                    }:
-                        raise
-                    current = _probe_digest(prepared.root)
-                    facts = {"code": exc.code, "message": str(exc), "details": exc.details}
-                    if previous == current:
-                        raise QualificationFailure(
-                            "probe_gate",
-                            "qualifier_stalled",
-                            "Qualifier changed no probe bytes after feedback",
-                            prior_failure=facts,
-                        ) from exc
-                    previous = current
-                    if turn + 1 == config.max_turns:
-                        raise
-                    _reset_probe_attempt(prepared.root, admitted=bundle is not None)
-                    prompt = _render_probe_feedback(exc)
+    codex_home.mkdir()
+    sdk_config = CodexConfig(
+        cwd=str(prepared.root),
+        env=_isolated_codex_env(codex_home, config.uv_cache_dir),
+        config_overrides=_provider_overrides(),
+    )
+    with Codex(sdk_config) as codex:
+        thread = codex.thread_start(
+            approval_mode=ApprovalMode.deny_all,
+            base_instructions=_BASE_INSTRUCTIONS,
+            cwd=str(prepared.root),
+            model=config.model,
+            sandbox=Sandbox.full_access,
+        )
+        prompt = _PROBE_PROMPT
+        for turn in range(config.max_turns):
+            _run_codex_turn(thread, prompt, config.turn_timeout_seconds)
+            prepared.verify_inputs()
+            prepared.verify_candidate_unchanged()
+            bundle: ProbeBundle | None = None
+            try:
+                bundle = validate_probe_bundle(
+                    prepared.root, prepared.expected, prepared.predicates
+                )
+                outputs = _execute_probes(prepared, bundle, config)
+                positive_journal, carriers = _require_host_outputs(outputs)
+                rows = validate_evidence_rows(outputs["rows"], prepared.expected, positive_journal)
+                negative = validate_negative_discrimination(
+                    bundle,
+                    outputs["negative_rows"],
+                    rows,
+                    prepared.expected,
+                    prepared.predicates,
+                    carriers,
+                    prepared.candidate_digest,
+                )
+                return (
+                    bundle,
+                    rows,
+                    negative,
+                    carriers,
+                    positive_journal,
+                    thread.id,
+                    codex_home,
+                )
+            except QualificationFailure as exc:
+                if exc.code in _CANDIDATE_FAILURE_CODES or exc.phase in {
+                    "candidate_execution",
+                    "provider",
+                    "infrastructure",
+                }:
+                    raise
+                current = _probe_digest(prepared.root)
+                facts = {"code": exc.code, "message": str(exc), "details": exc.details}
+                if previous == current:
+                    raise QualificationFailure(
+                        "probe_gate",
+                        "qualifier_stalled",
+                        "Qualifier changed no probe bytes after feedback",
+                        prior_failure=facts,
+                    ) from exc
+                previous = current
+                if turn + 1 == config.max_turns:
+                    raise
+                _reset_probe_attempt(prepared.root, admitted=bundle is not None)
+                prompt = _render_probe_feedback(exc)
     raise QualificationFailure("probe_gate", "probe_bundle_missing", "Qualifier produced no probes")
 
 
@@ -1940,6 +2038,10 @@ def _provider_overrides() -> tuple[str, ...]:
         f'model_providers.{provider}.env_key="OPENAI_API_KEY"',
         f'model_providers.{provider}.wire_api="responses"',
         f"model_providers.{provider}.supports_websockets=true",
+        "project_root_markers=[]",
+        "features.plugins=false",
+        "features.multi_agent=false",
+        "features.skill_search=false",
     )
 
 

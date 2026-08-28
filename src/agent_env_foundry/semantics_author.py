@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -16,6 +15,7 @@ from agent_env_foundry.builder import (
     BuilderConfig,
     CommandResult,
     _codex_provider_overrides,
+    _isolated_codex_env,
     _run,
 )
 from agent_env_foundry.preparation import _ChildTransport, _probe_origin
@@ -69,6 +69,7 @@ class SemanticsAuthorFailure(RuntimeError):
 class SemanticsBuild:
     root: Path
     thread_id: str
+    codex_home: Path
     factory: str
     project_digest: str
     checks: tuple[CommandResult, ...]
@@ -94,59 +95,141 @@ def run_semantics_author(
         "generated_task_semantics.release:make_semantics factory. Framework checks, not "
         "your response, decide acceptance."
     )
-    previous_failed_digest: str | None = None
-    with tempfile.TemporaryDirectory(
-        dir=prepared.root.parent,
-        prefix="agent-env-foundry-semantics-codex-home-",
-        ignore_cleanup_errors=True,
-    ) as codex_home:
-        with Codex(
-            CodexConfig(
-                cwd=str(prepared.root),
-                env={
-                    "CODEX_HOME": codex_home,
-                    "UV_CACHE_DIR": str(selected.uv_cache_dir),
-                },
-                config_overrides=_codex_provider_overrides(),
+    codex_home = prepared.root.parent / "semantics-codex-home"
+    _require_fresh_codex_home(codex_home)
+    with Codex(_codex_config(prepared.root, codex_home, selected)) as codex:
+        thread = codex.thread_start(
+            approval_mode=ApprovalMode.deny_all,
+            base_instructions=skill,
+            cwd=str(prepared.root),
+            model=selected.model,
+            sandbox=Sandbox.full_access,
+        )
+        return _drive_semantics_thread(
+            prepared,
+            thread,
+            codex_home,
+            selected,
+            prompt,
+            previous_failed_digest=None,
+        )
+
+
+def repair_semantics_author(
+    prepared: PreparedSemanticsAuthorWorkspace,
+    build: SemanticsBuild,
+    findings: list[dict[str, Any]],
+    *,
+    config: BuilderConfig,
+) -> SemanticsBuild:
+    """Resume the exact Semantics Author thread with physical CP3C findings."""
+    prepared.verify_inputs()
+    if (
+        build.root != prepared.root
+        or build.codex_home.is_symlink()
+        or not build.codex_home.is_dir()
+    ):
+        raise SemanticsAuthorFailure(
+            "semantics_author",
+            "semantics_author_resume_invalid",
+            "Semantics Author resume identity is unavailable",
+        )
+    skill = (Path(__file__).parent / "runtime_skills/task-semantics-codegen/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    prompt = (
+        "PHYSICAL SEMANTIC QUALIFICATION REJECTED\n"
+        "Fix semantic source/tests only; preserve immutable Host inputs and passed capabilities.\n"
+        "ALL_FINDINGS\n" + json.dumps(findings, ensure_ascii=False, sort_keys=True)
+    )
+    with Codex(_codex_config(prepared.root, build.codex_home, config)) as codex:
+        thread = codex.thread_resume(
+            build.thread_id,
+            approval_mode=ApprovalMode.deny_all,
+            base_instructions=skill,
+            cwd=str(prepared.root),
+            model=config.model,
+            sandbox=Sandbox.full_access,
+        )
+        return _drive_semantics_thread(
+            prepared,
+            thread,
+            build.codex_home,
+            config,
+            prompt,
+            previous_failed_digest=build.project_digest,
+        )
+
+
+def _drive_semantics_thread(
+    prepared: PreparedSemanticsAuthorWorkspace,
+    thread: Any,
+    codex_home: Path,
+    config: BuilderConfig,
+    prompt: str,
+    *,
+    previous_failed_digest: str | None,
+) -> SemanticsBuild:
+    last_checks: tuple[CommandResult, ...] = ()
+    for turn_index in range(config.max_turns):
+        try:
+            thread.run(prompt)
+        except Exception as exc:
+            if turn_index + 1 == config.max_turns:
+                raise SemanticsAuthorFailure(
+                    "infrastructure",
+                    "semantics_provider_turn_failed",
+                    "Semantics Author provider turn failed",
+                    original_code=type(exc).__name__,
+                    original_message=str(exc),
+                ) from exc
+            continue
+        prepared.verify_inputs()
+        last_checks = run_semantics_checks(prepared, config)
+        digest = compute_semantics_project_digest(prepared.root)
+        if last_checks and all(check.passed for check in last_checks):
+            return SemanticsBuild(
+                prepared.root,
+                thread.id,
+                codex_home,
+                SEMANTICS_FACTORY,
+                digest,
+                last_checks,
             )
-        ) as codex:
-            thread = codex.thread_start(
-                approval_mode=ApprovalMode.deny_all,
-                base_instructions=skill,
-                cwd=str(prepared.root),
-                model=selected.model,
-                sandbox=Sandbox.full_access,
+        if previous_failed_digest == digest:
+            raise SemanticsAuthorFailure(
+                "semantics_author",
+                "semantics_author_stalled",
+                "Semantics Author changed no project bytes after factual feedback",
+                project_digest=digest,
+                failures=[check.to_document() for check in last_checks if not check.passed],
             )
-            last_checks: tuple[CommandResult, ...] = ()
-            for _turn in range(selected.max_turns):
-                thread.run(prompt)
-                prepared.verify_inputs()
-                last_checks = run_semantics_checks(prepared, selected)
-                digest = compute_semantics_project_digest(prepared.root)
-                if last_checks and all(check.passed for check in last_checks):
-                    return SemanticsBuild(
-                        prepared.root,
-                        thread.id,
-                        SEMANTICS_FACTORY,
-                        digest,
-                        last_checks,
-                    )
-                if previous_failed_digest == digest:
-                    raise SemanticsAuthorFailure(
-                        "semantics_author",
-                        "semantics_author_stalled",
-                        "Semantics Author changed no project bytes after factual feedback",
-                        project_digest=digest,
-                        failures=[check.to_document() for check in last_checks if not check.passed],
-                    )
-                previous_failed_digest = digest
-                prompt = _feedback(last_checks)
+        previous_failed_digest = digest
+        prompt = _feedback(last_checks)
     raise SemanticsAuthorFailure(
         "semantics_author",
         "semantics_author_turns_exhausted",
         "Semantics Author exhausted its bounded repair turns",
         failures=[check.to_document() for check in last_checks if not check.passed],
     )
+
+
+def _codex_config(root: Path, codex_home: Path, config: BuilderConfig) -> CodexConfig:
+    return CodexConfig(
+        cwd=str(root),
+        env=_isolated_codex_env(codex_home, config.uv_cache_dir),
+        config_overrides=_codex_provider_overrides(),
+    )
+
+
+def _require_fresh_codex_home(path: Path) -> None:
+    if path.is_symlink() or (path.exists() and (not path.is_dir() or any(path.iterdir()))):
+        raise SemanticsAuthorFailure(
+            "semantics_author",
+            "semantics_codex_home_not_fresh",
+            "Semantics Author Codex home must be fresh",
+        )
+    path.mkdir(exist_ok=True)
 
 
 def run_semantics_checks(
@@ -426,6 +509,16 @@ def _align_expected_catalog(
             "actor_role": spec.actor_role,
             "task_kind": spec.task_kind,
             "intent_label": spec.intent_label,
+            "answer_fields": sorted(
+                (
+                    {
+                        "field_id": field.field_id,
+                        "public_label": field.public_label,
+                    }
+                    for field in spec.answer_fields
+                ),
+                key=lambda field: field["field_id"],
+            ),
         }
         for field, value in comparisons.items():
             if value != expected_item[field]:

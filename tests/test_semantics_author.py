@@ -57,6 +57,7 @@ def _workspace(tmp_path: Path) -> PreparedSemanticsAuthorWorkspace:
                     "actor_role": "operator",
                     "task_kind": "state_change",
                     "intent_label": "increment the counter",
+                    "answer_fields": [],
                 }
             ],
             "composition_rules": [],
@@ -158,10 +159,14 @@ def test_run_semantics_author_uses_codex_only_for_semantic_project_bytes(
     )
 
     assert result.thread_id == "semantics-thread"
+    assert result.codex_home.is_dir()
     assert result.factory == "generated_task_semantics.release:make_semantics"
     assert result.project_digest
     assert observed["thread"]["approval_mode"] is ApprovalMode.deny_all
     assert observed["thread"]["sandbox"] is Sandbox.full_access
+    assert set(observed["config"].env) == {"CODEX_HOME", "HOME", "UV_CACHE_DIR"}
+    assert Path(observed["config"].env["HOME"]).parent == result.codex_home
+    assert Path(observed["config"].env["HOME"]).is_dir()
     instructions = observed["thread"]["base_instructions"]
     assert "Do not write manifests, digests, verdicts, Tasks, rewards" in instructions
     assert "write the tasksemantics project" in observed["prompt"].casefold()
@@ -215,6 +220,13 @@ def test_framework_compares_generated_catalog_to_frozen_semantics(tmp_path: Path
 
     expected["capabilities"][0]["task_kind"] = "query"
     with pytest.raises(ValueError, match="task_kind"):
+        semantics_author_module._align_expected_catalog(expected, catalog)
+
+    expected["capabilities"][0]["task_kind"] = "state_change"
+    expected["capabilities"][0]["answer_fields"] = [
+        {"field_id": "unexpected", "public_label": "Unexpected"}
+    ]
+    with pytest.raises(ValueError, match="answer_fields"):
         semantics_author_module._align_expected_catalog(expected, catalog)
 
 
