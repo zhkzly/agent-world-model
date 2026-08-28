@@ -1,87 +1,132 @@
-# Canonical Agent Environment Foundry
+# Canonical Agent Environment and Task Foundry
 
 ## Product intent
 
-Build a paper-grade, publishable system that turns an arbitrary natural-language
-business Need into a real executable environment that another team can use
-directly for agent tool-calling and, later, SFT/RL data collection and training.
+Build a paper-grade system that turns a natural-language business Need into a
+real executable environment and then derives high-quality Agent Tasks from that
+already-built world.
 
-Completion means semantic product completion. A demo, mock, template,
-hard-coded dictionary world, green unit test, graph traversal or package-shaped
-file is not completion.
+Semantic completion is the product criterion. A demo, MVP label, mock, canned
+Task, dictionary world, green unit suite, single happy-path trace or
+package-shaped artifact is never sufficient evidence of completion.
 
 ## Product lifecycle
 
-Environment generation:
-
 ```text
 natural-language Need
--> research real workflows, interfaces, constraints and available libraries
--> state the required business capabilities and invariants
--> Codex SDK writes a real uv-managed project in a workspace
--> execute real tools and real persistent state transitions
--> independently validate behavior and failure semantics
--> publish an immutable EnvironmentRelease
+-> S1 Environment Foundry
+-> qualified immutable EnvironmentRelease
+-> S2 Goal-First Task Foundry
+-> verified release-bound TaskPacks and selected corpora
+-> S3 acting-Agent Episodes + verified facts + Reward/abstention
+-> S4 SFT/RL
 ```
 
-Environment use is a separate downstream lifecycle:
+### S1 owns the executable world
+
+S1 researches the requested world, builds a real uv-managed project, executes
+real public tools against real persistent state, independently qualifies
+success and refusal semantics, and publishes an immutable EnvironmentRelease.
+
+The release contract may evolve when a demonstrated cross-environment S2/S3
+consumer need requires it. Compatibility with earlier research releases is not
+a current product goal. Any S1 addition must remain environment-generic and may
+not contain Task-, sampler-, verifier-, reward- or training-specific fields.
+
+S1 must provide two trust-separated surfaces:
 
 ```text
-released EnvironmentRelease
--> synthesize and admit Graph-based and Programmatic Tasks
--> prove solvability with real execution and derive task truth
--> run an independent tool-calling Agent episode
--> verify state, observations and final answer as the Task requires
--> produce grounded Reward and trajectory
--> SFT / RL
+public actor surface
+  reset / tools / invoke / close
+
+protected trusted surface
+  isolated release preparation/opening
+  canonical read-only state inspection with a release-owned schema
 ```
 
-Environment generation must not depend on a training framework. Training must
-not gain authority to redefine environment state or release correctness.
+The protected state view is never exposed to an acting Agent and must be
+independently checked against native SQLite/files/Git or another authoritative
+representation during S1 Qualification.
 
-## Frozen stage and context boundaries
+### S2 owns Task semantics and admission
 
-- S1 consumes a Need and produces a qualified `EnvironmentRelease`: a real
-  generated uv project, meaningful initial state, public documentation,
-  `reset/tools/invoke/close`, tool schemas, uniform structured observations and
-  an immutable release identity.
-- S2 consumes only that released environment surface and produces a
-  release-bound sealed `TaskPack`: Task, start, constructive solvability evidence,
-  task truth and verifier/reward material.
-- S3 consumes `EnvironmentRelease + TaskPack`, executes the acting Agent and
-  emits a verified Episode and attributable Reward.
-- S4 consumes verified Episodes for SFT/RL and cannot redefine earlier truth.
+S2 consumes an exact EnvironmentRelease and produces TaskPacks. Task generation
+is goal-first:
 
-MCP, HTTP, OpenAI messages and call identifiers are adapters, not environment
-semantics. Graph-based and Programmatic generation are S2 algorithms and cannot
-require graph-, witness-, Task- or reward-specific fields from S1.
+```text
+Need/Brief intent
++ empirically observed public capabilities and state effects
+-> parameterized TaskBlueprint
+-> reproducible StartRecipe
+-> independently authored TaskChecker
+-> public-only constructive solution and fresh replay
+-> natural-language instruction
+-> adversarial admission
+-> TaskPack
+```
 
-Remaining choices inside S2-S4—Task sampling policy, verifier construction,
-reward mapping, trajectory representation and training configuration—must
-respect these frozen boundaries.
+Graph traversal, random walks, program synthesis, LLM agents and search
+algorithms are optional implementation techniques. None is a mandatory Task
+source or semantic authority.
+
+Every admitted Task must be:
+
+- publicly solvable from its actor-visible context;
+- deterministically verifiable from trusted state, public trace and answer as
+  required;
+- well-posed without leaking hidden operands, tool names or a reference path;
+- non-trivial at the initial state;
+- reproducible across fresh materializations;
+- anchored to a coherent user intent supported by the Brief;
+- useful for a named Agent capability and assigned empirical difficulty/cost
+  evidence.
+
+A selected Task corpus must additionally be structurally diverse, low in
+semantic redundancy and balanced for its declared SFT or RL use. Internal
+coverage fingerprints guide selection; they are not evidence that the complete
+Task space has been covered.
+
+### S3 and S4 cannot redefine earlier truth
+
+S3 receives a TaskPack public projection for the acting Agent and a protected
+projection for trusted materialization and verification. It owns the acting
+loop, trajectory, final answer, verifier execution and Reward/abstention.
+
+S4 consumes verified Episodes. Training code cannot alter EnvironmentRelease
+behavior, Task truth or admission evidence.
 
 ## Non-negotiable constraints
 
-1. Real execution: tools run real project code and mutate real database/file
-   state. No dict/map response simulation, fixed environment, canned Task or
-   repository candidate template as a normal success path.
-2. Semantic evidence: tests discriminate correct and incorrect state
-   transitions, not merely prove that code starts or returns schema-shaped data.
-3. Diagnose before patching: distinguish code, prompt, context, model, Task,
-   data, dependency, permission and infrastructure failures. Do not add a
-   fallback, compatibility layer, normalization rule or hard-coded exception
-   without causal evidence and an explicit product need.
-4. Minimal infrastructure: give Codex SDK a real workspace and reuse mature
-   libraries. Do not build custom sandboxes, protocols, schedulers or DSLs
-   unless a demonstrated product boundary requires them.
-5. Product alignment: every implementation and review explains how its evidence
-   advances Need -> executable environment -> independent verification ->
-   publication -> downstream consumption. Code-green/product-red is failure.
+1. **Real execution.** Public tools execute real project code and mutate real
+   persistent state. No response-map simulation or canned Task path is a normal
+   success route.
+2. **Public solvability.** A constructive solution may use only the same public
+   information and tools available to the acting Agent. Protected state may
+   select and verify a Task but may never supply an acting-time operand.
+3. **Independent truth.** A TaskChecker is frozen before the reference solution
+   is executed. The solution is evidence that the goal is reachable, not the
+   source of the goal or verifier.
+4. **Verifier sensitivity.** Admission must reject no-op, wrong-target,
+   near-miss, partial, collateral-damage and wrong-answer outcomes, while
+   accepting a valid alternative path when one is available.
+5. **No semantic authority by consensus.** LLMs may propose intents, code,
+   instructions and challenges. Model agreement never overrides deterministic
+   execution or state evidence.
+6. **No hidden direct setup.** S2 creates starts only through `reset(start)` and
+   public setup calls. Protected state inspection is read-only.
+7. **No domain branches in the framework.** Booking, SQLite and Git are
+   conformance cases, not framework categories or hard-coded schemas.
+8. **No fake completion.** Intermediate slices are checkpoints. S2 is complete
+   only after the full admission path works on contrasting real releases and a
+   frozen implementation transfers to a held-out release without domain code
+   changes.
+9. **Causal changes only.** Do not add compatibility layers, fallbacks,
+   abstractions, roles or fields without a named current consumer and observed
+   need.
 
-## Discussion standard
+## Current planning boundary
 
-Use a concrete stateful environment such as booking to walk every proposal from
-input through real tool calls, persistent state, verification, packaging and a
-downstream episode. Also test a contrasting environment such as filesystem/Git.
-Reject abstractions that cannot be expressed as executable pseudocode with named
-owners, inputs, outputs, failure behavior and observable evidence.
+The `s2-task-foundry` Trellis task owns the complete S2 redesign and the minimum
+cross-environment S1 runtime/inspection changes required by that design. The
+planning artifacts must be reviewed and explicitly approved before product code
+or task activation.
