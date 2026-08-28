@@ -26,7 +26,8 @@
     ".trellis/tasks/08-26-foundry-paper-product/prd.md",
     ".trellis/tasks/08-26-s2-task-foundry/prd.md",
     ".trellis/tasks/08-26-s2-task-foundry/design.md",
-    ".trellis/tasks/08-26-s2-task-foundry/implement.md"
+    ".trellis/tasks/08-26-s2-task-foundry/implement.md",
+    ".trellis/tasks/08-26-s2-task-foundry/research/goal-first-design-audit.md"
   ],
   "notes": "Old mandatory Graph/Programmatic design superseded on 2026-08-28. Task remains planning until final review, fresh plan-document Patrol, and later explicit implementation approval.",
   "meta": {
