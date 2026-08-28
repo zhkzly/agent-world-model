@@ -363,27 +363,47 @@ class ChallengeResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CheckerMutationResult:
+    mutation_id: str
+    reachable: bool
+    killed: bool
+    evidence_digest: str
+
+    @property
+    def passed(self) -> bool:
+        return self.reachable and self.killed and bool(self.evidence_digest)
+
+    def to_document(self) -> JSONObject:
+        return {
+            "mutation_id": self.mutation_id,
+            "reachable": self.reachable,
+            "killed": self.killed,
+            "evidence_digest": self.evidence_digest,
+            "passed": self.passed,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionReport:
     witness_digests: tuple[str, ...]
     challenges: tuple[ChallengeResult, ...]
-    checker_mutations_killed: int
-    checker_mutations_total: int
+    checker_mutations: tuple[CheckerMutationResult, ...]
 
     @property
     def accepted(self) -> bool:
+        reachable_mutations = tuple(item for item in self.checker_mutations if item.reachable)
         return (
             len(self.witness_digests) >= 2
             and all(item.passed for item in self.challenges if item.reachable)
-            and self.checker_mutations_total > 0
-            and self.checker_mutations_killed == self.checker_mutations_total
+            and bool(reachable_mutations)
+            and all(item.passed for item in reachable_mutations)
         )
 
     def to_document(self) -> JSONObject:
         return {
             "witness_digests": list(self.witness_digests),
             "challenges": [item.to_document() for item in self.challenges],
-            "checker_mutations_killed": self.checker_mutations_killed,
-            "checker_mutations_total": self.checker_mutations_total,
+            "checker_mutations": [item.to_document() for item in self.checker_mutations],
             "accepted": self.accepted,
         }
 
@@ -400,11 +420,24 @@ class TaskPack:
             raise TaskModelError("cannot seal a TaskPack with failed admission")
         if not self.checker_payload:
             raise TaskModelError("TaskPack requires reconstructable protected checker payload")
+        if self.checker_payload.get("checker_digest") != self.definition.checker.checker_digest:
+            raise TaskModelError("checker payload does not match TaskDefinition")
         if any(
             run.task_definition_id != self.definition.task_definition_id
             for run in self.witnesses
         ):
             raise TaskModelError("witness belongs to another TaskDefinition")
+        if len(self.witnesses) < 2 or len({run.materialization_id for run in self.witnesses}) < 2:
+            raise TaskModelError("TaskPack requires two distinct fresh materializations")
+        if any(not run.successful for run in self.witnesses):
+            raise TaskModelError("TaskPack contains an unsuccessful witness")
+        digests = tuple(run.evidence_digest for run in self.witnesses)
+        if self.admission.witness_digests != digests:
+            raise TaskModelError("AdmissionReport does not bind the witness evidence")
+        present = {item.challenge_id for item in self.admission.challenges if item.reachable}
+        missing = _required_challenges(self.definition) - present
+        if missing:
+            raise TaskModelError(f"TaskPack misses challenges: {sorted(missing)}")
 
     @property
     def taskpack_id(self) -> str:
@@ -423,6 +456,18 @@ class TaskPack:
             "taskpack_id": self.taskpack_id,
             "task": self.definition.public_projection(),
         }
+
+
+def _required_challenges(definition: TaskDefinition) -> set[str]:
+    required = {"positive", "no_op", "wrong_target", "collateral"}
+    goal = definition.blueprint.goal
+    if isinstance(goal, (AllGoal, ForEachGoal)):
+        required.add("partial")
+    if isinstance(goal, IfGoal):
+        required.add("wrong_branch")
+    if definition.blueprint.report is not None:
+        required.add("wrong_answer")
+    return required
 
 
 @dataclass(frozen=True, slots=True)
