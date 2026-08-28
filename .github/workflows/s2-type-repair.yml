@@ -29,11 +29,15 @@ jobs:
           from pathlib import Path
           path = Path("scripts/apply_s2_type_repairs.py")
           text = path.read_text(encoding="utf-8")
-          old = '        "def _selector(\\n",\n'
-          new = '        "def _selector(",\n'
-          if text.count(old) != 1:
-              raise SystemExit("repair-script selector anchor was not found exactly once")
-          path.write_text(text.replace(old, new, 1), encoding="utf-8")
+          replacements = {
+              '        "def _selector(\\n",\n': '        "def _selector(",\n',
+              '        "def _task_literals(\\n",\n': '        "def _task_literals(",\n',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f"repair-script anchor was not found exactly once: {old!r}")
+              text = text.replace(old, new, 1)
+          path.write_text(text, encoding="utf-8")
           PY
           python scripts/apply_s2_type_repairs.py
       - name: Format repaired files
