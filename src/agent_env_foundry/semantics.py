@@ -72,6 +72,7 @@ class FacetSpec:
     value_schema: JSONObject
     allowed_operators: tuple[FacetOperator, ...]
     visibility: Literal["task_literal", "reset", "public_tool"]
+    tool_name: str | None = None
     output_pointer: str | None = None
 
     def __post_init__(self) -> None:
@@ -82,7 +83,12 @@ class FacetSpec:
             raise SemanticsContractError("facet operators must not be empty")
         _unique(self.allowed_operators, "facet operators")
         if self.visibility == "public_tool":
+            if self.tool_name is None:
+                raise SemanticsContractError("public_tool facet requires tool_name")
+            _identifier(self.tool_name, "public_tool facet tool_name")
             _pointer(self.output_pointer, "public_tool facet output_pointer")
+        elif self.tool_name is not None or self.output_pointer is not None:
+            raise SemanticsContractError("non-tool facet cannot declare tool provenance")
 
     def to_document(self) -> JSONObject:
         return {
@@ -91,6 +97,7 @@ class FacetSpec:
             "value_schema": _json(self.value_schema),
             "allowed_operators": list(self.allowed_operators),
             "visibility": self.visibility,
+            "tool_name": self.tool_name,
             "output_pointer": self.output_pointer,
         }
 
@@ -121,9 +128,11 @@ class ConditionSpec:
     condition_id: str
     public_label: str
     visibility: Literal["reset", "public_tool"]
+    binding_scope: Literal["world", "selected_binding"] = "world"
     true_capability_ids: tuple[str, ...] = ()
     false_capability_ids: tuple[str, ...] = ()
     report_field: AnswerFieldSpec | None = None
+    tool_name: str | None = None
     output_pointer: str | None = None
 
     def __post_init__(self) -> None:
@@ -131,19 +140,30 @@ class ConditionSpec:
         _text(self.public_label, "condition label")
         _unique(self.true_capability_ids, "condition true capabilities")
         _unique(self.false_capability_ids, "condition false capabilities")
-        if not self.true_capability_ids and not self.false_capability_ids and self.report_field is None:
+        if (
+            not self.true_capability_ids
+            and not self.false_capability_ids
+            and self.report_field is None
+        ):
             raise SemanticsContractError("condition licenses neither a branch nor a report")
         if self.visibility == "public_tool":
+            if self.tool_name is None:
+                raise SemanticsContractError("public_tool condition requires tool_name")
+            _identifier(self.tool_name, "public_tool condition tool_name")
             _pointer(self.output_pointer, "condition output_pointer")
+        elif self.tool_name is not None or self.output_pointer is not None:
+            raise SemanticsContractError("reset condition cannot declare tool provenance")
 
     def to_document(self) -> JSONObject:
         return {
             "condition_id": self.condition_id,
             "public_label": self.public_label,
             "visibility": self.visibility,
+            "binding_scope": self.binding_scope,
             "true_capability_ids": list(self.true_capability_ids),
             "false_capability_ids": list(self.false_capability_ids),
             "report_field": self.report_field.to_document() if self.report_field else None,
+            "tool_name": self.tool_name,
             "output_pointer": self.output_pointer,
         }
 
@@ -243,9 +263,10 @@ class BindingCandidate:
 
     def __post_init__(self) -> None:
         _identifier(self.semantic_key, "semantic key")
-        if not all(is_json_object(value) for value in (
-            self.protected_binding, self.public_descriptor, self.facets
-        )):
+        if not all(
+            is_json_object(value)
+            for value in (self.protected_binding, self.public_descriptor, self.facets)
+        ):
             raise SemanticsContractError("binding projections must be JSON objects")
         _unique(self.reason_codes, "binding reason codes")
         if self.eligible and self.reason_codes:
@@ -355,9 +376,15 @@ def validate_catalog(specs: tuple[CapabilitySpec, ...]) -> dict[str, CapabilityS
 
 def validate_binding(spec: CapabilitySpec, binding: BindingCandidate) -> None:
     try:
-        validate_instance(binding.protected_binding, spec.protected_binding_schema, role="binding")
         validate_instance(
-            binding.public_descriptor, spec.public_descriptor_schema, role="public descriptor"
+            binding.protected_binding,
+            spec.protected_binding_schema,
+            role="binding",
+        )
+        validate_instance(
+            binding.public_descriptor,
+            spec.public_descriptor_schema,
+            role="public descriptor",
         )
     except SchemaError as exc:
         raise SemanticsContractError(str(exc)) from exc
@@ -372,7 +399,10 @@ def validate_binding(spec: CapabilitySpec, binding: BindingCandidate) -> None:
 
 
 def validate_start_cases(
-    cases: tuple[StartCase, ...], *, start_schema: JSONObject | None, limit: int
+    cases: tuple[StartCase, ...],
+    *,
+    start_schema: JSONObject | None,
+    limit: int,
 ) -> None:
     if not isinstance(cases, tuple) or len(cases) > limit:
         raise SemanticsContractError("invalid start-case result")
@@ -380,7 +410,11 @@ def validate_start_cases(
     for case in cases:
         if case.reset_input is not None and start_schema is not None:
             try:
-                validate_instance(case.reset_input, start_schema, role=f"start {case.case_id!r}")
+                validate_instance(
+                    case.reset_input,
+                    start_schema,
+                    role=f"start {case.case_id!r}",
+                )
             except SchemaError as exc:
                 raise SemanticsContractError(str(exc)) from exc
 
