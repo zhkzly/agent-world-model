@@ -2,5 +2,6 @@
 {"file":"DECISIONS.md","reason":"Check that implementation follows the accepted clean break, protected S1 semantics, checker-before-witness order and deleted old mechanisms."}
 {"file":".trellis/spec/backend/s1-coordinator.md","reason":"Verify S1 v2 remains a direct cold-published coordinator without compatibility or workflow-engine drift."}
 {"file":".trellis/spec/backend/qualification-debugging.md","reason":"Audit semantic qualification for independent native evidence, valid physical near misses, complete findings and causal repairs."}
+{"file":".trellis/tasks/08-26-s2-task-foundry/research/goal-first-design-audit.md","reason":"Use the conditional-feasibility verdict, workflow composition constraint, fatal risks and overdesign deletion list as explicit review criteria."}
 {"file":".trellis/tasks/08-26-s2-task-foundry/research/external-ai-interface-review-packet.md","reason":"Use as a historical interface/failure inventory only and detect reintroduction of previously identified overdesign or missing-runtime issues."}
 {"file":".trellis/tasks/08-26-s2-task-foundry/research/glm-interface-review-record.md","reason":"Check that prepare/open isolation, hidden setup, schema weakness and duplicate-role findings are resolved rather than renamed."}
