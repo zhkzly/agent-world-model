@@ -8,7 +8,7 @@ from typing import Any, Literal, TypeAlias
 
 import rfc8785
 
-from agent_env_foundry.semantics import JSONValue, JSONObject
+from agent_env_foundry.semantics import JSONObject, JSONValue
 
 SelectorOperator = Literal["eq", "neq", "lt", "lte", "gt", "gte"]
 RankDirection = Literal["min", "max"]
@@ -102,7 +102,7 @@ class AtomGoal:
 
 @dataclass(frozen=True, slots=True)
 class AllGoal:
-    children: tuple["GoalProgram", ...]
+    children: tuple[GoalProgram, ...]
     composition_rule_id: str
 
     def __post_init__(self) -> None:
@@ -121,8 +121,8 @@ class AllGoal:
 class IfGoal:
     condition_id: str
     selector_id: str | None
-    then_goal: "GoalProgram | None"
-    else_goal: "GoalProgram | None"
+    then_goal: GoalProgram | None
+    else_goal: GoalProgram | None
 
     def __post_init__(self) -> None:
         if self.then_goal is None and self.else_goal is None:
@@ -151,7 +151,7 @@ class ForEachGoal:
         }
 
 
-GoalProgram: TypeAlias = AtomGoal | AllGoal | IfGoal | ForEachGoal
+type GoalProgram = AtomGoal | AllGoal | IfGoal | ForEachGoal
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,8 +423,7 @@ class TaskPack:
         if self.checker_payload.get("checker_digest") != self.definition.checker.checker_digest:
             raise TaskModelError("checker payload does not match TaskDefinition")
         if any(
-            run.task_definition_id != self.definition.task_definition_id
-            for run in self.witnesses
+            run.task_definition_id != self.definition.task_definition_id for run in self.witnesses
         ):
             raise TaskModelError("witness belongs to another TaskDefinition")
         if len(self.witnesses) < 2 or len({run.materialization_id for run in self.witnesses}) < 2:
@@ -551,13 +550,7 @@ def goal_capability_ids(goal: GoalProgram) -> tuple[str, ...]:
         return (goal.atom.capability_id,)
     if isinstance(goal, AllGoal):
         return tuple(
-            sorted(
-                {
-                    item
-                    for child in goal.children
-                    for item in goal_capability_ids(child)
-                }
-            )
+            sorted({item for child in goal.children for item in goal_capability_ids(child)})
         )
     children = tuple(value for value in (goal.then_goal, goal.else_goal) if value is not None)
     return tuple(sorted({item for child in children for item in goal_capability_ids(child)}))
@@ -570,7 +563,11 @@ def goal_shape(goal: GoalProgram) -> str:
         return "foreach(atom)"
     if isinstance(goal, AllGoal):
         return "all(" + ",".join(goal_shape(child) for child in goal.children) + ")"
-    return "if(" + ",".join(
-        goal_shape(value) if value is not None else "report"
-        for value in (goal.then_goal, goal.else_goal)
-    ) + ")"
+    return (
+        "if("
+        + ",".join(
+            goal_shape(value) if value is not None else "report"
+            for value in (goal.then_goal, goal.else_goal)
+        )
+        + ")"
+    )

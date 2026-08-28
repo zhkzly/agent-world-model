@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from agent_env_foundry.semantics import (
     BindingCandidate,
@@ -121,9 +121,7 @@ def enumerate_blueprints(
 
     for capability in sorted(capabilities, key=lambda item: item.capability_id):
         candidates = tuple(
-            value
-            for value in bindings.get(capability.capability_id, ())
-            if value.eligible
+            value for value in bindings.get(capability.capability_id, ()) if value.eligible
         )
         atom_entries: list[tuple[SelectorSpec, AtomGoal]] = []
         for candidate in sorted(candidates, key=lambda item: item.semantic_key):
@@ -180,9 +178,7 @@ def enumerate_blueprints(
                 if then_goal is None and else_goal is None:
                     continue
                 report = (
-                    ReportSpec((condition.report_field.name,))
-                    if condition.report_field
-                    else None
+                    ReportSpec((condition.report_field.name,)) if condition.report_field else None
                 )
                 blueprints.append(
                     TaskBlueprint(
@@ -388,8 +384,7 @@ def _unique_selector(
         matches = [item for item in candidates if item.facets.get(facet.name) == value]
         if len(matches) == 1:
             selector_id = (
-                f"{capability.capability_id}:{facet.name}:eq:"
-                f"{digest_document(value)[:12]}"
+                f"{capability.capability_id}:{facet.name}:eq:{digest_document(value)[:12]}"
             )
             return SelectorSpec(
                 selector_id,

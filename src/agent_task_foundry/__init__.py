@@ -1,8 +1,8 @@
 """Goal-first Task synthesis contracts and deterministic admission gates."""
 
 from agent_task_foundry.compiler import (
-    CompiledTaskChecker,
     CompilationError,
+    CompiledTaskChecker,
     TaskCheckResult,
     compile_definition,
 )

@@ -138,9 +138,7 @@ def capability(
         intent_label="finish an item",
         protected_binding_schema=OBJECT,
         public_descriptor_schema=OBJECT,
-        facets=(
-            FacetSpec("name", "name", STRING, ("eq",), "task_literal"),
-        ),
+        facets=(FacetSpec("name", "name", STRING, ("eq",), "task_literal"),),
         composition_rules=rules,
         answer_fields=(AnswerFieldSpec("confirmation", "confirmation", STRING),),
         supported_goal_kinds=("atom", "all", "foreach"),
@@ -261,9 +259,7 @@ def test_two_fresh_public_runs_and_provenance_seal_taskpack() -> None:
             ChallengeResult("wrong_target", "failed", "failed"),
             ChallengeResult("collateral", "failed", "failed"),
         ),
-        checker_mutations=(
-            CheckerMutationResult("drop-goal", True, True, "evidence-drop-goal"),
-        ),
+        checker_mutations=(CheckerMutationResult("drop-goal", True, True, "evidence-drop-goal"),),
     )
     assert pack.taskpack_id
     assert "checker_payload" not in pack.public_projection()

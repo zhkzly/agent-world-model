@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping
 
 from agent_env_foundry.semantics import (
     AnswerFieldSpec,
@@ -14,8 +14,8 @@ from agent_env_foundry.semantics import (
     CompositionRule,
     ConditionCheckRequest,
     ConditionSpec,
-    JSONValue,
     JSONObject,
+    JSONValue,
     TaskSemantics,
     TraceEvent,
     validate_binding,
@@ -430,8 +430,7 @@ def _render_goal(
         )
     if isinstance(goal, AllGoal):
         return "; also ".join(
-            _render_goal(child, blueprint, catalog, resolved, bindings)
-            for child in goal.children
+            _render_goal(child, blueprint, catalog, resolved, bindings) for child in goal.children
         )
     _, condition = catalog.conditions[goal.condition_id]
     then_text = _branch_text(goal.then_goal, condition, blueprint, catalog, resolved, bindings)
@@ -517,15 +516,21 @@ def audit_instruction(
         quoted = f"`{normalized}`" in lowered or f'"{normalized}"' in lowered
         if quoted or (code_like and normalized in lowered):
             findings.append(f"tool_name_leak:{tool_name}")
-    public_values = set().union(
-        *(
-            _strings(value.public_descriptor) | _strings(value.facets)
-            for value in bindings.values()
+    public_values = (
+        set().union(
+            *(
+                _strings(value.public_descriptor) | _strings(value.facets)
+                for value in bindings.values()
+            )
         )
-    ) if bindings else set()
-    protected_values = set().union(
-        *(_strings(value.protected_binding) for value in bindings.values())
-    ) if bindings else set()
+        if bindings
+        else set()
+    )
+    protected_values = (
+        set().union(*(_strings(value.protected_binding) for value in bindings.values()))
+        if bindings
+        else set()
+    )
     for value in sorted(protected_values - public_values):
         if len(value) >= 4 and value.casefold() in lowered:
             findings.append(f"protected_value_leak:{value}")

@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
-from agent_env_foundry.semantics import JSONValue, JSONObject, TraceEvent
+from agent_env_foundry.semantics import JSONObject, JSONValue, TraceEvent
 from agent_task_foundry.compiler import CompiledTaskChecker
 from agent_task_foundry.models import (
     ArgumentOrigin,
@@ -278,8 +278,10 @@ def _contains(actual: JSONValue, required: JSONValue) -> bool:
             key in actual and _contains(actual[key], value) for key, value in required.items()
         )
     if isinstance(required, list):
-        return isinstance(actual, list) and len(actual) == len(required) and all(
-            _contains(left, right) for left, right in zip(actual, required, strict=True)
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(required)
+            and all(_contains(left, right) for left, right in zip(actual, required, strict=True))
         )
     return actual == required
 
