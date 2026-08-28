@@ -54,13 +54,14 @@ def run_public_policy(
     before_facts: JSONValue,
     after_facts: Callable[[], JSONValue],
     policy: Policy,
+    materialization_id: str,
     max_steps: int = 20,
 ) -> WitnessRun:
     """Run an injected public policy; no protected value enters its arguments."""
 
     reset_context = actor.reset(definition.blueprint.start_recipe.reset_input)
-    if reset_context != definition.public_reset_context:
-        raise RunnerError("fresh public reset context differs from TaskDefinition")
+    if not _contains(reset_context, definition.public_reset_context):
+        raise RunnerError("fresh reset context omits a TaskDefinition public fact")
     tools = tuple(actor.tools())
     trace: list[PublicTraceEvent] = []
     final_answer: JSONValue = None
@@ -74,7 +75,7 @@ def run_public_policy(
         spec = _tool_spec(tools, decision.tool_name)
         provenance = trace_argument_provenance(
             arguments=decision.arguments,
-            instruction=definition.instruction,
+            instruction_literals=_task_literals(definition),
             reset_context=reset_context,
             tool_spec=spec,
             prior_trace=tuple(trace),
@@ -99,6 +100,7 @@ def run_public_policy(
     result = checker.evaluate(before_facts, after_facts(), semantic_trace, final_answer)
     return WitnessRun(
         run_id=uuid.uuid4().hex,
+        materialization_id=materialization_id,
         task_definition_id=definition.task_definition_id,
         trace=tuple(trace),
         final_answer=final_answer,
@@ -110,7 +112,7 @@ def run_public_policy(
 def trace_argument_provenance(
     *,
     arguments: JSONObject,
-    instruction: str,
+    instruction_literals: tuple[JSONValue, ...],
     reset_context: JSONValue,
     tool_spec: Mapping[str, Any],
     prior_trace: tuple[PublicTraceEvent, ...],
@@ -130,7 +132,7 @@ def trace_argument_provenance(
             )
     for path, value in leaves:
         source = ArgumentOrigin(path, "unresolved")
-        if isinstance(value, str) and value and value in instruction:
+        if any(value == literal for literal in instruction_literals):
             source = ArgumentOrigin(path, "instruction")
         else:
             reset_match = next((pointer for pointer, item in reset_values if item == value), None)
@@ -158,6 +160,7 @@ def run_responses_policy(
     after_facts: Callable[[], JSONValue],
     model: str,
     base_url: str,
+    materialization_id: str,
     max_steps: int = 20,
 ) -> WitnessRun:
     """Run the final instruction with an OpenAI Responses function-tool loop.
@@ -221,7 +224,7 @@ def run_responses_policy(
             spec = _tool_spec(tools, call.name)
             provenance = trace_argument_provenance(
                 arguments=arguments,
-                instruction=definition.instruction,
+                instruction_literals=_task_literals(definition),
                 reset_context=reset_context,
                 tool_spec=spec,
                 prior_trace=tuple(public_trace),
@@ -243,6 +246,8 @@ def run_responses_policy(
                     "output": json.dumps(observation, ensure_ascii=False, sort_keys=True),
                 }
             )
+    else:
+        raise RunnerError("Responses policy exceeded max_steps")
     semantic_trace = tuple(
         TraceEvent(item.seq, item.tool_name, item.arguments, item.observation)
         for item in public_trace
@@ -250,12 +255,33 @@ def run_responses_policy(
     result = checker.evaluate(before_facts, after_facts(), semantic_trace, final_answer)
     return WitnessRun(
         uuid.uuid4().hex,
+        materialization_id,
         definition.task_definition_id,
         tuple(public_trace),
         final_answer,
         result.status,
         result.failures,
     )
+
+
+def _task_literals(definition: TaskDefinition) -> tuple[JSONValue, ...]:
+    return tuple(
+        predicate.value
+        for selector in definition.blueprint.selectors
+        for predicate in selector.filters
+    )
+
+
+def _contains(actual: JSONValue, required: JSONValue) -> bool:
+    if isinstance(required, dict):
+        return isinstance(actual, dict) and all(
+            key in actual and _contains(actual[key], value) for key, value in required.items()
+        )
+    if isinstance(required, list):
+        return isinstance(actual, list) and len(actual) == len(required) and all(
+            _contains(left, right) for left, right in zip(actual, required, strict=True)
+        )
+    return actual == required
 
 
 def _tool_spec(tools: tuple[Mapping[str, Any], ...], name: str) -> Mapping[str, Any]:
@@ -299,10 +325,14 @@ def _leaf_paths(value: JSONValue, pointer: str = "") -> list[tuple[str, JSONValu
         return [
             pair
             for key, child in value.items()
-            for pair in _leaf_paths(child, pointer + "/" + key.replace("~", "~0").replace("/", "~1"))
+            for pair in _leaf_paths(
+                child, pointer + "/" + key.replace("~", "~0").replace("/", "~1")
+            )
         ]
     if isinstance(value, list):
         return [
-            pair for index, child in enumerate(value) for pair in _leaf_paths(child, f"{pointer}/{index}")
+            pair
+            for index, child in enumerate(value)
+            for pair in _leaf_paths(child, f"{pointer}/{index}")
         ]
     return [(pointer or "/", value)]
