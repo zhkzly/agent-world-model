@@ -32,6 +32,7 @@ from agent_task_foundry.foundry import (
 from agent_task_foundry.models import (
     AllGoal,
     AtomGoal,
+    ChallengeResult,
     ReportSpec,
     SelectorPredicate,
     SelectorSpec,
@@ -58,7 +59,11 @@ class Semantics:
     def capabilities(self) -> tuple[CapabilitySpec, ...]:
         return self._capabilities
 
-    def enumerate_bindings(self, capability_id: str, facts: Any) -> tuple[BindingCandidate, ...]:
+    def enumerate_bindings(
+        self,
+        capability_id: str,
+        facts: Any,
+    ) -> tuple[BindingCandidate, ...]:
         return ()
 
     def evaluate_atom(self, request: AtomCheckRequest) -> AtomCheckResult:
@@ -108,13 +113,21 @@ class Actor:
 
     def invoke(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.state["done"][arguments["name"]] = True
-        return {"ok": True, "data": {"confirmation": f"ok-{arguments['name']}"}, "error": None}
+        return {
+            "ok": True,
+            "data": {"confirmation": f"ok-{arguments['name']}"},
+            "error": None,
+        }
 
     def close(self) -> None:
         return
 
 
-def capability(*, capability_id: str = "finish", rules: tuple[CompositionRule, ...] = ()) -> CapabilitySpec:
+def capability(
+    *,
+    capability_id: str = "finish",
+    rules: tuple[CompositionRule, ...] = (),
+) -> CapabilitySpec:
     return CapabilitySpec(
         capability_id=capability_id,
         requirement_ids=(f"req-{capability_id}",),
@@ -141,7 +154,11 @@ def binding(key: str) -> BindingCandidate:
 def compile_one(*, report: bool = True):
     spec = capability()
     semantics = Semantics((spec,))
-    selector = SelectorSpec("target", "finish", (SelectorPredicate("name", "eq", "alpha"),))
+    selector = SelectorSpec(
+        "target",
+        "finish",
+        (SelectorPredicate("name", "eq", "alpha"),),
+    )
     blueprint = TaskBlueprint(
         "release",
         "semantics",
@@ -167,20 +184,32 @@ def test_checker_is_frozen_before_witness_and_rejects_noop() -> None:
     assert checker.evaluate(before, before, (), None).status == "failed"
     assert "finish_item" not in definition.instruction
     assert definition.checker.checker_digest == checker.checker_digest
+    assert checker.protected_payload["checker_digest"] == checker.checker_digest
 
 
 def test_unqualified_all_composition_is_rejected() -> None:
     first = capability(capability_id="a")
     second = capability(capability_id="b")
     semantics = Semantics((first, second))
-    s1 = SelectorSpec("a-one", "a", (SelectorPredicate("name", "eq", "a"),))
-    s2 = SelectorSpec("b-one", "b", (SelectorPredicate("name", "eq", "b"),))
+    first_selector = SelectorSpec(
+        "a-one",
+        "a",
+        (SelectorPredicate("name", "eq", "a"),),
+    )
+    second_selector = SelectorSpec(
+        "b-one",
+        "b",
+        (SelectorPredicate("name", "eq", "b"),),
+    )
     blueprint = TaskBlueprint(
         "release",
         "semantics",
         StartRecipe("release", "case", None),
-        (s1, s2),
-        AllGoal((AtomGoal("a", "a-one"), AtomGoal("b", "b-one")), "missing"),
+        (first_selector, second_selector),
+        AllGoal(
+            (AtomGoal("a", "a-one"), AtomGoal("b", "b-one")),
+            "missing",
+        ),
     )
     with pytest.raises(CompilationError, match="CompositionRule"):
         compile_definition(
@@ -210,6 +239,7 @@ def test_two_fresh_public_runs_and_provenance_seal_taskpack() -> None:
             before_facts=before,
             after_facts=lambda actor=actor: actor.state,
             policy=policy,
+            materialization_id=f"episode-{len(runs)}",
         )
         assert run.successful
         assert run.trace[0].provenance.complete
@@ -223,12 +253,18 @@ def test_two_fresh_public_runs_and_provenance_seal_taskpack() -> None:
     )
     pack = seal_taskpack(
         definition=definition,
+        checker=checker,
         witnesses=tuple(runs),
-        challenges=challenges,
+        challenges=challenges
+        + (
+            ChallengeResult("wrong_target", "failed", "failed"),
+            ChallengeResult("collateral", "failed", "failed"),
+        ),
         checker_mutations_killed=1,
         checker_mutations_total=1,
     )
     assert pack.taskpack_id
+    assert "checker_payload" not in pack.public_projection()
     fingerprint = fingerprint_task(
         taskpack=pack,
         capabilities={"finish": spec},
@@ -261,6 +297,7 @@ def test_hidden_argument_is_rejected_by_provenance() -> None:
         before_facts=before,
         after_facts=lambda: actor.state,
         policy=policy,
+        materialization_id="hidden-episode",
     )
     assert not run.successful
     assert not run.trace[0].provenance.complete
@@ -284,7 +321,20 @@ def test_blueprint_enumeration_uses_qualified_structure_not_paraphrases() -> Non
 
 def test_task_identity_excludes_model_assessment() -> None:
     _, _, definition, _, _ = compile_one()
-    a = TaskAssessment("pack", "model-a", 3, 1, 7)
-    b = TaskAssessment("pack", "model-b", 3, 2, 8)
-    assert a.assessment_id != b.assessment_id
+    first = TaskAssessment("pack", "model-a", 3, 1, 7)
+    second = TaskAssessment("pack", "model-b", 3, 2, 8)
+    assert first.assessment_id != second.assessment_id
     assert definition.task_definition_id == definition.task_definition_id
+
+
+def test_no_argument_tool_has_vacuously_complete_provenance() -> None:
+    from agent_task_foundry.runner import trace_argument_provenance
+
+    report = trace_argument_provenance(
+        arguments={},
+        instruction_literals=(),
+        reset_context={},
+        tool_spec={"input_schema": {"type": "object", "properties": {}}},
+        prior_trace=(),
+    )
+    assert report.complete
