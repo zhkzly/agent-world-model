@@ -21,7 +21,6 @@ from agent_env_foundry.research import BuilderProjection, ResearchFailure
 EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "format": {"type": "string", "const": "expected-task-semantics/1"},
         "requirements": {
             "type": "array",
             "items": {
@@ -33,8 +32,6 @@ EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
                         "enum": ["Taskable", "NotTaskable", "Unsupported"],
                     },
                     "rationale": {"type": "string"},
-                    "actor_role": {"type": "string"},
-                    "intent": {"type": "string"},
                     "preconditions": {"type": "array", "items": {"type": "string"}},
                     "outcomes": {"type": "array", "items": {"type": "string"}},
                     "refusals": {"type": "array", "items": {"type": "string"}},
@@ -48,8 +45,6 @@ EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
                     "requirement_id",
                     "disposition",
                     "rationale",
-                    "actor_role",
-                    "intent",
                     "preconditions",
                     "outcomes",
                     "refusals",
@@ -146,7 +141,6 @@ EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
         },
     },
     "required": [
-        "format",
         "requirements",
         "capabilities",
         "composition_rules",
@@ -169,8 +163,6 @@ class ExpectedSemanticsError(ValueError):
 class ExpectedTaskSemantics:
     canonical_payload: bytes
     digest: str
-    requirement_ids: tuple[str, ...]
-    taskable_requirement_ids: tuple[str, ...]
 
     def to_document(self) -> dict[str, Any]:
         return cast(dict[str, Any], json.loads(self.canonical_payload))
@@ -184,7 +176,7 @@ def freeze_expected_task_semantics(
     expected_id_set = set(expected_ids)
     root = _exact(
         document,
-        {"format", "requirements", "capabilities", "composition_rules", "conditions"},
+        {"requirements", "capabilities", "composition_rules", "conditions"},
         "expected semantics",
     )
     requirements = [_requirement(item) for item in _array(root["requirements"], "requirements")]
@@ -200,8 +192,6 @@ def freeze_expected_task_semantics(
     _unique_index(conditions, "condition_id", "condition")
 
     findings: list[str] = []
-    if root["format"] != "expected-task-semantics/1":
-        findings.append("$.format: expected semantics format is invalid")
     if set(by_id) != expected_id_set:
         findings.append(
             "$.requirements: Requirement coverage mismatch: "
@@ -236,16 +226,6 @@ def freeze_expected_task_semantics(
         if unlicensed_workflows:
             findings.append(
                 f"{path}.workflow_ids: unlicensed workflow {sorted(unlicensed_workflows)}"
-            )
-        expected_roles = {
-            by_id[requirement_id]["actor_role"]
-            for requirement_id in known_taskable
-            if by_id[requirement_id]["actor_role"]
-        }
-        if expected_roles and expected_roles != {capability["actor_role"]}:
-            findings.append(
-                f"{path}.actor_role: expected one role {sorted(expected_roles)}, "
-                f"got {capability['actor_role']!r}"
             )
     if mapped_taskable != taskable_ids:
         findings.append(
@@ -341,8 +321,6 @@ def freeze_expected_task_semantics(
     return ExpectedTaskSemantics(
         payload,
         hashlib.sha256(payload).hexdigest(),
-        expected_ids,
-        tuple(sorted(taskable_ids)),
     )
 
 
@@ -446,8 +424,6 @@ def _requirement_findings(item: dict[str, Any], path: str) -> list[str]:
         findings.append(f"{path}.rationale: every Requirement disposition needs rationale")
     if item["disposition"] == "Taskable":
         required = {
-            "actor_role": item["actor_role"].strip(),
-            "intent": item["intent"].strip(),
             "preconditions": item["preconditions"],
             "outcomes": item["outcomes"],
             "workflow_ids": item["workflow_ids"],
@@ -465,8 +441,6 @@ def _requirement(value: Any) -> dict[str, Any]:
         "requirement_id",
         "disposition",
         "rationale",
-        "actor_role",
-        "intent",
         "preconditions",
         "outcomes",
         "refusals",
@@ -477,8 +451,7 @@ def _requirement(value: Any) -> dict[str, Any]:
     if item["disposition"] not in {"Taskable", "NotTaskable", "Unsupported"}:
         raise ExpectedSemanticsError("Requirement disposition is invalid")
     _identifier(item["requirement_id"], "requirement_id")
-    for field in ("rationale", "actor_role", "intent"):
-        _string(item[field], field)
+    _string(item["rationale"], "rationale")
     for field in (
         "preconditions",
         "outcomes",

@@ -75,14 +75,11 @@ def _projection() -> BuilderProjection:
 
 def _document() -> dict[str, Any]:
     return {
-        "format": "expected-task-semantics/1",
         "requirements": [
             {
                 "requirement_id": "REQ-001",
                 "disposition": "Taskable",
                 "rationale": "Public increment can establish the relation",
-                "actor_role": "operator",
-                "intent": "increment the counter",
                 "preconditions": ["counter exists"],
                 "outcomes": ["counter increases"],
                 "refusals": [],
@@ -93,8 +90,6 @@ def _document() -> dict[str, Any]:
                 "requirement_id": "REQ-002",
                 "disposition": "Taskable",
                 "rationale": "A public read can answer the current-value query",
-                "actor_role": "operator",
-                "intent": "read the current counter",
                 "preconditions": ["counter exists"],
                 "outcomes": ["the current count is reported"],
                 "refusals": [],
@@ -105,8 +100,6 @@ def _document() -> dict[str, Any]:
                 "requirement_id": "REQ-003",
                 "disposition": "NotTaskable",
                 "rationale": "A refusal is Qualification evidence, not a user goal",
-                "actor_role": "",
-                "intent": "",
                 "preconditions": [],
                 "outcomes": [],
                 "refusals": ["non-positive amount"],
@@ -117,8 +110,6 @@ def _document() -> dict[str, Any]:
                 "requirement_id": "REQ-004",
                 "disposition": "NotTaskable",
                 "rationale": "Initial state licenses starts and conditions, not an outcome Task",
-                "actor_role": "",
-                "intent": "",
                 "preconditions": [],
                 "outcomes": [],
                 "refusals": [],
@@ -171,8 +162,19 @@ def _document() -> dict[str, Any]:
 
 def test_expected_semantics_freezes_complete_requirement_coverage() -> None:
     frozen = freeze_expected_task_semantics(_projection(), _document())
-    assert frozen.requirement_ids == ("REQ-001", "REQ-002", "REQ-003", "REQ-004")
-    assert frozen.taskable_requirement_ids == ("REQ-001", "REQ-002")
+    frozen_document = frozen.to_document()
+    assert frozen_document["format"] == "expected-task-semantics/1"
+    assert [item["requirement_id"] for item in frozen_document["requirements"]] == [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+    ]
+    assert [
+        item["requirement_id"]
+        for item in frozen_document["requirements"]
+        if item["disposition"] == "Taskable"
+    ] == ["REQ-001", "REQ-002"]
     assert frozen.digest
     reordered = _document()
     reordered["requirements"] = list(reversed(reordered["requirements"]))
@@ -248,7 +250,7 @@ def test_expected_semantics_provider_turn_is_fresh_typed_and_candidate_blind(
         route=AgentRoute(),
         client_factory=lambda **_: _Client(responses),
     )
-    assert result.taskable_requirement_ids == ("REQ-001", "REQ-002")
+    assert len(result.to_document()["capabilities"]) == 2
     assert len(calls) == 1
     request = calls[0]
     assert request["text"]["format"]["type"] == "json_schema"
@@ -273,7 +275,7 @@ def test_provider_validation_feedback_reports_all_findings_then_accepts_replacem
         route=replace(AgentRoute(), max_provider_turns=2),
         client_factory=lambda **_: _Client(responses),
     )
-    assert result.taskable_requirement_ids == ("REQ-001", "REQ-002")
+    assert len(result.to_document()["capabilities"]) == 2
     assert len(calls) == 2
     feedback = json.dumps(calls[1]["input"], ensure_ascii=False)
     assert "Requirement coverage mismatch" in feedback
