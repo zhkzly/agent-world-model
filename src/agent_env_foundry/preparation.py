@@ -13,9 +13,10 @@ from typing import Any, Literal, Protocol, Self, runtime_checkable
 
 from agent_env_foundry.environment import Environment, JSONObject
 from agent_env_foundry.jsonvalue import is_json_object
+from agent_env_foundry.release import DESCRIPTOR_FORMAT_V2
 from agent_env_foundry.semantics import TaskSemantics
 
-ENVIRONMENT_RELEASE_V2_FORMAT = "environment-release/2"
+ENVIRONMENT_RELEASE_V2_FORMAT = DESCRIPTOR_FORMAT_V2
 _HEX = frozenset("0123456789abcdef")
 
 

@@ -32,10 +32,13 @@
     "src/agent_env_foundry/preparation.py",
     "src/agent_env_foundry/semantics.py",
     "src/agent_task_foundry/models.py",
+    "src/agent_env_foundry/release.py",
     "tests/test_semantics_contract.py",
-    "tests/task_foundry/test_models.py"
+    "tests/task_foundry/test_models.py",
+    "tests/v2_release_factory.py",
+    "tests/test_release_v2.py"
   ],
-  "notes": "Implementation reactivated after revert commit 7880133 removed the out-of-order deterministic scaffold. CP1 contracts are complete with RED/GREEN tests, mutation licenses and independent Claude BLOCK-to-ALLOW review. CP5-CP7 code and claims remain absent; the next active checkpoint is CP2 immutable preparation and separate runtimes. The user waived Patrol for this recovery implementation.",
+  "notes": "Implementation reactivated after revert commit 7880133 removed the out-of-order deterministic scaffold. CP1 contracts are complete. CP2 T1 now verifies canonical v2 descriptor/payload/project/qualification byte bindings while leaving v1 behavior untouched; it has RED/GREEN tests, five mutation licenses and independent Claude ALLOW. The next slice is locked preparation and separate child runtimes. CP5-CP7 code and claims remain absent. The user waived Patrol for this recovery implementation.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -55,6 +58,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "cp2_preparation_next"
+    "implementation_checkpoint": "cp2_locked_preparation_next"
   }
 }

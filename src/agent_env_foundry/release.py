@@ -16,7 +16,7 @@ import json
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import rfc8785
 
@@ -28,19 +28,29 @@ from agent_env_foundry.schema import (
     validate_schema_document,
 )
 
+if TYPE_CHECKING:
+    from agent_env_foundry.preparation import PreparedReleaseIdentity
+
 __all__ = [
     "DESCRIPTOR_FORMAT",
+    "DESCRIPTOR_FORMAT_V2",
     "PayloadRecord",
     "ReleaseDescriptor",
+    "ReleaseDescriptorV2",
     "ValidatedReleaseContract",
+    "ValidatedReleaseV2",
+    "compute_project_digest",
     "compute_payload_digest",
     "parse_descriptor",
+    "parse_descriptor_v2",
     "parse_manifest",
     "verify_release",
+    "verify_release_v2",
 ]
 
 DESCRIPTOR_NAME = "release.json"
 DESCRIPTOR_FORMAT = "environment-release/1"
+DESCRIPTOR_FORMAT_V2 = "environment-release/2"
 CANONICALIZATION = "rfc8785"
 HASH_ALGORITHM = "sha256"
 
@@ -57,6 +67,26 @@ DESCRIPTOR_KEYS = frozenset(
     }
 )
 RECORD_KEYS = frozenset({"path", "type", "mode", "digest"})
+DESCRIPTOR_KEYS_V2 = frozenset(
+    {
+        "format",
+        "canonicalization",
+        "hash",
+        "payload_manifest",
+        "payload_digest",
+        "qualification",
+        "qualification_digest",
+        "actor_project",
+        "actor_project_digest",
+        "actor_factory",
+        "semantics_project",
+        "semantics_project_digest",
+        "semantics_factory",
+        "start_schema",
+        "reset_observation_schema",
+    }
+)
+_V2_PAYLOAD_ROOTS = frozenset({"actor", "semantics", "dist", "docs", "licenses"})
 
 
 @dataclass(frozen=True)
@@ -67,6 +97,25 @@ class ReleaseDescriptor:
     payload_manifest: PurePosixPath
     payload_digest: str
     environment_factory: str
+    start_schema: PurePosixPath
+    reset_observation_schema: PurePosixPath
+
+
+@dataclass(frozen=True)
+class ReleaseDescriptorV2:
+    format: str
+    canonicalization: str
+    hash: str
+    payload_manifest: PurePosixPath
+    payload_digest: str
+    qualification: PurePosixPath
+    qualification_digest: str
+    actor_project: PurePosixPath
+    actor_project_digest: str
+    actor_factory: str
+    semantics_project: PurePosixPath
+    semantics_project_digest: str
+    semantics_factory: str
     start_schema: PurePosixPath
     reset_observation_schema: PurePosixPath
 
@@ -86,6 +135,27 @@ class ValidatedReleaseContract:
     descriptor: ReleaseDescriptor
     start_schema: dict[str, Any]
     reset_observation_schema: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ValidatedReleaseV2:
+    root: Path
+    descriptor: ReleaseDescriptorV2
+    records: tuple[PayloadRecord, ...]
+    start_schema: dict[str, Any]
+    reset_observation_schema: dict[str, Any]
+    release_id: str
+
+    @property
+    def identity(self) -> PreparedReleaseIdentity:
+        from agent_env_foundry.preparation import PreparedReleaseIdentity
+
+        return PreparedReleaseIdentity(
+            self.descriptor.format,
+            self.release_id,
+            self.descriptor.actor_project_digest,
+            self.descriptor.semantics_project_digest,
+        )
 
 
 def canonical_bytes(document: Any) -> bytes:
@@ -162,6 +232,53 @@ def parse_descriptor(document: Any) -> ReleaseDescriptor:
     )
 
 
+def parse_descriptor_v2(document: Any) -> ReleaseDescriptorV2:
+    """Strictly decode the clean-break EnvironmentRelease v2 descriptor."""
+
+    if not is_json_object(document):
+        raise EnvironmentContractError("v2 release.json must be a JSON object")
+    if document.get("format") != DESCRIPTOR_FORMAT_V2:
+        raise EnvironmentContractError(f"prepared release format must be {DESCRIPTOR_FORMAT_V2!r}")
+    if set(document) != DESCRIPTOR_KEYS_V2:
+        raise EnvironmentContractError(
+            f"v2 release.json must contain exactly {sorted(DESCRIPTOR_KEYS_V2)}, "
+            f"got {sorted(document)}"
+        )
+    if document["canonicalization"] != CANONICALIZATION:
+        raise EnvironmentContractError("v2 release canonicalization must be rfc8785")
+    if document["hash"] != HASH_ALGORITHM:
+        raise EnvironmentContractError("v2 release hash must be sha256")
+    actor_project = safe_member_path(document["actor_project"], field="actor_project")
+    semantics_project = safe_member_path(document["semantics_project"], field="semantics_project")
+    if actor_project != PurePosixPath("actor") or semantics_project != PurePosixPath("semantics"):
+        raise EnvironmentContractError("v2 actor and semantics projects must use fixed roots")
+    return ReleaseDescriptorV2(
+        format=document["format"],
+        canonicalization=document["canonicalization"],
+        hash=document["hash"],
+        payload_manifest=safe_member_path(document["payload_manifest"], field="payload_manifest"),
+        payload_digest=_hex_digest(document["payload_digest"], field="payload_digest"),
+        qualification=safe_member_path(document["qualification"], field="qualification"),
+        qualification_digest=_hex_digest(
+            document["qualification_digest"], field="qualification_digest"
+        ),
+        actor_project=actor_project,
+        actor_project_digest=_hex_digest(
+            document["actor_project_digest"], field="actor_project_digest"
+        ),
+        actor_factory=_entrypoint_reference(document["actor_factory"], "actor_factory"),
+        semantics_project=semantics_project,
+        semantics_project_digest=_hex_digest(
+            document["semantics_project_digest"], field="semantics_project_digest"
+        ),
+        semantics_factory=_entrypoint_reference(document["semantics_factory"], "semantics_factory"),
+        start_schema=safe_member_path(document["start_schema"], field="start_schema"),
+        reset_observation_schema=safe_member_path(
+            document["reset_observation_schema"], field="reset_observation_schema"
+        ),
+    )
+
+
 def parse_manifest(document: Any) -> list[PayloadRecord]:
     if not is_json_object(document) or set(document) != {"files"}:
         raise EnvironmentContractError(
@@ -207,6 +324,34 @@ def parse_manifest(document: Any) -> list[PayloadRecord]:
     if paths != sorted(paths):
         raise EnvironmentContractError("manifest records must be sorted by path")
     return records
+
+
+def compute_project_digest(
+    records: list[PayloadRecord] | tuple[PayloadRecord, ...],
+    project_root: PurePosixPath,
+) -> str:
+    """Digest one project from its release-bound relative file records."""
+
+    selected = [record for record in records if record.path.is_relative_to(project_root)]
+    if not selected:
+        raise EnvironmentContractError(f"project {project_root} has no bound files")
+    document = {
+        "files": [
+            {
+                "path": str(record.path.relative_to(project_root)),
+                "type": record.type,
+                "mode": record.mode,
+                "digest": record.digest,
+            }
+            for record in selected
+        ]
+    }
+    paths = {item["path"] for item in document["files"]}
+    if not {"pyproject.toml", "uv.lock"} <= paths:
+        raise EnvironmentContractError(
+            f"project {project_root} must bind pyproject.toml and uv.lock"
+        )
+    return sha256_hex(canonical_bytes(document))
 
 
 def verify_release(release_root: Path) -> ValidatedReleaseContract:
@@ -261,6 +406,105 @@ def verify_release(release_root: Path) -> ValidatedReleaseContract:
     )
 
 
+def verify_release_v2(release_root: Path) -> ValidatedReleaseV2:
+    """Verify one immutable two-project release without preparing either runtime."""
+
+    root = Path(release_root)
+    if not root.is_dir() or root.is_symlink():
+        raise EnvironmentContractError(f"v2 release root {root} must be a non-symlink directory")
+    descriptor_path = _regular_file_within(
+        root, PurePosixPath(DESCRIPTOR_NAME), role=DESCRIPTOR_NAME
+    )
+    descriptor_bytes = descriptor_path.read_bytes()
+    descriptor_document = _read_json(descriptor_path, role=DESCRIPTOR_NAME)
+    if descriptor_bytes != canonical_bytes(descriptor_document):
+        raise EnvironmentContractError(
+            "v2 release descriptor bytes are not canonical RFC 8785 JSON"
+        )
+    descriptor = parse_descriptor_v2(descriptor_document)
+    if descriptor.payload_manifest != PurePosixPath("payload-manifest.json"):
+        raise EnvironmentContractError("v2 payload manifest must be payload-manifest.json")
+    if descriptor.qualification != PurePosixPath("qualification.json"):
+        raise EnvironmentContractError("v2 qualification must be qualification.json")
+
+    manifest_path = _regular_file_within(
+        root, descriptor.payload_manifest, role="v2 payload manifest"
+    )
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_document = _read_json(manifest_path, role="v2 payload manifest")
+    if manifest_bytes != canonical_bytes(manifest_document):
+        raise EnvironmentContractError("v2 payload manifest bytes are not canonical RFC 8785 JSON")
+    actual_payload_digest = compute_payload_digest(manifest_document)
+    if actual_payload_digest != descriptor.payload_digest:
+        raise EnvironmentContractError("v2 payload digest mismatch")
+    records = tuple(parse_manifest(manifest_document))
+    by_path = {record.path: record for record in records}
+    protected = {
+        PurePosixPath(DESCRIPTOR_NAME),
+        descriptor.payload_manifest,
+        descriptor.qualification,
+    }
+    if protected & set(by_path):
+        raise EnvironmentContractError("v2 payload manifest creates a circular metadata identity")
+    if any(
+        not record.path.parts or record.path.parts[0] not in _V2_PAYLOAD_ROOTS for record in records
+    ):
+        raise EnvironmentContractError("v2 payload member lies outside the closed layout")
+
+    actual = {
+        PurePosixPath(path.relative_to(root).as_posix())
+        for path in root.rglob("*")
+        if path.is_file() or path.is_symlink()
+    } - protected
+    listed = set(by_path)
+    if actual != listed:
+        raise EnvironmentContractError(
+            "v2 payload closure differs from manifest: "
+            f"unlisted={sorted(map(str, actual - listed))}, "
+            f"missing={sorted(map(str, listed - actual))}"
+        )
+    for record in records:
+        _verify_payload_record(root, record)
+
+    qualification_path = _regular_file_within(
+        root, descriptor.qualification, role="v2 qualification"
+    )
+    qualification_bytes = qualification_path.read_bytes()
+    if sha256_hex(qualification_bytes) != descriptor.qualification_digest:
+        raise EnvironmentContractError("v2 qualification digest mismatch")
+    qualification_document = _read_json(qualification_path, role="v2 qualification")
+    if qualification_bytes != canonical_bytes(qualification_document):
+        raise EnvironmentContractError("v2 qualification bytes are not canonical RFC 8785 JSON")
+
+    _regular_directory_within(root, descriptor.actor_project, role="actor project")
+    _regular_directory_within(root, descriptor.semantics_project, role="semantics project")
+    actor_digest = compute_project_digest(records, descriptor.actor_project)
+    semantics_digest = compute_project_digest(records, descriptor.semantics_project)
+    if actor_digest != descriptor.actor_project_digest:
+        raise EnvironmentContractError("actor project digest mismatch")
+    if semantics_digest != descriptor.semantics_project_digest:
+        raise EnvironmentContractError("semantics project digest mismatch")
+
+    start_schema = _load_bound_schema(
+        root, by_path, descriptor.start_schema, role="start_schema", object_root_required=True
+    )
+    reset_schema = _load_bound_schema(
+        root,
+        by_path,
+        descriptor.reset_observation_schema,
+        role="reset_observation_schema",
+        object_root_required=False,
+    )
+    return ValidatedReleaseV2(
+        root=root,
+        descriptor=descriptor,
+        records=records,
+        start_schema=start_schema,
+        reset_observation_schema=reset_schema,
+        release_id=sha256_hex(descriptor_bytes),
+    )
+
+
 # --------------------------------------------------------------------- helpers
 
 
@@ -278,16 +522,19 @@ def _hex_digest(value: Any, *, field: str) -> str:
 
 
 def _factory_reference(value: Any) -> str:
+    return _entrypoint_reference(value, "environment_factory")
+
+
+def _entrypoint_reference(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value:
-        raise EnvironmentContractError("environment_factory must be a 'module:factory' string")
+        raise EnvironmentContractError(f"{field} must be a 'module:factory' string")
     if value.count(":") != 1:
         raise EnvironmentContractError(
-            f"environment_factory must contain exactly one ':' separating module and "
-            f"factory, got {value!r}"
+            f"{field} must contain exactly one ':' separating module and factory, got {value!r}"
         )
     module_name, _, attribute = value.partition(":")
     if not module_name or not attribute:
-        raise EnvironmentContractError(f"environment_factory has an empty part: {value!r}")
+        raise EnvironmentContractError(f"{field} has an empty part: {value!r}")
     return value
 
 
@@ -311,6 +558,18 @@ def _regular_file_within(root: Path, relative: PurePosixPath, *, role: str) -> P
         raise EnvironmentContractError(f"{role} at {relative} escapes the release root; rejected")
     if not resolved.is_file():
         raise EnvironmentContractError(f"{role} at {relative} is not a regular file")
+    return path
+
+
+def _regular_directory_within(root: Path, relative: PurePosixPath, *, role: str) -> Path:
+    path = root / relative
+    if path.is_symlink():
+        raise EnvironmentContractError(f"{role} at {relative} is a symlink; rejected")
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise EnvironmentContractError(f"{role} at {relative} escapes the release root; rejected")
+    if not resolved.is_dir():
+        raise EnvironmentContractError(f"{role} at {relative} is not a directory")
     return path
 
 
