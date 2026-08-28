@@ -3,10 +3,10 @@
   "name": "s2-task-foundry",
   "title": "S2 Goal-First Task Foundry",
   "description": "Implement S1 v2 qualified TaskSemantics and deterministic Goal/checker/instruction compilation, then prove public solvability and admit diverse TaskPacks",
-  "status": "in_progress",
-  "dev_type": "backend",
+  "status": "planning",
+  "dev_type": null,
   "scope": "Complete clean-break S2 implementation plus the minimum cross-environment S1 v2 preparation and TaskSemantics changes; no backward compatibility",
-  "package": "agent_task_foundry",
+  "package": null,
   "priority": "P0",
   "creator": "kelong",
   "assignee": "kelong",
@@ -28,19 +28,15 @@
     ".trellis/tasks/08-26-s2-task-foundry/design.md",
     ".trellis/tasks/08-26-s2-task-foundry/implement.md",
     ".trellis/tasks/08-26-s2-task-foundry/research/implementation-readiness-audit.md",
-    ".trellis/tasks/08-26-s2-task-foundry/research/goal-first-design-audit.md",
-    "src/agent_env_foundry/semantics.py",
-    "src/agent_task_foundry/",
-    "tests/task_foundry/"
+    ".trellis/tasks/08-26-s2-task-foundry/research/goal-first-design-audit.md"
   ],
-  "notes": "Implementation was explicitly approved by the user. Core checkpoint now includes the protected TaskSemantics contract, four-node Goal compilation, checker-before-witness ordering, canonical instruction audit, public execution/provenance, two-run TaskPack admission, TaskAssessment separation and structural corpus selection. The user waived plan-document-write Patrol. Full S1 v2 preparation/semantic authoring and live-model release trials remain open.",
+  "notes": "Old mandatory Graph/Programmatic design superseded. Final semantic order is capability/start -> checker -> canonical instruction -> two fresh public witnesses -> challenges -> TaskPack. TaskAssessment and CorpusManifest are separate. The user waived plan-document-write Patrol for this planning update.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
     "goal_nodes": ["atom", "all", "if", "foreach"],
     "codegen": ["environment_builder_codex", "task_semantics_codex"],
     "acting_policy": "responses_tool_loop",
-    "task_identity_excludes": ["assessment", "difficulty", "corpus_policy"],
-    "implementation_checkpoint": "core_contract_compiler_runner_admission"
+    "task_identity_excludes": ["assessment", "difficulty", "corpus_policy"]
   }
 }

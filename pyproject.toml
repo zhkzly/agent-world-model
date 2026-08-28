@@ -28,7 +28,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agent_env_foundry", "src/agent_task_foundry"]
+packages = ["src/agent_env_foundry"]
 
 [tool.ruff]
 line-length = 100
