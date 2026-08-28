@@ -1,0 +1,36 @@
+{
+  "format": "s1-cross-domain-e2e-evidence/1",
+  "status": "released",
+  "need_file": ".trellis/tasks/08-26-s1-environment-foundry/research/s1-git-live-need.md",
+  "frozen_framework_commit": "7803060062e41bbf23349dc24071ce21699a2d27",
+  "frozen_runtime_skills": {
+    "research": "3ef5c607c00be6d260a27a5f28a2d77e5ae3a5cf3f78ec195980067aacbcb945",
+    "environment_codegen": "6618de410c7ace4b6687468b1014ed4e85d86fd276c6518bcc6d8343d613416f",
+    "environment_contract": "253220cab6122451f63e9fd9156a4f248eb0a63bf40201ee98fc08ac91409fd0"
+  },
+  "run_root": "/home/kelong/pycodes/foundry-canonical-envpkg3/.artifacts/foundry-runs/run-75c90aae13894c3991b5be214b63182b",
+  "research_digest": "218999d056241ebab9f49488c1c06041acf6e4ae2bcbb00f91b3a30f3ac22515",
+  "candidate_digest": "b38416c1e9039abbca493a178e10e9fa5231a3a0ef0bbc105546ee6c8ffb2fc1",
+  "builder_checks": {
+    "uv_lock": "passed",
+    "uv_sync_frozen_all_groups": "passed",
+    "uv_build": "passed",
+    "candidate_pytest": "4/4 passed",
+    "release_contract": "passed",
+    "environment_load": "passed with 8 tools"
+  },
+  "qualification": {
+    "verdict": "passed",
+    "positive_evidence_count": 28,
+    "negative_evidence_count": 28,
+    "evidence_digest": "98248c29fc1c225e9ba03ba89888160a8313ce755da5c6b5c0e6d54fe3332cdc",
+    "cold_evidence_digest": "86899b2d7dab8a295dec29a8abd4d409b9f2d847e04a0d5ba635bedd83bec2b6"
+  },
+  "release": {
+    "release_id": "b953501fc6f3b6fdbf3249ea0b502e2d3dc1693fbf1719c3111365034bace2e9",
+    "payload_digest": "cbf86034fe1626ff0ea1de11e9d1c16726c0f90defd2ed29e5b46db7795e282c",
+    "qualification_digest": "bc8f2bb8fbd9c76e5519a4b0393cd2ada1d0bc885c0baeede479bdff9f843d72",
+    "archive_digest": "d84c2a770f3257471149004a833baa04fb1b560a775be86e8f050eece57b92c7"
+  },
+  "scope": "The same frozen framework generated and cold-published a real filesystem/Git environment after the SQLite-backed ocean-container release. This establishes the planned contrasting backend evidence, not universal held-out generality."
+}

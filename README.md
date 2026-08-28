@@ -7,10 +7,11 @@ environment contract/loader, real evidence-backed Research, Codex-authored uv
 project, independent public/native Qualification with physical near misses,
 canonical package assembly, cold relocation and immutable publication.
 
-One real ocean-container dispute Need has completed the public `foundry generate`
-command and produced a cold-verified `EnvironmentRelease`. This is
-evidence for that vertical; cross-domain and held-out experiments remain
-separate paper-scope claims and are not implied by one release.
+Two contrasting Needs have completed the public `foundry generate` command and
+produced cold-verified `EnvironmentRelease` artifacts with the same frozen
+framework: an SQLite-backed ocean-container dispute environment and a real
+filesystem/Git repository-maintenance environment. Broader held-out experiments
+remain separate paper-scope claims.
 
 Product intent, stage boundaries and working rules live in `PROJECT.md`,
 `DECISIONS.md` and `AGENTS.md`; this file only describes the code package.
