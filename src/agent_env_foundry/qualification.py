@@ -298,7 +298,7 @@ class QualificationResult:
     probe_bundle_digest: str | None = None
     negative_evidence_count: int = 0
     workspace_root: Path | None = None
-    semantics_author_workspace: Path | None = None
+    semantics_author_inputs: PreparedSemanticsAuthorWorkspace | None = None
     expected_task_semantics_digest: str | None = None
     public_surface_digest: str | None = None
     failure_code: str | None = None
@@ -486,6 +486,7 @@ def prepare_semantics_author_workspace(
         "format": "public-surface/1",
         "candidate_digest": prepared.candidate_digest,
         "candidate_view_digest": view_manifest.view_digest,
+        "actor_factory": verified.descriptor.environment_factory,
         "start_schema": verified.start_schema,
         "reset_observation_schema": verified.reset_observation_schema,
         "tool_specs": tool_specs,
@@ -1594,7 +1595,7 @@ def run_qualification(
             probe_bundle_digest=bundle.bundle_digest,
             negative_evidence_count=len(negative),
             workspace_root=prepared.root,
-            semantics_author_workspace=semantics_workspace.root,
+            semantics_author_inputs=semantics_workspace,
             expected_task_semantics_digest=expected_task_semantics.digest,
             public_surface_digest=semantics_workspace.input_digests[PUBLIC_SURFACE_NAME],
         )

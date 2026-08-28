@@ -42,3 +42,18 @@
 - [x] Are `EXPECTED_TASK_SEMANTICS.json`, `PUBLIC_SURFACE.json`,
   `TASK_SEMANTICS_CONTRACT.md` and the existing read-only candidate view bound by exact Host
   digests without a second loader or evidence subsystem?
+
+## CP3B Independent Semantics Author Checklist
+
+- [x] Does Framework create the uv project before Codex and retain ownership of lock, sync,
+  build, tests, source scan, import separation, digest and acceptance?
+- [x] Does Codex receive only immutable expected/public/contract/view inputs and write only
+  release-specific semantic source, tests and dependency declarations?
+- [x] Is the Codex thread fresh, deny-all approval and full-access as explicitly required,
+  without a custom sandbox subsystem?
+- [x] Are actor/Host imports and author-time candidate-view paths forbidden at runtime?
+- [x] Must generated capability/composition/condition identities equal the frozen expected
+  semantics before acceptance?
+- [x] Can model completion prose never override a failed Framework check?
+- [x] Did a real ocean Codex project pass source, lock, frozen sync, import separation, build,
+  tests and factory/catalog checks?

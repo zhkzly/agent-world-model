@@ -1194,6 +1194,9 @@ def test_semantics_author_inputs_reuse_qualification_view_and_host_journal(
     public_surface = json.loads((workspace.root / "PUBLIC_SURFACE.json").read_text())
     assert public_surface["candidate_digest"] == digest
     assert public_surface["candidate_view_digest"] == workspace.view_manifest.view_digest
+    assert public_surface["actor_factory"] == (
+        "mechanical_copy_environment.release:make_environment"
+    )
     assert [item["name"] for item in public_surface["tool_specs"]] == ["branch"]
     assert [item["operation"] for item in public_surface["public_probe_facts"]] == [
         "reset",
@@ -1216,6 +1219,12 @@ def test_semantics_author_inputs_reuse_qualification_view_and_host_journal(
         "enumerate_bindings",
         "evaluate_atom",
         "evaluate_condition",
+        "protected_binding_schema",
+        "public_descriptor_schema",
+        "supported_goal_kinds",
+        "BindingCandidateDocument",
+        "AtomCheckResultDocument",
+        "ConditionCheckResultDocument",
         "must not import the actor package",
         "must not mutate",
     ):
@@ -1266,7 +1275,8 @@ def test_passing_actor_qualification_stages_semantics_inputs_before_return(
     )
 
     assert result.status == "passed"
-    assert result.semantics_author_workspace == (tmp_path / "qualification/semantics-author")
+    assert result.semantics_author_inputs is not None
+    assert result.semantics_author_inputs.root == (tmp_path / "qualification/semantics-author")
     assert result.expected_task_semantics_digest is not None
     assert result.public_surface_digest is not None
 

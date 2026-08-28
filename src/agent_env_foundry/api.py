@@ -24,6 +24,7 @@ from agent_env_foundry.publication import (
 )
 from agent_env_foundry.qualification import (
     QualificationConfig,
+    QualificationFailure,
     QualificationResult,
     run_qualification,
 )
@@ -38,6 +39,7 @@ from agent_env_foundry.research import (
     ResearchTools,
     Unsupported,
 )
+from agent_env_foundry.semantics_author import SemanticsAuthorFailure, run_semantics_author
 from agent_env_foundry.semantics_authoring import generate_expected_task_semantics
 
 __all__ = [
@@ -177,7 +179,13 @@ def generate_environment(
     )
     if qualification.status != "passed":
         return _finish(run_root, _qualification_failure(qualification))
-    if qualification.workspace_root is None or qualification.evidence_digest is None:
+    if (
+        qualification.workspace_root is None
+        or qualification.evidence_digest is None
+        or qualification.semantics_author_inputs is None
+        or qualification.expected_task_semantics_digest is None
+        or qualification.public_surface_digest is None
+    ):
         return _finish(
             run_root,
             NotReleased(
@@ -186,6 +194,46 @@ def generate_environment(
                 {"phase": "qualification"},
             ),
         )
+
+    try:
+        semantics = run_semantics_author(
+            qualification.semantics_author_inputs,
+            config=selected.builder,
+        )
+    except SemanticsAuthorFailure as exc:
+        return _finish(
+            run_root,
+            NotReleased(exc.code, str(exc), dict(exc.details)),
+        )
+    except (QualificationFailure, BuilderFailure) as exc:
+        return _finish(
+            run_root,
+            NotReleased(exc.code, str(exc), dict(exc.details)),
+        )
+    except Exception as exc:
+        return _finish(
+            run_root,
+            NotReleased(
+                "semantics_author_sdk_failed",
+                "Semantics Author SDK execution failed",
+                {
+                    "phase": "semantics_author",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            ),
+        )
+    _write_json(
+        run_root / "semantics.json",
+        {
+            "thread_id": semantics.thread_id,
+            "factory": semantics.factory,
+            "project_digest": semantics.project_digest,
+            "checks": [item.to_document() for item in semantics.checks],
+            "expected_task_semantics_digest": qualification.expected_task_semantics_digest,
+            "public_surface_digest": qualification.public_surface_digest,
+        },
+    )
 
     try:
         assembled = assemble_environment_release(

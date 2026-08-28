@@ -95,3 +95,5 @@
 `s2-task-foundry-cp3a-core|介入1|返工1|real Luna strict schema+8 mutation licenses+Claude ALLOW|红线违反0`
 
 `s2-task-foundry-cp3a-wiring|介入2|返工2|real 20-relation Luna+Host journal staging+6 mutation licenses|红线违反1: initially introduced and deleted a duplicate staging subsystem`
+
+`s2-task-foundry-cp3b|介入0|返工1|real Codex SDK+7 Framework gates+9 mutation licenses|红线违反0`

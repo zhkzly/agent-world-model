@@ -42,6 +42,12 @@ generate_expected_task_semantics(
     route: AgentRoute | None = None,
     client_factory: ClientFactory | None = None,
 ) -> ExpectedTaskSemantics
+
+run_semantics_author(
+    prepared: PreparedSemanticsAuthorWorkspace,
+    *,
+    config: BuilderConfig | None = None,
+) -> SemanticsBuild
 ```
 
 ## 3. Contracts
@@ -86,6 +92,12 @@ generate_expected_task_semantics(
 - The workspace contains exactly the frozen expected semantics, public surface,
   TaskSemantics contract, candidate-view manifest and read-only candidate view. Public
   surface facts omit run IDs and Host digests; the manifest already binds view files.
+- Framework creates the fixed `generated_task_semantics.release:make_semantics` uv
+  project and owns source scanning, lock/frozen sync, import separation, build, tests,
+  catalog alignment and project digest. Codex owns only native decoding, semantic
+  records/evaluators, tests and dependency declarations.
+- Codex runs in a fresh deny-all/full-access thread. Full access is not trust: every
+  immutable input is rechecked after each turn, and model prose is discarded.
 
 ## 4. Validation & Error Matrix
 
@@ -103,6 +115,9 @@ generate_expected_task_semantics(
 | Capability cites non-Taskable/unknown Requirement or workflow | expected semantics | reject with field path |
 | Composition/condition cites unknown or unlicensed anchors | expected semantics | reject all observable findings together |
 | Local TCP denied before provider request | Infrastructure | rerun identical command with permitted localhost access |
+| Codex imports actor/Host or runtime-references candidate-view | Semantics Author | reject source before lock/build |
+| lock/sync/build/tests fail | Semantics Author or Infrastructure from exact command | return all available command facts to same thread |
+| generated catalog differs from frozen capability/composition/condition IDs | Semantics Author | reject catalog; model prose cannot override |
 
 ## 5. Good / Base / Bad Cases
 
@@ -121,6 +136,10 @@ generate_expected_task_semantics(
   dispositions and three capabilities, and Host freezes the canonical digest.
 - Bad: forward `cited_evidence`, Candidate source, native field names or a Host
   digest into the expectation turn.
+- Good: Codex writes one standalone uv project; seven Host gates pass and only project
+  digest/thread ID/check evidence survives.
+- Bad: Framework writes a domain decoder/evaluator, or Codex writes a pass verdict,
+  manifest, digest, Task, reward or witness.
 
 ## 6. Tests Required
 
@@ -143,6 +162,10 @@ generate_expected_task_semantics(
   all-findings and provider-schema mutants.
 - Run at least one real strict-JSON provider turn from accepted S1 relations; a
   fake client proves transport shape only.
+- Semantics Author tests kill full-access, model-self-authorization, actor/Host import,
+  catalog-alignment, fixed-factory, Skill-ownership and API fail-closed mutants.
+- A real cross-domain project must pass all seven Framework checks; fake Codex only
+  proves orchestration.
 
 ## 7. Wrong vs Correct
 

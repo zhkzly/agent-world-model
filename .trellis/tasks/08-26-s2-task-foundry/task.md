@@ -29,3 +29,6 @@ Gold reference: existing S1 locked cold-release/ValidatedEnvironment behavior pl
 - 选择：CP3A 直接接入 `generate_environment -> run_qualification`，复用现有 Host journal、`_stage_view` 和 Qualification workspace；删除了提前实现的 CP4 cold replay，不建立 `PublicSurface` 子系统。
 - 备选：保持 standalone freeze 或新建 staging/loader 层；拒绝，因为前者无生产消费者，后者重复现有物理权威。
 - 实证：完整真实 ocean Candidate/Host journal/20 条 accepted relations 一次 Luna turn 生成 20/20 disposition、9 capabilities、2 composition rules；Host 写出 7 ToolSpecs、58 public facts 和四个 0444 输入，expected digest `0790b8ee473b1aa2e9ab1191b635bf812463405e1784dab178a496eefe655b1e`。CP3A 完成；不声称 CP3B/CP3C/CP4 完成。
+- 选择：CP3B 将语义判断限定在 Codex 源码/测试/依赖声明；Framework 固定 factory、初始化 uv、执行 source/lock/sync/import/build/tests/catalog 全门，并删除模型 final response 字段。
+- 备选：让 Codex 写 manifest/digest/verdict 或让 Framework生成领域 decoder/evaluator；拒绝，前者是假权威，后者把语义硬编码进框架。
+- 实证：真实 ocean fresh Codex thread `01a04888-a0ae-7d31-b307-a16d6317c26f` 一次 author turn 通过 7/7 Framework checks；project digest `11ed3820d816cb1eb720f2fc62ed503dd1f983ffd9aecf2d0fa549c58acb82f1`，9 张 mutation license 与全库门通过。CP3B 完成；CP3C 尚未开始。

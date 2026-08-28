@@ -8,6 +8,7 @@ proof using real Research, Builder, Qualification, and cold publication.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -219,6 +220,57 @@ def test_expected_semantics_failure_stops_before_qualification(
     assert outcome.details["findings"] == ["REQ-001 omitted"]
 
 
+def test_semantics_author_failure_stops_before_assembly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = _research_ready()
+    candidate_root = tmp_path / "candidate"
+    candidate_root.mkdir()
+    candidate = CandidateBuild(candidate_root, "thread", "a" * 64, "done", ())
+    qualification = QualificationResult(
+        status="passed",
+        candidate_digest=candidate.candidate_digest,
+        expected_relations_digest="b" * 64,
+        evidence_digest="c" * 64,
+        probe_bundle_digest="d" * 64,
+        negative_evidence_count=1,
+        workspace_root=tmp_path / "qualification",
+        semantics_author_inputs=object(),
+        expected_task_semantics_digest="e" * 64,
+        public_surface_digest="f" * 64,
+    )
+    monkeypatch.setattr(api_module, "run_research", lambda **_kwargs: ready)
+    monkeypatch.setattr(api_module, "run_builder", lambda *_args, **_kwargs: candidate)
+    monkeypatch.setattr(
+        api_module,
+        "generate_expected_task_semantics",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(api_module, "run_qualification", lambda *_args, **_kwargs: qualification)
+    monkeypatch.setattr(
+        api_module,
+        "run_semantics_author",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            api_module.SemanticsAuthorFailure(
+                "semantics_author",
+                "semantics_source_forbidden",
+                "actor import is forbidden",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "assemble_environment_release",
+        lambda *_args, **_kwargs: pytest.fail("Assembly must not run"),
+    )
+
+    outcome = generate_environment("Create a real resettable world.", config=_config(tmp_path))
+
+    assert isinstance(outcome, NotReleased)
+    assert outcome.code == "semantics_source_forbidden"
+    assert outcome.details["phase"] == "semantics_author"
+
+
 def test_cold_failure_blocks_immutable_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -236,6 +288,9 @@ def test_cold_failure_blocks_immutable_publication(
         probe_bundle_digest="d" * 64,
         negative_evidence_count=1,
         workspace_root=qualification_root,
+        semantics_author_inputs=object(),
+        expected_task_semantics_digest="3" * 64,
+        public_surface_digest="4" * 64,
     )
     assembled_root = tmp_path / "assembled-fixture"
     assembled_root.mkdir()
@@ -254,6 +309,16 @@ def test_cold_failure_blocks_immutable_publication(
         lambda *_args, **_kwargs: object(),
     )
     monkeypatch.setattr(api_module, "run_qualification", lambda *_args, **_kwargs: qualification)
+    monkeypatch.setattr(
+        api_module,
+        "run_semantics_author",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            thread_id="semantics-thread",
+            factory="generated_task_semantics.release:make_semantics",
+            project_digest="5" * 64,
+            checks=(),
+        ),
+    )
     monkeypatch.setattr(api_module, "assemble_environment_release", lambda *_args: assembled)
 
     def write_archive(_root: Path, destination: Path) -> str:

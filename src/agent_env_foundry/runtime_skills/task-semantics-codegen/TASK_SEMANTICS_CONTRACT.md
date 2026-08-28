@@ -21,17 +21,105 @@ into generated semantic records.
 Expose one `module:factory` that returns an object with exactly these methods:
 
 ```python
-start_cases(seed: int, limit: int) -> tuple[StartCase, ...]
+start_cases(seed: int, limit: int) -> list[StartCaseDocument]
 inspect(instance_directory: Path) -> JSONValue
-capabilities() -> tuple[CapabilitySpec, ...]
-enumerate_bindings(capability_id: str, facts: JSONValue) -> tuple[BindingCandidate, ...]
-evaluate_atom(request: AtomCheckRequest) -> AtomCheckResult
-evaluate_condition(request: ConditionCheckRequest) -> ConditionCheckResult
+capabilities() -> list[CapabilitySpecDocument]
+enumerate_bindings(capability_id: str, facts: JSONValue) -> list[BindingCandidateDocument]
+evaluate_atom(request: AtomCheckRequestDocument) -> AtomCheckResultDocument
+evaluate_condition(request: ConditionCheckRequestDocument) -> ConditionCheckResultDocument
 ```
 
-The JSON shapes are those defined by `agent_env_foundry.semantics`. The generated
-project must encode the same fields without importing the Host package at
-runtime; its lockfile must contain every dependency it uses.
+Every document must be JSON-compatible and contain the exact fields defined by
+`agent_env_foundry.semantics`; the Host decodes those documents into its own
+typed values. The generated project must not import the Host package at runtime;
+its lockfile must contain every dependency it uses.
+
+## Exact JSON records
+
+`StartCaseDocument` has exactly:
+
+```text
+case_id: non-empty whitespace-free string
+reset_input: object or null
+regime_tags: unique string array
+```
+
+`CapabilitySpecDocument` has exactly:
+
+```text
+capability_id, requirement_ids, workflow_ids, composition_rules,
+actor_role, task_kind, intent_label,
+protected_binding_schema, public_descriptor_schema,
+facets, conditions, answer_fields,
+read_scopes, write_scopes, supported_goal_kinds, rendering
+```
+
+Nested records have exactly:
+
+```text
+CompositionRule:
+  rule_id, workflow_id, kind="all", capability_ids, max_occurrences
+FacetSpec:
+  name, public_label, value_schema, allowed_operators,
+  visibility, tool_name, output_schema_pointer
+ConditionSpec:
+  condition_id, public_label, visibility, binding_scope,
+  true_capability_ids, false_capability_ids, report_field,
+  tool_name, output_schema_pointer
+AnswerFieldSpec:
+  field_id, schema, public_label
+RenderingSpec:
+  imperative, target_noun, answer_phrase
+```
+
+Schemas are self-contained Draft 2020-12 JSON Schema objects. Protected/public
+binding schemas must have object roots. Every capability supports `atom`;
+additional goal kinds are only `all`, `if`, and `foreach`. Facet operators are
+only `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `min`, and `max`. Non-tool facets or
+conditions set `tool_name` and `output_schema_pointer` to null. A `public_tool`
+record supplies both, and the pointer is an RFC 6901 path (the empty string means
+the output root).
+
+`BindingCandidateDocument` has exactly:
+
+```text
+semantic_key, eligible, reason_codes,
+protected_binding, public_descriptor, facets
+```
+
+Eligible bindings have no reason codes. Ineligible bindings have at least one.
+The three projections are JSON objects and must validate against the capability
+schemas/facets.
+
+`AtomCheckResultDocument` has exactly:
+
+```text
+initially_satisfied, satisfied, required_effects_ok, collateral_ok,
+answer_ok, process_ok, report_values, failure_codes
+```
+
+`answer_ok` and `process_ok` are boolean or null. A satisfied result cannot have
+failed required effects/collateral/answer/process or non-empty failure codes.
+
+`ConditionCheckResultDocument` has exactly:
+
+```text
+status: "true" | "false" | "abstain"
+report_values: object
+failure_codes: unique string array
+```
+
+Requests passed to evaluators are JSON objects:
+
+```text
+AtomCheckRequest:
+  capability_id, before_facts, after_facts, protected_binding,
+  trace_projection, final_answer
+ConditionCheckRequest:
+  condition_id, before_facts, protected_binding, trace_projection
+TraceEvent:
+  seq, tool_name, arguments, observation
+```
 
 ## Separation and state rules
 
