@@ -26,3 +26,6 @@ Gold reference: existing S1 locked cold-release/ValidatedEnvironment behavior pl
 - 备选：让 Semantics Author 读取 candidate 后自行决定 taskability；拒绝，因为 actor 与 verifier 会共享同一错误来源并可静默遗漏 Requirement。
 - 翻案证据：CP3A 的 exact coverage/unknown-reference/Taskable completeness 负例与 candidate-blind provider-input 测试；通过前不运行 Codex Author。
 - 实证：7 条聚焦测试、8 张 mutation license、全库质量门和独立 Claude `ALLOW_CP3A` 已通过；真实 Luna strict-JSON 预检从 ocean S1 工件的 4 条已接受关系生成 4/4 disposition、3 个 capability，并由 Host 冻结为 `80f791af8c8ce6135d4cc35a4e75300e7d57e2b65eee0ab494a156440cc1a238`。这只闭合 semantic-freeze core，尚不声称 CP3A artifact staging、CP3B Author 或 CP3C Qualification 完成。
+- 选择：CP3A 直接接入 `generate_environment -> run_qualification`，复用现有 Host journal、`_stage_view` 和 Qualification workspace；删除了提前实现的 CP4 cold replay，不建立 `PublicSurface` 子系统。
+- 备选：保持 standalone freeze 或新建 staging/loader 层；拒绝，因为前者无生产消费者，后者重复现有物理权威。
+- 实证：完整真实 ocean Candidate/Host journal/20 条 accepted relations 一次 Luna turn 生成 20/20 disposition、9 capabilities、2 composition rules；Host 写出 7 ToolSpecs、58 public facts 和四个 0444 输入，expected digest `0790b8ee473b1aa2e9ab1191b635bf812463405e1784dab178a496eefe655b1e`。CP3A 完成；不声称 CP3B/CP3C/CP4 完成。

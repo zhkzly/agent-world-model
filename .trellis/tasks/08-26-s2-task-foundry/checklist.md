@@ -37,3 +37,8 @@
   provider-schema mutants?
 - [x] Did a real Luna strict-JSON turn accept the schema and produce a Host-frozen result from
   accepted S1 relations?
+- [x] Does the production API invoke the freeze after Builder and before Qualification/source
+  exposure, with typed failure stopping Qualification?
+- [x] Are `EXPECTED_TASK_SEMANTICS.json`, `PUBLIC_SURFACE.json`,
+  `TASK_SEMANTICS_CONTRACT.md` and the existing read-only candidate view bound by exact Host
+  digests without a second loader or evidence subsystem?

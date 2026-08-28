@@ -44,7 +44,7 @@
     "tests/fixtures/fx_v2_semantics.py",
     ".trellis/spec/backend/v2-preparation.md"
   ],
-  "notes": "Implementation reactivated after revert commit 7880133 removed the out-of-order deterministic scaffold. CP1 contracts and CP2 immutable v2 preparation/separate child runtimes are complete with real frozen uv sync, process/isolation/tamper tests, mutation licenses and independent Claude ALLOW. CP3 TaskSemantics Author and semantic Qualification is next. CP5-CP7 code and claims remain absent. The user waived Patrol for this recovery implementation.",
+  "notes": "Implementation reactivated after revert commit 7880133 removed the out-of-order deterministic scaffold. CP1 contracts, CP2 immutable v2 preparation/separate child runtimes, and CP3A candidate-blind expected-semantics plus exact Author inputs are complete with real execution and mutation evidence. CP3B TaskSemantics Author is next; CP3C Qualification and CP4-CP8 remain incomplete. The user waived Patrol for this recovery implementation.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -64,6 +64,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "cp3_semantics_authoring_next"
+    "implementation_checkpoint": "cp3b_semantics_author_next"
   }
 }

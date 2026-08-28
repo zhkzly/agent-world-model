@@ -36,6 +36,7 @@ from agent_env_foundry.qualification import (
 )
 from agent_env_foundry.release import canonical_bytes, compute_payload_digest, verify_release
 from agent_env_foundry.research import BuilderProjection
+from agent_env_foundry.semantics_authoring import freeze_expected_task_semantics
 
 
 def _projection(count: int = 24) -> BuilderProjection:
@@ -863,6 +864,7 @@ def test_predicate_authoring_turn_is_blind_then_frozen_before_source_turn(
         candidate,
         digest,
         workspace,
+        expected_task_semantics=_expected_task_semantics(_projection()),
         config=QualificationConfig(max_turns=1),
     )
     assert result.status != "passed"
@@ -943,6 +945,7 @@ def test_agent_verdict_cannot_bypass_source_gate_or_reach_executor(
         candidate,
         digest,
         workspace,
+        expected_task_semantics=_expected_task_semantics(_projection()),
         config=QualificationConfig(max_turns=1),
     )
     assert result.status == "probe_defect"
@@ -1067,6 +1070,205 @@ def make_environment(instance):
     (root / "unlisted.txt").write_text("must not copy")
     verify_release(root)
     return root, compute_candidate_digest(root)
+
+
+def _expected_task_semantics(projection: BuilderProjection) -> Any:
+    requirement_ids = [
+        item["id"]
+        for item in (
+            *projection.to_document()["requirements"],
+            *projection.to_document()["initial_world_relations"],
+        )
+    ]
+    taskable_ids = requirement_ids[:2]
+    document = {
+        "requirements": [
+            {
+                "requirement_id": requirement_id,
+                "disposition": "Taskable" if requirement_id in taskable_ids else "NotTaskable",
+                "rationale": "mechanical author-input fixture",
+                "preconditions": ["world exists"] if requirement_id in taskable_ids else [],
+                "outcomes": ["relation holds"] if requirement_id in taskable_ids else [],
+                "refusals": [],
+                "collateral_constraints": [],
+                "workflow_ids": ["mechanical-workflow"],
+            }
+            for requirement_id in requirement_ids
+        ],
+        "capabilities": [
+            {
+                "capability_id": f"capability-{index}",
+                "requirement_ids": [requirement_id],
+                "workflow_ids": ["mechanical-workflow"],
+                "actor_role": "operator",
+                "task_kind": "state_change" if index == 1 else "query",
+                "intent_label": f"exercise relation {index}",
+            }
+            for index, requirement_id in enumerate(taskable_ids, start=1)
+        ],
+        "composition_rules": [],
+        "conditions": [],
+    }
+    return freeze_expected_task_semantics(projection, document)
+
+
+def _semantics_input_journal(tmp_path: Path) -> Any:
+    tool = {
+        "name": "branch",
+        "description": "Return the state-independent branch",
+        "input_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "additionalProperties": False,
+        },
+        "output_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "required": ["branch"],
+            "properties": {"branch": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    }
+    events = [
+        ("reset", {"start": None}, {"branch": "baseline"}),
+        ("tools", {}, [tool]),
+        (
+            "invoke",
+            {"tool_name": "branch", "arguments": {}},
+            {"ok": True, "data": {"branch": "baseline"}, "error": None},
+        ),
+    ]
+    path = tmp_path / "semantics-input.journal.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "run_id": "semantics-input",
+                    "seq": sequence,
+                    "instance": "baseline",
+                    "operation": operation,
+                    "arguments": arguments,
+                    "result": result,
+                }
+            )
+            + "\n"
+            for sequence, (operation, arguments, result) in enumerate(events, start=1)
+        )
+    )
+    return _load_host_journal(path, "semantics-input")
+
+
+def test_semantics_author_inputs_reuse_qualification_view_and_host_journal(
+    tmp_path: Path,
+) -> None:
+    projection = _projection(3)
+    candidate, digest = _release_shaped_candidate(tmp_path)
+    prepared = prepare_qualification_workspace(
+        projection,
+        candidate,
+        digest,
+        tmp_path / "qualification",
+    )
+    with pytest.raises(QualificationFailure, match="Host-created"):
+        qualification_module.prepare_semantics_author_workspace(
+            prepared,
+            projection,
+            _expected_task_semantics(projection),
+            object(),
+        )
+    workspace = qualification_module.prepare_semantics_author_workspace(
+        prepared,
+        projection,
+        _expected_task_semantics(projection),
+        _semantics_input_journal(tmp_path),
+    )
+
+    assert workspace.root == prepared.root / "semantics-author"
+    assert {path.name for path in workspace.root.iterdir()} == {
+        "EXPECTED_TASK_SEMANTICS.json",
+        "PUBLIC_SURFACE.json",
+        "TASK_SEMANTICS_CONTRACT.md",
+        "CANDIDATE_VIEW_MANIFEST.json",
+        "candidate-view",
+    }
+    public_surface = json.loads((workspace.root / "PUBLIC_SURFACE.json").read_text())
+    assert public_surface["candidate_digest"] == digest
+    assert public_surface["candidate_view_digest"] == workspace.view_manifest.view_digest
+    assert [item["name"] for item in public_surface["tool_specs"]] == ["branch"]
+    assert [item["operation"] for item in public_surface["public_probe_facts"]] == [
+        "reset",
+        "invoke",
+    ]
+    view_manifest = json.loads((workspace.root / "CANDIDATE_VIEW_MANIFEST.json").read_text())
+    assert "src/mechanical_copy_environment/release.py" in {
+        item["path"] for item in view_manifest["files"]
+    }
+    assert not (workspace.root / "candidate-view/.venv").exists()
+    assert all(
+        stat.S_IMODE((workspace.root / name).stat().st_mode) == 0o444
+        for name in workspace.input_digests
+    )
+    contract = (workspace.root / "TASK_SEMANTICS_CONTRACT.md").read_text()
+    for required in (
+        "start_cases",
+        "inspect",
+        "capabilities",
+        "enumerate_bindings",
+        "evaluate_atom",
+        "evaluate_condition",
+        "must not import the actor package",
+        "must not mutate",
+    ):
+        assert required in contract
+    workspace.verify_inputs()
+
+    surface_path = workspace.root / "PUBLIC_SURFACE.json"
+    surface_path.chmod(0o644)
+    surface_path.write_text("{}")
+    with pytest.raises(QualificationFailure, match="changed"):
+        workspace.verify_inputs()
+
+
+def test_passing_actor_qualification_stages_semantics_inputs_before_return(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    projection = _projection(3)
+    candidate, digest = _release_shaped_candidate(tmp_path)
+    journal = _semantics_input_journal(tmp_path)
+
+    def admitted_actor_evidence(prepared: Any, config: Any) -> tuple[Any, ...]:
+        del config
+        rows = tuple(
+            qualification_module.EvidenceRow(
+                relation.requirement_id,
+                relation.relation_digest,
+                {"mechanical": True},
+            )
+            for relation in prepared.expected.relations
+        )
+        return (
+            qualification_module.ProbeBundle(prepared.root, (), "b" * 64),
+            rows,
+            tuple({"mechanical": True} for _ in rows),
+            (),
+            journal,
+        )
+
+    monkeypatch.setattr(qualification_module, "_author_probes", admitted_actor_evidence)
+    result = run_qualification(
+        projection,
+        candidate,
+        digest,
+        tmp_path / "qualification",
+        expected_task_semantics=_expected_task_semantics(projection),
+        config=QualificationConfig(max_turns=1),
+    )
+
+    assert result.status == "passed"
+    assert result.semantics_author_workspace == (tmp_path / "qualification/semantics-author")
+    assert result.expected_task_semantics_digest is not None
+    assert result.public_surface_digest is not None
 
 
 def test_tree_manifest_records_symlink_and_mode_without_following(tmp_path: Path) -> None:

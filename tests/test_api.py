@@ -21,6 +21,7 @@ from agent_env_foundry.research import (
     EvidenceIndex,
     EvidenceReview,
     NotReleased,
+    ResearchFailure,
     ResearchReady,
     finalize_research,
 )
@@ -155,6 +156,11 @@ def test_qualification_failure_cannot_reach_assembly(
     monkeypatch.setattr(api_module, "run_builder", lambda *_args, **_kwargs: candidate)
     monkeypatch.setattr(
         api_module,
+        "generate_expected_task_semantics",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        api_module,
         "run_qualification",
         lambda *_args, **_kwargs: QualificationResult(
             status="candidate_defect",
@@ -176,6 +182,41 @@ def test_qualification_failure_cannot_reach_assembly(
     assert outcome.code == "candidate_runtime_failed"
     assert outcome.details["qualification_status"] == "candidate_defect"
     assert not (tmp_path / "releases").exists()
+
+
+def test_expected_semantics_failure_stops_before_qualification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = _research_ready()
+    candidate_root = tmp_path / "candidate"
+    candidate_root.mkdir()
+    candidate = CandidateBuild(candidate_root, "thread", "a" * 64, "done", ())
+    monkeypatch.setattr(api_module, "run_research", lambda **_kwargs: ready)
+    monkeypatch.setattr(api_module, "run_builder", lambda *_args, **_kwargs: candidate)
+    monkeypatch.setattr(
+        api_module,
+        "generate_expected_task_semantics",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ResearchFailure(
+                phase="expected_semantics",
+                code="expected_semantics_invalid",
+                message="Requirement coverage mismatch",
+                details={"findings": ["REQ-001 omitted"]},
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "run_qualification",
+        lambda *_args, **_kwargs: pytest.fail("Qualification must not run"),
+    )
+
+    outcome = generate_environment("Create a real resettable world.", config=_config(tmp_path))
+
+    assert isinstance(outcome, NotReleased)
+    assert outcome.code == "expected_semantics_invalid"
+    assert outcome.details["phase"] == "expected_semantics"
+    assert outcome.details["findings"] == ["REQ-001 omitted"]
 
 
 def test_cold_failure_blocks_immutable_publication(
@@ -207,6 +248,11 @@ def test_cold_failure_blocks_immutable_publication(
     )
     monkeypatch.setattr(api_module, "run_research", lambda **_kwargs: ready)
     monkeypatch.setattr(api_module, "run_builder", lambda *_args, **_kwargs: candidate)
+    monkeypatch.setattr(
+        api_module,
+        "generate_expected_task_semantics",
+        lambda *_args, **_kwargs: object(),
+    )
     monkeypatch.setattr(api_module, "run_qualification", lambda *_args, **_kwargs: qualification)
     monkeypatch.setattr(api_module, "assemble_environment_release", lambda *_args: assembled)
 

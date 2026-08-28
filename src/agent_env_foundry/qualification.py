@@ -40,7 +40,14 @@ from agent_env_foundry.agents import (
     _run_fresh_json_turn,
 )
 from agent_env_foundry.builder import compute_candidate_digest
+from agent_env_foundry.environment import validate_tool_catalog
+from agent_env_foundry.release import verify_release
 from agent_env_foundry.research import BuilderProjection, ResearchFailure
+from agent_env_foundry.semantics_authoring import (
+    ExpectedSemanticsError,
+    ExpectedTaskSemantics,
+    freeze_expected_task_semantics,
+)
 
 EXPECTED_NAME = "EXPECTED_RELATIONS.json"
 PREDICATE_NAME = "QUALIFICATION_PREDICATES.json"
@@ -49,6 +56,10 @@ VIEW_MANIFEST_NAME = "CANDIDATE_VIEW_MANIFEST.json"
 CONTRACT_NAME = "ENVIRONMENT_CONTRACT.md"
 PROBE_MANIFEST_NAME = "probe_manifest.json"
 PROBE_SCRIPTS = ("native_probe.py", "negative_setup.py", "public_probe.py")
+SEMANTICS_AUTHOR_DIR = "semantics-author"
+EXPECTED_TASK_SEMANTICS_NAME = "EXPECTED_TASK_SEMANTICS.json"
+PUBLIC_SURFACE_NAME = "PUBLIC_SURFACE.json"
+TASK_SEMANTICS_CONTRACT_NAME = "TASK_SEMANTICS_CONTRACT.md"
 CHECK_CLASSES = frozenset(
     {
         "reset_reconstruction",
@@ -203,29 +214,7 @@ class PreparedQualificationWorkspace:
                     "Candidate view exists before Host-frozen predicates",
                 )
             return
-        actual = {
-            path.relative_to(view).as_posix()
-            for path in view.rglob("*")
-            if path.is_file() or path.is_symlink()
-        }
-        expected = {item.path for item in self.view_manifest.files}
-        if actual != expected:
-            raise QualificationFailure(
-                "qualification_input",
-                "candidate_view_members_changed",
-                "Candidate view members differ from its Host manifest",
-                expected=sorted(expected),
-                actual=sorted(actual),
-            )
-        directories = (view, *(path for path in view.rglob("*") if path.is_dir()))
-        if any(stat.S_IMODE(path.stat().st_mode) != 0o555 for path in directories):
-            raise QualificationFailure(
-                "qualification_input",
-                "candidate_view_directory_writable",
-                "Candidate view directories must remain read-only",
-            )
-        for item in self.view_manifest.files:
-            _verify_readonly(view / item.path, item.digest, "candidate view member")
+        _verify_staged_view(view, self.view_manifest)
 
     def stage_candidate_view(self) -> CandidateViewManifest:
         if self.predicate_digest is None:
@@ -254,6 +243,18 @@ class PreparedQualificationWorkspace:
         self.view_manifest = manifest
         self.verify_inputs()
         return manifest
+
+
+@dataclass(frozen=True)
+class PreparedSemanticsAuthorWorkspace:
+    root: Path
+    input_digests: dict[str, str]
+    view_manifest: CandidateViewManifest
+
+    def verify_inputs(self) -> None:
+        for name, digest in self.input_digests.items():
+            _verify_readonly(self.root / name, digest, "Semantics Author input")
+        _verify_staged_view(self.root / VIEW_NAME, self.view_manifest)
 
 
 @dataclass(frozen=True)
@@ -297,6 +298,9 @@ class QualificationResult:
     probe_bundle_digest: str | None = None
     negative_evidence_count: int = 0
     workspace_root: Path | None = None
+    semantics_author_workspace: Path | None = None
+    expected_task_semantics_digest: str | None = None
+    public_surface_digest: str | None = None
     failure_code: str | None = None
     details: Mapping[str, Any] | None = None
 
@@ -398,6 +402,178 @@ def prepare_qualification_workspace(
     prepared.verify_inputs()
     prepared.verify_candidate_unchanged()
     return prepared
+
+
+def prepare_semantics_author_workspace(
+    prepared: PreparedQualificationWorkspace,
+    projection: BuilderProjection,
+    expected_task_semantics: ExpectedTaskSemantics,
+    public_journal: HostJournal,
+) -> PreparedSemanticsAuthorWorkspace:
+    """Stage the four existing CP3A inputs after actor Qualification succeeds."""
+    prepared.verify_inputs()
+    prepared.verify_candidate_unchanged()
+    if not _is_host_journal(public_journal):
+        raise QualificationFailure(
+            "semantics_input",
+            "public_journal_invalid",
+            "Semantics Author inputs require a Host-created public journal",
+        )
+    expected_document = expected_task_semantics.to_document()
+    if expected_document.pop("format", None) != "expected-task-semantics/1":
+        raise QualificationFailure(
+            "semantics_input",
+            "expected_task_semantics_invalid",
+            "Expected TaskSemantics has an invalid Host format",
+        )
+    try:
+        refrozen = freeze_expected_task_semantics(projection, expected_document)
+    except (ExpectedSemanticsError, ValueError) as exc:
+        raise QualificationFailure(
+            "semantics_input",
+            "expected_task_semantics_invalid",
+            "Expected TaskSemantics no longer matches the accepted projection",
+            original_message=str(exc),
+        ) from exc
+    if (
+        refrozen.digest != expected_task_semantics.digest
+        or refrozen.canonical_payload != expected_task_semantics.canonical_payload
+    ):
+        raise QualificationFailure(
+            "semantics_input",
+            "expected_task_semantics_invalid",
+            "Expected TaskSemantics bytes do not match their Host validation",
+        )
+
+    root = prepared.root / SEMANTICS_AUTHOR_DIR
+    if root.is_symlink() or (root.exists() and any(root.iterdir())):
+        raise QualificationFailure(
+            "semantics_input",
+            "semantics_workspace_not_fresh",
+            "Semantics Author workspace must be fresh and empty",
+        )
+    root.mkdir()
+    view_manifest = _stage_view(
+        prepared.candidate_root,
+        root / VIEW_NAME,
+        prepared.candidate_digest,
+    )
+    view_manifest_path = root / VIEW_MANIFEST_NAME
+    view_manifest_path.write_bytes(_canonical(view_manifest.to_document()))
+    view_manifest_path.chmod(0o444)
+
+    verified = verify_release(prepared.candidate_root)
+    tool_specs = _journal_tool_specs(public_journal)
+    facts = [
+        {
+            "operation": event.operation,
+            "arguments": _copy(event.arguments),
+            "result": _copy(event.result),
+        }
+        for event in public_journal.events
+        if event.operation in {"reset", "invoke"}
+    ]
+    if not any(item["operation"] == "reset" for item in facts) or not any(
+        item["operation"] == "invoke" for item in facts
+    ):
+        raise QualificationFailure(
+            "semantics_input",
+            "public_probe_facts_incomplete",
+            "Semantics Author needs real reset and invoke public facts",
+        )
+    view_files = [{"path": item.path, "digest": item.digest} for item in view_manifest.files]
+    public_surface = {
+        "format": "public-surface/1",
+        "candidate_digest": prepared.candidate_digest,
+        "candidate_view_digest": view_manifest.view_digest,
+        "start_schema": verified.start_schema,
+        "reset_observation_schema": verified.reset_observation_schema,
+        "tool_specs": tool_specs,
+        "public_probe_facts": facts,
+        "public_documents": [
+            item["path"]
+            for item in view_files
+            if item["path"].startswith("docs/")
+            or Path(item["path"]).name.startswith(("README", "LICENSE"))
+        ],
+    }
+    paths = {
+        EXPECTED_TASK_SEMANTICS_NAME: root / EXPECTED_TASK_SEMANTICS_NAME,
+        PUBLIC_SURFACE_NAME: root / PUBLIC_SURFACE_NAME,
+        TASK_SEMANTICS_CONTRACT_NAME: root / TASK_SEMANTICS_CONTRACT_NAME,
+        VIEW_MANIFEST_NAME: view_manifest_path,
+    }
+    paths[EXPECTED_TASK_SEMANTICS_NAME].write_bytes(expected_task_semantics.canonical_payload)
+    paths[PUBLIC_SURFACE_NAME].write_bytes(_canonical(public_surface))
+    contract_source = (
+        Path(__file__).parent
+        / "runtime_skills"
+        / "task-semantics-codegen"
+        / TASK_SEMANTICS_CONTRACT_NAME
+    )
+    try:
+        shutil.copyfile(contract_source, paths[TASK_SEMANTICS_CONTRACT_NAME])
+    except OSError as exc:
+        raise QualificationFailure(
+            "semantics_input",
+            "task_semantics_contract_unavailable",
+            "TaskSemantics contract could not be staged",
+            original_code=type(exc).__name__,
+            original_message=str(exc),
+        ) from exc
+    for path in paths.values():
+        path.chmod(0o444)
+    workspace = PreparedSemanticsAuthorWorkspace(
+        root,
+        {name: _digest(path.read_bytes()) for name, path in paths.items()},
+        view_manifest,
+    )
+    workspace.verify_inputs()
+    prepared.verify_candidate_unchanged()
+    return workspace
+
+
+def _journal_tool_specs(journal: HostJournal) -> list[dict[str, Any]]:
+    catalogs: list[bytes] = []
+    selected: list[dict[str, Any]] | None = None
+    for event in journal.events:
+        if event.operation != "tools":
+            continue
+        if not isinstance(event.result, list):
+            raise QualificationFailure(
+                "semantics_input",
+                "public_tool_catalog_invalid",
+                "Host tools fact must contain a ToolSpec array",
+                seq=event.seq,
+            )
+        try:
+            catalog = validate_tool_catalog(
+                tuple(event.result), role=f"Host tools event {event.seq}"
+            )
+        except Exception as exc:
+            raise QualificationFailure(
+                "semantics_input",
+                "public_tool_catalog_invalid",
+                "Host tools fact contains an invalid ToolSpec catalog",
+                seq=event.seq,
+                original_code=type(exc).__name__,
+                original_message=str(exc),
+            ) from exc
+        selected = [_copy(catalog[name]) for name in sorted(catalog)]
+        catalogs.append(_canonical(selected))
+    if selected is None:
+        raise QualificationFailure(
+            "semantics_input",
+            "public_tool_catalog_missing",
+            "Semantics Author inputs require a real tools() fact",
+        )
+    if len(set(catalogs)) != 1:
+        raise QualificationFailure(
+            "semantics_input",
+            "public_tool_catalog_changed",
+            "ToolSpecs changed within the Host public journal",
+        )
+    return selected
 
 
 def validate_predicate_carrier(prepared: PreparedQualificationWorkspace) -> str:
@@ -533,6 +709,32 @@ def _stage_view(candidate: Path, destination: Path, candidate_digest: str) -> Ca
         "files": [{"path": item.path, "digest": item.digest} for item in records],
     }
     return CandidateViewManifest(candidate_digest, tuple(records), _digest(_canonical(preimage)))
+
+
+def _verify_staged_view(view: Path, manifest: CandidateViewManifest) -> None:
+    actual = {
+        path.relative_to(view).as_posix()
+        for path in view.rglob("*")
+        if path.is_file() or path.is_symlink()
+    }
+    expected = {item.path for item in manifest.files}
+    if actual != expected:
+        raise QualificationFailure(
+            "qualification_input",
+            "candidate_view_members_changed",
+            "Candidate view members differ from its Host manifest",
+            expected=sorted(expected),
+            actual=sorted(actual),
+        )
+    directories = (view, *(path for path in view.rglob("*") if path.is_dir()))
+    if any(stat.S_IMODE(path.stat().st_mode) != 0o555 for path in directories):
+        raise QualificationFailure(
+            "qualification_input",
+            "candidate_view_directory_writable",
+            "Candidate view directories must remain read-only",
+        )
+    for item in manifest.files:
+        _verify_readonly(view / item.path, item.digest, "candidate view member")
 
 
 def _view_allowed(relative: Path) -> bool:
@@ -1356,6 +1558,7 @@ def run_qualification(
     candidate_digest: str,
     workspace_root: Path,
     *,
+    expected_task_semantics: ExpectedTaskSemantics,
     config: QualificationConfig,
 ) -> QualificationResult:
     expected = freeze_expected_relations(projection)
@@ -1363,7 +1566,13 @@ def run_qualification(
         prepared = prepare_qualification_workspace(
             projection, candidate_root, candidate_digest, workspace_root
         )
-        bundle, rows, negative, carriers = _author_probes(prepared, config)
+        bundle, rows, negative, carriers, public_journal = _author_probes(prepared, config)
+        semantics_workspace = prepare_semantics_author_workspace(
+            prepared,
+            projection,
+            expected_task_semantics,
+            public_journal,
+        )
         prepared.verify_inputs()
         prepared.verify_candidate_unchanged()
         preimage = {
@@ -1373,6 +1582,8 @@ def run_qualification(
             "rows": [row.document for row in rows],
             "negative_rows": list(negative),
             "negative_carriers": [carrier.to_document() for carrier in carriers],
+            "expected_task_semantics_digest": expected_task_semantics.digest,
+            "public_surface_digest": semantics_workspace.input_digests[PUBLIC_SURFACE_NAME],
         }
         return QualificationResult(
             status="passed",
@@ -1383,6 +1594,9 @@ def run_qualification(
             probe_bundle_digest=bundle.bundle_digest,
             negative_evidence_count=len(negative),
             workspace_root=prepared.root,
+            semantics_author_workspace=semantics_workspace.root,
+            expected_task_semantics_digest=expected_task_semantics.digest,
+            public_surface_digest=semantics_workspace.input_digests[PUBLIC_SURFACE_NAME],
         )
     except QualificationFailure as exc:
         status: QualificationStatus = (
@@ -1604,6 +1818,7 @@ def _author_probes(
     tuple[EvidenceRow, ...],
     tuple[dict[str, Any], ...],
     tuple[ControlledRunCarrier, ...],
+    HostJournal,
 ]:
     previous: str | None = None
     _author_predicates(prepared, config)
@@ -1650,7 +1865,7 @@ def _author_probes(
                         carriers,
                         prepared.candidate_digest,
                     )
-                    return bundle, rows, negative, carriers
+                    return bundle, rows, negative, carriers, positive_journal
                 except QualificationFailure as exc:
                     if exc.code in _CANDIDATE_FAILURE_CODES or exc.phase in {
                         "candidate_execution",

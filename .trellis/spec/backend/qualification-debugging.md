@@ -80,6 +80,12 @@ generate_expected_task_semantics(
   canonicalizes the accepted document and computes its SHA-256 digest.
 - Semantic validation reports all currently observable findings in one replacement
   turn. Strict JSON-schema rejection remains fail-closed.
+- Production order is `Builder -> expected freeze -> actor Qualification -> Semantics
+  Author inputs`. The Author workspace reuses the existing Host journal and the same
+  `_stage_view` allowlist; it does not define a second loader or evidence authority.
+- The workspace contains exactly the frozen expected semantics, public surface,
+  TaskSemantics contract, candidate-view manifest and read-only candidate view. Public
+  surface facts omit run IDs and Host digests; the manifest already binds view files.
 
 ## 4. Validation & Error Matrix
 

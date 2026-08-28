@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -33,10 +33,12 @@ from agent_env_foundry.research import (
     NotReleased,
     ResearchBudget,
     ResearchConfig,
+    ResearchFailure,
     ResearchReady,
     ResearchTools,
     Unsupported,
 )
+from agent_env_foundry.semantics_authoring import generate_expected_task_semantics
 
 __all__ = [
     "GenerationConfig",
@@ -147,11 +149,30 @@ def generate_environment(
         },
     )
 
+    try:
+        expected_task_semantics = generate_expected_task_semantics(
+            research.builder_projection,
+            route=replace(
+                selected.route,
+                max_provider_turns=min(selected.route.max_provider_turns, 3),
+            ),
+        )
+    except ResearchFailure as exc:
+        return _finish(
+            run_root,
+            NotReleased(
+                exc.code,
+                str(exc),
+                {"phase": exc.phase, **dict(exc.details)},
+            ),
+        )
+
     qualification = run_qualification(
         research.builder_projection,
         candidate.workspace,
         candidate.candidate_digest,
         run_root / "qualification",
+        expected_task_semantics=expected_task_semantics,
         config=selected.qualification,
     )
     if qualification.status != "passed":
