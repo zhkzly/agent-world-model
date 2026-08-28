@@ -31,7 +31,7 @@ success and refusal semantics, and publishes an immutable EnvironmentRelease.
 The release contract may evolve when a demonstrated cross-environment S2/S3
 consumer need requires it. Compatibility with earlier research releases is not
 a current product goal. Any S1 addition must remain environment-generic and may
-not contain Task-, sampler-, verifier-, reward- or training-specific fields.
+not contain Task-instance-, sampler-, reward- or training-specific fields.
 
 S1 must provide two trust-separated surfaces:
 
@@ -41,10 +41,11 @@ public actor surface
 
 protected trusted surface
   isolated release preparation/opening
+  qualified taskable capability semantics
   canonical read-only state inspection with a release-owned schema
 ```
 
-The protected state view is never exposed to an acting Agent and must be
+The protected surface is never exposed to an acting Agent and must be
 independently checked against native SQLite/files/Git or another authoritative
 representation during S1 Qualification.
 
@@ -54,11 +55,10 @@ S2 consumes an exact EnvironmentRelease and produces TaskPacks. Task generation
 is goal-first:
 
 ```text
-Need/Brief intent
-+ empirically observed public capabilities and state effects
--> parameterized TaskBlueprint
--> reproducible StartRecipe
--> independently authored TaskChecker
+Need/Brief-anchored, independently qualified capability atoms
+-> parameterized TaskBlueprint / bounded GoalProgram
+-> reproducible reset-only StartRecipe
+-> TaskChecker compiled and frozen before solving
 -> public-only constructive solution and fresh replay
 -> natural-language instruction
 -> adversarial admission
@@ -112,8 +112,9 @@ behavior, Task truth or admission evidence.
 5. **No semantic authority by consensus.** LLMs may propose intents, code,
    instructions and challenges. Model agreement never overrides deterministic
    execution or state evidence.
-6. **No hidden direct setup.** S2 creates starts only through `reset(start)` and
-   public setup calls. Protected state inspection is read-only.
+6. **Reset-only starts.** S2 chooses only S1-qualified `reset(start)` cases. It
+   performs no hidden setup calls, direct native mutation or snapshot restore.
+   Protected state inspection is read-only.
 7. **No domain branches in the framework.** Booking, SQLite and Git are
    conformance cases, not framework categories or hard-coded schemas.
 8. **No fake completion.** Intermediate slices are checkpoints. S2 is complete
@@ -127,6 +128,6 @@ behavior, Task truth or admission evidence.
 ## Current planning boundary
 
 The `s2-task-foundry` Trellis task owns the complete S2 redesign and the minimum
-cross-environment S1 runtime/inspection changes required by that design. The
+cross-environment S1 runtime/semantics changes required by that design. The
 planning artifacts must be reviewed and explicitly approved before product code
 or task activation.
