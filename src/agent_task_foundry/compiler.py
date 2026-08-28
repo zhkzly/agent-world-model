@@ -14,12 +14,18 @@ from agent_env_foundry.semantics import (
     CompositionRule,
     ConditionCheckRequest,
     ConditionSpec,
+    FacetSpec,
     JSONObject,
     JSONValue,
     TaskSemantics,
     TraceEvent,
     validate_binding,
     validate_catalog,
+)
+from agent_task_foundry.facets import (
+    FacetValueError,
+    compare_facet_values,
+    extreme_facet_value,
 )
 from agent_task_foundry.models import (
     AllGoal,
@@ -154,10 +160,15 @@ class CompiledTaskChecker:
             )
         if isinstance(goal, AllGoal):
             return _combine(
-                [self._goal(child, before, after, trace, answer) for child in goal.children],
+                [
+                    self._goal(child_goal, before, after, trace, answer)
+                    for child_goal in goal.children
+                ],
                 "all",
             )
-        return self._if(goal, before, after, trace, answer)
+        if isinstance(goal, IfGoal):
+            return self._if(goal, before, after, trace, answer)
+        raise CompilationError(f"unsupported goal type {type(goal).__name__}")
 
     def _atom(
         self,
@@ -305,30 +316,32 @@ def _resolve_selector(
 def _rank(
     candidates: list[BindingCandidate],
     rank: RankSpec,
-    facets: Mapping[str, object],
+    facets: Mapping[str, FacetSpec],
 ) -> list[BindingCandidate]:
-    if rank.facet not in facets:
+    facet = facets.get(rank.facet)
+    if facet is None:
         raise CompilationError(f"unknown rank facet {rank.facet!r}")
+    if rank.direction not in facet.allowed_operators:
+        raise CompilationError(
+            f"rank direction {rank.direction!r} is not allowed for facet {rank.facet!r}"
+        )
     values = [candidate.facets.get(rank.facet) for candidate in candidates]
-    if any(not isinstance(value, (int, float, str)) for value in values):
-        raise CompilationError("rank facet values must be comparable scalars")
-    target = min(values) if rank.direction == "min" else max(values)
-    return [candidate for candidate in candidates if candidate.facets.get(rank.facet) == target]
+    try:
+        target = extreme_facet_value(values, rank.direction)
+    except FacetValueError as exc:
+        raise CompilationError(f"invalid rank facet {rank.facet!r}: {exc}") from exc
+    return [
+        candidate
+        for candidate in candidates
+        if compare_facet_values(candidate.facets.get(rank.facet), "eq", target)
+    ]
 
 
 def _compare(left: JSONValue, operator: str, right: JSONValue) -> bool:
-    if operator == "eq":
-        return left == right
-    if operator == "neq":
-        return left != right
-    if not isinstance(left, (int, float, str)) or not isinstance(right, type(left)):
-        return False
-    return {
-        "lt": left < right,
-        "lte": left <= right,
-        "gt": left > right,
-        "gte": left >= right,
-    }.get(operator, False)
+    try:
+        return compare_facet_values(left, operator, right)
+    except FacetValueError as exc:
+        raise CompilationError(f"invalid facet comparison {operator!r}: {exc}") from exc
 
 
 def _validate_goal(
@@ -353,35 +366,39 @@ def _validate_goal(
             raise CompilationError("capability does not support ForEach")
         return
     if isinstance(goal, AllGoal):
-        for child in goal.children:
-            _validate_goal(child, selectors, catalog)
+        for child_goal in goal.children:
+            _validate_goal(child_goal, selectors, catalog)
         rule = catalog.rules.get(goal.composition_rule_id)
         if rule is None:
             raise CompilationError("AllGoal has no qualified CompositionRule")
         if set(goal_capability_ids(goal)) != set(rule.capability_ids):
             raise CompilationError("AllGoal capability set does not match CompositionRule")
         return
-    owner, condition = catalog.conditions.get(goal.condition_id, (None, None))
-    if condition is None or owner is None:
-        raise CompilationError(f"unknown condition {goal.condition_id!r}")
-    if condition.binding_scope == "selected_binding":
-        if goal.selector_id is None:
-            raise CompilationError("selected-binding condition requires selector_id")
-        if _selector(goal.selector_id, selectors).capability_id != owner.capability_id:
-            raise CompilationError("condition selector uses the wrong capability")
-    elif goal.selector_id is not None:
-        raise CompilationError("world condition must not carry a binding selector")
-    for child, allowed in (
-        (goal.then_goal, condition.true_capability_ids),
-        (goal.else_goal, condition.false_capability_ids),
-    ):
-        if child is None:
-            if condition.report_field is None:
-                raise CompilationError("goal-less condition branch lacks a qualified report")
-            continue
-        _validate_goal(child, selectors, catalog)
-        if not set(goal_capability_ids(child)) <= set(allowed):
-            raise CompilationError("condition branch uses an unlicensed capability")
+    if isinstance(goal, IfGoal):
+        owner, condition = catalog.conditions.get(goal.condition_id, (None, None))
+        if condition is None or owner is None:
+            raise CompilationError(f"unknown condition {goal.condition_id!r}")
+        if condition.binding_scope == "selected_binding":
+            if goal.selector_id is None:
+                raise CompilationError("selected-binding condition requires selector_id")
+            if _selector(goal.selector_id, selectors).capability_id != owner.capability_id:
+                raise CompilationError("condition selector uses the wrong capability")
+        elif goal.selector_id is not None:
+            raise CompilationError("world condition must not carry a binding selector")
+        branches = (
+            (goal.then_goal, condition.true_capability_ids),
+            (goal.else_goal, condition.false_capability_ids),
+        )
+        for branch_goal, allowed_capability_ids in branches:
+            if branch_goal is None:
+                if condition.report_field is None:
+                    raise CompilationError("goal-less condition branch lacks a qualified report")
+                continue
+            _validate_goal(branch_goal, selectors, catalog)
+            if not set(goal_capability_ids(branch_goal)) <= set(allowed_capability_ids):
+                raise CompilationError("condition branch uses an unlicensed capability")
+        return
+    raise CompilationError(f"unsupported goal type {type(goal).__name__}")
 
 
 def _selector(selector_id: str, selectors: Mapping[str, SelectorSpec]) -> SelectorSpec:
@@ -430,12 +447,15 @@ def _render_goal(
         )
     if isinstance(goal, AllGoal):
         return "; also ".join(
-            _render_goal(child, blueprint, catalog, resolved, bindings) for child in goal.children
+            _render_goal(child_goal, blueprint, catalog, resolved, bindings)
+            for child_goal in goal.children
         )
-    _, condition = catalog.conditions[goal.condition_id]
-    then_text = _branch_text(goal.then_goal, condition, blueprint, catalog, resolved, bindings)
-    else_text = _branch_text(goal.else_goal, condition, blueprint, catalog, resolved, bindings)
-    return f"if {condition.public_label}, {then_text}; otherwise, {else_text}"
+    if isinstance(goal, IfGoal):
+        _, condition = catalog.conditions[goal.condition_id]
+        then_text = _branch_text(goal.then_goal, condition, blueprint, catalog, resolved, bindings)
+        else_text = _branch_text(goal.else_goal, condition, blueprint, catalog, resolved, bindings)
+        return f"if {condition.public_label}, {then_text}; otherwise, {else_text}"
+    raise CompilationError(f"unsupported goal type {type(goal).__name__}")
 
 
 def _branch_text(

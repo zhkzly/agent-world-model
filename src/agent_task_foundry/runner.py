@@ -5,10 +5,22 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
+from openai import OpenAI
+from openai.types.responses import (
+    EasyInputMessageParam,
+    FunctionToolParam,
+    ResponseFunctionToolCall,
+    ResponseInputItemParam,
+    ResponseInputParam,
+    ResponseOutputItem,
+)
+from openai.types.responses.response_input_param import FunctionCallOutput
+
+from agent_env_foundry.jsonvalue import is_json_object
 from agent_env_foundry.semantics import JSONObject, JSONValue, TraceEvent
 from agent_task_foundry.compiler import CompiledTaskChecker
 from agent_task_foundry.models import (
@@ -44,6 +56,15 @@ class PolicyFinish:
 
 PolicyDecision = PolicyAction | PolicyFinish
 Policy = Callable[[TaskDefinition, JSONValue, tuple[PublicTraceEvent, ...]], PolicyDecision]
+
+
+@dataclass(frozen=True, slots=True)
+class _ResponseTurn:
+    output: tuple[ResponseOutputItem, ...]
+    output_text: str
+
+
+ResponseTurnCreator = Callable[[ResponseInputParam, list[FunctionToolParam]], _ResponseTurn]
 
 
 def run_public_policy(
@@ -163,64 +184,95 @@ def run_responses_policy(
     materialization_id: str,
     max_steps: int = 20,
 ) -> WitnessRun:
-    """Run the final instruction with an OpenAI Responses function-tool loop.
+    """Run the final instruction with an OpenAI Responses function-tool loop."""
 
-    This function intentionally requires invocation-time credentials. It is not
-    used by deterministic unit tests and never receives checker/native data in
-    the model input.
-    """
-
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RunnerError("openai package is required for Responses execution") from exc
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise RunnerError("OPENAI_API_KEY is required for Responses execution")
-    reset_context = actor.reset(definition.blueprint.start_recipe.reset_input)
-    tools = tuple(actor.tools())
-    functions = [_responses_tool(spec) for spec in tools]
     client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
-    history: list[Any] = [
-        {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "instruction": definition.instruction,
-                    "reset_context": reset_context,
-                    "answer_schema": definition.answer_schema,
-                },
-                ensure_ascii=False,
-            ),
-        }
-    ]
-    public_trace: list[PublicTraceEvent] = []
-    final_answer: JSONValue = None
-    for _ in range(max_steps + 1):
+
+    def create_turn(
+        input_items: ResponseInputParam,
+        functions: list[FunctionToolParam],
+    ) -> _ResponseTurn:
         response = client.responses.create(
             model=model,
-            input=history,
+            input=input_items,
             tools=functions,
             tool_choice="auto",
             parallel_tool_calls=False,
             store=False,
         )
-        output = list(cast(Sequence[Any], response.output or ()))
-        history.extend(output)
-        calls = [item for item in output if getattr(item, "type", None) == "function_call"]
+        return _ResponseTurn(tuple(response.output), response.output_text or "")
+
+    return _run_responses_policy_loop(
+        actor=actor,
+        definition=definition,
+        checker=checker,
+        before_facts=before_facts,
+        after_facts=after_facts,
+        create_turn=create_turn,
+        materialization_id=materialization_id,
+        max_steps=max_steps,
+    )
+
+
+def _run_responses_policy_loop(
+    *,
+    actor: PublicActor,
+    definition: TaskDefinition,
+    checker: CompiledTaskChecker,
+    before_facts: JSONValue,
+    after_facts: Callable[[], JSONValue],
+    create_turn: ResponseTurnCreator,
+    materialization_id: str,
+    max_steps: int = 20,
+) -> WitnessRun:
+    """Execute typed Responses turns; injectable creator supports deterministic tests."""
+
+    reset_context = actor.reset(definition.blueprint.start_recipe.reset_input)
+    if not _contains(reset_context, definition.public_reset_context):
+        raise RunnerError("fresh reset context omits a TaskDefinition public fact")
+    tools = tuple(actor.tools())
+    functions = [_responses_tool(spec) for spec in tools]
+    initial_message: EasyInputMessageParam = {
+        "role": "user",
+        "content": json.dumps(
+            {
+                "instruction": definition.instruction,
+                "reset_context": reset_context,
+                "answer_schema": definition.answer_schema,
+            },
+            ensure_ascii=False,
+        ),
+    }
+    history: ResponseInputParam = [initial_message]
+    public_trace: list[PublicTraceEvent] = []
+    final_answer: JSONValue = None
+    for _ in range(max_steps + 1):
+        turn = create_turn(history, functions)
+        history.extend(_response_output_as_input(item) for item in turn.output)
+        calls = [item for item in turn.output if isinstance(item, ResponseFunctionToolCall)]
         if not calls:
-            text = response.output_text
-            if not isinstance(text, str) or not text.strip():
+            if not turn.output_text.strip():
                 raise RunnerError("Responses policy returned neither tool call nor answer")
             try:
-                final_answer = json.loads(text)
+                parsed_answer: object = json.loads(turn.output_text)
             except json.JSONDecodeError:
-                final_answer = text
+                final_answer = turn.output_text
+            else:
+                if not _is_json_value(parsed_answer):
+                    raise RunnerError("Responses final answer is not a JSON value")
+                final_answer = cast(JSONValue, parsed_answer)
             break
         for call in calls:
-            arguments = json.loads(call.arguments)
-            if not isinstance(arguments, dict):
+            try:
+                parsed_arguments: object = json.loads(call.arguments)
+            except json.JSONDecodeError as exc:
+                raise RunnerError("tool arguments are not valid JSON") from exc
+            if not is_json_object(parsed_arguments):
                 raise RunnerError("tool arguments must be an object")
+            arguments = cast(JSONObject, parsed_arguments)
             spec = _tool_spec(tools, call.name)
             provenance = trace_argument_provenance(
                 arguments=arguments,
@@ -229,23 +281,27 @@ def run_responses_policy(
                 tool_spec=spec,
                 prior_trace=tuple(public_trace),
             )
-            observation = dict(actor.invoke(call.name, arguments))
+            raw_observation = dict(actor.invoke(call.name, arguments))
+            if set(raw_observation) != {"ok", "data", "error"} or not is_json_object(
+                raw_observation
+            ):
+                raise RunnerError("actor returned a malformed ToolObservation")
+            observation = cast(JSONObject, raw_observation)
             public_trace.append(
                 PublicTraceEvent(
                     len(public_trace) + 1,
                     call.name,
                     arguments,
-                    cast(JSONObject, observation),
+                    observation,
                     provenance,
                 )
             )
-            history.append(
-                {
-                    "type": "function_call_output",
-                    "call_id": call.call_id,
-                    "output": json.dumps(observation, ensure_ascii=False, sort_keys=True),
-                }
-            )
+            function_output: FunctionCallOutput = {
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": json.dumps(observation, ensure_ascii=False, sort_keys=True),
+            }
+            history.append(function_output)
     else:
         raise RunnerError("Responses policy exceeded max_steps")
     semantic_trace = tuple(
@@ -262,6 +318,26 @@ def run_responses_policy(
         result.status,
         result.failures,
     )
+
+
+def _response_output_as_input(item: ResponseOutputItem) -> ResponseInputItemParam:
+    """Convert one validated SDK output model to its official input-item shape."""
+
+    document = item.model_dump(mode="json", exclude_none=True)
+    item_type = document.get("type") if isinstance(document, dict) else None
+    if not isinstance(item_type, str):
+        raise RunnerError("Responses output item lacks a typed input representation")
+    return cast(ResponseInputItemParam, document)
+
+
+def _is_json_value(value: object) -> bool:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return True
+    if isinstance(value, list):
+        return all(_is_json_value(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _is_json_value(item) for key, item in value.items())
+    return False
 
 
 def _task_literals(definition: TaskDefinition) -> tuple[JSONValue, ...]:
@@ -293,12 +369,22 @@ def _tool_spec(tools: tuple[Mapping[str, Any], ...], name: str) -> Mapping[str, 
     raise RunnerError(f"unknown public tool {name!r}")
 
 
-def _responses_tool(spec: Mapping[str, Any]) -> dict[str, Any]:
+def _responses_tool(spec: Mapping[str, Any]) -> FunctionToolParam:
+    name = spec.get("name")
+    description = spec.get("description", "")
+    parameters_value = spec.get("input_schema")
+    if not isinstance(name, str) or not name:
+        raise RunnerError("ToolSpec name must be a non-empty string")
+    if not isinstance(description, str):
+        raise RunnerError(f"ToolSpec {name!r} description must be a string")
+    if not isinstance(parameters_value, dict):
+        raise RunnerError(f"ToolSpec {name!r} input_schema must be an object")
+    parameters: dict[str, object] = {str(key): value for key, value in parameters_value.items()}
     return {
         "type": "function",
-        "name": spec["name"],
-        "description": spec.get("description", ""),
-        "parameters": spec["input_schema"],
+        "name": name,
+        "description": description,
+        "parameters": parameters,
         "strict": True,
     }
 

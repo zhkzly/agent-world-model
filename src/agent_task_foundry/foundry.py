@@ -15,6 +15,12 @@ from agent_env_foundry.semantics import (
     TraceEvent,
 )
 from agent_task_foundry.compiler import CompiledTaskChecker, compile_definition
+from agent_task_foundry.facets import (
+    ExtremeDirection,
+    FacetValueError,
+    compare_facet_values,
+    extreme_facet_value,
+)
 from agent_task_foundry.models import (
     AdmissionReport,
     AllGoal,
@@ -391,18 +397,25 @@ def _unique_selector(
                 capability.capability_id,
                 (SelectorPredicate(facet.name, "eq", value),),
             )
+    directions: tuple[ExtremeDirection, ...] = ("max", "min")
     for facet in capability.facets:
         if "max" not in facet.allowed_operators and "min" not in facet.allowed_operators:
             continue
         values = [item.facets.get(facet.name) for item in candidates]
-        for direction in ("max", "min"):
+        for direction in directions:
             if direction not in facet.allowed_operators:
                 continue
             try:
-                target = max(values) if direction == "max" else min(values)
-            except TypeError:
-                continue
-            matches = [item for item in candidates if item.facets.get(facet.name) == target]
+                target = extreme_facet_value(values, direction)
+            except FacetValueError as exc:
+                raise SynthesisError(
+                    f"qualified rank facet {facet.name!r} is not comparable: {exc}"
+                ) from exc
+            matches = [
+                item
+                for item in candidates
+                if compare_facet_values(item.facets.get(facet.name), "eq", target)
+            ]
             if len(matches) == 1 and matches[0] == candidate:
                 return SelectorSpec(
                     f"{capability.capability_id}:{facet.name}:{direction}",
