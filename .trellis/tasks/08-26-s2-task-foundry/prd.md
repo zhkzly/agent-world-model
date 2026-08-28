@@ -1,285 +1,455 @@
-# S2 Task Foundry
+# S2 Goal-First Task Foundry
 
 ## Goal
 
-Consume an exact qualified S1 `EnvironmentRelease` and synthesize Tasks that are
-grounded in a real initial world, have at least one publicly executable solution,
-carry independently challenged task-local verification, and can be handed to S3
-without exposing protected truth to the acting Agent.
+Build the complete S2 stage that consumes a qualified executable world and
+produces release-bound Agent Tasks that are publicly solvable, deterministically
+verifiable, well-posed, non-trivial, reproducible and useful for SFT/RL. S2 also
+selects a structurally diverse, low-redundancy corpus from the admitted Tasks.
 
-## Current phase
+The old design is superseded. Graph random walks and Programmatic generation are
+not required Task sources, and compatibility with the previous S1/S2 proposal is
+not a product requirement.
 
-This child owns semantic and cross-layer design only. It has no implementation
-plan and is not authorized for code. S1 is implemented first after the S1/S2
-contract is frozen; S2 design is then revalidated against a real S1 release
-before an S2 implementation plan is written.
+## Product outcome
 
-## Inputs and outputs
+```text
+natural-language Need
+-> S1 builds and independently qualifies an executable world
+-> EnvironmentRelease v2 includes qualified taskable capability contracts
+-> S2 compiles parameterized TaskBlueprints from those contracts
+-> S2 freezes a deterministic TaskChecker before solving
+-> a public-only planner constructs and freshly replays one witness
+-> S2 renders and audits the user instruction
+-> adversarial challenges and independent actor trials run
+-> admitted TaskPack + corpus metadata
+```
 
-S2 consumes exactly:
+A successful command, green unit suite, isolated happy path, canned Task, demo,
+mock or manually tailored domain branch is not S2 completion.
 
-- an exact qualified `EnvironmentRelease` identity and runtime project;
-- its public `start_schema`, `reset_observation_schema` and validated initial
-  observation;
-- `ToolSpec[]` from `tools()`, uniform `ToolObservation {ok,data,error}` results and public
-  Brief/environment documentation;
-- caller-owned isolated episode instances and trusted read-only access to each
-  instance directory for task-specific native inspection;
-- the S1 qualification summary and declared limitations.
+## Feasibility boundary
 
-This input is complete for both candidate lanes. S2 cannot require S1 to add
-Graph, Programmatic, Task, verifier, reward or trajectory-specific fields.
+The design is intentionally narrower than claiming post-hoc Task discovery from
+an arbitrary opaque program. Automatic high-quality Task synthesis is supported
+only when S1 can publish and qualify all of the following:
 
-S2 outputs either:
+1. deterministic isolated resettable starts;
+2. structured public tools and observations;
+3. a protected read-only semantic state inspector;
+4. parameterized taskable capability contracts anchored to the accepted Brief;
+5. deterministic success, collateral and answer evaluators for those
+   capabilities;
+6. a start-space generator that yields reproducible valid reset inputs.
 
-- `Admitted(TaskPack)`;
-- `QuarantinedCandidate` for a reference-solved Task that has not yet shown
-  stable recoverability from the public Agent view;
-- `RejectedCandidate` for a bad, leaky, ambiguous or publicly unsolved Task;
-- `VerifierDefect` for a Task whose verifier cannot discriminate outcomes;
-- `PackageDefect` for a reproducible violation of the S1 release contract;
-- `InfrastructureFailure`, which may retry identical identities but cannot
-  change package, Task or verifier semantics.
+A Need whose world cannot expose deterministic task truth under this contract is
+`Unsupported`; S2 must not substitute an LLM Judge or fabricate a weaker Task.
+
+## Good Task contract
+
+### Single Task qualities
+
+Every admitted Task must satisfy all of these properties.
+
+1. **Publicly solvable.** At least one constructive solution uses only the Task
+   instruction, actor-visible reset context, public tool schemas, successful
+   public observations and deterministic local computation over those values.
+2. **Reliably verifiable.** The frozen checker distinguishes success from no-op,
+   wrong target, boundary near miss, partial completion, collateral damage and
+   wrong/stale final answer. A valid alternative route is accepted when one is
+   available.
+3. **Well-posed.** The instruction states every material constraint without
+   exposing protected IDs, native fields, tool names or the reference route.
+4. **Non-trivial.** The goal is false at the start. A mutation Task requires a
+   real transition; a query Task requires information not already supplied as
+   its answer in the Task or reset observation.
+5. **Reproducible.** The same release and StartRecipe recreate the same business
+   predicates on fresh isolated instances, even when incidental IDs or bytes
+   differ.
+6. **Need-anchored and natural.** The goal traces to one or more accepted Brief
+   requirements and a qualified user-facing capability, not an accidental tool
+   chain.
+7. **Training-useful.** The Task names the capability it exercises and records
+   observed interaction cost and empirical difficulty from independent actor
+   trials.
+
+### Corpus qualities
+
+An admitted corpus must additionally be:
+
+- structurally diverse across goal, selector, composition, state regime,
+  binding depth, answer type and empirical difficulty;
+- deduplicated at Blueprint/checker semantics rather than only by text;
+- balanced for its declared SFT or RL use;
+- evaluated by downstream held-out performance rather than claiming universal
+  coverage from an internally defined taxonomy.
+
+## Required S1 v2 handoff
+
+S1 may be changed. The new release is a clean contract; no migration path from
+previous research releases is required.
+
+### Public actor surface
+
+The actor-facing environment remains transport-neutral:
+
+```python
+reset(start) -> JSONValue
+tools() -> tuple[ToolSpec, ...]
+invoke(tool_name, arguments) -> ToolObservation
+close() -> None
+```
+
+### Protected semantics surface
+
+The exact release additionally binds an independently qualified
+`SemanticsBundle` unavailable to the acting Agent:
+
+```python
+start_cases(seed, limit) -> tuple[JSONObject, ...]
+inspect(instance_directory) -> JSONValue
+capabilities() -> tuple[CapabilitySpec, ...]
+enumerate_bindings(capability_id, facts) -> tuple[BindingCandidate, ...]
+evaluate_atom(capability_id, before, after, binding, trace, answer)
+    -> AtomEvaluation
+```
+
+The interfaces may be implemented by release-local Python code, but S1
+Qualification must derive their expected semantics from the Need/Brief, read
+native SQLite/files/Git independently, and physically challenge each taskable
+capability. Candidate business functions and self-reported state are never the
+qualification oracle.
+
+### CapabilitySpec minimum semantics
+
+Each taskable capability provides:
+
+- stable capability and Requirement IDs;
+- actor role, user-facing intent phrase and Task kind;
+- parameter/binding schemas;
+- public descriptor facets and the operators allowed on each facet;
+- initial eligibility and terminal outcome semantics;
+- deterministic answer contract when reporting is required;
+- protected read/write scopes, required effects and forbidden collateral;
+- supported GoalProgram node types;
+- public labels needed for deterministic instruction rendering.
+
+### BindingCandidate separation
+
+A binding contains two strictly separated projections:
+
+```text
+protected binding
+  native identity and evaluator-only facts
+
+public descriptor
+  values safe to state in the Task or rediscover through public tools
+  plus typed selector facets
+```
+
+A protected value may select and verify a Task. It can never be injected into a
+public witness argument.
+
+### Start-space requirements
+
+Every release supplies a deterministic start-case generator bound to the
+release. S2 Task starts are reset-only:
+
+```text
+StartRecipe = exact release ID + canonical reset input
+```
+
+S2 performs no hidden setup calls and never writes native state directly. If the
+start space cannot instantiate a capability or boundary regime, that candidate
+is unsupported rather than repaired through private mutation.
+
+### Prepared release runtime
+
+S1 provides a public `prepare_release/open` runtime that installs exact locked
+bytes and opens each release in an isolated interpreter/process. S2 and S3 must
+not depend on a development checkout, Python import-cache luck or duplicated
+private cold-start code.
+
+## S2 inputs and outputs
+
+### Input
+
+```text
+exact EnvironmentRelease v2
++ prepared isolated runtime
++ public actor surface
++ protected qualified SemanticsBundle
++ synthesis budget and corpus policy
+```
+
+### Output
+
+```text
+Admitted(TaskPack)
+RejectedCandidate(reason, evidence)
+ReleaseDefect(reproducible evidence)
+InfrastructureFailure(identity-preserving diagnostics)
+```
+
+Candidates that fail admission may remain audit records, but there is no
+persistent `QuarantinedCandidate` product lifecycle.
 
 ## Requirements
 
-### R1. Exact release and trust separation
+### R1. Exact identity and trust separation
 
-- Every candidate and TaskPack binds one exact EnvironmentRelease identity.
-  No `latest`, mutable current alias, range resolution or compatibility
-  migration exists.
-- Candidate generators see public docs, ToolSpecs and public observations.
-  They never receive raw native state as user-facing knowledge.
-- The trusted materializer loads the release in a fresh caller-owned instance
-  directory and invokes `reset(start)`; later state changes use only public
-  `invoke()` calls.
-- Reference solvers see the same public interaction surface as the acting Agent.
-- Verifier authoring owns a protected task-local pair: a `TruthExtractor` that
-  reads the trusted episode instance directory and a separate `OutcomeVerifier`
-  that judges an episode against extracted facts, public trace and final answer. The acting
-  Agent receives neither artifact, only its public Task projection, ToolSpecs
-  and structured observations.
+- Every candidate, checker, witness, challenge, trial and TaskPack binds one
+  exact release and semantics-bundle digest.
+- Acting projections never contain the inspector, protected binding, checker,
+  witness, challenge evidence or native state.
+- Generated or model-authored code never receives release source, instance
+  roots or protected semantics unless its named role is trusted and read-only.
+- Changing release semantics, capability contracts, start, Blueprint,
+  instruction, checker or answer schema creates a new identity.
 
-### R2. Reproducible initial world
+### R2. Qualified capability semantics are the only Task truth source
 
-- A private `StartRecipe` binds release identity, canonical `reset(start)` input,
-  any ordinary package-asset references selected by that input and ordered
-  public setup calls.
-- A separate `StartRecord` attests one materialization, public setup trace,
-  protected native baseline, close/reload persistence, fresh-reset replay and
-  runtime identity.
-- S1 Qualification already attests release-level reset, persistence and
-  isolation. S2 checks the candidate Task by validating reset/setup observations,
-  replaying its public reference on another fresh materialization and rerunning
-  its task-local TruthExtractor. It consumes no generic machine-readable
-  invariant manifest from S1.
-- Agreement across fresh materializations means both task-local fact sets satisfy
-  the same frozen business predicates. Dynamic referents are aligned by their
-  public binding role/provenance within each run, never raw incidental ID or byte
-  equality and never an unconstrained subset match.
-- Dynamic values used by setup calls must come from the instruction, public
-  observations or bindings to earlier public results. A recipe depending on a
-  hidden native value is inadmissible.
-- Every dynamic value needed by the Graph witness, Programmatic witness or later
-  acting policy must likewise be present in actor-visible Task context,
-  independently discoverable through public tools, or bound from an earlier
-  public result. Protected native sampling may select a candidate referent, but
-  it cannot become a hidden operand.
-- S2 never writes SQLite, files, Git internals or simulator state directly and
-  never restores a generic native snapshot.
+- S2 admits only goals expressible as a `GoalProgram` over qualified
+  CapabilitySpecs.
+- Tool names, graph connectivity, successful traces and model consensus may
+  guide planning but cannot create a new Task meaning.
+- A capability without a Need/Brief anchor or discriminating S1 qualification
+  cannot enter Task synthesis.
+- New unsupported semantics return to S1 and require a newly qualified release;
+  S2 cannot patch its own truth.
 
-### R3. Both constructive solvability mechanisms are required
+### R3. Deterministic TaskBlueprint generation
 
-Graph-based and Programmatic generation are complementary mandatory candidate
-sources, not mutually exclusive Task types.
+S2 compiles bounded GoalPrograms from the qualified capability algebra:
 
-- Graph-based generation constructs candidates backward from empirically
-  witnessed public tool/data/state dependencies and a successfully replayed
-  public action chain.
-- Programmatic generation constructs a candidate instruction and a bounded
-  reference Python program that uses only the public environment client, then
-  executes and repairs the program until it succeeds or the candidate is
-  rejected.
-- Either mechanism may cover the same capability. Sampling/ranking may prefer a
-  lane for efficiency or coverage, but lane choice is provenance, not proof.
-- Both mechanisms are required at the S2 system/corpus level; one Task does not
-  need two redundant existence witnesses.
-- Both lanes must pass the same fresh-start reference execution and admission.
+```text
+Atom          achieve or query one capability binding
+Select        filter/rank publicly describable candidates, then evaluate a child
+If            choose a branch from a start-state public/qualified condition
+All           require compatible child goals
+ForEach       apply a child goal to every selected binding
+Report        return a deterministic structured result
+```
 
-### R4. Graph-based generation is execution-derived
+- Every node has a named compiler, checker rule, renderer and fingerprint.
+- Composition uses qualified read/write scopes and fresh execution; it never
+  concatenates unrelated capabilities merely to increase length.
+- Unsupported operator/capability combinations are rejected explicitly.
+- LLMs may rank or propose typed candidates, but host validation and compilation
+  are deterministic.
 
-- `tools()`, docs and LLM analysis propose weighted adjacency for sampling;
-  proposed links are not world truth.
-- An `output_binding` is witnessed when an earlier public result supplies a
-  later argument in an executed trace. Weak/independent links may diversify
-  sampling but impose no required order.
-- Graph exploration maintains an environment-neutral pool of actor-visible
-  typed values and JSON-Pointer provenance. Random walk is conditioned on tools
-  whose required arguments can currently be bound; it never samples blindly
-  from the complete catalog or hardcodes domain field names.
-- Every value feeding another call must come from `data` in a successful
-  `invoke()` observation validated against its ToolSpec output schema,
-  Task-visible context or a documented
-  public constant. Missing public roots/operands make the capability unreachable.
-- `contract.*` observations are invalid-action feedback. They never enter the
-  public value pool and cannot witness business refusal, state change, ordering
-  or Task truth.
-- A state-precondition or required-order claim needs a scoped omission/reversal
-  execution on replay-equivalent starts. Full counterfactual testing is not
-  required for edges that remain sampling scaffolding.
-- Random walk or another coverage sampler proposes chains from these labels. It
-  is not solvability proof, and distractor calls are never required solution
-  steps.
-- After pruning, the final public `tau*` chain must execute successfully on a
-  fresh start. That execution is the Graph lane's constructive existence
-  witness; no second reference-solver abstraction is required.
-- Task wording expresses the achieved business goal and constraints, not tool
-  names, database schema, hidden values or the sampled solution sequence.
+### R4. Native-backed parameterized instantiation
 
-### R5. Programmatic generation is public-only
+For every sampled StartRecipe:
 
-- The candidate instruction is grounded in the public Brief, qualified tool
-  surface and a real materialized world.
-- The reference program may call `tools()`/`invoke()`, branch, loop,
-  aggregate and perform local deterministic computation.
-- It cannot import package business code, read instance roots, call the
-  inspector, alter initialization or write private state.
-- Restricting `pi_code` to the same public Environment API as the acting Agent is a
-  deliberate strengthening over implementations that load tool code directly:
-  it proves public-agent solvability rather than privileged-code solvability.
-- Every acting-time operand follows the same public-value provenance rule as the
-  Graph lane.
-- Actual public observations and independently observed native outcomes—not
-  literals or expectations embedded in the program—produce ground truth and any
-  required final answer.
-- The reference program is trusted admission evidence. S3's acting policy still
-  performs its own think/action/observation tool loop.
+1. reset a fresh isolated instance;
+2. capture the public reset observation and protected semantic facts;
+3. enumerate qualified BindingCandidates;
+4. instantiate Blueprint slots and selector rules;
+5. prove the initial TaskChecker is false and the target is unambiguous under
+   the Blueprint semantics;
+6. freeze start facts, protected bindings and checker identity before witness
+   planning.
 
-### R6. Task truth and final answers are type-specific
+A TaskBlueprint is parameterized and may yield multiple TaskPacks across starts
+and bindings. Instance count is not treated as semantic diversity.
 
-- State-changing Tasks primarily use native before/after relations and
-  collateral-damage checks; final text is optional unless the instruction asks
-  for a report or identifier.
-- Read/query Tasks require a final answer derived from actual public execution
-  and cross-checked against native truth where relevant; unintended mutation is
-  normally a failure.
-- Process-constrained Tasks use the host-owned trace for declared milestones,
-  ordering and minefields in addition to the final relation.
-- Composite Tasks combine only the truth channels required by their subgoals.
-- Deterministic native-state, structured-answer and trace checks are preferred.
-  A bounded criterion-specific LLM Judge is permitted only for an irreducibly
-  semantic open-text residual, must abstain when evidence is insufficient, and
-  cannot override a deterministic failure.
-- S2 produces verifier facts and an answer contract; it does not define a
-  universal scalar reward.
+### R5. Checker-before-witness independence
 
-### R7. Independent task-local verifier
+- `TaskChecker` is compiled only from the exact GoalProgram, pre-execution facts,
+  protected bindings, capability evaluators, answer schema and declared process
+  rules.
+- Its bytes/configuration and digest are frozen before the witness planner runs.
+- The reference trace, planner reasoning and returned answer are never inputs to
+  checker construction.
+- The checker evaluates protected before/after facts, the host-owned public
+  trace and the parsed final answer; it never requires reference-path equality.
+- S2 uses no LLM Judge for final Task satisfaction.
 
-- Before source access, the truth author freezes Task/Brief-derived expected
-  relations and acceptance predicates. It may then inspect candidate source
-  read-only solely to locate/decode native representation, with purpose and
-  ordering recorded. It may not import/call candidate code or copy its business
-  predicates/expected literals.
-- It authors a digest-bound task-local `TruthExtractor` from the instruction,
-  StartRecord, Brief, terminal public observations and trusted baseline/terminal
-  instance access. The host executes it on baseline and terminal state. There is
-  no universal state adapter or candidate self-report.
-- For outcome Tasks it sees instruction, StartRecord, terminal public
-  observations and claim-scoped native before/after facts, not the complete
-  reference path.
-- For a declared process-constrained Task it may see the minimal trace projection
-  needed to state the process predicate.
-- The separate `OutcomeVerifier` is authored in a source-free context over
-  extracted task facts, answer contract and only the minimal declared-process
-  trace. Neither protected program receives reference program source or the full
-  ordinary-outcome reference path, calls candidate business functions as oracle,
-  or requires exact reference-path equality.
-- Fresh challenge runs include the positive reference, no-op, wrong parameter,
-  near miss, collateral damage, wrong/stale final answer when applicable, and an
-  alternative valid public path when one exists.
-- Claim-scoped task/verifier/environment mutations or physical negatives must
-  show that challenges depend on the intended semantic relation.
-- TruthExtractor mutations and native near-miss roots must show that fact
-  extraction itself distinguishes the intended entity, field and relation.
+### R6. Public-only constructive witness
 
-### R8. Common admission and trials
+- A host-controlled tool-calling planner receives only the same public surface
+  and Task projection available to a later actor.
+- Its successful execution is compiled into a restricted `WitnessRecipe` whose
+  values are references to Task slots, reset-observation fields, public constants
+  or prior successful tool outputs, plus deterministic local selectors.
+- Every argument carries machine-checkable provenance. A literal with no public
+  origin rejects the candidate.
+- The WitnessRecipe is replayed on at least one fresh equivalent start and must
+  satisfy the already-frozen checker.
+- Redundant calls, distractors and accidental refusals do not become required
+  Task steps. Tool count is not a difficulty label.
 
-- Both lanes rematerialize the exact start and execute a public-only reference
-  solution. This physical execution proves existence of at least one solution.
-- Verifier challenges follow reference success; no model verdict overrides
-  process/native evidence.
-- Repeated independent acting-Agent trials occur after provisional admission and
-  before final sealing. They measure public recoverability, Task wording
-  stability, verifier false negatives, practical feasibility and empirical
-  difficulty—not logical solvability.
-- A bounded S2-owned pilot harness runs these trials and emits only protected
-  trial evidence. It does not create S3 EpisodeRecords or Rewards. The immutable
-  sealing policy requires at least one pilot policy/model lineage independent of
-  the candidate generator and records all policy/runner identities.
-- A Task cannot be sealed into the current public-agent corpus without the
-  later-calibrated repeated-success requirement. All-policy failure leaves a
-  logically solved but unsealed `QuarantinedCandidate`; it cannot negate the
-  executed existence proof. A demonstrated Task/verifier flaw rejects it.
-- Numeric trial counts and thresholds are calibration choices for the later S2
-  implementation task, not architecture constants.
+Graph search, beam search, random walk or generated programs may later optimize
+this planner, but none is part of the Task semantics or a mandatory lane.
 
-### R9. Immutable TaskPack and invalidation
+### R7. Instruction generation and semantic integrity
 
-- TaskPack identity binds exact release identity, private StartRecipe/StartRecord,
-  public instruction and answer contract, verifier bytes/dependencies, reference
-  evidence, challenge evidence, immutable sealing-policy digest, exact trial
-  evidence and final admission status without circular self-inclusion.
-- Provisional candidate identity is distinct from the sealed TaskPack identity.
-- The acting projection excludes initialization, controls, protected baseline,
-  reference solution/trace, verifier source and challenge evidence.
-- A Task or verifier correction creates a new TaskPack identity and does not
-  rewrite the EnvironmentRelease.
-- A reproducible package defect quarantines new admissions and is returned to
-  S1 for cold requalification. A confirmed defect marks that immutable release
-  unavailable for new use and invalidates every descendant TaskPack without
-  rewriting historical bytes.
+- S2 renders the instruction only after Blueprint, start, checker and witness are
+  established.
+- Canonical rendering uses qualified public labels and bounded GoalProgram
+  templates. An optional LLM paraphrase is admitted only when it round-trips to
+  the same structured instruction frame.
+- Mechanical audits reject protected values, native field names, undeclared
+  constraints, tool names, answer leakage and reference-order hints.
+- Independent actor trials must not expose a repeatable alternate interpretation
+  accepted by the wording but rejected by the checker.
 
-### R10. S3 handoff
+### R8. Adversarial admission
 
-S3 receives the TaskPack public projection for the acting Agent and the protected
-projection for its trusted runtime. S3 loads the exact EnvironmentRelease,
-recreates the start with `reset`, exposes ToolSpecs through its selected Agent
-adapter, owns the episode loop and public trace, captures final answer/native evidence, executes
-the frozen verifier, and emits EpisodeRecord plus Reward or abstention. S2 does
-not implement rollout scheduling, trajectory formats, scalar reward mapping or
-training.
+Admission executes, where applicable:
 
-## Design acceptance criteria
+- positive witness and fresh witness replay;
+- no-op;
+- wrong target/binding;
+- boundary near miss;
+- partial `All`/`ForEach` completion;
+- correct goal plus collateral action;
+- wrong or stale structured answer;
+- same outcome through an alternative public path;
+- process-rule violation reaching the same terminal outcome.
 
-- [ ] Graph-based flow records public output provenance, executes and freshly
-  replays `tau*`, and uses scoped intervention only for asserted order or state
-  necessity.
-- [ ] Programmatic flow proves public tool-call solvability without making code
-  execution the acting policy interface.
-- [ ] Booking and filesystem/Git each traverse both generation, truth,
-  verification and TaskPack boundaries without hardcoded framework support.
-- [ ] After S1/S2 generic artifacts freeze, an independently selected held-out
-  multi-Need suite exercises both lanes without new domain bindings, field-name
-  rules or private-value adapters in the framework.
-- [ ] Task types and final-answer behavior have explicit truth sources.
-- [ ] Public/protected role projections prevent answer, path and native-state
-  leakage.
-- [ ] Every S2 operation maps to a named, physically tested S1 capability; the
-  S1 plan contains no unconsumed S2 schema/reward mechanism.
-- [ ] A fresh cross-layer review finds no S2 operation that would require direct
-  state mutation or an S1 package compatibility redesign.
+S1 physical negatives establish atomic inspector/evaluator sensitivity. S2
+challenges establish Blueprint composition, selection, answer and instruction
+sensitivity. Syntax failures, crashes and unreachable mutations do not count as
+semantic evidence.
 
-## Deferred until S2 implementation planning
+### R9. Independent actor trials and utility evidence
 
-- Models, prompts, Skills, code layout and service/process topology.
-- Lane sampling ratios, graph persistence, ranking, deduplication and corpus mix.
-- Trial counts, difficulty thresholds and curriculum policy.
-- TaskPack serialization/storage, verifier dependencies and access controls.
-- Mutation automation, batch execution, scaling and operational budgets.
-- EpisodeRecord schema, reward mapping, SFT/RL integration and training.
+- At least one acting model/policy lineage is independent of the capability
+  author, instruction renderer and witness planner.
+- Trials run through the same public actor surface and frozen TaskChecker.
+- Results measure wording recoverability, practical feasibility, tool/token
+  cost, reliability and empirical difficulty; they do not replace constructive
+  solvability.
+- A logically solved Task with systematic independent-agent failure is rejected
+  for the current corpus until its wording, observability or target policy is
+  causally corrected.
+- The trial runner is a shared actor-loop component later reused by S3 rather
+  than independently reimplemented.
 
-## Evidence basis
+### R10. Structural corpus selection
 
-- Agent-World Graph/Programmatic synthesis: <https://arxiv.org/html/2604.18292>
-- PROVE live tool synthesis/replay: <https://arxiv.org/html/2606.03892>
-- AWM executable environment generation: <https://arxiv.org/html/2602.10090>
+Each admitted Task receives a deterministic fingerprint including:
+
+```text
+capability IDs and effect signature
+GoalProgram AST shape
+selector/facet operators
+entity/relation count
+public binding depth
+state regime and refusal role
+answer/process requirements
+witness control-flow and cost
+empirical difficulty band
+```
+
+- Deduplication happens first at Blueprint/checker equivalence, then at public
+  text similarity.
+- Corpus policies declare target distributions and budgets explicitly.
+- Selection may use stratification, novelty search or quality-diversity
+  algorithms, but no internal coverage score is called complete Task-space
+  coverage.
+- Final value is established by matched-budget held-out SFT/RL evaluation.
+
+### R11. TaskPack and S3 handoff
+
+The public projection contains only:
+
+```text
+TaskPack ID and exact release ID
+natural-language instruction
+actor-visible reset context
+public process constraints
+structured final-answer schema
+public limitations
+```
+
+The protected projection contains only material required by S3:
+
+```text
+StartRecipe and protected start facts/bindings
+GoalProgram and frozen TaskChecker
+WitnessRecipe and solvability evidence
+challenge and independent-trial evidence
+semantics-bundle references/digests
+fingerprint and quality report
+```
+
+S2 does not define optimizer batches, SFT token masks, RL advantages or a model-
+specific tool-call envelope.
+
+### R12. Fail closed without hidden fallback
+
+- Provider, dependency, timeout and runner defects retain exact identities and
+  return `InfrastructureFailure`.
+- Reproducible release/runtime/semantics defects return `ReleaseDefect` with
+  public calls and protected evidence sufficient for S1 requalification.
+- Candidate defects return a typed rejection reason; they are not relabeled as
+  high difficulty.
+- No fallback LLM Judge, hard-coded domain evaluator, compatibility reader,
+  native setup patch or canned Task may turn a failure into admission.
+
+## Acceptance criteria
+
+- [ ] `EnvironmentRelease v2` binds a protected SemanticsBundle, start-case
+  generator and public preparation/open runtime, all cold-verifiable by digest.
+- [ ] The same frozen S1 framework produces and qualifies taskable capability
+  contracts for the existing SQLite-backed environment and filesystem/Git
+  environment without domain branches.
+- [ ] Every declared taskable capability either yields an admitted atomic
+  TaskPack or an evidence-backed unsupported reason; silent omission is invalid.
+- [ ] Every GoalProgram node declared supported by the conformance releases has
+  at least one full real execution through instantiation, checker freeze,
+  public witness, fresh replay, instruction audit and adversarial admission.
+- [ ] No admitted witness argument originates from protected state.
+- [ ] Every admitted mutation Task starts with a false goal and performs a real
+  qualified state transition; query answers are derived from public execution.
+- [ ] Checker challenges kill no-op, wrong-target, near-miss, partial,
+  collateral and wrong-answer cases applicable to the Blueprint, and accept a
+  genuinely different valid route when one exists.
+- [ ] An S3-shaped consumer recreates and verifies admitted TaskPacks solely from
+  their frozen public/protected projections.
+- [ ] After generic code, prompts and contracts are frozen, a held-out Need
+  produces a release and admitted Tasks without adding framework domain fields,
+  evaluator branches or Task templates.
+- [ ] Matched-budget experiments compare the new system with LLM-only Task
+  generation, execution-filtered trajectory abstraction and the previous
+  Graph/Programmatic proposal, reporting yield, replay, verifier sensitivity,
+  structural diversity, cost and downstream generalization.
+- [ ] Ruff, mypy, unit/integration tests and all real cold cross-domain trials
+  pass; fixture-only tests never authorize product completion.
+
+## Fatal rejection criteria
+
+The method must be reconsidered rather than cosmetically patched if any of these
+persist after causal debugging:
+
+- held-out releases require framework code containing domain names or native
+  field rules;
+- qualified capability contracts cannot achieve high physical-negative
+  sensitivity without human task-specific repair;
+- public witness replay succeeds only by leaking protected bindings;
+- checker false acceptance remains material under wrong-target or collateral
+  challenges;
+- Task yield collapses for releases whose actor surface is otherwise complete;
+- structural diversity does not improve matched-budget held-out training or
+  evaluation relative to simpler baselines;
+- the same model-authored semantics repeatedly cause correlated environment,
+  checker and Task errors that independent Qualification cannot detect.
+
+## Out of scope
+
+- compatibility with `environment-package/1` or the previous S2 documents;
+- subjective creative-writing or other Tasks whose success cannot be reduced to
+  qualified deterministic state/answer/process evidence;
+- MCP, HTTP or provider-specific tool-call envelopes as environment semantics;
+- S3 trajectory persistence and scalar reward mapping;
+- S4 optimizer/training implementation;
+- claims of universal Task-space coverage.
+
+## Planning status
+
+This task remains `planning`. The PRD, design, implementation plan and worker
+context manifests must be reviewed as one coherent proposal. Product code and
+`task.py start` require a later explicit user approval of that final summary.
