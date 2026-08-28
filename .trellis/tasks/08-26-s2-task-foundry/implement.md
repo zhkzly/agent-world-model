@@ -3,39 +3,41 @@
 ## 1. Execution boundary
 
 This is the complete production implementation plan, not a demo/MVP plan. Each
-section is a dependency checkpoint; no checkpoint may be described as S2
-completion. Completion requires both contrasting real releases, preregistered
-Task-yield/structure floors, held-out transfer and the Good Task gates in the PRD.
+checkpoint is a dependency boundary; none may be described as S2 completion.
+Completion requires both real conformance releases, preregistered Task-yield and
+structure floors, held-out transfer and every Good Task gate in the PRD.
 
-The work is a clean break:
+Clean break:
 
 - publish `EnvironmentRelease v2` only;
-- do not implement v1 compatibility/migration;
-- do not preserve mandatory Graph/Programmatic Task lanes;
-- do not add hidden setup, LLM final judging or domain framework branches.
+- no v1 compatibility/migration;
+- no mandatory Graph/Programmatic Task lanes;
+- no hidden setup, LLM final judge or domain framework branches.
 
 The user explicitly waived `plan-document-write` Patrol for this planning update.
-Normal code review, tests and causal failure attribution remain required.
+Code review, deterministic tests and causal semantic evidence remain required.
 
 ## 2. Code versus model responsibilities
 
-### Framework code that must be implemented directly
+### Framework code implemented directly
 
 ```text
-release parsing/preparation/process isolation
-public/protected proxies and Host journal
+v2 release parsing/preparation/two-runtime isolation
+public/protected proxies, no-mutation checks and Host journal
 TaskSemantics schemas/validation
-identity/canonical serialization
-StartCase iteration and Blueprint enumeration
+canonical identities/serialization
+StartCase iteration and deterministic Blueprint enumeration
+selector/composition/condition rules
 GoalProgram/checker compilation and execution
 canonical instruction rendering/audits
-Responses tool dispatch/trace capture/provenance
-fresh witness and challenge verdicts
-TaskDefinition/TaskPack/TaskAssessment/CorpusManifest
-semantic deduplication and deterministic selection
+Responses tool dispatch/trace/provenance
+fresh witnesses and challenge verdicts
+TaskDefinition/TaskPack identities
+TaskAssessment and CorpusManifest
+semantic deduplication/corpus selection
 ```
 
-None of these may be replaced by “tell the model to be careful”.
+None may be replaced by “tell the model to be careful”.
 
 ### Codex SDK code-generation tasks
 
@@ -43,12 +45,12 @@ None of these may be replaced by “tell the model to be careful”.
 Environment Builder
   writes actor uv project in its own workspace
 
-Semantics Author
-  writes protected TaskSemantics uv project in a fresh independent workspace
+TaskSemantics Author
+  writes protected semantics uv project in a fresh independent workspace
 ```
 
-Both receive immutable Host files, run bounded repair turns and are accepted only
-by deterministic checks plus real native/public evidence.
+Both receive immutable Host inputs, run bounded factual repair turns and are
+accepted only by deterministic checks plus public/native physical evidence.
 
 ### Responses Agent tasks
 
@@ -57,19 +59,17 @@ public witness search
 independent TaskAssessment trials
 ```
 
-The Host owns the episode loop and ToolSpec-derived function dispatch. These are
-acting-policy tasks, not Codex code-writing tasks.
+The Host owns the ToolSpec-derived function loop. These are acting-policy tasks,
+not Codex code-writing tasks.
 
 ## 3. Initial package ownership
-
-Start with the smallest modules that have distinct consumers:
 
 ```text
 src/agent_env_foundry/
   existing modules
   preparation.py
   semantics.py
-  qualification.py        # extend, do not create a second Agent organization
+  qualification.py        # extend existing independent route
   release.py
   publication.py
 
@@ -83,7 +83,7 @@ src/agent_task_foundry/
   api.py
 ```
 
-New runtime Skills/contracts:
+Runtime Skills/contracts:
 
 ```text
 src/agent_env_foundry/runtime_skills/task-semantics-codegen/SKILL.md
@@ -92,20 +92,21 @@ src/agent_task_foundry/runtime_skills/witness-agent/SKILL.md
 ```
 
 Do not pre-create plugins, graph packages, workflow engines, services or a
-Registry. Split files only after an observed ownership/test boundary.
+Registry. Split only after a real ownership/test boundary appears.
 
 ## 4. Ordered implementation checkpoints
 
-### Checkpoint 1 — Freeze types, identities and failing contract tests
+### Checkpoint 1 — Freeze contracts, identities and failing tests
 
 #### Framework work
 
 Implement immutable dataclasses/protocols and canonical serialization for:
 
 ```text
-PreparedRelease / PreparedSession public+trusted projections
+PreparedRelease / PreparedSession actor+trusted projections
 StartCase
-CapabilitySpec / FacetSpec / ConditionSpec / AnswerFieldSpec / RenderingSpec
+CapabilitySpec / CompositionRule / FacetSpec / ConditionSpec
+AnswerFieldSpec / RenderingSpec
 BindingCandidate / AtomCheckRequest / AtomCheckResult
 SelectorSpec
 AtomGoal / AllGoal / IfGoal / ForEachGoal
@@ -116,15 +117,23 @@ TaskAssessment / TaskFingerprint / CorpusManifest
 all typed non-success outcomes
 ```
 
-Create tests that fail against current v1 releases and prove:
+Key type rules:
 
-- no circular identity preimages;
+- `IfGoal.then_goal` and `else_goal` may be `None`, but at least one is a goal and
+  any goal-less branch requires a qualified condition report field;
+- `AllGoal` contains a `composition_rule_id`;
+- `FacetSpec.public_tool` contains an explicit ToolSpec output-schema pointer;
 - TaskDefinition excludes witness/model/corpus evidence;
-- TaskPack excludes TaskAssessment;
-- public projections cannot deserialize protected fields;
+- TaskPack excludes TaskAssessment.
+
+#### Tests
+
+- current v1 release fails the v2 contract;
+- no circular identity preimages;
+- public projection cannot deserialize trusted fields;
 - four Goal nodes only; selection/report are attributes;
-- initial ordering event model can prove checker and instruction freeze before a
-  model call.
+- semantics no-mutation event model exists;
+- ordering journal can prove checker/instruction freeze before model call.
 
 #### Files
 
@@ -145,13 +154,14 @@ uv run ruff check src tests
 
 #### Stop conditions
 
-- a model/object has no named producer and consumer;
-- one identity changes because a model trial or log formatting changes;
-- public/protected projections rely only on developer convention.
+- an object has no named producer/consumer;
+- model trial/log formatting changes Task identity;
+- public/protected separation is convention-only;
+- cross-capability composition lacks an explicit rule ID.
 
 ---
 
-### Checkpoint 2 — S1 v2 immutable release preparation and isolated opening
+### Checkpoint 2 — S1 v2 immutable preparation and separate runtimes
 
 #### Framework work
 
@@ -162,13 +172,19 @@ prepare_release(release_path: Path, cache_root: Path) -> PreparedRelease
 PreparedRelease.open(instance_directory: Path) -> PreparedSession
 ```
 
-- define clean outer/inner v2 descriptors binding actor and semantics projects;
-- prepare exact locked dependencies from directory/ZIP;
-- launch one isolated child interpreter per opened exact release/session;
-- expose typed actor/trusted proxies over the existing subprocess/journal style;
-- keep load/attach separate from explicit reset;
-- bind runtime identity and reject byte/mode/digest tampering;
-- delete same-process import-cache assumptions; add no v1 loader.
+- clean outer/inner v2 descriptors binding actor and semantics projects;
+- exact locked preparation from directory/ZIP;
+- separate actor and semantics runtimes/child interpreters;
+- actor runtime has actor package and instance read/write;
+- semantics runtime has semantics package, no actor package import and trusted
+  calls wrapped by before/after instance tree manifests;
+- Host-owned public/trusted call journals and runtime identities;
+- loading/attaching does not reset;
+- actor/semantics byte/mode/digest tampering rejected;
+- no v1 compatibility path.
+
+Use the existing subprocess/Host-journal design. Internal stdin/stdout messaging
+is private implementation detail, not a product service/protocol.
 
 #### Files
 
@@ -176,18 +192,21 @@ PreparedRelease.open(instance_directory: Path) -> PreparedSession
 src/agent_env_foundry/preparation.py
 src/agent_env_foundry/release.py
 src/agent_env_foundry/publication.py
-src/agent_env_foundry/_release_runner.py
+src/agent_env_foundry/_actor_runner.py
+src/agent_env_foundry/_semantics_runner.py
 tests/test_release_v2.py
 tests/test_preparation.py
 ```
 
-#### Required real cases
+#### Real cases
 
-- prepare two generated releases that use the same Python package name;
-- keep sessions live simultaneously and prove no import/state aliasing;
-- relocate ZIPs and reopen them;
-- reload an instance without implicit reset;
-- tamper actor and semantics bytes separately and reject both.
+- prepare two releases sharing the same generated package name;
+- keep both actor and semantics sessions live without import/state aliasing;
+- prove trusted calls leave instance tree unchanged;
+- prove semantics runtime cannot import actor business package;
+- relocate/reopen ZIPs;
+- reload instance without implicit reset;
+- tamper actor/semantics separately and reject.
 
 #### Validation
 
@@ -199,51 +218,54 @@ uv run ruff check src tests
 
 #### Stop conditions
 
-- S2 needs a development checkout/private cold helper;
-- child process can import another release accidentally;
-- preparation rewrites published bytes or dependency locks.
+- S2 needs development checkout/private cold helper;
+- actor imports alias across releases;
+- trusted call can mutate state or import actor oracle;
+- preparation rewrites published bytes/locks.
 
 ---
 
 ### Checkpoint 3 — Extend independent S1 Qualification to author TaskSemantics
 
-This checkpoint contains both Codex SDK work and deterministic Host work.
+This checkpoint contains Codex SDK authoring and deterministic Host work.
 
 #### 3A. Host expected-semantics freeze
 
-Extend the current independent Qualification preparation to produce and freeze:
+Extend current independent Qualification preparation to create/freeze:
 
 ```text
 EXPECTED_TASK_SEMANTICS.json
-  Requirement/workflow coverage
-  actor role and user intent
-  expected precondition/outcome/refusal/collateral relations
-  candidate Taskable/NotTaskable/Unsupported disposition
+  complete Requirement disposition
+  actor/intents/preconditions/outcomes/refusals/collateral
+  workflow IDs
+  explicit CompositionRules
+  public ConditionSpecs and branch licenses
 
 PUBLIC_SURFACE.json
-  public docs, start/reset schemas, ToolSpecs and selected public probe facts
+  public docs/start-reset schemas/ToolSpecs/public probe facts
 
 TASK_SEMANTICS_CONTRACT.md
-  exact protected protocol, schemas and forbidden imports/authority
+  exact protocol/schemas/output-path/import/no-mutation rules
 ```
 
-Expected relations are frozen before source/native decoding is exposed. Host
-validates every core Requirement disposition.
+Expected records are produced in a fresh typed model context, validated by Host
+for complete Requirement/workflow coverage and frozen before candidate/native
+source decoding is staged.
 
 #### 3B. Codex SDK Semantics Author
 
-Implement `run_semantics_author(...)` using the same hardened pattern as
-`run_builder(...)`:
+Implement `run_semantics_author(...)` using the hardened `run_builder(...)`
+pattern:
 
 ```text
 fresh Codex home/thread/workspace
-approval denied, full workspace sandbox
+approval deny-all, full own-workspace sandbox
 immutable Host inputs
-read-only candidate view staged only after relation freeze
-bounded repair turns from factual Host failures
+read-only candidate view only after relation freeze
+bounded repair turns from complete factual Host failures
 ```
 
-Codex writes a complete standalone semantics uv project implementing:
+Codex writes a standalone semantics uv project implementing:
 
 ```text
 start_cases
@@ -254,37 +276,41 @@ evaluate_atom
 evaluate_condition
 ```
 
-It owns no Host digest, manifest, verdict or actor code.
+It owns release-specific decoding and semantics records, but no actor bytes, Host
+digests/manifests/verdicts or concrete Task instances.
 
-#### 3C. Host semantic qualification
+#### 3C. Host semantic Qualification
 
-Extend `qualification.py` rather than introducing another Agent pipeline.
-For every Taskable capability, execute and prove:
+For every Taskable capability prove:
 
 ```text
 eligible StartCase exists
-inspect agrees with independent native read
+inspect agrees with independent native reader
 bindings/public descriptors identify intended referents
 public success flips atomic truth
-no-op/wrong-target/boundary remain false
-required effects and forbidden collateral differ
-answer fields are grounded
-public facets/conditions are observable
+no-op/wrong target/boundary remain false
+required effects and collateral differ
+answer/report values are grounded
+public_tool facets/conditions have explicit output-schema paths and real output
+CompositionRules/condition branches map to accepted Brief workflow relations
 fresh reset preserves predicates
+trusted calls do not mutate instance
+semantics runtime cannot import actor package
 physical inspector/evaluator mutants are killed while executable
 ```
+
+Marker/declaration-only and syntax/import/crash mutants do not count.
 
 #### Failure routing
 
 ```text
-actor relation wrong        -> EnvironmentDefect -> Builder repair -> regenerate semantics
-semantics decoding wrong     -> SemanticsDefect -> same semantics thread repair
-expected relation unsupported-> Research/Brief disposition
-provider/dependency failure  -> identical retry or InfrastructureFailure
+actor relation wrong         -> EnvironmentDefect -> rebuild actor -> regenerate semantics
+semantics decoding wrong      -> SemanticsDefect -> same semantics thread repair
+expected relation unsupported -> Research/Brief disposition
+provider/dependency failure   -> identical retry or InfrastructureFailure
 ```
 
-Any actor byte change invalidates the semantics project and reruns all semantic
-checks.
+Any actor byte change invalidates the semantics project and all semantic evidence.
 
 #### Files
 
@@ -307,11 +333,12 @@ uv run ruff check src tests
 
 #### Stop conditions
 
-- a new Researcher/Critic/Arbiter organization appears;
+- new Researcher/Critic/Arbiter product organization;
 - semantics imports/calls actor business functions as oracle;
-- marker/syntax/crash mutants count as semantic evidence;
-- a core Requirement disappears silently;
-- framework contains domain capability templates.
+- broad ToolSpec schema authorizes hidden nested public fields;
+- marker/crash mutants count;
+- core Requirement disappears;
+- framework contains domain templates.
 
 ---
 
@@ -320,11 +347,11 @@ uv run ruff check src tests
 #### Framework work
 
 - assemble actor + semantics projects into one immutable v2 artifact;
-- bind both digests, public docs/schemas and semantic Qualification evidence;
-- build/install both exact distributions in cold unrelated directories;
-- run public actor calls and protected semantics checks from exact archived bytes;
-- expose v2 verify/prepare commands through the existing direct CLI;
-- remove old v1 publication success path on this branch.
+- bind both digests, schemas/docs and semantic evidence;
+- build/install both exact distributions in cold unrelated directories/runtimes;
+- replay actor public calls and protected semantic checks from archived bytes;
+- expose v2 verify/prepare through existing direct CLI;
+- remove v1 publication success path on this branch.
 
 #### Files
 
@@ -346,42 +373,39 @@ foundry verify-release --release <v2-directory-or-zip>
 
 #### Stop conditions
 
-- the wheel alone is treated as the release;
-- cold verification cannot reproduce semantics evidence;
-- actor/trusted projections are mixed in the public CLI/runtime.
+- wheel alone treated as release;
+- cold semantics evidence not reproducible;
+- actor/trusted projections mixed.
 
 ---
 
-### Checkpoint 5 — Deterministic S2 compiler, checker and canonical instruction
+### Checkpoint 5 — Deterministic S2 compiler, checker and instruction
 
-#### Framework work
-
-Implement in `agent_task_foundry`:
+#### Framework work only
 
 1. exact v2 release admission;
 2. StartCase/fact/binding materialization;
 3. deterministic selector generation;
 4. bounded four-node GoalProgram enumeration;
-5. cross-capability composition only through shared qualified workflow IDs and
-   compatible scopes;
-6. TaskChecker compilation and canonical digest;
-7. initial-goal-false, cardinality/tie and hidden-operand gates;
-8. deterministic canonical instruction/answer schema rendering;
-9. slot coverage, leakage, tool/path/answer and cardinality audits.
+5. explicit CompositionRule and ConditionSpec enforcement;
+6. optional report-only If branch only through condition report field;
+7. TaskChecker compilation/canonical digest;
+8. initial-goal-false, cardinality/tie and hidden-operand gates;
+9. deterministic canonical instruction/answer schema rendering;
+10. slot coverage, schema-path, leakage, tool/path/answer/cardinality audits.
 
-No model call occurs in this checkpoint.
+No model call occurs.
 
-#### Required compiler order test
+#### Required order
 
 ```text
-compile checker
--> freeze checker digest
--> render/audit instruction
--> freeze TaskDefinition
+compile/freeze checker
+-> render/audit/freeze instruction
+-> persist TaskDefinition
 -> emit model-call permission event
 ```
 
-A test model factory must fail if invoked before this event.
+Test model factory fails if invoked earlier.
 
 #### Files
 
@@ -405,37 +429,38 @@ uv run mypy src
 uv run ruff check src tests
 ```
 
-#### Semantic-negative cases
+#### Semantic negatives
 
-- unqualified capability/condition;
-- `AllGoal` without shared workflow;
-- incompatible write scopes;
-- unique selector tie;
-- empty/vacuous selector;
+- unqualified capability/condition/composition;
+- shared workflow but no CompositionRule;
+- composition rule set mismatch/incompatible scopes;
+- unlicensed If branch or goal-less branch without report field;
+- unique selector tie/empty/vacuous selector;
 - duplicate/redundant child;
-- already-satisfied goal;
+- initially satisfied goal;
 - hidden target descriptor;
 - missing/extra/strengthened instruction constraint;
+- broad/missing public output-schema path;
 - answer/tool/native/path leakage.
 
 #### Stop conditions
 
-- arbitrary Python is needed for a supported checker;
-- an LLM is needed to enumerate/validate a Blueprint;
-- standalone Select/Report nodes reappear without a demonstrated need;
-- the compiler branches on domain labels/fields.
+- arbitrary Python needed for checker;
+- LLM needed to enumerate/validate Blueprint;
+- standalone Select/Report AST reappears without real need;
+- compiler branches on domain labels/fields.
 
 ---
 
-### Checkpoint 6 — Public Responses episode runner and constructive witnesses
+### Checkpoint 6 — Public Responses runner and two constructive witnesses
 
 #### Framework work
 
-Implement one neutral Host-owned public episode runner:
+Implement:
 
 ```python
 run_public_episode(
-    session_actor,
+    actor,
     instruction,
     reset_context,
     tool_specs,
@@ -445,22 +470,22 @@ run_public_episode(
 ) -> EpisodeRun
 ```
 
-- build strict Responses function tools from ToolSpecs;
-- preserve exact model output items/function results across turns;
-- Host dispatches and validates every call/observation;
-- record canonical trace, usage, final answer and runtime identities;
-- expose no trusted/checker fields to the policy;
-- validate load-bearing argument provenance;
-- classify agent-generated free inputs separately from protected/public operands;
-- reject protected-only guesses and prose/error scraping;
-- run two fresh successful witnesses for every TaskDefinition;
-- do not implement WitnessRecipe, expression DSL or removal replay.
+- strict Responses function tools from ToolSpecs;
+- exact prior output/function-result items across turns;
+- Host dispatch/observation schema validation;
+- canonical trace, usage, answer/runtime identities;
+- no trusted/checker projection;
+- load-bearing provenance validation;
+- `public_tool` values only at qualified schema paths;
+- AgentChoice only for non-target/non-answer/non-fixed free inputs and never a
+  protected-only binding;
+- protected guess and prose/error scraping rejection;
+- two fresh successful witnesses per TaskDefinition;
+- no WitnessRecipe/expression/removal-replay subsystem.
 
 #### Responses Skill
 
-`witness-agent/SKILL.md` gives method guidance only: understand the instruction,
-inspect public tools/results, recover dynamic IDs publicly, handle business
-refusals and return the declared answer schema. Host checks every property.
+`witness-agent/SKILL.md` gives method guidance only. Host enforces all properties.
 
 #### Files
 
@@ -474,13 +499,14 @@ tests/task_foundry/test_witness.py
 
 #### Validation
 
-- two fresh runs may use different IDs/routes but pass the same checker;
-- policy cannot access protected proxies even by serialization/introspection;
-- a guessed native ID is rejected;
-- `contract.*` errors provide no value/truth;
-- a free commit message is allowed only as non-load-bearing AgentChoice;
-- final answer schema is enforced;
-- `NoPublicWitness` is distinct from logical impossibility.
+- fresh runs may use different IDs/routes but same checker;
+- actor cannot access trusted proxy through serialization/introspection;
+- guessed protected ID rejected;
+- `contract.*` provides no value/truth;
+- free commit message allowed only as non-load-bearing AgentChoice;
+- missing output-schema path rejects load-bearing public-tool operand;
+- answer schema enforced;
+- `NoPublicWitness` distinct from impossibility.
 
 ```bash
 uv run pytest -q tests/task_foundry/test_runner.py \
@@ -490,10 +516,10 @@ uv run pytest -q tests/task_foundry/test_runner.py \
 
 #### Stop conditions
 
-- Codex SDK is used as the acting witness loop;
-- successful model text without real tool execution counts;
-- checker/native failure details leak back to the policy;
-- tool count becomes a difficulty label.
+- Codex SDK used as witness loop;
+- model text without real tools counts;
+- checker/native failure details leak;
+- tool count becomes difficulty.
 
 ---
 
@@ -503,45 +529,44 @@ uv run pytest -q tests/task_foundry/test_runner.py \
 
 Implement:
 
-- positive witness #1/#2;
-- no-op;
-- wrong/near-miss target where reachable;
-- partial All/ForEach;
-- collateral action where reachable;
-- wrong/stale/malformed answer;
-- valid alternative action signature;
-- process violation where declared;
-- checker mutation generation and kill report;
-- typed `not_applicable(reason)` without score inflation.
+```text
+witnesses #1/#2
+no-op
+wrong/near-miss target
+partial All/ForEach
+collateral action
+wrong atom/condition report
+valid alternative signature
+process violation
+checker mutations: child/set/selector/condition/collateral/answer/process
+not_applicable(reason) without score inflation
+```
 
 Seal:
 
 ```text
-TaskDefinition
-+ two WitnessRuns/provenance
-+ AdmissionReport
--> TaskPack
+TaskDefinition + two WitnessRuns/provenance + AdmissionReport -> TaskPack
 ```
 
-No independent actor trial/difficulty/corpus policy enters TaskPack identity.
+No model trial/difficulty/corpus policy enters TaskPack identity.
 
-#### 7B. Model-relative TaskAssessment
+#### 7B. TaskAssessment
 
-Reuse `run_public_episode` with an independent route/policy identity. Record
-pass/failure attribution, calls, tokens, latency and reliability. Pure model
-failure excludes the TaskPack from a target corpus; only causal evidence of an
-intrinsic defect invalidates the TaskPack.
+Reuse `run_public_episode` with independent route/policy. Record reliability,
+failure attribution, calls, tokens and latency. Pure model failure excludes a
+TaskPack from a target corpus; only causal intrinsic defect evidence invalidates
+TaskPack.
 
 #### 7C. Corpus selection
 
-- compute model-independent structural fingerprint;
-- deduplicate exact TaskDefinition/checker semantics;
+- model-independent fingerprint including composition rule IDs;
+- exact TaskDefinition/checker dedup;
 - text-near-duplicate filter inside structural groups;
-- apply capability/Goal/start budgets;
-- combine separate assessment reliability/cost;
-- produce immutable `CorpusManifest` and audit surplus/rejections.
+- capability/Goal/start budgets;
+- separate assessment reliability/cost;
+- immutable CorpusManifest and surplus/rejection audit.
 
-#### Direct API/CLI
+#### API/CLI
 
 ```python
 synthesize_tasks(
@@ -560,7 +585,7 @@ foundry synthesize-tasks \
   --output <task-store>
 ```
 
-No service layer is introduced.
+No service layer.
 
 #### Files
 
@@ -586,88 +611,88 @@ uv run ruff check src tests
 
 #### Stop conditions
 
-- TaskPack ID changes because another model is assessed;
-- empirical difficulty appears in structural fingerprint;
-- unreachable/crashing challenges improve mutation kill rate;
-- a valid Task is relabeled defective only because a weak model fails;
-- corpus size is inflated by paraphrases/parameter-only duplicates.
+- assessment changes TaskPack ID;
+- empirical difficulty in structural fingerprint;
+- unreachable/crashing challenges improve kill rate;
+- weak-model failure relabeled Task defect without cause;
+- paraphrase/parameter duplication inflates corpus.
 
 ---
 
-### Checkpoint 8 — Real cross-domain verticals, held-out transfer and paper gates
+### Checkpoint 8 — Real cross-domain, held-out and paper gates
 
-#### 8A. Regenerate the two conformance releases
+#### 8A. Regenerate conformance releases
 
 1. SQLite-backed ocean-container dispute world;
 2. filesystem/Git repository-maintenance world.
 
-For each exact release:
+For each:
 
 ```text
 Need/Research
 -> actor Codex project
 -> independent TaskSemantics Codex project
--> semantic physical Qualification
--> cold EnvironmentRelease v2
--> deterministic Blueprints/checkers/instructions
+-> physical semantic Qualification
+-> cold v2 release
+-> deterministic Tasks/checkers/instructions
 -> two public witnesses
 -> challenge admission
--> TaskAssessment and CorpusManifest
+-> TaskAssessment/CorpusManifest
 -> S3-shaped cold recreation
 ```
 
-#### Anti-demo floors per conformance release
+Anti-demo floors per release:
 
 ```text
 >= 20 admitted TaskPacks after semantic deduplication
 >= 4 canonical Goal/selector structure signatures
 >= 2 qualified StartCase regimes
-every core Taskable capability represented or newly dispositioned Unsupported
+every core Taskable capability represented or newly Unsupported with evidence
 ```
 
-Parameter-only changes and paraphrases do not satisfy structure floors.
+Parameter-only changes/paraphrases do not count.
 
 #### 8B. Freeze and held-out transfer
 
-Freeze framework code, contracts and Skills before selecting a new Need. Without
-framework domain edits, require:
+Freeze framework/contracts/Skills before selecting a new Need. Without framework
+domain edits require:
 
 ```text
 >= 10 admitted TaskPacks
 >= 3 canonical structure signatures
->= 2 taskable capabilities or an explicit method-falsifying result
-complete public-solvability/checker/leakage/cold evidence
+>= 2 taskable capabilities or explicit method-falsifying result
+complete solvability/checker/leakage/cold evidence
 ```
 
-#### 8C. Matched baselines and ablations
+#### 8C. Baselines and ablations
 
 Baselines:
 
-1. LLM writes Tasks from docs/tools;
-2. successful public traces are abstracted into Tasks;
+1. LLM writes Task from docs/tools;
+2. successful trace abstraction;
 3. old Graph/Programmatic proposal;
-4. new qualified-capability compiler;
-5. bounded human-authored Task/checker quality reference.
+4. qualified-capability compiler;
+5. bounded human-authored quality reference.
 
 Ablations:
 
 ```text
-remove Brief/workflow anchors
-checker built after witness
+remove Brief/workflow/composition anchors
+checker after witness
 remove physical semantic negatives
-remove public-provenance gate
+remove public provenance/schema-path gate
 text-only diversity
-merge TaskAssessment into TaskPack policy
+merge TaskAssessment into TaskPack
 ```
 
 Metrics:
 
 ```text
-capability disposition and admitted yield
-fresh public witness success
-hidden-operand rejection
+capability disposition and yield
+fresh witness success
+hidden operand rejection
 checker mutation kill/false acceptance
-valid-alternative false rejection
+alternative false rejection
 instruction defects
 structural redundancy/diversity
 actor reliability/calls/tokens/runtime
@@ -675,8 +700,8 @@ held-out Task/tool/state-regime generalization
 matched-budget downstream SFT/RL or Agent evaluation
 ```
 
-Fatal PRD criteria are reported, not hidden by larger models, relaxed gates or
-extra generation attempts.
+Fatal PRD outcomes are reported rather than hidden by larger models or relaxed
+gates.
 
 ## 5. Full validation gate
 
@@ -693,11 +718,11 @@ foundry verify-release --release <release-v2>
 foundry synthesize-tasks --release <release-v2> --policy <policy> --output <store>
 ```
 
-The held-out run repeats the same public commands after freeze.
+Held-out repeats the same commands after freeze.
 
 ## 6. Causal review and rollback
 
-For every failure, assign the first incorrect owner before editing:
+Assign first incorrect owner before editing:
 
 ```text
 Research/Brief
@@ -710,30 +735,30 @@ checker
 instruction
 public runner/provenance
 admission
-TaskAssessment/corpus policy
+TaskAssessment/corpus
 Infrastructure
 ```
 
-Rollback means reverting the current checkpoint changes; no dual v1/v2 path is
-kept.
+Rollback means reverting current checkpoint; no dual v1/v2 path.
 
 Completion boundaries:
 
 - before Checkpoint 4: no v2 release;
-- before Checkpoint 6: no constructive public solvability evidence;
-- before Checkpoint 7: no admitted TaskPack;
+- before Checkpoint 6: no public solvability evidence;
+- before Checkpoint 7: no TaskPack;
 - before Checkpoint 8A floors: no cross-domain S2 completion;
 - before Checkpoint 8B/C: no held-out/generalization/training claim.
 
 ## 7. Planning readiness checklist
 
-- [x] product goal and Good Task contract are explicit;
-- [x] framework, Codex SDK and Responses responsibilities are function-level;
-- [x] S1 v2 and TaskSemantics contracts are typed;
-- [x] Goal/checker/instruction/witness order is unambiguous;
-- [x] TaskPack and model-relative assessment identities are separated;
-- [x] overdesigned Graph/Program/WitnessRecipe/LLM-Judge paths are deleted;
-- [x] real cross-domain, anti-demo and held-out gates are preregistered;
-- [x] implementation/check manifests contain real context;
+- [x] Good Task contract explicit;
+- [x] framework/Codex/Responses responsibilities function-level;
+- [x] S1 v2 and TaskSemantics typed;
+- [x] explicit composition/condition and output-schema contracts;
+- [x] checker -> instruction -> witness order unambiguous;
+- [x] TaskPack and assessment identities separated;
+- [x] overdesigned Graph/Program/WitnessRecipe/LLM-Judge paths deleted;
+- [x] real cross-domain/anti-demo/held-out gates preregistered;
+- [x] implementation/check manifests curated;
 - [x] user waived plan-document Patrol for this planning update;
-- [ ] user approves this latest coherent plan and activates implementation.
+- [ ] user approves latest coherent plan and activates implementation.
