@@ -54,3 +54,4 @@
   immutable source capture and Crawl4AI extraction. The Python Codex SDK remains
   the separate coding-focused Builder transport. Research does not use raw
   app-server JSON-RPC, MCP, a shell imitation or a fixed framework search loop.
+- s1-environment-foundry|介入2|返工2|Need 换行等价、standalone uv workspace、cold publication|红线违反0

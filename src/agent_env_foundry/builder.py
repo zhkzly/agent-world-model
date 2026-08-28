@@ -26,6 +26,7 @@ __all__ = [
     "CandidateBuild",
     "CommandResult",
     "PreparedBuilderWorkspace",
+    "candidate_files",
     "compute_candidate_digest",
     "prepare_builder_workspace",
     "run_builder",
@@ -171,9 +172,10 @@ def prepare_builder_workspace(
     *,
     uv_cache_dir: Path,
 ) -> PreparedBuilderWorkspace:
-    workspace = Path(root)
-    if workspace.is_symlink():
+    requested_workspace = Path(root)
+    if requested_workspace.is_symlink():
         raise BuilderFailure("workspace", "workspace_symlink", "Builder workspace is a symlink")
+    workspace = requested_workspace.resolve()
     if workspace.exists() and any(workspace.iterdir()):
         raise BuilderFailure(
             "workspace",
@@ -182,13 +184,15 @@ def prepare_builder_workspace(
             path=str(workspace),
         )
     workspace.parent.mkdir(parents=True, exist_ok=True)
-    uv_cache_dir.mkdir(parents=True, exist_ok=True)
-    config = BuilderConfig(uv_cache_dir=uv_cache_dir)
+    resolved_uv_cache = Path(uv_cache_dir).resolve()
+    resolved_uv_cache.mkdir(parents=True, exist_ok=True)
+    config = BuilderConfig(uv_cache_dir=resolved_uv_cache)
     initialized = _run(
         (
             "uv",
             "init",
             "--package",
+            "--no-workspace",
             "--vcs",
             "none",
             "--name",
@@ -248,6 +252,11 @@ def _candidate_files(root: Path) -> list[Path]:
             continue
         files.append(path)
     return sorted(files, key=lambda item: item.relative_to(root).as_posix())
+
+
+def candidate_files(root: Path) -> tuple[Path, ...]:
+    """Return the exact project members bound by ``compute_candidate_digest``."""
+    return tuple(_candidate_files(Path(root)))
 
 
 def compute_candidate_digest(root: Path) -> str:

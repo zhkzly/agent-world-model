@@ -115,6 +115,26 @@ def test_prepare_workspace_has_no_domain_source_and_one_projection(
     assert (occupied / "user.txt").read_text() == "preserve me"
 
 
+def test_prepare_workspace_resolves_relative_target_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host_project = tmp_path / "pyproject.toml"
+    host_project.write_text('[project]\nname = "host-project"\nversion = "0.1.0"\n')
+    original_host_project = host_project.read_bytes()
+    monkeypatch.chdir(tmp_path)
+
+    prepared = prepare_builder_workspace(
+        Path("runs/run-001/candidate"),
+        projection(),
+        uv_cache_dir=Path("cache"),
+    )
+
+    assert prepared.root == (tmp_path / "runs/run-001/candidate").resolve()
+    assert (prepared.root / "BUILDER_PROJECTION.json").is_file()
+    assert not (prepared.root / "runs/run-001/candidate").exists()
+    assert host_project.read_bytes() == original_host_project
+
+
 def test_candidate_digest_excludes_inputs_and_build_caches_but_binds_source(
     tmp_path: Path,
 ) -> None:

@@ -1,0 +1,30 @@
+{
+  "format": "s1-e2e-evidence/1",
+  "status": "released",
+  "need_file": ".trellis/tasks/08-26-s1-environment-foundry/research/s1-live-need.md",
+  "run_root": "/home/kelong/pycodes/foundry-canonical-envpkg3/.artifacts/foundry-runs/run-9fcd5d948ba34e3590fc19e8317926e1",
+  "research_digest": "01f44850fccc72fed3ce53f9827adb986fba0eb12f6503b91daed20369f272d2",
+  "candidate_digest": "1981593558fd12f30d1c689fef0b77df265806f8929f4e88c2d10a0af0983498",
+  "builder_checks": {
+    "uv_lock": "passed",
+    "uv_sync_frozen_all_groups": "passed",
+    "uv_build": "passed",
+    "candidate_pytest": "3/3 passed",
+    "release_contract": "passed",
+    "environment_load": "passed with 7 tools"
+  },
+  "qualification": {
+    "verdict": "passed",
+    "positive_evidence_count": 20,
+    "negative_evidence_count": 20,
+    "evidence_digest": "bb917c2ec1b0994391a1d0a890674d20fc81a1d109410c0497b1d484a78ec1a3",
+    "cold_evidence_digest": "81d04b46ea40ebaf6df7d3099770e09df54b2d25e2d7c63cfd6e76946db0651e"
+  },
+  "release": {
+    "release_id": "4e2fb8fe7d81093aab5237d9e486b92407695f79b2cf899cc4a1466a86f7e1c1",
+    "payload_digest": "4a5f21b903d13aa1a963429ff8905d81b7db0ff8baaeee7f6a1a7118edc29806",
+    "qualification_digest": "505079ff0e73e28f3cd66e22ccc6d10f06864a81be4a22b2a78e23c7b9a66128",
+    "archive_digest": "7ef1d808ad962aa7d997acf737707b54a92f2930152972d611a9fd4a3a74c41b"
+  },
+  "scope": "One ocean-container dispute Need completed the public command. This does not by itself establish arbitrary-domain or held-out generality."
+}

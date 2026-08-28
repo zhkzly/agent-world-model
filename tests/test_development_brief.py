@@ -516,6 +516,28 @@ def test_need_text_atomization_preserves_leading_numeric_content() -> None:
     ]
 
 
+def test_need_text_atomization_ignores_prose_line_wrapping() -> None:
+    wrapped = NeedRecord.from_text(
+        "Create a resettable synthetic dispute environment that represents realistic\n"
+        "actors, invoices, containers, charge periods, and supporting evidence.\n\n"
+        "Refuse invalid or late disputes without prohibited state\n"
+        "mutation."
+    )
+    unwrapped = NeedRecord.from_text(
+        "Create a resettable synthetic dispute environment that represents realistic "
+        "actors, invoices, containers, charge periods, and supporting evidence.\n\n"
+        "Refuse invalid or late disputes without prohibited state mutation."
+    )
+
+    assert wrapped.original_need != unwrapped.original_need
+    assert wrapped.clauses == unwrapped.clauses
+    assert [clause.text for clause in wrapped.clauses] == [
+        "Create a resettable synthetic dispute environment that represents realistic "
+        "actors, invoices, containers, charge periods, and supporting evidence.",
+        "Refuse invalid or late disputes without prohibited state mutation.",
+    ]
+
+
 def test_need_basis_requirement_passes_without_web_evidence(tmp_path: Path) -> None:
     need = NeedRecord.from_clauses(
         "Payments must be due within 30 days after invoice receipt.",

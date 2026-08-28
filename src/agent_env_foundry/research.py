@@ -1337,12 +1337,30 @@ class NeedRecord:
     @classmethod
     def from_text(cls, original_need: str) -> NeedRecord:
         parts: list[str] = []
-        for raw_line in re.split(r"(?:\r?\n)+", original_need):
-            line = re.sub(r"^(?:[-*+]\s+|\d+[.)]\s+)", "", raw_line.strip())
-            for raw_clause in re.split(r"(?<=[.!?;])\s+", line):
-                text = raw_clause.strip()
-                if text:
-                    parts.append(text)
+        list_marker = re.compile(r"^(?:[-*+]\s+|\d+[.)]\s+)")
+        for raw_block in re.split(r"(?:\r?\n)\s*(?:\r?\n)+", original_need.strip()):
+            lines = [line.strip() for line in raw_block.splitlines() if line.strip()]
+            if not lines:
+                continue
+            segments: list[str] = []
+            if any(list_marker.match(line) for line in lines):
+                current = ""
+                for line in lines:
+                    if list_marker.match(line):
+                        if current:
+                            segments.append(current)
+                        current = list_marker.sub("", line)
+                    else:
+                        current = f"{current} {line}".strip()
+                if current:
+                    segments.append(current)
+            else:
+                segments.append(" ".join(lines))
+            for segment in segments:
+                for raw_clause in re.split(r"(?<=[.!?;])\s+", segment):
+                    text = raw_clause.strip()
+                    if text:
+                        parts.append(text)
         return cls.from_clauses(original_need, parts)
 
     def to_document(self) -> dict[str, Any]:

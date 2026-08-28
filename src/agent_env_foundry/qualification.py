@@ -1411,6 +1411,87 @@ def run_qualification(
         )
 
 
+def replay_qualification(
+    projection: BuilderProjection,
+    candidate_root: Path,
+    candidate_digest: str,
+    probe_source_root: Path,
+    workspace_root: Path,
+    *,
+    config: QualificationConfig,
+) -> QualificationResult:
+    """Replay already-admitted semantic probe code against cold Candidate bytes."""
+    expected = freeze_expected_relations(projection)
+    try:
+        prepared = prepare_qualification_workspace(
+            projection, candidate_root, candidate_digest, workspace_root
+        )
+        source = Path(probe_source_root)
+        for name in (PREDICATE_NAME, *PROBE_SCRIPTS):
+            path = source / name
+            if not path.is_file() or path.is_symlink():
+                raise QualificationFailure(
+                    "probe_replay",
+                    "probe_replay_source_invalid",
+                    "Cold replay source is missing an admitted regular file",
+                    path=str(path),
+                )
+        shutil.copyfile(source / PREDICATE_NAME, prepared.root / PREDICATE_NAME)
+        validate_predicate_carrier(prepared)
+        prepared.stage_candidate_view()
+        for name in PROBE_SCRIPTS:
+            shutil.copyfile(source / name, prepared.root / name)
+        bundle = validate_probe_bundle(prepared.root, prepared.expected, prepared.predicates)
+        outputs = _execute_probes(prepared, bundle, config)
+        positive_journal, carriers = _require_host_outputs(outputs)
+        rows = validate_evidence_rows(outputs["rows"], prepared.expected, positive_journal)
+        negative = validate_negative_discrimination(
+            bundle,
+            outputs["negative_rows"],
+            rows,
+            prepared.expected,
+            prepared.predicates,
+            carriers,
+            prepared.candidate_digest,
+        )
+        prepared.verify_inputs()
+        prepared.verify_candidate_unchanged()
+        preimage = {
+            "candidate_digest": prepared.candidate_digest,
+            "expected_relations_digest": expected.aggregate_digest,
+            "probe_bundle_digest": bundle.bundle_digest,
+            "rows": [row.document for row in rows],
+            "negative_rows": list(negative),
+            "negative_carriers": [carrier.to_document() for carrier in carriers],
+        }
+        return QualificationResult(
+            status="passed",
+            candidate_digest=candidate_digest,
+            expected_relations_digest=expected.aggregate_digest,
+            evidence_digest=_digest(_canonical(preimage)),
+            evidence_rows=rows,
+            probe_bundle_digest=bundle.bundle_digest,
+            negative_evidence_count=len(negative),
+            workspace_root=prepared.root,
+        )
+    except QualificationFailure as exc:
+        status: QualificationStatus = (
+            "candidate_defect"
+            if exc.code in _CANDIDATE_FAILURE_CODES
+            else "infra_failure"
+            if exc.phase in {"provider", "infrastructure"}
+            else "probe_defect"
+        )
+        return QualificationResult(
+            status=status,
+            candidate_digest=candidate_digest,
+            expected_relations_digest=expected.aggregate_digest,
+            workspace_root=Path(workspace_root),
+            failure_code=exc.code,
+            details={"message": str(exc), **exc.details},
+        )
+
+
 def _author_predicates(
     prepared: PreparedQualificationWorkspace,
     config: QualificationConfig,
