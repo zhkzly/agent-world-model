@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
@@ -310,6 +310,16 @@ class BindingCandidate:
             "facets": _json(self.facets),
         }
 
+    def to_document(self) -> JSONObject:
+        return {
+            "semantic_key": self.semantic_key,
+            "eligible": self.eligible,
+            "reason_codes": list(self.reason_codes),
+            "protected_binding": _json(self.protected_binding),
+            "public_descriptor": _json(self.public_descriptor),
+            "facets": _json(self.facets),
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class TraceEvent:
@@ -342,6 +352,16 @@ class AtomCheckRequest:
     protected_binding: JSONObject
     trace_projection: tuple[TraceEvent, ...]
     final_answer: JSONValue | None
+
+    def to_document(self) -> JSONObject:
+        return {
+            "capability_id": self.capability_id,
+            "before_facts": _json(self.before_facts),
+            "after_facts": _json(self.after_facts),
+            "protected_binding": _json(self.protected_binding),
+            "trace_projection": [item.to_document() for item in self.trace_projection],
+            "final_answer": _json(self.final_answer),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -388,6 +408,14 @@ class ConditionCheckRequest:
     protected_binding: JSONObject | None
     trace_projection: tuple[TraceEvent, ...]
 
+    def to_document(self) -> JSONObject:
+        return {
+            "condition_id": self.condition_id,
+            "before_facts": _json(self.before_facts),
+            "protected_binding": _json(self.protected_binding),
+            "trace_projection": [item.to_document() for item in self.trace_projection],
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class ConditionCheckResult:
@@ -401,6 +429,13 @@ class ConditionCheckResult:
         if not is_json_object(self.report_values):
             raise SemanticsContractError("condition report_values must be a JSON object")
         _unique(self.failure_codes, "condition failure_codes")
+
+    def to_document(self) -> JSONObject:
+        return {
+            "status": self.status,
+            "report_values": _json(self.report_values),
+            "failure_codes": list(self.failure_codes),
+        }
 
 
 @runtime_checkable
@@ -481,6 +516,275 @@ def validate_start_cases(
             validate_instance(case.reset_input, start_schema, role=f"start {case.case_id!r}")
         except SchemaError as exc:
             raise SemanticsContractError(str(exc)) from exc
+
+
+def start_case_from_document(value: Any) -> StartCase:
+    document = _exact(value, {"case_id", "reset_input", "regime_tags"}, "StartCase")
+    return StartCase(
+        _string(document["case_id"], "case_id"),
+        _optional_object(document["reset_input"], "reset_input"),
+        _string_tuple(document["regime_tags"], "regime_tags"),
+    )
+
+
+def capability_from_document(value: Any) -> CapabilitySpec:
+    keys = {
+        "capability_id",
+        "requirement_ids",
+        "workflow_ids",
+        "composition_rules",
+        "actor_role",
+        "task_kind",
+        "intent_label",
+        "protected_binding_schema",
+        "public_descriptor_schema",
+        "facets",
+        "conditions",
+        "answer_fields",
+        "read_scopes",
+        "write_scopes",
+        "supported_goal_kinds",
+        "rendering",
+    }
+    document = _exact(value, keys, "CapabilitySpec")
+    return CapabilitySpec(
+        capability_id=_string(document["capability_id"], "capability_id"),
+        requirement_ids=_string_tuple(document["requirement_ids"], "requirement_ids"),
+        workflow_ids=_string_tuple(document["workflow_ids"], "workflow_ids"),
+        composition_rules=tuple(
+            _composition(item)
+            for item in _array(document["composition_rules"], "composition_rules")
+        ),
+        actor_role=_string(document["actor_role"], "actor_role"),
+        task_kind=cast(TaskKind, _string(document["task_kind"], "task_kind")),
+        intent_label=_string(document["intent_label"], "intent_label"),
+        protected_binding_schema=_object(
+            document["protected_binding_schema"], "protected_binding_schema"
+        ),
+        public_descriptor_schema=_object(
+            document["public_descriptor_schema"], "public_descriptor_schema"
+        ),
+        facets=tuple(_facet(item) for item in _array(document["facets"], "facets")),
+        conditions=tuple(_condition(item) for item in _array(document["conditions"], "conditions")),
+        answer_fields=tuple(
+            _answer_field(item) for item in _array(document["answer_fields"], "answer_fields")
+        ),
+        read_scopes=_string_tuple(document["read_scopes"], "read_scopes"),
+        write_scopes=_string_tuple(document["write_scopes"], "write_scopes"),
+        supported_goal_kinds=cast(
+            tuple[GoalKind, ...],
+            _string_tuple(document["supported_goal_kinds"], "supported_goal_kinds"),
+        ),
+        rendering=_rendering(document["rendering"]),
+    )
+
+
+def binding_from_document(value: Any) -> BindingCandidate:
+    document = _exact(
+        value,
+        {
+            "semantic_key",
+            "eligible",
+            "reason_codes",
+            "protected_binding",
+            "public_descriptor",
+            "facets",
+        },
+        "BindingCandidate",
+    )
+    eligible = document["eligible"]
+    if not isinstance(eligible, bool):
+        raise SemanticsContractError("BindingCandidate eligible must be boolean")
+    return BindingCandidate(
+        _string(document["semantic_key"], "semantic_key"),
+        eligible,
+        _string_tuple(document["reason_codes"], "reason_codes"),
+        _object(document["protected_binding"], "protected_binding"),
+        _object(document["public_descriptor"], "public_descriptor"),
+        _object(document["facets"], "facets"),
+    )
+
+
+def atom_result_from_document(value: Any) -> AtomCheckResult:
+    keys = {
+        "initially_satisfied",
+        "satisfied",
+        "required_effects_ok",
+        "collateral_ok",
+        "answer_ok",
+        "process_ok",
+        "report_values",
+        "failure_codes",
+    }
+    document = _exact(value, keys, "AtomCheckResult")
+    return AtomCheckResult(
+        _boolean(document["initially_satisfied"], "initially_satisfied"),
+        _boolean(document["satisfied"], "satisfied"),
+        _boolean(document["required_effects_ok"], "required_effects_ok"),
+        _boolean(document["collateral_ok"], "collateral_ok"),
+        _optional_boolean(document["answer_ok"], "answer_ok"),
+        _optional_boolean(document["process_ok"], "process_ok"),
+        _object(document["report_values"], "report_values"),
+        _string_tuple(document["failure_codes"], "failure_codes"),
+    )
+
+
+def condition_result_from_document(value: Any) -> ConditionCheckResult:
+    document = _exact(value, {"status", "report_values", "failure_codes"}, "ConditionCheckResult")
+    return ConditionCheckResult(
+        cast(ConditionStatus, _string(document["status"], "status")),
+        _object(document["report_values"], "report_values"),
+        _string_tuple(document["failure_codes"], "failure_codes"),
+    )
+
+
+def _answer_field(value: Any) -> AnswerFieldSpec:
+    document = _exact(value, {"field_id", "schema", "public_label"}, "AnswerFieldSpec")
+    return AnswerFieldSpec(
+        _string(document["field_id"], "field_id"),
+        _object(document["schema"], "schema"),
+        _string(document["public_label"], "public_label"),
+    )
+
+
+def _facet(value: Any) -> FacetSpec:
+    keys = {
+        "name",
+        "public_label",
+        "value_schema",
+        "allowed_operators",
+        "visibility",
+        "tool_name",
+        "output_schema_pointer",
+    }
+    document = _exact(value, keys, "FacetSpec")
+    tool_name = document["tool_name"]
+    pointer = document["output_schema_pointer"]
+    if tool_name is not None and not isinstance(tool_name, str):
+        raise SemanticsContractError("FacetSpec tool_name must be string or null")
+    if pointer is not None and not isinstance(pointer, str):
+        raise SemanticsContractError("FacetSpec output_schema_pointer must be string or null")
+    return FacetSpec(
+        _string(document["name"], "name"),
+        _string(document["public_label"], "public_label"),
+        _object(document["value_schema"], "value_schema"),
+        cast(
+            tuple[FacetOperator, ...],
+            _string_tuple(document["allowed_operators"], "allowed_operators"),
+        ),
+        cast(FacetVisibility, _string(document["visibility"], "visibility")),
+        tool_name,
+        pointer,
+    )
+
+
+def _composition(value: Any) -> CompositionRule:
+    document = _exact(
+        value,
+        {"rule_id", "workflow_id", "kind", "capability_ids", "max_occurrences"},
+        "CompositionRule",
+    )
+    maximum = document["max_occurrences"]
+    if not isinstance(maximum, int) or isinstance(maximum, bool):
+        raise SemanticsContractError("CompositionRule max_occurrences must be integer")
+    return CompositionRule(
+        _string(document["rule_id"], "rule_id"),
+        _string(document["workflow_id"], "workflow_id"),
+        cast(Literal["all"], _string(document["kind"], "kind")),
+        _string_tuple(document["capability_ids"], "capability_ids"),
+        maximum,
+    )
+
+
+def _condition(value: Any) -> ConditionSpec:
+    keys = {
+        "condition_id",
+        "public_label",
+        "visibility",
+        "binding_scope",
+        "true_capability_ids",
+        "false_capability_ids",
+        "report_field",
+        "tool_name",
+        "output_schema_pointer",
+    }
+    document = _exact(value, keys, "ConditionSpec")
+    report = document["report_field"]
+    tool_name = document["tool_name"]
+    pointer = document["output_schema_pointer"]
+    if tool_name is not None and not isinstance(tool_name, str):
+        raise SemanticsContractError("ConditionSpec tool_name must be string or null")
+    if pointer is not None and not isinstance(pointer, str):
+        raise SemanticsContractError("ConditionSpec output_schema_pointer must be string or null")
+    return ConditionSpec(
+        _string(document["condition_id"], "condition_id"),
+        _string(document["public_label"], "public_label"),
+        cast(ConditionVisibility, _string(document["visibility"], "visibility")),
+        cast(BindingScope, _string(document["binding_scope"], "binding_scope")),
+        _string_tuple(document["true_capability_ids"], "true_capability_ids"),
+        _string_tuple(document["false_capability_ids"], "false_capability_ids"),
+        None if report is None else _answer_field(report),
+        tool_name,
+        pointer,
+    )
+
+
+def _rendering(value: Any) -> RenderingSpec:
+    document = _exact(value, {"imperative", "target_noun", "answer_phrase"}, "RenderingSpec")
+    phrase = document["answer_phrase"]
+    if phrase is not None and not isinstance(phrase, str):
+        raise SemanticsContractError("RenderingSpec answer_phrase must be string or null")
+    return RenderingSpec(
+        _string(document["imperative"], "imperative"),
+        _string(document["target_noun"], "target_noun"),
+        phrase,
+    )
+
+
+def _exact(value: Any, keys: set[str], role: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        actual = sorted(value) if isinstance(value, dict) else type(value).__name__
+        raise SemanticsContractError(f"{role} must have exactly {sorted(keys)}, got {actual}")
+    return cast(dict[str, Any], value)
+
+
+def _array(value: Any, role: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise SemanticsContractError(f"{role} must be an array")
+    return value
+
+
+def _string(value: Any, role: str) -> str:
+    if not isinstance(value, str):
+        raise SemanticsContractError(f"{role} must be a string")
+    return value
+
+
+def _string_tuple(value: Any, role: str) -> tuple[str, ...]:
+    values = _array(value, role)
+    if any(not isinstance(item, str) for item in values):
+        raise SemanticsContractError(f"{role} must contain only strings")
+    return tuple(cast(list[str], values))
+
+
+def _object(value: Any, role: str) -> JSONObject:
+    if not is_json_object(value):
+        raise SemanticsContractError(f"{role} must be a JSON object")
+    return cast(JSONObject, value)
+
+
+def _optional_object(value: Any, role: str) -> JSONObject | None:
+    return None if value is None else _object(value, role)
+
+
+def _boolean(value: Any, role: str) -> bool:
+    if not isinstance(value, bool):
+        raise SemanticsContractError(f"{role} must be boolean")
+    return value
+
+
+def _optional_boolean(value: Any, role: str) -> bool | None:
+    return None if value is None else _boolean(value, role)
 
 
 def _tool_projection(

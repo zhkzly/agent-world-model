@@ -33,12 +33,18 @@
     "src/agent_env_foundry/semantics.py",
     "src/agent_task_foundry/models.py",
     "src/agent_env_foundry/release.py",
+    "src/agent_env_foundry/_actor_runner.py",
+    "src/agent_env_foundry/_semantics_runner.py",
     "tests/test_semantics_contract.py",
     "tests/task_foundry/test_models.py",
     "tests/v2_release_factory.py",
-    "tests/test_release_v2.py"
+    "tests/test_release_v2.py",
+    "tests/test_preparation.py",
+    "tests/fixtures/fx_v2_actor.py",
+    "tests/fixtures/fx_v2_semantics.py",
+    ".trellis/spec/backend/v2-preparation.md"
   ],
-  "notes": "Implementation reactivated after revert commit 7880133 removed the out-of-order deterministic scaffold. CP1 contracts are complete. CP2 T1 now verifies canonical v2 descriptor/payload/project/qualification byte bindings while leaving v1 behavior untouched; it has RED/GREEN tests, five mutation licenses and independent Claude ALLOW. The next slice is locked preparation and separate child runtimes. CP5-CP7 code and claims remain absent. The user waived Patrol for this recovery implementation.",
+  "notes": "Implementation reactivated after revert commit 7880133 removed the out-of-order deterministic scaffold. CP1 contracts and CP2 immutable v2 preparation/separate child runtimes are complete with real frozen uv sync, process/isolation/tamper tests, mutation licenses and independent Claude ALLOW. CP3 TaskSemantics Author and semantic Qualification is next. CP5-CP7 code and claims remain absent. The user waived Patrol for this recovery implementation.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -58,6 +64,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "cp2_locked_preparation_next"
+    "implementation_checkpoint": "cp3_semantics_authoring_next"
   }
 }

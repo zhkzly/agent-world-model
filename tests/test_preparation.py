@@ -1,0 +1,214 @@
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+from agent_env_foundry.preparation import (
+    OpenPreparedRelease,
+    PreparationExecutionError,
+    PreparationSettings,
+    _ChildTransport,
+    prepare_release,
+)
+from agent_env_foundry.semantics import (
+    AtomCheckRequest,
+    ConditionCheckRequest,
+    SemanticsContractError,
+    start_case_from_document,
+)
+from v2_release_factory import build_v2_release, write_v2_zip
+
+
+def _settings() -> PreparationSettings:
+    return PreparationSettings(
+        Path(os.environ.get("UV_CACHE_DIR", "/tmp/foundry-s2-runtime-uv-cache")),
+        120.0,
+    )
+
+
+def test_prepare_open_runs_real_actor_and_all_trusted_methods(tmp_path: Path) -> None:
+    release = build_v2_release(tmp_path / "release", behavior="alpha")
+    prepared = prepare_release(release, tmp_path / "cache", settings=_settings())
+    assert isinstance(prepared, OpenPreparedRelease)
+    assert prepared.identity.actor_digest
+
+    instance = tmp_path / "instances/one"
+    assert not (instance / "state.json").exists()
+    with prepared.open(instance) as session:
+        assert session.actor.tools()[0]["name"] == "increment"
+        assert not (instance / "state.json").exists(), "open/tools must not reset"
+        reset = session.actor.reset({"seed": 2})
+        assert reset == {"behavior": "alpha", "count": 2, "resets": 1}
+        observation = session.actor.invoke("increment", {"amount": 3})
+        assert observation == {
+            "ok": True,
+            "data": {"behavior": "alpha", "count": 5},
+            "error": None,
+        }
+
+        starts = session.trusted.start_cases(7, 1)
+        facts = session.trusted.inspect(instance)
+        capabilities = session.trusted.capabilities()
+        bindings = session.trusted.enumerate_bindings("increment", facts)
+        atom = session.trusted.evaluate_atom(
+            AtomCheckRequest(
+                "increment",
+                {"count": 2},
+                facts,
+                bindings[0].protected_binding,
+                (),
+                {"count": 5},
+            )
+        )
+        condition = session.trusted.evaluate_condition(
+            ConditionCheckRequest("available", facts, None, ())
+        )
+        assert starts[0].reset_input == {"seed": 7}
+        assert facts["count"] == 5
+        assert capabilities[0].capability_id == "increment"
+        assert bindings[0].semantic_key == "counter"
+        assert atom.satisfied and atom.report_values == {"count": 5}
+        assert condition.status == "true"
+        assert len(session.trusted_events) == 6
+        assert all(event.unchanged for event in session.trusted_events)
+
+
+def test_trusted_mutation_is_recorded_and_rejected(tmp_path: Path) -> None:
+    release = build_v2_release(tmp_path / "release", mutate_semantics=True)
+    prepared = prepare_release(release, tmp_path / "cache", settings=_settings())
+    with prepared.open(tmp_path / "instance") as session:
+        with pytest.raises(PreparationExecutionError) as caught:
+            session.trusted.inspect(tmp_path / "instance")
+        assert caught.value.kind == "SemanticsDefect"
+        assert caught.value.code == "trusted_state_mutation"
+        assert len(session.trusted_events) == 1
+        assert not session.trusted_events[0].unchanged
+
+    failing_release = build_v2_release(
+        tmp_path / "failing-release",
+        mutate_semantics=True,
+        raise_after_mutation=True,
+    )
+    failing = prepare_release(failing_release, tmp_path / "failing-cache", settings=_settings())
+    with failing.open(tmp_path / "failing-instance") as session:
+        with pytest.raises(PreparationExecutionError) as caught:
+            session.trusted.inspect(tmp_path / "failing-instance")
+        assert caught.value.code == "trusted_state_mutation"
+        assert len(session.trusted_events) == 1
+        assert not session.trusted_events[0].unchanged
+
+
+def test_same_package_names_do_not_alias_and_open_never_resets(tmp_path: Path) -> None:
+    cache = tmp_path / "cache"
+    alpha = prepare_release(
+        build_v2_release(tmp_path / "alpha", behavior="alpha"), cache, settings=_settings()
+    )
+    beta = prepare_release(
+        build_v2_release(tmp_path / "beta", behavior="beta"), cache, settings=_settings()
+    )
+    alpha_instance = tmp_path / "alpha-instance"
+    with alpha.open(alpha_instance) as left, beta.open(tmp_path / "beta-instance") as right:
+        assert left.actor.reset({"seed": 1})["behavior"] == "alpha"
+        assert right.actor.reset({"seed": 1})["behavior"] == "beta"
+        left.actor.invoke("increment", {"amount": 4})
+
+    with alpha.open(alpha_instance) as reopened:
+        facts = reopened.trusted.inspect(alpha_instance)
+        assert facts["count"] == 5
+        assert facts["resets"] == 1
+
+
+def test_semantics_runtime_cannot_import_actor_package(tmp_path: Path) -> None:
+    release = build_v2_release(tmp_path / "release", leak_actor_into_semantics=True)
+    with pytest.raises(PreparationExecutionError) as caught:
+        prepare_release(release, tmp_path / "cache", settings=_settings())
+    assert caught.value.kind == "SemanticsDefect"
+    assert caught.value.code == "runtime_import_leak"
+
+    actor_leak = build_v2_release(tmp_path / "actor-leak", leak_semantics_into_actor=True)
+    with pytest.raises(PreparationExecutionError) as caught:
+        prepare_release(actor_leak, tmp_path / "actor-cache", settings=_settings())
+    assert caught.value.kind == "EnvironmentDefect"
+    assert caught.value.code == "runtime_import_leak"
+
+
+def test_semantics_startup_failure_is_attributed_to_semantics(tmp_path: Path) -> None:
+    release = build_v2_release(tmp_path / "release", broken_semantics_startup=True)
+    prepared = prepare_release(release, tmp_path / "cache", settings=_settings())
+    with prepared.open(tmp_path / "instance") as session:
+        with pytest.raises(PreparationExecutionError) as caught:
+            session.trusted.start_cases(1, 1)
+        assert caught.value.kind == "SemanticsDefect"
+        assert caught.value.code == "child_startup_failed"
+
+
+def test_directory_zip_identity_and_prepared_tamper_fail_closed(tmp_path: Path) -> None:
+    release = build_v2_release(tmp_path / "release")
+    archive = write_v2_zip(release, tmp_path / "release.zip")
+    directory = prepare_release(release, tmp_path / "directory-cache", settings=_settings())
+    zipped = prepare_release(archive, tmp_path / "zip-cache", settings=_settings())
+    assert directory.identity == zipped.identity
+
+    prepared_project = (
+        tmp_path
+        / "directory-cache/runtimes"
+        / directory.identity.release_id
+        / "actor/project/src/shared_actor/__init__.py"
+    )
+    prepared_project.write_text("TAMPERED = True\n", encoding="utf-8")
+    with pytest.raises(PreparationExecutionError, match="digest"):
+        directory.open(tmp_path / "instance")
+
+    clean = prepare_release(
+        build_v2_release(tmp_path / "pth-release"),
+        tmp_path / "pth-cache",
+        settings=_settings(),
+    )
+    actor_runtime = tmp_path / "pth-cache/runtimes" / clean.identity.release_id / "actor/project"
+    pth_files = tuple((actor_runtime / ".venv/lib").glob("python*/site-packages/*.pth"))
+    assert pth_files, "editable installation must have a bound .pth"
+    pth_files[0].write_text(str(tmp_path / "unbound-source"), encoding="utf-8")
+    with pytest.raises(PreparationExecutionError, match="prepared source"):
+        clean.open(tmp_path / "pth-instance")
+
+
+def test_semantics_wire_decoder_rejects_unknown_fields() -> None:
+    with pytest.raises(SemanticsContractError, match="exactly"):
+        start_case_from_document(
+            {"case_id": "case", "reset_input": None, "regime_tags": [], "extra": True}
+        )
+
+
+def test_private_transport_rejects_sequence_mismatch_and_timeout(tmp_path: Path) -> None:
+    mismatch = tmp_path / "mismatch.py"
+    mismatch.write_text(
+        "import json,sys\n"
+        "for line in sys.stdin:\n"
+        " request=json.loads(line)\n"
+        " response={'seq': request['seq']+1, 'ok': True, 'value': None}\n"
+        " print(json.dumps(response), flush=True)\n",
+        encoding="utf-8",
+    )
+    transport = _ChildTransport(
+        Path(sys.executable), mismatch, (), cwd=tmp_path, timeout=1.0, role="actor"
+    )
+    with pytest.raises(PreparationExecutionError) as caught:
+        transport.call("tools", {})
+    assert caught.value.code == "child_sequence_mismatch"
+    transport.close()
+
+    sleeper = tmp_path / "sleeper.py"
+    sleeper.write_text(
+        "import sys,time\nfor line in sys.stdin: time.sleep(10)\n",
+        encoding="utf-8",
+    )
+    transport = _ChildTransport(
+        Path(sys.executable), sleeper, (), cwd=tmp_path, timeout=0.05, role="actor"
+    )
+    with pytest.raises(PreparationExecutionError) as caught:
+        transport.call("tools", {})
+    assert caught.value.code == "child_timeout"
+    transport.close()

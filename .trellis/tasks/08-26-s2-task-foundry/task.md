@@ -19,3 +19,6 @@ Gold reference: existing S1 locked cold-release/ValidatedEnvironment behavior pl
 - 选择：CP2 先闭合独立 v2 字节合同，再实现 locked preparation 和两个 child runtime；v1 生成路径在 CP4 切除，但 `prepare_release` 永远只接收 v2。
 - 备选：一次同时修改 v1 publication、prepare、runner 和 semantics wire；拒绝，因为无法定位格式、安装或进程隔离的首个偏离。
 - 翻案证据：Claude CP2 boundary ALLOW；第一垂直测试只证明 v2 descriptor/payload/project digests、完整闭包、v1/tamper 拒绝，不声称可运行环境。
+- 选择：CP2 child runner 使用生成项目自己的 venv Python 与 stdlib-only script；Host 执行 schema/codec/origin/tree-manifest 判定，生成代码 stdout 被重定向到 stderr。
+- 备选：把 Host framework 安装进两个 runtime 或使用 Host importlib；拒绝，因为会引入依赖复制、ambient import 与跨 release cache alias。
+- 翻案证据：12 条真实进程 focused tests、13 条物理 mutation licenses、全库 314 tests 与 Claude BLOCK→ALLOW；CP3 必须消费同一个 PreparedSession，不能新增 loader。

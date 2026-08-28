@@ -30,12 +30,12 @@ def test_v2_descriptor_binds_actor_semantics_and_rejects_v1(tmp_path: Path) -> N
 
 def test_v2_tamper_mode_extra_member_and_symlink_fail_closed(tmp_path: Path) -> None:
     root = build_v2_release(tmp_path / "content")
-    (root / "actor/src/shared_generated_package/__init__.py").write_text("TAMPERED = True\n")
+    (root / "actor/src/shared_actor/__init__.py").write_text("TAMPERED = True\n")
     with pytest.raises(EnvironmentContractError, match="digest mismatch"):
         verify_release_v2(root)
 
     root = build_v2_release(tmp_path / "mode")
-    member = root / "semantics/src/shared_generated_package/__init__.py"
+    member = root / "semantics/src/shared_semantics/__init__.py"
     member.chmod(0o600)
     with pytest.raises(EnvironmentContractError, match="mode mismatch"):
         verify_release_v2(root)
