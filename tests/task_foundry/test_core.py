@@ -33,6 +33,7 @@ from agent_task_foundry.models import (
     AllGoal,
     AtomGoal,
     ChallengeResult,
+    CheckerMutationResult,
     ReportSpec,
     SelectorPredicate,
     SelectorSpec,
@@ -260,8 +261,9 @@ def test_two_fresh_public_runs_and_provenance_seal_taskpack() -> None:
             ChallengeResult("wrong_target", "failed", "failed"),
             ChallengeResult("collateral", "failed", "failed"),
         ),
-        checker_mutations_killed=1,
-        checker_mutations_total=1,
+        checker_mutations=(
+            CheckerMutationResult("drop-goal", True, True, "evidence-drop-goal"),
+        ),
     )
     assert pack.taskpack_id
     assert "checker_payload" not in pack.public_projection()
