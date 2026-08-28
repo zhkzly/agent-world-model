@@ -85,3 +85,7 @@
   environment or Task semantics.
 - S1 Research remains evidence-grounded and separate from the Python Codex SDK
   Builder. Candidate tests/model conversations never qualify their own release.
+
+## Execution record
+
+`s2-task-foundry|介入0|返工1|RED/GREEN+mutation-license+Claude BLOCK→ALLOW+full gate|红线违反0`
