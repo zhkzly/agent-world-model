@@ -432,3 +432,8 @@ def test_semantic_qualification_failure_blocks_release_assembly(
     assert outcome.details["phase"] == "semantic_qualification"
     assert qualification_calls == 2
     assert repair_calls == 1
+
+
+def test_native_oracle_disagreement_is_not_routed_to_semantics_self_repair() -> None:
+    assert api_module._semantics_repairable("semantic_noop_accepted")
+    assert not api_module._semantics_repairable("semantic_native_disagreement")

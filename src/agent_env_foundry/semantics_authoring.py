@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
@@ -216,6 +217,20 @@ def freeze_expected_task_semantics(
         findings.append(
             "$.requirements: initial-world Requirements define StartCases/setup and cannot be "
             f"Taskable; got {sorted(taskable_initial)}"
+        )
+    source_relations = {
+        cast(str, item.get("id")): item
+        for item in (*projection.requirements, *projection.initial_world_relations)
+    }
+    taskable_reset_setup = {
+        requirement_id
+        for requirement_id in taskable_ids
+        if _is_environment_reset_setup(source_relations.get(requirement_id, {}))
+    }
+    if taskable_reset_setup:
+        findings.append(
+            "$.requirements: environment reset/reconstruction is StartCase setup and cannot "
+            f"be Taskable; got {sorted(taskable_reset_setup)}"
         )
     for index, item in enumerate(requirements):
         findings.extend(_requirement_findings(item, f"$.requirements[{index}]"))
@@ -461,6 +476,14 @@ def _requirement_findings(item: dict[str, Any], path: str) -> list[str]:
                 f"{path}: Taskable Requirement is semantically incomplete; empty {missing}"
             )
     return findings
+
+
+def _is_environment_reset_setup(relation: Mapping[str, Any]) -> bool:
+    text = json.dumps(dict(relation), ensure_ascii=False, sort_keys=True).casefold()
+    reset = re.search(r"\breset\b|\breconstruct(?:ion|ed)?\b|\breinitial", text)
+    initial = re.search(r"initial (?:world|state)|\brestore(?:d|s)?\b|\breproduc", text)
+    environment = re.search(r"\benvironment\b|\bworld\b|\bscenario\b", text)
+    return bool(reset and initial and environment)
 
 
 def _requirement(value: Any) -> dict[str, Any]:
