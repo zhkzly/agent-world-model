@@ -3,11 +3,11 @@
 ## Product intent
 
 Build a paper-grade system that turns a natural-language business Need into a
-real executable environment and then derives high-quality Agent Tasks from that
-already-built world.
+real executable Agent environment and then derives high-quality training Tasks
+from that world.
 
-Semantic completion is the product criterion. A demo, MVP label, mock, canned
-Task, dictionary world, green unit suite, single happy-path trace or
+Semantic completion is the product criterion. A demo, MVP label, mock,
+dictionary world, canned Task, one successful trace, green unit suite or
 package-shaped artifact is never sufficient evidence of completion.
 
 ## Product lifecycle
@@ -17,117 +17,159 @@ natural-language Need
 -> S1 Environment Foundry
 -> qualified immutable EnvironmentRelease
 -> S2 Goal-First Task Foundry
--> verified release-bound TaskPacks and selected corpora
+-> verified TaskPacks + model-relative TaskAssessments + CorpusManifest
 -> S3 acting-Agent Episodes + verified facts + Reward/abstention
 -> S4 SFT/RL
 ```
 
-### S1 owns the executable world
+## S1 owns the executable world and reusable task semantics
 
-S1 researches the requested world, builds a real uv-managed project, executes
-real public tools against real persistent state, independently qualifies
-success and refusal semantics, and publishes an immutable EnvironmentRelease.
+S1 researches the Need, builds a real uv-managed project, executes real public
+tools against real persistent state, independently qualifies success/refusal
+semantics and publishes an immutable release.
 
-The release contract may evolve when a demonstrated cross-environment S2/S3
-consumer need requires it. Compatibility with earlier research releases is not
-a current product goal. Any S1 addition must remain environment-generic and may
-not contain Task-instance-, sampler-, reward- or training-specific fields.
-
-S1 must provide two trust-separated surfaces:
+The S1 release exposes two mechanically separated surfaces.
 
 ```text
 public actor surface
   reset / tools / invoke / close
 
 protected trusted surface
-  isolated release preparation/opening
-  qualified taskable capability semantics
-  canonical read-only state inspection with a release-owned schema
+  isolated prepare/open runtime
+  deterministic start-case generator
+  read-only semantic state inspection
+  qualified taskable CapabilitySpecs
+  binding enumeration and atomic evaluation
 ```
 
-The protected surface is never exposed to an acting Agent and must be
-independently checked against native SQLite/files/Git or another authoritative
-representation during S1 Qualification.
+The protected surface is release-specific and hidden from acting Agents. It is
+not a universal State IR. S1 Qualification must compare it with authoritative
+native SQLite/files/Git or another independently readable representation and
+must physically challenge every declared taskable capability.
 
-### S2 owns Task semantics and admission
+S1 may change when a demonstrated cross-environment S2/S3 consumer requirement
+requires it. Compatibility with earlier research releases is not a product
+requirement. S1 must not publish concrete Tasks, reference traces, corpus cells,
+rewards or training records.
 
-S2 consumes an exact EnvironmentRelease and produces TaskPacks. Task generation
-is goal-first:
+## S2 owns Goal compilation, public solvability and Task admission
+
+S2 is Goal-first. Its required order is:
 
 ```text
-Need/Brief-anchored, independently qualified capability atoms
--> parameterized TaskBlueprint / bounded GoalProgram
--> reproducible reset-only StartRecipe
--> TaskChecker compiled and frozen before solving
--> public-only constructive solution and fresh replay
--> natural-language instruction
--> adversarial admission
--> TaskPack
+qualified CapabilitySpecs
+-> deterministic StartCase and BindingCandidates
+-> bounded TaskBlueprint / GoalProgram
+-> compile and freeze TaskChecker
+-> render and audit the final canonical public instruction
+-> public-only Agent solves that exact instruction on real tools
+-> repeat on a fresh equivalent start
+-> challenge checker/instruction semantics
+-> seal TaskPack
+-> evaluate model-relative difficulty/cost separately
+-> select a CorpusManifest
 ```
 
-Graph traversal, random walks, program synthesis, LLM agents and search
-algorithms are optional implementation techniques. None is a mandatory Task
-source or semantic authority.
+A successful trace is evidence that a frozen Task is reachable. It never creates
+or weakens Task meaning. Graph traversal, random walk, program synthesis and
+other search methods are optional planner implementations, not Task sources or
+semantic authority.
+
+## Execution ownership
+
+### Deterministic framework code
+
+Framework Python owns schemas, release preparation, process isolation, identity,
+GoalProgram enumeration, checker compilation/execution, canonical instruction
+rendering, public/protected projection separation, tool dispatch, trace capture,
+argument-provenance validation, fresh-run admission, challenge verdicts,
+deduplication and corpus selection.
+
+These operations must not be implemented only as prompt instructions.
+
+### Python Codex SDK
+
+Codex SDK is used only to author persistent release-local code:
+
+1. the S1 Environment Builder writes the executable actor project;
+2. an independent S1 Semantics Author writes the protected semantics package
+   after Brief-derived expected relations are frozen.
+
+Codex never decides release admission, Task admission, identity, reward or final
+checker verdict. Generated code passes deterministic Host checks, native reads
+and physical negatives before publication.
+
+### OpenAI Responses tool-calling Agent
+
+A Host-owned Responses loop is used for public witness search and later
+model-relative assessment. It sees the exact final instruction, public reset
+context, ToolSpecs and ToolObservations only. It never sees GoalProgram,
+TaskChecker, protected bindings, native state or an answer key.
+
+The core implementation does not need an LLM paraphraser. A future paraphrase is
+a new instruction variant and must repeat public solving and admission.
+
+## Good Task contract
 
 Every admitted Task must be:
 
-- publicly solvable from its actor-visible context;
-- deterministically verifiable from trusted state, public trace and answer as
-  required;
-- well-posed without leaking hidden operands, tool names or a reference path;
-- non-trivial at the initial state;
-- reproducible across fresh materializations;
-- anchored to a coherent user intent supported by the Brief;
-- useful for a named Agent capability and assigned empirical difficulty/cost
-  evidence.
+- **publicly solvable:** at least two fresh real executions of the exact final
+  instruction succeed using public information and tools only;
+- **reliably verifiable:** deterministic checking rejects no-op, wrong target,
+  near miss, partial completion, collateral damage and wrong/stale answers where
+  applicable, while accepting a valid alternative route;
+- **well-posed:** all material constraints are explicit without exposing hidden
+  operands, native fields, tool names or a reference route;
+- **non-trivial:** the checker is false at the initial state, and query answers
+  are not already leaked by the instruction/reset context;
+- **reproducible:** the same release and StartCase reproduce the same business
+  predicates on isolated instances even when incidental IDs differ;
+- **Need-anchored and natural:** the capability and every cross-capability
+  composition are licensed by accepted Brief Requirements/workflows;
+- **path-open:** outcome Tasks are judged by Goal truth, not reference-trace
+  equality;
+- **training-targeted:** the Task names a qualified Agent capability. Its actual
+  difficulty and training value are empirical TaskAssessment/corpus properties,
+  not Task identity.
 
-A selected Task corpus must additionally be structurally diverse, low in
-semantic redundancy and balanced for its declared SFT or RL use. Internal
-coverage fingerprints guide selection; they are not evidence that the complete
-Task space has been covered.
-
-### S3 and S4 cannot redefine earlier truth
-
-S3 receives a TaskPack public projection for the acting Agent and a protected
-projection for trusted materialization and verification. It owns the acting
-loop, trajectory, final answer, verifier execution and Reward/abstention.
-
-S4 consumes verified Episodes. Training code cannot alter EnvironmentRelease
-behavior, Task truth or admission evidence.
+A corpus must additionally be structurally diverse, low in semantic redundancy
+and balanced for its declared SFT/RL use. Parameter changes and paraphrases do
+not count as new Task structures. Internal coverage is accounting evidence, not
+proof of complete Task-space coverage.
 
 ## Non-negotiable constraints
 
-1. **Real execution.** Public tools execute real project code and mutate real
-   persistent state. No response-map simulation or canned Task path is a normal
-   success route.
-2. **Public solvability.** A constructive solution may use only the same public
-   information and tools available to the acting Agent. Protected state may
-   select and verify a Task but may never supply an acting-time operand.
-3. **Independent truth.** A TaskChecker is frozen before the reference solution
-   is executed. The solution is evidence that the goal is reachable, not the
-   source of the goal or verifier.
-4. **Verifier sensitivity.** Admission must reject no-op, wrong-target,
-   near-miss, partial, collateral-damage and wrong-answer outcomes, while
-   accepting a valid alternative path when one is available.
-5. **No semantic authority by consensus.** LLMs may propose intents, code,
-   instructions and challenges. Model agreement never overrides deterministic
-   execution or state evidence.
-6. **Reset-only starts.** S2 chooses only S1-qualified `reset(start)` cases. It
-   performs no hidden setup calls, direct native mutation or snapshot restore.
-   Protected state inspection is read-only.
-7. **No domain branches in the framework.** Booking, SQLite and Git are
-   conformance cases, not framework categories or hard-coded schemas.
-8. **No fake completion.** Intermediate slices are checkpoints. S2 is complete
-   only after the full admission path works on contrasting real releases and a
-   frozen implementation transfers to a held-out release without domain code
-   changes.
-9. **Causal changes only.** Do not add compatibility layers, fallbacks,
-   abstractions, roles or fields without a named current consumer and observed
-   need.
+1. Public tools execute real project code and real persistent transitions.
+2. Protected facts may select and verify a Task but never supply an acting-time
+   operand.
+3. TaskChecker is frozen before the final instruction is exposed to the witness
+   Agent.
+4. The witness Agent solves exactly the instruction later exposed to S3.
+5. LLM consensus cannot override deterministic execution/state failure.
+6. S2 starts are reset-only; no hidden setup calls, native writes or snapshot
+   restoration are allowed.
+7. Framework code contains no booking/SQLite/Git/domain field branches.
+8. TaskPack semantic/admission identity is separate from model-relative
+   TaskAssessment and CorpusManifest identity.
+9. Unsupported semantics and bounded planner failure are explicit typed outcomes;
+   gates are never weakened to increase Task count.
+10. Intermediate implementation slices are checkpoints, never S2 completion.
 
-## Current planning boundary
+## Completion evidence
 
-The `s2-task-foundry` Trellis task owns the complete S2 redesign and the minimum
-cross-environment S1 runtime/semantics changes required by that design. The
-planning artifacts must be reviewed and explicitly approved before product code
-or task activation.
+S2 is complete only when the same frozen framework:
+
+- regenerates and consumes the contrasting SQLite and filesystem/Git releases;
+- produces non-trivial Task yield and multiple canonical GoalProgram shapes for
+  both without domain patches;
+- passes public solvability, checker sensitivity, leakage and fresh-start gates;
+- transfers to a held-out Need selected after framework/prompt freeze;
+- reports matched-budget baselines and downstream utility rather than relying on
+  internal diversity claims.
+
+## Current task boundary
+
+The `s2-task-foundry` branch and Trellis task own the complete S2 implementation
+and the minimum clean S1 release/runtime/semantics changes required by it. The
+old Graph/Programmatic-first proposal and backward compatibility are out of
+scope.
