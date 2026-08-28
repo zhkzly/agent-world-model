@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from agent_env_foundry.semantics import JSONValue
 from agent_task_foundry.facets import (
     FacetValueError,
     compare_facet_values,
@@ -33,15 +34,20 @@ def test_string_facets_compare_lexically() -> None:
         ({}, {}),
     ],
 )
-def test_ordering_rejects_mixed_or_non_scalar_facets(left: object, right: object) -> None:
+def test_ordering_rejects_mixed_or_non_scalar_facets(
+    left: JSONValue,
+    right: JSONValue,
+) -> None:
     with pytest.raises(FacetValueError):
-        compare_facet_values(left, "lt", right)  # type: ignore[arg-type]
+        compare_facet_values(left, "lt", right)
 
 
 @pytest.mark.parametrize("values", [[1, "2"], [True, 1], [None], [[]], [{}]])
-def test_ranking_rejects_heterogeneous_or_non_scalar_facets(values: list[object]) -> None:
+def test_ranking_rejects_heterogeneous_or_non_scalar_facets(
+    values: list[JSONValue],
+) -> None:
     with pytest.raises(FacetValueError):
-        extreme_facet_value(values, "max")  # type: ignore[arg-type]
+        extreme_facet_value(values, "max")
 
 
 def test_equality_remains_available_for_all_json_values() -> None:
