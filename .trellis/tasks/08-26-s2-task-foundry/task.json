@@ -27,6 +27,7 @@
     ".trellis/tasks/08-26-s2-task-foundry/prd.md",
     ".trellis/tasks/08-26-s2-task-foundry/design.md",
     ".trellis/tasks/08-26-s2-task-foundry/implement.md",
+    ".trellis/tasks/08-26-s2-task-foundry/research/implementation-readiness-audit.md",
     ".trellis/tasks/08-26-s2-task-foundry/research/goal-first-design-audit.md"
   ],
   "notes": "Old mandatory Graph/Programmatic design superseded. Final semantic order is capability/start -> checker -> canonical instruction -> two fresh public witnesses -> challenges -> TaskPack. TaskAssessment and CorpusManifest are separate. The user waived plan-document-write Patrol for this planning update.",
