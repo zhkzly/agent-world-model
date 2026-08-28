@@ -14,7 +14,11 @@ import pytest
 
 import agent_env_foundry.api as api_module
 from agent_env_foundry.api import GenerationConfig, generate_environment
-from agent_env_foundry.builder import BuilderFailure, CandidateBuild
+from agent_env_foundry.builder import (
+    BuilderFailure,
+    CandidateBuild,
+    _candidate_repair_finding,
+)
 from agent_env_foundry.publication import EnvironmentRelease, PublicationError
 from agent_env_foundry.qualification import QualificationResult
 from agent_env_foundry.research import (
@@ -183,6 +187,194 @@ def test_qualification_failure_cannot_reach_assembly(
     assert outcome.code == "candidate_runtime_failed"
     assert outcome.details["qualification_status"] == "candidate_defect"
     assert not (tmp_path / "releases").exists()
+
+
+def test_candidate_defect_repairs_same_builder_then_uses_fresh_qualification_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = _research_ready()
+    candidate_root = tmp_path / "candidate"
+    candidate_root.mkdir()
+    initial = CandidateBuild(candidate_root, "thread", "a" * 64, "done", ())
+    repaired = CandidateBuild(
+        candidate_root,
+        "thread",
+        "b" * 64,
+        "repaired",
+        (),
+        revision=2,
+    )
+    finding = _candidate_repair_finding(
+        failure_code="candidate_reload_failed",
+        contract_clause="factory_reattachment",
+        operation="invoke",
+        arguments={"tool_name": "read", "arguments": {}},
+        observation={"ok": False, "data": None, "error": {"code": "internal_error"}},
+    )
+    expected_semantics = object()
+    qualification_calls: list[dict[str, object]] = []
+
+    def qualify(
+        _projection: object,
+        _workspace: Path,
+        candidate_digest: str,
+        workspace_root: Path,
+        **kwargs: object,
+    ) -> QualificationResult:
+        qualification_calls.append(
+            {
+                "candidate_digest": candidate_digest,
+                "workspace_root": workspace_root,
+                "predicate_source_root": kwargs.get("predicate_source_root"),
+                "predicate_source_digest": kwargs.get("predicate_source_digest"),
+                "expected_task_semantics": kwargs["expected_task_semantics"],
+            }
+        )
+        if len(qualification_calls) == 1:
+            workspace_root.mkdir(parents=True)
+            return QualificationResult(
+                status="candidate_defect",
+                candidate_digest=initial.candidate_digest,
+                expected_relations_digest="c" * 64,
+                workspace_root=workspace_root,
+                predicate_digest="d" * 64,
+                failure_code="candidate_reload_failed",
+                details={
+                    "message": "reload failed",
+                    "probe_path": "PRIVATE_PROBE_SENTINEL",
+                    "patch": "PRIVATE_PATCH_SENTINEL",
+                },
+                candidate_finding=finding,
+            )
+        return QualificationResult(
+            status="passed",
+            candidate_digest=repaired.candidate_digest,
+            expected_relations_digest="c" * 64,
+            evidence_digest="e" * 64,
+            predicate_digest="d" * 64,
+            probe_bundle_digest="f" * 64,
+            negative_requirement_ids=("REQ-001",),
+            workspace_root=workspace_root,
+            semantics_author_inputs=object(),
+            expected_task_semantics_digest="1" * 64,
+            public_surface_digest="2" * 64,
+        )
+
+    repaired_inputs: list[object] = []
+
+    def repair(build: CandidateBuild, safe_finding: object, **kwargs: object) -> CandidateBuild:
+        repaired_inputs.extend((build, safe_finding, kwargs))
+        return repaired
+
+    monkeypatch.setattr(api_module, "run_research", lambda **_kwargs: ready)
+    monkeypatch.setattr(api_module, "run_builder", lambda *_args, **_kwargs: initial)
+    monkeypatch.setattr(
+        api_module,
+        "generate_expected_task_semantics",
+        lambda *_args, **_kwargs: expected_semantics,
+    )
+    monkeypatch.setattr(api_module, "run_qualification", qualify)
+    monkeypatch.setattr(api_module, "repair_builder", repair)
+    monkeypatch.setattr(
+        api_module,
+        "run_semantics_author",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            thread_id="semantics-thread",
+            factory="generated_task_semantics.release:make_semantics",
+            project_digest="3" * 64,
+            checks=(),
+        ),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "qualify_semantic_capabilities",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            semantics_digest="3" * 64,
+            public_episode_digest="4" * 64,
+            native_evidence_digest="5" * 64,
+            evidence_digest="6" * 64,
+            capabilities=(),
+        ),
+    )
+
+    def assemble(candidate: Path, qualification: QualificationResult, *_args: object) -> object:
+        assert candidate == repaired.workspace
+        assert qualification.candidate_digest == repaired.candidate_digest
+        assert qualification.workspace_root == qualification_calls[1]["workspace_root"]
+        raise PublicationError(
+            "assembly",
+            "fresh_assembly_reached",
+            "Fresh repaired lineage reached assembly",
+        )
+
+    monkeypatch.setattr(api_module, "assemble_environment_release", assemble)
+
+    outcome = generate_environment("Create a real resettable world.", config=_config(tmp_path))
+
+    assert isinstance(outcome, NotReleased)
+    assert outcome.code == "fresh_assembly_reached"
+    assert [item["candidate_digest"] for item in qualification_calls] == ["a" * 64, "b" * 64]
+    assert (
+        qualification_calls[0]["workspace_root"]
+        == tmp_path / "runs" / next((tmp_path / "runs").iterdir()).name / "qualification"
+    )
+    assert str(qualification_calls[1]["workspace_root"]).endswith("qualification-attempt-002")
+    assert (
+        qualification_calls[1]["predicate_source_root"] == qualification_calls[0]["workspace_root"]
+    )
+    assert qualification_calls[1]["predicate_source_digest"] == "d" * 64
+    assert all(
+        item["expected_task_semantics"] is expected_semantics for item in qualification_calls
+    )
+    assert repaired_inputs[0] is initial
+    assert repaired_inputs[1] is finding
+    assert repaired_inputs[2]["failed_candidate_digest"] == initial.candidate_digest
+    repair_record = next((tmp_path / "runs").rglob("candidate-repair-001.json")).read_text()
+    assert "PRIVATE_PROBE_SENTINEL" not in repair_record
+    assert "PRIVATE_PATCH_SENTINEL" not in repair_record
+
+
+def test_candidate_repair_requires_prior_qualification_lineage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    candidate_root = tmp_path / "candidate"
+    candidate_root.mkdir()
+    candidate = CandidateBuild(candidate_root, "thread", "a" * 64, "done", ())
+    finding = _candidate_repair_finding(
+        failure_code="candidate_reload_failed",
+        contract_clause="factory_reattachment",
+        operation="invoke",
+        arguments={},
+        observation={"ok": False, "data": None, "error": {"code": "internal_error"}},
+    )
+    monkeypatch.setattr(api_module, "run_research", lambda **_kwargs: _research_ready())
+    monkeypatch.setattr(api_module, "run_builder", lambda *_args, **_kwargs: candidate)
+    monkeypatch.setattr(
+        api_module,
+        "generate_expected_task_semantics",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "run_qualification",
+        lambda *_args, **_kwargs: QualificationResult(
+            status="candidate_defect",
+            candidate_digest=candidate.candidate_digest,
+            expected_relations_digest="b" * 64,
+            failure_code="candidate_reload_failed",
+            candidate_finding=finding,
+        ),
+    )
+    monkeypatch.setattr(
+        api_module,
+        "repair_builder",
+        lambda *_args, **_kwargs: pytest.fail("Repair must not run without prior lineage"),
+    )
+
+    outcome = generate_environment("Create a real resettable world.", config=_config(tmp_path))
+
+    assert isinstance(outcome, NotReleased)
+    assert outcome.code == "candidate_repair_lineage_missing"
 
 
 def test_expected_semantics_failure_stops_before_qualification(

@@ -9,12 +9,12 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
 import rfc8785
-from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
+from openai_codex import ApprovalMode, Codex, CodexConfig
 
 from agent_env_foundry.errors import EnvironmentContractError
 from agent_env_foundry.release import verify_release
@@ -24,11 +24,13 @@ __all__ = [
     "BuilderConfig",
     "BuilderFailure",
     "CandidateBuild",
+    "CandidateRepairFinding",
     "CommandResult",
     "PreparedBuilderWorkspace",
     "candidate_files",
     "compute_candidate_digest",
     "prepare_builder_workspace",
+    "repair_builder",
     "run_builder",
     "run_candidate_checks",
 ]
@@ -47,6 +49,11 @@ _EXCLUDED_PARTS = {
 }
 _EXCLUDED_NAMES = {PROJECTION_NAME, CONTRACT_NAME}
 _AMBIENT_PYTHON_ENV = ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME")
+_CANDIDATE_REPAIR_FINDING_ORIGIN = object()
+_CANDIDATE_REPAIR_CLAUSES = {
+    "candidate_runtime_failed": "public_environment_runtime",
+    "candidate_reload_failed": "factory_reattachment",
+}
 
 
 class BuilderFailure(RuntimeError):
@@ -55,6 +62,95 @@ class BuilderFailure(RuntimeError):
         self.phase = phase
         self.code = code
         self.details = {"phase": phase, **details}
+
+
+@dataclass(frozen=True)
+class CandidateRepairFinding:
+    failure_code: str
+    contract_clause: str
+    operation: str | None
+    arguments: dict[str, Any] | None
+    observation: Any
+    runtime_error: str | None
+    _origin: object = field(repr=False, compare=False)
+
+    def to_document(self) -> dict[str, Any]:
+        return {
+            "failure_code": self.failure_code,
+            "contract_clause": self.contract_clause,
+            "operation": self.operation,
+            "arguments": self.arguments,
+            "observation": self.observation,
+            "runtime_error": self.runtime_error,
+        }
+
+
+def _candidate_repair_finding(
+    *,
+    failure_code: str,
+    contract_clause: str,
+    operation: str | None = None,
+    arguments: dict[str, Any] | None = None,
+    observation: Any = None,
+    runtime_error: str | None = None,
+) -> CandidateRepairFinding:
+    if _CANDIDATE_REPAIR_CLAUSES.get(failure_code) != contract_clause:
+        raise BuilderFailure(
+            "builder_repair",
+            "candidate_repair_finding_invalid",
+            "Candidate repair finding is not a closed Host-owned failure",
+        )
+    if operation is not None and (not isinstance(operation, str) or not operation):
+        raise BuilderFailure(
+            "builder_repair",
+            "candidate_repair_finding_invalid",
+            "Candidate repair operation must be non-empty",
+        )
+    safe_observation: Any = None
+    if observation is not None:
+        error = observation.get("error") if isinstance(observation, dict) else None
+        code = error.get("code") if isinstance(error, dict) else None
+        if (
+            not isinstance(observation, dict)
+            or observation.get("ok") is not False
+            or observation.get("data") is not None
+            or not isinstance(code, str)
+            or not code
+        ):
+            raise BuilderFailure(
+                "builder_repair",
+                "candidate_repair_finding_invalid",
+                "Candidate repair observation must be a canonical failed public call",
+            )
+        safe_observation = {"ok": False, "data": None, "error": {"code": code}}
+    try:
+        rfc8785.dumps({"arguments": arguments, "observation": safe_observation})
+    except (TypeError, ValueError) as exc:
+        raise BuilderFailure(
+            "builder_repair",
+            "candidate_repair_finding_invalid",
+            "Candidate repair finding must contain only JSON facts",
+        ) from exc
+    if runtime_error is not None and (
+        not isinstance(runtime_error, str)
+        or not runtime_error
+        or len(runtime_error) > 100
+        or not runtime_error.replace("_", "").isalnum()
+    ):
+        raise BuilderFailure(
+            "builder_repair",
+            "candidate_repair_finding_invalid",
+            "Candidate repair runtime error must be text",
+        )
+    return CandidateRepairFinding(
+        failure_code,
+        contract_clause,
+        operation,
+        arguments,
+        safe_observation,
+        runtime_error,
+        _CANDIDATE_REPAIR_FINDING_ORIGIN,
+    )
 
 
 @dataclass(frozen=True)
@@ -125,6 +221,12 @@ class CandidateBuild:
     candidate_digest: str
     final_response: str
     checks: tuple[CommandResult, ...]
+    codex_home: Path | None = None
+    projection_digest: str | None = None
+    contract_digest: str | None = None
+    turns_used: int = 0
+    revision: int = 1
+    seen_digests: tuple[str, ...] = ()
 
 
 def _file_digest(path: Path) -> str:
@@ -403,6 +505,156 @@ def _isolated_codex_env(codex_home: str | Path, uv_cache_dir: Path) -> dict[str,
     }
 
 
+def _builder_skill() -> str:
+    return (Path(__file__).parent / "runtime_skills/environment-codegen/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def _builder_codex_config(
+    root: Path,
+    codex_home: Path,
+    config: BuilderConfig,
+) -> CodexConfig:
+    return CodexConfig(
+        cwd=str(root),
+        env=_isolated_codex_env(codex_home, config.uv_cache_dir),
+        config_overrides=(
+            *_codex_provider_overrides(),
+            *_codex_workspace_permission_overrides("foundry_builder", root),
+        ),
+    )
+
+
+def _codex_workspace_permission_overrides(profile: str, root: Path) -> tuple[str, ...]:
+    if not profile.replace("_", "").isalnum():
+        raise ValueError("Codex permission profile name is invalid")
+    workspace = Path(root).resolve()
+    parent = workspace.parent
+    filesystem = (
+        "{"
+        + ",".join(
+            (
+                f'{json.dumps(str(parent))}="deny"',
+                f'{json.dumps(str(workspace))}="write"',
+            )
+        )
+        + "}"
+    )
+    return (
+        f'default_permissions="{profile}"',
+        f'permissions.{profile}.extends=":workspace"',
+        f"permissions.{profile}.filesystem={filesystem}",
+        f"permissions.{profile}.network.enabled=true",
+    )
+
+
+def _require_fresh_builder_codex_home(path: Path) -> None:
+    if path.is_symlink() or path.exists():
+        raise BuilderFailure(
+            "builder",
+            "builder_codex_home_not_fresh",
+            "Builder Codex home must be absent before a new lineage",
+            path=str(path),
+        )
+    path.mkdir()
+
+
+def _drive_builder_thread(
+    prepared: PreparedBuilderWorkspace,
+    thread: Any,
+    codex_home: Path,
+    config: BuilderConfig,
+    prompt: str,
+    *,
+    turns_used: int,
+    revision: int,
+    seen_digests: tuple[str, ...],
+) -> CandidateBuild:
+    remaining = config.max_turns - turns_used
+    if remaining <= 0:
+        raise BuilderFailure(
+            "builder",
+            "builder_turns_exhausted",
+            "Builder lineage exhausted its total turn budget",
+            turns_used=turns_used,
+            max_turns=config.max_turns,
+        )
+    observed = list(seen_digests)
+    previous_digest = observed[-1] if observed else None
+    last_response = ""
+    last_checks: tuple[CommandResult, ...] = ()
+    for _ in range(remaining):
+        try:
+            result = thread.run(prompt)
+        except Exception as exc:
+            raise BuilderFailure(
+                "infrastructure",
+                "builder_provider_turn_failed",
+                "Builder provider turn failed",
+                original_code=type(exc).__name__,
+                original_message=str(exc),
+            ) from exc
+        turns_used += 1
+        last_response = result.final_response or ""
+        prepared.verify_inputs()
+        last_checks = run_candidate_checks(prepared.root, config)
+        digest = compute_candidate_digest(prepared.root)
+        if digest in observed:
+            code = "builder_stalled" if digest == previous_digest else "builder_revision_cycle"
+            failure_phase = next(
+                (item.phase for item in last_checks if not item.passed),
+                "builder",
+            )
+            raise BuilderFailure(
+                failure_phase,
+                code,
+                "Builder produced no new candidate revision after factual feedback",
+                candidate_digest=digest,
+                seen_digests=observed,
+            )
+        observed.append(digest)
+        if last_checks and all(item.passed for item in last_checks):
+            return CandidateBuild(
+                prepared.root,
+                thread.id,
+                digest,
+                last_response,
+                last_checks,
+                codex_home,
+                prepared.projection_digest,
+                prepared.contract_digest,
+                turns_used,
+                revision,
+                tuple(observed),
+            )
+        previous_digest = digest
+        prompt = _feedback(last_checks)
+    raise BuilderFailure(
+        "builder",
+        "builder_turns_exhausted",
+        "Builder lineage exhausted its total turn budget",
+        turns_used=turns_used,
+        max_turns=config.max_turns,
+        final_response=last_response,
+        checks=[item.to_document() for item in last_checks],
+    )
+
+
+def _qualification_feedback(build: CandidateBuild, finding: CandidateRepairFinding) -> str:
+    return (
+        "ACTOR QUALIFICATION REJECTED\n"
+        "Repair the general environment implementation and its diagnostic tests in the same "
+        "workspace. Preserve BUILDER_PROJECTION.json and ENVIRONMENT_CONTRACT.md. Do not "
+        "special-case one observed value; fresh Qualification will rerun all Requirements, "
+        "starts, instances, negatives, and cold checks.\n"
+        "REJECTED_CANDIDATE_DIGEST\n"
+        f"{build.candidate_digest}\n"
+        "SAFE_HOST_FINDING\n"
+        + json.dumps(finding.to_document(), ensure_ascii=False, sort_keys=True)
+    )
+
+
 def run_builder(
     projection: BuilderProjection,
     root: Path,
@@ -415,67 +667,118 @@ def run_builder(
         projection,
         uv_cache_dir=selected.uv_cache_dir,
     )
-    skill = (Path(__file__).parent / "runtime_skills/environment-codegen/SKILL.md").read_text(
-        encoding="utf-8"
-    )
-    previous_failed_digest: str | None = None
     prompt = (
         "Build the complete environment project described by BUILDER_PROJECTION.json and "
         "ENVIRONMENT_CONTRACT.md. Own all implementation decisions. Run and repair the "
         "project's real uv commands and diagnostic tests before reporting completion."
     )
-    provider_overrides = _codex_provider_overrides()
-    with tempfile.TemporaryDirectory(
-        dir=prepared.root.parent,
-        prefix="agent-env-foundry-codex-home-",
-        ignore_cleanup_errors=True,
-    ) as codex_home:
-        sdk_env = _isolated_codex_env(codex_home, selected.uv_cache_dir)
-        with Codex(
-            CodexConfig(
-                cwd=str(prepared.root),
-                env=sdk_env,
-                config_overrides=provider_overrides,
-            )
-        ) as codex:
-            thread = codex.thread_start(
-                approval_mode=ApprovalMode.deny_all,
-                base_instructions=skill,
-                cwd=str(prepared.root),
-                model=selected.model,
-                sandbox=Sandbox.full_access,
-            )
-            last_response = ""
-            last_checks: tuple[CommandResult, ...] = ()
-            for _turn in range(selected.max_turns):
-                result = thread.run(prompt)
-                last_response = result.final_response or ""
-                prepared.verify_inputs()
-                last_checks = run_candidate_checks(prepared.root, selected)
-                digest = compute_candidate_digest(prepared.root)
-                if last_checks and all(item.passed for item in last_checks):
-                    return CandidateBuild(
-                        prepared.root,
-                        thread.id,
-                        digest,
-                        last_response,
-                        last_checks,
-                    )
-                if previous_failed_digest == digest:
-                    failed = next(item for item in last_checks if not item.passed)
-                    raise BuilderFailure(
-                        failed.phase,
-                        "builder_stalled",
-                        "Builder produced no byte change after factual failure feedback",
-                        candidate_digest=digest,
-                        failure=failed.to_document(),
-                    )
-                previous_failed_digest = digest
-                prompt = _feedback(last_checks)
-    raise BuilderFailure(
-        "builder",
-        "builder_turns_exhausted",
-        "Builder exhausted its repair turns without passing deterministic checks",
-        final_response=last_response,
-        checks=[item.to_document() for item in last_checks],
+    codex_home = prepared.root.parent / f"{prepared.root.name}-codex-home"
+    _require_fresh_builder_codex_home(codex_home)
+    with Codex(_builder_codex_config(prepared.root, codex_home, selected)) as codex:
+        thread = codex.thread_start(
+            approval_mode=ApprovalMode.deny_all,
+            base_instructions=_builder_skill(),
+            cwd=str(prepared.root),
+            model=selected.model,
+        )
+        return _drive_builder_thread(
+            prepared,
+            thread,
+            codex_home,
+            selected,
+            prompt,
+            turns_used=0,
+            revision=1,
+            seen_digests=(),
+        )
+
+
+def repair_builder(
+    build: CandidateBuild,
+    finding: CandidateRepairFinding,
+    *,
+    failed_candidate_digest: str,
+    config: BuilderConfig,
+) -> CandidateBuild:
+    """Resume the exact Builder thread after a Host-owned Candidate finding."""
+    if finding._origin is not _CANDIDATE_REPAIR_FINDING_ORIGIN:
+        raise BuilderFailure(
+            "builder_repair",
+            "candidate_repair_finding_invalid",
+            "Builder repair requires a Host-origin finding",
+        )
+    if failed_candidate_digest != build.candidate_digest:
+        raise BuilderFailure(
+            "builder_repair",
+            "candidate_repair_digest_mismatch",
+            "Qualification failure binds a different Candidate revision",
+            build_digest=build.candidate_digest,
+            failed_digest=failed_candidate_digest,
+        )
+    if compute_candidate_digest(build.workspace) != build.candidate_digest:
+        raise BuilderFailure(
+            "builder_repair",
+            "candidate_changed_before_repair",
+            "Candidate workspace changed outside the Builder lineage",
+        )
+    if (
+        build.codex_home is None
+        or build.projection_digest is None
+        or build.contract_digest is None
+        or build.codex_home.is_symlink()
+        or not build.codex_home.is_dir()
+    ):
+        raise BuilderFailure(
+            "builder_repair",
+            "builder_resume_invalid",
+            "Builder resume identity is unavailable",
+        )
+    prepared = PreparedBuilderWorkspace(
+        build.workspace,
+        build.projection_digest,
+        build.contract_digest,
     )
+    prepared.verify_inputs()
+    if build.turns_used >= config.max_turns:
+        raise BuilderFailure(
+            "builder",
+            "builder_turns_exhausted",
+            "Builder lineage exhausted its total turn budget",
+            turns_used=build.turns_used,
+            max_turns=config.max_turns,
+        )
+    try:
+        with Codex(_builder_codex_config(build.workspace, build.codex_home, config)) as codex:
+            thread = codex.thread_resume(
+                build.thread_id,
+                approval_mode=ApprovalMode.deny_all,
+                base_instructions=_builder_skill(),
+                cwd=str(build.workspace),
+                model=config.model,
+            )
+            if thread.id != build.thread_id:
+                raise BuilderFailure(
+                    "builder_repair",
+                    "builder_resume_invalid",
+                    "Resumed Builder thread identity changed",
+                )
+            return _drive_builder_thread(
+                prepared,
+                thread,
+                build.codex_home,
+                config,
+                _qualification_feedback(build, finding),
+                turns_used=build.turns_used,
+                revision=build.revision + 1,
+                seen_digests=build.seen_digests or (build.candidate_digest,),
+            )
+    except BuilderFailure:
+        raise
+    except Exception as exc:
+        raise BuilderFailure(
+            "infrastructure",
+            "builder_resume_failed",
+            "Builder thread could not be resumed",
+            original_code=type(exc).__name__,
+            original_message=str(exc),
+        ) from exc

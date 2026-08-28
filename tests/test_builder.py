@@ -17,9 +17,12 @@ import agent_env_foundry.builder as builder_module
 from agent_env_foundry.builder import (
     BuilderConfig,
     BuilderFailure,
+    CandidateRepairFinding,
     CommandResult,
+    _candidate_repair_finding,
     compute_candidate_digest,
     prepare_builder_workspace,
+    repair_builder,
     run_builder,
     run_candidate_checks,
 )
@@ -189,6 +192,7 @@ class FakeThread:
 
 class FakeCodex:
     instances: list[FakeCodex] = []
+    threads: dict[str, FakeThread] = {}
 
     def __init__(self, config: Any) -> None:
         self.config = config
@@ -205,6 +209,12 @@ class FakeCodex:
     def thread_start(self, **kwargs: Any) -> FakeThread:
         self.thread_kwargs = kwargs
         self.thread = FakeThread(Path(kwargs["cwd"]))
+        self.__class__.threads[self.thread.id] = self.thread
+        return self.thread
+
+    def thread_resume(self, thread_id: str, **kwargs: Any) -> FakeThread:
+        self.thread_kwargs = kwargs
+        self.thread = self.__class__.threads[thread_id]
         return self.thread
 
 
@@ -239,11 +249,326 @@ def test_builder_uses_official_sdk_shape_and_same_thread_factual_repair(
     sdk = FakeCodex.instances[-1]
     assert sdk.thread_kwargs["cwd"] == str(tmp_path / "candidate")
     assert sdk.thread_kwargs["model"] == "gpt-5.6-luna"
-    assert sdk.thread_kwargs["sandbox"].value == "full-access"
+    assert "sandbox" not in sdk.thread_kwargs
     assert sdk.thread is not None and len(sdk.thread.prompts) == 2
     assert "first factual failure" in sdk.thread.prompts[1]
     assert result.thread_id == "fake-thread"
     assert result.checks[-1].exit_code == 0
+
+
+def test_qualification_repair_resumes_exact_builder_thread_and_lineage(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeCodex.instances.clear()
+    FakeCodex.threads.clear()
+    monkeypatch.setattr(builder_module, "Codex", FakeCodex)
+    monkeypatch.setattr(
+        builder_module,
+        "run_candidate_checks",
+        lambda root, config: (CommandResult("tests", ("pytest",), 0, "", ""),),
+    )
+    config = BuilderConfig(max_turns=3, uv_cache_dir=tmp_path / "uv-cache")
+    initial = run_builder(projection(), tmp_path / "candidate", config=config)
+    finding = _candidate_repair_finding(
+        failure_code="candidate_reload_failed",
+        contract_clause="factory_reattachment",
+        operation="invoke",
+        arguments={"tool_name": "read", "arguments": {}},
+        observation={
+            "ok": False,
+            "data": None,
+            "error": {"code": "internal_error", "message": "reset required"},
+        },
+    )
+
+    repaired = repair_builder(
+        initial,
+        finding,
+        failed_candidate_digest=initial.candidate_digest,
+        config=config,
+    )
+
+    assert isinstance(finding, CandidateRepairFinding)
+    assert repaired.thread_id == initial.thread_id
+    assert repaired.codex_home == initial.codex_home
+    assert repaired.codex_home is not None and repaired.codex_home.is_dir()
+    assert repaired.candidate_digest != initial.candidate_digest
+    assert repaired.turns_used == 2
+    assert repaired.revision == 2
+    assert repaired.seen_digests == (initial.candidate_digest, repaired.candidate_digest)
+    thread = FakeCodex.threads[initial.thread_id]
+    assert len(thread.prompts) == 2
+    assert "candidate_reload_failed" in thread.prompts[1]
+    assert "internal_error" in thread.prompts[1]
+    assert "reset required" not in thread.prompts[1]
+    assert "public_probe.py" not in thread.prompts[1]
+    assert FakeCodex.instances[-1].thread is thread
+
+
+def test_builder_resume_provider_failure_is_typed_infrastructure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class ResumeFailCodex(FakeCodex):
+        threads: dict[str, FakeThread] = {}
+
+        def thread_resume(self, thread_id: str, **kwargs: Any) -> FakeThread:
+            del thread_id, kwargs
+            raise RuntimeError("resume transport unavailable")
+
+    ResumeFailCodex.instances.clear()
+    ResumeFailCodex.threads.clear()
+    monkeypatch.setattr(builder_module, "Codex", ResumeFailCodex)
+    monkeypatch.setattr(
+        builder_module,
+        "run_candidate_checks",
+        lambda root, config: (CommandResult("tests", ("pytest",), 0, "", ""),),
+    )
+    config = BuilderConfig(max_turns=2, uv_cache_dir=tmp_path / "uv-cache")
+    initial = run_builder(projection(), tmp_path / "candidate", config=config)
+    finding = _candidate_repair_finding(
+        failure_code="candidate_reload_failed",
+        contract_clause="factory_reattachment",
+        operation="invoke",
+        arguments={},
+        observation={"ok": False, "data": None, "error": {"code": "internal_error"}},
+    )
+
+    with pytest.raises(BuilderFailure) as caught:
+        repair_builder(
+            initial,
+            finding,
+            failed_candidate_digest=initial.candidate_digest,
+            config=config,
+        )
+
+    assert caught.value.phase == "infrastructure"
+    assert caught.value.code == "builder_resume_failed"
+
+
+def test_builder_resume_rejects_changed_thread_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class WrongThread(FakeThread):
+        id = "wrong-thread"
+
+    class WrongThreadCodex(FakeCodex):
+        threads: dict[str, FakeThread] = {}
+
+        def thread_resume(self, thread_id: str, **kwargs: Any) -> FakeThread:
+            del thread_id
+            self.thread_kwargs = kwargs
+            return WrongThread(Path(kwargs["cwd"]))
+
+    WrongThreadCodex.instances.clear()
+    WrongThreadCodex.threads.clear()
+    monkeypatch.setattr(builder_module, "Codex", WrongThreadCodex)
+    monkeypatch.setattr(
+        builder_module,
+        "run_candidate_checks",
+        lambda root, config: (CommandResult("tests", ("pytest",), 0, "", ""),),
+    )
+    config = BuilderConfig(max_turns=2, uv_cache_dir=tmp_path / "uv-cache")
+    initial = run_builder(projection(), tmp_path / "candidate", config=config)
+    finding = _candidate_repair_finding(
+        failure_code="candidate_reload_failed",
+        contract_clause="factory_reattachment",
+        operation="invoke",
+        arguments={},
+        observation={"ok": False, "data": None, "error": {"code": "internal_error"}},
+    )
+
+    with pytest.raises(BuilderFailure) as caught:
+        repair_builder(
+            initial,
+            finding,
+            failed_candidate_digest=initial.candidate_digest,
+            config=config,
+        )
+
+    assert caught.value.code == "builder_resume_invalid"
+
+
+def test_builder_qualification_repair_requires_unchanged_candidate_and_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeCodex.instances.clear()
+    FakeCodex.threads.clear()
+    monkeypatch.setattr(builder_module, "Codex", FakeCodex)
+    monkeypatch.setattr(
+        builder_module,
+        "run_candidate_checks",
+        lambda root, config: (CommandResult("tests", ("pytest",), 0, "", ""),),
+    )
+    config = BuilderConfig(max_turns=3, uv_cache_dir=tmp_path / "uv-cache")
+    finding = _candidate_repair_finding(
+        failure_code="candidate_reload_failed",
+        contract_clause="factory_reattachment",
+        operation="invoke",
+        arguments={},
+        observation={"ok": False, "data": None, "error": {"code": "internal_error"}},
+    )
+    changed = run_builder(projection(), tmp_path / "changed", config=config)
+    with pytest.raises(BuilderFailure) as digest_failure:
+        repair_builder(
+            changed,
+            finding,
+            failed_candidate_digest="0" * 64,
+            config=config,
+        )
+    assert digest_failure.value.code == "candidate_repair_digest_mismatch"
+
+    (changed.workspace / "src/generated_environment/runtime.py").write_text("tampered = True\n")
+    with pytest.raises(BuilderFailure) as candidate_failure:
+        repair_builder(
+            changed,
+            finding,
+            failed_candidate_digest=changed.candidate_digest,
+            config=config,
+        )
+    assert candidate_failure.value.code == "candidate_changed_before_repair"
+
+    inputs = run_builder(projection(), tmp_path / "inputs", config=config)
+    projection_path = inputs.workspace / "BUILDER_PROJECTION.json"
+    projection_path.chmod(0o644)
+    projection_path.write_text("{}")
+    with pytest.raises(BuilderFailure) as input_failure:
+        repair_builder(
+            inputs,
+            finding,
+            failed_candidate_digest=inputs.candidate_digest,
+            config=config,
+        )
+    assert input_failure.value.code == "builder_input_modified"
+
+
+def test_builder_qualification_repair_shares_total_turn_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeCodex.instances.clear()
+    FakeCodex.threads.clear()
+    monkeypatch.setattr(builder_module, "Codex", FakeCodex)
+    monkeypatch.setattr(
+        builder_module,
+        "run_candidate_checks",
+        lambda root, config: (CommandResult("tests", ("pytest",), 0, "", ""),),
+    )
+    config = BuilderConfig(max_turns=1, uv_cache_dir=tmp_path / "uv-cache")
+    initial = run_builder(projection(), tmp_path / "candidate", config=config)
+    finding = _candidate_repair_finding(
+        failure_code="candidate_reload_failed",
+        contract_clause="factory_reattachment",
+        operation="invoke",
+        arguments={},
+        observation={"ok": False, "data": None, "error": {"code": "internal_error"}},
+    )
+
+    with pytest.raises(BuilderFailure) as caught:
+        repair_builder(
+            initial,
+            finding,
+            failed_candidate_digest=initial.candidate_digest,
+            config=config,
+        )
+
+    assert caught.value.code == "builder_turns_exhausted"
+    assert len(FakeCodex.instances) == 1
+
+
+def test_builder_qualification_repair_rejects_revision_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class CyclicThread(FakeThread):
+        def run(self, prompt: str) -> FakeResult:
+            self.prompts.append(prompt)
+            generated = self.workspace / "src/generated_environment/runtime.py"
+            generated.parent.mkdir(parents=True, exist_ok=True)
+            turn = 1 if len(self.prompts) == 3 else len(self.prompts)
+            generated.write_text(f"TURN = {turn}\n")
+            return FakeResult()
+
+    class CyclicCodex(FakeCodex):
+        threads: dict[str, FakeThread] = {}
+
+        def thread_start(self, **kwargs: Any) -> CyclicThread:
+            self.thread_kwargs = kwargs
+            self.thread = CyclicThread(Path(kwargs["cwd"]))
+            self.__class__.threads[self.thread.id] = self.thread
+            return self.thread
+
+    CyclicCodex.instances.clear()
+    CyclicCodex.threads.clear()
+    monkeypatch.setattr(builder_module, "Codex", CyclicCodex)
+    monkeypatch.setattr(
+        builder_module,
+        "run_candidate_checks",
+        lambda root, config: (CommandResult("tests", ("pytest",), 0, "", ""),),
+    )
+    config = BuilderConfig(max_turns=3, uv_cache_dir=tmp_path / "uv-cache")
+    finding = _candidate_repair_finding(
+        failure_code="candidate_reload_failed",
+        contract_clause="factory_reattachment",
+        operation="invoke",
+        arguments={},
+        observation={"ok": False, "data": None, "error": {"code": "internal_error"}},
+    )
+    initial = run_builder(projection(), tmp_path / "candidate", config=config)
+    repaired = repair_builder(
+        initial,
+        finding,
+        failed_candidate_digest=initial.candidate_digest,
+        config=config,
+    )
+
+    with pytest.raises(BuilderFailure) as caught:
+        repair_builder(
+            repaired,
+            finding,
+            failed_candidate_digest=repaired.candidate_digest,
+            config=config,
+        )
+
+    assert caught.value.code == "builder_revision_cycle"
+
+
+def test_builder_repair_rejects_forged_finding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    FakeCodex.instances.clear()
+    FakeCodex.threads.clear()
+    monkeypatch.setattr(builder_module, "Codex", FakeCodex)
+    monkeypatch.setattr(
+        builder_module,
+        "run_candidate_checks",
+        lambda root, config: (CommandResult("tests", ("pytest",), 0, "", ""),),
+    )
+    config = BuilderConfig(max_turns=2, uv_cache_dir=tmp_path / "uv-cache")
+    initial = run_builder(projection(), tmp_path / "candidate", config=config)
+    forged = CandidateRepairFinding(
+        "candidate_reload_failed",
+        "factory_reattachment",
+        "invoke",
+        {},
+        {"ok": False},
+        None,
+        object(),
+    )
+
+    with pytest.raises(BuilderFailure) as caught:
+        repair_builder(
+            initial,
+            forged,
+            failed_candidate_digest=initial.candidate_digest,
+            config=config,
+        )
+
+    assert caught.value.code == "candidate_repair_finding_invalid"
 
 
 def test_unchanged_failed_candidate_is_typed_stall(
@@ -278,7 +603,7 @@ def test_unchanged_failed_candidate_is_typed_stall(
     assert caught.value.details["phase"] == "build"
 
 
-def test_sequential_runs_use_distinct_ephemeral_codex_homes(
+def test_sequential_runs_use_distinct_persistent_codex_homes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -307,16 +632,16 @@ def test_sequential_runs_use_distinct_ephemeral_codex_homes(
     first_home, second_home = homes
     assert first_home != second_home
     assert listings == [["home"], ["home"]]
-    assert not first_home.exists()
-    assert not second_home.exists()
+    assert first_home.is_dir()
+    assert second_home.is_dir()
     assert not first_home.is_relative_to(tmp_path / "one")
     assert not second_home.is_relative_to(tmp_path / "two")
     sdk = FakeCodex.instances[-1]
     assert Path(sdk.config.env["CODEX_HOME"]) != inherited
     assert Path(sdk.config.env["CODEX_HOME"]) != Path.home() / ".codex"
     assert Path(sdk.config.env["HOME"]).parent == Path(sdk.config.env["CODEX_HOME"])
-    assert not Path(sdk.config.env["HOME"]).exists()
-    assert sdk.thread_kwargs["sandbox"].value == "full-access"
+    assert Path(sdk.config.env["HOME"]).is_dir()
+    assert "sandbox" not in sdk.thread_kwargs
     assert sdk.thread_kwargs["approval_mode"] == ApprovalMode.deny_all
     assert "OPENAI_API_KEY" not in sdk.config.env
     assert "OPENAI_BASE_URL" not in sdk.config.env
@@ -341,7 +666,7 @@ def test_sdk_uses_explicit_custom_provider_without_copying_key_value(
     )
 
     sdk = FakeCodex.instances[-1]
-    assert sdk.config.config_overrides == (
+    assert sdk.config.config_overrides[:10] == (
         'model_provider="foundry_runtime"',
         'model_providers.foundry_runtime.name="Foundry runtime"',
         'model_providers.foundry_runtime.base_url="http://provider.invalid/v1"',
@@ -353,9 +678,31 @@ def test_sdk_uses_explicit_custom_provider_without_copying_key_value(
         "features.multi_agent=false",
         "features.skill_search=false",
     )
+    assert sdk.config.config_overrides[10:] == builder_module._codex_workspace_permission_overrides(
+        "foundry_builder",
+        tmp_path / "candidate",
+    )
     assert "test-provider-key" not in repr(sdk.config.config_overrides)
     assert set(sdk.config.env) == {"CODEX_HOME", "HOME", "UV_CACHE_DIR"}
     assert Path(sdk.config.env["HOME"]).parent == Path(sdk.config.env["CODEX_HOME"])
+
+
+def test_product_codex_permission_profile_denies_run_siblings(tmp_path: Path) -> None:
+    workspace = (tmp_path / "run/candidate").resolve()
+    overrides = builder_module._codex_workspace_permission_overrides(
+        "foundry_builder",
+        workspace,
+    )
+
+    assert overrides == (
+        'default_permissions="foundry_builder"',
+        'permissions.foundry_builder.extends=":workspace"',
+        (
+            "permissions.foundry_builder.filesystem="
+            f'{{"{workspace.parent}"="deny","{workspace}"="write"}}'
+        ),
+        "permissions.foundry_builder.network.enabled=true",
+    )
 
 
 def test_product_codex_prompt_input_excludes_parent_and_user_guidance(tmp_path: Path) -> None:

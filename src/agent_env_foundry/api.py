@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from agent_env_foundry.agents import AgentRoute, run_research
-from agent_env_foundry.builder import BuilderConfig, BuilderFailure, run_builder
+from agent_env_foundry.builder import (
+    BuilderConfig,
+    BuilderFailure,
+    CandidateBuild,
+    repair_builder,
+    run_builder,
+)
 from agent_env_foundry.errors import EnvironmentContractError
 from agent_env_foundry.publication import (
     ColdReleaseConfig,
@@ -151,14 +157,7 @@ def generate_environment(
         )
     except OSError as exc:
         return _finish(run_root, _infrastructure_failure("builder", exc))
-    _write_json(
-        run_root / "candidate.json",
-        {
-            "candidate_digest": candidate.candidate_digest,
-            "thread_id": candidate.thread_id,
-            "checks": [item.to_document() for item in candidate.checks],
-        },
-    )
+    _write_candidate_record(run_root, candidate)
 
     try:
         expected_task_semantics = generate_expected_task_semantics(
@@ -178,16 +177,58 @@ def generate_environment(
             ),
         )
 
-    qualification = run_qualification(
-        research.builder_projection,
-        candidate.workspace,
-        candidate.candidate_digest,
-        run_root / "qualification",
-        expected_task_semantics=expected_task_semantics,
-        config=selected.qualification,
-    )
-    if qualification.status != "passed":
-        return _finish(run_root, _qualification_failure(qualification))
+    predicate_source_root: Path | None = None
+    predicate_source_digest: str | None = None
+    while True:
+        qualification_root = (
+            run_root / "qualification"
+            if candidate.revision == 1
+            else run_root / f"qualification-attempt-{candidate.revision:03d}"
+        )
+        qualification = run_qualification(
+            research.builder_projection,
+            candidate.workspace,
+            candidate.candidate_digest,
+            qualification_root,
+            expected_task_semantics=expected_task_semantics,
+            config=selected.qualification,
+            predicate_source_root=predicate_source_root,
+            predicate_source_digest=predicate_source_digest,
+        )
+        if qualification.status == "passed":
+            break
+        if qualification.candidate_finding is None:
+            return _finish(run_root, _qualification_failure(qualification))
+        if qualification.workspace_root is None or qualification.predicate_digest is None:
+            return _finish(
+                run_root,
+                NotReleased(
+                    "candidate_repair_lineage_missing",
+                    "Candidate repair requires the prior fresh Qualification lineage",
+                    {"phase": "qualification"},
+                ),
+            )
+        try:
+            _write_json(
+                run_root / f"candidate-repair-{candidate.revision:03d}.json",
+                {
+                    "rejected_candidate_digest": candidate.candidate_digest,
+                    "finding": qualification.candidate_finding.to_document(),
+                },
+            )
+            predicate_source_root = qualification.workspace_root
+            predicate_source_digest = qualification.predicate_digest
+            candidate = repair_builder(
+                candidate,
+                qualification.candidate_finding,
+                failed_candidate_digest=qualification.candidate_digest,
+                config=selected.builder,
+            )
+            _write_candidate_record(run_root, candidate)
+        except BuilderFailure as exc:
+            return _finish(run_root, NotReleased(exc.code, str(exc), dict(exc.details)))
+        except OSError as exc:
+            return _finish(run_root, _infrastructure_failure("builder_repair", exc))
     if (
         qualification.workspace_root is None
         or qualification.evidence_digest is None
@@ -446,6 +487,21 @@ _REPAIRABLE_SEMANTIC_FAILURES = frozenset(
 
 def _semantics_repairable(code: str) -> bool:
     return code in _REPAIRABLE_SEMANTIC_FAILURES
+
+
+def _write_candidate_record(run_root: Path, candidate: CandidateBuild) -> None:
+    document = {
+        "revision": candidate.revision,
+        "candidate_digest": candidate.candidate_digest,
+        "thread_id": candidate.thread_id,
+        "turns_used": candidate.turns_used,
+        "checks": [item.to_document() for item in candidate.checks],
+    }
+    _write_json(run_root / "candidate.json", document)
+    _write_json(
+        run_root / f"candidate-revision-{candidate.revision:03d}.json",
+        document,
+    )
 
 
 def _qualification_failure(result: QualificationResult) -> NotReleased:

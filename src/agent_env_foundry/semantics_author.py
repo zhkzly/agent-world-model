@@ -9,12 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
+from openai_codex import ApprovalMode, Codex, CodexConfig
 
 from agent_env_foundry.builder import (
     BuilderConfig,
     CommandResult,
     _codex_provider_overrides,
+    _codex_workspace_permission_overrides,
     _isolated_codex_env,
     _run,
 )
@@ -103,7 +104,6 @@ def run_semantics_author(
             base_instructions=skill,
             cwd=str(prepared.root),
             model=selected.model,
-            sandbox=Sandbox.full_access,
         )
         return _drive_semantics_thread(
             prepared,
@@ -149,7 +149,6 @@ def repair_semantics_author(
             base_instructions=skill,
             cwd=str(prepared.root),
             model=config.model,
-            sandbox=Sandbox.full_access,
         )
         return _drive_semantics_thread(
             prepared,
@@ -218,7 +217,10 @@ def _codex_config(root: Path, codex_home: Path, config: BuilderConfig) -> CodexC
     return CodexConfig(
         cwd=str(root),
         env=_isolated_codex_env(codex_home, config.uv_cache_dir),
-        config_overrides=_codex_provider_overrides(),
+        config_overrides=(
+            *_codex_provider_overrides(),
+            *_codex_workspace_permission_overrides("foundry_semantics", root),
+        ),
     )
 
 
