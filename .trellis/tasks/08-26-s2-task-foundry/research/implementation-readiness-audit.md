@@ -28,28 +28,43 @@ truth from arbitrary opaque tools/state after the fact.
 3. **Six-node GoalProgram overdesign.** `Select` and `Report` were removed as
    standalone nodes; selectors/reporting are Blueprint attributes. Core Goal AST
    is Atom/All/If/ForEach.
-4. **Unqualified natural composition.** CapabilitySpec now requires workflow IDs
-   and qualified public ConditionSpecs.
-5. **Custom WitnessRecipe/value-expression DSL.** Removed. TaskPack stores two
+4. **Unqualified natural composition.** CapabilitySpec requires Requirement and
+   workflow IDs plus qualified public ConditionSpecs. Cross-capability `AllGoal`
+   must additionally be licensed by an explicit release-local composition rule;
+   merely sharing a broad workflow name is not enough for mutually exclusive or
+   inverse actions.
+5. **Conditional report-only branch.** `IfGoal` may have one branch without a
+   state-changing goal only when the Blueprint has a qualified condition-report
+   field. This supports “act if valid, otherwise report why” without restoring a
+   general Report AST node.
+6. **Custom WitnessRecipe/value-expression DSL.** Removed. TaskPack stores two
    concrete successful public traces and provenance reports.
-6. **Codex SDK versus acting Agent ambiguity.** Codex SDK is restricted to actor
+7. **Codex SDK versus acting Agent ambiguity.** Codex SDK is restricted to actor
    project and TaskSemantics project code generation. Witness/assessment uses a
    Host-owned Responses function-tool loop. Deterministic framework code owns all
    compilation and verdicts.
-7. **Prompt-only requirements.** Every prompt responsibility now has a matching
+8. **Prompt-only requirements.** Every prompt responsibility has a matching
    schema, Host check, physical execution gate or explicit non-authority status.
-8. **Model-relative difficulty in structural diversity.** Removed from
+9. **Model-relative difficulty in structural diversity.** Removed from
    TaskFingerprint and placed in TaskAssessment.
-9. **One happy path could satisfy completion.** Added per-release and held-out
-   Task-yield/structure/start floors that cannot be met by paraphrases or
-   parameter-only variants.
+10. **One happy path could satisfy completion.** Added per-release and held-out
+    Task-yield/structure/start floors that cannot be met by paraphrases or
+    parameter-only variants.
+11. **Runtime trust separation.** `prepare_release` prepares separate actor and
+    semantics runtimes. Semantics calls are Host-manifested before/after and must
+    leave the instance unchanged; the semantics runtime does not install/import
+    the actor package as an oracle.
+12. **Broad ToolSpec output schemas.** Any field declared as a `public_tool`
+    facet or used as a load-bearing public operand must be covered by an explicit
+    output-schema path and demonstrated by S1 Qualification. A bare object schema
+    cannot authorize that field.
 
 ## Framework implementation responsibilities
 
 Framework code must directly implement:
 
 ```text
-release v2 identity and prepare/open isolation
+release v2 identity and separate actor/semantics prepare/open isolation
 TaskSemantics contract validation
 StartCase/materialization
 qualified selector and Goal enumeration
@@ -107,7 +122,7 @@ identities.
 | Well-posedness | qualified labels, deterministic renderer, slot/cardinality/leakage audit |
 | Non-triviality | checker false on before==after; query answer-leak check |
 | Reproducibility | deterministic reset-only StartCases and semantic-key alignment |
-| Need/natural grounding | Requirement IDs + shared qualified workflow IDs + qualified ConditionSpecs |
+| Need/natural grounding | Requirement IDs + explicit qualified composition rules + qualified ConditionSpecs |
 | Path openness | final facts/answer/process checked; reference-trace equality absent |
 | No collateral | atomic evaluator + scope-aware composition + collateral challenge |
 | Structural diversity | capability/workflow/Goal/selector/start/answer/process fingerprint |
@@ -133,6 +148,7 @@ expressed by:
 
 ```text
 qualified capability atom
++ explicit release-local composition/condition contracts
 + SelectorSpec
 + four-node GoalProgram
 + frozen checker
