@@ -75,15 +75,13 @@ def extreme_facet_value(
         for value in values[1:]:
             if not isinstance(value, str):
                 raise FacetValueError(
-                    "rank facet mixes string and non-string values: "
-                    f"str and {type(value).__name__}"
+                    f"rank facet mixes string and non-string values: str and {type(value).__name__}"
                 )
             string_values.append(value)
         return min(string_values) if direction == "min" else max(string_values)
 
     raise FacetValueError(
-        "rank facet values must be finite numbers or strings; "
-        f"got {type(first).__name__}"
+        f"rank facet values must be finite numbers or strings; got {type(first).__name__}"
     )
 
 
