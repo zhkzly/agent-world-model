@@ -20,3 +20,20 @@
 - [x] Does every trusted call produce before/after manifests and reject mutation-on-error?
 - [x] Are stdout noise, seq mismatch, timeout and startup failure fail-closed and correctly owned?
 - [x] Do focused physical tests, mutation licenses and the full repository gate pass?
+
+## CP3A Expected TaskSemantics Freeze Checklist
+
+- [x] Does the fresh typed turn see accepted Need/Requirement relations but no Candidate,
+  native state, source revisions, Task, trace, answer or verdict?
+- [x] Must every projected Requirement, including initial-world relations, receive exactly one
+  Taskable/NotTaskable/Unsupported disposition?
+- [x] Can capabilities reference only Taskable Requirements and their licensed workflows?
+- [x] Are composition and public condition records non-empty in the acceptance fixture and
+  anchored to known capabilities, Requirements and workflows?
+- [x] Does one rejection report every currently observable semantic finding and require a full
+  replacement document?
+- [x] Is the RFC 8785 payload digest stable under semantically irrelevant record ordering?
+- [x] Do focused tests kill coverage, completeness, reference, ordering, leakage, feedback and
+  provider-schema mutants?
+- [x] Did a real Luna strict-JSON turn accept the schema and produce a Host-frozen result from
+  accepted S1 relations?

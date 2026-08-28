@@ -98,7 +98,7 @@ class _ProviderTurnBudget:
             raise ResearchFailure(
                 phase=phase,
                 code="provider_turn_budget_exhausted",
-                message="Research exhausted its bounded provider turns before semantic closure",
+                message="Provider turn budget exhausted before semantic closure",
                 details={
                     "original_code": original_code,
                     "original_message": original_message,
@@ -804,6 +804,12 @@ def _run_fresh_json_turn(
     schema: Mapping[str, Any],
     final_validator: Callable[[dict[str, Any]], None] | None = None,
     provider_budget: _ProviderTurnBudget,
+    failure_phase: str = "reviewer",
+    feedback_subject: str = "Evidence Review",
+    feedback_instruction: str = (
+        "Return a complete corrected review; copy evidence handles exactly "
+        "from the bounded Evidence Index."
+    ),
 ) -> dict[str, Any]:
     credential = _credential()
     client = client_factory(api_key=credential, base_url=route.base_url, max_retries=0)
@@ -813,7 +819,7 @@ def _run_fresh_json_turn(
     try:
         while True:
             provider_budget.consume(
-                phase="reviewer",
+                phase=failure_phase,
                 original_code=next_original_code,
                 original_message=next_original_message,
             )
@@ -837,7 +843,7 @@ def _run_fresh_json_turn(
             output_text = _item_value(response, "output_text")
             if not isinstance(output_text, str) or not output_text.strip():
                 raise ResearchFailure(
-                    phase="reviewer",
+                    phase=failure_phase,
                     code="missing_structured_output",
                     message="reviewer returned no structured final text",
                     details={
@@ -846,7 +852,10 @@ def _run_fresh_json_turn(
                     },
                 )
             document = _parse_and_validate_json(
-                output_text, schema=schema, phase="reviewer", code="reviewer_output_invalid"
+                output_text,
+                schema=schema,
+                phase=failure_phase,
+                code=f"{failure_phase}_output_invalid",
             )
             if final_validator is not None:
                 try:
@@ -861,12 +870,11 @@ def _run_fresh_json_turn(
                         {
                             "role": "user",
                             "content": (
-                                "The deterministic host rejected the Evidence Review. "
+                                f"The deterministic host rejected the {feedback_subject}. "
                                 f"Rejected condition: {_model_safe_feedback_text(str(exc))}. "
                                 "Machine details: "
                                 f"{safe_details}. "
-                                "Return a complete corrected review; copy evidence handles exactly "
-                                "from the bounded Evidence Index."
+                                f"{feedback_instruction}"
                             ),
                         }
                     )
@@ -876,9 +884,9 @@ def _run_fresh_json_turn(
         raise
     except Exception as exc:
         raise ResearchFailure(
-            phase="reviewer",
+            phase=failure_phase,
             code="responses_request_failed",
-            message="fresh Evidence Reviewer failed with no provider fallback",
+            message=f"fresh {feedback_subject} turn failed with no provider fallback",
             details={
                 "original_code": type(exc).__name__,
                 "original_message": str(exc).replace(credential, "[REDACTED]"),

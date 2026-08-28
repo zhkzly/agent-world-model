@@ -22,3 +22,7 @@ Gold reference: existing S1 locked cold-release/ValidatedEnvironment behavior pl
 - 选择：CP2 child runner 使用生成项目自己的 venv Python 与 stdlib-only script；Host 执行 schema/codec/origin/tree-manifest 判定，生成代码 stdout 被重定向到 stderr。
 - 备选：把 Host framework 安装进两个 runtime 或使用 Host importlib；拒绝，因为会引入依赖复制、ambient import 与跨 release cache alias。
 - 翻案证据：12 条真实进程 focused tests、13 条物理 mutation licenses、全库 314 tests 与 Claude BLOCK→ALLOW；CP3 必须消费同一个 PreparedSession，不能新增 loader。
+- 选择：CP3A 先在 fresh typed model turn 中冻结 complete Requirement disposition 与 capability/workflow/condition/composition 关系，candidate view 在 digest 固定前不存在。
+- 备选：让 Semantics Author 读取 candidate 后自行决定 taskability；拒绝，因为 actor 与 verifier 会共享同一错误来源并可静默遗漏 Requirement。
+- 翻案证据：CP3A 的 exact coverage/unknown-reference/Taskable completeness 负例与 candidate-blind provider-input 测试；通过前不运行 Codex Author。
+- 实证：7 条聚焦测试、8 张 mutation license、全库质量门和独立 Claude `ALLOW_CP3A` 已通过；真实 Luna strict-JSON 预检从 ocean S1 工件的 4 条已接受关系生成 4/4 disposition、3 个 capability，并由 Host 冻结为 `80f791af8c8ce6135d4cc35a4e75300e7d57e2b65eee0ab494a156440cc1a238`。这只闭合 semantic-freeze core，尚不声称 CP3A artifact staging、CP3B Author 或 CP3C Qualification 完成。

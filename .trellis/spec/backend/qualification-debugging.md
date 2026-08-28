@@ -8,6 +8,10 @@ goal is to distinguish Candidate behavior from Qualifier-code, Framework and
 Infrastructure defects without adding a domain branch or weakening release
 requirements.
 
+For EnvironmentRelease v2, also use it before Semantics Authoring: a fresh typed
+turn freezes expected TaskSemantics from accepted Need/Requirement relations
+before any Candidate/native/source view is staged.
+
 ## 2. Signatures
 
 Codex authors exactly three semantic programs:
@@ -24,6 +28,20 @@ Framework-owned artifacts and calls:
 probe_manifest.json                         # Host-created only
 HostJournal(run_id, ordered events, digest) # Host-created only
 feedback = REJECTED + ALL_FINDINGS + REPAIR + RESUBMIT
+```
+
+```python
+freeze_expected_task_semantics(
+    projection: BuilderProjection,
+    document: Mapping[str, Any],
+) -> ExpectedTaskSemantics
+
+generate_expected_task_semantics(
+    projection: BuilderProjection,
+    *,
+    route: AgentRoute | None = None,
+    client_factory: ClientFactory | None = None,
+) -> ExpectedTaskSemantics
 ```
 
 ## 3. Contracts
@@ -52,6 +70,16 @@ feedback = REJECTED + ALL_FINDINGS + REPAIR + RESUBMIT
   later actions would erase the earlier evidence.
 - Loader dependencies prepare from the local uv cache with `--offline`; cache
   absence is Infrastructure, never a request for Codex to change semantics.
+- Expected-semantics input contains only frozen Need, selected world, Requirements,
+  initial-world relations and the Host contract. Cited source revisions, Candidate
+  bytes/native fields, Tasks, traces, answers and verdicts are absent.
+- Every Requirement is dispositioned exactly once. Capabilities reference only
+  Taskable Requirements and licensed workflows; composition and conditions carry
+  explicit Requirement/workflow/capability anchors.
+- Model output never carries a Host digest. Host sorts set-like records, RFC 8785
+  canonicalizes the accepted document and computes its SHA-256 digest.
+- Semantic validation reports all currently observable findings in one replacement
+  turn. Strict JSON-schema rejection remains fail-closed.
 
 ## 4. Validation & Error Matrix
 
@@ -65,6 +93,10 @@ feedback = REJECTED + ALL_FINDINGS + REPAIR + RESUBMIT
 | Only new marker bytes change | Qualifier | reject `negative_physical_noop` |
 | Matching public observations remain identical | Qualifier | reject `negative_public_behavior_unchanged` |
 | Provider capacity/network or missing offline cache | Infrastructure | retry identical bytes or end `NotReleased` |
+| Expected Requirement omitted or added | expected semantics | reject exact coverage mismatch |
+| Capability cites non-Taskable/unknown Requirement or workflow | expected semantics | reject with field path |
+| Composition/condition cites unknown or unlicensed anchors | expected semantics | reject all observable findings together |
+| Local TCP denied before provider request | Infrastructure | rerun identical command with permitted localhost access |
 
 ## 5. Good / Base / Bad Cases
 
@@ -79,6 +111,10 @@ feedback = REJECTED + ALL_FINDINGS + REPAIR + RESUBMIT
   verifier then interprets the final post-reset database as pre-reset evidence.
 - Bad: a substring scanner treats a controlled source path as a Candidate
   import. Import separation is checked from Python AST imports.
+- Good: a fresh typed turn sees four accepted S1 relations, returns four
+  dispositions and three capabilities, and Host freezes the canonical digest.
+- Bad: forward `cited_evidence`, Candidate source, native field names or a Host
+  digest into the expectation turn.
 
 ## 6. Tests Required
 
@@ -96,6 +132,11 @@ feedback = REJECTED + ALL_FINDINGS + REPAIR + RESUBMIT
   imports are rejected by AST inspection.
 - Full real run proves 24/24 positive, 24/24 negative, stable Candidate digest
   and a content-derived evidence digest.
+- Expected semantics tests use non-empty composition and condition records; kill
+  coverage, Taskable completeness, unknown-reference, ordering, leakage,
+  all-findings and provider-schema mutants.
+- Run at least one real strict-JSON provider turn from accepted S1 relations; a
+  fake client proves transport shape only.
 
 ## 7. Wrong vs Correct
 
@@ -115,3 +156,15 @@ REPAIR: edit all three current programs, preserve passed invariants, fix all fin
 RESUBMIT: end the turn after writing complete code; Framework reruns every gate
 ```
 
+Wrong:
+
+```text
+Candidate source + native fields -> model decides which Requirements are taskable
+```
+
+Correct:
+
+```text
+accepted Need/Requirements -> fresh typed expectation -> Host freeze
+-> only then stage public surface and read-only Candidate view for Semantics Author
+```
