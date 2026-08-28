@@ -7,8 +7,10 @@ from agent_task_foundry.compiler import (
     compile_definition,
 )
 from agent_task_foundry.foundry import (
+    CompilationBatch,
     CompiledCandidate,
     CorpusPolicy,
+    RejectedBlueprint,
     SynthesisError,
     SynthesisPolicy,
     base_challenges,
@@ -24,15 +26,18 @@ from agent_task_foundry.runner import (
     RunnerError,
     run_public_policy,
     run_responses_policy,
+    trace_argument_provenance,
 )
 
 __all__ = [
+    "CompilationBatch",
     "CompiledCandidate",
     "CompiledTaskChecker",
     "CompilationError",
     "CorpusPolicy",
     "PolicyAction",
     "PolicyFinish",
+    "RejectedBlueprint",
     "RunnerError",
     "SynthesisError",
     "SynthesisPolicy",
@@ -46,4 +51,5 @@ __all__ = [
     "run_responses_policy",
     "seal_taskpack",
     "select_corpus",
+    "trace_argument_provenance",
 ]
