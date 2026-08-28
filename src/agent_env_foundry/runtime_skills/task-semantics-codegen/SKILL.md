@@ -13,6 +13,12 @@ Read completely before editing:
 Implement `generated_task_semantics.release:make_semantics` plus diagnostic
 tests. Own the release-specific native decoder, deterministic StartCases,
 CapabilitySpecs, binding enumeration and atomic/condition evaluation logic.
+Every public descriptor leaf must be recoverable from the current materialization's
+explicitly schema-covered reset. A `reset` facet names its exact reset-observation
+pointer; a `public_tool` facet names its exact tool/output pointer and its concrete
+value is withheld from the public Agent until observed. `task_literal` is deliberate
+declassification for that facet only and may not be the sole discriminator between
+different semantic bindings.
 
 Do not write manifests, digests, verdicts, Tasks, rewards, witnesses or package
 receipts. Do not import/call actor business code as an oracle. Do not encode the

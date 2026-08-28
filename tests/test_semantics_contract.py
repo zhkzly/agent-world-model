@@ -142,6 +142,18 @@ def test_public_tool_visibility_binds_tool_and_output_pointer_together() -> None
     )
     assert facet.to_document()["tool_name"] == "lookup"
     assert facet.to_document()["output_schema_pointer"] == "/reference"
+    with pytest.raises(SemanticsContractError, match="reset facet requires"):
+        FacetSpec("status", "status", STRING, ("eq",), "reset")
+    reset_facet = FacetSpec(
+        "status",
+        "status",
+        STRING,
+        ("eq",),
+        "reset",
+        output_schema_pointer="/items/0/status",
+    )
+    assert reset_facet.tool_name is None
+    assert reset_facet.output_schema_pointer == "/items/0/status"
     with pytest.raises(SemanticsContractError, match="must not declare"):
         FacetSpec(
             "name",
@@ -177,6 +189,27 @@ def test_condition_visibility_and_binding_scope_are_closed() -> None:
             (),
             None,
         )
+    with pytest.raises(SemanticsContractError, match="reset condition requires"):
+        ConditionSpec(
+            "can_finish",
+            "can finish",
+            "reset",
+            "world",
+            ("finish",),
+            (),
+            None,
+        )
+    condition = ConditionSpec(
+        "can_finish",
+        "can finish",
+        "reset",
+        "world",
+        ("finish",),
+        (),
+        None,
+        output_schema_pointer="/can_finish",
+    )
+    assert condition.output_schema_pointer == "/can_finish"
 
 
 def test_composition_and_rendering_use_the_final_plan_contract() -> None:

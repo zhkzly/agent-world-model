@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -23,6 +24,7 @@ from agent_env_foundry.semantics import (
     AnswerFieldSpec,
     BindingCandidate,
     CapabilitySpec,
+    FacetSpec,
     RenderingSpec,
     StartCase,
     TraceEvent,
@@ -126,6 +128,29 @@ class _EpisodeActor:
         return None
 
 
+def _items_reset_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "status": {"type": "string"},
+                    },
+                    "required": ["name", "status"],
+                    "additionalProperties": False,
+                },
+            },
+            "other": {"type": "string"},
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+
+
 def _capability() -> CapabilitySpec:
     return CapabilitySpec(
         capability_id="finish-item",
@@ -161,6 +186,62 @@ def _binding(key: str = "alpha") -> BindingCandidate:
         {"private_id": f"secret-{key}"},
         {"name": key},
         {},
+    )
+
+
+def _public_tool_capability(
+    *, pointer: str = "/status", same_valued_literal: bool = False
+) -> CapabilitySpec:
+    facets = [
+        FacetSpec(
+            "status",
+            "status",
+            {"type": "string"},
+            ("eq",),
+            "public_tool",
+            "lookup",
+            pointer,
+        )
+    ]
+    if same_valued_literal:
+        facets.append(FacetSpec("hint", "hint", {"type": "string"}, ("eq",), "task_literal"))
+    return replace(_capability(), facets=tuple(facets))
+
+
+def _status_binding(
+    *,
+    name: str = "alpha",
+    status: str = "open",
+    key: str | None = None,
+    same_valued_literal: bool = False,
+) -> BindingCandidate:
+    facets = {"status": status}
+    if same_valued_literal:
+        facets["hint"] = status
+    semantic_key = key or name
+    return BindingCandidate(
+        semantic_key,
+        True,
+        (),
+        {"private_id": f"secret-{semantic_key}"},
+        {"name": name},
+        facets,
+    )
+
+
+def _reset_status_capability() -> CapabilitySpec:
+    return replace(
+        _capability(),
+        facets=(
+            FacetSpec(
+                "status",
+                "status",
+                {"type": "string"},
+                ("eq",),
+                "reset",
+                output_schema_pointer="/items/0/status",
+            ),
+        ),
     )
 
 
@@ -323,6 +404,7 @@ def test_public_capability_episode_uses_only_actor_tools_and_records_trace(
         capability=_capability(),
         binding=_binding(),
         reset_observation={"items": [{"name": "alpha", "status": "open"}]},
+        reset_schema=_items_reset_schema(),
         public_documents={"README.md": "Use lookup before changing an item."},
         client_factory=factory,
         max_provider_turns=4,
@@ -344,6 +426,80 @@ def test_public_capability_episode_uses_only_actor_tools_and_records_trace(
     assert "protected_binding" not in rendered
     assert request["text"]["format"]["strict"] is False
     assert client.responses.calls[0] == client.responses.calls[1]
+
+
+def test_agent_target_omits_public_tool_values_before_discovery() -> None:
+    capability = replace(
+        _capability(),
+        facets=(
+            FacetSpec(
+                "hint",
+                "hint",
+                {"type": "string"},
+                ("eq",),
+                "task_literal",
+            ),
+            FacetSpec(
+                "reset_status",
+                "reset status",
+                {"type": "string"},
+                ("eq",),
+                "reset",
+                output_schema_pointer="/items/0/status",
+            ),
+            FacetSpec(
+                "tool_status",
+                "tool status",
+                {"type": "string"},
+                ("eq",),
+                "public_tool",
+                "lookup",
+                "/status",
+            ),
+        ),
+    )
+    binding = BindingCandidate(
+        "alpha",
+        True,
+        (),
+        {"private_id": "secret-alpha"},
+        {"name": "alpha"},
+        {"hint": "concise", "reset_status": "open", "tool_status": "future-value"},
+    )
+
+    target = semantic_qualification_module._agent_visible_target(
+        capability,
+        binding,
+        {"items": [{"name": "alpha", "status": "open"}]},
+        _items_reset_schema(),
+    )
+
+    assert target == {
+        "public_descriptor": {"name": "alpha"},
+        "facets": {"hint": "concise", "reset_status": "open"},
+    }
+    assert "future-value" not in json.dumps(target)
+
+
+def test_tool_only_descriptor_is_rejected_before_model_call() -> None:
+    binding = BindingCandidate(
+        "beta",
+        True,
+        (),
+        {"private_id": "secret-beta"},
+        {"name": "beta"},
+        {},
+    )
+
+    with pytest.raises(SemanticQualificationFailure) as captured:
+        semantic_qualification_module._agent_visible_target(
+            _capability(),
+            binding,
+            {"items": []},
+            _items_reset_schema(),
+        )
+
+    assert captured.value.code == "semantic_public_binding_hidden"
 
 
 def test_framework_rejects_answer_ignoring_query_evaluator(tmp_path: Path) -> None:
@@ -666,7 +822,7 @@ def test_framework_rejects_task_semantics_native_oracle_disagreement(tmp_path: P
     assert captured.value.code == "semantic_native_disagreement"
 
 
-def test_framework_rejects_public_binding_values_absent_from_public_evidence() -> None:
+def test_framework_rejects_public_binding_values_absent_from_current_materialization() -> None:
     capability = _capability()
     binding = BindingCandidate(
         "hidden",
@@ -676,20 +832,419 @@ def test_framework_rejects_public_binding_values_absent_from_public_evidence() -
         {"name": "hidden-native-only"},
         {},
     )
-    public = {"public_probe_facts": []}
-
     with pytest.raises(
         SemanticQualificationFailure,
         match="publicly discoverable",
     ) as captured:
-        semantic_qualification_module._validate_public_binding_visibility(
+        semantic_qualification_module._validate_post_episode_binding_visibility(
             capability,
             binding,
             {"items": [{"name": "visible"}]},
-            public,
+            _items_reset_schema(),
+            (),
+            _EpisodeActor().tools(),
         )
 
     assert captured.value.code == "semantic_public_binding_hidden"
+
+
+def test_current_episode_tool_output_can_ground_public_descriptor_and_facet() -> None:
+    capability = _public_tool_capability()
+    binding = _status_binding()
+    trace = (
+        TraceEvent(
+            1,
+            "lookup",
+            {},
+            {"ok": True, "data": {"name": "alpha", "status": "open"}, "error": None},
+        ),
+    )
+
+    semantic_qualification_module._validate_post_episode_binding_visibility(
+        capability,
+        binding,
+        {"items": [{"name": "alpha", "status": "unknown"}]},
+        _items_reset_schema(),
+        trace,
+        _EpisodeActor().tools(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("trace_tool", "pointer", "observation"),
+    [
+        (
+            "finish",
+            "/status",
+            {"ok": True, "data": {"name": "alpha", "status": "open"}, "error": None},
+        ),
+        (
+            "lookup",
+            "/name",
+            {"ok": True, "data": {"name": "alpha", "status": "open"}, "error": None},
+        ),
+        (
+            "lookup",
+            "/status",
+            {"ok": False, "data": None, "error": {"code": "domain.refused"}},
+        ),
+    ],
+)
+def test_public_tool_facet_requires_exact_successful_tool_and_pointer(
+    trace_tool: str,
+    pointer: str,
+    observation: ToolObservation,
+) -> None:
+    capability = _public_tool_capability(pointer=pointer)
+    binding = _status_binding()
+    trace = (TraceEvent(1, trace_tool, {}, observation),)
+
+    with pytest.raises(SemanticQualificationFailure) as captured:
+        semantic_qualification_module._validate_post_episode_binding_visibility(
+            capability,
+            binding,
+            {"items": [{"name": "alpha", "status": "unknown"}]},
+            _items_reset_schema(),
+            trace,
+            _EpisodeActor().tools(),
+        )
+
+    assert captured.value.code == "semantic_public_binding_hidden"
+    assert any(item["path"] == "facets/status" for item in captured.value.details["findings"])
+
+
+def test_broad_tool_schema_cannot_ground_descriptor_value() -> None:
+    capability = _public_tool_capability()
+    binding = _status_binding(key="hidden")
+    trace = (
+        TraceEvent(
+            1,
+            "lookup",
+            {},
+            {
+                "ok": True,
+                "data": {"name": "alpha", "status": "open"},
+                "error": None,
+            },
+        ),
+    )
+    broad_tool = cast(
+        tuple[ToolSpec, ...],
+        (
+            {
+                "name": "lookup",
+                "description": "broad",
+                "input_schema": {"type": "object"},
+                "output_schema": {"type": "object"},
+            },
+        ),
+    )
+
+    with pytest.raises(SemanticQualificationFailure) as captured:
+        semantic_qualification_module._validate_post_episode_binding_visibility(
+            capability,
+            binding,
+            {"items": [{"name": "alpha", "status": "unknown"}]},
+            _items_reset_schema(),
+            trace,
+            broad_tool,
+        )
+
+    assert captured.value.code == "semantic_public_binding_hidden"
+
+
+def test_broad_reset_schema_cannot_ground_descriptor_value() -> None:
+    binding = BindingCandidate(
+        "hidden",
+        True,
+        (),
+        {"private_id": "secret-hidden"},
+        {"name": "alpha"},
+        {},
+    )
+
+    with pytest.raises(SemanticQualificationFailure) as captured:
+        semantic_qualification_module._validate_post_episode_binding_visibility(
+            _capability(),
+            binding,
+            {"name": "hidden-native-id"},
+            {"type": "object"},
+            (),
+            _EpisodeActor().tools(),
+        )
+
+    assert captured.value.code == "semantic_public_binding_hidden"
+
+
+def test_global_history_or_wrong_current_tool_value_cannot_ground_binding() -> None:
+    capability = _public_tool_capability()
+    binding = _status_binding(name="history-only", key="hidden")
+    trace = (
+        TraceEvent(
+            1,
+            "lookup",
+            {},
+            {"ok": True, "data": {"name": "other", "status": "closed"}, "error": None},
+        ),
+    )
+
+    with pytest.raises(SemanticQualificationFailure) as captured:
+        semantic_qualification_module._validate_post_episode_binding_visibility(
+            capability,
+            binding,
+            {"items": [{"name": "alpha", "status": "unknown"}]},
+            _items_reset_schema(),
+            trace,
+            _EpisodeActor().tools(),
+        )
+
+    assert captured.value.code == "semantic_public_binding_hidden"
+    assert {item["path"] for item in captured.value.details["findings"]} == {
+        "public_descriptor/name",
+        "facets/status",
+    }
+
+
+@pytest.mark.parametrize("same_valued_literal", (False, True))
+def test_argument_echo_cannot_launder_public_tool_facet(
+    same_valued_literal: bool,
+) -> None:
+    capability = _public_tool_capability(same_valued_literal=same_valued_literal)
+    binding = _status_binding(
+        status="secret-status",
+        key="hidden",
+        same_valued_literal=same_valued_literal,
+    )
+    trace = (
+        TraceEvent(
+            1,
+            "lookup",
+            {"name": "hidden-native-id", "status": "secret-status"},
+            {
+                "ok": True,
+                "data": {"name": "hidden-native-id", "status": "secret-status"},
+                "error": None,
+            },
+        ),
+    )
+
+    with pytest.raises(SemanticQualificationFailure) as captured:
+        semantic_qualification_module._validate_post_episode_binding_visibility(
+            capability,
+            binding,
+            {"items": [{"name": "alpha", "status": "unknown"}]},
+            _items_reset_schema(),
+            trace,
+            _EpisodeActor().tools(),
+        )
+
+    assert captured.value.code == "semantic_public_binding_hidden"
+    assert {item["reason"] for item in captured.value.details["findings"]} == {
+        "value_laundered_from_argument"
+    }
+
+
+def test_public_tool_value_may_be_used_after_an_earlier_public_observation() -> None:
+    capability = _public_tool_capability()
+    binding = _status_binding()
+    trace = (
+        TraceEvent(
+            1,
+            "finish",
+            {},
+            {"ok": True, "data": {"name": "alpha", "status": "open"}, "error": None},
+        ),
+        TraceEvent(
+            2,
+            "lookup",
+            {"status": "open"},
+            {"ok": True, "data": {"name": "alpha", "status": "open"}, "error": None},
+        ),
+    )
+
+    semantic_qualification_module._validate_post_episode_binding_visibility(
+        capability,
+        binding,
+        {"items": [{"name": "alpha", "status": "unknown"}]},
+        _items_reset_schema(),
+        trace,
+        _EpisodeActor().tools(),
+    )
+
+
+def test_public_tool_value_may_be_used_when_current_reset_already_exposes_it() -> None:
+    capability = _public_tool_capability()
+    binding = _status_binding()
+    trace = (
+        TraceEvent(
+            1,
+            "lookup",
+            {"status": "open"},
+            {"ok": True, "data": {"name": "alpha", "status": "open"}, "error": None},
+        ),
+    )
+
+    semantic_qualification_module._validate_post_episode_binding_visibility(
+        capability,
+        binding,
+        {"items": [{"name": "alpha", "status": "open"}]},
+        _items_reset_schema(),
+        trace,
+        _EpisodeActor().tools(),
+    )
+
+
+def test_every_enumerated_binding_requires_local_visibility() -> None:
+    alpha = _binding("alpha")
+    beta = _binding("hidden-beta")
+
+    with pytest.raises(SemanticQualificationFailure) as captured:
+        semantic_qualification_module._validate_post_episode_binding_set_visibility(
+            _capability(),
+            (alpha, beta),
+            {"items": [{"name": "alpha", "status": "open"}]},
+            _items_reset_schema(),
+            (),
+            _EpisodeActor().tools(),
+        )
+
+    assert captured.value.code == "semantic_public_binding_hidden"
+    assert captured.value.details["semantic_key"] == "hidden-beta"
+
+
+def test_task_literal_facet_needs_no_materialization_observation() -> None:
+    capability = replace(
+        _capability(),
+        facets=(
+            FacetSpec(
+                "instruction_style",
+                "instruction style",
+                {"type": "string"},
+                ("eq",),
+                "task_literal",
+            ),
+        ),
+    )
+    binding = BindingCandidate(
+        "alpha",
+        True,
+        (),
+        {"private_id": "secret-alpha"},
+        {"name": "alpha"},
+        {"instruction_style": "concise"},
+    )
+
+    semantic_qualification_module._validate_post_episode_binding_visibility(
+        capability,
+        binding,
+        {"items": [{"name": "alpha"}]},
+        _items_reset_schema(),
+        (),
+        _EpisodeActor().tools(),
+    )
+
+
+def test_task_literal_value_cannot_substitute_for_descriptor_evidence() -> None:
+    capability = replace(
+        _capability(),
+        facets=(
+            FacetSpec(
+                "hint",
+                "hint",
+                {"type": "string"},
+                ("eq",),
+                "task_literal",
+            ),
+        ),
+    )
+    binding = BindingCandidate(
+        "hidden",
+        True,
+        (),
+        {"private_id": "secret-hidden"},
+        {"name": "same-hidden-value"},
+        {"hint": "same-hidden-value"},
+    )
+
+    with pytest.raises(SemanticQualificationFailure) as captured:
+        semantic_qualification_module._validate_post_episode_binding_visibility(
+            capability,
+            binding,
+            {"items": []},
+            _items_reset_schema(),
+            (),
+            _EpisodeActor().tools(),
+        )
+
+    assert captured.value.code == "semantic_public_binding_hidden"
+    assert captured.value.details["findings"] == [
+        {
+            "path": "public_descriptor/name",
+            "reason": "value_absent_from_current_reset",
+        }
+    ]
+
+
+def test_reset_facet_must_exist_in_current_reset_before_episode() -> None:
+    capability = _reset_status_capability()
+    binding = _status_binding()
+
+    semantic_qualification_module._validate_pre_episode_binding_visibility(
+        capability,
+        binding,
+        {"items": [{"name": "alpha", "status": "open"}]},
+        _items_reset_schema(),
+    )
+
+
+def test_reset_facet_rejects_same_value_at_wrong_pointer() -> None:
+    capability = _reset_status_capability()
+    binding = _status_binding()
+
+    with pytest.raises(SemanticQualificationFailure) as captured:
+        semantic_qualification_module._validate_pre_episode_binding_visibility(
+            capability,
+            binding,
+            {"items": [{"name": "alpha", "status": "closed"}], "other": "open"},
+            _items_reset_schema(),
+        )
+    assert captured.value.code == "semantic_public_binding_hidden"
+
+
+def test_task_literal_alone_cannot_disambiguate_semantic_identity() -> None:
+    capability = replace(
+        _capability(),
+        facets=(
+            FacetSpec(
+                "hint",
+                "hint",
+                {"type": "string"},
+                ("eq",),
+                "task_literal",
+            ),
+        ),
+    )
+    alpha = BindingCandidate(
+        "alpha",
+        True,
+        (),
+        {"private_id": "secret-alpha"},
+        {"name": "same"},
+        {"hint": "first"},
+    )
+    beta = BindingCandidate(
+        "beta",
+        True,
+        (),
+        {"private_id": "secret-beta"},
+        {"name": "same"},
+        {"hint": "second"},
+    )
+
+    with pytest.raises(SemanticQualificationFailure) as captured:
+        semantic_qualification_module._validate_binding_set(capability, (alpha, beta))
+
+    assert captured.value.code == "semantic_task_literal_identity_ambiguous"
 
 
 def test_fresh_replay_requires_same_referent_and_before_facts() -> None:
@@ -862,6 +1417,20 @@ def test_framework_materializes_before_after_episode_before_semantic_verdict(
         "run_public_capability_episode",
         episode,
     )
+    visibility_calls: list[tuple[str, int]] = []
+    validate_visibility = semantic_qualification_module._validate_post_episode_binding_visibility
+
+    def record_visibility(*args: Any, **kwargs: Any) -> None:
+        binding = cast(BindingCandidate, args[1])
+        trace = cast(tuple[TraceEvent, ...], args[4])
+        visibility_calls.append((binding.semantic_key, len(trace)))
+        validate_visibility(*args, **kwargs)
+
+    monkeypatch.setattr(
+        semantic_qualification_module,
+        "_validate_post_episode_binding_visibility",
+        record_visibility,
+    )
     native_calls: list[dict[str, Any]] = []
 
     class FakeNativeOracleSession:
@@ -931,6 +1500,14 @@ def test_framework_materializes_before_after_episode_before_semantic_verdict(
     assert report.capabilities[0].physical_wrong_target_checked
     assert report.capabilities[0].fresh_replay_passed
     assert report.native_evidence_digest == "e" * 64
+    assert visibility_calls == [
+        ("alpha", 1),
+        ("beta", 1),
+        ("alpha", 1),
+        ("beta", 1),
+        ("alpha", 1),
+        ("beta", 1),
+    ]
     assert len(native_calls) == 10
     assert {item["role"] for item in native_calls} == {
         "primary",
