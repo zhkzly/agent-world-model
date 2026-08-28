@@ -32,6 +32,7 @@ jobs:
         run: |
           uv run ruff check --fix --exit-zero src tests
           uv run ruff check --fix --unsafe-fixes --select UP040 src/agent_task_foundry/models.py
+          uv run ruff check --fix src tests
           uv run ruff format src tests
       - name: Commit formatter-only changes
         shell: bash
