@@ -115,6 +115,9 @@ def trace_argument_provenance(
     tool_spec: Mapping[str, Any],
     prior_trace: tuple[PublicTraceEvent, ...],
 ) -> ProvenanceReport:
+    leaves = _leaf_paths(arguments)
+    if not leaves:
+        return ProvenanceReport((ArgumentOrigin("/", "tool_schema", "no_arguments"),))
     origins: list[ArgumentOrigin] = []
     constants = _schema_constants(tool_spec.get("input_schema"))
     reset_values = _leaf_paths(reset_context)
@@ -125,7 +128,7 @@ def trace_argument_provenance(
                 (value, f"trace[{event.seq}].observation.data{path}")
                 for path, value in _leaf_paths(event.observation.get("data"))
             )
-    for path, value in _leaf_paths(arguments):
+    for path, value in leaves:
         source = ArgumentOrigin(path, "unresolved")
         if isinstance(value, str) and value and value in instruction:
             source = ArgumentOrigin(path, "instruction")
@@ -159,7 +162,7 @@ def run_responses_policy(
 ) -> WitnessRun:
     """Run the final instruction with an OpenAI Responses function-tool loop.
 
-    This function intentionally requires invocation-time credentials.  It is not
+    This function intentionally requires invocation-time credentials. It is not
     used by deterministic unit tests and never receives checker/native data in
     the model input.
     """
