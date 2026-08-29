@@ -11,9 +11,14 @@ from typing import Any, cast
 from jsonschema import Draft202012Validator
 
 from agent_env_foundry.agents import AgentRoute
-from agent_env_foundry.environment import JSONObject, JSONValue
+from agent_env_foundry.environment import JSONObject, JSONValue, ToolSpec
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
 from agent_env_foundry.preparation import OpenPreparedRelease, OpenPreparedSession
+from agent_env_foundry.provenance import (
+    ArgumentProvenance,
+    resolve_argument_provenance,
+    validate_argument_provenance,
+)
 from agent_env_foundry.public_agent import PublicEpisodeRun, run_public_episode
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
@@ -77,11 +82,29 @@ class AtomTask:
 class AtomWitness:
     task_id: str
     materialization_id: str
+    reset_observation: JSONValue
     trace: tuple[TraceEvent, ...]
     final_answer: JSONObject
+    argument_provenance: tuple[ArgumentProvenance, ...]
     result: AtomCheckResult
     provider_turns: int
     usage: tuple[JSONObject | None, ...]
+
+    def __post_init__(self) -> None:
+        if not is_json_value(self.reset_observation):
+            raise TaskFoundryError(
+                "witness_reset_not_json",
+                "Atom witness reset observation is not JSON",
+            )
+        try:
+            validate_argument_provenance(self.trace, self.argument_provenance)
+        except Exception as exc:
+            raise TaskFoundryError(
+                "witness_provenance_invalid",
+                "Atom witness argument provenance is incomplete or invalid",
+                original_code=type(exc).__name__,
+                original_message=str(exc),
+            ) from exc
 
     @property
     def witness_id(self) -> str:
@@ -92,8 +115,10 @@ class AtomWitness:
             "format": "atom-witness/1",
             "task_id": self.task_id,
             "materialization_id": self.materialization_id,
+            "reset_observation": _json(self.reset_observation),
             "trace": [item.to_document() for item in self.trace],
             "final_answer": _json_object(self.final_answer),
+            "argument_provenance": [item.to_document() for item in self.argument_provenance],
             "result": self.result.to_document(),
             "provider_turns": self.provider_turns,
             "usage": [_json(item) for item in self.usage],
@@ -454,11 +479,12 @@ def solve_atom_task_twice(
                     "fresh logical binding changed the public Task descriptor",
                 )
             _verify_checker_preimage(prepared, task)
+            tool_specs = session.actor.tools()
             episode = run_public_episode(
                 actor=session.actor,
                 instruction=task.instruction,
                 reset_observation=reset,
-                tool_specs=session.actor.tools(),
+                tool_specs=tool_specs,
                 answer_schema=task.answer_schema,
                 route=selected_route,
                 max_provider_turns=max_provider_turns,
@@ -485,7 +511,16 @@ def solve_atom_task_twice(
                     "public Agent trace did not satisfy the frozen Atom checker",
                     result=result.to_document(),
                 )
-            witnesses.append(_witness(task, session.identity.materialization_id, episode, result))
+            witnesses.append(
+                _witness(
+                    task,
+                    session.identity.materialization_id,
+                    reset,
+                    tool_specs,
+                    episode,
+                    result,
+                )
+            )
     return SolvedAtomTask(
         task,
         admission_plan,
@@ -1039,14 +1074,23 @@ def _context(
 def _witness(
     task: AtomTask,
     materialization_id: str,
+    reset_observation: JSONValue,
+    tool_specs: tuple[ToolSpec, ...],
     episode: PublicEpisodeRun,
     result: AtomCheckResult,
 ) -> AtomWitness:
     return AtomWitness(
         task.task_id,
         materialization_id,
+        _json(reset_observation),
         episode.trace,
         episode.final_answer,
+        resolve_argument_provenance(
+            trace=episode.trace,
+            instruction_values=task.public_descriptor,
+            reset_observation=reset_observation,
+            tool_specs=tool_specs,
+        ),
         result,
         episode.provider_turns,
         episode.usage,

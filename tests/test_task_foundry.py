@@ -8,8 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 import agent_env_foundry.task_foundry as task_foundry_module
+from agent_env_foundry.environment import ToolSpec
+from agent_env_foundry.public_agent import PublicEpisodeRun
 from agent_env_foundry.release import canonical_bytes
-from agent_env_foundry.semantics import AtomCheckResult, StartCase
+from agent_env_foundry.semantics import AtomCheckResult, StartCase, TraceEvent
 from agent_env_foundry.task_foundry import (
     AtomAdmissionPlan,
     AtomChallengeReport,
@@ -65,8 +67,10 @@ def _witness(task: AtomTask, materialization_id: str, *, satisfied: bool = True)
     return AtomWitness(
         task.task_id,
         materialization_id,
+        {},
         (),
         {},
+        (),
         result,
         1,
         (None,),
@@ -101,6 +105,40 @@ def test_atom_task_and_witness_identities_bind_frozen_content() -> None:
     solved = SolvedAtomTask(task, plan, (witness, _witness(task, "c" * 64)))
     assert solved.to_document()["format"] == "solved-atom-task/1"
     assert solved.to_document()["admission_plan"]["plan_id"] == plan.plan_id
+
+
+def test_product_witness_builder_attaches_argument_provenance() -> None:
+    task = _task()
+    tool: ToolSpec = {
+        "name": "inspect",
+        "description": "Inspect one item.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"item": {"type": "string"}},
+            "required": ["item"],
+            "additionalProperties": False,
+        },
+        "output_schema": {"type": "object"},
+    }
+    trace = (
+        TraceEvent(
+            1,
+            "inspect",
+            {"item": "one"},
+            {"ok": True, "data": {"item": "one"}, "error": None},
+        ),
+    )
+    episode = PublicEpisodeRun(trace, {}, 1, (None,))
+    witness = task_foundry_module._witness(
+        task,
+        "b" * 64,
+        {},
+        (tool,),
+        episode,
+        _witness(task, "c" * 64).result,
+    )
+    assert len(witness.argument_provenance) == 1
+    assert witness.argument_provenance[0].source_kind == "task_literal"
 
 
 def test_solved_atom_requires_two_fresh_successful_witnesses() -> None:

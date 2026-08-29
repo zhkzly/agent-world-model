@@ -130,3 +130,5 @@
 `s2-f-atom-plan|介入0|返工1|pre-witness plan+real CAP-002 witnesses/challenges+3 mutation licences|红线违反0`
 
 `s2-f-wrong-target|介入0|返工0|preplanned sibling Task+real target success/current rejection+3 mutation licences|红线违反0`
+
+`s2-f-provenance|介入0|返工0|exact argument occurrences+real CAP-002 witnesses+3 mutation licences|红线违反0`
