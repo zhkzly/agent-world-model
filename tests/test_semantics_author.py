@@ -204,8 +204,6 @@ def test_framework_compares_generated_catalog_to_frozen_semantics(tmp_path: Path
             "facets": [],
             "conditions": [],
             "answer_fields": [],
-            "read_scopes": ["counter"],
-            "write_scopes": ["counter"],
             "supported_goal_kinds": ["atom"],
             "rendering": {
                 "imperative": "increment",

@@ -23,3 +23,14 @@
 - [x] Do active docs contain no instruction to restore deleted v1 modules or claim absent CLI/coordinator success?
 - [x] Does the ordered plan reach TaskPack, assessment, corpus, cross-domain and held-out gates rather than stop at packaging?
 - [x] Do independent reviewers find no remaining implementation-blocking ambiguity or overdesign?
+
+## Checkpoint A implementation
+
+- [x] Is public provenance represented once by `PublicValueSource` and exact leaf sources?
+- [x] Are legacy scope/visibility/tool-pointer encodings rejected rather than adapted?
+- [x] Does every atomic evaluation bind the current protected binding and exact selected siblings?
+- [x] Are Core/receipt/manifests acyclic, exact-keyed and free of final Release ID?
+- [x] Does the native-verifier request contain no TaskSemantics protected binding or facts?
+- [x] Do TaskDefinition/checker identities contain logical bindings/selections only?
+- [x] Are event occurrences, fresh episodes and pre-witness AdmissionPlan mechanically bound?
+- [x] Do 292 tests, static/lock/diff gates and all required mutation licences pass?

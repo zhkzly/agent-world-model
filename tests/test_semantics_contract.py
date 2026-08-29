@@ -26,13 +26,18 @@ from agent_env_foundry.semantics import (
     ConditionCheckRequest,
     ConditionCheckResult,
     ConditionSpec,
+    EvaluationBinding,
     FacetSpec,
+    GoalEvaluationContext,
+    PublicFieldSource,
+    PublicValueSource,
     RenderingSpec,
     SemanticsContractError,
     StartCase,
     TaskSemantics,
     TraceEvent,
     validate_binding,
+    validate_bindings,
     validate_catalog,
     validate_start_cases,
 )
@@ -112,70 +117,32 @@ def test_trusted_call_event_records_and_rejects_instance_mutation() -> None:
         )
 
 
-def test_public_tool_visibility_binds_tool_and_output_pointer_together() -> None:
+def test_public_tool_source_binds_tool_and_output_pointer_together() -> None:
     with pytest.raises(SemanticsContractError, match="tool_name"):
-        FacetSpec(
-            "reference",
-            "reference",
-            STRING,
-            ("eq",),
-            "public_tool",
-            output_schema_pointer="/reference",
-        )
-    with pytest.raises(SemanticsContractError, match="output_schema_pointer"):
-        FacetSpec(
-            "reference",
-            "reference",
-            STRING,
-            ("eq",),
-            "public_tool",
-            tool_name="lookup",
-        )
+        PublicValueSource("tool_output", None, "/reference", None)
+    with pytest.raises(SemanticsContractError, match="json_pointer"):
+        PublicValueSource("tool_output", "lookup", None, None)
+    source = PublicValueSource("tool_output", "lookup", "/reference", None)
+    assert source.tool_name == "lookup"
     facet = FacetSpec(
         "reference",
         "reference",
         STRING,
         ("eq",),
-        "public_tool",
-        tool_name="lookup",
-        output_schema_pointer="/reference",
     )
-    assert facet.to_document()["tool_name"] == "lookup"
-    assert facet.to_document()["output_schema_pointer"] == "/reference"
-    with pytest.raises(SemanticsContractError, match="must not declare"):
-        FacetSpec(
-            "name",
-            "name",
-            STRING,
-            ("eq",),
-            "task_literal",
-            tool_name="lookup",
-            output_schema_pointer="/name",
-        )
-    with pytest.raises(SemanticsContractError, match="visibility"):
-        FacetSpec("name", "name", STRING, ("eq",), "private")  # type: ignore[arg-type]
+    assert facet.to_document()["name"] == "reference"
 
 
-def test_condition_visibility_and_binding_scope_are_closed() -> None:
-    with pytest.raises(SemanticsContractError, match="visibility"):
-        ConditionSpec(
-            "can_finish",
-            "can finish",
-            "private",  # type: ignore[arg-type]
-            "world",
-            ("finish",),
-            (),
-            None,
-        )
+def test_condition_binding_scope_is_closed() -> None:
     with pytest.raises(SemanticsContractError, match="binding_scope"):
         ConditionSpec(
             "can_finish",
             "can finish",
-            "reset",
             "target",  # type: ignore[arg-type]
             ("finish",),
             (),
             None,
+            PublicValueSource("reset", None, "/can_finish", None),
         )
 
 
@@ -185,12 +152,23 @@ def test_composition_and_rendering_use_the_final_plan_contract() -> None:
     with pytest.raises(SemanticsContractError, match="max_occurrences"):
         CompositionRule("bad", "workflow", "all", ("a", "b"), 0)
 
-    answer = AnswerFieldSpec("confirmation", STRING, "confirmation")
+    answer = AnswerFieldSpec(
+        "confirmation",
+        STRING,
+        "confirmation",
+        PublicValueSource("tool_output", "finish_item", "/confirmation", None),
+    )
     rendering = RenderingSpec("finish", "item", "report the confirmation")
     assert answer.to_document() == {
         "field_id": "confirmation",
         "schema": STRING,
         "public_label": "confirmation",
+        "public_source": {
+            "kind": "tool_output",
+            "tool_name": "finish_item",
+            "json_pointer": "/confirmation",
+            "value": None,
+        },
     }
     assert rendering.to_document()["imperative"] == "finish"
     assert rendering.to_document()["answer_phrase"] == "report the confirmation"
@@ -207,11 +185,23 @@ def _capability(*, capability_id: str = "finish") -> CapabilitySpec:
         intent_label="finish an item",
         protected_binding_schema=OBJECT,
         public_descriptor_schema=OBJECT,
-        facets=(FacetSpec("name", "name", STRING, ("eq",), "task_literal"),),
+        facets=(
+            FacetSpec(
+                "name",
+                "name",
+                STRING,
+                ("eq",),
+            ),
+        ),
         conditions=(),
-        answer_fields=(AnswerFieldSpec("confirmation", STRING, "confirmation"),),
-        read_scopes=("items",),
-        write_scopes=("items",),
+        answer_fields=(
+            AnswerFieldSpec(
+                "confirmation",
+                STRING,
+                "confirmation",
+                PublicValueSource("tool_output", "finish_item", "/confirmation", None),
+            ),
+        ),
         supported_goal_kinds=("atom",),
         rendering=RenderingSpec("finish", "item", "report the confirmation"),
     )
@@ -230,8 +220,19 @@ def test_capability_binding_and_start_validation_are_closed() -> None:
         {"native_id": 1},
         {"name": "alpha"},
         {"name": "alpha"},
+        (
+            PublicFieldSource(
+                "/public_descriptor/name",
+                PublicValueSource("task_literal", None, None, "alpha"),
+            ),
+            PublicFieldSource(
+                "/facets/name",
+                PublicValueSource("task_literal", None, None, "alpha"),
+            ),
+        ),
     )
     validate_binding(capability, binding)
+    validate_bindings(capability, (binding,))
     assert binding.public_document() == {
         "public_descriptor": {"name": "alpha"},
         "facets": {"name": "alpha"},
@@ -244,6 +245,7 @@ def test_capability_binding_and_start_validation_are_closed() -> None:
             {"native_id": 1},
             {"name": "alpha"},
             {"name": "alpha"},
+            binding.public_sources,
         )
     with pytest.raises(SemanticsContractError, match="task_kind"):
         replace(capability, task_kind="mutation")  # type: ignore[arg-type]
@@ -296,6 +298,13 @@ def test_atomic_contract_has_no_scalar_reward_and_task_semantics_is_release_loca
         {"native_id": 1},
         trace,
         {"confirmation": "ok-alpha"},
+        GoalEvaluationContext(
+            "target",
+            (EvaluationBinding("target", "finish", "item-alpha", {"native_id": 1}),),
+            None,
+            None,
+            (),
+        ),
     )
     result = AtomCheckResult(False, True, True, True, True, None, {"confirmation": "ok-alpha"}, ())
     assert request.trace_projection == trace

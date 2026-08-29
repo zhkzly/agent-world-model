@@ -34,6 +34,9 @@ Current baseline:
   contradict it.
 - Remove concrete protected bindings from cross-materialization TaskDefinition and
   checker identity.
+- Recursively validate Goal→selector/slot/capability/cardinality references and
+  require the Goal to consume every frozen binding/selector. Composition and
+  ForEach identities live only in their Goal nodes, never duplicate selection annotations.
 - Make receipt admission reject arbitrary canonical JSON and fixture verdicts.
 
 ### RED tests
@@ -45,6 +48,8 @@ Current baseline:
 - reset/tool value without exact schema pointer rejected;
 - repeated tool calls cannot satisfy provenance without a trace-event occurrence;
 - All/ForEach run missing or adding one logical selection member rejected;
+- unused selectors/bindings, wrong Goal references/cardinality, duplicate or
+  reordered frozen/run members rejected;
 - composed/foreach evaluation without exact selected sibling context rejected.
 - legacy `read_scopes`/`write_scopes` fields rejected rather than ignored.
 - legacy/contradictory visibility/tool/pointer encodings rejected.

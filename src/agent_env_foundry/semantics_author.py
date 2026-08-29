@@ -558,9 +558,16 @@ def _align_expected_catalog(
     for condition_id, item in expected_conditions.items():
         condition = actual_conditions[condition_id]
         report_field_id = condition.report_field.field_id if condition.report_field else ""
+        visibility = (
+            "reset"
+            if condition.public_source.kind == "reset"
+            else "public_tool"
+            if condition.public_source.kind == "tool_output"
+            else condition.public_source.kind
+        )
         if (
             condition.public_label != item["public_label"]
-            or condition.visibility != item["visibility"]
+            or visibility != item["visibility"]
             or condition.binding_scope != item["binding_scope"]
             or sorted(condition.true_capability_ids) != item["true_capability_ids"]
             or sorted(condition.false_capability_ids) != item["false_capability_ids"]

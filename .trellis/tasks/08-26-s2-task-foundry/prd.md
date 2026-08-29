@@ -219,7 +219,7 @@ TaskDefinition stores a logical binding plan:
 binding slot
 capability_id
 stable semantic_key
-stable public selection constraints
+selector_id (the shared `LogicalSelection` owns the stable constraints)
 public source declarations
 ```
 
@@ -231,9 +231,12 @@ or challenge evidence. Failure to rebind is `SemanticsDefect` or
 
 For `AllGoal` and `ForEachGoal`, TaskDefinition additionally freezes a
 `LogicalSelection`: the exact semantic-key set, selector/cardinality rule,
-CompositionRule or ForEach identity, and stable member ordering. Every fresh run
-must re-resolve the complete same logical set; missing, extra or ambiguous
-members reject the run.
+and stable member ordering. Composition identity remains solely in `AllGoal` and
+ForEach identity solely in `ForEachGoal`. Recursive validation requires every
+frozen selector/binding to be consumed by the Goal. Every fresh run re-resolves
+the complete same logical tuple; missing, extra, reordered or ambiguous members
+reject the run. `exactly_one` and `any_one` freeze exactly one selected member;
+`all` freezes the complete non-empty member tuple.
 
 ## Public value provenance
 

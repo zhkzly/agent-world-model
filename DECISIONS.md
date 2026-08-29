@@ -119,3 +119,5 @@
 `s2-v2-clean-break|介入1|返工1|12k+ LOC deletion+277 tests+Ruff/Mypy/lock+zero-reference+tree-manifest mutation|红线违反0`
 
 `s2-v2-contract-reclosure|介入1|返工2|3 independent ALLOW+277 tests+task/spec validation+stale S1 deletion|红线违反0`
+
+`s2-checkpoint-a|介入1|返工5|292 tests+41 mutation licences+iterative high-level BLOCK→2 ALLOW|红线违反0`

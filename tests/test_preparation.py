@@ -16,6 +16,8 @@ from agent_env_foundry.preparation import (
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
     ConditionCheckRequest,
+    EvaluationBinding,
+    GoalEvaluationContext,
     SemanticsContractError,
     start_case_from_document,
 )
@@ -61,6 +63,20 @@ def test_prepare_open_runs_real_actor_and_all_trusted_methods(tmp_path: Path) ->
                 bindings[0].protected_binding,
                 (),
                 {"count": 5},
+                GoalEvaluationContext(
+                    "target",
+                    (
+                        EvaluationBinding(
+                            "target",
+                            "increment",
+                            bindings[0].semantic_key,
+                            bindings[0].protected_binding,
+                        ),
+                    ),
+                    None,
+                    None,
+                    (),
+                ),
             )
         )
         condition = session.trusted.evaluate_condition(

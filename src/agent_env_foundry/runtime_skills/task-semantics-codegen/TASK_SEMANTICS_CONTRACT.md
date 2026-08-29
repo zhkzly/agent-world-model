@@ -1,10 +1,8 @@
 # TaskSemantics Project Contract
 
-> **Status: Checkpoint-A target — not executable at current HEAD.** The current
-> Host decoders still use the pre-reclosure fields and would reject the
-> `public_source`, `public_sources` and `evaluation_context` records below. Land
-> this contract, Host models/decoders and tests atomically. Do not run the
-> Semantics Author before that change is complete.
+> **Status: Checkpoint-A contract implemented.** Host models/decoders and tests
+> use this exact shape. A model run belongs to a later checkpoint and cannot by
+> itself authorize Qualification or Publication.
 
 Write one standalone Python 3.12 uv project implementing a release-local,
 read-only `TaskSemantics` factory. The project is proposed code; Host execution
@@ -67,7 +65,7 @@ Nested records have exactly:
 CompositionRule:
   rule_id, workflow_id, kind="all", capability_ids, max_occurrences
 FacetSpec:
-  name, public_label, value_schema, allowed_operators, public_source
+  name, public_label, value_schema, allowed_operators
 ConditionSpec:
   condition_id, public_label, binding_scope,
   true_capability_ids, false_capability_ids, report_field, public_source
@@ -85,7 +83,8 @@ additional goal kinds are only `all`, `if`, and `foreach`. Facet operators are
 only `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `min`, and `max`.
 
 `PublicValueSource.kind` is exactly `task_literal`, `reset`, `tool_output`, or
-`tool_schema_constant`. Task literals supply `value`; reset sources supply an
+`tool_schema_constant`. Binding-leaf task literals supply their actual `value`;
+reset sources supply an
 RFC 6901 reset-observation pointer; tool sources supply a tool name and exact
 schema pointer. Unused fields are null. Broad object schemas do not authorize a
 descendant path.
@@ -107,7 +106,9 @@ The three projections are JSON objects and must validate against the capability
 schemas/facets.
 `public_sources` maps every public descriptor/facet leaf pointer to an exact
 `PublicValueSource`. No leaf may rely on prose, a protected value or an
-undeclared object descendant.
+undeclared object descendant. The binding owns this per-leaf source so different
+bindings may carry different literal values without duplicating them in the
+capability-wide FacetSpec.
 Within one StartCase and capability, different semantic keys must not expose the
 same public binding document. Public descriptors/facets must identify the
 intended referent using values available from schema-qualified reset or tool

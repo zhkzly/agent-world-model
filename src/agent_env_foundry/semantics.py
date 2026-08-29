@@ -19,12 +19,10 @@ FacetOperator = Literal["eq", "neq", "lt", "lte", "gt", "gte", "min", "max"]
 GoalKind = Literal["atom", "all", "if", "foreach"]
 TaskKind = Literal["query", "state_change", "process"]
 ConditionStatus = Literal["true", "false", "abstain"]
-FacetVisibility = Literal["task_literal", "reset", "public_tool"]
-ConditionVisibility = Literal["reset", "public_tool"]
+PublicValueKind = Literal["task_literal", "reset", "tool_output", "tool_schema_constant"]
 BindingScope = Literal["world", "selected_binding"]
 _FACET_OPERATORS = frozenset({"eq", "neq", "lt", "lte", "gt", "gte", "min", "max"})
-_FACET_VISIBILITIES = frozenset({"task_literal", "reset", "public_tool"})
-_CONDITION_VISIBILITIES = frozenset({"reset", "public_tool"})
+_PUBLIC_VALUE_KINDS = frozenset({"task_literal", "reset", "tool_output", "tool_schema_constant"})
 _BINDING_SCOPES = frozenset({"world", "selected_binding"})
 _TASK_KINDS = frozenset({"query", "state_change", "process"})
 _GOAL_KINDS = frozenset({"atom", "all", "if", "foreach"})
@@ -55,10 +53,54 @@ class StartCase:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicValueSource:
+    kind: PublicValueKind
+    tool_name: str | None
+    json_pointer: str | None
+    value: JSONValue | None
+
+    def __post_init__(self) -> None:
+        if self.kind not in _PUBLIC_VALUE_KINDS:
+            raise SemanticsContractError("public value source kind is invalid")
+        if self.kind == "task_literal":
+            if self.tool_name is not None or self.json_pointer is not None:
+                raise SemanticsContractError(
+                    "task_literal source must not declare tool_name or json_pointer"
+                )
+            return
+        if self.kind == "reset":
+            if self.tool_name is not None:
+                raise SemanticsContractError("reset source must not declare tool_name")
+            if self.json_pointer is None:
+                raise SemanticsContractError("reset source requires json_pointer")
+            _pointer(self.json_pointer, "reset source json_pointer")
+            if self.value is not None:
+                raise SemanticsContractError("reset source must not declare value")
+            return
+        if self.tool_name is None:
+            raise SemanticsContractError(f"{self.kind} source requires tool_name")
+        _identifier(self.tool_name, f"{self.kind} source tool_name")
+        if self.json_pointer is None:
+            raise SemanticsContractError(f"{self.kind} source requires json_pointer")
+        _pointer(self.json_pointer, f"{self.kind} source json_pointer")
+        if self.kind == "tool_output" and self.value is not None:
+            raise SemanticsContractError("tool_output source must not declare value")
+
+    def to_document(self) -> JSONObject:
+        return {
+            "kind": self.kind,
+            "tool_name": self.tool_name,
+            "json_pointer": self.json_pointer,
+            "value": _json(self.value),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AnswerFieldSpec:
     field_id: str
     schema: JSONObject
     public_label: str
+    public_source: PublicValueSource
 
     def __post_init__(self) -> None:
         _identifier(self.field_id, "answer field_id")
@@ -70,6 +112,7 @@ class AnswerFieldSpec:
             "field_id": self.field_id,
             "schema": _json(self.schema),
             "public_label": self.public_label,
+            "public_source": self.public_source.to_document(),
         }
 
 
@@ -79,9 +122,6 @@ class FacetSpec:
     public_label: str
     value_schema: JSONObject
     allowed_operators: tuple[FacetOperator, ...]
-    visibility: FacetVisibility
-    tool_name: str | None = None
-    output_schema_pointer: str | None = None
 
     def __post_init__(self) -> None:
         _identifier(self.name, "facet name")
@@ -92,14 +132,6 @@ class FacetSpec:
         _unique(self.allowed_operators, "facet allowed_operators")
         if any(operator not in _FACET_OPERATORS for operator in self.allowed_operators):
             raise SemanticsContractError("facet contains an unsupported operator")
-        if self.visibility not in _FACET_VISIBILITIES:
-            raise SemanticsContractError("facet visibility is invalid")
-        _tool_projection(
-            visibility=self.visibility,
-            tool_name=self.tool_name,
-            pointer=self.output_schema_pointer,
-            role="facet",
-        )
 
     def to_document(self) -> JSONObject:
         return {
@@ -107,9 +139,6 @@ class FacetSpec:
             "public_label": self.public_label,
             "value_schema": _json(self.value_schema),
             "allowed_operators": list(self.allowed_operators),
-            "visibility": self.visibility,
-            "tool_name": self.tool_name,
-            "output_schema_pointer": self.output_schema_pointer,
         }
 
 
@@ -146,21 +175,17 @@ class CompositionRule:
 class ConditionSpec:
     condition_id: str
     public_label: str
-    visibility: ConditionVisibility
     binding_scope: BindingScope
     true_capability_ids: tuple[str, ...]
     false_capability_ids: tuple[str, ...]
     report_field: AnswerFieldSpec | None
-    tool_name: str | None = None
-    output_schema_pointer: str | None = None
+    public_source: PublicValueSource
 
     def __post_init__(self) -> None:
         _identifier(self.condition_id, "condition_id")
         _text(self.public_label, "condition public_label")
         _unique(self.true_capability_ids, "condition true_capability_ids")
         _unique(self.false_capability_ids, "condition false_capability_ids")
-        if self.visibility not in _CONDITION_VISIBILITIES:
-            raise SemanticsContractError("condition visibility is invalid")
         if self.binding_scope not in _BINDING_SCOPES:
             raise SemanticsContractError("condition binding_scope is invalid")
         if (
@@ -169,24 +194,16 @@ class ConditionSpec:
             and self.report_field is None
         ):
             raise SemanticsContractError("condition licenses neither a branch nor a report")
-        _tool_projection(
-            visibility=self.visibility,
-            tool_name=self.tool_name,
-            pointer=self.output_schema_pointer,
-            role="condition",
-        )
 
     def to_document(self) -> JSONObject:
         return {
             "condition_id": self.condition_id,
             "public_label": self.public_label,
-            "visibility": self.visibility,
             "binding_scope": self.binding_scope,
             "true_capability_ids": list(self.true_capability_ids),
             "false_capability_ids": list(self.false_capability_ids),
             "report_field": self.report_field.to_document() if self.report_field else None,
-            "tool_name": self.tool_name,
-            "output_schema_pointer": self.output_schema_pointer,
+            "public_source": self.public_source.to_document(),
         }
 
 
@@ -224,8 +241,6 @@ class CapabilitySpec:
     facets: tuple[FacetSpec, ...]
     conditions: tuple[ConditionSpec, ...]
     answer_fields: tuple[AnswerFieldSpec, ...]
-    read_scopes: tuple[str, ...]
-    write_scopes: tuple[str, ...]
     supported_goal_kinds: tuple[GoalKind, ...]
     rendering: RenderingSpec
 
@@ -236,8 +251,6 @@ class CapabilitySpec:
         for values, role in (
             (self.requirement_ids, "requirement_ids"),
             (self.workflow_ids, "workflow_ids"),
-            (self.read_scopes, "read_scopes"),
-            (self.write_scopes, "write_scopes"),
             (self.supported_goal_kinds, "supported_goal_kinds"),
         ):
             _unique(values, role)
@@ -279,10 +292,25 @@ class CapabilitySpec:
             "facets": [value.to_document() for value in self.facets],
             "conditions": [value.to_document() for value in self.conditions],
             "answer_fields": [value.to_document() for value in self.answer_fields],
-            "read_scopes": list(self.read_scopes),
-            "write_scopes": list(self.write_scopes),
             "supported_goal_kinds": list(self.supported_goal_kinds),
             "rendering": self.rendering.to_document(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PublicFieldSource:
+    field_pointer: str
+    source: PublicValueSource
+
+    def __post_init__(self) -> None:
+        if not self.field_pointer.startswith("/"):
+            raise SemanticsContractError("public field_pointer must be an RFC 6901 pointer")
+        _pointer(self.field_pointer, "public field_pointer")
+
+    def to_document(self) -> JSONObject:
+        return {
+            "field_pointer": self.field_pointer,
+            "source": self.source.to_document(),
         }
 
 
@@ -294,6 +322,7 @@ class BindingCandidate:
     protected_binding: JSONObject
     public_descriptor: JSONObject
     facets: JSONObject
+    public_sources: tuple[PublicFieldSource, ...]
 
     def __post_init__(self) -> None:
         _identifier(self.semantic_key, "semantic_key")
@@ -307,6 +336,29 @@ class BindingCandidate:
             for value in (self.protected_binding, self.public_descriptor, self.facets)
         ):
             raise SemanticsContractError("binding projections must be JSON objects")
+        pointers = tuple(item.field_pointer for item in self.public_sources)
+        if len(pointers) != len(set(pointers)):
+            raise SemanticsContractError("duplicate binding public source pointer")
+        if set(pointers) != _public_leaf_pointers(self.public_descriptor, self.facets):
+            raise SemanticsContractError(
+                "binding public_sources must cover every public leaf exactly"
+            )
+        public_values = {
+            item.field_pointer: _resolve_public_pointer(
+                self.public_descriptor,
+                self.facets,
+                item.field_pointer,
+            )
+            for item in self.public_sources
+        }
+        for item in self.public_sources:
+            if (
+                item.source.kind == "task_literal"
+                and item.source.value != public_values[item.field_pointer]
+            ):
+                raise SemanticsContractError(
+                    "task_literal public source value differs from its public leaf"
+                )
 
     def public_document(self) -> JSONObject:
         return {
@@ -322,6 +374,7 @@ class BindingCandidate:
             "protected_binding": _json(self.protected_binding),
             "public_descriptor": _json(self.public_descriptor),
             "facets": _json(self.facets),
+            "public_sources": [item.to_document() for item in self.public_sources],
         }
 
 
@@ -349,6 +402,78 @@ class TraceEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class EvaluationBinding:
+    slot: str
+    capability_id: str
+    semantic_key: str
+    protected_binding: JSONObject
+
+    def __post_init__(self) -> None:
+        _identifier(self.slot, "evaluation binding slot")
+        _identifier(self.capability_id, "evaluation binding capability_id")
+        _identifier(self.semantic_key, "evaluation binding semantic_key")
+        if not is_json_object(self.protected_binding):
+            raise SemanticsContractError("evaluation protected_binding must be a JSON object")
+
+    def to_document(self) -> JSONObject:
+        return {
+            "slot": self.slot,
+            "capability_id": self.capability_id,
+            "semantic_key": self.semantic_key,
+            "protected_binding": _json(self.protected_binding),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class GoalEvaluationContext:
+    current_slot: str
+    resolved_bindings: tuple[EvaluationBinding, ...]
+    composition_rule_id: str | None
+    foreach_selector_id: str | None
+    permitted_sibling_slots: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        _identifier(self.current_slot, "evaluation current_slot")
+        if self.composition_rule_id is not None:
+            _identifier(self.composition_rule_id, "evaluation composition_rule_id")
+        if self.foreach_selector_id is not None:
+            _identifier(self.foreach_selector_id, "evaluation foreach_selector_id")
+        if self.composition_rule_id is not None and self.foreach_selector_id is not None:
+            raise SemanticsContractError(
+                "composition_rule_id and foreach_selector_id are mutually exclusive"
+            )
+        slots = tuple(item.slot for item in self.resolved_bindings)
+        _unique(slots, "evaluation binding slots")
+        if self.current_slot not in slots:
+            raise SemanticsContractError("evaluation current_slot is not resolved")
+        _unique(self.permitted_sibling_slots, "permitted_sibling_slots")
+        allowed = set(slots) - {self.current_slot}
+        if set(self.permitted_sibling_slots) != allowed:
+            raise SemanticsContractError(
+                "permitted_sibling_slots must contain exactly all selected siblings"
+            )
+        if self.composition_rule_id is not None and not allowed:
+            raise SemanticsContractError("composition evaluation requires a selected sibling")
+        if (
+            self.composition_rule_id is None
+            and self.foreach_selector_id is None
+            and self.permitted_sibling_slots
+        ):
+            raise SemanticsContractError(
+                "atom evaluation without composition/foreach cannot permit siblings"
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "current_slot": self.current_slot,
+            "resolved_bindings": [item.to_document() for item in self.resolved_bindings],
+            "composition_rule_id": self.composition_rule_id,
+            "foreach_selector_id": self.foreach_selector_id,
+            "permitted_sibling_slots": list(self.permitted_sibling_slots),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AtomCheckRequest:
     capability_id: str
     before_facts: JSONValue
@@ -356,6 +481,24 @@ class AtomCheckRequest:
     protected_binding: JSONObject
     trace_projection: tuple[TraceEvent, ...]
     final_answer: JSONValue | None
+    evaluation_context: GoalEvaluationContext
+
+    def __post_init__(self) -> None:
+        _identifier(self.capability_id, "atom capability_id")
+        if not is_json_value(self.before_facts) or not is_json_value(self.after_facts):
+            raise SemanticsContractError("atom facts must be JSON values")
+        if not is_json_object(self.protected_binding):
+            raise SemanticsContractError("atom protected_binding must be a JSON object")
+        _unique(tuple(item.seq for item in self.trace_projection), "trace sequence numbers")
+        current = next(
+            item
+            for item in self.evaluation_context.resolved_bindings
+            if item.slot == self.evaluation_context.current_slot
+        )
+        if current.capability_id != self.capability_id:
+            raise SemanticsContractError("evaluation current binding uses another capability")
+        if current.protected_binding != self.protected_binding:
+            raise SemanticsContractError("evaluation current binding differs from request binding")
 
     def to_document(self) -> JSONObject:
         return {
@@ -365,6 +508,7 @@ class AtomCheckRequest:
             "protected_binding": _json(self.protected_binding),
             "trace_projection": [item.to_document() for item in self.trace_projection],
             "final_answer": _json(self.final_answer),
+            "evaluation_context": self.evaluation_context.to_document(),
         }
 
 
@@ -500,6 +644,22 @@ def validate_binding(spec: CapabilitySpec, binding: BindingCandidate) -> None:
             raise SemanticsContractError(str(exc)) from exc
 
 
+def validate_bindings(
+    spec: CapabilitySpec,
+    bindings: tuple[BindingCandidate, ...],
+) -> None:
+    if not isinstance(bindings, tuple):
+        raise SemanticsContractError("bindings must be a tuple")
+    _unique(tuple(item.semantic_key for item in bindings), "binding semantic keys")
+    public_documents: list[JSONObject] = []
+    for binding in bindings:
+        validate_binding(spec, binding)
+        public = binding.public_document()
+        if public in public_documents:
+            raise SemanticsContractError("different semantic keys are publicly indistinguishable")
+        public_documents.append(public)
+
+
 def validate_start_cases(
     cases: tuple[StartCase, ...],
     *,
@@ -545,8 +705,6 @@ def capability_from_document(value: Any) -> CapabilitySpec:
         "facets",
         "conditions",
         "answer_fields",
-        "read_scopes",
-        "write_scopes",
         "supported_goal_kinds",
         "rendering",
     }
@@ -573,8 +731,6 @@ def capability_from_document(value: Any) -> CapabilitySpec:
         answer_fields=tuple(
             _answer_field(item) for item in _array(document["answer_fields"], "answer_fields")
         ),
-        read_scopes=_string_tuple(document["read_scopes"], "read_scopes"),
-        write_scopes=_string_tuple(document["write_scopes"], "write_scopes"),
         supported_goal_kinds=cast(
             tuple[GoalKind, ...],
             _string_tuple(document["supported_goal_kinds"], "supported_goal_kinds"),
@@ -593,6 +749,7 @@ def binding_from_document(value: Any) -> BindingCandidate:
             "protected_binding",
             "public_descriptor",
             "facets",
+            "public_sources",
         },
         "BindingCandidate",
     )
@@ -606,6 +763,27 @@ def binding_from_document(value: Any) -> BindingCandidate:
         _object(document["protected_binding"], "protected_binding"),
         _object(document["public_descriptor"], "public_descriptor"),
         _object(document["facets"], "facets"),
+        tuple(
+            _public_field_source(item)
+            for item in _array(document["public_sources"], "public_sources")
+        ),
+    )
+
+
+def trace_event_from_document(value: Any) -> TraceEvent:
+    document = _exact(
+        value,
+        {"seq", "tool_name", "arguments", "observation"},
+        "TraceEvent",
+    )
+    seq = document["seq"]
+    if not isinstance(seq, int) or isinstance(seq, bool):
+        raise SemanticsContractError("TraceEvent seq must be integer")
+    return TraceEvent(
+        seq,
+        _string(document["tool_name"], "tool_name"),
+        _object(document["arguments"], "arguments"),
+        _object(document["observation"], "observation"),
     )
 
 
@@ -643,11 +821,16 @@ def condition_result_from_document(value: Any) -> ConditionCheckResult:
 
 
 def _answer_field(value: Any) -> AnswerFieldSpec:
-    document = _exact(value, {"field_id", "schema", "public_label"}, "AnswerFieldSpec")
+    document = _exact(
+        value,
+        {"field_id", "schema", "public_label", "public_source"},
+        "AnswerFieldSpec",
+    )
     return AnswerFieldSpec(
         _string(document["field_id"], "field_id"),
         _object(document["schema"], "schema"),
         _string(document["public_label"], "public_label"),
+        _public_value_source(document["public_source"]),
     )
 
 
@@ -657,17 +840,8 @@ def _facet(value: Any) -> FacetSpec:
         "public_label",
         "value_schema",
         "allowed_operators",
-        "visibility",
-        "tool_name",
-        "output_schema_pointer",
     }
     document = _exact(value, keys, "FacetSpec")
-    tool_name = document["tool_name"]
-    pointer = document["output_schema_pointer"]
-    if tool_name is not None and not isinstance(tool_name, str):
-        raise SemanticsContractError("FacetSpec tool_name must be string or null")
-    if pointer is not None and not isinstance(pointer, str):
-        raise SemanticsContractError("FacetSpec output_schema_pointer must be string or null")
     return FacetSpec(
         _string(document["name"], "name"),
         _string(document["public_label"], "public_label"),
@@ -676,9 +850,6 @@ def _facet(value: Any) -> FacetSpec:
             tuple[FacetOperator, ...],
             _string_tuple(document["allowed_operators"], "allowed_operators"),
         ),
-        cast(FacetVisibility, _string(document["visibility"], "visibility")),
-        tool_name,
-        pointer,
     )
 
 
@@ -704,32 +875,22 @@ def _condition(value: Any) -> ConditionSpec:
     keys = {
         "condition_id",
         "public_label",
-        "visibility",
         "binding_scope",
         "true_capability_ids",
         "false_capability_ids",
         "report_field",
-        "tool_name",
-        "output_schema_pointer",
+        "public_source",
     }
     document = _exact(value, keys, "ConditionSpec")
     report = document["report_field"]
-    tool_name = document["tool_name"]
-    pointer = document["output_schema_pointer"]
-    if tool_name is not None and not isinstance(tool_name, str):
-        raise SemanticsContractError("ConditionSpec tool_name must be string or null")
-    if pointer is not None and not isinstance(pointer, str):
-        raise SemanticsContractError("ConditionSpec output_schema_pointer must be string or null")
     return ConditionSpec(
         _string(document["condition_id"], "condition_id"),
         _string(document["public_label"], "public_label"),
-        cast(ConditionVisibility, _string(document["visibility"], "visibility")),
         cast(BindingScope, _string(document["binding_scope"], "binding_scope")),
         _string_tuple(document["true_capability_ids"], "true_capability_ids"),
         _string_tuple(document["false_capability_ids"], "false_capability_ids"),
         None if report is None else _answer_field(report),
-        tool_name,
-        pointer,
+        _public_value_source(document["public_source"]),
     )
 
 
@@ -742,6 +903,38 @@ def _rendering(value: Any) -> RenderingSpec:
         _string(document["imperative"], "imperative"),
         _string(document["target_noun"], "target_noun"),
         phrase,
+    )
+
+
+def _public_value_source(value: Any) -> PublicValueSource:
+    document = _exact(
+        value,
+        {"kind", "tool_name", "json_pointer", "value"},
+        "PublicValueSource",
+    )
+    tool_name = document["tool_name"]
+    pointer = document["json_pointer"]
+    if tool_name is not None and not isinstance(tool_name, str):
+        raise SemanticsContractError("PublicValueSource tool_name must be string or null")
+    if pointer is not None and not isinstance(pointer, str):
+        raise SemanticsContractError("PublicValueSource json_pointer must be string or null")
+    return PublicValueSource(
+        cast(PublicValueKind, _string(document["kind"], "public source kind")),
+        tool_name,
+        pointer,
+        _json(document["value"]),
+    )
+
+
+def _public_field_source(value: Any) -> PublicFieldSource:
+    document = _exact(
+        value,
+        {"field_pointer", "source"},
+        "PublicFieldSource",
+    )
+    return PublicFieldSource(
+        _string(document["field_pointer"], "field_pointer"),
+        _public_value_source(document["source"]),
     )
 
 
@@ -791,24 +984,6 @@ def _optional_boolean(value: Any, role: str) -> bool | None:
     return None if value is None else _boolean(value, role)
 
 
-def _tool_projection(
-    *,
-    visibility: str,
-    tool_name: str | None,
-    pointer: str | None,
-    role: str,
-) -> None:
-    if visibility == "public_tool":
-        if tool_name is None:
-            raise SemanticsContractError(f"public_tool {role} requires tool_name")
-        _identifier(tool_name, f"public_tool {role} tool_name")
-        if pointer is None:
-            raise SemanticsContractError(f"public_tool {role} requires output_schema_pointer")
-        _pointer(pointer, f"public_tool {role} output_schema_pointer")
-    elif tool_name is not None or pointer is not None:
-        raise SemanticsContractError(f"non-tool {role} must not declare tool provenance")
-
-
 def _schema(value: JSONObject, role: str) -> None:
     try:
         validate_schema_document(value, role=role)
@@ -845,6 +1020,47 @@ def _unique(values: tuple[Any, ...], role: str) -> None:
 
 def _unique_by(values: tuple[Any, ...], attribute: str, role: str) -> None:
     _unique(tuple(getattr(value, attribute) for value in values), role)
+
+
+def _public_leaf_pointers(public_descriptor: JSONObject, facets: JSONObject) -> set[str]:
+    pointers: set[str] = set()
+
+    def visit(value: JSONValue, path: str) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                escaped = key.replace("~", "~0").replace("/", "~1")
+                visit(child, f"{path}/{escaped}")
+            return
+        if isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, f"{path}/{index}")
+            return
+        pointers.add(path)
+
+    visit(_json(public_descriptor), "/public_descriptor")
+    visit(_json(facets), "/facets")
+    return pointers
+
+
+def _resolve_public_pointer(
+    public_descriptor: JSONObject,
+    facets: JSONObject,
+    pointer: str,
+) -> JSONValue:
+    current: JSONValue = {
+        "public_descriptor": _json(public_descriptor),
+        "facets": _json(facets),
+    }
+    for raw_token in pointer.removeprefix("/").split("/"):
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict) and token in current:
+            current = current[token]
+            continue
+        if isinstance(current, list) and token.isdigit() and int(token) < len(current):
+            current = current[int(token)]
+            continue
+        raise SemanticsContractError(f"public source pointer {pointer!r} does not resolve")
+    return current
 
 
 def _json(value: Any) -> JSONValue:

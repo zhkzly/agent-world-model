@@ -56,7 +56,7 @@ from agent_env_foundry.semantics import (
     capability_from_document,
     condition_result_from_document,
     start_case_from_document,
-    validate_binding,
+    validate_bindings,
     validate_catalog,
     validate_start_cases,
 )
@@ -528,8 +528,7 @@ class TrustedProxy:
         catalog = self._catalog or validate_catalog(self.capabilities())
         if capability_id not in catalog:
             raise PreparationContractError(f"unknown capability {capability_id!r}")
-        for value in values:
-            validate_binding(catalog[capability_id], value)
+        validate_bindings(catalog[capability_id], values)
         return values
 
     def evaluate_atom(self, request: AtomCheckRequest) -> AtomCheckResult:

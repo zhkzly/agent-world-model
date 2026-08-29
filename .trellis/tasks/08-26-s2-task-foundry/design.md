@@ -298,7 +298,7 @@ class LogicalBindingRef:
     slot: str
     capability_id: str
     semantic_key: str
-    stable_selector: SelectorSpec
+    selector_id: str
     instruction_values: JSONObject
 
 @dataclass(frozen=True)
@@ -311,11 +311,8 @@ class ResolvedBinding:
 
 @dataclass(frozen=True)
 class LogicalSelection:
-    selection_id: str
     selector: SelectorSpec
     semantic_keys: tuple[str, ...]
-    composition_rule_id: str | None
-    foreach_selector_id: str | None
 ```
 
 TaskDefinition/checker template bind `LogicalBindingRef`, never a concrete
@@ -327,13 +324,22 @@ protected binding. Each witness/challenge:
 4. validates stable instruction values and public sources;
 5. stores `ResolvedBinding` only in run evidence.
 
+Member `slot` is unique per logical referent; multiple member slots may point to
+the same selection's `selector_id`. The full SelectorSpec exists once in
+`LogicalSelection`, so a multi-member ForEach set is representable without
+duplicating or conflating member and set identity.
+
 If a stable instruction value changes across equivalent starts, the Blueprint is
 rejected. Dynamic IDs must be discovered through a qualified public source.
 
-All/ForEach TaskDefinitions freeze `LogicalSelection`. Every materialization
-must resolve exactly the same semantic-key set and cardinality in stable order;
-missing, extra, tied or newly eligible members reject the run rather than mutate
-the checker.
+Every TaskDefinition freezes one `LogicalSelection` per selector. Composition
+identity lives only in `AllGoal`; ForEach identity lives only in `ForEachGoal`,
+so no duplicate annotation can become orphaned. Recursive Goal validation must
+consume every frozen binding and selector exactly once through the Goal graph.
+Every materialization resolves the same semantic-key tuple and cardinality in
+stable order; `exactly_one`/`any_one` contain one frozen member and `all`
+contains the complete non-empty tuple. Missing, extra, tied or newly eligible
+members reject the run.
 
 ## 10. Goal evaluation context
 

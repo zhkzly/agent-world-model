@@ -38,3 +38,32 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - Overdesign/guidance reviewer: `ALLOW`; additions are bounded Host-derived records, not new lifecycles, DSLs, services or public runtimes; stale active S1/v1 guidance was removed.
 - Repository validation after reclosure: Trellis context valid, 277 tests green, Ruff/format/Mypy/lock/diff checks green.
 - Next authorized implementation boundary, after user approval: Checkpoint A contracts/decoders/tests only; no author run, Qualification, Publication or S2 execution claim.
+
+## Checkpoint A implementation evidence
+
+- Implemented one clean-break semantic encoding: `PublicValueSource`, exact public leaf sources, run-local evaluation bindings/context, and no read/write scope algebra.
+- Implemented acyclic Qualification Core, strict receipt, public/catalog/coverage/StartCase manifests and a native verifier request with no protected TaskSemantics projection.
+- Replaced concrete TaskDefinition/checker bindings with logical refs/selections; added run-local resolutions, event-level value occurrences, fresh episode identity and pre-witness AdmissionPlan.
+- Migrated every fixture/consumer without adapters or optional legacy fields. Full 292-test suite, Ruff, format, Mypy, lock and diff checks pass.
+- Forty-one final behavior-level mutants were killed across the three target modules and recorded individually in `research/checkpoint-a-mutation-licenses.md`. Redundant-layer survivors that did not change external behavior were replaced by behavior-level mutants or the duplicate check was removed; none is counted.
+- No Author, Qualification, Publication, compiler or Responses execution has run; Checkpoint A authorizes contracts only.
+
+## Checkpoint A first high-level review and correction
+
+- Two high-level reviewers returned `BLOCK`: task-literal values were dropped; logical selections/sibling sets were underbound; witness occurrences, ordering and AdmissionPlan were not consumed by TaskPack; native wire decoders and public binding uniqueness were incomplete.
+- Root cause: immutable records existed but their downstream consumer invariants were missing, so unit-shape GREEN could not prove the advertised causal chain.
+- Corrected without new product nodes: per-binding literal values, selector-bound selections, exact siblings, public-binding uniqueness, exact wire decoders, trace occurrence resolution, TaskPack-owned plan/ordering and exact witness resolution sets.
+- Fresh re-review then found member slot identity conflated with shared selector identity, making a valid multi-member ForEach unrepresentable. `LogicalSelection` now owns one SelectorSpec while multiple uniquely slotted logical refs point to its selector ID; an accepted two-member TaskPack plus missing/extra-member negatives prove the boundary.
+- The next re-review found GoalProgram references/cardinality and ordered member multiplicity were not closed. Blueprint and Task construction now recursively validate ForEach selector/capability/`all` cardinality, Atom/If logical slots, checker-goal equality and exact ordered binding tuples; missing selectors, wrong cardinality, duplicates and reordering are RED.
+- The following re-review found fresh witness resolutions still compared as a set. TaskPack now compares the exact frozen logical-ref tuple, and a reversed second materialization is RED even with recomputed admission evidence.
+- The next review found inverse Goal closure missing: unused selectors/bindings and duplicate composition/ForEach annotations could survive. Duplicate annotations were deleted; recursive Goal validation now consumes every logical binding, with selector consumption derived from exact non-empty selection membership.
+- The next review found set-based inverse consumption could count one duplicate AllGoal leaf twice, plus unbound checker answer/preimage and witness StartCase edges. All simultaneously-required children must now consume disjoint slots, and TaskDefinition/TaskPack explicitly reconcile these three identity pairs.
+- The final semantic review found selector cardinality was not reconciled with frozen membership. `exactly_one`/`any_one` now require one member and `all` retains the complete ordered tuple.
+
+## Checkpoint A final review
+
+- Semantic/full-Task reviewer: `ALLOW`; all former literal, ambiguity, Goal, ForEach, order, provenance, plan and identity bypass probes now fail closed, while a valid two-member ForEach TaskPack succeeds.
+- Qualification/identity reviewer: `ALLOW`; Core/receipt/manifests/native wire remain acyclic/exact and final Task/checker/witness bindings are mechanically reconciled.
+- Final stable evidence: 292 tests, Ruff, format, Mypy, lock, diff and Trellis context GREEN; 41 auditable behavior mutation licences.
+- Checkpoint A is complete. This authorizes Checkpoint B verifier authoring only; it is not a Qualification, Publication or S2 completion claim.
+- Full gates and final mutation suite are GREEN again. A fresh high-level re-review is required before Checkpoint B.

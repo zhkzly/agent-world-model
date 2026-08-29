@@ -4,27 +4,19 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
 from agent_env_foundry.release import canonical_bytes
-from agent_env_foundry.semantics import StartCase
+from agent_env_foundry.semantics import PublicValueSource, StartCase
 
 SelectorOperator = Literal["eq", "neq", "lt", "lte", "gt", "gte"]
 RankDirection = Literal["min", "max"]
 SelectorCardinality = Literal["exactly_one", "any_one", "all"]
 CheckerStatus = Literal["satisfied", "failed", "abstain"]
 ChallengeVerdict = Literal["passed", "failed", "not_applicable"]
-ArgumentSource = Literal[
-    "instruction",
-    "reset",
-    "tool_schema",
-    "tool_output",
-    "agent_choice",
-    "unresolved",
-    "protected",
-]
+NonPublicArgumentSource = Literal["agent_choice", "unresolved", "protected"]
 OrderingKind = Literal[
     "checker_frozen",
     "instruction_frozen",
@@ -35,6 +27,7 @@ FailureKind = Literal[
     "InfrastructureFailure",
     "EnvironmentDefect",
     "SemanticsDefect",
+    "VerifierDefect",
     "UnsupportedCapability",
     "RejectedBlueprint",
     "CheckerDefect",
@@ -48,17 +41,7 @@ _SELECTOR_OPERATORS = frozenset({"eq", "neq", "lt", "lte", "gt", "gte"})
 _CARDINALITIES = frozenset({"exactly_one", "any_one", "all"})
 _CHECKER_STATUSES = frozenset({"satisfied", "failed", "abstain"})
 _CHALLENGE_VERDICTS = frozenset({"passed", "failed", "not_applicable"})
-_ARGUMENT_SOURCES = frozenset(
-    {
-        "instruction",
-        "reset",
-        "tool_schema",
-        "tool_output",
-        "agent_choice",
-        "unresolved",
-        "protected",
-    }
-)
+_NON_PUBLIC_ARGUMENT_SOURCES = frozenset({"agent_choice", "unresolved", "protected"})
 _ORDERING_KINDS = (
     "checker_frozen",
     "instruction_frozen",
@@ -70,6 +53,7 @@ _FAILURE_KINDS = frozenset(
         "InfrastructureFailure",
         "EnvironmentDefect",
         "SemanticsDefect",
+        "VerifierDefect",
         "UnsupportedCapability",
         "RejectedBlueprint",
         "CheckerDefect",
@@ -308,6 +292,7 @@ class TaskBlueprint:
 
     def __post_init__(self) -> None:
         _unique(tuple(selector.selector_id for selector in self.selectors), "selector IDs")
+        _validate_blueprint_goal(self.goal, self.selectors)
         required_reports = _goal_less_branch_reports(self.goal)
         provided_reports = (
             {
@@ -334,19 +319,107 @@ class TaskBlueprint:
 
 
 @dataclass(frozen=True, slots=True)
+class LogicalBindingRef:
+    slot: str
+    capability_id: str
+    semantic_key: str
+    selector_id: str
+    instruction_values: JSONObject
+
+    def __post_init__(self) -> None:
+        _identifier(self.slot, "logical binding slot")
+        _identifier(self.capability_id, "logical binding capability_id")
+        _identifier(self.semantic_key, "logical binding semantic_key")
+        _identifier(self.selector_id, "logical binding selector_id")
+        _object(self.instruction_values, "logical binding instruction_values")
+
+    @property
+    def logical_ref_digest(self) -> str:
+        return digest_document(self.to_document())
+
+    def to_document(self) -> JSONObject:
+        return {
+            "slot": self.slot,
+            "capability_id": self.capability_id,
+            "semantic_key": self.semantic_key,
+            "selector_id": self.selector_id,
+            "instruction_values": canonical_document(self.instruction_values),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class LogicalSelection:
+    selector: SelectorSpec
+    semantic_keys: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.semantic_keys:
+            raise TaskModelError("logical selection semantic_keys must not be empty")
+        _unique(self.semantic_keys, "logical selection semantic_keys")
+        for value in self.semantic_keys:
+            _identifier(value, "logical selection semantic_key")
+        if self.selector.cardinality in {"exactly_one", "any_one"} and len(self.semantic_keys) != 1:
+            raise TaskModelError("logical selection cardinality requires exactly one member")
+        if self.semantic_keys != tuple(sorted(self.semantic_keys)):
+            raise TaskModelError("logical selection semantic_keys must use stable order")
+
+    @property
+    def selector_id(self) -> str:
+        return self.selector.selector_id
+
+    @property
+    def selection_digest(self) -> str:
+        return digest_document(self.to_document())
+
+    def to_document(self) -> JSONObject:
+        return {
+            "selector": self.selector.to_document(),
+            "semantic_keys": list(self.semantic_keys),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedBinding:
+    logical_ref_digest: str
+    materialization_id: str
+    protected_binding: JSONObject
+    public_descriptor: JSONObject
+    source_evidence_digest: str
+
+    def __post_init__(self) -> None:
+        _digest(self.logical_ref_digest, "resolved logical_ref_digest")
+        _digest(self.materialization_id, "resolved materialization_id")
+        _digest(self.source_evidence_digest, "resolved source_evidence_digest")
+        _object(self.protected_binding, "resolved protected_binding")
+        _object(self.public_descriptor, "resolved public_descriptor")
+
+    def to_document(self) -> JSONObject:
+        return {
+            "logical_ref_digest": self.logical_ref_digest,
+            "materialization_id": self.materialization_id,
+            "protected_binding": canonical_document(self.protected_binding),
+            "public_descriptor": canonical_document(self.public_descriptor),
+            "source_evidence_digest": self.source_evidence_digest,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CheckerArtifact:
     task_preimage_digest: str
     goal_program: GoalProgram
-    selector_resolutions: JSONObject
-    protected_bindings: JSONObject
+    logical_bindings: tuple[LogicalBindingRef, ...]
+    logical_selections: tuple[LogicalSelection, ...]
     answer_schema: JSONObject | None
     semantics_digest: str
 
     def __post_init__(self) -> None:
         _digest(self.task_preimage_digest, "task_preimage_digest")
         _digest(self.semantics_digest, "semantics_digest")
-        _object(self.selector_resolutions, "selector_resolutions")
-        _object(self.protected_bindings, "protected_bindings")
+        _validate_logical_binding_graph(
+            self.logical_bindings,
+            self.logical_selections,
+            "checker",
+        )
         if self.answer_schema is not None:
             _object(self.answer_schema, "answer_schema")
 
@@ -358,8 +431,8 @@ class CheckerArtifact:
         return {
             "task_preimage_digest": self.task_preimage_digest,
             "goal_program": self.goal_program.to_document(),
-            "selector_resolutions": canonical_document(self.selector_resolutions),
-            "protected_bindings": canonical_document(self.protected_bindings),
+            "logical_bindings": [item.to_document() for item in self.logical_bindings],
+            "logical_selections": [item.to_document() for item in self.logical_selections],
             "answer_schema": canonical_document(self.answer_schema),
             "semantics_digest": self.semantics_digest,
         }
@@ -371,7 +444,8 @@ class TaskDefinition:
     semantics_digest: str
     start_case: StartCase
     blueprint: TaskBlueprint
-    protected_bindings: JSONObject
+    logical_bindings: tuple[LogicalBindingRef, ...]
+    logical_selections: tuple[LogicalSelection, ...]
     public_instruction_frame: JSONObject
     canonical_instruction: str
     answer_schema: JSONObject | None
@@ -380,13 +454,42 @@ class TaskDefinition:
     def __post_init__(self) -> None:
         _digest(self.release_id, "release_id")
         _digest(self.semantics_digest, "semantics_digest")
-        _object(self.protected_bindings, "protected_bindings")
+        _validate_logical_binding_graph(
+            self.logical_bindings,
+            self.logical_selections,
+            "Task",
+        )
+        blueprint_selectors = {item.selector_id: item for item in self.blueprint.selectors}
+        selection_selectors = {item.selector_id: item.selector for item in self.logical_selections}
+        if blueprint_selectors != selection_selectors:
+            raise TaskModelError("Task logical selections differ from Blueprint selectors")
         _object(self.public_instruction_frame, "public_instruction_frame")
         _text(self.canonical_instruction, "canonical_instruction")
         if self.answer_schema is not None:
             _object(self.answer_schema, "answer_schema")
         if self.checker.semantics_digest != self.semantics_digest:
             raise TaskModelError("checker binds a different semantics_digest")
+        if self.checker.goal_program != self.blueprint.goal:
+            raise TaskModelError("checker goal differs from Task Blueprint goal")
+        if self.checker.answer_schema != self.answer_schema:
+            raise TaskModelError("checker answer schema differs from TaskDefinition")
+        expected_preimage = digest_document(
+            {
+                "start_case_id": self.start_case.case_id,
+                "blueprint": self.blueprint.to_document(),
+            }
+        )
+        if self.checker.task_preimage_digest != expected_preimage:
+            raise TaskModelError("checker task preimage differs from TaskDefinition")
+        if self.checker.logical_bindings != self.logical_bindings:
+            raise TaskModelError("checker binds different logical bindings")
+        if self.checker.logical_selections != self.logical_selections:
+            raise TaskModelError("checker binds different logical selections")
+        _validate_task_goal(
+            self.blueprint.goal,
+            self.logical_bindings,
+            self.logical_selections,
+        )
 
     @property
     def task_id(self) -> str:
@@ -398,7 +501,8 @@ class TaskDefinition:
             "semantics_digest": self.semantics_digest,
             "start_case": self.start_case.to_document(),
             "blueprint": self.blueprint.to_document(),
-            "protected_bindings": canonical_document(self.protected_bindings),
+            "logical_bindings": [item.to_document() for item in self.logical_bindings],
+            "logical_selections": [item.to_document() for item in self.logical_selections],
             "public_instruction_frame": canonical_document(self.public_instruction_frame),
             "canonical_instruction": self.canonical_instruction,
             "answer_schema": canonical_document(self.answer_schema),
@@ -451,23 +555,108 @@ class OrderingJournal:
     def model_call_allowed(self) -> bool:
         return bool(self.events) and self.events[-1].kind == "model_call_allowed"
 
+    def to_document(self) -> JSONObject:
+        return {
+            "events": [item.to_document() for item in self.events],
+            "model_call_allowed": self.model_call_allowed,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeIdentity:
+    materialization_id: str
+    route_digest: str
+    prompt_digest: str
+    runner_digest: str
+    conversation_id: str
+
+    def __post_init__(self) -> None:
+        for value, role in (
+            (self.materialization_id, "episode materialization_id"),
+            (self.route_digest, "episode route_digest"),
+            (self.prompt_digest, "episode prompt_digest"),
+            (self.runner_digest, "episode runner_digest"),
+        ):
+            _digest(value, role)
+        _identifier(self.conversation_id, "episode conversation_id")
+
+    @property
+    def episode_id(self) -> str:
+        return digest_document(self.to_document())
+
+    def to_document(self) -> JSONObject:
+        return {
+            "materialization_id": self.materialization_id,
+            "route_digest": self.route_digest,
+            "prompt_digest": self.prompt_digest,
+            "runner_digest": self.runner_digest,
+            "conversation_id": self.conversation_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class PublicValueOccurrence:
+    source: PublicValueSource
+    materialization_id: str
+    instruction_slot: str | None
+    trace_event_seq: int | None
+    json_pointer: str | None
+
+    def __post_init__(self) -> None:
+        _digest(self.materialization_id, "value occurrence materialization_id")
+        if self.source.kind == "task_literal":
+            if self.instruction_slot is None:
+                raise TaskModelError("task_literal occurrence requires instruction_slot")
+            if not self.instruction_slot.startswith("/"):
+                raise TaskModelError("task_literal instruction_slot must be an RFC 6901 pointer")
+            if self.trace_event_seq is not None or self.json_pointer is not None:
+                raise TaskModelError("task_literal occurrence cannot use trace/json pointer")
+            return
+        if self.instruction_slot is not None:
+            raise TaskModelError("non-literal occurrence must not declare instruction_slot")
+        if self.json_pointer != self.source.json_pointer:
+            raise TaskModelError("value occurrence json_pointer differs from source")
+        if self.source.kind == "tool_output":
+            if self.trace_event_seq is None or self.trace_event_seq <= 0:
+                raise TaskModelError("tool_output occurrence requires trace_event_seq")
+        elif self.trace_event_seq is not None:
+            raise TaskModelError("non-output occurrence must not declare trace_event_seq")
+
+    @property
+    def occurrence_digest(self) -> str:
+        return digest_document(self.to_document())
+
+    def to_document(self) -> JSONObject:
+        return {
+            "source": self.source.to_document(),
+            "source_digest": digest_document(self.source.to_document()),
+            "materialization_id": self.materialization_id,
+            "instruction_slot": self.instruction_slot,
+            "trace_event_seq": self.trace_event_seq,
+            "json_pointer": self.json_pointer,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class ArgumentOrigin:
     path: str
-    source: ArgumentSource
-    source_path: str | None
+    source: PublicValueOccurrence | NonPublicArgumentSource
     load_bearing: bool
 
     def __post_init__(self) -> None:
-        if self.source not in _ARGUMENT_SOURCES:
+        if not self.path.startswith("/"):
+            raise TaskModelError("argument path must be an RFC 6901 pointer")
+        if isinstance(self.source, str) and self.source not in _NON_PUBLIC_ARGUMENT_SOURCES:
             raise TaskModelError("argument provenance source is invalid")
 
     def to_document(self) -> JSONObject:
         return {
             "path": self.path,
-            "source": self.source,
-            "source_path": self.source_path,
+            "source": (
+                self.source.to_document()
+                if isinstance(self.source, PublicValueOccurrence)
+                else self.source
+            ),
             "load_bearing": self.load_bearing,
         }
 
@@ -479,8 +668,7 @@ class ProvenanceReport:
     @property
     def complete(self) -> bool:
         return all(
-            not origin.load_bearing
-            or origin.source not in ("agent_choice", "unresolved", "protected")
+            not origin.load_bearing or isinstance(origin.source, PublicValueOccurrence)
             for origin in self.origins
         )
 
@@ -518,9 +706,11 @@ class PublicTraceEvent:
 
 @dataclass(frozen=True, slots=True)
 class WitnessRun:
-    materialization_id: str
+    episode: EpisodeIdentity
     task_definition_id: str
     start_case_id: str
+    reset_observation: JSONValue
+    resolved_bindings: tuple[ResolvedBinding, ...]
     trace: tuple[PublicTraceEvent, ...]
     final_answer: JSONValue
     checker_digest: str
@@ -531,7 +721,6 @@ class WitnessRun:
 
     def __post_init__(self) -> None:
         for value, role in (
-            (self.materialization_id, "materialization_id"),
             (self.task_definition_id, "task_definition_id"),
             (self.checker_digest, "checker_digest"),
             (self.before_facts_digest, "before_facts_digest"),
@@ -539,10 +728,70 @@ class WitnessRun:
         ):
             _digest(value, role)
         _identifier(self.start_case_id, "start_case_id")
+        _json(self.reset_observation, "reset_observation")
         _json(self.final_answer, "final_answer")
         _unique(self.checker_failures, "checker_failures")
         if self.checker_status not in _CHECKER_STATUSES:
             raise TaskModelError("checker_status is invalid")
+        if not self.resolved_bindings:
+            raise TaskModelError("witness requires resolved bindings")
+        if any(
+            item.materialization_id != self.episode.materialization_id
+            for item in self.resolved_bindings
+        ):
+            raise TaskModelError("witness binding belongs to another materialization")
+        _unique(
+            tuple(item.logical_ref_digest for item in self.resolved_bindings),
+            "witness logical binding resolutions",
+        )
+        _unique(tuple(item.seq for item in self.trace), "witness trace sequence numbers")
+        self._validate_provenance_occurrences()
+
+    def _validate_provenance_occurrences(self) -> None:
+        events = {item.seq: item for item in self.trace}
+        for event in self.trace:
+            for origin in event.provenance.origins:
+                if not isinstance(origin.source, PublicValueOccurrence):
+                    continue
+                occurrence = origin.source
+                if occurrence.materialization_id != self.episode.materialization_id:
+                    raise TaskModelError("value occurrence belongs to another materialization")
+                argument_value = _resolve_pointer(event.arguments, origin.path, "tool argument")
+                source = occurrence.source
+                if source.kind == "task_literal":
+                    expected = source.value
+                elif source.kind == "reset":
+                    expected = _resolve_pointer(
+                        self.reset_observation,
+                        cast(str, source.json_pointer),
+                        "reset observation",
+                    )
+                elif source.kind == "tool_schema_constant":
+                    expected = source.value
+                else:
+                    source_event = events.get(cast(int, occurrence.trace_event_seq))
+                    if source_event is None or source_event.seq >= event.seq:
+                        raise TaskModelError(
+                            "tool_output occurrence must reference an actual prior trace event"
+                        )
+                    if source_event.tool_name != source.tool_name:
+                        raise TaskModelError("tool_output occurrence references the wrong tool")
+                    observation = source_event.observation
+                    if observation.get("ok") is not True or "data" not in observation:
+                        raise TaskModelError(
+                            "tool_output occurrence requires successful observation"
+                        )
+                    expected = _resolve_pointer(
+                        observation["data"],
+                        cast(str, source.json_pointer),
+                        "tool observation data",
+                    )
+                if argument_value != expected:
+                    raise TaskModelError("argument value differs from its public source occurrence")
+
+    @property
+    def materialization_id(self) -> str:
+        return self.episode.materialization_id
 
     @property
     def successful(self) -> bool:
@@ -559,9 +808,12 @@ class WitnessRun:
 
     def identity_preimage_document(self) -> JSONObject:
         return {
-            "materialization_id": self.materialization_id,
+            "episode": self.episode.to_document(),
+            "episode_id": self.episode.episode_id,
             "task_definition_id": self.task_definition_id,
             "start_case_id": self.start_case_id,
+            "reset_observation": canonical_document(self.reset_observation),
+            "resolved_bindings": [item.to_document() for item in self.resolved_bindings],
             "trace": [item.to_document() for item in self.trace],
             "final_answer": canonical_document(self.final_answer),
             "checker_digest": self.checker_digest,
@@ -573,6 +825,73 @@ class WitnessRun:
 
     def to_document(self) -> JSONObject:
         return {"run_id": self.run_id, **self.identity_preimage_document()}
+
+
+@dataclass(frozen=True, slots=True)
+class ChallengePlan:
+    challenge_id: str
+    applicable: bool
+    reason_code: str | None
+
+    def __post_init__(self) -> None:
+        _identifier(self.challenge_id, "planned challenge_id")
+        _applicability(self.applicable, self.reason_code, "planned challenge")
+
+    def to_document(self) -> JSONObject:
+        return {
+            "challenge_id": self.challenge_id,
+            "applicable": self.applicable,
+            "reason_code": self.reason_code,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CheckerMutationPlan:
+    mutation_id: str
+    applicable: bool
+    reason_code: str | None
+
+    def __post_init__(self) -> None:
+        _identifier(self.mutation_id, "planned mutation_id")
+        _applicability(self.applicable, self.reason_code, "planned mutation")
+
+    def to_document(self) -> JSONObject:
+        return {
+            "mutation_id": self.mutation_id,
+            "applicable": self.applicable,
+            "reason_code": self.reason_code,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionPlan:
+    task_definition_id: str
+    checker_digest: str
+    challenges: tuple[ChallengePlan, ...]
+    checker_mutations: tuple[CheckerMutationPlan, ...]
+
+    def __post_init__(self) -> None:
+        _digest(self.task_definition_id, "admission plan task_definition_id")
+        _digest(self.checker_digest, "admission plan checker_digest")
+        _unique(tuple(item.challenge_id for item in self.challenges), "planned challenge IDs")
+        _unique(
+            tuple(item.mutation_id for item in self.checker_mutations),
+            "planned mutation IDs",
+        )
+        if not self.challenges or not self.checker_mutations:
+            raise TaskModelError("admission plan requires challenges and checker mutations")
+
+    @property
+    def plan_digest(self) -> str:
+        return digest_document(self.to_document())
+
+    def to_document(self) -> JSONObject:
+        return {
+            "task_definition_id": self.task_definition_id,
+            "checker_digest": self.checker_digest,
+            "challenges": [item.to_document() for item in self.challenges],
+            "checker_mutations": [item.to_document() for item in self.checker_mutations],
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -652,6 +971,7 @@ class CheckerMutationResult:
 class AdmissionReport:
     task_definition_id: str
     checker_digest: str
+    plan_digest: str
     witness_digests: tuple[str, str]
     challenges: tuple[ChallengeResult, ...]
     checker_mutations: tuple[CheckerMutationResult, ...]
@@ -659,8 +979,47 @@ class AdmissionReport:
     def __post_init__(self) -> None:
         _digest(self.task_definition_id, "admission task_definition_id")
         _digest(self.checker_digest, "admission checker_digest")
+        _digest(self.plan_digest, "admission plan_digest")
         for value in self.witness_digests:
             _digest(value, "admission witness_digest")
+        _unique(tuple(item.challenge_id for item in self.challenges), "challenge result IDs")
+        _unique(
+            tuple(item.mutation_id for item in self.checker_mutations),
+            "mutation result IDs",
+        )
+
+    def validate_plan(self, plan: AdmissionPlan) -> None:
+        if self.plan_digest != plan.plan_digest:
+            raise TaskModelError("AdmissionReport binds a different admission plan")
+        if self.task_definition_id != plan.task_definition_id:
+            raise TaskModelError("AdmissionReport plan belongs to another TaskDefinition")
+        if self.checker_digest != plan.checker_digest:
+            raise TaskModelError("AdmissionReport plan binds another checker")
+        challenge_results = {item.challenge_id: item for item in self.challenges}
+        if set(challenge_results) != {item.challenge_id for item in plan.challenges}:
+            raise TaskModelError("AdmissionReport does not cover its planned challenges")
+        for challenge_plan in plan.challenges:
+            challenge_result = challenge_results[challenge_plan.challenge_id]
+            if challenge_plan.applicable and challenge_result.verdict == "not_applicable":
+                raise TaskModelError("applicable planned challenge was not executed")
+            if not challenge_plan.applicable and (
+                challenge_result.verdict != "not_applicable"
+                or challenge_result.reason_code != challenge_plan.reason_code
+            ):
+                raise TaskModelError("non-applicable challenge differs from its plan")
+        mutation_results = {item.mutation_id: item for item in self.checker_mutations}
+        if set(mutation_results) != {item.mutation_id for item in plan.checker_mutations}:
+            raise TaskModelError("AdmissionReport does not cover its planned mutations")
+        for mutation_plan in plan.checker_mutations:
+            mutation_result = mutation_results[mutation_plan.mutation_id]
+            if mutation_plan.applicable and not mutation_result.reachable:
+                raise TaskModelError("applicable planned mutation is unreachable")
+            if not mutation_plan.applicable and (
+                mutation_result.reachable
+                or mutation_result.killed
+                or mutation_result.reason_code != mutation_plan.reason_code
+            ):
+                raise TaskModelError("non-applicable mutation differs from its plan")
 
     @property
     def accepted(self) -> bool:
@@ -675,6 +1034,7 @@ class AdmissionReport:
         return {
             "task_definition_id": self.task_definition_id,
             "checker_digest": self.checker_digest,
+            "plan_digest": self.plan_digest,
             "witness_digests": list(self.witness_digests),
             "challenges": [item.to_document() for item in self.challenges],
             "checker_mutations": [item.to_document() for item in self.checker_mutations],
@@ -686,6 +1046,8 @@ class AdmissionReport:
 class TaskPack:
     definition: TaskDefinition
     witness_evidence: tuple[WitnessRun, WitnessRun]
+    admission_plan: AdmissionPlan
+    ordering_journal: OrderingJournal
     admission_evidence: AdmissionReport
 
     def __post_init__(self) -> None:
@@ -696,8 +1058,40 @@ class TaskPack:
             raise TaskModelError("TaskPack witnesses must be successful")
         if first.materialization_id == second.materialization_id:
             raise TaskModelError("TaskPack requires distinct fresh materializations")
+        if first.episode.episode_id == second.episode.episode_id:
+            raise TaskModelError("TaskPack requires distinct fresh episodes")
         if first.start_case_id != second.start_case_id:
             raise TaskModelError("TaskPack witnesses must use the same start case")
+        if first.start_case_id != self.definition.start_case.case_id:
+            raise TaskModelError("TaskPack witnesses use another TaskDefinition start case")
+        expected_refs = tuple(item.logical_ref_digest for item in self.definition.logical_bindings)
+        for witness in self.witness_evidence:
+            actual_refs = tuple(item.logical_ref_digest for item in witness.resolved_bindings)
+            if actual_refs == expected_refs:
+                continue
+            if len(actual_refs) == len(expected_refs) and set(actual_refs) == set(expected_refs):
+                raise TaskModelError("TaskPack witness violates stable resolution order")
+            else:
+                raise TaskModelError(
+                    "TaskPack witness logical binding resolutions differ from TaskDefinition"
+                )
+        for witness in self.witness_evidence:
+            for event in witness.trace:
+                for origin in event.provenance.origins:
+                    occurrence = origin.source
+                    if (
+                        isinstance(occurrence, PublicValueOccurrence)
+                        and occurrence.source.kind == "task_literal"
+                    ):
+                        instruction_value = _resolve_pointer(
+                            self.definition.public_instruction_frame,
+                            cast(str, occurrence.instruction_slot),
+                            "public instruction frame",
+                        )
+                        if instruction_value != occurrence.source.value:
+                            raise TaskModelError(
+                                "task literal occurrence differs from frozen instruction frame"
+                            )
         if any(
             item.task_definition_id != self.definition.task_id for item in self.witness_evidence
         ):
@@ -711,6 +1105,23 @@ class TaskPack:
             raise TaskModelError("AdmissionReport belongs to another TaskDefinition")
         if self.admission_evidence.checker_digest != self.definition.checker.checker_digest:
             raise TaskModelError("AdmissionReport binds a different checker")
+        if self.admission_plan.task_definition_id != self.definition.task_id:
+            raise TaskModelError("admission plan belongs to another TaskDefinition")
+        if self.admission_plan.checker_digest != self.definition.checker.checker_digest:
+            raise TaskModelError("admission plan binds a different checker")
+        self.admission_evidence.validate_plan(self.admission_plan)
+        expected_ordering = (
+            self.definition.checker.checker_digest,
+            digest_document(self.definition.canonical_instruction),
+            self.definition.task_id,
+            self.admission_plan.plan_digest,
+        )
+        if (
+            len(self.ordering_journal.events) != 4
+            or tuple(item.artifact_digest for item in self.ordering_journal.events)
+            != expected_ordering
+        ):
+            raise TaskModelError("TaskPack ordering evidence does not bind frozen artifacts")
         actual = tuple(item.run_id for item in self.witness_evidence)
         if self.admission_evidence.witness_digests != actual:
             raise TaskModelError("AdmissionReport does not bind witness evidence")
@@ -725,6 +1136,9 @@ class TaskPack:
         return {
             "definition": self.definition.protected_document(),
             "witness_evidence": [item.to_document() for item in self.witness_evidence],
+            "admission_plan": self.admission_plan.to_document(),
+            "admission_plan_digest": self.admission_plan.plan_digest,
+            "ordering_journal": self.ordering_journal.to_document(),
             "admission_evidence": self.admission_evidence.to_document(),
         }
 
@@ -942,6 +1356,141 @@ def _digest(value: str, role: str) -> None:
 def _unique(values: tuple[Any, ...], role: str) -> None:
     if len(values) != len(set(values)):
         raise TaskModelError(f"{role} must be unique")
+
+
+def _validate_blueprint_goal(
+    goal: GoalProgram,
+    selectors: tuple[SelectorSpec, ...],
+) -> None:
+    selector_map = {item.selector_id: item for item in selectors}
+
+    def visit(node: GoalProgram) -> None:
+        if isinstance(node, ForEachGoal):
+            selector = selector_map.get(node.selector_id)
+            if selector is None:
+                raise TaskModelError("ForEach goal references a missing selector")
+            if selector.capability_id != node.capability_id:
+                raise TaskModelError("ForEach goal selector uses another capability")
+            if selector.cardinality != "all":
+                raise TaskModelError("ForEach goal requires selector cardinality all")
+            return
+        if isinstance(node, AllGoal):
+            for child in node.children:
+                visit(child)
+            return
+        if isinstance(node, IfGoal):
+            for branch in (node.then_goal, node.else_goal):
+                if branch is not None:
+                    visit(branch)
+
+    visit(goal)
+
+
+def _validate_task_goal(
+    goal: GoalProgram,
+    bindings: tuple[LogicalBindingRef, ...],
+    selections: tuple[LogicalSelection, ...],
+) -> None:
+    binding_map = {item.slot: item for item in bindings}
+    selection_map = {item.selector_id: item for item in selections}
+
+    def visit(node: GoalProgram) -> set[str]:
+        if isinstance(node, AtomGoal):
+            binding = binding_map.get(node.binding_slot)
+            if binding is None:
+                raise TaskModelError("Atom goal references a missing logical binding slot")
+            if binding.capability_id != node.capability_id:
+                raise TaskModelError("Atom goal binding uses another capability")
+            return {binding.slot}
+        if isinstance(node, ForEachGoal):
+            selection = selection_map.get(node.selector_id)
+            if selection is None:
+                raise TaskModelError("ForEach goal references a missing logical selection")
+            if selection.selector.capability_id != node.capability_id:
+                raise TaskModelError("ForEach logical selection uses another capability")
+            return {item.slot for item in bindings if item.selector_id == selection.selector_id}
+        if isinstance(node, AllGoal):
+            all_consumed: set[str] = set()
+            for child in node.children:
+                child_consumed = visit(child)
+                if all_consumed & child_consumed:
+                    raise TaskModelError("AllGoal consumes logical slot more than once")
+                all_consumed |= child_consumed
+            return all_consumed
+        if isinstance(node, IfGoal):
+            if_consumed: set[str] = set()
+            if node.binding_slot is not None:
+                binding = binding_map.get(node.binding_slot)
+                if binding is None:
+                    raise TaskModelError("If goal references a missing logical binding slot")
+                if_consumed.add(binding.slot)
+            for branch in (node.then_goal, node.else_goal):
+                if branch is not None:
+                    if_consumed |= visit(branch)
+            return if_consumed
+        raise AssertionError(f"unhandled goal type: {type(node).__name__}")
+
+    consumed_bindings = visit(goal)
+    if consumed_bindings != set(binding_map):
+        raise TaskModelError("Task Goal leaves unused logical bindings")
+
+
+def _validate_logical_binding_graph(
+    bindings: tuple[LogicalBindingRef, ...],
+    selections: tuple[LogicalSelection, ...],
+    role: str,
+) -> None:
+    _unique(tuple(item.slot for item in bindings), f"{role} logical slots")
+    _unique(
+        tuple(item.selector_id for item in selections),
+        f"{role} logical selection IDs",
+    )
+    by_selector = {item.selector_id: item for item in selections}
+    actual_members: dict[str, list[str]] = {selector_id: [] for selector_id in by_selector}
+    for binding in bindings:
+        selection = by_selector.get(binding.selector_id)
+        if selection is None:
+            raise TaskModelError(f"{role} logical binding references a missing selection")
+        if binding.capability_id != selection.selector.capability_id:
+            raise TaskModelError(f"{role} logical binding uses another selector capability")
+        actual_members[binding.selector_id].append(binding.semantic_key)
+    for selector_id, selection in by_selector.items():
+        actual = tuple(actual_members[selector_id])
+        if actual == selection.semantic_keys:
+            continue
+        if len(actual) == len(selection.semantic_keys) and set(actual) == set(
+            selection.semantic_keys
+        ):
+            raise TaskModelError(f"{role} logical selection violates stable member order")
+        else:
+            raise TaskModelError(f"{role} logical selection membership is inconsistent")
+
+
+def _applicability(applicable: bool, reason_code: str | None, role: str) -> None:
+    if applicable and reason_code is not None:
+        raise TaskModelError(f"{role} applicable item must not have reason_code")
+    if not applicable:
+        if reason_code is None:
+            raise TaskModelError(f"{role} non-applicable item requires reason_code")
+        _identifier(reason_code, f"{role} reason_code")
+
+
+def _resolve_pointer(value: JSONValue, pointer: str, role: str) -> JSONValue:
+    if pointer == "":
+        return value
+    if not pointer.startswith("/"):
+        raise TaskModelError(f"{role} pointer must be RFC 6901")
+    current = value
+    for raw_token in pointer[1:].split("/"):
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict) and token in current:
+            current = current[token]
+            continue
+        if isinstance(current, list) and token.isdigit() and int(token) < len(current):
+            current = current[int(token)]
+            continue
+        raise TaskModelError(f"{role} pointer {pointer!r} does not resolve")
+    return current
 
 
 def _object(value: JSONObject, role: str) -> None:

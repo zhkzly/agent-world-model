@@ -5,30 +5,38 @@ from typing import get_args
 
 import pytest
 
-from agent_env_foundry.semantics import StartCase
+from agent_env_foundry.semantics import PublicValueSource, StartCase
 from agent_task_foundry.models import (
+    AdmissionPlan,
     AdmissionReport,
     AllGoal,
     ArgumentOrigin,
     AssessmentRun,
     AtomGoal,
     AtomReportRef,
+    ChallengePlan,
     ChallengeResult,
     CheckerArtifact,
+    CheckerMutationPlan,
     CheckerMutationResult,
     ConditionReportRef,
     CorpusManifest,
+    EpisodeIdentity,
     FacetPredicate,
     ForEachGoal,
     FoundryFailure,
     GoalProgram,
     IfGoal,
+    LogicalBindingRef,
+    LogicalSelection,
     OrderingEvent,
     OrderingJournal,
     ProvenanceReport,
     PublicTraceEvent,
+    PublicValueOccurrence,
     RankSpec,
     ReportSpec,
+    ResolvedBinding,
     SelectorSpec,
     TaskAssessment,
     TaskBlueprint,
@@ -78,14 +86,30 @@ def _blueprint() -> TaskBlueprint:
     )
 
 
+def _logical(blueprint: TaskBlueprint) -> tuple[LogicalBindingRef, ...]:
+    return (
+        LogicalBindingRef(
+            "target",
+            "finish",
+            "item-alpha",
+            blueprint.selectors[0].selector_id,
+            {"name": "alpha"},
+        ),
+    )
+
+
+def _selections() -> tuple[LogicalSelection, ...]:
+    return (LogicalSelection(_blueprint().selectors[0], ("item-alpha",)),)
+
+
 def _checker(blueprint: TaskBlueprint) -> CheckerArtifact:
     return CheckerArtifact(
         task_preimage_digest=digest_document(
             {"start_case_id": "case-1", "blueprint": blueprint.to_document()}
         ),
         goal_program=blueprint.goal,
-        selector_resolutions={"target": ["item-alpha"]},
-        protected_bindings={"item-alpha": {"native_id": 1}},
+        logical_bindings=_logical(blueprint),
+        logical_selections=_selections(),
         answer_schema={
             "type": "object",
             "properties": {"confirmation": {"type": "string"}},
@@ -103,8 +127,10 @@ def _definition(*, instruction: str = "Finish the item named alpha.") -> TaskDef
         semantics_digest=DIGEST_B,
         start_case=StartCase("case-1", {"seed": 1}, ("baseline",)),
         blueprint=blueprint,
-        protected_bindings={"item-alpha": {"native_id": 1}},
+        logical_bindings=_logical(blueprint),
+        logical_selections=_selections(),
         public_instruction_frame={
+            "name": "alpha",
             "reset_context": {"user": "operator"},
             "answer_schema": _checker(blueprint).answer_schema,
             "limitations": [],
@@ -126,6 +152,8 @@ def test_task_definition_identity_is_non_circular_and_public_projection_is_blind
     assert "checker" not in public
     assert "semantics_digest" not in public
     protected = first.protected_document()
+    assert "protected_bindings" not in protected
+    assert protected["logical_bindings"][0]["semantic_key"] == "item-alpha"
     assert protected["semantics_digest"] == DIGEST_B
     assert protected["checker"]["semantics_digest"] == DIGEST_B
 
@@ -176,10 +204,15 @@ def test_ordering_journal_mechanically_gates_model_calls() -> None:
         )
 
 
-def _trace() -> tuple[PublicTraceEvent, ...]:
-    provenance = ProvenanceReport(
-        (ArgumentOrigin("/name", "instruction", "/selectors/target", True),)
+def _trace(materialization_id: str) -> tuple[PublicTraceEvent, ...]:
+    occurrence = PublicValueOccurrence(
+        PublicValueSource("task_literal", None, None, "alpha"),
+        materialization_id,
+        "/name",
+        None,
+        None,
     )
+    provenance = ProvenanceReport((ArgumentOrigin("/name", occurrence, True),))
     return (
         PublicTraceEvent(
             1,
@@ -193,10 +226,26 @@ def _trace() -> tuple[PublicTraceEvent, ...]:
 
 def _witness(definition: TaskDefinition, materialization_id: str) -> WitnessRun:
     return WitnessRun(
-        materialization_id=materialization_id,
+        episode=EpisodeIdentity(
+            materialization_id,
+            DIGEST_A,
+            DIGEST_B,
+            DIGEST_C,
+            f"conversation-{materialization_id[0]}",
+        ),
         task_definition_id=definition.task_id,
         start_case_id=definition.start_case.case_id,
-        trace=_trace(),
+        reset_observation={"name": "alpha"},
+        resolved_bindings=(
+            ResolvedBinding(
+                definition.logical_bindings[0].logical_ref_digest,
+                materialization_id,
+                {"native_id": 1},
+                {"name": "alpha"},
+                DIGEST_D,
+            ),
+        ),
+        trace=_trace(materialization_id),
         final_answer={"confirmation": "ok-alpha"},
         checker_digest=definition.checker.checker_digest,
         before_facts_digest=DIGEST_C,
@@ -211,6 +260,7 @@ def _admission(
     second: WitnessRun,
     definition: TaskDefinition,
 ) -> AdmissionReport:
+    plan = _plan(definition)
     challenge = ChallengeResult("no_op", "passed", None, DIGEST_E)
     mutation = CheckerMutationResult(
         "drop-goal",
@@ -220,12 +270,55 @@ def _admission(
         DIGEST_E,
         None,
     )
-    return AdmissionReport(
+    report = AdmissionReport(
+        task_definition_id=definition.task_id,
+        checker_digest=definition.checker.checker_digest,
+        plan_digest=plan.plan_digest,
+        witness_digests=(first.run_id, second.run_id),
+        challenges=(challenge,),
+        checker_mutations=(mutation,),
+    )
+    report.validate_plan(plan)
+    return report
+
+
+def _plan(definition: TaskDefinition) -> AdmissionPlan:
+    return AdmissionPlan(
         definition.task_id,
         definition.checker.checker_digest,
-        (first.run_id, second.run_id),
-        (challenge,),
-        (mutation,),
+        (ChallengePlan("no_op", True, None),),
+        (CheckerMutationPlan("drop-goal", True, None),),
+    )
+
+
+def _ordering(definition: TaskDefinition, plan: AdmissionPlan) -> OrderingJournal:
+    return OrderingJournal(
+        (
+            OrderingEvent(1, "checker_frozen", definition.checker.checker_digest),
+            OrderingEvent(
+                2,
+                "instruction_frozen",
+                digest_document(definition.canonical_instruction),
+            ),
+            OrderingEvent(3, "task_persisted", definition.task_id),
+            OrderingEvent(4, "model_call_allowed", plan.plan_digest),
+        )
+    )
+
+
+def _pack(
+    definition: TaskDefinition,
+    first: WitnessRun,
+    second: WitnessRun,
+    report: AdmissionReport | None = None,
+) -> TaskPack:
+    plan = _plan(definition)
+    return TaskPack(
+        definition,
+        (first, second),
+        plan,
+        _ordering(definition, plan),
+        report or _admission(first, second, definition),
     )
 
 
@@ -233,7 +326,7 @@ def test_taskpack_requires_two_bound_fresh_witnesses_and_real_evidence_digests()
     definition = _definition()
     first = _witness(definition, DIGEST_E)
     second = _witness(definition, DIGEST_F)
-    pack = TaskPack(definition, (first, second), _admission(first, second, definition))
+    pack = _pack(definition, first, second)
     assert pack.taskpack_id
     assert pack.public_document() == {
         "taskpack_id": pack.taskpack_id,
@@ -243,7 +336,9 @@ def test_taskpack_requires_two_bound_fresh_witnesses_and_real_evidence_digests()
     with pytest.raises(TaskModelError, match="fresh materializations"):
         TaskPack(
             definition,
-            (first, replace(second, materialization_id=DIGEST_E)),
+            (first, _witness(definition, DIGEST_E)),
+            _plan(definition),
+            _ordering(definition, _plan(definition)),
             _admission(first, second, definition),
         )
     bad_admission = replace(
@@ -251,7 +346,7 @@ def test_taskpack_requires_two_bound_fresh_witnesses_and_real_evidence_digests()
         witness_digests=(DIGEST_A, DIGEST_B),
     )
     with pytest.raises(TaskModelError, match="witness evidence"):
-        TaskPack(definition, (first, second), bad_admission)
+        _pack(definition, first, second, bad_admission)
 
 
 def test_challenge_and_mutation_records_cannot_assert_success_without_evidence() -> None:
@@ -267,8 +362,8 @@ def test_challenge_and_mutation_records_cannot_assert_success_without_evidence()
 
 def test_load_bearing_agent_choice_is_not_complete_provenance() -> None:
     with pytest.raises(TaskModelError, match="source"):
-        ArgumentOrigin("/message", "ambient", None, True)  # type: ignore[arg-type]
-    report = ProvenanceReport((ArgumentOrigin("/message", "agent_choice", None, True),))
+        ArgumentOrigin("/message", "ambient", True)  # type: ignore[arg-type]
+    report = ProvenanceReport((ArgumentOrigin("/message", "agent_choice", True),))
     assert not report.complete
 
 
@@ -287,7 +382,7 @@ def test_assessment_and_corpus_identity_stay_outside_taskpack() -> None:
     definition = _definition()
     first = _witness(definition, DIGEST_E)
     second = _witness(definition, DIGEST_F)
-    pack = TaskPack(definition, (first, second), _admission(first, second, definition))
+    pack = _pack(definition, first, second)
     run = AssessmentRun(DIGEST_C, "satisfied", 1, 100, 50, 120, None)
     assessment = TaskAssessment(
         pack.taskpack_id,

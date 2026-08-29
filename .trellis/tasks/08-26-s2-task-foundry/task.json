@@ -41,9 +41,10 @@
     "tests/fixtures/fx_v2_actor.py",
     "tests/fixtures/fx_v2_semantics.py",
     ".trellis/spec/backend/v2-preparation.md",
-    ".trellis/spec/backend/v2-qualification-publication.md"
+    ".trellis/spec/backend/v2-qualification-publication.md",
+    ".trellis/tasks/08-26-s2-task-foundry/research/checkpoint-a-mutation-licenses.md"
   ],
-  "notes": "Commit 9ba397b removed the complete v1 loader/publication/Qualification path. The amended plan closes the identity cycle and full S2 contracts with an acyclic Core ID, one audit-only mutually blind verifier, sealed runtime manifests/qualified StartCases, strict receipt, logical per-run rebinding/selection, exact public occurrences, fresh episode identity and a pre-witness AdmissionPlan. Three fresh independent reviews returned ALLOW. Checkpoint A awaits explicit user approval; Alignment Patrol remains disabled.",
+  "notes": "Checkpoint A is complete after iterative high-level BLOCK→correction→re-review. Final stable bytes implement clean semantic, Qualification and Task identities with no adapter; valid Atom/two-member ForEach TaskPacks pass and every documented drift is RED. Two independent final reviews returned ALLOW. 292 tests, static/lock/diff/task gates and 41 auditable behavior mutation licences pass. Checkpoint B verifier authoring is next; no Qualification/Publication/S2 execution claim. Alignment Patrol remains disabled.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -64,6 +65,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "checkpoint_a_awaiting_user_approval"
+    "implementation_checkpoint": "checkpoint_b_verifier_authoring"
   }
 }

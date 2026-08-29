@@ -48,17 +48,22 @@ class MechanicalSemantics:
                         "public_label": "name",
                         "value_schema": {"type": "string"},
                         "allowed_operators": ["eq"],
-                        "visibility": "task_literal",
-                        "tool_name": None,
-                        "output_schema_pointer": None,
                     }
                 ],
                 "conditions": [],
                 "answer_fields": [
-                    {"field_id": "count", "schema": {"type": "integer"}, "public_label": "count"}
+                    {
+                        "field_id": "count",
+                        "schema": {"type": "integer"},
+                        "public_label": "count",
+                        "public_source": {
+                            "kind": "tool_output",
+                            "tool_name": "increment",
+                            "json_pointer": "/count",
+                            "value": None,
+                        },
+                    }
                 ],
-                "read_scopes": ["counter"],
-                "write_scopes": ["counter"],
                 "supported_goal_kinds": ["atom"],
                 "rendering": {
                     "imperative": "increment",
@@ -77,6 +82,26 @@ class MechanicalSemantics:
                 "protected_binding": {"key": "counter"},
                 "public_descriptor": {"name": "counter"},
                 "facets": {"name": "counter"},
+                "public_sources": [
+                    {
+                        "field_pointer": "/public_descriptor/name",
+                        "source": {
+                            "kind": "task_literal",
+                            "tool_name": None,
+                            "json_pointer": None,
+                            "value": "counter",
+                        },
+                    },
+                    {
+                        "field_pointer": "/facets/name",
+                        "source": {
+                            "kind": "task_literal",
+                            "tool_name": None,
+                            "json_pointer": None,
+                            "value": "counter",
+                        },
+                    },
+                ],
             }
         ]
 

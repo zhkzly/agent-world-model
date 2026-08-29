@@ -3,3 +3,4 @@
 {"file":".trellis/spec/backend/s1-coordinator.md","reason":"Verify the v2-only stage order and that absent coordinator/CLI paths are not claimed implemented."}
 {"file":".trellis/spec/backend/v2-preparation.md","reason":"Audit sealed-release preparation for strict receipt admission and reuse of one materializer."}
 {"file":".trellis/spec/backend/v2-qualification-publication.md","reason":"Audit identity acyclicity, verifier independence, physical evidence completeness and no provisional/compatibility path."}
+{"file":".trellis/tasks/08-26-s2-task-foundry/research/checkpoint-a-mutation-licenses.md","reason":"Per-target behavior mutants, exact acceptance commands and observed killed/restored outcomes for Checkpoint A."}
