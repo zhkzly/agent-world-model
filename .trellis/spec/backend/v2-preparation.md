@@ -1,12 +1,11 @@
 # EnvironmentRelease v2 Preparation Contract
 
-> **Status: Shared three-role materializer implemented; strict admission
-> planned.** The current code verifies v2 closure and materializes actor,
-> semantics and audit-only verifier projects through one canonical physical
-> path. `prepare_release` still exposes actor/semantics only and does not yet
-> validate a passed Qualification receipt. Mechanical fixtures remain test
-> infrastructure, not product releases. Checkpoint D must close this gate before
-> any S2 entry point exists.
+> **Status: strict product admission and cold preparation implemented for the
+> SQLite C3+D vertical.** Public `verify_release_v2` and `prepare_release` reject
+> mechanical fixtures, bind the strict receipt/evidence/Core, reproduce sealed
+> ToolSpecs/CapabilitySpecs/StartCases and expose actor/semantics only. The
+> audit-only verifier is installed solely by `audit_release_v2` for cold replay.
+> Cross-environment filesystem/Git repetition remains required before stability.
 
 ## 1. Scope / Trigger
 

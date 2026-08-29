@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
 import agent_env_foundry.preparation as preparation_module
+from agent_env_foundry.errors import EnvironmentContractError
 from agent_env_foundry.preparation import (
     OpenPreparedRelease,
     PreparationExecutionError,
@@ -17,7 +20,7 @@ from agent_env_foundry.preparation import (
     prepare_release,
 )
 from agent_env_foundry.project_identity import ProjectIdentityError
-from agent_env_foundry.release import verify_release_v2
+from agent_env_foundry.release import _verify_release_layout_v2
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
     ConditionCheckRequest,
@@ -43,11 +46,56 @@ def _settings() -> PreparationSettings:
     )
 
 
+def _prepare_fixture(
+    release_path: Path,
+    cache_root: Path,
+    *,
+    settings: PreparationSettings,
+) -> OpenPreparedRelease:
+    with mock.patch.object(
+        preparation_module,
+        "verify_release_v2",
+        _verify_release_layout_v2,
+    ):
+        return prepare_release(release_path, cache_root, settings=settings)
+
+
+def test_product_prepare_rejects_mechanical_fixture(tmp_path: Path) -> None:
+    release = build_v2_release(tmp_path / "mechanical")
+    with pytest.raises(EnvironmentContractError, match="strict Qualification receipt"):
+        prepare_release(release, tmp_path / "cache", settings=_settings())
+
+
+def test_product_prepare_rejects_live_catalog_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    release_root = build_v2_release(tmp_path / "layout")
+    layout = _verify_release_layout_v2(release_root)
+    strict_like = replace(
+        layout,
+        sealed_tool_specs=(),
+        sealed_capabilities=(),
+        sealed_start_cases=(),
+        sealed_start_seed=0,
+        sealed_start_limit=1,
+    )
+    monkeypatch.setattr(
+        preparation_module,
+        "verify_release_v2",
+        lambda _path: strict_like,
+    )
+    with pytest.raises(PreparationExecutionError) as caught:
+        prepare_release(release_root, tmp_path / "cache", settings=_settings())
+    assert caught.value.kind == "EnvironmentDefect"
+    assert caught.value.code == "sealed_tool_catalog_mismatch"
+
+
 def test_one_materializer_installs_actor_semantics_and_verifier_roles(
     tmp_path: Path,
 ) -> None:
     release_root = build_v2_release(tmp_path / "release")
-    release = verify_release_v2(release_root)
+    release = _verify_release_layout_v2(release_root)
     actor_module = release.descriptor.actor_factory.partition(":")[0].partition(".")[0]
     semantics_module = release.descriptor.semantics_factory.partition(":")[0].partition(".")[0]
     actor = materialize_project(
@@ -117,7 +165,7 @@ def test_materializer_attributes_verifier_import_leak_to_verifier(
         tmp_path / "release",
         leak_actor_into_semantics=True,
     )
-    release = verify_release_v2(release_root)
+    release = _verify_release_layout_v2(release_root)
     actor_module = release.descriptor.actor_factory.partition(":")[0].partition(".")[0]
     semantics_module = release.descriptor.semantics_factory.partition(":")[0].partition(".")[0]
 
@@ -140,7 +188,7 @@ def test_materializer_attributes_verifier_import_leak_to_verifier(
 
 def test_materializer_rejects_changed_source_before_copy_or_sync(tmp_path: Path) -> None:
     release_root = build_v2_release(tmp_path / "release")
-    release = verify_release_v2(release_root)
+    release = _verify_release_layout_v2(release_root)
     actor_source = release_root / release.descriptor.actor_project
     actor_module = release.descriptor.actor_factory.partition(":")[0].partition(".")[0]
     semantics_module = release.descriptor.semantics_factory.partition(":")[0].partition(".")[0]
@@ -170,7 +218,7 @@ def test_materializer_attributes_copy_time_identity_failure_and_cleans_staging(
     tmp_path: Path,
 ) -> None:
     release_root = build_v2_release(tmp_path / "release")
-    release = verify_release_v2(release_root)
+    release = _verify_release_layout_v2(release_root)
     source = release_root / release.descriptor.semantics_project
     actor_module = release.descriptor.actor_factory.partition(":")[0].partition(".")[0]
     semantics_module = release.descriptor.semantics_factory.partition(":")[0].partition(".")[0]
@@ -207,7 +255,7 @@ def test_materializer_attributes_copy_time_identity_failure_and_cleans_staging(
 
 def test_prepare_open_runs_real_actor_and_all_trusted_methods(tmp_path: Path) -> None:
     release = build_v2_release(tmp_path / "release", behavior="alpha")
-    prepared = prepare_release(release, tmp_path / "cache", settings=_settings())
+    prepared = _prepare_fixture(release, tmp_path / "cache", settings=_settings())
     assert isinstance(prepared, OpenPreparedRelease)
     assert prepared.identity.actor_digest
 
@@ -268,7 +316,7 @@ def test_prepare_open_runs_real_actor_and_all_trusted_methods(tmp_path: Path) ->
 
 def test_trusted_mutation_is_recorded_and_rejected(tmp_path: Path) -> None:
     release = build_v2_release(tmp_path / "release", mutate_semantics=True)
-    prepared = prepare_release(release, tmp_path / "cache", settings=_settings())
+    prepared = _prepare_fixture(release, tmp_path / "cache", settings=_settings())
     with prepared.open(tmp_path / "instance") as session:
         with pytest.raises(PreparationExecutionError) as caught:
             session.trusted.inspect(tmp_path / "instance")
@@ -282,7 +330,7 @@ def test_trusted_mutation_is_recorded_and_rejected(tmp_path: Path) -> None:
         mutate_semantics=True,
         raise_after_mutation=True,
     )
-    failing = prepare_release(failing_release, tmp_path / "failing-cache", settings=_settings())
+    failing = _prepare_fixture(failing_release, tmp_path / "failing-cache", settings=_settings())
     with failing.open(tmp_path / "failing-instance") as session:
         with pytest.raises(PreparationExecutionError) as caught:
             session.trusted.inspect(tmp_path / "failing-instance")
@@ -293,10 +341,10 @@ def test_trusted_mutation_is_recorded_and_rejected(tmp_path: Path) -> None:
 
 def test_same_package_names_do_not_alias_and_open_never_resets(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
-    alpha = prepare_release(
+    alpha = _prepare_fixture(
         build_v2_release(tmp_path / "alpha", behavior="alpha"), cache, settings=_settings()
     )
-    beta = prepare_release(
+    beta = _prepare_fixture(
         build_v2_release(tmp_path / "beta", behavior="beta"), cache, settings=_settings()
     )
     alpha_instance = tmp_path / "alpha-instance"
@@ -314,20 +362,20 @@ def test_same_package_names_do_not_alias_and_open_never_resets(tmp_path: Path) -
 def test_semantics_runtime_cannot_import_actor_package(tmp_path: Path) -> None:
     release = build_v2_release(tmp_path / "release", leak_actor_into_semantics=True)
     with pytest.raises(PreparationExecutionError) as caught:
-        prepare_release(release, tmp_path / "cache", settings=_settings())
+        _prepare_fixture(release, tmp_path / "cache", settings=_settings())
     assert caught.value.kind == "SemanticsDefect"
     assert caught.value.code == "runtime_import_leak"
 
     actor_leak = build_v2_release(tmp_path / "actor-leak", leak_semantics_into_actor=True)
     with pytest.raises(PreparationExecutionError) as caught:
-        prepare_release(actor_leak, tmp_path / "actor-cache", settings=_settings())
+        _prepare_fixture(actor_leak, tmp_path / "actor-cache", settings=_settings())
     assert caught.value.kind == "EnvironmentDefect"
     assert caught.value.code == "runtime_import_leak"
 
 
 def test_semantics_startup_failure_is_attributed_to_semantics(tmp_path: Path) -> None:
     release = build_v2_release(tmp_path / "release", broken_semantics_startup=True)
-    prepared = prepare_release(release, tmp_path / "cache", settings=_settings())
+    prepared = _prepare_fixture(release, tmp_path / "cache", settings=_settings())
     with prepared.open(tmp_path / "instance") as session:
         with pytest.raises(PreparationExecutionError) as caught:
             session.trusted.start_cases(1, 1)
@@ -338,8 +386,8 @@ def test_semantics_startup_failure_is_attributed_to_semantics(tmp_path: Path) ->
 def test_directory_zip_identity_and_prepared_tamper_fail_closed(tmp_path: Path) -> None:
     release = build_v2_release(tmp_path / "release")
     archive = write_v2_zip(release, tmp_path / "release.zip")
-    directory = prepare_release(release, tmp_path / "directory-cache", settings=_settings())
-    zipped = prepare_release(archive, tmp_path / "zip-cache", settings=_settings())
+    directory = _prepare_fixture(release, tmp_path / "directory-cache", settings=_settings())
+    zipped = _prepare_fixture(archive, tmp_path / "zip-cache", settings=_settings())
     assert directory.identity == zipped.identity
 
     prepared_project = (
@@ -352,7 +400,7 @@ def test_directory_zip_identity_and_prepared_tamper_fail_closed(tmp_path: Path) 
     with pytest.raises(PreparationExecutionError, match="digest"):
         directory.open(tmp_path / "instance")
 
-    clean = prepare_release(
+    clean = _prepare_fixture(
         build_v2_release(tmp_path / "pth-release"),
         tmp_path / "pth-cache",
         settings=_settings(),

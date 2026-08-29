@@ -122,3 +122,5 @@
 `s2-checkpoint-c1|介入0|返工1|canonical project identity+real verifier materialization+6 mutation licences+BLOCK→2 ALLOW|红线违反0`
 
 `s2-checkpoint-c2|介入0|返工3|real Semantics Author+attested Core+3 runtimes+10 mutation licences+2 ALLOW|红线违反0`
+
+`s2-c3d-sqlite|介入2|返工3|11 physical cases+4 executable mutants+strict receipt+directory/ZIP relocation+cold audit|红线违反1: prematurely implemented and then deleted unconsumed TaskPack/CaseSpec contracts`

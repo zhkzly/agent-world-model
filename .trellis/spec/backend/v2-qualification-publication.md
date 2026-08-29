@@ -1,11 +1,11 @@
 # EnvironmentRelease v2 Qualification and Publication Contract
 
-> **Status: Checkpoint C2 Core and three-runtime materialization implemented;
-> physical Qualification and Publication remain planned.** The Host can author
-> both independent semantic lineages, bind their exact inputs/projects into one
-> acyclic Core and materialize actor/semantics/verifier runtimes. No current
-> artifact is an admitted product release. Checkpoints C3–D must still implement
-> cases, comparison, evidence, receipt, Publication and cold admission before S2.
+> **Status: SQLite C3+D vertical implemented and physically proven.** The Host
+> binds mutually blind Authors into one Core, seals 11 physical cases and four
+> executable mutants, issues a strict receipt, publishes deterministic directory
+> and ZIP bytes, verifies live sealed catalogs, and cold-replays archived readers.
+> The generic `run_v2_qualification` coordinator and unchanged filesystem/Git
+> repeat remain required before S1/S2 completion.
 
 ## 1. Scope / Trigger
 

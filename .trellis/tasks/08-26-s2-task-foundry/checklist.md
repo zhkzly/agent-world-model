@@ -10,9 +10,12 @@
 - [x] Are local failure-code names excluded from cross-reader semantic agreement?
 - [x] Are the model-only TaskPack/Admission/corpus scaffold and disabled Patrol absent?
 - [x] Do lock, Ruff, format, Mypy, full Pytest, diff and zero-reference checks pass?
-- [ ] Does C3 persist a complete immutable evidence manifest for the exact current Core?
-- [ ] Do applicable wrong-target, near-miss, collateral, fresh-replay and executable mutation cases pass?
-- [ ] Has a strict Qualification receipt been produced only from complete physical evidence?
-- [ ] Has Publication copied exact frozen bytes and passed cold relocation/replay?
+- [x] Does C3 persist a complete immutable evidence manifest for the exact current Core?
+- [x] Do applicable wrong-target, near-miss, collateral, fresh-replay and executable mutation cases pass?
+- [x] Has a strict Qualification receipt been produced only from complete physical evidence?
+- [x] Has Publication copied exact frozen bytes and passed cold relocation/replay?
+- [ ] Does one production `run_v2_qualification` API reproduce this matrix without `/tmp` orchestration?
+- [ ] Does the unchanged Framework repeat C3+D on the filesystem/Git environment?
+- [ ] Does the direct S1 coordinator reach the admitted release without development-checkout imports?
 
 Unchecked items block every Release, S2 compiler and TaskPack claim.

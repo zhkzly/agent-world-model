@@ -726,7 +726,133 @@ def prepare_release(
         runtime_root / "semantics",
         settings=settings,
     )
+    _verify_live_sealed_catalogs(
+        release,
+        actor,
+        semantics,
+        runtime_root / ".catalog-probe",
+        settings,
+    )
     return OpenPreparedRelease(release, actor, semantics, settings)
+
+
+def _verify_live_sealed_catalogs(
+    release: ValidatedReleaseV2,
+    actor_lock: RuntimeLock,
+    semantics_lock: RuntimeLock,
+    probe_instance: Path,
+    settings: PreparationSettings,
+) -> None:
+    sealed = (
+        release.sealed_tool_specs,
+        release.sealed_capabilities,
+        release.sealed_start_cases,
+        release.sealed_start_seed,
+        release.sealed_start_limit,
+    )
+    if any(item is None for item in sealed):
+        return  # Structural fixture path used only by lower-level tests.
+    actor_manifest = tree_manifest(actor_lock.project_root)
+    semantics_manifest = tree_manifest(semantics_lock.project_root)
+    actor_transport = _ChildTransport(
+        actor_lock.python,
+        Path(__file__).resolve().parent / "_actor_runner.py",
+        (release.descriptor.actor_factory, str(probe_instance)),
+        cwd=actor_lock.project_root,
+        timeout=settings.command_timeout_seconds,
+        role="actor",
+    )
+    semantics_transport: _ChildTransport | None = None
+    try:
+        actor_proxy = ActorProxy(
+            actor_transport,
+            start_schema=release.start_schema,
+            reset_observation_schema=release.reset_observation_schema,
+        )
+        live_tools = actor_proxy.tools()
+        if canonical_bytes([dict(item) for item in live_tools]) != canonical_bytes(
+            [dict(item) for item in cast(tuple[ToolSpec, ...], release.sealed_tool_specs)]
+        ):
+            raise PreparationExecutionError(
+                "EnvironmentDefect",
+                "sealed_tool_catalog_mismatch",
+                "live actor ToolSpecs differ from the sealed Public Surface",
+            )
+        semantics_transport = _ChildTransport(
+            semantics_lock.python,
+            Path(__file__).resolve().parent / "_semantics_runner.py",
+            (release.descriptor.semantics_factory,),
+            cwd=semantics_lock.project_root,
+            timeout=settings.command_timeout_seconds,
+            role="semantics",
+        )
+        raw_capabilities = semantics_transport.call("capabilities", {})
+        if not isinstance(raw_capabilities, list):
+            raise PreparationExecutionError(
+                "SemanticsDefect",
+                "sealed_capability_catalog_invalid",
+                "live TaskSemantics capabilities are not an array",
+            )
+        live_capabilities = tuple(capability_from_document(item) for item in raw_capabilities)
+        validate_catalog(live_capabilities)
+        if canonical_bytes([item.to_document() for item in live_capabilities]) != canonical_bytes(
+            [
+                item.to_document()
+                for item in cast(tuple[CapabilitySpec, ...], release.sealed_capabilities)
+            ]
+        ):
+            raise PreparationExecutionError(
+                "SemanticsDefect",
+                "sealed_capability_catalog_mismatch",
+                "live TaskSemantics capabilities differ from the sealed catalog",
+            )
+        raw_starts = semantics_transport.call(
+            "start_cases",
+            {
+                "seed": cast(int, release.sealed_start_seed),
+                "limit": cast(int, release.sealed_start_limit),
+            },
+        )
+        if not isinstance(raw_starts, list):
+            raise PreparationExecutionError(
+                "SemanticsDefect",
+                "sealed_start_cases_invalid",
+                "live TaskSemantics StartCases are not an array",
+            )
+        live_starts = tuple(start_case_from_document(item) for item in raw_starts)
+        validate_start_cases(
+            live_starts,
+            start_schema=release.start_schema,
+            limit=cast(int, release.sealed_start_limit),
+        )
+        if canonical_bytes([item.to_document() for item in live_starts]) != canonical_bytes(
+            [item.to_document() for item in cast(tuple[StartCase, ...], release.sealed_start_cases)]
+        ):
+            raise PreparationExecutionError(
+                "SemanticsDefect",
+                "sealed_start_cases_mismatch",
+                "live TaskSemantics StartCases differ from the sealed set",
+            )
+    finally:
+        actor_transport.close(operation="close")
+        if semantics_transport is not None:
+            semantics_transport.close(operation="close")
+        shutil.rmtree(probe_instance, ignore_errors=True)
+    changed = {
+        role: {"before": before.digest, "after": tree_manifest(path).digest}
+        for role, before, path in (
+            ("actor", actor_manifest, actor_lock.project_root),
+            ("semantics", semantics_manifest, semantics_lock.project_root),
+        )
+        if before.digest != tree_manifest(path).digest
+    }
+    if changed:
+        raise PreparationExecutionError(
+            "EnvironmentDefect",
+            "catalog_probe_mutated_runtime",
+            "live catalog verification changed a prepared project",
+            changed=changed,
+        )
 
 
 def parse_public_release_identity(document: Any) -> PublicReleaseIdentity:
