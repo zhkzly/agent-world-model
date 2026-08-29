@@ -162,3 +162,5 @@
 `s2-query-taskpack|介入1|返工4|non-leaking reset+13 physical Qualification cases+2 executable reader mutants+cold audit+2 fresh query witnesses+3 framework mutation licences|红线违反0`
 
 `s2-multistart-simplification|介入1|返工2|StartCase-scoped If identity+selected-binding refusal isolation+delete mandatory Atom alternative route+3 refreshed real TaskPacks|红线违反0`
+
+`s2-c-production-runner|介入0|返工1|production run_v2_qualification+18 physical cases+2 executable result mutants+strict publication/cold audit+mutation licence|红线违反0`

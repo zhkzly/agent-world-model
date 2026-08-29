@@ -1,11 +1,11 @@
 # EnvironmentRelease v2 Qualification and Publication Contract
 
-> **Status: SQLite C3+D vertical implemented and physically proven.** The Host
-> binds mutually blind Authors into one Core, seals 11 physical cases and four
-> executable mutants, issues a strict receipt, publishes deterministic directory
-> and ZIP bytes, verifies live sealed catalogs, and cold-replays archived readers.
-> The generic `run_v2_qualification` coordinator and unchanged filesystem/Git
-> repeat remain required before S1/S2 completion.
+> **Status: SQLite C3+D production path implemented and physically proven.**
+> The Host-owned `run_v2_qualification` binds mutually blind Authors into one
+> Core, seals 18 physical cases and executable reader mutants, issues a strict
+> receipt, publishes deterministic directory and ZIP bytes, verifies live sealed
+> catalogs, and cold-replays archived readers. The unchanged filesystem/Git
+> repeat remains required before S1/S2 completion.
 
 ## 1. Scope / Trigger
 
@@ -22,12 +22,15 @@ v1 migration.
 derive_qualification_core(inputs: FrozenCoreInputs) -> QualificationCore
 
 run_v2_qualification(
+    inputs: FrozenCoreInputs,
     core: QualificationCore,
-    *,
+    destination: Path,
     cache_root: Path,
+    *,
     route: AgentRoute,
     budget: QualificationBudget,
-) -> QualificationReport | QualificationFailure
+    settings: PreparationSettings | None = None,
+) -> QualificationReport
 
 publish_release_v2(
     core: QualificationCore,

@@ -41,7 +41,7 @@
     ".trellis/spec/backend/v2-preparation.md",
     ".trellis/spec/backend/v2-qualification-publication.md"
   ],
-  "notes": "SQLite C3+D vertical is real: 11 physical cases, 4 executable mutants, sealed evidence, strict receipt, immutable directory/ZIP Publication, relocation, live catalog equality and audit-only cold replay pass. Production Atom compilation now yields 6 unique Tasks and 12 successful fresh witnesses. Generic run_v2_qualification, filesystem/Git repeat, direct coordinator, physical per-Task challenge/admission and composed Goal shapes remain incomplete.",
+  "notes": "SQLite C3+D now uses production run_v2_qualification: 18 physical cases, executable reader mutants, strict receipt, immutable directory/ZIP Publication, relocation and cold audit pass. SQLite E/F proves Query Atom, State Atom, ForEach and If TaskPacks over 12 Atom, 4 ForEach and 6 If candidates. Filesystem/Git repeat, direct S1 coordinator and Checkpoint G remain incomplete.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -62,6 +62,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "checkpoint_e_atom_vertical_complete"
+    "implementation_checkpoint": "checkpoint_c_production_runner_complete"
   }
 }

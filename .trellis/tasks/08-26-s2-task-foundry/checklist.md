@@ -14,12 +14,12 @@
 - [x] Do applicable wrong-target, near-miss, collateral, fresh-replay and executable mutation cases pass?
 - [x] Has a strict Qualification receipt been produced only from complete physical evidence?
 - [x] Has Publication copied exact frozen bytes and passed cold relocation/replay?
-- [ ] Does one production `run_v2_qualification` API reproduce this matrix without `/tmp` orchestration?
+- [x] Does one production `run_v2_qualification` API reproduce this matrix without `/tmp` orchestration?
 - [ ] Does the unchanged Framework repeat C3+D on the filesystem/Git environment?
 - [ ] Does the direct S1 coordinator reach the admitted release without development-checkout imports?
 - [x] Does the production Atom compiler freeze the checker before rendering/exposing the instruction?
-- [x] Do all 6 SQLite Atom Tasks pass two fresh public-only witnesses with distinct materializations?
-- [ ] Do pre-witness challenge plans and physical challenges seal these solved Atom Tasks as TaskPacks?
-- [ ] Are argument provenance, alternative-route acceptance and checker mutations enforced per Task?
+- [x] Does the SQLite release compile 12 Atom, 4 ForEach and 6 If candidates over two StartCases?
+- [x] Do pre-witness plans and physical challenges seal Query, State, ForEach and If TaskPacks?
+- [x] Are argument provenance, path-open query evidence and checker mutations physically enforced?
 
 Unchecked items block every Release, S2 compiler and TaskPack claim.
