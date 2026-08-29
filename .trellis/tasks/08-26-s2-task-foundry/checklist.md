@@ -17,5 +17,9 @@
 - [ ] Does one production `run_v2_qualification` API reproduce this matrix without `/tmp` orchestration?
 - [ ] Does the unchanged Framework repeat C3+D on the filesystem/Git environment?
 - [ ] Does the direct S1 coordinator reach the admitted release without development-checkout imports?
+- [x] Does the production Atom compiler freeze the checker before rendering/exposing the instruction?
+- [x] Do all 6 SQLite Atom Tasks pass two fresh public-only witnesses with distinct materializations?
+- [ ] Do pre-witness challenge plans and physical challenges seal these solved Atom Tasks as TaskPacks?
+- [ ] Are argument provenance, alternative-route acceptance and checker mutations enforced per Task?
 
 Unchecked items block every Release, S2 compiler and TaskPack claim.

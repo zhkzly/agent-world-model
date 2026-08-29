@@ -629,6 +629,15 @@ class OpenPreparedRelease:
         self._semantics = semantics
         self._settings = settings
 
+    @property
+    def task_goals(self) -> JSONObject:
+        if self._release.sealed_task_goals is None:
+            raise PreparationContractError("prepared release has no admitted public task goals")
+        return cast(
+            JSONObject,
+            json.loads(json.dumps(self._release.sealed_task_goals, ensure_ascii=False)),
+        )
+
     def open(self, instance_directory: Path) -> OpenPreparedSession:
         _verify_runtime(self._actor, self._settings.command_timeout_seconds)
         _verify_runtime(self._semantics, self._settings.command_timeout_seconds)
@@ -652,6 +661,7 @@ class OpenPreparedRelease:
             timeout=self._settings.command_timeout_seconds,
             role="actor",
         )
+        semantics_transport: _ChildTransport | None = None
         try:
             semantics_transport = _ChildTransport(
                 self._semantics.python,
@@ -661,9 +671,20 @@ class OpenPreparedRelease:
                 timeout=self._settings.command_timeout_seconds,
                 role="semantics",
             )
+            raw_tools = actor_transport.call("tools", {})
+            if not isinstance(raw_tools, list):
+                raise PreparationExecutionError(
+                    "EnvironmentDefect",
+                    "session_actor_not_ready",
+                    "actor readiness tools response is not an array",
+                )
+            validate_tool_catalog(tuple(raw_tools), role="session actor readiness")
         except Exception:
             actor_transport.close()
+            if semantics_transport is not None:
+                semantics_transport.close(operation="close")
             raise
+        assert semantics_transport is not None
         events: list[TrustedCallEvent] = []
         actor = ActorProxy(
             actor_transport,

@@ -122,6 +122,7 @@ class ValidatedReleaseV2:
     sealed_start_cases: tuple[StartCase, ...] | None = None
     sealed_start_seed: int | None = None
     sealed_start_limit: int | None = None
+    sealed_task_goals: JSONObject | None = None
 
     @property
     def identity(self) -> PreparedReleaseIdentity:
@@ -661,6 +662,22 @@ def verify_release_v2(release_root: Path) -> ValidatedReleaseV2:
     ):
         raise EnvironmentContractError("descriptor schemas differ from the sealed Public Surface")
     required_capability_ids = tuple(item.capability_id for item in catalog.capabilities)
+    if not isinstance(expected_document, dict) or not isinstance(
+        expected_document.get("capabilities"), list
+    ):
+        raise EnvironmentContractError("Expected TaskSemantics capabilities are invalid")
+    task_goals: JSONObject = {}
+    for item in expected_document["capabilities"]:
+        if (
+            not isinstance(item, dict)
+            or not isinstance(item.get("capability_id"), str)
+            or not isinstance(item.get("qualification_goal"), str)
+            or not item["qualification_goal"].strip()
+        ):
+            raise EnvironmentContractError("Expected public task goal is invalid")
+        task_goals[item["capability_id"]] = item["qualification_goal"]
+    if set(task_goals) != set(required_capability_ids):
+        raise EnvironmentContractError("Expected public task goals differ from sealed catalog")
     from agent_env_foundry.qualification_v2 import verify_qualification_evidence
 
     evidence = verify_qualification_evidence(
@@ -683,6 +700,7 @@ def verify_release_v2(release_root: Path) -> ValidatedReleaseV2:
         sealed_start_cases=starts.cases,
         sealed_start_seed=starts.seed,
         sealed_start_limit=starts.requested_limit,
+        sealed_task_goals=task_goals,
     )
 
 

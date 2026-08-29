@@ -43,4 +43,6 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - Deterministic directory/ZIP bytes relocate to the same Release ID; cold preparation reproduces 5 tools, 3 capabilities and 1 StartCase.
 - Audit-only cold replay reinstalls archived Semantics/Verifier and reproduces all 11 sealed results without a model call.
 - Recomputed catalog/evidence tampering and a fully rebound sealed-result tamper are rejected by receipt and cold replay respectively.
+- Production Atom compilation consumes only the admitted release projection and produced 6 unique Tasks: CAP-001 ×3, CAP-002 ×1 and CAP-003 ×2.
+- Every compiled checker was false initially and frozen before instruction exposure; all 6 exact instructions passed two fresh public-only witnesses (12 total) with independent materialization IDs and rebinding.
 - Repository lock, Ruff, format, Mypy, full Pytest and diff checks are green after the deletion.

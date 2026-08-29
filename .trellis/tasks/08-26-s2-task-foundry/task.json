@@ -41,7 +41,7 @@
     ".trellis/spec/backend/v2-preparation.md",
     ".trellis/spec/backend/v2-qualification-publication.md"
   ],
-  "notes": "SQLite C3+D vertical is real: 11 physical cases, 4 executable mutants, sealed evidence, strict receipt, immutable directory/ZIP Publication, relocation, live catalog equality and audit-only cold replay pass. The model-only agent_task_foundry scaffold and disabled Alignment Patrol were deleted. Generic run_v2_qualification, filesystem/Git repeat, direct coordinator and all S2 compiler/TaskPack work remain incomplete.",
+  "notes": "SQLite C3+D vertical is real: 11 physical cases, 4 executable mutants, sealed evidence, strict receipt, immutable directory/ZIP Publication, relocation, live catalog equality and audit-only cold replay pass. Production Atom compilation now yields 6 unique Tasks and 12 successful fresh witnesses. Generic run_v2_qualification, filesystem/Git repeat, direct coordinator, physical per-Task challenge/admission and composed Goal shapes remain incomplete.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -62,6 +62,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "checkpoint_d_sqlite_vertical_complete"
+    "implementation_checkpoint": "checkpoint_e_atom_vertical_complete"
   }
 }
