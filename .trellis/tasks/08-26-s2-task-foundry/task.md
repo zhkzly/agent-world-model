@@ -56,4 +56,7 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - One consolidated rerun under that exact Plan bound two new witnesses, every AgentChoice perturbation, all planned challenges, a non-subsequence alternative route and 3/3 checker mutants into AdmissionReport `6f3b34cff1b6434b06e6eae78c8b196597ec8c29f5a1fac5413308c4703c9de9`.
 - First sealed Atom TaskPack: `74ecb308842ad6143f88059d00bb597eeb2a7ae71abb583d6d4394c431f35c10`; canonical artifact SHA-256 `7ab100e1eded17ccb8cbbde990e891075f63d7fb94b796d2d773fd60b2dd8803` under ignored `.artifacts/taskpacks/`.
 - This establishes one SQLite Atom vertical only. It does not satisfy multi-Goal, yield, cross-environment, held-out, corpus, assessment or downstream paper gates.
+- ForEach-all compilation ignores inert `supported_goal_kinds`/facets and freezes the complete eligible binding set directly. The SQLite release produced exactly CAP-001 (3 members) and CAP-003 (2 members), with no singleton CAP-002 pseudo-diversity.
+- CAP-003 ForEach Task `6d6bdf79a9d1851cb6c4d4a543f2880f13f17c2eaec933925e64686cdf374ea8` passed two fresh exact-instruction witnesses; both physically executed both selected refusals and every member Atom result was satisfied.
+- This is a ForEach compiler/witness vertical only; partial-set challenges, AgentChoice perturbations, alternative route, mutations and TaskPack sealing remain incomplete.
 - Repository lock, Ruff, format, Mypy, full Pytest and diff checks are green after the deletion.
