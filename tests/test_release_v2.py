@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 from pathlib import Path
 
@@ -31,6 +32,14 @@ def test_product_admission_rejects_mechanical_fixture(tmp_path: Path) -> None:
     root = build_v2_release(tmp_path / "mechanical")
     with pytest.raises(EnvironmentContractError, match="strict Qualification receipt"):
         verify_release_v2(root)
+
+
+def test_layout_verifier_resolves_relative_release_root(tmp_path: Path) -> None:
+    root = build_v2_release(tmp_path / "relative")
+    relative = Path(os.path.relpath(root, Path.cwd()))
+    verified = _verify_release_layout_v2(relative)
+    assert verified.root == root.resolve()
+    assert verified.root.is_absolute()
 
 
 def test_v2_tamper_mode_extra_member_and_symlink_fail_closed(tmp_path: Path) -> None:

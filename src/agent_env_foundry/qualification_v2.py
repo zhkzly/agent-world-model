@@ -366,6 +366,9 @@ def audit_release_v2(
                     "cold replay cannot resolve the sealed semantic key exactly once",
                     capability_id=record["capability_id"],
                     semantic_key=record["semantic_key"],
+                    category=record["category"],
+                    record_path=str(record_path),
+                    binding_keys=[item.semantic_key for item in bindings],
                 )
             binding = selected[0]
             request = cast(

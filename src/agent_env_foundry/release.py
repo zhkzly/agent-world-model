@@ -442,9 +442,12 @@ def publish_release_v2(
 def _verify_release_layout_v2(release_root: Path) -> ValidatedReleaseV2:
     """Verify one immutable two-project release without preparing either runtime."""
 
-    root = Path(release_root)
-    if not root.is_dir() or root.is_symlink():
-        raise EnvironmentContractError(f"v2 release root {root} must be a non-symlink directory")
+    requested_root = Path(release_root)
+    if not requested_root.is_dir() or requested_root.is_symlink():
+        raise EnvironmentContractError(
+            f"v2 release root {requested_root} must be a non-symlink directory"
+        )
+    root = requested_root.resolve()
     descriptor_path = _regular_file_within(
         root, PurePosixPath(DESCRIPTOR_NAME), role=DESCRIPTOR_NAME
     )
