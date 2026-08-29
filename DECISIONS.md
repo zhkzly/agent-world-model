@@ -148,3 +148,5 @@
 `s2-foreach-partials|介入0|返工0|pre-witness omit-each plan+2 physical partial runs+4 mutation licences|红线违反0`
 
 `s2-foreach-agent-choice|介入0|返工0|shared replay+4 one-at-a-time physical perturbations+2 mutation licences|红线违反0`
+
+`s2-foreach-route-mutations|介入0|返工0|fresh no-op+reverse member order+2/2 aggregate mutants+4 mutation licences|红线违反0`

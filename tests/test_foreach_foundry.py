@@ -11,11 +11,15 @@ import agent_env_foundry.foreach_foundry as foreach_module
 from agent_env_foundry.foreach_foundry import (
     ForEachAdmissionPlan,
     ForEachAgentChoicePerturbation,
+    ForEachAlternativeOrderProof,
+    ForEachCheckerMutationResult,
+    ForEachNoOpChallenge,
     ForEachPartialChallenge,
     ForEachPartialChallengeReport,
     ForEachTask,
     ForEachWitness,
     SolvedForEachTask,
+    run_foreach_checker_mutations,
 )
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
@@ -126,6 +130,11 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
     assert task.to_document()["semantic_keys"] == ["item:1", "item:2"]
     plan = _plan(task)
     assert plan.to_document()["agent_choice_policy"] == "perturb_each_occurrence"
+    assert plan.to_document()["alternative_order_policy"] == ("reverse_first_target_occurrences")
+    assert [item["mutation_id"] for item in plan.to_document()["checker_mutations"]] == [
+        "ignore_member_0",
+        "ignore_member_1",
+    ]
     solved = SolvedForEachTask(
         task,
         plan,
@@ -179,6 +188,13 @@ def test_partial_challenge_requires_only_the_omitted_member_to_fail() -> None:
     )
     report = ForEachPartialChallengeReport(task.task_id, _plan(task), (first, result))
     assert report.report_id
+    solved = SolvedForEachTask(
+        task,
+        _plan(task),
+        (_witness(task, "1" * 64), _witness(task, "2" * 64)),
+    )
+    mutations = run_foreach_checker_mutations(solved, report)
+    assert all(item.killed for item in mutations.mutations)
 
     with pytest.raises(TaskFoundryError, match="omitted"):
         replace(result, member_results=(_result(), _result()))
@@ -225,6 +241,37 @@ def test_foreach_agent_choice_perturbation_requires_every_member_to_stay_satisfi
             (),
             (_result(), _result(satisfied=False)),
         )
+
+
+def test_foreach_noop_and_alternative_order_are_discriminating() -> None:
+    task = _task()
+    plan = _plan(task)
+    with pytest.raises(TaskFoundryError, match="no-op"):
+        ForEachNoOpChallenge(
+            task.task_id,
+            plan.plan_id,
+            "a" * 64,
+            (_result(), _result(satisfied=False)),
+        )
+
+    proof = ForEachAlternativeOrderProof(
+        task.task_id,
+        plan.plan_id,
+        "b" * 64,
+        "c" * 64,
+        "d" * 64,
+        (1, 0),
+        (),
+        {"results": [{}, {}]},
+        (),
+        (_result(), _result()),
+    )
+    assert proof.proof_id
+    with pytest.raises(TaskFoundryError, match="reverse"):
+        replace(proof, member_action_order=(0, 1))
+
+    with pytest.raises(TaskFoundryError, match="mutant"):
+        ForEachCheckerMutationResult("ignore_member_0", 0, False, False, False)
 
 
 def test_foreach_fresh_selection_must_match_the_complete_frozen_set() -> None:

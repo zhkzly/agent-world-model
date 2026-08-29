@@ -35,6 +35,13 @@ from agent_env_foundry.task_foundry import (
     _schema_at_pointer,
 )
 
+_REVERSE_ORDER_PROMPT = (
+    "For this checker challenge, complete the same full task but perform the selected targets "
+    "in reverse descriptor order. Keep the required final results array in its original "
+    "descriptor order."
+)
+_REVERSE_ORDER_PROMPT_DIGEST = hashlib.sha256(_REVERSE_ORDER_PROMPT.encode()).hexdigest()
+
 
 @dataclass(frozen=True, slots=True)
 class ForEachTask:
@@ -110,6 +117,12 @@ class ForEachAdmissionPlan:
             "task_id": self.task_id,
             "omitted_member_indices": list(self.omitted_member_indices),
             "agent_choice_policy": "perturb_each_occurrence",
+            "alternative_order_policy": "reverse_first_target_occurrences",
+            "alternative_order_prompt_digest": _REVERSE_ORDER_PROMPT_DIGEST,
+            "checker_mutations": [
+                {"mutation_id": f"ignore_member_{index}", "omitted_member_index": index}
+                for index in self.omitted_member_indices
+            ],
         }
 
     def to_document(self) -> JSONObject:
@@ -331,6 +344,126 @@ class ForEachAgentChoiceProof:
 
     def to_document(self) -> JSONObject:
         return {**self._preimage(), "proof_id": self.proof_id}
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachNoOpChallenge:
+    task_id: str
+    admission_plan_id: str
+    materialization_id: str
+    member_results: tuple[AtomCheckResult, ...]
+
+    def __post_init__(self) -> None:
+        if not self.member_results or any(item.satisfied for item in self.member_results):
+            raise TaskFoundryError(
+                "foreach_noop_false_acceptance",
+                "ForEach no-op challenge must fail every selected member",
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "foreach-noop-challenge/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "materialization_id": self.materialization_id,
+            "member_results": [item.to_document() for item in self.member_results],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachAlternativeOrderProof:
+    task_id: str
+    admission_plan_id: str
+    reference_witness_id: str
+    materialization_id: str
+    challenge_instruction_digest: str
+    member_action_order: tuple[int, ...]
+    trace: tuple[TraceEvent, ...]
+    final_answer: JSONObject
+    argument_provenance: tuple[ArgumentProvenance, ...]
+    member_results: tuple[AtomCheckResult, ...]
+
+    def __post_init__(self) -> None:
+        if self.member_action_order != tuple(reversed(range(len(self.member_results)))):
+            raise TaskFoundryError(
+                "foreach_alternative_order_not_reversed",
+                "ForEach alternative route did not first act on every member in reverse order",
+            )
+        if any(not item.satisfied for item in self.member_results):
+            raise TaskFoundryError(
+                "foreach_alternative_order_rejected",
+                "ForEach checker rejected the reverse-order public route",
+            )
+
+    @property
+    def proof_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "foreach-alternative-order-proof/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "reference_witness_id": self.reference_witness_id,
+            "materialization_id": self.materialization_id,
+            "challenge_instruction_digest": self.challenge_instruction_digest,
+            "member_action_order": list(self.member_action_order),
+            "trace": [item.to_document() for item in self.trace],
+            "final_answer": _json_object(self.final_answer),
+            "argument_provenance": [item.to_document() for item in self.argument_provenance],
+            "member_results": [item.to_document() for item in self.member_results],
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "proof_id": self.proof_id}
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachCheckerMutationResult:
+    mutation_id: str
+    omitted_member_index: int
+    canonical_accepts: bool
+    mutant_accepts: bool
+    killed: bool
+
+    def __post_init__(self) -> None:
+        if not self.killed:
+            raise TaskFoundryError(
+                "foreach_checker_mutant_survived",
+                "ForEach ignore-member checker mutant survived its partial challenge",
+                mutation_id=self.mutation_id,
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "mutation_id": self.mutation_id,
+            "omitted_member_index": self.omitted_member_index,
+            "canonical_accepts": self.canonical_accepts,
+            "mutant_accepts": self.mutant_accepts,
+            "killed": self.killed,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachCheckerMutationReport:
+    task_id: str
+    admission_plan_id: str
+    mutations: tuple[ForEachCheckerMutationResult, ...]
+
+    @property
+    def report_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "foreach-checker-mutation-report/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "mutations": [item.to_document() for item in self.mutations],
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "report_id": self.report_id}
 
 
 def compile_foreach_tasks(
@@ -728,6 +861,153 @@ def prove_foreach_agent_choices_non_load_bearing(
     )
 
 
+def run_foreach_noop(
+    prepared: OpenPreparedRelease,
+    solved: SolvedForEachTask,
+    instance_root: Path,
+) -> ForEachNoOpChallenge:
+    task = solved.task
+    _verify_task(prepared, task)
+    with prepared.open(instance_root) as session:
+        session.actor.reset(task.start_case.reset_input)
+        before = session.trusted.inspect(instance_root)
+        bindings = _resolve_complete_selection(session, task, before)
+        contexts = _contexts(task, bindings)
+        results = tuple(
+            session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    before,
+                    binding.protected_binding,
+                    (),
+                    {},
+                    contexts[position],
+                )
+            )
+            for position, binding in enumerate(bindings)
+        )
+        return ForEachNoOpChallenge(
+            task.task_id,
+            solved.admission_plan.plan_id,
+            session.identity.materialization_id,
+            results,
+        )
+
+
+def prove_foreach_reverse_order(
+    prepared: OpenPreparedRelease,
+    solved: SolvedForEachTask,
+    instance_root: Path,
+    *,
+    route: AgentRoute | None = None,
+    max_provider_turns: int = 12,
+) -> ForEachAlternativeOrderProof:
+    task = solved.task
+    _verify_task(prepared, task)
+    challenge_instruction = "\n\n".join((task.instruction, _REVERSE_ORDER_PROMPT))
+    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
+    with prepared.open(instance_root) as session:
+        reset = session.actor.reset(task.start_case.reset_input)
+        before = session.trusted.inspect(instance_root)
+        bindings = _resolve_complete_selection(session, task, before)
+        tool_specs = session.actor.tools()
+        episode = run_public_episode(
+            actor=session.actor,
+            instruction=challenge_instruction,
+            reset_observation=reset,
+            tool_specs=tool_specs,
+            answer_schema=task.answer_schema,
+            route=selected_route,
+            max_provider_turns=max_provider_turns,
+        )
+        answers = episode.final_answer.get("results")
+        if not isinstance(answers, list) or len(answers) != len(bindings):
+            raise TaskFoundryError(
+                "foreach_reverse_answer_count_mismatch",
+                "Reverse-order ForEach answer does not cover the complete selection",
+            )
+        provenance = resolve_argument_provenance(
+            trace=episode.trace,
+            instruction_values={
+                "selected_targets": [_json_object(item) for item in task.public_descriptors]
+            },
+            reset_observation=reset,
+            tool_specs=tool_specs,
+        )
+        member_order = _member_action_order(
+            episode.trace,
+            provenance,
+            len(task.semantic_keys),
+        )
+        after = session.trusted.inspect(instance_root)
+        contexts = _contexts(task, bindings)
+        results = tuple(
+            session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after,
+                    binding.protected_binding,
+                    episode.trace,
+                    answers[position],
+                    contexts[position],
+                )
+            )
+            for position, binding in enumerate(bindings)
+        )
+        return ForEachAlternativeOrderProof(
+            task.task_id,
+            solved.admission_plan.plan_id,
+            solved.witnesses[0].witness_id,
+            session.identity.materialization_id,
+            hashlib.sha256(challenge_instruction.encode()).hexdigest(),
+            member_order,
+            episode.trace,
+            episode.final_answer,
+            provenance,
+            results,
+        )
+
+
+def run_foreach_checker_mutations(
+    solved: SolvedForEachTask,
+    partials: ForEachPartialChallengeReport,
+) -> ForEachCheckerMutationReport:
+    if (
+        partials.task_id != solved.task.task_id
+        or partials.admission_plan.plan_id != solved.admission_plan.plan_id
+    ):
+        raise TaskFoundryError(
+            "foreach_mutation_plan_mismatch",
+            "ForEach mutation evidence belongs to another Task or plan",
+        )
+    mutations = tuple(
+        ForEachCheckerMutationResult(
+            f"ignore_member_{item.omitted_member_index}",
+            item.omitted_member_index,
+            all(result.satisfied for result in item.member_results),
+            all(
+                result.satisfied
+                for index, result in enumerate(item.member_results)
+                if index != item.omitted_member_index
+            ),
+            not all(result.satisfied for result in item.member_results)
+            and all(
+                result.satisfied
+                for index, result in enumerate(item.member_results)
+                if index != item.omitted_member_index
+            ),
+        )
+        for item in partials.partials
+    )
+    return ForEachCheckerMutationReport(
+        solved.task.task_id,
+        solved.admission_plan.plan_id,
+        mutations,
+    )
+
+
 def _prove_initially_false(
     prepared: OpenPreparedRelease,
     task: ForEachTask,
@@ -822,6 +1102,39 @@ def _contexts(
     )
 
 
+def _member_action_order(
+    trace: tuple[TraceEvent, ...],
+    provenance: tuple[ArgumentProvenance, ...],
+    member_count: int,
+) -> tuple[int, ...]:
+    prefix = "/public_descriptor/selected_targets/"
+    by_event = {event.seq: event for event in trace}
+    order: list[int] = []
+    for occurrence in sorted(
+        provenance,
+        key=lambda item: (item.event_seq, item.argument_pointer),
+    ):
+        if occurrence.event_seq not in by_event or occurrence.source_kind != "task_literal":
+            continue
+        pointer = occurrence.source_pointer
+        if not isinstance(pointer, str) or not pointer.startswith(prefix):
+            continue
+        token = pointer.removeprefix(prefix).partition("/")[0]
+        if not token.isdigit():
+            continue
+        member_index = int(token)
+        if member_index not in order:
+            order.append(member_index)
+    if set(order) != set(range(member_count)):
+        raise TaskFoundryError(
+            "foreach_alternative_order_incomplete",
+            "Alternative ForEach route did not publicly act on every selected member",
+            observed_order=order,
+            member_count=member_count,
+        )
+    return tuple(order)
+
+
 def _verify_task(prepared: OpenPreparedRelease, task: ForEachTask) -> None:
     if task.release_id != prepared.identity.release_id:
         raise TaskFoundryError(
@@ -900,6 +1213,10 @@ __all__ = [
     "ForEachAdmissionPlan",
     "ForEachAgentChoicePerturbation",
     "ForEachAgentChoiceProof",
+    "ForEachAlternativeOrderProof",
+    "ForEachCheckerMutationReport",
+    "ForEachCheckerMutationResult",
+    "ForEachNoOpChallenge",
     "ForEachPartialChallenge",
     "ForEachPartialChallengeReport",
     "ForEachTask",
@@ -907,6 +1224,9 @@ __all__ = [
     "SolvedForEachTask",
     "compile_foreach_tasks",
     "prove_foreach_agent_choices_non_load_bearing",
+    "prove_foreach_reverse_order",
+    "run_foreach_checker_mutations",
+    "run_foreach_noop",
     "challenge_foreach_partials",
     "solve_foreach_task_twice",
 ]
