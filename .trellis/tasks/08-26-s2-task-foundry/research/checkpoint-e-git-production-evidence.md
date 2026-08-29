@@ -55,3 +55,11 @@ physical state.
 
 This is not full Checkpoint F: the remaining Atom bindings, ForEach/If
 admission, the >=20 floor, assessment and corpus selection remain open.
+
+Subsequent refusal traces narrowed `post_reopen_repository_status` to the exact
+public sequence `matching refusal -> commit_history -> repository_status`.
+Both readers changed, so the release and packs above are preserved as immutable
+diagnostic evidence but no longer count toward the final floor. Successor Core
+`e40f9e03e010e54493633cb4ca06c80b99b74e4eb0f982e12de6e08019bf5589`
+passed production Qualification with 19 cases and 2 mutants; Publication is the
+next required step.

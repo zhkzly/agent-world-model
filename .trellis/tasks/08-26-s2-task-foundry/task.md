@@ -132,3 +132,15 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
   mutations. Artifact SHA-256 is `94323a25...`.
 - Checkpoint F remains incomplete until Refusal/ForEach/If TaskPacks reach the
   anti-demo floor and assessment/corpus work begins.
+
+### Latest Core transition
+
+- Refusal replay established that `post_reopen_repository_status` is populated
+  only for `refusal -> commit_history -> repository_status`; an immediate
+  diagnostic status without the history/reopen observation leaves it null.
+- Both readers were independently repaired and v6 Qualification passed with
+  Core `e40f9e03e010e54493633cb4ca06c80b99b74e4eb0f982e12de6e08019bf5589`,
+  Semantics `e705dbeb...`, Verifier `cf2c2258...`, 19 cases and 2 mutants.
+- Release `3ee01aed...` and its five admitted Atom packs remain immutable
+  diagnostic evidence but are superseded for final-floor accounting. v6
+  Publication and fresh admission are next; no v6 TaskPack is claimed yet.
