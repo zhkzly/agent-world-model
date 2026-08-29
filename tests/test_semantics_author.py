@@ -7,14 +7,10 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from openai_codex import ApprovalMode
+from openai_codex import ApprovalMode, Sandbox
 
 import agent_env_foundry.semantics_author as semantics_author_module
-from agent_env_foundry.builder import (
-    BuilderConfig,
-    CommandResult,
-    _codex_workspace_permission_overrides,
-)
+from agent_env_foundry.builder import BuilderConfig, CommandResult
 from agent_env_foundry.qualification import (
     EXPECTED_TASK_SEMANTICS_NAME,
     PUBLIC_SURFACE_NAME,
@@ -167,14 +163,10 @@ def test_run_semantics_author_uses_codex_only_for_semantic_project_bytes(
     assert result.factory == "generated_task_semantics.release:make_semantics"
     assert result.project_digest
     assert observed["thread"]["approval_mode"] is ApprovalMode.deny_all
-    assert "sandbox" not in observed["thread"]
+    assert observed["thread"]["sandbox"] is Sandbox.full_access
     assert set(observed["config"].env) == {"CODEX_HOME", "HOME", "UV_CACHE_DIR"}
     assert Path(observed["config"].env["HOME"]).parent == result.codex_home
     assert Path(observed["config"].env["HOME"]).is_dir()
-    assert observed["config"].config_overrides[-4:] == _codex_workspace_permission_overrides(
-        "foundry_semantics",
-        workspace.root,
-    )
     instructions = observed["thread"]["base_instructions"]
     assert "Do not write manifests, digests, verdicts, Tasks, rewards" in instructions
     assert "write the tasksemantics project" in observed["prompt"].casefold()

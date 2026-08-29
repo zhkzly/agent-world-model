@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -19,8 +18,7 @@ from pathlib import Path
 from typing import Any, Literal, Never, cast
 
 import rfc8785
-from codex_cli_bin import bundled_codex_path  # type: ignore[import-untyped]
-from openai_codex import ApprovalMode, Codex, CodexConfig
+from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
 from agent_env_foundry._qualification_runner import (
     ControlledRunCarrier,
@@ -40,13 +38,7 @@ from agent_env_foundry.agents import (
     _ProviderTurnBudget,
     _run_fresh_json_turn,
 )
-from agent_env_foundry.builder import (
-    CandidateRepairFinding,
-    _candidate_repair_finding,
-    _codex_workspace_permission_overrides,
-    _isolated_codex_env,
-    compute_candidate_digest,
-)
+from agent_env_foundry.builder import _isolated_codex_env, compute_candidate_digest
 from agent_env_foundry.environment import validate_tool_catalog
 from agent_env_foundry.release import verify_release
 from agent_env_foundry.research import BuilderProjection, ResearchFailure
@@ -104,18 +96,9 @@ _CANDIDATE_FAILURE_CODES = frozenset(
 
 
 class QualificationFailure(RuntimeError):
-    def __init__(
-        self,
-        phase: str,
-        code: str,
-        message: str,
-        *,
-        candidate_finding: CandidateRepairFinding | None = None,
-        **details: Any,
-    ) -> None:
+    def __init__(self, phase: str, code: str, message: str, **details: Any) -> None:
         super().__init__(message)
         self.phase, self.code = phase, code
-        self.candidate_finding = candidate_finding
         self.details = {"phase": phase, **details}
 
 
@@ -309,7 +292,6 @@ class QualificationResult:
     expected_relations_digest: str
     evidence_digest: str | None = None
     evidence_rows: tuple[EvidenceRow, ...] = ()
-    predicate_digest: str | None = None
     probe_bundle_digest: str | None = None
     negative_requirement_ids: tuple[str, ...] = ()
     workspace_root: Path | None = None
@@ -320,7 +302,6 @@ class QualificationResult:
     qualifier_codex_home: Path | None = None
     failure_code: str | None = None
     details: Mapping[str, Any] | None = None
-    candidate_finding: CandidateRepairFinding | None = None
 
 
 def _canonical(value: Any) -> bytes:
@@ -1880,14 +1861,13 @@ _PROBE_PROMPT = (
     "native_probe.py is an argv program with a __main__ entry point. argv[1:4] are exactly "
     "runtime_root, evidence_jsonl, negative_evidence_jsonl. Use an independent standard "
     "reader appropriate to the candidate representation and never import candidate "
-    "business code or Builder tests. The runtime contains a Host-authored "
-    "execution-map.json. Its baseline object gives release and instances paths relative to "
-    "runtime_root; each negative entry binds one negative run_id to relative release, "
-    "instances, and declarations paths. Execution directory names are deliberately opaque: "
-    "always follow this map and never infer mode or identity from a path name. Each mapped "
-    "run directory also contains its Host journal.jsonl. Host journal rows contain run_id, "
-    "seq, instance, operation, arguments, and result. Do not append an extra instances "
-    "segment to a mapped instance root. "
+    "business code or Builder tests. The runtime contains baseline-instances, "
+    "baseline.journal.jsonl, and negative-runs/<negative_run_id>/{release,instances,"
+    "declarations.json,journal.jsonl}. Host journal rows contain run_id, seq, instance, "
+    "operation, arguments, and result. "
+    "For native paths, the positive instance root is runtime_root/baseline-instances and a "
+    "negative instance root is runtime_root/negative-runs/<negative_run_id>/instances; do "
+    "not append an extra instances segment to either root. "
     "When several named instance directories exist, select the instance that owns the "
     "public calls being verified; never use an ambiguous first/next recursive database match. "
     "A successful ToolObservation has error=null and a refusal has data=null. Handle these "
@@ -1908,9 +1888,9 @@ _PROBE_PROMPT = (
     "one identical assertion_id with the same expected fact false. Literal "
     "or unconditional True/False evidence is "
     "forbidden; derive the false result from the changed public/native behavior, never from "
-    "a marker or declaration file. Each negative row must read the matching opaque execution "
-    "directory selected by execution-map.json and its declarations file; never reuse one run "
-    "for all requirements. source_use is a structured object describing any source read solely to "
+    "a marker or declaration file. Each negative row must read the matching "
+    "negative-runs directory selected by its declarations.json; never reuse one run for all "
+    "requirements. source_use is a structured object describing any source read solely to "
     "decode native state. "
     "Additionally read EXPECTED_TASK_SEMANTICS.json and NATIVE_ORACLE_CONTRACT.md. The same "
     "native_probe.py must implement the disclosed semantic-check argv mode for arbitrary "
@@ -1931,11 +1911,8 @@ def run_qualification(
     *,
     expected_task_semantics: ExpectedTaskSemantics,
     config: QualificationConfig,
-    predicate_source_root: Path | None = None,
-    predicate_source_digest: str | None = None,
 ) -> QualificationResult:
     expected = freeze_expected_relations(projection)
-    prepared: PreparedQualificationWorkspace | None = None
     try:
         prepared = prepare_qualification_workspace(
             projection, candidate_root, candidate_digest, workspace_root
@@ -1949,12 +1926,7 @@ def run_qualification(
             public_journal,
             qualifier_thread_id,
             qualifier_codex_home,
-        ) = _author_probes(
-            prepared,
-            config,
-            predicate_source_root=predicate_source_root,
-            predicate_source_digest=predicate_source_digest,
-        )
+        ) = _author_probes(prepared, config)
         semantics_workspace = prepare_semantics_author_workspace(
             prepared,
             projection,
@@ -1979,7 +1951,6 @@ def run_qualification(
             expected_relations_digest=expected.aggregate_digest,
             evidence_digest=_digest(_canonical(preimage)),
             evidence_rows=rows,
-            predicate_digest=prepared.predicate_digest if prepared is not None else None,
             probe_bundle_digest=bundle.bundle_digest,
             negative_requirement_ids=tuple(item["requirement_id"] for item in negative),
             workspace_root=prepared.root,
@@ -1995,10 +1966,8 @@ def run_qualification(
             candidate_digest=candidate_digest,
             expected_relations_digest=expected.aggregate_digest,
             workspace_root=Path(workspace_root),
-            predicate_digest=prepared.predicate_digest if prepared is not None else None,
             failure_code=exc.code,
             details={"message": str(exc), **exc.details},
-            candidate_finding=exc.candidate_finding,
         )
     except Exception as exc:
         return QualificationResult(
@@ -2022,7 +1991,6 @@ def replay_qualification(
 ) -> QualificationResult:
     """Replay already-admitted semantic probe code against cold Candidate bytes."""
     expected = freeze_expected_relations(projection)
-    prepared: PreparedQualificationWorkspace | None = None
     try:
         prepared = prepare_qualification_workspace(
             projection, candidate_root, candidate_digest, workspace_root
@@ -2088,7 +2056,6 @@ def replay_qualification(
             expected_relations_digest=expected.aggregate_digest,
             evidence_digest=_digest(_canonical(preimage)),
             evidence_rows=rows,
-            predicate_digest=prepared.predicate_digest if prepared is not None else None,
             probe_bundle_digest=bundle.bundle_digest,
             negative_requirement_ids=tuple(item["requirement_id"] for item in negative),
             workspace_root=prepared.root,
@@ -2099,47 +2066,9 @@ def replay_qualification(
             candidate_digest=candidate_digest,
             expected_relations_digest=expected.aggregate_digest,
             workspace_root=Path(workspace_root),
-            predicate_digest=prepared.predicate_digest if prepared is not None else None,
             failure_code=exc.code,
             details={"message": str(exc), **exc.details},
-            candidate_finding=exc.candidate_finding,
         )
-
-
-def _reuse_predicate_carrier(
-    prepared: PreparedQualificationWorkspace,
-    source_root: Path,
-    expected_digest: str,
-) -> str:
-    source = Path(source_root).resolve() / PREDICATE_NAME
-    if not source.is_file() or source.is_symlink():
-        raise QualificationFailure(
-            "predicate_gate",
-            "predicate_reuse_invalid",
-            "Prior candidate-blind predicate carrier is unavailable",
-        )
-    if _digest(source.read_bytes()) != expected_digest:
-        raise QualificationFailure(
-            "predicate_gate",
-            "predicate_reuse_digest_mismatch",
-            "Prior predicate carrier bytes differ from the frozen digest",
-        )
-    target = prepared.root / PREDICATE_NAME
-    shutil.copyfile(source, target)
-    digest = validate_predicate_carrier(prepared)
-    if digest != expected_digest:
-        raise QualificationFailure(
-            "predicate_gate",
-            "predicate_reuse_digest_mismatch",
-            "Reused predicate carrier has a different frozen digest",
-        )
-    if target.read_bytes() != source.read_bytes():
-        raise QualificationFailure(
-            "predicate_gate",
-            "predicate_reuse_invalid",
-            "Reused predicate carrier changed during canonical validation",
-        )
-    return digest
 
 
 def _author_predicates(
@@ -2248,11 +2177,7 @@ def _run_codex_turn(thread: Any, prompt: str, timeout_seconds: float) -> Any:
 
 
 def _author_probes(
-    prepared: PreparedQualificationWorkspace,
-    config: QualificationConfig,
-    *,
-    predicate_source_root: Path | None = None,
-    predicate_source_digest: str | None = None,
+    prepared: PreparedQualificationWorkspace, config: QualificationConfig
 ) -> tuple[
     ProbeBundle,
     tuple[EvidenceRow, ...],
@@ -2263,18 +2188,9 @@ def _author_probes(
     Path,
 ]:
     previous: str | None = None
-    if predicate_source_root is None and predicate_source_digest is None:
-        _author_predicates(prepared, config)
-    elif predicate_source_root is None or predicate_source_digest is None:
-        raise QualificationFailure(
-            "predicate_gate",
-            "predicate_reuse_invalid",
-            "Predicate reuse requires both source root and frozen digest",
-        )
-    else:
-        _reuse_predicate_carrier(prepared, predicate_source_root, predicate_source_digest)
+    _author_predicates(prepared, config)
     prepared.stage_candidate_view()
-    codex_home = _qualifier_codex_home(prepared.root)
+    codex_home = prepared.root.parent / "qualification-codex-home"
     if codex_home.is_symlink() or codex_home.exists():
         raise QualificationFailure(
             "qualification_workspace",
@@ -2286,13 +2202,7 @@ def _author_probes(
     sdk_config = CodexConfig(
         cwd=str(prepared.root),
         env=_isolated_codex_env(codex_home, config.uv_cache_dir),
-        config_overrides=(
-            *_provider_overrides(),
-            *_codex_workspace_permission_overrides(
-                "foundry_qualification",
-                prepared.root,
-            ),
-        ),
+        config_overrides=_provider_overrides(),
     )
     with Codex(sdk_config) as codex:
         thread = codex.thread_start(
@@ -2300,6 +2210,7 @@ def _author_probes(
             base_instructions=_BASE_INSTRUCTIONS,
             cwd=str(prepared.root),
             model=config.model,
+            sandbox=Sandbox.full_access,
         )
         prompt = _PROBE_PROMPT
         for turn in range(config.max_turns):
@@ -2359,11 +2270,6 @@ def _author_probes(
                 _reset_probe_attempt(prepared.root, admitted=bundle is not None)
                 prompt = _render_probe_feedback(exc)
     raise QualificationFailure("probe_gate", "probe_bundle_missing", "Qualifier produced no probes")
-
-
-def _qualifier_codex_home(qualification_root: Path) -> Path:
-    root = Path(qualification_root)
-    return root.parent / f"{root.name}-codex-home"
 
 
 def _reset_probe_attempt(root: Path, *, admitted: bool) -> None:
@@ -2497,19 +2403,12 @@ def _execute_probes(
         config,
         "loader_dependency_install",
     )
-    executions = runtime / "executions"
-    executions.mkdir()
-    baseline_run_root = executions / uuid.uuid4().hex
-    baseline_release = baseline_run_root / "release"
-    baseline_instances = baseline_run_root / "instances"
-    _copy_release(prepared.candidate_root, baseline_release)
+    baseline_instances = runtime / "baseline-instances"
     baseline_instances.mkdir()
-    baseline_release_before = _tree_manifest(baseline_release)
-    baseline_journal_path = baseline_run_root / "journal.jsonl"
+    baseline_journal_path = runtime / "baseline.journal.jsonl"
     positive_journal = _execute_public_probe(
         candidate_python,
         prepared.candidate_root,
-        baseline_release,
         baseline_instances,
         f"baseline-{uuid.uuid4().hex}",
         baseline_journal_path,
@@ -2519,12 +2418,6 @@ def _execute_probes(
         env,
         config,
     )
-    if _tree_manifest(baseline_release).digest != baseline_release_before.digest:
-        raise QualificationFailure(
-            "candidate_execution",
-            "candidate_release_mutated",
-            "Candidate runtime changed the immutable baseline execution copy",
-        )
     _reject_failed_reload_attempt(positive_journal)
     _require_probe_topology(
         positive_journal,
@@ -2532,17 +2425,9 @@ def _execute_probes(
     )
     prepared.verify_candidate_unchanged()
     carriers: list[ControlledRunCarrier] = []
-    execution_map: dict[str, Any] = {
-        "format": "qualification-executions/1",
-        "baseline": {
-            "release": str(baseline_release.relative_to(runtime)),
-            "instances": str(baseline_instances.relative_to(runtime)),
-        },
-        "negative": [],
-    }
     declarations = bundle.negative_declarations
     for run_id in sorted({item["negative_run_id"] for item in declarations}):
-        run_root = executions / uuid.uuid4().hex
+        run_root = runtime / "negative-runs" / run_id
         release_root = run_root / "release"
         instance_root = run_root / "instances"
         try:
@@ -2593,7 +2478,6 @@ def _execute_probes(
         journal_path = run_root / "journal.jsonl"
         journal = _execute_public_probe(
             candidate_python,
-            prepared.candidate_root,
             release_root,
             instance_root,
             run_id,
@@ -2604,13 +2488,6 @@ def _execute_probes(
             env,
             config,
         )
-        if _tree_manifest(release_root).digest != release_after.digest:
-            raise QualificationFailure(
-                "probe_execution",
-                "controlled_release_mutated_during_probe",
-                "Public execution changed the Host-controlled near-miss release",
-                run_id=run_id,
-            )
         prepared.verify_candidate_unchanged()
         carriers.append(
             _make_run_carrier(
@@ -2625,17 +2502,6 @@ def _execute_probes(
                 prepared.candidate_digest,
             )
         )
-        cast(list[dict[str, str]], execution_map["negative"]).append(
-            {
-                "run_id": run_id,
-                "release": str(release_root.relative_to(runtime)),
-                "instances": str(instance_root.relative_to(runtime)),
-                "declarations": str(declarations_path.relative_to(runtime)),
-            }
-        )
-    execution_map_path = runtime / "execution-map.json"
-    execution_map_path.write_bytes(_canonical(execution_map))
-    execution_map_path.chmod(0o444)
     evidence_path = runtime / "evidence.jsonl"
     negative_evidence_path = runtime / "negative-evidence.jsonl"
     snapshots = [(baseline_instances, _tree_manifest(baseline_instances))]
@@ -2697,32 +2563,10 @@ def _reject_failed_reload_attempt(journal: HostJournal) -> None:
                 "host_exception" in result
                 or (result.get("ok") is False and code == "internal_error")
             ):
-                finding = (
-                    _candidate_repair_finding(
-                        failure_code="candidate_reload_failed",
-                        contract_clause="factory_reattachment",
-                        operation="invoke",
-                        arguments=event.arguments,
-                        runtime_error="EnvironmentRuntimeError",
-                    )
-                    if "host_exception" in result
-                    else _candidate_repair_finding(
-                        failure_code="candidate_reload_failed",
-                        contract_clause="factory_reattachment",
-                        operation="invoke",
-                        arguments=event.arguments,
-                        observation={
-                            "ok": False,
-                            "data": None,
-                            "error": {"code": code},
-                        },
-                    )
-                )
                 raise QualificationFailure(
                     "candidate_execution",
                     "candidate_reload_failed",
                     "Candidate cannot reattach and use an existing instance without reset",
-                    candidate_finding=finding,
                     instance=event.instance,
                     seq=event.seq,
                     result=result,
@@ -2732,7 +2576,6 @@ def _reject_failed_reload_attempt(journal: HostJournal) -> None:
 
 def _execute_public_probe(
     python: Path,
-    candidate_root: Path,
     release: Path,
     instances: Path,
     run_id: str,
@@ -2743,97 +2586,40 @@ def _execute_public_probe(
     env: dict[str, str],
     config: QualificationConfig,
 ) -> HostJournal:
-    sandbox_home = bundle.root / "candidate-runtime-sandbox-home"
-    sandbox_home.mkdir(exist_ok=True)
     public_env = {
         **env,
-        "CODEX_HOME": str(sandbox_home),
+        "AGENT_ENV_FOUNDRY_JOURNAL": str(journal_path),
+        "AGENT_ENV_FOUNDRY_RUN_ID": run_id,
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONPATH": os.pathsep.join(
             (
+                str(release / "src"),
                 str(Path(__file__).resolve().parents[1]),
                 str(dependencies),
             )
         ),
     }
-    result = _run(
-        _qualification_coordinator_command(
-            python,
-            candidate_root,
-            release,
-            instances,
-            sandbox_home,
-            dependencies,
-            bundle.root,
+    _run(
+        (
+            str(python),
+            "-B",
+            "-m",
+            "agent_env_foundry._qualification_runner",
+            "--probe",
+            str(bundle.root / "public_probe.py"),
+            "--release",
+            str(release),
+            "--instances",
+            str(instances),
+            "--mode",
+            mode,
         ),
-        release,
+        bundle.root,
         public_env,
         config,
         f"public_probe:{run_id}",
-        input_text=json.dumps(
-            {
-                "run_id": run_id,
-                "mode": mode,
-                "probe_source": (bundle.root / "public_probe.py").read_text(encoding="utf-8"),
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        ),
     )
-    try:
-        journal_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(journal_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            stream.write(result.stdout)
-    except OSError as exc:
-        raise QualificationFailure(
-            "probe_output",
-            "host_journal_write_failed",
-            "Host could not persist the private runner journal",
-            error=f"{type(exc).__name__}: {exc}",
-        ) from exc
     return _load_execution_journal(journal_path, run_id)
-
-
-def _qualification_coordinator_command(
-    python: Path,
-    candidate_root: Path,
-    release: Path,
-    instances: Path,
-    codex_home: Path,
-    dependencies: Path,
-    qualification_root: Path,
-) -> tuple[str, ...]:
-    candidate = Path(candidate_root).absolute()
-    expected_python = (candidate / ".venv/bin/python").absolute()
-    if Path(python).absolute() != expected_python:
-        raise QualificationFailure(
-            "infrastructure",
-            "candidate_python_mismatch",
-            "Candidate runtime Python is not rooted in the authoritative Candidate workspace",
-        )
-    return (
-        str(Path(sys.executable).absolute()),
-        "-B",
-        "-m",
-        "agent_env_foundry._qualification_runner",
-        "--release",
-        str(release),
-        "--instances",
-        str(instances),
-        "--dependencies",
-        str(dependencies),
-        "--actor-python",
-        str(python),
-        "--codex-binary",
-        str(bundled_codex_path()),
-        "--codex-home",
-        str(codex_home),
-        "--candidate-root",
-        str(candidate_root),
-        "--qualification-root",
-        str(qualification_root),
-    )
 
 
 def _load_execution_journal(path: Path, run_id: str) -> HostJournal:
@@ -2905,29 +2691,16 @@ def _run(
     env: dict[str, str],
     config: QualificationConfig,
     phase: str,
-    *,
-    input_text: str | None = None,
-) -> subprocess.CompletedProcess[str]:
+) -> None:
     try:
-        result = (
-            _run_public_process_group(
-                command,
-                cwd,
-                env,
-                input_text,
-                config.command_timeout_seconds,
-            )
-            if phase.startswith("public_probe:")
-            else subprocess.run(
-                command,
-                cwd=cwd,
-                env=env,
-                input=input_text,
-                text=True,
-                capture_output=True,
-                timeout=config.command_timeout_seconds,
-                check=False,
-            )
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=config.command_timeout_seconds,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise QualificationFailure(
@@ -2937,16 +2710,6 @@ def _run(
             error=f"{type(exc).__name__}: {exc}",
         ) from exc
     if result.returncode:
-        if phase.startswith("public_probe:") and result.returncode == 22:
-            raise QualificationFailure(
-                "infrastructure",
-                "candidate_transport_failed",
-                f"{phase} lost the private Candidate transport",
-                command=list(command),
-                exit_code=result.returncode,
-                stdout=result.stdout,
-                stderr=result.stderr,
-            )
         if phase == "loader_dependency_install":
             raise QualificationFailure(
                 "infrastructure",
@@ -2974,12 +2737,6 @@ def _run(
                 "candidate_execution",
                 "candidate_runtime_failed",
                 f"{phase} observed a canonical environment failure",
-                candidate_finding=_candidate_repair_finding(
-                    failure_code="candidate_runtime_failed",
-                    contract_clause="public_environment_runtime",
-                    operation="public_probe",
-                    runtime_error="EnvironmentRuntimeError",
-                ),
                 command=list(command),
                 exit_code=result.returncode,
                 stdout=result.stdout,
@@ -2994,48 +2751,6 @@ def _run(
             stdout=result.stdout,
             stderr=result.stderr,
         )
-    return result
-
-
-def _run_public_process_group(
-    command: tuple[str, ...],
-    cwd: Path,
-    env: dict[str, str],
-    input_text: str | None,
-    timeout: float,
-) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        stdout, stderr = process.communicate(input=input_text, timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            stdout, stderr = process.communicate(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            stdout, stderr = process.communicate()
-        raise subprocess.TimeoutExpired(
-            command,
-            timeout,
-            output=stdout,
-            stderr=stderr,
-        ) from exc
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def _read_json(path: Path, role: str) -> Any:

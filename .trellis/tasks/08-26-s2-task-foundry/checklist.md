@@ -49,8 +49,8 @@
   build, tests, source scan, import separation, digest and acceptance?
 - [x] Does Codex receive only immutable expected/public/contract/view inputs and write only
   release-specific semantic source, tests and dependency declarations?
-- [x] Is the Codex thread fresh and deny-all under the built-in workspace
-  permission profile, with the run parent denied and no custom sandbox subsystem?
+- [x] Is the Codex thread fresh, deny-all approval and full-access as explicitly required,
+  without a custom sandbox subsystem?
 - [x] Are actor/Host imports and author-time candidate-view paths forbidden at runtime?
 - [x] Must generated capability/composition/condition identities equal the frozen expected
   semantics before acceptance?
@@ -62,10 +62,6 @@
 
 ## CP3C Physical Semantic Qualification Checklist
 
-- [x] Does legacy Actor Qualification keep Host journal/dispatch in a trusted
-  coordinator while probe and Candidate run in distinct least-privilege processes?
-- [x] Do opaque execution paths and a Host map prevent baseline/negative mode leakage,
-  with a real sandbox attack regression and mutation licenses?
 - [ ] Are Environment Builder and TaskSemantics Author the only surviving Codex roles?
 - [ ] Does each Taskable capability begin from a reset-only qualified StartCase with an eligible
   before-state binding?

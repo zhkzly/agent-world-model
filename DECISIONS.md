@@ -105,7 +105,3 @@
 `s2-task-foundry-cp3c-causal-lifecycle|介入1|返工2|archived live trace+Host open/scope topology+19 mutation licenses+3 independent reviews|红线违反1: first mechanical-witness draft trusted global booleans before covers deletion`
 
 `s2-task-foundry-cp3c-local-visibility|介入0|返工2|materialization-local reset/trace provenance+13 mutation licenses+3 model-family reviews|红线违反1: first post-only gate still injected concrete public-tool target values`
-
-`s2-task-foundry-candidate-repair|介入0|返工3|exact resume+permission profile+fresh qualification lineage+24 mutation licenses+3 independent reviews|红线违反2: initial full-access repair could read hidden sibling probes; predicate reuse initially trusted path without digest join`
-
-`s2-task-foundry-qualification-isolation|介入0|返工2|trusted coordinator+separate probe/Candidate sandboxes+opaque execution map+real attack regression|红线违反1: first process split still shared instance-write authority with model-authored probe`

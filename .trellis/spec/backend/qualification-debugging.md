@@ -35,22 +35,6 @@ The Host journal records `open` before handle calls, followed by `reset`,
 one instance name may have only one active wrapper, so a fresh factory
 reattachment cannot be confused with a stale handle.
 
-Public execution has three physical roles, not one trusted Python stack:
-
-```text
-Host coordinator       owns schema validation, Candidate transports and journal
-read-only probe child  owns only public_probe source/mode and Session JSONL RPC
-Candidate actor child  owns raw environment code and one instance write root
-```
-
-The probe child receives no release, instance or journal path/file descriptor.
-The Candidate child receives no probe source/path, run ID, mode or journal and
-can write only its exact named instance, never a sibling instance. A transport/
-sequence/timeout failure remains Infrastructure even when a Host validation
-wrapper catches it. The RPC parser validates only its envelope and handle;
-canonical reset/invoke argument semantics remain owned by Host
-`ValidatedEnvironment`.
-
 ```python
 freeze_expected_task_semantics(
     projection: BuilderProjection,
@@ -79,11 +63,6 @@ run_semantics_author(
   subprocess execution, journals, evidence enrichment, structural topology,
   error ownership and verdict. Topology proves that a physical check was
   attempted; independent native evidence proves its business meaning.
-- Candidate-owned baseline runtime/reattachment failures carry a closed,
-  Host-origin `CandidateRepairFinding`. Only its public operation/arguments/
-  observation or bounded runtime error may reach the Builder. Raw diagnostics,
-  probe paths/source, predicate/assertion IDs, negative-run details, protected
-  values and patch suggestions never cross that boundary.
 - Evidence assertions contain exactly `assertion_id`, `passed`, `actual` and
   `expected`. Model-authored coverage labels have no authority.
 - Evidence invoke sequences are unique and strictly increasing. Baseline and
@@ -97,12 +76,9 @@ run_semantics_author(
   an executable repair condition. Every repair reruns the complete gate.
 - Positive ToolObservation has `error=null`; refusal has `data=null`. Readers
   use `(observation.get("error") or {})`, not chained `.get` on a nullable value.
-- Baseline and controlled-negative execution copies live under independent
-  random opaque directories. Host-owned `runtime/execution-map.json` binds the
-  baseline and each negative run ID to its relative release, instance and
-  declaration paths. Neither Candidate paths nor process metadata disclose the
-  mode. Native readers follow this map, select an explicit instance name and
-  never infer authority from a directory name or ambiguous first `rglob` hit.
+- Positive instances live directly under `runtime/baseline-instances`; negative
+  instances live under `runtime/negative-runs/<run>/instances`. Native readers
+  select an explicit instance name and never use an ambiguous first `rglob` hit.
 - A physical near miss changes a pre-existing file in the controlled release
   copy and changes at least one observation for a matching tool-name/arguments
   call. Added marker files and declaration-driven Boolean flips are invalid.
@@ -134,16 +110,8 @@ run_semantics_author(
 - Query capabilities require structured answer fields plus rendering wording. StartCases
   must cover every distinct reset input already demonstrated by Host public facts; case IDs
   alone are not world diversity, and identical seed/limit calls must be byte-equivalent.
-- Product Codex roles run deny-all under a built-in permission profile that
-  denies the run parent and reopens only their own workspace for writes. This
-  physically prevents Builder/Qualifier/Semantics siblings from reading each
-  other's source, homes and evidence; immutable inputs are still rechecked after
-  every turn and model prose is discarded.
-- Runtime permission profiles are role-specific: public probe is read-only and
-  cannot read or write the run root; Candidate can read its opaque release and
-  dependencies and write only the exact instance root. The coordinator alone
-  persists journal bytes. This is an internal process boundary, not a new
-  product node, RPC service or compatibility adapter.
+- Codex runs in a fresh deny-all/full-access thread. Full access is not trust: every
+  immutable input is rechecked after each turn, and model prose is discarded.
 
 ## 4. Validation & Error Matrix
 
@@ -157,7 +125,6 @@ run_semantics_author(
 | Only new marker bytes change | Qualifier | reject `negative_physical_noop` |
 | Matching public observations remain identical | Qualifier | reject `negative_public_behavior_unchanged` |
 | Provider capacity/network or missing offline cache | Infrastructure | retry identical bytes or end `NotReleased` |
-| Probe/Candidate wire timeout, EOF, JSON or sequence mismatch | Infrastructure | kill the full coordinator process group; no Builder finding |
 | Expected Requirement omitted or added | expected semantics | reject exact coverage mismatch |
 | Capability cites non-Taskable/unknown Requirement or workflow | expected semantics | reject with field path |
 | Composition/condition cites unknown or unlicensed anchors | expected semantics | reject all observable findings together |
@@ -203,17 +170,6 @@ run_semantics_author(
 - Added-marker-only and unchanged-public-behavior negatives are rejected.
 - Baseline exit 20 attributes Candidate; controlled-copy exit 20 attributes
   Qualifier.
-- A real built-in-sandbox test must prove that an absolute-path probe write,
-  Candidate probe read, original-workspace write and external `/tmp` write all
-  fail while baseline and controlled-copy code with a real dependency still
-  execute. A separate real-process protocol test rejects journal injection.
-- Candidate and probe run in distinct processes; Host rejects forged protocol
-  records, unclosed handles and non-monotonic calls, and timeout cleanup reaps
-  descendants.
-- Non-object reset input reaches the Host contract and remains Qualifier-owned;
-  invalid invoke types return the canonical contract observation rather than an
-  Infrastructure failure. Two live instance handles cannot read or write each
-  other's roots.
 - Source path strings are allowed in negative setup, while actual Candidate
   imports are rejected by AST inspection.
 - Full real run proves 24/24 positive, 24/24 negative, stable Candidate digest
@@ -223,7 +179,7 @@ run_semantics_author(
   all-findings and provider-schema mutants.
 - Run at least one real strict-JSON provider turn from accepted S1 relations; a
   fake client proves transport shape only.
-- Semantics Author tests kill permission-boundary removal, model-self-authorization, actor/Host import,
+- Semantics Author tests kill full-access, model-self-authorization, actor/Host import,
   catalog-alignment, query-answer, StartCase-coverage, fixed-factory, Skill-ownership and
   API fail-closed mutants.
 - A real cross-domain project must pass all seven Framework checks; fake Codex only

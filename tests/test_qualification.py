@@ -13,7 +13,6 @@ import stat
 import subprocess
 import sys
 import threading
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -24,7 +23,6 @@ import agent_env_foundry._qualification_runner as runner_module
 import agent_env_foundry.qualification as qualification_module
 from agent_env_foundry._qualification_runner import _is_host_journal, _load_host_journal
 from agent_env_foundry.builder import compute_candidate_digest
-from agent_env_foundry.errors import EnvironmentContractError
 from agent_env_foundry.qualification import (
     QualificationConfig,
     QualificationFailure,
@@ -885,45 +883,6 @@ def test_failed_close_reopen_is_owned_by_candidate(tmp_path: Path) -> None:
     assert caught.value.code == "candidate_reload_failed"
     assert caught.value.details["instance"] == "persist"
     assert caught.value.details["seq"] == 4
-    finding = caught.value.candidate_finding
-    assert finding is not None
-    assert finding.contract_clause == "factory_reattachment"
-    assert finding.arguments == {"tool_name": "inspect", "arguments": {}}
-
-
-def test_failed_close_reopen_host_exception_has_safe_candidate_finding(
-    tmp_path: Path,
-) -> None:
-    journal = _journal_from_events(
-        tmp_path,
-        "reload-host-exception",
-        [
-            ("persist", "reset", {"start": None}, {"state": "initial"}),
-            ("persist", "close", {}, None),
-            ("persist", "open", {}, {"attached": True}),
-            (
-                "persist",
-                "invoke",
-                {"tool_name": "inspect", "arguments": {}},
-                {
-                    "host_exception": {
-                        "type": "EnvironmentRuntimeError",
-                        "message": "PRIVATE_PROBE_PATH/public_probe.py",
-                    }
-                },
-            ),
-        ],
-    )
-
-    with pytest.raises(QualificationFailure) as caught:
-        qualification_module._reject_failed_reload_attempt(journal)
-
-    finding = caught.value.candidate_finding
-    assert caught.value.code == "candidate_reload_failed"
-    assert finding is not None
-    assert finding.observation is None
-    assert finding.runtime_error == "EnvironmentRuntimeError"
-    assert "PRIVATE_PROBE_PATH" not in json.dumps(finding.to_document())
 
 
 def test_closed_handle_without_fresh_open_is_not_misattributed_to_candidate(
@@ -1301,7 +1260,6 @@ def test_predicate_authoring_turn_is_blind_then_frozen_before_source_turn(
     class ProbeCodex:
         def __init__(self, config: Any) -> None:
             self.config = config
-            observed["permission_overrides"] = config.config_overrides[-4:]
 
         def __enter__(self) -> ProbeCodex:
             return self
@@ -1311,7 +1269,6 @@ def test_predicate_authoring_turn_is_blind_then_frozen_before_source_turn(
 
         def thread_start(self, **kwargs: Any) -> ProbeThread:
             observed["thread_starts"] += 1
-            observed["sandbox_absent"] = "sandbox" not in kwargs
             return ProbeThread()
 
     monkeypatch.setattr(qualification_module, "_run_fresh_json_turn", predicate_turn)
@@ -1338,88 +1295,7 @@ def test_predicate_authoring_turn_is_blind_then_frozen_before_source_turn(
         "probe_candidate_view_present": True,
         "predicate_bytes_frozen": True,
         "predicate_mode": 0o444,
-        "permission_overrides": qualification_module._codex_workspace_permission_overrides(
-            "foundry_qualification",
-            workspace,
-        ),
-        "sandbox_absent": True,
     }
-
-
-def test_candidate_repair_reuses_exact_candidate_blind_predicate_carrier(
-    tmp_path: Path,
-) -> None:
-    projection = _projection(3)
-    candidate, digest = _release_shaped_candidate(tmp_path)
-    expected_semantics = _expected_task_semantics(projection)
-    source = prepare_qualification_workspace(
-        projection,
-        candidate,
-        digest,
-        tmp_path / "qualification-source",
-    )
-    qualification_module.stage_qualification_oracle_inputs(
-        source,
-        projection,
-        expected_semantics,
-    )
-    source_path = source.root / qualification_module.PREDICATE_NAME
-    source_path.write_bytes(canonical_bytes(_predicate_document(source.expected.to_document())))
-    source_digest = qualification_module.validate_predicate_carrier(source)
-
-    target = prepare_qualification_workspace(
-        projection,
-        candidate,
-        digest,
-        tmp_path / "qualification-target",
-    )
-    qualification_module.stage_qualification_oracle_inputs(
-        target,
-        projection,
-        expected_semantics,
-    )
-    reused_digest = qualification_module._reuse_predicate_carrier(
-        target,
-        source.root,
-        source_digest,
-    )
-
-    assert reused_digest == source_digest
-    assert (
-        target.root / qualification_module.PREDICATE_NAME
-    ).read_bytes() == source_path.read_bytes()
-    assert target.predicates == source.predicates
-    assert not (target.root / "candidate-view").exists()
-
-    source_path.chmod(0o644)
-    source_path.write_bytes(source_path.read_bytes() + b"\n")
-    tampered = prepare_qualification_workspace(
-        projection,
-        candidate,
-        digest,
-        tmp_path / "qualification-tampered",
-    )
-    qualification_module.stage_qualification_oracle_inputs(
-        tampered,
-        projection,
-        expected_semantics,
-    )
-    with pytest.raises(QualificationFailure) as caught:
-        qualification_module._reuse_predicate_carrier(
-            tampered,
-            source.root,
-            source_digest,
-        )
-    assert caught.value.code == "predicate_reuse_digest_mismatch"
-
-
-def test_each_qualification_attempt_has_a_distinct_codex_home(tmp_path: Path) -> None:
-    assert qualification_module._qualifier_codex_home(tmp_path / "qualification") == (
-        tmp_path / "qualification-codex-home"
-    )
-    assert qualification_module._qualifier_codex_home(tmp_path / "qualification-attempt-002") == (
-        tmp_path / "qualification-attempt-002-codex-home"
-    )
 
 
 def test_agent_verdict_cannot_bypass_source_gate_or_reach_executor(
@@ -1811,14 +1687,8 @@ def test_passing_actor_qualification_stages_semantics_inputs_before_return(
     candidate, digest = _release_shaped_candidate(tmp_path)
     journal = _semantics_input_journal(tmp_path)
 
-    def admitted_actor_evidence(
-        prepared: Any,
-        config: Any,
-        *,
-        predicate_source_root: Path | None = None,
-        predicate_source_digest: str | None = None,
-    ) -> tuple[Any, ...]:
-        del config, predicate_source_root, predicate_source_digest
+    def admitted_actor_evidence(prepared: Any, config: Any) -> tuple[Any, ...]:
+        del config
         rows = tuple(
             qualification_module.EvidenceRow(
                 relation.requirement_id,
@@ -1974,296 +1844,6 @@ def test_private_runner_records_each_fresh_environment_open(tmp_path: Path) -> N
     ]
 
 
-def test_candidate_runtime_cannot_read_qualifier_probe_from_python_frames(
-    tmp_path: Path,
-) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    source = release / "src/mechanical_copy_environment/release.py"
-    source.write_text(
-        source.read_text().replace(
-            '    def reset(self, start=None):\n        return {"branch": BRANCH}\n',
-            "    def reset(self, start=None):\n"
-            "        import inspect\n"
-            "        frame = inspect.currentframe()\n"
-            "        while frame is not None:\n"
-            "            if 'PROBE_FRAME_SENTINEL' in repr(frame.f_locals):\n"
-            "                return {'branch': 'leaked'}\n"
-            "            frame = frame.f_back\n"
-            "        return {'branch': BRANCH}\n",
-            1,
-        )
-    )
-    runner_module._rebind_release_copy(release)
-    probe = tmp_path / "frame_probe.py"
-    probe.write_text(
-        "# PROBE_FRAME_SENTINEL\n"
-        "def run(session, mode):\n"
-        "    environment = session.open('case')\n"
-        "    assert environment.reset()['branch'] == 'baseline'\n"
-        "    environment.close()\n"
-    )
-    journal_path = tmp_path / "frame.journal.jsonl"
-
-    runner_module._run_public_probe(
-        probe,
-        release,
-        tmp_path / "frame-instances",
-        "frame-isolation",
-        journal_path,
-        "baseline",
-    )
-
-    journal = _load_host_journal(journal_path, "frame-isolation")
-    assert journal.events[1].result == {"branch": "baseline"}
-
-
-def test_candidate_stdout_cannot_corrupt_private_actor_transport(tmp_path: Path) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    source = release / "src/mechanical_copy_environment/release.py"
-    source.write_text(
-        source.read_text().replace(
-            '    def reset(self, start=None):\n        return {"branch": BRANCH}\n',
-            "    def reset(self, start=None):\n"
-            "        print('candidate-noise')\n"
-            "        return {'branch': BRANCH}\n",
-            1,
-        )
-    )
-    runner_module._rebind_release_copy(release)
-    probe = tmp_path / "stdout_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n"
-        "    environment = session.open('case')\n"
-        "    assert environment.reset()['branch'] == 'baseline'\n"
-        "    environment.close()\n"
-    )
-    journal_path = tmp_path / "stdout.journal.jsonl"
-
-    runner_module._run_public_probe(
-        probe,
-        release,
-        tmp_path / "stdout-instances",
-        "stdout-isolation",
-        journal_path,
-        "baseline",
-    )
-
-    journal = _load_host_journal(journal_path, "stdout-isolation")
-    assert [event.operation for event in journal.events] == ["open", "reset", "close"]
-
-
-def test_candidate_named_environment_contract_error_remains_candidate_owned(
-    tmp_path: Path,
-) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    source = release / "src/mechanical_copy_environment/release.py"
-    source.write_text(
-        source.read_text().replace(
-            '    def reset(self, start=None):\n        return {"branch": BRANCH}\n',
-            "    def reset(self, start=None):\n"
-            "        error = type('EnvironmentContractError', (Exception,), {})\n"
-            "        raise error('candidate-controlled name')\n",
-            1,
-        )
-    )
-    runner_module._rebind_release_copy(release)
-    probe = tmp_path / "named_error_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n    environment = session.open('case')\n    environment.reset()\n"
-    )
-    journal_path = tmp_path / "named-error.journal.jsonl"
-
-    with pytest.raises(runner_module.CandidateExecutionFailure) as caught:
-        runner_module._run_public_probe(
-            probe,
-            release,
-            tmp_path / "named-error-instances",
-            "named-error",
-            journal_path,
-            "baseline",
-        )
-
-    assert caught.value.error_type == "EnvironmentRuntimeError"
-    journal = _load_host_journal(journal_path, "named-error")
-    assert journal.events[-1].result["host_exception"]["type"] == "EnvironmentRuntimeError"
-
-
-def test_probe_return_with_open_handle_is_rejected_and_child_reaped(tmp_path: Path) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    source = release / "src/mechanical_copy_environment/release.py"
-    source.write_text(
-        source.read_text().replace(
-            '    def reset(self, start=None):\n        return {"branch": BRANCH}\n',
-            "    def reset(self, start=None):\n"
-            "        import os\n"
-            "        (self.instance / 'candidate.pid').write_text(str(os.getpid()))\n"
-            "        return {'branch': BRANCH}\n",
-            1,
-        )
-    )
-    runner_module._rebind_release_copy(release)
-    probe = tmp_path / "unclosed_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n    environment = session.open('case')\n    environment.reset()\n"
-    )
-    instances = tmp_path / "unclosed-instances"
-
-    with pytest.raises(RuntimeError, match="active environment handles"):
-        runner_module._run_public_probe(
-            probe,
-            release,
-            instances,
-            "unclosed",
-            tmp_path / "unclosed.journal.jsonl",
-            "baseline",
-        )
-
-    candidate_pid = int((instances / "case/candidate.pid").read_text())
-    assert not Path(f"/proc/{candidate_pid}").exists()
-
-
-def test_public_probe_cannot_inject_a_host_journal_record(tmp_path: Path) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    probe = tmp_path / "journal_forgery_probe.py"
-    probe.write_text(
-        "import json\n"
-        "def run(session, mode):\n"
-        "    session._client._wire.write(json.dumps({\n"
-        "        'run_id': 'forged', 'seq': 1, 'instance': 'case',\n"
-        "        'operation': 'reset', 'arguments': {'start': None},\n"
-        "        'result': {'forged': True},\n"
-        "    }) + '\\n')\n"
-        "    session._client._wire.flush()\n"
-    )
-    journal_path = tmp_path / "forgery.journal.jsonl"
-
-    with pytest.raises(runner_module.RunnerInfrastructureFailure, match="invalid call"):
-        runner_module._run_public_probe(
-            probe,
-            release,
-            tmp_path / "forgery-instances",
-            "real-run-id",
-            journal_path,
-            "baseline",
-        )
-
-    assert journal_path.read_bytes() == b""
-
-
-def test_candidate_transport_failure_survives_host_validation_as_infrastructure(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    original_call = runner_module._CandidateActorTransport.call
-
-    def fail_reset(transport: Any, operation: str, arguments: dict[str, Any]) -> Any:
-        if operation == "reset":
-            raise runner_module.RunnerInfrastructureFailure("transport sentinel")
-        return original_call(transport, operation, arguments)
-
-    monkeypatch.setattr(runner_module._CandidateActorTransport, "call", fail_reset)
-    probe = tmp_path / "transport_failure_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n    environment = session.open('case')\n    environment.reset()\n"
-    )
-    journal_path = tmp_path / "transport-failure.journal.jsonl"
-
-    with pytest.raises(runner_module.RunnerInfrastructureFailure, match="transport sentinel"):
-        runner_module._run_public_probe(
-            probe,
-            release,
-            tmp_path / "transport-failure-instances",
-            "transport-failure",
-            journal_path,
-            "baseline",
-        )
-
-    journal = _load_host_journal(journal_path, "transport-failure")
-    assert journal.events[-1].result == {
-        "host_infrastructure_exception": {"type": "RunnerInfrastructureFailure"}
-    }
-
-
-def test_candidate_close_timeout_kills_and_reaps_actor(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setattr(runner_module, "_CHILD_TIMEOUT_SECONDS", 0.05)
-    release, _ = _release_shaped_candidate(tmp_path)
-    source = release / "src/mechanical_copy_environment/release.py"
-    source.write_text(
-        source.read_text().replace(
-            "    def close(self):\n        return None\n",
-            "    def close(self):\n"
-            "        import os, subprocess, threading, time\n"
-            "        (self.instance / 'close.pid').write_text(str(os.getpid()))\n"
-            "        child = subprocess.Popen(['sleep', '30'])\n"
-            "        (self.instance / 'descendant.pid').write_text(str(child.pid))\n"
-            "        threading.Thread(target=lambda: time.sleep(30), daemon=False).start()\n",
-            1,
-        )
-    )
-    runner_module._rebind_release_copy(release)
-    probe = tmp_path / "close_timeout_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n"
-        "    environment = session.open('case')\n"
-        "    environment.reset()\n"
-        "    environment.close()\n"
-    )
-    instances = tmp_path / "close-timeout-instances"
-    journal_path = tmp_path / "close-timeout.journal.jsonl"
-
-    with pytest.raises(
-        runner_module.RunnerInfrastructureFailure,
-        match="did not exit after close",
-    ):
-        runner_module._run_public_probe(
-            probe,
-            release,
-            instances,
-            "close-timeout",
-            journal_path,
-            "baseline",
-        )
-
-    actor_pid = int((instances / "case/close.pid").read_text())
-    descendant_pid = int((instances / "case/descendant.pid").read_text())
-    assert not Path(f"/proc/{actor_pid}").exists()
-    assert not Path(f"/proc/{descendant_pid}").exists()
-    journal = _load_host_journal(journal_path, "close-timeout")
-    assert journal.events[-1].result == {
-        "host_infrastructure_exception": {"type": "RunnerInfrastructureFailure"}
-    }
-
-
-def test_public_process_timeout_kills_descendant_process_group(tmp_path: Path) -> None:
-    child_pid_path = tmp_path / "child.pid"
-    program = (
-        "import pathlib,subprocess,time; "
-        "child=subprocess.Popen(['sleep','30']); "
-        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid)); "
-        "time.sleep(30)"
-    )
-
-    with pytest.raises(subprocess.TimeoutExpired):
-        qualification_module._run_public_process_group(
-            (sys.executable, "-c", program),
-            tmp_path,
-            dict(os.environ),
-            None,
-            0.2,
-        )
-
-    child_pid = int(child_pid_path.read_text())
-    for _ in range(50):
-        if not Path(f"/proc/{child_pid}").exists():
-            break
-        time.sleep(0.01)
-    assert not Path(f"/proc/{child_pid}").exists()
-
-
 def test_private_runner_rejects_old_closed_wrapper_after_fresh_open(tmp_path: Path) -> None:
     release, _ = _release_shaped_candidate(tmp_path)
     probe = tmp_path / "stale_wrapper_probe.py"
@@ -2318,97 +1898,6 @@ def test_private_runner_rejects_concurrent_handles_for_one_instance(tmp_path: Pa
     assert [event.operation for event in journal.events] == ["open"]
 
 
-def test_invalid_probe_reset_start_remains_qualifier_owned(tmp_path: Path) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    source = release / "src/mechanical_copy_environment/release.py"
-    source.write_text(
-        source.read_text().replace(
-            '    def reset(self, start=None):\n        return {"branch": BRANCH}\n',
-            "    def reset(self, start=None):\n"
-            "        (self.instance / 'invalid-reset-reached').write_text('bad')\n"
-            "        return {'branch': BRANCH}\n",
-            1,
-        )
-    )
-    runner_module._rebind_release_copy(release)
-    probe = tmp_path / "invalid_start_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n"
-        "    environment = session.open('case')\n"
-        "    environment.reset({'unexpected': 1})\n"
-    )
-    journal_path = tmp_path / "invalid-start.journal.jsonl"
-
-    with pytest.raises(EnvironmentContractError, match="invalid reset start"):
-        runner_module._run_public_probe(
-            probe,
-            release,
-            tmp_path / "invalid-start-instances",
-            "invalid-start",
-            journal_path,
-            "baseline",
-        )
-
-    journal = _load_host_journal(journal_path, "invalid-start")
-    assert [event.operation for event in journal.events] == ["open", "reset"]
-    assert journal.events[-1].result["host_exception"]["type"] == "EnvironmentContractError"
-    assert not (tmp_path / "invalid-start-instances/case/invalid-reset-reached").exists()
-
-
-def test_non_object_probe_reset_reaches_host_contract_not_transport(
-    tmp_path: Path,
-) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    probe = tmp_path / "non_object_start_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n"
-        "    environment = session.open('case')\n"
-        "    environment.reset([])\n"
-    )
-    journal_path = tmp_path / "non-object-start.journal.jsonl"
-
-    with pytest.raises(EnvironmentContractError, match="must be a JSON object"):
-        runner_module._run_public_probe(
-            probe,
-            release,
-            tmp_path / "non-object-start-instances",
-            "non-object-start",
-            journal_path,
-            "baseline",
-        )
-
-    journal = _load_host_journal(journal_path, "non-object-start")
-    assert journal.events[-1].arguments == {"start": []}
-    assert journal.events[-1].result["host_exception"]["type"] == "EnvironmentContractError"
-
-
-def test_invalid_invoke_types_return_host_contract_observation(tmp_path: Path) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    probe = tmp_path / "invalid_invoke_types_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n"
-        "    environment = session.open('case')\n"
-        "    observation = environment.invoke(7, [])\n"
-        "    assert observation['error']['code'] == 'contract.invalid_arguments'\n"
-        "    environment.close()\n"
-    )
-    journal_path = tmp_path / "invalid-invoke-types.journal.jsonl"
-
-    runner_module._run_public_probe(
-        probe,
-        release,
-        tmp_path / "invalid-invoke-types-instances",
-        "invalid-invoke-types",
-        journal_path,
-        "baseline",
-    )
-
-    journal = _load_host_journal(journal_path, "invalid-invoke-types")
-    invoke = next(event for event in journal.events if event.operation == "invoke")
-    assert invoke.arguments == {"tool_name": 7, "arguments": []}
-    assert invoke.result["error"]["code"] == "contract.invalid_arguments"
-
-
 def test_native_reader_mutation_is_rejected(tmp_path: Path) -> None:
     instance = tmp_path / "instance"
     instance.mkdir()
@@ -2422,20 +1911,70 @@ def test_native_reader_mutation_is_rejected(tmp_path: Path) -> None:
     assert caught.value.code == "native_reader_mutated_state"
 
 
+def test_public_probe_cli_hides_journal_metadata_from_normal_probe_code(
+    tmp_path: Path,
+) -> None:
+    release, _ = _release_shaped_candidate(tmp_path)
+    probe = tmp_path / "metadata_probe.py"
+    probe.write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "def run(session, mode):\n"
+        "    Path('observed.json').write_text(json.dumps({\n"
+        "        'cmdline': Path('/proc/self/cmdline').read_bytes().decode('utf-8', 'replace'),\n"
+        "        'journal_env': os.environ.get('AGENT_ENV_FOUNDRY_JOURNAL'),\n"
+        "        'run_env': os.environ.get('AGENT_ENV_FOUNDRY_RUN_ID'),\n"
+        "    }))\n"
+    )
+    journal = tmp_path / "secret-journal.jsonl"
+    run_id = "secret-run-id"
+    env = {
+        **os.environ,
+        "AGENT_ENV_FOUNDRY_JOURNAL": str(journal),
+        "AGENT_ENV_FOUNDRY_RUN_ID": run_id,
+        "PYTHONPATH": os.pathsep.join(
+            (str(release / "src"), str(Path(__file__).resolve().parents[1] / "src"))
+        ),
+    }
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-m",
+            "agent_env_foundry._qualification_runner",
+            "--probe",
+            str(probe),
+            "--release",
+            str(release),
+            "--instances",
+            str(tmp_path / "instances"),
+            "--mode",
+            "baseline",
+        ),
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    observed = json.loads((tmp_path / "observed.json").read_text())
+    assert run_id not in observed["cmdline"]
+    assert str(journal) not in observed["cmdline"]
+    assert observed["journal_env"] is None
+    assert observed["run_env"] is None
+
+
 def test_public_probe_candidate_exit_is_attributed_to_candidate(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(
-        qualification_module,
-        "_run_public_process_group",
+        qualification_module.subprocess,
+        "run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=20,
             stdout="",
-            stderr=(
-                '{"error_type":"EnvironmentRuntimeError",'
-                '"message":"PRIVATE_PROBE_PATH/public_probe.py"}'
-            ),
+            stderr='{"error_type":"EnvironmentRuntimeError","message":"boom"}',
         ),
     )
     with pytest.raises(QualificationFailure) as caught:
@@ -2448,38 +1987,6 @@ def test_public_probe_candidate_exit_is_attributed_to_candidate(
         )
     assert caught.value.phase == "candidate_execution"
     assert caught.value.code == "candidate_runtime_failed"
-    assert caught.value.candidate_finding is not None
-    assert caught.value.candidate_finding.contract_clause == "public_environment_runtime"
-    assert caught.value.candidate_finding.runtime_error == "EnvironmentRuntimeError"
-    assert "PRIVATE_PROBE_PATH" not in json.dumps(caught.value.candidate_finding.to_document())
-
-
-def test_probe_contract_exit_is_not_attributed_to_candidate(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setattr(
-        qualification_module,
-        "_run_public_process_group",
-        lambda *args, **kwargs: SimpleNamespace(
-            returncode=21,
-            stdout="",
-            stderr=('{"error_type":"EnvironmentContractError","message":"invalid reset start"}'),
-        ),
-    )
-
-    with pytest.raises(QualificationFailure) as caught:
-        qualification_module._run(
-            ("candidate-python",),
-            tmp_path,
-            {},
-            QualificationConfig(),
-            "public_probe:baseline-test-run",
-        )
-
-    assert caught.value.phase == "probe_execution"
-    assert caught.value.code == "probe_execution_failed"
-    assert caught.value.candidate_finding is None
 
 
 def test_qualifier_prompt_forbids_unrelated_fallback_and_aggregate_assertions() -> None:
@@ -2497,8 +2004,8 @@ def test_negative_copy_candidate_exit_is_attributed_to_qualifier(
     tmp_path: Path,
 ) -> None:
     monkeypatch.setattr(
-        qualification_module,
-        "_run_public_process_group",
+        qualification_module.subprocess,
+        "run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=20,
             stdout="",
@@ -2517,7 +2024,7 @@ def test_negative_copy_candidate_exit_is_attributed_to_qualifier(
     assert caught.value.code == "negative_public_runtime_failed"
 
 
-def test_private_runner_attributes_real_environment_crash_to_candidate(
+def test_private_runner_emits_candidate_exit_for_real_environment_crash(
     tmp_path: Path,
 ) -> None:
     release, _ = _release_shaped_candidate(tmp_path)
@@ -2535,228 +2042,38 @@ def test_private_runner_attributes_real_environment_crash_to_candidate(
         "def run(session, mode):\n    environment = session.open('case')\n    environment.reset()\n"
     )
     journal = tmp_path / "crash.journal.jsonl"
-    with pytest.raises(runner_module.CandidateExecutionFailure) as caught:
-        runner_module._run_public_probe(
-            probe,
-            release,
-            tmp_path / "crash-instances",
-            "candidate-crash",
-            journal,
+    env = {
+        **os.environ,
+        "AGENT_ENV_FOUNDRY_JOURNAL": str(journal),
+        "AGENT_ENV_FOUNDRY_RUN_ID": "candidate-crash",
+        "PYTHONPATH": os.pathsep.join(
+            (str(release / "src"), str(Path(__file__).resolve().parents[1] / "src"))
+        ),
+    }
+    result = subprocess.run(
+        (
+            sys.executable,
+            "-B",
+            "-m",
+            "agent_env_foundry._qualification_runner",
+            "--probe",
+            str(probe),
+            "--release",
+            str(release),
+            "--instances",
+            str(tmp_path / "crash-instances"),
+            "--mode",
             "baseline",
-        )
-
-    assert caught.value.error_type == "EnvironmentRuntimeError"
-    assert str(caught.value) == "reset failed: candidate boom"
-
-
-def test_real_candidate_sandbox_runs_baseline_and_negative_without_private_leaks(
-    tmp_path: Path,
-) -> None:
-    if os.environ.get("RUN_CODEX_SANDBOX_INTEGRATION") != "1":
-        pytest.skip("set RUN_CODEX_SANDBOX_INTEGRATION=1 outside an existing sandbox")
-    candidate, _ = _release_shaped_candidate(tmp_path)
-    qualification = tmp_path / "qualification"
-    qualification.mkdir()
-    runtime = qualification / "runtime"
-    runtime.mkdir()
-    executions = runtime / "executions"
-    executions.mkdir()
-    baseline_root = executions / "67f3d9d55b51470e8f213ee83e3fcb51"
-    baseline_instances = baseline_root / "instances"
-    negative_root = executions / "e0a6f4573ef5460399eef715a06bfc73"
-    negative_instances = negative_root / "instances"
-    sibling_home = tmp_path / "qualification-codex-home"
-    sibling_home.mkdir()
-    sibling_secret = sibling_home / "hidden-verifier-context.txt"
-    sibling_secret.write_text("hidden verifier context")
-    dependencies = runtime / "loader-deps"
-    dependencies.mkdir()
-    (dependencies / "third_party_runtime.py").write_text("VALUE = 'dependency'\n")
-    public_probe = qualification / "public_probe.py"
-    public_probe.write_text(
-        "from pathlib import Path\n"
-        "def run(session, mode):\n"
-        f"    for root in ({str(baseline_instances)!r}, {str(negative_instances)!r}):\n"
-        "        try:\n"
-        "            (Path(root) / 'probe-forgery').write_text('forged')\n"
-        "        except OSError:\n"
-        "            pass\n"
-        "        else:\n"
-        "            raise AssertionError('public probe can mutate the Candidate instance')\n"
-        "    environment = session.open('case')\n"
-        "    sibling = session.open('other')\n"
-        "    expected = 'baseline:dependency' if mode == 'baseline' else 'near-miss:dependency'\n"
-        "    assert environment.reset()['branch'] == expected\n"
-        "    assert sibling.reset()['branch'] == expected\n"
-        "    environment.close()\n"
-        "    sibling.close()\n"
+        ),
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
     )
-    original_leak = candidate / ".venv/qualification-leak.txt"
-    external_leak = Path(f"/tmp/foundry-candidate-leak-{tmp_path.name}")
-    external_leak.unlink(missing_ok=True)
-    source = candidate / "src/mechanical_copy_environment/release.py"
-    original_source = source
-    replacement = (
-        "    def reset(self, start=None):\n"
-        "        import os\n"
-        "        from pathlib import Path\n"
-        "        (self.instance / 'actor.pid').write_text(str(os.getpid()))\n"
-        "        sibling_name = 'other' if self.instance.name == 'case' else 'case'\n"
-        "        try:\n"
-        "            target = self.instance.parent / sibling_name / 'cross-instance-forgery'\n"
-        "            target.write_text('bad')\n"
-        "        except OSError:\n"
-        "            pass\n"
-        "        else:\n"
-        "            return {'branch': 'leaked-cross-instance'}\n"
-        "        try:\n"
-        "            parent = Path(f'/proc/{os.getppid()}')\n"
-        "            metadata = (parent / 'cmdline').read_bytes()\n"
-        "            metadata += (parent / 'environ').read_bytes()\n"
-        "        except OSError:\n"
-        "            metadata = b''\n"
-        "        if any(value in metadata for value in "
-        "(b'baseline-sandbox', b'negative-sandbox', b'near-miss:dependency')):\n"
-        "            return {'branch': 'leaked-parent-metadata'}\n"
-        f"        for target in ({str(original_leak)!r}, {str(external_leak)!r}):\n"
-        "            try:\n"
-        "                Path(target).write_text('leak')\n"
-        "            except OSError:\n"
-        "                pass\n"
-        "            else:\n"
-        "                return {'branch': 'leaked-write'}\n"
-        "        try:\n"
-        f"            Path({str(public_probe)!r}).read_text()\n"
-        "        except OSError:\n"
-        "            pass\n"
-        "        else:\n"
-        "            return {'branch': 'leaked-probe'}\n"
-        "        try:\n"
-        f"            Path({str(original_source)!r}).read_text()\n"
-        "        except OSError:\n"
-        "            pass\n"
-        "        else:\n"
-        "            return {'branch': 'leaked-original-source'}\n"
-        "        try:\n"
-        f"            Path({str(sibling_secret)!r}).read_text()\n"
-        "        except OSError:\n"
-        "            pass\n"
-        "        else:\n"
-        "            return {'branch': 'leaked-sibling-context'}\n"
-        "        import third_party_runtime\n"
-        "        return {'branch': BRANCH + ':' + third_party_runtime.VALUE}\n"
-    )
-    source.write_text(
-        source.read_text().replace(
-            '    def reset(self, start=None):\n        return {"branch": BRANCH}\n',
-            replacement,
-            1,
-        )
-    )
-    runner_module._rebind_release_copy(candidate)
-    candidate_python = candidate / ".venv/bin/python"
-    candidate_python.parent.mkdir(parents=True, exist_ok=True)
-    candidate_python.symlink_to(sys.executable)
-    bundle = qualification_module.ProbeBundle(qualification, (), "b" * 64)
-    config = QualificationConfig(uv_cache_dir=tmp_path / "uv-cache")
-    baseline_release = baseline_root / "release"
-    runner_module._copy_release(candidate, baseline_release)
-    baseline_instances.mkdir()
-    baseline = qualification_module._execute_public_probe(
-        candidate_python,
-        candidate,
-        baseline_release,
-        baseline_instances,
-        "baseline-sandbox",
-        baseline_root / "journal.jsonl",
-        "baseline",
-        bundle,
-        dependencies,
-        qualification_module._clean_env(config),
-        config,
-    )
-
-    negative_release = negative_root / "release"
-    runner_module._copy_release(candidate, negative_release)
-    negative_source = negative_release / "src/mechanical_copy_environment/release.py"
-    negative_source.write_text(negative_source.read_text().replace('"baseline"', '"near-miss"', 1))
-    runner_module._rebind_release_copy(negative_release)
-    negative_instances.mkdir()
-    negative = qualification_module._execute_public_probe(
-        candidate_python,
-        candidate,
-        negative_release,
-        negative_instances,
-        "negative-sandbox",
-        negative_root / "journal.jsonl",
-        "negative",
-        bundle,
-        dependencies,
-        qualification_module._clean_env(config),
-        config,
-    )
-
-    assert [event.result for event in baseline.events if event.operation == "reset"] == [
-        {"branch": "baseline:dependency"},
-        {"branch": "baseline:dependency"},
-    ]
-    assert [event.result for event in negative.events if event.operation == "reset"] == [
-        {"branch": "near-miss:dependency"},
-        {"branch": "near-miss:dependency"},
-    ]
-    assert not original_leak.exists()
-    assert not external_leak.exists()
-
-    public_probe.write_text(
-        "import time\n"
-        "def run(session, mode):\n"
-        "    environment = session.open('case')\n"
-        "    environment.reset()\n"
-        "    time.sleep(30)\n"
-    )
-    timeout_root = executions / "069472bc48a14905be8d17bc9814c75c"
-    timeout_release = timeout_root / "release"
-    runner_module._copy_release(candidate, timeout_release)
-    timeout_instances = timeout_root / "instances"
-    timeout_instances.mkdir()
-    timeout_config = QualificationConfig(
-        command_timeout_seconds=0.5,
-        uv_cache_dir=tmp_path / "uv-cache",
-    )
-    with pytest.raises(QualificationFailure) as timeout:
-        qualification_module._execute_public_probe(
-            candidate_python,
-            candidate,
-            timeout_release,
-            timeout_instances,
-            "timeout-sandbox",
-            timeout_root / "journal.jsonl",
-            "baseline",
-            bundle,
-            dependencies,
-            qualification_module._clean_env(timeout_config),
-            timeout_config,
-        )
-
-    assert timeout.value.phase == "infrastructure"
-    assert timeout.value.code == "probe_process_failed"
-    timeout_marker = str(timeout_root).encode()
-
-    def matching_processes() -> list[int]:
-        matches: list[int] = []
-        for process in Path("/proc").iterdir():
-            if not process.name.isdigit():
-                continue
-            try:
-                command = (process / "cmdline").read_bytes()
-            except OSError:
-                continue
-            if timeout_marker in command:
-                matches.append(int(process.name))
-        return matches
-
-    for _ in range(50):
-        if not matching_processes():
-            break
-        time.sleep(0.01)
-    assert matching_processes() == []
+    assert result.returncode == 20
+    failure = json.loads(result.stderr)
+    assert failure == {
+        "error_type": "EnvironmentRuntimeError",
+        "message": "reset failed: candidate boom",
+    }
