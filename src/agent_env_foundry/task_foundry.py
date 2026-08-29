@@ -226,6 +226,7 @@ class AtomAdmissionPlan:
     task_id: str
     agent_choice_policy: str
     alternative_route_policy: str
+    no_op_result: AtomCheckResult
     checker_mutations: tuple[AtomCheckerMutationSpec, ...]
     challenges: tuple[AtomPlannedChallenge, ...]
 
@@ -240,6 +241,11 @@ class AtomAdmissionPlan:
                 "admission_alternative_route_policy_invalid",
                 "Atom admission must require a non-subsequence alternative tool sequence",
             )
+        if self.no_op_result.satisfied:
+            raise TaskFoundryError(
+                "admission_plan_noop_accepted",
+                "Atom admission no-op result must reject the Task before witnesses",
+            )
         categories = tuple(item.category for item in self.challenges)
         if categories != _ATOM_CHALLENGE_CATEGORIES:
             raise TaskFoundryError(
@@ -253,7 +259,10 @@ class AtomAdmissionPlan:
                 "admission_plan_noop_missing",
                 "Atom admission plan requires an applicable no-op challenge",
             )
-        expected_mutations = _derive_checker_mutation_specs(self.challenges)
+        expected_mutations = _derive_checker_mutation_specs(
+            self.challenges,
+            self.no_op_result,
+        )
         if self.checker_mutations != expected_mutations:
             raise TaskFoundryError(
                 "checker_mutation_plan_incomplete",
@@ -266,11 +275,12 @@ class AtomAdmissionPlan:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-admission-plan/1",
+            "format": "atom-admission-plan/2",
             "task_id": self.task_id,
             "agent_choice_policy": self.agent_choice_policy,
             "alternative_route_policy": self.alternative_route_policy,
             "alternative_route_prompt_digest": _ALTERNATIVE_ROUTE_PROMPT_DIGEST,
+            "no_op_result": self.no_op_result.to_document(),
             "checker_mutations": [item.to_document() for item in self.checker_mutations],
             "challenges": [item.to_document() for item in self.challenges],
         }
@@ -281,16 +291,23 @@ class AtomAdmissionPlan:
 
 def _derive_checker_mutation_specs(
     challenges: tuple[AtomPlannedChallenge, ...],
+    no_op_result: AtomCheckResult,
 ) -> tuple[AtomCheckerMutationSpec, ...]:
     by_category = {item.category: item for item in challenges}
-    specs = [
-        AtomCheckerMutationSpec("force_satisfied", "no_op", "satisfied"),
-        AtomCheckerMutationSpec(
-            "force_required_effects_ok",
-            "no_op",
-            "required_effects_ok",
-        ),
-    ]
+    if no_op_result.satisfied:
+        raise TaskFoundryError(
+            "admission_plan_noop_accepted",
+            "Atom admission cannot derive mutations from an accepted no-op",
+        )
+    specs = [AtomCheckerMutationSpec("force_satisfied", "no_op", "satisfied")]
+    if not no_op_result.required_effects_ok:
+        specs.append(
+            AtomCheckerMutationSpec(
+                "force_required_effects_ok",
+                "no_op",
+                "required_effects_ok",
+            )
+        )
     for category, field in (
         ("wrong_answer", "answer_ok"),
         ("missing_process", "process_ok"),
@@ -428,6 +445,12 @@ class AtomChallengeReport:
                     "Atom checker accepted an applicable negative challenge",
                     category=item.category,
                 )
+        no_op = self.challenges[0]
+        if no_op.result != self.admission_plan.no_op_result:
+            raise TaskFoundryError(
+                "challenge_noop_result_drift",
+                "Physical no-op result differs from its pre-witness frozen axes",
+            )
 
     def to_document(self) -> JSONObject:
         return {
@@ -791,6 +814,50 @@ def seal_atom_task_pack(
         checker_mutations,
     )
     return AtomTaskPack(solved.task, admission)
+
+
+def admit_atom_task(
+    prepared: OpenPreparedRelease,
+    task: AtomTask,
+    task_universe: tuple[AtomTask, ...],
+    instance_root: Path,
+    *,
+    route: AgentRoute | None = None,
+    max_provider_turns: int = 8,
+) -> AtomTaskPack:
+    """Run the existing same-plan Atom admission pipeline and seal one TaskPack."""
+
+    root = Path(instance_root)
+    solved = solve_atom_task_twice(
+        prepared,
+        task,
+        task_universe,
+        root / "solve",
+        route=route,
+        max_provider_turns=max_provider_turns,
+    )
+    challenges = challenge_atom_task(
+        prepared,
+        solved,
+        task_universe,
+        root / "challenges",
+        route=route,
+        max_provider_turns=max_provider_turns,
+    )
+    choices = prove_agent_choices_non_load_bearing(
+        prepared,
+        solved,
+        root / "agent-choices",
+    )
+    alternative = prove_alternative_route(
+        prepared,
+        solved,
+        root / "alternative-route",
+        route=route,
+        max_provider_turns=max_provider_turns,
+    )
+    mutations = run_atom_checker_mutations(solved.admission_plan, challenges)
+    return seal_atom_task_pack(solved, challenges, choices, alternative, mutations)
 
 
 def compile_atom_tasks(
@@ -1609,7 +1676,8 @@ def _derive_atom_admission_plan(
         task.task_id,
         "perturb_each_occurrence",
         _ALTERNATIVE_ROUTE_POLICY,
-        _derive_checker_mutation_specs(planned_challenges),
+        initial,
+        _derive_checker_mutation_specs(planned_challenges, initial),
         planned_challenges,
     )
 
@@ -2106,6 +2174,7 @@ __all__ = [
     "AtomWitness",
     "SolvedAtomTask",
     "TaskFoundryError",
+    "admit_atom_task",
     "challenge_atom_task",
     "compile_atom_tasks",
     "prove_agent_choices_non_load_bearing",

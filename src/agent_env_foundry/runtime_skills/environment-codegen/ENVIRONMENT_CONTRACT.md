@@ -40,6 +40,13 @@ relationships and other values the public Agent may read or reuse.
 ## State and reset
 
 - `reset(None)` creates a meaningful package-owned default world.
+- The reset result is the Agent's initial observation, not a dump of every
+  public fact in native state. It may expose stable discovery anchors and the
+  context needed to choose a public read, but it must not already contain the
+  complete answer tuple of an accepted query/read Requirement. A query whose
+  final answer can be copied entirely from reset is not a taskable public read;
+  keep those answer values behind the appropriate public tool instead of
+  requiring a redundant tool call in a later checker.
 - The public start schema and reset implementation provide enough legal
   reset-only beginning situations for every accepted workflow precondition to
   be reachable. A workflow that begins from an intermediate business state

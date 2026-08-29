@@ -171,6 +171,28 @@ public process. Compute `required_effects_ok`, `collateral_ok`, `answer_ok` and
 `process_ok` from their distinct obligations; do not copy one `satisfied`
 boolean into every field.
 
+For a query, "real public read" means evidence carried by a successful public
+ToolObservation for the selected referent, not one hard-coded tool name or one
+reference sequence. When the frozen public surface exposes the same qualified
+answer through more than one read tool, accept every such schema-valid route
+and compare the submitted answer against independently decoded native truth.
+Generated tests must exercise an equivalent alternate public read when one
+exists. Conversely, if the complete answer is already present in the reset
+observation, do not invent a mandatory tool call to make the query appear
+non-trivial: report the upstream environment defect instead of authoring a
+path-bound checker.
+
+The query axes are independent and have one fixed interpretation:
+
+- `required_effects_ok=true` for a supported selected query because it has no
+  state-effect obligation;
+- `collateral_ok` is exact permitted before/after native-state equality and is
+  independent of whether a read occurred;
+- `answer_ok` compares the submitted answer with native `report_values` and is
+  independent of process evidence;
+- `process_ok` alone records whether an equivalent selected public read
+  occurred.
+
 `ConditionCheckResultDocument` has exactly:
 
 ```text

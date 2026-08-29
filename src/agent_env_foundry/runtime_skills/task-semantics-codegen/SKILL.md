@@ -19,6 +19,12 @@ Implement `generated_task_semantics.release:make_semantics` plus diagnostic
 tests. Own the release-specific native decoder, deterministic StartCases,
 CapabilitySpecs, binding enumeration and atomic/condition evaluation logic.
 
+For query capabilities, inspect the complete public surface and accept any
+successful public read that exposes the selected referent and the exact
+declared answer values. Do not bind `process_ok` to one tool name when an
+equivalent public read exists. If reset already exposes the complete answer,
+fail that upstream design instead of masking it with a mandatory call.
+
 Do not write manifests, digests, verdicts, Tasks, rewards, witnesses or package
 receipts. Do not import/call actor business code as an oracle. Do not encode the
 authoring `candidate-view` path into runtime code. Do not weaken an expected

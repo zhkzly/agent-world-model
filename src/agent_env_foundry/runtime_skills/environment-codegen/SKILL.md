@@ -16,8 +16,12 @@ input file.
    These are your design decisions; do not ask the framework for a template.
 3. Make `reset(None)` build a meaningful coherent default world and use the
    public start schema for any additional reset-only beginning situation needed
-   to reach every accepted workflow precondition. Do not rely on hidden setup
-   actions or native patches.
+   to reach every accepted workflow precondition. Treat reset as an initial
+   observation: expose discovery anchors, but keep the complete answer to a
+   query/read Requirement behind its public read tool. Do not make a query
+   artificially non-trivial by returning its answer in reset and later
+   requiring a redundant tool call. Do not rely on hidden setup actions or
+   native patches.
 4. Return structured, chainable tool data and fully describe every emitted
    public leaf in the reset/tool output schemas. Execute state changes against native
    persistent state in the assigned instance directory. Never return canned
@@ -27,9 +31,9 @@ input file.
    the Host assembles the actor and TaskSemantics projects into EnvironmentRelease v2.
    Document the native storage layout needed by independent read-only code
    authors, but do not write TaskSemantics or Qualification Verifier code.
-   Include tests for native state change, multi-step value
-   reuse, refusal without prohibited mutation, reset, reload, and instance
-   isolation.
+   Include tests for native state change, multi-step value reuse, refusal
+   without prohibited mutation, reset, reload, instance isolation, and the
+   absence of complete query-answer leakage from reset.
 6. Declare and lock every runtime and test dependency yourself in the project's
    `pyproject.toml` and `uv.lock` (test tools such as a test runner belong in a
    dev dependency group). Install and run through the project's own uv

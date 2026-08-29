@@ -99,6 +99,24 @@ declared answer fields must not return an empty `report_values`. Missing,
 wrong, or stale answers set `answer_ok=false` without changing the other
 independently computed axes.
 
+For a query, public-process evidence is any successful public observation that
+contains the selected referent and the exact qualified answer values. Do not
+bind `process_ok` to one tool name or one reference sequence when the frozen
+public surface exposes an equivalent read route. If reset already exposes the
+complete answer, do not mask that upstream environment defect by requiring a
+redundant call.
+
+The query axes are independent and have one fixed interpretation:
+
+- `required_effects_ok=true` for a supported selected query because it has no
+  state-effect obligation;
+- `collateral_ok` is exact permitted before/after native-state equality and is
+  independent of whether a read occurred;
+- `answer_ok` compares the submitted answer with native `report_values` and is
+  independent of process evidence;
+- `process_ok` alone records whether an equivalent selected public read
+  occurred.
+
 Read the two instance directories with independent standard/native readers.
 `verify_transition` must be read-only. Do not write marker files, mutate state,
 call public tools, restore snapshots or return a scalar reward.
