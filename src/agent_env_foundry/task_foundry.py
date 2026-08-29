@@ -190,10 +190,43 @@ class AtomPlannedChallenge:
 
 
 @dataclass(frozen=True, slots=True)
+class AtomCheckerMutationSpec:
+    mutation_id: str
+    challenge_category: str
+    result_field: str
+
+    def __post_init__(self) -> None:
+        allowed_fields = {
+            "satisfied",
+            "required_effects_ok",
+            "collateral_ok",
+            "answer_ok",
+            "process_ok",
+        }
+        if (
+            self.mutation_id != f"force_{self.result_field}"
+            or self.challenge_category not in _ATOM_CHALLENGE_CATEGORIES
+            or self.result_field not in allowed_fields
+        ):
+            raise TaskFoundryError(
+                "checker_mutation_spec_invalid",
+                "Atom checker mutation must force one declared result axis",
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "mutation_id": self.mutation_id,
+            "challenge_category": self.challenge_category,
+            "result_field": self.result_field,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AtomAdmissionPlan:
     task_id: str
     agent_choice_policy: str
     alternative_route_policy: str
+    checker_mutations: tuple[AtomCheckerMutationSpec, ...]
     challenges: tuple[AtomPlannedChallenge, ...]
 
     def __post_init__(self) -> None:
@@ -220,6 +253,12 @@ class AtomAdmissionPlan:
                 "admission_plan_noop_missing",
                 "Atom admission plan requires an applicable no-op challenge",
             )
+        expected_mutations = _derive_checker_mutation_specs(self.challenges)
+        if self.checker_mutations != expected_mutations:
+            raise TaskFoundryError(
+                "checker_mutation_plan_incomplete",
+                "Atom admission plan must freeze every applicable result-axis mutation",
+            )
 
     @property
     def plan_id(self) -> str:
@@ -232,11 +271,35 @@ class AtomAdmissionPlan:
             "agent_choice_policy": self.agent_choice_policy,
             "alternative_route_policy": self.alternative_route_policy,
             "alternative_route_prompt_digest": _ALTERNATIVE_ROUTE_PROMPT_DIGEST,
+            "checker_mutations": [item.to_document() for item in self.checker_mutations],
             "challenges": [item.to_document() for item in self.challenges],
         }
 
     def to_document(self) -> JSONObject:
         return {**self._preimage(), "plan_id": self.plan_id}
+
+
+def _derive_checker_mutation_specs(
+    challenges: tuple[AtomPlannedChallenge, ...],
+) -> tuple[AtomCheckerMutationSpec, ...]:
+    by_category = {item.category: item for item in challenges}
+    specs = [
+        AtomCheckerMutationSpec("force_satisfied", "no_op", "satisfied"),
+        AtomCheckerMutationSpec(
+            "force_required_effects_ok",
+            "no_op",
+            "required_effects_ok",
+        ),
+    ]
+    for category, field in (
+        ("wrong_answer", "answer_ok"),
+        ("missing_process", "process_ok"),
+        ("collateral", "collateral_ok"),
+    ):
+        planned = by_category.get(category)
+        if planned is not None and planned.applicable:
+            specs.append(AtomCheckerMutationSpec(f"force_{field}", category, field))
+    return tuple(specs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +419,101 @@ class AtomChallengeReport:
             "admission_plan_id": self.admission_plan.plan_id,
             "challenges": [item.to_document() for item in self.challenges],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class AtomCheckerMutationResult:
+    spec: AtomCheckerMutationSpec
+    challenge_materialization_id: str
+    original_result: JSONObject
+    mutant_result: JSONObject
+    killed: bool
+
+    def __post_init__(self) -> None:
+        if not self.killed:
+            raise TaskFoundryError(
+                "checker_mutant_survived",
+                "Planned Atom checker result-axis mutant survived its physical challenge",
+                mutation_id=self.spec.mutation_id,
+                challenge_category=self.spec.challenge_category,
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "atom-checker-mutation-result/1",
+            "spec": self.spec.to_document(),
+            "challenge_materialization_id": self.challenge_materialization_id,
+            "original_result": _json_object(self.original_result),
+            "mutant_result": _json_object(self.mutant_result),
+            "killed": self.killed,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AtomCheckerMutationReport:
+    task_id: str
+    admission_plan_id: str
+    mutations: tuple[AtomCheckerMutationResult, ...]
+
+    @property
+    def report_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "atom-checker-mutation-report/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "mutations": [item.to_document() for item in self.mutations],
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "report_id": self.report_id}
+
+
+def run_atom_checker_mutations(
+    plan: AtomAdmissionPlan,
+    challenge_report: AtomChallengeReport,
+) -> AtomCheckerMutationReport:
+    """Execute every pre-witness result-axis mutant against its live challenge result."""
+
+    if (
+        challenge_report.task_id != plan.task_id
+        or challenge_report.admission_plan.plan_id != plan.plan_id
+    ):
+        raise TaskFoundryError(
+            "checker_mutation_plan_mismatch",
+            "Checker mutation inputs do not share one Task and AdmissionPlan",
+        )
+    challenges = {item.category: item for item in challenge_report.challenges}
+    results: list[AtomCheckerMutationResult] = []
+    for spec in plan.checker_mutations:
+        challenge = challenges[spec.challenge_category]
+        if not challenge.applicable or challenge.result is None or not challenge.materialization_id:
+            raise TaskFoundryError(
+                "checker_mutation_challenge_missing",
+                "Planned checker mutant has no applicable physical challenge result",
+                mutation_id=spec.mutation_id,
+            )
+        original = challenge.result.to_document()
+        mutant = _json_object(original)
+        field_was_false = mutant.get(spec.result_field) is False
+        mutant[spec.result_field] = True
+        results.append(
+            AtomCheckerMutationResult(
+                spec,
+                challenge.materialization_id,
+                original,
+                mutant,
+                field_was_false and mutant != original,
+            )
+        )
+    if tuple(item.spec for item in results) != plan.checker_mutations:
+        raise TaskFoundryError(
+            "checker_mutation_report_incomplete",
+            "Checker mutation report does not account for its frozen plan",
+        )
+    return AtomCheckerMutationReport(plan.task_id, plan.plan_id, tuple(results))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1276,17 +1434,19 @@ def _derive_atom_admission_plan(
             "no disjoint-workflow state-change Task is available",
         )
     )
+    planned_challenges = (
+        AtomPlannedChallenge("no_op", True, None, None, None),
+        wrong_target_plan,
+        wrong_answer_plan,
+        process_plan,
+        collateral_plan,
+    )
     return AtomAdmissionPlan(
         task.task_id,
         "perturb_each_occurrence",
         _ALTERNATIVE_ROUTE_POLICY,
-        (
-            AtomPlannedChallenge("no_op", True, None, None, None),
-            wrong_target_plan,
-            wrong_answer_plan,
-            process_plan,
-            collateral_plan,
-        ),
+        _derive_checker_mutation_specs(planned_challenges),
+        planned_challenges,
     )
 
 
@@ -1763,6 +1923,9 @@ __all__ = [
     "AtomAdmissionPlan",
     "AtomChallengeReport",
     "AtomChallengeResult",
+    "AtomCheckerMutationReport",
+    "AtomCheckerMutationResult",
+    "AtomCheckerMutationSpec",
     "AtomPlannedChallenge",
     "AtomTask",
     "AtomWitness",
@@ -1772,5 +1935,6 @@ __all__ = [
     "compile_atom_tasks",
     "prove_agent_choices_non_load_bearing",
     "prove_alternative_route",
+    "run_atom_checker_mutations",
     "solve_atom_task_twice",
 ]

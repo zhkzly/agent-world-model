@@ -138,3 +138,5 @@
 `s2-f-collateral|介入0|返工0|disjoint-workflow state change+isolated collateral axis+3 mutation licences|红线违反0`
 
 `s2-f-alternative-route|介入0|返工0|fresh non-subsequence public route+same checker+3 mutation licences|红线违反0`
+
+`s2-f-checker-mutations|介入0|返工0|preplanned live result-axis mutants+physical challenges+3 mutation licences|红线违反0`

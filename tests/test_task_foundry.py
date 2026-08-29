@@ -19,11 +19,13 @@ from agent_env_foundry.task_foundry import (
     AtomAdmissionPlan,
     AtomChallengeReport,
     AtomChallengeResult,
+    AtomCheckerMutationSpec,
     AtomPlannedChallenge,
     AtomTask,
     AtomWitness,
     SolvedAtomTask,
     TaskFoundryError,
+    run_atom_checker_mutations,
     solve_atom_task_twice,
 )
 
@@ -85,6 +87,19 @@ def _plan(task: AtomTask) -> AtomAdmissionPlan:
         task.task_id,
         "perturb_each_occurrence",
         "non_subsequence_tool_sequence",
+        (
+            AtomCheckerMutationSpec("force_satisfied", "no_op", "satisfied"),
+            AtomCheckerMutationSpec(
+                "force_required_effects_ok",
+                "no_op",
+                "required_effects_ok",
+            ),
+            AtomCheckerMutationSpec(
+                "force_process_ok",
+                "missing_process",
+                "process_ok",
+            ),
+        ),
         (
             AtomPlannedChallenge("no_op", True, None, None, None),
             AtomPlannedChallenge("wrong_target", True, "d" * 64, None, None),
@@ -185,6 +200,7 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
             task.task_id,
             "perturb_each_occurrence",
             "non_subsequence_tool_sequence",
+            plan.checker_mutations,
             plan.challenges[:-1],
         )
     assert caught.value.code == "admission_plan_incomplete"
@@ -198,6 +214,7 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
             task.task_id,
             "ignore_choices",
             "non_subsequence_tool_sequence",
+            plan.checker_mutations,
             plan.challenges,
         )
     assert caught.value.code == "admission_agent_choice_policy_invalid"
@@ -207,9 +224,15 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
             task.task_id,
             "perturb_each_occurrence",
             "allow_extra_calls",
+            plan.checker_mutations,
             plan.challenges,
         )
     assert caught.value.code == "admission_alternative_route_policy_invalid"
+    assert tuple(item.mutation_id for item in plan.checker_mutations) == (
+        "force_satisfied",
+        "force_required_effects_ok",
+        "force_process_ok",
+    )
 
 
 def test_replay_rebinds_dynamic_outputs_and_changes_only_the_targeted_choice() -> None:
@@ -500,6 +523,21 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
         (no_op, wrong_target, not_applicable, missing_process, collateral),
     )
     assert report.to_document()["format"] == "atom-challenge-report/1"
+    mutation_report = run_atom_checker_mutations(plan, report)
+    assert all(item.killed for item in mutation_report.mutations)
+
+    surviving_process = replace(
+        missing_process,
+        result=replace(missing_process.result, process_ok=True),
+    )
+    surviving_report = AtomChallengeReport(
+        task.task_id,
+        plan,
+        (no_op, wrong_target, not_applicable, surviving_process, collateral),
+    )
+    with pytest.raises(TaskFoundryError) as caught:
+        run_atom_checker_mutations(plan, surviving_report)
+    assert caught.value.code == "checker_mutant_survived"
 
     with pytest.raises(TaskFoundryError) as caught:
         AtomChallengeReport(
@@ -527,12 +565,16 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
         )
     assert caught.value.code == "challenge_false_acceptance"
 
+    applicable_collateral_challenges = (
+        *plan.challenges[:-1],
+        AtomPlannedChallenge("collateral", True, "e" * 64, None, None),
+    )
     applicable_collateral_plan = replace(
         plan,
-        challenges=(
-            *plan.challenges[:-1],
-            AtomPlannedChallenge("collateral", True, "e" * 64, None, None),
+        checker_mutations=task_foundry_module._derive_checker_mutation_specs(
+            applicable_collateral_challenges
         ),
+        challenges=applicable_collateral_challenges,
     )
     accepted_collateral = replace(
         wrong_target,

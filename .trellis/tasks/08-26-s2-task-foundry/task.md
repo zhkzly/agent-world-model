@@ -52,5 +52,6 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - Plan `981ac12ff1303e1624dbc38c7c35e0854b508cf933b4657300365f56053b8cd9` precommitted to perturb every AgentChoice occurrence; two fresh public replays changed the two `/reason` values, rebound dynamic dispute references and both remained satisfied (`aad280a4861b7adcfb0c2e80c4d6b26ce6a792ae5e477dea70caba5101b4053d`).
 - CAP-001 plan `12ff5376e4e9b71a5a6e8c56b12a050c88a3d0c02e991b38b5527b60b94a4317` froze disjoint-workflow CAP-002 as collateral; CAP-002 succeeded, while CAP-001 retained effects/answer/process truth and failed only `collateral_ok`.
 - CAP-002 plan `ae2ec448c8a04ce1712f32455cf4da786b0a00598e6a05cf40a78c105c688d88` produced a fresh non-subsequence route that replaced public discovery/readback steps and remained satisfied (`636b079a9a9880f05fb441eb4a5a57c5864a34360dcaaee83ecc075c44d280b2`).
-- This is partial Checkpoint F evidence only. Checker mutation remains blocking before any TaskPack claim.
+- Current CAP-002 plan `d7b6262950eb754d0a78dc7d376d109d5ca6327f4dcc38eb2f41e79c514b0742` froze three applicable checker result-axis mutants; live no-op/process challenges killed all three (`2fe45b87cf9d14e4bf9ddd8ed81536dff948b64f5b2a528505ba757abc9f5f49`).
+- This is partial Checkpoint F evidence only. One consolidated same-Plan admission run and TaskPack sealing remain blocking.
 - Repository lock, Ruff, format, Mypy, full Pytest and diff checks are green after the deletion.
