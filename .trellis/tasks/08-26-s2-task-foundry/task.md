@@ -59,5 +59,7 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - ForEach-all compilation ignores inert `supported_goal_kinds`/facets and freezes the complete eligible binding set directly. The SQLite release produced exactly CAP-001 (3 members) and CAP-003 (2 members), with no singleton CAP-002 pseudo-diversity.
 - CAP-003 ForEach Task `6d6bdf79a9d1851cb6c4d4a543f2880f13f17c2eaec933925e64686cdf374ea8` passed two fresh exact-instruction witnesses; both physically executed both selected refusals and every member Atom result was satisfied.
 - The same Task's pre-witness plan `e6326de196b75529ae4774f36b2a9ac868844d1785411f0fe839a30b47ccd533` froze one fresh omission per member. Physical partial report `052f7f5195d539ba1916a8aadf65a1d85e723dc744987efdd7eaa2706950d9a9` produced exactly `[false,true]` and `[true,false]`.
-- This remains an unsealed ForEach vertical; AgentChoice perturbations, applicable route/mutation evidence and TaskPack sealing are incomplete.
+- Current plan `e8b8d19235bdd0939eb889b1b46daa34ccda65fb45b1dd0ff1fe2a269fa93264` also precommitted to perturb every AgentChoice. Four independent fresh replays changed one `/reason` at a time and kept both members satisfied (`fde30f1716460b90aa85220b794f2802ee63f5546c0d1baf25bed7e9bcc61d04`).
+- Under the same plan, physical partial report `27fe26f60899dcafd5bb1d9861f5b03ed8fcf96a70123a623b1501ff5c9c0c35` again produced exactly `[false,true]` and `[true,false]`.
+- This remains an unsealed ForEach vertical; applicable route/mutation evidence and TaskPack sealing are incomplete.
 - Repository lock, Ruff, format, Mypy, full Pytest and diff checks are green after the deletion.

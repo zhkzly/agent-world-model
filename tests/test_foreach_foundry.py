@@ -10,6 +10,7 @@ import pytest
 import agent_env_foundry.foreach_foundry as foreach_module
 from agent_env_foundry.foreach_foundry import (
     ForEachAdmissionPlan,
+    ForEachAgentChoicePerturbation,
     ForEachPartialChallenge,
     ForEachPartialChallengeReport,
     ForEachTask,
@@ -124,6 +125,7 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
     assert task.task_id
     assert task.to_document()["semantic_keys"] == ["item:1", "item:2"]
     plan = _plan(task)
+    assert plan.to_document()["agent_choice_policy"] == "perturb_each_occurrence"
     solved = SolvedForEachTask(
         task,
         plan,
@@ -209,6 +211,20 @@ def test_foreach_plan_freezes_before_any_witness_opens(
     with pytest.raises(StopAfterPlan):
         foreach_module.solve_foreach_task_twice(Prepared(), task, tmp_path)  # type: ignore[arg-type]
     assert events == ["plan"]
+
+
+def test_foreach_agent_choice_perturbation_requires_every_member_to_stay_satisfied() -> None:
+    with pytest.raises(TaskFoundryError, match="AgentChoice"):
+        ForEachAgentChoicePerturbation(
+            "a" * 64,
+            "b" * 64,
+            1,
+            "/reason",
+            "original",
+            "alternative",
+            (),
+            (_result(), _result(satisfied=False)),
+        )
 
 
 def test_foreach_fresh_selection_must_match_the_complete_frozen_set() -> None:

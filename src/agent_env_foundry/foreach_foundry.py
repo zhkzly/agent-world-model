@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from jsonschema import Draft202012Validator
+
 from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
@@ -24,7 +26,14 @@ from agent_env_foundry.semantics import (
     StartCase,
     TraceEvent,
 )
-from agent_env_foundry.task_foundry import AtomTask, TaskFoundryError
+from agent_env_foundry.task_foundry import (
+    _NO_ALTERNATIVE,
+    AtomTask,
+    TaskFoundryError,
+    _alternative_value,
+    _replay_arguments,
+    _schema_at_pointer,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +109,7 @@ class ForEachAdmissionPlan:
             "format": "foreach-admission-plan/1",
             "task_id": self.task_id,
             "omitted_member_indices": list(self.omitted_member_indices),
+            "agent_choice_policy": "perturb_each_occurrence",
         }
 
     def to_document(self) -> JSONObject:
@@ -263,6 +273,64 @@ class ForEachPartialChallengeReport:
 
     def to_document(self) -> JSONObject:
         return {**self._preimage(), "report_id": self.report_id}
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachAgentChoicePerturbation:
+    witness_id: str
+    materialization_id: str
+    event_seq: int
+    argument_pointer: str
+    original_value: JSONValue
+    replacement_value: JSONValue
+    trace: tuple[TraceEvent, ...]
+    member_results: tuple[AtomCheckResult, ...]
+
+    def __post_init__(self) -> None:
+        if self.original_value == self.replacement_value or any(
+            not item.satisfied for item in self.member_results
+        ):
+            raise TaskFoundryError(
+                "foreach_agent_choice_load_bearing",
+                "Changing one ForEach AgentChoice caused a member checker to fail",
+                event_seq=self.event_seq,
+                argument_pointer=self.argument_pointer,
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "foreach-agent-choice-perturbation/1",
+            "witness_id": self.witness_id,
+            "materialization_id": self.materialization_id,
+            "event_seq": self.event_seq,
+            "argument_pointer": self.argument_pointer,
+            "original_value": _json(self.original_value),
+            "replacement_value": _json(self.replacement_value),
+            "trace": [item.to_document() for item in self.trace],
+            "member_results": [item.to_document() for item in self.member_results],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachAgentChoiceProof:
+    task_id: str
+    admission_plan_id: str
+    perturbations: tuple[ForEachAgentChoicePerturbation, ...]
+
+    @property
+    def proof_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "foreach-agent-choice-proof/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "perturbations": [item.to_document() for item in self.perturbations],
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "proof_id": self.proof_id}
 
 
 def compile_foreach_tasks(
@@ -551,6 +619,115 @@ def challenge_foreach_partials(
     )
 
 
+def prove_foreach_agent_choices_non_load_bearing(
+    prepared: OpenPreparedRelease,
+    solved: SolvedForEachTask,
+    instance_root: Path,
+) -> ForEachAgentChoiceProof:
+    """Perturb every witness AgentChoice independently on a fresh full-selection replay."""
+
+    task = solved.task
+    _verify_task(prepared, task)
+    choices = [
+        (witness, occurrence)
+        for witness in solved.witnesses
+        for occurrence in witness.argument_provenance
+        if occurrence.source_kind == "agent_choice"
+    ]
+    perturbations: list[ForEachAgentChoicePerturbation] = []
+    for index, (witness, occurrence) in enumerate(choices, start=1):
+        instance = Path(instance_root) / f"choice-{index}"
+        with prepared.open(instance) as session:
+            reset = session.actor.reset(task.start_case.reset_input)
+            before = session.trusted.inspect(instance)
+            bindings = _resolve_complete_selection(session, task, before)
+            tool_specs = {item["name"]: item for item in session.actor.tools()}
+            source_event = next(item for item in witness.trace if item.seq == occurrence.event_seq)
+            source_spec = tool_specs[source_event.tool_name]
+            schema = _schema_at_pointer(source_spec["input_schema"], occurrence.argument_pointer)
+            replacement = _alternative_value(schema, occurrence.value)
+            if replacement is _NO_ALTERNATIVE:
+                raise TaskFoundryError(
+                    "foreach_agent_choice_not_perturbable",
+                    "ForEach AgentChoice schema has no distinct valid alternative",
+                    event_seq=occurrence.event_seq,
+                    argument_pointer=occurrence.argument_pointer,
+                )
+            replay_observations: dict[int, JSONObject] = {}
+            replay_trace: list[TraceEvent] = []
+            provenance_by_event = {
+                event.seq: tuple(
+                    item for item in witness.argument_provenance if item.event_seq == event.seq
+                )
+                for event in witness.trace
+            }
+            for event in witness.trace:
+                arguments = _replay_arguments(
+                    event,
+                    provenance_by_event[event.seq],
+                    reset,
+                    replay_observations,
+                    (occurrence.event_seq, occurrence.argument_pointer),
+                    cast(JSONValue, replacement),
+                )
+                spec = tool_specs[event.tool_name]
+                errors = tuple(Draft202012Validator(spec["input_schema"]).iter_errors(arguments))
+                if errors:
+                    raise TaskFoundryError(
+                        "foreach_replay_arguments_invalid",
+                        "Perturbed ForEach replay arguments violate the ToolSpec",
+                        event_seq=event.seq,
+                        original_message=errors[0].message,
+                    )
+                observation = _json_object(session.actor.invoke(event.tool_name, arguments))
+                replay_observations[event.seq] = observation
+                replay_trace.append(TraceEvent(event.seq, event.tool_name, arguments, observation))
+            answers = witness.final_answer.get("results")
+            if not isinstance(answers, list) or len(answers) != len(bindings):
+                raise TaskFoundryError(
+                    "foreach_replay_answer_count_mismatch",
+                    "ForEach witness answer cannot be replayed over the complete selection",
+                )
+            after = session.trusted.inspect(instance)
+            contexts = _contexts(task, bindings)
+            results = tuple(
+                session.trusted.evaluate_atom(
+                    AtomCheckRequest(
+                        task.capability_id,
+                        before,
+                        after,
+                        binding.protected_binding,
+                        tuple(replay_trace),
+                        answers[position],
+                        contexts[position],
+                    )
+                )
+                for position, binding in enumerate(bindings)
+            )
+            perturbations.append(
+                ForEachAgentChoicePerturbation(
+                    witness.witness_id,
+                    session.identity.materialization_id,
+                    occurrence.event_seq,
+                    occurrence.argument_pointer,
+                    occurrence.value,
+                    cast(JSONValue, replacement),
+                    tuple(replay_trace),
+                    results,
+                )
+            )
+    if len(perturbations) != len(choices):
+        raise TaskFoundryError(
+            "foreach_agent_choice_proof_incomplete",
+            "ForEach AgentChoice proof omitted a witness occurrence",
+        )
+    return ForEachAgentChoiceProof(
+        task.task_id,
+        solved.admission_plan.plan_id,
+        tuple(perturbations),
+    )
+
+
 def _prove_initially_false(
     prepared: OpenPreparedRelease,
     task: ForEachTask,
@@ -721,12 +898,15 @@ def _json_object(value: Any) -> JSONObject:
 
 __all__ = [
     "ForEachAdmissionPlan",
+    "ForEachAgentChoicePerturbation",
+    "ForEachAgentChoiceProof",
     "ForEachPartialChallenge",
     "ForEachPartialChallengeReport",
     "ForEachTask",
     "ForEachWitness",
     "SolvedForEachTask",
     "compile_foreach_tasks",
+    "prove_foreach_agent_choices_non_load_bearing",
     "challenge_foreach_partials",
     "solve_foreach_task_twice",
 ]
