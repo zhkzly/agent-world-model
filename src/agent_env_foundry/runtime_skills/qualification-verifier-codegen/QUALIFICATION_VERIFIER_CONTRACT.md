@@ -54,6 +54,11 @@ actor. A business refusal is an executed process: its observation has
 capability expects that error code, do not mistake `ok=false` for a missing or
 failed process.
 
+Scope public process evidence to the selected public referent. A sibling call,
+success, or business refusal may be collateral-safe but must not satisfy the
+current referent's required effect or process axis; validate its arguments and
+corresponding outcome/error code.
+
 ## Exact result
 
 Return exactly:

@@ -216,6 +216,11 @@ GoalEvaluationContext:
   foreach_selector_id, permitted_sibling_slots
 ```
 
+Every evaluator scopes public process evidence to its current selected binding.
+A successful or refused sibling call may be permitted collateral, but it must
+not satisfy the current binding's required effect or process axis. Validate the
+target arguments/referent and the corresponding outcome or stable refusal code.
+
 The evaluation context contains the exact run-local protected bindings selected
 for the current Goal. `permitted_sibling_slots` must match the qualified
 CompositionRule or ForEach selection. Evaluators may allow those sibling effects

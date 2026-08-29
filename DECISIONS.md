@@ -160,3 +160,5 @@
 `s2-if-taskpack|介入0|返工0|reuse full Atom branch admission+2 conditional witnesses+preimage mutation licence|红线违反0`
 
 `s2-query-taskpack|介入1|返工4|non-leaking reset+13 physical Qualification cases+2 executable reader mutants+cold audit+2 fresh query witnesses+3 framework mutation licences|红线违反0`
+
+`s2-multistart-simplification|介入1|返工2|StartCase-scoped If identity+selected-binding refusal isolation+delete mandatory Atom alternative route+3 refreshed real TaskPacks|红线违反0`

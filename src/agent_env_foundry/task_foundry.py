@@ -39,13 +39,6 @@ _ATOM_CHALLENGE_CATEGORIES = (
     "missing_process",
     "collateral",
 )
-_ALTERNATIVE_ROUTE_POLICY = "non_subsequence_tool_sequence"
-_ALTERNATIVE_ROUTE_PROMPT = (
-    "Alternative-route checker challenge: solve the same public task, but do not use "
-    "the reference tool-name sequence below. Use a meaningfully different sequence; "
-    "merely inserting or deleting redundant calls does not count. Reference sequence: {route}"
-)
-_ALTERNATIVE_ROUTE_PROMPT_DIGEST = hashlib.sha256(_ALTERNATIVE_ROUTE_PROMPT.encode()).hexdigest()
 
 
 class TaskFoundryError(RuntimeError):
@@ -225,7 +218,6 @@ class AtomCheckerMutationSpec:
 class AtomAdmissionPlan:
     task_id: str
     agent_choice_policy: str
-    alternative_route_policy: str
     no_op_result: AtomCheckResult
     checker_mutations: tuple[AtomCheckerMutationSpec, ...]
     challenges: tuple[AtomPlannedChallenge, ...]
@@ -235,11 +227,6 @@ class AtomAdmissionPlan:
             raise TaskFoundryError(
                 "admission_agent_choice_policy_invalid",
                 "Atom admission must perturb every AgentChoice occurrence",
-            )
-        if self.alternative_route_policy != _ALTERNATIVE_ROUTE_POLICY:
-            raise TaskFoundryError(
-                "admission_alternative_route_policy_invalid",
-                "Atom admission must require a non-subsequence alternative tool sequence",
             )
         if self.no_op_result.satisfied:
             raise TaskFoundryError(
@@ -275,11 +262,9 @@ class AtomAdmissionPlan:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-admission-plan/2",
+            "format": "atom-admission-plan/3",
             "task_id": self.task_id,
             "agent_choice_policy": self.agent_choice_policy,
-            "alternative_route_policy": self.alternative_route_policy,
-            "alternative_route_prompt_digest": _ALTERNATIVE_ROUTE_PROMPT_DIGEST,
             "no_op_result": self.no_op_result.to_document(),
             "checker_mutations": [item.to_document() for item in self.checker_mutations],
             "challenges": [item.to_document() for item in self.challenges],
@@ -629,61 +614,10 @@ class AgentChoiceProof:
 
 
 @dataclass(frozen=True, slots=True)
-class AlternativeRouteProof:
-    task_id: str
-    admission_plan_id: str
-    reference_witness_id: str
-    materialization_id: str
-    challenge_instruction_digest: str
-    reference_route: tuple[str, ...]
-    trace: tuple[TraceEvent, ...]
-    final_answer: JSONObject
-    result: AtomCheckResult
-
-    def __post_init__(self) -> None:
-        candidate_route = tuple(item.tool_name for item in self.trace)
-        if not _meaningfully_distinct_route(self.reference_route, candidate_route):
-            raise TaskFoundryError(
-                "alternative_route_not_distinct",
-                "Alternative route only inserts or deletes calls from the reference route",
-                reference_route=self.reference_route,
-                candidate_route=candidate_route,
-            )
-        if not self.result.satisfied:
-            raise TaskFoundryError(
-                "alternative_route_not_accepted",
-                "Frozen checker rejected the meaningfully different public route",
-                result=self.result.to_document(),
-            )
-
-    @property
-    def proof_id(self) -> str:
-        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
-
-    def _preimage(self) -> JSONObject:
-        return {
-            "format": "alternative-route-proof/1",
-            "task_id": self.task_id,
-            "admission_plan_id": self.admission_plan_id,
-            "reference_witness_id": self.reference_witness_id,
-            "materialization_id": self.materialization_id,
-            "challenge_instruction_digest": self.challenge_instruction_digest,
-            "reference_route": list(self.reference_route),
-            "trace": [item.to_document() for item in self.trace],
-            "final_answer": _json_object(self.final_answer),
-            "result": self.result.to_document(),
-        }
-
-    def to_document(self) -> JSONObject:
-        return {**self._preimage(), "proof_id": self.proof_id}
-
-
-@dataclass(frozen=True, slots=True)
 class AtomAdmissionReport:
     solved: SolvedAtomTask
     challenges: AtomChallengeReport
     agent_choices: AgentChoiceProof
-    alternative_route: AlternativeRouteProof
     checker_mutations: AtomCheckerMutationReport
 
     def __post_init__(self) -> None:
@@ -692,11 +626,9 @@ class AtomAdmissionReport:
         if (
             self.challenges.task_id != task_id
             or self.agent_choices.task_id != task_id
-            or self.alternative_route.task_id != task_id
             or self.checker_mutations.task_id != task_id
             or self.challenges.admission_plan.plan_id != plan_id
             or self.agent_choices.admission_plan_id != plan_id
-            or self.alternative_route.admission_plan_id != plan_id
             or self.checker_mutations.admission_plan_id != plan_id
         ):
             raise TaskFoundryError(
@@ -720,12 +652,6 @@ class AtomAdmissionReport:
                 "atom_admission_agent_choice_incomplete",
                 "Atom admission does not perturb every witness AgentChoice exactly once",
             )
-        witness_ids = {item.witness_id for item in self.solved.witnesses}
-        if self.alternative_route.reference_witness_id not in witness_ids:
-            raise TaskFoundryError(
-                "atom_admission_alternative_reference_missing",
-                "Alternative-route proof does not reference one admitted witness",
-            )
         if tuple(item.spec for item in self.checker_mutations.mutations) != (
             self.solved.admission_plan.checker_mutations
         ):
@@ -734,15 +660,11 @@ class AtomAdmissionReport:
                 "Atom admission mutation evidence differs from its frozen plan",
             )
         witness_materializations = {item.materialization_id for item in self.solved.witnesses}
-        later_materializations = (
-            {
-                item.materialization_id
-                for item in self.challenges.challenges
-                if item.materialization_id is not None
-            }
-            | {item.materialization_id for item in self.agent_choices.perturbations}
-            | {self.alternative_route.materialization_id}
-        )
+        later_materializations = {
+            item.materialization_id
+            for item in self.challenges.challenges
+            if item.materialization_id is not None
+        } | {item.materialization_id for item in self.agent_choices.perturbations}
         if witness_materializations & later_materializations:
             raise TaskFoundryError(
                 "atom_admission_materialization_reused",
@@ -755,13 +677,12 @@ class AtomAdmissionReport:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-admission-report/1",
+            "format": "atom-admission-report/2",
             "task_id": self.solved.task.task_id,
             "admission_plan": self.solved.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.solved.witnesses],
             "challenges": self.challenges.to_document(),
             "agent_choices": self.agent_choices.to_document(),
-            "alternative_route": self.alternative_route.to_document(),
             "checker_mutations": self.checker_mutations.to_document(),
         }
 
@@ -787,7 +708,7 @@ class AtomTaskPack:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-task-pack/1",
+            "format": "atom-task-pack/2",
             "task": self.task.to_document(),
             "admission": self.admission.to_document(),
         }
@@ -800,7 +721,6 @@ def seal_atom_task_pack(
     solved: SolvedAtomTask,
     challenges: AtomChallengeReport,
     agent_choices: AgentChoiceProof,
-    alternative_route: AlternativeRouteProof,
     checker_mutations: AtomCheckerMutationReport,
 ) -> AtomTaskPack:
     """Seal one Atom Task only after every same-plan admission proof is complete."""
@@ -810,7 +730,6 @@ def seal_atom_task_pack(
         solved,
         challenges,
         agent_choices,
-        alternative_route,
         checker_mutations,
     )
     return AtomTaskPack(solved.task, admission)
@@ -849,15 +768,8 @@ def admit_atom_task(
         solved,
         root / "agent-choices",
     )
-    alternative = prove_alternative_route(
-        prepared,
-        solved,
-        root / "alternative-route",
-        route=route,
-        max_provider_turns=max_provider_turns,
-    )
     mutations = run_atom_checker_mutations(solved.admission_plan, challenges)
-    return seal_atom_task_pack(solved, challenges, choices, alternative, mutations)
+    return seal_atom_task_pack(solved, challenges, choices, mutations)
 
 
 def compile_atom_tasks(
@@ -1163,80 +1075,6 @@ def prove_agent_choices_non_load_bearing(
         solved.admission_plan.plan_id,
         tuple(perturbations),
     )
-
-
-def prove_alternative_route(
-    prepared: OpenPreparedRelease,
-    solved: SolvedAtomTask,
-    instance_root: Path,
-    *,
-    route: AgentRoute | None = None,
-    max_provider_turns: int = 8,
-) -> AlternativeRouteProof:
-    """Ask one fresh public Agent for a non-subsequence route and run the frozen checker."""
-
-    task = solved.task
-    if task.release_id != prepared.identity.release_id:
-        raise TaskFoundryError(
-            "task_release_mismatch",
-            "Atom Task belongs to another release",
-        )
-    if solved.admission_plan.alternative_route_policy != _ALTERNATIVE_ROUTE_POLICY:
-        raise TaskFoundryError(
-            "admission_alternative_route_policy_invalid",
-            "Solved Atom Task did not precommit to the alternative-route policy",
-        )
-    reference = solved.witnesses[0]
-    reference_route = tuple(item.tool_name for item in reference.trace)
-    route_text = json.dumps(
-        list(reference_route),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-    challenge_instruction = "\n\n".join(
-        (task.instruction, _ALTERNATIVE_ROUTE_PROMPT.format(route=route_text))
-    )
-    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
-    with prepared.open(instance_root) as session:
-        reset = session.actor.reset(task.start_case.reset_input)
-        before = session.trusted.inspect(instance_root)
-        binding = _resolve_binding(session, task, before)
-        episode = run_public_episode(
-            actor=session.actor,
-            instruction=challenge_instruction,
-            reset_observation=reset,
-            tool_specs=session.actor.tools(),
-            answer_schema=task.answer_schema,
-            route=selected_route,
-            max_provider_turns=max_provider_turns,
-        )
-        after = session.trusted.inspect(instance_root)
-        result = session.trusted.evaluate_atom(
-            AtomCheckRequest(
-                task.capability_id,
-                before,
-                after,
-                binding.protected_binding,
-                episode.trace,
-                episode.final_answer,
-                _context(
-                    task.capability_id,
-                    binding.semantic_key,
-                    binding.protected_binding,
-                ),
-            )
-        )
-        return AlternativeRouteProof(
-            task.task_id,
-            solved.admission_plan.plan_id,
-            reference.witness_id,
-            session.identity.materialization_id,
-            hashlib.sha256(challenge_instruction.encode()).hexdigest(),
-            reference_route,
-            episode.trace,
-            episode.final_answer,
-            result,
-        )
 
 
 def challenge_atom_task(
@@ -1675,7 +1513,6 @@ def _derive_atom_admission_plan(
     return AtomAdmissionPlan(
         task.task_id,
         "perturb_each_occurrence",
-        _ALTERNATIVE_ROUTE_POLICY,
         initial,
         _derive_checker_mutation_specs(planned_challenges, initial),
         planned_challenges,
@@ -1828,21 +1665,6 @@ def _combine_traces(
         )
         for item in second
     )
-
-
-def _meaningfully_distinct_route(
-    reference: tuple[str, ...],
-    candidate: tuple[str, ...],
-) -> bool:
-    return not _is_subsequence(reference, candidate) and not _is_subsequence(candidate, reference)
-
-
-def _is_subsequence(left: tuple[str, ...], right: tuple[str, ...]) -> bool:
-    position = 0
-    for item in right:
-        if position < len(left) and left[position] == item:
-            position += 1
-    return position == len(left)
 
 
 def _assert_collateral_discriminated(result: AtomCheckResult) -> None:
@@ -2160,7 +1982,6 @@ def _json_object(value: Any) -> JSONObject:
 __all__ = [
     "AgentChoicePerturbation",
     "AgentChoiceProof",
-    "AlternativeRouteProof",
     "AtomAdmissionPlan",
     "AtomAdmissionReport",
     "AtomChallengeReport",
@@ -2178,7 +1999,6 @@ __all__ = [
     "challenge_atom_task",
     "compile_atom_tasks",
     "prove_agent_choices_non_load_bearing",
-    "prove_alternative_route",
     "run_atom_checker_mutations",
     "seal_atom_task_pack",
     "solve_atom_task_twice",

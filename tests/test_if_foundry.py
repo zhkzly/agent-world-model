@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -12,11 +13,12 @@ from agent_env_foundry.if_foundry import (
     IfTask,
     IfWitness,
     SolvedIfTask,
+    compile_if_tasks,
     seal_if_task_pack,
 )
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import AtomCheckResult, ConditionCheckResult, StartCase
-from agent_env_foundry.task_foundry import TaskFoundryError
+from agent_env_foundry.task_foundry import AtomTask, TaskFoundryError
 
 
 def _task() -> IfTask:
@@ -81,6 +83,34 @@ def _witness(task: IfTask, materialization_id: str) -> IfWitness:
         _atom_result(satisfied=False),
         1,
         (None,),
+    )
+
+
+def _atom(start: StartCase) -> AtomTask:
+    answer_schema = {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
+    checker = {
+        "release_id": "a" * 64,
+        "start_case_id": start.case_id,
+        "capability_id": "cap-true",
+        "semantic_key": "item:1",
+        "answer_schema": answer_schema,
+    }
+    instruction = "Complete the selected public task."
+    return AtomTask(
+        "a" * 64,
+        start,
+        "cap-true",
+        "item:1",
+        {"item": "one"},
+        hashlib.sha256(canonical_bytes(checker)).hexdigest(),
+        instruction,
+        hashlib.sha256(instruction.encode()).hexdigest(),
+        answer_schema,
     )
 
 
@@ -158,3 +188,24 @@ def test_if_task_pack_reuses_the_exact_admitted_atom_branch() -> None:
 
     with pytest.raises(TaskFoundryError, match="differs from its frozen Atom branch"):
         seal_if_task_pack(solved, WrongBranchPack())  # type: ignore[arg-type]
+
+
+def test_if_atom_uniqueness_is_scoped_by_start_case(tmp_path: Path) -> None:
+    first = _atom(StartCase("first", {"mode": "first"}, ("first",)))
+    second = _atom(StartCase("second", {"mode": "second"}, ("second",)))
+
+    class ReachedOpen(RuntimeError):
+        pass
+
+    class Prepared:
+        identity = SimpleNamespace(release_id="a" * 64)
+
+        def open(self, _root: Path) -> object:
+            raise ReachedOpen
+
+    with pytest.raises(ReachedOpen):
+        compile_if_tasks(Prepared(), (first, second), tmp_path)  # type: ignore[arg-type]
+
+    with pytest.raises(TaskFoundryError) as caught:
+        compile_if_tasks(Prepared(), (first, first), tmp_path)  # type: ignore[arg-type]
+    assert caught.value.code == "if_atom_universe_invalid"

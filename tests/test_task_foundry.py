@@ -16,7 +16,6 @@ from agent_env_foundry.semantics import AtomCheckResult, StartCase, TraceEvent
 from agent_env_foundry.task_foundry import (
     AgentChoicePerturbation,
     AgentChoiceProof,
-    AlternativeRouteProof,
     AtomAdmissionPlan,
     AtomChallengeReport,
     AtomChallengeResult,
@@ -89,7 +88,6 @@ def _plan(task: AtomTask) -> AtomAdmissionPlan:
     return AtomAdmissionPlan(
         task.task_id,
         "perturb_each_occurrence",
-        "non_subsequence_tool_sequence",
         no_op_result,
         (
             AtomCheckerMutationSpec("force_satisfied", "no_op", "satisfied"),
@@ -189,7 +187,6 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
     plan = _plan(task)
     assert plan.plan_id
     assert plan.agent_choice_policy == "perturb_each_occurrence"
-    assert plan.alternative_route_policy == "non_subsequence_tool_sequence"
     assert tuple(item.category for item in plan.challenges) == (
         "no_op",
         "wrong_target",
@@ -203,7 +200,6 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
         AtomAdmissionPlan(
             task.task_id,
             "perturb_each_occurrence",
-            "non_subsequence_tool_sequence",
             plan.no_op_result,
             plan.checker_mutations,
             plan.challenges[:-1],
@@ -218,23 +214,12 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
         AtomAdmissionPlan(
             task.task_id,
             "ignore_choices",
-            "non_subsequence_tool_sequence",
             plan.no_op_result,
             plan.checker_mutations,
             plan.challenges,
         )
     assert caught.value.code == "admission_agent_choice_policy_invalid"
 
-    with pytest.raises(TaskFoundryError) as caught:
-        AtomAdmissionPlan(
-            task.task_id,
-            "perturb_each_occurrence",
-            "allow_extra_calls",
-            plan.no_op_result,
-            plan.checker_mutations,
-            plan.challenges,
-        )
-    assert caught.value.code == "admission_alternative_route_policy_invalid"
     assert tuple(item.mutation_id for item in plan.checker_mutations) == (
         "force_satisfied",
         "force_required_effects_ok",
@@ -316,60 +301,6 @@ def test_agent_choice_perturbation_requires_the_checker_to_stay_satisfied() -> N
     assert caught.value.code == "agent_choice_is_load_bearing"
 
 
-def test_alternative_route_requires_a_non_subsequence_tool_sequence() -> None:
-    reference = ("inspect", "submit", "inspect_result")
-    assert task_foundry_module._meaningfully_distinct_route(
-        reference,
-        ("inspect", "submit", "inspect_source"),
-    )
-    assert not task_foundry_module._meaningfully_distinct_route(
-        reference,
-        ("list", "inspect", "submit", "inspect_result"),
-    )
-    assert not task_foundry_module._meaningfully_distinct_route(
-        reference,
-        ("inspect", "submit"),
-    )
-    redundant_trace = (
-        TraceEvent(1, "list", {}, {"ok": True, "data": {}, "error": None}),
-        TraceEvent(2, "inspect", {}, {"ok": True, "data": {}, "error": None}),
-        TraceEvent(3, "submit", {}, {"ok": True, "data": {}, "error": None}),
-        TraceEvent(4, "inspect_result", {}, {"ok": True, "data": {}, "error": None}),
-    )
-    with pytest.raises(TaskFoundryError) as caught:
-        AlternativeRouteProof(
-            "a" * 64,
-            "b" * 64,
-            "c" * 64,
-            "d" * 64,
-            "e" * 64,
-            reference,
-            redundant_trace,
-            {},
-            _witness(_task(), "f" * 64).result,
-        )
-    assert caught.value.code == "alternative_route_not_distinct"
-
-    distinct_trace = (
-        TraceEvent(1, "inspect", {}, {"ok": True, "data": {}, "error": None}),
-        TraceEvent(2, "submit", {}, {"ok": True, "data": {}, "error": None}),
-        TraceEvent(3, "inspect_source", {}, {"ok": True, "data": {}, "error": None}),
-    )
-    with pytest.raises(TaskFoundryError) as caught:
-        AlternativeRouteProof(
-            "a" * 64,
-            "b" * 64,
-            "c" * 64,
-            "d" * 64,
-            "e" * 64,
-            reference,
-            distinct_trace,
-            {},
-            _witness(_task(), "f" * 64, satisfied=False).result,
-        )
-    assert caught.value.code == "alternative_route_not_accepted"
-
-
 def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
     task = _task()
     plan = _plan(task)
@@ -433,28 +364,16 @@ def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
     )
     mutations = run_atom_checker_mutations(plan, challenges)
     choices = AgentChoiceProof(task.task_id, plan.plan_id, ())
-    alternative = AlternativeRouteProof(
-        task.task_id,
-        plan.plan_id,
-        first.witness_id,
-        "6" * 64,
-        "7" * 64,
-        ("inspect", "submit", "result"),
-        trace("inspect", "submit", "source"),
-        {},
-        control,
-    )
 
-    task_pack = seal_atom_task_pack(solved, challenges, choices, alternative, mutations)
+    task_pack = seal_atom_task_pack(solved, challenges, choices, mutations)
     assert task_pack.task_pack_id
-    assert task_pack.to_document()["format"] == "atom-task-pack/1"
+    assert task_pack.to_document()["format"] == "atom-task-pack/2"
 
     with pytest.raises(TaskFoundryError) as caught:
         seal_atom_task_pack(
             solved,
             challenges,
-            choices,
-            replace(alternative, admission_plan_id="8" * 64),
+            replace(choices, admission_plan_id="8" * 64),
             mutations,
         )
     assert caught.value.code == "atom_admission_identity_mismatch"
@@ -476,7 +395,7 @@ def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
     )
     choice_solved = SolvedAtomTask(task, plan, (choice_witness, second))
     with pytest.raises(TaskFoundryError) as caught:
-        seal_atom_task_pack(choice_solved, challenges, choices, alternative, mutations)
+        seal_atom_task_pack(choice_solved, challenges, choices, mutations)
     assert caught.value.code == "atom_admission_agent_choice_incomplete"
 
 
@@ -641,7 +560,7 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
         (no_op, wrong_target, not_applicable, missing_process, collateral),
     )
     assert report.to_document()["format"] == "atom-challenge-report/1"
-    assert plan.to_document()["format"] == "atom-admission-plan/2"
+    assert plan.to_document()["format"] == "atom-admission-plan/3"
     mutation_report = run_atom_checker_mutations(plan, report)
     assert all(item.killed for item in mutation_report.mutations)
 
@@ -780,7 +699,6 @@ def test_admit_atom_task_runs_one_complete_existing_pipeline(
     solved = SimpleNamespace(admission_plan=plan)
     challenges = object()
     choices = object()
-    alternative = object()
     mutations = object()
     task_pack = object()
 
@@ -798,11 +716,6 @@ def test_admit_atom_task_runs_one_complete_existing_pipeline(
         task_foundry_module,
         "prove_agent_choices_non_load_bearing",
         lambda *_args: events.append(("choices", _args[-1])) or choices,
-    )
-    monkeypatch.setattr(
-        task_foundry_module,
-        "prove_alternative_route",
-        lambda *_args, **kwargs: events.append(("alternative", kwargs)) or alternative,
     )
     monkeypatch.setattr(
         task_foundry_module,
@@ -831,13 +744,11 @@ def test_admit_atom_task_runs_one_complete_existing_pipeline(
         "solve",
         "challenge",
         "choices",
-        "alternative",
         "mutations",
         "seal",
     ]
     assert events[0][1] == {"route": route, "max_provider_turns": 5}
     assert events[1][1] == {"route": route, "max_provider_turns": 5}
     assert events[2][1] == tmp_path / "agent-choices"
-    assert events[3][1] == {"route": route, "max_provider_turns": 5}
-    assert events[4][1] == (plan, challenges)
-    assert events[5][1] == (solved, challenges, choices, alternative, mutations)
+    assert events[3][1] == (plan, challenges)
+    assert events[4][1] == (solved, challenges, choices, mutations)

@@ -295,11 +295,14 @@ def compile_if_tasks(
             "task_release_mismatch",
             "Atom Task belongs to another release",
         )
-    atom_index = {(item.capability_id, item.semantic_key): item for item in atom_tasks}
+    atom_index = {
+        (item.start_case.case_id, item.capability_id, item.semantic_key): item
+        for item in atom_tasks
+    }
     if len(atom_index) != len(atom_tasks):
         raise TaskFoundryError(
             "if_atom_universe_invalid",
-            "If compiler requires a unique Atom Task per capability and semantic key",
+            "If compiler requires one Atom Task per StartCase, capability and semantic key",
         )
     root = Path(instance_root)
     compiled: list[IfTask] = []
