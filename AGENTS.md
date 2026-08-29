@@ -7,34 +7,18 @@ Accepted decisions may specialize, never contradict, those sources.
 Discussion-only turns are not state transitions. When the latest user message
 asks only for discussion, explanation, design exploration, or read-only
 research, answer it directly: do not resume implementation, do not dispatch a
-worker, do not edit files, and do not require a Patrol `ALLOW`. An active task
+worker, and do not edit files. An active task
 or injected workflow phase does not override the latest user intent.
-
-After compact/resume, inject only the deterministic alignment reminder; do not
-run semantic Patrol or gate discussion. Run the fresh, read-only
-`alignment-patrol` for persisted plan-document changes, after controlled
-write-worker turns, and immediately before supported implementation/lifecycle
-actions. Put each supported state-changing action in the same shell condition
-as its fresh Patrol check. A non-`ALLOW` result blocks only that attempted
-action; stored runtime verdicts are diagnostic and cannot authorize later work.
-
-This is a cooperative, auditable protocol for supported operations, not a claim
-that arbitrary host, shell, ignored-file, or external writes are intercepted.
 
 A not-yet-active task produced by discussion is reviewed as a candidate
 proposal against `PROJECT.md` and accepted decisions. It is not the current
 task and cannot authorize itself. Once explicitly activated, it becomes the
 canonical task authority for implementation checks.
 
-On `BLOCK` or `ASK`, surface the verdict instead of silently retrying around it.
-An explicit user instruction naming that exact action may override it once;
-record this as `OVERRIDDEN(BLOCK)` or `OVERRIDDEN(ASK)`, never as `ALLOW`. A
-changed action, diff, task, or scope requires a fresh review.
-
-Patrol checks exactly five failures: fake implementation, fake completion,
-causal-free patching, overdesign, and stale guidance/context drift. It may not
-edit files or spawn agents. `ALLOW` means only that the current task slice and
-transition have no detected violation; it never certifies global completion.
+After compact/resume, inject only deterministic Trellis task and workflow
+context. Alignment Patrol is disabled and must not be invoked as a hook or a
+manual implementation/lifecycle gate. Use the active task, deterministic tests
+and independent code review for ordinary implementation checks.
 
 Do not add product nodes, interfaces, packages, Consumers, Registry behavior,
 or other future implementation details while the active task is harness design.

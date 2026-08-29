@@ -8,11 +8,6 @@
             "type": "command",
             "command": "python3 -X utf8 .codex/hooks/session-start.py",
             "timeout": 30
-          },
-          {
-            "type": "command",
-            "command": "python3 -X utf8 \"$(git rev-parse --show-toplevel)/.trellis/scripts/run_alignment_patrol.py\" hook",
-            "timeout": 15
           }
         ]
       }

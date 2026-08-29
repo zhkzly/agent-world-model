@@ -312,46 +312,21 @@ class TriggerAndWiringTests(unittest.TestCase):
         self.assertIn("plan-document-write", card)
         self.assertIn("proposal, not authority", card)
 
-    def test_platform_hooks_and_workflow_reference_shared_runner(self):
+    def test_platform_hooks_and_guidance_leave_patrol_disabled(self):
         claude = json.loads((REPO_ROOT / ".claude/settings.json").read_text(encoding="utf-8"))
         codex = json.loads((REPO_ROOT / ".codex/hooks.json").read_text(encoding="utf-8"))
         runner_name = "run_alignment_patrol.py"
-        self.assertIn(runner_name, json.dumps(claude))
-        self.assertIn(runner_name, json.dumps(codex))
-        claude_groups = {
-            group.get("matcher"): json.dumps(group)
-            for group in claude["hooks"]["SessionStart"]
-        }
-        for source in ("compact", "resume", "fork"):
-            self.assertIn(source, claude_groups)
-            self.assertIn(runner_name, claude_groups[source])
-        self.assertIn(runner_name, json.dumps(codex["hooks"]["SessionStart"]))
-        patrol_commands = [
-            hook["command"]
-            for config in (claude, codex)
-            for group in config["hooks"]["SessionStart"]
-            for hook in group["hooks"]
-            if runner_name in hook["command"]
-        ]
-        self.assertTrue(patrol_commands)
-        self.assertTrue(
-            all("git rev-parse --show-toplevel" in command for command in patrol_commands),
-            patrol_commands,
-        )
-        patrol_timeouts = [
-            hook["timeout"]
-            for config in (claude, codex)
-            for group in config["hooks"]["SessionStart"]
-            for hook in group["hooks"]
-            if runner_name in hook["command"]
-        ]
-        self.assertTrue(all(timeout <= 30 for timeout in patrol_timeouts), patrol_timeouts)
+        self.assertNotIn(runner_name, json.dumps(claude))
+        self.assertNotIn(runner_name, json.dumps(codex))
+        self.assertIn("session-start.py", json.dumps(claude["hooks"]["SessionStart"]))
+        self.assertIn("session-start.py", json.dumps(codex["hooks"]["SessionStart"]))
+        self.assertIn("inject-workflow-state.py", json.dumps(claude["hooks"]))
+        self.assertIn("inject-workflow-state.py", json.dumps(codex["hooks"]))
         workflow = (REPO_ROOT / ".trellis/workflow.md").read_text(encoding="utf-8")
-        self.assertIn("alignment-patrol", workflow)
-        self.assertIn("worker-turn", workflow)
-        self.assertIn("transition", workflow)
-        self.assertIn("diagnostic only", workflow)
-        self.assertIn("&& <exact-transition-command>", workflow)
+        agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertNotIn("alignment-patrol", workflow)
+        self.assertIn("Alignment Patrol is disabled", agents)
+        self.assertIn("must not be invoked", agents)
         opened = re.findall(r"(?m)^\[workflow-state:([a-z0-9_-]+)\]\s*$", workflow)
         closed = re.findall(r"(?m)^\[/workflow-state:([a-z0-9_-]+)\]\s*$", workflow)
         self.assertEqual(opened, closed)
