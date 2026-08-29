@@ -20,13 +20,19 @@ from agent_env_foundry.semantics import (
     AtomCheckRequest,
     AtomCheckResult,
     BindingCandidate,
+    CapabilitySpec,
     EvaluationBinding,
     GoalEvaluationContext,
     StartCase,
     TraceEvent,
 )
 
-_ATOM_CHALLENGE_CATEGORIES = ("no_op", "wrong_answer", "missing_process")
+_ATOM_CHALLENGE_CATEGORIES = (
+    "no_op",
+    "wrong_target",
+    "wrong_answer",
+    "missing_process",
+)
 
 
 class TaskFoundryError(RuntimeError):
@@ -98,6 +104,7 @@ class AtomWitness:
 class AtomPlannedChallenge:
     category: str
     applicable: bool
+    target_task_id: str | None
     final_answer: JSONObject | None
     reason: str | None
 
@@ -112,6 +119,18 @@ class AtomPlannedChallenge:
             raise TaskFoundryError(
                 "admission_plan_disposition_invalid",
                 "Applicable challenges cannot have a reason; non-applicable challenges require one",
+                category=self.category,
+            )
+        if self.category == "wrong_target" and self.applicable:
+            if not self.target_task_id:
+                raise TaskFoundryError(
+                    "admission_plan_wrong_target_missing",
+                    "Applicable wrong-target challenge requires its frozen target Task",
+                )
+        elif self.target_task_id is not None:
+            raise TaskFoundryError(
+                "admission_plan_target_unexpected",
+                "Only an applicable wrong-target challenge may freeze a target Task",
                 category=self.category,
             )
         if self.category == "wrong_answer" and self.applicable:
@@ -131,6 +150,7 @@ class AtomPlannedChallenge:
         return {
             "category": self.category,
             "applicable": self.applicable,
+            "target_task_id": self.target_task_id,
             "final_answer": None if self.final_answer is None else _json_object(self.final_answer),
             "reason": self.reason,
         }
@@ -212,11 +232,26 @@ class SolvedAtomTask:
 class AtomChallengeResult:
     category: str
     applicable: bool
-    materialization_id: str
+    materialization_id: str | None
     trace: tuple[TraceEvent, ...]
     final_answer: JSONObject
     result: AtomCheckResult | None
     reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.applicable:
+            if not self.materialization_id or self.result is None or self.reason is not None:
+                raise TaskFoundryError(
+                    "challenge_evidence_incomplete",
+                    "Applicable Atom challenge requires materialization, result and no reason",
+                    category=self.category,
+                )
+        elif self.materialization_id is not None or self.result is not None or self.reason is None:
+            raise TaskFoundryError(
+                "challenge_non_applicable_evidence_invalid",
+                "Non-applicable Atom challenge requires only its frozen reason",
+                category=self.category,
+            )
 
     def to_document(self) -> JSONObject:
         return {
@@ -372,6 +407,7 @@ def compile_atom_tasks(
 def solve_atom_task_twice(
     prepared: OpenPreparedRelease,
     task: AtomTask,
+    task_universe: tuple[AtomTask, ...],
     instance_root: Path,
     *,
     route: AgentRoute | None = None,
@@ -387,6 +423,7 @@ def solve_atom_task_twice(
     admission_plan = _derive_atom_admission_plan(
         prepared,
         task,
+        task_universe,
         Path(instance_root) / "admission-plan",
     )
     selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
@@ -459,6 +496,7 @@ def solve_atom_task_twice(
 def challenge_atom_task(
     prepared: OpenPreparedRelease,
     solved: SolvedAtomTask,
+    task_universe: tuple[AtomTask, ...],
     instance_root: Path,
     *,
     route: AgentRoute | None = None,
@@ -508,6 +546,88 @@ def challenge_atom_task(
             )
         )
 
+    wrong_target_plan = _planned_challenge(admission_plan, "wrong_target")
+    if not wrong_target_plan.applicable:
+        challenges.append(
+            AtomChallengeResult(
+                "wrong_target",
+                False,
+                None,
+                (),
+                {},
+                None,
+                wrong_target_plan.reason,
+            )
+        )
+    else:
+        assert wrong_target_plan.target_task_id is not None
+        target_task = _task_by_id(task_universe, wrong_target_plan.target_task_id)
+        _verify_checker_preimage(prepared, target_task)
+        wrong_target_root = Path(instance_root) / "wrong-target"
+        with prepared.open(wrong_target_root) as session:
+            reset = session.actor.reset(target_task.start_case.reset_input)
+            before = session.trusted.inspect(wrong_target_root)
+            current_binding = _resolve_binding(session, task, before)
+            target_binding = _resolve_binding(session, target_task, before)
+            episode = run_public_episode(
+                actor=session.actor,
+                instruction=target_task.instruction,
+                reset_observation=reset,
+                tool_specs=session.actor.tools(),
+                answer_schema=target_task.answer_schema,
+                route=selected_route,
+                max_provider_turns=max_provider_turns,
+            )
+            after = session.trusted.inspect(wrong_target_root)
+            target_result = session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    target_task.capability_id,
+                    before,
+                    after,
+                    target_binding.protected_binding,
+                    episode.trace,
+                    episode.final_answer,
+                    _context(
+                        target_task.capability_id,
+                        target_binding.semantic_key,
+                        target_binding.protected_binding,
+                    ),
+                )
+            )
+            if not target_result.satisfied:
+                raise TaskFoundryError(
+                    "wrong_target_baseline_failed",
+                    "Planned wrong-target Task did not satisfy its own frozen checker",
+                    target_task_id=target_task.task_id,
+                    result=target_result.to_document(),
+                )
+            current_result = session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after,
+                    current_binding.protected_binding,
+                    episode.trace,
+                    episode.final_answer,
+                    _context(
+                        task.capability_id,
+                        current_binding.semantic_key,
+                        current_binding.protected_binding,
+                    ),
+                )
+            )
+            challenges.append(
+                AtomChallengeResult(
+                    "wrong_target",
+                    True,
+                    session.identity.materialization_id,
+                    episode.trace,
+                    episode.final_answer,
+                    current_result,
+                    None,
+                )
+            )
+
     active_root = Path(instance_root) / "active"
     with prepared.open(active_root) as session:
         reset = session.actor.reset(task.start_case.reset_input)
@@ -545,13 +665,13 @@ def challenge_atom_task(
                 "Atom challenge baseline did not satisfy the checker",
                 result=correct.to_document(),
             )
-        wrong_answer_plan = admission_plan.challenges[1]
+        wrong_answer_plan = _planned_challenge(admission_plan, "wrong_answer")
         if not wrong_answer_plan.applicable:
             challenges.append(
                 AtomChallengeResult(
                     "wrong_answer",
                     False,
-                    session.identity.materialization_id,
+                    None,
                     (),
                     {},
                     None,
@@ -589,13 +709,13 @@ def challenge_atom_task(
                 )
             )
 
-        missing_process_plan = admission_plan.challenges[2]
+        missing_process_plan = _planned_challenge(admission_plan, "missing_process")
         if not missing_process_plan.applicable:
             challenges.append(
                 AtomChallengeResult(
                     "missing_process",
                     False,
-                    session.identity.materialization_id,
+                    None,
                     (),
                     {},
                     None,
@@ -636,15 +756,28 @@ def challenge_atom_task(
 def _derive_atom_admission_plan(
     prepared: OpenPreparedRelease,
     task: AtomTask,
+    task_universe: tuple[AtomTask, ...],
     instance_root: Path,
 ) -> AtomAdmissionPlan:
     """Freeze deterministic challenge dispositions before any witness model call."""
 
     _verify_checker_preimage(prepared, task)
+    task_ids = tuple(item.task_id for item in task_universe)
+    if len(task_ids) != len(set(task_ids)) or task.task_id not in task_ids:
+        raise TaskFoundryError(
+            "admission_task_universe_invalid",
+            "Atom admission requires a unique Task universe containing the current Task",
+        )
+    if any(item.release_id != task.release_id for item in task_universe):
+        raise TaskFoundryError(
+            "admission_task_universe_release_mismatch",
+            "Atom admission Task universe crosses release identities",
+        )
     with prepared.open(instance_root) as session:
         session.actor.reset(task.start_case.reset_input)
         facts = session.trusted.inspect(instance_root)
         binding = _resolve_binding(session, task, facts)
+        capabilities = {item.capability_id: item for item in session.trusted.capabilities()}
         initial = session.trusted.evaluate_atom(
             AtomCheckRequest(
                 task.capability_id,
@@ -656,23 +789,37 @@ def _derive_atom_admission_plan(
                 _context(task.capability_id, binding.semantic_key, binding.protected_binding),
             )
         )
+    wrong_target = _select_wrong_target_task(task, task_universe, capabilities)
+    wrong_target_plan = (
+        AtomPlannedChallenge("wrong_target", True, wrong_target.task_id, None, None)
+        if wrong_target is not None
+        else AtomPlannedChallenge(
+            "wrong_target",
+            False,
+            None,
+            None,
+            "no other compiled Atom Task shares this release and StartCase",
+        )
+    )
     wrong_answer = _wrong_answer(task.answer_schema, initial.report_values)
     wrong_answer_plan = (
-        AtomPlannedChallenge("wrong_answer", True, wrong_answer, None)
+        AtomPlannedChallenge("wrong_answer", True, None, wrong_answer, None)
         if wrong_answer is not None
         else AtomPlannedChallenge(
             "wrong_answer",
             False,
             None,
+            None,
             "answer schema has no schema-valid alternative value",
         )
     )
     process_plan = (
-        AtomPlannedChallenge("missing_process", True, None, None)
+        AtomPlannedChallenge("missing_process", True, None, None, None)
         if initial.process_ok is not None
         else AtomPlannedChallenge(
             "missing_process",
             False,
+            None,
             None,
             "capability checker declares no process outcome axis",
         )
@@ -680,11 +827,66 @@ def _derive_atom_admission_plan(
     return AtomAdmissionPlan(
         task.task_id,
         (
-            AtomPlannedChallenge("no_op", True, None, None),
+            AtomPlannedChallenge("no_op", True, None, None, None),
+            wrong_target_plan,
             wrong_answer_plan,
             process_plan,
         ),
     )
+
+
+def _select_wrong_target_task(
+    task: AtomTask,
+    task_universe: tuple[AtomTask, ...],
+    capabilities: dict[str, CapabilitySpec],
+) -> AtomTask | None:
+    current = capabilities.get(task.capability_id)
+    if current is None:
+        raise TaskFoundryError(
+            "task_capability_missing",
+            "live release no longer exposes the Task capability",
+        )
+    candidates = [
+        item
+        for item in task_universe
+        if item.task_id != task.task_id and item.start_case == task.start_case
+    ]
+    for item in candidates:
+        if item.capability_id not in capabilities:
+            raise TaskFoundryError(
+                "admission_target_capability_missing",
+                "Task universe contains a capability absent from the live release",
+                capability_id=item.capability_id,
+            )
+
+    def rank(item: AtomTask) -> tuple[int, int, int, str, str, str]:
+        candidate = capabilities[item.capability_id]
+        shared_workflow = bool(set(current.workflow_ids) & set(candidate.workflow_ids))
+        return (
+            int(item.capability_id != task.capability_id),
+            int(not shared_workflow),
+            int(candidate.task_kind != current.task_kind),
+            item.capability_id,
+            item.semantic_key,
+            item.task_id,
+        )
+
+    return min(candidates, key=rank) if candidates else None
+
+
+def _planned_challenge(plan: AtomAdmissionPlan, category: str) -> AtomPlannedChallenge:
+    return next(item for item in plan.challenges if item.category == category)
+
+
+def _task_by_id(task_universe: tuple[AtomTask, ...], task_id: str) -> AtomTask:
+    matching = [item for item in task_universe if item.task_id == task_id]
+    if len(matching) != 1:
+        raise TaskFoundryError(
+            "admission_target_task_missing",
+            "Frozen wrong-target Task is not uniquely present in the Task universe",
+            target_task_id=task_id,
+        )
+    return matching[0]
 
 
 def _verify_checker_preimage(

@@ -77,14 +77,16 @@ def _plan(task: AtomTask) -> AtomAdmissionPlan:
     return AtomAdmissionPlan(
         task.task_id,
         (
-            AtomPlannedChallenge("no_op", True, None, None),
+            AtomPlannedChallenge("no_op", True, None, None, None),
+            AtomPlannedChallenge("wrong_target", True, "d" * 64, None, None),
             AtomPlannedChallenge(
                 "wrong_answer",
                 False,
                 None,
+                None,
                 "answer schema has no schema-valid alternative value",
             ),
-            AtomPlannedChallenge("missing_process", True, None, None),
+            AtomPlannedChallenge("missing_process", True, None, None, None),
         ),
     )
 
@@ -119,13 +121,19 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
     assert plan.plan_id
     assert tuple(item.category for item in plan.challenges) == (
         "no_op",
+        "wrong_target",
         "wrong_answer",
         "missing_process",
     )
+    assert plan.challenges[1].target_task_id == "d" * 64
 
     with pytest.raises(TaskFoundryError) as caught:
         AtomAdmissionPlan(task.task_id, plan.challenges[:-1])
     assert caught.value.code == "admission_plan_incomplete"
+
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomPlannedChallenge("wrong_target", True, None, None, None)
+    assert caught.value.code == "admission_plan_wrong_target_missing"
 
 
 def test_solve_freezes_admission_plan_before_opening_a_witness(
@@ -151,8 +159,47 @@ def test_solve_freezes_admission_plan_before_opening_a_witness(
 
     monkeypatch.setattr(task_foundry_module, "_derive_atom_admission_plan", stop_after_plan)
     with pytest.raises(StopAfterPlan):
-        solve_atom_task_twice(Prepared(), task, tmp_path)  # type: ignore[arg-type]
+        solve_atom_task_twice(Prepared(), task, (task,), tmp_path)  # type: ignore[arg-type]
     assert events == ["plan"]
+
+
+def test_wrong_target_selection_prefers_same_capability_then_shared_workflow() -> None:
+    current = _task()
+    same_capability = replace(
+        current,
+        semantic_key="item:2",
+        public_descriptor={"item": "two"},
+    )
+    shared_workflow = replace(
+        current,
+        capability_id="cap-2",
+        semantic_key="item:3",
+        public_descriptor={"item": "three"},
+    )
+    unrelated = replace(
+        current,
+        capability_id="cap-3",
+        semantic_key="item:4",
+        public_descriptor={"item": "four"},
+    )
+    capabilities = {
+        "cap-1": SimpleNamespace(workflow_ids=("workflow-1",), task_kind="state_change"),
+        "cap-2": SimpleNamespace(workflow_ids=("workflow-1",), task_kind="state_change"),
+        "cap-3": SimpleNamespace(workflow_ids=("workflow-2",), task_kind="query"),
+    }
+
+    selected = task_foundry_module._select_wrong_target_task(
+        current,
+        (current, unrelated, shared_workflow, same_capability),
+        capabilities,  # type: ignore[arg-type]
+    )
+    assert selected == same_capability
+    selected = task_foundry_module._select_wrong_target_task(
+        current,
+        (current, unrelated, shared_workflow),
+        capabilities,  # type: ignore[arg-type]
+    )
+    assert selected == shared_workflow
 
 
 def test_atom_challenge_report_requires_rejected_noop() -> None:
@@ -177,10 +224,11 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
         rejected,
         None,
     )
+    wrong_target = replace(no_op, category="wrong_target")
     not_applicable = AtomChallengeResult(
         "wrong_answer",
         False,
-        "b" * 64,
+        None,
         (),
         {},
         None,
@@ -190,12 +238,12 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
     report = AtomChallengeReport(
         task.task_id,
         plan,
-        (no_op, not_applicable, missing_process),
+        (no_op, wrong_target, not_applicable, missing_process),
     )
     assert report.to_document()["format"] == "atom-challenge-report/1"
 
     with pytest.raises(TaskFoundryError) as caught:
-        AtomChallengeReport(task.task_id, plan, (no_op, not_applicable))
+        AtomChallengeReport(task.task_id, plan, (no_op, wrong_target, not_applicable))
     assert caught.value.code == "challenge_plan_incomplete"
 
     accepted = replace(no_op, result=_witness(task, "c" * 64).result)
@@ -203,6 +251,15 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
         AtomChallengeReport(
             task.task_id,
             plan,
-            (accepted, not_applicable, missing_process),
+            (accepted, wrong_target, not_applicable, missing_process),
+        )
+    assert caught.value.code == "challenge_false_acceptance"
+
+    accepted_wrong_target = replace(wrong_target, result=_witness(task, "c" * 64).result)
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomChallengeReport(
+            task.task_id,
+            plan,
+            (no_op, accepted_wrong_target, not_applicable, missing_process),
         )
     assert caught.value.code == "challenge_false_acceptance"

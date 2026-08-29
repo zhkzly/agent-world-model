@@ -47,5 +47,6 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - Every compiled checker was false initially and frozen before instruction exposure; all 6 exact instructions passed two fresh public-only witnesses (12 total) with independent materialization IDs and rebinding.
 - A new Atom admission run freezes plan `90a247e9111a09da5f3303bffa699e834dbcae40d4f6bed9bc84b916b2243d14` before any witness call for Task `197d40396dd6b510124ba1f85d75d03e8e76db428fbd563b8359c00e41dabd68`.
 - Its two fresh public witnesses used distinct materializations and both satisfied the checker; independently executed no-op and full process-ablation challenges were rejected.
-- This is partial Checkpoint F evidence only. Wrong/near-miss target, collateral, alternative-route, argument provenance and checker mutation remain blocking before any TaskPack claim.
+- The next fresh CAP-002 run froze CAP-003/`charge:CHG-INELIGIBLE-001` as its wrong-target Task, proved that target's own checker passed, then proved CAP-002 rejected the same physical episode.
+- This is partial Checkpoint F evidence only. Collateral, alternative-route, argument provenance and checker mutation remain blocking before any TaskPack claim.
 - Repository lock, Ruff, format, Mypy, full Pytest and diff checks are green after the deletion.
