@@ -8,10 +8,9 @@ and Qualification alone decide whether it is usable.
 
 - `EXPECTED_TASK_SEMANTICS.json`: accepted Requirement dispositions and the
   expected capability/workflow/composition/condition relations, including the
-  exact answer field IDs and public labels shared with the independent native
-  oracle.
-- `PUBLIC_SURFACE.json`: public schemas, ToolSpecs, real public probe facts and
-  the exact candidate-view manifest.
+  exact answer field IDs and public labels later checked by v2 Qualification.
+- `PUBLIC_SURFACE.json`: the actor factory, public schemas, ToolSpecs, public
+  documents and the exact candidate-view digest.
 - `candidate-view/`: read-only actor source/native format documentation exposed
   only after expected semantics were frozen.
 
@@ -149,9 +148,9 @@ TraceEvent:
   seq, tool_name, arguments, observation
 ```
 
-`start_cases` must include every distinct reset input demonstrated in
-`PUBLIC_SURFACE.json.public_probe_facts`. Case IDs alone do not create different
-world regimes. Repeated `(seed, limit)` calls return identical records.
+`start_cases` must return deterministic, schema-valid reset-only world regimes.
+Case IDs alone do not create different world regimes. Repeated `(seed, limit)`
+calls return identical records.
 
 ## Separation and state rules
 
@@ -164,7 +163,7 @@ world regimes. Repeated `(seed, limit)` calls return identical records.
 - Protected bindings/native fields must never be copied into public descriptors,
   labels or rendering text.
 - `public_tool` facets and conditions require an exact ToolSpec output-schema
-  pointer and must agree with real public facts.
+  pointer and must agree with real public execution during Qualification.
 - Composition and condition branches may only use the frozen Requirement,
   workflow and capability relations.
 - Return structured values; do not return scalar rewards or terminal verdicts.

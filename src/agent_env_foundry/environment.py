@@ -1,4 +1,4 @@
-"""Canonical environment contract and release loader (S1 Slice 1).
+"""Transport-neutral actor environment types and validation.
 
 Transport-neutral surface every generated environment package implements:
 
@@ -10,8 +10,6 @@ Transport-neutral surface every generated environment package implements:
   the tool catalog (unique names, complete self-contained Draft 2020-12
   schemas, object-root inputs) and every domain observation before it reaches
   the caller;
-- ``load_environment``: standard ``module:factory`` import with a
-  caller-owned instance directory (loading never implies reset).
 
 Reserved ``contract.unknown_tool`` / ``contract.invalid_arguments``
 observations are produced by the wrapper before any domain dispatch; the
@@ -22,13 +20,10 @@ here — adapters own any transport or correlation concerns.
 
 from __future__ import annotations
 
-import importlib
-from pathlib import Path
 from typing import Any, NotRequired, Protocol, TypedDict, cast, runtime_checkable
 
 from agent_env_foundry.errors import EnvironmentContractError, EnvironmentRuntimeError
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
-from agent_env_foundry.release import ValidatedReleaseContract, verify_release
 from agent_env_foundry.schema import (
     SchemaError,
     require_object_root,
@@ -50,7 +45,6 @@ __all__ = [
     "failure_observation",
     "invalid_arguments_observation",
     "is_contract_observation",
-    "load_environment",
     "success_observation",
     "unknown_tool_observation",
     "validate_observation",
@@ -329,44 +323,3 @@ class ValidatedEnvironment:
             self._environment.close()
         except Exception as exc:
             raise EnvironmentRuntimeError(f"close failed: {exc}") from exc
-
-
-# -------------------------------------------------------------------- loading
-
-
-def load_environment(
-    release_path: str | Path, instance_directory: str | Path
-) -> ValidatedEnvironment:
-    """Load a release into a caller-owned instance directory.
-
-    The instance directory is created if absent and handed to the release's
-    standard ``module:factory`` entry point; loading implies no reset and never
-    deletes committed state. Caller adapters own any transport concerns.
-    """
-    verified: ValidatedReleaseContract = verify_release(Path(release_path))
-    module_name, _, attribute = verified.descriptor.environment_factory.partition(":")
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError as exc:
-        raise EnvironmentContractError(
-            f"cannot import environment factory module {module_name!r}: {exc}"
-        ) from exc
-    factory = getattr(module, attribute, None)
-    if not callable(factory):
-        raise EnvironmentContractError(
-            f"environment factory {verified.descriptor.environment_factory!r} is not callable"
-        )
-    instance = Path(instance_directory)
-    instance.mkdir(parents=True, exist_ok=True)
-    environment = factory(instance)
-    for method in ("reset", "tools", "invoke", "close"):
-        if not callable(getattr(environment, method, None)):
-            raise EnvironmentContractError(
-                f"environment factory {verified.descriptor.environment_factory!r} returned "
-                f"an object missing the canonical {method} method"
-            )
-    return ValidatedEnvironment(
-        environment,
-        start_schema=verified.start_schema,
-        reset_observation_schema=verified.reset_observation_schema,
-    )

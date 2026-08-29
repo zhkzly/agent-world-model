@@ -1,6 +1,5 @@
 {"file":"PROJECT.md","reason":"Stable product intent, Good Task contract and exact framework/Codex/Responses ownership after the implementation-readiness rewrite."}
 {"file":"DECISIONS.md","reason":"Current clean-break decisions: S1 v2 TaskSemantics, four-node GoalProgram, checker-instruction-witness order, trace evidence and separate assessment identity."}
 {"file":".trellis/spec/backend/s1-coordinator.md","reason":"Existing direct imperative S1 coordinator, cold-publication and no-compatibility conventions that v2 must preserve."}
-{"file":".trellis/spec/backend/qualification-debugging.md","reason":"Existing independent public/native Qualification, physical-negative and causal-repair contract to extend rather than duplicate."}
 {"file":".trellis/tasks/08-26-s2-task-foundry/research/implementation-readiness-audit.md","reason":"Final code-level audit: blocking ambiguities corrected, role matrix, Good Task mapping, remaining risks and anti-overdesign rule."}
 {"file":".trellis/tasks/08-26-s2-task-foundry/research/goal-first-design-audit.md","reason":"Earlier adversarial feasibility findings and risks; use only where consistent with the newer readiness audit and canonical PRD/design."}

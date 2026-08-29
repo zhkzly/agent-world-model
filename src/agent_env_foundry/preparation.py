@@ -20,7 +20,6 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any, Literal, Protocol, Self, TextIO, cast, runtime_checkable
 
-from agent_env_foundry._qualification_runner import _tree_manifest
 from agent_env_foundry.environment import (
     Environment,
     JSONObject,
@@ -61,6 +60,7 @@ from agent_env_foundry.semantics import (
     validate_catalog,
     validate_start_cases,
 )
+from agent_env_foundry.tree_manifest import tree_manifest
 
 ENVIRONMENT_RELEASE_V2_FORMAT = DESCRIPTOR_FORMAT_V2
 _HEX = frozenset("0123456789abcdef")
@@ -460,7 +460,7 @@ class TrustedProxy:
         self._catalog: dict[str, CapabilitySpec] | None = None
 
     def _call(self, operation: TrustedOperation, arguments: JSONObject) -> JSONValue:
-        before = _tree_manifest(self._instance)
+        before = tree_manifest(self._instance)
         failure: PreparationExecutionError | None = None
         try:
             value = self._transport.call(operation, arguments)
@@ -472,7 +472,7 @@ class TrustedProxy:
                 "code": exc.code,
                 "message": str(exc),
             }
-        after = _tree_manifest(self._instance)
+        after = tree_manifest(self._instance)
         event = TrustedCallEvent(
             len(self._events) + 1,
             self._identity,

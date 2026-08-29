@@ -9,11 +9,10 @@ import rfc8785
 
 from agent_env_foundry.errors import EnvironmentContractError
 from agent_env_foundry.release import verify_release_v2
-from release_factory import build_release
 from v2_release_factory import build_v2_release
 
 
-def test_v2_descriptor_binds_actor_semantics_and_rejects_v1(tmp_path: Path) -> None:
+def test_v2_descriptor_binds_actor_semantics_and_rejects_other_formats(tmp_path: Path) -> None:
     root = build_v2_release(tmp_path / "v2")
     verified = verify_release_v2(root)
     assert verified.identity.format == "environment-release/2"
@@ -21,11 +20,11 @@ def test_v2_descriptor_binds_actor_semantics_and_rejects_v1(tmp_path: Path) -> N
     assert verified.identity.actor_digest == verified.descriptor.actor_project_digest
     assert verified.identity.semantics_digest == verified.descriptor.semantics_project_digest
 
-    v1 = build_release(tmp_path / "v1")
-    v1_descriptor = json.loads((v1 / "release.json").read_text())
-    (v1 / "release.json").write_bytes(rfc8785.dumps(v1_descriptor))
+    descriptor = json.loads((root / "release.json").read_text())
+    descriptor["format"] = "environment-release/unsupported"
+    (root / "release.json").write_bytes(rfc8785.dumps(descriptor))
     with pytest.raises(EnvironmentContractError, match="environment-release/2"):
-        verify_release_v2(v1)
+        verify_release_v2(root)
 
 
 def test_v2_tamper_mode_extra_member_and_symlink_fail_closed(tmp_path: Path) -> None:

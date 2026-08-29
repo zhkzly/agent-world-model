@@ -1,13 +1,4 @@
-"""Release descriptor and payload-manifest parsing with digest verification.
-
-This is the loader-facing half of the release contract (S1 Slice 1): it parses
-``release.json`` and ``payload-manifest.json`` strictly, verifies the payload
-digest plus every listed member's bytes and normalized mode, and loads
-digest-bound schema members without letting any path escape the release root.
-
-Release identity, assembly, Qualification binding and cold publication belong
-to Slice 5; nothing here writes, publishes, or claims a qualified release.
-"""
+"""Clean-break EnvironmentRelease v2 parsing and digest verification."""
 
 from __future__ import annotations
 
@@ -32,40 +23,22 @@ if TYPE_CHECKING:
     from agent_env_foundry.preparation import PreparedReleaseIdentity
 
 __all__ = [
-    "DESCRIPTOR_FORMAT",
     "DESCRIPTOR_FORMAT_V2",
     "PayloadRecord",
-    "ReleaseDescriptor",
     "ReleaseDescriptorV2",
-    "ValidatedReleaseContract",
     "ValidatedReleaseV2",
     "compute_project_digest",
     "compute_payload_digest",
-    "parse_descriptor",
     "parse_descriptor_v2",
     "parse_manifest",
-    "verify_release",
     "verify_release_v2",
 ]
 
 DESCRIPTOR_NAME = "release.json"
-DESCRIPTOR_FORMAT = "environment-release/1"
 DESCRIPTOR_FORMAT_V2 = "environment-release/2"
 CANONICALIZATION = "rfc8785"
 HASH_ALGORITHM = "sha256"
 
-DESCRIPTOR_KEYS = frozenset(
-    {
-        "format",
-        "canonicalization",
-        "hash",
-        "payload_manifest",
-        "payload_digest",
-        "environment_factory",
-        "start_schema",
-        "reset_observation_schema",
-    }
-)
 RECORD_KEYS = frozenset({"path", "type", "mode", "digest"})
 DESCRIPTOR_KEYS_V2 = frozenset(
     {
@@ -87,18 +60,6 @@ DESCRIPTOR_KEYS_V2 = frozenset(
     }
 )
 _V2_PAYLOAD_ROOTS = frozenset({"actor", "semantics", "dist", "docs", "licenses"})
-
-
-@dataclass(frozen=True)
-class ReleaseDescriptor:
-    format: str
-    canonicalization: str
-    hash: str
-    payload_manifest: PurePosixPath
-    payload_digest: str
-    environment_factory: str
-    start_schema: PurePosixPath
-    reset_observation_schema: PurePosixPath
 
 
 @dataclass(frozen=True)
@@ -126,15 +87,6 @@ class PayloadRecord:
     type: str
     mode: int
     digest: str
-
-
-@dataclass(frozen=True)
-class ValidatedReleaseContract:
-    """Loader-facing release metadata; not a qualified EnvironmentRelease."""
-
-    descriptor: ReleaseDescriptor
-    start_schema: dict[str, Any]
-    reset_observation_schema: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -192,44 +144,6 @@ def safe_member_path(value: Any, *, field: str) -> PurePosixPath:
     if path == PurePosixPath("."):
         raise EnvironmentContractError(f"{field} must name a member, got {value!r}")
     return path
-
-
-def parse_descriptor(document: Any) -> ReleaseDescriptor:
-    """Strictly parse ``release.json``; unknown fields are rejected, not normalized."""
-    if not is_json_object(document):
-        raise EnvironmentContractError("release.json must be a JSON object")
-    keys = set(document)
-    missing = sorted(DESCRIPTOR_KEYS - keys)
-    if missing:
-        raise EnvironmentContractError(f"release.json is missing required fields: {missing}")
-    unknown = sorted(keys - DESCRIPTOR_KEYS)
-    if unknown:
-        raise EnvironmentContractError(
-            f"release.json contains fields outside the release contract: {unknown}; "
-            "rejected, not normalized"
-        )
-    if document["format"] != DESCRIPTOR_FORMAT:
-        raise EnvironmentContractError(
-            f"unsupported release format {document['format']!r}; expected {DESCRIPTOR_FORMAT!r}"
-        )
-    if document["canonicalization"] != CANONICALIZATION:
-        raise EnvironmentContractError(
-            f"unsupported canonicalization {document['canonicalization']!r}"
-        )
-    if document["hash"] != HASH_ALGORITHM:
-        raise EnvironmentContractError(f"unsupported hash algorithm {document['hash']!r}")
-    return ReleaseDescriptor(
-        format=document["format"],
-        canonicalization=document["canonicalization"],
-        hash=document["hash"],
-        payload_manifest=safe_member_path(document["payload_manifest"], field="payload_manifest"),
-        payload_digest=_hex_digest(document["payload_digest"], field="payload_digest"),
-        environment_factory=_factory_reference(document["environment_factory"]),
-        start_schema=safe_member_path(document["start_schema"], field="start_schema"),
-        reset_observation_schema=safe_member_path(
-            document["reset_observation_schema"], field="reset_observation_schema"
-        ),
-    )
 
 
 def parse_descriptor_v2(document: Any) -> ReleaseDescriptorV2:
@@ -354,58 +268,6 @@ def compute_project_digest(
     return sha256_hex(canonical_bytes(document))
 
 
-def verify_release(release_root: Path) -> ValidatedReleaseContract:
-    """Validate loader-facing release bytes without assigning a release ID."""
-    root = Path(release_root)
-    if not root.is_dir():
-        raise EnvironmentContractError(f"release root {root} is not a directory")
-    if (root / DESCRIPTOR_NAME).is_symlink():
-        raise EnvironmentContractError(f"{DESCRIPTOR_NAME} must not be a symlink")
-
-    descriptor_document = _read_json(root / DESCRIPTOR_NAME, role=DESCRIPTOR_NAME)
-    descriptor = parse_descriptor(descriptor_document)
-
-    manifest_document = _read_json(
-        _regular_file_within(root, descriptor.payload_manifest, role="payload manifest"),
-        role="payload manifest",
-    )
-    actual_digest = compute_payload_digest(manifest_document)
-    if actual_digest != descriptor.payload_digest:
-        raise EnvironmentContractError(
-            "payload digest mismatch: release.json declares "
-            f"{descriptor.payload_digest}, manifest verifies to {actual_digest}"
-        )
-
-    records = parse_manifest(manifest_document)
-    by_path = {record.path: record for record in records}
-    # Non-circular identity DAG: the manifest must not bind itself or the
-    # descriptor it is summarized by.
-    for protected in (PurePosixPath(DESCRIPTOR_NAME), descriptor.payload_manifest):
-        if protected in by_path:
-            raise EnvironmentContractError(
-                f"payload manifest must not list {protected}; identity would be circular"
-            )
-
-    for record in records:
-        _verify_payload_record(root, record)
-
-    start_schema = _load_bound_schema(
-        root, by_path, descriptor.start_schema, role="start_schema", object_root_required=True
-    )
-    reset_observation_schema = _load_bound_schema(
-        root,
-        by_path,
-        descriptor.reset_observation_schema,
-        role="reset_observation_schema",
-        object_root_required=False,
-    )
-    return ValidatedReleaseContract(
-        descriptor=descriptor,
-        start_schema=start_schema,
-        reset_observation_schema=reset_observation_schema,
-    )
-
-
 def verify_release_v2(release_root: Path) -> ValidatedReleaseV2:
     """Verify one immutable two-project release without preparing either runtime."""
 
@@ -519,10 +381,6 @@ def _hex_digest(value: Any, *, field: str) -> str:
             f"{field} must be a lowercase 64-character sha256 hex digest"
         )
     return value
-
-
-def _factory_reference(value: Any) -> str:
-    return _entrypoint_reference(value, "environment_factory")
 
 
 def _entrypoint_reference(value: Any, field: str) -> str:

@@ -45,9 +45,9 @@ DIGEST_C = "c" * 64
 DIGEST_D = "d" * 64
 
 
-def test_v1_identity_is_rejected_and_public_projection_cannot_decode_trusted_fields() -> None:
+def test_non_v2_identity_is_rejected_and_public_projection_cannot_decode_trusted_fields() -> None:
     with pytest.raises(PreparationContractError, match="environment-release/2"):
-        PreparedReleaseIdentity("environment-release/1", DIGEST_A, DIGEST_B, DIGEST_C)
+        PreparedReleaseIdentity("environment-release/unsupported", DIGEST_A, DIGEST_B, DIGEST_C)
 
     identity = PreparedReleaseIdentity(
         ENVIRONMENT_RELEASE_V2_FORMAT,

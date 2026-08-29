@@ -9,7 +9,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
-from fx_contract_ok import MechanicalEnvironment
+from fx_contract_ok import RESET_OBSERVATION_SCHEMA, START_SCHEMA, MechanicalEnvironment
 
 from agent_env_foundry.environment import (
     CONTRACT_INVALID_ARGUMENTS,
@@ -17,7 +17,6 @@ from agent_env_foundry.environment import (
     ValidatedEnvironment,
 )
 from agent_env_foundry.errors import EnvironmentContractError, EnvironmentRuntimeError
-from release_factory import DEFAULT_RESET_OBSERVATION_SCHEMA, DEFAULT_START_SCHEMA
 
 OK_SPEC: dict[str, Any] = {
     "name": "t",
@@ -80,8 +79,8 @@ def _raise_reset(start: Any) -> dict[str, Any]:
 def make_wrapper(
     environment: Any,
     *,
-    start_schema: Any = DEFAULT_START_SCHEMA,
-    reset_observation_schema: Any = DEFAULT_RESET_OBSERVATION_SCHEMA,
+    start_schema: Any = START_SCHEMA,
+    reset_observation_schema: Any = RESET_OBSERVATION_SCHEMA,
 ) -> ValidatedEnvironment:
     return ValidatedEnvironment(
         environment,

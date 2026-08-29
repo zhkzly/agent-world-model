@@ -1,85 +1,12 @@
-# CP1 YES/NO Checklist
+# S2 Clean-Break YES/NO Checklist
 
-- [x] Does every new object have one named producer and consumer?
-- [x] Are release, actor runtime, semantics runtime and materialization identities non-circular and content-bound?
-- [x] Does the current v1 release fail the v2 admission contract?
-- [x] Can the public projection deserialize no trusted field?
-- [x] Can trusted calls be represented without implying state mutation or actor import access?
-- [x] Are all non-success outcomes typed instead of collapsed into booleans/strings?
-- [x] Are Graph/Programmatic, compatibility, domain templates and CP5–CP7 paths still absent?
-- [x] Does each acceptance test fail before implementation and kill its corresponding mutant?
-- [x] Do locked sync, Ruff, format, Mypy and full Pytest pass after implementation?
-
-## CP2 Physical Runtime Checklist
-
-- [x] Do directory and ZIP inputs admit only exact v2 bytes?
-- [x] Are actor and semantics installed and executed by different locked venv interpreters?
-- [x] Can same-named packages from two releases remain live without aliasing?
-- [x] Does open/reopen preserve state without implicit reset?
-- [x] Are project bytes, editable origins and both import directions checked at every open?
-- [x] Does every trusted call produce before/after manifests and reject mutation-on-error?
-- [x] Are stdout noise, seq mismatch, timeout and startup failure fail-closed and correctly owned?
-- [x] Do focused physical tests, mutation licenses and the full repository gate pass?
-
-## CP3A Expected TaskSemantics Freeze Checklist
-
-- [x] Does the fresh typed turn see accepted Need/Requirement relations but no Candidate,
-  native state, source revisions, Task, trace, answer or verdict?
-- [x] Must every projected Requirement, including initial-world relations, receive exactly one
-  Taskable/NotTaskable/Unsupported disposition?
-- [x] Can capabilities reference only Taskable Requirements and their licensed workflows?
-- [x] Are composition and public condition records non-empty in the acceptance fixture and
-  anchored to known capabilities, Requirements and workflows?
-- [x] Does one rejection report every currently observable semantic finding and require a full
-  replacement document?
-- [x] Is the RFC 8785 payload digest stable under semantically irrelevant record ordering?
-- [x] Do focused tests kill coverage, completeness, reference, ordering, leakage, feedback and
-  provider-schema mutants?
-- [x] Did a real Luna strict-JSON turn accept the schema and produce a Host-frozen result from
-  accepted S1 relations?
-- [x] Does the production API invoke the freeze after Builder and before Qualification/source
-  exposure, with typed failure stopping Qualification?
-- [x] Are `EXPECTED_TASK_SEMANTICS.json`, `PUBLIC_SURFACE.json`,
-  `TASK_SEMANTICS_CONTRACT.md` and the existing read-only candidate view bound by exact Host
-  digests without a second loader or evidence subsystem?
-
-## CP3B Independent Semantics Author Checklist
-
-- [x] Does Framework create the uv project before Codex and retain ownership of lock, sync,
-  build, tests, source scan, import separation, digest and acceptance?
-- [x] Does Codex receive only immutable expected/public/contract/view inputs and write only
-  release-specific semantic source, tests and dependency declarations?
-- [x] Is the Codex thread fresh, deny-all approval and full-access as explicitly required,
-  without a custom sandbox subsystem?
-- [x] Are actor/Host imports and author-time candidate-view paths forbidden at runtime?
-- [x] Must generated capability/composition/condition identities equal the frozen expected
-  semantics before acceptance?
-- [x] Must every query capability publish answer fields/wording, and must StartCases cover
-  distinct reset inputs already demonstrated by public physical evidence?
-- [x] Can model completion prose never override a failed Framework check?
-- [x] Did a real ocean Codex project pass source, lock, frozen sync, import separation, build,
-  tests and factory/catalog checks?
-
-## CP3C Physical Semantic Qualification Checklist
-
-- [ ] Are Environment Builder and TaskSemantics Author the only surviving Codex roles?
-- [ ] Does each Taskable capability begin from a reset-only qualified StartCase with an eligible
-  before-state binding?
-- [ ] Does a Host-owned Responses episode use only public reset context, docs, ToolSpecs and
-  ToolObservations, with no generated semantics/native/checker projection?
-- [ ] Are before and after real equivalent instances, with only after receiving public episode
-  calls and both available to the independent native reader?
-- [ ] Does Framework bind Host journal, independent native evidence, generated semantics,
-  no-op, wrong-target, answer/process/collateral and fresh-replay results?
-- [ ] Does every native-oracle result bind one unique materialization/request/journal/manifest
-  and get compared field-by-field with TaskSemantics rather than merely co-hashed?
-- [ ] Is the independent oracle absent from the public Actor/Consumer surface and isolated from
-  both Builder and Semantics Author conversations/tests?
-- [ ] Is a passing `SemanticQualificationReport` mandatory before release assembly?
-- [ ] Do product Codex launches redirect an empty `HOME` and reject user/project Skill,
-  AGENTS, plugin or hook leakage in the model-visible context?
-- [ ] Are ScenarioPlan, `$ref`, WitnessRecipe, pair/setup protocols and the Codex
-  `semantic_probe.py` production path absent?
-- [ ] Do focused tests and mutations kill missing release gate, context leakage, fake episode,
-  no-op acceptance, wrong-target acceptance and native/semantics disagreement?
-- [ ] Does one real ocean/SQLite run pass before CP4 work resumes?
+- [x] Are all v1 descriptor, loader, publication, Qualification, CLI and native-oracle production symbols absent?
+- [x] Are old positive fixtures/tests removed rather than adapted to the v2 path?
+- [x] Does Builder produce only a real actor uv project while Host owns later v2 assembly?
+- [x] Does release verification accept exactly `environment-release/2` with no conversion or fallback?
+- [x] Does preparation use only v2 release data and version-neutral physical helpers?
+- [x] Are TaskSemantics author inputs independent of deleted Qualification modules?
+- [x] Are stale active specs, task context manifests and review packets removed or rewritten?
+- [x] Do focused physical tests, full Pytest, Ruff, format, Mypy and lock checks pass?
+- [x] Does zero-reference search prove the old production path is dead?
+- [x] Is this checkpoint described only as a clean v2 foundation, not S2 completion?

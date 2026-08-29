@@ -19,7 +19,6 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Error Handling](./error-handling.md) | Error types, handling strategies | To fill |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
-| [Qualification Debugging](./qualification-debugging.md) | S1 Qualifier authorship, feedback, attribution and physical evidence | Active |
 | [S1 Coordinator](./s1-coordinator.md) | Need anchoring, standalone uv workspace, fail-closed cold publication | Active |
 | [V2 Preparation](./v2-preparation.md) | Two locked runtimes, private stdio and trusted no-mutation enforcement | Active |
 

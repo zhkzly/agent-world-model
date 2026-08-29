@@ -16,8 +16,6 @@ from typing import Any, cast
 import rfc8785
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
-from agent_env_foundry.errors import EnvironmentContractError
-from agent_env_foundry.release import verify_release
 from agent_env_foundry.research import BuilderProjection
 
 __all__ = [
@@ -292,56 +290,7 @@ def run_candidate_checks(root: Path, config: BuilderConfig) -> tuple[CommandResu
     results.append(tests_result)
     if not tests_result.passed:
         return tuple(results)
-    release_result = _verify_release_contract(root)
-    results.append(release_result)
-    if not release_result.passed:
-        return tuple(results)
-    return (*results, _smoke_environment_load(root, config))
-
-
-def _verify_release_contract(root: Path) -> CommandResult:
-    """Loader-contract check on the candidate's own release.json/manifest bytes."""
-    command = ("verify_release", str(root))
-    try:
-        verify_release(root)
-    except EnvironmentContractError as exc:
-        return CommandResult("release_contract", command, 1, "", str(exc))
-    return CommandResult("release_contract", command, 0, "", "")
-
-
-def _smoke_environment_load(root: Path, config: BuilderConfig) -> CommandResult:
-    candidate_python = root / ".venv/bin/python"
-    host_source = Path(__file__).resolve().parents[1]
-    with tempfile.TemporaryDirectory(
-        prefix="agent-env-foundry-loader-deps-",
-        dir=root.parent,
-    ) as temporary:
-        dependencies = Path(temporary) / "site"
-        install = _run(
-            (
-                "uv",
-                "pip",
-                "install",
-                "--python",
-                str(candidate_python),
-                "--target",
-                str(dependencies),
-                "rfc8785",
-                "jsonschema",
-            ),
-            cwd=root.parent,
-            phase="environment_load",
-            config=config,
-        )
-        if not install.passed:
-            return install
-        return _run(
-            (str(candidate_python), "-m", "agent_env_foundry._smoke", str(root.resolve())),
-            cwd=root.parent,
-            phase="environment_load",
-            config=config,
-            extra_env={"PYTHONPATH": os.pathsep.join((str(host_source), str(dependencies)))},
-        )
+    return tuple(results)
 
 
 def _feedback(checks: tuple[CommandResult, ...]) -> str:

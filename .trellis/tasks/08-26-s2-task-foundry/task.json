@@ -44,7 +44,7 @@
     "tests/fixtures/fx_v2_semantics.py",
     ".trellis/spec/backend/v2-preparation.md"
   ],
-  "notes": "Implementation reactivated after revert commit 7880133 removed the out-of-order deterministic scaffold. CP1, CP2, CP3A expected-semantics/Author inputs and CP3B independent Codex Semantics Author are complete with real ocean execution and mutation evidence. CP3C physical semantic Qualification is next; CP4-CP8 remain incomplete. The user waived Patrol for this recovery implementation.",
+  "notes": "Clean-break implementation is removing the complete v1 loader/publication/Qualification path before any new semantic work. The v2 release verifier, locked two-runtime preparation, expected-semantics core and independent Semantics Author foundation remain; native v2 Qualification and Publication must be rebuilt before S2 compilation begins. Alignment Patrol is disabled by user decision.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -64,6 +64,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "cp3c_semantic_qualification_next"
+    "implementation_checkpoint": "v2_clean_break_foundation"
   }
 }

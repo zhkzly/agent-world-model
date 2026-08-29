@@ -6,8 +6,9 @@ runtime.
 
 ## Public environment surface
 
-Expose a standard factory named by `release.json`. The factory receives one
-caller-owned instance directory and returns an object implementing:
+Expose the fixed `generated_environment.release:make_environment` factory. The
+factory receives one caller-owned instance directory and returns an object
+implementing:
 
 ```python
 reset(start: dict | None = None) -> JSONValue
@@ -61,70 +62,14 @@ relationships and other values the public Agent may read or reuse.
   prohibited mutation exactly zero times.
 - `close()` releases resources without deleting committed state.
 
-## Release envelope
+## Actor-project handoff
 
-Write `release.json` and `payload-manifest.json` at the project root. The host
-loader parses both strictly: missing fields, guessed alias field names and
-unknown extra fields are rejected, never normalized. `release.json` contains
-exactly these fields and nothing else:
-
-- `format`: `"environment-release/1"`
-- `canonicalization`: `"rfc8785"`
-- `hash`: `"sha256"`
-- `payload_manifest`: `"payload-manifest.json"`
-- `payload_digest`: SHA-256 hex of the RFC 8785 canonical JSON bytes of the
-  payload-manifest document
-- `environment_factory`: the factory's `module:factory` import path
-- `start_schema`: release-relative path of the start schema file
-- `reset_observation_schema`: release-relative path of the reset-observation
-  schema file
-
-The digest in this example is a placeholder with the required shape; compute
-the real value from your actual manifest bytes:
-
-```json
-{
-  "format": "environment-release/1",
-  "canonicalization": "rfc8785",
-  "hash": "sha256",
-  "payload_manifest": "payload-manifest.json",
-  "payload_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "environment_factory": "generated_environment.release:make_environment",
-  "start_schema": "docs/schemas/start.json",
-  "reset_observation_schema": "docs/schemas/reset-observation.json"
-}
-```
-
-The payload-manifest document is exactly `{"files": [records...]}` with no
-other keys. Records are sorted by path and each record has exactly `path`,
-`type`, `mode` and `digest`: `type` is `"file"`, `mode` is the integer
-normalized file mode, and `digest` is the lowercase SHA-256 hex of the member
-bytes. The manifest lists both named schema files (further members may be
-listed the same way) and never lists itself or `release.json`. Digests below
-are placeholders with the required shape:
-
-```json
-{
-  "files": [
-    {
-      "path": "docs/schemas/reset-observation.json",
-      "type": "file",
-      "mode": 420,
-      "digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-    },
-    {
-      "path": "docs/schemas/start.json",
-      "type": "file",
-      "mode": 420,
-      "digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-    }
-  ]
-}
-```
-
-Both schemas are self-contained Draft 2020-12 documents that may reference
-local fragments only; the start schema has an object root. The named factory
-and schema files must be included in the project/build output.
+Produce only the actor uv project. Use the fixed
+`generated_environment.release:make_environment` factory and publish the
+self-contained Draft 2020-12 start/reset schemas under `docs/schemas/`.
+Do not write `release.json`, `payload-manifest.json`, qualification receipts or
+digests. The Host combines this project with the independently authored
+TaskSemantics project and creates the sole EnvironmentRelease v2 descriptor.
 
 ## Project quality
 

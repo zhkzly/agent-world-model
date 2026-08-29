@@ -22,8 +22,10 @@ input file.
    public leaf in the reset/tool output schemas. Execute state changes against native
    persistent state in the assigned instance directory. Never return canned
    success or maintain load-bearing state only in process memory.
-5. Implement the complete release envelope, public documentation, package data,
-   and diagnostic tests. Include tests for native state change, multi-step value
+5. Implement the complete actor project, public schemas/documentation, package
+   data, and diagnostic tests. Do not write release or qualification metadata;
+   the Host assembles the actor and TaskSemantics projects into EnvironmentRelease v2.
+   Include tests for native state change, multi-step value
    reuse, refusal without prohibited mutation, reset, reload, and instance
    isolation.
 6. Declare and lock every runtime and test dependency yourself in the project's

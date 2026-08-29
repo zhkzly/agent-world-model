@@ -11,11 +11,23 @@ from __future__ import annotations
 
 from typing import Any
 
-from release_factory import DEFAULT_RESET_OBSERVATION_SCHEMA, DEFAULT_START_SCHEMA
-
-# Published alongside the mechanical release built by tests/release_factory.py.
-START_SCHEMA: dict[str, Any] = DEFAULT_START_SCHEMA
-RESET_OBSERVATION_SCHEMA: dict[str, Any] = DEFAULT_RESET_OBSERVATION_SCHEMA
+START_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"seed": {"type": "integer", "minimum": 0}},
+    "required": ["seed"],
+    "additionalProperties": False,
+}
+RESET_OBSERVATION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "kind": {"const": "mechanical"},
+        "token": {"type": "integer"},
+        "started": {"type": "boolean"},
+        "seed": {"type": ["integer", "null"]},
+    },
+    "required": ["kind", "token", "started", "seed"],
+    "additionalProperties": False,
+}
 
 NEXT_VALUE_SPEC: dict[str, Any] = {
     "name": "next_value",

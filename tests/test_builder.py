@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -23,9 +22,7 @@ from agent_env_foundry.builder import (
     run_builder,
     run_candidate_checks,
 )
-from agent_env_foundry.release import DESCRIPTOR_FORMAT, parse_descriptor, parse_manifest
 from agent_env_foundry.research import BuilderProjection
-from release_factory import MANIFEST_PATH, build_release
 
 
 @pytest.fixture(autouse=True)
@@ -516,7 +513,6 @@ def test_host_preparation_owns_installation_and_scrubs_ambient_python_env(
 ) -> None:
     log = _wire_fake_toolchain(monkeypatch, tmp_path, _VENV_PYTHON_WITH_PYTEST)
     root = _candidate_root(tmp_path, "candidate")
-    build_release(root)
     config = BuilderConfig(uv_cache_dir=tmp_path / "uv-cache")
 
     results = run_candidate_checks(root, config)
@@ -527,8 +523,6 @@ def test_host_preparation_owns_installation_and_scrubs_ambient_python_env(
         "sync",
         "build",
         "tests",
-        "release_contract",
-        "environment_load",
     ]
     lines = log.read_text().splitlines()
     argv = [line for line in lines if line.startswith("ARGV:")]
@@ -538,17 +532,10 @@ def test_host_preparation_owns_installation_and_scrubs_ambient_python_env(
         "ARGV: build",
         "ARGV: -m pytest -q",
     ]
-    assert argv[4].startswith(f"ARGV: pip install --python {root / '.venv/bin/python'} --target ")
-    assert argv[4].endswith(" rfc8785 jsonschema")
-    assert argv[5] == f"ARGV: -m agent_env_foundry._smoke {root}"
     assert "AMBIENT_PYTEST_EXECUTED" not in lines
     for prefix in ("VIRTUAL_ENV=", "PYTHONPATH=", "PYTHONHOME="):
         values = [line for line in lines if line.startswith(prefix)]
-        if prefix == "PYTHONPATH=":
-            assert values[:5] == [prefix] * 5
-            assert values[5].startswith("PYTHONPATH=") and values[5] != prefix
-        else:
-            assert values == [prefix] * 6
+        assert values == [prefix] * 4
     assert f"UV_CACHE_DIR={config.uv_cache_dir}" in lines
 
 
@@ -572,67 +559,23 @@ def test_ambient_host_pytest_cannot_satisfy_candidate_checks(
     assert "AMBIENT_PYTEST_EXECUTED" not in log.read_text()
 
 
-def test_release_contract_rejects_guessed_descriptor_despite_green_toolchain(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """The observed failure mode: lock/sync/build/tests green, release.json guessed."""
-    _wire_fake_toolchain(monkeypatch, tmp_path, _VENV_PYTHON_WITH_PYTEST)
-    root = _candidate_root(tmp_path, "candidate")
-    build_release(
-        root,
-        descriptor_drop=("canonicalization", "hash"),
-        descriptor_patch={
-            "factory": "generated_environment.release:make_environment",
-            "manifest": MANIFEST_PATH,
-        },
-    )
-
-    results = run_candidate_checks(root, BuilderConfig(uv_cache_dir=tmp_path / "uv-cache"))
-
-    assert [item.phase for item in results] == [
-        "lock",
-        "sync",
-        "build",
-        "tests",
-        "release_contract",
-    ]
-    assert all(item.passed for item in results[:-1])
-    rejected = results[-1]
-    assert not rejected.passed
-    assert rejected.command == ("verify_release", str(root))
-    assert "missing required fields" in rejected.stderr
-    assert "canonicalization" in rejected.stderr and "hash" in rejected.stderr
-
-
 _CONTRACT_PATH = (
     Path(__file__).resolve().parents[1]
     / "src/agent_env_foundry/runtime_skills/environment-codegen/ENVIRONMENT_CONTRACT.md"
 )
 
 
-def test_contract_document_discloses_the_exact_loader_contract() -> None:
+def test_contract_document_keeps_release_assembly_out_of_builder() -> None:
     text = _CONTRACT_PATH.read_text(encoding="utf-8")
     assert "plain mapping" in text
     assert "Every emitted public leaf" in text
     assert "reset-only beginning situation" in text
     assert "every accepted workflow precondition" in text
     assert "hidden setup" in text
-    blocks = re.findall(r"```json\s*\n(.*?)```", text, flags=re.DOTALL)
-    assert len(blocks) == 2
-    documents = [json.loads(block) for block in blocks]
-    descriptor = parse_descriptor(
-        next(document for document in documents if "environment_factory" in document)
-    )
-    assert descriptor.format == DESCRIPTOR_FORMAT
-    assert descriptor.canonicalization == "rfc8785"
-    assert descriptor.hash == "sha256"
-    assert descriptor.environment_factory == ("generated_environment.release:make_environment")
-    records = parse_manifest(next(document for document in documents if set(document) == {"files"}))
-    listed = {str(record.path) for record in records}
-    assert {str(descriptor.start_schema), str(descriptor.reset_observation_schema)} <= listed
-    assert str(descriptor.payload_manifest) not in listed
-    assert "release.json" not in listed
+    assert "generated_environment.release:make_environment" in text
+    assert "Do not write `release.json`" in text
+    assert "Host combines this project" in text
+    assert "EnvironmentRelease v2" in text
 
 
 def test_candidate_identity_binds_post_lock_bytes(
