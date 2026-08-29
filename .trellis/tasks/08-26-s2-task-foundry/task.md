@@ -67,3 +67,24 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - Final stable evidence: 292 tests, Ruff, format, Mypy, lock, diff and Trellis context GREEN; 41 auditable behavior mutation licences.
 - Checkpoint A is complete. This authorizes Checkpoint B verifier authoring only; it is not a Qualification, Publication or S2 completion claim.
 - Full gates and final mutation suite are GREEN again. A fresh high-level re-review is required before Checkpoint B.
+
+## Checkpoint B implementation candidate
+
+- Added one mutually blind verifier-author input projection, one fixed
+  qualification-verifier codegen skill/contract and one Codex SDK author/repair
+  route. Framework owns immutable inputs, source/output rejection, locked build,
+  import separation, identity and typed invocation.
+- Closed the actor schema handoff with exact mechanical paths; schema meaning
+  remains Builder-authored and Framework contains no domain field branch.
+- Reused the Checkpoint A `public-surface/2` type exactly; legacy v1 dictionaries
+  are rejected and actor factory identity remains Host-owned.
+- Real ocean/SQLite execution produced verifier digest
+  `a9784a74ec963d962a5b11c8b891d270863c8792faa1ba9a06e11fbeeddeeb0e`.
+  Query/state/refusal positives, no-op, wrong answer and missing process all
+  changed the intended axes; full before/after trees remained unchanged.
+- Full repository Pytest, Ruff, format, Mypy, uv lock and diff checks are GREEN;
+  fifteen targeted behavior mutations were killed.
+- Semantic, prior-blocker and identity/scope reviewers independently returned
+  `ALLOW` on the final boundary. Checkpoint B is complete and authorizes
+  Checkpoint C shared materialization/Qualification only. It is not
+  Qualification, Publication, Release or S2 completion evidence.

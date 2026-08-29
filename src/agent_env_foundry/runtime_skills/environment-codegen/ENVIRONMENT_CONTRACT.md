@@ -66,7 +66,10 @@ relationships and other values the public Agent may read or reuse.
 
 Produce only the actor uv project. Use the fixed
 `generated_environment.release:make_environment` factory and publish the
-self-contained Draft 2020-12 start/reset schemas under `docs/schemas/`.
+self-contained Draft 2020-12 start schema at `docs/schemas/start.json` and reset
+observation schema at `docs/schemas/reset.json`. These exact mechanical paths
+let the Host stage one unambiguous public surface; schema meaning remains the
+Builder's domain decision.
 Do not write `release.json`, `payload-manifest.json`, qualification receipts or
 digests. The Host combines this project with the independently authored
 TaskSemantics project and creates the sole EnvironmentRelease v2 descriptor.

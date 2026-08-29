@@ -17,13 +17,17 @@ import rfc8785
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
 from agent_env_foundry.research import BuilderProjection
+from agent_env_foundry.schema import SchemaError, require_object_root, validate_schema_document
 
 __all__ = [
+    "ACTOR_FACTORY",
     "BuilderConfig",
     "BuilderFailure",
     "CandidateBuild",
     "CommandResult",
     "PreparedBuilderWorkspace",
+    "RESET_OBSERVATION_SCHEMA_PATH",
+    "START_SCHEMA_PATH",
     "candidate_files",
     "compute_candidate_digest",
     "prepare_builder_workspace",
@@ -33,6 +37,9 @@ __all__ = [
 
 PROJECTION_NAME = "BUILDER_PROJECTION.json"
 CONTRACT_NAME = "ENVIRONMENT_CONTRACT.md"
+ACTOR_FACTORY = "generated_environment.release:make_environment"
+START_SCHEMA_PATH = Path("docs/schemas/start.json")
+RESET_OBSERVATION_SCHEMA_PATH = Path("docs/schemas/reset.json")
 _CODEX_PROVIDER_ID = "foundry_runtime"
 _EXCLUDED_PARTS = {
     ".git",
@@ -136,6 +143,7 @@ def _run(
     phase: str,
     config: BuilderConfig,
     extra_env: dict[str, str] | None = None,
+    input_text: str | None = None,
 ) -> CommandResult:
     env = dict(os.environ)
     for ambient in _AMBIENT_PYTHON_ENV:
@@ -148,6 +156,7 @@ def _run(
             command,
             cwd=cwd,
             env=env,
+            input=input_text,
             text=True,
             capture_output=True,
             timeout=config.command_timeout_seconds,
@@ -290,7 +299,45 @@ def run_candidate_checks(root: Path, config: BuilderConfig) -> tuple[CommandResu
     results.append(tests_result)
     if not tests_result.passed:
         return tuple(results)
+    results.append(_public_contract_check(root))
     return tuple(results)
+
+
+def _public_contract_check(root: Path) -> CommandResult:
+    failures: list[dict[str, str]] = []
+    for relative, object_root_required in (
+        (START_SCHEMA_PATH, True),
+        (RESET_OBSERVATION_SCHEMA_PATH, False),
+    ):
+        path = root / relative
+        if path.is_symlink() or not path.is_file():
+            failures.append(
+                {
+                    "path": relative.as_posix(),
+                    "reason": "missing_regular_file",
+                }
+            )
+            continue
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            if object_root_required:
+                require_object_root(document, role=relative.as_posix())
+            else:
+                validate_schema_document(document, role=relative.as_posix())
+        except (OSError, json.JSONDecodeError, SchemaError) as exc:
+            failures.append(
+                {
+                    "path": relative.as_posix(),
+                    "reason": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return CommandResult(
+        "public_contract",
+        ("host", "validate-public-contract"),
+        1 if failures else 0,
+        "" if failures else "public contract passed",
+        json.dumps(failures, ensure_ascii=False, sort_keys=True) if failures else "",
+    )
 
 
 def _feedback(checks: tuple[CommandResult, ...]) -> str:

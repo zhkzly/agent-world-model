@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -280,6 +281,7 @@ def compute_semantics_project_digest(root: Path) -> str:
     records = [
         {
             "path": path.relative_to(root).as_posix(),
+            "mode": stat.S_IMODE(path.stat().st_mode),
             "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
         }
         for path in _project_files(root)

@@ -12,7 +12,11 @@ from openai_codex import ApprovalMode, Sandbox
 import agent_env_foundry.semantics_author as semantics_author_module
 from agent_env_foundry.builder import BuilderConfig, CommandResult
 from agent_env_foundry.semantics import capability_from_document, validate_catalog
-from agent_env_foundry.semantics_author import SemanticsAuthorFailure, run_semantics_author
+from agent_env_foundry.semantics_author import (
+    SemanticsAuthorFailure,
+    compute_semantics_project_digest,
+    run_semantics_author,
+)
 from agent_env_foundry.semantics_inputs import (
     EXPECTED_TASK_SEMANTICS_NAME,
     PUBLIC_SURFACE_NAME,
@@ -172,6 +176,29 @@ def test_run_semantics_author_uses_codex_only_for_semantic_project_bytes(
     assert "verdict" not in observed["prompt"].casefold()
     assert stat.S_IMODE((workspace.root / PUBLIC_SURFACE_NAME).stat().st_mode) == 0o444
     workspace.verify_inputs()
+
+
+def test_task_semantics_contract_separates_initial_truth_from_eligibility() -> None:
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "src/agent_env_foundry/runtime_skills/task-semantics-codegen/"
+        "TASK_SEMANTICS_CONTRACT.md"
+    ).read_text()
+
+    assert "entire Task goal" in contract
+    assert "not capability eligibility" in contract
+
+
+def test_semantics_digest_binds_file_mode(tmp_path: Path) -> None:
+    source = tmp_path / "src/generated_task_semantics/release.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def make_semantics():\n    return object()\n")
+    source.chmod(0o644)
+    first = compute_semantics_project_digest(tmp_path)
+
+    source.chmod(0o755)
+
+    assert compute_semantics_project_digest(tmp_path) != first
 
 
 def test_framework_rejects_actor_or_host_imports_in_semantics_source(tmp_path: Path) -> None:

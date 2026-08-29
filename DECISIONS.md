@@ -121,3 +121,5 @@
 `s2-v2-contract-reclosure|介入1|返工2|3 independent ALLOW+277 tests+task/spec validation+stale S1 deletion|红线违反0`
 
 `s2-checkpoint-a|介入1|返工5|292 tests+41 mutation licences+iterative high-level BLOCK→2 ALLOW|红线违反0`
+
+`s2-checkpoint-b|介入2|返工5|real Builder+verifier+physical matrix+15 mutation licences+3 independent ALLOW|红线违反0`

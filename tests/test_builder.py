@@ -504,6 +504,11 @@ def _candidate_root(tmp_path: Path, name: str) -> Path:
     root = tmp_path / name
     (root / "tests").mkdir(parents=True)
     (root / "tests" / "test_smoke.py").write_text("def test_smoke() -> None:\n    pass\n")
+    schemas = root / "docs/schemas"
+    schemas.mkdir(parents=True)
+    schema = json.dumps({"type": "object"})
+    (schemas / "start.json").write_text(schema)
+    (schemas / "reset.json").write_text(schema)
     return root
 
 
@@ -523,6 +528,7 @@ def test_host_preparation_owns_installation_and_scrubs_ambient_python_env(
         "sync",
         "build",
         "tests",
+        "public_contract",
     ]
     lines = log.read_text().splitlines()
     argv = [line for line in lines if line.startswith("ARGV:")]
@@ -559,6 +565,28 @@ def test_ambient_host_pytest_cannot_satisfy_candidate_checks(
     assert "AMBIENT_PYTEST_EXECUTED" not in log.read_text()
 
 
+def test_candidate_checks_reject_noncanonical_schema_handoff_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _wire_fake_toolchain(monkeypatch, tmp_path, _VENV_PYTHON_WITH_PYTEST)
+    root = _candidate_root(tmp_path, "candidate")
+    schemas = root / "docs/schemas"
+    (schemas / "start.json").rename(schemas / "reset_start.schema.json")
+    (schemas / "reset.json").rename(schemas / "reset_observation.schema.json")
+
+    results = run_candidate_checks(
+        root,
+        BuilderConfig(uv_cache_dir=tmp_path / "uv-cache"),
+    )
+
+    public_contract = results[-1]
+    assert public_contract.phase == "public_contract"
+    assert not public_contract.passed
+    assert "docs/schemas/start.json" in public_contract.stderr
+    assert "docs/schemas/reset.json" in public_contract.stderr
+
+
 _CONTRACT_PATH = (
     Path(__file__).resolve().parents[1]
     / "src/agent_env_foundry/runtime_skills/environment-codegen/ENVIRONMENT_CONTRACT.md"
@@ -573,6 +601,8 @@ def test_contract_document_keeps_release_assembly_out_of_builder() -> None:
     assert "every accepted workflow precondition" in text
     assert "hidden setup" in text
     assert "generated_environment.release:make_environment" in text
+    assert "`docs/schemas/start.json`" in text
+    assert "`docs/schemas/reset.json`" in text
     assert "Do not write `release.json`" in text
     assert "Host combines this project" in text
     assert "EnvironmentRelease v2" in text

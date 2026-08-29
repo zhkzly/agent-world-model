@@ -1,10 +1,11 @@
 # EnvironmentRelease v2 Qualification and Publication Contract
 
-> **Status: Planned — not implemented at current HEAD.** Current
-> `verify_release_v2` checks structural bytes/digests only and accepts the
-> mechanical fixture receipt. No current artifact is an admitted product
-> release. Checkpoints A–D in `implement.md` must implement and prove this
-> contract before S2 may consume a release.
+> **Status: Checkpoint B verifier authoring implemented; Qualification and
+> Publication remain planned.** The Host can author, repair, identify and invoke
+> one independent native verifier through real locked projects. No current
+> artifact is an admitted product release. Checkpoints C–D in `implement.md`
+> must still implement and prove Qualification, receipt, Publication and cold
+> admission before S2 may consume a release.
 
 ## 1. Scope / Trigger
 
@@ -35,6 +36,18 @@ publish_release_v2(
 ) -> PublishedRelease | PublicationFailure
 
 verify_release_v2(path: Path) -> ValidatedReleaseV2
+
+prepare_verifier_author_workspace(...) -> PreparedVerifierAuthorWorkspace
+run_verifier_author(prepared, *, config) -> VerifierBuild
+repair_verifier_author(prepared, build, findings, *, config) -> VerifierBuild
+invoke_verifier_transition(
+    verifier_root,
+    request,
+    *,
+    expected_verifier_project_digest,
+    expected_report_field_ids,
+    config,
+) -> NativeVerificationResult
 ```
 
 Qualification verifier factory:
@@ -73,6 +86,22 @@ verify_transition(request: NativeVerificationRequest) -> NativeVerificationResul
 - Verifier cannot import actor, semantics or Host packages and cannot mutate
   either instance.
 - Host compares every result axis and report value and owns the verdict.
+
+Checkpoint B enforces the author/invocation boundary as follows:
+
+- Author inputs use exact `public-surface/2`, frozen Expected Semantics, the
+  fixed verifier contract and a manifested actor view; legacy surface
+  dictionaries are rejected.
+- Project identity binds path, mode and content. Repair accepts only typed
+  Framework/native factual findings and requires the same root, Codex home,
+  thread and current project digest.
+- Host scans generated authority artifacts before and after project tests and
+  factory loading. Every invocation recomputes the accepted project digest,
+  rejects resolved before/after aliases, exact-decodes the result, checks frozen
+  report field IDs and proves verifier/before/after trees unchanged.
+- The user requires full-access code authoring without a product sandbox.
+  Therefore B proves causal/context blindness and runtime import denial, not
+  OS-level containment against malicious arbitrary filesystem scanning.
 
 ### Shared materialization
 
@@ -145,6 +174,10 @@ results.
 | Semantics/verifier axis disagreement | `SemanticsDefect` or `VerifierDefect`; fail closed if unresolved |
 | Verifier imports actor/semantics/Host | `VerifierDefect(import_leak)` |
 | Semantics/verifier mutates instance | corresponding typed defect |
+| Verifier project differs from accepted digest | `VerifierDefect` before invocation |
+| Before/after paths resolve to one instance | `VerifierDefect` before invocation |
+| Verifier returns missing/aliased report fields | `VerifierDefect`; factual same-thread repair |
+| Generated tests/factory/invocation write authority/project bytes | `VerifierDefect`; reject |
 | Missing applicable physical case | Qualification not passed |
 | Executable required mutant survives | Qualification not passed |
 | Provider/dependency/process unavailable | `InfrastructureFailure`; no semantic repair |
@@ -174,6 +207,10 @@ results.
 - Per-field Core preimage mutation and explicit proof that final Release ID is
   absent from Qualification inputs.
 - Mutual author-view denial and source/import scans.
+- Exact v2 author input, same-lineage typed repair, path/mode/content identity,
+  post-test artifact rescan and accepted-digest invocation tests.
+- Real query/state/refusal, no-op, wrong-answer and missing-process verifier
+  calls with exact report fields and immutable verifier/native trees.
 - Real separate actor/semantics/verifier interpreters against the same instances.
 - Mutate-on-success and mutate-then-error no-mutation tests for semantics/verifier.
 - Axis/report mismatch, no-op, wrong target, near miss, answer, collateral,

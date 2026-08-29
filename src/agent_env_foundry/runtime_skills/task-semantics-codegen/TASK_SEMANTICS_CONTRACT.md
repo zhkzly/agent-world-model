@@ -123,6 +123,13 @@ answer_ok, process_ok, report_values, failure_codes
 
 `answer_ok` and `process_ok` are boolean or null. A satisfied result cannot have
 failed required effects/collateral/answer/process or non-empty failure codes.
+`initially_satisfied` means that the entire Task goal would already pass for
+the selected referent in the before state, before any public action, tool
+observation, final answer, or process evidence is credited. It is not capability eligibility,
+a workflow precondition, or a refusal condition. An eligible object still
+requiring a mutation is not initially satisfied; neither is a query still
+requiring a public read and correct answer. A genuinely already-complete goal
+may return true so the S2 compiler can reject that Blueprint as trivial.
 Every `task_kind="query"` capability declares at least one `answer_fields`
 record and a non-null rendering `answer_phrase`; requiring `final_answer`
 without publishing its answer contract is invalid.

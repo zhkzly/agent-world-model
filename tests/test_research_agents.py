@@ -373,12 +373,13 @@ def test_missing_invocation_credential_is_typed_and_secret_safe(
     assert "OPENAI_API_KEY" in excinfo.value.message
 
 
-def test_only_the_three_approved_runtime_skills_are_packaged() -> None:
+def test_only_the_four_approved_runtime_skills_are_packaged() -> None:
     skill = load_research_skill()
     skill_files = list((Path(skill.path).parents[1]).rglob("SKILL.md"))
     assert {path.parent.name for path in skill_files} == {
         "research",
         "environment-codegen",
+        "qualification-verifier-codegen",
         "task-semantics-codegen",
     }
     assert Path(skill.path) in skill_files

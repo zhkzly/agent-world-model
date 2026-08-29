@@ -34,3 +34,16 @@
 - [x] Do TaskDefinition/checker identities contain logical bindings/selections only?
 - [x] Are event occurrences, fresh episodes and pre-witness AdmissionPlan mechanically bound?
 - [x] Do 292 tests, static/lock/diff gates and all required mutation licences pass?
+
+## Checkpoint B implementation
+
+- [x] Does Verifier Author consume exact `public-surface/2` and frozen Expected Semantics?
+- [x] Is TaskSemantics absent from the verifier author context/workspace?
+- [x] Does typed repair bind the same root, Codex home, thread and current project digest?
+- [x] Are model-authored authority artifacts rejected before and after generated checks?
+- [x] Do verifier and semantics project identities bind path, mode and content?
+- [x] Does invocation bind the accepted verifier digest and reject resolved instance aliases?
+- [x] Are result shape, exact report fields and verifier/native tree immutability Host-enforced?
+- [x] Does the real matrix distinguish success, no-op, wrong answer and missing process?
+- [x] Do full gates and fifteen behavior mutations pass?
+- [x] Did three independent reviews ALLOW B without claiming Qualification/Release/S2 completion?
