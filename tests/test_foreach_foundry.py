@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import agent_env_foundry.foreach_foundry as foreach_module
 from agent_env_foundry.foreach_foundry import (
+    ForEachAdmissionPlan,
+    ForEachPartialChallenge,
+    ForEachPartialChallengeReport,
     ForEachTask,
     ForEachWitness,
     SolvedForEachTask,
@@ -94,6 +98,10 @@ def _witness(task: ForEachTask, materialization_id: str) -> ForEachWitness:
     )
 
 
+def _plan(task: ForEachTask) -> ForEachAdmissionPlan:
+    return ForEachAdmissionPlan(task.task_id, (0, 1))
+
+
 def _binding(key: str, item: str) -> BindingCandidate:
     return BindingCandidate(
         key,
@@ -115,19 +123,92 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
     task = _task()
     assert task.task_id
     assert task.to_document()["semantic_keys"] == ["item:1", "item:2"]
-    solved = SolvedForEachTask(task, (_witness(task, "c" * 64), _witness(task, "d" * 64)))
+    plan = _plan(task)
+    solved = SolvedForEachTask(
+        task,
+        plan,
+        (_witness(task, "c" * 64), _witness(task, "d" * 64)),
+    )
     assert solved.to_document()["format"] == "solved-foreach-task/1"
+    assert solved.to_document()["admission_plan"]["plan_id"] == plan.plan_id
 
     with pytest.raises(TaskFoundryError, match="ordered"):
         replace(task, semantic_keys=("item:2", "item:1"))
+    with pytest.raises(TaskFoundryError, match="every member"):
+        SolvedForEachTask(
+            task,
+            ForEachAdmissionPlan(task.task_id, (0,)),
+            (_witness(task, "c" * 64), _witness(task, "d" * 64)),
+        )
     with pytest.raises(TaskFoundryError, match="fresh"):
-        SolvedForEachTask(task, (_witness(task, "c" * 64), _witness(task, "c" * 64)))
+        SolvedForEachTask(
+            task,
+            plan,
+            (_witness(task, "c" * 64), _witness(task, "c" * 64)),
+        )
     failed = replace(
         _witness(task, "d" * 64),
         member_results=(_result(), _result(satisfied=False)),
     )
     with pytest.raises(TaskFoundryError, match="Every selected"):
-        SolvedForEachTask(task, (_witness(task, "c" * 64), failed))
+        SolvedForEachTask(task, plan, (_witness(task, "c" * 64), failed))
+
+
+def test_partial_challenge_requires_only_the_omitted_member_to_fail() -> None:
+    task = _task()
+    result = ForEachPartialChallenge(
+        task.task_id,
+        _plan(task).plan_id,
+        1,
+        task.semantic_keys[1],
+        "e" * 64,
+        (),
+        {"results": [{}]},
+        (),
+        (_result(), _result(satisfied=False)),
+    )
+    assert result.to_document()["omitted_semantic_key"] == "item:2"
+    first = replace(
+        result,
+        omitted_member_index=0,
+        omitted_semantic_key="item:1",
+        materialization_id="f" * 64,
+        member_results=(_result(satisfied=False), _result()),
+    )
+    report = ForEachPartialChallengeReport(task.task_id, _plan(task), (first, result))
+    assert report.report_id
+
+    with pytest.raises(TaskFoundryError, match="omitted"):
+        replace(result, member_results=(_result(), _result()))
+    with pytest.raises(TaskFoundryError, match="every frozen omission"):
+        replace(report, partials=(result,))
+
+
+def test_foreach_plan_freezes_before_any_witness_opens(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    events: list[str] = []
+
+    class StopAfterPlan(RuntimeError):
+        pass
+
+    class Prepared:
+        identity = SimpleNamespace(release_id=task.release_id)
+
+        def open(self, _path: object) -> object:
+            events.append("witness")
+            raise AssertionError("witness opened before ForEach plan froze")
+
+    def stop_after_plan(_task: ForEachTask) -> ForEachAdmissionPlan:
+        events.append("plan")
+        raise StopAfterPlan
+
+    monkeypatch.setattr(foreach_module, "_derive_admission_plan", stop_after_plan)
+    with pytest.raises(StopAfterPlan):
+        foreach_module.solve_foreach_task_twice(Prepared(), task, tmp_path)  # type: ignore[arg-type]
+    assert events == ["plan"]
 
 
 def test_foreach_fresh_selection_must_match_the_complete_frozen_set() -> None:

@@ -144,3 +144,5 @@
 `s2-f-first-taskpack|介入0|返工0|same-Plan aggregate+control evidence+canonical Atom TaskPack+3 mutation licences|红线违反0`
 
 `s2-foreach-all-vertical|介入1|返工1|complete binding set+2 real public witnesses+4 mutation licences|红线违反1: proposed then fully removed unused Expected Semantics v2 authority fields before commit`
+
+`s2-foreach-partials|介入0|返工0|pre-witness omit-each plan+2 physical partial runs+4 mutation licences|红线违反0`

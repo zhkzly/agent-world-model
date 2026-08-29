@@ -80,6 +80,33 @@ class ForEachTask:
 
 
 @dataclass(frozen=True, slots=True)
+class ForEachAdmissionPlan:
+    task_id: str
+    omitted_member_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.omitted_member_indices != tuple(range(len(self.omitted_member_indices))):
+            raise TaskFoundryError(
+                "foreach_admission_plan_invalid",
+                "ForEach partial plan must omit every member once in stable order",
+            )
+
+    @property
+    def plan_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "foreach-admission-plan/1",
+            "task_id": self.task_id,
+            "omitted_member_indices": list(self.omitted_member_indices),
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "plan_id": self.plan_id}
+
+
+@dataclass(frozen=True, slots=True)
 class ForEachWitness:
     task_id: str
     materialization_id: str
@@ -113,9 +140,19 @@ class ForEachWitness:
 @dataclass(frozen=True, slots=True)
 class SolvedForEachTask:
     task: ForEachTask
+    admission_plan: ForEachAdmissionPlan
     witnesses: tuple[ForEachWitness, ForEachWitness]
 
     def __post_init__(self) -> None:
+        if (
+            self.admission_plan.task_id != self.task.task_id
+            or self.admission_plan.omitted_member_indices
+            != tuple(range(len(self.task.semantic_keys)))
+        ):
+            raise TaskFoundryError(
+                "foreach_admission_plan_incomplete",
+                "ForEach admission plan must challenge every member before witnesses",
+            )
         if any(item.task_id != self.task.task_id for item in self.witnesses):
             raise TaskFoundryError(
                 "foreach_witness_task_mismatch",
@@ -139,8 +176,93 @@ class SolvedForEachTask:
         return {
             "format": "solved-foreach-task/1",
             "task": self.task.to_document(),
+            "admission_plan": self.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.witnesses],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachPartialChallenge:
+    task_id: str
+    admission_plan_id: str
+    omitted_member_index: int
+    omitted_semantic_key: str
+    materialization_id: str
+    trace: tuple[TraceEvent, ...]
+    final_answer: JSONObject
+    argument_provenance: tuple[ArgumentProvenance, ...]
+    member_results: tuple[AtomCheckResult, ...]
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.omitted_member_index < len(self.member_results):
+            raise TaskFoundryError(
+                "foreach_partial_index_invalid",
+                "ForEach partial challenge omitted index is invalid",
+            )
+        for index, result in enumerate(self.member_results):
+            expected = index != self.omitted_member_index
+            if result.satisfied != expected:
+                raise TaskFoundryError(
+                    "foreach_partial_not_discriminated",
+                    "ForEach partial challenge must fail only the omitted member",
+                    omitted_member_index=self.omitted_member_index,
+                    failed_member_index=index,
+                )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "foreach-partial-challenge/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "omitted_member_index": self.omitted_member_index,
+            "omitted_semantic_key": self.omitted_semantic_key,
+            "materialization_id": self.materialization_id,
+            "trace": [item.to_document() for item in self.trace],
+            "final_answer": _json_object(self.final_answer),
+            "argument_provenance": [item.to_document() for item in self.argument_provenance],
+            "member_results": [item.to_document() for item in self.member_results],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachPartialChallengeReport:
+    task_id: str
+    admission_plan: ForEachAdmissionPlan
+    partials: tuple[ForEachPartialChallenge, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            self.admission_plan.task_id != self.task_id
+            or tuple(item.omitted_member_index for item in self.partials)
+            != self.admission_plan.omitted_member_indices
+        ):
+            raise TaskFoundryError(
+                "foreach_partial_report_incomplete",
+                "ForEach partial report does not account for every frozen omission",
+            )
+        if any(
+            item.task_id != self.task_id or item.admission_plan_id != self.admission_plan.plan_id
+            for item in self.partials
+        ):
+            raise TaskFoundryError(
+                "foreach_partial_report_identity_mismatch",
+                "ForEach partial result belongs to another Task or AdmissionPlan",
+            )
+
+    @property
+    def report_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "foreach-partial-challenge-report/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan.plan_id,
+            "partials": [item.to_document() for item in self.partials],
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "report_id": self.report_id}
 
 
 def compile_foreach_tasks(
@@ -252,6 +374,7 @@ def solve_foreach_task_twice(
     """Solve the exact ForEach instruction over two fresh complete selections."""
 
     _verify_task(prepared, task)
+    admission_plan = _derive_admission_plan(task)
     selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
     witnesses: list[ForEachWitness] = []
     for index in (1, 2):
@@ -322,7 +445,109 @@ def solve_foreach_task_twice(
             )
     return SolvedForEachTask(
         task,
+        admission_plan,
         cast(tuple[ForEachWitness, ForEachWitness], tuple(witnesses)),
+    )
+
+
+def challenge_foreach_partials(
+    prepared: OpenPreparedRelease,
+    solved: SolvedForEachTask,
+    instance_root: Path,
+    *,
+    route: AgentRoute | None = None,
+    max_provider_turns: int = 12,
+) -> ForEachPartialChallengeReport:
+    """Physically execute every preplanned one-member omission on a fresh instance."""
+
+    task = solved.task
+    _verify_task(prepared, task)
+    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
+    partials: list[ForEachPartialChallenge] = []
+    goal = prepared.task_goals.get(task.capability_id)
+    if not isinstance(goal, str) or not goal.strip():
+        raise TaskFoundryError(
+            "task_goal_missing",
+            "Admitted release has no public goal for a ForEach capability",
+        )
+    for omitted_index in solved.admission_plan.omitted_member_indices:
+        instance = Path(instance_root) / f"omit-{omitted_index}"
+        included_indices = tuple(
+            index for index in range(len(task.semantic_keys)) if index != omitted_index
+        )
+        included_descriptors = tuple(task.public_descriptors[index] for index in included_indices)
+        partial_instruction = _instruction(goal, included_descriptors)
+        partial_answer_schema = _foreach_answer_schema(
+            task.member_answer_schema,
+            len(included_indices),
+        )
+        with prepared.open(instance) as session:
+            reset = session.actor.reset(task.start_case.reset_input)
+            before = session.trusted.inspect(instance)
+            bindings = _resolve_complete_selection(session, task, before)
+            tool_specs = session.actor.tools()
+            episode = run_public_episode(
+                actor=session.actor,
+                instruction=partial_instruction,
+                reset_observation=reset,
+                tool_specs=tool_specs,
+                answer_schema=partial_answer_schema,
+                route=selected_route,
+                max_provider_turns=max_provider_turns,
+            )
+            partial_answers = episode.final_answer.get("results")
+            if not isinstance(partial_answers, list) or len(partial_answers) != len(
+                included_indices
+            ):
+                raise TaskFoundryError(
+                    "foreach_partial_answer_count_mismatch",
+                    "Partial ForEach answer does not cover every included member",
+                )
+            answers: list[JSONValue] = [{} for _ in task.semantic_keys]
+            for position, member_index in enumerate(included_indices):
+                answers[member_index] = partial_answers[position]
+            after = session.trusted.inspect(instance)
+            contexts = _contexts(task, bindings)
+            results = tuple(
+                session.trusted.evaluate_atom(
+                    AtomCheckRequest(
+                        task.capability_id,
+                        before,
+                        after,
+                        binding.protected_binding,
+                        episode.trace,
+                        answers[position],
+                        contexts[position],
+                    )
+                )
+                for position, binding in enumerate(bindings)
+            )
+            partials.append(
+                ForEachPartialChallenge(
+                    task.task_id,
+                    solved.admission_plan.plan_id,
+                    omitted_index,
+                    task.semantic_keys[omitted_index],
+                    session.identity.materialization_id,
+                    episode.trace,
+                    episode.final_answer,
+                    resolve_argument_provenance(
+                        trace=episode.trace,
+                        instruction_values={
+                            "selected_targets": [
+                                _json_object(item) for item in included_descriptors
+                            ]
+                        },
+                        reset_observation=reset,
+                        tool_specs=tool_specs,
+                    ),
+                    results,
+                )
+            )
+    return ForEachPartialChallengeReport(
+        task.task_id,
+        solved.admission_plan,
+        tuple(partials),
     )
 
 
@@ -354,6 +579,13 @@ def _prove_initially_false(
                     "A selected ForEach member is already satisfied before public action",
                     semantic_key=binding.semantic_key,
                 )
+
+
+def _derive_admission_plan(task: ForEachTask) -> ForEachAdmissionPlan:
+    return ForEachAdmissionPlan(
+        task.task_id,
+        tuple(range(len(task.semantic_keys))),
+    )
 
 
 def _resolve_complete_selection(
@@ -488,9 +720,13 @@ def _json_object(value: Any) -> JSONObject:
 
 
 __all__ = [
+    "ForEachAdmissionPlan",
+    "ForEachPartialChallenge",
+    "ForEachPartialChallengeReport",
     "ForEachTask",
     "ForEachWitness",
     "SolvedForEachTask",
     "compile_foreach_tasks",
+    "challenge_foreach_partials",
     "solve_foreach_task_twice",
 ]
