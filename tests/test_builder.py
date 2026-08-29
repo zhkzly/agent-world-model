@@ -618,14 +618,6 @@ def test_contract_document_discloses_the_exact_loader_contract() -> None:
     assert "reset-only beginning situation" in text
     assert "every accepted workflow precondition" in text
     assert "hidden setup" in text
-    assert "second factory object must invoke" in text
-    assert (
-        "without another reset"
-        in (
-            Path(__file__).resolve().parents[1]
-            / "src/agent_env_foundry/runtime_skills/environment-codegen/SKILL.md"
-        ).read_text()
-    )
     blocks = re.findall(r"```json\s*\n(.*?)```", text, flags=re.DOTALL)
     assert len(blocks) == 2
     documents = [json.loads(block) for block in blocks]

@@ -316,7 +316,7 @@ def test_host_compiles_probe_manifest_and_binds_all_three_sources(tmp_path: Path
         "negative_setup.py",
         "public_probe.py",
     ]
-    assert "required_physical_checks" not in manifest
+    assert manifest["required_physical_checks"] == sorted(CLASSES)
 
     (tmp_path / "native_probe.py").chmod(0o644)
     (tmp_path / "native_probe.py").write_text("import json\n")
@@ -367,10 +367,22 @@ def test_native_probe_instructions_do_not_force_sqlite_for_git_state(tmp_path: P
     assert "observation.get('error') or {}" in instructions
 
 
+CLASSES = (
+    "reset_reconstruction",
+    "value_chain",
+    "native_before_after",
+    "refusal_no_mutation",
+    "instance_isolation",
+    "nondefault_start_repeat",
+    "reload_persistence",
+)
+
+
 def _rows(count: int = 24) -> tuple[Any, list[dict[str, Any]]]:
     expected = freeze_expected_relations(_projection(count))
     rows = []
     for index, relation in enumerate(expected.relations):
+        check_class = CLASSES[index] if index < len(CLASSES) else "native_before_after"
         rows.append(
             {
                 "requirement_id": relation.requirement_id,
@@ -380,6 +392,7 @@ def _rows(count: int = 24) -> tuple[Any, list[dict[str, Any]]]:
                     {
                         "assertion_id": f"assert-{index:03d}",
                         "passed": True,
+                        "covers": [check_class],
                         "expected": index,
                         "actual": index,
                     }
@@ -442,10 +455,7 @@ def test_host_journal_has_private_provenance_and_canonical_record_shape(
 
 
 def _journal_for_rows(
-    tmp_path: Path,
-    rows: list[dict[str, Any]],
-    *,
-    refusal_code: str = "domain.refused",
+    tmp_path: Path, rows: list[dict[str, Any]], *, contract_refusal: bool = False
 ) -> Any:
     calls: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
@@ -459,7 +469,7 @@ def _journal_for_rows(
                 "ok": False,
                 "data": None,
                 "error": {
-                    "code": refusal_code,
+                    "code": "contract.invalid_arguments" if contract_refusal else "domain.refused",
                     "message": "refused",
                 },
             }
@@ -470,7 +480,11 @@ def _journal_for_rows(
                 "observation": observation,
             }
         )
-    return _host_journal(tmp_path, "positive", calls)
+    return _host_journal(
+        tmp_path,
+        "positive",
+        calls,
+    )
 
 
 def _negative_rows(
@@ -485,6 +499,7 @@ def _negative_rows(
                 {
                     "assertion_id": f"assert-{index:03d}",
                     "passed": False,
+                    "covers": [CLASSES[index] if index < len(CLASSES) else "native_before_after"],
                     "expected": index,
                     "actual": "near-miss",
                 }
@@ -536,7 +551,7 @@ def _mechanical_carriers(
                 },
             }
         ]
-        journal = _host_journal(tmp_path, run_id, calls, instance="primary")
+        journal = _host_journal(tmp_path, run_id, calls, instance="negative")
         carriers.append(
             runner_module._make_run_carrier(
                 run_id,
@@ -562,6 +577,8 @@ def _negative_case(
     public_changed: bool = True,
 ) -> tuple[Any, ...]:
     expected, rows = _rows(count)
+    if count < len(CLASSES):
+        rows[0]["assertions"][0]["covers"] = list(CLASSES)
     validated = validate_evidence_rows(rows, expected, _journal_for_rows(tmp_path, rows))
     predicates = {
         item["requirement_id"]: item
@@ -570,6 +587,7 @@ def _negative_case(
     declarations = _negative_declarations(expected, predicates)
     negatives = _negative_rows(declarations)
     for row, negative in zip(rows, negatives, strict=True):
+        negative["assertions"][0]["covers"] = list(row["assertions"][0]["covers"])
         negative["assertions"][0]["expected"] = row["assertions"][0]["expected"]
     carriers = _mechanical_carriers(
         tmp_path / "carriers",
@@ -583,7 +601,9 @@ def _negative_case(
     return expected, validated, predicates, bundle, negatives, carriers
 
 
-def test_evidence_requires_exact_24_relations(tmp_path: Path) -> None:
+def test_evidence_requires_exact_24_relations_and_seven_physical_obligations(
+    tmp_path: Path,
+) -> None:
     expected, rows = _rows()
     validated = validate_evidence_rows(rows, expected, _journal_for_rows(tmp_path, rows))
     assert len(validated) == 24
@@ -592,35 +612,12 @@ def test_evidence_requires_exact_24_relations(tmp_path: Path) -> None:
     }
 
 
-def test_model_assertion_cannot_self_authorize_physical_coverage(tmp_path: Path) -> None:
-    expected, rows = _rows(1)
-    rows[0]["assertions"][0]["covers"] = ["reload_persistence"]
-
-    with pytest.raises(QualificationFailure) as caught:
-        validate_evidence_rows(rows, expected, _journal_for_rows(tmp_path, rows))
-
-    assert caught.value.code == "assertion_failed"
-
-
 def test_evidence_public_calls_must_come_from_host_journal(tmp_path: Path) -> None:
     expected, rows = _rows()
     rows[0]["public_call_seqs"] = [999]
     with pytest.raises(QualificationFailure) as caught:
         validate_evidence_rows(rows, expected, _journal_for_rows(tmp_path, rows))
     assert caught.value.code == "public_call_missing"
-
-
-@pytest.mark.parametrize("sequences", ([1, 1], [2, 1]))
-def test_evidence_public_call_sequences_are_unique_and_ordered(
-    sequences: list[int], tmp_path: Path
-) -> None:
-    expected, rows = _rows(2)
-    rows[0]["public_call_seqs"] = sequences
-
-    with pytest.raises(QualificationFailure) as caught:
-        validate_evidence_rows(rows, expected, _journal_for_rows(tmp_path, rows))
-
-    assert caught.value.code == "public_call_sequence_invalid"
 
 
 @pytest.mark.parametrize(
@@ -635,6 +632,15 @@ def test_evidence_public_call_sequences_are_unique_and_ordered(
         (lambda rows: rows[0]["assertions"][0].__setitem__("passed", False), "assertion_failed"),
         (lambda rows: rows[0]["assertions"][0].pop("actual"), "assertion_failed"),
         (lambda rows: rows[0].__setitem__("native_observations", []), "native_observation_missing"),
+        (
+            lambda rows: [
+                assertion["covers"].__setitem__(0, "native_before_after")
+                for row in rows
+                for assertion in row["assertions"]
+                if "reload_persistence" in assertion["covers"]
+            ],
+            "missing_physical_check_coverage",
+        ),
     ],
 )
 def test_evidence_rejects_each_host_contract_violation(
@@ -650,14 +656,13 @@ def test_evidence_rejects_each_host_contract_violation(
     )
 
 
-@pytest.mark.parametrize("code", ("contract.invalid_arguments", "internal_error"))
-def test_refusal_requirement_must_bind_a_real_business_refusal(code: str, tmp_path: Path) -> None:
+def test_refusal_requirement_must_bind_a_real_business_refusal(tmp_path: Path) -> None:
     expected, rows = _rows()
     with pytest.raises(QualificationFailure) as caught:
         validate_evidence_rows(
             rows,
             expected,
-            _journal_for_rows(tmp_path, rows, refusal_code=code),
+            _journal_for_rows(tmp_path, rows, contract_refusal=True),
         )
     assert caught.value.code == "business_refusal_missing"
 
@@ -676,6 +681,7 @@ def test_negative_discrimination_may_be_scoped_to_taskable_requirements(
     tmp_path: Path,
 ) -> None:
     expected, rows = _rows(4)
+    rows[0]["assertions"][0]["covers"] = list(CLASSES)
     validated = validate_evidence_rows(rows, expected, _journal_for_rows(tmp_path, rows))
     predicates = {
         item["requirement_id"]: item
@@ -692,6 +698,7 @@ def test_negative_discrimination_may_be_scoped_to_taskable_requirements(
     for negative in negatives:
         baseline = by_id[negative["requirement_id"]]
         negative["assertions"][0]["assertion_id"] = baseline["assertions"][0]["assertion_id"]
+        negative["assertions"][0]["covers"] = list(baseline["assertions"][0]["covers"])
         negative["assertions"][0]["expected"] = baseline["assertions"][0]["expected"]
     carriers = _mechanical_carriers(
         tmp_path / "taskable-carriers",
@@ -812,377 +819,6 @@ def test_near_miss_must_change_matching_public_behavior(tmp_path: Path) -> None:
             bundle, negatives, rows, expected, predicates, carriers, "a" * 64
         )
     assert caught.value.code == "negative_public_behavior_unchanged"
-
-
-def test_public_behavior_comparison_preserves_repeated_call_occurrences() -> None:
-    first = {
-        "scope": {"instance": "case", "open_epoch": 1, "reset_epoch": 1},
-        "tool_name": "inspect",
-        "arguments": {"record_id": "record-1"},
-        "observation": {"ok": True, "data": {"state": "before"}, "error": None},
-    }
-    second = {
-        **first,
-        "observation": {"ok": True, "data": {"state": "after"}, "error": None},
-    }
-
-    assert not qualification_module._public_behavior_changed(
-        [first, second],
-        [first, second],
-    )
-    assert qualification_module._public_behavior_changed(
-        [first, second],
-        [first, {**second, "observation": {"ok": True, "data": {"state": "wrong"}, "error": None}}],
-    )
-
-
-def test_public_behavior_comparison_does_not_pair_different_lifecycle_scopes() -> None:
-    baseline = {
-        "scope": {"instance": "case", "open_epoch": 1, "reset_epoch": 1},
-        "tool_name": "inspect",
-        "arguments": {},
-        "observation": {"ok": True, "data": {"state": "before"}, "error": None},
-    }
-    different_scope = {
-        **baseline,
-        "scope": {"instance": "case", "open_epoch": 2, "reset_epoch": 1},
-        "observation": {"ok": True, "data": {"state": "after"}, "error": None},
-    }
-
-    assert not qualification_module._public_behavior_changed([baseline], [different_scope])
-
-
-def test_failed_close_reopen_is_owned_by_candidate(tmp_path: Path) -> None:
-    journal = _journal_from_events(
-        tmp_path,
-        "reload-failure",
-        [
-            ("persist", "reset", {"start": None}, {"state": "initial"}),
-            ("persist", "close", {}, None),
-            ("persist", "open", {}, {"attached": True}),
-            (
-                "persist",
-                "invoke",
-                {"tool_name": "inspect", "arguments": {}},
-                {
-                    "ok": False,
-                    "data": None,
-                    "error": {
-                        "code": "internal_error",
-                        "message": "reset must be called before using the environment",
-                    },
-                },
-            ),
-        ],
-    )
-
-    with pytest.raises(QualificationFailure) as caught:
-        qualification_module._reject_failed_reload_attempt(journal)
-
-    assert caught.value.phase == "candidate_execution"
-    assert caught.value.code == "candidate_reload_failed"
-    assert caught.value.details["instance"] == "persist"
-    assert caught.value.details["seq"] == 4
-
-
-def test_closed_handle_without_fresh_open_is_not_misattributed_to_candidate(
-    tmp_path: Path,
-) -> None:
-    journal = _journal_from_events(
-        tmp_path,
-        "stale-handle",
-        [
-            ("persist", "close", {}, None),
-            (
-                "persist",
-                "invoke",
-                {"tool_name": "inspect", "arguments": {}},
-                {
-                    "ok": False,
-                    "data": None,
-                    "error": {"code": "internal_error", "message": "closed handle"},
-                },
-            ),
-        ],
-    )
-
-    qualification_module._reject_failed_reload_attempt(journal)
-
-
-def _journal_from_events(
-    tmp_path: Path,
-    run_id: str,
-    events: list[tuple[str, str, dict[str, Any], Any]],
-) -> Any:
-    path = tmp_path / f"{run_id}.events.jsonl"
-    records = [
-        {
-            "run_id": run_id,
-            "seq": seq,
-            "instance": instance,
-            "operation": operation,
-            "arguments": arguments,
-            "result": result,
-        }
-        for seq, (instance, operation, arguments, result) in enumerate(events, start=1)
-    ]
-    path.write_text("".join(f"{json.dumps(record)}\n" for record in records))
-    return _load_host_journal(path, run_id)
-
-
-def _success_observation(data: Any) -> dict[str, Any]:
-    return {"ok": True, "data": data, "error": None}
-
-
-def _invoke_event(
-    instance: str,
-    tool_name: str,
-    arguments: dict[str, Any],
-    result: dict[str, Any],
-) -> tuple[str, str, dict[str, Any], Any]:
-    return (instance, "invoke", {"tool_name": tool_name, "arguments": arguments}, result)
-
-
-def test_host_probe_topology_records_attempts_without_claiming_semantic_truth(
-    tmp_path: Path,
-) -> None:
-    journal = _journal_from_events(
-        tmp_path,
-        "topology",
-        [
-            ("a", "open", {}, {"attached": True}),
-            ("a", "reset", {"start": {"mode": "variant"}}, {"incidental_id": "one"}),
-            _invoke_event("a", "produce", {}, _success_observation({"token": "A1"})),
-            _invoke_event("a", "consume", {"token": "A1"}, _success_observation({"used": True})),
-            _invoke_event("a", "inspect", {}, _success_observation({"state": "same"})),
-            _invoke_event(
-                "a",
-                "act",
-                {},
-                {"ok": False, "data": None, "error": {"code": "domain.refused"}},
-            ),
-            _invoke_event("a", "inspect", {}, _success_observation({"state": "same"})),
-            ("a", "reset", {"start": {"mode": "variant"}}, {"incidental_id": "two"}),
-            _invoke_event("a", "inspect", {}, _success_observation({"state": "same"})),
-            ("a", "close", {}, None),
-            ("a", "open", {}, {"attached": True}),
-            _invoke_event("a", "inspect", {}, _success_observation({"state": "same"})),
-            ("a", "close", {}, None),
-            ("b", "open", {}, {"attached": True}),
-            ("b", "reset", {"start": {"mode": "variant"}}, {"incidental_id": "three"}),
-            _invoke_event("b", "inspect", {}, _success_observation({"state": "same"})),
-            ("b", "close", {}, None),
-        ],
-    )
-
-    witnesses = qualification_module._probe_topology_witnesses(journal)
-
-    assert set(witnesses) == {
-        "business_refusal_bracket",
-        "fresh_reopen_invoke",
-        "nondefault_start_distinct_instances",
-        "reset_after_activity",
-        "same_instance_value_reuse",
-        "same_start_distinct_instances",
-    }
-    qualification_module._require_probe_topology(
-        journal,
-        {
-            "type": "object",
-            "properties": {"mode": {"type": "string"}},
-            "additionalProperties": False,
-        },
-    )
-
-
-@pytest.mark.parametrize("refusal_code", ("contract.invalid_arguments", "internal_error"))
-def test_probe_topology_rejects_cross_instance_and_nonbusiness_refusal_shortcuts(
-    refusal_code: str,
-    tmp_path: Path,
-) -> None:
-    journal = _journal_from_events(
-        tmp_path,
-        "topology-shortcuts",
-        [
-            ("a", "open", {}, {"attached": True}),
-            ("a", "reset", {"start": {"mode": "variant"}}, {"state": "initial"}),
-            _invoke_event("a", "produce", {}, _success_observation({"token": "TOKEN-123"})),
-            _invoke_event("a", "inspect", {}, _success_observation({"state": "same"})),
-            _invoke_event(
-                "a",
-                "act",
-                {},
-                {"ok": False, "data": None, "error": {"code": refusal_code}},
-            ),
-            _invoke_event("a", "inspect", {}, _success_observation({"state": "same"})),
-            ("a", "reset", {"start": {"mode": "variant"}}, {"state": "initial"}),
-            ("b", "open", {}, {"attached": True}),
-            _invoke_event(
-                "b", "consume", {"token": "TOKEN-123"}, _success_observation({"used": True})
-            ),
-        ],
-    )
-
-    witnesses = qualification_module._probe_topology_witnesses(journal)
-
-    assert "same_instance_value_reuse" not in witnesses
-    assert "business_refusal_bracket" not in witnesses
-    assert "nondefault_start_distinct_instances" not in witnesses
-
-
-def test_probe_topology_rejects_pre_reset_shortcuts(tmp_path: Path) -> None:
-    journal = _journal_from_events(
-        tmp_path,
-        "pre-reset-shortcuts",
-        [
-            ("a", "open", {}, {"attached": True}),
-            _invoke_event("a", "produce", {}, _success_observation({"token": "A1"})),
-            _invoke_event("a", "consume", {"token": "A1"}, _success_observation({"used": True})),
-            _invoke_event("a", "inspect", {}, _success_observation({"state": "same"})),
-            _invoke_event(
-                "a",
-                "act",
-                {},
-                {"ok": False, "data": None, "error": {"code": "domain.refused"}},
-            ),
-            _invoke_event("a", "inspect", {}, _success_observation({"state": "same"})),
-            ("a", "close", {}, None),
-            ("a", "open", {}, {"attached": True}),
-            _invoke_event("a", "inspect", {}, _success_observation({"state": "same"})),
-        ],
-    )
-
-    witnesses = qualification_module._probe_topology_witnesses(journal)
-
-    assert "same_instance_value_reuse" not in witnesses
-    assert "business_refusal_bracket" not in witnesses
-    assert "fresh_reopen_invoke" not in witnesses
-
-
-def test_pre_reset_reopen_failure_is_not_misattributed_to_candidate(tmp_path: Path) -> None:
-    journal = _journal_from_events(
-        tmp_path,
-        "pre-reset-reopen",
-        [
-            ("case", "open", {}, {"attached": True}),
-            ("case", "close", {}, None),
-            ("case", "open", {}, {"attached": True}),
-            _invoke_event(
-                "case",
-                "inspect",
-                {},
-                {
-                    "ok": False,
-                    "data": None,
-                    "error": {"code": "internal_error", "message": "reset required"},
-                },
-            ),
-        ],
-    )
-
-    qualification_module._reject_failed_reload_attempt(journal)
-
-
-def test_nondefault_start_topology_is_required_only_when_schema_publishes_fields(
-    tmp_path: Path,
-) -> None:
-    journal = _journal_from_events(tmp_path, "empty-topology", [])
-    empty_start = {"type": "object", "properties": {}, "additionalProperties": False}
-    field_start = {
-        "type": "object",
-        "properties": {"mode": {"type": "string"}},
-        "additionalProperties": False,
-    }
-    referenced_start = {
-        "type": "object",
-        "allOf": [{"$ref": "#/$defs/start"}],
-        "$defs": {"start": field_start},
-        "additionalProperties": False,
-    }
-
-    assert (
-        "nondefault_start_distinct_instances"
-        not in qualification_module._required_probe_topology(empty_start)
-    )
-    assert "nondefault_start_distinct_instances" in qualification_module._required_probe_topology(
-        field_start
-    )
-    assert "nondefault_start_distinct_instances" in qualification_module._required_probe_topology(
-        referenced_start
-    )
-    with pytest.raises(QualificationFailure) as caught:
-        qualification_module._require_probe_topology(journal, field_start)
-    assert caught.value.code == "public_probe_topology_incomplete"
-    assert "nondefault_start_distinct_instances" in caught.value.details["missing"]
-
-
-def test_execute_probes_rejects_missing_topology_before_native_evidence(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    projection = _projection(1)
-    candidate, digest = _release_shaped_candidate(tmp_path)
-    candidate_python = candidate / ".venv/bin/python"
-    candidate_python.parent.mkdir(parents=True)
-    candidate_python.write_text("mechanical")
-    prepared = prepare_qualification_workspace(
-        projection,
-        candidate,
-        digest,
-        tmp_path / "qualification-topology",
-    )
-    journal = _journal_from_events(
-        tmp_path,
-        "missing-topology",
-        [
-            ("case", "open", {}, {"attached": True}),
-            ("case", "reset", {"start": None}, {"state": "initial"}),
-        ],
-    )
-    monkeypatch.setattr(qualification_module, "_verify_probe_bundle_unchanged", lambda _: None)
-    monkeypatch.setattr(qualification_module, "_run", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        qualification_module,
-        "_execute_public_probe",
-        lambda *args, **kwargs: journal,
-    )
-
-    with pytest.raises(QualificationFailure) as caught:
-        qualification_module._execute_probes(
-            prepared,
-            qualification_module.ProbeBundle(tmp_path, (), "f" * 64),
-            QualificationConfig(uv_cache_dir=tmp_path / "uv-cache"),
-        )
-
-    assert caught.value.code == "public_probe_topology_incomplete"
-
-
-def test_candidate_execution_failure_remains_candidate_owned_at_api_boundary(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    projection = _projection()
-    candidate, digest = _release_shaped_candidate(tmp_path)
-
-    def fail_candidate(*args: Any, **kwargs: Any) -> Any:
-        raise QualificationFailure(
-            "candidate_execution",
-            "candidate_reload_failed",
-            "freshly reopened environment cannot invoke without reset",
-        )
-
-    monkeypatch.setattr(qualification_module, "_author_probes", fail_candidate)
-    result = run_qualification(
-        projection,
-        candidate,
-        digest,
-        tmp_path / "qualification-attribution",
-        expected_task_semantics=_expected_task_semantics(projection),
-        config=QualificationConfig(uv_cache_dir=tmp_path / "uv-cache"),
-    )
-
-    assert result.status == "candidate_defect"
-    assert result.failure_code == "candidate_reload_failed"
 
 
 def test_negative_requires_per_run_source_copy_carrier(tmp_path: Path) -> None:
@@ -1702,7 +1338,7 @@ def test_passing_actor_qualification_stages_semantics_inputs_before_return(
         return (
             qualification_module.ProbeBundle(prepared.root, (), "b" * 64),
             rows,
-            tuple({"requirement_id": row.requirement_id} for row in rows[:2]),
+            tuple({"mechanical": True} for _ in rows),
             (),
             journal,
             "qualifier-thread",
@@ -1806,98 +1442,6 @@ def test_source_copy_rebind_executes_changed_copy_and_preserves_original(
     )
 
 
-def test_private_runner_records_each_fresh_environment_open(tmp_path: Path) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    probe = tmp_path / "reopen_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n"
-        "    first = session.open('case')\n"
-        "    first.reset()\n"
-        "    first.close()\n"
-        "    second = session.open('case')\n"
-        "    second.invoke('branch', {})\n"
-        "    second.close()\n"
-    )
-    journal_path = tmp_path / "reopen.journal.jsonl"
-
-    runner_module._run_public_probe(
-        probe,
-        release,
-        tmp_path / "reopen-instances",
-        "reopen",
-        journal_path,
-        "baseline",
-    )
-
-    journal = _load_host_journal(journal_path, "reopen")
-    assert [event.operation for event in journal.events] == [
-        "open",
-        "reset",
-        "close",
-        "open",
-        "invoke",
-        "close",
-    ]
-    assert [event.result for event in journal.events if event.operation == "open"] == [
-        {"attached": True},
-        {"attached": True},
-    ]
-
-
-def test_private_runner_rejects_old_closed_wrapper_after_fresh_open(tmp_path: Path) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    probe = tmp_path / "stale_wrapper_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n"
-        "    first = session.open('case')\n"
-        "    first.reset()\n"
-        "    first.close()\n"
-        "    session.open('case')\n"
-        "    first.invoke('branch', {})\n"
-    )
-    journal_path = tmp_path / "stale-wrapper.journal.jsonl"
-
-    with pytest.raises(RuntimeError, match="closed environment handle"):
-        runner_module._run_public_probe(
-            probe,
-            release,
-            tmp_path / "stale-wrapper-instances",
-            "stale-wrapper",
-            journal_path,
-            "baseline",
-        )
-
-    journal = _load_host_journal(journal_path, "stale-wrapper")
-    assert [event.operation for event in journal.events] == [
-        "open",
-        "reset",
-        "close",
-        "open",
-    ]
-
-
-def test_private_runner_rejects_concurrent_handles_for_one_instance(tmp_path: Path) -> None:
-    release, _ = _release_shaped_candidate(tmp_path)
-    probe = tmp_path / "concurrent_wrapper_probe.py"
-    probe.write_text(
-        "def run(session, mode):\n    session.open('case')\n    session.open('case')\n"
-    )
-    journal_path = tmp_path / "concurrent-wrapper.journal.jsonl"
-
-    with pytest.raises(RuntimeError, match="already has an active environment handle"):
-        runner_module._run_public_probe(
-            probe,
-            release,
-            tmp_path / "concurrent-wrapper-instances",
-            "concurrent-wrapper",
-            journal_path,
-            "baseline",
-        )
-
-    journal = _load_host_journal(journal_path, "concurrent-wrapper")
-    assert [event.operation for event in journal.events] == ["open"]
-
-
 def test_native_reader_mutation_is_rejected(tmp_path: Path) -> None:
     instance = tmp_path / "instance"
     instance.mkdir()
@@ -1995,8 +1539,6 @@ def test_qualifier_prompt_forbids_unrelated_fallback_and_aggregate_assertions() 
     assert "never fall back" in prompt
     assert "matching acceptance assertion" in prompt
     assert "exact public call sequences and named instance" in prompt
-    assert "call session.open again with the same instance name" in prompt
-    assert "reusing a closed object" in prompt
 
 
 def test_negative_copy_candidate_exit_is_attributed_to_qualifier(

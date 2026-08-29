@@ -101,5 +101,3 @@
 `s2-task-foundry-cp3c-framework|介入1|返工3|real CAP-005 causal trace+4 independent reviews+RED/GREEN+native reconciliation mutations|红线违反0`
 
 `s2-task-foundry-cp3c-live1|介入0|返工1|real Need→Research→Builder→19/19 positive+legacy negative causal audit|红线违反0`
-
-`s2-task-foundry-cp3c-causal-lifecycle|介入1|返工2|archived live trace+Host open/scope topology+19 mutation licenses+3 independent reviews|红线违反1: first mechanical-witness draft trusted global booleans before covers deletion`

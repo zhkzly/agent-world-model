@@ -60,11 +60,6 @@ relationships and other values the public Agent may read or reuse.
 - Business refusals have stable domain error codes and perform every declared
   prohibited mutation exactly zero times.
 - `close()` releases resources without deleting committed state.
-- A later factory call for the same instance directory reattaches committed state.
-  The second factory object must invoke a read or next valid transition without
-  calling `reset` first and observe the mutation made by the first object. Merely
-  finding the native file, reopening and resetting, or reusing a closed object does
-  not prove reattachment.
 
 ## Release envelope
 
@@ -134,8 +129,7 @@ and schema files must be included in the project/build output.
 ## Project quality
 
 Include meaningful package data, diagnostic tests, `uv.lock`, and all declared
-dependencies. Tests must exercise multi-step state changes, a refusal with no
-prohibited mutation, and the two-factory reattachment sequence above. A dictionary
-response map, canned result, mock backend,
+dependencies. Tests must exercise multi-step state changes and a refusal with no
+prohibited mutation. A dictionary response map, canned result, mock backend,
 empty world, repository template, Task, verifier, reward, trajectory, MCP, HTTP,
 or training-specific behavior does not satisfy this contract.

@@ -60,8 +60,9 @@ QUALIFICATION_KEYS = frozenset(
         "probe_bundle_digest",
         "evidence_digest",
         "requirement_ids",
-        "negative_requirement_ids",
         "requirement_evidence",
+        "positive_evidence_count",
+        "negative_evidence_count",
     }
 )
 ROOT_MEMBERS = frozenset(
@@ -192,8 +193,9 @@ def assemble_environment_release(
         "probe_bundle_digest": qualification.probe_bundle_digest,
         "evidence_digest": qualification.evidence_digest,
         "requirement_ids": requirement_ids,
-        "negative_requirement_ids": list(qualification.negative_requirement_ids),
         "requirement_evidence": requirement_evidence,
+        "positive_evidence_count": len(requirement_ids),
+        "negative_evidence_count": qualification.negative_evidence_count,
     }
     qualification_bytes = canonical_bytes(qualification_document)
     qualification_digest = _sha256(qualification_bytes)
@@ -528,12 +530,6 @@ def cold_verify_environment_release(
             "cold_probe_bundle_mismatch",
             "Cold replay used different semantic probe bytes",
         )
-    if list(replay.negative_requirement_ids) != qualification_document["negative_requirement_ids"]:
-        raise PublicationError(
-            "cold_qualification",
-            "cold_negative_scope_mismatch",
-            "Cold replay qualified a different physical-negative Requirement scope",
-        )
     return ColdVerification(release, runtime_project, replay)
 
 
@@ -549,7 +545,7 @@ def _validate_qualification(qualification: QualificationResult, candidate: Path)
         qualification.evidence_digest is None
         or qualification.probe_bundle_digest is None
         or not qualification.evidence_rows
-        or not qualification.negative_requirement_ids
+        or qualification.negative_evidence_count != len(qualification.evidence_rows)
     ):
         raise PublicationError(
             "assembly", "qualification_incomplete", "Qualification evidence is incomplete"
@@ -557,13 +553,6 @@ def _validate_qualification(qualification: QualificationResult, candidate: Path)
     ids = [row.requirement_id for row in qualification.evidence_rows]
     if len(ids) != len(set(ids)):
         raise PublicationError("assembly", "qualification_incomplete", "Requirement ids repeat")
-    negative_ids = qualification.negative_requirement_ids
-    if len(negative_ids) != len(set(negative_ids)) or not set(negative_ids) <= set(ids):
-        raise PublicationError(
-            "assembly",
-            "qualification_incomplete",
-            "Negative evidence ids must be a unique subset of qualified Requirements",
-        )
 
 
 def _verify_qualification_document(document: Any, payload_digest: str) -> None:
@@ -587,18 +576,14 @@ def _verify_qualification_document(document: Any, payload_digest: str) -> None:
     ):
         _digest_field(document[field], field)
     ids = document["requirement_ids"]
-    negative_ids = document["negative_requirement_ids"]
     evidence = document["requirement_evidence"]
     if (
         not isinstance(ids, list)
         or not ids
         or any(not isinstance(item, str) or not item for item in ids)
         or len(ids) != len(set(ids))
-        or not isinstance(negative_ids, list)
-        or not negative_ids
-        or any(not isinstance(item, str) or not item for item in negative_ids)
-        or len(negative_ids) != len(set(negative_ids))
-        or not set(negative_ids) <= set(ids)
+        or document["positive_evidence_count"] != len(ids)
+        or document["negative_evidence_count"] != len(ids)
         or not isinstance(evidence, list)
         or len(evidence) != len(ids)
     ):

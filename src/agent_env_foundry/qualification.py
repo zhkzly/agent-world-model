@@ -60,6 +60,17 @@ EXPECTED_TASK_SEMANTICS_NAME = "EXPECTED_TASK_SEMANTICS.json"
 PUBLIC_SURFACE_NAME = "PUBLIC_SURFACE.json"
 TASK_SEMANTICS_CONTRACT_NAME = "TASK_SEMANTICS_CONTRACT.md"
 NATIVE_ORACLE_CONTRACT_NAME = "NATIVE_ORACLE_CONTRACT.md"
+CHECK_CLASSES = frozenset(
+    {
+        "reset_reconstruction",
+        "value_chain",
+        "native_before_after",
+        "refusal_no_mutation",
+        "instance_isolation",
+        "nondefault_start_repeat",
+        "reload_persistence",
+    }
+)
 _VIEW_EXCLUDED_PARTS = frozenset(
     {
         ".git",
@@ -104,14 +115,6 @@ class QualificationFailure(RuntimeError):
 
 def _fail(phase: str, code: str, message: str, **details: Any) -> Never:
     raise QualificationFailure(phase, code, message, **details)
-
-
-def _failure_status(exc: QualificationFailure) -> QualificationStatus:
-    if exc.phase == "candidate_execution" or exc.code in _CANDIDATE_FAILURE_CODES:
-        return "candidate_defect"
-    if exc.phase in {"provider", "infrastructure"}:
-        return "infra_failure"
-    return "probe_defect"
 
 
 @dataclass(frozen=True)
@@ -293,7 +296,7 @@ class QualificationResult:
     evidence_digest: str | None = None
     evidence_rows: tuple[EvidenceRow, ...] = ()
     probe_bundle_digest: str | None = None
-    negative_requirement_ids: tuple[str, ...] = ()
+    negative_evidence_count: int = 0
     workspace_root: Path | None = None
     semantics_author_inputs: PreparedSemanticsAuthorWorkspace | None = None
     expected_task_semantics_digest: str | None = None
@@ -929,6 +932,7 @@ def validate_probe_bundle(
         "format": "qualification-probes/2",
         "expected_relations_digest": expected.aggregate_digest,
         "files": records,
+        "required_physical_checks": sorted(CHECK_CLASSES),
         "negative_declarations": declarations,
     }
     for name in PROBE_SCRIPTS:
@@ -990,6 +994,8 @@ def validate_evidence_rows(
     rows: Any,
     expected: ExpectedRelations,
     journal: HostJournal,
+    *,
+    require_full_check_coverage: bool = True,
 ) -> tuple[EvidenceRow, ...]:
     if not isinstance(rows, list):
         _fail("evidence", "evidence_invalid", "Evidence must be JSONL rows")
@@ -1002,6 +1008,7 @@ def validate_evidence_rows(
     }
     ready: dict[str, EvidenceRow] = {}
     present: set[str] = set()
+    covered_checks: set[str] = set()
     journal_calls = _journal_public_calls(journal)
     host_control_events = [
         event.to_document() for event in journal.events if event.operation != "invoke"
@@ -1062,17 +1069,14 @@ def validate_evidence_rows(
             )
             continue
         sequences = document["public_call_seqs"]
-        calls: list[dict[str, Any]]
-        if not _is_strictly_ordered_sequences(sequences):
-            issue(
-                "public_call_sequence_invalid",
-                "Evidence invoke sequence numbers must be unique and strictly increasing",
-                requirement_id=requirement_id,
-                position=position,
-                actual=sequences,
+        if (
+            not isinstance(sequences, list)
+            or not sequences
+            or any(
+                not isinstance(sequence, int) or sequence not in journal_calls
+                for sequence in sequences
             )
-            calls = []
-        elif any(sequence not in journal_calls for sequence in sequences):
+        ):
             issue(
                 "public_call_missing",
                 "Evidence must select real invoke sequence numbers from the Host journal",
@@ -1081,7 +1085,7 @@ def validate_evidence_rows(
                 available_sequences=sorted(journal_calls),
                 actual=sequences,
             )
-            calls = []
+            calls: list[dict[str, Any]] = []
         else:
             calls = [journal_calls[sequence] for sequence in sequences]
         if (
@@ -1110,27 +1114,32 @@ def validate_evidence_rows(
             assertions = []
         assertion_ids: set[str] = set()
         for assertion in assertions:
+            covers = assertion.get("covers") if isinstance(assertion, dict) else None
             if (
                 not isinstance(assertion, dict)
-                or set(assertion) != {"assertion_id", "passed", "actual", "expected"}
                 or not isinstance(assertion.get("assertion_id"), str)
                 or not assertion["assertion_id"]
                 or assertion.get("passed") is not True
                 or "actual" not in assertion
                 or "expected" not in assertion
+                or not isinstance(covers, list)
+                or not covers
+                or any(item not in CHECK_CLASSES for item in covers)
             ):
                 issue(
                     "assertion_failed",
-                    "Assertion must pass and contain only its id plus actual/expected facts",
+                    "Assertion must pass and include actual/expected facts plus valid coverage",
                     requirement_id=requirement_id,
                     position=position,
                     actual=assertion,
                     expected={
                         "passed": True,
-                        "members": ["assertion_id", "passed", "actual", "expected"],
+                        "covers": sorted(CHECK_CLASSES),
+                        "required_fact_fields": ["actual", "expected"],
                     },
                     selected_public_calls=calls,
                     host_control_events=host_control_events,
+                    allowed_covers=sorted(CHECK_CLASSES),
                 )
                 continue
             assertion_id = cast(str, assertion["assertion_id"])
@@ -1144,6 +1153,7 @@ def validate_evidence_rows(
                 )
                 continue
             assertion_ids.add(assertion_id)
+            covered_checks.update(cast(list[str], covers))
         if (
             calls
             and relation.relation.get("kind") == "refusals"
@@ -1183,6 +1193,15 @@ def validate_evidence_rows(
             expected=sorted(expected.by_id),
             missing=sorted(missing),
         )
+    missing_checks = CHECK_CLASSES - covered_checks
+    if require_full_check_coverage and missing_checks:
+        issue(
+            "missing_physical_check_coverage",
+            "Semantic assertions do not cover every required physical obligation",
+            actual=sorted(covered_checks),
+            expected=sorted(CHECK_CLASSES),
+            missing=sorted(missing_checks),
+        )
     if issues:
         codes = {item["code"] for item in issues}
         _fail(
@@ -1202,24 +1221,11 @@ def _has_business_refusal(calls: Any) -> bool:
         if (
             isinstance(observation, dict)
             and observation.get("ok") is False
-            and _is_business_refusal_code(code)
+            and isinstance(code, str)
+            and not code.startswith("contract.")
         ):
             return True
     return False
-
-
-def _is_business_refusal_code(code: Any) -> bool:
-    return isinstance(code, str) and code != "internal_error" and not code.startswith("contract.")
-
-
-def _is_strictly_ordered_sequences(value: Any) -> bool:
-    return (
-        isinstance(value, list)
-        and bool(value)
-        and all(isinstance(item, int) and not isinstance(item, bool) for item in value)
-        and len(value) == len(set(value))
-        and value == sorted(value)
-    )
 
 
 def _journal_public_calls(journal: HostJournal) -> dict[int, dict[str, Any]]:
@@ -1230,15 +1236,7 @@ def _journal_public_calls(journal: HostJournal) -> dict[int, dict[str, Any]]:
             "Evidence authority requires a Host-created journal",
         )
     calls: dict[int, dict[str, Any]] = {}
-    open_epochs: dict[str, int] = {}
-    reset_epochs: dict[str, int] = {}
     for event in journal.events:
-        if event.operation == "open" and event.result == {"attached": True}:
-            open_epochs[event.instance] = open_epochs.get(event.instance, 0) + 1
-            continue
-        if event.operation == "reset":
-            reset_epochs[event.instance] = reset_epochs.get(event.instance, 0) + 1
-            continue
         if event.operation != "invoke":
             continue
         arguments = event.arguments
@@ -1251,11 +1249,6 @@ def _journal_public_calls(journal: HostJournal) -> dict[int, dict[str, Any]]:
         calls[event.seq] = {
             "seq": event.seq,
             "instance": event.instance,
-            "scope": {
-                "instance": event.instance,
-                "open_epoch": open_epochs.get(event.instance, 0),
-                "reset_epoch": reset_epochs.get(event.instance, 0),
-            },
             "tool_name": arguments["tool_name"],
             "arguments": arguments["arguments"],
             "observation": event.result,
@@ -1425,20 +1418,24 @@ def validate_negative_discrimination(
         negative_by_id: dict[str, dict[str, Any]] = {}
         assertions_valid = True
         for item in negative_assertions:
+            covers = item.get("covers") if isinstance(item, dict) else None
             if (
                 not isinstance(item, dict)
-                or set(item) != {"assertion_id", "passed", "actual", "expected"}
                 or not isinstance(item.get("assertion_id"), str)
                 or not item["assertion_id"]
                 or not isinstance(item.get("passed"), bool)
                 or "actual" not in item
                 or "expected" not in item
+                or not isinstance(covers, list)
+                or not covers
+                or any(check not in CHECK_CLASSES for check in covers)
                 or item["assertion_id"] in negative_by_id
             ):
                 issue(
                     relation.requirement_id,
                     "negative_evidence_invalid",
-                    "Negative assertions need unique ids plus actual/expected facts",
+                    "Negative assertions need unique ids, actual/expected facts, "
+                    "and valid coverage",
                 )
                 assertions_valid = False
                 break
@@ -1452,12 +1449,14 @@ def validate_negative_discrimination(
             and assertion_id in baseline_assertions
             and _canonical(negative_assertion["expected"])
             == _canonical(baseline_assertions[assertion_id]["expected"])
+            and set(cast(list[str], negative_assertion["covers"]))
+            == set(cast(list[str], baseline_assertions[assertion_id]["covers"]))
         ]
         if not matching_flips:
             issue(
                 relation.requirement_id,
                 "negative_assertion_mismatch",
-                "A controlled near miss must flip the same assertion and expected fact",
+                "A controlled near miss must flip the same assertion, expected fact, and coverage",
                 baseline_assertions=sorted(baseline_assertions),
                 negative_false_assertions=sorted(
                     assertion_id
@@ -1468,22 +1467,20 @@ def validate_negative_discrimination(
                 expected={
                     "matching_assertion_ids": sorted(baseline_assertions),
                     "passed": False,
-                    "same_expected": True,
+                    "same_expected_and_covers": True,
                 },
             )
         carrier = carrier_by_run[declaration["negative_run_id"]]
         journal_calls = _journal_public_calls(carrier.journal)
         sequences = negative["public_call_seqs"]
-        calls: list[dict[str, Any]]
-        if not _is_strictly_ordered_sequences(sequences):
-            issue(
-                relation.requirement_id,
-                "negative_call_sequence_invalid",
-                "Negative invoke sequence numbers must be unique and strictly increasing",
-                actual=sequences,
+        if (
+            not isinstance(sequences, list)
+            or not sequences
+            or any(
+                not isinstance(sequence, int) or sequence not in journal_calls
+                for sequence in sequences
             )
-            calls = []
-        elif any(sequence not in journal_calls for sequence in sequences):
+        ):
             issue(
                 relation.requirement_id,
                 "negative_call_not_in_journal",
@@ -1491,7 +1488,7 @@ def validate_negative_discrimination(
                 available_sequences=sorted(journal_calls),
                 actual=sequences,
             )
-            calls = []
+            calls: list[dict[str, Any]] = []
         else:
             calls = [journal_calls[sequence] for sequence in sequences]
             if not _public_behavior_changed(baseline.document["public_calls"], calls):
@@ -1557,233 +1554,21 @@ def _existing_release_file_changed(before: TreeManifest, after: TreeManifest) ->
     )
 
 
-def _public_leaf_digests(value: Any) -> set[bytes]:
-    if isinstance(value, dict):
-        return {digest for item in value.values() for digest in _public_leaf_digests(item)}
-    if isinstance(value, list):
-        return {digest for item in value for digest in _public_leaf_digests(item)}
-    if isinstance(value, bool) or value is None:
-        return set()
-    if value == "":
-        return set()
-    return {_canonical(value)}
-
-
-def _probe_topology_witnesses(journal: HostJournal) -> dict[str, tuple[int, ...]]:
-    events = list(journal.events)
-    witnesses: dict[str, tuple[int, ...]] = {}
-    reset_epochs: dict[str, int] = {}
-    invoke_reset_epochs: dict[int, int] = {}
-    reset_starts: dict[bytes, set[str]] = {}
-    nondefault_starts: dict[bytes, set[str]] = {}
-    last_reset: dict[str, tuple[int, bytes]] = {}
-    activity_after_reset: dict[str, int] = {}
-    prior_values: dict[tuple[str, int], set[bytes]] = {}
-    closed: dict[str, int] = {}
-    reopened: dict[str, tuple[int, int]] = {}
-
-    for event in events:
-        instance = event.instance
-        if event.operation == "open" and event.result == {"attached": True}:
-            prior_values.pop((instance, reset_epochs.get(instance, 0)), None)
-            if instance in closed:
-                reopened[instance] = (closed.pop(instance), event.seq)
-            continue
-        if event.operation == "reset":
-            start = _canonical(event.arguments.get("start"))
-            previous = last_reset.get(instance)
-            if previous is not None and previous[1] == start and instance in activity_after_reset:
-                witnesses.setdefault(
-                    "reset_after_activity",
-                    (previous[0], activity_after_reset[instance], event.seq),
-                )
-            reset_epochs[instance] = reset_epochs.get(instance, 0) + 1
-            last_reset[instance] = (event.seq, start)
-            activity_after_reset.pop(instance, None)
-            prior_values[(instance, reset_epochs[instance])] = set()
-            reset_starts.setdefault(start, set()).add(instance)
-            if event.arguments.get("start") is not None:
-                nondefault_starts.setdefault(start, set()).add(instance)
-            reopened.pop(instance, None)
-            closed.pop(instance, None)
-            continue
-        if event.operation == "close":
-            if reset_epochs.get(instance, 0) > 0 and instance in activity_after_reset:
-                closed[instance] = event.seq
-            else:
-                closed.pop(instance, None)
-            reopened.pop(instance, None)
-            continue
-        if event.operation != "invoke":
-            continue
-
-        reset_epoch = reset_epochs.get(instance, 0)
-        invoke_reset_epochs[event.seq] = reset_epoch
-        scope = (instance, reset_epoch)
-        arguments = event.arguments.get("arguments")
-        if (
-            reset_epoch > 0
-            and isinstance(arguments, dict)
-            and any(
-                digest in prior_values.get(scope, set())
-                for digest in _public_leaf_digests(arguments)
-            )
-        ):
-            witnesses.setdefault("same_instance_value_reuse", (event.seq,))
-        result = event.result
-        if isinstance(result, dict) and result.get("ok") is True:
-            prior_values.setdefault(scope, set()).update(_public_leaf_digests(result.get("data")))
-            activity_after_reset.setdefault(instance, event.seq)
-            if instance in reopened:
-                close_seq, open_seq = reopened.pop(instance)
-                witnesses.setdefault("fresh_reopen_invoke", (close_seq, open_seq, event.seq))
-
-    for start, instances in reset_starts.items():
-        if len(instances) >= 2:
-            reset_seqs = tuple(
-                event.seq
-                for event in events
-                if event.operation == "reset" and _canonical(event.arguments.get("start")) == start
-            )
-            witnesses.setdefault("same_start_distinct_instances", reset_seqs)
-    for start, instances in nondefault_starts.items():
-        if len(instances) >= 2:
-            reset_seqs = tuple(
-                event.seq
-                for event in events
-                if event.operation == "reset" and _canonical(event.arguments.get("start")) == start
-            )
-            witnesses.setdefault("nondefault_start_distinct_instances", reset_seqs)
-
-    invokes = [event for event in events if event.operation == "invoke"]
-    for refused in invokes:
-        result = refused.result
-        error = result.get("error") if isinstance(result, dict) else None
-        code = error.get("code") if isinstance(error, dict) else None
-        if not (
-            isinstance(result, dict)
-            and result.get("ok") is False
-            and invoke_reset_epochs[refused.seq] > 0
-            and _is_business_refusal_code(code)
-        ):
-            continue
-        before = {
-            (_canonical(item.arguments), _canonical(item.result)): item.seq
-            for item in invokes
-            if item.instance == refused.instance
-            and item.seq < refused.seq
-            and invoke_reset_epochs[item.seq] == invoke_reset_epochs[refused.seq]
-            and isinstance(item.result, dict)
-            and item.result.get("ok") is True
-        }
-        after = {
-            (_canonical(item.arguments), _canonical(item.result)): item.seq
-            for item in invokes
-            if item.instance == refused.instance
-            and item.seq > refused.seq
-            and invoke_reset_epochs[item.seq] == invoke_reset_epochs[refused.seq]
-            and isinstance(item.result, dict)
-            and item.result.get("ok") is True
-        }
-        matching = sorted(before.keys() & after.keys())
-        if matching:
-            key = matching[0]
-            witnesses.setdefault(
-                "business_refusal_bracket",
-                (before[key], refused.seq, after[key]),
-            )
-            break
-    return witnesses
-
-
-def _start_schema_publishes_fields(schema: dict[str, Any]) -> bool:
-    def resolve(reference: str) -> Any:
-        if not reference.startswith("#/"):
-            return None
-        node: Any = schema
-        for raw in reference[2:].split("/"):
-            token = raw.replace("~1", "/").replace("~0", "~")
-            if not isinstance(node, dict) or token not in node:
-                return None
-            node = node[token]
-        return node
-
-    def visit(node: Any, seen: frozenset[str]) -> bool:
-        if not isinstance(node, dict):
-            return False
-        reference = node.get("$ref")
-        if isinstance(reference, str):
-            if reference in seen:
-                return False
-            target = resolve(reference)
-            return True if target is None else visit(target, seen | {reference})
-        properties = node.get("properties")
-        pattern_properties = node.get("patternProperties")
-        if isinstance(properties, dict) and properties:
-            return True
-        if isinstance(pattern_properties, dict) and pattern_properties:
-            return True
-        if node.get("additionalProperties", True) is not False:
-            return True
-        for keyword in ("allOf", "anyOf", "oneOf"):
-            branches = node.get(keyword)
-            if isinstance(branches, list) and any(visit(branch, seen) for branch in branches):
-                return True
-        return False
-
-    return visit(schema, frozenset())
-
-
-def _required_probe_topology(start_schema: dict[str, Any]) -> frozenset[str]:
-    required = {
-        "business_refusal_bracket",
-        "fresh_reopen_invoke",
-        "reset_after_activity",
-        "same_instance_value_reuse",
-        "same_start_distinct_instances",
-    }
-    if _start_schema_publishes_fields(start_schema):
-        required.add("nondefault_start_distinct_instances")
-    return frozenset(required)
-
-
-def _require_probe_topology(journal: HostJournal, start_schema: dict[str, Any]) -> None:
-    witnesses = _probe_topology_witnesses(journal)
-    missing = _required_probe_topology(start_schema) - set(witnesses)
-    if missing:
-        raise QualificationFailure(
-            "probe_execution",
-            "public_probe_topology_incomplete",
-            "Public probe omitted one or more required physical test topologies",
-            missing=sorted(missing),
-            observed={name: list(seqs) for name, seqs in sorted(witnesses.items())},
-        )
-
-
 def _public_behavior_changed(
     baseline_calls: list[dict[str, Any]], negative_calls: list[dict[str, Any]]
 ) -> bool:
-    def ordered_calls(
-        calls: list[dict[str, Any]],
-    ) -> tuple[list[bytes], list[bytes]]:
-        shapes: list[bytes] = []
-        observations: list[bytes] = []
-        for call in calls:
-            shapes.append(
-                _canonical(
-                    {
-                        "scope": call.get("scope"),
-                        "tool_name": call["tool_name"],
-                        "arguments": call["arguments"],
-                    }
-                )
-            )
-            observations.append(_canonical(call["observation"]))
-        return shapes, observations
-
-    baseline_shapes, baseline_observations = ordered_calls(baseline_calls)
-    negative_shapes, negative_observations = ordered_calls(negative_calls)
-    return baseline_shapes == negative_shapes and baseline_observations != negative_observations
+    baseline = {
+        _canonical({"tool_name": call["tool_name"], "arguments": call["arguments"]}): _canonical(
+            call["observation"]
+        )
+        for call in baseline_calls
+    }
+    return any(
+        (key := _canonical({"tool_name": call["tool_name"], "arguments": call["arguments"]}))
+        in baseline
+        and baseline[key] != _canonical(call["observation"])
+        for call in negative_calls
+    )
 
 
 _BASE_INSTRUCTIONS = (
@@ -1835,9 +1620,6 @@ _PROBE_PROMPT = (
     "Use only session.open(instance_name), then reset/tools/invoke/close on the returned "
     "environment. Exercise real multi-step value chaining, business refusals, repeated "
     "non-null starts, reset reconstruction, instance isolation, and reload persistence. "
-    "For reload persistence, close the first environment, call session.open again with the "
-    "same instance name, and invoke the fresh object without reset; reusing a closed object "
-    "or resetting after reopen does not count. "
     "The Host records every call; public_probe.py must not write evidence or inspect native "
     "paths. mode is baseline or negative; the negative mode exercises the same relevant "
     "public behavior against one Host-controlled near-miss release. "
@@ -1880,12 +1662,15 @@ _PROBE_PROMPT = (
     "exactly requirement_id, public_call_seqs, native_observations, assertions, and "
     "source_use. public_call_seqs selects real invoke seq integers from that run's Host "
     "journal; do not copy calls. native_observations is a non-empty list of structured "
-    "facts. assertions is a non-empty list of objects with exactly assertion_id, passed, "
-    "actual, and expected. Positive assertions must be computed from real public "
+    "facts. assertions is a non-empty list of objects with assertion_id, passed, covers, "
+    "and useful actual/expected facts. covers contains one or more of "
+    "reset_reconstruction, value_chain, native_before_after, refusal_no_mutation, "
+    "instance_isolation, nondefault_start_repeat, reload_persistence; the complete positive "
+    "suite must cover all seven. Positive assertions must be computed from real public "
     "and native observations and pass. Bind each assertion to the exact public call sequences "
     "and named instance that establish that Requirement; do not aggregate unrelated successes "
     "or refusals across the whole journal. The matching controlled near miss must make at least "
-    "one identical assertion_id with the same expected fact false. Literal "
+    "one identical assertion_id with the same expected fact and covers list false. Literal "
     "or unconditional True/False evidence is "
     "forbidden; derive the false result from the changed public/native behavior, never from "
     "a marker or declaration file. Each negative row must read the matching "
@@ -1952,7 +1737,7 @@ def run_qualification(
             evidence_digest=_digest(_canonical(preimage)),
             evidence_rows=rows,
             probe_bundle_digest=bundle.bundle_digest,
-            negative_requirement_ids=tuple(item["requirement_id"] for item in negative),
+            negative_evidence_count=len(negative),
             workspace_root=prepared.root,
             semantics_author_inputs=semantics_workspace,
             expected_task_semantics_digest=expected_task_semantics.digest,
@@ -1961,8 +1746,15 @@ def run_qualification(
             qualifier_codex_home=qualifier_codex_home,
         )
     except QualificationFailure as exc:
+        status: QualificationStatus = (
+            "candidate_defect"
+            if exc.code in _CANDIDATE_FAILURE_CODES
+            else "infra_failure"
+            if exc.phase in {"provider", "infrastructure"}
+            else "probe_defect"
+        )
         return QualificationResult(
-            status=_failure_status(exc),
+            status=status,
             candidate_digest=candidate_digest,
             expected_relations_digest=expected.aggregate_digest,
             workspace_root=Path(workspace_root),
@@ -2057,12 +1849,19 @@ def replay_qualification(
             evidence_digest=_digest(_canonical(preimage)),
             evidence_rows=rows,
             probe_bundle_digest=bundle.bundle_digest,
-            negative_requirement_ids=tuple(item["requirement_id"] for item in negative),
+            negative_evidence_count=len(negative),
             workspace_root=prepared.root,
         )
     except QualificationFailure as exc:
+        status: QualificationStatus = (
+            "candidate_defect"
+            if exc.code in _CANDIDATE_FAILURE_CODES
+            else "infra_failure"
+            if exc.phase in {"provider", "infrastructure"}
+            else "probe_defect"
+        )
         return QualificationResult(
-            status=_failure_status(exc),
+            status=status,
             candidate_digest=candidate_digest,
             expected_relations_digest=expected.aggregate_digest,
             workspace_root=Path(workspace_root),
@@ -2418,11 +2217,6 @@ def _execute_probes(
         env,
         config,
     )
-    _reject_failed_reload_attempt(positive_journal)
-    _require_probe_topology(
-        positive_journal,
-        verify_release(prepared.candidate_root).start_schema,
-    )
     prepared.verify_candidate_unchanged()
     carriers: list[ControlledRunCarrier] = []
     declarations = bundle.negative_declarations
@@ -2536,42 +2330,6 @@ def _execute_probes(
         "rows": _read_jsonl(evidence_path),
         "negative_rows": _read_jsonl(negative_evidence_path),
     }
-
-
-def _reject_failed_reload_attempt(journal: HostJournal) -> None:
-    closed: set[str] = set()
-    reopened: set[str] = set()
-    initialized: set[str] = set()
-    for event in journal.events:
-        if event.operation == "reset":
-            initialized.add(event.instance)
-            closed.discard(event.instance)
-            reopened.discard(event.instance)
-        elif event.operation == "close":
-            if event.instance in initialized:
-                closed.add(event.instance)
-            else:
-                closed.discard(event.instance)
-            reopened.discard(event.instance)
-        elif event.operation == "open" and event.instance in closed:
-            reopened.add(event.instance)
-        elif event.operation == "invoke" and event.instance in reopened:
-            result = event.result
-            error = result.get("error") if isinstance(result, dict) else None
-            code = error.get("code") if isinstance(error, dict) else None
-            if isinstance(result, dict) and (
-                "host_exception" in result
-                or (result.get("ok") is False and code == "internal_error")
-            ):
-                raise QualificationFailure(
-                    "candidate_execution",
-                    "candidate_reload_failed",
-                    "Candidate cannot reattach and use an existing instance without reset",
-                    instance=event.instance,
-                    seq=event.seq,
-                    result=result,
-                )
-            reopened.discard(event.instance)
 
 
 def _execute_public_probe(

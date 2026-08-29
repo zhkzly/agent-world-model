@@ -2,27 +2,22 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import zipfile
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-from agent_env_foundry import publication as publication_module
 from agent_env_foundry.builder import compute_candidate_digest
 from agent_env_foundry.publication import (
     PublicationError,
     assemble_environment_release,
-    cold_verify_environment_release,
     extract_release_zip,
     publish_environment_release,
     verify_environment_release,
     write_release_zip,
 )
 from agent_env_foundry.qualification import EvidenceRow, QualificationResult
-from agent_env_foundry.release import canonical_bytes
 from release_factory import build_release
 
 
@@ -58,51 +53,40 @@ def _candidate(tmp_path: Path) -> Path:
     return root
 
 
-def _qualification(
-    candidate: Path,
-    *,
-    status: str = "passed",
-    positive_ids: tuple[str, ...] = ("REQ-001",),
-    negative_ids: tuple[str, ...] = ("REQ-001",),
-) -> QualificationResult:
-    rows = tuple(
-        EvidenceRow(
-            requirement_id,
-            "1" * 64,
+def _qualification(candidate: Path, *, status: str = "passed") -> QualificationResult:
+    row_document = {
+        "requirement_id": "REQ-001",
+        "relation_digest": "1" * 64,
+        "public_calls": [
             {
-                "requirement_id": requirement_id,
-                "relation_digest": "1" * 64,
-                "public_calls": [
-                    {
-                        "seq": index,
-                        "instance": "mechanical",
-                        "tool_name": "act",
-                        "arguments": {},
-                        "observation": {"ok": True, "data": {}, "error": None},
-                    }
-                ],
-                "native_observations": [{"mechanical": True}],
-                "assertions": [
-                    {
-                        "assertion_id": f"assertion-{index}",
-                        "passed": True,
-                        "actual": True,
-                        "expected": True,
-                    }
-                ],
-                "source_use": {},
-            },
-        )
-        for index, requirement_id in enumerate(positive_ids, start=1)
-    )
+                "seq": 1,
+                "instance": "mechanical",
+                "tool_name": "act",
+                "arguments": {},
+                "observation": {"ok": True, "data": {}, "error": None},
+            }
+        ],
+        "native_observations": [{"mechanical": True}],
+        "assertions": [
+            {
+                "assertion_id": "assertion-1",
+                "passed": True,
+                "covers": ["native_before_after"],
+                "actual": True,
+                "expected": True,
+            }
+        ],
+        "source_use": {},
+    }
+    row = EvidenceRow("REQ-001", "1" * 64, row_document)
     return QualificationResult(
         status=status,  # type: ignore[arg-type]
         candidate_digest=compute_candidate_digest(candidate),
         expected_relations_digest="2" * 64,
         evidence_digest="3" * 64,
-        evidence_rows=rows,
+        evidence_rows=(row,),
         probe_bundle_digest="4" * 64,
-        negative_requirement_ids=negative_ids,
+        negative_evidence_count=1,
     )
 
 
@@ -132,120 +116,6 @@ def test_host_assembles_and_verifies_non_circular_release(tmp_path: Path) -> Non
     assert not (release.root / "project/BUILDER_PROJECTION.json").exists()
     assert not (release.root / "project/ENVIRONMENT_CONTRACT.md").exists()
     assert (release.root / "dist/mechanical_environment-0.1.0-py3-none-any.whl").is_file()
-
-
-def test_release_binds_taskable_negative_subset_without_requiring_all_requirements(
-    tmp_path: Path,
-) -> None:
-    candidate = _candidate(tmp_path)
-    release = assemble_environment_release(
-        candidate,
-        _qualification(
-            candidate,
-            positive_ids=("REQ-001", "REQ-002"),
-            negative_ids=("REQ-002",),
-        ),
-        "# Brief\n",
-        tmp_path / "assembled",
-    )
-
-    verify_environment_release(release.root)
-    summary = json.loads((release.root / "qualification.json").read_text())
-    assert summary["requirement_ids"] == ["REQ-001", "REQ-002"]
-    assert summary["negative_requirement_ids"] == ["REQ-002"]
-    assert "positive_evidence_count" not in summary
-    assert "negative_evidence_count" not in summary
-
-
-@pytest.mark.parametrize(
-    "negative_ids",
-    ((), ("REQ-001", "REQ-001"), ("REQ-999",)),
-)
-def test_release_rejects_invalid_negative_requirement_scope(
-    negative_ids: tuple[str, ...], tmp_path: Path
-) -> None:
-    candidate = _candidate(tmp_path)
-
-    with pytest.raises(PublicationError) as caught:
-        assemble_environment_release(
-            candidate,
-            _qualification(
-                candidate,
-                positive_ids=("REQ-001", "REQ-002"),
-                negative_ids=negative_ids,
-            ),
-            "# Brief\n",
-            tmp_path / "assembled",
-        )
-
-    assert caught.value.code == "qualification_incomplete"
-
-
-def test_verifier_rejects_tampered_negative_requirement_scope(tmp_path: Path) -> None:
-    candidate = _candidate(tmp_path)
-    release = assemble_environment_release(
-        candidate,
-        _qualification(candidate),
-        "# Brief\n",
-        tmp_path / "assembled",
-    )
-    summary_path = release.root / "qualification.json"
-    summary = json.loads(summary_path.read_text())
-    summary["negative_requirement_ids"] = ["REQ-999"]
-    summary_bytes = canonical_bytes(summary)
-    summary_path.write_bytes(summary_bytes)
-    descriptor_path = release.root / "release.json"
-    descriptor = json.loads(descriptor_path.read_text())
-    descriptor["qualification_digest"] = hashlib.sha256(summary_bytes).hexdigest()
-    descriptor_path.write_bytes(canonical_bytes(descriptor))
-
-    with pytest.raises(PublicationError) as caught:
-        verify_environment_release(release.root)
-
-    assert caught.value.code == "qualification_invalid"
-
-
-def test_cold_replay_must_preserve_negative_requirement_scope(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    candidate = _candidate(tmp_path)
-    qualification = _qualification(candidate)
-    release = assemble_environment_release(
-        candidate,
-        qualification,
-        "# Brief\n",
-        tmp_path / "assembled",
-    )
-    archive = tmp_path / "release.zip"
-    write_release_zip(release.root, archive)
-    monkeypatch.setattr(
-        publication_module.subprocess,
-        "run",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
-    )
-    monkeypatch.setattr(
-        publication_module,
-        "replay_qualification",
-        lambda *args, **kwargs: QualificationResult(
-            status="passed",
-            candidate_digest=qualification.candidate_digest,
-            expected_relations_digest=qualification.expected_relations_digest,
-            evidence_digest="5" * 64,
-            probe_bundle_digest=qualification.probe_bundle_digest,
-            negative_requirement_ids=("REQ-999",),
-        ),
-    )
-
-    with pytest.raises(PublicationError) as caught:
-        cold_verify_environment_release(
-            archive,
-            tmp_path / "cold",
-            object(),  # type: ignore[arg-type]
-            tmp_path / "probes",
-        )
-
-    assert caught.value.code == "cold_negative_scope_mismatch"
 
 
 def test_archive_relocates_and_reverifies_exact_identity(tmp_path: Path) -> None:

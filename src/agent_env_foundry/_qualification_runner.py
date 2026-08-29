@@ -26,9 +26,9 @@ from agent_env_foundry.release import (
     verify_release,
 )
 
-type Operation = Literal["open", "reset", "tools", "invoke", "close"]
+type Operation = Literal["reset", "tools", "invoke", "close"]
 
-_OPERATIONS = frozenset({"open", "reset", "tools", "invoke", "close"})
+_OPERATIONS = frozenset({"reset", "tools", "invoke", "close"})
 _SESSION_TOKEN = object()
 _ENVIRONMENT_TOKEN = object()
 _JOURNAL_ORIGIN = object()
@@ -119,7 +119,7 @@ class ControlledRunCarrier:
 class RecordedEnvironment:
     """Canonical Environment wrapper whose only extra behavior is Host journaling."""
 
-    __slots__ = ("__closed", "__environment", "__instance_key", "__on_close", "__recorder")
+    __slots__ = ("__environment", "__instance_key", "__recorder")
 
     def __init__(
         self,
@@ -127,18 +127,14 @@ class RecordedEnvironment:
         environment: ValidatedEnvironment,
         instance_key: str,
         recorder: _JournalRecorder,
-        on_close: Callable[[str], None],
     ) -> None:
         if token is not _ENVIRONMENT_TOKEN:
             raise TypeError("RecordedEnvironment is created only by ProbeSession")
         self.__environment = environment
         self.__instance_key = instance_key
         self.__recorder = recorder
-        self.__on_close = on_close
-        self.__closed = False
 
     def reset(self, start: dict[str, Any] | None = None) -> Any:
-        self.__require_open()
         return self.__forward(
             "reset",
             {"start": start},
@@ -146,14 +142,12 @@ class RecordedEnvironment:
         )
 
     def tools(self) -> tuple[Any, ...]:
-        self.__require_open()
         return cast(
             tuple[Any, ...],
             self.__forward("tools", {}, self.__environment.tools),
         )
 
     def invoke(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        self.__require_open()
         return self.__forward(
             "invoke",
             {"tool_name": tool_name, "arguments": arguments},
@@ -161,14 +155,7 @@ class RecordedEnvironment:
         )
 
     def close(self) -> None:
-        self.__require_open()
         self.__forward("close", {}, self.__environment.close)
-        self.__closed = True
-        self.__on_close(self.__instance_key)
-
-    def __require_open(self) -> None:
-        if self.__closed:
-            raise RuntimeError("closed environment handle cannot be reused")
 
     def __forward(
         self,
@@ -261,35 +248,18 @@ def _create_probe_session(
     instances = instances_root.resolve()
     instances.mkdir(parents=True, exist_ok=True)
     recorder = _JournalRecorder(journal_path, run_id)
-    active_instances: set[str] = set()
 
     def open_environment(instance_key: str) -> RecordedEnvironment:
         _validate_instance_key(instance_key)
-        if instance_key in active_instances:
-            raise RuntimeError("instance already has an active environment handle")
         try:
             environment = load_environment(release, instances / instance_key)
         except Exception as exc:
-            recorder.record(
-                instance_key,
-                "open",
-                {},
-                {
-                    "host_exception": {
-                        "type": type(exc).__name__,
-                        "message": str(exc),
-                    }
-                },
-            )
             raise CandidateExecutionFailure(exc) from exc
-        recorder.record(instance_key, "open", {}, {"attached": True})
-        active_instances.add(instance_key)
         return RecordedEnvironment(
             _ENVIRONMENT_TOKEN,
             environment,
             instance_key,
             recorder,
-            active_instances.discard,
         )
 
     return ProbeSession(_SESSION_TOKEN, open_environment), recorder
