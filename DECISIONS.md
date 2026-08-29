@@ -12,13 +12,18 @@
   - protected release-local `TaskSemantics` with start cases, read-only inspect,
     qualified capabilities, binding enumeration and atomic/condition checks.
 - S1 TaskSemantics is written by a fresh Codex SDK thread/workspace independent
-  of the Environment Builder. Existing independent Qualification machinery is
-  extended; no new multi-Agent organization is introduced.
+  of the Environment Builder. The deleted v1 Qualification machinery is not
+  restored or extended.
+- One third, qualification-only Codex lineage writes a native verifier package.
+  It sees frozen expected semantics and a read-only actor view, but never the
+  TaskSemantics project, outputs or repair history. It is archived for cold
+  audit and is not an actor, S2 or Consumer runtime.
 - Host code freezes Brief-derived expected capability/workflow relations before
   the Semantics Author receives decode-only source/native access.
-- Host code owns schemas, manifests, identities, execution, native readers,
-  physical negatives, repair ownership and final release verdict. Generated
-  code and model consensus are never self-authorizing.
+- Host code owns schemas, manifests, identities, execution of both semantic
+  lineages, axis-by-axis comparison, physical negatives, repair ownership and
+  final release verdict. Generated code and model consensus are never
+  self-authorizing.
 - Every core Brief Requirement is dispositioned `Taskable`, `NotTaskable` or
   `Unsupported`; silent omission is invalid.
 - S2 is Goal-first. A graph, random walk, generated program or successful trace
@@ -38,16 +43,18 @@
 - The bounded GoalProgram has four nodes only: `AtomGoal`, `AllGoal`, `IfGoal`
   and `ForEachGoal`. Selection and reporting are TaskBlueprint attributes, not
   standalone AST nodes.
-- Cross-capability `AllGoal` requires a shared independently qualified workflow
-  ID and compatible scopes. `IfGoal` may reference only a qualified publicly
-  observable `ConditionSpec`.
+- Cross-capability `AllGoal` requires an explicit independently qualified
+  CompositionRule and exact selected-sibling evaluation context. `IfGoal` may
+  reference only a qualified publicly observable `ConditionSpec`.
 - TaskChecker is canonical Host-interpreted data compiled from qualified atomic
-  semantics. Arbitrary LLM-authored verifier Python is forbidden.
+  semantics. Arbitrary per-Task LLM-authored verifier Python is forbidden; the
+  release-level qualification verifier is audit-only and mutually blind from
+  TaskSemantics.
 - The final canonical instruction is frozen before any witness-model call. The
   witness and later S3 actor receive exactly the same instruction string.
 - Public witness search and independent assessments use a Host-owned OpenAI
   Responses tool-calling loop, not Codex SDK. Codex SDK is reserved for
-  persistent environment/semantics code authoring.
+  the three frozen release-local code artifacts and is never the witness loop.
 - Each TaskPack requires two successful fresh public executions and per-argument
   public/protected provenance validation. Concrete traces are evidence; no
   custom `WitnessRecipe` or value-expression DSL is required.
@@ -66,6 +73,15 @@
 - Persistent `QuarantinedCandidate`, universal tool/state graphs, per-Task
   unrestricted truth code, mutable Registry aliases, demo/MVP and canned Task
   paths are deleted.
+- Qualification binds a derived Core ID over frozen actor, semantics, verifier,
+  factory, schema and documentation inputs. Publication seals the passed receipt
+  into the final descriptor; Qualification never depends on the final Release ID.
+- Task definitions bind stable logical referents, not one materialization's
+  protected IDs. Each witness/challenge run re-resolves the referent and records
+  its own protected resolution evidence.
+- Public binding and answer operands carry exact instruction/reset/tool-output
+  source references. Composition evaluation receives the selected sibling set;
+  no generic scope algebra or universal State IR is introduced.
 - Completion requires the preregistered real SQLite/Git Task-yield and structure
   floors, cold S3-shaped recreation, a framework-frozen held-out Need and
   matched-budget baselines. Unit tests or one Task cannot authorize completion.
@@ -101,3 +117,5 @@
 `s2-task-foundry-cp3c-framework|介入1|返工3|real CAP-005 causal trace+4 independent reviews+RED/GREEN+native reconciliation mutations|红线违反0`
 
 `s2-v2-clean-break|介入1|返工1|12k+ LOC deletion+277 tests+Ruff/Mypy/lock+zero-reference+tree-manifest mutation|红线违反0`
+
+`s2-v2-contract-reclosure|介入1|返工2|3 independent ALLOW+277 tests+task/spec validation+stale S1 deletion|红线违反0`

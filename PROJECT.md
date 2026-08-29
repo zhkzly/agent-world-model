@@ -47,6 +47,12 @@ not a universal State IR. S1 Qualification must compare it with authoritative
 native SQLite/files/Git or another independently readable representation and
 must physically challenge every declared taskable capability.
 
+That comparison is produced by one qualification-only verifier authored in an
+independent clean context. It is archived for cold audit but is never exposed to
+the actor, S2 compiler, witness Agent or Consumer. It cannot see TaskSemantics
+source, outputs or repair history. The Host executes both lineages against the
+same physical instances and owns every comparison and verdict.
+
 S1 may change when a demonstrated cross-environment S2/S3 consumer requirement
 requires it. Compatibility with earlier research releases is not a product
 requirement. S1 must not publish concrete Tasks, reference traces, corpus cells,
@@ -87,13 +93,17 @@ deduplication and corpus selection.
 
 These operations must not be implemented only as prompt instructions.
 
-### Python Codex SDK
+### Python Codex SDK code authoring
 
-Codex SDK is used only to author persistent release-local code:
+Codex SDK is used only to author three mutually isolated release-local code
+artifacts:
 
 1. the S1 Environment Builder writes the executable actor project;
 2. an independent S1 Semantics Author writes the protected semantics package
-   after Brief-derived expected relations are frozen.
+   after Brief-derived expected relations are frozen;
+3. an independent Qualification Verifier Author writes one audit-only native
+   verifier package from the same frozen expectations and actor view, without
+   access to the semantics project.
 
 Codex never decides release admission, Task admission, identity, reward or final
 checker verdict. Generated code passes deterministic Host checks, native reads
@@ -154,6 +164,13 @@ proof of complete Task-space coverage.
 9. Unsupported semantics and bounded planner failure are explicit typed outcomes;
    gates are never weakened to increase Task count.
 10. Intermediate implementation slices are checkpoints, never S2 completion.
+11. Qualification binds a derived pre-publication Core ID; the final Release ID
+    is computed only after the passed receipt is sealed, so no hash fixed point or
+    provisional public release exists.
+12. TaskDefinition stores stable logical binding plans. Every witness/challenge
+    materialization resolves its own protected bindings after reset.
+13. Every acting-time target, constraint and answer operand has an exact public
+    source in the instruction, reset observation or schema-qualified tool output.
 
 ## Completion evidence
 

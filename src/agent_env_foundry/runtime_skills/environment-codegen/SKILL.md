@@ -25,6 +25,8 @@ input file.
 5. Implement the complete actor project, public schemas/documentation, package
    data, and diagnostic tests. Do not write release or qualification metadata;
    the Host assembles the actor and TaskSemantics projects into EnvironmentRelease v2.
+   Document the native storage layout needed by independent read-only code
+   authors, but do not write TaskSemantics or Qualification Verifier code.
    Include tests for native state change, multi-step value
    reuse, refusal without prohibited mutation, reset, reload, and instance
    isolation.

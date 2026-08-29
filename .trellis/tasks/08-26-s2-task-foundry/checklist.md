@@ -10,3 +10,16 @@
 - [x] Do focused physical tests, full Pytest, Ruff, format, Mypy and lock checks pass?
 - [x] Does zero-reference search prove the old production path is dead?
 - [x] Is this checkpoint described only as a clean v2 foundation, not S2 completion?
+
+## Contract reclosure review
+
+- [x] Is Core → Qualification receipt → final Release ID mechanically acyclic?
+- [x] Are TaskSemantics and verifier mutually blind with Host-owned comparison?
+- [x] Is the verifier audit-only, archived for replay and absent from S2/Consumer runtime?
+- [x] Do Qualification and sealed preparation reuse one project materializer?
+- [x] Do logical bindings re-resolve on every fresh witness/challenge instance?
+- [x] Does composed/foreach evaluation receive the exact selected sibling context without a scope DSL?
+- [x] Does every binding/facet/answer operand have an exact public source?
+- [x] Do active docs contain no instruction to restore deleted v1 modules or claim absent CLI/coordinator success?
+- [x] Does the ordered plan reach TaskPack, assessment, corpus, cross-domain and held-out gates rather than stop at packaging?
+- [x] Do independent reviewers find no remaining implementation-blocking ambiguity or overdesign?

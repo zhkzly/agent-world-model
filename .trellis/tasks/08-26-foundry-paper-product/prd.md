@@ -41,6 +41,8 @@ S1 owns:
 - public `reset/tools/invoke/close` behavior and persistent native state;
 - an independent Codex SDK TaskSemantics project authored after expected
   relations freeze;
+- a mutually blind qualification-only native verifier project archived for
+  cold audit and unavailable to S2/Consumers;
 - Host-owned public/native/physical-negative Qualification;
 - exact prepare/open process isolation and immutable publication.
 
@@ -94,6 +96,7 @@ Framework Python
 Python Codex SDK
   actor environment project
   independent protected TaskSemantics project
+  mutually blind qualification-only verifier project
 
 OpenAI Responses tool-calling policy
   public witness execution

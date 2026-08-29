@@ -1,91 +1,96 @@
-# S1 Direct Coordinator Contract
+# S1 v2 Coordinator Contract
 
 ## 1. Scope / Trigger
 
-Use this contract for the public `Need -> EnvironmentRelease` coordinator and
-for any generated uv workspace created beneath the Foundry checkout. It prevents
-formatting-only Need changes from changing semantic coverage and prevents `uv`
-from attaching a generated Candidate to the Foundry's own workspace.
+Use this contract for the future direct Python coordinator from one natural
+language Need to one admitted EnvironmentRelease v2. The coordinator does not
+currently exist at HEAD and must not be claimed implemented until its real
+cross-domain acceptance passes.
 
-## 2. Signatures
+## 2. Signature
 
 ```python
-generate_environment(need_text: str, *, config: GenerationConfig) -> (
-    Released | NotReleased | Unsupported
-)
+generate_environment_v2(
+    need_text: str,
+    *,
+    config: GenerationConfig,
+) -> Released | NotReleased | Unsupported
 ```
 
-```bash
-foundry generate --need-file NEED.md [--run-store PATH] [--release-store PATH]
-foundry verify-release --release RELEASE_DIRECTORY_OR_ZIP
+The imperative order is:
+
+```text
+Research
+-> actor Builder
+-> expected-semantics freeze
+-> mutually blind TaskSemantics and Verifier Authors
+-> Core derivation
+-> physical Qualification
+-> Publication
+-> cold verification/replay
 ```
 
-The coordinator is imperative: Research, Builder, Qualification, cold
-verification, then publication. There is no workflow engine or compatibility
-path.
+A CLI may wrap this API after the API exists. CLI existence never proves the
+coordinator or release is complete.
 
 ## 3. Contracts
 
-- Preserve `NeedRecord.original_need` byte-for-byte as decoded text.
-- Derive coverage anchors from Markdown paragraphs/list items and complete
-  sentence boundaries. Ordinary prose line wrapping must not change anchors.
-- Resolve run and release stores to absolute paths at invocation construction.
-- Builder workspace setup uses an absolute target and `uv init --no-workspace`.
-  The parent Foundry `pyproject.toml` and `uv.lock` must remain byte-identical.
-- Publish only after the exact archive passes cold locked installation and the
-  admitted Qualification replay.
-- Any Research, Builder, Qualification, cold-use or publication failure returns
-  `NotReleased`; it cannot publish a release ID.
+- Preserve `NeedRecord.original_need` exactly and derive wrapping-invariant
+  coverage anchors.
+- Generated projects are standalone uv workspaces created with absolute paths
+  and `uv init --no-workspace`; parent project bytes remain unchanged.
+- Freeze expected semantics before exposing actor source/native details.
+- TaskSemantics and verifier workspaces/threads are fresh and mutually blind.
+- Derive one acyclic Core ID; Qualification binds Core, not final Release ID.
+- Publish only from a passed strict receipt and immutable frozen bytes.
+- Cold verification uses archived actor/semantics/verifier/evidence bytes.
+- Any stage failure returns a typed non-release outcome; there is no v1 fallback.
 
 ## 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
 | Empty Need | `NotReleased(invalid_need)` |
-| Research cannot close before budget | typed Research `NotReleased`; Builder absent |
-| Builder command/workspace failure | phase-attributed `NotReleased`; Qualification absent |
-| Qualification not passed | no assembly/publication |
-| Malformed release ZIP | `not_verified`, `extraction/zip_invalid`, no traceback |
-| Cold replay fails or changes probe bytes | no publication |
-| Published archive differs from cold-tested archive | `NotReleased(published_archive_digest_mismatch)` |
+| Research cannot close | typed Research failure; no Builder |
+| Actor build fails | `EnvironmentDefect` or Infrastructure; no semantic authors |
+| Expected semantics incomplete | fail before source exposure |
+| Semantics/verifier author failure | typed owner; no Core Qualification |
+| Core byte changes | invalidate all descendant evidence |
+| Qualification not passed | no Publication |
+| Receipt/layout/cold replay fails | no released ID |
+| v1 input/output requested | unsupported; no conversion |
 
 ## 5. Good / Base / Bad Cases
 
-- Good: wrapped and unwrapped forms of the same prose preserve different
-  `original_need` text but produce identical complete anchors.
-- Good: a Candidate under `.artifacts/foundry-runs/...` is a standalone uv
-  project and never appears in the parent workspace members.
-- Base: an accepted Research handoff produces one Candidate, one independent
-  Qualification lineage, one cold replay and one content-addressed release.
-- Bad: each visual line becomes a clause (`invoice` / `dispute environment...`).
-- Bad: `uv init` discovers the Foundry parent and edits its `pyproject.toml`.
-- Bad: a structural ZIP check is called release success without cold execution.
+- Good: SQLite and filesystem/Git Needs use the same coordinator and Framework
+  code with separate generated projects.
+- Base: exact Core qualifies, seals, relocates and cold replays to one Release ID.
+- Bad: restore deleted `api.py/cli.py/qualification.py/publication.py` wholesale.
+- Bad: let one generated semantic package authorize its own receipt.
+- Bad: expose an unqualified/pending release to S2.
 
 ## 6. Tests Required
 
-- Wrapped/unwrapped Need equivalence while preserving exact original text.
-- Relative Builder target resolves once and parent `pyproject.toml` bytes do not
-  change; mutations removing either `.resolve()` or `--no-workspace` must fail.
-- Every pre-publication stage failure prevents the publication function call.
-- Malformed ZIP returns a typed CLI failure.
-- A live public command must produce `research-ready.json`, `candidate.json`,
-  passing positive/negative Qualification evidence, cold evidence and a release
-  whose directory and ZIP verify to the same ID.
+- Need wrapping equivalence and parent workspace immutability.
+- Three author input-visibility matrices and immutable input checks.
+- Per-stage fail-closed absence of later calls/artifacts.
+- Core/receipt/Release identity DAG mutations.
+- Real public/native Qualification and cold replay for SQLite and filesystem/Git.
+- S2 opens only exact admitted bytes without development-checkout imports.
 
 ## 7. Wrong vs Correct
 
 Wrong:
 
-```python
-for line in need.splitlines():
-    clauses.append(line)
-subprocess.run(["uv", "init", str(relative_workspace)], cwd=relative_parent)
+```text
+Builder -> self-authored tests -> package -> release
 ```
 
 Correct:
 
-```python
-anchors = paragraph_list_and_sentence_anchors(need)  # wrapping invariant
-workspace = requested_workspace.resolve()
-subprocess.run(["uv", "init", "--no-workspace", str(workspace)], cwd=workspace.parent)
+```text
+Builder + mutually blind semantic/verifier artifacts
+-> Host physical agreement/negatives
+-> strict receipt
+-> immutable v2 release
 ```

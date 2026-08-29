@@ -1,5 +1,11 @@
 # TaskSemantics Project Contract
 
+> **Status: Checkpoint-A target — not executable at current HEAD.** The current
+> Host decoders still use the pre-reclosure fields and would reject the
+> `public_source`, `public_sources` and `evaluation_context` records below. Land
+> this contract, Host models/decoders and tests atomically. Do not run the
+> Semantics Author before that change is complete.
+
 Write one standalone Python 3.12 uv project implementing a release-local,
 read-only `TaskSemantics` factory. The project is proposed code; Host execution
 and Qualification alone decide whether it is usable.
@@ -52,7 +58,7 @@ capability_id, requirement_ids, workflow_ids, composition_rules,
 actor_role, task_kind, intent_label,
 protected_binding_schema, public_descriptor_schema,
 facets, conditions, answer_fields,
-read_scopes, write_scopes, supported_goal_kinds, rendering
+supported_goal_kinds, rendering
 ```
 
 Nested records have exactly:
@@ -61,25 +67,28 @@ Nested records have exactly:
 CompositionRule:
   rule_id, workflow_id, kind="all", capability_ids, max_occurrences
 FacetSpec:
-  name, public_label, value_schema, allowed_operators,
-  visibility, tool_name, output_schema_pointer
+  name, public_label, value_schema, allowed_operators, public_source
 ConditionSpec:
-  condition_id, public_label, visibility, binding_scope,
-  true_capability_ids, false_capability_ids, report_field,
-  tool_name, output_schema_pointer
+  condition_id, public_label, binding_scope,
+  true_capability_ids, false_capability_ids, report_field, public_source
 AnswerFieldSpec:
-  field_id, schema, public_label
+  field_id, schema, public_label, public_source
 RenderingSpec:
   imperative, target_noun, answer_phrase
+PublicValueSource:
+  kind, tool_name, json_pointer, value
 ```
 
 Schemas are self-contained Draft 2020-12 JSON Schema objects. Protected/public
 binding schemas must have object roots. Every capability supports `atom`;
 additional goal kinds are only `all`, `if`, and `foreach`. Facet operators are
-only `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `min`, and `max`. Non-tool facets or
-conditions set `tool_name` and `output_schema_pointer` to null. A `public_tool`
-record supplies both, and the pointer is an RFC 6901 path (the empty string means
-the output root).
+only `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `min`, and `max`.
+
+`PublicValueSource.kind` is exactly `task_literal`, `reset`, `tool_output`, or
+`tool_schema_constant`. Task literals supply `value`; reset sources supply an
+RFC 6901 reset-observation pointer; tool sources supply a tool name and exact
+schema pointer. Unused fields are null. Broad object schemas do not authorize a
+descendant path.
 
 Every generated capability must preserve the exact `field_id`/`public_label`
 pairs frozen in its expected capability record. You author the release-local
@@ -90,12 +99,15 @@ different semantic label.
 
 ```text
 semantic_key, eligible, reason_codes,
-protected_binding, public_descriptor, facets
+protected_binding, public_descriptor, facets, public_sources
 ```
 
 Eligible bindings have no reason codes. Ineligible bindings have at least one.
 The three projections are JSON objects and must validate against the capability
 schemas/facets.
+`public_sources` maps every public descriptor/facet leaf pointer to an exact
+`PublicValueSource`. No leaf may rely on prose, a protected value or an
+undeclared object descendant.
 Within one StartCase and capability, different semantic keys must not expose the
 same public binding document. Public descriptors/facets must identify the
 intended referent using values available from schema-qualified reset or tool
@@ -141,12 +153,21 @@ Requests passed to evaluators are JSON objects:
 ```text
 AtomCheckRequest:
   capability_id, before_facts, after_facts, protected_binding,
-  trace_projection, final_answer
+  trace_projection, final_answer, evaluation_context
 ConditionCheckRequest:
   condition_id, before_facts, protected_binding, trace_projection
 TraceEvent:
   seq, tool_name, arguments, observation
+GoalEvaluationContext:
+  current_slot, resolved_bindings, composition_rule_id,
+  foreach_selector_id, permitted_sibling_slots
 ```
+
+The evaluation context contains the exact run-local protected bindings selected
+for the current Goal. `permitted_sibling_slots` must match the qualified
+CompositionRule or ForEach selection. Evaluators may allow those sibling effects
+without treating unrelated mutations as collateral. Do not invent or interpret
+a generic read/write-scope algebra.
 
 `start_cases` must return deterministic, schema-valid reset-only world regimes.
 Case IDs alone do not create different world regimes. Repeated `(seed, limit)`
@@ -156,14 +177,16 @@ calls return identical records.
 
 - The semantics project must not import the actor package or call actor business
   functions as an answer oracle.
+- The semantics project never receives the independent Qualification Verifier
+  source, outputs, tests or repair history and must not attempt to discover them.
 - `inspect`, `capabilities`, `enumerate_bindings`, `evaluate_atom` and
   `evaluate_condition` must not mutate the instance directory.
 - Native state may be decoded with independent standard readers appropriate to
   the generated representation.
 - Protected bindings/native fields must never be copied into public descriptors,
   labels or rendering text.
-- `public_tool` facets and conditions require an exact ToolSpec output-schema
-  pointer and must agree with real public execution during Qualification.
+- Every binding, facet, condition and answer operand requires an exact public
+  source and must agree with real public execution during Qualification.
 - Composition and condition branches may only use the frozen Requirement,
   workflow and capability relations.
 - Return structured values; do not return scalar rewards or terminal verdicts.

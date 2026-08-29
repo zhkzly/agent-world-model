@@ -1,0 +1,217 @@
+# EnvironmentRelease v2 Qualification and Publication Contract
+
+> **Status: Planned — not implemented at current HEAD.** Current
+> `verify_release_v2` checks structural bytes/digests only and accepts the
+> mechanical fixture receipt. No current artifact is an admitted product
+> release. Checkpoints A–D in `implement.md` must implement and prove this
+> contract before S2 may consume a release.
+
+## 1. Scope / Trigger
+
+Use this contract after actor, expected semantics, TaskSemantics and the
+qualification-only verifier have frozen. It defines the only path from those
+projects to an S2-admissible EnvironmentRelease v2.
+
+It does not define Task generation, a public service, Registry behavior or any
+v1 migration.
+
+## 2. Signatures
+
+```python
+derive_qualification_core(inputs: FrozenCoreInputs) -> QualificationCore
+
+run_v2_qualification(
+    core: QualificationCore,
+    *,
+    cache_root: Path,
+    route: AgentRoute,
+    budget: QualificationBudget,
+) -> QualificationReport | QualificationFailure
+
+publish_release_v2(
+    core: QualificationCore,
+    report: QualificationReport,
+    destination: Path,
+) -> PublishedRelease | PublicationFailure
+
+verify_release_v2(path: Path) -> ValidatedReleaseV2
+```
+
+Qualification verifier factory:
+
+```python
+generated_qualification_verifier.release:make_verifier
+```
+
+Verifier call:
+
+```python
+verify_transition(request: NativeVerificationRequest) -> NativeVerificationResult
+```
+
+## 3. Contracts
+
+### Identity
+
+- `core_id` is RFC 8785/SHA-256 over expected-semantics, actor, semantics,
+  verifier, factory, schema and public-document digests.
+- Core identity excludes evidence, receipt and final Release ID.
+- Qualification evidence and receipt bind `core_id`.
+- Publication copies Core bytes unchanged, then adds evidence/receipt and
+  computes payload and final descriptor digests.
+- Qualification never consumes final Release ID. Publication never rewrites Core
+  bytes or Qualification evidence.
+
+### Independent verifier
+
+- Verifier Author never receives TaskSemantics source/output/tests/feedback.
+- Semantics Author never receives verifier source/output/tests/feedback.
+- Verifier receives public descriptor/trace/answer and before/after native paths;
+  it never receives TaskSemantics protected bindings or facts.
+- If those public inputs cannot identify the intended native referent, the
+  capability is Unsupported; Host never supplies a hidden identifier.
+- Verifier cannot import actor, semantics or Host packages and cannot mutate
+  either instance.
+- Host compares every result axis and report value and owns the verdict.
+
+### Shared materialization
+
+- Qualification and sealed preparation call one internal project materializer.
+- Actor, semantics and verifier use separate locked interpreters and project roots.
+- Sealed `prepare_release` installs actor/semantics only. The verifier is installed
+  only for Qualification or cold audit.
+- There is no `allow_unqualified`, pending release or alternate cache/transport.
+
+### Receipt
+
+The receipt has exact fields:
+
+```text
+format
+verdict
+core_id
+expected_semantics_digest
+actor_project_digest
+semantics_project_digest
+verifier_project_digest
+public_surface_manifest_digest
+qualified_catalog_digest
+requirement_coverage_digest
+qualified_start_cases_digest
+evidence_manifest_digest
+```
+
+`format` is `environment-qualification/2`; `verdict` is `passed`. Every digest
+must match recomputed archived bytes.
+
+Bound data documents are:
+
+```text
+public-surface.json        public schemas/docs and exact ToolSpec catalog
+qualified-catalog.json     exact capability/condition/composition catalog
+requirement-coverage.json  every Requirement disposition and evidence IDs
+qualified-start-cases.json exact reset inputs/regimes S2 may use
+evidence-manifest.json     public/native/negative/replay/mutation evidence
+```
+
+Every prepared session must reproduce the sealed ToolSpec and CapabilitySpec
+catalog digests. The live StartCase generator must reproduce the sealed qualified
+set; unlisted generated cases are not S2-admissible.
+
+Evidence manifest requires public success, applicable negatives, fresh replay,
+cross-reader agreement, no-mutation/import evidence and executable mutation
+results.
+
+### Runtime versus audit projection
+
+- S2 receives an `AdmittedReleaseView` containing only identity, sealed public
+  surface/catalog/StartCases and actor/TaskSemantics session factories.
+- Native evidence, verifier paths and Qualification traces exist only in a
+  separate `QualificationAuditView` used for cold replay.
+
+### Release admission
+
+- Checkpoint D changes `verify_release_v2` from the current structural verifier
+  into closed-byte plus strict-receipt admission.
+- Checkpoint D makes `prepare_release` reject structural/mechanical fixtures.
+  Current fixture preparation is test infrastructure, never S2 admission.
+- Directory and ZIP forms must resolve to the same descriptor/Release ID.
+
+## 4. Validation & Error Matrix
+
+| Condition | Result |
+| --- | --- |
+| Core member changes after evidence | `QualificationFailure(core_changed)` |
+| Semantics/verifier axis disagreement | `SemanticsDefect` or `VerifierDefect`; fail closed if unresolved |
+| Verifier imports actor/semantics/Host | `VerifierDefect(import_leak)` |
+| Semantics/verifier mutates instance | corresponding typed defect |
+| Missing applicable physical case | Qualification not passed |
+| Executable required mutant survives | Qualification not passed |
+| Provider/dependency/process unavailable | `InfrastructureFailure`; no semantic repair |
+| Receipt missing/unknown field or non-passed verdict | release rejection |
+| Receipt/Core/evidence digest mismatch | release rejection |
+| Live tools/capabilities/StartCases differ from sealed documents | release/session rejection |
+| Mechanical fixture receipt | release rejection |
+| Publication changes frozen project/evidence byte | `PublicationFailure(core_changed)` |
+| Final descriptor/payload/ZIP tamper | release rejection |
+
+## 5. Good / Base / Bad Cases
+
+- Good: actor and semantics agree on a success, the independently authored
+  verifier reaches the same axes from native before/after state, and no-op/wrong
+  target/collateral/wrong-answer cases are rejected by both.
+- Base: a Core is qualified, sealed once, relocated, cold reopened and replayed;
+  all identities recompute exactly.
+- Bad: write a canonical `{verdict: "mechanical_fixture_only"}` receipt and call
+  it a release.
+- Bad: let the verifier read TaskSemantics protected facts or copy its evaluator.
+- Bad: prepare a pending release through a private flag and later replace its
+  receipt.
+- Bad: implement a second uv installer for Qualification.
+
+## 6. Tests Required
+
+- Per-field Core preimage mutation and explicit proof that final Release ID is
+  absent from Qualification inputs.
+- Mutual author-view denial and source/import scans.
+- Real separate actor/semantics/verifier interpreters against the same instances.
+- Mutate-on-success and mutate-then-error no-mutation tests for semantics/verifier.
+- Axis/report mismatch, no-op, wrong target, near miss, answer, collateral,
+  process and fresh replay cases.
+- Executable inspector/evaluator/verifier mutants; crash/syntax mutants excluded.
+- Exact receipt schema, category completeness and every digest mismatch.
+- Exact public-surface/catalog/coverage/StartCase documents, live equality and
+  rejection of unqualified generated StartCases.
+- Type/projection test proving S2 cannot deserialize verifier/evidence/reference traces.
+- Mechanical fixture cannot pass `verify_release_v2`/`prepare_release` admission.
+- Publication byte preservation, directory/ZIP relocation and cold replay.
+- Real SQLite and filesystem/Git releases with unchanged Framework code.
+
+## 7. Wrong vs Correct
+
+Wrong:
+
+```text
+temporary release ID -> Qualification -> replace qualification.json -> new release ID
+```
+
+Correct:
+
+```text
+frozen Core bytes -> Core ID -> Qualification receipt -> final descriptor -> Release ID
+```
+
+Wrong:
+
+```text
+TaskSemantics.inspect -> TaskSemantics.evaluate_atom -> "independent" agreement
+```
+
+Correct:
+
+```text
+same physical before/after instances
+├─ TaskSemantics evaluation
+└─ mutually blind verifier native evaluation
+Host compares exact axes and physical negatives
+```

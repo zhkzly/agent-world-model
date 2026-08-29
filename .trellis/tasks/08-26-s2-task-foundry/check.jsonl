@@ -1,5 +1,5 @@
 {"file":"PROJECT.md","reason":"Review all code/evidence against real execution, exact public solvability, deterministic truth, role separation and no fake completion."}
 {"file":"DECISIONS.md","reason":"Reject reintroduction of old Graph/Programmatic lanes, six-node AST, WitnessRecipe DSL, LLM Judge, hidden setup or model-relative Task identity."}
-{"file":".trellis/spec/backend/s1-coordinator.md","reason":"Verify S1 v2 remains a direct cold-published coordinator with no compatibility or workflow-engine drift."}
-{"file":".trellis/tasks/08-26-s2-task-foundry/research/implementation-readiness-audit.md","reason":"Primary review checklist for framework versus Codex/Responses responsibilities, Good Task gates, remaining risks and anti-overdesign constraints."}
-{"file":".trellis/tasks/08-26-s2-task-foundry/research/goal-first-design-audit.md","reason":"Secondary adversarial risk inventory; canonical documents and the newer readiness audit take precedence where details changed."}
+{"file":".trellis/spec/backend/s1-coordinator.md","reason":"Verify the v2-only stage order and that absent coordinator/CLI paths are not claimed implemented."}
+{"file":".trellis/spec/backend/v2-preparation.md","reason":"Audit sealed-release preparation for strict receipt admission and reuse of one materializer."}
+{"file":".trellis/spec/backend/v2-qualification-publication.md","reason":"Audit identity acyclicity, verifier independence, physical evidence completeness and no provisional/compatibility path."}

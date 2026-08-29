@@ -1,5 +1,11 @@
 # EnvironmentRelease v2 Preparation Contract
 
+> **Status: Implemented structural foundation; strict admission planned.** The
+> current code verifies v2 closure and runs isolated actor/semantics projects,
+> but does not yet validate a passed Qualification receipt. Mechanical fixtures
+> can currently reach `prepare_release` for runtime tests and are not product
+> releases. Checkpoint D must close this gate before any S2 entry point exists.
+
 ## 1. Scope / Trigger
 
 Use this contract when consuming an `environment-release/2` directory or ZIP for
@@ -28,8 +34,16 @@ with prepared.open(instance_directory) as session:
 ## 3. Contracts
 
 - Accept only canonical v2 bytes; v1 has no compatibility reader.
+- Checkpoint D target: admit only a strict passed
+  `environment-qualification/2` receipt whose Core and evidence bindings
+  recompute from archived bytes. Until implemented, preparation is structural
+  test infrastructure and cannot authorize S2.
 - Copy actor and semantics projects into different content-addressed runtime roots
   and run real `uv sync --frozen --all-groups --link-mode copy` in each.
+- Checkpoint C target: use the same internal per-project materializer for
+  pre-publication Qualification and sealed preparation. Qualification additionally
+  materializes its audit-only verifier; `prepare_release` never exposes or
+  installs that verifier for Consumers.
 - Children run their own `.venv/bin/python -I -B`; scrub `VIRTUAL_ENV`,
   `PYTHONPATH` and `PYTHONHOME`. Generated packages are never imported by Host.
 - The private request is exactly `{seq, op, args}`. Responses echo `seq` and are
@@ -47,7 +61,8 @@ with prepared.open(instance_directory) as session:
 
 | Condition | Result |
 | --- | --- |
-| v1/malformed/tampered release | `EnvironmentDefect` or contract rejection before sync |
+| unsupported/malformed/tampered release | `EnvironmentDefect` or contract rejection before sync |
+| missing/non-passed/mismatched Qualification receipt | Checkpoint D target: rejection before sync |
 | frozen uv sync unavailable/fails | `InfrastructureFailure` with command outputs |
 | actor startup/factory failure | `EnvironmentDefect/child_startup_failed` |
 | semantics startup/factory failure | `SemanticsDefect/child_startup_failed` |
@@ -70,7 +85,9 @@ with prepared.open(instance_directory) as session:
 
 ## 6. Tests Required
 
-- Directory and safe-ZIP identity equality; v1 and byte/mode/symlink/extra-member rejection.
+- Current: directory and safe-ZIP identity equality plus unsupported format,
+  byte/mode/symlink/extra-member rejection.
+- Checkpoint D: invalid/missing/non-passed receipt rejection before sync.
 - Real frozen sync and real child interpreters for actor plus all six trusted calls.
 - Same-name cross-release non-aliasing and reopen-without-reset persistence.
 - Trusted mutation and mutate-then-error both produce an unchanged=false event and rejection.

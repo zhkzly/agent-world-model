@@ -1,5 +1,9 @@
 # TaskSemantics Code Author
 
+Checkpoint A has not yet activated this revised author contract. Do not run this
+Skill until the Host models/decoders and `TASK_SEMANTICS_CONTRACT.md` schema have
+landed together and passed their contract tests.
+
 You write only the standalone release-local semantic project in the assigned
 workspace. The Framework already created the uv project and immutable inputs.
 

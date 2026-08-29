@@ -27,8 +27,6 @@
     ".trellis/tasks/08-26-s2-task-foundry/prd.md",
     ".trellis/tasks/08-26-s2-task-foundry/design.md",
     ".trellis/tasks/08-26-s2-task-foundry/implement.md",
-    ".trellis/tasks/08-26-s2-task-foundry/research/implementation-readiness-audit.md",
-    ".trellis/tasks/08-26-s2-task-foundry/research/goal-first-design-audit.md",
     "src/agent_env_foundry/preparation.py",
     "src/agent_env_foundry/semantics.py",
     "src/agent_task_foundry/models.py",
@@ -42,9 +40,10 @@
     "tests/test_preparation.py",
     "tests/fixtures/fx_v2_actor.py",
     "tests/fixtures/fx_v2_semantics.py",
-    ".trellis/spec/backend/v2-preparation.md"
+    ".trellis/spec/backend/v2-preparation.md",
+    ".trellis/spec/backend/v2-qualification-publication.md"
   ],
-  "notes": "Clean-break implementation is removing the complete v1 loader/publication/Qualification path before any new semantic work. The v2 release verifier, locked two-runtime preparation, expected-semantics core and independent Semantics Author foundation remain; native v2 Qualification and Publication must be rebuilt before S2 compilation begins. Alignment Patrol is disabled by user decision.",
+  "notes": "Commit 9ba397b removed the complete v1 loader/publication/Qualification path. The amended plan closes the identity cycle and full S2 contracts with an acyclic Core ID, one audit-only mutually blind verifier, sealed runtime manifests/qualified StartCases, strict receipt, logical per-run rebinding/selection, exact public occurrences, fresh episode identity and a pre-witness AdmissionPlan. Three fresh independent reviews returned ALLOW. Checkpoint A awaits explicit user approval; Alignment Patrol remains disabled.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -56,7 +55,8 @@
     ],
     "codegen": [
       "environment_builder_codex",
-      "task_semantics_codex"
+      "task_semantics_codex",
+      "qualification_verifier_codex"
     ],
     "acting_policy": "responses_tool_loop",
     "task_identity_excludes": [
@@ -64,6 +64,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "v2_clean_break_foundation"
+    "implementation_checkpoint": "checkpoint_a_awaiting_user_approval"
   }
 }
