@@ -27,6 +27,7 @@ from agent_env_foundry.semantics import (
 )
 from agent_env_foundry.task_foundry import (
     AtomTask,
+    AtomTaskPack,
     TaskFoundryError,
     _context,
     _resolve_binding,
@@ -197,6 +198,89 @@ class SolvedIfTask:
             "admission_plan": self.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.witnesses],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class IfAdmissionReport:
+    solved: SolvedIfTask
+    branch_task_pack: AtomTaskPack
+
+    def __post_init__(self) -> None:
+        task = self.solved.task
+        branch = self.branch_task_pack.task
+        if (
+            branch.task_id != task.branch_task_id
+            or branch.release_id != task.release_id
+            or branch.start_case != task.start_case
+            or branch.capability_id != task.branch_capability_id
+            or branch.semantic_key != task.semantic_key
+        ):
+            raise TaskFoundryError(
+                "if_branch_task_pack_mismatch",
+                "If admission branch TaskPack differs from its frozen Atom branch",
+            )
+        if self.solved.admission_plan.checker_mutations != ("flip_condition_branch",) or any(
+            not item.branch_result.satisfied or item.opposite_branch_result.satisfied
+            for item in self.solved.witnesses
+        ):
+            raise TaskFoundryError(
+                "if_branch_mutation_survived",
+                "If flip-condition-branch mutant survived admission",
+            )
+
+    @property
+    def report_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "if-admission-report/1",
+            "task_id": self.solved.task.task_id,
+            "admission_plan": self.solved.admission_plan.to_document(),
+            "witnesses": [item.to_document() for item in self.solved.witnesses],
+            "branch_task_pack": self.branch_task_pack.to_document(),
+            "checker_mutation": {
+                "mutation_id": "flip_condition_branch",
+                "killed": True,
+                "witness_ids": [item.witness_id for item in self.solved.witnesses],
+            },
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "report_id": self.report_id}
+
+
+@dataclass(frozen=True, slots=True)
+class IfTaskPack:
+    task: IfTask
+    admission: IfAdmissionReport
+
+    def __post_init__(self) -> None:
+        if self.admission.solved.task.task_id != self.task.task_id:
+            raise TaskFoundryError(
+                "if_task_pack_task_mismatch",
+                "If TaskPack admission belongs to another Task",
+            )
+
+    @property
+    def task_pack_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "if-task-pack/1",
+            "task": self.task.to_document(),
+            "admission": self.admission.to_document(),
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "task_pack_id": self.task_pack_id}
+
+
+def seal_if_task_pack(solved: SolvedIfTask, branch_task_pack: AtomTaskPack) -> IfTaskPack:
+    _verify_task_preimage(solved.task)
+    admission = IfAdmissionReport(solved, branch_task_pack)
+    return IfTaskPack(solved.task, admission)
 
 
 def compile_if_tasks(
@@ -484,6 +568,10 @@ def _conditions(catalog: dict[str, Any]) -> tuple[ConditionSpec, ...]:
 def _verify_task(prepared: OpenPreparedRelease, task: IfTask) -> None:
     if task.release_id != prepared.identity.release_id:
         raise TaskFoundryError("task_release_mismatch", "If Task belongs to another release")
+    _verify_task_preimage(task)
+
+
+def _verify_task_preimage(task: IfTask) -> None:
     preimage: JSONObject = {
         "release_id": task.release_id,
         "start_case_id": task.start_case.case_id,
@@ -546,9 +634,12 @@ def _json_object(value: Any) -> JSONObject:
 
 __all__ = [
     "IfAdmissionPlan",
+    "IfAdmissionReport",
     "IfTask",
+    "IfTaskPack",
     "IfWitness",
     "SolvedIfTask",
     "compile_if_tasks",
+    "seal_if_task_pack",
     "solve_if_task_twice",
 ]
