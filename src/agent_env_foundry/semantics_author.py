@@ -11,6 +11,7 @@ from typing import Any, cast
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
 from agent_env_foundry.builder import (
+    ACTOR_FACTORY,
     BuilderConfig,
     CommandResult,
     _codex_provider_overrides,
@@ -315,11 +316,7 @@ def _project_files(root: Path) -> tuple[Path, ...]:
 
 
 def _source_check(root: Path) -> CommandResult:
-    public = _read_json(root / PUBLIC_SURFACE_NAME)
-    actor_factory = public.get("actor_factory")
-    actor_module = (
-        actor_factory.partition(":")[0].split(".", 1)[0] if isinstance(actor_factory, str) else ""
-    )
+    actor_module = ACTOR_FACTORY.partition(":")[0].split(".", 1)[0]
     violations: list[dict[str, str]] = []
     source_root = root / "src/generated_task_semantics"
     if not (source_root / "release.py").is_file():
@@ -345,7 +342,11 @@ def _source_check(root: Path) -> CommandResult:
             for node in ast.walk(tree)
             if isinstance(node, ast.ImportFrom) and node.module
         )
-        for forbidden in {"agent_env_foundry", actor_module} - {""}:
+        for forbidden in {
+            "agent_env_foundry",
+            "generated_qualification_verifier",
+            actor_module,
+        } - {""}:
             if forbidden in imports:
                 violations.append({"path": relative, "reason": f"forbidden_import:{forbidden}"})
     return CommandResult(
@@ -419,12 +420,16 @@ def _import_separation_check(
     prepared: PreparedSemanticsAuthorWorkspace,
     config: BuilderConfig,
 ) -> CommandResult:
-    public = _read_json(prepared.root / PUBLIC_SURFACE_NAME)
-    actor_factory = public.get("actor_factory")
-    actor_module = (
-        actor_factory.partition(":")[0].split(".", 1)[0] if isinstance(actor_factory, str) else ""
+    actor_module = ACTOR_FACTORY.partition(":")[0].split(".", 1)[0]
+    modules = tuple(
+        module
+        for module in (
+            actor_module,
+            "generated_qualification_verifier",
+            "agent_env_foundry",
+        )
+        if module
     )
-    modules = tuple(module for module in (actor_module, "agent_env_foundry") if module)
     python = prepared.root / ".venv/bin/python"
     try:
         own_origin = _probe_origin(

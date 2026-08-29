@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import stat
 from collections.abc import Sequence
 from pathlib import Path
@@ -49,6 +50,36 @@ def verify_staged_view(
         )
 
 
+def stage_readonly_view(
+    source_root: Path,
+    destination: Path,
+    source_files: Sequence[Path],
+) -> tuple[tuple[str, str], ...]:
+    root = Path(source_root).resolve()
+    view = Path(destination)
+    if view.exists():
+        raise ValueError("read-only view destination already exists")
+    view.mkdir(parents=True)
+    records: list[tuple[str, str]] = []
+    for source in source_files:
+        path = Path(source)
+        if path.is_symlink() or not path.is_file() or not path.resolve().is_relative_to(root):
+            raise ValueError("read-only view source must be one regular project file")
+        relative = path.relative_to(root)
+        target = view / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(path, target)
+        target.chmod(0o444)
+        records.append((relative.as_posix(), hashlib.sha256(target.read_bytes()).hexdigest()))
+    for directory in sorted(
+        (path for path in view.rglob("*") if path.is_dir()),
+        reverse=True,
+    ):
+        directory.chmod(0o555)
+    view.chmod(0o555)
+    return tuple(records)
+
+
 def verify_readonly(
     path: Path,
     digest: str,
@@ -66,4 +97,10 @@ def verify_readonly(
         raise error_type(f"{role} changed after Host staging: {path}")
 
 
-__all__ = ["ViewFileLike", "ViewManifestLike", "verify_readonly", "verify_staged_view"]
+__all__ = [
+    "ViewFileLike",
+    "ViewManifestLike",
+    "stage_readonly_view",
+    "verify_readonly",
+    "verify_staged_view",
+]

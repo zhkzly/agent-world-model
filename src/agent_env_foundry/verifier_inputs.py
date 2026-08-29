@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import hashlib
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 from agent_env_foundry.builder import candidate_files, compute_candidate_digest
-from agent_env_foundry.frozen_inputs import verify_readonly, verify_staged_view
+from agent_env_foundry.frozen_inputs import (
+    stage_readonly_view,
+    verify_readonly,
+    verify_staged_view,
+)
 from agent_env_foundry.qualification_contracts import PublicSurfaceManifest
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics_inputs import (
@@ -95,31 +98,21 @@ def prepare_verifier_author_workspace(
     if not isinstance(public_surface, PublicSurfaceManifest):
         raise VerifierInputError("Verifier Author requires one frozen public-surface/2 manifest")
 
-    view = root / ACTOR_VIEW_NAME
-    view.mkdir()
-    records: list[ViewFile] = []
-    for source in candidate_files(actor):
-        relative = source.relative_to(actor)
-        target = view / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, target)
-        target.chmod(0o444)
-        records.append(
-            ViewFile(relative.as_posix(), hashlib.sha256(target.read_bytes()).hexdigest())
+    records = tuple(
+        ViewFile(path, digest)
+        for path, digest in stage_readonly_view(
+            actor,
+            root / ACTOR_VIEW_NAME,
+            candidate_files(actor),
         )
-    for directory in sorted(
-        (path for path in view.rglob("*") if path.is_dir()),
-        reverse=True,
-    ):
-        directory.chmod(0o555)
-    view.chmod(0o555)
+    )
     view_preimage = {
         "actor_digest": actor_digest,
         "files": [{"path": item.path, "digest": item.digest} for item in records],
     }
     manifest = ActorViewManifest(
         actor_digest,
-        tuple(records),
+        records,
         hashlib.sha256(canonical_bytes(view_preimage)).hexdigest(),
     )
 

@@ -104,3 +104,17 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
   `BLOCK` was corrected with the actual accepted verifier. C1 is complete. It
   is not physical Qualification or S1 completion and authorizes C2 Core and
   three-runtime Qualification wiring only.
+
+## Checkpoint C2 Core and three-runtime closure
+
+- Added exact v2 Semantics Author staging and generated the real ocean
+  TaskSemantics project (`82b7997e...0c18`) in an isolated fresh thread.
+- `FrozenCoreInputs` binds typed Semantics/Verifier input attestations, the exact
+  Expected/Public bytes both Authors received, identical actor views, fixed
+  factories and three recomputed project identities.
+- Derived real Core `7539278a...edf29` and materialized three distinct locked
+  runtimes with the full peer/Host denial matrix.
+- Closed project nesting, cache/source overlap and alternative unseen
+  Expected/Public rebinding counterexamples; ten mutations were killed.
+- Two reviewers returned `ALLOW`. C2 is complete and authorizes C3 physical
+  case execution/comparison only. It is not Qualification, Release or S2 completion.

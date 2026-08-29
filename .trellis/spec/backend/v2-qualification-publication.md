@@ -1,11 +1,11 @@
 # EnvironmentRelease v2 Qualification and Publication Contract
 
-> **Status: Checkpoint B verifier authoring implemented; Qualification and
-> Publication remain planned.** The Host can author, repair, identify and invoke
-> one independent native verifier through real locked projects. No current
-> artifact is an admitted product release. Checkpoints C–D in `implement.md`
-> must still implement and prove Qualification, receipt, Publication and cold
-> admission before S2 may consume a release.
+> **Status: Checkpoint C2 Core and three-runtime materialization implemented;
+> physical Qualification and Publication remain planned.** The Host can author
+> both independent semantic lineages, bind their exact inputs/projects into one
+> acyclic Core and materialize actor/semantics/verifier runtimes. No current
+> artifact is an admitted product release. Checkpoints C3–D must still implement
+> cases, comparison, evidence, receipt, Publication and cold admission before S2.
 
 ## 1. Scope / Trigger
 
@@ -74,6 +74,12 @@ verify_transition(request: NativeVerificationRequest) -> NativeVerificationResul
   computes payload and final descriptor digests.
 - Qualification never consumes final Release ID. Publication never rewrites Core
   bytes or Qualification evidence.
+- Core derivation re-verifies the immutable Expected Semantics/Public Surface
+  bytes and identical actor view actually received by both Authors. In-memory
+  replacement bytes cannot be rebound to unchanged generated projects.
+- Actor, semantics and verifier project roots are distinct, non-nested and
+  disjoint from the Qualification cache. Core-addressed materialization rejects
+  any post-Core source drift before use.
 
 ### Independent verifier
 
@@ -171,6 +177,8 @@ results.
 | Condition | Result |
 | --- | --- |
 | Core member changes after evidence | `QualificationFailure(core_changed)` |
+| Author attestation Expected/Public/view differs | Core derivation rejection |
+| Project roots alias/nest or cache overlaps a source | rejection before cache writes |
 | Semantics/verifier axis disagreement | `SemanticsDefect` or `VerifierDefect`; fail closed if unresolved |
 | Verifier imports actor/semantics/Host | `VerifierDefect(import_leak)` |
 | Semantics/verifier mutates instance | corresponding typed defect |

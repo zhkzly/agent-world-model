@@ -58,3 +58,14 @@
 - [x] Does `prepare_release` still expose only actor and semantics?
 - [x] Are duplicate installer/transport/cache/sandbox/Qualification paths absent?
 - [x] Did two independent reviewers ALLOW the actual accepted-verifier handoff?
+
+## Checkpoint C2 Core and three runtimes
+
+- [x] Does Semantics Author consume exact v2 surface/Expected bytes and the same actor view?
+- [x] Do typed attestations prove both Authors received the Core-bound inputs?
+- [x] Does Core recompute actor/semantics/verifier identities with no Release ID?
+- [x] Are all three project roots distinct, non-nested and cache-disjoint?
+- [x] Does the exact three-lineage peer/Host import-denial matrix hold?
+- [x] Do changed project/input bytes fail before unsafe use?
+- [x] Did the real ocean Core materialize three separate locked interpreters?
+- [x] Did ten mutations and two independent C2 reviews pass?

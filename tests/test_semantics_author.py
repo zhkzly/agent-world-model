@@ -10,7 +10,8 @@ import pytest
 from openai_codex import ApprovalMode, Sandbox
 
 import agent_env_foundry.semantics_author as semantics_author_module
-from agent_env_foundry.builder import BuilderConfig, CommandResult
+from agent_env_foundry.builder import BuilderConfig, CommandResult, compute_candidate_digest
+from agent_env_foundry.qualification_contracts import PublicSurfaceManifest
 from agent_env_foundry.semantics import capability_from_document, validate_catalog
 from agent_env_foundry.semantics_author import (
     SemanticsAuthorFailure,
@@ -24,11 +25,58 @@ from agent_env_foundry.semantics_inputs import (
     VIEW_MANIFEST_NAME,
     CandidateViewManifest,
     PreparedSemanticsAuthorWorkspace,
+    prepare_semantics_author_workspace,
 )
 
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _surface() -> PublicSurfaceManifest:
+    return PublicSurfaceManifest(
+        start_schema={"type": "object"},
+        reset_observation_schema={"type": "object"},
+        tool_specs=(),
+        public_documents_digest="b" * 64,
+    )
+
+
+def test_host_stages_exact_v2_semantics_inputs_and_actor_view(tmp_path: Path) -> None:
+    actor = tmp_path / "actor"
+    source = actor / "src/generated_environment/release.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def make_environment(path):\n    return object()\n")
+    (actor / "pyproject.toml").write_text("[project]\nname='actor'\nversion='0.1.0'\n")
+    (actor / "uv.lock").write_text("version = 1\n")
+    actor_digest = compute_candidate_digest(actor)
+    expected = b'{"format":"expected-task-semantics/1"}'
+
+    prepared = prepare_semantics_author_workspace(
+        tmp_path / "prepared",
+        actor_root=actor,
+        actor_digest=actor_digest,
+        expected_semantics_payload=expected,
+        expected_semantics_digest=_sha(expected),
+        public_surface=_surface(),
+    )
+
+    prepared.verify_inputs()
+    assert json.loads((prepared.root / PUBLIC_SURFACE_NAME).read_text())["format"] == (
+        "public-surface/2"
+    )
+    assert (prepared.root / "candidate-view/src/generated_environment/release.py").is_file()
+    assert not (prepared.root / "VERIFIER_PROJECT").exists()
+
+    with pytest.raises(ValueError, match="Actor project digest"):
+        prepare_semantics_author_workspace(
+            tmp_path / "bad",
+            actor_root=actor,
+            actor_digest="0" * 64,
+            expected_semantics_payload=expected,
+            expected_semantics_digest=_sha(expected),
+            public_surface=_surface(),
+        )
 
 
 def _workspace(tmp_path: Path) -> PreparedSemanticsAuthorWorkspace:
@@ -67,20 +115,7 @@ def _workspace(tmp_path: Path) -> PreparedSemanticsAuthorWorkspace:
             "composition_rules": [],
             "conditions": [],
         },
-        PUBLIC_SURFACE_NAME: {
-            "format": "public-surface/1",
-            "candidate_digest": "a" * 64,
-            "candidate_view_digest": manifest.view_digest,
-            "actor_factory": "generated_actor.release:make_environment",
-            "start_schema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": False,
-            },
-            "reset_observation_schema": {"type": "object"},
-            "tool_specs": [],
-            "public_documents": [],
-        },
+        PUBLIC_SURFACE_NAME: _surface().to_document(),
     }
     inputs: dict[str, str] = {}
     for name, document in documents.items():
@@ -205,12 +240,17 @@ def test_framework_rejects_actor_or_host_imports_in_semantics_source(tmp_path: P
     workspace = _workspace(tmp_path)
     source = workspace.root / "src/generated_task_semantics/release.py"
     source.parent.mkdir(parents=True)
-    source.write_text("import generated_actor\nimport agent_env_foundry\n")
+    source.write_text(
+        "import generated_environment\n"
+        "import generated_qualification_verifier\n"
+        "import agent_env_foundry\n"
+    )
 
     result = semantics_author_module._source_check(workspace.root)
 
     assert not result.passed
-    assert "forbidden_import:generated_actor" in result.stderr
+    assert "forbidden_import:generated_environment" in result.stderr
+    assert "forbidden_import:generated_qualification_verifier" in result.stderr
     assert "forbidden_import:agent_env_foundry" in result.stderr
 
 
@@ -260,7 +300,8 @@ def test_runtime_import_probe_requires_own_source_and_rejects_actor(
 ) -> None:
     workspace = _workspace(tmp_path)
     own = workspace.root / "src/generated_task_semantics/__init__.py"
-    actor = tmp_path / "actor/generated_actor/__init__.py"
+    actor = tmp_path / "actor/generated_environment/__init__.py"
+    verifier = tmp_path / "verifier/generated_qualification_verifier/__init__.py"
 
     def clean_probe(python: Path, project: Path, module: str, timeout: float) -> Path | None:
         del python, project, timeout
@@ -277,13 +318,16 @@ def test_runtime_import_probe_requires_own_source_and_rejects_actor(
             own
             if module == "generated_task_semantics"
             else actor
-            if module == "generated_actor"
+            if module == "generated_environment"
+            else verifier
+            if module == "generated_qualification_verifier"
             else None
         ),
     )
     rejected = semantics_author_module._import_separation_check(workspace, config)
     assert not rejected.passed
-    assert "generated_actor" in rejected.stderr
+    assert "generated_environment" in rejected.stderr
+    assert "generated_qualification_verifier" in rejected.stderr
 
 
 def test_model_completion_text_cannot_override_failed_framework_checks(
