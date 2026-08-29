@@ -126,5 +126,9 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
   `bdd03537134deaba82f0f1c93e706337c470b7a9c7f502929d43311de8c92903`
   sealed two fresh witnesses, a physically applicable state-change collateral
   challenge and 4/4 checker mutations. Artifact SHA-256 is `083aa5e7...`.
+- Current-release protected-path Refusal Atom TaskPack
+  `94cce2133a20b443765073b6649a221e88a773dde2303761923ce5c6fb8aefe6`
+  sealed two fresh witnesses, all applicable negatives and 3/3 checker
+  mutations. Artifact SHA-256 is `94323a25...`.
 - Checkpoint F remains incomplete until Refusal/ForEach/If TaskPacks reach the
   anti-demo floor and assessment/corpus work begins.

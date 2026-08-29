@@ -41,7 +41,7 @@
     ".trellis/spec/backend/v2-preparation.md",
     ".trellis/spec/backend/v2-qualification-publication.md"
   ],
-  "notes": "SQLite and filesystem/Git C3+D use the same production Qualification/Publication path. Current Git Release 3ee01aedf891592abc14d0039ce65127463eacb5785d7d1014ca9ad50fcfdfde cold-compiles 12 Atom, 4 ForEach and 6 If candidates (22 total) over two StartCases. After transient 503/auth_unavailable recovered without product fallback, current-release State Atom TaskPack 17323878... and Query Atom TaskPack bdd03537... each sealed two fresh witnesses, complete applicable challenges and 4/4 checker mutations; Query collateral is physically applicable and rejected. Git F still needs Refusal/ForEach/If expansion to the anti-demo floor. Direct S1 coordinator and Checkpoint G remain incomplete.",
+  "notes": "SQLite and filesystem/Git C3+D use the same production Qualification/Publication path. Current Git Release 3ee01aedf891592abc14d0039ce65127463eacb5785d7d1014ca9ad50fcfdfde cold-compiles 12 Atom, 4 ForEach and 6 If candidates (22 total) over two StartCases. Current-release State 17323878..., Query bdd03537... and Refusal 94cce213... Atom TaskPacks each sealed two fresh witnesses plus complete applicable challenges/mutations; Query collateral is physically applicable and rejected. Git F still needs remaining Atom/ForEach/If expansion to the anti-demo floor. Direct S1 coordinator and Checkpoint G remain incomplete.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",

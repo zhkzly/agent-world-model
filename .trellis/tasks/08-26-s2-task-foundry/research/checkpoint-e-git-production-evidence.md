@@ -44,6 +44,7 @@ or fallback was added. Fresh current-release runs then sealed:
 ```text
 State Atom TaskPack  173238781decdfb8829a2a303c502fcc7fe8bd42df9b8d4fc1a2b3766075ccee
 Query Atom TaskPack  bdd03537134deaba82f0f1c93e706337c470b7a9c7f502929d43311de8c92903
+Refusal Atom Pack    94cce2133a20b443765073b6649a221e88a773dde2303761923ce5c6fb8aefe6
 ```
 
 Each has two fresh witnesses and all applicable negative/mutation evidence.
@@ -52,5 +53,5 @@ while rebinding the resulting dynamic commit IDs. The Query pack selected the
 state-change Task as an applicable collateral control and rejected the combined
 physical state.
 
-This is not full Checkpoint F: Refusal/ForEach/If admission, the >=20 floor,
-assessment and corpus selection remain open.
+This is not full Checkpoint F: the remaining Atom bindings, ForEach/If
+admission, the >=20 floor, assessment and corpus selection remain open.
