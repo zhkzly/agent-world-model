@@ -5,7 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from agent_env_foundry.if_foundry import IfTask, IfWitness, SolvedIfTask
+from agent_env_foundry.if_foundry import IfAdmissionPlan, IfTask, IfWitness, SolvedIfTask
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import AtomCheckResult, ConditionCheckResult, StartCase
 from agent_env_foundry.task_foundry import TaskFoundryError
@@ -70,6 +70,7 @@ def _witness(task: IfTask, materialization_id: str) -> IfWitness:
         (),
         ConditionCheckResult("true", {}, ()),
         _atom_result(),
+        _atom_result(satisfied=False),
         1,
         (None,),
     )
@@ -78,20 +79,34 @@ def _witness(task: IfTask, materialization_id: str) -> IfWitness:
 def test_if_task_binds_condition_branch_and_two_fresh_witnesses() -> None:
     task = _task()
     assert task.task_id
-    solved = SolvedIfTask(task, (_witness(task, "c" * 64), _witness(task, "d" * 64)))
+    plan = IfAdmissionPlan(task.task_id, ("flip_condition_branch",))
+    with pytest.raises(TaskFoundryError, match="flip-condition"):
+        IfAdmissionPlan(task.task_id, ())
+    solved = SolvedIfTask(
+        task,
+        plan,
+        (_witness(task, "c" * 64), _witness(task, "d" * 64)),
+    )
     assert solved.to_document()["format"] == "solved-if-task/1"
+    assert solved.to_document()["admission_plan"]["plan_id"] == plan.plan_id
 
     wrong_condition = replace(
         _witness(task, "e" * 64),
         condition_result=ConditionCheckResult("false", {}, ()),
     )
     with pytest.raises(TaskFoundryError, match="condition branch"):
-        SolvedIfTask(task, (_witness(task, "c" * 64), wrong_condition))
+        SolvedIfTask(task, plan, (_witness(task, "c" * 64), wrong_condition))
     failed_branch = replace(
         _witness(task, "f" * 64),
         branch_result=_atom_result(satisfied=False),
     )
     with pytest.raises(TaskFoundryError, match="selected Atom branch"):
-        SolvedIfTask(task, (_witness(task, "c" * 64), failed_branch))
+        SolvedIfTask(task, plan, (_witness(task, "c" * 64), failed_branch))
+    false_accept = replace(
+        _witness(task, "f" * 64),
+        opposite_branch_result=_atom_result(),
+    )
+    with pytest.raises(TaskFoundryError, match="opposite Atom branch"):
+        SolvedIfTask(task, plan, (_witness(task, "c" * 64), false_accept))
     with pytest.raises(TaskFoundryError, match="fresh"):
-        SolvedIfTask(task, (_witness(task, "c" * 64), _witness(task, "c" * 64)))
+        SolvedIfTask(task, plan, (_witness(task, "c" * 64), _witness(task, "c" * 64)))

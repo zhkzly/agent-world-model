@@ -11,13 +11,14 @@ from typing import Any, Literal, cast
 from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
-from agent_env_foundry.preparation import OpenPreparedRelease
+from agent_env_foundry.preparation import OpenPreparedRelease, OpenPreparedSession
 from agent_env_foundry.provenance import ArgumentProvenance, resolve_argument_provenance
 from agent_env_foundry.public_agent import run_public_episode
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
     AtomCheckResult,
+    BindingCandidate,
     ConditionCheckRequest,
     ConditionCheckResult,
     ConditionSpec,
@@ -59,6 +60,12 @@ class IfTask:
         )
 
     @property
+    def opposite_capability_id(self) -> str:
+        return (
+            self.false_capability_id if self.expected_branch == "true" else self.true_capability_id
+        )
+
+    @property
     def task_id(self) -> str:
         return hashlib.sha256(canonical_bytes(self.to_document())).hexdigest()
 
@@ -82,6 +89,33 @@ class IfTask:
 
 
 @dataclass(frozen=True, slots=True)
+class IfAdmissionPlan:
+    task_id: str
+    checker_mutations: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.checker_mutations != ("flip_condition_branch",):
+            raise TaskFoundryError(
+                "if_admission_plan_invalid",
+                "If admission must precommit to the flip-condition-branch mutant",
+            )
+
+    @property
+    def plan_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "if-admission-plan/1",
+            "task_id": self.task_id,
+            "checker_mutations": list(self.checker_mutations),
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "plan_id": self.plan_id}
+
+
+@dataclass(frozen=True, slots=True)
 class IfWitness:
     task_id: str
     materialization_id: str
@@ -91,6 +125,7 @@ class IfWitness:
     argument_provenance: tuple[ArgumentProvenance, ...]
     condition_result: ConditionCheckResult
     branch_result: AtomCheckResult
+    opposite_branch_result: AtomCheckResult
     provider_turns: int
     usage: tuple[JSONObject | None, ...]
 
@@ -109,6 +144,7 @@ class IfWitness:
             "argument_provenance": [item.to_document() for item in self.argument_provenance],
             "condition_result": self.condition_result.to_document(),
             "branch_result": self.branch_result.to_document(),
+            "opposite_branch_result": self.opposite_branch_result.to_document(),
             "provider_turns": self.provider_turns,
             "usage": [_json(item) for item in self.usage],
         }
@@ -117,9 +153,15 @@ class IfWitness:
 @dataclass(frozen=True, slots=True)
 class SolvedIfTask:
     task: IfTask
+    admission_plan: IfAdmissionPlan
     witnesses: tuple[IfWitness, IfWitness]
 
     def __post_init__(self) -> None:
+        if self.admission_plan.task_id != self.task.task_id:
+            raise TaskFoundryError(
+                "if_admission_plan_task_mismatch",
+                "If AdmissionPlan belongs to another Task",
+            )
         if any(item.task_id != self.task.task_id for item in self.witnesses):
             raise TaskFoundryError(
                 "if_witness_task_mismatch",
@@ -142,11 +184,17 @@ class SolvedIfTask:
                 "if_witness_branch_failed",
                 "If witness did not satisfy its selected Atom branch",
             )
+        if any(item.opposite_branch_result.satisfied for item in self.witnesses):
+            raise TaskFoundryError(
+                "if_witness_opposite_branch_accepted",
+                "If witness was falsely accepted by the opposite Atom branch",
+            )
 
     def to_document(self) -> JSONObject:
         return {
             "format": "solved-if-task/1",
             "task": self.task.to_document(),
+            "admission_plan": self.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.witnesses],
         }
 
@@ -298,6 +346,7 @@ def solve_if_task_twice(
     _verify_task(prepared, task)
     branch_task = _task_by_id(atom_task_universe, task.branch_task_id)
     _verify_checker_preimage(prepared, branch_task)
+    admission_plan = IfAdmissionPlan(task.task_id, ("flip_condition_branch",))
     selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
     witnesses: list[IfWitness] = []
     for index in (1, 2):
@@ -306,6 +355,7 @@ def solve_if_task_twice(
             reset = session.actor.reset(task.start_case.reset_input)
             before = session.trusted.inspect(instance)
             binding = _resolve_binding(session, branch_task, before)
+            opposite_binding = _resolve_opposite_binding(session, task, before)
             condition_result = session.trusted.evaluate_condition(
                 ConditionCheckRequest(
                     task.condition_id,
@@ -345,12 +395,33 @@ def solve_if_task_twice(
                     ),
                 )
             )
+            opposite_result = session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.opposite_capability_id,
+                    before,
+                    after,
+                    opposite_binding.protected_binding,
+                    episode.trace,
+                    episode.final_answer,
+                    _context(
+                        task.opposite_capability_id,
+                        opposite_binding.semantic_key,
+                        opposite_binding.protected_binding,
+                    ),
+                )
+            )
             if not branch_result.satisfied:
                 raise TaskFoundryError(
                     "if_public_witness_failed",
                     "Public Agent did not satisfy the condition-selected branch",
                     condition_result=condition_result.to_document(),
                     branch_result=branch_result.to_document(),
+                )
+            if opposite_result.satisfied:
+                raise TaskFoundryError(
+                    "if_opposite_branch_false_acceptance",
+                    "Physical If witness was accepted by the opposite branch checker",
+                    opposite_result=opposite_result.to_document(),
                 )
             witnesses.append(
                 IfWitness(
@@ -367,11 +438,34 @@ def solve_if_task_twice(
                     ),
                     condition_result,
                     branch_result,
+                    opposite_result,
                     episode.provider_turns,
                     episode.usage,
                 )
             )
-    return SolvedIfTask(task, cast(tuple[IfWitness, IfWitness], tuple(witnesses)))
+    return SolvedIfTask(
+        task,
+        admission_plan,
+        cast(tuple[IfWitness, IfWitness], tuple(witnesses)),
+    )
+
+
+def _resolve_opposite_binding(
+    session: OpenPreparedSession,
+    task: IfTask,
+    facts: JSONValue,
+) -> BindingCandidate:
+    matching = [
+        item
+        for item in session.trusted.enumerate_bindings(task.opposite_capability_id, facts)
+        if item.semantic_key == task.semantic_key
+    ]
+    if len(matching) != 1 or matching[0].public_descriptor != task.public_descriptor:
+        raise TaskFoundryError(
+            "if_opposite_binding_unresolved",
+            "If checker cannot resolve the same public referent in the opposite branch",
+        )
+    return matching[0]
 
 
 def _conditions(catalog: dict[str, Any]) -> tuple[ConditionSpec, ...]:
@@ -451,6 +545,7 @@ def _json_object(value: Any) -> JSONObject:
 
 
 __all__ = [
+    "IfAdmissionPlan",
     "IfTask",
     "IfWitness",
     "SolvedIfTask",

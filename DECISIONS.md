@@ -154,3 +154,5 @@
 `s2-foreach-taskpack|介入0|返工1|preselected physical collateral+same-Plan aggregate+8 mutation licences+one external TLS retry|红线违反0`
 
 `s2-if-vertical|介入0|返工0|existing public branch goals+3 compiled referents+4 real witnesses+3 mutation licences|红线违反0`
+
+`s2-if-branch-mutation|介入0|返工0|pre-witness flip-branch plan+4 selected-true/opposite-false runs+2 mutation licences|红线违反0`
