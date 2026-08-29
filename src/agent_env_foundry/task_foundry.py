@@ -1038,7 +1038,7 @@ def prove_agent_choices_non_load_bearing(
                 replay_observations[event.seq] = observation
                 replay_trace.append(TraceEvent(event.seq, event.tool_name, arguments, observation))
             after = session.trusted.inspect(instance)
-            result = session.trusted.evaluate_atom(
+            probe_result = session.trusted.evaluate_atom(
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1046,6 +1046,25 @@ def prove_agent_choices_non_load_bearing(
                     binding.protected_binding,
                     tuple(replay_trace),
                     witness.final_answer,
+                    _context(
+                        task.capability_id,
+                        binding.semantic_key,
+                        binding.protected_binding,
+                    ),
+                )
+            )
+            rebound_answer = _rebound_final_answer(
+                probe_result,
+                task.answer_schema,
+            )
+            result = session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after,
+                    binding.protected_binding,
+                    tuple(replay_trace),
+                    rebound_answer,
                     _context(
                         task.capability_id,
                         binding.semantic_key,
@@ -1853,6 +1872,21 @@ def _wrong_answer(schema: JSONObject, answer: JSONObject) -> JSONObject | None:
         if not tuple(Draft202012Validator(schema).iter_errors(candidate)):
             return candidate
     return None
+
+
+def _rebound_final_answer(
+    result: AtomCheckResult,
+    answer_schema: JSONObject,
+) -> JSONObject:
+    answer = _json_object(result.report_values)
+    errors = tuple(Draft202012Validator(answer_schema).iter_errors(answer))
+    if errors:
+        raise TaskFoundryError(
+            "rebound_final_answer_schema_invalid",
+            "Checker report values cannot rebind the perturbed run's final answer",
+            original_message=errors[0].message,
+        )
+    return answer
 
 
 _NO_ALTERNATIVE = object()

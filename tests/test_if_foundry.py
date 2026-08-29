@@ -209,3 +209,24 @@ def test_if_atom_uniqueness_is_scoped_by_start_case(tmp_path: Path) -> None:
     with pytest.raises(TaskFoundryError) as caught:
         compile_if_tasks(Prepared(), (first, first), tmp_path)  # type: ignore[arg-type]
     assert caught.value.code == "if_atom_universe_invalid"
+
+
+def test_abstaining_condition_rejects_only_that_if_blueprint() -> None:
+    condition = SimpleNamespace(
+        true_capability_ids=("cap-true",),
+        false_capability_ids=("cap-false",),
+    )
+    assert (
+        if_module._condition_capability(
+            condition,  # type: ignore[arg-type]
+            ConditionCheckResult("abstain", {}, ()),
+        )
+        is None
+    )
+    assert (
+        if_module._condition_capability(
+            condition,  # type: ignore[arg-type]
+            ConditionCheckResult("true", {}, ()),
+        )
+        == "cap-true"
+    )

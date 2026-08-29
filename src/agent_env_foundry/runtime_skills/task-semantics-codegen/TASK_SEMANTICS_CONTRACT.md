@@ -66,6 +66,18 @@ facets, conditions, answer_fields,
 supported_goal_kinds, rendering
 ```
 
+`task_kind` has precedence semantics, not a loose style label:
+
+- `state_change`: successful completion requires any business-state change,
+  even when a multi-step public process is also required;
+- `process`: successful completion requires public action/process evidence but
+  no business-state change, such as a stable refusal;
+- `query`: successful completion requires no business-state change and returns
+  one or more public answer fields.
+
+Qualification compares `inspect(before)` and `inspect(after)` and rejects a
+catalog whose declared kind disagrees with the physical semantic transition.
+
 Nested records have exactly:
 
 ```text
@@ -149,9 +161,20 @@ a workflow precondition, or a refusal condition. An eligible object still
 requiring a mutation is not initially satisfied; neither is a query still
 requiring a public read and correct answer. A genuinely already-complete goal
 may return true so the S2 compiler can reject that Blueprint as trivial.
-Every `task_kind="query"` capability declares at least one `answer_fields`
-record and a non-null rendering `answer_phrase`; requiring `final_answer`
-without publishing its answer contract is invalid.
+Every Taskable capability declares at least one `answer_fields` record,
+including state-change and process/refusal capabilities. Every Task therefore
+has a structured public final answer; requiring `final_answer` without
+publishing its answer contract is invalid. Capabilities licensed by the same
+ConditionSpec use identical branch-neutral answer field IDs and schemas. A
+field that does not apply to one branch uses its declared JSON `null` value;
+the answer schema must not reveal which branch is expected.
+
+Every answer-field schema must also be accepted as a strict structured-output
+subschema. Recursively, every array declares an `items` schema. Every object
+declares `properties`, lists every property in `required`, and sets
+`additionalProperties` to `false`; these rules also apply inside nullable types
+and `anyOf`/`oneOf`/`allOf` branches. Draft-valid broad arrays or objects are not
+acceptable because the public Responses runner cannot submit them.
 
 For every declared answer field, compute the expected value from independently
 decoded native facts and the qualified public trace, put that value under the

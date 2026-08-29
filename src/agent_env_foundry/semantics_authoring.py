@@ -249,8 +249,8 @@ def freeze_expected_task_semantics(
             findings.append(
                 f"{path}.workflow_ids: unlicensed workflow {sorted(unlicensed_workflows)}"
             )
-        if capability["task_kind"] == "query" and not capability["answer_fields"]:
-            findings.append(f"{path}: query capability requires answer_fields")
+        if not capability["answer_fields"]:
+            findings.append(f"{path}: Taskable capability requires answer_fields")
     if mapped_taskable != taskable_ids:
         findings.append(
             "$.capabilities: every Taskable Requirement must map to a capability; "
@@ -330,6 +330,18 @@ def freeze_expected_task_semantics(
         for reference in branch_refs & set(capability_index):
             if not condition_workflows.intersection(capability_index[reference]["workflow_ids"]):
                 findings.append(f"{path}: capability {reference!r} shares no condition workflow")
+        branch_answer_contracts = {
+            tuple(
+                (field["field_id"], field["public_label"])
+                for field in capability_index[reference]["answer_fields"]
+            )
+            for reference in branch_refs & set(capability_index)
+        }
+        if len(branch_answer_contracts) > 1:
+            findings.append(
+                f"{path}: condition branches require identical branch-neutral answer field IDs "
+                "and labels"
+            )
 
     if findings:
         raise ExpectedSemanticsError(findings)
@@ -401,11 +413,23 @@ def generate_expected_task_semantics(
                 "all declare its workflow.",
                 "Each condition must cite Requirement and workflow anchors, state the public "
                 "observable relation, and license only known capability branches.",
-                "Every query capability must declare one or more answer field IDs and public "
-                "labels. Every answer field must denote one exact value that the acting Agent "
+                "A capability whose successful goal requires any business-state change must "
+                "use task_kind=state_change, even when it also requires a multi-step public "
+                "process. Use task_kind=process only when success requires no business state "
+                "change but does require public action/process evidence, such as a stable "
+                "refusal. A query requires no business state change and returns public answer "
+                "fields.",
+                "Every Taskable capability must declare at least one answer field ID and public "
+                "label, including state-change and process/refusal capabilities. Every answer "
+                "field must denote one exact value that the acting Agent "
                 "can copy from the public instruction or a public observation. Its public_label "
                 "must define that value and any null case without a run-specific answer. Do not "
                 "invent free-form summaries of state changes or verifier judgments.",
+                "Capabilities licensed by the same public condition must declare identical "
+                "branch-neutral answer field IDs and labels. A field inapplicable to one branch "
+                "uses its declared null value; never vary the output schema to reveal the selected "
+                "branch. Do not omit a publicly observable condition when it distinguishes a "
+                "Taskable success outcome from a Taskable refusal for the same user request.",
                 "Every capability must provide one source-blind qualification_goal: a concise "
                 "public user objective that covers every mapped Taskable Requirement outcome, "
                 "refusal, collateral constraint, and public process obligation relevant to the "

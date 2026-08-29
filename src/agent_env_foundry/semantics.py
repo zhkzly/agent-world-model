@@ -104,7 +104,7 @@ class AnswerFieldSpec:
 
     def __post_init__(self) -> None:
         _identifier(self.field_id, "answer field_id")
-        _schema(self.schema, f"answer field {self.field_id!r}")
+        _strict_output_schema(self.schema, f"answer field {self.field_id!r}")
         _text(self.public_label, "answer field public_label")
 
     def to_document(self) -> JSONObject:
@@ -989,6 +989,65 @@ def _schema(value: JSONObject, role: str) -> None:
         validate_schema_document(value, role=role)
     except SchemaError as exc:
         raise SemanticsContractError(str(exc)) from exc
+
+
+def _strict_output_schema(value: JSONObject, role: str) -> None:
+    _schema(value, role)
+    pending: list[tuple[Any, str]] = [(value, "$")]
+    while pending:
+        node, path = pending.pop()
+        if not isinstance(node, dict):
+            raise SemanticsContractError(
+                f"{role} strict structured output schema at {path} must be an object"
+            )
+        raw_types = node.get("type")
+        types = (
+            {raw_types}
+            if isinstance(raw_types, str)
+            else set(raw_types)
+            if isinstance(raw_types, list)
+            else set()
+        )
+        if "array" in types:
+            items = node.get("items")
+            if not isinstance(items, dict):
+                raise SemanticsContractError(
+                    f"{role} strict structured output array at {path} requires items"
+                )
+            pending.append((items, f"{path}.items"))
+        if "object" in types:
+            properties = node.get("properties")
+            required = node.get("required")
+            if (
+                not isinstance(properties, dict)
+                or node.get("additionalProperties") is not False
+                or not isinstance(required, list)
+                or set(required) != set(properties)
+            ):
+                raise SemanticsContractError(
+                    f"{role} strict structured output object at {path} requires properties, "
+                    "all properties in required, and additionalProperties=false"
+                )
+            pending.extend(
+                (schema, f"{path}.properties.{name}") for name, schema in properties.items()
+            )
+        for keyword in ("anyOf", "oneOf", "allOf"):
+            branches = node.get(keyword)
+            if branches is not None:
+                if not isinstance(branches, list):
+                    raise SemanticsContractError(
+                        f"{role} strict structured output {keyword} at {path} must be an array"
+                    )
+                pending.extend(
+                    (branch, f"{path}.{keyword}[{index}]") for index, branch in enumerate(branches)
+                )
+        definitions = node.get("$defs")
+        if definitions is not None:
+            if not isinstance(definitions, dict):
+                raise SemanticsContractError(
+                    f"{role} strict structured output $defs at {path} must be an object"
+                )
+            pending.extend((schema, f"{path}.$defs.{name}") for name, schema in definitions.items())
 
 
 def _object_schema(value: JSONObject, role: str) -> None:

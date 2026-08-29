@@ -77,3 +77,24 @@ def test_result_axis_mutants_are_killed_by_independent_physical_cases() -> None:
     assert tuple(item["target_role"] for item in records) == ("semantics", "verifier")
     assert all(item["killed"] is True for item in records)
     assert all(item["killed_by"] == "physical_axis_comparison" for item in records)
+
+
+def test_task_kind_must_match_observed_semantic_state_change() -> None:
+    unchanged = {"count": 1}
+    changed = {"count": 2}
+    query = SimpleNamespace(capability_id="query", task_kind="query")
+    process = SimpleNamespace(capability_id="process", task_kind="process")
+    state_change = SimpleNamespace(capability_id="state", task_kind="state_change")
+
+    runner_module._validate_task_kind_transition(query, unchanged, unchanged)
+    runner_module._validate_task_kind_transition(process, unchanged, unchanged)
+    runner_module._validate_task_kind_transition(state_change, unchanged, changed)
+
+    for capability, before, after in (
+        (query, unchanged, changed),
+        (process, unchanged, changed),
+        (state_change, unchanged, unchanged),
+    ):
+        with pytest.raises(runner_module.QualificationV2Error) as caught:
+            runner_module._validate_task_kind_transition(capability, before, after)
+        assert caught.value.code == "qualification_task_kind_mismatch"

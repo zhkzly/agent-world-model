@@ -301,6 +301,28 @@ def test_agent_choice_perturbation_requires_the_checker_to_stay_satisfied() -> N
     assert caught.value.code == "agent_choice_is_load_bearing"
 
 
+def test_agent_choice_rebinds_dynamic_final_answer_from_checker_report() -> None:
+    result = AtomCheckResult(
+        initially_satisfied=False,
+        satisfied=False,
+        required_effects_ok=True,
+        collateral_ok=True,
+        answer_ok=False,
+        process_ok=True,
+        report_values={"commit_reference": "new-commit"},
+        failure_codes=("ANSWER_MISMATCH",),
+    )
+    schema = {
+        "type": "object",
+        "properties": {"commit_reference": {"type": "string"}},
+        "required": ["commit_reference"],
+        "additionalProperties": False,
+    }
+    assert task_foundry_module._rebound_final_answer(result, schema) == {
+        "commit_reference": "new-commit"
+    }
+
+
 def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
     task = _task()
     plan = _plan(task)

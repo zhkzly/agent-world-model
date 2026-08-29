@@ -90,3 +90,32 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
   ZIP writing/staging now preserves explicit directory entries and modes; the
   corrected canonical ZIP SHA-256 is
   `6bb57a0744127accbe8bd60a657d77566eba6c4523044d830d78487ee07d652e`.
+
+## Filesystem/Git semantic successor and Checkpoint E
+
+- Cross-layer compilation exposed that the first Git release classified the
+  real update+commit as `process`, allowing S2 to omit a physically applicable
+  collateral challenge. The Expected Semantics contract now defines and
+  physically enforces state-effect precedence for `task_kind`.
+- Every Taskable capability now has a structured final answer. Public conditions
+  require one branch-neutral answer contract, and generated AnswerField schemas
+  are rejected before Provider use unless they satisfy the strict structured
+  output subset recursively.
+- The current mutually blind Authors are TaskSemantics `e92b4db5...` and
+  Verifier `0720dcf7...`. Production Qualification sealed 19 physical cases and
+  two reader mutants under Core `5d185bd1...`.
+- Current immutable Git Release ID:
+  `3ee01aedf891592abc14d0039ce65127463eacb5785d7d1014ca9ad50fcfdfde`;
+  evidence digest `f632a710...`, receipt digest `3d604a5c...`, canonical ZIP
+  SHA-256 `e5c43ce5ff635776537f280fc4a2f255a9b6cc261e8bf85b9dd90367d002fa0b`.
+- Cold Checkpoint E compiled 12 Atom, 4 complete ForEach and 6 If candidates
+  from that exact release: 22 total over `git-clean` and
+  `git-pending_change`. Irrelevant condition/binding pairs abstain and reject
+  only that Blueprint.
+- Post-witness AgentChoice replay now rebinds dynamic final answers from the new
+  physical run's checker report before its second evaluation. Public witness
+  answers are never rewritten by Framework.
+- Checkpoint F remains incomplete for the current Release. One state-Atom run
+  reached its later challenge phase before an upstream 503; the next fresh run
+  failed before witness execution with `auth_unavailable` for the configured
+  Luna route. No current-release TaskPack is claimed.

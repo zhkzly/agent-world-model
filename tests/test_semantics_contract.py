@@ -174,6 +174,32 @@ def test_composition_and_rendering_use_the_final_plan_contract() -> None:
     assert rendering.to_document()["answer_phrase"] == "report the confirmation"
 
 
+def test_answer_field_schema_is_strict_structured_output_compatible() -> None:
+    source = PublicValueSource("tool_output", "inspect", "/value", None)
+    invalid = (
+        {"type": "array"},
+        {"type": ["array", "null"]},
+        {"type": "object", "properties": {}, "additionalProperties": True},
+        {
+            "type": ["object", "null"],
+            "properties": {"value": {"type": "string"}},
+            "required": [],
+            "additionalProperties": False,
+        },
+    )
+    for schema in invalid:
+        with pytest.raises(SemanticsContractError, match="strict structured output"):
+            AnswerFieldSpec("value", schema, "value", source)
+
+    valid = AnswerFieldSpec(
+        "values",
+        {"type": ["array", "null"], "items": {"type": "string"}},
+        "values",
+        source,
+    )
+    assert valid.schema["items"] == {"type": "string"}
+
+
 def _capability(*, capability_id: str = "finish") -> CapabilitySpec:
     return CapabilitySpec(
         capability_id=capability_id,

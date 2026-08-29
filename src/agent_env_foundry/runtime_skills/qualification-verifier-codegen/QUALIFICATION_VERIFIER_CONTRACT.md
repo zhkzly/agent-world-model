@@ -92,6 +92,13 @@ forbidden unrelated state changed; `answer_ok` checks the submitted answer; and
 have `required_effects_ok=false` while `collateral_ok=true`. Never gate one axis
 on another merely to make them match final `satisfied`.
 
+The frozen `task_kind` uses state-effect precedence: any successful goal that
+requires a business-state change is `state_change`, even if it also has a
+multi-step public process. `process` requires public action/process evidence
+but no business-state change; `query` is likewise state-preserving and returns
+public answers. The Host independently checks this declaration against the two
+semantic state projections.
+
 For every `answer_fields` entry of the selected capability in
 `EXPECTED_TASK_SEMANTICS.json`, independently derive the expected value from
 native before/after state and the qualified public trace, return it under the

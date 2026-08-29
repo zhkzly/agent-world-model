@@ -125,6 +125,20 @@ Checkpoint B enforces the author/invocation boundary as follows:
   only for Qualification or cold audit.
 - There is no `allow_unqualified`, pending release or alternate cache/transport.
 
+### Task-kind and answer-schema closure
+
+- `task_kind` uses state-effect precedence. A success that requires any
+  business-state change is `state_change`, even when it also requires public
+  process evidence. `process` and `query` are state-preserving.
+- Production Qualification compares TaskSemantics `inspect(before/after)` for
+  every positive and fresh replay and rejects a mismatched kind before sealing.
+- Every Taskable capability has a structured final answer. Answer-field schemas
+  must be strict structured-output subschemas: arrays have `items`; objects
+  declare all properties as required and set `additionalProperties=false`.
+- Capabilities sharing one ConditionSpec use identical branch-neutral answer
+  field IDs/labels; an irrelevant selected binding returns `abstain` and does
+  not create an If Blueprint.
+
 ### Receipt
 
 The receipt has exact fields:
@@ -195,6 +209,8 @@ results.
 | Verifier returns missing/aliased report fields | `VerifierDefect`; factual same-thread repair |
 | Generated tests/factory/invocation write authority/project bytes | `VerifierDefect`; reject |
 | Missing applicable physical case | Qualification not passed |
+| Declared task kind disagrees with semantic before/after state | `qualification_task_kind_mismatch` |
+| Answer field cannot be submitted as strict structured output | Semantics Author rejection before public Agent call |
 | Executable required mutant survives | Qualification not passed |
 | Provider/dependency/process unavailable | `InfrastructureFailure`; no semantic repair |
 | Receipt missing/unknown field or non-passed verdict | release rejection |

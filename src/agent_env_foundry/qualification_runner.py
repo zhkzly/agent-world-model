@@ -396,6 +396,23 @@ def _reset_pair(
     return before, after, after_actor, after_reset, before_facts
 
 
+def _validate_task_kind_transition(
+    capability: CapabilitySpec,
+    before_facts: JSONValue,
+    after_facts: JSONValue,
+) -> None:
+    changed = canonical_bytes(before_facts) != canonical_bytes(after_facts)
+    expected_change = capability.task_kind == "state_change"
+    if changed != expected_change:
+        raise QualificationV2Error(
+            "qualification_task_kind_mismatch",
+            "Capability task_kind disagrees with its physical semantic state transition",
+            capability_id=capability.capability_id,
+            task_kind=capability.task_kind,
+            semantic_state_changed=changed,
+        )
+
+
 def _evaluate(
     harness: _QualificationHarness,
     category: str,
@@ -993,6 +1010,11 @@ def run_v2_qualification(
                         capability_id=capability.capability_id,
                         result=positive.semantics_result.to_document(),
                     )
+                _validate_task_kind_transition(
+                    capability,
+                    harness.inspect(positive.before),
+                    harness.inspect(positive.after),
+                )
                 positives.append(positive)
                 cases.append(positive)
                 replay = _run_episode_case(
@@ -1008,6 +1030,11 @@ def run_v2_qualification(
                     ordinal,
                 )
                 ordinal += 1
+                _validate_task_kind_transition(
+                    capability,
+                    harness.inspect(replay.before),
+                    harness.inspect(replay.after),
+                )
                 cases.append(replay)
 
         represented = {item.capability.capability_id for item in positives}
@@ -1020,11 +1047,7 @@ def run_v2_qualification(
             )
 
         stateful_positives = [
-            item
-            for item in positives
-            if item.capability.task_kind != "query"
-            and canonical_bytes(harness.inspect(item.before))
-            != canonical_bytes(harness.inspect(item.after))
+            item for item in positives if item.capability.task_kind == "state_change"
         ]
         if not stateful_positives:
             raise QualificationV2Error(
@@ -1105,7 +1128,7 @@ def run_v2_qualification(
         )
         ordinal += 1
 
-        state_ineligible = [item for item in ineligible if item[0].task_kind != "query"]
+        state_ineligible = [item for item in ineligible if item[0].task_kind == "state_change"]
         if state_ineligible:
             capability, start, binding = state_ineligible[0]
             cases.append(

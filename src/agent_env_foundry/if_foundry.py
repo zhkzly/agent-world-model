@@ -344,14 +344,13 @@ def compile_if_tasks(
                             (),
                         )
                     )
-                    if condition_result.status not in {"true", "false"}:
-                        raise TaskFoundryError(
-                            "if_condition_abstained",
-                            "If condition cannot choose one public branch for a binding",
-                        )
-                    expected_capability = (
-                        true_capability if condition_result.status == "true" else false_capability
+                    expected_capability = _condition_capability(
+                        condition,
+                        condition_result,
                     )
+                    if expected_capability is None:
+                        continue
+                    assert condition_result.status in {"true", "false"}
                     if atom.capability_id != expected_capability:
                         raise TaskFoundryError(
                             "if_condition_branch_mismatch",
@@ -419,6 +418,19 @@ def compile_if_tasks(
     if len(ids) != len(set(ids)):
         raise TaskFoundryError("if_task_identity_collision", "Compiled If Tasks are not unique")
     return tuple(compiled)
+
+
+def _condition_capability(
+    condition: ConditionSpec,
+    result: ConditionCheckResult,
+) -> str | None:
+    if result.status == "abstain":
+        return None
+    return (
+        condition.true_capability_ids[0]
+        if result.status == "true"
+        else condition.false_capability_ids[0]
+    )
 
 
 def solve_if_task_twice(

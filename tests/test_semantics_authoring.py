@@ -128,7 +128,7 @@ def _document() -> dict[str, Any]:
                 "qualification_goal": (
                     "Increase the selected counter and report the resulting public value."
                 ),
-                "answer_fields": [],
+                "answer_fields": [{"field_id": "current-count", "public_label": "Current count"}],
             },
             {
                 "capability_id": "read-counter",
@@ -235,8 +235,13 @@ def test_expected_semantics_rejects_omission_and_incomplete_taskable_relation() 
 
     missing_query_answer = _document()
     missing_query_answer["capabilities"][1]["answer_fields"] = []
-    with pytest.raises(ExpectedSemanticsError, match="query capability requires answer_fields"):
+    with pytest.raises(ExpectedSemanticsError, match="Taskable capability requires answer_fields"):
         freeze_expected_task_semantics(_projection(), missing_query_answer)
+
+    missing_state_answer = _document()
+    missing_state_answer["capabilities"][0]["answer_fields"] = []
+    with pytest.raises(ExpectedSemanticsError, match="Taskable capability requires answer_fields"):
+        freeze_expected_task_semantics(_projection(), missing_state_answer)
 
 
 def test_expected_semantics_rejects_unanchored_composition_and_condition() -> None:
@@ -253,6 +258,13 @@ def test_expected_semantics_rejects_unanchored_composition_and_condition() -> No
     message = str(caught.value)
     assert "conditions[0].requirement_ids" in message
     assert "conditions[0].true_capability_ids" in message
+
+    leaking_branch_contract = _document()
+    leaking_branch_contract["capabilities"][0]["answer_fields"] = [
+        {"field_id": "updated-count", "public_label": "Updated count"}
+    ]
+    with pytest.raises(ExpectedSemanticsError, match="branch-neutral answer field IDs"):
+        freeze_expected_task_semantics(_projection(), leaking_branch_contract)
 
 
 class _Response:
@@ -300,6 +312,10 @@ def test_expected_semantics_provider_turn_is_fresh_typed_and_candidate_blind(
     assert "covers every mapped Taskable Requirement outcome" in visible
     assert "one exact value" in visible
     assert "free-form summaries" in visible
+    assert "must use task_kind=state_change" in visible
+    assert "task_kind=process only when success requires no business state change" in visible
+    assert "Every Taskable capability must declare at least one answer field" in visible
+    assert "branch-neutral answer field IDs" in visible
 
 
 def test_provider_validation_feedback_reports_all_findings_then_accepts_replacement(
