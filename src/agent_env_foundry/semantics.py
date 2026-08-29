@@ -805,12 +805,6 @@ def _tool_projection(
         if pointer is None:
             raise SemanticsContractError(f"public_tool {role} requires output_schema_pointer")
         _pointer(pointer, f"public_tool {role} output_schema_pointer")
-    elif visibility == "reset":
-        if tool_name is not None:
-            raise SemanticsContractError(f"reset {role} must not declare tool_name")
-        if pointer is None:
-            raise SemanticsContractError(f"reset {role} requires output_schema_pointer")
-        _pointer(pointer, f"reset {role} output_schema_pointer")
     elif tool_name is not None or pointer is not None:
         raise SemanticsContractError(f"non-tool {role} must not declare tool provenance")
 

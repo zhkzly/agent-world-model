@@ -77,12 +77,10 @@ RenderingSpec:
 Schemas are self-contained Draft 2020-12 JSON Schema objects. Protected/public
 binding schemas must have object roots. Every capability supports `atom`;
 additional goal kinds are only `all`, `if`, and `foreach`. Facet operators are
-only `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `min`, and `max`. A `task_literal`
-facet sets `tool_name` and `output_schema_pointer` to null. A `reset` facet or
-condition sets `tool_name` to null and supplies an RFC 6901 pointer into the
-reset observation. A `public_tool` record supplies both its tool name and an
-RFC 6901 pointer into that tool's successful output data (the empty string means
-the relevant root).
+only `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `min`, and `max`. Non-tool facets or
+conditions set `tool_name` and `output_schema_pointer` to null. A `public_tool`
+record supplies both, and the pointer is an RFC 6901 path (the empty string means
+the output root).
 
 Every generated capability must preserve the exact `field_id`/`public_label`
 pairs frozen in its expected capability record. You author the release-local
@@ -103,12 +101,6 @@ Within one StartCase and capability, different semantic keys must not expose the
 same public binding document. Public descriptors/facets must identify the
 intended referent using values available from schema-qualified reset or tool
 observations; protected-only identity cannot resolve a public ambiguity.
-Every public-descriptor leaf must be present at an explicitly covered path in
-the current reset observation before an acting turn. Initial Agent input contains
-only that descriptor plus `task_literal` and `reset` facet values; concrete
-`public_tool` facet values remain Host-only until the current trace observes the
-declared tool/output pointer. A later argument echo cannot authorize an earlier
-hidden operand.
 
 `AtomCheckResultDocument` has exactly:
 

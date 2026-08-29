@@ -80,7 +80,6 @@ def run_public_capability_episode(
     capability: CapabilitySpec,
     binding: BindingCandidate,
     reset_observation: JSONValue,
-    reset_schema: dict[str, Any],
     public_documents: dict[str, str],
     route: AgentRoute | None = None,
     client_factory: ClientFactory | None = None,
@@ -122,12 +121,7 @@ def run_public_capability_episode(
             "rendering": capability.rendering.to_document(),
             "answer_fields": [field.to_document() for field in capability.answer_fields],
         },
-        "target": _agent_visible_target(
-            capability,
-            binding,
-            reset_observation,
-            reset_schema,
-        ),
+        "target": binding.public_document(),
         "reset_observation": reset_observation,
         "public_documents": public_documents,
     }
@@ -174,31 +168,6 @@ def run_public_capability_episode(
         tuple(trace),
         cast(JSONValue | None, answer),
         selected_route.model,
-    )
-
-
-def _agent_visible_target(
-    spec: CapabilitySpec,
-    binding: BindingCandidate,
-    reset_observation: JSONValue,
-    reset_schema: dict[str, Any],
-) -> JSONObject:
-    _validate_pre_episode_binding_visibility(spec, binding, reset_observation, reset_schema)
-    facet_specs = {facet.name: facet for facet in spec.facets}
-    return cast(
-        JSONObject,
-        json.loads(
-            json.dumps(
-                {
-                    "public_descriptor": binding.public_descriptor,
-                    "facets": {
-                        name: value
-                        for name, value in binding.facets.items()
-                        if facet_specs[name].visibility in {"task_literal", "reset"}
-                    },
-                }
-            )
-        ),
     )
 
 
@@ -544,7 +513,6 @@ def _preflight_native_oracle(
     root: Path,
     config: QualificationConfig,
 ) -> None:
-    reset_schema, _tool_specs = _visibility_inputs(public)
     for capability_id in sorted(catalog):
         capability = catalog[capability_id]
         for start_case in cases:
@@ -574,11 +542,11 @@ def _preflight_native_oracle(
             bindings = tuple(binding_from_document(item) for item in raw_bindings)
             _validate_binding_set(capability, bindings)
             for binding in bindings:
-                _validate_pre_episode_binding_visibility(
+                _validate_public_binding_visibility(
                     capability,
                     binding,
                     reset_observation,
-                    reset_schema,
+                    public,
                 )
             selected = next((binding for binding in bindings if binding.eligible), None)
             if selected is None:
@@ -643,7 +611,6 @@ def _materialize_capability_episode(
     client_factory: ClientFactory | None,
 ) -> tuple[SemanticCapabilityEvidence, _CapabilityMaterialization]:
     root.mkdir(parents=True)
-    reset_schema, tool_specs = _visibility_inputs(public)
     eligible_seen = False
     action_failures: list[dict[str, Any]] = []
     selected_cases = (required_start_case,) if required_start_case is not None else cases
@@ -678,11 +645,11 @@ def _materialize_capability_episode(
                 bindings = tuple(binding_from_document(item) for item in raw_bindings)
                 _validate_binding_set(capability, bindings)
                 for binding in bindings:
-                    _validate_pre_episode_binding_visibility(
+                    _validate_public_binding_visibility(
                         capability,
                         binding,
                         reset_observation,
-                        reset_schema,
+                        public,
                     )
                 eligible = sorted(
                     (binding for binding in bindings if binding.eligible),
@@ -715,19 +682,10 @@ def _materialize_capability_episode(
                     capability=capability,
                     binding=selected_binding,
                     reset_observation=reset_observation,
-                    reset_schema=reset_schema,
                     public_documents=_load_public_documents(candidate, public),
                     route=route,
                     client_factory=client_factory,
                     max_provider_turns=config.max_turns,
-                )
-                _validate_post_episode_binding_set_visibility(
-                    capability,
-                    bindings,
-                    reset_observation,
-                    reset_schema,
-                    episode.trace,
-                    tool_specs,
                 )
             finally:
                 before_actor.close()
@@ -899,7 +857,6 @@ def _materialize_physical_wrong_target(
 ) -> tuple[bool, _CapabilityMaterialization | None]:
     if capability.task_kind == "query":
         return False, None
-    reset_schema, tool_specs = _visibility_inputs(public)
     before_instance = root / "before"
     after_instance = root / "after"
     before_actor = _open_candidate_actor(candidate, before_instance, public, config)
@@ -927,12 +884,7 @@ def _materialize_physical_wrong_target(
         bindings = tuple(binding_from_document(item) for item in raw_bindings)
         _validate_binding_set(capability, bindings)
         for binding in bindings:
-            _validate_pre_episode_binding_visibility(
-                capability,
-                binding,
-                after_reset,
-                reset_schema,
-            )
+            _validate_public_binding_visibility(capability, binding, after_reset, public)
         selected = next(
             (
                 binding
@@ -963,19 +915,10 @@ def _materialize_physical_wrong_target(
             capability=capability,
             binding=alternative,
             reset_observation=after_reset,
-            reset_schema=reset_schema,
             public_documents=_load_public_documents(candidate, public),
             route=route,
             client_factory=client_factory,
             max_provider_turns=config.max_turns,
-        )
-        _validate_post_episode_binding_set_visibility(
-            capability,
-            bindings,
-            after_reset,
-            reset_schema,
-            episode.trace,
-            tool_specs,
         )
     finally:
         before_actor.close()
@@ -1337,15 +1280,6 @@ def _different_json_values(value: JSONValue) -> tuple[JSONValue, ...]:
     return ("__wrong__", 0, False, {}, [])
 
 
-def _visibility_inputs(
-    public: dict[str, Any],
-) -> tuple[dict[str, Any], tuple[ToolSpec, ...]]:
-    return (
-        cast(dict[str, Any], public["reset_observation_schema"]),
-        cast(tuple[ToolSpec, ...], tuple(public["tool_specs"])),
-    )
-
-
 def _validate_binding_set(
     spec: CapabilitySpec,
     bindings: tuple[BindingCandidate, ...],
@@ -1364,171 +1298,66 @@ def _validate_binding_set(
                 semantic_keys=sorted((previous, candidate.semantic_key)),
                 public_binding=candidate.public_document(),
             )
-    nonliteral_owners: dict[bytes, str] = {}
-    task_literal_names = {facet.name for facet in spec.facets if facet.visibility == "task_literal"}
-    for candidate in bindings:
-        identity = {
-            "public_descriptor": candidate.public_descriptor,
-            "facets": {
-                name: value
-                for name, value in candidate.facets.items()
-                if name not in task_literal_names
-            },
-        }
-        identity_bytes = canonical_bytes(identity)
-        previous = nonliteral_owners.setdefault(identity_bytes, candidate.semantic_key)
-        if previous != candidate.semantic_key:
-            raise SemanticQualificationFailure(
-                "semantic_task_literal_identity_ambiguous",
-                "Task-literal facets cannot be the only public binding discriminator",
-                capability_id=spec.capability_id,
-                semantic_keys=sorted((previous, candidate.semantic_key)),
-                nonliteral_identity=identity,
-            )
 
 
-def _validate_pre_episode_binding_visibility(
+def _validate_public_binding_visibility(
     spec: CapabilitySpec,
     binding: BindingCandidate,
     reset_observation: JSONValue,
-    reset_schema: dict[str, Any],
+    public: dict[str, Any],
 ) -> None:
-    _raise_binding_visibility_findings(
-        spec,
-        binding,
-        _pre_episode_binding_visibility_findings(
-            spec,
-            binding,
-            reset_observation,
-            reset_schema,
-        ),
-    )
-
-
-def _pre_episode_binding_visibility_findings(
-    spec: CapabilitySpec,
-    binding: BindingCandidate,
-    reset_observation: JSONValue,
-    reset_schema: dict[str, Any],
-) -> list[dict[str, Any]]:
-    findings: list[dict[str, Any]] = []
+    reset_values = set(_leaf_value_digests(reset_observation).values())
+    public_values = set(reset_values)
+    facts = public.get("public_probe_facts")
+    if isinstance(facts, list):
+        for fact in facts:
+            if isinstance(fact, dict) and "result" in fact:
+                public_values.update(_leaf_value_digests(fact["result"]).values())
     descriptor_values = _leaf_value_digests(binding.public_descriptor)
-    reset_values = _schema_qualified_value_digests(reset_observation, reset_schema)
+    findings: list[dict[str, Any]] = []
     if not descriptor_values:
         findings.append({"path": "public_descriptor", "reason": "empty"})
     for path, digest in descriptor_values.items():
-        if digest not in reset_values:
+        if digest not in public_values:
             findings.append(
                 {
                     "path": f"public_descriptor{path}",
-                    "reason": "value_absent_from_current_reset",
+                    "reason": "value_absent_from_public_evidence",
                 }
             )
     facet_specs = {facet.name: facet for facet in spec.facets}
     for name, value in binding.facets.items():
         facet = facet_specs[name]
-        if facet.visibility != "reset":
+        if facet.visibility == "task_literal":
             continue
-        candidate = _schema_qualified_value_at_pointer(
-            reset_observation,
-            reset_schema,
-            facet.output_schema_pointer or "",
-        )
-        if candidate is _MISSING or canonical_bytes(candidate) != canonical_bytes(value):
-            findings.append({"path": f"facets/{name}", "reason": "value_absent_from_reset_path"})
-    return findings
-
-
-def _validate_post_episode_binding_visibility(
-    spec: CapabilitySpec,
-    binding: BindingCandidate,
-    reset_observation: JSONValue,
-    reset_schema: dict[str, Any],
-    trace: tuple[TraceEvent, ...],
-    tool_specs: tuple[ToolSpec, ...],
-) -> None:
-    findings = _pre_episode_binding_visibility_findings(
-        spec,
-        binding,
-        reset_observation,
-        reset_schema,
-    )
-    reset_values = _schema_qualified_value_digests(reset_observation, reset_schema)
-    tool_schemas = {tool["name"]: tool["output_schema"] for tool in tool_specs}
-    trace_values: dict[bytes, int] = {}
-    argument_values: dict[bytes, int] = {}
-    for event in trace:
-        for digest in _leaf_value_digests(event.arguments).values():
-            argument_values.setdefault(digest, event.seq)
-        observation = event.observation
-        schema = tool_schemas.get(event.tool_name)
-        if observation.get("ok") is not True or not isinstance(schema, dict):
+        if facet.visibility == "reset":
+            if hashlib.sha256(canonical_bytes(value)).digest() not in reset_values:
+                findings.append({"path": f"facets/{name}", "reason": "value_absent_from_reset"})
             continue
-        for digest in _schema_qualified_value_digests(observation.get("data"), schema):
-            trace_values.setdefault(digest, event.seq)
-
-    facet_specs = {facet.name: facet for facet in spec.facets}
-    for name, value in binding.facets.items():
-        facet = facet_specs[name]
-        if facet.visibility != "public_tool":
-            continue
-        facet_observed_at: int | None = None
-        schema = tool_schemas.get(facet.tool_name or "")
-        if isinstance(schema, dict):
-            for event in trace:
-                if event.tool_name != facet.tool_name or event.observation.get("ok") is not True:
+        observed = False
+        if isinstance(facts, list):
+            for fact in facts:
+                if not isinstance(fact, dict) or fact.get("operation") != "invoke":
                     continue
-                candidate = _schema_qualified_value_at_pointer(
-                    event.observation.get("data"),
-                    schema,
-                    facet.output_schema_pointer or "",
-                )
+                arguments = fact.get("arguments")
+                result = fact.get("result")
+                if (
+                    not isinstance(arguments, dict)
+                    or arguments.get("tool_name") != facet.tool_name
+                    or not isinstance(result, dict)
+                    or result.get("ok") is not True
+                ):
+                    continue
+                candidate = _value_at_pointer(result.get("data"), facet.output_schema_pointer or "")
                 if candidate is not _MISSING and canonical_bytes(candidate) == canonical_bytes(
                     value
                 ):
-                    facet_observed_at = event.seq
+                    observed = True
                     break
-        if facet_observed_at is None:
+        if not observed:
             findings.append(
-                {"path": f"facets/{name}", "reason": "value_absent_from_current_tool_path"}
+                {"path": f"facets/{name}", "reason": "value_absent_from_qualified_tool_path"}
             )
-            continue
-        facet_digests = set(_leaf_value_digests(value).values())
-        if any(
-            (argument_at := argument_values.get(digest)) is not None
-            and argument_at <= facet_observed_at
-            and digest not in reset_values
-            and trace_values.get(digest, facet_observed_at + 1) >= argument_at
-            for digest in facet_digests
-        ):
-            findings.append({"path": f"facets/{name}", "reason": "value_laundered_from_argument"})
-    _raise_binding_visibility_findings(spec, binding, findings)
-
-
-def _validate_post_episode_binding_set_visibility(
-    spec: CapabilitySpec,
-    bindings: tuple[BindingCandidate, ...],
-    reset_observation: JSONValue,
-    reset_schema: dict[str, Any],
-    trace: tuple[TraceEvent, ...],
-    tool_specs: tuple[ToolSpec, ...],
-) -> None:
-    for binding in bindings:
-        _validate_post_episode_binding_visibility(
-            spec,
-            binding,
-            reset_observation,
-            reset_schema,
-            trace,
-            tool_specs,
-        )
-
-
-def _raise_binding_visibility_findings(
-    spec: CapabilitySpec,
-    binding: BindingCandidate,
-    findings: list[dict[str, Any]],
-) -> None:
     if findings:
         raise SemanticQualificationFailure(
             "semantic_public_binding_hidden",
@@ -1556,56 +1385,6 @@ def _leaf_value_digests(value: Any, prefix: tuple[str | int, ...] = ()) -> dict[
             for path, digest in _leaf_value_digests(item, (*prefix, index)).items()
         }
     return {_json_pointer(prefix): hashlib.sha256(canonical_bytes(value)).digest()}
-
-
-def _value_at_path(value: Any, path: tuple[str | int, ...]) -> Any:
-    node = value
-    for token in path:
-        if isinstance(token, str) and isinstance(node, dict) and token in node:
-            node = node[token]
-        elif isinstance(token, int) and isinstance(node, list) and token < len(node):
-            node = node[token]
-        else:
-            return _MISSING
-    return node
-
-
-def _schema_qualified_value_digests(value: Any, schema: dict[str, Any]) -> set[bytes]:
-    return {
-        hashlib.sha256(canonical_bytes(candidate)).digest()
-        for path in _leaf_paths(value)
-        if _schema_covers_path(schema, schema, value, path, frozenset())
-        and (candidate := _value_at_path(value, path)) is not _MISSING
-    }
-
-
-def _schema_qualified_value_at_pointer(
-    value: Any,
-    schema: dict[str, Any],
-    pointer: str,
-) -> Any:
-    if pointer == "":
-        path: tuple[str | int, ...] = ()
-    elif not pointer.startswith("/"):
-        return _MISSING
-    else:
-        node = value
-        tokens: list[str | int] = []
-        for raw in pointer[1:].split("/"):
-            token = raw.replace("~1", "/").replace("~0", "~")
-            if isinstance(node, dict) and token in node:
-                tokens.append(token)
-                node = node[token]
-            elif isinstance(node, list) and token.isdigit() and int(token) < len(node):
-                index = int(token)
-                tokens.append(index)
-                node = node[index]
-            else:
-                return _MISSING
-        path = tuple(tokens)
-    if not _schema_covers_path(schema, schema, value, path, frozenset()):
-        return _MISSING
-    return _value_at_path(value, path)
 
 
 def _value_at_pointer(value: Any, pointer: str) -> Any:
