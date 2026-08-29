@@ -150,3 +150,5 @@
 `s2-foreach-agent-choice|介入0|返工0|shared replay+4 one-at-a-time physical perturbations+2 mutation licences|红线违反0`
 
 `s2-foreach-route-mutations|介入0|返工0|fresh no-op+reverse member order+2/2 aggregate mutants+4 mutation licences|红线违反0`
+
+`s2-foreach-taskpack|介入0|返工1|preselected physical collateral+same-Plan aggregate+8 mutation licences+one external TLS retry|红线违反0`

@@ -31,8 +31,13 @@ from agent_env_foundry.task_foundry import (
     AtomTask,
     TaskFoundryError,
     _alternative_value,
+    _combine_traces,
+    _context,
     _replay_arguments,
+    _resolve_binding,
     _schema_at_pointer,
+    _task_by_id,
+    _verify_checker_preimage,
 )
 
 _REVERSE_ORDER_PROMPT = (
@@ -99,12 +104,18 @@ class ForEachTask:
 class ForEachAdmissionPlan:
     task_id: str
     omitted_member_indices: tuple[int, ...]
+    collateral_task_id: str
 
     def __post_init__(self) -> None:
         if self.omitted_member_indices != tuple(range(len(self.omitted_member_indices))):
             raise TaskFoundryError(
                 "foreach_admission_plan_invalid",
                 "ForEach partial plan must omit every member once in stable order",
+            )
+        if not self.collateral_task_id:
+            raise TaskFoundryError(
+                "foreach_collateral_plan_missing",
+                "ForEach admission requires one preselected out-of-selection collateral Task",
             )
 
     @property
@@ -116,6 +127,7 @@ class ForEachAdmissionPlan:
             "format": "foreach-admission-plan/1",
             "task_id": self.task_id,
             "omitted_member_indices": list(self.omitted_member_indices),
+            "collateral_task_id": self.collateral_task_id,
             "agent_choice_policy": "perturb_each_occurrence",
             "alternative_order_policy": "reverse_first_target_occurrences",
             "alternative_order_prompt_digest": _REVERSE_ORDER_PROMPT_DIGEST,
@@ -371,6 +383,59 @@ class ForEachNoOpChallenge:
 
 
 @dataclass(frozen=True, slots=True)
+class ForEachCollateralChallenge:
+    task_id: str
+    admission_plan_id: str
+    control_task_id: str
+    materialization_id: str
+    foreach_trace: tuple[TraceEvent, ...]
+    control_trace: tuple[TraceEvent, ...]
+    final_answer: JSONObject
+    baseline_member_results: tuple[AtomCheckResult, ...]
+    control_result: AtomCheckResult
+    collateral_member_results: tuple[AtomCheckResult, ...]
+
+    def __post_init__(self) -> None:
+        if not self.control_result.satisfied or any(
+            not item.satisfied for item in self.baseline_member_results
+        ):
+            raise TaskFoundryError(
+                "foreach_collateral_control_failed",
+                "ForEach collateral challenge requires successful baseline and control Tasks",
+            )
+        if len(self.baseline_member_results) != len(self.collateral_member_results) or any(
+            item.satisfied
+            or item.collateral_ok is not False
+            or not item.required_effects_ok
+            or item.process_ok is False
+            for item in self.collateral_member_results
+        ):
+            raise TaskFoundryError(
+                "foreach_collateral_not_discriminated",
+                "ForEach checker did not isolate the out-of-selection state change as collateral",
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "foreach-collateral-challenge/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "control_task_id": self.control_task_id,
+            "materialization_id": self.materialization_id,
+            "foreach_trace": [item.to_document() for item in self.foreach_trace],
+            "control_trace": [item.to_document() for item in self.control_trace],
+            "final_answer": _json_object(self.final_answer),
+            "baseline_member_results": [
+                item.to_document() for item in self.baseline_member_results
+            ],
+            "control_result": self.control_result.to_document(),
+            "collateral_member_results": [
+                item.to_document() for item in self.collateral_member_results
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ForEachAlternativeOrderProof:
     task_id: str
     admission_plan_id: str
@@ -464,6 +529,165 @@ class ForEachCheckerMutationReport:
 
     def to_document(self) -> JSONObject:
         return {**self._preimage(), "report_id": self.report_id}
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachAdmissionReport:
+    solved: SolvedForEachTask
+    noop: ForEachNoOpChallenge
+    partials: ForEachPartialChallengeReport
+    agent_choices: ForEachAgentChoiceProof
+    alternative_order: ForEachAlternativeOrderProof
+    collateral: ForEachCollateralChallenge
+    checker_mutations: ForEachCheckerMutationReport
+
+    def __post_init__(self) -> None:
+        task = self.solved.task
+        task_id = task.task_id
+        plan_id = self.solved.admission_plan.plan_id
+        component_pairs = (
+            (self.noop.task_id, self.noop.admission_plan_id),
+            (self.partials.task_id, self.partials.admission_plan.plan_id),
+            (self.agent_choices.task_id, self.agent_choices.admission_plan_id),
+            (self.alternative_order.task_id, self.alternative_order.admission_plan_id),
+            (self.collateral.task_id, self.collateral.admission_plan_id),
+            (self.checker_mutations.task_id, self.checker_mutations.admission_plan_id),
+        )
+        if any(
+            item_task != task_id or item_plan != plan_id for item_task, item_plan in component_pairs
+        ):
+            raise TaskFoundryError(
+                "foreach_admission_identity_mismatch",
+                "ForEach admission evidence does not share one Task and plan",
+            )
+        required = task.member_answer_schema.get("required")
+        if required != []:
+            raise TaskFoundryError(
+                "foreach_wrong_answer_admission_missing",
+                "ForEach Task with answer fields requires physical wrong-answer admission",
+            )
+        expected_choices = {
+            (witness.witness_id, item.event_seq, item.argument_pointer)
+            for witness in self.solved.witnesses
+            for item in witness.argument_provenance
+            if item.source_kind == "agent_choice"
+        }
+        actual_choices = {
+            (item.witness_id, item.event_seq, item.argument_pointer)
+            for item in self.agent_choices.perturbations
+        }
+        if expected_choices != actual_choices or len(actual_choices) != len(
+            self.agent_choices.perturbations
+        ):
+            raise TaskFoundryError(
+                "foreach_admission_agent_choice_incomplete",
+                "ForEach admission does not perturb every AgentChoice exactly once",
+            )
+        if self.collateral.control_task_id != self.solved.admission_plan.collateral_task_id:
+            raise TaskFoundryError(
+                "foreach_admission_collateral_target_mismatch",
+                "ForEach collateral result used another control Task",
+            )
+        if self.alternative_order.reference_witness_id not in {
+            item.witness_id for item in self.solved.witnesses
+        }:
+            raise TaskFoundryError(
+                "foreach_admission_alternative_reference_missing",
+                "ForEach alternative route does not reference an admitted witness",
+            )
+        if tuple(item.omitted_member_index for item in self.checker_mutations.mutations) != (
+            self.solved.admission_plan.omitted_member_indices
+        ):
+            raise TaskFoundryError(
+                "foreach_admission_mutations_incomplete",
+                "ForEach checker mutation report differs from its frozen plan",
+            )
+        witness_materializations = {item.materialization_id for item in self.solved.witnesses}
+        later_materializations = {
+            self.noop.materialization_id,
+            self.alternative_order.materialization_id,
+            self.collateral.materialization_id,
+            *(item.materialization_id for item in self.partials.partials),
+            *(item.materialization_id for item in self.agent_choices.perturbations),
+        }
+        if witness_materializations & later_materializations:
+            raise TaskFoundryError(
+                "foreach_admission_materialization_reused",
+                "ForEach witness and post-witness evidence reused a materialization",
+            )
+
+    @property
+    def report_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "foreach-admission-report/1",
+            "task_id": self.solved.task.task_id,
+            "admission_plan": self.solved.admission_plan.to_document(),
+            "witnesses": [item.to_document() for item in self.solved.witnesses],
+            "noop": self.noop.to_document(),
+            "partials": self.partials.to_document(),
+            "agent_choices": self.agent_choices.to_document(),
+            "alternative_order": self.alternative_order.to_document(),
+            "collateral": self.collateral.to_document(),
+            "checker_mutations": self.checker_mutations.to_document(),
+            "not_applicable": {
+                "wrong_answer": "member answer schema has no required fields",
+            },
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "report_id": self.report_id}
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachTaskPack:
+    task: ForEachTask
+    admission: ForEachAdmissionReport
+
+    def __post_init__(self) -> None:
+        if self.admission.solved.task.task_id != self.task.task_id:
+            raise TaskFoundryError(
+                "foreach_task_pack_task_mismatch",
+                "ForEach TaskPack admission belongs to another Task",
+            )
+
+    @property
+    def task_pack_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "foreach-task-pack/1",
+            "task": self.task.to_document(),
+            "admission": self.admission.to_document(),
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "task_pack_id": self.task_pack_id}
+
+
+def seal_foreach_task_pack(
+    solved: SolvedForEachTask,
+    noop: ForEachNoOpChallenge,
+    partials: ForEachPartialChallengeReport,
+    agent_choices: ForEachAgentChoiceProof,
+    alternative_order: ForEachAlternativeOrderProof,
+    collateral: ForEachCollateralChallenge,
+    checker_mutations: ForEachCheckerMutationReport,
+) -> ForEachTaskPack:
+    _verify_task_preimage(solved.task)
+    admission = ForEachAdmissionReport(
+        solved,
+        noop,
+        partials,
+        agent_choices,
+        alternative_order,
+        collateral,
+        checker_mutations,
+    )
+    return ForEachTaskPack(solved.task, admission)
 
 
 def compile_foreach_tasks(
@@ -567,6 +791,7 @@ def compile_foreach_tasks(
 def solve_foreach_task_twice(
     prepared: OpenPreparedRelease,
     task: ForEachTask,
+    atom_task_universe: tuple[AtomTask, ...],
     instance_root: Path,
     *,
     route: AgentRoute | None = None,
@@ -575,7 +800,12 @@ def solve_foreach_task_twice(
     """Solve the exact ForEach instruction over two fresh complete selections."""
 
     _verify_task(prepared, task)
-    admission_plan = _derive_admission_plan(task)
+    admission_plan = _derive_admission_plan(
+        prepared,
+        task,
+        atom_task_universe,
+        Path(instance_root) / "admission-plan",
+    )
     selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
     witnesses: list[ForEachWitness] = []
     for index in (1, 2):
@@ -895,6 +1125,113 @@ def run_foreach_noop(
         )
 
 
+def challenge_foreach_collateral(
+    prepared: OpenPreparedRelease,
+    solved: SolvedForEachTask,
+    atom_task_universe: tuple[AtomTask, ...],
+    instance_root: Path,
+    *,
+    route: AgentRoute | None = None,
+    max_provider_turns: int = 12,
+) -> ForEachCollateralChallenge:
+    task = solved.task
+    _verify_task(prepared, task)
+    control_task = _task_by_id(
+        atom_task_universe,
+        solved.admission_plan.collateral_task_id,
+    )
+    _verify_checker_preimage(prepared, control_task)
+    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
+    with prepared.open(instance_root) as session:
+        reset = session.actor.reset(task.start_case.reset_input)
+        before = session.trusted.inspect(instance_root)
+        bindings = _resolve_complete_selection(session, task, before)
+        contexts = _contexts(task, bindings)
+        foreach_episode = run_public_episode(
+            actor=session.actor,
+            instruction=task.instruction,
+            reset_observation=reset,
+            tool_specs=session.actor.tools(),
+            answer_schema=task.answer_schema,
+            route=selected_route,
+            max_provider_turns=max_provider_turns,
+        )
+        answers = foreach_episode.final_answer.get("results")
+        if not isinstance(answers, list) or len(answers) != len(bindings):
+            raise TaskFoundryError(
+                "foreach_collateral_answer_count_mismatch",
+                "ForEach collateral baseline answer does not cover the complete selection",
+            )
+        after_foreach = session.trusted.inspect(instance_root)
+        baseline_results = tuple(
+            session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after_foreach,
+                    binding.protected_binding,
+                    foreach_episode.trace,
+                    answers[position],
+                    contexts[position],
+                )
+            )
+            for position, binding in enumerate(bindings)
+        )
+        control_binding = _resolve_binding(session, control_task, after_foreach)
+        control_episode = run_public_episode(
+            actor=session.actor,
+            instruction=control_task.instruction,
+            reset_observation=reset,
+            tool_specs=session.actor.tools(),
+            answer_schema=control_task.answer_schema,
+            route=selected_route,
+            max_provider_turns=max_provider_turns,
+        )
+        after_collateral = session.trusted.inspect(instance_root)
+        control_result = session.trusted.evaluate_atom(
+            AtomCheckRequest(
+                control_task.capability_id,
+                after_foreach,
+                after_collateral,
+                control_binding.protected_binding,
+                control_episode.trace,
+                control_episode.final_answer,
+                _context(
+                    control_task.capability_id,
+                    control_binding.semantic_key,
+                    control_binding.protected_binding,
+                ),
+            )
+        )
+        combined_trace = _combine_traces(foreach_episode.trace, control_episode.trace)
+        collateral_results = tuple(
+            session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after_collateral,
+                    binding.protected_binding,
+                    combined_trace,
+                    answers[position],
+                    contexts[position],
+                )
+            )
+            for position, binding in enumerate(bindings)
+        )
+        return ForEachCollateralChallenge(
+            task.task_id,
+            solved.admission_plan.plan_id,
+            control_task.task_id,
+            session.identity.materialization_id,
+            foreach_episode.trace,
+            control_episode.trace,
+            foreach_episode.final_answer,
+            baseline_results,
+            control_result,
+            collateral_results,
+        )
+
+
 def prove_foreach_reverse_order(
     prepared: OpenPreparedRelease,
     solved: SolvedForEachTask,
@@ -1038,11 +1375,61 @@ def _prove_initially_false(
                 )
 
 
-def _derive_admission_plan(task: ForEachTask) -> ForEachAdmissionPlan:
+def _derive_admission_plan(
+    prepared: OpenPreparedRelease,
+    task: ForEachTask,
+    atom_task_universe: tuple[AtomTask, ...],
+    instance_root: Path,
+) -> ForEachAdmissionPlan:
+    task_ids = tuple(item.task_id for item in atom_task_universe)
+    if len(task_ids) != len(set(task_ids)) or any(
+        item.release_id != task.release_id for item in atom_task_universe
+    ):
+        raise TaskFoundryError(
+            "foreach_atom_universe_invalid",
+            "ForEach admission requires one unique same-release Atom Task universe",
+        )
+    with prepared.open(instance_root) as session:
+        session.actor.reset(task.start_case.reset_input)
+        facts = session.trusted.inspect(instance_root)
+        catalog = {item.capability_id: item for item in session.trusted.capabilities()}
+        collateral_task = _select_collateral_task(
+            task,
+            atom_task_universe,
+            catalog,
+        )
+        if collateral_task is None:
+            raise TaskFoundryError(
+                "foreach_collateral_target_missing",
+                "No out-of-selection state-change Atom Task can challenge ForEach collateral",
+            )
+        _resolve_binding(session, collateral_task, facts)
     return ForEachAdmissionPlan(
         task.task_id,
         tuple(range(len(task.semantic_keys))),
+        collateral_task.task_id,
     )
+
+
+def _select_collateral_task(
+    task: ForEachTask,
+    atom_task_universe: tuple[AtomTask, ...],
+    catalog: dict[str, Any],
+) -> AtomTask | None:
+    candidates = tuple(
+        sorted(
+            (
+                item
+                for item in atom_task_universe
+                if item.start_case == task.start_case
+                and item.capability_id != task.capability_id
+                and item.semantic_key not in task.semantic_keys
+                and catalog[item.capability_id].task_kind == "state_change"
+            ),
+            key=lambda item: (item.capability_id, item.semantic_key, item.task_id),
+        )
+    )
+    return candidates[0] if candidates else None
 
 
 def _resolve_complete_selection(
@@ -1141,6 +1528,10 @@ def _verify_task(prepared: OpenPreparedRelease, task: ForEachTask) -> None:
             "task_release_mismatch",
             "ForEach Task belongs to another release",
         )
+    _verify_task_preimage(task)
+
+
+def _verify_task_preimage(task: ForEachTask) -> None:
     preimage: JSONObject = {
         "release_id": task.release_id,
         "start_case_id": task.start_case.case_id,
@@ -1211,15 +1602,18 @@ def _json_object(value: Any) -> JSONObject:
 
 __all__ = [
     "ForEachAdmissionPlan",
+    "ForEachAdmissionReport",
     "ForEachAgentChoicePerturbation",
     "ForEachAgentChoiceProof",
     "ForEachAlternativeOrderProof",
     "ForEachCheckerMutationReport",
     "ForEachCheckerMutationResult",
+    "ForEachCollateralChallenge",
     "ForEachNoOpChallenge",
     "ForEachPartialChallenge",
     "ForEachPartialChallengeReport",
     "ForEachTask",
+    "ForEachTaskPack",
     "ForEachWitness",
     "SolvedForEachTask",
     "compile_foreach_tasks",
@@ -1227,6 +1621,8 @@ __all__ = [
     "prove_foreach_reverse_order",
     "run_foreach_checker_mutations",
     "run_foreach_noop",
+    "seal_foreach_task_pack",
     "challenge_foreach_partials",
+    "challenge_foreach_collateral",
     "solve_foreach_task_twice",
 ]

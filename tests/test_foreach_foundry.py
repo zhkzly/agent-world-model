@@ -11,8 +11,10 @@ import agent_env_foundry.foreach_foundry as foreach_module
 from agent_env_foundry.foreach_foundry import (
     ForEachAdmissionPlan,
     ForEachAgentChoicePerturbation,
+    ForEachAgentChoiceProof,
     ForEachAlternativeOrderProof,
     ForEachCheckerMutationResult,
+    ForEachCollateralChallenge,
     ForEachNoOpChallenge,
     ForEachPartialChallenge,
     ForEachPartialChallengeReport,
@@ -20,7 +22,9 @@ from agent_env_foundry.foreach_foundry import (
     ForEachWitness,
     SolvedForEachTask,
     run_foreach_checker_mutations,
+    seal_foreach_task_pack,
 )
+from agent_env_foundry.provenance import ArgumentProvenance
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
     AtomCheckResult,
@@ -28,6 +32,7 @@ from agent_env_foundry.semantics import (
     PublicFieldSource,
     PublicValueSource,
     StartCase,
+    TraceEvent,
 )
 from agent_env_foundry.task_foundry import TaskFoundryError
 
@@ -104,7 +109,7 @@ def _witness(task: ForEachTask, materialization_id: str) -> ForEachWitness:
 
 
 def _plan(task: ForEachTask) -> ForEachAdmissionPlan:
-    return ForEachAdmissionPlan(task.task_id, (0, 1))
+    return ForEachAdmissionPlan(task.task_id, (0, 1), "e" * 64)
 
 
 def _binding(key: str, item: str) -> BindingCandidate:
@@ -130,6 +135,7 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
     assert task.to_document()["semantic_keys"] == ["item:1", "item:2"]
     plan = _plan(task)
     assert plan.to_document()["agent_choice_policy"] == "perturb_each_occurrence"
+    assert plan.to_document()["collateral_task_id"] == "e" * 64
     assert plan.to_document()["alternative_order_policy"] == ("reverse_first_target_occurrences")
     assert [item["mutation_id"] for item in plan.to_document()["checker_mutations"]] == [
         "ignore_member_0",
@@ -145,10 +151,12 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
 
     with pytest.raises(TaskFoundryError, match="ordered"):
         replace(task, semantic_keys=("item:2", "item:1"))
+    with pytest.raises(TaskFoundryError, match="instruction"):
+        foreach_module._verify_task_preimage(replace(task, instruction="tampered"))
     with pytest.raises(TaskFoundryError, match="every member"):
         SolvedForEachTask(
             task,
-            ForEachAdmissionPlan(task.task_id, (0,)),
+            ForEachAdmissionPlan(task.task_id, (0,), "e" * 64),
             (_witness(task, "c" * 64), _witness(task, "d" * 64)),
         )
     with pytest.raises(TaskFoundryError, match="fresh"):
@@ -219,13 +227,15 @@ def test_foreach_plan_freezes_before_any_witness_opens(
             events.append("witness")
             raise AssertionError("witness opened before ForEach plan froze")
 
-    def stop_after_plan(_task: ForEachTask) -> ForEachAdmissionPlan:
+    def stop_after_plan(*_args: object) -> ForEachAdmissionPlan:
         events.append("plan")
         raise StopAfterPlan
 
     monkeypatch.setattr(foreach_module, "_derive_admission_plan", stop_after_plan)
     with pytest.raises(StopAfterPlan):
-        foreach_module.solve_foreach_task_twice(Prepared(), task, tmp_path)  # type: ignore[arg-type]
+        foreach_module.solve_foreach_task_twice(  # type: ignore[arg-type]
+            Prepared(), task, (), tmp_path
+        )
     assert events == ["plan"]
 
 
@@ -274,6 +284,154 @@ def test_foreach_noop_and_alternative_order_are_discriminating() -> None:
         ForEachCheckerMutationResult("ignore_member_0", 0, False, False, False)
 
 
+def test_foreach_collateral_requires_successful_control_and_isolated_axis() -> None:
+    task = _task()
+    plan = _plan(task)
+    collateral = replace(
+        _result(satisfied=False),
+        required_effects_ok=True,
+        collateral_ok=False,
+        process_ok=True,
+    )
+    challenge = ForEachCollateralChallenge(
+        task.task_id,
+        plan.plan_id,
+        plan.collateral_task_id,
+        "a" * 64,
+        (),
+        (),
+        {"results": [{}, {}]},
+        (_result(), _result()),
+        _result(),
+        (collateral, collateral),
+    )
+    assert challenge.to_document()["control_result"]["satisfied"] is True
+
+    with pytest.raises(TaskFoundryError, match="successful baseline and control"):
+        replace(challenge, control_result=_result(satisfied=False))
+    non_collateral = replace(collateral, collateral_ok=True)
+    with pytest.raises(TaskFoundryError, match="isolate"):
+        replace(challenge, collateral_member_results=(non_collateral, collateral))
+
+
+def test_foreach_task_pack_requires_one_complete_same_plan_admission() -> None:
+    task = _task()
+    plan = _plan(task)
+    witnesses = (_witness(task, "1" * 64), _witness(task, "2" * 64))
+    solved = SolvedForEachTask(task, plan, witnesses)
+    failed = _result(satisfied=False)
+    first = ForEachPartialChallenge(
+        task.task_id,
+        plan.plan_id,
+        0,
+        task.semantic_keys[0],
+        "3" * 64,
+        (),
+        {"results": [{}]},
+        (),
+        (failed, _result()),
+    )
+    second = replace(
+        first,
+        omitted_member_index=1,
+        omitted_semantic_key=task.semantic_keys[1],
+        materialization_id="4" * 64,
+        member_results=(_result(), failed),
+    )
+    partials = ForEachPartialChallengeReport(task.task_id, plan, (first, second))
+    mutations = run_foreach_checker_mutations(solved, partials)
+    noop = ForEachNoOpChallenge(task.task_id, plan.plan_id, "5" * 64, (failed, failed))
+    alternative = ForEachAlternativeOrderProof(
+        task.task_id,
+        plan.plan_id,
+        witnesses[0].witness_id,
+        "6" * 64,
+        "7" * 64,
+        (1, 0),
+        (),
+        {"results": [{}, {}]},
+        (),
+        (_result(), _result()),
+    )
+    collateral_result = replace(
+        failed,
+        required_effects_ok=True,
+        collateral_ok=False,
+        process_ok=True,
+    )
+    collateral = ForEachCollateralChallenge(
+        task.task_id,
+        plan.plan_id,
+        plan.collateral_task_id,
+        "8" * 64,
+        (),
+        (),
+        {"results": [{}, {}]},
+        (_result(), _result()),
+        _result(),
+        (collateral_result, collateral_result),
+    )
+    pack = seal_foreach_task_pack(
+        solved,
+        noop,
+        partials,
+        ForEachAgentChoiceProof(task.task_id, plan.plan_id, ()),
+        alternative,
+        collateral,
+        mutations,
+    )
+    assert pack.task_pack_id
+    assert pack.to_document()["format"] == "foreach-task-pack/1"
+
+    with pytest.raises(TaskFoundryError, match="reused a materialization"):
+        seal_foreach_task_pack(
+            solved,
+            noop,
+            partials,
+            ForEachAgentChoiceProof(task.task_id, plan.plan_id, ()),
+            replace(alternative, materialization_id=witnesses[0].materialization_id),
+            collateral,
+            mutations,
+        )
+
+    with pytest.raises(TaskFoundryError, match="does not share one Task and plan"):
+        seal_foreach_task_pack(
+            solved,
+            noop,
+            partials,
+            ForEachAgentChoiceProof(task.task_id, "9" * 64, ()),
+            alternative,
+            collateral,
+            mutations,
+        )
+
+    choice_witness = replace(
+        witnesses[0],
+        trace=(
+            TraceEvent(
+                1,
+                "submit",
+                {"reason": "original"},
+                {"ok": True, "data": {}, "error": None},
+            ),
+        ),
+        argument_provenance=(
+            ArgumentProvenance(1, "/reason", "original", "agent_choice", None, None, None),
+        ),
+    )
+    choice_solved = SolvedForEachTask(task, plan, (choice_witness, witnesses[1]))
+    with pytest.raises(TaskFoundryError, match="does not perturb every AgentChoice"):
+        seal_foreach_task_pack(
+            choice_solved,
+            noop,
+            partials,
+            ForEachAgentChoiceProof(task.task_id, plan.plan_id, ()),
+            alternative,
+            collateral,
+            mutations,
+        )
+
+
 def test_foreach_fresh_selection_must_match_the_complete_frozen_set() -> None:
     task = _task()
 
@@ -292,3 +450,31 @@ def test_foreach_fresh_selection_must_match_the_complete_frozen_set() -> None:
     trusted.bindings = (*trusted.bindings, _binding("item:3", "three"))
     with pytest.raises(TaskFoundryError, match="missing, extra, or reordered"):
         foreach_module._resolve_complete_selection(session, task, {})
+
+
+def test_foreach_collateral_target_is_out_of_selection_state_change() -> None:
+    task = _task()
+
+    def candidate(capability: str, key: str, identity: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            capability_id=capability,
+            semantic_key=key,
+            task_id=identity * 64,
+            start_case=task.start_case,
+        )
+
+    same_capability = candidate(task.capability_id, "item:3", "1")
+    selected_key = candidate("cap-2", "item:1", "2")
+    query = candidate("cap-0", "item:3", "3")
+    expected = candidate("cap-2", "item:3", "4")
+    catalog = {
+        task.capability_id: SimpleNamespace(task_kind="state_change"),
+        "cap-2": SimpleNamespace(task_kind="state_change"),
+        "cap-0": SimpleNamespace(task_kind="query"),
+    }
+    actual = foreach_module._select_collateral_task(
+        task,
+        (same_capability, selected_key, query, expected),  # type: ignore[arg-type]
+        catalog,
+    )
+    assert actual is expected
