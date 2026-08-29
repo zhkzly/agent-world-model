@@ -394,7 +394,7 @@ class _ChildTransport:
     def _failure(self, code: str, cause: Exception | None) -> PreparationExecutionError:
         status = self._process.poll()
         stderr = self._stderr.read() if status is not None else ""
-        if code == "child_exited" and self._next_seq == 2:
+        if code in {"child_exited", "child_transport_failed"} and self._next_seq == 2:
             kind: PreparationFailureKind = (
                 "EnvironmentDefect" if self._role == "actor" else "SemanticsDefect"
             )
@@ -679,6 +679,14 @@ class OpenPreparedRelease:
                     "actor readiness tools response is not an array",
                 )
             validate_tool_catalog(tuple(raw_tools), role="session actor readiness")
+            raw_capabilities = semantics_transport.call("capabilities", {})
+            if not isinstance(raw_capabilities, list):
+                raise PreparationExecutionError(
+                    "SemanticsDefect",
+                    "session_semantics_not_ready",
+                    "semantics readiness capabilities response is not an array",
+                )
+            validate_catalog(tuple(capability_from_document(item) for item in raw_capabilities))
         except Exception:
             actor_transport.close()
             if semantics_transport is not None:

@@ -126,3 +126,5 @@
 `s2-c3d-sqlite|介入2|返工3|11 physical cases+4 executable mutants+strict receipt+directory/ZIP relocation+cold audit|红线违反1: prematurely implemented and then deleted unconsumed TaskPack/CaseSpec contracts`
 
 `s2-e-atom|介入0|返工1|admitted release→6 Atom checkers→12 fresh public witnesses|红线违反0`
+
+`s2-f-atom-plan|介入0|返工1|pre-witness plan+real CAP-002 witnesses/challenges+3 mutation licences|红线违反0`

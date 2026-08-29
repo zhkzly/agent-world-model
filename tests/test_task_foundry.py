@@ -2,16 +2,24 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import agent_env_foundry.task_foundry as task_foundry_module
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import AtomCheckResult, StartCase
 from agent_env_foundry.task_foundry import (
+    AtomAdmissionPlan,
+    AtomChallengeReport,
+    AtomChallengeResult,
+    AtomPlannedChallenge,
     AtomTask,
     AtomWitness,
     SolvedAtomTask,
     TaskFoundryError,
+    solve_atom_task_twice,
 )
 
 
@@ -65,23 +73,136 @@ def _witness(task: AtomTask, materialization_id: str, *, satisfied: bool = True)
     )
 
 
+def _plan(task: AtomTask) -> AtomAdmissionPlan:
+    return AtomAdmissionPlan(
+        task.task_id,
+        (
+            AtomPlannedChallenge("no_op", True, None, None),
+            AtomPlannedChallenge(
+                "wrong_answer",
+                False,
+                None,
+                "answer schema has no schema-valid alternative value",
+            ),
+            AtomPlannedChallenge("missing_process", True, None, None),
+        ),
+    )
+
+
 def test_atom_task_and_witness_identities_bind_frozen_content() -> None:
     task = _task()
     assert task.task_id
     assert task.task_id != replace(task, instruction="Different instruction").task_id
     witness = _witness(task, "b" * 64)
     assert witness.witness_id
-    solved = SolvedAtomTask(task, (witness, _witness(task, "c" * 64)))
+    plan = _plan(task)
+    solved = SolvedAtomTask(task, plan, (witness, _witness(task, "c" * 64)))
     assert solved.to_document()["format"] == "solved-atom-task/1"
+    assert solved.to_document()["admission_plan"]["plan_id"] == plan.plan_id
 
 
 def test_solved_atom_requires_two_fresh_successful_witnesses() -> None:
     task = _task()
     first = _witness(task, "b" * 64)
     with pytest.raises(TaskFoundryError) as caught:
-        SolvedAtomTask(task, (first, _witness(task, "b" * 64)))
+        SolvedAtomTask(task, _plan(task), (first, _witness(task, "b" * 64)))
     assert caught.value.code == "witness_materialization_reused"
 
     with pytest.raises(TaskFoundryError) as caught:
-        SolvedAtomTask(task, (first, _witness(task, "c" * 64, satisfied=False)))
+        SolvedAtomTask(task, _plan(task), (first, _witness(task, "c" * 64, satisfied=False)))
     assert caught.value.code == "witness_not_satisfied"
+
+
+def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
+    task = _task()
+    plan = _plan(task)
+    assert plan.plan_id
+    assert tuple(item.category for item in plan.challenges) == (
+        "no_op",
+        "wrong_answer",
+        "missing_process",
+    )
+
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomAdmissionPlan(task.task_id, plan.challenges[:-1])
+    assert caught.value.code == "admission_plan_incomplete"
+
+
+def test_solve_freezes_admission_plan_before_opening_a_witness(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    events: list[str] = []
+
+    class StopAfterPlan(RuntimeError):
+        pass
+
+    class Prepared:
+        identity = SimpleNamespace(release_id=task.release_id)
+
+        def open(self, _path: object) -> object:
+            events.append("witness")
+            raise AssertionError("witness opened before admission plan froze")
+
+    def stop_after_plan(*_args: object) -> AtomAdmissionPlan:
+        events.append("plan")
+        raise StopAfterPlan
+
+    monkeypatch.setattr(task_foundry_module, "_derive_atom_admission_plan", stop_after_plan)
+    with pytest.raises(StopAfterPlan):
+        solve_atom_task_twice(Prepared(), task, tmp_path)  # type: ignore[arg-type]
+    assert events == ["plan"]
+
+
+def test_atom_challenge_report_requires_rejected_noop() -> None:
+    task = _task()
+    plan = _plan(task)
+    rejected = AtomCheckResult(
+        initially_satisfied=False,
+        satisfied=False,
+        required_effects_ok=False,
+        collateral_ok=True,
+        answer_ok=None,
+        process_ok=False,
+        report_values={},
+        failure_codes=("NO_OP",),
+    )
+    no_op = AtomChallengeResult(
+        "no_op",
+        True,
+        "b" * 64,
+        (),
+        {},
+        rejected,
+        None,
+    )
+    not_applicable = AtomChallengeResult(
+        "wrong_answer",
+        False,
+        "b" * 64,
+        (),
+        {},
+        None,
+        "answer schema has no schema-valid alternative value",
+    )
+    missing_process = replace(no_op, category="missing_process")
+    report = AtomChallengeReport(
+        task.task_id,
+        plan,
+        (no_op, not_applicable, missing_process),
+    )
+    assert report.to_document()["format"] == "atom-challenge-report/1"
+
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomChallengeReport(task.task_id, plan, (no_op, not_applicable))
+    assert caught.value.code == "challenge_plan_incomplete"
+
+    accepted = replace(no_op, result=_witness(task, "c" * 64).result)
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomChallengeReport(
+            task.task_id,
+            plan,
+            (accepted, not_applicable, missing_process),
+        )
+    assert caught.value.code == "challenge_false_acceptance"

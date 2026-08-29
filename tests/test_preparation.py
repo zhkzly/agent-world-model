@@ -376,11 +376,10 @@ def test_semantics_runtime_cannot_import_actor_package(tmp_path: Path) -> None:
 def test_semantics_startup_failure_is_attributed_to_semantics(tmp_path: Path) -> None:
     release = build_v2_release(tmp_path / "release", broken_semantics_startup=True)
     prepared = _prepare_fixture(release, tmp_path / "cache", settings=_settings())
-    with prepared.open(tmp_path / "instance") as session:
-        with pytest.raises(PreparationExecutionError) as caught:
-            session.trusted.start_cases(1, 1)
-        assert caught.value.kind == "SemanticsDefect"
-        assert caught.value.code == "child_startup_failed"
+    with pytest.raises(PreparationExecutionError) as caught:
+        prepared.open(tmp_path / "instance")
+    assert caught.value.kind == "SemanticsDefect"
+    assert caught.value.code == "child_startup_failed"
 
 
 def test_directory_zip_identity_and_prepared_tamper_fail_closed(tmp_path: Path) -> None:
@@ -449,6 +448,22 @@ def test_private_transport_rejects_sequence_mismatch_and_timeout(tmp_path: Path)
     with pytest.raises(PreparationExecutionError) as caught:
         transport.call("tools", {})
     assert caught.value.code == "child_timeout"
+    transport.close()
+
+
+def test_private_transport_attributes_first_broken_pipe_to_role_startup(tmp_path: Path) -> None:
+    crashed = tmp_path / "crashed.py"
+    crashed.write_text("raise RuntimeError('startup failed')\n", encoding="utf-8")
+    transport = _ChildTransport(
+        Path(sys.executable), crashed, (), cwd=tmp_path, timeout=1.0, role="semantics"
+    )
+    transport._process.wait(timeout=1.0)
+
+    with pytest.raises(PreparationExecutionError) as caught:
+        transport.call("capabilities", {})
+
+    assert caught.value.kind == "SemanticsDefect"
+    assert caught.value.code == "child_startup_failed"
     transport.close()
 
 
