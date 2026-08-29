@@ -115,7 +115,16 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - Post-witness AgentChoice replay now rebinds dynamic final answers from the new
   physical run's checker report before its second evaluation. Public witness
   answers are never rewritten by Framework.
-- Checkpoint F remains incomplete for the current Release. One state-Atom run
-  reached its later challenge phase before an upstream 503; the next fresh run
-  failed before witness execution with `auth_unavailable` for the configured
-  Luna route. No current-release TaskPack is claimed.
+- The configured route briefly returned an upstream 503 and then
+  `auth_unavailable`; a later unchanged health probe and fresh runs recovered,
+  so no product retry/fallback was added.
+- Current-release State Atom TaskPack
+  `173238781decdfb8829a2a303c502fcc7fe8bd42df9b8d4fc1a2b3766075ccee`
+  sealed two fresh witnesses, four AgentChoice perturbations, all applicable
+  negatives and 4/4 checker mutations. Artifact SHA-256 is `8932833c...`.
+- Current-release Query Atom TaskPack
+  `bdd03537134deaba82f0f1c93e706337c470b7a9c7f502929d43311de8c92903`
+  sealed two fresh witnesses, a physically applicable state-change collateral
+  challenge and 4/4 checker mutations. Artifact SHA-256 is `083aa5e7...`.
+- Checkpoint F remains incomplete until Refusal/ForEach/If TaskPacks reach the
+  anti-demo floor and assessment/corpus work begins.

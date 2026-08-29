@@ -41,7 +41,7 @@
     ".trellis/spec/backend/v2-preparation.md",
     ".trellis/spec/backend/v2-qualification-publication.md"
   ],
-  "notes": "SQLite and filesystem/Git C3+D use the same production Qualification/Publication path. Cross-layer feedback added physical task-kind precedence, all-Task final answers, strict AnswerField schemas, shared condition bindings and If abstention. Current Git Release 3ee01aedf891592abc14d0039ce65127463eacb5785d7d1014ca9ad50fcfdfde cold-compiles 12 Atom, 4 ForEach and 6 If candidates (22 total) over two StartCases. Git F is not complete: configured Luna returned upstream 503 then auth_unavailable before a current-release TaskPack could seal. Direct S1 coordinator and Checkpoint G remain incomplete.",
+  "notes": "SQLite and filesystem/Git C3+D use the same production Qualification/Publication path. Current Git Release 3ee01aedf891592abc14d0039ce65127463eacb5785d7d1014ca9ad50fcfdfde cold-compiles 12 Atom, 4 ForEach and 6 If candidates (22 total) over two StartCases. After transient 503/auth_unavailable recovered without product fallback, current-release State Atom TaskPack 17323878... and Query Atom TaskPack bdd03537... each sealed two fresh witnesses, complete applicable challenges and 4/4 checker mutations; Query collateral is physically applicable and rejected. Git F still needs Refusal/ForEach/If expansion to the anti-demo floor. Direct S1 coordinator and Checkpoint G remain incomplete.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -62,6 +62,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "checkpoint_e_git_complete_f_provider_blocked"
+    "implementation_checkpoint": "checkpoint_f_git_atom_verticals_complete"
   }
 }

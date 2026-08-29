@@ -37,7 +37,20 @@ than domain-specific were each RED/GREEN and mutation-licensed:
 - post-witness AgentChoice replay rebinds dynamic report answers without
   changing public witness answers.
 
-Checkpoint F is not claimed. A state Atom attempt reached post-witness challenge
-execution, then the configured route returned an upstream 503. The next fresh
-attempt returned `auth_unavailable` before witness execution. These are retained
-as InfrastructureFailure, not converted into semantic success or a fallback.
+The configured route temporarily returned an upstream 503 and then
+`auth_unavailable`. A later unchanged health probe succeeded; no product retry
+or fallback was added. Fresh current-release runs then sealed:
+
+```text
+State Atom TaskPack  173238781decdfb8829a2a303c502fcc7fe8bd42df9b8d4fc1a2b3766075ccee
+Query Atom TaskPack  bdd03537134deaba82f0f1c93e706337c470b7a9c7f502929d43311de8c92903
+```
+
+Each has two fresh witnesses and all applicable negative/mutation evidence.
+The State pack physically perturbed four commit-message AgentChoice occurrences
+while rebinding the resulting dynamic commit IDs. The Query pack selected the
+state-change Task as an applicable collateral control and rejected the combined
+physical state.
+
+This is not full Checkpoint F: Refusal/ForEach/If admission, the >=20 floor,
+assessment and corpus selection remain open.
