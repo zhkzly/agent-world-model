@@ -132,3 +132,5 @@
 `s2-f-wrong-target|介入0|返工0|preplanned sibling Task+real target success/current rejection+3 mutation licences|红线违反0`
 
 `s2-f-provenance|介入0|返工0|exact argument occurrences+real CAP-002 witnesses+3 mutation licences|红线违反0`
+
+`s2-f-agent-choice|介入0|返工0|precommitted fresh physical perturbations+dynamic rebinding+3 mutation licences|红线违反0`

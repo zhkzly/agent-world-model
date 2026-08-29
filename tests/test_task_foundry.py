@@ -9,10 +9,12 @@ import pytest
 
 import agent_env_foundry.task_foundry as task_foundry_module
 from agent_env_foundry.environment import ToolSpec
+from agent_env_foundry.provenance import ArgumentProvenance
 from agent_env_foundry.public_agent import PublicEpisodeRun
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import AtomCheckResult, StartCase, TraceEvent
 from agent_env_foundry.task_foundry import (
+    AgentChoicePerturbation,
     AtomAdmissionPlan,
     AtomChallengeReport,
     AtomChallengeResult,
@@ -80,6 +82,7 @@ def _witness(task: AtomTask, materialization_id: str, *, satisfied: bool = True)
 def _plan(task: AtomTask) -> AtomAdmissionPlan:
     return AtomAdmissionPlan(
         task.task_id,
+        "perturb_each_occurrence",
         (
             AtomPlannedChallenge("no_op", True, None, None, None),
             AtomPlannedChallenge("wrong_target", True, "d" * 64, None, None),
@@ -157,6 +160,7 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
     task = _task()
     plan = _plan(task)
     assert plan.plan_id
+    assert plan.agent_choice_policy == "perturb_each_occurrence"
     assert tuple(item.category for item in plan.challenges) == (
         "no_op",
         "wrong_target",
@@ -166,12 +170,90 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
     assert plan.challenges[1].target_task_id == "d" * 64
 
     with pytest.raises(TaskFoundryError) as caught:
-        AtomAdmissionPlan(task.task_id, plan.challenges[:-1])
+        AtomAdmissionPlan(task.task_id, "perturb_each_occurrence", plan.challenges[:-1])
     assert caught.value.code == "admission_plan_incomplete"
 
     with pytest.raises(TaskFoundryError) as caught:
         AtomPlannedChallenge("wrong_target", True, None, None, None)
     assert caught.value.code == "admission_plan_wrong_target_missing"
+
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomAdmissionPlan(task.task_id, "ignore_choices", plan.challenges)
+    assert caught.value.code == "admission_agent_choice_policy_invalid"
+
+
+def test_replay_rebinds_dynamic_outputs_and_changes_only_the_targeted_choice() -> None:
+    first = TraceEvent(
+        1,
+        "submit",
+        {"charge_reference": "CHG-1", "reason": "original"},
+        {"ok": True, "data": {"dispute_reference": "DSP-OLD"}, "error": None},
+    )
+    first_provenance = (
+        ArgumentProvenance(
+            1,
+            "/charge_reference",
+            "CHG-1",
+            "task_literal",
+            None,
+            None,
+            "/public_descriptor/charge_reference",
+        ),
+        ArgumentProvenance(1, "/reason", "original", "agent_choice", None, None, None),
+    )
+    first_arguments = task_foundry_module._replay_arguments(
+        first,
+        first_provenance,
+        {},
+        {},
+        (1, "/reason"),
+        "alternative",
+    )
+    assert first_arguments == {"charge_reference": "CHG-1", "reason": "alternative"}
+
+    second = TraceEvent(
+        2,
+        "inspect",
+        {"dispute_reference": "DSP-OLD"},
+        {"ok": True, "data": {}, "error": None},
+    )
+    second_provenance = (
+        ArgumentProvenance(
+            2,
+            "/dispute_reference",
+            "DSP-OLD",
+            "tool_observation",
+            1,
+            "submit",
+            "/data/dispute_reference",
+        ),
+    )
+    second_arguments = task_foundry_module._replay_arguments(
+        second,
+        second_provenance,
+        {},
+        {1: {"ok": True, "data": {"dispute_reference": "DSP-NEW"}, "error": None}},
+        (1, "/reason"),
+        "alternative",
+    )
+    assert second_arguments == {"dispute_reference": "DSP-NEW"}
+
+
+def test_agent_choice_perturbation_requires_the_checker_to_stay_satisfied() -> None:
+    task = _task()
+    failed = _witness(task, "b" * 64, satisfied=False).result
+    with pytest.raises(TaskFoundryError) as caught:
+        AgentChoicePerturbation(
+            "c" * 64,
+            "d" * 64,
+            1,
+            "/reason",
+            "original",
+            "alternative",
+            (),
+            failed,
+        )
+    assert caught.value.code == "agent_choice_is_load_bearing"
 
 
 def test_solve_freezes_admission_plan_before_opening_a_witness(

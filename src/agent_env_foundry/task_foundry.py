@@ -184,9 +184,15 @@ class AtomPlannedChallenge:
 @dataclass(frozen=True, slots=True)
 class AtomAdmissionPlan:
     task_id: str
+    agent_choice_policy: str
     challenges: tuple[AtomPlannedChallenge, ...]
 
     def __post_init__(self) -> None:
+        if self.agent_choice_policy != "perturb_each_occurrence":
+            raise TaskFoundryError(
+                "admission_agent_choice_policy_invalid",
+                "Atom admission must perturb every AgentChoice occurrence",
+            )
         categories = tuple(item.category for item in self.challenges)
         if categories != _ATOM_CHALLENGE_CATEGORIES:
             raise TaskFoundryError(
@@ -209,6 +215,7 @@ class AtomAdmissionPlan:
         return {
             "format": "atom-admission-plan/1",
             "task_id": self.task_id,
+            "agent_choice_policy": self.agent_choice_policy,
             "challenges": [item.to_document() for item in self.challenges],
         }
 
@@ -333,6 +340,78 @@ class AtomChallengeReport:
             "admission_plan_id": self.admission_plan.plan_id,
             "challenges": [item.to_document() for item in self.challenges],
         }
+
+
+@dataclass(frozen=True, slots=True)
+class AgentChoicePerturbation:
+    witness_id: str
+    materialization_id: str
+    event_seq: int
+    argument_pointer: str
+    original_value: JSONValue
+    replacement_value: JSONValue
+    trace: tuple[TraceEvent, ...]
+    result: AtomCheckResult
+
+    def __post_init__(self) -> None:
+        if (
+            not self.witness_id
+            or not self.materialization_id
+            or self.event_seq <= 0
+            or not self.argument_pointer.startswith("/")
+        ):
+            raise TaskFoundryError(
+                "agent_choice_perturbation_identity_invalid",
+                "AgentChoice perturbation identity is invalid",
+            )
+        if self.original_value == self.replacement_value:
+            raise TaskFoundryError(
+                "agent_choice_perturbation_unchanged",
+                "AgentChoice perturbation must use a different schema-valid value",
+            )
+        if not self.result.satisfied:
+            raise TaskFoundryError(
+                "agent_choice_is_load_bearing",
+                "Changing an AgentChoice caused the frozen checker to fail",
+                event_seq=self.event_seq,
+                argument_pointer=self.argument_pointer,
+                result=self.result.to_document(),
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "agent-choice-perturbation/1",
+            "witness_id": self.witness_id,
+            "materialization_id": self.materialization_id,
+            "event_seq": self.event_seq,
+            "argument_pointer": self.argument_pointer,
+            "original_value": _json(self.original_value),
+            "replacement_value": _json(self.replacement_value),
+            "trace": [item.to_document() for item in self.trace],
+            "result": self.result.to_document(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class AgentChoiceProof:
+    task_id: str
+    admission_plan_id: str
+    perturbations: tuple[AgentChoicePerturbation, ...]
+
+    @property
+    def proof_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "agent-choice-proof/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "perturbations": [item.to_document() for item in self.perturbations],
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "proof_id": self.proof_id}
 
 
 def compile_atom_tasks(
@@ -525,6 +604,118 @@ def solve_atom_task_twice(
         task,
         admission_plan,
         cast(tuple[AtomWitness, AtomWitness], tuple(witnesses)),
+    )
+
+
+def prove_agent_choices_non_load_bearing(
+    prepared: OpenPreparedRelease,
+    solved: SolvedAtomTask,
+    instance_root: Path,
+) -> AgentChoiceProof:
+    """Physically perturb every witness AgentChoice on a fresh public replay."""
+
+    task = solved.task
+    if task.release_id != prepared.identity.release_id:
+        raise TaskFoundryError(
+            "task_release_mismatch",
+            "Atom Task belongs to another release",
+        )
+    if solved.admission_plan.agent_choice_policy != "perturb_each_occurrence":
+        raise TaskFoundryError(
+            "admission_agent_choice_policy_invalid",
+            "Solved Atom Task did not precommit to perturb every AgentChoice",
+        )
+    choices = [
+        (witness, occurrence)
+        for witness in solved.witnesses
+        for occurrence in witness.argument_provenance
+        if occurrence.source_kind == "agent_choice"
+    ]
+    perturbations: list[AgentChoicePerturbation] = []
+    for index, (witness, occurrence) in enumerate(choices, start=1):
+        instance = Path(instance_root) / f"choice-{index}"
+        with prepared.open(instance) as session:
+            reset = session.actor.reset(task.start_case.reset_input)
+            before = session.trusted.inspect(instance)
+            binding = _resolve_binding(session, task, before)
+            tool_specs = {item["name"]: item for item in session.actor.tools()}
+            source_event = next(item for item in witness.trace if item.seq == occurrence.event_seq)
+            source_spec = tool_specs[source_event.tool_name]
+            schema = _schema_at_pointer(source_spec["input_schema"], occurrence.argument_pointer)
+            replacement = _alternative_value(schema, occurrence.value)
+            if replacement is _NO_ALTERNATIVE:
+                raise TaskFoundryError(
+                    "agent_choice_not_perturbable",
+                    "AgentChoice schema has no distinct schema-valid alternative",
+                    event_seq=occurrence.event_seq,
+                    argument_pointer=occurrence.argument_pointer,
+                )
+            replay_observations: dict[int, JSONObject] = {}
+            replay_trace: list[TraceEvent] = []
+            provenance_by_event = {
+                event.seq: tuple(
+                    item for item in witness.argument_provenance if item.event_seq == event.seq
+                )
+                for event in witness.trace
+            }
+            for event in witness.trace:
+                arguments = _replay_arguments(
+                    event,
+                    provenance_by_event[event.seq],
+                    reset,
+                    replay_observations,
+                    (occurrence.event_seq, occurrence.argument_pointer),
+                    cast(JSONValue, replacement),
+                )
+                spec = tool_specs[event.tool_name]
+                errors = tuple(Draft202012Validator(spec["input_schema"]).iter_errors(arguments))
+                if errors:
+                    raise TaskFoundryError(
+                        "replay_arguments_schema_invalid",
+                        "Perturbed replay arguments violate the frozen ToolSpec",
+                        event_seq=event.seq,
+                        original_message=errors[0].message,
+                    )
+                observation = _json_object(session.actor.invoke(event.tool_name, arguments))
+                replay_observations[event.seq] = observation
+                replay_trace.append(TraceEvent(event.seq, event.tool_name, arguments, observation))
+            after = session.trusted.inspect(instance)
+            result = session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after,
+                    binding.protected_binding,
+                    tuple(replay_trace),
+                    witness.final_answer,
+                    _context(
+                        task.capability_id,
+                        binding.semantic_key,
+                        binding.protected_binding,
+                    ),
+                )
+            )
+            perturbations.append(
+                AgentChoicePerturbation(
+                    witness.witness_id,
+                    session.identity.materialization_id,
+                    occurrence.event_seq,
+                    occurrence.argument_pointer,
+                    occurrence.value,
+                    cast(JSONValue, replacement),
+                    tuple(replay_trace),
+                    result,
+                )
+            )
+    if len(perturbations) != len(choices):
+        raise TaskFoundryError(
+            "agent_choice_proof_incomplete",
+            "AgentChoice proof did not account for every witness occurrence",
+        )
+    return AgentChoiceProof(
+        task.task_id,
+        solved.admission_plan.plan_id,
+        tuple(perturbations),
     )
 
 
@@ -861,6 +1052,7 @@ def _derive_atom_admission_plan(
     )
     return AtomAdmissionPlan(
         task.task_id,
+        "perturb_each_occurrence",
         (
             AtomPlannedChallenge("no_op", True, None, None, None),
             wrong_target_plan,
@@ -922,6 +1114,158 @@ def _task_by_id(task_universe: tuple[AtomTask, ...], task_id: str) -> AtomTask:
             target_task_id=task_id,
         )
     return matching[0]
+
+
+def _replay_arguments(
+    event: TraceEvent,
+    provenance: tuple[ArgumentProvenance, ...],
+    reset_observation: JSONValue,
+    replay_observations: dict[int, JSONObject],
+    perturbed_occurrence: tuple[int, str],
+    replacement: JSONValue,
+) -> JSONObject:
+    arguments = _json_object(event.arguments)
+    for occurrence in provenance:
+        if occurrence.event_seq != event.seq:
+            raise TaskFoundryError(
+                "replay_provenance_event_mismatch",
+                "Replay received provenance for another trace event",
+            )
+        occurrence_key = (occurrence.event_seq, occurrence.argument_pointer)
+        if occurrence_key == perturbed_occurrence:
+            if occurrence.source_kind != "agent_choice":
+                raise TaskFoundryError(
+                    "replay_perturbation_not_agent_choice",
+                    "Replay may perturb only an AgentChoice occurrence",
+                )
+            value = replacement
+        elif occurrence.source_kind == "reset":
+            assert occurrence.source_pointer is not None
+            value = _resolve_json_pointer(reset_observation, occurrence.source_pointer)
+        elif occurrence.source_kind == "tool_observation":
+            assert occurrence.source_event_seq is not None
+            assert occurrence.source_pointer is not None
+            source = replay_observations.get(occurrence.source_event_seq)
+            if source is None:
+                raise TaskFoundryError(
+                    "replay_source_event_missing",
+                    "Replay has not produced the required prior observation",
+                    source_event_seq=occurrence.source_event_seq,
+                )
+            value = _resolve_json_pointer(source, occurrence.source_pointer)
+        else:
+            value = occurrence.value
+        _set_json_pointer(arguments, occurrence.argument_pointer, value)
+    return arguments
+
+
+def _resolve_json_pointer(value: JSONValue, pointer: str) -> JSONValue:
+    current = value
+    for token in _pointer_tokens(pointer):
+        if isinstance(current, dict):
+            if token not in current:
+                raise TaskFoundryError(
+                    "replay_source_pointer_missing",
+                    "Replay source pointer does not resolve",
+                    pointer=pointer,
+                )
+            current = current[token]
+        elif isinstance(current, list):
+            try:
+                current = current[int(token)]
+            except (IndexError, ValueError) as exc:
+                raise TaskFoundryError(
+                    "replay_source_pointer_missing",
+                    "Replay source pointer does not resolve",
+                    pointer=pointer,
+                ) from exc
+        else:
+            raise TaskFoundryError(
+                "replay_source_pointer_scalar",
+                "Replay source pointer traverses a scalar",
+                pointer=pointer,
+            )
+    return _json(current)
+
+
+def _set_json_pointer(document: JSONObject, pointer: str, value: JSONValue) -> None:
+    tokens = _pointer_tokens(pointer)
+    if not tokens:
+        raise TaskFoundryError(
+            "replay_argument_pointer_root",
+            "Replay argument pointer cannot replace the object root",
+        )
+    current: JSONValue = document
+    for token in tokens[:-1]:
+        if isinstance(current, dict):
+            current = current[token]
+        elif isinstance(current, list):
+            current = current[int(token)]
+        else:
+            raise TaskFoundryError(
+                "replay_argument_pointer_scalar",
+                "Replay argument pointer traverses a scalar",
+            )
+    final = tokens[-1]
+    if isinstance(current, dict):
+        current[final] = _json(value)
+    elif isinstance(current, list):
+        current[int(final)] = _json(value)
+    else:
+        raise TaskFoundryError(
+            "replay_argument_pointer_scalar",
+            "Replay argument pointer traverses a scalar",
+        )
+
+
+def _pointer_tokens(pointer: str) -> tuple[str, ...]:
+    if pointer == "":
+        return ()
+    if not pointer.startswith("/"):
+        raise TaskFoundryError(
+            "replay_pointer_invalid",
+            "Replay value source is not an RFC 6901 pointer",
+        )
+    return tuple(token.replace("~1", "/").replace("~0", "~") for token in pointer[1:].split("/"))
+
+
+def _schema_at_pointer(schema: JSONObject, pointer: str) -> dict[str, Any]:
+    current: Any = schema
+    for token in _pointer_tokens(pointer):
+        if not isinstance(current, dict):
+            raise TaskFoundryError(
+                "agent_choice_schema_pointer_invalid",
+                "AgentChoice argument pointer traverses a non-object schema",
+                pointer=pointer,
+            )
+        properties = current.get("properties")
+        if isinstance(properties, dict) and token in properties:
+            current = properties[token]
+            continue
+        items = current.get("items")
+        if isinstance(items, dict):
+            try:
+                int(token)
+            except ValueError as exc:
+                raise TaskFoundryError(
+                    "agent_choice_schema_pointer_invalid",
+                    "AgentChoice array pointer token is not an index",
+                    pointer=pointer,
+                ) from exc
+            current = items
+            continue
+        raise TaskFoundryError(
+            "agent_choice_schema_pointer_invalid",
+            "AgentChoice argument pointer does not resolve in the ToolSpec",
+            pointer=pointer,
+        )
+    if not isinstance(current, dict):
+        raise TaskFoundryError(
+            "agent_choice_schema_pointer_invalid",
+            "AgentChoice argument schema is not an object",
+            pointer=pointer,
+        )
+    return cast(dict[str, Any], current)
 
 
 def _verify_checker_preimage(
@@ -1111,6 +1455,8 @@ def _json_object(value: Any) -> JSONObject:
 
 
 __all__ = [
+    "AgentChoicePerturbation",
+    "AgentChoiceProof",
     "AtomAdmissionPlan",
     "AtomChallengeReport",
     "AtomChallengeResult",
@@ -1121,5 +1467,6 @@ __all__ = [
     "TaskFoundryError",
     "challenge_atom_task",
     "compile_atom_tasks",
+    "prove_agent_choices_non_load_bearing",
     "solve_atom_task_twice",
 ]
