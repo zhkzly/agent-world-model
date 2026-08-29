@@ -347,6 +347,7 @@ class AtomChallengeResult:
     trace: tuple[TraceEvent, ...]
     final_answer: JSONObject
     result: AtomCheckResult | None
+    control_result: AtomCheckResult | None
     reason: str | None
 
     def __post_init__(self) -> None:
@@ -363,6 +364,19 @@ class AtomChallengeResult:
                 "Non-applicable Atom challenge requires only its frozen reason",
                 category=self.category,
             )
+        requires_control = self.applicable and self.category in {"wrong_target", "collateral"}
+        if requires_control and (self.control_result is None or not self.control_result.satisfied):
+            raise TaskFoundryError(
+                "challenge_control_result_missing",
+                "Target-based Atom challenge requires a successful control Task result",
+                category=self.category,
+            )
+        if not requires_control and self.control_result is not None:
+            raise TaskFoundryError(
+                "challenge_control_result_unexpected",
+                "Only an applicable target-based challenge may carry a control result",
+                category=self.category,
+            )
 
     def to_document(self) -> JSONObject:
         return {
@@ -373,6 +387,9 @@ class AtomChallengeResult:
             "trace": [item.to_document() for item in self.trace],
             "final_answer": _json_object(self.final_answer),
             "result": None if self.result is None else self.result.to_document(),
+            "control_result": (
+                None if self.control_result is None else self.control_result.to_document()
+            ),
             "reason": self.reason,
         }
 
@@ -636,6 +653,144 @@ class AlternativeRouteProof:
 
     def to_document(self) -> JSONObject:
         return {**self._preimage(), "proof_id": self.proof_id}
+
+
+@dataclass(frozen=True, slots=True)
+class AtomAdmissionReport:
+    solved: SolvedAtomTask
+    challenges: AtomChallengeReport
+    agent_choices: AgentChoiceProof
+    alternative_route: AlternativeRouteProof
+    checker_mutations: AtomCheckerMutationReport
+
+    def __post_init__(self) -> None:
+        task_id = self.solved.task.task_id
+        plan_id = self.solved.admission_plan.plan_id
+        if (
+            self.challenges.task_id != task_id
+            or self.agent_choices.task_id != task_id
+            or self.alternative_route.task_id != task_id
+            or self.checker_mutations.task_id != task_id
+            or self.challenges.admission_plan.plan_id != plan_id
+            or self.agent_choices.admission_plan_id != plan_id
+            or self.alternative_route.admission_plan_id != plan_id
+            or self.checker_mutations.admission_plan_id != plan_id
+        ):
+            raise TaskFoundryError(
+                "atom_admission_identity_mismatch",
+                "Atom admission evidence does not share one Task and AdmissionPlan",
+            )
+        expected_choices = {
+            (witness.witness_id, item.event_seq, item.argument_pointer)
+            for witness in self.solved.witnesses
+            for item in witness.argument_provenance
+            if item.source_kind == "agent_choice"
+        }
+        actual_choices = {
+            (item.witness_id, item.event_seq, item.argument_pointer)
+            for item in self.agent_choices.perturbations
+        }
+        if expected_choices != actual_choices or len(actual_choices) != len(
+            self.agent_choices.perturbations
+        ):
+            raise TaskFoundryError(
+                "atom_admission_agent_choice_incomplete",
+                "Atom admission does not perturb every witness AgentChoice exactly once",
+            )
+        witness_ids = {item.witness_id for item in self.solved.witnesses}
+        if self.alternative_route.reference_witness_id not in witness_ids:
+            raise TaskFoundryError(
+                "atom_admission_alternative_reference_missing",
+                "Alternative-route proof does not reference one admitted witness",
+            )
+        if tuple(item.spec for item in self.checker_mutations.mutations) != (
+            self.solved.admission_plan.checker_mutations
+        ):
+            raise TaskFoundryError(
+                "atom_admission_mutations_incomplete",
+                "Atom admission mutation evidence differs from its frozen plan",
+            )
+        witness_materializations = {item.materialization_id for item in self.solved.witnesses}
+        later_materializations = (
+            {
+                item.materialization_id
+                for item in self.challenges.challenges
+                if item.materialization_id is not None
+            }
+            | {item.materialization_id for item in self.agent_choices.perturbations}
+            | {self.alternative_route.materialization_id}
+        )
+        if witness_materializations & later_materializations:
+            raise TaskFoundryError(
+                "atom_admission_materialization_reused",
+                "Witness and post-witness evidence reused a materialization",
+            )
+
+    @property
+    def report_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "atom-admission-report/1",
+            "task_id": self.solved.task.task_id,
+            "admission_plan": self.solved.admission_plan.to_document(),
+            "witnesses": [item.to_document() for item in self.solved.witnesses],
+            "challenges": self.challenges.to_document(),
+            "agent_choices": self.agent_choices.to_document(),
+            "alternative_route": self.alternative_route.to_document(),
+            "checker_mutations": self.checker_mutations.to_document(),
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "report_id": self.report_id}
+
+
+@dataclass(frozen=True, slots=True)
+class AtomTaskPack:
+    task: AtomTask
+    admission: AtomAdmissionReport
+
+    def __post_init__(self) -> None:
+        if self.admission.solved.task.task_id != self.task.task_id:
+            raise TaskFoundryError(
+                "atom_task_pack_task_mismatch",
+                "Atom TaskPack admission belongs to another Task",
+            )
+
+    @property
+    def task_pack_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
+
+    def _preimage(self) -> JSONObject:
+        return {
+            "format": "atom-task-pack/1",
+            "task": self.task.to_document(),
+            "admission": self.admission.to_document(),
+        }
+
+    def to_document(self) -> JSONObject:
+        return {**self._preimage(), "task_pack_id": self.task_pack_id}
+
+
+def seal_atom_task_pack(
+    solved: SolvedAtomTask,
+    challenges: AtomChallengeReport,
+    agent_choices: AgentChoiceProof,
+    alternative_route: AlternativeRouteProof,
+    checker_mutations: AtomCheckerMutationReport,
+) -> AtomTaskPack:
+    """Seal one Atom Task only after every same-plan admission proof is complete."""
+
+    _verify_task_preimage(solved.task)
+    admission = AtomAdmissionReport(
+        solved,
+        challenges,
+        agent_choices,
+        alternative_route,
+        checker_mutations,
+    )
+    return AtomTaskPack(solved.task, admission)
 
 
 def compile_atom_tasks(
@@ -1067,6 +1222,7 @@ def challenge_atom_task(
                 {},
                 result,
                 None,
+                None,
             )
         )
 
@@ -1079,6 +1235,7 @@ def challenge_atom_task(
                 None,
                 (),
                 {},
+                None,
                 None,
                 wrong_target_plan.reason,
             )
@@ -1148,6 +1305,7 @@ def challenge_atom_task(
                     episode.trace,
                     episode.final_answer,
                     current_result,
+                    target_result,
                     None,
                 )
             )
@@ -1199,6 +1357,7 @@ def challenge_atom_task(
                     (),
                     {},
                     None,
+                    None,
                     wrong_answer_plan.reason,
                 )
             )
@@ -1230,6 +1389,7 @@ def challenge_atom_task(
                     wrong_answer,
                     wrong_result,
                     None,
+                    None,
                 )
             )
 
@@ -1242,6 +1402,7 @@ def challenge_atom_task(
                     None,
                     (),
                     {},
+                    None,
                     None,
                     missing_process_plan.reason,
                 )
@@ -1272,6 +1433,7 @@ def challenge_atom_task(
                     episode.final_answer,
                     missing_result,
                     None,
+                    None,
                 )
             )
         collateral_plan = _planned_challenge(admission_plan, "collateral")
@@ -1283,6 +1445,7 @@ def challenge_atom_task(
                     None,
                     (),
                     {},
+                    None,
                     None,
                     collateral_plan.reason,
                 )
@@ -1345,6 +1508,7 @@ def challenge_atom_task(
                     combined_trace,
                     episode.final_answer,
                     current_with_collateral,
+                    collateral_result,
                     None,
                 )
             )
@@ -1734,8 +1898,17 @@ def _verify_checker_preimage(
     prepared: OpenPreparedRelease,
     task: AtomTask,
 ) -> None:
+    if prepared.identity.release_id != task.release_id:
+        raise TaskFoundryError(
+            "task_release_mismatch",
+            "Atom Task belongs to another release",
+        )
+    _verify_task_preimage(task)
+
+
+def _verify_task_preimage(task: AtomTask) -> None:
     preimage: JSONObject = {
-        "release_id": prepared.identity.release_id,
+        "release_id": task.release_id,
         "start_case_id": task.start_case.case_id,
         "capability_id": task.capability_id,
         "semantic_key": task.semantic_key,
@@ -1921,6 +2094,7 @@ __all__ = [
     "AgentChoiceProof",
     "AlternativeRouteProof",
     "AtomAdmissionPlan",
+    "AtomAdmissionReport",
     "AtomChallengeReport",
     "AtomChallengeResult",
     "AtomCheckerMutationReport",
@@ -1928,6 +2102,7 @@ __all__ = [
     "AtomCheckerMutationSpec",
     "AtomPlannedChallenge",
     "AtomTask",
+    "AtomTaskPack",
     "AtomWitness",
     "SolvedAtomTask",
     "TaskFoundryError",
@@ -1936,5 +2111,6 @@ __all__ = [
     "prove_agent_choices_non_load_bearing",
     "prove_alternative_route",
     "run_atom_checker_mutations",
+    "seal_atom_task_pack",
     "solve_atom_task_twice",
 ]

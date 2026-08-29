@@ -15,6 +15,7 @@ from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import AtomCheckResult, StartCase, TraceEvent
 from agent_env_foundry.task_foundry import (
     AgentChoicePerturbation,
+    AgentChoiceProof,
     AlternativeRouteProof,
     AtomAdmissionPlan,
     AtomChallengeReport,
@@ -26,6 +27,7 @@ from agent_env_foundry.task_foundry import (
     SolvedAtomTask,
     TaskFoundryError,
     run_atom_checker_mutations,
+    seal_atom_task_pack,
     solve_atom_task_twice,
 )
 
@@ -363,6 +365,116 @@ def test_alternative_route_requires_a_non_subsequence_tool_sequence() -> None:
     assert caught.value.code == "alternative_route_not_accepted"
 
 
+def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
+    task = _task()
+    plan = _plan(task)
+
+    def trace(*names: str) -> tuple[TraceEvent, ...]:
+        return tuple(
+            TraceEvent(index, name, {}, {"ok": True, "data": {}, "error": None})
+            for index, name in enumerate(names, start=1)
+        )
+
+    first = replace(_witness(task, "1" * 64), trace=trace("inspect", "submit", "result"))
+    second = replace(_witness(task, "2" * 64), trace=trace("inspect", "submit", "result"))
+    solved = SolvedAtomTask(task, plan, (first, second))
+    rejected = _witness(task, "3" * 64, satisfied=False).result
+    control = _witness(task, "4" * 64).result
+    no_op = AtomChallengeResult("no_op", True, "3" * 64, (), {}, rejected, None, None)
+    wrong_target = AtomChallengeResult(
+        "wrong_target",
+        True,
+        "4" * 64,
+        (),
+        {},
+        rejected,
+        control,
+        None,
+    )
+    wrong_answer = AtomChallengeResult(
+        "wrong_answer",
+        False,
+        None,
+        (),
+        {},
+        None,
+        None,
+        "answer schema has no schema-valid alternative value",
+    )
+    missing_process = AtomChallengeResult(
+        "missing_process",
+        True,
+        "5" * 64,
+        (),
+        {},
+        rejected,
+        None,
+        None,
+    )
+    collateral = AtomChallengeResult(
+        "collateral",
+        False,
+        None,
+        (),
+        {},
+        None,
+        None,
+        "no disjoint-workflow state-change Task is available",
+    )
+    challenges = AtomChallengeReport(
+        task.task_id,
+        plan,
+        (no_op, wrong_target, wrong_answer, missing_process, collateral),
+    )
+    mutations = run_atom_checker_mutations(plan, challenges)
+    choices = AgentChoiceProof(task.task_id, plan.plan_id, ())
+    alternative = AlternativeRouteProof(
+        task.task_id,
+        plan.plan_id,
+        first.witness_id,
+        "6" * 64,
+        "7" * 64,
+        ("inspect", "submit", "result"),
+        trace("inspect", "submit", "source"),
+        {},
+        control,
+    )
+
+    task_pack = seal_atom_task_pack(solved, challenges, choices, alternative, mutations)
+    assert task_pack.task_pack_id
+    assert task_pack.to_document()["format"] == "atom-task-pack/1"
+
+    with pytest.raises(TaskFoundryError) as caught:
+        seal_atom_task_pack(
+            solved,
+            challenges,
+            choices,
+            replace(alternative, admission_plan_id="8" * 64),
+            mutations,
+        )
+    assert caught.value.code == "atom_admission_identity_mismatch"
+
+    choice_trace = (
+        TraceEvent(
+            1,
+            "submit",
+            {"reason": "original"},
+            {"ok": True, "data": {}, "error": None},
+        ),
+    )
+    choice_witness = replace(
+        first,
+        trace=choice_trace,
+        argument_provenance=(
+            ArgumentProvenance(1, "/reason", "original", "agent_choice", None, None, None),
+        ),
+    )
+    choice_solved = SolvedAtomTask(task, plan, (choice_witness, second))
+    with pytest.raises(TaskFoundryError) as caught:
+        seal_atom_task_pack(choice_solved, challenges, choices, alternative, mutations)
+    assert caught.value.code == "atom_admission_agent_choice_incomplete"
+
+
 def test_solve_freezes_admission_plan_before_opening_a_witness(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -496,14 +608,23 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
         {},
         rejected,
         None,
+        None,
     )
-    wrong_target = replace(no_op, category="wrong_target")
+    with pytest.raises(TaskFoundryError) as caught:
+        replace(no_op, category="wrong_target")
+    assert caught.value.code == "challenge_control_result_missing"
+    wrong_target = replace(
+        no_op,
+        category="wrong_target",
+        control_result=_witness(task, "c" * 64).result,
+    )
     not_applicable = AtomChallengeResult(
         "wrong_answer",
         False,
         None,
         (),
         {},
+        None,
         None,
         "answer schema has no schema-valid alternative value",
     )
@@ -514,6 +635,7 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
         None,
         (),
         {},
+        None,
         None,
         "no disjoint-workflow state-change Task is available",
     )

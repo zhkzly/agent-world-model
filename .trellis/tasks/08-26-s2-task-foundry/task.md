@@ -53,5 +53,7 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - CAP-001 plan `12ff5376e4e9b71a5a6e8c56b12a050c88a3d0c02e991b38b5527b60b94a4317` froze disjoint-workflow CAP-002 as collateral; CAP-002 succeeded, while CAP-001 retained effects/answer/process truth and failed only `collateral_ok`.
 - CAP-002 plan `ae2ec448c8a04ce1712f32455cf4da786b0a00598e6a05cf40a78c105c688d88` produced a fresh non-subsequence route that replaced public discovery/readback steps and remained satisfied (`636b079a9a9880f05fb441eb4a5a57c5864a34360dcaaee83ecc075c44d280b2`).
 - Current CAP-002 plan `d7b6262950eb754d0a78dc7d376d109d5ca6327f4dcc38eb2f41e79c514b0742` froze three applicable checker result-axis mutants; live no-op/process challenges killed all three (`2fe45b87cf9d14e4bf9ddd8ed81536dff948b64f5b2a528505ba757abc9f5f49`).
-- This is partial Checkpoint F evidence only. One consolidated same-Plan admission run and TaskPack sealing remain blocking.
+- One consolidated rerun under that exact Plan bound two new witnesses, every AgentChoice perturbation, all planned challenges, a non-subsequence alternative route and 3/3 checker mutants into AdmissionReport `6f3b34cff1b6434b06e6eae78c8b196597ec8c29f5a1fac5413308c4703c9de9`.
+- First sealed Atom TaskPack: `74ecb308842ad6143f88059d00bb597eeb2a7ae71abb583d6d4394c431f35c10`; canonical artifact SHA-256 `7ab100e1eded17ccb8cbbde990e891075f63d7fb94b796d2d773fd60b2dd8803` under ignored `.artifacts/taskpacks/`.
+- This establishes one SQLite Atom vertical only. It does not satisfy multi-Goal, yield, cross-environment, held-out, corpus, assessment or downstream paper gates.
 - Repository lock, Ruff, format, Mypy, full Pytest and diff checks are green after the deletion.
