@@ -15,6 +15,7 @@ from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import AtomCheckResult, StartCase, TraceEvent
 from agent_env_foundry.task_foundry import (
     AgentChoicePerturbation,
+    AlternativeRouteProof,
     AtomAdmissionPlan,
     AtomChallengeReport,
     AtomChallengeResult,
@@ -83,6 +84,7 @@ def _plan(task: AtomTask) -> AtomAdmissionPlan:
     return AtomAdmissionPlan(
         task.task_id,
         "perturb_each_occurrence",
+        "non_subsequence_tool_sequence",
         (
             AtomPlannedChallenge("no_op", True, None, None, None),
             AtomPlannedChallenge("wrong_target", True, "d" * 64, None, None),
@@ -168,6 +170,7 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
     plan = _plan(task)
     assert plan.plan_id
     assert plan.agent_choice_policy == "perturb_each_occurrence"
+    assert plan.alternative_route_policy == "non_subsequence_tool_sequence"
     assert tuple(item.category for item in plan.challenges) == (
         "no_op",
         "wrong_target",
@@ -178,7 +181,12 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
     assert plan.challenges[1].target_task_id == "d" * 64
 
     with pytest.raises(TaskFoundryError) as caught:
-        AtomAdmissionPlan(task.task_id, "perturb_each_occurrence", plan.challenges[:-1])
+        AtomAdmissionPlan(
+            task.task_id,
+            "perturb_each_occurrence",
+            "non_subsequence_tool_sequence",
+            plan.challenges[:-1],
+        )
     assert caught.value.code == "admission_plan_incomplete"
 
     with pytest.raises(TaskFoundryError) as caught:
@@ -186,8 +194,22 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
     assert caught.value.code == "admission_plan_wrong_target_missing"
 
     with pytest.raises(TaskFoundryError) as caught:
-        AtomAdmissionPlan(task.task_id, "ignore_choices", plan.challenges)
+        AtomAdmissionPlan(
+            task.task_id,
+            "ignore_choices",
+            "non_subsequence_tool_sequence",
+            plan.challenges,
+        )
     assert caught.value.code == "admission_agent_choice_policy_invalid"
+
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomAdmissionPlan(
+            task.task_id,
+            "perturb_each_occurrence",
+            "allow_extra_calls",
+            plan.challenges,
+        )
+    assert caught.value.code == "admission_alternative_route_policy_invalid"
 
 
 def test_replay_rebinds_dynamic_outputs_and_changes_only_the_targeted_choice() -> None:
@@ -262,6 +284,60 @@ def test_agent_choice_perturbation_requires_the_checker_to_stay_satisfied() -> N
             failed,
         )
     assert caught.value.code == "agent_choice_is_load_bearing"
+
+
+def test_alternative_route_requires_a_non_subsequence_tool_sequence() -> None:
+    reference = ("inspect", "submit", "inspect_result")
+    assert task_foundry_module._meaningfully_distinct_route(
+        reference,
+        ("inspect", "submit", "inspect_source"),
+    )
+    assert not task_foundry_module._meaningfully_distinct_route(
+        reference,
+        ("list", "inspect", "submit", "inspect_result"),
+    )
+    assert not task_foundry_module._meaningfully_distinct_route(
+        reference,
+        ("inspect", "submit"),
+    )
+    redundant_trace = (
+        TraceEvent(1, "list", {}, {"ok": True, "data": {}, "error": None}),
+        TraceEvent(2, "inspect", {}, {"ok": True, "data": {}, "error": None}),
+        TraceEvent(3, "submit", {}, {"ok": True, "data": {}, "error": None}),
+        TraceEvent(4, "inspect_result", {}, {"ok": True, "data": {}, "error": None}),
+    )
+    with pytest.raises(TaskFoundryError) as caught:
+        AlternativeRouteProof(
+            "a" * 64,
+            "b" * 64,
+            "c" * 64,
+            "d" * 64,
+            "e" * 64,
+            reference,
+            redundant_trace,
+            {},
+            _witness(_task(), "f" * 64).result,
+        )
+    assert caught.value.code == "alternative_route_not_distinct"
+
+    distinct_trace = (
+        TraceEvent(1, "inspect", {}, {"ok": True, "data": {}, "error": None}),
+        TraceEvent(2, "submit", {}, {"ok": True, "data": {}, "error": None}),
+        TraceEvent(3, "inspect_source", {}, {"ok": True, "data": {}, "error": None}),
+    )
+    with pytest.raises(TaskFoundryError) as caught:
+        AlternativeRouteProof(
+            "a" * 64,
+            "b" * 64,
+            "c" * 64,
+            "d" * 64,
+            "e" * 64,
+            reference,
+            distinct_trace,
+            {},
+            _witness(_task(), "f" * 64, satisfied=False).result,
+        )
+    assert caught.value.code == "alternative_route_not_accepted"
 
 
 def test_solve_freezes_admission_plan_before_opening_a_witness(
