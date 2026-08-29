@@ -125,6 +125,9 @@ def _document() -> dict[str, Any]:
                 "actor_role": "operator",
                 "task_kind": "state_change",
                 "intent_label": "increment the counter",
+                "qualification_goal": (
+                    "Increase the selected counter and report the resulting public value."
+                ),
                 "answer_fields": [],
             },
             {
@@ -134,6 +137,10 @@ def _document() -> dict[str, Any]:
                 "actor_role": "operator",
                 "task_kind": "query",
                 "intent_label": "read the current counter",
+                "qualification_goal": (
+                    "Read the selected counter through the public interface and report "
+                    "Current count."
+                ),
                 "answer_fields": [{"field_id": "current-count", "public_label": "Current count"}],
             },
         ],
@@ -219,6 +226,7 @@ def test_expected_semantics_rejects_omission_and_incomplete_taskable_relation() 
             "actor_role": "operator",
             "task_kind": "process",
             "intent_label": "reset the world",
+            "qualification_goal": "Create the initial public world and report completion.",
             "answer_fields": [],
         }
     )
@@ -289,6 +297,9 @@ def test_expected_semantics_provider_turn_is_fresh_typed_and_candidate_blind(
     assert "source-secret-must-not-be-forwarded" not in visible
     assert "REQ-001" in visible
     assert "required_requirement_ids" in visible
+    assert "covers every mapped Taskable Requirement outcome" in visible
+    assert "one exact value" in visible
+    assert "free-form summaries" in visible
 
 
 def test_provider_validation_feedback_reports_all_findings_then_accepts_replacement(

@@ -10,6 +10,7 @@ from typing import Any
 
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
+from agent_env_foundry.author_finding import AuthorFinding
 from agent_env_foundry.builder import (
     ACTOR_FACTORY,
     BuilderConfig,
@@ -29,7 +30,6 @@ from agent_env_foundry.qualification_contracts import (
     NativeVerificationResult,
     native_verification_result_from_document,
 )
-from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.tree_manifest import tree_manifest
 from agent_env_foundry.verifier_inputs import (
     ACTOR_VIEW_NAME,
@@ -38,7 +38,6 @@ from agent_env_foundry.verifier_inputs import (
 
 VERIFIER_FACTORY = "generated_qualification_verifier.release:make_verifier"
 _PROHIBITED_OUTPUT_TOKENS = frozenset({"digest", "evidence", "manifest", "receipt", "verdict"})
-_FINDING_SOURCES = frozenset({"framework_check", "native_physical_check"})
 
 
 class VerifierAuthorFailure(RuntimeError):
@@ -59,34 +58,7 @@ class VerifierBuild:
     checks: tuple[CommandResult, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class VerifierAuthorFinding:
-    source: str
-    code: str
-    condition: str
-    expected: Any
-    actual: Any
-    decisive_inputs: dict[str, Any]
-
-    def __post_init__(self) -> None:
-        if self.source not in _FINDING_SOURCES:
-            raise ValueError("Verifier Author finding source is invalid")
-        if not self.code or not self.condition:
-            raise ValueError("Verifier Author finding code/condition must be non-empty")
-        try:
-            canonical_bytes(self.to_document())
-        except Exception as exc:
-            raise ValueError("Verifier Author finding must be canonical JSON") from exc
-
-    def to_document(self) -> dict[str, Any]:
-        return {
-            "source": self.source,
-            "code": self.code,
-            "condition": self.condition,
-            "expected": self.expected,
-            "actual": self.actual,
-            "decisive_inputs": self.decisive_inputs,
-        }
+VerifierAuthorFinding = AuthorFinding
 
 
 def run_verifier_author(
@@ -133,7 +105,7 @@ def run_verifier_author(
 def repair_verifier_author(
     prepared: PreparedVerifierAuthorWorkspace,
     build: VerifierBuild,
-    findings: tuple[VerifierAuthorFinding, ...],
+    findings: tuple[AuthorFinding, ...],
     *,
     config: BuilderConfig,
 ) -> VerifierBuild:
@@ -147,7 +119,7 @@ def repair_verifier_author(
         or build.codex_home.is_symlink()
         or not build.codex_home.is_dir()
         or not findings
-        or any(not isinstance(item, VerifierAuthorFinding) for item in findings)
+        or any(not isinstance(item, AuthorFinding) for item in findings)
         or len({item.code for item in findings}) != len(findings)
     ):
         raise VerifierAuthorFailure(

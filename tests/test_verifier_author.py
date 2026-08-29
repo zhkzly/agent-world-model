@@ -579,6 +579,54 @@ def test_host_verifier_boundary_rejects_report_field_aliases(
     assert caught.value.details["unexpected"] == ["deadline"]
 
 
+def test_host_verifier_boundary_accepts_neutral_null_report_on_unresolved_branch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    before = tmp_path / "before"
+    after = tmp_path / "after"
+    before.mkdir()
+    after.mkdir()
+
+    def unresolved(command: tuple[str, ...], **kwargs: Any) -> CommandResult:
+        del kwargs
+        payload = _native_result_document()
+        payload["satisfied"] = False
+        payload["required_effects_ok"] = False
+        payload["answer_ok"] = False
+        payload["report_values"] = {"item": None}
+        payload["failure_codes"] = ["UNSUPPORTED_REFERENT"]
+        return CommandResult("verifier_transition", command, 0, json.dumps(payload), "")
+
+    monkeypatch.setattr(verifier_author_module, "_run", unresolved)
+
+    verifier = tmp_path / "verifier"
+    verifier.mkdir()
+    result = invoke_verifier_transition(
+        verifier,
+        _native_request(before, after),
+        expected_verifier_project_digest=compute_verifier_project_digest(verifier),
+        expected_report_field_ids=("item",),
+        config=BuilderConfig(uv_cache_dir=tmp_path / "cache"),
+    )
+
+    assert result.satisfied is False
+    assert result.report_values == {"item": None}
+    assert result.failure_codes == ("UNSUPPORTED_REFERENT",)
+
+
+def test_verifier_contract_states_exact_report_and_referent_rules() -> None:
+    contract = (
+        Path(__file__).resolve().parents[1]
+        / "src/agent_env_foundry/runtime_skills/qualification-verifier-codegen/"
+        "QUALIFICATION_VERIFIER_CONTRACT.md"
+    ).read_text()
+
+    assert "exactly the declared" in contract
+    assert "`null`" in contract
+    assert "authoritative intended referent" in " ".join(contract.split())
+
+
 def test_host_verifier_boundary_rejects_verifier_project_mutation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

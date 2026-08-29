@@ -6,7 +6,7 @@
   "status": "in_progress",
   "dev_type": "backend",
   "scope": "Complete clean-break S2 implementation plus the minimum cross-environment S1 v2 preparation and TaskSemantics changes; no backward compatibility",
-  "package": "agent_task_foundry",
+  "package": "agent_env_foundry",
   "priority": "P0",
   "creator": "kelong",
   "assignee": "kelong",
@@ -29,22 +29,19 @@
     ".trellis/tasks/08-26-s2-task-foundry/implement.md",
     "src/agent_env_foundry/preparation.py",
     "src/agent_env_foundry/semantics.py",
-    "src/agent_task_foundry/models.py",
     "src/agent_env_foundry/release.py",
     "src/agent_env_foundry/_actor_runner.py",
     "src/agent_env_foundry/_semantics_runner.py",
     "tests/test_semantics_contract.py",
-    "tests/task_foundry/test_models.py",
     "tests/v2_release_factory.py",
     "tests/test_release_v2.py",
     "tests/test_preparation.py",
     "tests/fixtures/fx_v2_actor.py",
     "tests/fixtures/fx_v2_semantics.py",
     ".trellis/spec/backend/v2-preparation.md",
-    ".trellis/spec/backend/v2-qualification-publication.md",
-    ".trellis/tasks/08-26-s2-task-foundry/research/checkpoint-a-mutation-licenses.md"
+    ".trellis/spec/backend/v2-qualification-publication.md"
   ],
-  "notes": "Checkpoint A is complete after iterative high-level BLOCK→correction→re-review. Final stable bytes implement clean semantic, Qualification and Task identities with no adapter; valid Atom/two-member ForEach TaskPacks pass and every documented drift is RED. Two independent final reviews returned ALLOW. 292 tests, static/lock/diff/task gates and 41 auditable behavior mutation licences pass. Checkpoint B verifier authoring is next; no Qualification/Publication/S2 execution claim. Alignment Patrol remains disabled.",
+  "notes": "Current boundary is C3 physical Qualification. The model-only agent_task_foundry scaffold and disabled Alignment Patrol were deleted. Real public query, state-change and refusal positives pass with Semantics/Verifier axis agreement; no-op, wrong-answer and missing-readback negatives also agree on axes/report values. No Qualification receipt, Publication, Release or S2 completion claim yet.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -65,6 +62,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "checkpoint_b_verifier_authoring"
+    "implementation_checkpoint": "checkpoint_c3_physical_qualification"
   }
 }

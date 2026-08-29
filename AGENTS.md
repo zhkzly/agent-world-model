@@ -16,9 +16,8 @@ task and cannot authorize itself. Once explicitly activated, it becomes the
 canonical task authority for implementation checks.
 
 After compact/resume, inject only deterministic Trellis task and workflow
-context. Alignment Patrol is disabled and must not be invoked as a hook or a
-manual implementation/lifecycle gate. Use the active task, deterministic tests
-and independent code review for ordinary implementation checks.
+context. Use the active task, deterministic tests and independent code review
+for ordinary implementation checks.
 
 Do not add product nodes, interfaces, packages, Consumers, Registry behavior,
 or other future implementation details while the active task is harness design.

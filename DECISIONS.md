@@ -85,9 +85,6 @@
 - Completion requires the preregistered real SQLite/Git Task-yield and structure
   floors, cold S3-shaped recreation, a framework-frozen held-out Need and
   matched-budget baselines. Unit tests or one Task cannot authorize completion.
-- The user explicitly waived `plan-document-write` Alignment Patrol for the
-  current planning update. This does not weaken code review, deterministic tests
-  or semantic evidence gates.
 
 ## Preserved stage boundaries
 
@@ -119,8 +116,6 @@
 `s2-v2-clean-break|介入1|返工1|12k+ LOC deletion+277 tests+Ruff/Mypy/lock+zero-reference+tree-manifest mutation|红线违反0`
 
 `s2-v2-contract-reclosure|介入1|返工2|3 independent ALLOW+277 tests+task/spec validation+stale S1 deletion|红线违反0`
-
-`s2-checkpoint-a|介入1|返工5|292 tests+41 mutation licences+iterative high-level BLOCK→2 ALLOW|红线违反0`
 
 `s2-checkpoint-b|介入2|返工5|real Builder+verifier+physical matrix+15 mutation licences+3 independent ALLOW|红线违反0`
 

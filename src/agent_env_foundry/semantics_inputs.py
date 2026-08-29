@@ -14,10 +14,12 @@ from agent_env_foundry.frozen_inputs import (
 )
 from agent_env_foundry.qualification_contracts import PublicSurfaceManifest
 from agent_env_foundry.release import canonical_bytes
+from agent_env_foundry.semantics_wire import semantics_wire_document
 
 EXPECTED_TASK_SEMANTICS_NAME = "EXPECTED_TASK_SEMANTICS.json"
 PUBLIC_SURFACE_NAME = "PUBLIC_SURFACE.json"
 TASK_SEMANTICS_CONTRACT_NAME = "TASK_SEMANTICS_CONTRACT.md"
+TASK_SEMANTICS_WIRE_NAME = "TASK_SEMANTICS_WIRE.json"
 VIEW_NAME = "candidate-view"
 VIEW_MANIFEST_NAME = "CANDIDATE_VIEW_MANIFEST.json"
 
@@ -58,6 +60,7 @@ class PreparedSemanticsAuthorWorkspace:
             EXPECTED_TASK_SEMANTICS_NAME,
             PUBLIC_SURFACE_NAME,
             TASK_SEMANTICS_CONTRACT_NAME,
+            TASK_SEMANTICS_WIRE_NAME,
             VIEW_MANIFEST_NAME,
         }
         if set(self.input_digests) != expected_names:
@@ -126,6 +129,7 @@ def prepare_semantics_author_workspace(
             Path(__file__).parent
             / "runtime_skills/task-semantics-codegen/TASK_SEMANTICS_CONTRACT.md"
         ).read_bytes(),
+        TASK_SEMANTICS_WIRE_NAME: canonical_bytes(semantics_wire_document()),
     }
     input_digests: dict[str, str] = {}
     for name, payload in payloads.items():
@@ -142,6 +146,7 @@ __all__ = [
     "EXPECTED_TASK_SEMANTICS_NAME",
     "PUBLIC_SURFACE_NAME",
     "TASK_SEMANTICS_CONTRACT_NAME",
+    "TASK_SEMANTICS_WIRE_NAME",
     "VIEW_MANIFEST_NAME",
     "VIEW_NAME",
     "CandidateViewManifest",

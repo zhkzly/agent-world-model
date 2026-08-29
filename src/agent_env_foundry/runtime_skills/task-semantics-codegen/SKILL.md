@@ -12,7 +12,8 @@ Read completely before editing:
 1. `EXPECTED_TASK_SEMANTICS.json`
 2. `PUBLIC_SURFACE.json`
 3. `TASK_SEMANTICS_CONTRACT.md`
-4. the read-only `candidate-view/` needed to decode native state
+4. `TASK_SEMANTICS_WIRE.json` — machine schemas and Host-accepted examples
+5. the read-only `candidate-view/` needed to decode native state
 
 Implement `generated_task_semantics.release:make_semantics` plus diagnostic
 tests. Own the release-specific native decoder, deterministic StartCases,

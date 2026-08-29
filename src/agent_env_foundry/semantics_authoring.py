@@ -68,6 +68,7 @@ EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
                         "enum": ["query", "state_change", "process"],
                     },
                     "intent_label": {"type": "string"},
+                    "qualification_goal": {"type": "string"},
                     "answer_fields": {
                         "type": "array",
                         "items": {
@@ -88,6 +89,7 @@ EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
                     "actor_role",
                     "task_kind",
                     "intent_label",
+                    "qualification_goal",
                     "answer_fields",
                 ],
                 "additionalProperties": False,
@@ -400,8 +402,17 @@ def generate_expected_task_semantics(
                 "Each condition must cite Requirement and workflow anchors, state the public "
                 "observable relation, and license only known capability branches.",
                 "Every query capability must declare one or more answer field IDs and public "
-                "labels. These names are semantic contracts; do not include native paths or "
-                "reference answers.",
+                "labels. Every answer field must denote one exact value that the acting Agent "
+                "can copy from the public instruction or a public observation. Its public_label "
+                "must define that value and any null case without a run-specific answer. Do not "
+                "invent free-form summaries of state changes or verifier judgments.",
+                "Every capability must provide one source-blind qualification_goal: a concise "
+                "public user objective that covers every mapped Taskable Requirement outcome, "
+                "refusal, collateral constraint, and public process obligation relevant to the "
+                "capability. If persistence must be publicly confirmed, say so explicitly in "
+                "this goal. Do not include a function/tool name, prescribed call order, "
+                "native/protected term, run-local descriptor value, reference route, or concrete "
+                "answer value.",
                 "Use empty composition_rules or conditions arrays when none are justified.",
             ],
         },
@@ -498,11 +509,12 @@ def _capability(value: Any) -> dict[str, Any]:
         "actor_role",
         "task_kind",
         "intent_label",
+        "qualification_goal",
         "answer_fields",
     }
     item = _exact(value, keys, "capability")
     _identifier(item["capability_id"], "capability_id")
-    for field in ("actor_role", "intent_label"):
+    for field in ("actor_role", "intent_label", "qualification_goal"):
         _text(item[field], field)
     _string(item["task_kind"], "task_kind")
     if item["task_kind"] not in {"query", "state_change", "process"}:

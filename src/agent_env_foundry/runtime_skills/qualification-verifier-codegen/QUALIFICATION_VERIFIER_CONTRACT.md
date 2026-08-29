@@ -40,8 +40,12 @@ after_instance_directory
 
 It never contains a protected binding, TaskSemantics facts, checker, Task,
 reference solution or verdict. Identify the native referent from the public
-descriptor/trace. If that is impossible without a hidden ID, return a structured
-unsupported failure; never guess or inspect TaskSemantics.
+descriptor/trace. The `public_descriptor` is the authoritative intended
+referent whenever it uniquely resolves one referent; unrelated identities that
+merely appear inside broad public trace observations must not create false
+ambiguity or override that resolution. If identification is impossible without
+a hidden ID, return a structured unsupported failure; never guess or inspect
+TaskSemantics.
 
 Every `public_trace` item has exactly `seq`, `tool_name`, `arguments`, and
 `observation`. `observation` is the public ToolObservation returned by the
@@ -87,9 +91,13 @@ For every `answer_fields` entry of the selected capability in
 `EXPECTED_TASK_SEMANTICS.json`, independently derive the expected value from
 native before/after state and the qualified public trace, return it under the
 same field ID in `report_values`, and compare the submitted `final_answer`
-against it. A capability with declared answer fields must not return an empty
-`report_values`. Missing, wrong, or stale answers set `answer_ok=false` without
-changing the other independently computed axes.
+against it. Report `report_values` with exactly the declared answer field IDs;
+JSON `null` is the neutral value for a field that is inapplicable on the
+observed branch, never a silent omission. Compare source-bound exact public
+values, never synonyms, reformattings, or paraphrases. A capability with
+declared answer fields must not return an empty `report_values`. Missing,
+wrong, or stale answers set `answer_ok=false` without changing the other
+independently computed axes.
 
 Read the two instance directories with independent standard/native readers.
 `verify_transition` must be read-only. Do not write marker files, mutate state,

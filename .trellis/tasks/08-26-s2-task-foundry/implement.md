@@ -14,51 +14,13 @@ Current baseline:
 - expected-semantics, Semantics Author and Task/S2 identity models exist;
 - strict v2 Qualification/Publication and executable S2 do not yet exist.
 
-## 2. Checkpoint A — Freeze corrected contracts
+## 2. No standalone future-contract checkpoint
 
-### Work
-
-- Add exact models/decoders for:
-  - `QualificationCore` and acyclic identity preimages;
-  - verifier request/result and strict Qualification receipt;
-  - sealed public-surface/catalog/Requirement-coverage/qualified-StartCase documents;
-  - `PublicValueSource` plus run-local `PublicValueOccurrence`;
-  - `LogicalBindingRef`, `LogicalSelection` and run-local `ResolvedBinding`;
-  - `GoalEvaluationContext` in atomic evaluation.
-  - pre-witness `AdmissionPlan` and fresh `EpisodeIdentity`.
-- Delete `CapabilitySpec.read_scopes`/`write_scopes` from models, decoders,
-  author schema, fixtures and tests. CompositionRule plus the exact selected
-  sibling context are the sole composition/collateral authority.
-- Replace legacy facet/condition visibility plus tool/pointer fields with the
-  single `PublicValueSource`; visibility is derived from source kind and cannot
-  contradict it.
-- Remove concrete protected bindings from cross-materialization TaskDefinition and
-  checker identity.
-- Recursively validate Goal→selector/slot/capability/cardinality references and
-  require the Goal to consume every frozen binding/selector. Composition and
-  ForEach identities live only in their Goal nodes, never duplicate selection annotations.
-- Make receipt admission reject arbitrary canonical JSON and fixture verdicts.
-
-### RED tests
-
-- final Release ID cannot appear in Core/Qualification preimages;
-- arbitrary/mechanical receipt rejected;
-- live ToolSpecs/CapabilitySpecs/StartCases differing from sealed documents rejected;
-- concrete protected ID cannot enter TaskDefinition/checker template;
-- reset/tool value without exact schema pointer rejected;
-- repeated tool calls cannot satisfy provenance without a trace-event occurrence;
-- All/ForEach run missing or adding one logical selection member rejected;
-- unused selectors/bindings, wrong Goal references/cardinality, duplicate or
-  reordered frozen/run members rejected;
-- composed/foreach evaluation without exact selected sibling context rejected.
-- legacy `read_scopes`/`write_scopes` fields rejected rather than ignored.
-- legacy/contradictory visibility/tool/pointer encodings rejected.
-
-### Stop conditions
-
-- new public package format or compatibility reader appears;
-- generic state/query/effect DSL appears;
-- contracts cannot name one producer and consumer.
+Do not create model-only TaskDefinition, TaskPack, AdmissionPlan, assessment or
+corpus packages before an admitted release and executable compiler consume them.
+The former `agent_task_foundry` contract scaffold was deleted because only its
+tests consumed it. Implement each S2 record together with its first real runtime
+consumer in Checkpoints E–G.
 
 ## 3. Checkpoint B — Independent verifier authoring
 

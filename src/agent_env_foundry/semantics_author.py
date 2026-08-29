@@ -10,6 +10,7 @@ from typing import Any, cast
 
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
+from agent_env_foundry.author_finding import AuthorFinding
 from agent_env_foundry.builder import (
     ACTOR_FACTORY,
     BuilderConfig,
@@ -37,6 +38,7 @@ from agent_env_foundry.semantics_inputs import (
     PUBLIC_SURFACE_NAME,
     PreparedSemanticsAuthorWorkspace,
 )
+from agent_env_foundry.semantics_wire import validate_semantics_wire_items
 
 SEMANTICS_FACTORY = "generated_task_semantics.release:make_semantics"
 
@@ -102,21 +104,35 @@ def run_semantics_author(
 def repair_semantics_author(
     prepared: PreparedSemanticsAuthorWorkspace,
     build: SemanticsBuild,
-    findings: list[dict[str, Any]],
+    findings: tuple[AuthorFinding, ...],
     *,
     config: BuilderConfig,
 ) -> SemanticsBuild:
     """Resume the exact Semantics Author thread with physical CP3C findings."""
     prepared.verify_inputs()
     if (
-        build.root != prepared.root
+        build.root.resolve() != prepared.root.resolve()
+        or build.factory != SEMANTICS_FACTORY
+        or not build.thread_id
         or build.codex_home.is_symlink()
         or not build.codex_home.is_dir()
+        or not findings
+        or any(not isinstance(item, AuthorFinding) for item in findings)
+        or len({item.code for item in findings}) != len(findings)
     ):
         raise SemanticsAuthorFailure(
             "semantics_author",
             "semantics_author_resume_invalid",
             "Semantics Author resume identity is unavailable",
+        )
+    actual_digest = compute_semantics_project_digest(prepared.root)
+    if actual_digest != build.project_digest:
+        raise SemanticsAuthorFailure(
+            "semantics_author",
+            "semantics_author_digest_mismatch",
+            "TaskSemantics project bytes changed before factual repair",
+            expected=build.project_digest,
+            actual=actual_digest,
         )
     skill = (Path(__file__).parent / "runtime_skills/task-semantics-codegen/SKILL.md").read_text(
         encoding="utf-8"
@@ -124,7 +140,12 @@ def repair_semantics_author(
     prompt = (
         "PHYSICAL SEMANTIC QUALIFICATION REJECTED\n"
         "Fix semantic source/tests only; preserve immutable Host inputs and passed capabilities.\n"
-        "ALL_FINDINGS\n" + json.dumps(findings, ensure_ascii=False, sort_keys=True)
+        "ALL_FINDINGS\n"
+        + json.dumps(
+            [item.to_document() for item in findings],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
     )
     with Codex(_codex_config(prepared.root, build.codex_home, config)) as codex:
         thread = codex.thread_resume(
@@ -378,20 +399,43 @@ def _contract_check(
         raw_cases = transport.call("start_cases", {"seed": 0, "limit": start_limit})
         repeated_cases = transport.call("start_cases", {"seed": 0, "limit": start_limit})
         raw_capabilities = transport.call("capabilities", {})
-        if not isinstance(raw_cases, list) or not raw_cases:
-            raise ValueError("start_cases must return a non-empty array")
+        findings: list[str] = []
+        if not isinstance(raw_cases, list):
+            raise ValueError("start_cases must return an array")
+        if not raw_cases:
+            findings.append("$.start_cases: must return a non-empty array")
         if canonical_bytes(raw_cases) != canonical_bytes(repeated_cases):
-            raise ValueError("start_cases are not deterministic for the same seed and limit")
+            findings.append("$.start_cases: results differ for the same seed and limit")
         if not isinstance(raw_capabilities, list):
             raise ValueError("capabilities must return an array")
-        cases = tuple(start_case_from_document(item) for item in raw_cases)
+        findings.extend(
+            f"$.start_cases{item.removeprefix('$')}"
+            for item in validate_semantics_wire_items("start_case", raw_cases)
+        )
+        findings.extend(
+            f"$.capabilities{item.removeprefix('$')}"
+            for item in validate_semantics_wire_items("capability", raw_capabilities)
+        )
+        cases = []
+        for index, item in enumerate(raw_cases):
+            try:
+                cases.append(start_case_from_document(item))
+            except Exception as exc:
+                findings.append(f"$.start_cases[{index}]: {type(exc).__name__}: {exc}")
+        specs = []
+        for index, item in enumerate(raw_capabilities):
+            try:
+                specs.append(capability_from_document(item))
+            except Exception as exc:
+                findings.append(f"$.capabilities[{index}]: {type(exc).__name__}: {exc}")
+        if findings:
+            raise ValueError(json.dumps({"findings": findings}, ensure_ascii=False, sort_keys=True))
         validate_start_cases(
-            cases,
+            tuple(cases),
             start_schema=cast(dict[str, Any], public["start_schema"]),
             limit=start_limit,
         )
-        specs = tuple(capability_from_document(item) for item in raw_capabilities)
-        catalog = validate_catalog(specs)
+        catalog = validate_catalog(tuple(specs))
         _align_expected_catalog(
             _read_json(prepared.root / EXPECTED_TASK_SEMANTICS_NAME),
             catalog,
@@ -483,6 +527,7 @@ def _align_expected_catalog(
         raise ValueError(
             f"capability IDs differ: expected {sorted(expected_capabilities)}, got {sorted(actual)}"
         )
+    capability_findings: list[dict[str, Any]] = []
     for capability_id, expected_item in expected_capabilities.items():
         spec = actual[capability_id]
         comparisons = {
@@ -502,9 +547,21 @@ def _align_expected_catalog(
                 key=lambda field: field["field_id"],
             ),
         }
-        for field, value in comparisons.items():
-            if value != expected_item[field]:
-                raise ValueError(f"capability {capability_id!r} differs at {field}")
+        mismatches = {
+            field: {"expected": expected_item[field], "actual": value}
+            for field, value in comparisons.items()
+            if value != expected_item[field]
+        }
+        if mismatches:
+            capability_findings.append({"capability_id": capability_id, "mismatches": mismatches})
+    if capability_findings:
+        raise ValueError(
+            json.dumps(
+                {"capability_findings": capability_findings},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
 
     actual_rules = {
         rule.rule_id: rule for spec in actual.values() for rule in spec.composition_rules
@@ -539,6 +596,7 @@ def _align_expected_catalog(
     expected_conditions = {item["condition_id"]: item for item in expected["conditions"]}
     if set(actual_conditions) != set(expected_conditions):
         raise ValueError("condition IDs differ from frozen semantics")
+    condition_findings: list[dict[str, Any]] = []
     for condition_id, item in expected_conditions.items():
         condition = actual_conditions[condition_id]
         report_field_id = condition.report_field.field_id if condition.report_field else ""
@@ -549,15 +607,37 @@ def _align_expected_catalog(
             if condition.public_source.kind == "tool_output"
             else condition.public_source.kind
         )
-        if (
-            condition.public_label != item["public_label"]
-            or visibility != item["visibility"]
-            or condition.binding_scope != item["binding_scope"]
-            or sorted(condition.true_capability_ids) != item["true_capability_ids"]
-            or sorted(condition.false_capability_ids) != item["false_capability_ids"]
-            or report_field_id != item["report_field_id"]
-        ):
-            raise ValueError(f"condition {condition_id!r} differs from frozen semantics")
+        expected_values = {
+            "public_label": item["public_label"],
+            "visibility": item["visibility"],
+            "binding_scope": item["binding_scope"],
+            "true_capability_ids": item["true_capability_ids"],
+            "false_capability_ids": item["false_capability_ids"],
+            "report_field_id": item["report_field_id"],
+        }
+        actual_values = {
+            "public_label": condition.public_label,
+            "visibility": visibility,
+            "binding_scope": condition.binding_scope,
+            "true_capability_ids": sorted(condition.true_capability_ids),
+            "false_capability_ids": sorted(condition.false_capability_ids),
+            "report_field_id": report_field_id,
+        }
+        mismatches = {
+            field: {"expected": expected_values[field], "actual": actual_values[field]}
+            for field in expected_values
+            if expected_values[field] != actual_values[field]
+        }
+        if mismatches:
+            condition_findings.append({"condition_id": condition_id, "mismatches": mismatches})
+    if condition_findings:
+        raise ValueError(
+            json.dumps(
+                {"condition_findings": condition_findings},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
 
 
 def _feedback(checks: tuple[CommandResult, ...]) -> str:

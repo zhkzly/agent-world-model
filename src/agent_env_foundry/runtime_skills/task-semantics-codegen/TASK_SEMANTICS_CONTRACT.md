@@ -15,11 +15,18 @@ and Qualification alone decide whether it is usable.
   exact answer field IDs and public labels later checked by v2 Qualification.
 - `PUBLIC_SURFACE.json`: the actor factory, public schemas, ToolSpecs, public
   documents and the exact candidate-view digest.
+- `TASK_SEMANTICS_WIRE.json`: machine-readable exact wire schemas plus minimal
+  examples already accepted by the Host decoders. It is the authority for
+  record shape when prose is ambiguous.
 - `candidate-view/`: read-only actor source/native format documentation exposed
   only after expected semantics were frozen.
 
 Do not edit these files. Do not copy Host digests, manifests, run IDs or verdicts
 into generated semantic records.
+
+Generated diagnostic tests must validate representative `start_cases`,
+`capabilities`, `enumerate_bindings`, atom results and condition results against
+`TASK_SEMANTICS_WIRE.json` before reporting completion.
 
 ## Required factory surface
 
@@ -101,6 +108,18 @@ semantic_key, eligible, reason_codes,
 protected_binding, public_descriptor, facets, public_sources
 ```
 
+`public_sources` is an array of exact `PublicFieldSource` records, never a JSON
+object/map. Each record has exactly:
+
+```text
+field_pointer: RFC 6901 pointer rooted at /public_descriptor or /facets
+source: one PublicValueSource document
+```
+
+For example, a descriptor leaf `{"charge_reference": "CHG-1"}` uses
+`field_pointer="/public_descriptor/charge_reference"`. Every descriptor/facet
+leaf appears exactly once; do not shorten the pointer to `/charge_reference`.
+
 Eligible bindings have no reason codes. Ineligible bindings have at least one.
 The three projections are JSON objects and must validate against the capability
 schemas/facets.
@@ -137,7 +156,11 @@ without publishing its answer contract is invalid.
 For every declared answer field, compute the expected value from independently
 decoded native facts and the qualified public trace, put that value under the
 same field ID in `report_values`, and compare the submitted `final_answer`
-exactly. A missing, schema-valid wrong or stale answer must set
+exactly. Return `report_values` with exactly the declared answer field IDs of
+the capability; JSON `null` is the neutral value for a field that is
+inapplicable on the observed branch, never a silent omission. Readers compare
+source-bound exact public values, not synonyms, reformattings, or
+near-equivalents. A missing, schema-valid wrong or stale answer must set
 `answer_ok=false` and `satisfied=false`. Never read an undeclared final-answer
 field or treat mere field presence as semantic agreement.
 

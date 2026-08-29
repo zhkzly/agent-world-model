@@ -36,6 +36,7 @@ _ROLE_EXCLUDED_NAMES: dict[ProjectRole, frozenset[str]] = {
             "EXPECTED_TASK_SEMANTICS.json",
             "PUBLIC_SURFACE.json",
             "TASK_SEMANTICS_CONTRACT.md",
+            "TASK_SEMANTICS_WIRE.json",
             "CANDIDATE_VIEW_MANIFEST.json",
         }
     ),

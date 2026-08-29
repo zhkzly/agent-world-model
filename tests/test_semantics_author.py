@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -10,23 +11,28 @@ import pytest
 from openai_codex import ApprovalMode, Sandbox
 
 import agent_env_foundry.semantics_author as semantics_author_module
+from agent_env_foundry.author_finding import AuthorFinding
 from agent_env_foundry.builder import BuilderConfig, CommandResult, compute_candidate_digest
 from agent_env_foundry.qualification_contracts import PublicSurfaceManifest
 from agent_env_foundry.semantics import capability_from_document, validate_catalog
 from agent_env_foundry.semantics_author import (
     SemanticsAuthorFailure,
+    SemanticsBuild,
     compute_semantics_project_digest,
+    repair_semantics_author,
     run_semantics_author,
 )
 from agent_env_foundry.semantics_inputs import (
     EXPECTED_TASK_SEMANTICS_NAME,
     PUBLIC_SURFACE_NAME,
     TASK_SEMANTICS_CONTRACT_NAME,
+    TASK_SEMANTICS_WIRE_NAME,
     VIEW_MANIFEST_NAME,
     CandidateViewManifest,
     PreparedSemanticsAuthorWorkspace,
     prepare_semantics_author_workspace,
 )
+from agent_env_foundry.semantics_wire import semantics_wire_document
 
 
 def _sha(data: bytes) -> str:
@@ -109,6 +115,9 @@ def _workspace(tmp_path: Path) -> PreparedSemanticsAuthorWorkspace:
                     "actor_role": "operator",
                     "task_kind": "state_change",
                     "intent_label": "increment the counter",
+                    "qualification_goal": (
+                        "Increase the selected counter and report the resulting public value."
+                    ),
                     "answer_fields": [],
                 }
             ],
@@ -116,6 +125,7 @@ def _workspace(tmp_path: Path) -> PreparedSemanticsAuthorWorkspace:
             "conditions": [],
         },
         PUBLIC_SURFACE_NAME: _surface().to_document(),
+        TASK_SEMANTICS_WIRE_NAME: semantics_wire_document(),
     }
     inputs: dict[str, str] = {}
     for name, document in documents.items():
@@ -222,6 +232,91 @@ def test_task_semantics_contract_separates_initial_truth_from_eligibility() -> N
 
     assert "entire Task goal" in contract
     assert "not capability eligibility" in contract
+    assert "`public_sources` is an array" in contract
+    assert 'field_pointer="/public_descriptor/charge_reference"' in contract
+    assert "exactly the declared answer field IDs" in contract
+    assert "`null`" in contract
+
+
+def test_semantics_repair_binds_same_thread_current_digest_and_typed_finding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = workspace.root / "src/generated_task_semantics/release.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("VERSION = 1\ndef make_semantics():\n    return object()\n")
+    codex_home = tmp_path / "semantics-codex-home"
+    codex_home.mkdir()
+    finding = AuthorFinding(
+        source="native_physical_check",
+        code="COLLATERAL_AXIS_MISMATCH",
+        condition="selected required effect is not collateral",
+        expected=True,
+        actual=False,
+        decisive_inputs={"capability_id": "CAP-002"},
+    )
+    changed = SemanticsBuild(
+        workspace.root,
+        "same-thread",
+        codex_home,
+        "generated_task_semantics.release:make_semantics",
+        "0" * 64,
+        (),
+    )
+    with pytest.raises(SemanticsAuthorFailure) as digest_error:
+        repair_semantics_author(
+            workspace,
+            changed,
+            (finding,),
+            config=BuilderConfig(max_turns=1, uv_cache_dir=tmp_path / "cache"),
+        )
+    assert digest_error.value.code == "semantics_author_digest_mismatch"
+
+    observed: dict[str, Any] = {}
+
+    class Thread:
+        id = "same-thread"
+
+        def run(self, prompt: str) -> None:
+            observed["prompt"] = prompt
+            source.write_text("VERSION = 2\ndef make_semantics():\n    return object()\n")
+
+    class FakeCodex:
+        def __init__(self, config: Any) -> None:
+            del config
+
+        def __enter__(self) -> FakeCodex:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def thread_resume(self, thread_id: str, **kwargs: Any) -> Thread:
+            del kwargs
+            observed["thread_id"] = thread_id
+            return Thread()
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://provider.invalid/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(semantics_author_module, "Codex", FakeCodex)
+    monkeypatch.setattr(
+        semantics_author_module,
+        "run_semantics_checks",
+        lambda *_args, **_kwargs: (CommandResult("host", ("host",), 0, "passed", ""),),
+    )
+    build = replace(changed, project_digest=compute_semantics_project_digest(workspace.root))
+
+    repaired = repair_semantics_author(
+        workspace,
+        build,
+        (finding,),
+        config=BuilderConfig(max_turns=1, uv_cache_dir=tmp_path / "cache"),
+    )
+
+    assert observed["thread_id"] == "same-thread"
+    assert "COLLATERAL_AXIS_MISMATCH" in observed["prompt"]
+    assert repaired.project_digest != build.project_digest
 
 
 def test_semantics_digest_binds_file_mode(tmp_path: Path) -> None:
@@ -292,6 +387,55 @@ def test_framework_compares_generated_catalog_to_frozen_semantics(tmp_path: Path
     ]
     with pytest.raises(ValueError, match="answer_fields"):
         semantics_author_module._align_expected_catalog(expected, catalog)
+
+
+def test_frozen_catalog_feedback_reports_every_capability_field_together(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    expected = json.loads((workspace.root / EXPECTED_TASK_SEMANTICS_NAME).read_text())
+    capability = capability_from_document(
+        {
+            "capability_id": "increment",
+            "requirement_ids": ["REQ-001"],
+            "workflow_ids": ["other-workflow"],
+            "composition_rules": [],
+            "actor_role": "operator",
+            "task_kind": "state_change",
+            "intent_label": "increment the counter",
+            "protected_binding_schema": {"type": "object", "additionalProperties": True},
+            "public_descriptor_schema": {"type": "object", "additionalProperties": True},
+            "facets": [],
+            "conditions": [],
+            "answer_fields": [
+                {
+                    "field_id": "unexpected",
+                    "schema": {"type": "string"},
+                    "public_label": "Unexpected",
+                    "public_source": {
+                        "kind": "task_literal",
+                        "tool_name": None,
+                        "json_pointer": None,
+                        "value": None,
+                    },
+                }
+            ],
+            "supported_goal_kinds": ["atom"],
+            "rendering": {
+                "imperative": "increment",
+                "target_noun": "counter",
+                "answer_phrase": None,
+            },
+        }
+    )
+    catalog = validate_catalog((capability,))
+
+    with pytest.raises(ValueError) as caught:
+        semantics_author_module._align_expected_catalog(expected, catalog)
+
+    message = str(caught.value)
+    assert "workflow_ids" in message
+    assert "answer_fields" in message
 
 
 def test_runtime_import_probe_requires_own_source_and_rejects_actor(
