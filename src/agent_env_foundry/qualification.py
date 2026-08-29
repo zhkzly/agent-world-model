@@ -582,35 +582,6 @@ def _validate_expected_task_semantics(
         )
 
 
-def _taskable_requirement_ids(root: Path, expected: ExpectedRelations) -> set[str]:
-    document = _read_json(
-        Path(root) / EXPECTED_TASK_SEMANTICS_NAME,
-        "Expected TaskSemantics",
-    )
-    capabilities = document.get("capabilities")
-    if not isinstance(capabilities, list):
-        raise QualificationFailure(
-            "qualification_input",
-            "expected_task_semantics_invalid",
-            "Expected TaskSemantics capabilities are unavailable",
-        )
-    identifiers = {
-        requirement_id
-        for capability in capabilities
-        if isinstance(capability, dict)
-        for requirement_id in capability.get("requirement_ids", [])
-        if isinstance(requirement_id, str)
-    }
-    if not identifiers or not identifiers <= set(expected.by_id):
-        raise QualificationFailure(
-            "qualification_input",
-            "taskable_negative_scope_invalid",
-            "Taskable physical-negative scope differs from frozen Requirements",
-            taskable=sorted(identifiers),
-        )
-    return identifiers
-
-
 def _journal_tool_specs(journal: HostJournal) -> list[dict[str, Any]]:
     catalogs: list[bytes] = []
     selected: list[dict[str, Any]] | None = None
@@ -846,8 +817,6 @@ def validate_probe_bundle(
     root: Path,
     expected: ExpectedRelations,
     predicates: Mapping[str, Mapping[str, Any]],
-    *,
-    negative_requirement_ids: set[str] | None = None,
 ) -> ProbeBundle:
     workspace = Path(root)
     allowed = {
@@ -893,24 +862,8 @@ def validate_probe_bundle(
             "Probe source bypasses candidate-business execution separation",
             violations=forbidden_references,
         )
-    required_negative_ids = (
-        set(expected.by_id) if negative_requirement_ids is None else set(negative_requirement_ids)
-    )
-    unknown_negative_ids = required_negative_ids - set(expected.by_id)
-    if not required_negative_ids or unknown_negative_ids:
-        _fail(
-            "probe_gate",
-            "negative_requirement_scope_invalid",
-            "Physical negatives must name a non-empty subset of frozen Requirements",
-            unknown=sorted(unknown_negative_ids),
-        )
     declarations: list[dict[str, Any]] = []
-    selected_relations = [
-        relation
-        for relation in expected.relations
-        if relation.requirement_id in required_negative_ids
-    ]
-    for position, relation in enumerate(selected_relations, start=1):
+    for position, relation in enumerate(expected.relations, start=1):
         predicate = predicates.get(relation.requirement_id)
         if predicate is None:
             _fail(
@@ -1284,26 +1237,19 @@ def validate_negative_discrimination(
     predicates: Mapping[str, Mapping[str, Any]],
     carriers: tuple[ControlledRunCarrier, ...],
     candidate_digest: str,
-    *,
-    required_negative_ids: set[str] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     declarations = {
         item.get("requirement_id"): item
         for item in bundle.negative_declarations
         if isinstance(item, dict)
     }
-    required_ids = (
-        set(expected.by_id) if required_negative_ids is None else set(required_negative_ids)
-    )
-    missing = required_ids - set(declarations)
-    extras = set(declarations) - required_ids
-    if missing or extras or len(declarations) != len(bundle.negative_declarations):
+    missing = set(expected.by_id) - set(declarations)
+    if missing or len(declarations) != len(bundle.negative_declarations):
         _fail(
             "negative",
             "missing_negative_relation_coverage",
-            "Every required Taskable relation needs one negative discrimination row",
+            "Every frozen relation needs one negative discrimination row",
             missing=sorted(missing),
-            extras=sorted(extras),
         )
     carrier_by_run = {carrier.run_id: carrier for carrier in carriers}
     required_runs = {item["negative_run_id"] for item in declarations.values()}
@@ -1346,11 +1292,11 @@ def validate_negative_discrimination(
     negatives = {
         item.get("requirement_id"): item for item in negative_rows if isinstance(item, dict)
     }
-    if set(negatives) != required_ids or len(negatives) != len(negative_rows):
+    if set(negatives) != set(expected.by_id) or len(negatives) != len(negative_rows):
         _fail(
             "negative",
             "missing_negative_relation_coverage",
-            "Negative evidence does not cover every required Taskable relation exactly once",
+            "Negative evidence does not cover every frozen relation exactly once",
         )
     model_fields = {
         "requirement_id",
@@ -1373,8 +1319,6 @@ def validate_negative_discrimination(
         )
 
     for relation in expected.relations:
-        if relation.requirement_id not in required_ids:
-            continue
         issue_count = len(issues)
         declaration = declarations[relation.requirement_id]
         negative = negatives[relation.requirement_id]
@@ -1535,11 +1479,7 @@ def validate_negative_discrimination(
             "Controlled negative evidence has one or more semantic failures",
             issues=issues,
         )
-    validated = [
-        ready[relation.requirement_id]
-        for relation in expected.relations
-        if relation.requirement_id in required_ids
-    ]
+    validated = [ready[relation.requirement_id] for relation in expected.relations]
     return tuple(validated)
 
 
@@ -1634,12 +1574,7 @@ _PROBE_PROMPT = (
     "beneath the supplied release/instance roots by modifying a real file that already "
     "exists in release_root. Adding a marker, metadata, declaration, or unrelated file does "
     "not count. The mutation must make at least one public call with the same tool name and "
-    "arguments as baseline return a different observation. Design each mutation backward "
-    "from its matching acceptance assertion: the intended source fragment must occur exactly "
-    "once, otherwise raise without changing any file; never fall back to an unrelated source "
-    "change. When redundant facts independently satisfy the predicate, change enough of the "
-    "load-bearing relation to make that same predicate false. public_probe.py must exercise "
-    "the reset mode and public calls affected by the mutation in both baseline and negative. "
+    "arguments as baseline return a different observation. "
     "native_probe.py is an argv program with a __main__ entry point. argv[1:4] are exactly "
     "runtime_root, evidence_jsonl, negative_evidence_jsonl. Use an independent standard "
     "reader appropriate to the candidate representation and never import candidate "
@@ -1655,10 +1590,7 @@ _PROBE_PROMPT = (
     "A successful ToolObservation has error=null and a refusal has data=null. Handle these "
     "nullable fields explicitly; for example use (observation.get('error') or {}).get('code'), "
     "never chain .get after observation.get('error', {}). "
-    "Write exactly one positive JSONL row per frozen Requirement. Write negative JSONL rows "
-    "only for the Taskable Requirement IDs referenced by capabilities in "
-    "EXPECTED_TASK_SEMANTICS.json; the Host creates exactly those negative-run declarations. "
-    "Every row has "
+    "Write exactly one positive and one negative JSONL row per requirement. Every row has "
     "exactly requirement_id, public_call_seqs, native_observations, assertions, and "
     "source_use. public_call_seqs selects real invoke seq integers from that run's Host "
     "journal; do not copy calls. native_observations is a non-empty list of structured "
@@ -1667,9 +1599,7 @@ _PROBE_PROMPT = (
     "reset_reconstruction, value_chain, native_before_after, refusal_no_mutation, "
     "instance_isolation, nondefault_start_repeat, reload_persistence; the complete positive "
     "suite must cover all seven. Positive assertions must be computed from real public "
-    "and native observations and pass. Bind each assertion to the exact public call sequences "
-    "and named instance that establish that Requirement; do not aggregate unrelated successes "
-    "or refusals across the whole journal. The matching controlled near miss must make at least "
+    "and native observations and pass. The matching controlled near miss must make at least "
     "one identical assertion_id with the same expected fact and covers list false. Literal "
     "or unconditional True/False evidence is "
     "forbidden; derive the false result from the changed public/native behavior, never from "
@@ -1812,13 +1742,7 @@ def replay_qualification(
         prepared.stage_candidate_view()
         for name in PROBE_SCRIPTS:
             shutil.copyfile(source / name, prepared.root / name)
-        negative_ids = _taskable_requirement_ids(prepared.root, prepared.expected)
-        bundle = validate_probe_bundle(
-            prepared.root,
-            prepared.expected,
-            prepared.predicates,
-            negative_requirement_ids=negative_ids,
-        )
+        bundle = validate_probe_bundle(prepared.root, prepared.expected, prepared.predicates)
         outputs = _execute_probes(prepared, bundle, config)
         positive_journal, carriers = _require_host_outputs(outputs)
         rows = validate_evidence_rows(outputs["rows"], prepared.expected, positive_journal)
@@ -1830,7 +1754,6 @@ def replay_qualification(
             prepared.predicates,
             carriers,
             prepared.candidate_digest,
-            required_negative_ids=negative_ids,
         )
         prepared.verify_inputs()
         prepared.verify_candidate_unchanged()
@@ -2018,12 +1941,8 @@ def _author_probes(
             prepared.verify_candidate_unchanged()
             bundle: ProbeBundle | None = None
             try:
-                negative_ids = _taskable_requirement_ids(prepared.root, prepared.expected)
                 bundle = validate_probe_bundle(
-                    prepared.root,
-                    prepared.expected,
-                    prepared.predicates,
-                    negative_requirement_ids=negative_ids,
+                    prepared.root, prepared.expected, prepared.predicates
                 )
                 outputs = _execute_probes(prepared, bundle, config)
                 positive_journal, carriers = _require_host_outputs(outputs)
@@ -2036,7 +1955,6 @@ def _author_probes(
                     prepared.predicates,
                     carriers,
                     prepared.candidate_digest,
-                    required_negative_ids=negative_ids,
                 )
                 return (
                     bundle,

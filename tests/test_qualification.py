@@ -677,50 +677,6 @@ def test_24_relation_negative_validator_fixture_is_mechanical_only(
     assert len(result) == 24
 
 
-def test_negative_discrimination_may_be_scoped_to_taskable_requirements(
-    tmp_path: Path,
-) -> None:
-    expected, rows = _rows(4)
-    rows[0]["assertions"][0]["covers"] = list(CLASSES)
-    validated = validate_evidence_rows(rows, expected, _journal_for_rows(tmp_path, rows))
-    predicates = {
-        item["requirement_id"]: item
-        for item in _predicate_document(expected.to_document())["predicates"]
-    }
-    required = {"REQ-001", "REQ-003"}
-    declarations = [
-        item
-        for item in _negative_declarations(expected, predicates)
-        if item["requirement_id"] in required
-    ]
-    negatives = _negative_rows(declarations)
-    by_id = {row["requirement_id"]: row for row in rows}
-    for negative in negatives:
-        baseline = by_id[negative["requirement_id"]]
-        negative["assertions"][0]["assertion_id"] = baseline["assertions"][0]["assertion_id"]
-        negative["assertions"][0]["covers"] = list(baseline["assertions"][0]["covers"])
-        negative["assertions"][0]["expected"] = baseline["assertions"][0]["expected"]
-    carriers = _mechanical_carriers(
-        tmp_path / "taskable-carriers",
-        declarations,
-        negatives,
-    )
-    bundle = qualification_module.ProbeBundle(tmp_path, tuple(declarations), "f" * 64)
-
-    result = validate_negative_discrimination(
-        bundle,
-        negatives,
-        validated,
-        expected,
-        predicates,
-        carriers,
-        "a" * 64,
-        required_negative_ids=required,
-    )
-
-    assert {item["requirement_id"] for item in result} == required
-
-
 def test_negative_baseline_and_assertion_identity_must_match(tmp_path: Path) -> None:
     expected, rows, predicates, bundle, negatives, carriers = _negative_case(tmp_path, 1)
     negatives[0]["assertions"][0]["assertion_id"] = "different-assertion"
@@ -1531,14 +1487,6 @@ def test_public_probe_candidate_exit_is_attributed_to_candidate(
         )
     assert caught.value.phase == "candidate_execution"
     assert caught.value.code == "candidate_runtime_failed"
-
-
-def test_qualifier_prompt_forbids_unrelated_fallback_and_aggregate_assertions() -> None:
-    prompt = qualification_module._PROBE_PROMPT
-    assert "must occur exactly once" in prompt
-    assert "never fall back" in prompt
-    assert "matching acceptance assertion" in prompt
-    assert "exact public call sequences and named instance" in prompt
 
 
 def test_negative_copy_candidate_exit_is_attributed_to_qualifier(

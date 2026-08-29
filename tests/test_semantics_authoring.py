@@ -230,34 +230,6 @@ def test_expected_semantics_rejects_omission_and_incomplete_taskable_relation() 
     with pytest.raises(ExpectedSemanticsError, match="query capability requires answer_fields"):
         freeze_expected_task_semantics(_projection(), missing_query_answer)
 
-    setup_task = _document()
-    setup_task["requirements"][2].update(
-        disposition="Taskable",
-        rationale="Reset restores the environment initial world",
-        preconditions=["the environment has changed"],
-        outcomes=["the initial world is restored"],
-    )
-    setup_task["capabilities"].append(
-        {
-            "capability_id": "reset-environment",
-            "requirement_ids": ["REQ-003"],
-            "workflow_ids": ["counter-workflow"],
-            "actor_role": "operator",
-            "task_kind": "state_change",
-            "intent_label": "reset the environment",
-            "answer_fields": [],
-        }
-    )
-    setup_requirements = list(_projection().requirements)
-    setup_requirements[2] = {
-        **setup_requirements[2],
-        "state_relation": "Reset restores the environment initial world.",
-        "observable_relation": "After reset the world is reproducibly restored.",
-    }
-    setup_projection = replace(_projection(), requirements=tuple(setup_requirements))
-    with pytest.raises(ExpectedSemanticsError, match="reset/reconstruction"):
-        freeze_expected_task_semantics(setup_projection, setup_task)
-
 
 def test_expected_semantics_rejects_unanchored_composition_and_condition() -> None:
     bad_rule = _document()

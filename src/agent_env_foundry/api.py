@@ -440,6 +440,7 @@ _REPAIRABLE_SEMANTIC_FAILURES = frozenset(
         "semantic_physical_wrong_target_accepted",
         "semantic_fresh_replay_mismatch",
         "semantic_fresh_replay_facts_mismatch",
+        "semantic_native_disagreement",
     }
 )
 
