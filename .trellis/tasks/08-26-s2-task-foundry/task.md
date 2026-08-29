@@ -50,5 +50,6 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - The next fresh CAP-002 run froze CAP-003/`charge:CHG-INELIGIBLE-001` as its wrong-target Task, proved that target's own checker passed, then proved CAP-002 rejected the same physical episode.
 - Two further fresh CAP-002 witnesses resolved every argument leaf: charge references to Task literals, each generated dispute reference to one prior successful trace event, and free dispute reasons explicitly to `agent_choice`; error prose is never a source.
 - Plan `981ac12ff1303e1624dbc38c7c35e0854b508cf933b4657300365f56053b8cd9` precommitted to perturb every AgentChoice occurrence; two fresh public replays changed the two `/reason` values, rebound dynamic dispute references and both remained satisfied (`aad280a4861b7adcfb0c2e80c4d6b26ce6a792ae5e477dea70caba5101b4053d`).
-- This is partial Checkpoint F evidence only. Collateral, alternative-route and checker mutation remain blocking before any TaskPack claim.
+- CAP-001 plan `12ff5376e4e9b71a5a6e8c56b12a050c88a3d0c02e991b38b5527b60b94a4317` froze disjoint-workflow CAP-002 as collateral; CAP-002 succeeded, while CAP-001 retained effects/answer/process truth and failed only `collateral_ok`.
+- This is partial Checkpoint F evidence only. Alternative-route and checker mutation remain blocking before any TaskPack claim.
 - Repository lock, Ruff, format, Mypy, full Pytest and diff checks are green after the deletion.

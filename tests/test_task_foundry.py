@@ -94,6 +94,13 @@ def _plan(task: AtomTask) -> AtomAdmissionPlan:
                 "answer schema has no schema-valid alternative value",
             ),
             AtomPlannedChallenge("missing_process", True, None, None, None),
+            AtomPlannedChallenge(
+                "collateral",
+                False,
+                None,
+                None,
+                "no disjoint-workflow state-change Task is available",
+            ),
         ),
     )
 
@@ -166,6 +173,7 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
         "wrong_target",
         "wrong_answer",
         "missing_process",
+        "collateral",
     )
     assert plan.challenges[1].target_task_id == "d" * 64
 
@@ -322,6 +330,52 @@ def test_wrong_target_selection_prefers_same_capability_then_shared_workflow() -
     assert selected == shared_workflow
 
 
+def test_collateral_selection_requires_a_disjoint_state_change_workflow() -> None:
+    current = _task()
+    shared_state_change = replace(
+        current,
+        capability_id="cap-2",
+        semantic_key="item:2",
+        public_descriptor={"item": "two"},
+    )
+    disjoint_query = replace(
+        current,
+        capability_id="cap-3",
+        semantic_key="item:3",
+        public_descriptor={"item": "three"},
+    )
+    disjoint_state_change = replace(
+        current,
+        capability_id="cap-4",
+        semantic_key="item:4",
+        public_descriptor={"item": "four"},
+    )
+    capabilities = {
+        "cap-1": SimpleNamespace(workflow_ids=("workflow-1",), task_kind="query"),
+        "cap-2": SimpleNamespace(workflow_ids=("workflow-1",), task_kind="state_change"),
+        "cap-3": SimpleNamespace(workflow_ids=("workflow-2",), task_kind="query"),
+        "cap-4": SimpleNamespace(workflow_ids=("workflow-2",), task_kind="state_change"),
+    }
+    selected = task_foundry_module._select_collateral_task(
+        current,
+        (current, shared_state_change, disjoint_query, disjoint_state_change),
+        capabilities,  # type: ignore[arg-type]
+    )
+    assert selected == disjoint_state_change
+
+    with pytest.raises(TaskFoundryError) as caught:
+        task_foundry_module._assert_collateral_discriminated(
+            _witness(current, "b" * 64, satisfied=False).result
+        )
+    assert caught.value.code == "collateral_not_discriminated"
+    task_foundry_module._assert_collateral_discriminated(
+        replace(
+            _witness(current, "b" * 64, satisfied=False).result,
+            collateral_ok=False,
+        )
+    )
+
+
 def test_atom_challenge_report_requires_rejected_noop() -> None:
     task = _task()
     plan = _plan(task)
@@ -355,15 +409,28 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
         "answer schema has no schema-valid alternative value",
     )
     missing_process = replace(no_op, category="missing_process")
+    collateral = AtomChallengeResult(
+        "collateral",
+        False,
+        None,
+        (),
+        {},
+        None,
+        "no disjoint-workflow state-change Task is available",
+    )
     report = AtomChallengeReport(
         task.task_id,
         plan,
-        (no_op, wrong_target, not_applicable, missing_process),
+        (no_op, wrong_target, not_applicable, missing_process, collateral),
     )
     assert report.to_document()["format"] == "atom-challenge-report/1"
 
     with pytest.raises(TaskFoundryError) as caught:
-        AtomChallengeReport(task.task_id, plan, (no_op, wrong_target, not_applicable))
+        AtomChallengeReport(
+            task.task_id,
+            plan,
+            (no_op, wrong_target, not_applicable, missing_process),
+        )
     assert caught.value.code == "challenge_plan_incomplete"
 
     accepted = replace(no_op, result=_witness(task, "c" * 64).result)
@@ -371,7 +438,7 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
         AtomChallengeReport(
             task.task_id,
             plan,
-            (accepted, wrong_target, not_applicable, missing_process),
+            (accepted, wrong_target, not_applicable, missing_process, collateral),
         )
     assert caught.value.code == "challenge_false_acceptance"
 
@@ -380,6 +447,26 @@ def test_atom_challenge_report_requires_rejected_noop() -> None:
         AtomChallengeReport(
             task.task_id,
             plan,
-            (no_op, accepted_wrong_target, not_applicable, missing_process),
+            (no_op, accepted_wrong_target, not_applicable, missing_process, collateral),
+        )
+    assert caught.value.code == "challenge_false_acceptance"
+
+    applicable_collateral_plan = replace(
+        plan,
+        challenges=(
+            *plan.challenges[:-1],
+            AtomPlannedChallenge("collateral", True, "e" * 64, None, None),
+        ),
+    )
+    accepted_collateral = replace(
+        wrong_target,
+        category="collateral",
+        result=_witness(task, "c" * 64).result,
+    )
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomChallengeReport(
+            task.task_id,
+            applicable_collateral_plan,
+            (no_op, wrong_target, not_applicable, missing_process, accepted_collateral),
         )
     assert caught.value.code == "challenge_false_acceptance"

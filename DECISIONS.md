@@ -134,3 +134,5 @@
 `s2-f-provenance|介入0|返工0|exact argument occurrences+real CAP-002 witnesses+3 mutation licences|红线违反0`
 
 `s2-f-agent-choice|介入0|返工0|precommitted fresh physical perturbations+dynamic rebinding+3 mutation licences|红线违反0`
+
+`s2-f-collateral|介入0|返工0|disjoint-workflow state change+isolated collateral axis+3 mutation licences|红线违反0`

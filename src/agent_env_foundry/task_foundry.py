@@ -37,6 +37,7 @@ _ATOM_CHALLENGE_CATEGORIES = (
     "wrong_target",
     "wrong_answer",
     "missing_process",
+    "collateral",
 )
 
 
@@ -146,11 +147,11 @@ class AtomPlannedChallenge:
                 "Applicable challenges cannot have a reason; non-applicable challenges require one",
                 category=self.category,
             )
-        if self.category == "wrong_target" and self.applicable:
+        if self.category in {"wrong_target", "collateral"} and self.applicable:
             if not self.target_task_id:
                 raise TaskFoundryError(
-                    "admission_plan_wrong_target_missing",
-                    "Applicable wrong-target challenge requires its frozen target Task",
+                    f"admission_plan_{self.category}_missing",
+                    f"Applicable {self.category} challenge requires its frozen target Task",
                 )
         elif self.target_task_id is not None:
             raise TaskFoundryError(
@@ -976,6 +977,80 @@ def challenge_atom_task(
                     None,
                 )
             )
+        collateral_plan = _planned_challenge(admission_plan, "collateral")
+        if not collateral_plan.applicable:
+            challenges.append(
+                AtomChallengeResult(
+                    "collateral",
+                    False,
+                    None,
+                    (),
+                    {},
+                    None,
+                    collateral_plan.reason,
+                )
+            )
+        else:
+            assert collateral_plan.target_task_id is not None
+            collateral_task = _task_by_id(task_universe, collateral_plan.target_task_id)
+            _verify_checker_preimage(prepared, collateral_task)
+            collateral_binding = _resolve_binding(session, collateral_task, after)
+            collateral_episode = run_public_episode(
+                actor=session.actor,
+                instruction=collateral_task.instruction,
+                reset_observation=reset,
+                tool_specs=session.actor.tools(),
+                answer_schema=collateral_task.answer_schema,
+                route=selected_route,
+                max_provider_turns=max_provider_turns,
+            )
+            after_collateral = session.trusted.inspect(active_root)
+            collateral_result = session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    collateral_task.capability_id,
+                    after,
+                    after_collateral,
+                    collateral_binding.protected_binding,
+                    collateral_episode.trace,
+                    collateral_episode.final_answer,
+                    _context(
+                        collateral_task.capability_id,
+                        collateral_binding.semantic_key,
+                        collateral_binding.protected_binding,
+                    ),
+                )
+            )
+            if not collateral_result.satisfied:
+                raise TaskFoundryError(
+                    "collateral_baseline_failed",
+                    "Planned collateral Task did not satisfy its own frozen checker",
+                    target_task_id=collateral_task.task_id,
+                    result=collateral_result.to_document(),
+                )
+            combined_trace = _combine_traces(episode.trace, collateral_episode.trace)
+            current_with_collateral = session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after_collateral,
+                    binding.protected_binding,
+                    combined_trace,
+                    episode.final_answer,
+                    context,
+                )
+            )
+            _assert_collateral_discriminated(current_with_collateral)
+            challenges.append(
+                AtomChallengeResult(
+                    "collateral",
+                    True,
+                    session.identity.materialization_id,
+                    combined_trace,
+                    episode.final_answer,
+                    current_with_collateral,
+                    None,
+                )
+            )
     return AtomChallengeReport(task.task_id, admission_plan, tuple(challenges))
 
 
@@ -1050,6 +1125,18 @@ def _derive_atom_admission_plan(
             "capability checker declares no process outcome axis",
         )
     )
+    collateral = _select_collateral_task(task, task_universe, capabilities)
+    collateral_plan = (
+        AtomPlannedChallenge("collateral", True, collateral.task_id, None, None)
+        if collateral is not None
+        else AtomPlannedChallenge(
+            "collateral",
+            False,
+            None,
+            None,
+            "no disjoint-workflow state-change Task is available",
+        )
+    )
     return AtomAdmissionPlan(
         task.task_id,
         "perturb_each_occurrence",
@@ -1058,6 +1145,7 @@ def _derive_atom_admission_plan(
             wrong_target_plan,
             wrong_answer_plan,
             process_plan,
+            collateral_plan,
         ),
     )
 
@@ -1099,6 +1187,41 @@ def _select_wrong_target_task(
         )
 
     return min(candidates, key=rank) if candidates else None
+
+
+def _select_collateral_task(
+    task: AtomTask,
+    task_universe: tuple[AtomTask, ...],
+    capabilities: dict[str, CapabilitySpec],
+) -> AtomTask | None:
+    current = capabilities.get(task.capability_id)
+    if current is None:
+        raise TaskFoundryError(
+            "task_capability_missing",
+            "live release no longer exposes the Task capability",
+        )
+    current_workflows = set(current.workflow_ids)
+    candidates = []
+    for item in task_universe:
+        candidate = capabilities.get(item.capability_id)
+        if candidate is None:
+            raise TaskFoundryError(
+                "admission_target_capability_missing",
+                "Task universe contains a capability absent from the live release",
+                capability_id=item.capability_id,
+            )
+        if (
+            item.task_id != task.task_id
+            and item.start_case == task.start_case
+            and candidate.task_kind == "state_change"
+            and current_workflows.isdisjoint(candidate.workflow_ids)
+        ):
+            candidates.append(item)
+    return min(
+        candidates,
+        key=lambda item: (item.capability_id, item.semantic_key, item.task_id),
+        default=None,
+    )
 
 
 def _planned_challenge(plan: AtomAdmissionPlan, category: str) -> AtomPlannedChallenge:
@@ -1157,6 +1280,30 @@ def _replay_arguments(
             value = occurrence.value
         _set_json_pointer(arguments, occurrence.argument_pointer, value)
     return arguments
+
+
+def _combine_traces(
+    first: tuple[TraceEvent, ...],
+    second: tuple[TraceEvent, ...],
+) -> tuple[TraceEvent, ...]:
+    offset = max((item.seq for item in first), default=0)
+    return first + tuple(
+        TraceEvent(
+            offset + item.seq,
+            item.tool_name,
+            item.arguments,
+            item.observation,
+        )
+        for item in second
+    )
+
+
+def _assert_collateral_discriminated(result: AtomCheckResult) -> None:
+    if result.collateral_ok is not False or result.satisfied:
+        raise TaskFoundryError(
+            "collateral_not_discriminated",
+            "Atom checker did not reject a successful disjoint-workflow state change",
+        )
 
 
 def _resolve_json_pointer(value: JSONValue, pointer: str) -> JSONValue:
