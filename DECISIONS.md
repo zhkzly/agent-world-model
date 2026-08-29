@@ -152,3 +152,5 @@
 `s2-foreach-route-mutations|介入0|返工0|fresh no-op+reverse member order+2/2 aggregate mutants+4 mutation licences|红线违反0`
 
 `s2-foreach-taskpack|介入0|返工1|preselected physical collateral+same-Plan aggregate+8 mutation licences+one external TLS retry|红线违反0`
+
+`s2-if-vertical|介入0|返工0|existing public branch goals+3 compiled referents+4 real witnesses+3 mutation licences|红线违反0`
