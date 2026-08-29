@@ -1,11 +1,10 @@
 # EnvironmentRelease v2 Preparation Contract
 
 > **Status: strict product admission and cold preparation implemented for the
-> SQLite C3+D vertical.** Public `verify_release_v2` and `prepare_release` reject
+> SQLite and filesystem/Git C3+D verticals.** Public `verify_release_v2` and `prepare_release` reject
 > mechanical fixtures, bind the strict receipt/evidence/Core, reproduce sealed
 > ToolSpecs/CapabilitySpecs/StartCases and expose actor/semantics only. The
 > audit-only verifier is installed solely by `audit_release_v2` for cold replay.
-> Cross-environment filesystem/Git repetition remains required before stability.
 
 ## 1. Scope / Trigger
 
@@ -67,6 +66,9 @@ with prepared.open(instance_directory) as session:
   Actor must not import semantics; semantics must not import actor.
 - Manifest the instance before and after every trusted call, append a
   `TrustedCallEvent`, and reject mutation even when the child also raises.
+- ZIP staging restores explicit directory entries and their Unix modes before
+  admission. It must not rely on file-parent creation because sealed native
+  trees can contain meaningful empty directories.
 - Structured semantics documents use exact-key decoders and existing constructors;
   no expression language, recipe or executable verifier crosses the wire.
 
@@ -82,6 +84,7 @@ with prepared.open(instance_directory) as session:
 | actor startup/factory failure | `EnvironmentDefect/child_startup_failed` |
 | semantics startup/factory failure | `SemanticsDefect/child_startup_failed` |
 | response timeout/EOF after healthy use | `InfrastructureFailure` |
+| ZIP drops an empty sealed directory or changes its mode | strict evidence tree mismatch before preparation |
 | response seq or shape mismatch | fail closed; no value reaches caller |
 | prepared source or `.pth` origin changes | reject before child launch |
 | actor imports semantics | `EnvironmentDefect/runtime_import_leak` |
@@ -102,6 +105,8 @@ with prepared.open(instance_directory) as session:
 
 - Current: directory and safe-ZIP identity equality plus unsupported format,
   byte/mode/symlink/extra-member rejection.
+- Directory-entry/mode round trip, including empty native Git directories whose
+  presence is bound by Qualification evidence.
 - Shared materializer: real actor/semantics/verifier locked sync, canonical
   author-input filtering, accepted verifier digest equality, multi-module import
   denial and role-specific error attribution.

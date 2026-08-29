@@ -277,6 +277,48 @@ def test_evidence_sealing_requires_complete_physical_matrix(tmp_path: Path) -> N
         == manifest
     )
 
+    without_alternative = tuple(
+        item
+        for item in _cases(tmp_path / "no-alternative-inputs")
+        if item["category"] not in {"alternative_route", "near_miss"}
+    )
+    no_alternative_manifest = seal_qualification_evidence(
+        core,
+        tmp_path / "no-alternative",
+        case_records=without_alternative,
+        mutation_records=_mutants(),
+        required_capability_ids=("cap-1",),
+    )
+    assert len(no_alternative_manifest["cases"]) == 7
+
+    query_wrong_target = list(_cases(tmp_path / "query-wrong-target-inputs"))
+    wrong_target_index = next(
+        index for index, item in enumerate(query_wrong_target) if item["category"] == "wrong_target"
+    )
+    wrong_target = query_wrong_target[wrong_target_index]
+    query_result = {
+        **wrong_target["semantics_result"],
+        "required_effects_ok": True,
+        "answer_ok": False,
+        "process_ok": False,
+    }
+    query_wrong_target[wrong_target_index] = {
+        **wrong_target,
+        "semantics_result": query_result,
+        "verifier_result": {
+            **query_result,
+            "failure_codes": ["INDEPENDENT_WRONG_TARGET"],
+        },
+    }
+    query_manifest = seal_qualification_evidence(
+        core,
+        tmp_path / "query-wrong-target",
+        case_records=tuple(query_wrong_target),
+        mutation_records=_mutants(),
+        required_capability_ids=("cap-1",),
+    )
+    assert len(query_manifest["cases"]) == 9
+
     first = destination / manifest["cases"][0]["path"]
     first.write_bytes(b"{}")
     with pytest.raises(QualificationV2Error) as caught:

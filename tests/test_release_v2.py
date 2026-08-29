@@ -3,13 +3,21 @@ from __future__ import annotations
 import json
 import os
 import stat
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import rfc8785
 
+import agent_env_foundry.preparation as preparation_module
+import agent_env_foundry.release as release_module
 from agent_env_foundry.errors import EnvironmentContractError
-from agent_env_foundry.release import _verify_release_layout_v2, verify_release_v2
+from agent_env_foundry.release import (
+    _verify_release_layout_v2,
+    verify_release_v2,
+    write_release_zip_v2,
+)
 from v2_release_factory import build_v2_release
 
 
@@ -101,3 +109,36 @@ def test_v2_project_and_qualification_bindings_fail_closed(tmp_path: Path) -> No
     )
     with pytest.raises(EnvironmentContractError, match="qualification digest"):
         _verify_release_layout_v2(root)
+
+
+def test_release_zip_round_trip_preserves_empty_directory_and_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = tmp_path / "release"
+    empty = release / "qualification/evidence/instances/native/.git/refs/tags"
+    empty.mkdir(parents=True)
+    empty.chmod(0o750)
+    (release / "release.json").write_text("{}")
+    monkeypatch.setattr(
+        release_module,
+        "verify_release_v2",
+        lambda _path: SimpleNamespace(root=release),
+    )
+
+    archive = write_release_zip_v2(release, tmp_path / "release.zip")
+    with zipfile.ZipFile(archive) as package:
+        info = package.getinfo("qualification/evidence/instances/native/.git/refs/tags/")
+        assert info.is_dir()
+        assert stat.S_IMODE(info.external_attr >> 16) == 0o750
+
+    monkeypatch.setattr(
+        preparation_module,
+        "verify_release_v2",
+        lambda path: SimpleNamespace(root=Path(path)),
+    )
+    staged, ephemeral = preparation_module._stage_release(archive, tmp_path / "cache")
+    restored = staged / "qualification/evidence/instances/native/.git/refs/tags"
+    assert ephemeral is True
+    assert restored.is_dir()
+    assert stat.S_IMODE(restored.stat().st_mode) == 0o750

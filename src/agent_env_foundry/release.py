@@ -723,9 +723,19 @@ def write_release_zip_v2(release_root: Path, destination: Path) -> Path:
                 release.root.rglob("*"),
                 key=lambda item: item.relative_to(release.root).as_posix(),
             ):
+                relative = path.relative_to(release.root).as_posix()
+                if path.is_dir():
+                    info = zipfile.ZipInfo(
+                        f"{relative}/",
+                        date_time=(1980, 1, 1, 0, 0, 0),
+                    )
+                    info.create_system = 3
+                    info.external_attr = (stat.S_IFDIR | stat.S_IMODE(path.stat().st_mode)) << 16
+                    info.compress_type = zipfile.ZIP_STORED
+                    archive.writestr(info, b"")
+                    continue
                 if not path.is_file():
                     continue
-                relative = path.relative_to(release.root).as_posix()
                 info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
                 info.create_system = 3
                 info.external_attr = (stat.S_IFREG | stat.S_IMODE(path.stat().st_mode)) << 16

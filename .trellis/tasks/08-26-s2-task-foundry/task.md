@@ -17,7 +17,7 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - C3 SQLite vertical is complete: public physical cases, dual-reader comparison, evidence and executable mutants are sealed.
 - D SQLite vertical is complete: strict receipt, immutable Publication, deterministic ZIP, relocation and audit-only cold replay pass.
 - Failure-code strings are local diagnostics; cross-reader agreement covers the declared result axes and `report_values`.
-- The generic cross-environment Qualification coordinator and filesystem/Git repeat remain incomplete; there is no S2 completion claim.
+- The generic cross-environment Qualification coordinator and filesystem/Git C3+D repeat are complete; Checkpoints E-G remain incomplete, so there is no S2 completion claim.
 
 ## Deletion-first correction
 
@@ -71,3 +71,22 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - The true If Task reuses exact admitted CAP-002 AtomTaskPack `151d94d0dc4e39276acb487275e3ae546843b7072c7cdf59f0f4b82f3497dc36` instead of duplicating branch challenges. Conditional AdmissionReport `924041773a79eba232512553a460cdac5c87801cb5290418256cc8d29d502bae` sealed If TaskPack `ac444345bea360f5489829a75b82022991faa77b449b5f6d7b89997e757a10c8`; canonical artifact SHA-256 `9b3f00c093c90c9536df06bd059ab10d82069ecc2e1772fcff0cc4a9be576469`.
 - This establishes one true-branch If TaskPack. False-branch admission remains dependent on a complete CAP-003 AtomTaskPack; AllGoal remains unavailable without a natural qualified CompositionRule.
 - Repository lock, Ruff, format, Mypy, full Pytest and diff checks are green after the deletion.
+
+## Filesystem/Git C3+D evidence
+
+- The same production `run_v2_qualification` used for SQLite sealed 18 Git
+  physical cases: six positives, six fresh replays, two missing-process cases,
+  and one each for no-op, wrong answer, wrong target and collateral.
+- Core `ce26a09b89c4ee3ef7487b1fae968f4af8add4ce7f47bd054779455799e9ed43`
+  binds actor `055dfeae...`, TaskSemantics `ead395ed...` and independent
+  verifier `249f03c9...`; evidence digest is `8a3ed79c...`.
+- Strict Publication produced Release ID
+  `175d92d1d8c107ad6cabc6b5b39c7334216b849a3971a5233781ae8ddbff393e`.
+- Directory verification, audit-only cold replay, renamed ZIP preparation and a
+  Consumer-side real `reset/tools/invoke` all reproduced that exact Release ID,
+  three capabilities, two StartCases and six Git tools.
+- The first ZIP attempt exposed a real physical defect: file-only archives drop
+  empty `.git` directories that are included in sealed tree identity. Production
+  ZIP writing/staging now preserves explicit directory entries and modes; the
+  corrected canonical ZIP SHA-256 is
+  `6bb57a0744127accbe8bd60a657d77566eba6c4523044d830d78487ee07d652e`.

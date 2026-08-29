@@ -931,9 +931,16 @@ def _stage_release(source: Path, cache: Path) -> tuple[Path, bool]:
                 if relative in seen:
                     raise PreparationContractError("v2 ZIP contains duplicate members")
                 seen.add(relative)
-                if info.is_dir():
-                    continue
                 mode = (info.external_attr >> 16) & 0xFFFF
+                if info.is_dir():
+                    if stat.S_IFMT(mode) not in {0, stat.S_IFDIR}:
+                        raise PreparationContractError(
+                            "v2 ZIP contains an invalid directory member"
+                        )
+                    target = incoming / relative
+                    target.mkdir(parents=True, exist_ok=True)
+                    target.chmod(stat.S_IMODE(mode))
+                    continue
                 if stat.S_IFMT(mode) not in {0, stat.S_IFREG}:
                     raise PreparationContractError("v2 ZIP contains a non-regular member")
                 target = incoming / relative

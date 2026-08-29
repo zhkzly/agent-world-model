@@ -435,6 +435,34 @@ def _evaluate(
         trace,
         final_answer,
     )
+    agreement_fields = (
+        "initially_satisfied",
+        "satisfied",
+        "required_effects_ok",
+        "collateral_ok",
+        "answer_ok",
+        "process_ok",
+        "report_values",
+    )
+    disagreements = {
+        name: {
+            "semantics": getattr(semantics_result, name),
+            "verifier": getattr(verifier_result, name),
+        }
+        for name in agreement_fields
+        if getattr(semantics_result, name) != getattr(verifier_result, name)
+    }
+    if disagreements:
+        raise QualificationV2Error(
+            "qualification_reader_disagreement",
+            "TaskSemantics and Verifier disagree on physical result axes",
+            category=category,
+            capability_id=capability.capability_id,
+            semantic_key=live_binding.semantic_key,
+            disagreements=disagreements,
+            semantics_result=semantics_result.to_document(),
+            verifier_result=verifier_result.to_document(),
+        )
     return _EvaluatedCase(
         category,
         capability,
@@ -486,8 +514,6 @@ def _run_episode_case(
     route: AgentRoute,
     budget: QualificationBudget,
     ordinal: int,
-    *,
-    extra_instruction: str | None = None,
 ) -> _EvaluatedCase:
     case = _case_root(root, category, capability, start, binding.semantic_key, ordinal)
     before, after, actor, reset, before_facts = _reset_pair(harness, case, start)
@@ -504,8 +530,6 @@ def _run_episode_case(
             live_binding.public_descriptor,
             capability.answer_fields,
         )
-        if extra_instruction is not None:
-            instruction = "\n\n".join((instruction, extra_instruction))
         episode = run_public_episode(
             actor=actor,
             instruction=instruction,
@@ -572,6 +596,74 @@ def _variant_case(
         source.after,
         source.trace if trace is None else trace,
         source.final_answer if final_answer is None else final_answer,
+    )
+
+
+def _run_wrong_target_case(
+    harness: _QualificationHarness,
+    root: Path,
+    capability: CapabilitySpec,
+    start: StartCase,
+    target: BindingCandidate,
+    control: BindingCandidate,
+    goal: str,
+    route: AgentRoute,
+    budget: QualificationBudget,
+    ordinal: int,
+) -> _EvaluatedCase:
+    case = _case_root(root, "wrong_target", capability, start, target.semantic_key, ordinal)
+    before, after, actor, reset, before_facts = _reset_pair(harness, case, start)
+    try:
+        live_control = _resolve_binding(
+            harness,
+            capability,
+            before_facts,
+            before,
+            control.semantic_key,
+        )
+        episode = run_public_episode(
+            actor=actor,
+            instruction=_instruction(
+                goal,
+                live_control.public_descriptor,
+                capability.answer_fields,
+            ),
+            reset_observation=reset,
+            tool_specs=actor.tools(),
+            answer_schema=_answer_schema(capability.answer_fields),
+            route=route,
+            max_provider_turns=budget.max_provider_turns,
+        )
+    finally:
+        actor.close()
+    control_result = _evaluate(
+        harness,
+        "positive",
+        capability,
+        start,
+        live_control,
+        before,
+        after,
+        episode.trace,
+        episode.final_answer,
+    )
+    if not control_result.semantics_result.satisfied:
+        raise QualificationV2Error(
+            "qualification_wrong_target_control_failed",
+            "Wrong-target control binding did not satisfy its own semantics",
+            capability_id=capability.capability_id,
+            semantic_key=live_control.semantic_key,
+        )
+    return _evaluate(
+        harness,
+        "wrong_target",
+        capability,
+        start,
+        target,
+        before,
+        after,
+        episode.trace,
+        episode.final_answer,
     )
 
 
@@ -676,35 +768,6 @@ def _run_collateral_case(
 
 
 def _mutation_records(cases: tuple[_EvaluatedCase, ...]) -> tuple[dict[str, object], ...]:
-    no_op = next(
-        (
-            item
-            for item in cases
-            if item.category == "no_op" and not item.semantics_result.required_effects_ok
-        ),
-        None,
-    )
-    collateral = next(
-        (
-            item
-            for item in cases
-            if item.category == "collateral" and not item.verifier_result.collateral_ok
-        ),
-        None,
-    )
-    if no_op is None or collateral is None:
-        raise QualificationV2Error(
-            "qualification_mutation_killer_missing",
-            "Qualification lacks physical no-op or collateral mutation killers",
-        )
-    semantic_mutant = {
-        **no_op.semantics_result.to_document(),
-        "required_effects_ok": True,
-    }
-    verifier_mutant = {
-        **collateral.verifier_result.to_document(),
-        "collateral_ok": True,
-    }
     agreement_fields = (
         "initially_satisfied",
         "satisfied",
@@ -714,47 +777,64 @@ def _mutation_records(cases: tuple[_EvaluatedCase, ...]) -> tuple[dict[str, obje
         "process_ok",
         "report_values",
     )
-    semantic_independent = no_op.verifier_result.to_document()
-    verifier_independent = collateral.semantics_result.to_document()
-    semantic_killed = any(
-        semantic_mutant[name] != semantic_independent[name] for name in agreement_fields
-    )
-    verifier_killed = any(
-        verifier_mutant[name] != verifier_independent[name] for name in agreement_fields
-    )
-    if not semantic_killed or not verifier_killed:
-        raise QualificationV2Error(
-            "qualification_mutant_survived",
-            "Executable result-axis mutant survived physical cross-reader comparison",
+    mutable_axes = ("required_effects_ok", "collateral_ok", "answer_ok", "process_ok")
+    records: list[dict[str, object]] = []
+    for role in ("semantics", "verifier"):
+        selected: tuple[_EvaluatedCase, str, JSONObject, JSONObject] | None = None
+        for item in cases:
+            own = (
+                item.semantics_result.to_document()
+                if role == "semantics"
+                else item.verifier_result.to_document()
+            )
+            independent = (
+                item.verifier_result.to_document()
+                if role == "semantics"
+                else item.semantics_result.to_document()
+            )
+            axis = next(
+                (
+                    name
+                    for name in mutable_axes
+                    if own[name] is False and independent[name] is False
+                ),
+                None,
+            )
+            if axis is not None:
+                selected = (item, axis, own, independent)
+                break
+        if selected is None:
+            raise QualificationV2Error(
+                "qualification_mutation_killer_missing",
+                "Qualification lacks an independently false result axis for a reader mutant",
+                role=role,
+            )
+        item, axis, original, independent = selected
+        mutant = {**original, axis: True}
+        killed = any(mutant[name] != independent[name] for name in agreement_fields)
+        if not killed:
+            raise QualificationV2Error(
+                "qualification_mutant_survived",
+                "Executable result-axis mutant survived physical cross-reader comparison",
+                role=role,
+                axis=axis,
+            )
+        records.append(
+            {
+                "mutant_id": f"{role}-{axis}-always-true",
+                "target_role": role,
+                "killed": True,
+                "killed_by": "physical_axis_comparison",
+                "evidence": {
+                    "category": item.category,
+                    "capability_id": item.capability.capability_id,
+                    "original": original,
+                    "mutant": mutant,
+                    "independent": independent,
+                },
+            }
         )
-    return (
-        {
-            "mutant_id": "semantics-required-effects-always-true",
-            "target_role": "semantics",
-            "killed": True,
-            "killed_by": "physical_axis_comparison",
-            "evidence": {
-                "category": no_op.category,
-                "capability_id": no_op.capability.capability_id,
-                "original": no_op.semantics_result.to_document(),
-                "mutant": semantic_mutant,
-                "independent": semantic_independent,
-            },
-        },
-        {
-            "mutant_id": "verifier-collateral-always-true",
-            "target_role": "verifier",
-            "killed": True,
-            "killed_by": "physical_axis_comparison",
-            "evidence": {
-                "category": collateral.category,
-                "capability_id": collateral.capability.capability_id,
-                "original": collateral.verifier_result.to_document(),
-                "mutant": verifier_mutant,
-                "independent": verifier_independent,
-            },
-        },
-    )
+    return tuple(records)
 
 
 def _requirement_coverage(
@@ -939,9 +1019,19 @@ def run_v2_qualification(
                 missing=sorted(missing),
             )
 
-        no_op_source = next(
-            item for item in positives if item.capability.task_kind == "state_change"
-        )
+        stateful_positives = [
+            item
+            for item in positives
+            if item.capability.task_kind != "query"
+            and canonical_bytes(harness.inspect(item.before))
+            != canonical_bytes(harness.inspect(item.after))
+        ]
+        if not stateful_positives:
+            raise QualificationV2Error(
+                "qualification_state_change_case_missing",
+                "Qualification requires one positive case with a real native state change",
+            )
+        no_op_source = stateful_positives[0]
         cases.append(
             _run_noop_case(
                 harness,
@@ -976,22 +1066,53 @@ def run_v2_qualification(
         cases.append(_variant_case(harness, query_source, "wrong_answer", final_answer=wrong))
         cases.append(_variant_case(harness, query_source, "missing_process", trace=()))
 
-        state_ineligible = [item for item in ineligible if item[0].task_kind == "state_change"]
-        if len(state_ineligible) < 2:
-            raise QualificationV2Error(
-                "qualification_negative_bindings_missing",
-                "Qualification requires two ineligible state-change bindings",
+        query_bindings = [
+            item
+            for item in _discover_bindings(
+                harness,
+                work / "wrong-target-discovery",
+                query_source.capability,
+                query_source.start,
             )
-        for category, (capability, start, binding) in zip(
-            ("wrong_target", "near_miss"),
-            state_ineligible[:2],
-            strict=True,
-        ):
+            if item.eligible
+        ]
+        wrong_control = next(
+            (
+                item
+                for item in query_bindings
+                if item.semantic_key != query_source.binding.semantic_key
+            ),
+            None,
+        )
+        if wrong_control is None:
+            raise QualificationV2Error(
+                "qualification_wrong_target_binding_missing",
+                "Qualification requires two eligible bindings for a wrong-target challenge",
+            )
+        cases.append(
+            _run_wrong_target_case(
+                harness,
+                work / "cases",
+                query_source.capability,
+                query_source.start,
+                query_source.binding,
+                wrong_control,
+                goals[query_source.capability.capability_id],
+                route,
+                budget,
+                ordinal,
+            )
+        )
+        ordinal += 1
+
+        state_ineligible = [item for item in ineligible if item[0].task_kind != "query"]
+        if state_ineligible:
+            capability, start, binding = state_ineligible[0]
             cases.append(
                 _run_episode_case(
                     harness,
                     work / "cases",
-                    category,
+                    "near_miss",
                     capability,
                     start,
                     binding,
@@ -1011,9 +1132,8 @@ def run_v2_qualification(
         )
         control_source = next(
             item
-            for item in positives
-            if item.capability.task_kind == "state_change"
-            and set(item.capability.workflow_ids).isdisjoint(query_source.capability.workflow_ids)
+            for item in stateful_positives
+            if set(item.capability.workflow_ids).isdisjoint(query_source.capability.workflow_ids)
             and item.start == query_source.start
         )
         control = (
@@ -1059,33 +1179,6 @@ def run_v2_qualification(
                     existing_alternative.final_answer,
                 )
             )
-        else:
-            forbidden_names = sorted(set(reference_route))
-            alternative_prompt = (
-                "Qualification path-open challenge: solve the same task without calling any "
-                "tool in this forbidden reference set: "
-                + json.dumps(forbidden_names)
-                + ". Use another available public read tool and return the same answer schema."
-            )
-            alternative = _run_episode_case(
-                harness,
-                work / "cases",
-                "alternative_route",
-                query_source.capability,
-                query_source.start,
-                query_source.binding,
-                goals[query_source.capability.capability_id],
-                route,
-                budget,
-                ordinal,
-                extra_instruction=alternative_prompt,
-            )
-            if tuple(item.tool_name for item in alternative.trace) == reference_route:
-                raise QualificationV2Error(
-                    "qualification_alternative_route_missing",
-                    "Qualification Agent repeated the reference public route",
-                )
-            cases.append(alternative)
 
         mutations = _mutation_records(tuple(cases))
         manifest = seal_qualification_evidence(

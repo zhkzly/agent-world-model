@@ -164,3 +164,5 @@
 `s2-multistart-simplification|介入1|返工2|StartCase-scoped If identity+selected-binding refusal isolation+delete mandatory Atom alternative route+3 refreshed real TaskPacks|红线违反0`
 
 `s2-c-production-runner|介入0|返工1|production run_v2_qualification+18 physical cases+2 executable result mutants+strict publication/cold audit+mutation licence|红线违反0`
+
+`s2-cd-git-repeat|介入0|返工4|18 Git physical cases+dual-reader repairs+strict release+directory-faithful ZIP relocation+5 mutation licences|红线违反0`

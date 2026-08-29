@@ -15,7 +15,7 @@
 - [x] Has a strict Qualification receipt been produced only from complete physical evidence?
 - [x] Has Publication copied exact frozen bytes and passed cold relocation/replay?
 - [x] Does one production `run_v2_qualification` API reproduce this matrix without `/tmp` orchestration?
-- [ ] Does the unchanged Framework repeat C3+D on the filesystem/Git environment?
+- [x] Does the unchanged Framework repeat C3+D on the filesystem/Git environment?
 - [ ] Does the direct S1 coordinator reach the admitted release without development-checkout imports?
 - [x] Does the production Atom compiler freeze the checker before rendering/exposing the instruction?
 - [x] Does the SQLite release compile 12 Atom, 4 ForEach and 6 If candidates over two StartCases?

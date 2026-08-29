@@ -91,6 +91,7 @@ _CASE_CATEGORIES = frozenset(
         "fresh_replay",
     }
 )
+_REQUIRED_CASE_CATEGORIES = _CASE_CATEGORIES - {"alternative_route", "near_miss"}
 _AGREEMENT_FIELDS = (
     "initially_satisfied",
     "satisfied",
@@ -465,7 +466,7 @@ def _validate_evidence_matrix(
     required_capability_ids: tuple[str, ...],
 ) -> None:
     present_categories = {cast(str, item["category"]) for item in cases}
-    missing_categories = _CASE_CATEGORIES - present_categories
+    missing_categories = _REQUIRED_CASE_CATEGORIES - present_categories
     if missing_categories:
         raise QualificationV2Error(
             "qualification_evidence_categories_missing",
@@ -716,8 +717,14 @@ def _validate_case_semantics(normalized: JSONObject) -> None:
 def _validate_category_result(category: str, result: NativeVerificationResult) -> None:
     if category in {"positive", "alternative_route", "fresh_replay"}:
         valid = result.satisfied
-    elif category in {"no_op", "wrong_target", "near_miss"}:
+    elif category in {"no_op", "near_miss"}:
         valid = not result.satisfied and not result.required_effects_ok
+    elif category == "wrong_target":
+        valid = not result.satisfied and (
+            not result.required_effects_ok
+            or result.answer_ok is False
+            or result.process_ok is False
+        )
     elif category == "wrong_answer":
         valid = not result.satisfied and result.answer_ok is False
     elif category == "collateral":

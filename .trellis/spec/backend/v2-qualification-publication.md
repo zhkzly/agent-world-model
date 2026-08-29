@@ -1,11 +1,12 @@
 # EnvironmentRelease v2 Qualification and Publication Contract
 
-> **Status: SQLite C3+D production path implemented and physically proven.**
+> **Status: SQLite and filesystem/Git C3+D production paths implemented and
+> physically proven with unchanged Framework code.**
 > The Host-owned `run_v2_qualification` binds mutually blind Authors into one
-> Core, seals 18 physical cases and executable reader mutants, issues a strict
+> Core, seals physical cases and executable reader mutants, issues a strict
 > receipt, publishes deterministic directory and ZIP bytes, verifies live sealed
-> catalogs, and cold-replays archived readers. The unchanged filesystem/Git
-> repeat remains required before S1/S2 completion.
+> catalogs, and cold-replays archived readers. This closes the required
+> cross-environment C/D repeat; Checkpoints E-G remain incomplete.
 
 ## 1. Scope / Trigger
 
@@ -75,6 +76,10 @@ verify_transition(request: NativeVerificationRequest) -> NativeVerificationResul
 - Qualification evidence and receipt bind `core_id`.
 - Publication copies Core bytes unchanged, then adds evidence/receipt and
   computes payload and final descriptor digests.
+- Directory-mode physical evidence is part of sealed instance identity. The
+  deterministic ZIP writer must therefore emit every directory, including empty
+  native directories, with its Unix mode; extraction must recreate and chmod
+  directory entries before strict evidence verification.
 - Qualification never consumes final Release ID. Publication never rewrites Core
   bytes or Qualification evidence.
 - Core derivation re-verifies the immutable Expected Semantics/Public Surface
@@ -198,6 +203,7 @@ results.
 | Mechanical fixture receipt | release rejection |
 | Publication changes frozen project/evidence byte | `PublicationFailure(core_changed)` |
 | Final descriptor/payload/ZIP tamper | release rejection |
+| ZIP omits or changes a sealed empty directory/mode | `qualification_case_tree_mismatch` during strict admission |
 
 ## 5. Good / Base / Bad Cases
 
@@ -233,6 +239,8 @@ results.
 - Type/projection test proving S2 cannot deserialize verifier/evidence/reference traces.
 - Mechanical fixture cannot pass `verify_release_v2`/`prepare_release` admission.
 - Publication byte preservation, directory/ZIP relocation and cold replay.
+- Empty native directory and directory-mode preservation through the production
+  ZIP writer/extractor, plus a real Git release containing empty `.git` directories.
 - Real SQLite and filesystem/Git releases with unchanged Framework code.
 
 ## 7. Wrong vs Correct
@@ -262,4 +270,17 @@ same physical before/after instances
 ├─ TaskSemantics evaluation
 └─ mutually blind verifier native evaluation
 Host compares exact axes and physical negatives
+```
+
+Wrong:
+
+```text
+ZIP only regular files -> extractor recreates parent directories incidentally
+```
+
+Correct:
+
+```text
+ZIP binds files + directory entries/modes -> extractor restores the same tree
+-> sealed before/after tree digests still match
 ```
