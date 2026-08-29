@@ -32,12 +32,16 @@ from agent_env_foundry.environment import (
     validate_tool_catalog,
 )
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
+from agent_env_foundry.project_identity import (
+    ProjectIdentityError,
+    ProjectRole,
+    compute_authored_project_digest,
+    copy_authored_project,
+)
 from agent_env_foundry.release import (
     DESCRIPTOR_FORMAT_V2,
-    PayloadRecord,
     ValidatedReleaseV2,
     canonical_bytes,
-    compute_project_digest,
     safe_member_path,
     verify_release_v2,
 )
@@ -64,10 +68,16 @@ from agent_env_foundry.tree_manifest import tree_manifest
 
 ENVIRONMENT_RELEASE_V2_FORMAT = DESCRIPTOR_FORMAT_V2
 _HEX = frozenset("0123456789abcdef")
-PreparationFailureKind = Literal["EnvironmentDefect", "InfrastructureFailure", "SemanticsDefect"]
+PreparationFailureKind = Literal[
+    "EnvironmentDefect",
+    "InfrastructureFailure",
+    "SemanticsDefect",
+    "VerifierDefect",
+]
 _PREPARATION_FAILURE_KINDS = frozenset(
-    {"EnvironmentDefect", "InfrastructureFailure", "SemanticsDefect"}
+    {"EnvironmentDefect", "InfrastructureFailure", "SemanticsDefect", "VerifierDefect"}
 )
+_PROJECT_ROLES = frozenset({"actor", "semantics", "verifier"})
 
 
 class PreparationContractError(ValueError):
@@ -246,13 +256,36 @@ class PreparedRelease(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class ProjectMaterializationInput:
+    source_root: Path
+    project_digest: str
+    own_module: str
+    forbidden_modules: tuple[str, ...]
+    role: ProjectRole
+
+    def __post_init__(self) -> None:
+        _digest(self.project_digest, "materialized project_digest")
+        if self.role not in _PROJECT_ROLES:
+            raise ValueError("materialized project role is invalid")
+        if not self.own_module or "." in self.own_module:
+            raise ValueError("materialized own_module must be one top-level module")
+        if (
+            not self.forbidden_modules
+            or len(set(self.forbidden_modules)) != len(self.forbidden_modules)
+            or any(not item or "." in item for item in self.forbidden_modules)
+            or self.own_module in self.forbidden_modules
+        ):
+            raise ValueError("materialized forbidden_modules are invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeLock:
     project_root: Path
     project_digest: str
     python: Path
     own_module: str
-    forbidden_module: str
-    role: Literal["actor", "semantics"]
+    forbidden_modules: tuple[str, ...]
+    role: ProjectRole
 
 
 class _ChildTransport:
@@ -663,23 +696,27 @@ def prepare_release(
             shutil.rmtree(source)
     release = verify_release_v2(release_cache)
     runtime_root = cache / "runtimes" / release.release_id
-    actor = _prepare_runtime(
-        release_cache / release.descriptor.actor_project,
+    actor = materialize_project(
+        ProjectMaterializationInput(
+            source_root=release_cache / release.descriptor.actor_project,
+            project_digest=release.descriptor.actor_project_digest,
+            own_module=_module_name(release.descriptor.actor_factory),
+            forbidden_modules=(_module_name(release.descriptor.semantics_factory),),
+            role="actor",
+        ),
         runtime_root / "actor",
-        release.descriptor.actor_project_digest,
-        _module_name(release.descriptor.actor_factory),
-        _module_name(release.descriptor.semantics_factory),
-        "actor",
-        settings,
+        settings=settings,
     )
-    semantics = _prepare_runtime(
-        release_cache / release.descriptor.semantics_project,
+    semantics = materialize_project(
+        ProjectMaterializationInput(
+            source_root=release_cache / release.descriptor.semantics_project,
+            project_digest=release.descriptor.semantics_project_digest,
+            own_module=_module_name(release.descriptor.semantics_factory),
+            forbidden_modules=(_module_name(release.descriptor.actor_factory),),
+            role="semantics",
+        ),
         runtime_root / "semantics",
-        release.descriptor.semantics_project_digest,
-        _module_name(release.descriptor.semantics_factory),
-        _module_name(release.descriptor.actor_factory),
-        "semantics",
-        settings,
+        settings=settings,
     )
     return OpenPreparedRelease(release, actor, semantics, settings)
 
@@ -748,28 +785,70 @@ def _stage_release(source: Path, cache: Path) -> tuple[Path, bool]:
     return incoming, True
 
 
-def _prepare_runtime(
-    source: Path,
+def materialize_project(
+    project_input: ProjectMaterializationInput,
     runtime_root: Path,
-    expected_digest: str,
-    own_module: str,
-    forbidden_module: str,
-    role: Literal["actor", "semantics"],
+    *,
     settings: PreparationSettings,
 ) -> RuntimeLock:
+    if project_input.source_root.is_symlink():
+        raise PreparationExecutionError(
+            _role_defect(project_input.role),
+            "source_project_symlink",
+            "source project root must not be a symlink",
+        )
+    source = project_input.source_root.resolve()
+    actual_source_digest = _project_source_digest(source, project_input.role)
+    if actual_source_digest != project_input.project_digest:
+        raise PreparationExecutionError(
+            _role_defect(project_input.role),
+            "source_project_digest_mismatch",
+            "source project differs from its accepted project identity",
+            expected=project_input.project_digest,
+            actual=actual_source_digest,
+        )
     project = runtime_root / "project"
     if not runtime_root.exists():
         runtime_root.parent.mkdir(parents=True, exist_ok=True)
         temporary = runtime_root.parent / f".{runtime_root.name}.{uuid.uuid4().hex}.tmp"
-        shutil.copytree(source, temporary / "project", symlinks=False)
-        temporary.rename(runtime_root)
         try:
+            copied_digest = copy_authored_project(
+                source,
+                temporary / "project",
+                project_input.role,
+            )
+            if copied_digest != project_input.project_digest:
+                raise PreparationExecutionError(
+                    _role_defect(project_input.role),
+                    "copied_project_digest_mismatch",
+                    "copied project differs from its accepted project identity",
+                    expected=project_input.project_digest,
+                    actual=copied_digest,
+                )
+            temporary.rename(runtime_root)
             _run_uv_sync(project, settings)
-        except Exception:
-            shutil.rmtree(runtime_root)
+        except Exception as exc:
+            if runtime_root.exists():
+                shutil.rmtree(runtime_root)
+            elif temporary.exists():
+                shutil.rmtree(temporary)
+            if isinstance(exc, ProjectIdentityError):
+                raise PreparationExecutionError(
+                    _role_defect(project_input.role),
+                    exc.code,
+                    str(exc),
+                    path=exc.path,
+                ) from exc
             raise
     python = project / ".venv/bin/python"
-    lock = RuntimeLock(project, expected_digest, python, own_module, forbidden_module, role)
+    lock = RuntimeLock(
+        project,
+        project_input.project_digest,
+        python,
+        project_input.own_module,
+        project_input.forbidden_modules,
+        project_input.role,
+    )
     _verify_runtime(lock, settings.command_timeout_seconds)
     return lock
 
@@ -829,12 +908,14 @@ def _probe_origin(python: Path, project: Path, module: str, timeout: float) -> P
 def _verify_runtime(lock: RuntimeLock, timeout: float) -> None:
     if lock.project_root.is_symlink() or not lock.project_root.is_dir():
         raise PreparationExecutionError(
-            "EnvironmentDefect", "prepared_project_missing", "prepared project is missing"
+            _role_defect(lock.role),
+            "prepared_project_missing",
+            "prepared project is missing",
         )
-    actual = _project_source_digest(lock.project_root)
+    actual = _project_source_digest(lock.project_root, lock.role)
     if actual != lock.project_digest:
         raise PreparationExecutionError(
-            "EnvironmentDefect",
+            _role_defect(lock.role),
             "prepared_project_tampered",
             "prepared project digest differs",
             expected=lock.project_digest,
@@ -846,9 +927,10 @@ def _verify_runtime(lock: RuntimeLock, timeout: float) -> None:
         )
     try:
         own_origin = _probe_origin(lock.python, lock.project_root, lock.own_module, timeout)
-        forbidden_origin = _probe_origin(
-            lock.python, lock.project_root, lock.forbidden_module, timeout
-        )
+        forbidden_origins = {
+            module: _probe_origin(lock.python, lock.project_root, module, timeout)
+            for module in lock.forbidden_modules
+        }
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise PreparationExecutionError(
             "InfrastructureFailure", "runtime_import_probe_failed", str(exc)
@@ -856,40 +938,42 @@ def _verify_runtime(lock: RuntimeLock, timeout: float) -> None:
     expected_source = (lock.project_root / "src").resolve()
     if own_origin is None or not own_origin.resolve().is_relative_to(expected_source):
         raise PreparationExecutionError(
-            "EnvironmentDefect",
+            _role_defect(lock.role),
             "runtime_package_origin_invalid",
             f"runtime package {lock.own_module} is not bound to prepared source",
             origin=str(own_origin) if own_origin else None,
         )
-    if forbidden_origin is not None:
-        kind: PreparationFailureKind = (
-            "EnvironmentDefect" if lock.role == "actor" else "SemanticsDefect"
-        )
+    visible = {
+        module: str(origin) for module, origin in forbidden_origins.items() if origin is not None
+    }
+    if visible:
         raise PreparationExecutionError(
-            kind,
+            _role_defect(lock.role),
             "runtime_import_leak",
-            f"runtime can import forbidden package {lock.forbidden_module}",
-            origin=str(forbidden_origin),
+            "runtime can import forbidden packages",
+            origins=visible,
         )
 
 
-def _project_source_digest(project: Path) -> str:
-    records: list[PayloadRecord] = []
-    for path in sorted(project.rglob("*"), key=lambda item: item.relative_to(project).as_posix()):
-        relative = path.relative_to(project)
-        if ".venv" in relative.parts:
-            continue
-        if path.is_symlink():
-            raise PreparationExecutionError(
-                "EnvironmentDefect", "prepared_project_symlink", "prepared project has symlink"
-            )
-        if path.is_file():
-            records.append(
-                PayloadRecord(
-                    PurePosixPath(relative.as_posix()),
-                    "file",
-                    stat.S_IMODE(path.stat().st_mode),
-                    _sha(path.read_bytes()),
-                )
-            )
-    return compute_project_digest(records, PurePosixPath("."))
+def _project_source_digest(project: Path, role: ProjectRole) -> str:
+    try:
+        return compute_authored_project_digest(
+            project,
+            role,
+            require_locked_project=True,
+        )
+    except ProjectIdentityError as exc:
+        raise PreparationExecutionError(
+            _role_defect(role),
+            exc.code,
+            str(exc),
+            path=exc.path,
+        ) from exc
+
+
+def _role_defect(role: ProjectRole) -> PreparationFailureKind:
+    if role == "actor":
+        return "EnvironmentDefect"
+    if role == "semantics":
+        return "SemanticsDefect"
+    return "VerifierDefect"

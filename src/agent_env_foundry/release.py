@@ -13,6 +13,7 @@ import rfc8785
 
 from agent_env_foundry.errors import EnvironmentContractError
 from agent_env_foundry.jsonvalue import is_json_object
+from agent_env_foundry.project_identity import ProjectFileRecord, project_digest
 from agent_env_foundry.schema import (
     SchemaError,
     require_object_root,
@@ -249,23 +250,22 @@ def compute_project_digest(
     selected = [record for record in records if record.path.is_relative_to(project_root)]
     if not selected:
         raise EnvironmentContractError(f"project {project_root} has no bound files")
-    document = {
-        "files": [
-            {
-                "path": str(record.path.relative_to(project_root)),
-                "type": record.type,
-                "mode": record.mode,
-                "digest": record.digest,
-            }
-            for record in selected
-        ]
-    }
-    paths = {item["path"] for item in document["files"]}
-    if not {"pyproject.toml", "uv.lock"} <= paths:
-        raise EnvironmentContractError(
-            f"project {project_root} must bind pyproject.toml and uv.lock"
+    try:
+        return project_digest(
+            tuple(
+                ProjectFileRecord(
+                    str(record.path.relative_to(project_root)),
+                    record.mode,
+                    record.digest,
+                )
+                for record in selected
+            ),
+            require_locked_project=True,
         )
-    return sha256_hex(canonical_bytes(document))
+    except ValueError as exc:
+        raise EnvironmentContractError(
+            f"project {project_root} identity is invalid: {exc}"
+        ) from exc
 
 
 def verify_release_v2(release_root: Path) -> ValidatedReleaseV2:

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import json
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +19,11 @@ from agent_env_foundry.builder import (
     _run,
 )
 from agent_env_foundry.preparation import _probe_origin
+from agent_env_foundry.project_identity import (
+    ProjectIdentityError,
+    compute_authored_project_digest,
+    project_files,
+)
 from agent_env_foundry.qualification_contracts import (
     NativeVerificationRequest,
     NativeVerificationResult,
@@ -29,37 +32,13 @@ from agent_env_foundry.qualification_contracts import (
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.tree_manifest import tree_manifest
 from agent_env_foundry.verifier_inputs import (
-    ACTOR_VIEW_MANIFEST_NAME,
     ACTOR_VIEW_NAME,
-    EXPECTED_TASK_SEMANTICS_NAME,
-    PUBLIC_SURFACE_NAME,
-    QUALIFICATION_VERIFIER_CONTRACT_NAME,
     PreparedVerifierAuthorWorkspace,
 )
 
 VERIFIER_FACTORY = "generated_qualification_verifier.release:make_verifier"
 _PROHIBITED_OUTPUT_TOKENS = frozenset({"digest", "evidence", "manifest", "receipt", "verdict"})
 _FINDING_SOURCES = frozenset({"framework_check", "native_physical_check"})
-_EXCLUDED_PARTS = frozenset(
-    {
-        ".git",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".venv",
-        "__pycache__",
-        ACTOR_VIEW_NAME,
-        "dist",
-    }
-)
-_EXCLUDED_NAMES = frozenset(
-    {
-        EXPECTED_TASK_SEMANTICS_NAME,
-        PUBLIC_SURFACE_NAME,
-        QUALIFICATION_VERIFIER_CONTRACT_NAME,
-        ACTOR_VIEW_MANIFEST_NAME,
-    }
-)
 
 
 class VerifierAuthorFailure(RuntimeError):
@@ -425,15 +404,15 @@ def invoke_verifier_transition(
 
 
 def compute_verifier_project_digest(root: Path) -> str:
-    records = [
-        {
-            "path": path.relative_to(root).as_posix(),
-            "mode": stat.S_IMODE(path.stat().st_mode),
-            "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
-        }
-        for path in _project_files(root)
-    ]
-    return hashlib.sha256(canonical_bytes({"files": records})).hexdigest()
+    try:
+        return compute_authored_project_digest(root, "verifier")
+    except ProjectIdentityError as exc:
+        raise VerifierAuthorFailure(
+            "verifier_identity",
+            exc.code,
+            str(exc),
+            path=exc.path,
+        ) from exc
 
 
 def _codex_config(root: Path, codex_home: Path, config: BuilderConfig) -> CodexConfig:
@@ -485,21 +464,15 @@ def _initialize_project(root: Path, config: BuilderConfig) -> None:
 
 
 def _project_files(root: Path) -> tuple[Path, ...]:
-    files: list[Path] = []
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if any(part in _EXCLUDED_PARTS for part in relative.parts):
-            continue
-        if path.is_symlink():
-            raise VerifierAuthorFailure(
-                "verifier_identity",
-                "verifier_symlink_forbidden",
-                "Verifier project identity does not accept symlinks",
-                path=relative.as_posix(),
-            )
-        if path.is_file() and path.name not in _EXCLUDED_NAMES:
-            files.append(path)
-    return tuple(sorted(files, key=lambda path: path.relative_to(root).as_posix()))
+    try:
+        return project_files(root, "verifier")
+    except ProjectIdentityError as exc:
+        raise VerifierAuthorFailure(
+            "verifier_identity",
+            exc.code,
+            str(exc),
+            path=exc.path,
+        ) from exc
 
 
 def _source_check(root: Path, *, phase: str = "source_contract") -> CommandResult:

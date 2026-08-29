@@ -47,3 +47,14 @@
 - [x] Does the real matrix distinguish success, no-op, wrong answer and missing process?
 - [x] Do full gates and fifteen behavior mutations pass?
 - [x] Did three independent reviews ALLOW B without claiming Qualification/Release/S2 completion?
+
+## Checkpoint C1 shared materializer
+
+- [x] Do actor, semantics and verifier use one canonical project identity?
+- [x] Does one materializer own filtered copy, locked uv sync, origin and import checks?
+- [x] Can the accepted B verifier materialize with its exact unchanged digest?
+- [x] Are author inputs/views/old runtime/cache/dist excluded from the copied project?
+- [x] Are source/copy/runtime drift and import leaks attributed to the correct role?
+- [x] Does `prepare_release` still expose only actor and semantics?
+- [x] Are duplicate installer/transport/cache/sandbox/Qualification paths absent?
+- [x] Did two independent reviewers ALLOW the actual accepted-verifier handoff?

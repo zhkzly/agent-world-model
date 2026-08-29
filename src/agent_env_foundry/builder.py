@@ -6,16 +6,20 @@ import hashlib
 import json
 import os
 import shutil
-import stat
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import rfc8785
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
+from agent_env_foundry.project_identity import (
+    ProjectIdentityError,
+    compute_authored_project_digest,
+    project_files,
+)
 from agent_env_foundry.research import BuilderProjection
 from agent_env_foundry.schema import SchemaError, require_object_root, validate_schema_document
 
@@ -41,16 +45,6 @@ ACTOR_FACTORY = "generated_environment.release:make_environment"
 START_SCHEMA_PATH = Path("docs/schemas/start.json")
 RESET_OBSERVATION_SCHEMA_PATH = Path("docs/schemas/reset.json")
 _CODEX_PROVIDER_ID = "foundry_runtime"
-_EXCLUDED_PARTS = {
-    ".git",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".venv",
-    "__pycache__",
-    "dist",
-}
-_EXCLUDED_NAMES = {PROJECTION_NAME, CONTRACT_NAME}
 _AMBIENT_PYTHON_ENV = ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME")
 
 
@@ -241,24 +235,18 @@ def prepare_builder_workspace(
 
 
 def _candidate_files(root: Path) -> list[Path]:
-    files: list[Path] = []
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if any(part in _EXCLUDED_PARTS for part in relative.parts):
-            continue
-        if path.is_symlink():
-            raise BuilderFailure(
-                "candidate_identity",
-                "candidate_symlink_forbidden",
-                "Candidate identity does not accept symlinks",
-                path=relative.as_posix(),
-            )
-        if not path.is_file():
-            continue
-        if path.name in _EXCLUDED_NAMES:
-            continue
-        files.append(path)
-    return sorted(files, key=lambda item: item.relative_to(root).as_posix())
+    try:
+        return list(project_files(root, "actor"))
+    except ProjectIdentityError as exc:
+        code = (
+            "candidate_symlink_forbidden" if exc.code == "project_symlink_forbidden" else exc.code
+        )
+        raise BuilderFailure(
+            "candidate_identity",
+            code,
+            str(exc),
+            path=exc.path,
+        ) from exc
 
 
 def candidate_files(root: Path) -> tuple[Path, ...]:
@@ -267,16 +255,18 @@ def candidate_files(root: Path) -> tuple[Path, ...]:
 
 
 def compute_candidate_digest(root: Path) -> str:
-    records = []
-    for path in _candidate_files(Path(root)):
-        records.append(
-            {
-                "path": path.relative_to(root).as_posix(),
-                "mode": stat.S_IMODE(path.stat().st_mode),
-                "digest": _file_digest(path),
-            }
+    try:
+        return compute_authored_project_digest(Path(root), "actor")
+    except ProjectIdentityError as exc:
+        code = (
+            "candidate_symlink_forbidden" if exc.code == "project_symlink_forbidden" else exc.code
         )
-    return hashlib.sha256(rfc8785.dumps(cast(Any, {"files": records}))).hexdigest()
+        raise BuilderFailure(
+            "candidate_identity",
+            code,
+            str(exc),
+            path=exc.path,
+        ) from exc
 
 
 def run_candidate_checks(root: Path, config: BuilderConfig) -> tuple[CommandResult, ...]:

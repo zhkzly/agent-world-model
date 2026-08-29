@@ -6,13 +6,18 @@ from pathlib import Path
 
 import pytest
 
+import agent_env_foundry.preparation as preparation_module
 from agent_env_foundry.preparation import (
     OpenPreparedRelease,
     PreparationExecutionError,
     PreparationSettings,
+    ProjectMaterializationInput,
     _ChildTransport,
+    materialize_project,
     prepare_release,
 )
+from agent_env_foundry.project_identity import ProjectIdentityError
+from agent_env_foundry.release import verify_release_v2
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
     ConditionCheckRequest,
@@ -20,6 +25,13 @@ from agent_env_foundry.semantics import (
     GoalEvaluationContext,
     SemanticsContractError,
     start_case_from_document,
+)
+from agent_env_foundry.verifier_author import compute_verifier_project_digest
+from agent_env_foundry.verifier_inputs import (
+    ACTOR_VIEW_MANIFEST_NAME,
+    EXPECTED_TASK_SEMANTICS_NAME,
+    PUBLIC_SURFACE_NAME,
+    QUALIFICATION_VERIFIER_CONTRACT_NAME,
 )
 from v2_release_factory import build_v2_release, write_v2_zip
 
@@ -29,6 +41,168 @@ def _settings() -> PreparationSettings:
         Path(os.environ.get("UV_CACHE_DIR", "/tmp/foundry-s2-runtime-uv-cache")),
         120.0,
     )
+
+
+def test_one_materializer_installs_actor_semantics_and_verifier_roles(
+    tmp_path: Path,
+) -> None:
+    release_root = build_v2_release(tmp_path / "release")
+    release = verify_release_v2(release_root)
+    actor_module = release.descriptor.actor_factory.partition(":")[0].partition(".")[0]
+    semantics_module = release.descriptor.semantics_factory.partition(":")[0].partition(".")[0]
+    actor = materialize_project(
+        ProjectMaterializationInput(
+            source_root=release_root / release.descriptor.actor_project,
+            project_digest=release.descriptor.actor_project_digest,
+            own_module=actor_module,
+            forbidden_modules=(semantics_module,),
+            role="actor",
+        ),
+        tmp_path / "runtimes/actor",
+        settings=_settings(),
+    )
+    semantics = materialize_project(
+        ProjectMaterializationInput(
+            source_root=release_root / release.descriptor.semantics_project,
+            project_digest=release.descriptor.semantics_project_digest,
+            own_module=semantics_module,
+            forbidden_modules=(actor_module,),
+            role="semantics",
+        ),
+        tmp_path / "runtimes/semantics",
+        settings=_settings(),
+    )
+    verifier_source = release_root / release.descriptor.semantics_project
+    for name in (
+        EXPECTED_TASK_SEMANTICS_NAME,
+        PUBLIC_SURFACE_NAME,
+        QUALIFICATION_VERIFIER_CONTRACT_NAME,
+        ACTOR_VIEW_MANIFEST_NAME,
+    ):
+        (verifier_source / name).write_text("author input\n")
+    (verifier_source / "actor-view").mkdir()
+    (verifier_source / "actor-view/secret.py").write_text("SECRET = True\n")
+    (verifier_source / ".venv").mkdir()
+    (verifier_source / ".venv/poison").write_text("unbound\n")
+    verifier_digest = compute_verifier_project_digest(verifier_source)
+    assert verifier_digest == release.descriptor.semantics_project_digest
+    verifier = materialize_project(
+        ProjectMaterializationInput(
+            source_root=verifier_source,
+            project_digest=verifier_digest,
+            own_module=semantics_module,
+            forbidden_modules=(actor_module, "agent_env_foundry"),
+            role="verifier",
+        ),
+        tmp_path / "runtimes/verifier",
+        settings=_settings(),
+    )
+
+    assert (actor.role, semantics.role, verifier.role) == (
+        "actor",
+        "semantics",
+        "verifier",
+    )
+    assert len({actor.project_root, semantics.project_root, verifier.project_root}) == 3
+    assert all(lock.python.is_file() for lock in (actor, semantics, verifier))
+    assert not (verifier.project_root / EXPECTED_TASK_SEMANTICS_NAME).exists()
+    assert not (verifier.project_root / "actor-view").exists()
+    assert not (verifier.project_root / ".venv/poison").exists()
+
+
+def test_materializer_attributes_verifier_import_leak_to_verifier(
+    tmp_path: Path,
+) -> None:
+    release_root = build_v2_release(
+        tmp_path / "release",
+        leak_actor_into_semantics=True,
+    )
+    release = verify_release_v2(release_root)
+    actor_module = release.descriptor.actor_factory.partition(":")[0].partition(".")[0]
+    semantics_module = release.descriptor.semantics_factory.partition(":")[0].partition(".")[0]
+
+    with pytest.raises(PreparationExecutionError) as caught:
+        materialize_project(
+            ProjectMaterializationInput(
+                source_root=release_root / release.descriptor.semantics_project,
+                project_digest=release.descriptor.semantics_project_digest,
+                own_module=semantics_module,
+                forbidden_modules=(actor_module,),
+                role="verifier",
+            ),
+            tmp_path / "runtime",
+            settings=_settings(),
+        )
+
+    assert caught.value.kind == "VerifierDefect"
+    assert caught.value.code == "runtime_import_leak"
+
+
+def test_materializer_rejects_changed_source_before_copy_or_sync(tmp_path: Path) -> None:
+    release_root = build_v2_release(tmp_path / "release")
+    release = verify_release_v2(release_root)
+    actor_source = release_root / release.descriptor.actor_project
+    actor_module = release.descriptor.actor_factory.partition(":")[0].partition(".")[0]
+    semantics_module = release.descriptor.semantics_factory.partition(":")[0].partition(".")[0]
+    (actor_source / "src/shared_actor/__init__.py").write_text("TAMPERED = True\n")
+    runtime = tmp_path / "runtime"
+
+    with pytest.raises(PreparationExecutionError) as caught:
+        materialize_project(
+            ProjectMaterializationInput(
+                source_root=actor_source,
+                project_digest=release.descriptor.actor_project_digest,
+                own_module=actor_module,
+                forbidden_modules=(semantics_module,),
+                role="actor",
+            ),
+            runtime,
+            settings=_settings(),
+        )
+
+    assert caught.value.kind == "EnvironmentDefect"
+    assert caught.value.code == "source_project_digest_mismatch"
+    assert not runtime.exists()
+
+
+def test_materializer_attributes_copy_time_identity_failure_and_cleans_staging(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    release_root = build_v2_release(tmp_path / "release")
+    release = verify_release_v2(release_root)
+    source = release_root / release.descriptor.semantics_project
+    actor_module = release.descriptor.actor_factory.partition(":")[0].partition(".")[0]
+    semantics_module = release.descriptor.semantics_factory.partition(":")[0].partition(".")[0]
+    digest = compute_verifier_project_digest(source)
+
+    def changed_during_copy(*_args: object, **_kwargs: object) -> str:
+        raise ProjectIdentityError(
+            "project_source_changed",
+            "source changed during copy",
+            path="src/release.py",
+        )
+
+    monkeypatch.setattr(preparation_module, "copy_authored_project", changed_during_copy)
+    runtime = tmp_path / "runtime"
+    with pytest.raises(PreparationExecutionError) as caught:
+        materialize_project(
+            ProjectMaterializationInput(
+                source_root=source,
+                project_digest=digest,
+                own_module=semantics_module,
+                forbidden_modules=(actor_module,),
+                role="verifier",
+            ),
+            runtime,
+            settings=_settings(),
+        )
+
+    assert caught.value.kind == "VerifierDefect"
+    assert caught.value.code == "project_source_changed"
+    assert caught.value.details["path"] == "src/release.py"
+    assert not runtime.exists()
+    assert not tuple(tmp_path.glob(".runtime.*.tmp"))
 
 
 def test_prepare_open_runs_real_actor_and_all_trusted_methods(tmp_path: Path) -> None:

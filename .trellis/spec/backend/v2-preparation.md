@@ -1,10 +1,12 @@
 # EnvironmentRelease v2 Preparation Contract
 
-> **Status: Implemented structural foundation; strict admission planned.** The
-> current code verifies v2 closure and runs isolated actor/semantics projects,
-> but does not yet validate a passed Qualification receipt. Mechanical fixtures
-> can currently reach `prepare_release` for runtime tests and are not product
-> releases. Checkpoint D must close this gate before any S2 entry point exists.
+> **Status: Shared three-role materializer implemented; strict admission
+> planned.** The current code verifies v2 closure and materializes actor,
+> semantics and audit-only verifier projects through one canonical physical
+> path. `prepare_release` still exposes actor/semantics only and does not yet
+> validate a passed Qualification receipt. Mechanical fixtures remain test
+> infrastructure, not product releases. Checkpoint D must close this gate before
+> any S2 entry point exists.
 
 ## 1. Scope / Trigger
 
@@ -22,6 +24,13 @@ prepare_release(
     settings: PreparationSettings | None = None,
 ) -> PreparedRelease
 
+materialize_project(
+    project_input: ProjectMaterializationInput,
+    runtime_root: Path,
+    *,
+    settings: PreparationSettings,
+) -> RuntimeLock
+
 with prepared.open(instance_directory) as session:
     session.actor.reset(...)
     session.actor.tools()
@@ -34,6 +43,11 @@ with prepared.open(instance_directory) as session:
 ## 3. Contracts
 
 - Accept only canonical v2 bytes; v1 has no compatibility reader.
+- Actor, semantics, verifier, release verification and materialization use one
+  canonical project identity over exact relative path, normalized mode and
+  content digest.
+- Materialization copies only identity-bound project files. Author inputs,
+  actor/candidate views, old `.venv`, caches and `dist` never enter the runtime.
 - Checkpoint D target: admit only a strict passed
   `environment-qualification/2` receipt whose Core and evidence bindings
   recompute from archived bytes. Until implemented, preparation is structural
@@ -63,6 +77,8 @@ with prepared.open(instance_directory) as session:
 | --- | --- |
 | unsupported/malformed/tampered release | `EnvironmentDefect` or contract rejection before sync |
 | missing/non-passed/mismatched Qualification receipt | Checkpoint D target: rejection before sync |
+| source/copy/runtime project digest mismatch | role-owned defect before use |
+| copy-time identity TOCTOU | role-owned defect; temporary/runtime staging removed |
 | frozen uv sync unavailable/fails | `InfrastructureFailure` with command outputs |
 | actor startup/factory failure | `EnvironmentDefect/child_startup_failed` |
 | semantics startup/factory failure | `SemanticsDefect/child_startup_failed` |
@@ -87,6 +103,9 @@ with prepared.open(instance_directory) as session:
 
 - Current: directory and safe-ZIP identity equality plus unsupported format,
   byte/mode/symlink/extra-member rejection.
+- Shared materializer: real actor/semantics/verifier locked sync, canonical
+  author-input filtering, accepted verifier digest equality, multi-module import
+  denial and role-specific error attribution.
 - Checkpoint D: invalid/missing/non-passed receipt rejection before sync.
 - Real frozen sync and real child interpreters for actor plus all six trusted calls.
 - Same-name cross-release non-aliasing and reopen-without-reset persistence.

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import ast
-import hashlib
 import json
-import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -20,6 +18,11 @@ from agent_env_foundry.builder import (
     _run,
 )
 from agent_env_foundry.preparation import _ChildTransport, _probe_origin
+from agent_env_foundry.project_identity import (
+    ProjectIdentityError,
+    compute_authored_project_digest,
+    project_files,
+)
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
     CapabilitySpec,
@@ -35,26 +38,6 @@ from agent_env_foundry.semantics_inputs import (
 )
 
 SEMANTICS_FACTORY = "generated_task_semantics.release:make_semantics"
-_EXCLUDED_PARTS = frozenset(
-    {
-        ".git",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".venv",
-        "__pycache__",
-        "candidate-view",
-        "dist",
-    }
-)
-_EXCLUDED_NAMES = frozenset(
-    {
-        "EXPECTED_TASK_SEMANTICS.json",
-        "PUBLIC_SURFACE.json",
-        "TASK_SEMANTICS_CONTRACT.md",
-        "CANDIDATE_VIEW_MANIFEST.json",
-    }
-)
 
 
 class SemanticsAuthorFailure(RuntimeError):
@@ -278,15 +261,15 @@ def run_semantics_checks(
 
 
 def compute_semantics_project_digest(root: Path) -> str:
-    records = [
-        {
-            "path": path.relative_to(root).as_posix(),
-            "mode": stat.S_IMODE(path.stat().st_mode),
-            "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
-        }
-        for path in _project_files(root)
-    ]
-    return hashlib.sha256(canonical_bytes({"files": records})).hexdigest()
+    try:
+        return compute_authored_project_digest(root, "semantics")
+    except ProjectIdentityError as exc:
+        raise SemanticsAuthorFailure(
+            "semantics_identity",
+            exc.code,
+            str(exc),
+            path=exc.path,
+        ) from exc
 
 
 def _initialize_project(root: Path, config: BuilderConfig) -> None:
@@ -320,21 +303,15 @@ def _initialize_project(root: Path, config: BuilderConfig) -> None:
 
 
 def _project_files(root: Path) -> tuple[Path, ...]:
-    files: list[Path] = []
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if any(part in _EXCLUDED_PARTS for part in relative.parts):
-            continue
-        if path.is_symlink():
-            raise SemanticsAuthorFailure(
-                "semantics_identity",
-                "semantics_symlink_forbidden",
-                "Semantics project identity does not accept symlinks",
-                path=relative.as_posix(),
-            )
-        if path.is_file() and path.name not in _EXCLUDED_NAMES:
-            files.append(path)
-    return tuple(sorted(files, key=lambda path: path.relative_to(root).as_posix()))
+    try:
+        return project_files(root, "semantics")
+    except ProjectIdentityError as exc:
+        raise SemanticsAuthorFailure(
+            "semantics_identity",
+            exc.code,
+            str(exc),
+            path=exc.path,
+        ) from exc
 
 
 def _source_check(root: Path) -> CommandResult:

@@ -88,3 +88,19 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
   `ALLOW` on the final boundary. Checkpoint B is complete and authorizes
   Checkpoint C shared materialization/Qualification only. It is not
   Qualification, Publication, Release or S2 completion evidence.
+
+## Checkpoint C1 shared materializer candidate
+
+- Replaced the actor/semantics-only runtime installer with one three-role
+  `materialize_project` while preserving the existing uv/cache/origin path.
+- Unified Builder, Semantics Author, Verifier Author, release and runtime project
+  identity over path/mode/content; no translation identity or compatibility
+  profile exists.
+- Real accepted verifier `a9784a74...eb0e` filtered, installed and passed all
+  three import denials without copying author inputs/view/old runtime.
+- Six materializer/identity mutants were killed; full repository gates and the
+  original B physical matrix remain GREEN.
+- Two independent reviewers returned `ALLOW` after an initial identity-handoff
+  `BLOCK` was corrected with the actual accepted verifier. C1 is complete. It
+  is not physical Qualification or S1 completion and authorizes C2 Core and
+  three-runtime Qualification wiring only.

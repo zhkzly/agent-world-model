@@ -41,7 +41,11 @@ def _project_digest(records: list[dict[str, Any]], prefix: str) -> str:
     marker = prefix + "/"
     project = {
         "files": [
-            {**record, "path": record["path"][len(marker) :]}
+            {
+                "path": record["path"][len(marker) :],
+                "mode": record["mode"],
+                "digest": record["digest"],
+            }
             for record in records
             if record["path"].startswith(marker)
         ]
