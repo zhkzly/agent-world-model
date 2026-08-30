@@ -16,10 +16,12 @@ from agent_env_foundry.assessment import (
     TaskAssessment,
     TaskFoundryProductReport,
     assess_task,
+    read_identity_artifact,
     select_corpus,
 )
 from agent_env_foundry.batch_foundry import AdmittedTaskRecord, TaskBatchReport
 from agent_env_foundry.public_agent import PublicAgentFailure
+from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import AtomCheckResult, StartCase
 from agent_env_foundry.task_foundry import AtomTask, AtomWitness
 
@@ -160,6 +162,26 @@ def test_product_report_keeps_taskpack_assessment_and_corpus_identities_separate
         )
     with pytest.raises(ValueError, match="duplicate TaskAssessments"):
         TaskFoundryProductReport(batch, (assessment, assessment), corpus)
+
+
+def test_cold_identity_reader_recomputes_assessment_preimage(tmp_path) -> None:
+    policy = AssessmentPolicy("gpt-5.6-luna", DIGEST_B, DIGEST_C, 12, 1)
+    assessment = TaskAssessment(
+        DIGEST_A,
+        DIGEST_D,
+        "atom",
+        policy,
+        (_run(1, satisfied=True),),
+    )
+    path = tmp_path / "TaskAssessment.json"
+    path.write_bytes(canonical_bytes(assessment.to_document()))
+
+    assert read_identity_artifact(path, assessment.assessment_id) == assessment.to_document()
+
+    tampered = {**assessment.to_document(), "reliability": 0.0}
+    path.write_bytes(canonical_bytes(tampered))
+    with pytest.raises(ValueError, match="preimage"):
+        read_identity_artifact(path, assessment.assessment_id)
 
 
 def test_assessment_records_checker_failure_without_weakening_task(

@@ -46,6 +46,11 @@ type AssessmentWitness = AtomWitness | ForEachWitness | IfWitness
 _GOAL_KINDS = frozenset({"atom", "foreach", "if"})
 _PURPOSES = frozenset({"sft", "rl", "evaluation"})
 _HEX = frozenset("0123456789abcdef")
+_IDENTITY_FIELDS = {
+    "task-assessment/1": "assessment_id",
+    "corpus-manifest/1": "corpus_id",
+    "task-foundry-product-report/1": "product_run_id",
+}
 
 
 class AssessmentError(ValueError):
@@ -731,6 +736,48 @@ def _persist_identity_document(path: Path, document: JSONObject) -> None:
     if path.exists() and path.read_bytes() != payload:
         raise AssessmentError("identity artifact collision")
     path.write_bytes(payload)
+    identity_field = _identity_field(document)
+    expected = document.get(identity_field)
+    if not isinstance(expected, str):
+        raise AssessmentError("identity artifact has no identity value")
+    read_identity_artifact(path, expected)
+
+
+def read_identity_artifact(
+    path: Path,
+    expected_identity: str | None = None,
+) -> JSONObject:
+    """Cold-read one current Assessment/Corpus/Product identity document."""
+
+    try:
+        payload = Path(path).read_bytes()
+        raw = json.loads(payload)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise AssessmentError("identity artifact is unreadable") from exc
+    if not is_json_object(raw) or payload != canonical_bytes(raw):
+        raise AssessmentError("identity artifact is not canonical JSON")
+    document = cast(JSONObject, raw)
+    identity_field = _identity_field(document)
+    claimed = document.get(identity_field)
+    if not isinstance(claimed, str):
+        raise AssessmentError("identity artifact has no identity value")
+    _digest(claimed, f"identity artifact {identity_field}")
+    if expected_identity is not None:
+        _digest(expected_identity, "expected identity artifact ID")
+        if claimed != expected_identity:
+            raise AssessmentError("identity artifact differs from its expected identity")
+    preimage = dict(document)
+    preimage.pop(identity_field)
+    if _document_digest(preimage) != claimed:
+        raise AssessmentError("identity artifact preimage differs from its identity")
+    return _object(document)
+
+
+def _identity_field(document: JSONObject) -> str:
+    format_value = document.get("format")
+    if not isinstance(format_value, str) or format_value not in _IDENTITY_FIELDS:
+        raise AssessmentError("identity artifact format is unsupported")
+    return _IDENTITY_FIELDS[format_value]
 
 
 def _safe_object(value: Any) -> JSONObject:
@@ -786,6 +833,7 @@ __all__ = [
     "TaskAssessment",
     "TaskFoundryProductReport",
     "assess_task",
+    "read_identity_artifact",
     "run_task_foundry_product",
     "select_corpus",
 ]

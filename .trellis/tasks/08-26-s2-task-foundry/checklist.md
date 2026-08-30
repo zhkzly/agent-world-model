@@ -12,7 +12,7 @@
   physically demonstrated rather than inferred from green unit tests?
 - [x] Does semantic dedup distinguish real Goal/condition/selector differences
   while treating paraphrases and entity swaps as the same structure?
-- [ ] Are TaskAssessment and CorpusManifest downstream of Task validity and
+- [x] Are TaskAssessment and CorpusManifest downstream of Task validity and
   incapable of changing TaskPack truth or identity?
 - [ ] Do Git, SQLite and a post-freeze held-out release use the same Framework
   without domain branches or weakened Good-Task gates?

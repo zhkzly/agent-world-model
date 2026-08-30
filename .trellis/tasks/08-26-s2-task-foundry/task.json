@@ -45,7 +45,7 @@
     ".trellis/spec/backend/v2-qualification-publication.md",
     ".trellis/spec/backend/s2-assessment-corpus.md"
   ],
-  "notes": "The active product is the Direct Goal-first Good-Task sampling path. Authority restoration, structural batch/cold identity and intrinsic Good-Task admission are closed on refreshed Git and SQLite releases. All remains unsupported because neither release declares a CompositionRule. Current work closes assessment/corpus, cold handoff and held-out transfer.",
+  "notes": "The active product is the Direct Goal-first Good-Task sampling path. Authority restoration, structural batch/cold identity, intrinsic admission and assessment/corpus are closed on refreshed Git and SQLite releases. All remains unsupported because neither release declares a CompositionRule. Current work is held-out transfer and the S3-shaped public handoff.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "release-direct_candidates-structural_dedup-freeze-two_fresh_witnesses-physical_challenges-taskpack-assessment-corpus",
@@ -69,6 +69,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "direct_assessment_corpus"
+    "implementation_checkpoint": "direct_held_out_handoff"
   }
 }

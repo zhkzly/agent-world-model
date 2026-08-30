@@ -242,3 +242,25 @@ Focused collateral, wrong-answer and recursive-answer mutants were killed; all
 deterministic gates passed. Checkpoint 3 is closed. Both qualified releases
 declare zero CompositionRules, so Checkpoint 4 is closed as typed unsupported;
 no All compiler or fabricated composition was added.
+
+## Assessment and corpus closure
+
+The unchanged product API ran three fresh assessment trials for every admitted
+TaskPack and then selected a structurally unique RL corpus at minimum
+reliability 0.5:
+
+- Git product
+  `4ca65aeec9b6b2a36cc14536f8fa240f31fc895b9166d9fcca0a05e5563bad6a`:
+  three admitted/assessed/corpus Tasks, all reliability 1.0, corpus
+  `4fddce70a03b716de69041397b941c4e752e7bf969b8de27d387777ebaaa8344`;
+- SQLite product
+  `135b0a3415c154103c09beaf01b2468b56fec9edba963145a86bcf9f0969a5dd`:
+  three admitted/assessed/corpus Tasks, reliability 1.0/1.0/0.667, with one
+  `PROCESS_EVIDENCE_MISSING` trial retained, corpus
+  `a750a8127058f8afc9e2f1c038d1a3c3ef39a9205d2e9b83aee69a221802ae68`.
+
+Assessment, Corpus and Product identity documents now cold-read canonical bytes
+and recompute their current-format identity after persistence. Relocated copies
+under `/tmp/foundry-cp5-relocation-qz0vTG` independently verified all six
+TaskPacks, six Assessments, two CorpusManifests and two ProductReports. The
+identity-bypass mutant was killed. Checkpoint 5 is closed.
