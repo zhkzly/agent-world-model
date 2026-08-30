@@ -180,3 +180,5 @@
 `s2-nullable-wrong-answer|介入0|返工0|null→schema-valid non-null alternative+old physical failure replay+mutation licence|红线违反0`
 
 `s2-bounded-admission-attempts|介入0|返工0|batch/2 frozen 3-attempt budget+fresh roots+typed failure owners+real retry smoke+3 mutation licences|红线违反0`
+
+`s2-if-false-context|介入0|返工0|explicit report fields+mandatory branch execution+2 fresh PATH_NOT_FOUND witnesses+2 mutation licences|红线违反0`
