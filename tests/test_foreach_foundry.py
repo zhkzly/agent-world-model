@@ -20,6 +20,7 @@ from agent_env_foundry.foreach_foundry import (
     ForEachPartialChallengeReport,
     ForEachTask,
     ForEachWitness,
+    ForEachWrongAnswerChallenge,
     SolvedForEachTask,
     run_foreach_checker_mutations,
     seal_foreach_task_pack,
@@ -109,7 +110,7 @@ def _witness(task: ForEachTask, materialization_id: str) -> ForEachWitness:
 
 
 def _plan(task: ForEachTask) -> ForEachAdmissionPlan:
-    return ForEachAdmissionPlan(task.task_id, (0, 1), "e" * 64)
+    return ForEachAdmissionPlan(task.task_id, (0, 1), None, "e" * 64)
 
 
 def _binding(key: str, item: str) -> BindingCandidate:
@@ -141,6 +142,11 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
         "ignore_member_0",
         "ignore_member_1",
     ]
+    answer_plan = ForEachAdmissionPlan(task.task_id, (0, 1), 0, "e" * 64)
+    assert answer_plan.to_document()["format"] == "foreach-admission-plan/2"
+    assert answer_plan.to_document()["wrong_answer_member_index"] == 0
+    with pytest.raises(TaskFoundryError, match="wrong-answer member"):
+        ForEachAdmissionPlan(task.task_id, (0, 1), 2, "e" * 64)
     solved = SolvedForEachTask(
         task,
         plan,
@@ -156,7 +162,7 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
     with pytest.raises(TaskFoundryError, match="every member"):
         SolvedForEachTask(
             task,
-            ForEachAdmissionPlan(task.task_id, (0,), "e" * 64),
+            ForEachAdmissionPlan(task.task_id, (0,), None, "e" * 64),
             (_witness(task, "c" * 64), _witness(task, "d" * 64)),
         )
     with pytest.raises(TaskFoundryError, match="fresh"):
@@ -284,6 +290,32 @@ def test_foreach_noop_and_alternative_order_are_discriminating() -> None:
         ForEachCheckerMutationResult("ignore_member_0", 0, False, False, False)
 
 
+def test_foreach_wrong_answer_fails_only_the_planned_member() -> None:
+    task = _task()
+    plan = _plan(task)
+    wrong = replace(
+        _result(satisfied=False),
+        required_effects_ok=True,
+        collateral_ok=True,
+        answer_ok=False,
+        process_ok=True,
+    )
+    challenge = ForEachWrongAnswerChallenge(
+        task.task_id,
+        plan.plan_id,
+        0,
+        "a" * 64,
+        (),
+        {"results": [{}, {}]},
+        {"results": [{"wrong": True}, {}]},
+        (_result(), _result()),
+        (wrong, _result()),
+    )
+    assert challenge.member_index == 0
+    with pytest.raises(TaskFoundryError, match="planned member"):
+        replace(challenge, member_results=(_result(), wrong))
+
+
 def test_foreach_collateral_requires_successful_control_and_isolated_axis() -> None:
     task = _task()
     plan = _plan(task)
@@ -374,6 +406,7 @@ def test_foreach_task_pack_requires_one_complete_same_plan_admission() -> None:
     pack = seal_foreach_task_pack(
         solved,
         noop,
+        None,
         partials,
         ForEachAgentChoiceProof(task.task_id, plan.plan_id, ()),
         alternative,
@@ -387,6 +420,7 @@ def test_foreach_task_pack_requires_one_complete_same_plan_admission() -> None:
         seal_foreach_task_pack(
             solved,
             noop,
+            None,
             partials,
             ForEachAgentChoiceProof(task.task_id, plan.plan_id, ()),
             replace(alternative, materialization_id=witnesses[0].materialization_id),
@@ -398,6 +432,7 @@ def test_foreach_task_pack_requires_one_complete_same_plan_admission() -> None:
         seal_foreach_task_pack(
             solved,
             noop,
+            None,
             partials,
             ForEachAgentChoiceProof(task.task_id, "9" * 64, ()),
             alternative,
@@ -424,6 +459,7 @@ def test_foreach_task_pack_requires_one_complete_same_plan_admission() -> None:
         seal_foreach_task_pack(
             choice_solved,
             noop,
+            None,
             partials,
             ForEachAgentChoiceProof(task.task_id, plan.plan_id, ()),
             alternative,

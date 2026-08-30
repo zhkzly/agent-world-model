@@ -38,6 +38,7 @@ from agent_env_foundry.task_foundry import (
     _schema_at_pointer,
     _task_by_id,
     _verify_checker_preimage,
+    _wrong_answer,
 )
 
 _REVERSE_ORDER_PROMPT = (
@@ -104,6 +105,7 @@ class ForEachTask:
 class ForEachAdmissionPlan:
     task_id: str
     omitted_member_indices: tuple[int, ...]
+    wrong_answer_member_index: int | None
     collateral_task_id: str
 
     def __post_init__(self) -> None:
@@ -117,6 +119,13 @@ class ForEachAdmissionPlan:
                 "foreach_collateral_plan_missing",
                 "ForEach admission requires one preselected out-of-selection collateral Task",
             )
+        if self.wrong_answer_member_index is not None and not (
+            0 <= self.wrong_answer_member_index < len(self.omitted_member_indices)
+        ):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_plan_invalid",
+                "ForEach wrong-answer member index is outside the complete selection",
+            )
 
     @property
     def plan_id(self) -> str:
@@ -124,9 +133,10 @@ class ForEachAdmissionPlan:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "foreach-admission-plan/1",
+            "format": "foreach-admission-plan/2",
             "task_id": self.task_id,
             "omitted_member_indices": list(self.omitted_member_indices),
+            "wrong_answer_member_index": self.wrong_answer_member_index,
             "collateral_task_id": self.collateral_task_id,
             "agent_choice_policy": "perturb_each_occurrence",
             "alternative_order_policy": "reverse_first_target_occurrences",
@@ -383,6 +393,59 @@ class ForEachNoOpChallenge:
 
 
 @dataclass(frozen=True, slots=True)
+class ForEachWrongAnswerChallenge:
+    task_id: str
+    admission_plan_id: str
+    member_index: int
+    materialization_id: str
+    trace: tuple[TraceEvent, ...]
+    baseline_final_answer: JSONObject
+    wrong_final_answer: JSONObject
+    baseline_member_results: tuple[AtomCheckResult, ...]
+    member_results: tuple[AtomCheckResult, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not 0 <= self.member_index < len(self.member_results)
+            or len(self.baseline_member_results) != len(self.member_results)
+            or any(not item.satisfied for item in self.baseline_member_results)
+            or self.baseline_final_answer == self.wrong_final_answer
+        ):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_baseline_invalid",
+                "ForEach wrong-answer challenge requires one valid changed member answer",
+            )
+        for index, result in enumerate(self.member_results):
+            if index == self.member_index:
+                valid = not result.satisfied and result.answer_ok is False
+            else:
+                valid = result.satisfied
+            if not valid:
+                raise TaskFoundryError(
+                    "foreach_wrong_answer_not_discriminated",
+                    "ForEach wrong answer must fail only the planned member",
+                    member_index=self.member_index,
+                    observed_index=index,
+                )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "foreach-wrong-answer-challenge/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "member_index": self.member_index,
+            "materialization_id": self.materialization_id,
+            "trace": [item.to_document() for item in self.trace],
+            "baseline_final_answer": _json_object(self.baseline_final_answer),
+            "wrong_final_answer": _json_object(self.wrong_final_answer),
+            "baseline_member_results": [
+                item.to_document() for item in self.baseline_member_results
+            ],
+            "member_results": [item.to_document() for item in self.member_results],
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ForEachCollateralChallenge:
     task_id: str
     admission_plan_id: str
@@ -535,6 +598,7 @@ class ForEachCheckerMutationReport:
 class ForEachAdmissionReport:
     solved: SolvedForEachTask
     noop: ForEachNoOpChallenge
+    wrong_answer: ForEachWrongAnswerChallenge | None
     partials: ForEachPartialChallengeReport
     agent_choices: ForEachAgentChoiceProof
     alternative_order: ForEachAlternativeOrderProof
@@ -545,7 +609,7 @@ class ForEachAdmissionReport:
         task = self.solved.task
         task_id = task.task_id
         plan_id = self.solved.admission_plan.plan_id
-        component_pairs = (
+        component_pairs: tuple[tuple[str, str], ...] = (
             (self.noop.task_id, self.noop.admission_plan_id),
             (self.partials.task_id, self.partials.admission_plan.plan_id),
             (self.agent_choices.task_id, self.agent_choices.admission_plan_id),
@@ -553,6 +617,11 @@ class ForEachAdmissionReport:
             (self.collateral.task_id, self.collateral.admission_plan_id),
             (self.checker_mutations.task_id, self.checker_mutations.admission_plan_id),
         )
+        if self.wrong_answer is not None:
+            component_pairs = (
+                *component_pairs,
+                (self.wrong_answer.task_id, self.wrong_answer.admission_plan_id),
+            )
         if any(
             item_task != task_id or item_plan != plan_id for item_task, item_plan in component_pairs
         ):
@@ -560,11 +629,13 @@ class ForEachAdmissionReport:
                 "foreach_admission_identity_mismatch",
                 "ForEach admission evidence does not share one Task and plan",
             )
-        required = task.member_answer_schema.get("required")
-        if required != []:
+        planned_wrong = self.solved.admission_plan.wrong_answer_member_index
+        if (planned_wrong is None) != (self.wrong_answer is None) or (
+            self.wrong_answer is not None and self.wrong_answer.member_index != planned_wrong
+        ):
             raise TaskFoundryError(
-                "foreach_wrong_answer_admission_missing",
-                "ForEach Task with answer fields requires physical wrong-answer admission",
+                "foreach_wrong_answer_admission_incomplete",
+                "ForEach wrong-answer evidence differs from its frozen plan",
             )
         expected_choices = {
             (witness.witness_id, item.event_seq, item.argument_pointer)
@@ -610,6 +681,8 @@ class ForEachAdmissionReport:
             *(item.materialization_id for item in self.partials.partials),
             *(item.materialization_id for item in self.agent_choices.perturbations),
         }
+        if self.wrong_answer is not None:
+            later_materializations.add(self.wrong_answer.materialization_id)
         if witness_materializations & later_materializations:
             raise TaskFoundryError(
                 "foreach_admission_materialization_reused",
@@ -627,14 +700,19 @@ class ForEachAdmissionReport:
             "admission_plan": self.solved.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.solved.witnesses],
             "noop": self.noop.to_document(),
+            "wrong_answer": (
+                None if self.wrong_answer is None else self.wrong_answer.to_document()
+            ),
             "partials": self.partials.to_document(),
             "agent_choices": self.agent_choices.to_document(),
             "alternative_order": self.alternative_order.to_document(),
             "collateral": self.collateral.to_document(),
             "checker_mutations": self.checker_mutations.to_document(),
-            "not_applicable": {
-                "wrong_answer": "member answer schema has no required fields",
-            },
+            "not_applicable": (
+                {"wrong_answer": "member answer schema has no required fields"}
+                if self.wrong_answer is None
+                else {}
+            ),
         }
 
     def to_document(self) -> JSONObject:
@@ -671,6 +749,7 @@ class ForEachTaskPack:
 def seal_foreach_task_pack(
     solved: SolvedForEachTask,
     noop: ForEachNoOpChallenge,
+    wrong_answer: ForEachWrongAnswerChallenge | None,
     partials: ForEachPartialChallengeReport,
     agent_choices: ForEachAgentChoiceProof,
     alternative_order: ForEachAlternativeOrderProof,
@@ -681,6 +760,7 @@ def seal_foreach_task_pack(
     admission = ForEachAdmissionReport(
         solved,
         noop,
+        wrong_answer,
         partials,
         agent_choices,
         alternative_order,
@@ -1125,6 +1205,99 @@ def run_foreach_noop(
         )
 
 
+def challenge_foreach_wrong_answer(
+    prepared: OpenPreparedRelease,
+    solved: SolvedForEachTask,
+    instance_root: Path,
+    *,
+    route: AgentRoute | None = None,
+    max_provider_turns: int = 12,
+) -> ForEachWrongAnswerChallenge | None:
+    task = solved.task
+    _verify_task(prepared, task)
+    member_index = solved.admission_plan.wrong_answer_member_index
+    if member_index is None:
+        return None
+    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
+    with prepared.open(instance_root) as session:
+        reset = session.actor.reset(task.start_case.reset_input)
+        before = session.trusted.inspect(instance_root)
+        bindings = _resolve_complete_selection(session, task, before)
+        contexts = _contexts(task, bindings)
+        episode = run_public_episode(
+            actor=session.actor,
+            instruction=task.instruction,
+            reset_observation=reset,
+            tool_specs=session.actor.tools(),
+            answer_schema=task.answer_schema,
+            route=selected_route,
+            max_provider_turns=max_provider_turns,
+        )
+        answers = episode.final_answer.get("results")
+        if not isinstance(answers, list) or len(answers) != len(bindings):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_baseline_count_mismatch",
+                "ForEach wrong-answer baseline does not cover the complete selection",
+            )
+        after = session.trusted.inspect(instance_root)
+        baseline_results = tuple(
+            session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after,
+                    binding.protected_binding,
+                    episode.trace,
+                    _json_object(answers[position]),
+                    contexts[position],
+                )
+            )
+            for position, binding in enumerate(bindings)
+        )
+        if any(not item.satisfied for item in baseline_results):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_baseline_failed",
+                "ForEach wrong-answer baseline did not satisfy every member",
+            )
+        wrong_member = _wrong_answer(
+            task.member_answer_schema,
+            baseline_results[member_index].report_values,
+        )
+        if wrong_member is None:
+            raise TaskFoundryError(
+                "foreach_wrong_answer_unavailable",
+                "Planned ForEach member answer has no schema-valid wrong alternative",
+            )
+        wrong_answers = [_json_object(item) for item in answers]
+        wrong_answers[member_index] = wrong_member
+        wrong_final = _json_object({"results": wrong_answers})
+        wrong_results = tuple(
+            session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after,
+                    binding.protected_binding,
+                    episode.trace,
+                    wrong_answers[position],
+                    contexts[position],
+                )
+            )
+            for position, binding in enumerate(bindings)
+        )
+        return ForEachWrongAnswerChallenge(
+            task.task_id,
+            solved.admission_plan.plan_id,
+            member_index,
+            session.identity.materialization_id,
+            episode.trace,
+            episode.final_answer,
+            wrong_final,
+            baseline_results,
+            wrong_results,
+        )
+
+
 def challenge_foreach_collateral(
     prepared: OpenPreparedRelease,
     solved: SolvedForEachTask,
@@ -1407,6 +1580,7 @@ def _derive_admission_plan(
     return ForEachAdmissionPlan(
         task.task_id,
         tuple(range(len(task.semantic_keys))),
+        0 if task.member_answer_schema.get("required") else None,
         collateral_task.task_id,
     )
 
@@ -1583,6 +1757,9 @@ def _instruction(goal: str, descriptors: tuple[JSONObject, ...]) -> str:
             "target in exactly that order.",
             "Copy exact public JSON values from the instruction or observations; do not "
             "paraphrase.",
+            "Respect temporal qualifiers in answer-field descriptions: an observation before "
+            "that event cannot fill an after-event field; use null when the qualified "
+            "observation did not occur.",
         )
     )
 
@@ -1615,6 +1792,7 @@ __all__ = [
     "ForEachTask",
     "ForEachTaskPack",
     "ForEachWitness",
+    "ForEachWrongAnswerChallenge",
     "SolvedForEachTask",
     "compile_foreach_tasks",
     "prove_foreach_agent_choices_non_load_bearing",
@@ -1623,6 +1801,7 @@ __all__ = [
     "run_foreach_noop",
     "seal_foreach_task_pack",
     "challenge_foreach_partials",
+    "challenge_foreach_wrong_answer",
     "challenge_foreach_collateral",
     "solve_foreach_task_twice",
 ]
