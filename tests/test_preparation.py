@@ -33,6 +33,7 @@ from agent_env_foundry.semantics import (
     EvaluationBinding,
     GoalEvaluationContext,
     SemanticsContractError,
+    StartCase,
     start_case_from_document,
 )
 from agent_env_foundry.verifier_author import compute_verifier_project_digest
@@ -79,9 +80,11 @@ def test_prepared_release_exposes_only_the_sealed_obligation_projection() -> Non
         "The selected operation succeeds.",
         ObligationApplicability("binding_eligible", capability_id="cap-1"),
     )
+    start = StartCase("case-1", None, ("baseline",))
     release = SimpleNamespace(
         identity=SimpleNamespace(release_id="a" * 64),
         sealed_requirement_obligations=(obligation,),
+        sealed_start_cases=(start,),
         sealed_task_goals={},
     )
     prepared = OpenPreparedRelease(
@@ -92,6 +95,7 @@ def test_prepared_release_exposes_only_the_sealed_obligation_projection() -> Non
     )
 
     assert prepared.requirement_obligations == (obligation,)
+    assert prepared.start_cases == (start,)
 
 
 def test_product_prepare_rejects_live_catalog_drift(

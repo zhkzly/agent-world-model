@@ -2,10 +2,10 @@
 
 ## 1. Scope / Trigger
 
-Use this contract between sealed S1 Requirement obligations and public binding/
-witness search. It owns the common proposal boundary, parameterized semantic
-freeze and bounded V0 plan. It does not own concrete binding, instruction,
-PublicClosureEvidence, witness, challenge, TaskPack or S3 reward.
+Use this contract between sealed S1 Requirement obligations and witness search.
+It owns the common proposal boundary, parameterized semantic freeze, bounded V0,
+physical reset-only binding, canonical instruction and PublicClosureEvidence.
+It does not own witness, challenge, TaskPack or S3 reward.
 
 ## 2. Signatures
 
@@ -21,6 +21,10 @@ compile_task_semantic_section(
 compile_verifier_bundle(
     semantic, *, capabilities, obligations
 ) -> VerifierBundle
+
+materialize_task_specification(
+    prepared, semantic, verifier, instance_root, *, start_case_id
+) -> TaskSpecification
 ```
 
 ## 3. Contracts
@@ -50,6 +54,17 @@ initial_non_vacuity
 It contains obligation and qualified-operation IDs, never Python source or a
 reference trace.
 
+Concrete materialization opens the exact prepared Release, resets one sealed
+StartCase, inspects facts, enumerates live eligible bindings and evaluates every
+condition handle through trusted TaskSemantics. Callers cannot submit condition
+statuses or protected operands. `abstain` fails closed rather than authorizing
+irrelevance.
+
+The canonical instruction is built only from the objective, public descriptors,
+applicable obligation text and qualified answer labels. PublicClosureEvidence
+accounts exactly once for applicable obligations, every descriptor/facet source
+and every AnswerField source/opacity decision.
+
 ## 4. Validation & Error Matrix
 
 | Condition | Result |
@@ -61,6 +76,10 @@ reference trace.
 | colliding AnswerField IDs | semantic freeze rejection |
 | V0 catalog differs from semantic section | verifier compilation rejection |
 | sampler/evidence lineage differs but truth is equal | different proposal ID, same semantic digest |
+| caller-selected/unsealed Start or no eligible live binding | materialization rejection |
+| binding-time condition returns `abstain` | fail closed; no irrelevant disposition |
+| protected binding appears in instruction | regression/mutation failure |
+| closure omits a constraint/operand/answer decision | `TaskSpecification` rejection |
 
 ## 5. Good / Base / Bad Cases
 
@@ -80,6 +99,8 @@ reference trace.
 - V0 maps each obligation kind to its bounded axis;
 - direct baseline emits the same `CandidateTaskProposal/1` used by later samplers;
 - real cold Release direct compile repeats to an identical semantic digest.
+- physical materializer owns reset/binding/condition evaluation and rejects
+  `abstain` or forged closure evidence.
 
 ## 7. Wrong vs Correct
 
@@ -93,5 +114,5 @@ Correct:
 
 ```text
 sealed S1 obligations -> proposal coverage -> semantic freeze -> V0
--> later Start/binding -> later public witness
+-> physical Start/binding/PublicClosure -> later public witness
 ```

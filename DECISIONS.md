@@ -132,3 +132,5 @@ session.
 `s2-checkpoint-b1-obligations|介入1|返工1|real Git multi-capability counterexample+expected/2 finite handles+strict schema preflight+live Luna digest|红线违反0`
 
 `s2-checkpoint-b2-semantic-freeze|介入1|返工1|omitted-obligation RED+common proposal/V0+physical Semantics repair+new SQLite Release/cold compile|红线违反0`
+
+`s2-checkpoint-b3-binding-git|介入1|返工1|remove caller status authority+physical materializer/PublicClosure+24-obligation Git Release|红线违反0`

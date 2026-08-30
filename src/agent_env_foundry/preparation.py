@@ -645,6 +645,12 @@ class OpenPreparedRelease:
             raise PreparationContractError("prepared release has no sealed Requirement obligations")
         return self._release.sealed_requirement_obligations
 
+    @property
+    def start_cases(self) -> tuple[StartCase, ...]:
+        if self._release.sealed_start_cases is None:
+            raise PreparationContractError("prepared release has no sealed StartCases")
+        return self._release.sealed_start_cases
+
     def open(self, instance_directory: Path) -> OpenPreparedSession:
         _verify_runtime(self._actor, self._settings.command_timeout_seconds)
         _verify_runtime(self._semantics, self._settings.command_timeout_seconds)

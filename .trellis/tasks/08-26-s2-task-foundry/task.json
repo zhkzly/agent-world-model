@@ -34,12 +34,14 @@
     "src/agent_env_foundry/task_execution.py",
     "src/agent_env_foundry/requirement_obligations.py",
     "src/agent_env_foundry/task_specification.py",
+    "src/agent_env_foundry/task_binding.py",
     "src/agent_env_foundry/_actor_runner.py",
     "src/agent_env_foundry/_semantics_runner.py",
     "tests/test_semantics_contract.py",
     "tests/test_task_execution.py",
     "tests/test_requirement_obligations.py",
     "tests/test_task_specification.py",
+    "tests/test_task_binding.py",
     "tests/v2_release_factory.py",
     "tests/test_release_v2.py",
     "tests/test_preparation.py",
@@ -49,7 +51,7 @@
     ".trellis/spec/backend/v2-qualification-publication.md",
     ".trellis/spec/backend/s2-assessment-corpus.md"
   ],
-  "notes": "Checkpoint A is GREEN. B1 seals expected-task-semantics/2 obligations. B2 now has the common proposal/semantic-freeze/V0 compiler and one new cold SQLite Release proof; concrete binding/PublicClosure, a new Git Release, and Checkpoints C-H remain pending.",
+  "notes": "Checkpoints A and B are GREEN. B seals expected-task-semantics/2 obligations, common proposal/semantic/V0, physical reset-only materialization, canonical instruction/PublicClosure, and new cold SQLite/Git Release proofs. Checkpoints C-H remain pending.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "release-discovery-task_spec-v0-start-binding-freeze-witness-truth_challenge-taskpack-assessment-corpus",
@@ -75,6 +77,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "checkpoint_b2_semantic_freeze_sqlite_green"
+    "implementation_checkpoint": "checkpoint_b_good_task_authority_green"
   }
 }

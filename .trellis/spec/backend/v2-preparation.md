@@ -35,6 +35,7 @@ with prepared.open(instance_directory) as session:
     session.trusted.inspect(instance_directory)
 
 prepared.requirement_obligations  # read-only sealed S1 catalog for S2
+prepared.start_cases              # exact sealed StartCases for Framework materialization
 ```
 
 `open` never resets or deletes the caller-owned instance.

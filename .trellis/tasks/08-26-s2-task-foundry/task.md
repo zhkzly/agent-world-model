@@ -368,3 +368,37 @@ and V0 ID
 
 This does not complete Checkpoint B: concrete public binding,
 PublicClosureEvidence and a newly published Git conformance Release remain.
+
+## Checkpoint B3 execution evidence — physical binding/PublicClosure and Git
+
+The first binder draft accepted caller-provided condition statuses. Main-session
+authority review rejected that as an S2 self-waiver path. The public entry is now
+`materialize_task_specification`: it owns open/reset/inspect, live binding
+enumeration and trusted condition evaluation; `abstain` fails closed. The pure
+binder is private.
+
+SQLite physical materialization reproduced specification
+`0ed32802bd2f20c4dadba010a950f134e58e74db26063c7f966534c5e62dc0cf`
+with three disclosures, six public operand sources and five dynamic AnswerFields.
+
+The Git conformance run produced:
+
+- expected semantics digest
+  `af9d0864d855dc9fbcd82c432bd717d089ca604c44df2480e16a18420ccabc0a`;
+- 4 capabilities and 24 obligations spanning precondition/effect/refusal/
+  collateral/process plus all finite handle families used by the run;
+- repaired Semantics digest
+  `d758955f6525e822f230626969e588f13f08c56883603244d1b1ca63c7247bb8`;
+- Native Auditor digest
+  `496b356188c27e93145a67a0d9c0c6a4dfed4c59e61ce1e2303e448d5fbec799`;
+- Core `a6acdb1996bc6f966643536749ee5aaadd36add3683122873aa3fee3e7dea3f5`;
+- 4/4 positive Qualification cases and Release
+  `fd3b90a04bff80c3cc959a3d65d41e686a1f21b57ab388d7123e412b51b6d1b2`.
+
+Cold Git inspection materialization sealed specification
+`60a64bcb8f611ed1bff7e6af7facc7fee65215eca34880420ff240d78eb49519`
+with five disclosures, eight public operands and all seven answers dynamic.
+
+Checkpoint B is GREEN. Graph/Programmatic execution, public witnesses,
+challenges and TaskPack remain owned by C-F; this checkpoint does not claim
+those later products.
