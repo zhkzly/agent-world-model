@@ -32,16 +32,10 @@
     "src/agent_env_foundry/release.py",
     "src/agent_env_foundry/assessment.py",
     "src/agent_env_foundry/task_execution.py",
-    "src/agent_env_foundry/requirement_obligations.py",
-    "src/agent_env_foundry/task_specification.py",
-    "src/agent_env_foundry/task_binding.py",
     "src/agent_env_foundry/_actor_runner.py",
     "src/agent_env_foundry/_semantics_runner.py",
     "tests/test_semantics_contract.py",
     "tests/test_task_execution.py",
-    "tests/test_requirement_obligations.py",
-    "tests/test_task_specification.py",
-    "tests/test_task_binding.py",
     "tests/v2_release_factory.py",
     "tests/test_release_v2.py",
     "tests/test_preparation.py",
@@ -51,15 +45,15 @@
     ".trellis/spec/backend/v2-qualification-publication.md",
     ".trellis/spec/backend/s2-assessment-corpus.md"
   ],
-  "notes": "Checkpoints A and B are GREEN. B seals expected-task-semantics/2 obligations, common proposal/semantic/V0, physical reset-only materialization, canonical instruction/PublicClosure, and new cold SQLite/Git Release proofs. Checkpoints C-H remain pending.",
+  "notes": "The active product is the Direct Goal-first Good-Task sampling path. Physical reload/provenance is retained; the later parallel obligation/TaskSpecification path and mandatory Graph/Programmatic plan are deleted. Post-deletion Git and SQLite Direct batches cold-ran successfully; current work audits structural dedup, admission, assessment/corpus, cold handoff and held-out transfer.",
   "meta": {
     "compatibility": "clean-break",
-    "semantic_order": "release-discovery-task_spec-v0-start-binding-freeze-witness-truth_challenge-taskpack-assessment-corpus",
+    "semantic_order": "release-direct_candidates-structural_dedup-freeze-two_fresh_witnesses-physical_challenges-taskpack-assessment-corpus",
     "target_goal_nodes": [
       "atom",
-      "all",
+      "foreach",
       "if",
-      "foreach"
+      "all_when_composition_is_qualified"
     ],
     "codegen": [
       "environment_builder_codex",
@@ -68,15 +62,13 @@
     ],
     "acting_policy": "responses_tool_loop",
     "candidate_samplers": [
-      "direct",
-      "graph",
-      "programmatic"
+      "direct"
     ],
     "task_identity_excludes": [
       "assessment",
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "checkpoint_b_good_task_authority_green"
+    "implementation_checkpoint": "direct_sampling_product_path"
   }
 }

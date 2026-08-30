@@ -6,10 +6,6 @@ This contract is the only path from frozen actor/TaskSemantics/Native Auditor
 projects to an S2-admissible EnvironmentRelease v2. It defines no v1 migration,
 Registry, service, Task generator, or reward system.
 
-Expected semantics uses only `expected-task-semantics/2`; `/1` has no reader or
-adapter. The existing expected-semantics digest in Core/receipt binds the entire
-Requirement obligation catalog, so no second receipt identity is introduced.
-
 ## APIs
 
 ```python
@@ -61,28 +57,6 @@ Each capability declares only answer values necessary for its user objective.
 Condition branches may use different answer schemas. Process/state/collateral
 evidence is not padded into final answers.
 
-## Requirement obligation authority
-
-Every Taskable precondition, effect, refusal, collateral clause and genuinely
-required public-process clause carries one finite applicability handle. The
-Framework derives `obligation_id` and `canonical_text_digest`; an author never
-writes hashes or manifests. Non-Taskable background clauses carry neither an
-ID nor a handle.
-
-```text
-always
-start_case(case_id)
-binding_eligible(capability_id)
-condition_branch(condition_id, true|false)
-facet_predicate(capability_id, facet_name, operator, public_scalar)
-```
-
-Publication and cold verification recompute every obligation identity and
-reject unknown StartCase/Capability/Condition/Facet references, unanchored
-capabilities/conditions, unsupported facet operators and schema-invalid facet
-literals. Facet literals are JSON scalars; composite values require a qualified
-binding/condition rather than an embedded expression language.
-
 ## Positive qualification
 
 Framework executes one representative eligible binding per capability. A case
@@ -117,9 +91,6 @@ qualified_start_cases_digest
 evidence_manifest_digest
 ```
 
-`expected_semantics_digest` already binds the obligation catalog. Do not add a
-parallel obligation-manifest digest.
-
 Generated code never writes receipts, manifests, digests, or verdicts.
 
 ## Publication
@@ -134,7 +105,6 @@ Preparation verifies package bytes and digests, installs exact actor and
 TaskSemantics projects, checks live ToolSpecs/catalog/StartCases against sealed
 values, and opens a real session. It does not replay every historical
 qualification case whenever a Consumer opens the release.
-It also returns the recomputed read-only Requirement obligations to S2.
 
 ## Forbidden
 
@@ -145,18 +115,4 @@ It also returns the recomputed read-only Requirement obligations to S2.
   disjoint workflow;
 - result-object boolean flipping described as executable mutation testing;
 - S1 copies of S2 Task challenge matrices;
-- domain-specific Framework branches;
-- model-authored obligation IDs/digests, free-text relevance decisions, or an
-  `expected-task-semantics/1` fallback.
-
-## Required tests
-
-- every independent obligation identity edge (Requirement, kind, text and
-  applicability) kills a mutant;
-- tampered clause ID/text digest and `/1` format fail cold decoding;
-- Taskable null handles and non-Taskable non-null handles fail before an author
-  project is accepted;
-- unknown StartCase/Capability/Condition/Facet references and invalid facet
-  literals fail both Semantics Author contract checking and cold release read;
-- one real expected-semantics/2 turn passes the same strict schema preflight
-  used before the Responses request.
+- domain-specific Framework branches.

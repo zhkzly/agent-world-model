@@ -1,29 +1,22 @@
-# S2 Good-Task Sampling Completion Checklist
+# S2 Direct Good-Task Sampling Completion Checklist
 
-- [ ] Do direct, Graph and Programmatic proposal mechanisms execute public tools
-  and feed one common CandidateTaskProposal/admission boundary?
-- [ ] Is TaskSpecification frozen before witness search, with every semantic
-  predicate authorized only by an S1 obligation/qualified operation and every
-  sealed applicable obligation included rather than self-waived by S2?
-- [ ] Is the task-local VerifierBundle compiled from frozen semantics without
-  learning truth, allowed effects or answers from witness diffs?
-- [ ] Are every target/argument/condition/answer operand publicly grounded, the
-  exact Task solved twice on fresh starts, and declared persistence physically
-  checked after close/reopen?
-- [ ] Do all applicable no-op, wrong-entity, wrong/stale-answer, partial,
-  omitted-obligation, near-miss, collateral and process challenges have physical
-  evidence; does every required process cite an S1 process obligation; and do
-  known valid alternatives remain accepted without reference-route equality?
-- [ ] Are admitted Tasks well-posed, non-vacuous, replayable, isolated and
-  minimally purposeful rather than arbitrary tool chains or padded witnesses?
-- [ ] Can current TaskPacks be cold-read with exact identity recomputation and
-  projected to a non-leaking S3 PublicTaskView without compatibility fallback?
-- [ ] Do fixed-budget Git/SQLite batches report sampler attempts, honest yield,
-  rejection ownership, unique semantic/execution structures, redundancy and
-  cost instead of stopping at a demo count?
-- [ ] Do at least two policy lineages/checkpoints calibrate difficulty, and does
-  CorpusManifest select a declared SFT/RL distribution without changing Task
-  truth?
-- [ ] After Framework/prompt/budget freeze, does a held-out release complete or
-  honestly abstain without domain edits, with all deterministic, mutation,
-  static and real-execution gates green?
+- [ ] Is the only required sampling path Direct Goal-first over the exact
+  EnvironmentRelease, with Graph/Programmatic explicitly optional?
+- [ ] Does the production API compile candidates, deduplicate structures,
+  execute admission and persist both TaskPacks and typed rejections?
+- [ ] Is every admitted Task publicly solvable twice on fresh instances with
+  all acting-time operands grounded in instruction/reset/tool observations?
+- [ ] Does deterministic verification reject applicable no-op, wrong target,
+  partial, collateral and wrong-answer cases without matching one witness path?
+- [ ] Are reset/reload, dynamic binding rediscovery and episode isolation
+  physically demonstrated rather than inferred from green unit tests?
+- [ ] Does semantic dedup distinguish real Goal/condition/selector differences
+  while treating paraphrases and entity swaps as the same structure?
+- [ ] Are TaskAssessment and CorpusManifest downstream of Task validity and
+  incapable of changing TaskPack truth or identity?
+- [ ] Do Git, SQLite and a post-freeze held-out release use the same Framework
+  without domain branches or weakened Good-Task gates?
+- [ ] Are Graph/Programmatic evaluated only after a demonstrated coverage gap,
+  under matched budgets, and removable when they add no useful Tasks?
+- [ ] Are the old parallel semantic path and all mandatory-sampler authority
+  references absent from production code, tests and active Trellis context?

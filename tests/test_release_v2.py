@@ -28,7 +28,7 @@ from v2_release_factory import build_v2_release
 def test_requirement_coverage_accepts_positive_only_evidence() -> None:
     case_digest = "a" * 64
     expected = {
-        "format": "expected-task-semantics/2",
+        "format": "expected-task-semantics/1",
         "requirements": [{"requirement_id": "REQ-1", "disposition": "Taskable"}],
         "capabilities": [{"capability_id": "cap-1", "requirement_ids": ["REQ-1"]}],
     }

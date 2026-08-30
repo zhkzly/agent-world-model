@@ -22,15 +22,9 @@ from agent_env_foundry.project_identity import (
     copy_authored_project,
     project_digest,
 )
-from agent_env_foundry.requirement_obligations import (
-    RequirementObligation,
-    RequirementObligationError,
-    requirement_obligations_from_expected_document,
-)
 from agent_env_foundry.schema import (
     SchemaError,
     require_object_root,
-    validate_instance,
     validate_schema_document,
 )
 from agent_env_foundry.semantics import CapabilitySpec, StartCase
@@ -56,7 +50,6 @@ __all__ = [
     "parse_descriptor_v2",
     "parse_manifest",
     "publish_release_v2",
-    "validate_requirement_obligation_references",
     "verify_release_v2",
     "write_release_zip_v2",
 ]
@@ -130,7 +123,6 @@ class ValidatedReleaseV2:
     sealed_start_seed: int | None = None
     sealed_start_limit: int | None = None
     sealed_task_goals: JSONObject | None = None
-    sealed_requirement_obligations: tuple[RequirementObligation, ...] | None = None
 
     @property
     def identity(self) -> PreparedReleaseIdentity:
@@ -332,18 +324,6 @@ def publish_release_v2(
         raise EnvironmentContractError("Expected Semantics bytes are not canonical JSON")
     if sha256_hex(expected_semantics_payload) != core.expected_semantics_digest:
         raise EnvironmentContractError("Expected Semantics differs from the Qualification Core")
-    try:
-        obligations = requirement_obligations_from_expected_document(expected_document)
-        validate_requirement_obligation_references(
-            obligations,
-            qualified_catalog.capabilities,
-            qualified_start_cases.cases,
-            expected_document,
-        )
-    except RequirementObligationError as exc:
-        raise EnvironmentContractError(
-            f"Expected Requirement obligations are invalid: {exc}"
-        ) from exc
     declared = (
         (Path(actor_project), "actor", core.actor_project_digest),
         (Path(semantics_project), "semantics", core.semantics_project_digest),
@@ -614,12 +594,6 @@ def verify_release_v2(release_root: Path) -> ValidatedReleaseV2:
     expected_document = _read_json(expected_path, role="Expected TaskSemantics")
     if expected_bytes != canonical_bytes(expected_document):
         raise EnvironmentContractError("Expected TaskSemantics bytes are not canonical")
-    try:
-        obligations = requirement_obligations_from_expected_document(expected_document)
-    except RequirementObligationError as exc:
-        raise EnvironmentContractError(
-            f"Expected Requirement obligations are invalid: {exc}"
-        ) from exc
     surface = public_surface_manifest_from_document(
         _load_bound_json_document(
             release.root,
@@ -704,17 +678,6 @@ def verify_release_v2(release_root: Path) -> ValidatedReleaseV2:
         task_goals[item["capability_id"]] = item["qualification_goal"]
     if set(task_goals) != set(required_capability_ids):
         raise EnvironmentContractError("Expected public task goals differ from sealed catalog")
-    try:
-        validate_requirement_obligation_references(
-            obligations,
-            catalog.capabilities,
-            starts.cases,
-            expected_document,
-        )
-    except RequirementObligationError as exc:
-        raise EnvironmentContractError(
-            f"Expected Requirement obligations are invalid: {exc}"
-        ) from exc
     from agent_env_foundry.qualification_v2 import verify_qualification_evidence
 
     evidence = verify_qualification_evidence(
@@ -738,7 +701,6 @@ def verify_release_v2(release_root: Path) -> ValidatedReleaseV2:
         sealed_start_seed=starts.seed,
         sealed_start_limit=starts.requested_limit,
         sealed_task_goals=task_goals,
-        sealed_requirement_obligations=obligations,
     )
 
 
@@ -849,86 +811,6 @@ def _load_bound_json_document(
     return document
 
 
-def validate_requirement_obligation_references(
-    obligations: tuple[RequirementObligation, ...],
-    capabilities: tuple[CapabilitySpec, ...],
-    start_cases: tuple[StartCase, ...],
-    expected: Any,
-) -> None:
-    findings: list[str] = []
-    capability_index = {item.capability_id: item for item in capabilities}
-    start_ids = {item.case_id for item in start_cases}
-    condition_index = {
-        condition.condition_id: condition
-        for capability in capabilities
-        for condition in capability.conditions
-    }
-    if not isinstance(expected, dict) or not isinstance(expected.get("conditions"), list):
-        raise RequirementObligationError("Expected condition catalog is invalid")
-    expected_conditions = {
-        item.get("condition_id"): item
-        for item in expected["conditions"]
-        if isinstance(item, dict) and isinstance(item.get("condition_id"), str)
-    }
-    if len(expected_conditions) != len(expected["conditions"]):
-        raise RequirementObligationError("Expected condition IDs are invalid")
-
-    for obligation in obligations:
-        handle = obligation.applicability
-        if handle.kind == "start_case":
-            if handle.case_id not in start_ids:
-                findings.append(f"obligation {obligation.obligation_id} cites unknown StartCase")
-            continue
-        if handle.kind in {"binding_eligible", "facet_predicate"}:
-            capability = capability_index.get(cast(str, handle.capability_id))
-            if capability is None:
-                findings.append(f"obligation {obligation.obligation_id} cites unknown capability")
-                continue
-            if obligation.requirement_id not in capability.requirement_ids:
-                findings.append(
-                    f"obligation {obligation.obligation_id} capability is not Requirement-anchored"
-                )
-            if handle.kind == "facet_predicate":
-                facets = {item.name: item for item in capability.facets}
-                facet = facets.get(cast(str, handle.facet_name))
-                if facet is None or handle.operator not in facet.allowed_operators:
-                    findings.append(
-                        f"obligation {obligation.obligation_id} cites an unsupported "
-                        "facet predicate"
-                    )
-                    continue
-                try:
-                    validate_instance(
-                        handle.public_literal,
-                        facet.value_schema,
-                        role=f"obligation {obligation.obligation_id} facet literal",
-                    )
-                except SchemaError as exc:
-                    findings.append(f"obligation {obligation.obligation_id}: {exc}")
-            continue
-        if handle.kind == "condition_branch":
-            condition_id = cast(str, handle.condition_id)
-            if condition_id not in condition_index:
-                findings.append(
-                    f"obligation {obligation.obligation_id} cites unknown qualified condition"
-                )
-                continue
-            expected_condition = expected_conditions.get(condition_id)
-            requirement_ids = (
-                expected_condition.get("requirement_ids")
-                if isinstance(expected_condition, dict)
-                else None
-            )
-            if not isinstance(requirement_ids, list) or (
-                obligation.requirement_id not in requirement_ids
-            ):
-                findings.append(
-                    f"obligation {obligation.obligation_id} condition is not Requirement-anchored"
-                )
-    if findings:
-        raise RequirementObligationError("; ".join(findings))
-
-
 def _validate_requirement_coverage(
     expected: Any,
     coverage: Any,
@@ -937,7 +819,7 @@ def _validate_requirement_coverage(
 ) -> None:
     if (
         not isinstance(expected, dict)
-        or expected.get("format") != "expected-task-semantics/2"
+        or expected.get("format") != "expected-task-semantics/1"
         or not isinstance(expected.get("requirements"), list)
         or not isinstance(expected.get("capabilities"), list)
     ):

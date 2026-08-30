@@ -3,28 +3,26 @@
 ## Goal
 
 Deliver a publishable system that converts a natural-language Need into a real
-executable Agent world, qualified high-quality Tasks, verified Episodes and real
-SFT/RL evidence. Product completion means semantic completion of the causal
-chain, never a demo, MVP, mock, canned Task, one successful trace or green unit
-suite.
+executable Agent environment, samples good training Tasks, verifies real Agent
+episodes and produces SFT/RL evidence. Product completion means semantic
+completion of the causal chain, never a demo, mock, canned Task or green suite.
 
 ## Product stages
 
 ```text
 S1 Environment Foundry
-  -> immutable EnvironmentRelease v2
-     public actor project + independently qualified protected TaskSemantics
+  -> qualified immutable EnvironmentRelease
 
-S2 Goal-First Task Foundry
-  -> TaskDefinition / TaskPack
-     separate TaskAssessment / CorpusManifest
+S2 Direct Good-Task Sampling Foundry
+  -> admitted TaskPacks
+  -> separate TaskAssessments and CorpusManifest
 
 S3 Episode Runtime and Evaluator
-  -> real acting-Agent trajectory + frozen Task verification
-     + attributable Reward/abstention
+  -> real public tool trajectory
+  -> frozen Task verification and Reward/abstention
 
-S4 SFT/RL Integrations
-  -> real datasets, optimizer runs, checkpoints and held-out evidence
+S4 SFT/RL
+  -> datasets, optimizer runs, checkpoints and held-out evidence
 ```
 
 The parent owns the cross-stage causal claim only; it is not another runtime
@@ -34,125 +32,79 @@ layer.
 
 ### S1
 
-S1 owns:
+S1 owns Research, the Development Brief, Codex-authored executable actor,
+release-local protected semantics, independent native Qualification, process
+isolation and immutable publication.
 
-- Need/evidence Research and the accepted Development Brief;
-- Codex SDK generation of a real actor environment project;
-- public `reset/tools/invoke/close` behavior and persistent native state;
-- an independent Codex SDK TaskSemantics project authored after expected
-  relations freeze;
-- a mutually blind qualification-only native verifier project archived for
-  cold audit and unavailable to S2/Consumers;
-- Host-owned positive capability Qualification with an independent native
-  effects/collateral audit;
-- exact prepare/open process isolation and immutable publication.
-
-S1 publishes qualified capability atoms, workflow/condition metadata, start
-cases, atomic evaluators and a sealed RequirementObligation catalog with finite
-applicability handles. It does not publish concrete Tasks, reference traces,
-Task checkers, corpus cells, rewards or trajectories.
+S1 may publish qualified atomic capabilities, conditions, StartCases, bindings
+and reusable read-only evaluators. It does not publish Tasks, reference traces,
+Task distributions, Task checkers, rewards or trajectories.
 
 ### S2
 
-S2 consumes one exact v2 release and follows this fixed order:
+S2 samples good Tasks from one exact release through the Direct production path:
 
 ```text
-direct + Graph + Programmatic grounded proposals
--> bidirectionally anchored TaskSpecification
--> bounded task-local VerifierBundle V0
--> fresh Start replay and concrete public binding
--> freeze checker/instruction/answer contract
--> two fresh public Responses-Agent executions
--> reload/truth extraction and applicable semantic challenges
+Direct Goal/Start/Binding candidate enumeration
+-> structural deduplication and selection
+-> checker/instruction freeze
+-> two fresh public solves
+-> deterministic verification and physical challenges
 -> TaskPack
--> separate model-relative TaskAssessment
+-> TaskAssessment
 -> CorpusManifest
 ```
 
-Graph and Programmatic mechanisms are required proposal paths for conformance,
-but they share one CandidateTaskProposal/TaskPack ABI and cannot define truth.
-Their graphs, programs and successful routes remain disposable evidence.
-
-Every admitted Task is publicly solvable, deterministically verifiable,
-well-posed, non-trivial, reproducible, Need/workflow anchored and path-open.
-Difficulty and training utility are empirical assessment/corpus properties, not
-Task identity.
+Graph and Programmatic are optional experiments after a demonstrated coverage
+gap. They are not required nodes and cannot define Task truth.
 
 ### S3
 
-S3 recreates a TaskPack, exposes only its public projection to the acting policy,
-records real actions/observations/final answer and executes the frozen checker.
-The neutral public Responses episode runner used by S2 witness/assessment is
-reused rather than reimplemented.
+S3 recreates a TaskPack, gives only the public projection to the acting policy,
+records real actions/observations/final answer and executes the frozen verifier.
 
 ### S4
 
-S4 consumes exact release/TaskPack identities and verified Episode facts. It
-cannot redefine environment or Task truth.
-
-## Implementation ownership
-
-```text
-Framework Python
-  release/runtime/contracts/compiler/checker/instruction/runner dispatch/
-  provenance/admission/identity/corpus verdicts
-
-Python Codex SDK
-  actor environment project
-  independent protected TaskSemantics project
-  mutually blind qualification-only verifier project
-
-OpenAI Responses tool-calling policy
-  public witness execution
-  independent model-relative assessment
-```
-
-Prompts guide model work but cannot replace deterministic framework code or
-physical evidence.
+S4 consumes exact Release/TaskPack/Episode identities. It cannot redefine
+environment or Task truth.
 
 ## Trust boundary
 
 ```text
 acting policy
-  canonical instruction + public reset context + ToolSpecs + ToolObservations
+  instruction + reset context + ToolSpecs + ToolObservations
 
 trusted runtime
-  reset input + TaskSemantics + protected binding + checker + native facts
+  reset recipe + protected binding + native facts + checker
 ```
 
 Protected state may select and verify a Task but never provide an acting-time
-operand or reference route. LLM agreement cannot override deterministic failure.
+operand. Model consensus cannot override deterministic failure.
 
-## Current scope
+## Current S2 scope
 
-The `s2-task-foundry` task owns the complete S2 implementation and minimum clean
-S1 v2 changes. Compatibility with previous research releases/Task proposals is
-out of scope. S3/S4 remain later children except for the minimal TaskPack and
-shared public episode-runner contracts.
+The active child owns completion of the existing Direct sampling, admission,
+batch, assessment and corpus path plus minimum demonstrated S1 corrections.
+Backward compatibility, mandatory Graph/Programmatic, Registry, S3 reward and
+S4 training are outside the active implementation.
 
 ## Product acceptance
 
-- [ ] S1 v2 cold-publishes exact actor and TaskSemantics projects with independent
-  native/physical Qualification and process-isolated prepare/open.
-- [ ] Every core Brief Requirement is explicitly Taskable, NotTaskable or
-  Unsupported.
-- [ ] Every S2-visible Requirement obligation has a stable S1-owned semantic
-  kind and finite applicability handle; S2 cannot invent or waive it.
-- [ ] Checker and final instruction freeze before any witness-model call.
-- [ ] Each TaskPack has two fresh successful public executions of the exact final
-  instruction and no load-bearing hidden operand.
-- [ ] Bidirectional Requirement coverage rejects unanchored predicates and
-  omitted applicable obligations before witness search.
-- [ ] Every applicable physical no-op, wrong-entity, near-miss, partial,
-  omitted-obligation, collateral, wrong-answer and process/reload challenge
-  fails; a known constructible valid alternative route passes.
-- [ ] TaskPack identity excludes model trials/difficulty/corpus policy.
-- [ ] Both conformance releases and a post-freeze held-out Need run direct,
-  Graph and Programmatic samplers under preregistered budgets without Framework
-  domain edits, reporting honest yield or typed abstention rather than weakening
-  Task gates.
-- [ ] Strict cold TaskPack read and PublicTaskView projection reproduce the
-  exact S2-to-S3 handoff without leaking checker/protected data.
-- [ ] Corpus diversity/redundancy/cost are reported separately from downstream
-  matched-budget SFT/RL or Agent generalization.
-- [ ] Exact cold artifacts reproduce the complete S1 -> S2 -> S3-shaped claim.
+- [ ] S1 cold-publishes real actor and protected semantics projects with
+  independent native Qualification.
+- [ ] The production S2 API directly samples and structurally deduplicates
+  candidates from exact Release capabilities/Starts/bindings/conditions.
+- [ ] Every admitted Task is public-only solvable twice, non-trivial,
+  reproducible and deterministically verifiable.
+- [ ] Applicable no-op, wrong-target, partial, collateral and wrong-answer cases
+  fail without enforcing one witness path.
+- [ ] Declared persistence is verified after close/reopen of the same instance.
+- [ ] TaskPack identity excludes model assessment and corpus selection.
+- [ ] Git, SQLite and a post-freeze held-out Need run without Framework domain
+  edits or weakened Task gates.
+- [ ] Strict cold TaskPack read produces a non-leaking S3 PublicTaskView.
+- [ ] Assessment/corpus reports difficulty, cost, redundancy and distribution
+  separately from Task validity.
+- [ ] Optional sampler experiments are retained only when matched-budget evidence
+  shows additional useful non-redundant admitted Tasks.
+- [ ] Exact artifacts reproduce the complete S1 -> S2 -> S3-shaped handoff.

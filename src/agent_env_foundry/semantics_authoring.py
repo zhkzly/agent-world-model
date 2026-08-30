@@ -15,100 +15,9 @@ from agent_env_foundry.agents import (
     _ProviderTurnBudget,
     _run_fresh_json_turn,
 )
-from agent_env_foundry.environment import JSONObject
 from agent_env_foundry.qualification_contracts import PublicSurfaceManifest
 from agent_env_foundry.release import canonical_bytes
-from agent_env_foundry.requirement_obligations import (
-    ObligationKind,
-    RequirementObligation,
-    RequirementObligationError,
-    applicability_from_document,
-    background_clause_document,
-    requirement_obligations_from_expected_document,
-)
 from agent_env_foundry.research import BuilderProjection, ResearchFailure
-from agent_env_foundry.schema import SchemaError, validate_strict_output_schema
-
-_APPLICABILITY_SCHEMA: dict[str, Any] = {
-    "type": ["object", "null"],
-    "properties": {
-        "kind": {
-            "type": ["string", "null"],
-            "enum": [
-                "always",
-                "start_case",
-                "binding_eligible",
-                "condition_branch",
-                "facet_predicate",
-                None,
-            ],
-        },
-        "case_id": {"type": ["string", "null"]},
-        "capability_id": {"type": ["string", "null"]},
-        "condition_id": {"type": ["string", "null"]},
-        "branch": {"type": ["string", "null"], "enum": ["true", "false", None]},
-        "facet_name": {"type": ["string", "null"]},
-        "operator": {
-            "type": ["string", "null"],
-            "enum": ["eq", "neq", "lt", "lte", "gt", "gte", "min", "max", None],
-        },
-        "public_literal": {"type": ["boolean", "null", "number", "string"]},
-    },
-    "required": [
-        "kind",
-        "case_id",
-        "capability_id",
-        "condition_id",
-        "branch",
-        "facet_name",
-        "operator",
-        "public_literal",
-    ],
-    "additionalProperties": False,
-}
-
-_REQUIREMENT_CLAUSE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "canonical_text": {"type": "string"},
-        "applicability_handle": _APPLICABILITY_SCHEMA,
-    },
-    "required": ["canonical_text", "applicability_handle"],
-    "additionalProperties": False,
-}
-
-_APPLICABILITY_EXAMPLES: dict[str, JSONObject] = {
-    "always": {
-        "kind": "always",
-        "case_id": None,
-        "capability_id": None,
-        "condition_id": None,
-        "branch": None,
-        "facet_name": None,
-        "operator": None,
-        "public_literal": None,
-    },
-    "binding_eligible": {
-        "kind": "binding_eligible",
-        "case_id": None,
-        "capability_id": "declared-capability-id",
-        "condition_id": None,
-        "branch": None,
-        "facet_name": None,
-        "operator": None,
-        "public_literal": None,
-    },
-    "condition_branch": {
-        "kind": "condition_branch",
-        "case_id": None,
-        "capability_id": None,
-        "condition_id": "declared-condition-id",
-        "branch": "true",
-        "facet_name": None,
-        "operator": None,
-        "public_literal": None,
-    },
-}
 
 EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -124,25 +33,12 @@ EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
                         "enum": ["Taskable", "NotTaskable", "Unsupported"],
                     },
                     "rationale": {"type": "string"},
-                    "preconditions": {
-                        "type": "array",
-                        "items": _REQUIREMENT_CLAUSE_SCHEMA,
-                    },
-                    "outcomes": {
-                        "type": "array",
-                        "items": _REQUIREMENT_CLAUSE_SCHEMA,
-                    },
-                    "refusals": {
-                        "type": "array",
-                        "items": _REQUIREMENT_CLAUSE_SCHEMA,
-                    },
+                    "preconditions": {"type": "array", "items": {"type": "string"}},
+                    "outcomes": {"type": "array", "items": {"type": "string"}},
+                    "refusals": {"type": "array", "items": {"type": "string"}},
                     "collateral_constraints": {
                         "type": "array",
-                        "items": _REQUIREMENT_CLAUSE_SCHEMA,
-                    },
-                    "process_constraints": {
-                        "type": "array",
-                        "items": _REQUIREMENT_CLAUSE_SCHEMA,
+                        "items": {"type": "string"},
                     },
                     "workflow_ids": {"type": "array", "items": {"type": "string"}},
                 },
@@ -154,7 +50,6 @@ EXPECTED_TASK_SEMANTICS_SCHEMA: dict[str, Any] = {
                     "outcomes",
                     "refusals",
                     "collateral_constraints",
-                    "process_constraints",
                     "workflow_ids",
                 ],
                 "additionalProperties": False,
@@ -284,7 +179,6 @@ class ExpectedSemanticsError(ValueError):
 class ExpectedTaskSemantics:
     canonical_payload: bytes
     digest: str
-    requirement_obligations: tuple[RequirementObligation, ...]
 
     def to_document(self) -> dict[str, Any]:
         return cast(dict[str, Any], json.loads(self.canonical_payload))
@@ -442,28 +336,16 @@ def freeze_expected_task_semantics(
         raise ExpectedSemanticsError(findings)
 
     canonical = {
-        "format": "expected-task-semantics/2",
+        "format": "expected-task-semantics/1",
         "requirements": sorted(requirements, key=lambda item: item["requirement_id"]),
         "capabilities": sorted(capabilities, key=lambda item: item["capability_id"]),
         "composition_rules": sorted(rules, key=lambda item: item["rule_id"]),
         "conditions": sorted(conditions, key=lambda item: item["condition_id"]),
     }
-    try:
-        obligations = requirement_obligations_from_expected_document(canonical)
-    except RequirementObligationError as exc:
-        raise ExpectedSemanticsError(str(exc)) from exc
-    reference_findings = _obligation_reference_findings(
-        obligations,
-        capability_index,
-        {item["condition_id"]: item for item in conditions},
-    )
-    if reference_findings:
-        raise ExpectedSemanticsError(reference_findings)
     payload = canonical_bytes(canonical)
     return ExpectedTaskSemantics(
         payload,
         hashlib.sha256(payload).hexdigest(),
-        obligations,
     )
 
 
@@ -476,13 +358,6 @@ def generate_expected_task_semantics(
 ) -> ExpectedTaskSemantics:
     if not isinstance(public_surface, PublicSurfaceManifest):
         raise TypeError("Expected Semantics requires one frozen public-surface/2 manifest")
-    try:
-        validate_strict_output_schema(
-            EXPECTED_TASK_SEMANTICS_SCHEMA,
-            role="Expected TaskSemantics Responses format",
-        )
-    except SchemaError as exc:
-        raise ExpectedSemanticsError(str(exc)) from exc
     selected = route or AgentRoute()
 
     def validate(document: dict[str, Any]) -> None:
@@ -539,33 +414,8 @@ def generate_expected_task_semantics(
                     "a required relation that this bounded world cannot expose deterministically"
                 ),
             },
-            "applicability_contract": {
-                "framework_owned": (
-                    "The Host derives obligation IDs and text digests after validation; never "
-                    "emit either field."
-                ),
-                "taskable_clause": (
-                    "Use {canonical_text, applicability_handle}. The handle uses all eight "
-                    "fields shown by the examples; fields not selected by kind are null."
-                ),
-                "non_taskable_clause": (
-                    "Use {canonical_text, applicability_handle:null}; background clauses are "
-                    "not S2 Task obligations."
-                ),
-                "examples": _APPLICABILITY_EXAMPLES,
-            },
             "rules": [
                 "Disposition every required Requirement exactly once.",
-                "Every precondition, outcome, refusal, collateral constraint and public-process "
-                "constraint is one clause object. Taskable clauses require one finite "
-                "applicability_handle; non-Taskable clauses require null.",
-                "Use process_constraints only for a process that the user objective itself "
-                "requires, such as public confirmation after reopen. Do not encode one sampled "
-                "tool route, tool name or incidental call order as a process constraint.",
-                "Use always only when the clause applies to every Task for that Requirement; "
-                "otherwise select start_case, binding_eligible, condition_branch or "
-                "facet_predicate with exactly the referenced fields. References must use "
-                "declared semantic IDs, never run-local values.",
                 "Every Taskable Requirement must be mapped by at least one capability.",
                 "Initial-world Requirements define StartCases/setup and are never Taskable.",
                 "Capabilities may reference only Taskable Requirements and their workflows.",
@@ -614,8 +464,7 @@ def generate_expected_task_semantics(
             "world choice and frozen Requirement relations. Treat the supplied Host contract as "
             "mandatory. The supplied public surface is the complete public observation authority "
             "for answer/report feasibility; actor source and native state remain unavailable. "
-            "Preconditions, outcomes, refusals, collateral constraints and declared public "
-            "process constraints describe "
+            "Preconditions, outcomes, refusals and collateral constraints describe "
             "business truth, not tool call recipes. A shared workflow alone does not justify "
             "composition. Environment reset/reconstruction is StartCase setup, not a user Task "
             "capability. A condition is legal only when its truth is publicly observable. Do "
@@ -666,43 +515,6 @@ def _requirement_findings(item: dict[str, Any], path: str) -> list[str]:
     return findings
 
 
-def _obligation_reference_findings(
-    obligations: tuple[RequirementObligation, ...],
-    capabilities: dict[str, dict[str, Any]],
-    conditions: dict[str, dict[str, Any]],
-) -> list[str]:
-    findings: list[str] = []
-    for obligation in obligations:
-        handle = obligation.applicability
-        if handle.kind in {"binding_eligible", "facet_predicate"}:
-            capability = capabilities.get(cast(str, handle.capability_id))
-            if capability is None:
-                findings.append(
-                    f"obligation {obligation.obligation_id}: unknown capability_id "
-                    f"{handle.capability_id!r}"
-                )
-            elif obligation.requirement_id not in capability["requirement_ids"]:
-                findings.append(
-                    f"obligation {obligation.obligation_id}: capability "
-                    f"{handle.capability_id!r} is not anchored to "
-                    f"{obligation.requirement_id!r}"
-                )
-        if handle.kind == "condition_branch":
-            condition = conditions.get(cast(str, handle.condition_id))
-            if condition is None:
-                findings.append(
-                    f"obligation {obligation.obligation_id}: unknown condition_id "
-                    f"{handle.condition_id!r}"
-                )
-            elif obligation.requirement_id not in condition["requirement_ids"]:
-                findings.append(
-                    f"obligation {obligation.obligation_id}: condition "
-                    f"{handle.condition_id!r} is not anchored to "
-                    f"{obligation.requirement_id!r}"
-                )
-    return findings
-
-
 def _requirement(value: Any) -> dict[str, Any]:
     keys = {
         "requirement_id",
@@ -712,7 +524,6 @@ def _requirement(value: Any) -> dict[str, Any]:
         "outcomes",
         "refusals",
         "collateral_constraints",
-        "process_constraints",
         "workflow_ids",
     }
     item = _exact(value, keys, "Requirement disposition")
@@ -720,72 +531,15 @@ def _requirement(value: Any) -> dict[str, Any]:
         raise ExpectedSemanticsError("Requirement disposition is invalid")
     _identifier(item["requirement_id"], "requirement_id")
     _string(item["rationale"], "rationale")
-    item["workflow_ids"] = _strings(item["workflow_ids"], "workflow_ids")
-    obligation_kinds = {
-        "preconditions": "precondition",
-        "outcomes": "effect",
-        "refusals": "refusal",
-        "collateral_constraints": "collateral",
-        "process_constraints": "process",
-    }
-    taskable = item["disposition"] == "Taskable"
-    for field, kind in obligation_kinds.items():
-        item[field] = _requirement_clauses(
-            item[field],
-            requirement_id=item["requirement_id"],
-            kind=cast(ObligationKind, kind),
-            taskable=taskable,
-            role=field,
-        )
+    for field in (
+        "preconditions",
+        "outcomes",
+        "refusals",
+        "collateral_constraints",
+        "workflow_ids",
+    ):
+        item[field] = _strings(item[field], field)
     return item
-
-
-def _requirement_clauses(
-    value: Any,
-    *,
-    requirement_id: str,
-    kind: ObligationKind,
-    taskable: bool,
-    role: str,
-) -> list[JSONObject]:
-    clauses = _array(value, role)
-    result: list[JSONObject] = []
-    texts: list[str] = []
-    for raw in clauses:
-        item = _exact(
-            raw,
-            {"canonical_text", "applicability_handle"},
-            f"{role} clause",
-        )
-        canonical_text = _text(item["canonical_text"], f"{role} canonical_text")
-        texts.append(canonical_text)
-        handle = item["applicability_handle"]
-        if taskable:
-            if handle is None:
-                raise ExpectedSemanticsError(
-                    f"{role} Taskable clause requires applicability_handle"
-                )
-            try:
-                applicability = applicability_from_document(handle)
-                result.append(
-                    RequirementObligation(
-                        requirement_id=requirement_id,
-                        kind=kind,
-                        canonical_text=canonical_text,
-                        applicability=applicability,
-                    ).to_clause_document()
-                )
-            except RequirementObligationError as exc:
-                raise ExpectedSemanticsError(f"{role}: {exc}") from exc
-            continue
-        if handle is not None:
-            raise ExpectedSemanticsError(
-                f"{role} non-Taskable clause must not carry applicability_handle"
-            )
-        result.append(background_clause_document(canonical_text))
-    if len(texts) != len(set(texts)):
-        raise ExpectedSemanticsError(f"{role} canonical_text values must be unique")
-    return sorted(result, key=lambda clause: cast(str, clause["canonical_text"]))
 
 
 def _capability(value: Any) -> dict[str, Any]:

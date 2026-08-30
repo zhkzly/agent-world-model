@@ -1,399 +1,209 @@
-# S2 Good-Task Sampling Foundry — Implementation Plan
+# S2 Direct Good-Task Sampling Foundry — Implementation Plan
 
 ## 1. Execution rules
 
-- This plan is documentation-only until the user reviews it.
-- Implement one vertical claim at a time; do not restore old branches wholesale.
-- Framework owns deterministic contracts, identity, execution and verdicts.
-- Models may propose Tasks/programs and solve public Tasks; they never define
-  truth, reward or admission.
-- Every new enforcement starts RED on a real or real-derived artifact, kills an
-  injected mutant, then turns GREEN.
-- A green unit suite never substitutes for a real release, process, state
-  transition, reload, challenge or public Agent execution.
-- No subagent/reviewer is started unless the user explicitly requests it.
+- Implement one Direct product claim at a time.
+- Models may execute public Tasks; they never define Task truth or admission.
+- Every new enforcement starts RED on real or real-derived evidence and kills a
+  focused mutant before acceptance.
+- Green unit tests never replace real Release, state transition, fresh witness,
+  reload, challenge or cold artifact evidence.
+- No backward compatibility, dual product path, hidden setup or domain branch.
+- Graph/Programmatic are not active checkpoints.
+- Main session performs alignment/overdesign review unless the user explicitly
+  requests another reviewer.
 
 ## 2. Baseline and rollback point
 
-Start from commit `189be1b`.
+The Direct production path at `189be1b` is the implementation baseline. Later A
+commits adding shared physical reload/ReloadEvidence remain retained.
 
-Retain its verified physical foundations and treat its TaskPacks as diagnostic
-checkpoints. They are not Good Task gold data. In particular, retain the real
-SQLite counterexample:
+The abandoned B1-B3 obligation/TaskSpecification parallel path is deleted. Git
+history is the rollback/audit record; no compatibility code or archive copy is
+kept in the active branch.
 
-```text
-instruction claims close/reopen persistence
-witness performs same-process reads only
-checker accepts
-```
-
-The first new acceptance must reject that exact artifact. Do not edit the old
-artifact to make the test pass.
-
-## 3. Checkpoint A — Physical attempt lifecycle and ReloadEvidence
+## 3. Checkpoint 1 — Authority and single-path restoration
 
 ### Product claim
 
-S2 has one reusable public-attempt lifecycle that physically verifies declared
-persistence across process close/reopen and emits exact ReloadEvidence without
-depending on the current provisional TaskPack format.
+Active documents, Trellis context and production code describe exactly one
+required Direct sampling path.
 
 ### Work
 
-- bind Host-produced ReloadEvidence to one native_instance_id, distinct acting/
-  reopened session IDs, one reset-before-act lifecycle journal, pre-close and
-  post-reopen facts, and post-reopen checker result;
-- extract one reusable single-attempt lifecycle:
-
-```text
-open -> reset -> public episode -> close
--> reopen same instance -> trusted inspect/evaluate -> close
-```
-
-- use that lifecycle for positive witnesses and assessment rather than
-  duplicating it; Checkpoint E migrates applicable challenge episodes before
-  final admission seal;
-- retain the current SQLite TaskPack only as a gold rejected behavior trace, not
-  as a format the new code must support.
+- remove mandatory Graph/Programmatic language from PROJECT, parent and S2
+  authority;
+- delete the isolated obligation/TaskSpecification/binding modules and tests;
+- restore the current release/semantics contract consumed by Direct sampling;
+- keep shared physical reload/provenance changes;
+- prove `run_task_foundry_batch` and `run_task_foundry_product` are the actual
+  production entry points;
+- remove stale B GREEN and sampler metadata from task/context files.
 
 ### RED acceptance
 
-- a real-derived current SQLite attempt that claims reload but performs only
-  same-process inspection cannot produce ReloadEvidence;
-- after-state collected before reopen cannot satisfy a declared reload claim.
-- another native instance, reused session ID, second reset, missing close or
-  checker evaluation before reopen cannot satisfy ReloadEvidence.
+- active authority containing a mandatory Graph/Programmatic phrase fails;
+- task metadata listing required non-Direct samplers fails;
+- any abandoned parallel B module still present fails;
+- production batch imports a second candidate/admission path fails.
 
 ### Real exit
 
-Regenerate one SQLite state-change Task. Two witnesses must show different
-materialization IDs and explicit close/reopen evidence over the same per-witness
-native instance. Git query Tasks must remain valid without domain branches.
+Full deterministic gates pass, old B symbols have zero live references and one
+current Git/SQLite release can enter the Direct batch without a compatibility
+switch.
 
-### Expected files
-
-`task_foundry.py`, `foreach_foundry.py`, `if_foundry.py`, `assessment.py`, the
-existing preparation/session boundary, and focused tests. Do not add a TaskPack
-reader, service or Registry in this checkpoint.
-
-## 4. Checkpoint B — TaskSpecification, coverage and V0
+## 4. Checkpoint 2 — Structural dedup and production batch audit
 
 ### Product claim
 
-Task meaning freezes before witness search and covers every applicable declared
-Requirement obligation in both directions.
+Direct sampling reports honest unique Task structures and persists admitted and
+rejected candidates through one production API.
 
 ### Work
 
-- introduce one bounded TaskSpecification document;
-- add the narrow sealed S1 RequirementObligation catalog with stable semantic
-  kinds and finite always/start/binding/condition/facet applicability handles;
-- require every sampler to emit the exact canonical CandidateTaskProposal/1
-  schema; sampler-specific evidence stays behind digests;
-- reject multi-capability proposals without one matching sealed S1
-  CompositionRule, regardless of executed sampler success;
-- freeze its parameterized semantic section from qualified
-  Requirements/Capabilities and a Candidate proposal;
-- after Start, append only concrete public-provenance values to its binding
-  section without changing semantic fields;
-- record semantic-predicate-to-S1-obligation/qualified-operation mappings and
-  separate public disclosure/provenance mappings;
-- consume and verify every S1-issued obligation ID; S2 cannot create/delete an
-  obligation or applicability handle;
-- evaluate the sealed S1 handle in Framework; irrelevance is permitted only
-  when it is false, and free-text rationale cannot remove an obligation;
-- fail closed on unanchored predicates, omitted obligations or unjustified
-  irrelevance;
-- compile V0 as an evaluation plan over existing qualified TaskSemantics, not
-  arbitrary per-Task Python;
-- audit the bound instruction for public constraint/operand closure, hidden
-  predicate leakage, answer leakage and solver-route leakage; a fresh
-  public-view critic may reject ambiguity/purposefulness but cannot authorize a
-  deterministic failure;
-- seal PublicClosureEvidence that accounts exactly once for each load-bearing
-  predicate, public operand and answer-opacity decision;
-- make the current direct Capability compiler emit proposals into this path.
+- audit `task_structure_id` against real Atom/ForEach/If examples;
+- prove entity/parameter substitutions and paraphrases deduplicate;
+- prove Goal/selector/condition/answer/Start differences remain distinct;
+- audit balanced selection and candidate-attempt budgets;
+- preserve every typed failure instead of retrying to success;
+- cold-verify every persisted TaskPack identity.
 
 ### RED acceptance
 
-Use a real-derived cancellation-style fixture with three obligations:
-
-```text
-cancel reservation
-restore capacity
-issue refund
-```
-
-A candidate/checker that encodes only the first two must be rejected even when
-its witness and existing predicates pass. Also reject: a checker predicate
-authorized only by instruction/schema; an S2-created applicability handle; an
-`irrelevant` obligation whose sealed handle evaluates true; an instruction that
-omits one load-bearing frozen constraint; and an instruction that exposes a
-dynamic answer or prescribed reference route.
+- parameter-only variants satisfying a new structure target fail;
+- a genuine condition/selector/answer difference collapsing to one structure
+  fails;
+- a batch target admitting an invalid Task or hiding a rejected attempt fails;
+- artifact collision/tampering fails closed.
 
 ### Real exit
 
-Republish one Git and SQLite release with the narrow obligation catalog, then
-compile one Task through direct proposal -> specification -> V0 -> freeze. The
-frozen digest must be identical across recompilation and must not depend on
-witness bytes.
+Run fixed-budget Git and SQLite batches and report candidate count, unique
+structures, admitted TaskPacks, typed rejection classes and cost. No arbitrary
+Task floor is a product gate.
 
-### Anti-overdesign
-
-Do not create a world ontology, Rule IR, generic expression language or fourth
-Codex-authored verifier project. Add only fields exercised by the two real
-Tasks and the omitted-obligation counterexample.
-
-## 5. Checkpoint C — Graph sampler
+## 5. Checkpoint 3 — Good-Task admission closure
 
 ### Product claim
 
-Graph sampling proposes Need-anchored Tasks from real public value-flow and
-state-enablement evidence rather than LLM-imagined tool edges.
+Every TaskPack accepted by the Direct batch satisfies the intrinsic Good-Task
+gates with physical evidence.
 
 ### Work
 
-- use disposable reset instances and the existing public tool runner;
-- retain executed nodes, observations and public argument provenance;
-- create edges only after the later call actually executes with values derived
-  from earlier public observations/schema constants;
-- admit value-flow edges only with exact observation-pointer to argument-pointer
-  provenance;
-- admit state-enablement edges only when the same later tool/arguments fails
-  before and succeeds after the earlier action on equivalent fresh starts, with
-  the enabling effect confirmed by qualified TaskSemantics;
-- sample bounded paths/subgraphs under a fixed calls/tokens/time budget;
-- map each proposal to accepted Requirement anchors;
-- discard the graph after proposal/evidence persistence.
+- audit two-fresh-witness enforcement for Atom/ForEach/If;
+- verify full public argument provenance;
+- retain close/reopen evidence for persistence;
+- audit applicable no-op, wrong-target, partial, collateral and wrong-answer
+  challenges;
+- reject initially satisfied or publicly ungrounded Tasks;
+- accept another valid path when found without requiring exhaustive search;
+- migrate any remaining challenge that still verifies only in-process state.
 
 ### RED acceptance
 
-- an LLM-only edge with no executed later call cannot propose a Task;
-- a later argument copied from protected/native state is rejected;
-- two unrelated successful tools cannot be stitched without one coherent
-  Requirement objective;
-- a successful executed path with an omitted Requirement obligation still fails
-  Checkpoint B.
-- state-enablement evidence may prioritize a proposal/witness but cannot, by
-  itself, authorize a required process predicate.
+Each applicable class has one real-derived bad execution accepted by the old
+gate and rejected by the corrected gate. Boolean result flipping is not
+physical evidence.
 
 ### Real exit
 
-Produce proposals on both Git and SQLite, including one multi-step value-flow or
-state-enablement candidate where the release supports it. Report zero-yield
-honestly when it does not.
+Seal real query, mutation/refusal, collection and condition TaskPacks across Git
+and SQLite where the releases support them. Unsupported shapes abstain.
 
-### Non-goals
-
-No persistent graph package, learned universal dependency model, GraphTask ABI
-or claim of exhaustive tool-space coverage.
-
-## 6. Checkpoint D — Programmatic sampler
+## 6. Checkpoint 4 — AllGoal only when licensed
 
 ### Product claim
 
-A public-only bounded solution program can propose different grounded Task
-structures, while its successful route remains constructive evidence rather
-than the only accepted solution.
+Direct sampling can compose capabilities only when a real qualified
+CompositionRule exists.
 
 ### Work
 
-- give the planner only Requirement/public schemas/reset observations;
-- return a bounded run-local JSON program containing only call, public-pointer
-  if, bounded public-array for_each and finish operations;
-- execute on a disposable instance and provide complete factual repair feedback
-  only for public execution/shape failures;
-- fresh replay the repaired program;
-- convert Requirement + executed evidence into the common proposal;
-- discard source program from acting-time PublicTaskView.
+- first obtain a release whose business Need and Qualification support one
+  CompositionRule;
+- then implement All compilation, fresh binding, witness and physical
+  challenges through the same admission/TaskPack path;
+- do nothing when no conformance release supports All.
 
 ### RED acceptance
 
-- hidden literal/native ID use fails provenance;
-- a program that executes but solves another Requirement is rejected;
-- a program whose successful answer cannot be recomputed from public evidence is
-  rejected;
-- verifier output is never returned as planner guidance;
-- alternate public execution satisfying the same frozen Task is accepted.
+- arbitrary successful tool adjacency cannot authorize All;
+- an All candidate omitting a rule capability or exceeding occurrences fails;
+- unrelated collateral effects remain rejected.
 
 ### Real exit
 
-Run one real Git and SQLite Programmatic proposal under the same published
-budget as Graph. Record attempts, repair turns, executions, yield and failure
-ownership.
+One real All TaskPack, or a documented unsupported result if no accepted
+CompositionRule exists. Coverage targets cannot manufacture one.
 
-### Non-goals
-
-No ProgrammaticTask product type, arbitrary Python from untrusted data or
-solution-program equality checker.
-
-## 7. Checkpoint E — Applicability-planned Good Task challenges
+## 7. Checkpoint 5 — TaskAssessment and CorpusManifest
 
 ### Product claim
 
-Every admitted Task rejects constructible close counterexamples without running
-an exhaustive or decorative challenge matrix.
+Assessment and corpus selection describe a training distribution without
+changing individual Task truth.
 
 ### Work
 
-- derive and freeze challenge applicability before witness search;
-- implement physical initial/no-op, wrong entity, wrong/stale answer,
-  partial/omitted obligation, near-miss, collateral and process/reload cases;
-- allow a required process predicate only when it cites an S1 obligation of
-  kind process; Graph state-enablement is not semantic authorization;
-- record a bounded process evidence section with milestone/obligation IDs,
-  semantic trace-predicate digest, real witness, missing-milestone trace
-  ablation, a physical omission episode when constructible, and known
-  alternative-route results;
-- prune retained constructive witness evidence to calls that support a public
-  operand, branch, required effect or declared process milestone, without making
-  trace minimality an acceptance rule for future acting policies;
-- compare qualified TaskSemantics truth across fresh/reloaded instances;
-- execute a distinct valid route when one is actually found;
-- record deterministic non-applicability reasons;
-- restart TaskSpecification on semantic correction and V0 on verifier correction.
+- run fresh policy trials distinct from admission witnesses;
+- preserve failure ownership, calls, tokens, latency and cost;
+- verify TaskAssessment identity binds exact TaskPack and policy;
+- verify CorpusManifest binds exact TaskPack/Assessment pairs;
+- deduplicate structures and balance declared buckets deterministically;
+- report model-relative difficulty without labelling Task/Verifier/Environment/
+  Infrastructure defects as hard.
 
 ### RED acceptance
 
-Each applicable category must have one real-derived mutant that the unmodified
-checker would accept and the strengthened admission rejects. Mutating result
-booleans or hand-writing an impossible native state is not physical evidence.
-Additionally reject a witness-derived required process with no S1 process
-obligation, and prove trace ablation of each declared milestone fails V0 while a
-different route satisfying the same semantic milestone remains accepted.
+- assessment retry-until-success fails;
+- one policy with uniform success cannot claim discrimination;
+- corpus policy cannot validate or invalidate a TaskPack;
+- paraphrase/entity variants cannot satisfy structural diversity alone.
 
 ### Real exit
 
-Seal at least one query, state-change/refusal, collection and condition/composed
-Task across the conformance releases when their semantics support those shapes.
-No environment is forced to manufacture an unsupported Goal.
+Produce cold-readable Git/SQLite CorpusManifests with honest reliability,
+distribution, redundancy and cost reports.
 
-### Anti-overdesign
-
-Do not test every member, order, parameter or route. One discriminating physical
-case per applicable semantic failure class is the production gate; broader
-sampling belongs to robustness experiments.
-
-## 8. Checkpoint F — Unified TaskPack and sampler batch
+## 8. Checkpoint 6 — Held-out transfer and S3-shaped handoff
 
 ### Product claim
 
-All samplers feed one identity/admission path and a fixed-budget batch reports
-honest yield and rejection causes.
+The frozen Direct Framework transfers to a Need selected after freeze and emits
+TaskPacks consumable by the later episode/reward runtime.
 
 ### Work
 
-- seal TaskSpecification, StartRecipe, V0 and AdmissionEvidence into one current
-  TaskPackManifest;
-- remove any current in-memory-only identity assumption;
-- add exact current TaskPack decoders with no legacy fallback and recompute all
-  section/pack identities from canonical bytes;
-- return a trusted host projection plus one minimal PublicTaskView containing
-  only instruction and final-answer schema; reset observation and ToolSpecs are
-  obtained freshly from the release;
-- run direct, Graph and Programmatic proposals under declared budgets;
-- deduplicate by semantic/execution structure, not text or entity ID;
-- persist accepted packs and typed rejected-proposal/admission records;
-- never stop merely because three structures were admitted unless that is an
-  explicitly labelled smoke run.
+- freeze Direct code, prompts, sampling/admission rules and budgets;
+- select one held-out Need afterward and run S1 publication plus complete S2;
+- relocate/cold-read Release, TaskPacks and Corpus;
+- expose only PublicTaskView to the acting policy;
+- exercise the public tool loop and deterministic verified facts;
+- report typed low yield/abstention without domain patches.
 
 ### RED acceptance
 
-- same semantics with paraphrase/entity swap deduplicates structurally;
-- different objective/quantifier/constraint/information dependency remains
-  distinct;
-- sampler lineage changes evidence identity but not Task truth;
-- batch target cannot override Good Task failure.
-- tampered section/pack identities fail cold read, and PublicTaskView containing
-  semantic keys, expected branch, checker, witness, Start reset input or
-  protected binding is rejected.
+- preselecting/tuning the held-out Need fails contamination checks;
+- TaskPack identity or PublicTaskView leakage fails before acting;
+- domain-specific Framework changes or weaker held-out gates fail transfer;
+- S3 reward/logprob/training fields in S2 output fail the boundary.
 
 ### Real exit
 
-Run complete fixed-budget batches on Git and SQLite, cold-read every admitted
-pack, and report proposal count, execution count, TaskPack yield, unique
-structures, rejection classes and cost.
+Held-out execution yields valid TaskPacks or justified abstention, with the same
+metrics and gates used for conformance releases.
 
-## 9. Checkpoint G — Difficulty and CorpusManifest
+## 9. Optional sampler experiments
 
-### Product claim
+Graph, Programmatic, backward planning or other search methods require a new
+explicit experiment task after Direct fixed-budget evidence demonstrates a
+named gap. The experiment must use the same admission path and matched budget.
+No incremental useful Task gain means deletion. Optional experiments never
+block Checkpoints 1–6.
 
-Corpus selection produces a declared training distribution rather than a list
-of easy duplicates.
-
-### Work
-
-- run at least two policy lineages/checkpoints with repeated fresh trials;
-- preserve complete success/failure attribution and cost;
-- classify difficulty from empirical success and failure patterns, not tool
-  count;
-- select by Goal/capability/state/constraint/information dependency and declared
-  SFT/RL purpose;
-- report redundancy, easy/intermediate/hard/defect-suspect partitions;
-- keep assessment/corpus identity outside TaskPack truth.
-
-### RED acceptance
-
-- one policy at 100% cannot establish discrimination;
-- Task/Verifier/Environment/Infrastructure failures cannot be labelled “hard”;
-- parameter/paraphrase variants cannot satisfy structure diversity alone;
-- a corpus threshold cannot retroactively invalidate or validate a TaskPack.
-
-### Real exit
-
-Generate a conformance CorpusManifest with exact TaskPack/Assessment pairs and
-publish all selection evidence. Do not claim learning value yet.
-
-## 10. Checkpoint H — Held-out transfer and S3-shaped handoff
-
-### Product claim
-
-The frozen S2 Framework transfers without domain edits and its output is
-consumable by a future Agentic RL episode runner.
-
-### Work
-
-- freeze Framework code, prompts, sampler budgets and acceptance rules;
-- select one held-out Need afterward;
-- run S1 publication and the complete S2 pipeline;
-- cold-read TaskPack/Corpus from relocated bytes;
-- exercise PublicTaskView through the public tool loop;
-- serialize a neutral OpenAI-style message trace as a compatibility probe only.
-
-### RED acceptance
-
-- selecting or tuning the held-out Need before Framework/prompt/budget freeze is
-  rejected as contaminated evidence;
-- a TaskPack that cannot cold-read after relocation fails before acting;
-- PublicTaskView or the neutral trace containing semantic keys, expected branch,
-  checker/witness/protected facts is rejected;
-- held-out execution requiring a Framework domain branch or weaker Good Task
-  gate fails transfer rather than being patched locally;
-- S3-only reward, logprob or training fields appearing in S2 output are rejected.
-
-### S2 boundary
-
-The probe may demonstrate:
-
-```text
-system/user/tool schemas
-assistant tool calls
-tool observations
-assistant final answer
-verified Task facts
-```
-
-S2 does not implement rollout logprobs, response masks, token rewards,
-advantages, reward mapping or training. Those become the S3/S4 plan after S2
-completion.
-
-### Real exit
-
-Held-out execution must produce valid TaskPacks or typed justified low yield,
-with no domain branch or weakened gate. Report the same metrics as conformance
-runs.
-
-## 11. Required validation at every checkpoint
+## 10. Required validation
 
 ```bash
 UV_CACHE_DIR=/tmp/foundry-s2-uv-cache uv lock --check
@@ -404,20 +214,11 @@ UV_CACHE_DIR=/tmp/foundry-s2-uv-cache uv lock --check
 git diff --check
 ```
 
-Additionally:
+At every checkpoint also retain real run IDs/facts, run focused mutation
+licenses, grep deleted symbols/domain branches and report production/test LOC
+added and removed.
 
-- run focused RED/GREEN tests and one mutation license for each independent
-  binding/enforcement edge;
-- retain real run IDs, TaskPack IDs, process/state before-after facts and typed
-  failures;
-- grep for deleted legacy symbols and domain branches;
-- report source/test LOC added/deleted at each checkpoint;
-- main session performs the alignment/overdesign review unless the user
-  explicitly requests another reviewer.
+## 11. Completion
 
-## 12. Completion
-
-S2 completes only when Checkpoints A–H satisfy their real exits. A checkpoint
-may be committed independently. Failure at a later checkpoint does not justify
-restoring legacy ABI, adding compatibility, weakening an earlier Good Task gate
-or claiming S3 has begun.
+S2 completes only when Checkpoints 1–6 satisfy their real exits. Optional
+sampler experiments and S3/S4 training are not completion gates.

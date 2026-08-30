@@ -6,10 +6,8 @@ from typing import Any
 
 import pytest
 
-import agent_env_foundry.semantics_authoring as authoring_module
 from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.qualification_contracts import PublicSurfaceManifest
-from agent_env_foundry.requirement_obligations import applicability_from_document
 from agent_env_foundry.research import BuilderProjection, ResearchFailure
 from agent_env_foundry.semantics_authoring import (
     EXPECTED_TASK_SEMANTICS_SCHEMA,
@@ -29,13 +27,6 @@ def test_provider_schema_declares_a_type_for_every_property() -> None:
         if isinstance(properties, dict):
             assert all(isinstance(value, dict) and "type" in value for value in properties.values())
         pending.extend(node.values())
-
-
-def test_prompt_applicability_examples_pass_the_production_decoder() -> None:
-    assert {
-        applicability_from_document(value).kind
-        for value in authoring_module._APPLICABILITY_EXAMPLES.values()
-    } == {"always", "binding_eligible", "condition_branch"}
 
 
 def _projection() -> BuilderProjection:
@@ -114,43 +105,6 @@ def _surface() -> PublicSurfaceManifest:
     )
 
 
-def _handle(
-    kind: str,
-    *,
-    case_id: str | None = None,
-    capability_id: str | None = None,
-    condition_id: str | None = None,
-    branch: str | None = None,
-    facet_name: str | None = None,
-    operator: str | None = None,
-    public_literal: Any = None,
-) -> dict[str, Any]:
-    return {
-        "kind": kind,
-        "case_id": case_id,
-        "capability_id": capability_id,
-        "condition_id": condition_id,
-        "branch": branch,
-        "facet_name": facet_name,
-        "operator": operator,
-        "public_literal": public_literal,
-    }
-
-
-def _task_clause(text: str, capability_id: str) -> dict[str, Any]:
-    return {
-        "canonical_text": text,
-        "applicability_handle": _handle(
-            "binding_eligible",
-            capability_id=capability_id,
-        ),
-    }
-
-
-def _background_clause(text: str) -> dict[str, Any]:
-    return {"canonical_text": text, "applicability_handle": None}
-
-
 def _document() -> dict[str, Any]:
     return {
         "requirements": [
@@ -158,24 +112,20 @@ def _document() -> dict[str, Any]:
                 "requirement_id": "REQ-001",
                 "disposition": "Taskable",
                 "rationale": "Public increment can establish the relation",
-                "preconditions": [_task_clause("counter exists", "increment")],
-                "outcomes": [_task_clause("counter increases", "increment")],
+                "preconditions": ["counter exists"],
+                "outcomes": ["counter increases"],
                 "refusals": [],
-                "collateral_constraints": [_task_clause("no unrelated state changes", "increment")],
-                "process_constraints": [],
+                "collateral_constraints": ["no unrelated state changes"],
                 "workflow_ids": ["counter-workflow"],
             },
             {
                 "requirement_id": "REQ-002",
                 "disposition": "Taskable",
                 "rationale": "A public read can answer the current-value query",
-                "preconditions": [_task_clause("counter exists", "read-counter")],
-                "outcomes": [_task_clause("the current count is reported", "read-counter")],
+                "preconditions": ["counter exists"],
+                "outcomes": ["the current count is reported"],
                 "refusals": [],
-                "collateral_constraints": [
-                    _task_clause("counter state remains unchanged", "read-counter")
-                ],
-                "process_constraints": [],
+                "collateral_constraints": ["counter state remains unchanged"],
                 "workflow_ids": ["counter-workflow"],
             },
             {
@@ -184,9 +134,8 @@ def _document() -> dict[str, Any]:
                 "rationale": "A refusal is Qualification evidence, not a user goal",
                 "preconditions": [],
                 "outcomes": [],
-                "refusals": [_background_clause("non-positive amount")],
-                "collateral_constraints": [_background_clause("counter unchanged")],
-                "process_constraints": [],
+                "refusals": ["non-positive amount"],
+                "collateral_constraints": ["counter unchanged"],
                 "workflow_ids": ["counter-workflow"],
             },
             {
@@ -197,7 +146,6 @@ def _document() -> dict[str, Any]:
                 "outcomes": [],
                 "refusals": [],
                 "collateral_constraints": [],
-                "process_constraints": [],
                 "workflow_ids": ["counter-workflow"],
             },
         ],
@@ -256,7 +204,7 @@ def _document() -> dict[str, Any]:
 def test_expected_semantics_freezes_complete_requirement_coverage() -> None:
     frozen = freeze_expected_task_semantics(_projection(), _document())
     frozen_document = frozen.to_document()
-    assert frozen_document["format"] == "expected-task-semantics/2"
+    assert frozen_document["format"] == "expected-task-semantics/1"
     assert [item["requirement_id"] for item in frozen_document["requirements"]] == [
         "REQ-001",
         "REQ-002",
@@ -269,11 +217,6 @@ def test_expected_semantics_freezes_complete_requirement_coverage() -> None:
         if item["disposition"] == "Taskable"
     ] == ["REQ-001", "REQ-002"]
     assert frozen.digest
-    assert len(frozen.requirement_obligations) == 6
-    assert {item.requirement_id for item in frozen.requirement_obligations} == {
-        "REQ-001",
-        "REQ-002",
-    }
     assert frozen_document["capabilities"][1]["answer_fields"] == [
         {"field_id": "current-count", "public_label": "Current count"}
     ]
@@ -296,16 +239,6 @@ def test_expected_semantics_rejects_omission_and_incomplete_taskable_relation() 
     with pytest.raises(ExpectedSemanticsError, match="Taskable"):
         freeze_expected_task_semantics(_projection(), incomplete)
 
-    missing_handle = _document()
-    missing_handle["requirements"][0]["outcomes"][0]["applicability_handle"] = None
-    with pytest.raises(ExpectedSemanticsError, match="requires applicability_handle"):
-        freeze_expected_task_semantics(_projection(), missing_handle)
-
-    background_handle = _document()
-    background_handle["requirements"][2]["refusals"][0]["applicability_handle"] = _handle("always")
-    with pytest.raises(ExpectedSemanticsError, match="non-Taskable"):
-        freeze_expected_task_semantics(_projection(), background_handle)
-
     unknown = _document()
     unknown["capabilities"][0]["requirement_ids"] = ["REQ-999"]
     with pytest.raises(ExpectedSemanticsError, match="unknown Requirement"):
@@ -314,8 +247,8 @@ def test_expected_semantics_rejects_omission_and_incomplete_taskable_relation() 
     initial_task = _document()
     initial_task["requirements"][3].update(
         disposition="Taskable",
-        preconditions=[_task_clause("world can be reset", "reset-world")],
-        outcomes=[_task_clause("initial world exists", "reset-world")],
+        preconditions=["world can be reset"],
+        outcomes=["initial world exists"],
     )
     initial_task["capabilities"].append(
         {
@@ -364,14 +297,6 @@ def test_expected_semantics_rejects_unanchored_composition_and_condition() -> No
     ]
     assert freeze_expected_task_semantics(_projection(), branch_specific_contract).digest
 
-    bad_obligation = _document()
-    bad_obligation["requirements"][0]["outcomes"][0]["applicability_handle"] = _handle(
-        "binding_eligible",
-        capability_id="missing-capability",
-    )
-    with pytest.raises(ExpectedSemanticsError, match="unknown capability_id"):
-        freeze_expected_task_semantics(_projection(), bad_obligation)
-
 
 class _Response:
     output = ()
@@ -419,9 +344,6 @@ def test_expected_semantics_provider_turn_is_fresh_typed_and_candidate_blind(
     assert "current_count" in visible
     assert "REQ-001" in visible
     assert "required_requirement_ids" in visible
-    assert "applicability_contract" in visible
-    assert "The Host derives obligation IDs" in visible
-    assert "process_constraints" in visible
     assert "covers every mapped Taskable Requirement outcome" in visible
     assert "one exact value" in visible
     assert "free-form summaries" in visible

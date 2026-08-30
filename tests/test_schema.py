@@ -9,7 +9,6 @@ from agent_env_foundry.schema import (
     require_object_root,
     validate_instance,
     validate_schema_document,
-    validate_strict_output_schema,
 )
 
 LOCAL_REF_SCHEMA = {
@@ -138,37 +137,3 @@ def test_validate_instance_error_names_the_role() -> None:
 def test_validate_instance_bool_is_not_integer() -> None:
     with pytest.raises(SchemaError):
         validate_instance(True, {"type": "integer"}, role="strict bool/int")
-
-
-def test_strict_output_schema_rejects_incomplete_array_and_object_branches() -> None:
-    for schema in (
-        {
-            "type": "object",
-            "properties": {"values": {"type": ["array", "null"]}},
-            "required": ["values"],
-            "additionalProperties": False,
-        },
-        {
-            "type": "object",
-            "properties": {"value": {"type": ["object", "null"]}},
-            "required": ["value"],
-            "additionalProperties": False,
-        },
-    ):
-        with pytest.raises(SchemaError, match="strict structured output"):
-            validate_strict_output_schema(schema, role="Responses format")
-
-    validate_strict_output_schema(
-        {
-            "type": "object",
-            "properties": {
-                "values": {
-                    "type": ["array", "null"],
-                    "items": {"type": "string"},
-                }
-            },
-            "required": ["values"],
-            "additionalProperties": False,
-        },
-        role="Responses format",
-    )
