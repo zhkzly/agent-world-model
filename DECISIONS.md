@@ -170,3 +170,5 @@
 `s2-git-e-reclosure|介入0|返工8|all-Task answers+task-kind physics+strict schemas+shared condition bindings+22 cold candidates+6 mutation licences|红线违反0`
 
 `s2-git-f-first-atoms|介入0|返工3|2 current-release TaskPacks+4 AgentChoice rebinds+physical collateral+8 checker mutants|红线违反0`
+
+`s2-git-foreach-wrong-answer|介入1|返工2|v8 real two-witness replay+single-member answer mutation+full ForEach TaskPack+mutation licence|红线违反1: initially used an unnecessary stochastic Agent call for a deterministic checker challenge`

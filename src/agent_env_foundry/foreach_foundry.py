@@ -1096,35 +1096,14 @@ def prove_foreach_agent_choices_non_load_bearing(
                     event_seq=occurrence.event_seq,
                     argument_pointer=occurrence.argument_pointer,
                 )
-            replay_observations: dict[int, JSONObject] = {}
-            replay_trace: list[TraceEvent] = []
-            provenance_by_event = {
-                event.seq: tuple(
-                    item for item in witness.argument_provenance if item.event_seq == event.seq
-                )
-                for event in witness.trace
-            }
-            for event in witness.trace:
-                arguments = _replay_arguments(
-                    event,
-                    provenance_by_event[event.seq],
-                    reset,
-                    replay_observations,
-                    (occurrence.event_seq, occurrence.argument_pointer),
-                    cast(JSONValue, replacement),
-                )
-                spec = tool_specs[event.tool_name]
-                errors = tuple(Draft202012Validator(spec["input_schema"]).iter_errors(arguments))
-                if errors:
-                    raise TaskFoundryError(
-                        "foreach_replay_arguments_invalid",
-                        "Perturbed ForEach replay arguments violate the ToolSpec",
-                        event_seq=event.seq,
-                        original_message=errors[0].message,
-                    )
-                observation = _json_object(session.actor.invoke(event.tool_name, arguments))
-                replay_observations[event.seq] = observation
-                replay_trace.append(TraceEvent(event.seq, event.tool_name, arguments, observation))
+            replay_trace = _replay_witness_trace(
+                session,
+                witness,
+                reset,
+                tool_specs,
+                perturbed_occurrence=(occurrence.event_seq, occurrence.argument_pointer),
+                replacement=cast(JSONValue, replacement),
+            )
             answers = witness.final_answer.get("results")
             if not isinstance(answers, list) or len(answers) != len(bindings):
                 raise TaskFoundryError(
@@ -1140,7 +1119,7 @@ def prove_foreach_agent_choices_non_load_bearing(
                         before,
                         after,
                         binding.protected_binding,
-                        tuple(replay_trace),
+                        replay_trace,
                         answers[position],
                         contexts[position],
                     )
@@ -1155,7 +1134,7 @@ def prove_foreach_agent_choices_non_load_bearing(
                     occurrence.argument_pointer,
                     occurrence.value,
                     cast(JSONValue, replacement),
-                    tuple(replay_trace),
+                    replay_trace,
                     results,
                 )
             )
@@ -1209,37 +1188,42 @@ def challenge_foreach_wrong_answer(
     prepared: OpenPreparedRelease,
     solved: SolvedForEachTask,
     instance_root: Path,
-    *,
-    route: AgentRoute | None = None,
-    max_provider_turns: int = 12,
 ) -> ForEachWrongAnswerChallenge | None:
     task = solved.task
     _verify_task(prepared, task)
     member_index = solved.admission_plan.wrong_answer_member_index
     if member_index is None:
         return None
-    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
+    witness = solved.witnesses[0]
     with prepared.open(instance_root) as session:
         reset = session.actor.reset(task.start_case.reset_input)
         before = session.trusted.inspect(instance_root)
         bindings = _resolve_complete_selection(session, task, before)
         contexts = _contexts(task, bindings)
-        episode = run_public_episode(
-            actor=session.actor,
-            instruction=task.instruction,
-            reset_observation=reset,
-            tool_specs=session.actor.tools(),
-            answer_schema=task.answer_schema,
-            route=selected_route,
-            max_provider_turns=max_provider_turns,
-        )
-        answers = episode.final_answer.get("results")
+        tool_specs = {item["name"]: item for item in session.actor.tools()}
+        replay_trace = _replay_witness_trace(session, witness, reset, tool_specs)
+        answers = witness.final_answer.get("results")
         if not isinstance(answers, list) or len(answers) != len(bindings):
             raise TaskFoundryError(
                 "foreach_wrong_answer_baseline_count_mismatch",
                 "ForEach wrong-answer baseline does not cover the complete selection",
             )
         after = session.trusted.inspect(instance_root)
+        probe_results = tuple(
+            session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after,
+                    binding.protected_binding,
+                    replay_trace,
+                    _json_object(answers[position]),
+                    contexts[position],
+                )
+            )
+            for position, binding in enumerate(bindings)
+        )
+        correct_answers = [_json_object(item.report_values) for item in probe_results]
         baseline_results = tuple(
             session.trusted.evaluate_atom(
                 AtomCheckRequest(
@@ -1247,8 +1231,8 @@ def challenge_foreach_wrong_answer(
                     before,
                     after,
                     binding.protected_binding,
-                    episode.trace,
-                    _json_object(answers[position]),
+                    replay_trace,
+                    correct_answers[position],
                     contexts[position],
                 )
             )
@@ -1268,7 +1252,8 @@ def challenge_foreach_wrong_answer(
                 "foreach_wrong_answer_unavailable",
                 "Planned ForEach member answer has no schema-valid wrong alternative",
             )
-        wrong_answers = [_json_object(item) for item in answers]
+        baseline_final = _json_object({"results": correct_answers})
+        wrong_answers = [_json_object(item) for item in correct_answers]
         wrong_answers[member_index] = wrong_member
         wrong_final = _json_object({"results": wrong_answers})
         wrong_results = tuple(
@@ -1278,7 +1263,7 @@ def challenge_foreach_wrong_answer(
                     before,
                     after,
                     binding.protected_binding,
-                    episode.trace,
+                    replay_trace,
                     wrong_answers[position],
                     contexts[position],
                 )
@@ -1290,8 +1275,8 @@ def challenge_foreach_wrong_answer(
             solved.admission_plan.plan_id,
             member_index,
             session.identity.materialization_id,
-            episode.trace,
-            episode.final_answer,
+            replay_trace,
+            baseline_final,
             wrong_final,
             baseline_results,
             wrong_results,
@@ -1661,6 +1646,48 @@ def _contexts(
         )
         for slot in slots
     )
+
+
+def _replay_witness_trace(
+    session: OpenPreparedSession,
+    witness: ForEachWitness,
+    reset_observation: JSONValue,
+    tool_specs: dict[str, Any],
+    *,
+    perturbed_occurrence: tuple[int, str] = (-1, ""),
+    replacement: JSONValue = None,
+) -> tuple[TraceEvent, ...]:
+    observations: dict[int, JSONObject] = {}
+    trace: list[TraceEvent] = []
+    provenance_by_event = {
+        event.seq: tuple(
+            item for item in witness.argument_provenance if item.event_seq == event.seq
+        )
+        for event in witness.trace
+    }
+    for event in witness.trace:
+        arguments = _replay_arguments(
+            event,
+            provenance_by_event[event.seq],
+            reset_observation,
+            observations,
+            perturbed_occurrence,
+            replacement,
+        )
+        errors = tuple(
+            Draft202012Validator(tool_specs[event.tool_name]["input_schema"]).iter_errors(arguments)
+        )
+        if errors:
+            raise TaskFoundryError(
+                "foreach_replay_arguments_invalid",
+                "ForEach replay arguments violate the frozen ToolSpec",
+                event_seq=event.seq,
+                original_message=errors[0].message,
+            )
+        observation = _json_object(session.actor.invoke(event.tool_name, arguments))
+        observations[event.seq] = observation
+        trace.append(TraceEvent(event.seq, event.tool_name, arguments, observation))
+    return tuple(trace)
 
 
 def _member_action_order(
