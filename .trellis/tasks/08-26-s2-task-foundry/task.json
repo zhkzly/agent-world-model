@@ -41,7 +41,7 @@
     ".trellis/spec/backend/v2-preparation.md",
     ".trellis/spec/backend/v2-qualification-publication.md"
   ],
-  "notes": "Latest Git successor Core e40f9e03... (Semantics e705dbeb..., Verifier cf2c2258...) passed production Qualification with 19 cases and 2 mutants after fixing exact refusal->history->status reopen semantics. Prior Release 3ee01aed... and its five Atom packs remain immutable diagnostic evidence but are superseded for final-floor accounting. v6 Publication and fresh admission are next; no v6 TaskPack is claimed. Direct S1 coordinator and Checkpoint G remain incomplete.",
+  "notes": "Git v6 Core e40f9e03... passed 19-case Qualification and published immutable Release f4a5f29c... with audit/ZIP/cold Consumer proof. Four v6 Atom packs are sealed (two query, protected refusal, missing refusal). Prior Release 3ee01aed... and packs are diagnostic only. Remaining Atom/ForEach/If admission, direct S1 coordinator and Checkpoint G remain incomplete.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "capability-start-checker-instruction-witness-admission",
@@ -62,6 +62,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "checkpoint_f_v6_qualification_complete_publication_pending"
+    "implementation_checkpoint": "checkpoint_f_v6_four_atom_packs"
   }
 }

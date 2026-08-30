@@ -142,5 +142,9 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
   Core `e40f9e03e010e54493633cb4ca06c80b99b74e4eb0f982e12de6e08019bf5589`,
   Semantics `e705dbeb...`, Verifier `cf2c2258...`, 19 cases and 2 mutants.
 - Release `3ee01aed...` and its five admitted Atom packs remain immutable
-  diagnostic evidence but are superseded for final-floor accounting. v6
-  Publication and fresh admission are next; no v6 TaskPack is claimed yet.
+  diagnostic evidence but are superseded for final-floor accounting.
+- v6 Release `f4a5f29c4fdc5c08a7fd9b189b5a9498646a19c5bcaaf2140400f016bccfb706`
+  passed Publication, audit replay, ZIP relocation and cold Consumer use.
+- Four v6 Atom TaskPacks are currently sealed: query MAINTAINERS `a7ca1403...`,
+  query notes `643ef3da...`, protected refusal `6ddaa6f0...`, and missing
+  refusal `a082ccb5...`. Remaining Atom/ForEach/If admission is open.
