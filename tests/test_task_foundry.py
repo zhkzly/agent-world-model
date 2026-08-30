@@ -487,6 +487,35 @@ def test_wrong_target_selection_prefers_same_capability_then_shared_workflow() -
     assert selected == shared_workflow
 
 
+def test_wrong_target_selection_prefers_closest_public_descriptor() -> None:
+    current = replace(
+        _task(),
+        public_descriptor={"operation": "update", "path": "one", "content": "value"},
+    )
+    distant = replace(
+        current,
+        semantic_key="create:one",
+        public_descriptor={"operation": "create", "path": "one", "content": None},
+    )
+    close = replace(
+        current,
+        semantic_key="update:two",
+        public_descriptor={"operation": "update", "path": "two", "content": "value"},
+    )
+    capabilities = {
+        current.capability_id: SimpleNamespace(
+            workflow_ids=("workflow-1",),
+            task_kind="process",
+        )
+    }
+    selected = task_foundry_module._select_wrong_target_task(
+        current,
+        (current, distant, close),
+        capabilities,  # type: ignore[arg-type]
+    )
+    assert selected == close
+
+
 def test_collateral_selection_requires_a_disjoint_state_change_workflow() -> None:
     current = _task()
     shared_state_change = replace(

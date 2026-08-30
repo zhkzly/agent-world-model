@@ -1562,13 +1562,19 @@ def _select_wrong_target_task(
                 capability_id=item.capability_id,
             )
 
-    def rank(item: AtomTask) -> tuple[int, int, int, str, str, str]:
+    def rank(item: AtomTask) -> tuple[int, int, int, int, str, str, str]:
         candidate = capabilities[item.capability_id]
         shared_workflow = bool(set(current.workflow_ids) & set(candidate.workflow_ids))
+        shared_descriptor_fields = sum(
+            1
+            for name, value in task.public_descriptor.items()
+            if item.public_descriptor.get(name) == value
+        )
         return (
             int(item.capability_id != task.capability_id),
             int(not shared_workflow),
             int(candidate.task_kind != current.task_kind),
+            -shared_descriptor_fields,
             item.capability_id,
             item.semantic_key,
             item.task_id,
