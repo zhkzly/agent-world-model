@@ -338,3 +338,33 @@ semantics digest
 with three sealed obligations. This is live B1 contract evidence only: it is
 not a new qualified Release and does not complete TaskSpecification/V0 or
 Checkpoint B.
+
+## Checkpoint B2 execution evidence — proposal, semantic freeze and V0
+
+Implemented one common `CandidateTaskProposal/1` plus parameterized
+`TaskSemanticSection` and bounded `VerifierBundle`. The compiler recomputes
+potential obligation coverage from S1; both an omitted and an invented
+obligation fail before witness search. Sampler/evidence lineage changes proposal
+identity but is excluded from Task truth.
+
+Real SQLite execution used the existing Actor and fresh mutually blind generated
+projects. Semantics Author initially misclassified a late charge as eligible;
+one physical finding repaired the same thread by adding deadline-vs-as-of
+eligibility. Final generated digests:
+
+- Semantics: `8938f6a464e80b49f00e992c867219bd8df847ae0a7633fdcb8318317411865a`;
+- Native Auditor: `9b7cf4ed9eb2d581c4d370bf3b8406a9c5c2eb1c9d2aaefc0ff38fc7e99dc5a8`.
+
+Qualification Core
+`fe27cdf020f72b958484af7aa9736e1325add21ab6bc3a84f15716a6f42e492e`
+passed one real capability case and published Release
+`de769cdd07ae22ed7eb63218a294c840ea6feb08434d0a3bba13ee0c8a12cb41`.
+Cold preparation then compiled direct proposal
+`3bffb3c612032ad2a3dfacdfe7f48313fa325d3b48c0ec8c4a5c6dee75f00a3c`
+twice to semantic digest
+`c63e4941da5f0aabe31917f1a33ae4a3f1c7480dd15e15f1a0d91dba63fa61e8`
+and V0 ID
+`d1c1cdfb8e4360f4046d24dd0da9fffe984b9d52c2776563baf9b75113133d25`.
+
+This does not complete Checkpoint B: concrete public binding,
+PublicClosureEvidence and a newly published Git conformance Release remain.
