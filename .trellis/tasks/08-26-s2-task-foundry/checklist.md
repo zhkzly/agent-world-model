@@ -4,13 +4,13 @@
   EnvironmentRelease, with Graph/Programmatic explicitly optional?
 - [x] Does the production API compile candidates, deduplicate structures,
   execute admission and persist both TaskPacks and typed rejections?
-- [ ] Is every admitted Task publicly solvable twice on fresh instances with
+- [x] Is every admitted Task publicly solvable twice on fresh instances with
   all acting-time operands grounded in instruction/reset/tool observations?
 - [ ] Does deterministic verification reject applicable no-op, wrong target,
   partial, collateral and wrong-answer cases without matching one witness path?
-- [ ] Are reset/reload, dynamic binding rediscovery and episode isolation
+- [x] Are reset/reload, dynamic binding rediscovery and episode isolation
   physically demonstrated rather than inferred from green unit tests?
-- [ ] Does semantic dedup distinguish real Goal/condition/selector differences
+- [x] Does semantic dedup distinguish real Goal/condition/selector differences
   while treating paraphrases and entity swaps as the same structure?
 - [ ] Are TaskAssessment and CorpusManifest downstream of Task validity and
   incapable of changing TaskPack truth or identity?

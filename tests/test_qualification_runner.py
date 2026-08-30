@@ -50,6 +50,31 @@ def test_noop_qualification_accepts_unchanged_collateral_but_not_task_completion
         assert caught.value.code == "qualification_case_outcome_invalid"
 
 
+def test_answer_source_evidence_is_required_only_for_a_satisfied_positive_case() -> None:
+    failed = AtomCheckResult(
+        initially_satisfied=False,
+        satisfied=False,
+        required_effects_ok=True,
+        collateral_ok=True,
+        answer_ok=False,
+        process_ok=False,
+        report_values={"code": "PATH_NOT_FOUND"},
+        failure_codes=("PROCESS_EVIDENCE_MISSING",),
+    )
+    passed = replace(
+        failed,
+        satisfied=True,
+        answer_ok=True,
+        process_ok=True,
+        failure_codes=(),
+    )
+    verifier = NativeVerificationResult(True, True, ())
+
+    assert runner_module._answer_evidence_required("positive", passed, verifier)
+    assert not runner_module._answer_evidence_required("positive", failed, verifier)
+    assert not runner_module._answer_evidence_required("noop", failed, verifier)
+
+
 def test_qualification_budget_is_bounded_and_positive() -> None:
     budget = QualificationBudget(
         start_seed=7,

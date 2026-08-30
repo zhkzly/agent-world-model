@@ -174,3 +174,45 @@ of treating aggregate `satisfied=false` as sufficient negative evidence.
 Checkpoint 3 therefore remains open until S1 Qualification rejects such
 axis-conflated semantics, a corrected SQLite release is published, and real
 mutation/condition TaskPacks pass the unchanged S2 gates.
+
+## S1 noop Qualification correction and refreshed releases
+
+S1 Qualification now seals one deterministic physical `noop` and one real
+positive case per capability. TaskSemantics and the mutually blind Native
+Verifier must agree on required-effect/collateral axes; unchanged state must
+keep collateral true even when the required effect is absent. Failed public
+positive episodes are attributed before AnswerField source evidence, so policy
+failure is not misreported as generated-code corruption.
+
+The old evidence/2 releases are fail-closed and no compatibility reader exists.
+Fresh releases are:
+
+- SQLite release
+  `64fa07e1a144536df2ae3ff9b0cf30175e8b0f913f1e34d8731b8377a80ebb87`:
+  4 noop + 4 positive cases, receipt
+  `46619aaad44ed5e09b1dc620738b5363b4f1c7fae0458a7fa6cbfb6731936292`;
+- Git release
+  `14331ac6e82e0ac79382d5c5e964c62f6cc9ece506f726299d0645594fbafe80`:
+  6 noop + 6 positive cases, receipt
+  `a2db5637233f1825bd806d3824f100e42ac3476f0a00d6ac05f5fc280950b9ac`.
+
+The SQLite Semantics Author and Git Native Verifier remained role-separated.
+The former fixed axis independence; the latter learned to resolve a noop target
+from the public descriptor when trace is intentionally empty. Framework owned
+both verdicts.
+
+Unchanged S2 gates then produced:
+
+- Git run
+  `f30da63ad2774cb34553e85cf95e6f0bd5c11227a25eec84dce63eed1a61aef3`:
+  20 candidates, 16 structures, 3 admitted, 2 recorded witness failures;
+- SQLite run
+  `f7ef8e02885b0e4961c65edab3e27742d7e45fed31641c933bc04418939dc2b0`:
+  12 candidates, 8 structures, Atom + ForEach + If admitted, one separately
+  admitted `CAP-SUBMIT-DISPUTE` branch dependency, and 2 recorded If failures.
+
+This closes the upstream mutation/condition blocker. Checkpoint 3 remains open
+only for the final admission audit: freeze an explicit collateral
+applicable/non-applicable disposition and independently challenge a complete
+ForEach wrong answer where constructible. No CompositionRule exists in either
+release, so All remains honestly unsupported rather than fabricated.

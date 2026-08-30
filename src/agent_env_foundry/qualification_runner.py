@@ -702,6 +702,14 @@ def _same_json(left: Any, right: Any) -> bool:
         return False
 
 
+def _answer_evidence_required(
+    category: str,
+    semantic: AtomCheckResult,
+    verifier: NativeVerificationResult,
+) -> bool:
+    return category == "positive" and semantic.satisfied and verifier.satisfied
+
+
 def _evaluate(
     harness: _QualificationHarness,
     category: str,
@@ -772,10 +780,11 @@ def _evaluate(
             trace,
             semantics_result.report_values,
         )
-        if category == "positive"
+        if _answer_evidence_required(category, semantics_result, verifier_result)
         else ()
     )
-    validate_qualification_case_outcome(category, semantics_result, verifier_result)
+    if category != "positive":
+        validate_qualification_case_outcome(category, semantics_result, verifier_result)
     return _EvaluatedCase(
         category,
         capability,

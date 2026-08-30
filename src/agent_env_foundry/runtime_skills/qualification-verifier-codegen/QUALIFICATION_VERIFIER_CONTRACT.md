@@ -38,6 +38,13 @@ checkers, Tasks, reference solutions, or verdicts. Resolve the intended native
 referent from the public descriptor and trace. If that is impossible without a
 hidden identifier, return a structured failure instead of guessing.
 
+The public trace may be empty for a physical no-op case. When the public
+descriptor already identifies the selected referent, an empty trace must not
+turn that referent into `UNRESOLVED`. Evaluate the unchanged before/after state:
+the required effect may be absent, while `collateral_ok` remains independently
+true when no prohibited native state changed. Diagnostic tests must cover this
+case for every state-changing capability.
+
 Every trace event has `seq`, `tool_name`, `arguments`, and the exact public
 `observation`. Trace may identify the selected attempted operation, but this
 verifier must not become a second public-answer or process evaluator.
