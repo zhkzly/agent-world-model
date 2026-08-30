@@ -324,7 +324,7 @@ When reload is required, AdmissionEvidence contains one Host-produced section:
 
 ```text
 ReloadEvidence/1
-  release_id, task_id, witness_id
+  release_id, task_id, attempt_id       # generated before execution; no witness hash cycle
   native_instance_id                 # assigned before creating its directory
   acting_session_id
   reopened_session_id                # distinct session, same native_instance_id

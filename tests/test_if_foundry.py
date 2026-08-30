@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.fixtures.fx_task_execution import reload_evidence
 
 import agent_env_foundry.if_foundry as if_module
 from agent_env_foundry.if_foundry import (
@@ -74,6 +75,7 @@ def _witness(task: IfTask, materialization_id: str) -> IfWitness:
     return IfWitness(
         task.task_id,
         materialization_id,
+        reload_evidence(task.task_id, materialization_id),
         {},
         (),
         {},
@@ -124,6 +126,15 @@ def test_if_task_binds_condition_branch_and_two_fresh_witnesses() -> None:
         plan,
         (_witness(task, "c" * 64), _witness(task, "d" * 64)),
     )
+    assert solved.witnesses[0].to_document()["format"] == "if-witness/2"
+    with pytest.raises(TaskFoundryError, match="reload evidence"):
+        replace(
+            solved.witnesses[0],
+            reload_evidence=replace(
+                solved.witnesses[0].reload_evidence,
+                task_id="f" * 64,
+            ),
+        )
     assert solved.to_document()["format"] == "solved-if-task/1"
     assert solved.to_document()["admission_plan"]["plan_id"] == plan.plan_id
 

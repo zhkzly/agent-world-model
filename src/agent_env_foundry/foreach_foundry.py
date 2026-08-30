@@ -24,6 +24,7 @@ from agent_env_foundry.semantics import (
     StartCase,
     TraceEvent,
 )
+from agent_env_foundry.task_execution import ReloadEvidence, run_public_attempt
 from agent_env_foundry.task_foundry import (
     AtomTask,
     TaskFoundryError,
@@ -114,6 +115,7 @@ class ForEachAdmissionPlan:
 class ForEachWitness:
     task_id: str
     materialization_id: str
+    reload_evidence: ReloadEvidence
     reset_observation: JSONValue
     trace: tuple[TraceEvent, ...]
     final_answer: JSONObject
@@ -122,15 +124,26 @@ class ForEachWitness:
     provider_turns: int
     usage: tuple[JSONObject | None, ...]
 
+    def __post_init__(self) -> None:
+        if (
+            self.reload_evidence.task_id != self.task_id
+            or self.reload_evidence.acting_session_id != self.materialization_id
+        ):
+            raise TaskFoundryError(
+                "foreach_witness_reload_evidence_mismatch",
+                "ForEach witness reload evidence belongs to another Task or session",
+            )
+
     @property
     def witness_id(self) -> str:
         return hashlib.sha256(canonical_bytes(self.to_document())).hexdigest()
 
     def to_document(self) -> JSONObject:
         return {
-            "format": "foreach-witness/1",
+            "format": "foreach-witness/2",
             "task_id": self.task_id,
             "materialization_id": self.materialization_id,
+            "reload_evidence": self.reload_evidence.to_document(),
             "reset_observation": _json(self.reset_observation),
             "trace": [item.to_document() for item in self.trace],
             "final_answer": _json_object(self.final_answer),
@@ -537,38 +550,41 @@ def run_foreach_task_once(
 
     _verify_task(prepared, task)
     selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
-    instance = Path(instance_root)
-    with prepared.open(instance) as session:
-        reset = session.actor.reset(task.start_case.reset_input)
-        before = session.trusted.inspect(instance)
-        bindings = _resolve_complete_selection(session, task, before)
-        tool_specs = session.actor.tools()
-        episode = run_public_episode(
-            actor=session.actor,
-            instruction=task.instruction,
-            reset_observation=reset,
-            tool_specs=tool_specs,
-            answer_schema=task.answer_schema,
-            route=selected_route,
-            max_provider_turns=max_provider_turns,
-        )
-        answers = episode.final_answer.get("results")
+
+    def preflight(
+        session: OpenPreparedSession,
+        before: JSONValue,
+    ) -> tuple[BindingCandidate, ...]:
+        return _resolve_complete_selection(session, task, before)
+
+    with run_public_attempt(
+        prepared,
+        Path(instance_root),
+        task_id=task.task_id,
+        start_input=task.start_case.reset_input,
+        instruction=task.instruction,
+        answer_schema=task.answer_schema,
+        preflight=preflight,
+        route=selected_route,
+        max_provider_turns=max_provider_turns,
+    ) as attempt:
+        bindings = attempt.preflight_value
+        answers = attempt.episode.final_answer.get("results")
         if not isinstance(answers, list) or len(answers) != len(bindings):
             raise TaskFoundryError(
                 "foreach_answer_count_mismatch",
                 "ForEach final answer does not cover the complete ordered selection",
             )
-        after = session.trusted.inspect(instance)
         contexts = _contexts(task, bindings)
         results = tuple(
             _evaluate_report_atom(
-                session,
+                attempt.evaluation_session,
                 AtomCheckRequest(
                     task.capability_id,
-                    before,
-                    after,
+                    attempt.before_facts,
+                    attempt.post_reopen_facts,
                     binding.protected_binding,
-                    episode.trace,
+                    attempt.episode.trace,
                     answers[position],
                     contexts[position],
                 ),
@@ -576,24 +592,27 @@ def run_foreach_task_once(
             )
             for position, binding in enumerate(bindings)
         )
-        return ForEachWitness(
-            task.task_id,
-            session.identity.materialization_id,
-            _json(reset),
-            episode.trace,
-            episode.final_answer,
-            resolve_argument_provenance(
-                trace=episode.trace,
-                instruction_values={
-                    "selected_targets": [_json_object(item) for item in task.public_descriptors]
-                },
-                reset_observation=reset,
-                tool_specs=tool_specs,
-            ),
-            results,
-            episode.provider_turns,
-            episode.usage,
-        )
+        attempt.record_checker_result({"member_results": [item.to_document() for item in results]})
+    assert attempt.reload_evidence is not None
+    return ForEachWitness(
+        task.task_id,
+        attempt.acting_session_id,
+        attempt.reload_evidence,
+        _json(attempt.reset_observation),
+        attempt.episode.trace,
+        attempt.episode.final_answer,
+        resolve_argument_provenance(
+            trace=attempt.episode.trace,
+            instruction_values={
+                "selected_targets": [_json_object(item) for item in task.public_descriptors]
+            },
+            reset_observation=attempt.reset_observation,
+            tool_specs=attempt.tool_specs,
+        ),
+        results,
+        attempt.episode.provider_turns,
+        attempt.episode.usage,
+    )
 
 
 def challenge_foreach_partials(

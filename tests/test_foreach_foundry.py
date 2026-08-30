@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.fixtures.fx_task_execution import reload_evidence
 
 import agent_env_foundry.foreach_foundry as foreach_module
 from agent_env_foundry.foreach_foundry import (
@@ -90,6 +91,7 @@ def _witness(task: ForEachTask, materialization_id: str) -> ForEachWitness:
     return ForEachWitness(
         task.task_id,
         materialization_id,
+        reload_evidence(task.task_id, materialization_id),
         {},
         (),
         {"results": [{}, {}]},
@@ -132,6 +134,15 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
         plan,
         (_witness(task, "c" * 64), _witness(task, "d" * 64)),
     )
+    assert solved.witnesses[0].to_document()["format"] == "foreach-witness/2"
+    with pytest.raises(TaskFoundryError, match="reload evidence"):
+        replace(
+            solved.witnesses[0],
+            reload_evidence=replace(
+                solved.witnesses[0].reload_evidence,
+                task_id="f" * 64,
+            ),
+        )
     assert solved.to_document()["format"] == "solved-foreach-task/1"
     assert solved.to_document()["admission_plan"]["plan_id"] == plan.plan_id
 

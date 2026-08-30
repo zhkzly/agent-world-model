@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from typing import Literal
 
 import pytest
+from tests.fixtures.fx_task_execution import reload_evidence
 
 from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.assessment import (
@@ -33,7 +34,7 @@ def _run(index: int, *, satisfied: bool) -> AssessmentRun:
         trial_index=index,
         status="satisfied" if satisfied else "failed",
         materialization_id=("1" if satisfied else "2") * 64,
-        evidence={"format": "atom-witness/1", "trial": index},
+        evidence={"format": "atom-witness/2", "trial": index},
         provider_turns=index,
         input_tokens=10 * index,
         output_tokens=5 * index,
@@ -186,6 +187,7 @@ def test_assessment_records_checker_failure_without_weakening_task(
             AtomWitness(
                 task.task_id,
                 "1" * 64,
+                reload_evidence(task.task_id, "1" * 64),
                 {},
                 (),
                 {},
@@ -197,6 +199,7 @@ def test_assessment_records_checker_failure_without_weakening_task(
             AtomWitness(
                 task.task_id,
                 "2" * 64,
+                reload_evidence(task.task_id, "2" * 64),
                 {},
                 (),
                 {},

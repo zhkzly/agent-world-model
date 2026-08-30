@@ -31,6 +31,7 @@ from agent_env_foundry.semantics import (
     StartCase,
     TraceEvent,
 )
+from agent_env_foundry.task_execution import ReloadEvidence, run_public_attempt
 
 _ATOM_CHALLENGE_CATEGORIES = (
     "no_op",
@@ -81,6 +82,7 @@ class AtomTask:
 class AtomWitness:
     task_id: str
     materialization_id: str
+    reload_evidence: ReloadEvidence
     reset_observation: JSONValue
     trace: tuple[TraceEvent, ...]
     final_answer: JSONObject
@@ -90,6 +92,14 @@ class AtomWitness:
     usage: tuple[JSONObject | None, ...]
 
     def __post_init__(self) -> None:
+        if (
+            self.reload_evidence.task_id != self.task_id
+            or self.reload_evidence.acting_session_id != self.materialization_id
+        ):
+            raise TaskFoundryError(
+                "witness_reload_evidence_mismatch",
+                "Atom witness reload evidence belongs to another Task or acting session",
+            )
         if not is_json_value(self.reset_observation):
             raise TaskFoundryError(
                 "witness_reset_not_json",
@@ -111,9 +121,10 @@ class AtomWitness:
 
     def to_document(self) -> JSONObject:
         return {
-            "format": "atom-witness/1",
+            "format": "atom-witness/2",
             "task_id": self.task_id,
             "materialization_id": self.materialization_id,
+            "reload_evidence": self.reload_evidence.to_document(),
             "reset_observation": _json(self.reset_observation),
             "trace": [item.to_document() for item in self.trace],
             "final_answer": _json_object(self.final_answer),
@@ -634,10 +645,11 @@ def run_atom_task_once(
             "Atom Task belongs to another release",
         )
     selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
-    instance = Path(instance_root)
-    with prepared.open(instance) as session:
-        reset = session.actor.reset(task.start_case.reset_input)
-        before = session.trusted.inspect(instance)
+
+    def preflight(
+        session: OpenPreparedSession,
+        before: JSONValue,
+    ) -> BindingCandidate:
         capabilities = {item.capability_id: item for item in session.trusted.capabilities()}
         if task.capability_id not in capabilities:
             raise TaskFoundryError(
@@ -646,26 +658,29 @@ def run_atom_task_once(
             )
         binding = _resolve_binding(session, task, before)
         _verify_checker_preimage(prepared, task)
-        tool_specs = session.actor.tools()
-        episode = run_public_episode(
-            actor=session.actor,
-            instruction=task.instruction,
-            reset_observation=reset,
-            tool_specs=tool_specs,
-            answer_schema=task.answer_schema,
-            route=selected_route,
-            max_provider_turns=max_provider_turns,
-        )
-        after = session.trusted.inspect(instance)
+        return binding
+
+    with run_public_attempt(
+        prepared,
+        Path(instance_root),
+        task_id=task.task_id,
+        start_input=task.start_case.reset_input,
+        instruction=task.instruction,
+        answer_schema=task.answer_schema,
+        preflight=preflight,
+        route=selected_route,
+        max_provider_turns=max_provider_turns,
+    ) as attempt:
+        binding = attempt.preflight_value
         result = _evaluate_report_atom(
-            session,
+            attempt.evaluation_session,
             AtomCheckRequest(
                 task.capability_id,
-                before,
-                after,
+                attempt.before_facts,
+                attempt.post_reopen_facts,
                 binding.protected_binding,
-                episode.trace,
-                episode.final_answer,
+                attempt.episode.trace,
+                attempt.episode.final_answer,
                 _context(
                     task.capability_id,
                     binding.semantic_key,
@@ -674,14 +689,17 @@ def run_atom_task_once(
             ),
             task.answer_schema,
         )
-        return _witness(
-            task,
-            session.identity.materialization_id,
-            reset,
-            tool_specs,
-            episode,
-            result,
-        )
+        attempt.record_checker_result(result.to_document())
+    assert attempt.reload_evidence is not None
+    return _witness(
+        task,
+        attempt.acting_session_id,
+        attempt.reload_evidence,
+        attempt.reset_observation,
+        attempt.tool_specs,
+        attempt.episode,
+        result,
+    )
 
 
 def challenge_atom_task(
@@ -1287,6 +1305,7 @@ def _context(
 def _witness(
     task: AtomTask,
     materialization_id: str,
+    reload_evidence: ReloadEvidence,
     reset_observation: JSONValue,
     tool_specs: tuple[ToolSpec, ...],
     episode: PublicEpisodeRun,
@@ -1295,6 +1314,7 @@ def _witness(
     return AtomWitness(
         task.task_id,
         materialization_id,
+        reload_evidence,
         _json(reset_observation),
         episode.trace,
         episode.final_answer,

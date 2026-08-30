@@ -202,3 +202,80 @@ closed:
 
 Independent verdict: `ALLOW`. No code was reviewed as implementing these future
 stages. Checkpoint A may begin only after explicit user acceptance.
+
+## Checkpoint A activated — physical lifecycle and ReloadEvidence
+
+User explicitly accepted implementation. This slice is limited to one reusable
+attempt lifecycle used by Atom/ForEach/If and assessment:
+
+```text
+open acting session -> reset once -> public episode -> inspect -> close
+-> open a distinct session on the same native instance without reset
+-> inspect -> trusted checker -> close
+```
+
+Selected design:
+
+- every new witness/assessment attempt evaluates after a real reopen; a later
+  TaskSpecification decides whether reload is also a user-required process
+  predicate;
+- ReloadEvidence binds a pre-generated attempt_id rather than witness_id, avoiding
+  an identity hash cycle;
+- lifecycle events and facts/checker digests are Host-generated and included in
+  each witness; no absolute temporary path is identity;
+- one shared lifecycle module owns ordering; Goal modules own only preflight and
+  checker evaluation.
+- challenge episodes remain explicitly owned by Checkpoint E and are not claimed
+  complete by this slice.
+
+Rejected alternatives:
+
+- three duplicated close/reopen implementations;
+- a reload feature flag selecting old/new execution paths;
+- writing a cold reader for the provisional current TaskPack format;
+- treating Graph state-enablement or instruction wording as reload authority.
+
+Evidence that would reverse this design: a qualified release whose legitimate
+TaskSemantics cannot survive close/open of the same reset instance despite S1's
+replay/persistence contract. Such a failure is an upstream Environment/Start
+defect, not permission to restore same-process checking.
+
+## Checkpoint A execution evidence — GREEN
+
+Implemented one shared Host-owned lifecycle and `ReloadEvidence/1`; Atom,
+ForEach and If positive witnesses plus model-relative assessment now evaluate
+through a distinct reopened session on the same native instance. Witness formats
+bind the evidence as `atom/foreach/if-witness/2`. Challenge episode migration
+remains Checkpoint E scope.
+
+Deterministic evidence:
+
+- 353 tests, Ruff, formatting, Mypy, lock and diff checks pass;
+- ReloadEvidence rejects same-session reuse, lifecycle reordering/second reset,
+  another native instance and missing post-reopen checker;
+- one initially toothless same-session test caused mutation-license rejection;
+  the test was corrected before implementation acceptance;
+- four ReloadEvidence enforcement mutants and one witness-binding mutant for
+  each Goal module were killed and restored GREEN.
+
+Real physical evidence:
+
+- SQLite state-change Task `1bfe37441b10657d9db0f42bbe87217bfc82ed1ba173c24f4f1d42530d8a42b5`
+  produced two successful fresh reload witnesses. One earlier public-policy
+  attempt failed `public_witness_failed` and remains part of the honest run
+  record; no gate was weakened or failure relabelled.
+- second retained SQLite witness:
+  `bd74390287054400c9e065859bf7a27d88e519432cdfc2b22d9330b5e022ad51`;
+  acting/reopened sessions differ and pre-close/post-reopen facts match.
+- Git query Task `10d1cd1aa6e47da993becd9c649f3283b69ffba330f6b6f8263004ffb93c7b37`
+  passed two fresh reload attempts with witness IDs
+  `aff84610c3cb75c36041c72bbe4bedcf8fc031a0da63933e530f2bdcfb09fb76`
+  and `47c454fbe0b2ab1e5497c82f957359b060ad67ce756738cf8be338f25c97144a`.
+- real SQLite ForEach witness
+  `d6a4d907d7d745b151efa22e31067acacdb44dc047ecb5d3ac853e252d58705e`
+  and If/refusal witness
+  `e13e34c9026c53793ca065f27db11a991a350b9364d5a5e449e8d99fd368b9b6`
+  both passed after physical reopen with persisted facts.
+
+Generated run details are retained under `.artifacts/checkpoint-a/` and remain
+non-authoritative generated evidence rather than source code.

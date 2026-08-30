@@ -50,7 +50,9 @@ open -> reset -> public episode -> close
 -> reopen same instance -> trusted inspect/evaluate -> close
 ```
 
-- use that lifecycle for admission and assessment rather than duplicating it;
+- use that lifecycle for positive witnesses and assessment rather than
+  duplicating it; Checkpoint E migrates applicable challenge episodes before
+  final admission seal;
 - retain the current SQLite TaskPack only as a gold rejected behavior trace, not
   as a format the new code must support.
 

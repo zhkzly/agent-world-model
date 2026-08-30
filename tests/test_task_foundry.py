@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.fixtures.fx_task_execution import reload_evidence
 
 import agent_env_foundry.task_foundry as task_foundry_module
 from agent_env_foundry.environment import ToolSpec
@@ -68,6 +69,7 @@ def _witness(task: AtomTask, materialization_id: str, *, satisfied: bool = True)
     return AtomWitness(
         task.task_id,
         materialization_id,
+        reload_evidence(task.task_id, materialization_id),
         {},
         (),
         {},
@@ -103,6 +105,12 @@ def test_atom_task_and_witness_identities_bind_frozen_content() -> None:
     assert task.task_id != replace(task, instruction="Different instruction").task_id
     witness = _witness(task, "b" * 64)
     assert witness.witness_id
+    assert witness.to_document()["format"] == "atom-witness/2"
+    with pytest.raises(TaskFoundryError, match="reload evidence"):
+        replace(
+            witness,
+            reload_evidence=replace(witness.reload_evidence, task_id="f" * 64),
+        )
     plan = _plan(task)
     solved = SolvedAtomTask(task, plan, (witness, _witness(task, "c" * 64)))
     assert solved.to_document()["format"] == "solved-atom-task/1"
@@ -134,6 +142,7 @@ def test_product_witness_builder_attaches_argument_provenance() -> None:
     witness = task_foundry_module._witness(
         task,
         "b" * 64,
+        reload_evidence(task.task_id, "b" * 64),
         {},
         (tool,),
         episode,

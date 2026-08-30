@@ -11,19 +11,20 @@ from typing import Any, Literal, cast
 from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
-from agent_env_foundry.preparation import OpenPreparedRelease
+from agent_env_foundry.preparation import OpenPreparedRelease, OpenPreparedSession
 from agent_env_foundry.provenance import ArgumentProvenance, resolve_argument_provenance
-from agent_env_foundry.public_agent import run_public_episode
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
     AtomCheckResult,
+    BindingCandidate,
     ConditionCheckRequest,
     ConditionCheckResult,
     ConditionSpec,
     StartCase,
     TraceEvent,
 )
+from agent_env_foundry.task_execution import ReloadEvidence, run_public_attempt
 from agent_env_foundry.task_foundry import (
     AtomTask,
     AtomTaskPack,
@@ -105,6 +106,7 @@ class IfAdmissionPlan:
 class IfWitness:
     task_id: str
     materialization_id: str
+    reload_evidence: ReloadEvidence
     reset_observation: JSONValue
     trace: tuple[TraceEvent, ...]
     final_answer: JSONObject
@@ -114,15 +116,26 @@ class IfWitness:
     provider_turns: int
     usage: tuple[JSONObject | None, ...]
 
+    def __post_init__(self) -> None:
+        if (
+            self.reload_evidence.task_id != self.task_id
+            or self.reload_evidence.acting_session_id != self.materialization_id
+        ):
+            raise TaskFoundryError(
+                "if_witness_reload_evidence_mismatch",
+                "If witness reload evidence belongs to another Task or session",
+            )
+
     @property
     def witness_id(self) -> str:
         return hashlib.sha256(canonical_bytes(self.to_document())).hexdigest()
 
     def to_document(self) -> JSONObject:
         return {
-            "format": "if-witness/1",
+            "format": "if-witness/2",
             "task_id": self.task_id,
             "materialization_id": self.materialization_id,
+            "reload_evidence": self.reload_evidence.to_document(),
             "reset_observation": _json(self.reset_observation),
             "trace": [item.to_document() for item in self.trace],
             "final_answer": _json_object(self.final_answer),
@@ -455,10 +468,11 @@ def run_if_task_once(
     branch_task = _task_by_id(atom_task_universe, task.branch_task_id)
     _verify_checker_preimage(prepared, branch_task)
     selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
-    instance = Path(instance_root)
-    with prepared.open(instance) as session:
-        reset = session.actor.reset(task.start_case.reset_input)
-        before = session.trusted.inspect(instance)
+
+    def preflight(
+        session: OpenPreparedSession,
+        before: JSONValue,
+    ) -> tuple[BindingCandidate, ConditionCheckResult]:
         binding = _resolve_binding(session, branch_task, before)
         condition_result = session.trusted.evaluate_condition(
             ConditionCheckRequest(
@@ -473,26 +487,29 @@ def run_if_task_once(
                 "if_condition_drift",
                 "Fresh If condition selected another branch",
             )
-        tool_specs = session.actor.tools()
-        episode = run_public_episode(
-            actor=session.actor,
-            instruction=task.instruction,
-            reset_observation=reset,
-            tool_specs=tool_specs,
-            answer_schema=task.answer_schema,
-            route=selected_route,
-            max_provider_turns=max_provider_turns,
-        )
-        after = session.trusted.inspect(instance)
+        return binding, condition_result
+
+    with run_public_attempt(
+        prepared,
+        Path(instance_root),
+        task_id=task.task_id,
+        start_input=task.start_case.reset_input,
+        instruction=task.instruction,
+        answer_schema=task.answer_schema,
+        preflight=preflight,
+        route=selected_route,
+        max_provider_turns=max_provider_turns,
+    ) as attempt:
+        binding, condition_result = attempt.preflight_value
         branch_result = _evaluate_report_atom(
-            session,
+            attempt.evaluation_session,
             AtomCheckRequest(
                 task.branch_capability_id,
-                before,
-                after,
+                attempt.before_facts,
+                attempt.post_reopen_facts,
                 binding.protected_binding,
-                episode.trace,
-                episode.final_answer,
+                attempt.episode.trace,
+                attempt.episode.final_answer,
                 _context(
                     task.branch_capability_id,
                     binding.semantic_key,
@@ -501,23 +518,31 @@ def run_if_task_once(
             ),
             task.answer_schema,
         )
-        return IfWitness(
-            task.task_id,
-            session.identity.materialization_id,
-            _json(reset),
-            episode.trace,
-            episode.final_answer,
-            resolve_argument_provenance(
-                trace=episode.trace,
-                instruction_values={"selected_target": task.public_descriptor},
-                reset_observation=reset,
-                tool_specs=tool_specs,
-            ),
-            condition_result,
-            branch_result,
-            episode.provider_turns,
-            episode.usage,
+        attempt.record_checker_result(
+            {
+                "condition_result": condition_result.to_document(),
+                "branch_result": branch_result.to_document(),
+            }
         )
+    assert attempt.reload_evidence is not None
+    return IfWitness(
+        task.task_id,
+        attempt.acting_session_id,
+        attempt.reload_evidence,
+        _json(attempt.reset_observation),
+        attempt.episode.trace,
+        attempt.episode.final_answer,
+        resolve_argument_provenance(
+            trace=attempt.episode.trace,
+            instruction_values={"selected_target": task.public_descriptor},
+            reset_observation=attempt.reset_observation,
+            tool_specs=attempt.tool_specs,
+        ),
+        condition_result,
+        branch_result,
+        attempt.episode.provider_turns,
+        attempt.episode.usage,
+    )
 
 
 def _conditions(catalog: dict[str, Any]) -> tuple[ConditionSpec, ...]:

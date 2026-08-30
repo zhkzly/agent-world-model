@@ -69,6 +69,25 @@ with prepared.open(instance_directory) as session:
 - Structured semantics documents use exact-key decoders and existing constructors;
   no expression language, recipe or executable verifier crosses the wire.
 
+## S2 witness/assessment attempt lifecycle
+
+Every S2 positive witness or model-relative assessment attempt uses one native
+instance and two distinct prepared sessions:
+
+```text
+acting open -> reset once -> public episode -> trusted pre-close inspect -> close
+-> reopen same instance without reset -> trusted inspect/checker -> close
+```
+
+The Host emits `ReloadEvidence/1` with a pre-generated attempt/native-instance
+identity, ordered lifecycle events, distinct session identities, pre-close and
+post-reopen fact digests, and post-reopen checker-result digest. It contains no
+absolute temporary path and cannot reference its enclosing witness ID.
+
+Current negative/challenge episode migration remains owned by the S2 Good Task
+challenge checkpoint; this lifecycle section does not claim those paths are
+already converted.
+
 ## 4. Validation & Error Matrix
 
 | Condition | Result |
@@ -110,6 +129,9 @@ with prepared.open(instance_directory) as session:
 - Checkpoint D: invalid/missing/non-passed receipt rejection before sync.
 - Real frozen sync and real child interpreters for actor plus all six trusted calls.
 - Same-name cross-release non-aliasing and reopen-without-reset persistence.
+- S2 witness/assessment evidence rejects same-session reuse, another native
+  instance, a second reset, missing close, reordered lifecycle and checker
+  evaluation before reopen.
 - Trusted mutation and mutate-then-error both produce an unchanged=false event and rejection.
 - Both import-leak directions, ambient Host import, source and `.pth` tamper.
 - Generated stdout noise, startup attribution, sequence mismatch and real timeout.

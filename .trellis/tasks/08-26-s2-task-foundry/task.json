@@ -31,9 +31,11 @@
     "src/agent_env_foundry/semantics.py",
     "src/agent_env_foundry/release.py",
     "src/agent_env_foundry/assessment.py",
+    "src/agent_env_foundry/task_execution.py",
     "src/agent_env_foundry/_actor_runner.py",
     "src/agent_env_foundry/_semantics_runner.py",
     "tests/test_semantics_contract.py",
+    "tests/test_task_execution.py",
     "tests/v2_release_factory.py",
     "tests/test_release_v2.py",
     "tests/test_preparation.py",
@@ -43,7 +45,7 @@
     ".trellis/spec/backend/v2-qualification-publication.md",
     ".trellis/spec/backend/s2-assessment-corpus.md"
   ],
-  "notes": "Commit 189be1b is a real Git/SQLite Capability-to-Task execution checkpoint, not S2 completion. Independent Good Task review returned REVISE; corrected semantic-authority, process-necessity, canonical proposal and reload-evidence contracts then passed a fresh independent ALLOW review. Checkpoint A awaits explicit user acceptance. Gold failure: a SQLite Task claimed reopen persistence but admission performed only same-process reads.",
+  "notes": "Checkpoint A physical lifecycle/ReloadEvidence is GREEN: 353 tests and real SQLite state-change, Git query, SQLite ForEach/If reopen evidence pass. One public-policy failure was retained honestly. Commit 189be1b remains only the older Capability-to-Task checkpoint; Good Task Checkpoints B-H remain pending.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "release-discovery-task_spec-v0-start-binding-freeze-witness-truth_challenge-taskpack-assessment-corpus",
@@ -69,6 +71,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "good_task_plan_independent_allow_pending_user_acceptance"
+    "implementation_checkpoint": "checkpoint_a_reload_evidence_green"
   }
 }
