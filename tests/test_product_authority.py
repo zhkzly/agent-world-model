@@ -4,14 +4,14 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-S2_TASK = ROOT / ".trellis/tasks/08-26-s2-task-foundry"
+S2_TASK = ROOT / ".trellis/tasks/archive/2026-08/08-26-s2-task-foundry"
 
 
 def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def test_active_s2_authority_keeps_graph_and_programmatic_optional() -> None:
+def test_archived_s2_authority_keeps_graph_and_programmatic_optional() -> None:
     documents = (
         ROOT / "PROJECT.md",
         ROOT / ".trellis/tasks/08-26-foundry-paper-product/prd.md",
@@ -34,8 +34,9 @@ def test_active_s2_authority_keeps_graph_and_programmatic_optional() -> None:
     assert "Optional sampler experiments" in _text(S2_TASK / "implement.md")
 
 
-def test_active_task_and_context_select_only_the_direct_product_path() -> None:
+def test_archived_task_and_context_select_only_the_direct_product_path() -> None:
     task = json.loads(_text(S2_TASK / "task.json"))
+    assert task["status"] == "completed"
     assert task["meta"]["candidate_samplers"] == ["direct"]
     checkpoint = task["meta"]["implementation_checkpoint"]
     assert checkpoint.startswith("direct_")

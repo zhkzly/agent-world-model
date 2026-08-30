@@ -23,3 +23,9 @@
 - Chosen: one attempt per rollout; no SDK/Host automatic retry and no veRL integration.
 - Alternative rejected: preallocated attempt slots and trainer-shaped S3 schemas.
 - Reconsider only after measured S4 evidence creates a separate accepted task.
+
+### 2026-08-31 — baseline harness repair
+
+- Chosen: point the S2 product-authority test to the canonical archived task and run pytest via `python -m`.
+- Alternative rejected: exclude the stale harness tests from every checkpoint gate.
+- Evidence: full collection/path failures while S2 task status is completed under the archive path.

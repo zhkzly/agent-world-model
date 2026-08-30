@@ -836,7 +836,7 @@ UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv lock --check
 UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv run --frozen ruff check src tests
 UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv run --frozen ruff format --check src tests
 UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv run --frozen mypy src
-UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv run --frozen pytest -q
+UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv run --frozen python -m pytest -q
 git diff --check
 ```
 

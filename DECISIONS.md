@@ -136,3 +136,5 @@ accepted Direct sampling plan.
 The violation was allowing the candidate plan to accumulate multi-defect and
 atomic-publication machinery before the user restated the anti-overdesign
 boundary; both were removed before task activation or product implementation.
+
+`s3-baseline-harness|介入0|返工1|archived S2 authority path+python -m pytest|红线违反0`
