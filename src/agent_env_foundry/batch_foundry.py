@@ -48,6 +48,55 @@ FailureKind = Literal[
 type CandidateTask = AtomTask | ForEachTask | IfTask
 _GOAL_ORDER: tuple[GoalKind, ...] = ("atom", "foreach", "if")
 _HEX = frozenset("0123456789abcdef")
+_TASK_PACK_FORMATS: dict[str, tuple[GoalKind, str]] = {
+    "atom-task-pack/4": ("atom", "atom-task/1"),
+    "foreach-task-pack/3": ("foreach", "foreach-task/1"),
+    "if-task-pack/3": ("if", "if-task/1"),
+}
+_TASK_DOCUMENT_KEYS = {
+    "atom-task/1": {
+        "format",
+        "release_id",
+        "start_case",
+        "capability_id",
+        "semantic_key",
+        "public_descriptor",
+        "checker_digest",
+        "instruction",
+        "instruction_digest",
+        "answer_schema",
+    },
+    "foreach-task/1": {
+        "format",
+        "release_id",
+        "start_case",
+        "capability_id",
+        "semantic_keys",
+        "public_descriptors",
+        "selector_id",
+        "checker_digest",
+        "instruction",
+        "instruction_digest",
+        "member_answer_schema",
+        "answer_schema",
+    },
+    "if-task/1": {
+        "format",
+        "release_id",
+        "start_case",
+        "condition_id",
+        "semantic_key",
+        "public_descriptor",
+        "true_capability_id",
+        "false_capability_id",
+        "expected_branch",
+        "branch_task_id",
+        "checker_digest",
+        "instruction",
+        "instruction_digest",
+        "answer_schema",
+    },
+}
 _RETRYABLE_TASK_CODES = frozenset(
     {
         "public_witness_failed",
@@ -67,6 +116,35 @@ class _Pack(Protocol):
     def task_pack_id(self) -> str: ...
 
     def to_document(self) -> JSONObject: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PublicTaskView:
+    task_pack_id: str
+    task_id: str
+    release_id: str
+    goal_kind: GoalKind
+    instruction: str
+    answer_schema: JSONObject
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "public-task-view/1",
+            "task_pack_id": self.task_pack_id,
+            "task_id": self.task_id,
+            "release_id": self.release_id,
+            "goal_kind": self.goal_kind,
+            "instruction": self.instruction,
+            "answer_schema": _object(self.answer_schema),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedTaskView:
+    public: PublicTaskView
+    start_case: JSONObject
+    checker_digest: str
+    task_document: JSONObject
 
 
 @dataclass(frozen=True, slots=True)
@@ -547,7 +625,7 @@ def _persist_pack(output_root: Path, kind: GoalKind, pack: _Pack) -> str:
     return relative.as_posix()
 
 
-def verify_task_pack_artifact(path: Path, task_pack_id: str) -> None:
+def verify_task_pack_artifact(path: Path, task_pack_id: str) -> JSONObject:
     """Cold-read canonical TaskPack bytes and recompute their claimed identity."""
 
     _task_pack_digest(task_pack_id)
@@ -566,7 +644,86 @@ def verify_task_pack_artifact(path: Path, task_pack_id: str) -> None:
             "TaskPack artifact is not canonical JSON",
             task_pack_id=task_pack_id,
         )
-    _validate_task_pack_document(cast(JSONObject, document), task_pack_id)
+    normalized = cast(JSONObject, document)
+    _validate_task_pack_document(normalized, task_pack_id)
+    return _object(normalized)
+
+
+def read_task_pack_artifact(path: Path, task_pack_id: str) -> TrustedTaskView:
+    """Return separate trusted/public projections from one exact current TaskPack."""
+
+    document = verify_task_pack_artifact(path, task_pack_id)
+    if set(document) != {"format", "task", "admission", "task_pack_id"}:
+        raise TaskFoundryError(
+            "task_pack_reader_shape_invalid",
+            "TaskPack top-level shape is invalid",
+        )
+    pack_format = document.get("format")
+    if not isinstance(pack_format, str) or pack_format not in _TASK_PACK_FORMATS:
+        raise TaskFoundryError(
+            "task_pack_reader_format_unsupported",
+            "TaskPack format is not current",
+        )
+    kind, expected_task_format = _TASK_PACK_FORMATS[pack_format]
+    task = _object(document.get("task"))
+    if (
+        task.get("format") != expected_task_format
+        or set(task) != _TASK_DOCUMENT_KEYS[expected_task_format]
+    ):
+        raise TaskFoundryError(
+            "task_pack_reader_task_shape_invalid",
+            "TaskPack Task document has an invalid current shape",
+        )
+    task_id = hashlib.sha256(canonical_bytes(task)).hexdigest()
+    admission = _object(document.get("admission"))
+    if admission.get("task_id") != task_id:
+        raise TaskFoundryError(
+            "task_pack_reader_admission_mismatch",
+            "TaskPack admission belongs to another Task",
+        )
+    release_id = task.get("release_id")
+    checker_digest = task.get("checker_digest")
+    instruction = task.get("instruction")
+    instruction_digest = task.get("instruction_digest")
+    if not all(
+        isinstance(value, str)
+        for value in (release_id, checker_digest, instruction, instruction_digest)
+    ):
+        raise TaskFoundryError(
+            "task_pack_reader_task_shape_invalid",
+            "TaskPack Task identity or instruction fields are invalid",
+        )
+    assert isinstance(release_id, str)
+    assert isinstance(checker_digest, str)
+    assert isinstance(instruction, str)
+    assert isinstance(instruction_digest, str)
+    for value, role in (
+        (task_pack_id, "task_pack_id"),
+        (task_id, "task_id"),
+        (release_id, "release_id"),
+        (checker_digest, "checker_digest"),
+        (instruction_digest, "instruction_digest"),
+    ):
+        _reader_digest(value, role)
+    if hashlib.sha256(instruction.encode()).hexdigest() != instruction_digest:
+        raise TaskFoundryError(
+            "task_pack_reader_instruction_mismatch",
+            "TaskPack instruction differs from its digest",
+        )
+    public = PublicTaskView(
+        task_pack_id,
+        task_id,
+        release_id,
+        kind,
+        instruction,
+        _object(task.get("answer_schema")),
+    )
+    return TrustedTaskView(
+        public,
+        _object(task.get("start_case")),
+        checker_digest,
+        task,
+    )
 
 
 def _validate_task_pack_document(document: JSONObject, task_pack_id: str) -> None:
@@ -595,6 +752,14 @@ def _task_pack_digest(value: str) -> None:
             "task_pack_artifact_identity_invalid",
             "TaskPack artifact identity must be a sha256 digest",
             task_pack_id=value,
+        )
+
+
+def _reader_digest(value: str, role: str) -> None:
+    if len(value) != 64 or any(character not in _HEX for character in value):
+        raise TaskFoundryError(
+            "task_pack_reader_digest_invalid",
+            f"TaskPack {role} must be a sha256 digest",
         )
 
 
@@ -684,7 +849,10 @@ def _object(value: Any) -> JSONObject:
 __all__ = [
     "AdmittedTaskRecord",
     "RejectedTaskRecord",
+    "PublicTaskView",
     "TaskBatchReport",
+    "TrustedTaskView",
+    "read_task_pack_artifact",
     "run_task_foundry_batch",
     "task_structure_id",
     "verify_task_pack_artifact",

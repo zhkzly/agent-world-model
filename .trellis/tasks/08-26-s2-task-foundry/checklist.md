@@ -14,9 +14,9 @@
   while treating paraphrases and entity swaps as the same structure?
 - [x] Are TaskAssessment and CorpusManifest downstream of Task validity and
   incapable of changing TaskPack truth or identity?
-- [ ] Do Git, SQLite and a post-freeze held-out release use the same Framework
+- [x] Do Git, SQLite and a post-freeze held-out release use the same Framework
   without domain branches or weakened Good-Task gates?
-- [ ] Are Graph/Programmatic evaluated only after a demonstrated coverage gap,
+- [x] Are Graph/Programmatic evaluated only after a demonstrated coverage gap,
   under matched budgets, and removable when they add no useful Tasks?
 - [x] Are the old parallel semantic path and all mandatory-sampler authority
   references absent from production code, tests and active Trellis context?

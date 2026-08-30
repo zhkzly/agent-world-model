@@ -69,10 +69,72 @@ passes only when:
 - task kind matches the physical semantic state transition;
 - all authored projects and native instances remain within their mutation roles.
 
-Qualification evidence contains positive cases only and covers every qualified
-capability. Wrong-answer/target, partial, alternative-route, AgentChoice,
+Qualification evidence contains one positive and one physical noop case for
+every qualified capability. Wrong-answer/target, partial, alternative-route, AgentChoice,
 collateral-manufacture, and checker-mutation evidence belongs to Task admission
 or optional paper experiments.
+
+## Scenario: Noop axis qualification
+
+### 1. Scope / Trigger
+
+Every new or repaired release-local TaskSemantics/Native Auditor pair must pass
+this scenario before publication. It prevents effect, collateral and public
+process truth from collapsing into one aggregate boolean.
+
+### 2. Signatures
+
+```python
+validate_qualification_case_outcome(category, semantic, verifier) -> None
+run_v2_qualification(...) -> QualificationReport
+```
+
+### 3. Contracts
+
+- Current evidence format is `qualification-evidence/3`.
+- Each capability contributes exactly one `noop` and at least one `positive`.
+- Noop uses distinct, identically reset before/after native directories, empty
+  public trace and empty final answer.
+- Unchanged state requires `collateral_ok=true`. A state-change effect may be
+  absent; a process/refusal native no-mutation relation may already hold, while
+  `process_ok` remains false and the Task remains unsatisfied.
+- Answer-source occurrences are required only for a satisfied positive case.
+
+### 4. Validation & Error Matrix
+
+| Condition | Error |
+| --- | --- |
+| Semantics/Auditor effect or collateral disagreement | `qualification_reader_disagreement` |
+| noop is satisfied, collateral false, or process true | `qualification_case_outcome_invalid` |
+| any capability lacks noop evidence | `qualification_noop_coverage_missing` |
+| failed positive has no public answer occurrence | attribute `qualification_positive_failed` before source checking |
+
+### 5. Good / Base / Bad Cases
+
+- Good: state change noop is effect=false, collateral=true, process=false.
+- Base: query/refusal noop may have native effect=true but public process=false.
+- Bad: required effect missing automatically sets collateral=false.
+
+### 6. Tests Required
+
+- One-sided Semantics and Auditor collateral mutants must each fail.
+- Evidence sealing/cold reading requires both categories per capability.
+- A failed positive must not be misreported as AnswerField source corruption.
+
+### 7. Wrong vs Correct
+
+Wrong:
+
+```python
+collateral_ok = required_effects_ok
+```
+
+Correct:
+
+```python
+required_effects_ok = required_native_relation(before, after)
+collateral_ok = no_prohibited_unrelated_change(before, after)
+```
 
 ## Receipt
 

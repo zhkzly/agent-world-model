@@ -264,3 +264,51 @@ and recompute their current-format identity after persistence. Relocated copies
 under `/tmp/foundry-cp5-relocation-qz0vTG` independently verified all six
 TaskPacks, six Assessments, two CorpusManifests and two ProductReports. The
 identity-bypass mutant was killed. Checkpoint 5 is closed.
+
+## Held-out transfer and S3-shaped handoff
+
+After freezing Framework code at `93c1de6`, the held-out Need was selected as a
+resettable equipment-maintenance work-order environment. No maintenance-domain
+Framework branch or weaker gate was added.
+
+Physical S1 evidence:
+
+- ResearchReady
+  `9ddb65fc2c561b2288106b5024de51f6fef290b10a9111a513bc213f32a20a17`;
+- actor digest
+  `5d7f2e6604fb1e21e0ced26ec2420ff462636d26fb5a63ca113545c71b747fcc`;
+- Expected TaskSemantics
+  `eb675ad4c28967b501dcf896e92b9b56028f59cf39c217efdd6bdf16ed7b9fb6`;
+- qualified release
+  `7e2c0718a7de84b07261b729cbe12da86e313c75e4aa107d60ede4c2c34e407a`,
+  with 7 noop + 7 positive cases and receipt
+  `ed240f2b5f3d675c6c8a82053b2088447d52da8977b8490a90030d3e77284ed9`.
+
+The first Qualification rejected one process/refusal effect/process axis
+conflation. Only the original release-local Semantics thread received the
+factual finding; the blind Native Verifier and Framework were unchanged.
+
+Frozen Direct compilation produced 10 candidates / 8 structures. Product run
+`6b39060c909e06c74e447c57deca822adbcd48e7eaf02b86a33df81e64b0d00e`
+admitted 3 Tasks with zero rejection and assessment reliability 1.0/1.0/1.0;
+corpus
+`31eb42b31e621c4ba75892f5866222f80055ccca00a0a018788a4f17d32eb14e`
+contains all three unique structures.
+
+The strict current TaskPack reader now returns a trusted Host projection and an
+exact-key `PublicTaskView/1`. Relocated root
+`/tmp/foundry-heldout-handoff-n9uBeF` cold-read the Release, Product, Corpus,
+Assessments and TaskPack. A fresh public episode driven by the view completed in
+2 provider turns and satisfied the protected checker; witness
+`ef1754426db9f0b4526ad782f33e37ef1083a395f03f225f29cd897f99be5d43`.
+
+Two preceding attempts failed before any tool call with provider TLS EOF. The
+fault reproduced on a minimal Responses request and was isolated to
+CLIProxyAPI 7.2.137/7.2.113 startup/TLS behavior. CLIProxyAPI 7.2.97 passed the
+same probe and is now hosted by the active user transient unit
+`cliproxyapi.service`; this infrastructure recovery did not change product
+evidence or Task truth.
+
+Checkpoint 6 and all required S2 checkpoints are closed. Graph/Programmatic
+remain optional experiments because no Direct coverage result demonstrated a
+blocking need for them.

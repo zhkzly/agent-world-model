@@ -282,6 +282,34 @@ def test_task_pack_cold_verifier_recomputes_identity_from_disk(tmp_path: Path) -
     assert raised.value.code == "task_pack_artifact_preimage_mismatch"
 
 
+def test_task_pack_reader_projects_only_the_public_acting_view(tmp_path: Path) -> None:
+    task = _atom("item:secret-key", "public-item")
+    preimage = {
+        "format": "atom-task-pack/4",
+        "task": task.to_document(),
+        "admission": {"task_id": task.task_id},
+    }
+    task_pack_id = hashlib.sha256(canonical_bytes(preimage)).hexdigest()
+    path = tmp_path / "AtomTaskPack.json"
+    path.write_bytes(canonical_bytes({**preimage, "task_pack_id": task_pack_id}))
+
+    loaded = batch_module.read_task_pack_artifact(path, task_pack_id)
+
+    assert set(loaded.public.to_document()) == {
+        "format",
+        "task_pack_id",
+        "task_id",
+        "release_id",
+        "goal_kind",
+        "instruction",
+        "answer_schema",
+    }
+    assert "semantic_key" not in loaded.public.to_document()
+    assert "public_descriptor" not in loaded.public.to_document()
+    assert loaded.start_case == task.start_case.to_document()
+    assert loaded.checker_digest == task.checker_digest
+
+
 def test_batch_reports_dependency_packs_and_progress_events(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

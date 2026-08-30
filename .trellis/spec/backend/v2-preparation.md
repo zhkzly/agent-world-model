@@ -84,9 +84,9 @@ identity, ordered lifecycle events, distinct session identities, pre-close and
 post-reopen fact digests, and post-reopen checker-result digest. It contains no
 absolute temporary path and cannot reference its enclosing witness ID.
 
-Current negative/challenge episode migration remains owned by the S2 Good Task
-challenge checkpoint; this lifecycle section does not claim those paths are
-already converted.
+Action-bearing Atom wrong-target/wrong-answer and ForEach partial/wrong-target/
+wrong-answer challenges use this same lifecycle. Noop remains a separate
+initial-state check because it intentionally executes no public episode.
 
 ## 4. Validation & Error Matrix
 
