@@ -43,8 +43,26 @@ from agent_env_foundry.task_foundry import (
 )
 
 GoalKind = Literal["atom", "foreach", "if"]
+FailureKind = Literal[
+    "NoPublicWitness",
+    "ChallengePolicyFailure",
+    "AdmissionPlanningDefect",
+    "RejectedTaskPack",
+]
 type CandidateTask = AtomTask | ForEachTask | IfTask
 _GOAL_ORDER: tuple[GoalKind, ...] = ("atom", "foreach", "if")
+_RETRYABLE_TASK_CODES = frozenset(
+    {
+        "public_witness_failed",
+        "foreach_public_witness_failed",
+        "if_public_witness_failed",
+        "challenge_baseline_failed",
+        "wrong_target_baseline_failed",
+        "foreach_partial_not_discriminated",
+        "foreach_alternative_order_incomplete",
+        "foreach_alternative_order_not_reversed",
+    }
+)
 
 
 class _Pack(Protocol):
@@ -96,17 +114,23 @@ class RejectedTaskRecord:
     kind: GoalKind
     task_id: str
     structure_id: str
-    failure_type: str
+    attempt_index: int
+    failure_kind: FailureKind
     code: str
     message: str
     details: JSONObject
+
+    def __post_init__(self) -> None:
+        if self.attempt_index <= 0:
+            raise ValueError("attempt_index must be positive")
 
     def to_document(self) -> JSONObject:
         return {
             "kind": self.kind,
             "task_id": self.task_id,
             "structure_id": self.structure_id,
-            "failure_type": self.failure_type,
+            "attempt_index": self.attempt_index,
+            "failure_kind": self.failure_kind,
             "code": self.code,
             "message": self.message,
             "details": _object(self.details),
@@ -117,6 +141,7 @@ class RejectedTaskRecord:
 class TaskBatchReport:
     release_id: str
     target_structures: int
+    candidate_attempt_limit: int
     candidate_count: int
     structure_count: int
     admitted: tuple[AdmittedTaskRecord, ...]
@@ -124,11 +149,18 @@ class TaskBatchReport:
     rejected: tuple[RejectedTaskRecord, ...]
 
     def __post_init__(self) -> None:
+        if self.candidate_attempt_limit <= 0:
+            raise ValueError("candidate_attempt_limit must be positive")
         structure_ids = tuple(item.structure_id for item in self.admitted)
         if len(structure_ids) != len(set(structure_ids)):
             raise TaskFoundryError(
                 "batch_duplicate_structure_admission",
                 "A Task batch admitted the same structure more than once",
+            )
+        if any(item.attempt_index > self.candidate_attempt_limit for item in self.rejected):
+            raise TaskFoundryError(
+                "batch_attempt_evidence_out_of_range",
+                "A rejected Task attempt exceeds the frozen batch attempt limit",
             )
 
     @property
@@ -141,9 +173,10 @@ class TaskBatchReport:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "task-foundry-batch/1",
+            "format": "task-foundry-batch/2",
             "release_id": self.release_id,
             "target_structures": self.target_structures,
+            "candidate_attempt_limit": self.candidate_attempt_limit,
             "candidate_count": self.candidate_count,
             "structure_count": self.structure_count,
             "target_reached": self.target_reached,
@@ -168,12 +201,15 @@ def run_task_foundry_batch(
     target_structures: int,
     route: AgentRoute | None = None,
     max_provider_turns: int = 12,
+    candidate_attempt_limit: int = 3,
     event_sink: Callable[[JSONObject], None] | None = None,
 ) -> TaskBatchReport:
     if target_structures <= 0:
         raise ValueError("target_structures must be positive")
     if max_provider_turns <= 0:
         raise ValueError("max_provider_turns must be positive")
+    if candidate_attempt_limit <= 0:
+        raise ValueError("candidate_attempt_limit must be positive")
     work = Path(work_root)
     output = Path(output_root)
     work.mkdir(parents=True, exist_ok=True)
@@ -188,65 +224,98 @@ def run_task_foundry_batch(
         if len(admitted) >= target_structures:
             break
         for candidate in group.candidates:
-            _emit(
-                event_sink,
-                "candidate_started",
-                candidate,
-                admitted_count=len(admitted),
-            )
-            try:
-                pack = _admit_candidate(
-                    prepared,
+            candidate_admitted = False
+            for attempt_index in range(1, candidate_attempt_limit + 1):
+                _emit(
+                    event_sink,
+                    "candidate_started",
                     candidate,
-                    atom_tasks,
-                    work / "admission" / candidate.kind / candidate.task_id,
-                    output,
-                    route,
-                    max_provider_turns,
-                    atom_cache,
-                    dependencies,
+                    admitted_count=len(admitted),
+                    attempt_index=attempt_index,
                 )
-            except PublicAgentFailure as exc:
-                if exc.kind == "InfrastructureFailure":
+                try:
+                    pack = _admit_candidate(
+                        prepared,
+                        candidate,
+                        atom_tasks,
+                        work
+                        / "admission"
+                        / candidate.kind
+                        / candidate.task_id
+                        / f"attempt-{attempt_index}",
+                        output,
+                        route,
+                        max_provider_turns,
+                        atom_cache,
+                        dependencies,
+                    )
+                except PublicAgentFailure as exc:
+                    if exc.kind == "InfrastructureFailure":
+                        raise
+                    record = _rejection(
+                        candidate,
+                        attempt_index,
+                        "NoPublicWitness",
+                        exc.code,
+                        str(exc),
+                        exc.details,
+                    )
+                    rejected.append(record)
+                    _emit(
+                        event_sink,
+                        "candidate_rejected",
+                        candidate,
+                        rejection=record.to_document(),
+                    )
+                    continue
+                except PreparationExecutionError:
                     raise
-                record = _rejection(candidate, exc.kind, exc.code, str(exc), exc.details)
-                rejected.append(record)
-                _emit(event_sink, "candidate_rejected", candidate, rejection=record.to_document())
-                continue
-            except PreparationExecutionError:
-                raise
-            except TaskFoundryError as exc:
-                record = _rejection(
+                except TaskFoundryError as exc:
+                    failure_kind = _task_failure_kind(exc.code)
+                    record = _rejection(
+                        candidate,
+                        attempt_index,
+                        failure_kind,
+                        exc.code,
+                        str(exc),
+                        exc.details,
+                    )
+                    rejected.append(record)
+                    _emit(
+                        event_sink,
+                        "candidate_rejected",
+                        candidate,
+                        rejection=record.to_document(),
+                    )
+                    if exc.code in _RETRYABLE_TASK_CODES:
+                        continue
+                    break
+                artifact = _persist_pack(output, candidate.kind, pack)
+                admitted.append(
+                    AdmittedTaskRecord(
+                        candidate.kind,
+                        candidate.task_id,
+                        candidate.structure_id,
+                        pack.task_pack_id,
+                        artifact,
+                    )
+                )
+                _emit(
+                    event_sink,
+                    "candidate_admitted",
                     candidate,
-                    type(exc).__name__,
-                    exc.code,
-                    str(exc),
-                    exc.details,
+                    task_pack_id=pack.task_pack_id,
+                    admitted_count=len(admitted),
+                    attempt_index=attempt_index,
                 )
-                rejected.append(record)
-                _emit(event_sink, "candidate_rejected", candidate, rejection=record.to_document())
-                continue
-            artifact = _persist_pack(output, candidate.kind, pack)
-            admitted.append(
-                AdmittedTaskRecord(
-                    candidate.kind,
-                    candidate.task_id,
-                    candidate.structure_id,
-                    pack.task_pack_id,
-                    artifact,
-                )
-            )
-            _emit(
-                event_sink,
-                "candidate_admitted",
-                candidate,
-                task_pack_id=pack.task_pack_id,
-                admitted_count=len(admitted),
-            )
-            break
+                candidate_admitted = True
+                break
+            if candidate_admitted:
+                break
     report = TaskBatchReport(
         prepared.identity.release_id,
         target_structures,
+        candidate_attempt_limit,
         len(candidates),
         len(groups),
         tuple(admitted),
@@ -505,7 +574,8 @@ def _persist_report(output_root: Path, report: TaskBatchReport) -> None:
 
 def _rejection(
     candidate: _Candidate,
-    failure_type: str,
+    attempt_index: int,
+    failure_kind: FailureKind,
     code: str,
     message: str,
     details: Any,
@@ -514,11 +584,32 @@ def _rejection(
         candidate.kind,
         candidate.task_id,
         candidate.structure_id,
-        failure_type,
+        attempt_index,
+        failure_kind,
         code,
         message,
         _safe_details(details),
     )
+
+
+def _task_failure_kind(code: str) -> FailureKind:
+    if code in {
+        "public_witness_failed",
+        "foreach_public_witness_failed",
+        "if_public_witness_failed",
+    }:
+        return "NoPublicWitness"
+    if code in {
+        "challenge_baseline_failed",
+        "wrong_target_baseline_failed",
+        "foreach_partial_not_discriminated",
+        "foreach_alternative_order_incomplete",
+        "foreach_alternative_order_not_reversed",
+    }:
+        return "ChallengePolicyFailure"
+    if code == "foreach_wrong_answer_unavailable":
+        return "AdmissionPlanningDefect"
+    return "RejectedTaskPack"
 
 
 def _safe_details(details: Any) -> JSONObject:

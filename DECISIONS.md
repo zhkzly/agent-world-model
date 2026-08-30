@@ -178,3 +178,5 @@
 `s2-batch-foundry|介入1|返工1|126 candidates→84 structures→20 real admitted packs+13 dependencies+37 attributed rejects+5 mutation licences|红线违反0`
 
 `s2-nullable-wrong-answer|介入0|返工0|null→schema-valid non-null alternative+old physical failure replay+mutation licence|红线违反0`
+
+`s2-bounded-admission-attempts|介入0|返工0|batch/2 frozen 3-attempt budget+fresh roots+typed failure owners+real retry smoke+3 mutation licences|红线违反0`

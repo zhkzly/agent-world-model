@@ -100,6 +100,7 @@ def test_batch_tries_another_parameterization_after_candidate_rejection(
         tmp_path / "work",
         tmp_path / "output",
         target_structures=1,
+        candidate_attempt_limit=1,
     )
 
     assert attempts == [first.task_id, second.task_id]
@@ -107,6 +108,100 @@ def test_batch_tries_another_parameterization_after_candidate_rejection(
     assert len(report.admitted) == 1
     assert len(report.rejected) == 1
     assert report.rejected[0].code == "public_witness_failed"
+    assert report.rejected[0].attempt_index == 1
+
+
+def test_batch_retries_retryable_failure_with_a_fresh_attempt_root(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _atom("item:one", "one")
+    candidate = batch_module._candidate("atom", task)
+    roots: list[Path] = []
+
+    class Pack:
+        task_pack_id = "f" * 64
+
+        def to_document(self) -> dict[str, object]:
+            return {"format": "atom-task-pack/1", "task_pack_id": self.task_pack_id}
+
+    monkeypatch.setattr(
+        batch_module,
+        "_compile_candidates",
+        lambda *_args: ((candidate,), (task,)),
+    )
+
+    def admit(*args: object, **_kwargs: object) -> Pack:
+        root = next(
+            item for item in args if isinstance(item, Path) and item.name.startswith("attempt-")
+        )
+        roots.append(root)
+        if len(roots) == 1:
+            raise TaskFoundryError("public_witness_failed", "transient policy failure")
+        return Pack()
+
+    monkeypatch.setattr(batch_module, "_admit_candidate", admit)
+    report = batch_module.run_task_foundry_batch(
+        SimpleNamespace(identity=SimpleNamespace(release_id="a" * 64)),
+        tmp_path / "work",
+        tmp_path / "output",
+        target_structures=1,
+        candidate_attempt_limit=2,
+    )
+
+    assert [root.name for root in roots] == ["attempt-1", "attempt-2"]
+    assert report.target_reached is True
+    assert report.candidate_attempt_limit == 2
+    assert report.to_document()["format"] == "task-foundry-batch/2"
+    assert [item.attempt_index for item in report.rejected] == [1]
+
+
+def test_batch_failure_taxonomy_distinguishes_policy_and_framework_owners() -> None:
+    assert batch_module._task_failure_kind("public_witness_failed") == "NoPublicWitness"
+    assert (
+        batch_module._task_failure_kind("foreach_alternative_order_not_reversed")
+        == "ChallengePolicyFailure"
+    )
+    assert (
+        batch_module._task_failure_kind("foreach_wrong_answer_unavailable")
+        == "AdmissionPlanningDefect"
+    )
+    assert batch_module._task_failure_kind("checker_mutant_survived") == "RejectedTaskPack"
+
+
+def test_batch_does_not_retry_non_policy_framework_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _atom("item:one", "one")
+    candidate = batch_module._candidate("atom", task)
+    attempts = 0
+    monkeypatch.setattr(
+        batch_module,
+        "_compile_candidates",
+        lambda *_args: ((candidate,), (task,)),
+    )
+
+    def reject(*_args: object, **_kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise TaskFoundryError(
+            "foreach_wrong_answer_unavailable",
+            "deterministic challenge construction failed",
+        )
+
+    monkeypatch.setattr(batch_module, "_admit_candidate", reject)
+    report = batch_module.run_task_foundry_batch(
+        SimpleNamespace(identity=SimpleNamespace(release_id="a" * 64)),
+        tmp_path / "work",
+        tmp_path / "output",
+        target_structures=1,
+        candidate_attempt_limit=3,
+    )
+
+    assert attempts == 1
+    assert report.target_reached is False
+    assert report.rejected[0].failure_kind == "AdmissionPlanningDefect"
 
 
 def test_batch_persists_canonical_pack_and_report(
