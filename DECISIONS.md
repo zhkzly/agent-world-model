@@ -126,3 +126,5 @@ session.
 `s2-good-task-independent-review|介入1|返工1|Terra REVISE→authority/process/proposal/reload corrections→Terra ALLOW|红线违反0`
 
 `s2-checkpoint-a-reload|介入1|返工1|roleplay trace+shared lifecycle+7 mutation licenses+SQLite/Git/ForEach/If real reopen|红线违反0`
+
+`s2-checkpoint-a-identity-audit|介入1|返工1|post-GREEN scope audit+attempt preimage RED/GREEN+mutation license|红线违反0`

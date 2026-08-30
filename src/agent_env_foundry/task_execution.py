@@ -92,7 +92,7 @@ class ReloadEvidence:
     lifecycle_events: tuple[LifecycleEvent, ...]
     pre_close_facts_digest: str
     post_reopen_facts_digest: str
-    checker_result_digest: str
+    post_reopen_checker_result_digest: str
 
     def __post_init__(self) -> None:
         for value, role in (
@@ -104,9 +104,21 @@ class ReloadEvidence:
             (self.reopened_session_id, "reload reopened_session_id"),
             (self.pre_close_facts_digest, "reload pre_close_facts_digest"),
             (self.post_reopen_facts_digest, "reload post_reopen_facts_digest"),
-            (self.checker_result_digest, "reload checker_result_digest"),
+            (
+                self.post_reopen_checker_result_digest,
+                "reload post_reopen_checker_result_digest",
+            ),
         ):
             _digest(value, role)
+        if self.attempt_id != _derive_attempt_id(
+            self.release_id,
+            self.task_id,
+            self.native_instance_id,
+        ):
+            raise TaskExecutionError(
+                "reload_attempt_identity_mismatch",
+                "reload attempt identity does not bind release, Task, and native instance",
+            )
         if self.acting_session_id == self.reopened_session_id:
             raise TaskExecutionError(
                 "reload_session_reused",
@@ -161,7 +173,7 @@ class ReloadEvidence:
             "lifecycle_event_digest": self.lifecycle_event_digest,
             "pre_close_facts_digest": self.pre_close_facts_digest,
             "post_reopen_facts_digest": self.post_reopen_facts_digest,
-            "checker_result_digest": self.checker_result_digest,
+            "post_reopen_checker_result_digest": self.post_reopen_checker_result_digest,
         }
 
     def to_document(self) -> JSONObject:
@@ -231,14 +243,7 @@ def run_public_attempt[T](
             "nonce": uuid.uuid4().hex,
         }
     )
-    attempt_id = _document_digest(
-        {
-            "format": "public-task-attempt/1",
-            "release_id": release_id,
-            "task_id": task_id,
-            "native_instance_id": native_instance_id,
-        }
-    )
+    attempt_id = _derive_attempt_id(release_id, task_id, native_instance_id)
     instance = Path(instance_root)
     events: list[LifecycleEvent] = []
 
@@ -353,6 +358,17 @@ def run_public_attempt[T](
 
 def _document_digest(value: Any) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def _derive_attempt_id(release_id: str, task_id: str, native_instance_id: str) -> str:
+    return _document_digest(
+        {
+            "format": "public-task-attempt/1",
+            "release_id": release_id,
+            "task_id": task_id,
+            "native_instance_id": native_instance_id,
+        }
+    )
 
 
 def _digest(value: str, role: str) -> None:

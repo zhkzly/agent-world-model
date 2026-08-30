@@ -1,6 +1,22 @@
 from __future__ import annotations
 
+import hashlib
+
+from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.task_execution import LifecycleEvent, ReloadEvidence
+
+
+def public_attempt_id(release_id: str, task_id: str, native_instance_id: str) -> str:
+    return hashlib.sha256(
+        canonical_bytes(
+            {
+                "format": "public-task-attempt/1",
+                "release_id": release_id,
+                "task_id": task_id,
+                "native_instance_id": native_instance_id,
+            }
+        )
+    ).hexdigest()
 
 
 def reload_evidence(
@@ -37,7 +53,7 @@ def reload_evidence(
     return ReloadEvidence(
         release_id,
         task_id,
-        "1" * 64,
+        public_attempt_id(release_id, task_id, native_instance_id),
         native_instance_id,
         acting_session_id,
         selected_reopened_id,
@@ -48,4 +64,4 @@ def reload_evidence(
     )
 
 
-__all__ = ["reload_evidence"]
+__all__ = ["public_attempt_id", "reload_evidence"]

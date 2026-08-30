@@ -109,7 +109,7 @@ def test_atom_task_and_witness_identities_bind_frozen_content() -> None:
     with pytest.raises(TaskFoundryError, match="reload evidence"):
         replace(
             witness,
-            reload_evidence=replace(witness.reload_evidence, task_id="f" * 64),
+            reload_evidence=reload_evidence("f" * 64, witness.materialization_id),
         )
     plan = _plan(task)
     solved = SolvedAtomTask(task, plan, (witness, _witness(task, "c" * 64)))

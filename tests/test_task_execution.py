@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests.fixtures.fx_task_execution import public_attempt_id
 
 import agent_env_foundry.task_execution as execution_module
 from agent_env_foundry.public_agent import PublicEpisodeRun
@@ -49,14 +50,14 @@ def _evidence() -> ReloadEvidence:
     return ReloadEvidence(
         release_id=DIGEST_A,
         task_id=DIGEST_B,
-        attempt_id="1" * 64,
+        attempt_id=public_attempt_id(DIGEST_A, DIGEST_B, DIGEST_C),
         native_instance_id=DIGEST_C,
         acting_session_id=DIGEST_D,
         reopened_session_id=DIGEST_E,
         lifecycle_events=_events(),
         pre_close_facts_digest="2" * 64,
         post_reopen_facts_digest="2" * 64,
-        checker_result_digest="3" * 64,
+        post_reopen_checker_result_digest="3" * 64,
     )
 
 
@@ -66,6 +67,8 @@ def test_reload_evidence_binds_exact_order_same_instance_and_distinct_sessions()
     assert evidence.evidence_id
     assert evidence.to_document()["format"] == "reload-evidence/1"
     assert evidence.to_document()["lifecycle_event_digest"]
+    assert evidence.to_document()["post_reopen_checker_result_digest"] == "3" * 64
+    assert "checker_result_digest" not in evidence.to_document()
     assert [item["kind"] for item in evidence.to_document()["lifecycle_events"]] == [
         "acting_open",
         "reset",
@@ -130,6 +133,11 @@ def test_reload_evidence_requires_distinct_sessions_even_when_events_agree() -> 
             reopened_session_id=evidence.acting_session_id,
             lifecycle_events=same_session_events,
         )
+
+
+def test_reload_evidence_rejects_attempt_id_from_another_preimage() -> None:
+    with pytest.raises(TaskExecutionError, match="attempt identity"):
+        replace(_evidence(), attempt_id="9" * 64)
 
 
 def test_public_attempt_closes_then_reopens_same_instance_before_checker(

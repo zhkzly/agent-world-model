@@ -130,9 +130,9 @@ def test_if_task_binds_condition_branch_and_two_fresh_witnesses() -> None:
     with pytest.raises(TaskFoundryError, match="reload evidence"):
         replace(
             solved.witnesses[0],
-            reload_evidence=replace(
-                solved.witnesses[0].reload_evidence,
-                task_id="f" * 64,
+            reload_evidence=reload_evidence(
+                "f" * 64,
+                solved.witnesses[0].materialization_id,
             ),
         )
     assert solved.to_document()["format"] == "solved-if-task/1"

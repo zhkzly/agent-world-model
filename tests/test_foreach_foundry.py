@@ -138,9 +138,9 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
     with pytest.raises(TaskFoundryError, match="reload evidence"):
         replace(
             solved.witnesses[0],
-            reload_evidence=replace(
-                solved.witnesses[0].reload_evidence,
-                task_id="f" * 64,
+            reload_evidence=reload_evidence(
+                "f" * 64,
+                solved.witnesses[0].materialization_id,
             ),
         )
     assert solved.to_document()["format"] == "solved-foreach-task/1"

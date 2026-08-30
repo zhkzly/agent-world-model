@@ -279,3 +279,21 @@ Real physical evidence:
 
 Generated run details are retained under `.artifacts/checkpoint-a/` and remain
 non-authoritative generated evidence rather than source code.
+
+## Checkpoint A post-GREEN overdesign/identity audit
+
+Selected: keep the single nine-event lifecycle because each event is required
+to distinguish reset, act, close, reopen and post-reopen checking, while closing
+the one discovered identity gap: `attempt_id` now recomputes from exact Release,
+Task and native-instance identities. The emitted checker digest field now uses
+the approved `post_reopen_checker_result_digest` name.
+
+Rejected: deleting lifecycle/fact fields merely to reduce LOC, adding a reader
+or signature layer before the unified TaskPack format freezes, or expanding the
+slice into challenge migration. The existing Host execution path is the
+physical authority; Checkpoint F will own strict cold decoding.
+
+Evidence: the pre-fix implementation accepted an unrelated 64-hex attempt ID;
+the new focused test observed that RED, the corrected code is GREEN, and an
+attempt-identity-check mutant is killed. The audit found no sampler, S3,
+compatibility, domain-specific or extra service/node drift.
