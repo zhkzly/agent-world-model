@@ -97,13 +97,53 @@ Task validity and corpus selection are separate. A corpus additionally needs:
 
 Counts and floors are experiment targets, never permission to weaken a Task.
 
+## S3 owns verified policy Episodes
+
+S3 consumes exact current Release/TaskPack/Corpus authority and records what a
+target acting policy actually does. Its required order is:
+
+```text
+cold Release + TaskPack
+-> freeze EpisodeRequest and public projection
+-> target policy calls real public tools
+-> preserve complete success or failure trajectory
+-> close and reopen the same native instance
+-> execute the frozen Task checker
+-> map truth to binary Reward or typed abstention
+-> persist EpisodeRecord / TrainingEpisodeView / EpisodeBatchManifest
+```
+
+S3 does not generate or re-admit Tasks, alter a checker, choose another corpus or
+train a model. It must retain policy failures rather than only successful
+witnesses and must distinguish model/policy failure from provider,
+environment, semantics, verifier and evidence defects.
+
+The initial base reward contract is:
+
+```text
+verified success                         -> 1.0
+valid policy episode but Task not met    -> 0.0
+untrustworthy infrastructure/truth path  -> null / abstain
+```
+
+The acting policy sees only the canonical instruction, fresh reset observation,
+ToolSpecs, prior ToolObservations and final-answer schema. It never sees S2
+witnesses/admission, Start input as a hint, semantic keys, protected bindings,
+expected branch, native facts or checker internals.
+
+S3 owns one small public PolicyDriver boundary and one shared Host execution
+path. The current Responses driver and a later S4 rollout driver must use that
+same path; there is no second Agent loop, service or Registry.
+
 ## Execution ownership
 
 ### Framework Python
 
 Owns release preparation, identities, Direct candidate enumeration, checker
 freeze/execution, instruction rendering, provenance, admission, structural
-deduplication, TaskPack persistence, assessment recording and corpus selection.
+deduplication, TaskPack persistence, assessment recording, corpus selection,
+Episode lifecycle, deterministic Reward/abstention and cold artifact
+projections.
 
 ### Python Codex SDK
 
@@ -118,24 +158,28 @@ reward.
 
 ### OpenAI Responses tool-calling policy
 
-Runs the exact frozen public Task for solvability witnesses and independent
-model-relative assessment. It never sees protected bindings, native facts,
-checker internals, a reference path or answer key.
+Runs the exact frozen public Task for S2 solvability witnesses, S2 model-relative
+assessment and S3 target-policy Episodes. It never sees protected bindings,
+native facts, checker internals, a reference path or answer key. S3 may also be
+driven by a later S4 policy adapter through the same restricted public
+interface.
 
 ## Non-negotiable constraints
 
 1. Public tools execute real project code and real persistent transitions.
 2. Protected facts may select and verify a Task but never supply acting operands.
-3. Checker and final instruction freeze before the witness Agent executes.
-4. The witness solves exactly the instruction later exposed to S3.
+3. Checker and final instruction freeze before the witness or target policy executes.
+4. The policy solves exactly the instruction exposed by the TaskPack.
 5. LLM agreement cannot override deterministic execution/state failure.
 6. Starts are reset-only; no hidden setup calls or native writes.
 7. Framework contains no booking/SQLite/Git/domain branches.
 8. Witness proves existence of a public solution, never the only valid path.
-9. TaskPack identity excludes assessment, difficulty and corpus policy.
-10. Unsupported semantics and low sampling yield remain typed outcomes.
-11. Only current clean-break formats are supported; no compatibility switch.
-12. Intermediate checkpoints and candidate counts are never S2 completion.
+9. TaskPack identity excludes assessment, difficulty, corpus policy and Episodes.
+10. Episode reward cannot change Task truth or use TaskAssessment reliability.
+11. Provider/trust defects abstain rather than become model reward zero.
+12. Unsupported semantics and low sampling yield remain typed outcomes.
+13. Only current clean-break formats are supported; no compatibility switch.
+14. Intermediate checkpoints, candidate counts and successful demos are never stage completion.
 
 ## S2 completion evidence
 
@@ -155,3 +199,22 @@ S2 completes only when the frozen Direct Framework:
   and training implementation to S3/S4.
 
 Optional Graph/Programmatic experiments are not completion gates.
+
+## S3 completion evidence
+
+S3 completes only when one frozen runtime:
+
+- consumes relocated Release, TaskPack and Corpus artifacts;
+- preserves complete public trajectories for verified success and policy
+  failure;
+- evaluates Atom, ForEach and If after real close/reopen without witness-trace
+  matching;
+- produces physical `1.0`, `0.0` and typed `null`/abstain outcomes with correct
+  causal ownership;
+- cold-reads immutable EpisodeRecord and non-leaking TrainingEpisodeView
+  artifacts;
+- runs Git, SQLite and the post-freeze held-out release without domain edits;
+- supports the current Responses policy and one second policy/driver identity
+  through the same restricted Host path;
+- hands S4 public trajectories and reward labels without implementing trainer,
+  tokenization, logprob or optimizer code.
