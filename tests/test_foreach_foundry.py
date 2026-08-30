@@ -11,11 +11,16 @@ from tests.fixtures.fx_task_execution import reload_evidence
 import agent_env_foundry.foreach_foundry as foreach_module
 from agent_env_foundry.foreach_foundry import (
     ForEachAdmissionPlan,
+    ForEachAdmissionReport,
     ForEachNoOpChallenge,
     ForEachPartialChallenge,
     ForEachPartialChallengeReport,
     ForEachTask,
     ForEachWitness,
+    ForEachWrongAnswerChallenge,
+    ForEachWrongAnswerPlan,
+    ForEachWrongTargetChallenge,
+    ForEachWrongTargetPlan,
     SolvedForEachTask,
     seal_foreach_task_pack,
 )
@@ -103,7 +108,12 @@ def _witness(task: ForEachTask, materialization_id: str) -> ForEachWitness:
 
 
 def _plan(task: ForEachTask) -> ForEachAdmissionPlan:
-    return ForEachAdmissionPlan(task.task_id, (0,))
+    return ForEachAdmissionPlan(
+        task.task_id,
+        (0,),
+        ForEachWrongTargetPlan(False, None, False, "no target"),
+        ForEachWrongAnswerPlan(False, None, None, "no alternative"),
+    )
 
 
 def _binding(key: str, item: str) -> BindingCandidate:
@@ -128,7 +138,7 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
     assert task.task_id
     assert task.to_document()["semantic_keys"] == ["item:1", "item:2"]
     plan = _plan(task)
-    assert plan.to_document()["format"] == "foreach-admission-plan/4"
+    assert plan.to_document()["format"] == "foreach-admission-plan/5"
     solved = SolvedForEachTask(
         task,
         plan,
@@ -153,7 +163,7 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
     with pytest.raises(TaskFoundryError, match="representative"):
         SolvedForEachTask(
             task,
-            ForEachAdmissionPlan(task.task_id, (1,)),
+            replace(plan, omitted_member_indices=(1,)),
             (_witness(task, "c" * 64), _witness(task, "d" * 64)),
         )
     with pytest.raises(TaskFoundryError, match="fresh"):
@@ -282,17 +292,106 @@ def test_foreach_task_pack_seals_witnesses_noop_and_one_partial() -> None:
     partials = ForEachPartialChallengeReport(task.task_id, plan, (partial,))
     noop = ForEachNoOpChallenge(task.task_id, plan.plan_id, "4" * 64, (failed, failed))
 
-    pack = seal_foreach_task_pack(solved, noop, partials)
+    pack = seal_foreach_task_pack(solved, noop, partials, None, None)
     assert pack.task_pack_id
-    assert pack.to_document()["format"] == "foreach-task-pack/2"
-    assert pack.to_document()["admission"]["format"] == "foreach-admission-report/3"
+    assert pack.to_document()["format"] == "foreach-task-pack/3"
+    assert pack.to_document()["admission"]["format"] == "foreach-admission-report/4"
 
     with pytest.raises(TaskFoundryError, match="reused a materialization"):
         seal_foreach_task_pack(
             solved,
             replace(noop, materialization_id=witnesses[0].materialization_id),
             partials,
+            None,
+            None,
         )
+
+
+def test_foreach_wrong_target_and_wrong_answer_are_frozen_and_discriminated() -> None:
+    task = _task()
+    wrong_target_plan = ForEachWrongTargetPlan(True, "f" * 64, True, None)
+    wrong_answer_document = {"results": [{"value": "wrong"}, {}]}
+    wrong_answer_plan = ForEachWrongAnswerPlan(True, 0, wrong_answer_document, None)
+    plan = ForEachAdmissionPlan(
+        task.task_id,
+        (0,),
+        wrong_target_plan,
+        wrong_answer_plan,
+    )
+    control = _result()
+    collateral_failure = replace(
+        _result(satisfied=False),
+        collateral_ok=False,
+        failure_codes=("FAILED", "PROHIBITED_COLLATERAL"),
+    )
+    wrong_target = ForEachWrongTargetChallenge(
+        task.task_id,
+        plan.plan_id,
+        "f" * 64,
+        True,
+        "3" * 64,
+        (),
+        {},
+        (collateral_failure, collateral_failure),
+        control,
+        reload_evidence(task.task_id, "3" * 64),
+    )
+    wrong_answer_result = replace(
+        control,
+        satisfied=False,
+        answer_ok=False,
+        failure_codes=("ANSWER_MISMATCH",),
+    )
+    wrong_answer = ForEachWrongAnswerChallenge(
+        task.task_id,
+        plan.plan_id,
+        0,
+        "4" * 64,
+        (),
+        wrong_answer_document,
+        (control, control),
+        (wrong_answer_result, control),
+        reload_evidence(task.task_id, "4" * 64),
+    )
+
+    with pytest.raises(TaskFoundryError) as caught:
+        replace(wrong_answer, member_results=(control, control))
+    assert caught.value.code == "foreach_wrong_answer_not_discriminated"
+
+    with pytest.raises(TaskFoundryError) as caught:
+        replace(
+            wrong_target,
+            member_results=(_result(satisfied=False), _result(satisfied=False)),
+        )
+    assert caught.value.code == "foreach_collateral_not_discriminated"
+
+    solved = SolvedForEachTask(
+        task,
+        plan,
+        (_witness(task, "1" * 64), _witness(task, "2" * 64)),
+    )
+    failed = _result(satisfied=False)
+    noop = ForEachNoOpChallenge(task.task_id, plan.plan_id, "5" * 64, (failed, failed))
+    partial = ForEachPartialChallenge(
+        task.task_id,
+        plan.plan_id,
+        0,
+        task.semantic_keys[0],
+        "6" * 64,
+        (),
+        {"results": [{}]},
+        (),
+        (failed, control),
+        reload_evidence(task.task_id, "6" * 64),
+    )
+    admission = ForEachAdmissionReport(
+        solved,
+        noop,
+        ForEachPartialChallengeReport(task.task_id, plan, (partial,)),
+        wrong_target,
+        wrong_answer,
+    )
+    assert admission.to_document()["wrong_target"]["target_task_id"] == "f" * 64
 
 
 def test_foreach_fresh_selection_must_match_the_complete_frozen_set() -> None:

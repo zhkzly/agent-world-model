@@ -17,6 +17,7 @@ from agent_env_foundry.task_foundry import (
     AtomAdmissionPlan,
     AtomChallengeReport,
     AtomChallengeResult,
+    AtomCollateralPlan,
     AtomPlannedChallenge,
     AtomTask,
     AtomWitness,
@@ -96,6 +97,7 @@ def _plan(task: AtomTask) -> AtomAdmissionPlan:
                 "answer schema has no schema-valid alternative value",
             ),
         ),
+        AtomCollateralPlan(True, "d" * 64, None),
     )
 
 
@@ -180,8 +182,10 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
             task.task_id,
             plan.no_op_result,
             plan.challenges[:-1],
+            plan.collateral,
         )
     assert caught.value.code == "admission_plan_incomplete"
+    assert plan.collateral.target_task_id == plan.challenges[1].target_task_id
 
     with pytest.raises(TaskFoundryError) as caught:
         AtomPlannedChallenge("wrong_target", True, None, None, None)
@@ -198,7 +202,7 @@ def test_atom_noop_rejects_semantics_that_call_an_unchanged_world_collateral() -
     )
 
     with pytest.raises(TaskFoundryError) as caught:
-        AtomAdmissionPlan(task.task_id, invalid, plan.challenges)
+        AtomAdmissionPlan(task.task_id, invalid, plan.challenges, plan.collateral)
 
     assert caught.value.code == "admission_plan_noop_axis_invalid"
 
@@ -240,7 +244,11 @@ def test_atom_challenge_report_requires_each_applicable_core_negative_to_fail() 
         "c" * 64,
         (),
         {},
-        rejected,
+        replace(
+            rejected,
+            collateral_ok=False,
+            failure_codes=(*rejected.failure_codes, "PROHIBITED_COLLATERAL"),
+        ),
         _witness(task, "d" * 64).result,
         None,
         reload_evidence=reload_evidence(task.task_id, "c" * 64),
@@ -258,7 +266,15 @@ def test_atom_challenge_report_requires_each_applicable_core_negative_to_fail() 
 
     report = AtomChallengeReport(task.task_id, plan, (no_op, wrong_target, wrong_answer))
     assert report.to_document()["format"] == "atom-challenge-report/2"
-    assert plan.to_document()["format"] == "atom-admission-plan/4"
+    assert plan.to_document()["format"] == "atom-admission-plan/5"
+
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomChallengeReport(
+            task.task_id,
+            plan,
+            (no_op, replace(wrong_target, result=rejected), wrong_answer),
+        )
+    assert caught.value.code == "challenge_collateral_not_discriminated"
 
     with pytest.raises(TaskFoundryError) as caught:
         replace(wrong_target, reload_evidence=None)
@@ -319,7 +335,11 @@ def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
         "4" * 64,
         (),
         {},
-        rejected,
+        replace(
+            rejected,
+            collateral_ok=False,
+            failure_codes=(*rejected.failure_codes, "PROHIBITED_COLLATERAL"),
+        ),
         control,
         None,
         reload_evidence=reload_evidence(task.task_id, "4" * 64),
@@ -342,7 +362,7 @@ def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
 
     task_pack = seal_atom_task_pack(solved, challenges)
     assert task_pack.task_pack_id
-    assert task_pack.to_document()["format"] == "atom-task-pack/3"
+    assert task_pack.to_document()["format"] == "atom-task-pack/4"
 
 
 def test_solve_freezes_admission_plan_before_opening_a_witness(
@@ -582,6 +602,32 @@ def test_nullable_union_has_a_schema_valid_non_null_wrong_answer() -> None:
         )
         is False
     )
+
+
+def test_wrong_answer_mutates_a_nested_schema_valid_leaf() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "record": {
+                "type": "object",
+                "properties": {
+                    "amount": {"type": "number", "minimum": 0},
+                    "status": {"type": "string", "enum": ["ready", "done"]},
+                },
+                "required": ["amount", "status"],
+                "additionalProperties": False,
+            }
+        },
+        "required": ["record"],
+        "additionalProperties": False,
+    }
+    answer = {"record": {"amount": 10, "status": "ready"}}
+
+    wrong = task_foundry_module._wrong_answer(schema, answer)
+
+    assert wrong is not None
+    assert wrong != answer
+    assert wrong["record"] != answer["record"]
 
 
 def test_atom_instruction_does_not_duplicate_structured_output_schema() -> None:

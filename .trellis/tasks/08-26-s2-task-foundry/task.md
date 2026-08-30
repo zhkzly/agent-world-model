@@ -216,3 +216,29 @@ only for the final admission audit: freeze an explicit collateral
 applicable/non-applicable disposition and independently challenge a complete
 ForEach wrong answer where constructible. No CompositionRule exists in either
 release, so All remains honestly unsupported rather than fabricated.
+
+## Good-Task admission closure
+
+Atom AdmissionPlan now freezes whether a same-Start state-changing wrong target
+can physically challenge collateral. It reuses the existing wrong-target
+episode, adding no provider call. A real SQLite query Task rejected the
+successful dispute mutation as `PROHIBITED_COLLATERAL` after reopen; run
+`d637ff580bb9e1738f25a2f9e385f1e8b722d7428ee3ed86a07ac8da57f82821`.
+
+ForEach AdmissionPlan now freezes a public wrong target (preferring a real
+state change) plus one deterministic member-level schema-valid wrong answer.
+Nested objects/arrays are mutated recursively at one valid leaf; the complete
+answer remains schema-valid. Real run
+`d1705505b106bbba1d9a6dbf509eb5cfe4b708a29274237aaf5950798784e9dc`
+admitted Atom and ForEach with no rejection. Its ForEach TaskPack proves:
+
+- all three members reject the unrelated state change on collateral;
+- the wrong-answer control satisfies all three members;
+- changing only member 0's nested amount makes only its answer axis fail;
+- partial, wrong-target and wrong-answer each carry distinct post-reopen
+  evidence.
+
+Focused collateral, wrong-answer and recursive-answer mutants were killed; all
+deterministic gates passed. Checkpoint 3 is closed. Both qualified releases
+declare zero CompositionRules, so Checkpoint 4 is closed as typed unsupported;
+no All compiler or fabricated composition was added.

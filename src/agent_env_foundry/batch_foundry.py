@@ -14,6 +14,8 @@ from agent_env_foundry.environment import JSONObject
 from agent_env_foundry.foreach_foundry import (
     ForEachTask,
     challenge_foreach_partials,
+    challenge_foreach_wrong_answer,
+    challenge_foreach_wrong_target,
     compile_foreach_tasks,
     run_foreach_noop,
     seal_foreach_task_pack,
@@ -54,6 +56,8 @@ _RETRYABLE_TASK_CODES = frozenset(
         "challenge_baseline_failed",
         "wrong_target_baseline_failed",
         "foreach_partial_not_discriminated",
+        "foreach_wrong_target_baseline_failed",
+        "foreach_wrong_answer_baseline_failed",
     }
 )
 
@@ -423,10 +427,27 @@ def _admit_candidate(
             route=route,
             max_provider_turns=max_provider_turns,
         )
+        wrong_target = challenge_foreach_wrong_target(
+            prepared,
+            solved_foreach,
+            atom_tasks,
+            root / "wrong-target",
+            route=route,
+            max_provider_turns=max_provider_turns,
+        )
+        wrong_answer = challenge_foreach_wrong_answer(
+            prepared,
+            solved_foreach,
+            root / "wrong-answer",
+            route=route,
+            max_provider_turns=max_provider_turns,
+        )
         return seal_foreach_task_pack(
             solved_foreach,
             noop,
             partials,
+            wrong_target,
+            wrong_answer,
         )
     if_task = cast(IfTask, candidate.task)
     matching = [item for item in atom_tasks if item.task_id == if_task.branch_task_id]
@@ -621,6 +642,8 @@ def _task_failure_kind(code: str) -> FailureKind:
         "challenge_baseline_failed",
         "wrong_target_baseline_failed",
         "foreach_partial_not_discriminated",
+        "foreach_wrong_target_baseline_failed",
+        "foreach_wrong_answer_baseline_failed",
     }:
         return "ChallengePolicyFailure"
     return "RejectedTaskPack"

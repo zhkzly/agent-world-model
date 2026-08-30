@@ -27,7 +27,13 @@ from agent_env_foundry.task_execution import ReloadEvidence, run_public_attempt
 from agent_env_foundry.task_foundry import (
     AtomTask,
     TaskFoundryError,
+    _context,
     _evaluate_report_atom,
+    _select_collateral_target_task,
+    _select_wrong_target_task,
+    _task_by_id,
+    _verify_checker_preimage,
+    _wrong_answer,
 )
 
 
@@ -84,9 +90,76 @@ class ForEachTask:
 
 
 @dataclass(frozen=True, slots=True)
+class ForEachWrongTargetPlan:
+    applicable: bool
+    target_task_id: str | None
+    collateral_applicable: bool
+    reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.applicable:
+            if not self.target_task_id or self.reason is not None:
+                raise TaskFoundryError(
+                    "foreach_wrong_target_plan_invalid",
+                    "Applicable ForEach wrong target requires one Task and no reason",
+                )
+        elif self.target_task_id is not None or self.collateral_applicable or not self.reason:
+            raise TaskFoundryError(
+                "foreach_wrong_target_plan_invalid",
+                "Non-applicable ForEach wrong target requires only its reason",
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "applicable": self.applicable,
+            "target_task_id": self.target_task_id,
+            "collateral_applicable": self.collateral_applicable,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachWrongAnswerPlan:
+    applicable: bool
+    member_index: int | None
+    final_answer: JSONObject | None
+    reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.applicable:
+            if self.member_index is None or self.member_index < 0 or self.final_answer is None:
+                raise TaskFoundryError(
+                    "foreach_wrong_answer_plan_invalid",
+                    "Applicable ForEach wrong answer requires one member and final answer",
+                )
+            if self.reason is not None:
+                raise TaskFoundryError(
+                    "foreach_wrong_answer_plan_invalid",
+                    "Applicable ForEach wrong answer cannot carry a reason",
+                )
+        elif self.member_index is not None or self.final_answer is not None or not self.reason:
+            raise TaskFoundryError(
+                "foreach_wrong_answer_plan_invalid",
+                "Non-applicable ForEach wrong answer requires only its reason",
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "applicable": self.applicable,
+            "member_index": self.member_index,
+            "final_answer": (
+                None if self.final_answer is None else _json_object(self.final_answer)
+            ),
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ForEachAdmissionPlan:
     task_id: str
     omitted_member_indices: tuple[int, ...]
+    wrong_target: ForEachWrongTargetPlan
+    wrong_answer: ForEachWrongAnswerPlan
 
     def __post_init__(self) -> None:
         if self.omitted_member_indices != (0,):
@@ -101,9 +174,11 @@ class ForEachAdmissionPlan:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "foreach-admission-plan/4",
+            "format": "foreach-admission-plan/5",
             "task_id": self.task_id,
             "omitted_member_indices": list(self.omitted_member_indices),
+            "wrong_target": self.wrong_target.to_document(),
+            "wrong_answer": self.wrong_answer.to_document(),
         }
 
     def to_document(self) -> JSONObject:
@@ -164,6 +239,14 @@ class SolvedForEachTask:
             raise TaskFoundryError(
                 "foreach_admission_plan_incomplete",
                 "ForEach admission plan belongs to another Task",
+            )
+        wrong_answer_index = self.admission_plan.wrong_answer.member_index
+        if self.admission_plan.wrong_answer.applicable and (
+            wrong_answer_index is None or wrong_answer_index >= len(self.task.semantic_keys)
+        ):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_plan_invalid",
+                "ForEach wrong-answer member lies outside the frozen selection",
             )
         if any(item.task_id != self.task.task_id for item in self.witnesses):
             raise TaskFoundryError(
@@ -330,10 +413,136 @@ class ForEachNoOpChallenge:
 
 
 @dataclass(frozen=True, slots=True)
+class ForEachWrongTargetChallenge:
+    task_id: str
+    admission_plan_id: str
+    target_task_id: str
+    collateral_applicable: bool
+    materialization_id: str
+    trace: tuple[TraceEvent, ...]
+    final_answer: JSONObject
+    member_results: tuple[AtomCheckResult, ...]
+    control_result: AtomCheckResult
+    reload_evidence: ReloadEvidence
+
+    def __post_init__(self) -> None:
+        if (
+            self.reload_evidence.task_id != self.task_id
+            or self.reload_evidence.acting_session_id != self.materialization_id
+        ):
+            raise TaskFoundryError(
+                "foreach_wrong_target_reload_mismatch",
+                "ForEach wrong-target reload evidence belongs to another Task or session",
+            )
+        if (
+            not self.control_result.satisfied
+            or not self.member_results
+            or any(item.satisfied for item in self.member_results)
+        ):
+            raise TaskFoundryError(
+                "foreach_wrong_target_not_discriminated",
+                "ForEach wrong target must satisfy its control and fail every selected member",
+            )
+        if self.collateral_applicable and any(item.collateral_ok for item in self.member_results):
+            raise TaskFoundryError(
+                "foreach_collateral_not_discriminated",
+                "State-changing ForEach wrong target must fail collateral for every member",
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "foreach-wrong-target-challenge/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "target_task_id": self.target_task_id,
+            "collateral_applicable": self.collateral_applicable,
+            "materialization_id": self.materialization_id,
+            "trace": [item.to_document() for item in self.trace],
+            "final_answer": _json_object(self.final_answer),
+            "member_results": [item.to_document() for item in self.member_results],
+            "control_result": self.control_result.to_document(),
+            "reload_evidence": self.reload_evidence.to_document(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ForEachWrongAnswerChallenge:
+    task_id: str
+    admission_plan_id: str
+    member_index: int
+    materialization_id: str
+    trace: tuple[TraceEvent, ...]
+    final_answer: JSONObject
+    control_results: tuple[AtomCheckResult, ...]
+    member_results: tuple[AtomCheckResult, ...]
+    reload_evidence: ReloadEvidence
+
+    def __post_init__(self) -> None:
+        if (
+            self.reload_evidence.task_id != self.task_id
+            or self.reload_evidence.acting_session_id != self.materialization_id
+        ):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_reload_mismatch",
+                "ForEach wrong-answer reload evidence belongs to another Task or session",
+            )
+        if (
+            not self.control_results
+            or len(self.control_results) != len(self.member_results)
+            or not 0 <= self.member_index < len(self.member_results)
+            or any(not item.satisfied for item in self.control_results)
+        ):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_control_invalid",
+                "ForEach wrong answer requires one complete successful control",
+            )
+        for index, (control, result) in enumerate(
+            zip(self.control_results, self.member_results, strict=True)
+        ):
+            if index != self.member_index:
+                if not result.satisfied:
+                    raise TaskFoundryError(
+                        "foreach_wrong_answer_not_isolated",
+                        "ForEach wrong answer changed an unselected member",
+                    )
+                continue
+            if result.satisfied or result.answer_ok is not False:
+                raise TaskFoundryError(
+                    "foreach_wrong_answer_not_discriminated",
+                    "ForEach checker accepted its frozen wrong member answer",
+                )
+            if (
+                result.required_effects_ok != control.required_effects_ok
+                or result.collateral_ok != control.collateral_ok
+                or result.process_ok != control.process_ok
+            ):
+                raise TaskFoundryError(
+                    "foreach_wrong_answer_axis_drift",
+                    "ForEach wrong answer changed a non-answer checker axis",
+                )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "foreach-wrong-answer-challenge/1",
+            "task_id": self.task_id,
+            "admission_plan_id": self.admission_plan_id,
+            "member_index": self.member_index,
+            "materialization_id": self.materialization_id,
+            "trace": [item.to_document() for item in self.trace],
+            "final_answer": _json_object(self.final_answer),
+            "control_results": [item.to_document() for item in self.control_results],
+            "member_results": [item.to_document() for item in self.member_results],
+            "reload_evidence": self.reload_evidence.to_document(),
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ForEachAdmissionReport:
     solved: SolvedForEachTask
     noop: ForEachNoOpChallenge
     partials: ForEachPartialChallengeReport
+    wrong_target: ForEachWrongTargetChallenge | None
+    wrong_answer: ForEachWrongAnswerChallenge | None
 
     def __post_init__(self) -> None:
         task = self.solved.task
@@ -350,10 +559,44 @@ class ForEachAdmissionReport:
                 "foreach_admission_identity_mismatch",
                 "ForEach admission evidence does not share one Task and plan",
             )
+        expected_target = self.solved.admission_plan.wrong_target
+        if expected_target.applicable != (self.wrong_target is not None):
+            raise TaskFoundryError(
+                "foreach_wrong_target_evidence_incomplete",
+                "ForEach wrong-target evidence differs from its frozen disposition",
+            )
+        if self.wrong_target is not None and (
+            self.wrong_target.task_id != task_id
+            or self.wrong_target.admission_plan_id != plan_id
+            or self.wrong_target.target_task_id != expected_target.target_task_id
+            or self.wrong_target.collateral_applicable != expected_target.collateral_applicable
+        ):
+            raise TaskFoundryError(
+                "foreach_wrong_target_evidence_mismatch",
+                "ForEach wrong-target evidence differs from its frozen plan",
+            )
+        expected_answer = self.solved.admission_plan.wrong_answer
+        if expected_answer.applicable != (self.wrong_answer is not None):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_evidence_incomplete",
+                "ForEach wrong-answer evidence differs from its frozen disposition",
+            )
+        if self.wrong_answer is not None and (
+            self.wrong_answer.task_id != task_id
+            or self.wrong_answer.admission_plan_id != plan_id
+            or self.wrong_answer.member_index != expected_answer.member_index
+            or self.wrong_answer.final_answer != expected_answer.final_answer
+        ):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_evidence_mismatch",
+                "ForEach wrong-answer evidence differs from its frozen plan",
+            )
         witness_materializations = {item.materialization_id for item in self.solved.witnesses}
         later_materializations = {
             self.noop.materialization_id,
             *(item.materialization_id for item in self.partials.partials),
+            *((self.wrong_target.materialization_id,) if self.wrong_target is not None else ()),
+            *((self.wrong_answer.materialization_id,) if self.wrong_answer is not None else ()),
         }
         if witness_materializations & later_materializations:
             raise TaskFoundryError(
@@ -367,12 +610,18 @@ class ForEachAdmissionReport:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "foreach-admission-report/3",
+            "format": "foreach-admission-report/4",
             "task_id": self.solved.task.task_id,
             "admission_plan": self.solved.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.solved.witnesses],
             "noop": self.noop.to_document(),
             "partials": self.partials.to_document(),
+            "wrong_target": (
+                None if self.wrong_target is None else self.wrong_target.to_document()
+            ),
+            "wrong_answer": (
+                None if self.wrong_answer is None else self.wrong_answer.to_document()
+            ),
         }
 
     def to_document(self) -> JSONObject:
@@ -397,7 +646,7 @@ class ForEachTaskPack:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "foreach-task-pack/2",
+            "format": "foreach-task-pack/3",
             "task": self.task.to_document(),
             "admission": self.admission.to_document(),
         }
@@ -410,12 +659,16 @@ def seal_foreach_task_pack(
     solved: SolvedForEachTask,
     noop: ForEachNoOpChallenge,
     partials: ForEachPartialChallengeReport,
+    wrong_target: ForEachWrongTargetChallenge | None,
+    wrong_answer: ForEachWrongAnswerChallenge | None,
 ) -> ForEachTaskPack:
     _verify_task_preimage(solved.task)
     admission = ForEachAdmissionReport(
         solved,
         noop,
         partials,
+        wrong_target,
+        wrong_answer,
     )
     return ForEachTaskPack(solved.task, admission)
 
@@ -752,6 +1005,212 @@ def challenge_foreach_partials(
     )
 
 
+def challenge_foreach_wrong_target(
+    prepared: OpenPreparedRelease,
+    solved: SolvedForEachTask,
+    atom_task_universe: tuple[AtomTask, ...],
+    instance_root: Path,
+    *,
+    route: AgentRoute | None = None,
+    max_provider_turns: int = 12,
+) -> ForEachWrongTargetChallenge | None:
+    task = solved.task
+    plan = solved.admission_plan.wrong_target
+    if not plan.applicable:
+        return None
+    assert plan.target_task_id is not None
+    target = _task_by_id(atom_task_universe, plan.target_task_id)
+    _verify_checker_preimage(prepared, target)
+    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
+
+    def preflight(
+        session: OpenPreparedSession,
+        before: JSONValue,
+    ) -> tuple[tuple[BindingCandidate, ...], BindingCandidate]:
+        return (
+            _resolve_complete_selection(session, task, before),
+            _resolve_atom_binding(session, target, before),
+        )
+
+    with run_public_attempt(
+        prepared,
+        Path(instance_root),
+        task_id=task.task_id,
+        start_input=task.start_case.reset_input,
+        instruction=target.instruction,
+        answer_schema=target.answer_schema,
+        preflight=preflight,
+        route=selected_route,
+        max_provider_turns=max_provider_turns,
+    ) as attempt:
+        bindings, target_binding = attempt.preflight_value
+        control = _evaluate_report_atom(
+            attempt.evaluation_session,
+            AtomCheckRequest(
+                target.capability_id,
+                attempt.before_facts,
+                attempt.post_reopen_facts,
+                target_binding.protected_binding,
+                attempt.episode.trace,
+                attempt.episode.final_answer,
+                _context(
+                    target.capability_id,
+                    target_binding.semantic_key,
+                    target_binding.protected_binding,
+                ),
+            ),
+            target.answer_schema,
+        )
+        if not control.satisfied:
+            raise TaskFoundryError(
+                "foreach_wrong_target_baseline_failed",
+                "ForEach wrong-target control Task did not satisfy its own checker",
+                target_task_id=target.task_id,
+                result=control.to_document(),
+            )
+        contexts = _contexts(task, bindings)
+        results = tuple(
+            _evaluate_report_atom(
+                attempt.evaluation_session,
+                AtomCheckRequest(
+                    task.capability_id,
+                    attempt.before_facts,
+                    attempt.post_reopen_facts,
+                    binding.protected_binding,
+                    attempt.episode.trace,
+                    attempt.episode.final_answer,
+                    contexts[position],
+                ),
+                task.member_answer_schema,
+            )
+            for position, binding in enumerate(bindings)
+        )
+        attempt.record_checker_result(
+            {
+                "control_result": control.to_document(),
+                "member_results": [item.to_document() for item in results],
+            }
+        )
+    assert attempt.reload_evidence is not None
+    return ForEachWrongTargetChallenge(
+        task.task_id,
+        solved.admission_plan.plan_id,
+        target.task_id,
+        plan.collateral_applicable,
+        attempt.acting_session_id,
+        attempt.episode.trace,
+        attempt.episode.final_answer,
+        results,
+        control,
+        attempt.reload_evidence,
+    )
+
+
+def challenge_foreach_wrong_answer(
+    prepared: OpenPreparedRelease,
+    solved: SolvedForEachTask,
+    instance_root: Path,
+    *,
+    route: AgentRoute | None = None,
+    max_provider_turns: int = 12,
+) -> ForEachWrongAnswerChallenge | None:
+    task = solved.task
+    plan = solved.admission_plan.wrong_answer
+    if not plan.applicable:
+        return None
+    assert plan.member_index is not None
+    assert plan.final_answer is not None
+    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
+
+    def preflight(
+        session: OpenPreparedSession,
+        before: JSONValue,
+    ) -> tuple[BindingCandidate, ...]:
+        return _resolve_complete_selection(session, task, before)
+
+    with run_public_attempt(
+        prepared,
+        Path(instance_root),
+        task_id=task.task_id,
+        start_input=task.start_case.reset_input,
+        instruction=task.instruction,
+        answer_schema=task.answer_schema,
+        preflight=preflight,
+        route=selected_route,
+        max_provider_turns=max_provider_turns,
+    ) as attempt:
+        bindings = attempt.preflight_value
+        answers = attempt.episode.final_answer.get("results")
+        wrong_answers = plan.final_answer.get("results")
+        if (
+            not isinstance(answers, list)
+            or not isinstance(wrong_answers, list)
+            or len(answers) != len(bindings)
+            or len(wrong_answers) != len(bindings)
+        ):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_count_mismatch",
+                "ForEach wrong-answer control or frozen answer is incomplete",
+            )
+        contexts = _contexts(task, bindings)
+        control_results = tuple(
+            _evaluate_report_atom(
+                attempt.evaluation_session,
+                AtomCheckRequest(
+                    task.capability_id,
+                    attempt.before_facts,
+                    attempt.post_reopen_facts,
+                    binding.protected_binding,
+                    attempt.episode.trace,
+                    answers[position],
+                    contexts[position],
+                ),
+                task.member_answer_schema,
+            )
+            for position, binding in enumerate(bindings)
+        )
+        if any(not item.satisfied for item in control_results):
+            raise TaskFoundryError(
+                "foreach_wrong_answer_baseline_failed",
+                "ForEach wrong-answer control did not satisfy every member",
+                results=[item.to_document() for item in control_results],
+            )
+        results = tuple(
+            _evaluate_report_atom(
+                attempt.evaluation_session,
+                AtomCheckRequest(
+                    task.capability_id,
+                    attempt.before_facts,
+                    attempt.post_reopen_facts,
+                    binding.protected_binding,
+                    attempt.episode.trace,
+                    wrong_answers[position],
+                    contexts[position],
+                ),
+                task.member_answer_schema,
+            )
+            for position, binding in enumerate(bindings)
+        )
+        attempt.record_checker_result(
+            {
+                "control_results": [item.to_document() for item in control_results],
+                "wrong_results": [item.to_document() for item in results],
+            }
+        )
+    assert attempt.reload_evidence is not None
+    return ForEachWrongAnswerChallenge(
+        task.task_id,
+        solved.admission_plan.plan_id,
+        plan.member_index,
+        attempt.acting_session_id,
+        attempt.episode.trace,
+        plan.final_answer,
+        control_results,
+        results,
+        attempt.reload_evidence,
+    )
+
+
 def run_foreach_noop(
     prepared: OpenPreparedRelease,
     solved: SolvedForEachTask,
@@ -832,10 +1291,91 @@ def _derive_admission_plan(
             "foreach_atom_universe_invalid",
             "ForEach admission requires one unique same-release Atom Task universe",
         )
-    del prepared, instance_root
+    with prepared.open(instance_root) as session:
+        session.actor.reset(task.start_case.reset_input)
+        facts = session.trusted.inspect(instance_root)
+        bindings = _resolve_complete_selection(session, task, facts)
+        capabilities = {item.capability_id: item for item in session.trusted.capabilities()}
+        contexts = _contexts(task, bindings)
+        initial_results = tuple(
+            session.trusted.evaluate_atom(
+                AtomCheckRequest(
+                    task.capability_id,
+                    facts,
+                    facts,
+                    binding.protected_binding,
+                    (),
+                    {},
+                    contexts[position],
+                )
+            )
+            for position, binding in enumerate(bindings)
+        )
+    representatives = [
+        item
+        for item in atom_task_universe
+        if item.start_case == task.start_case
+        and item.capability_id == task.capability_id
+        and item.semantic_key == task.semantic_keys[0]
+    ]
+    if len(representatives) != 1:
+        raise TaskFoundryError(
+            "foreach_representative_atom_missing",
+            "ForEach admission cannot resolve its first selected Atom Task",
+        )
+    representative = representatives[0]
+    collateral_target = _select_collateral_target_task(
+        representative,
+        atom_task_universe,
+        capabilities,
+    )
+    wrong_target = collateral_target or _select_wrong_target_task(
+        representative,
+        atom_task_universe,
+        capabilities,
+    )
+    wrong_target_plan = (
+        ForEachWrongTargetPlan(
+            True,
+            wrong_target.task_id,
+            collateral_target is not None,
+            None,
+        )
+        if wrong_target is not None
+        else ForEachWrongTargetPlan(
+            False,
+            None,
+            False,
+            "no other compiled Atom Task shares this release and StartCase",
+        )
+    )
+    member_answers = [item.report_values for item in initial_results]
+    wrong_member_index: int | None = None
+    wrong_final_answer: JSONObject | None = None
+    for index, answer in enumerate(member_answers):
+        alternative = _wrong_answer(task.member_answer_schema, answer)
+        if alternative is None:
+            continue
+        wrong_answers = [_json_object(item) for item in member_answers]
+        wrong_answers[index] = alternative
+        wrong_member_index = index
+        wrong_final_answer = {"results": cast(JSONValue, wrong_answers)}
+        break
+    wrong_answer_plan = (
+        ForEachWrongAnswerPlan(True, wrong_member_index, wrong_final_answer, None)
+        if wrong_final_answer is not None
+        else ForEachWrongAnswerPlan(
+            False,
+            None,
+            None,
+            "member answer schema has no schema-valid alternative value",
+        )
+    )
     return ForEachAdmissionPlan(
         task.task_id,
         (0,),
+        wrong_target_plan,
+        wrong_answer_plan,
     )
 
 
@@ -868,6 +1408,29 @@ def _resolve_complete_selection(
             "Fresh ForEach selection changed a public descriptor",
         )
     return eligible
+
+
+def _resolve_atom_binding(
+    session: OpenPreparedSession,
+    task: AtomTask,
+    facts: JSONValue,
+) -> BindingCandidate:
+    matching = [
+        item
+        for item in session.trusted.enumerate_bindings(task.capability_id, facts)
+        if item.semantic_key == task.semantic_key
+    ]
+    if len(matching) != 1 or not matching[0].eligible:
+        raise TaskFoundryError(
+            "foreach_target_binding_unresolved",
+            "ForEach challenge target binding is not uniquely eligible",
+        )
+    if matching[0].public_descriptor != task.public_descriptor:
+        raise TaskFoundryError(
+            "foreach_target_descriptor_drift",
+            "ForEach challenge target public descriptor changed",
+        )
+    return matching[0]
 
 
 def _contexts(
@@ -986,11 +1549,17 @@ __all__ = [
     "ForEachTask",
     "ForEachTaskPack",
     "ForEachWitness",
+    "ForEachWrongAnswerChallenge",
+    "ForEachWrongAnswerPlan",
+    "ForEachWrongTargetChallenge",
+    "ForEachWrongTargetPlan",
     "SolvedForEachTask",
     "compile_foreach_tasks",
     "run_foreach_task_once",
     "run_foreach_noop",
     "seal_foreach_task_pack",
     "challenge_foreach_partials",
+    "challenge_foreach_wrong_answer",
+    "challenge_foreach_wrong_target",
     "solve_foreach_task_twice",
 ]

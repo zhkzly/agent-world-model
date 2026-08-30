@@ -6,7 +6,7 @@
   execute admission and persist both TaskPacks and typed rejections?
 - [x] Is every admitted Task publicly solvable twice on fresh instances with
   all acting-time operands grounded in instruction/reset/tool observations?
-- [ ] Does deterministic verification reject applicable no-op, wrong target,
+- [x] Does deterministic verification reject applicable no-op, wrong target,
   partial, collateral and wrong-answer cases without matching one witness path?
 - [x] Are reset/reload, dynamic binding rediscovery and episode isolation
   physically demonstrated rather than inferred from green unit tests?

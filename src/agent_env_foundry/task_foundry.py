@@ -192,10 +192,38 @@ class AtomPlannedChallenge:
 
 
 @dataclass(frozen=True, slots=True)
+class AtomCollateralPlan:
+    applicable: bool
+    target_task_id: str | None
+    reason: str | None
+
+    def __post_init__(self) -> None:
+        if self.applicable:
+            if not self.target_task_id or self.reason is not None:
+                raise TaskFoundryError(
+                    "admission_plan_collateral_invalid",
+                    "Applicable collateral challenge requires one target Task and no reason",
+                )
+        elif self.target_task_id is not None or not self.reason:
+            raise TaskFoundryError(
+                "admission_plan_collateral_invalid",
+                "Non-applicable collateral challenge requires only its reason",
+            )
+
+    def to_document(self) -> JSONObject:
+        return {
+            "applicable": self.applicable,
+            "target_task_id": self.target_task_id,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class AtomAdmissionPlan:
     task_id: str
     no_op_result: AtomCheckResult
     challenges: tuple[AtomPlannedChallenge, ...]
+    collateral: AtomCollateralPlan
 
     def __post_init__(self) -> None:
         if self.no_op_result.satisfied:
@@ -227,6 +255,15 @@ class AtomAdmissionPlan:
                 "admission_plan_noop_missing",
                 "Atom admission plan requires an applicable no-op challenge",
             )
+        wrong_target = self.challenges[1]
+        if self.collateral.applicable and (
+            not wrong_target.applicable
+            or wrong_target.target_task_id != self.collateral.target_task_id
+        ):
+            raise TaskFoundryError(
+                "admission_plan_collateral_target_mismatch",
+                "Applicable collateral evidence must reuse its frozen wrong-target Task",
+            )
 
     @property
     def plan_id(self) -> str:
@@ -234,10 +271,11 @@ class AtomAdmissionPlan:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-admission-plan/4",
+            "format": "atom-admission-plan/5",
             "task_id": self.task_id,
             "no_op_result": self.no_op_result.to_document(),
             "challenges": [item.to_document() for item in self.challenges],
+            "collateral": self.collateral.to_document(),
         }
 
     def to_document(self) -> JSONObject:
@@ -420,6 +458,14 @@ class AtomChallengeReport:
                 "challenge_noop_result_drift",
                 "Physical no-op result differs from its pre-witness frozen axes",
             )
+        if self.admission_plan.collateral.applicable:
+            wrong_target = self.challenges[1]
+            assert wrong_target.result is not None
+            if wrong_target.result.collateral_ok:
+                raise TaskFoundryError(
+                    "challenge_collateral_not_discriminated",
+                    "Frozen state-changing wrong target did not trigger collateral rejection",
+                )
 
     def to_document(self) -> JSONObject:
         return {
@@ -461,7 +507,7 @@ class AtomAdmissionReport:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-admission-report/4",
+            "format": "atom-admission-report/5",
             "task_id": self.solved.task.task_id,
             "admission_plan": self.solved.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.solved.witnesses],
@@ -490,7 +536,7 @@ class AtomTaskPack:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-task-pack/3",
+            "format": "atom-task-pack/4",
             "task": self.task.to_document(),
             "admission": self.admission.to_document(),
         }
@@ -1055,7 +1101,12 @@ def _derive_atom_admission_plan(
                 _context(task.capability_id, binding.semantic_key, binding.protected_binding),
             )
         )
-    wrong_target = _select_wrong_target_task(task, task_universe, capabilities)
+    collateral_target = _select_collateral_target_task(task, task_universe, capabilities)
+    wrong_target = collateral_target or _select_wrong_target_task(
+        task,
+        task_universe,
+        capabilities,
+    )
     wrong_target_plan = (
         AtomPlannedChallenge("wrong_target", True, wrong_target.task_id, None, None)
         if wrong_target is not None
@@ -1084,10 +1135,20 @@ def _derive_atom_admission_plan(
         wrong_target_plan,
         wrong_answer_plan,
     )
+    collateral_plan = (
+        AtomCollateralPlan(True, collateral_target.task_id, None)
+        if collateral_target is not None
+        else AtomCollateralPlan(
+            False,
+            None,
+            "no other compiled state-changing Atom Task shares this StartCase",
+        )
+    )
     return AtomAdmissionPlan(
         task.task_id,
         initial,
         planned_challenges,
+        collateral_plan,
     )
 
 
@@ -1135,6 +1196,28 @@ def _select_wrong_target_task(
         )
 
     return min(candidates, key=rank) if candidates else None
+
+
+def _select_collateral_target_task(
+    task: AtomTask,
+    task_universe: tuple[AtomTask, ...],
+    capabilities: dict[str, CapabilitySpec],
+) -> AtomTask | None:
+    missing = sorted(
+        {item.capability_id for item in task_universe if item.capability_id not in capabilities}
+    )
+    if missing:
+        raise TaskFoundryError(
+            "admission_target_capability_missing",
+            "Task universe contains capabilities absent from the live release",
+            capability_ids=missing,
+        )
+    eligible = tuple(
+        item
+        for item in task_universe
+        if item == task or capabilities[item.capability_id].task_kind == "state_change"
+    )
+    return _select_wrong_target_task(task, eligible, capabilities)
 
 
 def _planned_challenge(plan: AtomAdmissionPlan, category: str) -> AtomPlannedChallenge:
@@ -1233,9 +1316,55 @@ def _alternative_value(schema: dict[str, Any], value: JSONValue) -> JSONValue | 
         for item in enum:
             if item != value and is_json_value(item):
                 return cast(JSONValue, item)
+    for keyword in ("anyOf", "oneOf"):
+        branches = schema.get(keyword)
+        if not isinstance(branches, list):
+            continue
+        for branch in branches:
+            if not isinstance(branch, dict):
+                continue
+            alternative = _alternative_value(branch, value)
+            if (
+                alternative is not _NO_ALTERNATIVE
+                and is_json_value(alternative)
+                and alternative != value
+                and not tuple(Draft202012Validator(schema).iter_errors(alternative))
+            ):
+                return cast(JSONValue, alternative)
     types = schema.get("type")
     ordered_types = (types,) if isinstance(types, str) else tuple(types or ())
     allowed = set(ordered_types)
+    if isinstance(value, dict) and ("object" in allowed or "properties" in schema):
+        properties = schema.get("properties")
+        if isinstance(properties, dict):
+            for field in sorted(properties):
+                child_schema = properties[field]
+                if field not in value or not isinstance(child_schema, dict):
+                    continue
+                alternative = _alternative_value(child_schema, value[field])
+                if alternative is _NO_ALTERNATIVE or not is_json_value(alternative):
+                    continue
+                object_candidate = cast(
+                    JSONObject,
+                    json.loads(json.dumps(value, ensure_ascii=False)),
+                )
+                object_candidate[field] = cast(JSONValue, alternative)
+                if not tuple(Draft202012Validator(schema).iter_errors(object_candidate)):
+                    return object_candidate
+    if isinstance(value, list) and ("array" in allowed or "items" in schema):
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                alternative = _alternative_value(item_schema, item)
+                if alternative is _NO_ALTERNATIVE or not is_json_value(alternative):
+                    continue
+                array_candidate = cast(
+                    list[JSONValue],
+                    json.loads(json.dumps(value, ensure_ascii=False)),
+                )
+                array_candidate[index] = cast(JSONValue, alternative)
+                if not tuple(Draft202012Validator(schema).iter_errors(array_candidate)):
+                    return array_candidate
     if isinstance(value, bool) and "boolean" in allowed:
         return not value
     if isinstance(value, int) and not isinstance(value, bool) and "integer" in allowed:
@@ -1264,11 +1393,11 @@ def _alternative_value(schema: dict[str, Any], value: JSONValue) -> JSONValue | 
         "null": (None,),
     }
     for allowed_type in ordered_types:
-        for candidate in defaults.get(allowed_type, ()):
-            if candidate != value and not tuple(
-                Draft202012Validator(schema).iter_errors(candidate)
+        for default_candidate in defaults.get(allowed_type, ()):
+            if default_candidate != value and not tuple(
+                Draft202012Validator(schema).iter_errors(default_candidate)
             ):
-                return candidate
+                return default_candidate
     return _NO_ALTERNATIVE
 
 
