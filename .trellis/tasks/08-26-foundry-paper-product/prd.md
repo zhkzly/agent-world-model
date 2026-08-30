@@ -105,9 +105,9 @@ S4 data consumer
 Protected state may select and verify a Task but never provide an acting-time
 operand. Model consensus cannot override deterministic failure.
 
-## Current S3 scope
+## Planned S3 scope
 
-The active S3 child owns:
+Once explicitly activated, the planned S3 child will own:
 
 ```text
 shared complete public-policy outcome capture
@@ -148,8 +148,8 @@ tokenization, logprobs, optimizer code and checkpoints are outside S3.
   conflation.
 - [ ] EpisodeRecord and TrainingEpisodeView cold-read after relocation and have
   exact trusted/public projections.
-- [ ] One direct batch API executes exact CorpusManifest entries and retains all
-  rollout/retry attempts.
+- [ ] One direct batch API executes exact CorpusManifest entries and retains one
+  honest success, failure, abstention or blocked result for every rollout slot.
 - [ ] Git, SQLite and held-out TaskPacks run through one target-policy runtime
   without domain edits.
 - [ ] S4 can consume public trajectories/reward labels without protected data or

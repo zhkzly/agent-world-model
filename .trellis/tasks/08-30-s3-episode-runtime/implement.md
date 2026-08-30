@@ -1,42 +1,135 @@
 # S3 Verified Episode Runtime — Implementation Plan
 
-## 1. Execution rules
+## 1. Planning and execution rules
 
-- Preserve S2 TaskPack truth and identities unless a concrete runtime blocker
-  proves a format change unavoidable.
-- Implement one shared public-policy/lifecycle path; refactor existing S2 callers
-  onto it rather than add a parallel S3 loop.
-- Models choose actions. Framework validates, dispatches, records and verifies.
-- Every success/failure/abstention claim requires a named causal owner.
-- Green unit tests never replace real Release, public tool, close/reopen, frozen
-  checker and cold artifact evidence.
-- Do not implement S4 training, a service layer or optional infrastructure.
+This document is a candidate execution plan, not implementation authority.
+The task remains `planning` until:
 
-## 2. Baseline and rollback
+1. PRD, design, this plan, checklist and context manifests converge;
+2. activation input readiness is closed;
+3. the final planning summary receives explicit user approval;
+4. `task.py start` succeeds.
 
-Base commit:
+Execution rules after activation:
+
+- complete one checkpoint at a time;
+- implement only mechanisms consumed by the current checkpoint;
+- preserve exact S2 TaskPack truth and the current successful S2 artifact
+  formats/identity preimages;
+- keep one Host-owned policy/tool/lifecycle path;
+- models choose public actions; Host validates, dispatches, records and verifies;
+- every non-success has one named causal owner;
+- deterministic tests, physical evidence, live-provider evidence and relocation
+  evidence are distinct;
+- a checkpoint is an acceptance gate, never a demo or MVP milestone;
+- no later checkpoint starts until the current checkpoint is explicitly
+  `ACCEPTED`.
+
+No checkpoint may add task generation, automatic retry, a second Agent loop,
+veRL/trainer code, a service, Registry, queue, database or optional framework.
+
+## 2. Baseline, authority readiness and rollback
+
+### Product-code baseline
 
 ```text
 c180112fb7d684707aecafd6d538dca50b38f983
 ```
 
-The retained S2 product baseline includes exact Release v2 preparation,
-PublicTaskView/TrustedTaskView, public Responses execution, close/reopen
-ReloadEvidence, Atom/ForEach/If evaluators, TaskAssessment and CorpusManifest.
+Changes after this commit on the S3 branch are planning/session records only.
+At activation, record the base HEAD plus canonical digests of the accepted
+planning artifacts; do not silently use later edited documents as authority.
 
-Rollback is Git history. No compatibility adapters or duplicate old/new episode
-paths are allowed.
+Rollback is Git history. No compatibility adapter, feature flag or duplicate
+old/new episode path is allowed.
 
-## 3. Checkpoint 1 — Freeze S3 contracts and ownership
+### Upstream input readiness
+
+Paths below are operational locators only and never identity fields.
+
+| Authority | Exact IDs / current coverage | Current readiness |
+| --- | --- | --- |
+| Git | Release `14331ac6e82e0ac79382d5c5e964c62f6cc9ece506f726299d0645594fbafe80`; Corpus `4fddce70a03b716de69041397b941c4e752e7bf969b8de27d387777ebaaa8344`; Atom + two ForEach packs | READY: retained Release located, exact regeneration command recovered, current readers passed. |
+| SQLite | Release `64fa07e1a144536df2ae3ff9b0cf30175e8b0f913f1e34d8731b8377a80ebb87`; Corpus `a750a8127058f8afc9e2f1c038d1a3c3ef39a9205d2e9b83aee69a221802ae68`; Atom + ForEach + If packs | READY: Release, selected packs and embedded-If dependency passed current readers. |
+| inherited maintenance | Release `7e2c0718a7de84b07261b729cbe12da86e313c75e4aa107d60ede4c2c34e407a`; Corpus `31eb42b31e621c4ba75892f5866222f80055ccca00a0a018788a4f17d32eb14e`; Atom + ForEach packs | READY: Release, Corpus and all selected packs passed current readers. |
+
+Activation readiness requires:
+
+- exact Release IDs recomputed with current `verify_release_v2`;
+- exact Corpus identities recomputed with `read_identity_artifact`;
+- every selected TaskPack cold-read with its expected identity;
+- every corpus entry matched to the one Release used by that batch;
+- current Task kind coverage and If embedded-branch availability recorded;
+- reproducible reconstruction commands/inputs retained without making temporary
+  paths authoritative.
+
+The exact receipt and Git regeneration provenance are recorded in
+`research/input-readiness.md`. Any later locator loss or ID mismatch returns
+the task to planning; no substitute authority is allowed.
+
+## 3. Checkpoint closure protocol
+
+CP1–CP6 close only after all of the following:
+
+1. **Scope/authority audit**
+   - reread `PROJECT.md`, `DECISIONS.md`, current task artifacts and relevant
+     specs;
+   - identify the exact existing mechanism being reused;
+   - prove no later-checkpoint component is being introduced.
+2. **Named RED evidence**
+   - add the checkpoint's listed failing cases;
+   - run them before implementation and record that they fail for the intended
+     reason, not import/setup noise.
+3. **Implementation**
+   - change only the named checkpoint scope;
+   - preserve unrelated user changes and successful S2 projections.
+4. **Named mutation licence**
+   - state one concrete semantic corruption;
+   - name the test that kills it and the exact command/result;
+   - reject tautological result-object flipping.
+5. **Validation**
+   - focused checkpoint tests;
+   - locked lint, format and type checking;
+   - full deterministic suite;
+   - `git diff --check`.
+6. **Required non-deterministic evidence**
+   - run only the physical/live/cold evidence owned by this checkpoint;
+   - retain exact Release/TaskPack/Corpus/Policy/Episode IDs.
+7. **Independent review**
+   - review scope, trust flow, leakage, code reuse, cross-layer identities and
+     plan drift at the exact source snapshot (HEAD plus diff digest);
+   - critical findings are verified against code before acceptance.
+8. **Verdict**
+   - `ACCEPTED` or `REWORK`;
+   - rework remains inside the same checkpoint.
+
+CP7 introduces no new production RED or component. It reruns the frozen full
+matrix. Any failure returns to the owning checkpoint, requires rework/review,
+and restarts downstream evidence.
+
+## 4. Evidence classes
+
+| Evidence class | Valid claim | Invalid claim |
+| --- | --- | --- |
+| Deterministic | schema, identity, capture mechanics, failure/reward matrix, killed mutants | real provider behavior or physical persistence |
+| Physical | real Release code, public tools, native persistence, close/reopen/checker; scripted policy allowed | model solvability or provider quality |
+| Live provider | actual Responses request, continuation, model/tool behavior and reported usage | reward or physical lifecycle by itself |
+| Cold/relocation | canonical writes, path independence, identity/projection verification | execution behavior by itself |
+
+A naturally occurring live failure is useful evidence but never a deterministic
+checkpoint gate.
+
+## 5. Checkpoint 1 — Minimal Episode/Policy/Reward contract kernel
 
 ### Product claim
 
-S3 has an explicit identity/projection/reward contract before execution code is
-changed.
+Identity, public capture and base reward ownership are explicit before the
+shared execution code changes, without prebuilding persistence or batch
+machinery.
 
 ### Framework work
 
-Add immutable typed objects for:
+Add one `episodes.py` module containing only:
 
 ```text
 PolicySpec
@@ -45,24 +138,41 @@ PublicEpisodeInput
 EpisodeToolCall
 PolicyTurn
 PolicyCompletion
-EpisodeVerification
+PublicEpisodeCapture
+EpisodeDefect + closed DefectOwner
 RewardOutcome
-EpisodeRecord
-TrainingEpisodeView
-EpisodeBatchManifest
-all typed non-success owners
 ```
 
-Rules:
+Required invariants:
 
-- `PolicySpec` contains no credential and is not the current research-only
-  hard-coded `AgentRoute`;
-- `EpisodeRequest` freezes before the first policy call;
-- `EpisodeRecord` separates public trajectory and trusted verification;
-- `TrainingEpisodeView` has an exact allowed-key set;
-- only `1.0`, `0.0` and `null` are valid base rewards;
-- reward/disposition/abstain owner combinations are closed and validated;
-- temporary paths, secrets and S2 witness IDs do not enter identity preimages.
+- PolicySpec binds applied, non-secret policy facts and rejects credentials,
+  auth headers, paths and arbitrary plugin fields;
+- EpisodeRequest has release/task-pack/task/policy IDs plus positive 1-based
+  `rollout_index`, with no retry/attempt index;
+- public input contains exact prompt text, instruction, reset observation,
+  model-facing ToolSpecs and answer schema;
+- invalid calls retain raw call-ID/name/argument material plus optional
+  normalized IDs/names and parsed values;
+- Host turns own calls/observations/usage exactly once;
+- completion contains only `completed` or `policy_failure`;
+- PublicEpisodeCapture contains at least one completion or defect; both are
+  allowed when valid completion is followed by Host close/usage failure;
+- defects use one flat `(owner, code, phase)` value with provider and
+  infrastructure distinct;
+- RewardOutcome allows only:
+
+```text
+verified_success / 1.0 / no abstain owner
+verified_failure / 0.0 / no abstain owner
+abstain         / null / required owner+code
+```
+
+- every JSON value is deeply snapshotted; caller alias mutation cannot change
+  an object's identity or serialization.
+
+Do not add `EpisodeVerification`, `EpisodeRecord`,
+`TrainingEpisodeView`, `EpisodeBatchManifest`, persistence, Task runtime or
+retry types.
 
 ### Files
 
@@ -71,71 +181,107 @@ src/agent_env_foundry/episodes.py
 tests/test_episode_models.py
 ```
 
-Do not create a package hierarchy, registry or persistence backend.
+### RED and mutation evidence
 
-### RED tests
+- credential/auth/path field in PolicySpec;
+- route identity derived from URL credentials/query secrets, or identical
+  non-secret routes producing different policy IDs under credential rotation;
+- generic generation/config bag or undeclared identity-bearing driver option;
+- request index zero/negative/non-integer;
+- any attempt/retry field in EpisodeRequest;
+- provider omitted from the owner set or collapsed into infrastructure;
+- completion containing infrastructure status;
+- valid completion followed by driver-close/usage defect cannot discard either
+  the completion or the one primary defect;
+- reward `1.0` for failure, `0.0` for abstention, or null without owner/code;
+- original nested JSON mutation changing a constructed value;
+- output path, TaskAssessment or S2 witness entering an identity preimage.
 
-- credential/base auth serialized in PolicySpec;
-- reward `1.0` with failed checker;
-- reward `0.0` with infrastructure owner;
-- `null` reward without abstain owner/code;
-- trusted field in TrainingEpisodeView;
-- rollout/attempt indices zero, missing or duplicated;
-- Episode ID changed by output path but not by trace/result mutation;
-- TaskAssessment or S2 witness identity copied into Episode identity.
+Named mutation licence: change one closed reward/owner combination or retain a
+mutable input alias; `tests/test_episode_models.py` must kill it.
 
 ### Validation
 
 ```bash
-uv run pytest -q tests/test_episode_models.py
-uv run mypy src
-uv run ruff check src tests
+UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv run --frozen pytest -q tests/test_episode_models.py
 ```
 
 ### Stop conditions
 
-- an object has no direct S3 or S4 consumer;
-- a universal state/reward ontology is introduced;
-- target-policy identity still depends on the fixed S1 research route.
+- a CP2/CP4 consumer cannot be named for a type;
+- a generic failure hierarchy or universal trajectory ontology appears;
+- EpisodeRecord/View/Batch scaffolding is introduced;
+- target identity still depends on fixed research `AgentRoute`.
 
 ---
 
-## 4. Checkpoint 2 — Preserve complete public policy outcomes
+## 6. Checkpoint 2 — One Host-owned public loop and Responses adapter
 
 ### Product claim
 
-A healthy provider policy failure yields a complete failed trajectory instead of
-throwing away prior tool actions.
+One trusted Host loop preserves complete public decisions for successful and
+healthy failed policies; Responses is only a one-turn adapter.
 
 ### Framework work
 
-Refactor `public_agent.py` into one core:
+Refactor the existing `run_public_episode` implementation into:
 
 ```python
-capture_public_episode(port, policy_driver) -> PolicyCompletion
+capture_public_episode(
+    *,
+    actor: Environment,
+    instruction: str,
+    reset_observation: JSONValue,
+    answer_schema: JSONObject,
+    policy_driver: PolicyDriver,
+) -> PublicEpisodeCapture
 ```
 
-and retain the S2 wrapper:
+The Host:
 
-```python
-run_public_episode(...)
-  -> capture_public_episode(...)
-  -> require protocol completion
+- snapshots `actor.tools()` once, builds model-facing specs and dispatch catalog
+  from the same value, and freezes PublicEpisodeInput before driver start;
+- verifies prompt text digest and driver PolicySpec, and takes the sole turn
+  budget from that PolicySpec;
+- requests one decision per turn;
+- validates call metadata, JSON and schema;
+- dispatches validated calls and validates observations;
+- records raw invalid calls and public terminal material;
+- derives the flat checker trace;
+- distinguishes policy, provider and local infrastructure terminals.
+
+`PolicyDriver` exposes PolicySpec and one decision method. The production
+`ResponsesPolicyDriver`:
+
+- applies exactly the PolicySpec model, prompt, route, turn-independent request
+  fields and any explicit identity-bearing options accepted by CP1;
+- keeps opaque provider continuation state only in memory;
+- is single-Episode/single-use and rejects a second start;
+- is closed by the Host in `finally` for every terminal path;
+- performs one `responses.create` call per Host request;
+- cannot invoke tools, reset, inspect, check, retry or run a loop;
+- filters hidden/private reasoning items from persisted output.
+
+Retain `run_public_episode` as the successful S2 wrapper:
+
+```text
+capture_public_episode
+-> require healthy completed protocol
+-> project exact existing PublicEpisodeRun
+-> otherwise raise the existing S2 failure semantics
 ```
 
-Implement one minimal `PolicyDriver` protocol and one production
-`ResponsesPolicyDriver`.
+Provider boundary:
 
-Record:
-
-- ordered provider/policy turns;
-- function call IDs, names and raw parsed arguments;
-- Host schema/dispatch outcome;
-- public observations;
-- final answer or public policy terminal code;
-- per-turn usage.
-
-Do not persist provider-private reasoning items.
+- explicit remote 429/5xx/outage/timeout/service failure after a valid request:
+  `provider`;
+- credential/auth/route/client/DNS/TLS/proxy/socket/dependency/process/I/O:
+  `infrastructure`;
+- remote 400/422 request rejection caused by the Host request: `evidence`;
+- unexpected envelope without proved remote/Host ownership: unattributed block;
+- healthy refusal/malformed call/wrong answer/budget exhaustion:
+  policy failure;
+- unattributed exception: block, do not guess or emit training evidence.
 
 ### Files
 
@@ -143,83 +289,110 @@ Do not persist provider-private reasoning items.
 src/agent_env_foundry/public_agent.py
 src/agent_env_foundry/episodes.py
 tests/test_public_agent.py
-tests/test_policy_completion.py
+tests/test_policy_capture.py
 ```
 
 ### RED tests
 
-Use deterministic client responses to prove retained partial history for:
+Deterministic client responses must preserve the full earlier prefix for:
 
-- unknown tool after one successful tool call;
-- schema-invalid arguments;
-- malformed function call;
-- missing/schema-invalid final answer after a state change;
-- provider-turn budget exhaustion;
-- healthy policy refusal;
-- provider exception after a tool call, attributed to infrastructure rather than
-  policy.
+- unknown tool after a successful call;
+- missing/malformed/non-string call ID or name with exact raw values retained;
+- non-JSON, non-object and schema-invalid arguments;
+- multiple calls where an earlier call succeeded and a later call failed;
+- missing/malformed/schema-invalid final answer after mutation;
+- healthy refusal;
+- Host turn-budget exhaustion;
+- explicit provider 429/5xx/service defect after a call;
+- remote 400/422 and unexpected envelope are not mislabeled provider defects;
+- local infrastructure defect after a call;
+- driver close/usage sealing defect after a valid final answer retains the
+  completion and adds the primary defect.
 
 Also prove:
 
-- S2 `run_public_episode` still fails admission on non-completion;
-- only function calls/final public answer are retained, not reasoning items;
-- turn grouping and flat `TraceEvent` projection agree.
+- invalid calls do not enter `TraceEvent`;
+- turn grouping and flat trace agree;
+- raw Responses fixtures map every public call/terminal item exactly into a
+  decision, and Host ledger rejects duplicate IDs/result mismatches;
+- usage exists only on Host turns;
+- actual Responses request matches PolicySpec;
+- mismatched prompt digest, independent turn budget or driver PolicySpec fails
+  before the first provider call;
+- actor ToolSpecs are snapshotted once and the model/dispatch catalogs cannot
+  diverge;
+- successful S2 `PublicEpisodeRun` format/key set and projection behavior are
+  unchanged;
+- provider-private reasoning does not persist;
+- driver continuation/client state cannot cross two Episode captures.
+
+Named mutation licence: restore the old raise-before-return behavior after one
+successful call; the partial-capture tests must kill it.
 
 ### Real exit
 
-Run one current Responses route preflight that performs:
+Run one live current Responses route:
 
 ```text
-function_call -> real tool observation -> continuation -> final answer
+decision -> real public tool observation -> continuation -> final answer
 ```
 
-and retain one real policy-level failed completion if naturally available. A fake
-client proves mechanics only.
+The live success proves adapter integration only. Deterministic failure cases,
+not a naturally occurring model failure, close CP2.
 
 ### Stop conditions
 
-- a second Responses loop is added;
-- policy failures are converted to empty traces;
-- infrastructure faults become reward-zero candidates;
-- raw hidden reasoning becomes required artifact content.
+- driver receives `invoke` or direct actor/session access;
+- a second Responses/Agent loop exists;
+- provider and infrastructure collapse;
+- policy failures become empty captures;
+- hidden reasoning becomes an artifact.
 
 ---
 
-## 5. Checkpoint 3 — Shared physical attempt lifecycle for success and failure
+## 7. Checkpoint 3 — Shared physical lifecycle and request-bound evidence
 
 ### Product claim
 
-Completed and policy-failed episodes are both evaluated after closing and
-reopening the same native instance.
+Completed, policy-failed and sealable defected captures all use one physical
+open/reset/close/reopen/check lifecycle, while current S2 formats, validators
+and identity preimages remain compatible. Fresh randomized physical IDs are not
+expected to repeat.
 
 ### Framework work
 
-Refactor `task_execution.py` to expose one lower-level episode lifecycle used by
-S2 and S3:
-
-```python
-run_episode_attempt(
-    prepared,
-    instance_root,
-    *,
-    task_runtime,
-    policy_driver,
-) -> AttemptOutcome
-```
-
-Required order:
+Generalize current `run_public_attempt` mechanics into a callback-driven core
+that does not depend on the future cold Task loader:
 
 ```text
-open -> reset once -> inspect/preflight -> policy execute -> inspect -> close
--> reopen same native instance without reset -> inspect -> checker -> close
+open -> reset once -> inspect/preflight -> execute Host capture
+-> inspect -> close -> reopen same instance without reset
+-> inspect -> supplied evaluator -> close
 ```
 
-The lifecycle must complete post-reopen verification for policy-level terminal
-failures. It may abstain when infrastructure/environment failure prevents
-trustworthy closure.
+The outcome records:
 
-Keep `run_public_attempt` only as a thin successful-S2 compatibility wrapper over
-this same core, or replace its callers directly. No duplicate lifecycle.
+- optional capture, because reset/preflight can fail before public input;
+- every lifecycle event actually achieved in causal order;
+- the one primary defect owner/code/phase;
+- cleanup/reopen/checker events achieved after that defect;
+- available facts/checker digests;
+- one S3 request-bound attempt envelope;
+- authoritative S3 attempt events with explicit `capture_terminal` for every
+  valid public-input attempt;
+- unchanged `ReloadEvidence/1` only when the public protocol completed and the
+  exact canonical lifecycle finished.
+
+Keep `run_public_attempt` as the successful S2 compatibility projection or
+replace its callers with the same core without changing their successful
+documents.
+
+Narrowly repair TaskAssessment:
+
+- healthy policy-failed trials retain partial calls, observations, provider
+  turns, reported usage, latency and post-reopen result where available;
+- infrastructure/provider/trust defects remain typed upstream failures;
+- reliability rules, Task truth and TaskPack identity do not change.
 
 ### Files
 
@@ -230,84 +403,124 @@ src/agent_env_foundry/foreach_foundry.py
 src/agent_env_foundry/if_foundry.py
 src/agent_env_foundry/assessment.py
 tests/test_task_execution.py
+tests/test_assessment.py
 ```
 
 ### RED tests
 
-- policy reaches budget after mutating state: post-reopen facts and checker still
-  recorded, reward later zero;
-- invalid final answer after correct state transition: same behavior;
-- second reset during reopen;
-- another native instance substituted;
-- same session reused for reopen;
-- checker omitted or executed before reopen;
-- provider outage after mutation: abstention owner preserved;
-- S2 witness wrappers accept only completed+satisfied outcomes.
+- policy budget after real mutation still reaches reopen/checker;
+- invalid final answer after correct mutation still reaches reopen/checker;
+- provider/infrastructure defect after mutation retains public/lifecycle evidence
+  and abstains later;
+- reset, tool dispatch, pre-close inspect, acting close, reopen, post-reopen
+  inspect, checker and reopened close each fail at a deterministic boundary;
+- reset/preflight failure before public-input construction yields capture=None
+  and no EpisodeRecord/View;
+- policy/provider/infrastructure capture terminal or incomplete lifecycle cannot create
+  a legacy `episode_complete`/ReloadEvidence projection;
+- second reset, another native instance or same session on reopen;
+- checker before reopen or missing checker;
+- reload evidence transplanted across request IDs;
+- successful S2 wrapper format/key set or identity-preimage behavior changes;
+- failed TaskAssessment erases earlier calls/usage or counts infrastructure as
+  model failure.
+
+Named mutation licence: reorder close/reopen/checker or transplant one complete
+reload record into another request; lifecycle/request-binding tests must kill it.
 
 ### Physical exit
 
-Use current real SQLite and Git releases to run:
+Prerequisite: exact Git and SQLite Release/TaskPack inputs from Section 2 are
+cold-ready.
 
-- one successful episode;
-- one scripted public policy failure after a real tool mutation;
-- one real close/reopen verifier evaluation for each.
+Using real Git and SQLite releases, run:
 
-The scripted driver is allowed to prove runtime failure handling; it is not
-public-solvability evidence.
+- one successful public attempt;
+- one scripted policy failure after real public mutation;
+- one full close/reopen checker evaluation for each.
+
+Scripted policy is valid physical lifecycle evidence, not model-solvability
+evidence.
 
 ### Stop conditions
 
-- in-memory state is used as final truth;
-- S2 and S3 use different reopen/checker paths;
-- Task checker details leak back into the same acting episode.
+- only in-memory/fake sessions prove persistence;
+- S2 and S3 use different lifecycle/checker paths;
+- partial evidence is represented only by `None`;
+- successful S2 ReloadEvidence/TaskPack identities drift;
+- CP4 Task-runtime abstractions are introduced early.
 
 ---
 
-## 6. Checkpoint 4 — Strict TaskPack runtime and base Reward/abstention
+## 8. Checkpoint 4 — Strict TaskPack runtime, frozen verification and Reward
 
 ### Product claim
 
-One direct API runs any current admitted TaskPack kind and maps its frozen truth
-to `1.0`, `0.0` or `null` without changing Task meaning.
+One direct API consumes an exact current TaskPack, runs Atom/ForEach/If through
+the shared lifecycle and returns an immutable in-memory EpisodeRecord with
+truthful `1.0`, `0.0` or typed null.
 
 ### Framework work
 
-Implement strict current-format runtime deserialization and dispatch:
+Implement strict current-format private loading:
 
 ```python
-load_runtime_task(trusted_view) -> AtomTask | ForEachTask | IfTask
+load_runtime_task(verified_pack_document) -> LoadedAtom | LoadedForEach | LoadedIf
+```
 
+For If, validate and extract the embedded branch AtomTaskPack from admission;
+do not recompile an Atom universe.
+
+Implement:
+
+```python
 run_task_episode(
     prepared,
     task_pack_path,
-    task_pack_id,
+    expected_task_pack_id,
+    *,
     policy_driver,
+    rollout_index,
     instance_root,
-    request,
 ) -> EpisodeRecord
 ```
 
 Before acting:
 
-- cold-read TaskPack;
-- match Release/Task IDs;
-- reconstruct fresh logical binding/context;
-- recompute current checker preimage/digest;
-- validate exact PublicTaskView projection;
-- freeze EpisodeRequest and public input.
+- cold-read exact TaskPack bytes and IDs;
+- match the prepared Release;
+- decode only Atom v4, ForEach v3 and If v3 current formats;
+- freeze PolicySpec and logical EpisodeRequest, requiring request.policy_id to
+  equal the fresh driver's PolicySpec ID;
+- open/reset, reconstruct fresh logical binding/context and recompute checker
+  preimage/digest;
+- snapshot actor tools, construct PublicEpisodeInput and validate the exact
+  public projection;
+- only then make the first policy call.
 
 After acting:
 
-- evaluate task-kind-specific frozen checker post-reopen;
-- preserve exact canonical checker request/result;
-- map base reward by the fixed policy;
-- never compare with S2 witness traces;
-- never rerun Task admission challenges.
+- execute the exact canonical task-kind checker request after reopen;
+- retain exact checker request/result as trusted EpisodeVerification;
+- bind request, capture, request-bound attempt evidence, verification and
+  RewardOutcome into EpisodeRecord;
+- derive Episode ID from the entire canonical record.
+
+Input-authority behavior:
+
+- invalid Release/Corpus/TaskPack authority before request: typed direct failure
+  or corpus-slot blocked result, no EpisodeRecord/View;
+- reset/preflight/environment/semantics failure after request but before public
+  input: request-bound blocked result, no empty capture/Record/View;
+- post-freeze Task artifact drift: abstained EpisodeRecord if the attempt can be
+  honestly sealed;
+- unattributed exception: block, no completion claim.
 
 ### Files
 
 ```text
 src/agent_env_foundry/episode_runtime.py
+src/agent_env_foundry/episodes.py
 src/agent_env_foundry/batch_foundry.py
 src/agent_env_foundry/task_foundry.py
 src/agent_env_foundry/foreach_foundry.py
@@ -315,73 +528,99 @@ src/agent_env_foundry/if_foundry.py
 tests/test_episode_runtime.py
 ```
 
-### Required reward tests
+### Required reward/authority tests
 
 ```text
-completed + satisfied             -> verified_success / 1.0
-completed + checker failed        -> verified_failure / 0.0
-policy terminal + checker failed  -> verified_failure / 0.0
-correct mutation + missing answer -> verified_failure / 0.0
-wrong target/partial/collateral   -> verified_failure / 0.0
-provider/TLS error                -> abstain / null
-actor observation defect          -> abstain / null
-Task/checker identity drift        -> fail before policy call
-semantics/checker crash            -> abstain / null
-reload evidence incomplete         -> abstain / null
+completed + satisfied                           -> success / 1.0
+completed + checker failed                      -> failure / 0.0
+policy terminal + checker failed                -> failure / 0.0
+policy terminal + checker satisfied             -> failure / 0.0
+correct mutation + missing answer               -> failure / 0.0
+wrong target/partial/collateral                  -> failure / 0.0
+provider defect after satisfying mutation       -> abstain / null
+infrastructure defect after satisfying mutation -> abstain / null
+completed+satisfied + any trust defect           -> abstain / null
+policy failure + incomplete reopen/checker       -> abstain / null
+environment/semantics/verifier/evidence defect   -> abstain / null
+pre-input Task/checker authority defect          -> no Episode / typed failure
+post-freeze Task/checker drift                    -> abstain / null
+unattributed exception                           -> block / no training view
 ```
 
-### Real exit
+Also prove:
 
-Across current Atom, ForEach and If TaskPacks, produce at least:
+- exact If embedded branch is required and validated;
+- malformed nested admission fails before policy call;
+- candidate recompilation is impossible;
+- TaskAssessment/witness data cannot enter reward;
+- output path and native directory are absent from identity;
+- changing any call, lifecycle, checker, policy, request or outcome under an old
+  ID fails validation.
 
-- one physical success;
-- one physical checker failure;
-- one infrastructure abstention using a controlled failing provider route;
-- exact causal attribution for each.
+Named mutation licence: flip one checker/reward/defect-precedence branch; the
+exhaustive matrix must kill it.
+
+### Physical exit
+
+Across the exact authority set:
+
+- execute Atom, ForEach and If after real close/reopen;
+- produce a real-persistent verified success;
+- produce a real-persistent checker/policy failure;
+- carry one controlled provider/infrastructure abstention through the real
+  lifecycle with exact owner separation.
+
+All three Task kinds are required across the total set, not necessarily in
+every release.
 
 ### Stop conditions
 
-- TaskAssessment reliability enters reward;
-- a model judge decides success;
-- reward shaping weights appear before base policy evidence;
-- a task-specific arbitrary Python verifier is loaded from TaskPack.
+- TaskPack format changes or compatibility readers appear;
+- candidate compilation or an arbitrary verifier is used;
+- raw checker data leaks to policy;
+- model judge or reward shaping enters;
+- provider and infrastructure owners conflate.
 
 ---
 
-## 7. Checkpoint 5 — Episode persistence and non-leaking S4 view
+## 9. Checkpoint 5 — Canonical Episode bundle and non-leaking view
 
 ### Product claim
 
-Episode truth survives persistence/relocation, while S4 receives only public
-trajectory plus reward labels.
+Episode truth survives canonical persistence and relocation, while downstream
+receives the exact public trajectory/reward projection and no trusted checker
+material.
 
 ### Framework work
 
-Persist:
+Persist one paired bundle only under a required-new output root:
 
 ```text
-episodes/<episode_id>/EpisodeRecord.json
-views/<episode_id>/TrainingEpisodeView.json
+episodes/<episode_id>/
+  EpisodeRecord.json
+  TrainingEpisodeView.json
 ```
 
-Implement:
+Implement one authoritative paired reader. An S4-facing helper may return only
+the view, but must verify the trusted record and exact projection internally.
 
-```python
-verify_episode_artifact(path, episode_id) -> JSONObject
-read_episode_artifact(path, episode_id) -> TrustedEpisodeView
-read_training_episode_view(path, episode_id) -> TrainingEpisodeView
-```
+Cold verification checks:
 
-Cold readers must verify:
+- canonical bytes/current format;
+- request/policy/task/release/attempt/lifecycle/checker cross-bindings;
+- Host turns versus checker trace;
+- checker result versus reload digest and RewardOutcome;
+- exact nested TrainingEpisodeView schema;
+- exact public prompt/instruction/reset/model-facing ToolSpecs/answer schema;
+- nullable PolicyCompletion kind/code for terminals without raw output/final
+  answer;
+- no provider usage/latency, native facts, lifecycle, checker data/codes,
+  defect details, Start input, protected bindings, S2 evidence or hidden
+  reasoning in the view.
 
-- canonical bytes and exact current format;
-- request/policy/task/release identity bindings;
-- public input digest;
-- turn/trace/final-answer consistency;
-- checker result/reward consistency;
-- exact public/training projection key set;
-- no protected facts, semantic keys, Start input, expected branch, checker
-  details, S2 witnesses or admission challenges in the training view.
+Publication failure produces no valid bundle/view. It is a run-level evidence
+failure and cannot be self-certified by mutating the same EpisodeRecord being
+published. Strict readers reject any partial directory.
 
 ### Files
 
@@ -393,33 +632,48 @@ tests/test_episode_artifacts.py
 
 ### RED tests
 
-- change one tool argument, observation, final answer, reward or checker result;
-- replace policy ID or TaskPack ID;
-- copy an Episode into another request;
-- add a protected field to TrainingEpisodeView;
-- make TrainingEpisodeView reward differ from trusted record;
-- relocate artifacts and attempt path-dependent identity.
+- mutate a raw or normalized call ID/name/argument/observation;
+- mutate raw terminal/final answer/usage/latency;
+- replace policy/request/TaskPack/Release identity;
+- mutate lifecycle event/fact/checker request/result/reward;
+- copy one Episode bundle under another request/ID;
+- add a trusted field or raw checker failure code to the view;
+- omit prompt text, model-facing ToolSpecs, answer schema or PolicyCompletion
+  kind/code;
+- make view reward/disposition/trajectory differ from the record;
+- relocate and attempt path-dependent identity;
+- mutate original nested JSON after object construction;
+- fail after record write, after view write or during paired cold-read; the
+  partial directory must be rejected and no TrainingView claimed;
+- collide with an existing output directory.
 
-### Physical exit
+Named mutation licence: add one checker-derived field to the view or allow a
+view-only reader to bypass the trusted record; projection tests must kill it.
 
-Relocate one success, one failure and one abstention Episode. Cold-read all
-identities and use only TrainingEpisodeView to reconstruct the public
-instruction/tool trajectory needed by a dummy S4 consumer.
+### Cold/physical exit
+
+Persist and relocate one success, one failure and one abstention bundle.
+Cold-read each through the paired reader and reconstruct the exact public input
+and trajectory from only the returned TrainingEpisodeView.
+
+No production dummy/S4 consumer is added.
 
 ### Stop conditions
 
-- full TaskPack/Episode trusted JSON is handed to S4 as the training view;
-- a database/registry is added for artifact lookup;
-- native instance directories are required as permanent Episode identity.
+- view is trusted independently of EpisodeRecord;
+- full TaskPack/Episode JSON is handed downstream;
+- a Registry/database is introduced;
+- native instance directories become permanent identity.
 
 ---
 
-## 8. Checkpoint 6 — Deterministic corpus batch execution
+## 10. Checkpoint 6 — Exact serial Corpus batch
 
 ### Product claim
 
-One direct batch API executes an exact CorpusManifest under a target policy and
-retains every rollout outcome honestly.
+One direct batch API executes an exact single-release CorpusManifest under one
+target policy. A successfully published batch retains one honest result for
+every rollout slot; a publication failure aborts without a final manifest.
 
 ### Framework work
 
@@ -430,25 +684,48 @@ run_episode_batch(
     prepared,
     task_store_root,
     corpus_manifest_path,
+    expected_corpus_id,
     output_root,
     *,
-    policy_driver,
+    policy_spec,
+    policy_driver_factory,
     rollouts_per_task,
-    infrastructure_retry_limit=1,
 ) -> EpisodeBatchManifest
 ```
 
-The runner must:
+Before acting:
 
-- cold-verify CorpusManifest and TaskPack paths;
-- freeze all EpisodeRequests before the first policy call;
-- execute serially initially;
-- persist every policy success/failure;
-- persist every infrastructure abstention/retry attempt;
-- never retry policy failure as the same rollout;
-- stop the affected authority on Task/Environment/Semantics/Verifier defects;
-- report reward distribution, failure/abstain owners, calls, tokens and latency;
-- not reselect Tasks or alter CorpusManifest.
+- cold-verify exact expected CorpusManifest;
+- typed-reject multi-release corpora;
+- resolve every TaskPack and release binding;
+- freeze all valid requests in deterministic corpus/rollout order;
+- retain invalid/missing TaskPack entries as blocked rollout slots without
+  fabricating request/public/Episode data.
+- retain post-request pre-public-input failures as request-bound blocked slots
+  without fabricating capture/Episode data.
+
+Execution:
+
+- serial only;
+- create, PolicySpec-check and close one fresh driver per rollout;
+- one attempt per rollout;
+- no SDK/Host retry parameter or retry slots;
+- persist every success, failure, abstention and blocked slot;
+- abort without a final EpisodeBatchManifest if any Episode bundle fails
+  write/cold-read; do not fabricate the unexecuted remainder as blocked;
+- stop affected Task/Release authority on trusted defects;
+- never change corpus membership or Task validity.
+
+Persist only:
+
+```text
+batches/<batch_id>/EpisodeBatchManifest.json
+```
+
+Aggregates are derived from retained records: dispositions, blocked counts,
+attempted/dispatched calls, provider turns, reported input/output tokens,
+missing-usage count, latency and abstain-owner counts. Do not claim monetary
+cost.
 
 ### Files
 
@@ -460,103 +737,124 @@ tests/test_episode_batch.py
 
 ### RED tests
 
-- hidden retry-until-success;
-- dropped failed rollout;
-- corpus entry resolved to another TaskPack;
-- duplicate request index;
-- policy failure retried as infrastructure;
-- task/verifier defect counted as model failure;
-- aggregate counts/cost disagree with Episode records;
-- output root reused/collided.
+- wrong expected corpus ID or noncanonical manifest;
+- multi-release corpus silently accepted/skipped;
+- corpus entry resolved to another TaskPack/Release;
+- duplicate logical request/rollout index;
+- invalid TaskPack fabricated into an EpisodeRequest;
+- policy failure retried or overwritten;
+- dropped success/failure/abstain/blocked result;
+- authority defect counted as model failure;
+- aggregate mismatch, including missing usage silently treated as zero;
+- Episode publication failure still emits a final manifest or fake blocked
+  remainder;
+- reused/colliding output root;
+- duplicate run artifact emitted;
+- driver instance or continuation state reused across rollouts.
 
-### Real exit
+Named mutation licence: drop one failed/blocked result or alter one aggregate;
+manifest reconciliation tests must kill it.
 
-Run fixed rollouts over one Git and one SQLite corpus. Report exact success,
-failure, abstain, tool call, token and latency counts. Batch size is an
-experiment parameter, not a correctness gate.
+### Physical exit
+
+Run fixed rollout counts over exact Git and SQLite single-release corpora.
+Report all IDs, dispositions, blocked slots, calls, provider turns, reported
+tokens, missing-usage count and latency.
 
 ### Stop conditions
 
-- parallel scheduler/queue added before a measured bottleneck;
-- batch policy modifies Task validity or corpus membership;
-- only successful episodes are persisted.
+- parallel scheduler/queue or automatic retry appears;
+- explicit TaskPack-set batch source appears;
+- batch changes Task validity/corpus membership;
+- only successful Episodes persist;
+- a multi-release scheduler is invented.
 
 ---
 
-## 9. Checkpoint 7 — Held-out transfer and S4-shaped handoff
+## 11. Checkpoint 7 — Frozen S3 stage acceptance
 
 ### Product claim
 
-The frozen S3 runtime transfers across current conformance and held-out releases
-and exposes a usable policy/training boundary without implementing S4.
+The CP1–CP6 runtime transfers across exact conformance and inherited maintenance
+authority and exposes the S4 boundary without implementing S4.
 
-### Work
+### Freeze rule
 
-- freeze S3 contracts, prompt, reward map and batch rules;
-- run current Git, SQLite and post-freeze equipment-maintenance artifacts without
-  domain changes;
-- execute Atom/ForEach/If where present;
-- run at least one real Responses policy through the full batch path;
-- exercise a second policy identity or scripted public driver to prove the
-  runtime is not bound to the S2 witness model;
-- cold-read TrainingEpisodeViews;
-- implement one tiny S4-shaped consumer that groups successful/failed/non-trainable
-  episodes without tokenization or optimization;
-- confirm TaskPack and Corpus identities are unchanged.
+Pin the accepted CP6 source snapshot (HEAD plus diff digest) before the CP7 run.
+CP7 adds no production component, schema or helper.
+
+If CP7 finds a defect:
+
+1. identify the owning earlier checkpoint;
+2. mark it `REWORK`;
+3. fix/review there;
+4. rerun every affected downstream checkpoint;
+5. freeze a new source snapshot before repeating CP7.
 
 ### Required evidence
 
-```text
-real verified_success
-real or physical verified_failure
-controlled infrastructure abstention
-close/reopen evidence
-cold artifact relocation
-exact public/training projection
-cross-policy identity separation
-cross-environment no-domain-branch execution
-```
+- exact Git, SQLite and inherited maintenance Release/Corpus/TaskPack IDs;
+- Atom, ForEach and If across the total authority set;
+- one real Responses policy through the full production batch path;
+- one scripted second PolicyDriver identity through the same Host loop;
+- real-persistent verified success and verified failure;
+- controlled typed provider/infrastructure abstention with no owner conflation;
+- complete and partial lifecycle evidence;
+- relocated paired Episode bundles;
+- exact non-leaking S4-facing view;
+- unchanged TaskPack and Corpus identities;
+- no Framework domain branches.
+
+The scripted second driver proves boundary generality only. The view consumer is
+test-only. Internal success counts are not called training utility.
 
 ### Fatal outcomes
 
-- target policy receives protected fields;
+- new production code is required only for CP7;
+- target policy sees protected fields;
 - failed trajectories cannot be reconstructed;
-- provider failure and model failure are inseparable;
-- S3 requires modifying Task truth or re-admitting Tasks;
-- S4 cannot drive/read the public trajectory without bypassing trust;
-- runtime is hard-coded to one model/route or one environment domain.
-
-### Stop conditions
-
-- trainer/chat-template/logprob/token-mask code enters S3;
-- a new Agent framework is introduced instead of the small PolicyDriver boundary;
-- internal success counts are called training utility.
+- provider/infrastructure/policy failures are inseparable;
+- S3 changes/re-admits Task truth;
+- runtime is hard-coded to one model/route/domain;
+- S4 requires bypassing trusted projection;
+- trainer/veRL/service/Registry code appears.
 
 ---
 
-## 10. Required validation
+## 12. Locked validation
 
-At every checkpoint:
+At activation, create/sync the locked development environment once if absent:
+
+```bash
+UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv sync --frozen --group dev
+```
+
+At every CP1–CP6 verdict:
 
 ```bash
 UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv lock --check
-.venv/bin/ruff check src tests
-.venv/bin/ruff format --check src tests
-.venv/bin/mypy src
-.venv/bin/python -m pytest -q
+UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv run --frozen ruff check src tests
+UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv run --frozen ruff format --check src tests
+UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv run --frozen mypy src
+UV_CACHE_DIR=/tmp/foundry-s3-uv-cache uv run --frozen pytest -q
 git diff --check
 ```
 
-Also retain:
+Focused tests are additive; they never replace the full suite.
 
-- focused mutation licences for projection, reward and identity;
-- exact real Release/TaskPack/Corpus/Episode IDs;
-- provider route/version and non-secret PolicySpec;
-- production/test LOC added and removed;
-- typed failures rather than repaired-away attempts.
+Retain per checkpoint:
 
-## 11. Completion
+- named RED and killed mutant;
+- exact reviewed source snapshot and diff scope;
+- exact input/output artifact IDs;
+- non-secret PolicySpec and actual Responses configuration;
+- typed defects and lifecycle evidence;
+- independent review findings and final verdict.
 
-S3 completes only after Checkpoints 1–7 meet their real exits. A successful
-Responses demo, an Episode dataclass, a binary reward function or green tests
-alone are not completion.
+## 13. Completion
+
+CP1 closes contracts only. CP1–CP5 may close the single-Task runtime slice.
+Only CP1–CP7 together complete S3.
+
+An Episode dataclass, green tests, one successful Responses run, a scripted
+physical path or a binary reward function alone is never S3 completion.

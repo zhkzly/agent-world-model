@@ -1,7 +1,10 @@
-{"file":".trellis/tasks/08-30-s3-episode-runtime/prd.md","reason":"Verify S3 records target-policy behavior and Reward/abstention without taking Task truth or training ownership."}
-{"file":".trellis/tasks/08-30-s3-episode-runtime/design.md","reason":"Audit reuse of one policy/tool/reload path, exact public/trusted projections and minimal component count."}
-{"file":".trellis/tasks/08-30-s3-episode-runtime/implement.md","reason":"Check checkpoint order, real evidence exits, failure attribution and no demo/MVP substitution."}
-{"file":"src/agent_env_foundry/public_agent.py","reason":"Ensure failed policy turns are preserved and infrastructure remains distinct without a second Responses loop."}
-{"file":"src/agent_env_foundry/task_execution.py","reason":"Ensure every valid episode is checked only after closing and reopening the same native instance."}
-{"file":"src/agent_env_foundry/batch_foundry.py","reason":"Ensure TaskPack public/trusted boundaries and identities remain unchanged by S3."}
-{"file":"src/agent_env_foundry/assessment.py","reason":"Ensure TaskAssessment remains downstream metadata and shares mechanics without determining Episode reward."}
+{"file":"PROJECT.md","reason":"Reject any diff that substitutes a demo, green suite or partial slice for full S3 completion."}
+{"file":"DECISIONS.md","reason":"Audit exact S2 authority, Host ownership, reward precedence, provider/infrastructure separation and forbidden scope."}
+{"file":".trellis/tasks/08-26-foundry-paper-product/prd.md","reason":"Check cross-stage S1->S2->S3->S4 claims and ensure the parent remains planning authority only."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/prd.md","reason":"Verify successful S2 TaskPack/Witness/Corpus identities and semantics do not drift."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/design.md","reason":"Compare shared execution/checker behavior with the accepted Direct upstream path."}
+{"file":".trellis/spec/backend/v2-preparation.md","reason":"Audit same-instance close/reopen order, distinct sessions, no second reset and unchanged ReloadEvidence/1."}
+{"file":".trellis/spec/backend/s2-assessment-corpus.md","reason":"Audit cold TaskPack/Corpus identity and strict public/trusted projection boundaries."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reject duplicated Responses, lifecycle, checker, decoder or projection logic."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Audit end-to-end data ownership and mutation resistance from policy input through S4-facing view."}
+{"file":".trellis/tasks/08-30-s3-episode-runtime/research/input-readiness.md","reason":"Reject activation or physical claims when exact upstream IDs lack current cold-reader receipts."}

@@ -2,253 +2,85 @@
 
 ## 1. Design judgment
 
-S3 should be a thin trusted execution/evaluation layer over current S2
-artifacts, not another foundry.
+S3 is one thin trusted execution/evaluation layer over current S1/S2 authority,
+not another foundry and not an S4 trainer.
 
-The current repository already contains most hard mechanics:
+The repository already owns most physical mechanics:
 
-| Existing component | Reuse in S3 |
+| Existing component | S3 reuse |
 | --- | --- |
-| `prepare_release` / actor+trusted child runtimes | exact Release isolation |
-| `read_task_pack_artifact` | cold TaskPack verification and public/trusted split |
-| `run_public_episode` | Responses function-tool policy adapter |
-| `run_public_attempt` / `ReloadEvidence` | physical open-reset-act-close-reopen-check lifecycle |
-| Atom/ForEach/If runtime evaluators | frozen Task-kind verification |
-| provenance code | public operand evidence |
-| `TaskAssessment` | source of shared execution/cost patterns, not S3 truth |
+| `prepare_release` / isolated actor and trusted runtimes | exact Release execution |
+| `read_task_pack_artifact` | canonical TaskPack verification and public/trusted split |
+| `run_public_episode` | the one Responses loop to refactor, never duplicate |
+| `run_public_attempt` / `ReloadEvidence/1` | physical reset/close/reopen/check path |
+| Atom/ForEach/If evaluators | frozen Task truth |
+| `TaskAssessment` | shared capture/lifecycle consumer, never reward authority |
+| `CorpusManifest` | exact batch membership |
 
-S3 adds only what these components do not currently provide:
+Concrete gaps in current code are:
 
-1. retain complete trajectories when the policy fails;
-2. run an arbitrary target policy identity instead of the research-specific
-   hard-coded route;
-3. map frozen verification to one base Reward/abstention contract;
-4. persist cold-readable Episode artifacts and batch manifests for S4;
-5. expose one restricted policy-driving boundary usable by Responses now and an
-   S4 rollout adapter later.
+1. policy failures raise and discard the accumulated public prefix;
+2. a public failure prevents pre-close inspection, reopen and checker execution;
+3. `AgentRoute` is fixed to one research model/route;
+4. the cold TaskPack reader does not construct current runtime Task values and
+   drops the If admission that contains the exact branch AtomTaskPack;
+5. no immutable Episode, reward or non-leaking training projection exists;
+6. no direct exact-Corpus episode batch exists.
 
-## 2. One runtime, two drivers
+Each new component below exists for one of those gaps. Types appear only at
+their named checkpoint; S3 does not prebuild future batch/trainer machinery.
 
-```text
-                         trusted Host
-                             |
-         +-------------------+-------------------+
-         |                                       |
-  ResponsesPolicyDriver                    future S4 driver
-         |                                       |
-         +---------- restricted PublicEpisodePort+
-                             |
-                    actor reset/tools/invoke
-                             |
-                      close -> reopen
-                             |
-                   frozen Task verification
-                             |
-                    EpisodeRecord + reward
-```
-
-There is no driver registry. S3 defines one small `PolicyDriver` protocol and
-ships one production implementation, `ResponsesPolicyDriver`. Tests may use a
-scripted driver. S4 may later implement the same protocol without changing the
-Host's trust boundary.
-
-## 3. Minimal public policy port
-
-The policy driver must never receive `OpenPreparedSession`, `TrustedTaskView` or
-checker callbacks. It receives a restricted object:
-
-```python
-class PublicEpisodePort(Protocol):
-    @property
-    def input(self) -> PublicEpisodeInput: ...
-
-    def invoke(self, tool_name: str, arguments: JSONObject) -> ToolObservation: ...
-```
-
-`PublicEpisodeInput` contains:
-
-```python
-@dataclass(frozen=True, slots=True)
-class PublicEpisodeInput:
-    instruction: str
-    reset_observation: JSONValue
-    tool_specs: tuple[ToolSpec, ...]
-    answer_schema: JSONObject
-    system_prompt_digest: str
-```
-
-The Host records each invocation before returning the public observation. The
-policy cannot inspect native state, reset again or evaluate the checker.
-
-The driver returns a typed terminal outcome:
-
-```python
-@dataclass(frozen=True, slots=True)
-class PolicyCompletion:
-    turns: tuple[PolicyTurn, ...]
-    final_answer: JSONObject | None
-    terminal_kind: Literal[
-        "completed",
-        "policy_failure",
-        "infrastructure_failure",
-    ]
-    terminal_code: str | None
-    usage: tuple[JSONObject | None, ...]
-```
-
-Environment/trusted defects are raised by the Host and routed to abstention.
-Policy protocol defects are represented in `PolicyCompletion` so prior actions
-are not discarded.
-
-## 4. Required refactor of current public execution
-
-Current `run_public_episode` returns only after a valid final answer and raises
-`NoPublicWitness` for policy-level failures. That behavior is correct for S2
-witness admission but insufficient for S3 because partial trajectories vanish.
-
-Refactor without creating a second loop:
+## 2. Authority and dependency order
 
 ```text
-capture_public_episode(...) -> PolicyCompletion
-
-run_public_episode(...)     # retained S2 convenience wrapper
-  -> capture_public_episode(...)
-  -> require terminal_kind == completed
-  -> otherwise raise the existing typed S2 failure
+CP1 contract kernel
+  -> CP2 Host policy loop and Responses decision adapter
+  -> CP3 shared physical lifecycle and partial evidence
+  -> CP4 strict Task runtime, verification, reward and EpisodeRecord
+  -> CP5 canonical Episode bundle and TrainingEpisodeView
+  -> CP6 exact Corpus batch and EpisodeBatchManifest
+  -> CP7 frozen acceptance only
 ```
 
-`capture_public_episode` records:
+CP3 is callback-driven and does not depend on the CP4 cold Task loader. CP4
+supplies current Atom/ForEach/If callbacks to the already accepted lifecycle.
+This removes the previous circular dependency where CP3 accepted an undefined
+`task_runtime`.
 
-- provider turn index;
-- normalized function-call items, including invalid/unknown calls where safely
-  parseable;
-- Host dispatch result or the policy protocol error;
-- public ToolObservation;
-- final structured answer when valid;
-- usage per provider turn.
+## 3. CP1 contract kernel
 
-It excludes provider-private reasoning items. Function-call ordering and turn
-grouping are retained; the existing `TraceEvent` remains the checker-facing
-projection.
+CP1 owns only stable leaf/cross-checkpoint contracts. In addition to the four
+identity/outcome values below, it freezes the public capture values described
+in Section 5 because CP2 consumes them directly. It does not create any
+verification, persistence or batch aggregate.
 
-## 5. Required refactor of physical lifecycle
-
-Current `run_public_attempt` assumes the policy runner returns normally before
-post-reopen evaluation. S3 needs the same physical lifecycle for completed and
-policy-failed episodes.
-
-Extract one lower-level context:
-
-```python
-run_episode_attempt(
-    prepared,
-    instance_root,
-    task_runtime,
-    policy_driver,
-) -> AttemptOutcome
-```
-
-The exact lifecycle remains:
-
-```text
-open acting session
--> reset once
--> trusted before inspect
--> checker/binding preflight
--> policy execution through PublicEpisodePort
--> trusted pre-close inspect
--> close
--> reopen same native instance without reset
--> trusted post-reopen inspect
--> frozen checker evaluation
--> close
-```
-
-The existing successful S2 wrappers call this core and require a successful
-policy completion plus satisfied checker. S3 accepts either satisfied or failed
-checker results and publishes an EpisodeRecord. No duplicate lifecycle remains.
-
-Infrastructure failure after one or more tool calls is still recorded as an
-abstained attempt when enough evidence can be sealed; it never becomes reward
-zero.
-
-## 6. Runtime Task adapter
-
-S3 must not deserialize arbitrary verifier code. It supports only current
-admitted TaskPack formats and explicit goal-kind dispatch:
-
-```python
-type RuntimeTask = AtomTask | ForEachTask | IfTask
-```
-
-A single module provides:
-
-```python
-load_runtime_task(trusted_view: TrustedTaskView) -> RuntimeTask
-
-prepare_task_evaluation(
-    session,
-    task,
-    before_facts,
-) -> FrozenEvaluationContext
-
-evaluate_task_episode(
-    session,
-    task,
-    context,
-    before_facts,
-    post_reopen_facts,
-    trace,
-    final_answer,
-) -> JSONObject
-```
-
-The adapter reuses the same task-kind-specific binding and evaluation logic used
-by S2. It performs before-policy checks:
-
-- exact release match;
-- current Task format and identity;
-- fresh logical binding reconstruction;
-- checker preimage/digest equality;
-- initial state validity.
-
-`All` is added automatically only after S2 publishes a current admitted All
-TaskPack format. S3 does not invent composition support.
-
-## 7. Policy identity
-
-The current `AgentRoute` is intentionally fixed to one research route/model and
-cannot identify arbitrary S3 target policies. Keep it for S1 research where it
-is authoritative, but remove it from generic Task episode identity.
-
-Introduce:
+### `PolicySpec`
 
 ```python
 @dataclass(frozen=True, slots=True)
 class PolicySpec:
-    policy_name: str
     model_id: str
+    checkpoint_id: str | None
     driver_id: str
     driver_version: str
-    route_digest: str
+    route_id: str
     system_prompt_digest: str
     max_provider_turns: int
-    generation_config: JSONObject
 ```
 
 Rules:
 
-- no credentials or raw auth headers;
-- include only generation parameters actually applied;
-- route digest may bind a non-secret normalized route document;
-- model/checkpoint changes produce a new policy identity;
-- batch retry policy is not hidden in the driver.
-
-## 8. Episode objects and identities
+- credentials, auth headers and temporary paths are impossible fields;
+- route_id is an explicit normalized non-secret identifier, never a caller
+  digest over URL userinfo, query tokens or auth material;
+- there is no generic generation/config bag in CP1; if CP2 proves another
+  applied parameter is identity-bearing, implementation returns to CP1 and
+  adds one explicit named field before CP2 can pass;
+- human labels do not change identity unless they are the declared
+  model/checkpoint identifier;
+- the Responses adapter proves its actual request matches the spec.
 
 ### `EpisodeRequest`
-
-Frozen before any policy call:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -258,219 +90,567 @@ class EpisodeRequest:
     task_id: str
     policy_id: str
     rollout_index: int
-    attempt_index: int
 ```
 
-`request_id` is its canonical digest.
+`request_id` is the canonical digest. `rollout_index` is positive and
+1-based. There is no retry/attempt index in the logical request.
 
-### `PolicyTurn`
+### `EpisodeDefect`
 
-One provider/policy decision turn:
+One flat value:
 
 ```python
+@dataclass(frozen=True, slots=True)
+class EpisodeDefect:
+    owner: DefectOwner
+    code: str
+    phase: str
+```
+
+`DefectOwner` is closed over `provider`, `infrastructure`,
+`environment`, `task_artifact`, `semantics`, `verifier` and
+`evidence`. There is no subclass/exception hierarchy per owner.
+
+### `RewardOutcome`
+
+```python
+@dataclass(frozen=True, slots=True)
+class RewardOutcome:
+    disposition: Literal["verified_success", "verified_failure", "abstain"]
+    reward: float | None
+    abstain_owner: DefectOwner | None
+    abstain_code: str | None
+```
+
+Python typing does not use float Literals here. The constructor runtime-validates
+that reward is exactly `1.0`, `0.0` or `None` and enforces the complete truth
+table. It cannot by itself decide reward; CP4's pure mapper does that from
+capture, verification and defect.
+
+### Deep immutability
+
+Frozen dataclasses are not enough when they contain JSON dictionaries/lists.
+Every contract:
+
+- snapshots input JSON rather than retaining caller aliases;
+- exposes no mutable internal identity preimage;
+- returns fresh JSON documents from serialization;
+- rejects non-JSON, noncanonical or unexpected-key content.
+
+Alias-mutation tests are required for policy config and all later public,
+checker, usage and artifact JSON values.
+
+## 4. One Host-owned policy loop
+
+The previous `PublicEpisodePort.invoke()` design is removed. Tool authority
+never crosses into a driver.
+
+```text
+                         trusted Host
+                              |
+            turn budget / validation / ledger / dispatch
+                              |
+                  PolicyDriver.next_decision(...)
+                         /              \
+          ResponsesPolicyDriver      scripted test driver
+                              |
+                       public decision only
+```
+
+The minimal driver protocol is stateful but decision-only:
+
+```python
+class PolicyDriver(Protocol):
+    @property
+    def policy_spec(self) -> PolicySpec: ...
+
+    def start(self, public_input: PublicEpisodeInput) -> None: ...
+
+    def next_decision(
+        self,
+        prior_public_results: tuple[tuple[str, JSONObject], ...],
+    ) -> DriverDecision: ...
+
+    def close(self) -> None: ...
+```
+
+The exact method names may follow existing code style, but the authority is
+fixed:
+
+- one Host call requests one provider/policy decision;
+- the driver may retain opaque in-memory continuation state;
+- one driver instance belongs to exactly one Episode and rejects reuse;
+- the Host closes it in `finally` on success, policy failure or defect;
+- continuation state is not persisted or treated as public reasoning;
+- the driver cannot reset, invoke, inspect, check, retry or loop;
+- the Host owns budgets, validation, dispatch, recording and termination.
+
+The Host entry accepts the actor, instruction, reset observation, answer schema
+and one fresh driver—not a separately authoritative PublicEpisodeInput. It:
+
+- snapshots `actor.tools()` once and uses that one validated catalog for both
+  model-facing ToolSpecs and dispatch;
+- constructs the exact public prompt/input internally;
+- verifies the prompt digest and driver PolicySpec identity;
+- takes the only turn budget from PolicySpec.
+
+For Responses, the adapter maps one `responses.create` result into a
+`DriverDecision` and retains only provider continuation objects needed for the
+next API call. The Host remains the only Agent loop.
+
+## 5. Public input and authoritative capture
+
+### `PublicEpisodeInput`
+
+```text
+system_prompt              exact public text
+instruction                canonical Task instruction
+reset_observation          fresh public reset output
+tool_specs                 exact model-facing public ToolSpecs
+answer_schema              exact final-answer schema
+```
+
+The Host constructs this value before the first decision. Any public
+tool-description guidance is included here so the persisted input equals what
+the model saw; it is not hidden inside the Responses adapter.
+
+### Decision and ledger values
+
+These immutable ledger values are part of the CP1 contract kernel. CP2 adds the
+driver protocol and the Host loop that produces them; it does not redesign
+their persisted shape.
+
+`DriverDecision` is an ephemeral provider-adapter result. The Host converts it
+into immutable public records:
+
+```python
+@dataclass(frozen=True, slots=True)
+class EpisodeToolCall:
+    raw_call_id: JSONValue | None
+    raw_tool_name: JSONValue | None
+    call_id: str | None
+    tool_name: str | None
+    raw_arguments: JSONValue | str | None
+    parsed_arguments: JSONObject | None
+    parse_status: str
+    schema_status: str
+    dispatch_status: str
+    observation: JSONObject | None
+
 @dataclass(frozen=True, slots=True)
 class PolicyTurn:
     turn_index: int
     calls: tuple[EpisodeToolCall, ...]
-    final_answer: JSONObject | None
-    failure_code: str | None
+    raw_public_terminal: JSONValue | str | None
     usage: JSONObject | None
+
+@dataclass(frozen=True, slots=True)
+class PolicyCompletion:
+    terminal_kind: Literal["completed", "policy_failure"]
+    final_answer: JSONObject | None
+    terminal_code: str | None
+
+@dataclass(frozen=True, slots=True)
+class PublicEpisodeCapture:
+    public_input: PublicEpisodeInput
+    turns: tuple[PolicyTurn, ...]
+    completion: PolicyCompletion | None
+    defect: EpisodeDefect | None
 ```
 
-`EpisodeToolCall` binds call ID, tool name, arguments, dispatch status and public
-observation. It preserves turn grouping while `TraceEvent` remains a derived
-flat verifier input.
+Exact field types may be specialized during CP1/CP2 RED tests, but these
+authorities are invariant:
+
+- calls/observations/usage exist once in Host turns;
+- completion contains only public terminal classification and final answer;
+- at least one completion or defect is present; both are allowed when a valid
+  public completion is followed by Host close/usage/evidence failure;
+- the flat checker `TraceEvent` is derived only from validated dispatched
+  calls;
+- invalid calls and raw invalid terminal material remain in the public turns.
+
+The Host rejects duplicate call IDs and any mismatch between dispatched calls,
+returned call results and its ledger. Separate Responses-adapter mapping tests
+prove every public call/terminal item in a raw provider fixture becomes the
+corresponding DriverDecision; the generic Host does not pretend it can inspect
+provider-private state. Hidden reasoning output items are not copied.
+
+## 6. Provider versus infrastructure
+
+The current catch-all conversion of every Responses request exception to
+`InfrastructureFailure` is removed.
+
+Deterministic classification uses observable boundaries:
+
+- `provider`: a valid request crossed the provider API boundary and returned an
+  explicit remote 429, 5xx, provider outage/timeout code or declared service
+  failure;
+- `infrastructure`: credential/auth/route configuration, client initialization,
+  DNS/TLS/proxy/socket transport, dependency, process or I/O failure;
+- `evidence`: remote 400/422 request rejection caused by the Host request, or a
+  proved Host capture/adapter contract defect.
+
+A healthy Responses envelope containing refusal, malformed calls or a wrong
+answer is policy behavior. Host turn-budget exhaustion is policy failure.
+401/403 and route/model configuration rejection are infrastructure, never
+provider quality.
+An unexpected envelope remains unattributed until raw current-contract evidence
+assigns it to provider nonconformance or the Host adapter.
+
+An exception without sufficient causal evidence is not guessed into either
+owner. It becomes an internal unattributed blocker: no TrainingEpisodeView,
+the run stops, and checkpoint acceptance fails until classification is repaired.
+
+## 7. Shared physical attempt lifecycle
+
+The existing successful lifecycle is generalized, not replaced:
+
+```python
+run_episode_attempt(
+    prepared,
+    instance_root,
+    *,
+    task_id,
+    start_input,
+    preflight,
+    execute_policy,
+    evaluate_after_reopen,
+) -> AttemptOutcome
+```
+
+The concrete signature may retain the current context-manager style. Required
+behavior is:
+
+```text
+acting open
+-> reset once
+-> before inspect / preflight
+-> snapshot tools / freeze PublicEpisodeInput
+-> Host public-capture terminal (completion, policy failure or typed defect)
+-> pre-close inspect
+-> acting close
+-> reopened open on same native instance
+-> post-reopen inspect
+-> supplied frozen evaluator
+-> reopened close
+```
+
+`AttemptOutcome` owns:
+
+- an optional `PublicEpisodeCapture` because reset/preflight may fail before
+  public input exists;
+- every lifecycle event actually achieved in causal order;
+- native and acting/reopened session identities when available;
+- pre-close/post-reopen fact digests when available;
+- checker result digest when available;
+- one optional lifecycle defect; the Episode's primary defect is
+  `capture.defect` when present, otherwise this lifecycle defect;
+- authoritative request-bound S3 lifecycle evidence with an explicit
+  `capture_terminal` event;
+- unchanged `ReloadEvidence/1` only as a compatibility projection when the
+  public protocol completed and the canonical lifecycle finished.
+
+S3 adds a request-bound attempt envelope containing `request_id`; it does not
+change the existing S2 reload document/preimage.
+
+Cleanup may continue after a provider/policy defect, so lifecycle evidence may
+extend past the primary defect. A later cleanup failure makes the lifecycle
+incomplete but does not create a general multi-defect event model; the Episode
+already abstains and records the achieved terminal phase.
+Only protocol-completed exact canonical sequences project to
+`ReloadEvidence/1`. A fully closed/reopened policy/provider/infrastructure
+terminal remains complete S3 attempt evidence but never receives the misleading
+legacy `episode_complete` event.
+
+The S2 `run_public_attempt` wrapper and Atom/ForEach/If witness projections
+remain exact for successful paths. New failed TaskAssessment trials use the
+shared capture/lifecycle and retain partial public activity and usage without
+changing Task truth.
+
+## 8. Strict current TaskPack runtime
+
+S3 supports only:
+
+```text
+atom-task-pack/4
+foreach-task-pack/3
+if-task-pack/3
+```
+
+The private loader consumes the complete output of canonical TaskPack
+verification and uses exact-key current decoders:
+
+```python
+type LoadedRuntimeTask = LoadedAtom | LoadedForEach | LoadedIf
+```
+
+- `LoadedAtom` contains the exact AtomTask;
+- `LoadedForEach` contains the exact ForEachTask;
+- `LoadedIf` contains the exact IfTask plus the validated embedded branch
+  AtomTask extracted from `admission.branch_task_pack`.
+
+For If, the loader recomputes nested AtomTaskPack identity/current shape,
+checker preimages and If-to-Atom release/start/capability/semantic bindings. It
+then discards admission witnesses from the runtime value.
+
+The loader never:
+
+- recompiles candidates or an Atom universe;
+- changes TaskPack bytes or format;
+- loads arbitrary Python verifier code;
+- invents a dependency registry or universal Task DSL.
+
+Current task-kind evaluator logic remains authoritative. Only the smallest
+private helpers needed for the shared preflight/post-reopen callback are
+extracted from Atom/ForEach/If modules.
+
+## 9. Verification, reward and EpisodeRecord
 
 ### `EpisodeVerification`
 
-Do not invent a universal state ontology. Store:
-
 ```text
 checker_digest
-task-kind-specific canonical checker request
-exact checker result document
-common status: satisfied / failed
-common failure codes
+exact canonical task-kind checker request or request set
+exact canonical checker result or result set
+derived satisfied/failed status
+trusted checker failure codes
 ```
 
-The task-kind-specific request may contain protected facts/bindings and exists
-only in the trusted EpisodeRecord.
+It stores no universal state ontology. The exact request/result remain trusted
+and never enter the training view.
+
+### Reward mapper
+
+```python
+def map_base_reward(
+    *,
+    capture: PublicEpisodeCapture,
+    verification: EpisodeVerification | None,
+    attempt_evidence: EpisodeAttemptEvidence,
+) -> RewardOutcome:
+    ...
+```
+
+Precedence:
+
+```text
+any provider/infrastructure/trust defect
+  -> abstain / null
+
+no defect + trustworthy complete lifecycle/checker
++ completed protocol + checker satisfied
+  -> verified_success / 1.0
+
+no defect + trustworthy complete lifecycle/checker
++ any policy failure or checker not satisfied
+  -> verified_failure / 0.0
+```
+
+A valid checker returning failed is not a verifier defect. A policy terminal
+with satisfying state is still reward zero. A provider defect after satisfying
+mutation is still null.
 
 ### `EpisodeRecord`
+
+Introduced at CP4 after capture, lifecycle and verification shapes are real:
 
 ```python
 @dataclass(frozen=True, slots=True)
 class EpisodeRecord:
     request: EpisodeRequest
     policy: PolicySpec
-    public_input: PublicEpisodeInput
-    completion: PolicyCompletion
-    reload_evidence: ReloadEvidence | None
+    capture: PublicEpisodeCapture
+    attempt_evidence: EpisodeAttemptEvidence
     verification: EpisodeVerification | None
-    disposition: Literal["verified_success", "verified_failure", "abstain"]
-    reward: float | None
-    abstain_owner: str | None
-    abstain_code: str | None
+    outcome: RewardOutcome
     latency_ms: int
 ```
 
-The Episode ID hashes the complete canonical record except its own ID. Paths,
-credentials and temporary directories are excluded.
+`EpisodeAttemptEvidence` binds `request_id`, physical native/session
+identities, achieved lifecycle events, available fact/checker digests and
+optional protocol-completed `ReloadEvidence/1` compatibility projection, and
+owns the lifecycle defect when the capture itself does not already own the
+primary defect.
 
-### `TrainingEpisodeView`
+The Episode ID hashes the complete canonical record except its own ID. All
+duplicate projections are derived or cross-validated:
 
-Exact allowed keys:
+- request policy ID equals PolicySpec identity;
+- Host turns equal flat checker trace projection;
+- any legacy reload checker digest equals the verification result digest;
+- RewardOutcome matches completion/attempt defect/verification;
+- paths, credentials, S2 witnesses and assessment/corpus-selection identity are
+  absent.
 
-```text
-episode_id
-request_id
-release_id
-task_pack_id
-task_id
-policy_id
-instruction
-reset_observation
-tool_specs
-policy_turns
-final_answer
-verified_status
-failure_codes
-reward
-disposition
-```
+A valid public input plus a later typed defect may produce an abstained
+EpisodeRecord. A cold authority failure before valid public input produces no
+EpisodeRecord.
 
-It excludes native facts, Start input, semantic key, protected binding, expected
-branch, checker request/result, TaskPack witnesses/admission and S2 assessment.
+A valid logical request may exist before reset/preflight constructs public
+input. If that early physical/trusted step fails, AttemptOutcome has
+`capture=None`; direct execution returns the typed failure and batch records a
+request-bound blocked result, never an empty Episode capture.
 
-## 9. Reward mapper
+## 10. Canonical Episode bundle
 
-One deterministic function:
-
-```python
-def map_base_reward(
-    *,
-    completion: PolicyCompletion,
-    verification: EpisodeVerification | None,
-    defect: EpisodeDefect | None,
-) -> RewardOutcome:
-    ...
-```
-
-Rules:
-
-```text
-defect owned by infrastructure/environment/task/semantics/verifier/evidence
-  -> abstain / null
-
-no trust defect and completion is protocol-complete and checker satisfied
-  -> verified_success / 1.0
-
-otherwise, with valid post-reopen verification
-  -> verified_failure / 0.0
-```
-
-A state effect achieved before provider/TLS failure remains abstained because
-the policy outcome cannot be causally separated from infrastructure failure.
-A malformed tool call, wrong answer or turn-budget exhaustion produced by a
-healthy provider remains policy failure and reward zero.
-
-## 10. Artifact layout
-
-No Registry or database:
+One bundle, no Registry/database:
 
 ```text
 <output>/
-  episodes/<episode_id>/EpisodeRecord.json
-  views/<episode_id>/TrainingEpisodeView.json
-  batches/<batch_id>/EpisodeBatchManifest.json
-  runs/<batch_run_id>.json
+  episodes/<episode_id>/
+    EpisodeRecord.json
+    TrainingEpisodeView.json
+  batches/<batch_id>/
+    EpisodeBatchManifest.json
 ```
 
-Every write follows:
+Write order under a required-new output root:
 
 ```text
-validate in-memory preimage
--> write canonical bytes to a new path
--> immediate cold-read
--> recompute identity and projection
+validate in-memory record
+-> write canonical EpisodeRecord and derived TrainingEpisodeView
+-> cold-read both and recompute identities/projection
 ```
 
-Collision or unsupported current format fails closed.
+Collision, partial write, view derivation or cold-read failure leaves the new
+run invalid and no TrainingEpisodeView/final batch claim. The unpersisted
+EpisodeRecord cannot recursively record that its own publication failed. Strict
+readers reject any partial directory.
 
-## 11. Batch runner
+The primary reader verifies the pair:
+
+```python
+read_episode_bundle(root, episode_id) -> EpisodeBundle
+```
+
+An S4-facing helper may return only `TrainingEpisodeView`, but it must
+internally resolve and verify the trusted record. A separately trusted view is
+not accepted.
+
+The exact training projection includes:
+
+```text
+episode/request/release/task-pack/task/policy IDs
+rollout index
+system prompt text
+instruction
+reset observation
+model-facing ToolSpecs
+answer schema
+ordered public turns/calls/raw terminal material/observations/final answer
+nullable PolicyCompletion terminal kind/code
+disposition and reward
+```
+
+It excludes usage/latency, native/lifecycle evidence, checker data/codes,
+defect attribution, S2 evidence and hidden reasoning.
+
+Relocation changes no identity. Any call, observation, terminal, lifecycle,
+checker, policy, request or reward mutation under an old claimed ID fails.
+
+## 11. Exact single-release Corpus batch
 
 ```python
 run_episode_batch(
     prepared: OpenPreparedRelease,
     task_store_root: Path,
     corpus_manifest_path: Path,
+    expected_corpus_id: str,
     output_root: Path,
     *,
-    policy: PolicyDriver,
+    policy_spec: PolicySpec,
+    policy_driver_factory: Callable[[], PolicyDriver],
     rollouts_per_task: int,
-    infrastructure_retry_limit: int = 1,
 ) -> EpisodeBatchManifest
 ```
 
-The batch runner:
+Before the first policy call the runner:
 
-1. cold-reads the CorpusManifest and exact TaskPacks;
-2. creates the complete ordered `EpisodeRequest` set before the first rollout;
-3. executes serially in the initial implementation;
-4. retains every policy success/failure and infrastructure attempt;
-5. never retries a policy failure as the same rollout;
-6. fails closed on Task/Release/Semantics/Verifier authority defects;
-7. aggregates reward counts, abstention owners, tool calls, tokens and latency.
+1. cold-verifies the expected CorpusManifest;
+2. rejects a multi-release corpus as typed unsupported input;
+3. resolves every referenced current TaskPack;
+4. verifies each valid entry belongs to `prepared.identity.release_id`;
+5. freezes every valid EpisodeRequest in deterministic corpus/rollout order;
+6. records entries that cannot form a valid request as immutable blocked slots.
 
-The batch manifest does not choose another corpus and cannot modify Task or
-Episode identity.
+An invalid CorpusManifest itself produces no batch artifact. A valid corpus with
+an invalid/missing TaskPack may produce blocked slots and stops that affected
+TaskPack authority.
 
-## 12. S2 integration rule
+The runner is serial and retry-free. It creates one fresh single-use driver per
+rollout, verifies that driver's PolicySpec equals the frozen batch PolicySpec,
+and closes it before the next rollout. One rollout yields one retained result.
+Provider SDK retries are zero. Policy failure is never repaired or retried.
+If any Episode bundle fails write/cold-read, the batch aborts and writes no final
+EpisodeBatchManifest; remaining slots are not fabricated as blocked outcomes.
 
-S3 may change existing S2 code only for shared causal needs:
+`EpisodeBatchManifest` appears first in CP6 and binds:
 
-- `public_agent.py`: expose complete policy outcomes;
-- `task_execution.py`: evaluate policy failures after close/reopen;
-- TaskPack readers: export strict runtime deserialization;
-- `assessment.py`: reuse the shared public execution/lifecycle rather than keep
-  divergent mechanics;
-- current TaskPack formats only when an unavoidable new identity field is
-  required. Prefer no TaskPack format change.
+- expected corpus/release/policy identity;
+- rollout count and ordered requests;
+- every Episode ID and blocked slot;
+- aggregates recomputed from retained results: disposition, blocked count,
+  attempted/dispatched calls, provider turns, reported input/output tokens,
+  missing-usage count, latency and abstain-owner counts.
 
-Changes forbidden as “S3 cleanup”:
+It does not reselect Tasks, load an explicit TaskPack set, calculate monetary
+cost, schedule parallel work or emit a duplicate run artifact.
 
-- changing Task instructions, selectors, checkers or admission evidence;
-- weakening two-witness or challenge gates;
-- adding hidden setup or witness hints;
-- making TaskAssessment determine Episode reward.
+## 12. S2 integration and compatibility
 
-## 13. Failure ownership
+Allowed shared changes:
 
-```text
-PolicyFailure          healthy policy execution did not complete/satisfy Task -> reward 0
-InfrastructureFailure  provider/process/dependency unavailable -> abstain
-EnvironmentDefect      actor/reset/tool/observation/persistence wrong -> abstain, block release
-TaskArtifactDefect     TaskPack/corpus/identity/checker preimage invalid -> fail before acting
-SemanticsDefect        binding/inspection/evaluator contract wrong -> abstain, reopen S1/S2
-VerifierDefect         checker crashes/contradicts current frozen contract -> abstain
-EvidenceDefect         lifecycle/projection/persistence incomplete -> abstain
-```
+- `public_agent.py`: split the existing loop into Host control plus one-turn
+  Responses adaptation while retaining the successful S2 wrapper;
+- `task_execution.py`: support typed terminals/partial evidence while
+  preserving complete `ReloadEvidence/1`;
+- TaskPack reader/private loader: retain the already verified full pack long
+  enough to build current runtime truth;
+- Atom/ForEach/If modules: expose only concrete shared preflight/evaluation
+  helpers;
+- `assessment.py`: retain partial failed-trial capture through the shared path.
 
-Do not call all failures “hard Tasks”. Do not retry until success.
+Forbidden as S3 cleanup:
+
+- changing Task instructions, selectors, checker truth or admission evidence;
+- changing TaskPack bytes/formats or successful witness/reload projections;
+- weakening two-witness/challenge gates;
+- recompiling candidates during Episode execution;
+- making Assessment reliability affect Episode reward.
+
+If a TaskPack format blocker is discovered, implementation stops and returns to
+planning/S2 authority. It is not an escape hatch inside S3.
+
+## 13. Evidence classes
+
+The plan uses four non-interchangeable evidence classes:
+
+| Evidence | Proves | Does not prove |
+| --- | --- | --- |
+| deterministic fake/scripted tests and killed mutants | schemas, identities, capture mechanics, owner/reward matrix | provider behavior or physical persistence |
+| physical Release/tool/native-state execution | real mutation, persistence, close/reopen/checker; scripted policy allowed | public model solvability/provider quality |
+| live provider execution | actual Responses request/continuation/usage path | reward/lifecycle correctness by itself |
+| cold relocation | canonical persistence, path independence and reader projection | live execution by itself |
+
+A natural live failure is never a deterministic gate. A scripted policy with a
+real environment is physical evidence, not a demo, but it does not prove model
+solvability.
 
 ## 14. Anti-overdesign constraints
 
 Do not add:
 
-- a new Agent orchestration framework;
-- a second Responses loop;
-- event sourcing beyond the canonical Episode artifact;
-- a server, broker, worker queue, database or registry;
-- generic plugin discovery;
-- a universal Task/state/reward DSL;
-- partial-reward weights before real training evidence requires them;
-- logprobs/token masks/trainer schemas inside S3;
-- hidden reasoning storage.
+- another Agent/Responses loop or driver-side tool invocation;
+- a service, broker, queue, database, Registry or event-sourcing system;
+- a universal Task/state/reward/failure ontology;
+- per-owner class hierarchies;
+- a generic Task runtime or public prepare/evaluate adapter framework;
+- automatic retry/attempt slots;
+- an explicit-TaskPack-set batch source or multi-release scheduler;
+- partial-reward weights, cost pricing, logprobs, token masks, chat templates,
+  veRL/trainer types or hidden reasoning storage;
+- a production second driver or S4 consumer.
 
-A new component requires one named S3/S4 handoff or trust claim that the current
-components cannot satisfy, plus a failing test or real counterexample.
+Every new type/function must name its immediate checkpoint consumer and the
+identity, trust or S4 handoff claim it protects. CP7 adds no production
+component; it only evaluates the frozen CP1–CP6 runtime.

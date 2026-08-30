@@ -130,3 +130,9 @@ the unfinished verdict was discarded.
 The violation was promoting optional Graph/Programmatic mechanisms and an
 isolated contract path into mandatory product authority without rechecking the
 accepted Direct sampling plan.
+
+`s3-plan-convergence|介入1|返工1|adversarial review+exact input cold-read+scope deletion|红线违反1`
+
+The violation was allowing the candidate plan to accumulate multi-defect and
+atomic-publication machinery before the user restated the anti-overdesign
+boundary; both were removed before task activation or product implementation.

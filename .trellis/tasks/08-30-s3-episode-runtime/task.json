@@ -32,7 +32,7 @@
     "src/agent_env_foundry/batch_foundry.py",
     "src/agent_env_foundry/assessment.py"
   ],
-  "notes": "Plan only. S3 must reuse exact S2 Task truth and the existing close/reopen lifecycle. It may refactor shared execution primitives where failed policy trajectories or S4 policy driving cannot otherwise be represented, but may not add a second Agent loop, Task generator, verifier authority, service layer, Registry, optimizer or training format.",
+  "notes": "Candidate plan only; no implementation authority until the revised artifacts receive explicit user approval and task.py start runs. Exact Git, SQLite and inherited-maintenance Release/Corpus/TaskPack authority passed current production cold readers on 2026-08-31; Git regeneration provenance is recorded in research/input-readiness.md. S3 must reuse exact S2 Task truth and the existing close/reopen lifecycle. It may refactor shared execution primitives where failed policy trajectories or S4 policy driving cannot otherwise be represented, but may not add a second Agent loop, Task generator, verifier authority, automatic retry scheduler, service layer, Registry, optimizer or training format.",
   "meta": {
     "semantic_order": "cold-inputs-policy-execution-close-reopen-frozen-verification-reward-or-abstention-persistence",
     "base_reward": "binary-task-success/1",
@@ -41,6 +41,7 @@
       "verified_failure"
     ],
     "abstain_owners": [
+      "provider",
       "infrastructure",
       "environment",
       "task_artifact",
@@ -54,6 +55,7 @@
       "llm_judge_reward",
       "hidden_reasoning_storage",
       "sft_or_rl_optimization",
+      "automatic_retry",
       "service_or_registry"
     ]
   }

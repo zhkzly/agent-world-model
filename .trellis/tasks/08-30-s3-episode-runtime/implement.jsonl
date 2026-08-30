@@ -1,8 +1,10 @@
-{"file":"PROJECT.md","reason":"Keep S3 aligned with the paper-grade S1->S2->S3->S4 causal chain and semantic-completion standard."}
-{"file":"DECISIONS.md","reason":"Preserve accepted Task truth, trust boundaries, clean-break rules and anti-overdesign constraints."}
-{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/prd.md","reason":"Consume the exact S2 TaskPack/PublicTaskView handoff without reopening Task generation or admission."}
-{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/design.md","reason":"Reuse Direct execution, provenance, physical reload and failure ownership instead of creating parallel runtime paths."}
-{"file":"src/agent_env_foundry/public_agent.py","reason":"Refactor one Responses loop to preserve complete policy outcomes, including failed trajectories."}
-{"file":"src/agent_env_foundry/task_execution.py","reason":"Reuse and generalize the existing open-reset-act-close-reopen-check lifecycle for success and policy failure."}
-{"file":"src/agent_env_foundry/batch_foundry.py","reason":"Cold-read exact TaskPacks and preserve the strict PublicTaskView/TrustedTaskView boundary."}
-{"file":"src/agent_env_foundry/assessment.py","reason":"Prevent S2 TaskAssessment and S3 Episode execution from drifting into duplicate policy/runtime mechanics."}
+{"file":"PROJECT.md","reason":"Canonical S3 product outcome, causal order, completion evidence and non-negotiable boundaries."}
+{"file":"DECISIONS.md","reason":"Accepted S2/S3 trust, reward, provider-versus-infrastructure and anti-overdesign decisions."}
+{"file":".trellis/tasks/08-26-foundry-paper-product/prd.md","reason":"Parent S1-S4 causal claim and planned S3 stage boundary."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/prd.md","reason":"Exact upstream TaskPack, TaskAssessment and Corpus authority that S3 consumes unchanged."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/design.md","reason":"Upstream Direct execution, checker, physical reload and public/trusted design to reuse rather than duplicate."}
+{"file":".trellis/spec/backend/v2-preparation.md","reason":"Implemented Release v2 preparation and exact S2 physical attempt lifecycle contract."}
+{"file":".trellis/spec/backend/s2-assessment-corpus.md","reason":"Implemented strict TaskPack/PublicTaskView/Corpus cold-handoff and Assessment separation contract."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Require search-first reuse when extracting one Host loop and one lifecycle from existing S2 code."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Trace request, capture, lifecycle, checker, reward, artifact and batch identity across every boundary."}
+{"file":".trellis/tasks/08-30-s3-episode-runtime/research/input-readiness.md","reason":"Activation-blocking exact Release/Corpus/TaskPack inventory, locators and current cold-reader closure status."}
