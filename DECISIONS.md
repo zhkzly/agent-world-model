@@ -138,3 +138,9 @@ atomic-publication machinery before the user restated the anti-overdesign
 boundary; both were removed before task activation or product implementation.
 
 `s3-baseline-harness|介入0|返工1|archived S2 authority path+python -m pytest|红线违反0`
+
+`s3-cp1-contracts|介入0|返工1|25 focused+392 full+Mypy/Ruff+4 semantic mutants|红线违反1`
+
+The CP1 violation was using missing-module import noise as the initial RED.
+Mutation evidence later proved the contract tests, but did not rewrite that
+history; every later checkpoint must begin with a reachable behavioral RED.

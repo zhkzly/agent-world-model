@@ -29,3 +29,9 @@
 - Chosen: point the S2 product-authority test to the canonical archived task and run pytest via `python -m`.
 - Alternative rejected: exclude the stale harness tests from every checkpoint gate.
 - Evidence: full collection/path failures while S2 task status is completed under the archive path.
+
+### 2026-08-31 — CP1 ACCEPTED with one protocol violation
+
+- Chosen: accept the contract code after 25 focused tests, full 392-test suite, Mypy/Ruff and four killed semantic mutants.
+- Alternative rejected: replay a fake historical RED or rewrite already-green code solely to stage one.
+- Violation: initial RED was ModuleNotFound import noise; CP2+ must first fail on a reachable behavioral assertion.
