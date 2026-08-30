@@ -13,7 +13,6 @@ from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
 from agent_env_foundry.preparation import OpenPreparedRelease, OpenPreparedSession
 from agent_env_foundry.provenance import ArgumentProvenance, resolve_argument_provenance
-from agent_env_foundry.public_agent import run_public_episode
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
@@ -205,8 +204,17 @@ class ForEachPartialChallenge:
     final_answer: JSONObject
     argument_provenance: tuple[ArgumentProvenance, ...]
     member_results: tuple[AtomCheckResult, ...]
+    reload_evidence: ReloadEvidence
 
     def __post_init__(self) -> None:
+        if (
+            self.reload_evidence.task_id != self.task_id
+            or self.reload_evidence.acting_session_id != self.materialization_id
+        ):
+            raise TaskFoundryError(
+                "foreach_partial_reload_evidence_mismatch",
+                "ForEach partial challenge reload evidence belongs to another Task or session",
+            )
         if not 0 <= self.omitted_member_index < len(self.member_results):
             raise TaskFoundryError(
                 "foreach_partial_index_invalid",
@@ -221,10 +229,19 @@ class ForEachPartialChallenge:
                     omitted_member_index=self.omitted_member_index,
                     failed_member_index=index,
                 )
+        omitted = self.member_results[self.omitted_member_index]
+        if not omitted.collateral_ok or omitted.process_ok is True:
+            raise TaskFoundryError(
+                "foreach_partial_axis_invalid",
+                "An omitted ForEach member must preserve collateral and have no successful "
+                "process evidence",
+                omitted_member_index=self.omitted_member_index,
+                result=omitted.to_document(),
+            )
 
     def to_document(self) -> JSONObject:
         return {
-            "format": "foreach-partial-challenge/1",
+            "format": "foreach-partial-challenge/2",
             "task_id": self.task_id,
             "admission_plan_id": self.admission_plan_id,
             "omitted_member_index": self.omitted_member_index,
@@ -234,6 +251,7 @@ class ForEachPartialChallenge:
             "final_answer": _json_object(self.final_answer),
             "argument_provenance": [item.to_document() for item in self.argument_provenance],
             "member_results": [item.to_document() for item in self.member_results],
+            "reload_evidence": self.reload_evidence.to_document(),
         }
 
 
@@ -268,7 +286,7 @@ class ForEachPartialChallengeReport:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "foreach-partial-challenge-report/1",
+            "format": "foreach-partial-challenge-report/2",
             "task_id": self.task_id,
             "admission_plan_id": self.admission_plan.plan_id,
             "partials": [item.to_document() for item in self.partials],
@@ -290,6 +308,15 @@ class ForEachNoOpChallenge:
             raise TaskFoundryError(
                 "foreach_noop_false_acceptance",
                 "ForEach no-op challenge must fail every selected member",
+            )
+        if any(
+            item.initially_satisfied or not item.collateral_ok or item.process_ok is True
+            for item in self.member_results
+        ):
+            raise TaskFoundryError(
+                "foreach_noop_axis_invalid",
+                "ForEach no-op must be initially false, preserve collateral, and provide no "
+                "successful process evidence for every member",
             )
 
     def to_document(self) -> JSONObject:
@@ -340,7 +367,7 @@ class ForEachAdmissionReport:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "foreach-admission-report/2",
+            "format": "foreach-admission-report/3",
             "task_id": self.solved.task.task_id,
             "admission_plan": self.solved.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.solved.witnesses],
@@ -370,7 +397,7 @@ class ForEachTaskPack:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "foreach-task-pack/1",
+            "format": "foreach-task-pack/2",
             "task": self.task.to_document(),
             "admission": self.admission.to_document(),
         }
@@ -646,21 +673,26 @@ def challenge_foreach_partials(
             task.member_answer_schema,
             len(included_indices),
         )
-        with prepared.open(instance) as session:
-            reset = session.actor.reset(task.start_case.reset_input)
-            before = session.trusted.inspect(instance)
-            bindings = _resolve_complete_selection(session, task, before)
-            tool_specs = session.actor.tools()
-            episode = run_public_episode(
-                actor=session.actor,
-                instruction=partial_instruction,
-                reset_observation=reset,
-                tool_specs=tool_specs,
-                answer_schema=partial_answer_schema,
-                route=selected_route,
-                max_provider_turns=max_provider_turns,
-            )
-            partial_answers = episode.final_answer.get("results")
+
+        def partial_preflight(
+            session: OpenPreparedSession,
+            before: JSONValue,
+        ) -> tuple[BindingCandidate, ...]:
+            return _resolve_complete_selection(session, task, before)
+
+        with run_public_attempt(
+            prepared,
+            instance,
+            task_id=task.task_id,
+            start_input=task.start_case.reset_input,
+            instruction=partial_instruction,
+            answer_schema=partial_answer_schema,
+            preflight=partial_preflight,
+            route=selected_route,
+            max_provider_turns=max_provider_turns,
+        ) as attempt:
+            bindings = attempt.preflight_value
+            partial_answers = attempt.episode.final_answer.get("results")
             if not isinstance(partial_answers, list) or len(partial_answers) != len(
                 included_indices
             ):
@@ -671,17 +703,16 @@ def challenge_foreach_partials(
             answers: list[JSONValue] = [{} for _ in task.semantic_keys]
             for position, member_index in enumerate(included_indices):
                 answers[member_index] = partial_answers[position]
-            after = session.trusted.inspect(instance)
             contexts = _contexts(task, bindings)
             results = tuple(
                 _evaluate_report_atom(
-                    session,
+                    attempt.evaluation_session,
                     AtomCheckRequest(
                         task.capability_id,
-                        before,
-                        after,
+                        attempt.before_facts,
+                        attempt.post_reopen_facts,
                         binding.protected_binding,
-                        episode.trace,
+                        attempt.episode.trace,
                         answers[position],
                         contexts[position],
                     ),
@@ -689,28 +720,31 @@ def challenge_foreach_partials(
                 )
                 for position, binding in enumerate(bindings)
             )
-            partials.append(
-                ForEachPartialChallenge(
-                    task.task_id,
-                    solved.admission_plan.plan_id,
-                    omitted_index,
-                    task.semantic_keys[omitted_index],
-                    session.identity.materialization_id,
-                    episode.trace,
-                    episode.final_answer,
-                    resolve_argument_provenance(
-                        trace=episode.trace,
-                        instruction_values={
-                            "selected_targets": [
-                                _json_object(item) for item in included_descriptors
-                            ]
-                        },
-                        reset_observation=reset,
-                        tool_specs=tool_specs,
-                    ),
-                    results,
-                )
+            attempt.record_checker_result(
+                {"member_results": [item.to_document() for item in results]}
             )
+        assert attempt.reload_evidence is not None
+        partials.append(
+            ForEachPartialChallenge(
+                task.task_id,
+                solved.admission_plan.plan_id,
+                omitted_index,
+                task.semantic_keys[omitted_index],
+                attempt.acting_session_id,
+                attempt.episode.trace,
+                attempt.episode.final_answer,
+                resolve_argument_provenance(
+                    trace=attempt.episode.trace,
+                    instruction_values={
+                        "selected_targets": [_json_object(item) for item in included_descriptors]
+                    },
+                    reset_observation=attempt.reset_observation,
+                    tool_specs=attempt.tool_specs,
+                ),
+                results,
+                attempt.reload_evidence,
+            )
+        )
     return ForEachPartialChallengeReport(
         task.task_id,
         solved.admission_plan,

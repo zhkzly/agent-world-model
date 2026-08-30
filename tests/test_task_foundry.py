@@ -188,6 +188,47 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
     assert caught.value.code == "admission_plan_wrong_target_missing"
 
 
+def test_atom_noop_rejects_semantics_that_call_an_unchanged_world_collateral() -> None:
+    task = _task()
+    plan = _plan(task)
+    invalid = replace(
+        plan.no_op_result,
+        collateral_ok=False,
+        failure_codes=("FAILED", "PROHIBITED_COLLATERAL"),
+    )
+
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomAdmissionPlan(task.task_id, invalid, plan.challenges)
+
+    assert caught.value.code == "admission_plan_noop_axis_invalid"
+
+
+def test_wrong_answer_challenge_requires_a_successful_same_trace_control() -> None:
+    task = _task()
+    control = _witness(task, "b" * 64).result
+    wrong = replace(
+        control,
+        satisfied=False,
+        answer_ok=False,
+        failure_codes=("ANSWER_MISMATCH",),
+    )
+
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomChallengeResult(
+            "wrong_answer",
+            True,
+            "c" * 64,
+            (),
+            {"value": "wrong"},
+            wrong,
+            None,
+            None,
+            reload_evidence=reload_evidence(task.task_id, "c" * 64),
+        )
+
+    assert caught.value.code == "challenge_control_result_missing"
+
+
 def test_atom_challenge_report_requires_each_applicable_core_negative_to_fail() -> None:
     task = _task()
     plan = _plan(task)
@@ -202,6 +243,7 @@ def test_atom_challenge_report_requires_each_applicable_core_negative_to_fail() 
         rejected,
         _witness(task, "d" * 64).result,
         None,
+        reload_evidence=reload_evidence(task.task_id, "c" * 64),
     )
     wrong_answer = AtomChallengeResult(
         "wrong_answer",
@@ -215,8 +257,27 @@ def test_atom_challenge_report_requires_each_applicable_core_negative_to_fail() 
     )
 
     report = AtomChallengeReport(task.task_id, plan, (no_op, wrong_target, wrong_answer))
-    assert report.to_document()["format"] == "atom-challenge-report/1"
+    assert report.to_document()["format"] == "atom-challenge-report/2"
     assert plan.to_document()["format"] == "atom-admission-plan/4"
+
+    with pytest.raises(TaskFoundryError) as caught:
+        replace(wrong_target, reload_evidence=None)
+    assert caught.value.code == "challenge_reload_evidence_missing"
+
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomChallengeReport(
+            task.task_id,
+            plan,
+            (
+                no_op,
+                replace(
+                    wrong_target,
+                    reload_evidence=reload_evidence("f" * 64, "c" * 64),
+                ),
+                wrong_answer,
+            ),
+        )
+    assert caught.value.code == "challenge_reload_task_mismatch"
 
     with pytest.raises(TaskFoundryError) as caught:
         AtomChallengeReport(
@@ -261,6 +322,7 @@ def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
         rejected,
         control,
         None,
+        reload_evidence=reload_evidence(task.task_id, "4" * 64),
     )
     wrong_answer = AtomChallengeResult(
         "wrong_answer",
@@ -280,7 +342,7 @@ def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
 
     task_pack = seal_atom_task_pack(solved, challenges)
     assert task_pack.task_pack_id
-    assert task_pack.to_document()["format"] == "atom-task-pack/2"
+    assert task_pack.to_document()["format"] == "atom-task-pack/3"
 
 
 def test_solve_freezes_admission_plan_before_opening_a_witness(

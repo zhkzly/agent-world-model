@@ -217,7 +217,7 @@ class IfAdmissionReport:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "if-admission-report/2",
+            "format": "if-admission-report/3",
             "task_id": self.solved.task.task_id,
             "admission_plan": self.solved.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.solved.witnesses],
@@ -246,7 +246,7 @@ class IfTaskPack:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "if-task-pack/1",
+            "format": "if-task-pack/2",
             "task": self.task.to_document(),
             "admission": self.admission.to_document(),
         }

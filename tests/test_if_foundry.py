@@ -178,7 +178,7 @@ def test_if_task_pack_reuses_the_exact_admitted_atom_branch() -> None:
 
     pack = seal_if_task_pack(solved, BranchPack())  # type: ignore[arg-type]
     assert pack.task_pack_id
-    assert pack.to_document()["format"] == "if-task-pack/1"
+    assert pack.to_document()["format"] == "if-task-pack/2"
 
     wrong_branch = SimpleNamespace(**{**branch_task.__dict__, "semantic_key": "item:other"})
 

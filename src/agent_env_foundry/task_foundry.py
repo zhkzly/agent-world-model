@@ -19,7 +19,7 @@ from agent_env_foundry.provenance import (
     resolve_argument_provenance,
     validate_argument_provenance,
 )
-from agent_env_foundry.public_agent import PublicEpisodeRun, run_public_episode
+from agent_env_foundry.public_agent import PublicEpisodeRun
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
@@ -203,6 +203,17 @@ class AtomAdmissionPlan:
                 "admission_plan_noop_accepted",
                 "Atom admission no-op result must reject the Task before witnesses",
             )
+        if (
+            self.no_op_result.initially_satisfied
+            or not self.no_op_result.collateral_ok
+            or self.no_op_result.process_ok is True
+        ):
+            raise TaskFoundryError(
+                "admission_plan_noop_axis_invalid",
+                "Atom no-op must be initially false, preserve collateral, and provide no "
+                "successful process evidence",
+                result=self.no_op_result.to_document(),
+            )
         categories = tuple(item.category for item in self.challenges)
         if categories != _ATOM_CHALLENGE_CATEGORIES:
             raise TaskFoundryError(
@@ -280,6 +291,7 @@ class AtomChallengeResult:
     result: AtomCheckResult | None
     control_result: AtomCheckResult | None
     reason: str | None
+    reload_evidence: ReloadEvidence | None = None
 
     def __post_init__(self) -> None:
         if self.applicable:
@@ -295,23 +307,40 @@ class AtomChallengeResult:
                 "Non-applicable Atom challenge requires only its frozen reason",
                 category=self.category,
             )
-        requires_control = self.applicable and self.category == "wrong_target"
+        requires_control = self.applicable and self.category in {"wrong_target", "wrong_answer"}
         if requires_control and (self.control_result is None or not self.control_result.satisfied):
             raise TaskFoundryError(
                 "challenge_control_result_missing",
-                "Target-based Atom challenge requires a successful control Task result",
+                "Action-bearing Atom challenge requires a successful same-trace control result",
                 category=self.category,
             )
         if not requires_control and self.control_result is not None:
             raise TaskFoundryError(
                 "challenge_control_result_unexpected",
-                "Only an applicable target-based challenge may carry a control result",
+                "Only an applicable action-bearing challenge may carry a control result",
+                category=self.category,
+            )
+        requires_reload = self.applicable and self.category in {"wrong_target", "wrong_answer"}
+        if requires_reload:
+            if (
+                self.reload_evidence is None
+                or self.reload_evidence.acting_session_id != self.materialization_id
+            ):
+                raise TaskFoundryError(
+                    "challenge_reload_evidence_missing",
+                    "Action-bearing Atom challenge requires same-attempt reload evidence",
+                    category=self.category,
+                )
+        elif self.reload_evidence is not None:
+            raise TaskFoundryError(
+                "challenge_reload_evidence_unexpected",
+                "Only an applicable action-bearing Atom challenge carries reload evidence",
                 category=self.category,
             )
 
     def to_document(self) -> JSONObject:
         return {
-            "format": "atom-challenge/1",
+            "format": "atom-challenge/2",
             "category": self.category,
             "applicable": self.applicable,
             "materialization_id": self.materialization_id,
@@ -322,6 +351,9 @@ class AtomChallengeResult:
                 None if self.control_result is None else self.control_result.to_document()
             ),
             "reason": self.reason,
+            "reload_evidence": (
+                None if self.reload_evidence is None else self.reload_evidence.to_document()
+            ),
         }
 
 
@@ -359,6 +391,29 @@ class AtomChallengeReport:
                     "Atom checker accepted an applicable negative challenge",
                     category=item.category,
                 )
+            if item.reload_evidence is not None and item.reload_evidence.task_id != self.task_id:
+                raise TaskFoundryError(
+                    "challenge_reload_task_mismatch",
+                    "Atom challenge reload evidence belongs to another Task",
+                    category=item.category,
+                )
+            if item.applicable and item.category == "wrong_answer":
+                assert item.result is not None
+                assert item.control_result is not None
+                if item.result.answer_ok is not False:
+                    raise TaskFoundryError(
+                        "wrong_answer_not_discriminated",
+                        "Atom checker did not reject a schema-valid wrong answer",
+                    )
+                if (
+                    item.result.required_effects_ok != item.control_result.required_effects_ok
+                    or item.result.collateral_ok != item.control_result.collateral_ok
+                    or item.result.process_ok != item.control_result.process_ok
+                ):
+                    raise TaskFoundryError(
+                        "wrong_answer_axis_drift",
+                        "Changing only the final answer changed a non-answer checker axis",
+                    )
         no_op = self.challenges[0]
         if no_op.result != self.admission_plan.no_op_result:
             raise TaskFoundryError(
@@ -368,7 +423,7 @@ class AtomChallengeReport:
 
     def to_document(self) -> JSONObject:
         return {
-            "format": "atom-challenge-report/1",
+            "format": "atom-challenge-report/2",
             "task_id": self.task_id,
             "admission_plan_id": self.admission_plan.plan_id,
             "challenges": [item.to_document() for item in self.challenges],
@@ -406,7 +461,7 @@ class AtomAdmissionReport:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-admission-report/3",
+            "format": "atom-admission-report/4",
             "task_id": self.solved.task.task_id,
             "admission_plan": self.solved.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.solved.witnesses],
@@ -435,7 +490,7 @@ class AtomTaskPack:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-task-pack/2",
+            "format": "atom-task-pack/3",
             "task": self.task.to_document(),
             "admission": self.admission.to_document(),
         }
@@ -777,30 +832,37 @@ def challenge_atom_task(
         target_task = _task_by_id(task_universe, wrong_target_plan.target_task_id)
         _verify_checker_preimage(prepared, target_task)
         wrong_target_root = Path(instance_root) / "wrong-target"
-        with prepared.open(wrong_target_root) as session:
-            reset = session.actor.reset(target_task.start_case.reset_input)
-            before = session.trusted.inspect(wrong_target_root)
-            current_binding = _resolve_binding(session, task, before)
-            target_binding = _resolve_binding(session, target_task, before)
-            episode = run_public_episode(
-                actor=session.actor,
-                instruction=target_task.instruction,
-                reset_observation=reset,
-                tool_specs=session.actor.tools(),
-                answer_schema=target_task.answer_schema,
-                route=selected_route,
-                max_provider_turns=max_provider_turns,
+
+        def wrong_target_preflight(
+            session: OpenPreparedSession,
+            before: JSONValue,
+        ) -> tuple[BindingCandidate, BindingCandidate]:
+            return (
+                _resolve_binding(session, task, before),
+                _resolve_binding(session, target_task, before),
             )
-            after = session.trusted.inspect(wrong_target_root)
+
+        with run_public_attempt(
+            prepared,
+            wrong_target_root,
+            task_id=task.task_id,
+            start_input=target_task.start_case.reset_input,
+            instruction=target_task.instruction,
+            answer_schema=target_task.answer_schema,
+            preflight=wrong_target_preflight,
+            route=selected_route,
+            max_provider_turns=max_provider_turns,
+        ) as wrong_target_attempt:
+            current_binding, target_binding = wrong_target_attempt.preflight_value
             target_result = _evaluate_report_atom(
-                session,
+                wrong_target_attempt.evaluation_session,
                 AtomCheckRequest(
                     target_task.capability_id,
-                    before,
-                    after,
+                    wrong_target_attempt.before_facts,
+                    wrong_target_attempt.post_reopen_facts,
                     target_binding.protected_binding,
-                    episode.trace,
-                    episode.final_answer,
+                    wrong_target_attempt.episode.trace,
+                    wrong_target_attempt.episode.final_answer,
                     _context(
                         target_task.capability_id,
                         target_binding.semantic_key,
@@ -817,14 +879,14 @@ def challenge_atom_task(
                     result=target_result.to_document(),
                 )
             current_result = _evaluate_report_atom(
-                session,
+                wrong_target_attempt.evaluation_session,
                 AtomCheckRequest(
                     task.capability_id,
-                    before,
-                    after,
+                    wrong_target_attempt.before_facts,
+                    wrong_target_attempt.post_reopen_facts,
                     current_binding.protected_binding,
-                    episode.trace,
-                    episode.final_answer,
+                    wrong_target_attempt.episode.trace,
+                    wrong_target_attempt.episode.final_answer,
                     _context(
                         task.capability_id,
                         current_binding.semantic_key,
@@ -833,83 +895,96 @@ def challenge_atom_task(
                 ),
                 task.answer_schema,
             )
-            challenges.append(
-                AtomChallengeResult(
-                    "wrong_target",
-                    True,
-                    session.identity.materialization_id,
-                    episode.trace,
-                    episode.final_answer,
-                    current_result,
-                    target_result,
-                    None,
-                )
+            wrong_target_attempt.record_checker_result(
+                {
+                    "target_result": target_result.to_document(),
+                    "current_result": current_result.to_document(),
+                }
             )
+        assert wrong_target_attempt.reload_evidence is not None
+        challenges.append(
+            AtomChallengeResult(
+                "wrong_target",
+                True,
+                wrong_target_attempt.acting_session_id,
+                wrong_target_attempt.episode.trace,
+                wrong_target_attempt.episode.final_answer,
+                current_result,
+                target_result,
+                None,
+                wrong_target_attempt.reload_evidence,
+            )
+        )
 
-    active_root = Path(instance_root) / "active"
-    with prepared.open(active_root) as session:
-        reset = session.actor.reset(task.start_case.reset_input)
-        before = session.trusted.inspect(active_root)
-        binding = _resolve_binding(session, task, before)
-        episode = run_public_episode(
-            actor=session.actor,
+    wrong_answer_plan = _planned_challenge(admission_plan, "wrong_answer")
+    if not wrong_answer_plan.applicable:
+        challenges.append(
+            AtomChallengeResult(
+                "wrong_answer",
+                False,
+                None,
+                (),
+                {},
+                None,
+                None,
+                wrong_answer_plan.reason,
+            )
+        )
+    else:
+        assert wrong_answer_plan.final_answer is not None
+        wrong_answer = wrong_answer_plan.final_answer
+        active_root = Path(instance_root) / "wrong-answer"
+
+        def active_preflight(
+            session: OpenPreparedSession,
+            before: JSONValue,
+        ) -> BindingCandidate:
+            return _resolve_binding(session, task, before)
+
+        with run_public_attempt(
+            prepared,
+            active_root,
+            task_id=task.task_id,
+            start_input=task.start_case.reset_input,
             instruction=task.instruction,
-            reset_observation=reset,
-            tool_specs=session.actor.tools(),
             answer_schema=task.answer_schema,
+            preflight=active_preflight,
             route=selected_route,
             max_provider_turns=max_provider_turns,
-        )
-        after = session.trusted.inspect(active_root)
-        context = _context(
-            task.capability_id,
-            binding.semantic_key,
-            binding.protected_binding,
-        )
-        correct = _evaluate_report_atom(
-            session,
-            AtomCheckRequest(
+        ) as wrong_answer_attempt:
+            binding = wrong_answer_attempt.preflight_value
+            context = _context(
                 task.capability_id,
-                before,
-                after,
+                binding.semantic_key,
                 binding.protected_binding,
-                episode.trace,
-                episode.final_answer,
-                context,
-            ),
-            task.answer_schema,
-        )
-        if not correct.satisfied:
-            raise TaskFoundryError(
-                "challenge_baseline_failed",
-                "Atom challenge baseline did not satisfy the checker",
-                result=correct.to_document(),
             )
-        wrong_answer_plan = _planned_challenge(admission_plan, "wrong_answer")
-        if not wrong_answer_plan.applicable:
-            challenges.append(
-                AtomChallengeResult(
-                    "wrong_answer",
-                    False,
-                    None,
-                    (),
-                    {},
-                    None,
-                    None,
-                    wrong_answer_plan.reason,
-                )
-            )
-        else:
-            assert wrong_answer_plan.final_answer is not None
-            wrong_answer = wrong_answer_plan.final_answer
-            wrong_result = _evaluate_report_atom(
-                session,
+            correct = _evaluate_report_atom(
+                wrong_answer_attempt.evaluation_session,
                 AtomCheckRequest(
                     task.capability_id,
-                    before,
-                    after,
+                    wrong_answer_attempt.before_facts,
+                    wrong_answer_attempt.post_reopen_facts,
                     binding.protected_binding,
-                    episode.trace,
+                    wrong_answer_attempt.episode.trace,
+                    wrong_answer_attempt.episode.final_answer,
+                    context,
+                ),
+                task.answer_schema,
+            )
+            if not correct.satisfied:
+                raise TaskFoundryError(
+                    "challenge_baseline_failed",
+                    "Atom challenge baseline did not satisfy the checker",
+                    result=correct.to_document(),
+                )
+            wrong_result = _evaluate_report_atom(
+                wrong_answer_attempt.evaluation_session,
+                AtomCheckRequest(
+                    task.capability_id,
+                    wrong_answer_attempt.before_facts,
+                    wrong_answer_attempt.post_reopen_facts,
+                    binding.protected_binding,
+                    wrong_answer_attempt.episode.trace,
                     wrong_answer,
                     context,
                 ),
@@ -920,18 +995,26 @@ def challenge_atom_task(
                     "wrong_answer_not_discriminated",
                     "Atom checker did not reject a schema-valid wrong answer",
                 )
-            challenges.append(
-                AtomChallengeResult(
-                    "wrong_answer",
-                    True,
-                    session.identity.materialization_id,
-                    episode.trace,
-                    wrong_answer,
-                    wrong_result,
-                    None,
-                    None,
-                )
+            wrong_answer_attempt.record_checker_result(
+                {
+                    "correct_result": correct.to_document(),
+                    "wrong_result": wrong_result.to_document(),
+                }
             )
+        assert wrong_answer_attempt.reload_evidence is not None
+        challenges.append(
+            AtomChallengeResult(
+                "wrong_answer",
+                True,
+                wrong_answer_attempt.acting_session_id,
+                wrong_answer_attempt.episode.trace,
+                wrong_answer,
+                wrong_result,
+                correct,
+                None,
+                wrong_answer_attempt.reload_evidence,
+            )
+        )
 
     return AtomChallengeReport(task.task_id, admission_plan, tuple(challenges))
 

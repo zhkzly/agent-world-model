@@ -144,3 +144,33 @@ Fresh fixed-budget production batches after that change:
 Checkpoint 2 is closed. These runs prove honest structure grouping, attempt
 retention and cold TaskPack identity; they do not by themselves close all
 Good-Task challenge classes or S2 completion.
+
+## Good-Task admission reload and axis evidence
+
+Action-bearing negatives now reuse the same physical lifecycle as positive
+witnesses. Atom wrong-target/wrong-answer and ForEach partial challenges close
+the actor, reopen the same native instance in a distinct session, evaluate
+post-reopen facts and seal `ReloadEvidence`. Non-applicable wrong-answer no
+longer spends an unnecessary model call. Current clean-break pack formats are
+Atom v3, ForEach v2 and If v2; no old reader was added.
+
+Two focused reload-evidence mutants and two no-op/collateral-axis mutants were
+killed. Fresh physical runs after the lifecycle change succeeded on both
+releases. The subsequent stricter axis run produced:
+
+- Git run
+  `707fad6476d4daf62049c9936d1270bc4907331049ad9bf9ff844f9227a1b0eb`:
+  20 candidates, 16 structures, 3 admitted (Atom, ForEach, ForEach), 2 honest
+  `public_witness_failed` records;
+- SQLite run
+  `5bbb5ec08542a5c420271664189e124d973b2fd40e02f5707aa46820051d8b52`:
+  12 candidates, 8 structures, 3 admitted (Atom, ForEach, Atom), and one If
+  rejected as `admission_plan_noop_axis_invalid`.
+
+The rejected If exposed an upstream S1 TaskSemantics defect: for
+`CAP-SUBMIT-DISPUTE`, identical before/after facts returned
+`collateral_ok=false` and `PROHIBITED_COLLATERAL`. S2 now rejects this instead
+of treating aggregate `satisfied=false` as sufficient negative evidence.
+Checkpoint 3 therefore remains open until S1 Qualification rejects such
+axis-conflated semantics, a corrected SQLite release is published, and real
+mutation/condition TaskPacks pass the unchanged S2 gates.

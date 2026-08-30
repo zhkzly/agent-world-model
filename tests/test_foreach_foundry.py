@@ -182,13 +182,26 @@ def test_partial_challenge_requires_only_the_omitted_member_to_fail() -> None:
         {"results": [{}]},
         (),
         (_result(satisfied=False), _result()),
+        reload_evidence(task.task_id, "e" * 64),
     )
     assert result.to_document()["omitted_semantic_key"] == "item:1"
     report = ForEachPartialChallengeReport(task.task_id, _plan(task), (result,))
     assert report.report_id
 
+    with pytest.raises(TaskFoundryError) as caught:
+        replace(result, reload_evidence=reload_evidence("f" * 64, "e" * 64))
+    assert caught.value.code == "foreach_partial_reload_evidence_mismatch"
+
     with pytest.raises(TaskFoundryError, match="omitted"):
         replace(result, member_results=(_result(), _result()))
+    invalid_collateral = replace(
+        _result(satisfied=False),
+        collateral_ok=False,
+        failure_codes=("FAILED", "PROHIBITED_COLLATERAL"),
+    )
+    with pytest.raises(TaskFoundryError) as caught:
+        replace(result, member_results=(invalid_collateral, _result()))
+    assert caught.value.code == "foreach_partial_axis_invalid"
     with pytest.raises(TaskFoundryError, match="representative"):
         replace(report, partials=())
 
@@ -233,6 +246,20 @@ def test_foreach_noop_rejects_every_selected_member() -> None:
             (_result(), _result(satisfied=False)),
         )
 
+    invalid_collateral = replace(
+        _result(satisfied=False),
+        collateral_ok=False,
+        failure_codes=("FAILED", "PROHIBITED_COLLATERAL"),
+    )
+    with pytest.raises(TaskFoundryError) as caught:
+        ForEachNoOpChallenge(
+            task.task_id,
+            plan.plan_id,
+            "a" * 64,
+            (invalid_collateral, _result(satisfied=False)),
+        )
+    assert caught.value.code == "foreach_noop_axis_invalid"
+
 
 def test_foreach_task_pack_seals_witnesses_noop_and_one_partial() -> None:
     task = _task()
@@ -250,13 +277,15 @@ def test_foreach_task_pack_seals_witnesses_noop_and_one_partial() -> None:
         {"results": [{}]},
         (),
         (failed, _result()),
+        reload_evidence(task.task_id, "3" * 64),
     )
     partials = ForEachPartialChallengeReport(task.task_id, plan, (partial,))
     noop = ForEachNoOpChallenge(task.task_id, plan.plan_id, "4" * 64, (failed, failed))
 
     pack = seal_foreach_task_pack(solved, noop, partials)
     assert pack.task_pack_id
-    assert pack.to_document()["admission"]["format"] == "foreach-admission-report/2"
+    assert pack.to_document()["format"] == "foreach-task-pack/2"
+    assert pack.to_document()["admission"]["format"] == "foreach-admission-report/3"
 
     with pytest.raises(TaskFoundryError, match="reused a materialization"):
         seal_foreach_task_pack(
