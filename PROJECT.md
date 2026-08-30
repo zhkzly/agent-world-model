@@ -60,28 +60,31 @@ requires it. Compatibility with earlier research releases is not a product
 requirement. S1 must not publish concrete Tasks, reference traces, corpus cells,
 rewards or training records.
 
-## S2 owns Goal compilation, public solvability and Task admission
+## S2 owns grounded Task sampling, Good Task admission and corpus selection
 
-S2 is Goal-first. Its required order is:
+S2 is Good-Task-first. Direct compilation, Graph exploration and Programmatic
+execution are complementary proposal mechanisms feeding one common boundary;
+none is semantic authority or a separate Task ABI. Its required order is:
 
 ```text
-qualified CapabilitySpecs
--> deterministic StartCase and BindingCandidates
--> bounded TaskBlueprint / GoalProgram
--> compile and freeze TaskChecker
--> render and audit the final canonical public instruction
--> public-only Agent solves that exact instruction on real tools
--> repeat on a fresh equivalent start
--> challenge checker/instruction semantics
+exact EnvironmentRelease
+-> disposable public discovery and CandidateTaskProposal
+-> freeze bidirectionally anchored TaskSpecification
+-> compile bounded task-local VerifierBundle V0
+-> materialize/replay Start and bind public operands
+-> freeze concrete checker, instruction and answer contract
+-> public-only Agent solves that exact instruction twice on real tools
+-> physical reload/truth extraction and applicable semantic challenges
 -> seal TaskPack
 -> evaluate model-relative difficulty/cost separately
 -> select a CorpusManifest
 ```
 
 A successful trace is evidence that a frozen Task is reachable. It never creates
-or weakens Task meaning. Graph traversal, random walk, program synthesis and
-other search methods are optional planner implementations, not Task sources or
-semantic authority.
+or weakens Task meaning. Graph and Programmatic samplers are required conformance
+proposal paths, but their graphs/programs remain disposable evidence rather than
+persistent Task types. Task meaning comes from accepted Need/Requirement anchors
+and the frozen TaskSpecification.
 
 ## Execution ownership
 
@@ -127,18 +130,22 @@ Every admitted Task must be:
 
 - **publicly solvable:** at least two fresh real executions of the exact final
   instruction succeed using public information and tools only;
-- **reliably verifiable:** deterministic checking rejects the minimal applicable
-  no-op, wrong-target, partial-completion and wrong/stale-answer cases;
-- **well-posed:** all material constraints are explicit without exposing hidden
-  operands, native fields, tool names or a reference route;
+- **reliably verifiable and path-open:** deterministic checking rejects every
+  constructible applicable no-op, wrong-entity, near-miss, partial,
+  omitted-obligation, collateral, wrong/stale-answer and required-process
+  violation, while accepting a known valid alternative route when one exists;
+- **bidirectionally anchored and well-posed:** every checker predicate has a
+  public entailment, and every publicly applicable Requirement obligation is
+  included or has a frozen justified irrelevance decision, without exposing
+  hidden operands, native fields, tool names or a reference route;
 - **non-trivial:** the checker is false at the initial state, and query answers
   are not already leaked by the instruction/reset context;
-- **reproducible:** the same release and StartCase reproduce the same business
-  predicates on isolated instances even when incidental IDs differ;
-- **Need-anchored and natural:** the capability and every cross-capability
-  composition are licensed by accepted Brief Requirements/workflows;
-- **path-open:** outcome Tasks are judged by Goal truth, not reference-trace
-  equality;
+- **replayable and isolated:** the same release and StartRecipe reproduce the
+  same business predicates on isolated instances even when incidental IDs
+  differ; declared persistence is checked after a real close/reopen;
+- **minimally purposeful:** the objective and every cross-capability composition
+  are licensed by accepted Requirements/workflows, and no witness step is
+  decorative tool stitching or padding;
 - **training-targeted:** the Task names a qualified Agent capability. Its actual
   difficulty and training value are empirical TaskAssessment/corpus properties,
   not Task identity.
@@ -172,22 +179,30 @@ proof of complete Task-space coverage.
     materialization resolves its own protected bindings after reset.
 13. Every acting-time target, constraint and answer operand has an exact public
     source in the instruction, reset observation or schema-qualified tool output.
+14. Graph/Programmatic/direct sampler lineage may affect proposal evidence but
+    never Task truth, verifier acceptance or S3 public projection.
+15. S2 publishes a strict cold-readable TaskPack and non-leaking PublicTaskView;
+    complete TaskPack bytes are never handed to the acting policy.
 
 ## Completion evidence
 
 S2 is complete only when the same frozen framework:
 
 - regenerates and consumes the contrasting SQLite and filesystem/Git releases;
-- produces non-trivial Task yield and multiple canonical GoalProgram shapes for
-  both without domain patches;
-- passes public solvability, minimal checker sensitivity, leakage and fresh-start gates;
+- executes direct, Graph and Programmatic proposal paths under fixed budgets and
+  reports honest proposal/yield/rejection evidence;
+- produces non-trivial, structurally distinct Task yield without domain patches;
+- passes bidirectional coverage, public solvability, physical reload,
+  applicability-planned verifier challenges, leakage and fresh-start gates;
 - transfers to a held-out Need selected after framework/prompt freeze;
-- reports matched-budget baselines and downstream utility rather than relying on
-  internal diversity claims.
+- uses at least two policy lineages/checkpoints to report difficulty,
+  discrimination, redundancy and cost; downstream learning utility remains an
+  S3/S4 experiment rather than Task truth.
 
 ## Current task boundary
 
 The `s2-task-foundry` branch and Trellis task own the complete S2 implementation
-and the minimum clean S1 release/runtime/semantics changes required by it. The
-old Graph/Programmatic-first proposal and backward compatibility are out of
-scope.
+and the minimum clean S1 release/runtime/semantics changes required by it.
+Graph and Programmatic proposal samplers on the common Good Task path are in
+scope; their former separate product lanes and all backward compatibility are
+out of scope.

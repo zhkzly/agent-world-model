@@ -1,5 +1,6 @@
 {"file":"PROJECT.md","reason":"Stable product intent, Good Task contract and exact framework/Codex/Responses ownership after the implementation-readiness rewrite."}
-{"file":"DECISIONS.md","reason":"Current clean-break decisions: S1 v2 TaskSemantics, four-node GoalProgram, checker-instruction-witness order, trace evidence and separate assessment identity."}
+{"file":"DECISIONS.md","reason":"Current clean-break and Good Task correction: common direct/Graph/Programmatic proposal boundary, specification/verifier freeze, physical challenges, and separate assessment identity without legacy ABI restoration."}
 {"file":".trellis/spec/backend/s1-coordinator.md","reason":"Current direct v2 coordinator order and explicit statement that the coordinator is not yet implemented."}
 {"file":".trellis/spec/backend/v2-preparation.md","reason":"Shared materialization, two released runtimes and strict admitted-release preparation boundary."}
 {"file":".trellis/spec/backend/v2-qualification-publication.md","reason":"Acyclic Core identity, positive capability qualification, minimal native audit, strict receipt and cold Publication contract."}
+{"file":".trellis/spec/backend/s2-assessment-corpus.md","reason":"Fresh model-relative assessment and identity-separated corpus policy after Good Task admission."}

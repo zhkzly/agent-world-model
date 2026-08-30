@@ -2,9 +2,10 @@
 
 ## Scope
 
-This layer starts only after TaskPack admission. It measures an acting policy
-and selects a corpus; it never changes Task meaning, checker truth, admission
-evidence, EnvironmentRelease qualification, or scalar training reward.
+This layer starts only after the active S2 PRD's intrinsic Good Task gates and
+TaskPack admission. It measures acting policies and selects a corpus; it never
+changes Task meaning, checker truth, admission evidence, EnvironmentRelease
+qualification, or scalar training reward.
 
 ## TaskAssessment
 
@@ -27,6 +28,11 @@ error and must not be counted as model difficulty.
 Admission witnesses are not assessment trials. Assessment reports empirical
 reliability, provider turns, tokens, latency, failure codes and a structured
 difficulty summary. These values do not enter TaskPack identity.
+
+One policy lineage with uniform success cannot establish useful difficulty or
+discrimination. Paper-ready S2 evidence uses at least two declared policy
+lineages/checkpoints under matched trial budgets and keeps Task/Verifier/
+Environment/Infrastructure defects out of the difficulty label.
 
 ## CorpusManifest
 

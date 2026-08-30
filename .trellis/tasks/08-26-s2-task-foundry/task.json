@@ -1,8 +1,8 @@
 {
   "id": "s2-task-foundry",
   "name": "s2-task-foundry",
-  "title": "S2 Goal-First Task Foundry",
-  "description": "Implement S1 v2 qualified TaskSemantics and deterministic Goal/checker/instruction compilation, then prove public solvability and admit diverse TaskPacks",
+  "title": "S2 Good-Task Sampling Foundry",
+  "description": "Sample Need-anchored Candidate Tasks from sealed releases, enforce Good Task validity, and publish an assessed structurally selected TaskPack corpus for later Agentic RL",
   "status": "in_progress",
   "dev_type": "backend",
   "scope": "Complete clean-break S2 implementation plus the minimum cross-environment S1 v2 preparation and TaskSemantics changes; no backward compatibility",
@@ -30,6 +30,7 @@
     "src/agent_env_foundry/preparation.py",
     "src/agent_env_foundry/semantics.py",
     "src/agent_env_foundry/release.py",
+    "src/agent_env_foundry/assessment.py",
     "src/agent_env_foundry/_actor_runner.py",
     "src/agent_env_foundry/_semantics_runner.py",
     "tests/test_semantics_contract.py",
@@ -39,13 +40,14 @@
     "tests/fixtures/fx_v2_actor.py",
     "tests/fixtures/fx_v2_semantics.py",
     ".trellis/spec/backend/v2-preparation.md",
-    ".trellis/spec/backend/v2-qualification-publication.md"
+    ".trellis/spec/backend/v2-qualification-publication.md",
+    ".trellis/spec/backend/s2-assessment-corpus.md"
   ],
-  "notes": "Git v7 Release 04b1a288... passed full StartCase/binding/condition preflight and exposes 11 Atom, 4 ForEach and 6 If candidates (21). Ten Atom packs are admitted; clean no-staged refusal is rejected for public-witness unreliability, leaving a possible floor of 20. ForEach execution reached seal but the Framework intentionally blocks because physical ForEach wrong-answer admission is not implemented. That challenge is the next slice; no gate is waived.",
+  "notes": "Commit 189be1b is a real Git/SQLite Capability-to-Task execution checkpoint, not S2 completion. Revised Good Task documents are awaiting user acceptance before implementation. Known gold failure: a SQLite Task claimed reopen persistence but admission performed only same-process reads.",
   "meta": {
     "compatibility": "clean-break",
-    "semantic_order": "capability-start-checker-instruction-witness-admission",
-    "goal_nodes": [
+    "semantic_order": "release-discovery-task_spec-v0-start-binding-freeze-witness-truth_challenge-taskpack-assessment-corpus",
+    "target_goal_nodes": [
       "atom",
       "all",
       "if",
@@ -57,11 +59,16 @@
       "qualification_verifier_codex"
     ],
     "acting_policy": "responses_tool_loop",
+    "candidate_samplers": [
+      "direct",
+      "graph",
+      "programmatic"
+    ],
     "task_identity_excludes": [
       "assessment",
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "checkpoint_f_v7_ten_atoms_foreach_wrong_answer_pending"
+    "implementation_checkpoint": "good_task_documents_reopened_pending_review"
   }
 }

@@ -1,178 +1,228 @@
-# S2 Goal-First Task Foundry
+# S2 Good-Task Sampling Foundry
 
-## Goal
+## Status and authority
 
-Build the paper-grade production path:
+This PRD supersedes the deletion-first interpretation that treated a small
+Capability-to-Task vertical as complete S2. Commit `189be1b` is retained as a
+real executable checkpoint, not as paper-grade S2 completion.
 
-```text
-Need
--> real executable EnvironmentRelease
--> Goal-first Tasks grounded in that release
--> public Agent tool execution
--> protected checker truth
--> TaskPack
--> separate assessment/corpus
--> later SFT/RL consumption
-```
+S2 begins with an immutable qualified `EnvironmentRelease` and ends with a
+quality-controlled Task corpus suitable for later tool-calling Agentic RL
+rollouts. S2 does not generate reward, trajectories, token masks or training
+updates; those belong to S3/S4.
 
-Semantic completion requires real processes and state transitions. Mocks,
-dictionary worlds, hand-written successful traces, green unit tests, or model
-self-approval are not completion evidence.
+There is no compatibility requirement for pre-clean-break releases or Task
+formats.
 
-There is no EnvironmentRelease v1 compatibility path.
-
-## Stage ownership
-
-### S1 EnvironmentRelease
-
-S1 owns:
-
-- a real uv actor project exposing `reset`, `tools`, `invoke`, and `close`;
-- public schemas and exact ToolSpecs;
-- release-local TaskSemantics;
-- one independent native-state auditor;
-- one real positive public execution for every qualified capability;
-- immutable publication, relocation, and cold preparation.
-
-S1 does not prove every future Task, alternative route, difficulty level, or
-corpus yield.
-
-### S2 Task Foundry
-
-S2 consumes only a sealed EnvironmentRelease and owns:
-
-- logical Task binding and Goal compilation;
-- checker freeze before instruction exposure;
-- public solvability;
-- minimal applicable negative checks;
-- TaskPack identity;
-- separate TaskAssessment and CorpusManifest.
-
-S2 does not invent environment truth or scalar training reward.
-
-### Paper evaluation and S3
-
-Corpus size/structure targets, route diversity, perturbation studies, mutation
-benchmarks, difficulty, and downstream SFT/RL value are experiment metrics.
-They do not authorize or block an individual EnvironmentRelease or TaskPack.
-
-## Author and Framework ownership
-
-Three isolated authored artifacts remain:
-
-1. Environment Builder writes actor code.
-2. TaskSemantics Author writes protected release-local checker code.
-3. Native Auditor writes an independent read-only native effects/collateral reader.
-
-The Native Auditor returns only:
+## Product goal
 
 ```text
-required_effects_ok
-collateral_ok
-failure_codes
+EnvironmentRelease
+-> grounded Candidate Task sampling
+-> frozen Task semantics and concrete public binding
+-> public-only solving on real tools
+-> deterministic truth and adversarial verification
+-> admitted TaskPack
+-> model-relative TaskAssessment
+-> structurally selected CorpusManifest
 ```
 
-It does not duplicate final-answer, report-value, process, Task, or reward
-evaluation. Framework owns schemas, identities, execution, source matching,
-receipts, publication, TaskPack admission, and final verdicts.
+The output must be useful as the Task/reward-truth input to a future Agentic RL
+episode runner. A real environment, a successful trace, three admitted Tasks,
+green tests, or an identity-bearing ZIP is evidence for a slice, never evidence
+that S2 sampling is complete.
 
-## Answer contract
+## Inputs from S1
 
-Each capability declares only final-answer values needed by its own user
-objective. Examples:
+S2 consumes only sealed S1 authority:
 
-- query: the requested public values;
-- successful mutation: the user-relevant result such as a commit reference;
-- refusal: the stable refusal code.
+- exact EnvironmentRelease identity and cold preparation;
+- public `reset/tools/invoke/close`, schemas and structured observations;
+- accepted Need/Requirement anchors and qualified CapabilitySpecs;
+- deterministic StartCases and public binding candidates;
+- protected, read-only release-local TaskSemantics.
 
-State integrity, persistence, process completion, and collateral constraints
-are checker evidence, not padded final-answer fields.
+S2 may request a narrowly demonstrated S1 fix, such as a missing public operand
+or reloadable truth route. It must not demand a universal ontology, State IR,
+generic snapshot importer, persistent graph, reward field or S2-specific
+domain schema from S1.
 
-Every AnswerField declares exactly one public source:
+## Candidate Task sampling
+
+S2 requires at least two complementary proposal mechanisms:
+
+1. **Graph sampler** — explores real public tool dependencies and propagates
+   values from actual ToolObservations into later calls.
+2. **Programmatic sampler** — proposes a bounded parameterized public solution
+   program, executes and repairs it on a disposable instance, and derives a
+   Candidate Task only from the successful public execution and Need anchors.
+
+The existing deterministic Capability/Goal compiler remains a grounded direct
+baseline. Graph, Programmatic and direct proposals all emit one ephemeral
+`CandidateTaskProposal`; they are not separate product ABIs, Task truth sources
+or persistent Task types.
+
+Execution proves reachability, not meaning. Candidate meaning must remain
+anchored to accepted S1 Requirements rather than being invented from a trace.
+
+## Good Task hard gates
+
+Every admitted TaskPack must satisfy all six intrinsic properties.
+
+### 1. Bidirectionally anchored and well-posed
+
+- every checker predicate and process constraint has a public Requirement,
+  instruction or public-schema entailment;
+- every publicly applicable Requirement obligation is included or has a frozen,
+  reviewable reason why it is irrelevant to this Task;
+- the instruction states every load-bearing constraint without exposing hidden
+  fields, a reference route or an answer key.
+
+### 2. Publicly closed and solvable
+
+- the acting policy sees only the final instruction, public reset observation,
+  ToolSpecs and ToolObservations;
+- every target, argument, condition operand and answer operand has exact public
+  provenance;
+- the exact frozen Task succeeds on at least two fresh materializations.
+
+### 3. Reliably verifiable and path-open
+
+- the checker evaluates frozen outcome/effect/answer and declared process truth,
+  not reference-trace equality;
+- applicable no-op, wrong-entity, near-miss, partial, omitted-obligation,
+  collateral, wrong-answer and process violations are rejected;
+- a known constructible alternative valid route is accepted. Absence of a
+  second discovered route is reported, not treated as proof of path closure.
+
+### 4. Non-vacuous and answer-opaque
+
+- mutation/process Tasks are false at Start and after no-op;
+- query Tasks reject blank, stale, unsupported or ungrounded answers;
+- reset, instruction and descriptors do not reveal expected dynamic answers.
+
+### 5. Replayable and isolated
+
+- Start, logical binding, public operands and checker truth agree across fresh
+  instances;
+- dynamic IDs may change but are rediscoverable from the public surface;
+- when persistence is claimed, the acting process is closed and the same native
+  instance is reopened before final protected verification;
+- one episode cannot inherit another episode's business state.
+
+### 6. Minimally purposeful
+
+- the Task expresses one coherent Need-anchored business objective;
+- declared tools/process milestones are causally necessary for binding,
+  branching, required effects or required evidence;
+- arbitrary tool stitching is excluded, and retained constructive witness
+  evidence is pruned to its causal support. A checker still accepts harmless
+  exploratory calls on another otherwise valid route.
+
+## Verification ownership
+
+Framework freezes the parameterized semantic section of one
+`TaskSpecification` before Start materialization: objective, quantifiers, public
+slot constraints, required/allowed/forbidden effects, answer semantics and
+genuinely required process milestones. After Start, a binding section may fill
+those slots only with public-provenance values; it cannot change predicates or
+answer meaning. The complete bound TaskSpecification freezes before witness
+search.
+
+A bounded task-local `VerifierBundle` is compiled from that specification and
+the already-qualified S1 TaskSemantics. It is an evaluation plan, not
+unrestricted model-authored Python and not a universal verifier DSL. Witness
+state may instantiate dynamic values but cannot add, remove or weaken
+predicates.
+
+If candidate semantics change, restart from TaskSpecification. If verifier
+implementation changes, rerun all applicable challenges.
+
+## Task corpus quality
+
+Task validity and corpus selection are separate.
+
+`TaskAssessment` records fresh model-relative trials, success/failure classes,
+tool calls, tokens and latency without changing TaskPack truth.
+
+`CorpusManifest` selects exact TaskPack/Assessment pairs using:
+
+- semantic and execution structure rather than paraphrase similarity;
+- Goal, capability, state regime, information-dependency and constraint shape;
+- redundancy control;
+- difficulty gradient and policy discrimination;
+- declared SFT/RL purpose and rollout budget.
+
+Corpus targets are preregistered experiment/reporting expectations, not a way
+to waive an individual Good Task gate. S2 may return typed low-yield or
+unsupported outcomes rather than manufacture Tasks.
+
+## S2 to S3 handoff
+
+S2 publishes a strict cold-readable TaskPack and a minimal `PublicTaskView`.
+
+The S3 host sees TaskPack identity, StartRecipe and VerifierBundle. The acting
+policy sees only:
 
 ```text
-task_literal(value)
-task_descriptor(pointer)
-reset(pointer)
-tool_observation(tool_name, pointer rooted at {ok,data,error})
-tool_schema_constant(tool_name, input_pointer, value)
+canonical instruction
+public reset observation
+ToolSpecs
+ToolObservations
+final-answer schema
 ```
 
-Qualification proves every reported non-null value matches a real public
-occurrence. Different condition branches may use different answer schemas.
+S2 does not expose semantic keys, expected branches, protected bindings,
+checker data, witness traces or answers to the acting policy.
 
-## S1 qualification
+## Current checkpoint evidence
 
-For every capability, Framework finds one eligible representative binding and
-runs the public qualification goal once on a fresh materialization. Admission
-requires:
+The current branch has real reusable foundations:
 
-- TaskSemantics accepts the real execution;
-- Native Auditor agrees on required effects and collateral only;
-- AnswerFields match real public source occurrences;
-- `task_kind` matches the physical semantic state transition;
-- actor, TaskSemantics, and auditor remain read-only outside their roles.
+- Git and SQLite cold releases;
+- public Agent tool execution and structured observations;
+- checker-before-instruction ordering;
+- Atom/ForEach/If compilation;
+- two fresh public witnesses and basic negative checks;
+- argument provenance;
+- TaskPack/TaskAssessment/Corpus identity separation.
 
-Wrong-answer, wrong-target, partial, alternative-route, AgentChoice, and
-checker-mutation experiments are not repeated in S1.
-
-## S2 Good Task contract
-
-A TaskPack requires:
-
-- one sealed release and qualified StartCase;
-- one frozen logical selection and checker;
-- one final instruction rendered after checker freeze;
-- two successful fresh public witnesses with independent materializations;
-- exact public argument provenance;
-- the minimal applicable negative evidence for its Goal.
-
-Minimal negatives:
-
-| Goal | Required Task-level negatives |
-|---|---|
-| Atom | no-op; wrong target if available; wrong answer if constructible |
-| ForEach | no-op; one representative omitted member |
-| If | condition-selected branch must be satisfied |
-| All | no-op; one representative missing child |
-
-Collateral is still evaluated by TaskSemantics on every witness; S2 does not
-run an extra unrelated Task solely to manufacture collateral damage.
-
-## Goal contract
-
-The bounded GoalProgram contains only:
-
-```text
-AtomGoal
-AllGoal
-IfGoal
-ForEachGoal
-```
-
-Task diversity comes from Goal/process/evidence structure and qualified logical
-selection, not answer-field singleton profiles, parameter swaps, or paraphrases.
+It is not complete because Candidate sampling, bidirectional coverage,
+task-local verification challenges, physical reload, strict TaskPack cold read,
+held-out transfer and corpus-quality evidence remain incomplete. The observed
+SQLite Task that said “reopen” but only queried in the same process is the gold
+failure case this correction must reject.
 
 ## Acceptance criteria
 
-- no v1 parser, adapter, reader, publisher, or fallback;
-- one real cold-published EnvironmentRelease for Git and SQLite with unchanged Framework code;
-- every qualified capability has real positive execution and source evidence;
-- public Consumer can reset and invoke the relocated release;
-- Atom/ForEach/If compiler and TaskPack paths use only admitted release views, and
-  no individual environment must manufacture a Goal kind absent from its qualified semantics;
-- two fresh public witnesses pass for admitted Tasks;
-- minimal applicable Task negatives fail for the intended reason;
-- deterministic tests, Ruff, formatting, Mypy, lock check, and diff check pass;
-- paper experiments report corpus yield and downstream utility separately.
+- Graph and Programmatic samplers execute real public tools and feed one common
+  CandidateTaskProposal boundary; direct compilation remains a baseline.
+- Candidate semantics freeze before concrete witness search and cannot be
+  repaired from witness/verifier outcomes in place.
+- bidirectional Requirement coverage is explicit and fail-closed;
+- every admitted Task passes public solvability, provenance, non-vacuity,
+  replay/isolation and all applicable physical challenges;
+- persistence claims include real close/reopen evidence;
+- strict TaskPack cold read recomputes identities and produces a non-leaking
+  PublicTaskView;
+- Git, SQLite and one post-freeze held-out release run without Framework domain
+  branches;
+- sampler proposal/yield/rejection, unique structure, redundancy, difficulty and
+  cost are reported under fixed budgets;
+- at least two acting policies or checkpoints provide model-relative assessment;
+- deterministic tests, mutation licenses, Ruff, formatting, Mypy, lock and diff
+  checks pass, and real run artifacts are retained outside source authority.
 
 ## Forbidden
 
-- compatibility readers or `allow_unqualified` paths;
-- self-authored manifests, receipts, verdicts, Tasks, or rewards;
-- exact duplicate public-answer evaluation in the Native Auditor;
-- S1 copies of Task-level challenge matrices;
-- mandatory alternative routes or per-occurrence AgentChoice perturbation;
-- result-object boolean flipping presented as executable mutation evidence;
-- domain branches in Framework;
-- product release decisions based on corpus-count targets.
+- restoring old TaskIntent/WitnessSet, dual readers, feature flags or v1 ABI;
+- GraphTask and ProgrammaticTask as persistent product types;
+- a universal world ontology, State IR, unrestricted verifier code or large
+  generic DSL;
+- native writes, hidden setup calls or protected operands during public solving;
+- learning Task meaning, allowed effects or answer truth from witness diffs;
+- mandatory Cartesian challenge matrices, every-parameter perturbation, fake
+  boolean mutation or exhaustive route replay;
+- domain-specific Framework branches or hard-coded booking/Git/SQLite Tasks;
+- claiming corpus quality from Task count, text variety, tool count or one model;
+- implementing S3 reward, training trajectories or veRL integration inside S2.

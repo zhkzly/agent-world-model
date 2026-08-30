@@ -81,3 +81,66 @@ Gold reference: contrasting real Git and SQLite releases plus a held-out Need.
   all nine run identities, the product report and CorpusManifest digests; the
   nine assessment materializations are unique and disjoint from admission
   witness materializations. No subagent verdict is used for this closure.
+
+## S2 Good Task correction — 2026-08-30
+
+The preceding evidence remains valid for the implemented execution checkpoint,
+but it does not complete S2 Task sampling. User correction: S2 must sample and
+admit a quality-controlled Task corpus for later tool-calling Agentic RL, using
+the previously agreed Good Task definition rather than merely compiling and
+solving three Tasks.
+
+Selected correction:
+
+- retain the v2 runtime, public Agent loop, provenance, fresh starts and current
+  identity foundations;
+- use direct, Graph and Programmatic mechanisms as proposal samplers feeding one
+  common CandidateTaskProposal boundary;
+- freeze a bidirectionally anchored TaskSpecification and bounded V0 before
+  witness search;
+- require public solving, physical reload where declared, and applicability-
+  planned semantic challenges before TaskPack seal;
+- calibrate and select a corpus separately from Task truth;
+- keep S3 reward, messages/tokens/masks/logprobs and training out of S2.
+
+Alternatives rejected:
+
+- restoring the deleted legacy implementation wholesale;
+- making GraphTask/ProgrammaticTask separate persistent formats;
+- restoring universal State/Rule IR, unrestricted verifier code, exhaustive
+  perturbation matrices or compatibility readers;
+- treating the real `189be1b` vertical as paper-grade S2 completion.
+
+Evidence that would reverse this correction: an end-to-end physical proof that
+the current minimal compiler satisfies bidirectional obligation coverage,
+reload persistence, the Good Task challenge set, multi-policy discrimination
+and held-out corpus transfer. The existing SQLite “reopen” instruction accepted
+without any close/reopen event is a concrete counterexample, so that evidence
+does not currently exist.
+
+No product code may be changed from this correction until the revised PRD,
+design and implementation plan pass the main-session drift/overdesign review
+and the user accepts the plan.
+
+## Documentation self-review — 2026-08-30
+
+Main-session review passed after correcting detected drift. Verified:
+
+- S2 product goal is a Good Task corpus for tool-calling Agentic RL, not a
+  three-Task execution demo;
+- direct/Graph/Programmatic share one proposal/admission boundary;
+- all six intrinsic Good Task properties and corpus-level quality are explicit;
+- parameterized semantics freeze before Start, concrete public bindings append
+  later without changing meaning, and the bound Task freezes before witness;
+- obligation IDs, public applicability, executed Graph edges and the bounded
+  four-operation Programmatic proposal are implementable rather than prose-only;
+- physical reload and applicable semantic challenges are required without an
+  exhaustive Cartesian matrix;
+- current code is labelled an incomplete checkpoint; no code change is claimed;
+- legacy ABI, universal State/Rule IR, persistent sampler types, hidden setup,
+  domain branches and S3 reward/training remain out of scope;
+- all eight checkpoints contain a product claim, RED acceptance and real exit;
+  the ten-item completion checklist, task JSON/JSONL and Markdown diff validate.
+
+This review authorizes presenting the plan to the user. It does not authorize
+Checkpoint A implementation until the user accepts the revised plan.

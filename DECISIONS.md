@@ -25,6 +25,38 @@
 - Historical C3/F mutation and challenge records are recoverable from Git but
   no longer define current implementation authority.
 
+## 2026-08-30 — Good Task correction to the S2 deletion-first boundary
+
+This section supersedes the earlier Atom/ForEach/If minimal-admission bullets as
+the definition of S2 completion. The earlier S1 deduplication, reduced Native
+Auditor, fake-mutation deletion and anti-compatibility decisions remain active.
+
+- Commit `189be1b` is a real execution checkpoint, not complete S2 sampling.
+- S2 must produce a quality-controlled Task corpus for later tool-calling
+  Agentic RL, not merely compile and solve a small number of Capability Tasks.
+- Direct, Graph and Programmatic mechanisms are proposal samplers feeding one
+  common CandidateTaskProposal/TaskPack path. They are not separate persistent
+  Task formats and cannot define truth from a successful route.
+- TaskSpecification and bounded V0 freeze before witness search and must prove
+  bidirectional coverage over the declared S1 Requirement set.
+- Production admission physically exercises one discriminating case for each
+  applicable semantic failure class: no-op, wrong entity/answer, near-miss,
+  partial/omitted obligation, collateral and required process/reload. A known
+  constructible alternative valid route must remain accepted.
+- Applicability prevents a Cartesian matrix: the product does not replay every
+  member, parameter, order or possible route, and fake result mutation remains
+  forbidden.
+- A declared persistence claim requires close/reopen of the same native
+  instance before final trusted evaluation.
+- S2 publishes a strict cold-readable TaskPack/PublicTaskView handoff. Reward,
+  trajectory messages/tokens/masks/logprobs and training remain S3/S4.
+- Corpus counts never waive Good Task validity, but fixed-budget sampler yield,
+  unique structures, redundancy, multi-policy difficulty/discrimination and
+  cost are required S2 evidence.
+- Universal State/Rule IR, unrestricted per-Task verifier code, legacy ABI,
+  persistent GraphTask/ProgrammaticTask, hidden setup and domain-specific
+  Framework branches remain deleted.
+
 ## S1/S2 clean-break architecture
 
 - Only EnvironmentRelease v2 is supported; no v1 compatibility or fallback.
@@ -75,3 +107,5 @@ The one process violation was starting a review worker without a fresh explicit
 request. It was stopped immediately; its unfinished turn was not used as an
 acceptance verdict. Final assessment/corpus review was completed in the main
 session.
+
+`s2-good-task-docs|介入1|返工1|Good Task memory+real reopen counterexample+main-session drift/overdesign audit|红线违反0`

@@ -43,7 +43,8 @@ S1 owns:
   relations freeze;
 - a mutually blind qualification-only native verifier project archived for
   cold audit and unavailable to S2/Consumers;
-- Host-owned public/native/physical-negative Qualification;
+- Host-owned positive capability Qualification with an independent native
+  effects/collateral audit;
 - exact prepare/open process isolation and immutable publication.
 
 S1 publishes qualified capability atoms, workflow/condition metadata, start cases
@@ -55,19 +56,21 @@ Task checkers, corpus cells, rewards or trajectories.
 S2 consumes one exact v2 release and follows this fixed order:
 
 ```text
-CapabilitySpecs + StartCase + bindings
--> deterministic selector/GoalProgram TaskBlueprint
--> freeze deterministic TaskChecker
--> render/audit final canonical instruction
--> two fresh public Responses-Agent executions of that exact instruction
--> checker/instruction/provenance challenges
+direct + Graph + Programmatic grounded proposals
+-> bidirectionally anchored TaskSpecification
+-> bounded task-local VerifierBundle V0
+-> fresh Start replay and concrete public binding
+-> freeze checker/instruction/answer contract
+-> two fresh public Responses-Agent executions
+-> reload/truth extraction and applicable semantic challenges
 -> TaskPack
 -> separate model-relative TaskAssessment
 -> CorpusManifest
 ```
 
-Graph/random-walk/program synthesis are optional future public-search
-implementations only. They are not Task sources or truth.
+Graph and Programmatic mechanisms are required proposal paths for conformance,
+but they share one CandidateTaskProposal/TaskPack ABI and cannot define truth.
+Their graphs, programs and successful routes remain disposable evidence.
 
 Every admitted Task is publicly solvable, deterministically verifiable,
 well-posed, non-trivial, reproducible, Need/workflow anchored and path-open.
@@ -135,11 +138,18 @@ shared public episode-runner contracts.
 - [ ] Checker and final instruction freeze before any witness-model call.
 - [ ] Each TaskPack has two fresh successful public executions of the exact final
   instruction and no load-bearing hidden operand.
-- [ ] Applicable no-op, wrong-target, near-miss, partial, collateral,
-  wrong-answer and process challenges fail; a valid alternative route passes.
+- [ ] Bidirectional Requirement coverage rejects unanchored predicates and
+  omitted applicable obligations before witness search.
+- [ ] Every applicable physical no-op, wrong-entity, near-miss, partial,
+  omitted-obligation, collateral, wrong-answer and process/reload challenge
+  fails; a known constructible valid alternative route passes.
 - [ ] TaskPack identity excludes model trials/difficulty/corpus policy.
-- [ ] Both conformance releases and a post-freeze held-out Need meet the
-  preregistered Task-yield/structure/start floors without framework domain edits.
+- [ ] Both conformance releases and a post-freeze held-out Need run direct,
+  Graph and Programmatic samplers under preregistered budgets without Framework
+  domain edits, reporting honest yield or typed abstention rather than weakening
+  Task gates.
+- [ ] Strict cold TaskPack read and PublicTaskView projection reproduce the
+  exact S2-to-S3 handoff without leaking checker/protected data.
 - [ ] Corpus diversity/redundancy/cost are reported separately from downstream
   matched-budget SFT/RL or Agent generalization.
 - [ ] Exact cold artifacts reproduce the complete S1 -> S2 -> S3-shaped claim.
