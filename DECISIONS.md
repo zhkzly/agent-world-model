@@ -176,3 +176,5 @@
 `s2-bounded-report-profiles|介入2|返工2|shared full+singleton report profiles+3 real Goal TaskPacks+5 mutation licences+338 tests|红线违反1: initially misread code-redundancy concern as a reason to restrict ForEach/If semantics`
 
 `s2-batch-foundry|介入1|返工1|126 candidates→84 structures→20 real admitted packs+13 dependencies+37 attributed rejects+5 mutation licences|红线违反0`
+
+`s2-nullable-wrong-answer|介入0|返工0|null→schema-valid non-null alternative+old physical failure replay+mutation licence|红线违反0`

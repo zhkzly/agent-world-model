@@ -909,3 +909,20 @@ def test_report_projection_reuses_release_truth_and_only_scores_selected_fields(
         {"first": "wrong"},
         {"first": "wrong", "second": "other"},
     ]
+
+
+def test_nullable_union_has_a_schema_valid_non_null_wrong_answer() -> None:
+    assert (
+        task_foundry_module._alternative_value(
+            {"type": ["string", "null"]},
+            None,
+        )
+        == "wrong"
+    )
+    assert (
+        task_foundry_module._alternative_value(
+            {"type": ["boolean", "null"]},
+            None,
+        )
+        is False
+    )

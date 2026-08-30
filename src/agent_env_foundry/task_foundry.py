@@ -1940,7 +1940,8 @@ def _alternative_value(schema: dict[str, Any], value: JSONValue) -> JSONValue | 
             if item != value and is_json_value(item):
                 return cast(JSONValue, item)
     types = schema.get("type")
-    allowed = {types} if isinstance(types, str) else set(types or ())
+    ordered_types = (types,) if isinstance(types, str) else tuple(types or ())
+    allowed = set(ordered_types)
     if isinstance(value, bool) and "boolean" in allowed:
         return not value
     if isinstance(value, int) and not isinstance(value, bool) and "integer" in allowed:
@@ -1959,6 +1960,21 @@ def _alternative_value(schema: dict[str, Any], value: JSONValue) -> JSONValue | 
                 return string_candidate
     if value is not None and "null" in allowed:
         return None
+    defaults: dict[str, tuple[JSONValue, ...]] = {
+        "boolean": (False, True),
+        "integer": (0, 1, -1),
+        "number": (0, 1, -1, 0.5),
+        "string": ("wrong", "alternative", "x"),
+        "array": ([], [None]),
+        "object": ({},),
+        "null": (None,),
+    }
+    for allowed_type in ordered_types:
+        for candidate in defaults.get(allowed_type, ()):
+            if candidate != value and not tuple(
+                Draft202012Validator(schema).iter_errors(candidate)
+            ):
+                return candidate
     return _NO_ALTERNATIVE
 
 
