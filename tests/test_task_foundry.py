@@ -323,6 +323,15 @@ def test_agent_choice_rebinds_dynamic_final_answer_from_checker_report() -> None
     }
 
 
+def test_instruction_preserves_temporal_answer_qualifiers() -> None:
+    instruction = task_foundry_module._instruction(
+        "Complete the task.",
+        {"target": "one"},
+        (SimpleNamespace(field_id="status", public_label="Status after reopening"),),
+    )
+    assert "observation before that event cannot fill an after-event field" in instruction
+
+
 def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
     task = _task()
     plan = _plan(task)

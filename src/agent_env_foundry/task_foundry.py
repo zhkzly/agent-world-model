@@ -1931,17 +1931,25 @@ def _instruction(goal: str, descriptor: JSONObject, answer_fields: tuple[Any, ..
     labels = [
         {"field_id": field.field_id, "public_label": field.public_label} for field in answer_fields
     ]
-    return "\n".join(
-        (
-            goal.strip(),
-            "Selected public target descriptor: "
-            + json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            "Return a JSON object with these fields: "
-            + json.dumps(labels, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            "Copy exact public JSON values from the instruction or observations; "
-            "do not paraphrase.",
+    lines = [
+        goal.strip(),
+        "Selected public target descriptor: "
+        + json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        "Return a JSON object with these fields: "
+        + json.dumps(labels, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        "Copy exact public JSON values from the instruction or observations; do not paraphrase.",
+    ]
+    if any(
+        marker in field.public_label.casefold()
+        for field in answer_fields
+        for marker in (" after ", " before ", "post_", "pre_")
+    ):
+        lines.append(
+            "Respect temporal qualifiers in field labels: an observation before that event "
+            "cannot fill an after-event field; return null when the qualified observation "
+            "did not occur."
         )
-    )
+    return "\n".join(lines)
 
 
 def _answer_schema(answer_fields: tuple[Any, ...]) -> JSONObject:
