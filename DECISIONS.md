@@ -174,3 +174,5 @@
 `s2-git-foreach-wrong-answer|介入1|返工2|v8 real two-witness replay+single-member answer mutation+full ForEach TaskPack+mutation licence|红线违反1: initially used an unnecessary stochastic Agent call for a deterministic checker challenge`
 
 `s2-bounded-report-profiles|介入2|返工2|shared full+singleton report profiles+3 real Goal TaskPacks+5 mutation licences+338 tests|红线违反1: initially misread code-redundancy concern as a reason to restrict ForEach/If semantics`
+
+`s2-batch-foundry|介入1|返工1|126 candidates→84 structures→20 real admitted packs+13 dependencies+37 attributed rejects+5 mutation licences|红线违反0`
