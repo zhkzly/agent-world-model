@@ -3,7 +3,7 @@
   "name": "s3-episode-runtime",
   "title": "S3 Verified Episode Runtime",
   "description": "Run admitted TaskPacks with target policies, preserve complete public trajectories, execute frozen verification, and publish deterministic Reward/abstention Episode artifacts for S4",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": "backend",
   "scope": "Implement one reusable public-policy episode runtime and immutable Episode artifacts over exact EnvironmentRelease v2 and S2 TaskPacks; allow narrowly required refactors of S2 execution code, but do not generate Tasks or train models",
   "package": "agent_env_foundry",
