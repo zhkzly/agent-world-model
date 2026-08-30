@@ -43,12 +43,8 @@ from agent_env_foundry.task_foundry import (
     _wrong_answer,
 )
 
-_REVERSE_ORDER_PROMPT = (
-    "For this checker challenge, complete the same full task but perform the selected targets "
-    "in reverse descriptor order. Keep the required final results array in its original "
-    "descriptor order."
-)
-_REVERSE_ORDER_PROMPT_DIGEST = hashlib.sha256(_REVERSE_ORDER_PROMPT.encode()).hexdigest()
+_REVERSE_REPLAY_POLICY = "deterministic_dependency_safe_reverse_replay/v1"
+_REVERSE_REPLAY_POLICY_DIGEST = hashlib.sha256(_REVERSE_REPLAY_POLICY.encode()).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,14 +131,14 @@ class ForEachAdmissionPlan:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "foreach-admission-plan/2",
+            "format": "foreach-admission-plan/3",
             "task_id": self.task_id,
             "omitted_member_indices": list(self.omitted_member_indices),
             "wrong_answer_member_index": self.wrong_answer_member_index,
             "collateral_task_id": self.collateral_task_id,
             "agent_choice_policy": "perturb_each_occurrence",
-            "alternative_order_policy": "reverse_first_target_occurrences",
-            "alternative_order_prompt_digest": _REVERSE_ORDER_PROMPT_DIGEST,
+            "alternative_order_policy": "deterministic_dependency_safe_reverse_replay",
+            "alternative_order_policy_digest": _REVERSE_REPLAY_POLICY_DIGEST,
             "checker_mutations": [
                 {"mutation_id": f"ignore_member_{index}", "omitted_member_index": index}
                 for index in self.omitted_member_indices
@@ -506,7 +502,7 @@ class ForEachAlternativeOrderProof:
     admission_plan_id: str
     reference_witness_id: str
     materialization_id: str
-    challenge_instruction_digest: str
+    replay_policy_digest: str
     member_action_order: tuple[int, ...]
     trace: tuple[TraceEvent, ...]
     final_answer: JSONObject
@@ -531,12 +527,12 @@ class ForEachAlternativeOrderProof:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "foreach-alternative-order-proof/1",
+            "format": "foreach-alternative-order-proof/2",
             "task_id": self.task_id,
             "admission_plan_id": self.admission_plan_id,
             "reference_witness_id": self.reference_witness_id,
             "materialization_id": self.materialization_id,
-            "challenge_instruction_digest": self.challenge_instruction_digest,
+            "replay_policy_digest": self.replay_policy_digest,
             "member_action_order": list(self.member_action_order),
             "trace": [item.to_document() for item in self.trace],
             "final_answer": _json_object(self.final_answer),
@@ -1423,49 +1419,85 @@ def prove_foreach_reverse_order(
     prepared: OpenPreparedRelease,
     solved: SolvedForEachTask,
     instance_root: Path,
-    *,
-    route: AgentRoute | None = None,
-    max_provider_turns: int = 12,
 ) -> ForEachAlternativeOrderProof:
     task = solved.task
     _verify_task(prepared, task)
-    challenge_instruction = "\n\n".join((task.instruction, _REVERSE_ORDER_PROMPT))
-    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
+    witness = solved.witnesses[0]
+    ordered_events = _reverse_replay_order(witness, task.public_descriptors)
     with prepared.open(instance_root) as session:
         reset = session.actor.reset(task.start_case.reset_input)
         before = session.trusted.inspect(instance_root)
         bindings = _resolve_complete_selection(session, task, before)
-        tool_specs = session.actor.tools()
-        episode = run_public_episode(
-            actor=session.actor,
-            instruction=challenge_instruction,
-            reset_observation=reset,
-            tool_specs=tool_specs,
-            answer_schema=task.answer_schema,
-            route=selected_route,
-            max_provider_turns=max_provider_turns,
-        )
-        answers = episode.final_answer.get("results")
-        if not isinstance(answers, list) or len(answers) != len(bindings):
-            raise TaskFoundryError(
-                "foreach_reverse_answer_count_mismatch",
-                "Reverse-order ForEach answer does not cover the complete selection",
+        tool_specs = {item["name"]: item for item in session.actor.tools()}
+        provenance_by_event = {
+            event.seq: tuple(
+                item for item in witness.argument_provenance if item.event_seq == event.seq
             )
+            for event in witness.trace
+        }
+        replay_observations: dict[int, JSONObject] = {}
+        replay_trace: list[TraceEvent] = []
+        for new_seq, event in enumerate(ordered_events, start=1):
+            arguments = _replay_arguments(
+                event,
+                provenance_by_event[event.seq],
+                reset,
+                replay_observations,
+                (-1, ""),
+                None,
+            )
+            errors = tuple(
+                Draft202012Validator(tool_specs[event.tool_name]["input_schema"]).iter_errors(
+                    arguments
+                )
+            )
+            if errors:
+                raise TaskFoundryError(
+                    "foreach_reverse_replay_arguments_invalid",
+                    "Reverse ForEach replay arguments violate the frozen ToolSpec",
+                    event_seq=event.seq,
+                    original_message=errors[0].message,
+                )
+            observation = _json_object(session.actor.invoke(event.tool_name, arguments))
+            replay_observations[event.seq] = observation
+            replay_trace.append(TraceEvent(new_seq, event.tool_name, arguments, observation))
+        replay = tuple(replay_trace)
         provenance = resolve_argument_provenance(
-            trace=episode.trace,
+            trace=replay,
             instruction_values={
                 "selected_targets": [_json_object(item) for item in task.public_descriptors]
             },
             reset_observation=reset,
-            tool_specs=tool_specs,
+            tool_specs=tuple(tool_specs.values()),
         )
-        member_order = _member_action_order(
-            episode.trace,
-            provenance,
-            len(task.semantic_keys),
-        )
+        member_order = _member_action_order(replay, provenance, task.public_descriptors)
+        answers = witness.final_answer.get("results")
+        if not isinstance(answers, list) or len(answers) != len(bindings):
+            raise TaskFoundryError(
+                "foreach_reverse_answer_count_mismatch",
+                "ForEach witness answer does not cover the complete selection for replay",
+            )
         after = session.trusted.inspect(instance_root)
         contexts = _contexts(task, bindings)
+        probe_results = tuple(
+            _evaluate_report_atom(
+                session,
+                AtomCheckRequest(
+                    task.capability_id,
+                    before,
+                    after,
+                    binding.protected_binding,
+                    replay,
+                    answers[position],
+                    contexts[position],
+                ),
+                task.member_answer_schema,
+            )
+            for position, binding in enumerate(bindings)
+        )
+        correct_answers = [
+            _rebound_final_answer(item, task.member_answer_schema) for item in probe_results
+        ]
         results = tuple(
             _evaluate_report_atom(
                 session,
@@ -1474,23 +1506,24 @@ def prove_foreach_reverse_order(
                     before,
                     after,
                     binding.protected_binding,
-                    episode.trace,
-                    answers[position],
+                    replay,
+                    correct_answers[position],
                     contexts[position],
                 ),
                 task.member_answer_schema,
             )
             for position, binding in enumerate(bindings)
         )
+        final_answer = _json_object({"results": correct_answers})
         return ForEachAlternativeOrderProof(
             task.task_id,
             solved.admission_plan.plan_id,
-            solved.witnesses[0].witness_id,
+            witness.witness_id,
             session.identity.materialization_id,
-            hashlib.sha256(challenge_instruction.encode()).hexdigest(),
+            _REVERSE_REPLAY_POLICY_DIGEST,
             member_order,
-            episode.trace,
-            episode.final_answer,
+            replay,
+            final_answer,
             provenance,
             results,
         )
@@ -1721,27 +1754,157 @@ def _replay_witness_trace(
     return tuple(trace)
 
 
+def _reverse_replay_order(
+    witness: ForEachWitness,
+    public_descriptors: tuple[JSONObject, ...],
+) -> tuple[TraceEvent, ...]:
+    member_count = len(public_descriptors)
+    discriminators = _descriptor_discriminators(public_descriptors)
+    provenance_by_event = {
+        event.seq: tuple(
+            item for item in witness.argument_provenance if item.event_seq == event.seq
+        )
+        for event in witness.trace
+    }
+    member_by_event: dict[int, int | None] = {}
+    dependencies: dict[int, set[int]] = {}
+    for event in witness.trace:
+        member_indices = {
+            member_index
+            for item in provenance_by_event[event.seq]
+            if (member_index := _provenance_member_index(item, discriminators)) is not None
+        }
+        if len(member_indices) > 1:
+            raise TaskFoundryError(
+                "foreach_reverse_replay_cross_member_event",
+                "One public trace event contains operands from multiple ForEach members",
+                event_seq=event.seq,
+                member_indices=sorted(member_indices),
+            )
+        member_by_event[event.seq] = next(iter(member_indices), None)
+        dependencies[event.seq] = {
+            cast(int, item.source_event_seq)
+            for item in provenance_by_event[event.seq]
+            if item.source_kind == "tool_observation"
+        }
+    remaining = {event.seq: event for event in witness.trace}
+    executed: set[int] = set()
+    ordered: list[TraceEvent] = []
+    while remaining:
+        ready = [event for event in remaining.values() if dependencies[event.seq] <= executed]
+        if not ready:
+            raise TaskFoundryError(
+                "foreach_reverse_replay_dependency_cycle",
+                "ForEach witness provenance has no dependency-safe replay order",
+                remaining_event_seqs=sorted(remaining),
+            )
+        selected = min(
+            ready,
+            key=lambda event: (
+                0 if member_by_event[event.seq] is None else 1,
+                -(member_by_event[event.seq] or 0),
+                event.seq,
+            ),
+        )
+        ordered.append(selected)
+        executed.add(selected.seq)
+        del remaining[selected.seq]
+    observed_members: list[int] = []
+    for event in ordered:
+        member_index = member_by_event[event.seq]
+        if member_index is not None and member_index not in observed_members:
+            observed_members.append(member_index)
+    expected = list(reversed(range(member_count)))
+    if observed_members != expected:
+        raise TaskFoundryError(
+            "foreach_reverse_replay_unavailable",
+            "Trace dependencies prevent a complete reverse member order",
+            expected_order=expected,
+            observed_order=observed_members,
+        )
+    return tuple(ordered)
+
+
+def _provenance_member_index(
+    occurrence: ArgumentProvenance,
+    discriminators: frozenset[tuple[int, str]],
+) -> int | None:
+    prefix = "/public_descriptor/selected_targets/"
+    pointer = occurrence.source_pointer
+    if occurrence.source_kind != "task_literal" or not isinstance(pointer, str):
+        return None
+    if not pointer.startswith(prefix):
+        return None
+    token, separator, relative = pointer.removeprefix(prefix).partition("/")
+    if not token.isdigit():
+        return None
+    member_index = int(token)
+    relative_pointer = f"/{relative}" if separator else ""
+    return member_index if (member_index, relative_pointer) in discriminators else None
+
+
+def _descriptor_discriminators(
+    public_descriptors: tuple[JSONObject, ...],
+) -> frozenset[tuple[int, str]]:
+    leaves = tuple(_json_leaves(descriptor) for descriptor in public_descriptors)
+    discriminators = {
+        (member_index, pointer)
+        for member_index, member_leaves in enumerate(leaves)
+        for pointer, value in member_leaves.items()
+        if all(
+            pointer not in other_leaves
+            or canonical_bytes(other_leaves[pointer]) != canonical_bytes(value)
+            for other_index, other_leaves in enumerate(leaves)
+            if other_index != member_index
+        )
+    }
+    missing = [
+        index
+        for index in range(len(public_descriptors))
+        if not any(member_index == index for member_index, _ in discriminators)
+    ]
+    if missing:
+        raise TaskFoundryError(
+            "foreach_public_descriptor_not_discriminating",
+            "ForEach member has no unique public descriptor leaf for physical ordering",
+            member_indices=missing,
+        )
+    return frozenset(discriminators)
+
+
+def _json_leaves(value: JSONValue, pointer: str = "") -> dict[str, JSONValue]:
+    if isinstance(value, dict):
+        leaves: dict[str, JSONValue] = {}
+        for key, child in value.items():
+            token = key.replace("~", "~0").replace("/", "~1")
+            leaves.update(_json_leaves(child, f"{pointer}/{token}"))
+        return leaves
+    if isinstance(value, list):
+        leaves = {}
+        for index, child in enumerate(value):
+            leaves.update(_json_leaves(child, f"{pointer}/{index}"))
+        return leaves
+    return {pointer: value}
+
+
 def _member_action_order(
     trace: tuple[TraceEvent, ...],
     provenance: tuple[ArgumentProvenance, ...],
-    member_count: int,
+    public_descriptors: tuple[JSONObject, ...],
 ) -> tuple[int, ...]:
-    prefix = "/public_descriptor/selected_targets/"
+    member_count = len(public_descriptors)
+    discriminators = _descriptor_discriminators(public_descriptors)
     by_event = {event.seq: event for event in trace}
     order: list[int] = []
     for occurrence in sorted(
         provenance,
         key=lambda item: (item.event_seq, item.argument_pointer),
     ):
-        if occurrence.event_seq not in by_event or occurrence.source_kind != "task_literal":
+        if occurrence.event_seq not in by_event:
             continue
-        pointer = occurrence.source_pointer
-        if not isinstance(pointer, str) or not pointer.startswith(prefix):
+        member_index = _provenance_member_index(occurrence, discriminators)
+        if member_index is None:
             continue
-        token = pointer.removeprefix(prefix).partition("/")[0]
-        if not token.isdigit():
-            continue
-        member_index = int(token)
         if member_index not in order:
             order.append(member_index)
     if set(order) != set(range(member_count)):

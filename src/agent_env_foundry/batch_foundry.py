@@ -442,8 +442,6 @@ def _admit_candidate(
             prepared,
             solved_foreach,
             root / "alternative-order",
-            route=route,
-            max_provider_turns=max_provider_turns,
         )
         collateral = challenge_foreach_collateral(
             prepared,

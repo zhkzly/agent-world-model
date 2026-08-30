@@ -137,13 +137,16 @@ def test_foreach_task_binds_complete_ordered_selection_and_two_fresh_witnesses()
     plan = _plan(task)
     assert plan.to_document()["agent_choice_policy"] == "perturb_each_occurrence"
     assert plan.to_document()["collateral_task_id"] == "e" * 64
-    assert plan.to_document()["alternative_order_policy"] == ("reverse_first_target_occurrences")
+    assert plan.to_document()["format"] == "foreach-admission-plan/3"
+    assert plan.to_document()["alternative_order_policy"] == (
+        "deterministic_dependency_safe_reverse_replay"
+    )
     assert [item["mutation_id"] for item in plan.to_document()["checker_mutations"]] == [
         "ignore_member_0",
         "ignore_member_1",
     ]
     answer_plan = ForEachAdmissionPlan(task.task_id, (0, 1), 0, "e" * 64)
-    assert answer_plan.to_document()["format"] == "foreach-admission-plan/2"
+    assert answer_plan.to_document()["format"] == "foreach-admission-plan/3"
     assert answer_plan.to_document()["wrong_answer_member_index"] == 0
     with pytest.raises(TaskFoundryError, match="wrong-answer member"):
         ForEachAdmissionPlan(task.task_id, (0, 1), 2, "e" * 64)
@@ -288,6 +291,85 @@ def test_foreach_noop_and_alternative_order_are_discriminating() -> None:
 
     with pytest.raises(TaskFoundryError, match="mutant"):
         ForEachCheckerMutationResult("ignore_member_0", 0, False, False, False)
+
+
+def test_reverse_replay_order_preserves_dependencies_and_reverses_members() -> None:
+    task = replace(
+        _task(),
+        public_descriptors=(
+            {"item": "one", "shared": "same"},
+            {"item": "two", "shared": "same"},
+        ),
+    )
+    witness = replace(
+        _witness(task, "a" * 64),
+        trace=(
+            TraceEvent(1, "discover", {}, {"ok": True}),
+            TraceEvent(2, "act", {"item": "one", "shared": "same"}, {"ok": True}),
+            TraceEvent(3, "act", {"item": "two", "shared": "same"}, {"id": "two-id"}),
+            TraceEvent(4, "confirm", {"item": "two", "id": "two-id"}, {"ok": True}),
+        ),
+        argument_provenance=(
+            ArgumentProvenance(
+                2,
+                "/item",
+                "one",
+                "task_literal",
+                None,
+                None,
+                "/public_descriptor/selected_targets/0/item",
+            ),
+            ArgumentProvenance(
+                3,
+                "/item",
+                "two",
+                "task_literal",
+                None,
+                None,
+                "/public_descriptor/selected_targets/1/item",
+            ),
+            ArgumentProvenance(
+                2,
+                "/shared",
+                "same",
+                "task_literal",
+                None,
+                None,
+                "/public_descriptor/selected_targets/1/shared",
+            ),
+            ArgumentProvenance(
+                3,
+                "/shared",
+                "same",
+                "task_literal",
+                None,
+                None,
+                "/public_descriptor/selected_targets/0/shared",
+            ),
+            ArgumentProvenance(
+                4,
+                "/item",
+                "two",
+                "task_literal",
+                None,
+                None,
+                "/public_descriptor/selected_targets/1/item",
+            ),
+            ArgumentProvenance(
+                4,
+                "/id",
+                "two-id",
+                "tool_observation",
+                3,
+                "act",
+                "/id",
+            ),
+        ),
+    )
+
+    ordered = foreach_module._reverse_replay_order(witness, task.public_descriptors)
+
+    assert [item.seq for item in ordered] == [1, 3, 4, 2]
 
 
 def test_foreach_wrong_answer_fails_only_the_planned_member() -> None:
