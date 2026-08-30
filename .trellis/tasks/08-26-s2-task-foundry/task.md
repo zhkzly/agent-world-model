@@ -148,3 +148,20 @@ Gold reference: the contrasting real SQLite and filesystem/Git releases and the 
 - Four v6 Atom TaskPacks are currently sealed: query MAINTAINERS `a7ca1403...`,
   query notes `643ef3da...`, protected refusal `6ddaa6f0...`, and missing
   refusal `a082ccb5...`. Remaining Atom/ForEach/If admission is open.
+
+### v7 preflight and admission
+
+- Binding eligibility now rejects the no-staged `create_commit` refusal under
+  `git-pending_change`; deterministic pre-publication preflight covered every
+  StartCase/binding/condition and produced 11 Atom, 4 ForEach and 6 If
+  candidates (21 total).
+- v7 Release `04b1a2888c4f33567f28d22f827524cf231adaa1099971b513c37b7f3347f821`
+  passed Publication, audit and ZIP relocation.
+- Ten of eleven v7 Atom Tasks are admitted. The sole rejected Blueprint is the
+  clean no-staged refusal, which did not meet repeated public-witness answer
+  reliability; rejecting it still leaves exactly 20 possible packs.
+- First ForEach reached final sealing after its witnesses/no-op/partials/
+  choices/reverse/collateral/mutations, then correctly failed because the
+  Framework has no physical ForEach wrong-answer evidence type yet. The next
+  implementation slice is that missing planned challenge; the gate is not
+  waived.
