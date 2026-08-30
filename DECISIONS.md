@@ -63,18 +63,55 @@
 - Diversity is semantic/execution-structural, not text or entity variation.
 - Downstream learning utility is established only by S3/S4 experiments.
 
+## S3 episode and reward boundary
+
+- S3 consumes current cold-verified Release/TaskPack/Corpus authority and cannot
+  generate, repair, re-admit or weaken a Task.
+- One Host-owned public-policy/tool/lifecycle path is shared by S2 witnesses,
+  S2 TaskAssessment and S3 target-policy Episodes. No second Responses loop or
+  verifier path is allowed.
+- Healthy policy failures preserve their complete public trajectory and receive
+  deterministic reward zero after post-reopen verification; they are not
+  discarded as exceptions.
+- Provider, infrastructure, Environment, Task artifact, Semantics, Verifier and
+  evidence-integrity defects abstain with `reward=null`. They never become model
+  failures or hard-Task labels.
+- The initial reward policy is `binary-task-success/1`: verified success is
+  `1.0`, valid verified failure is `0.0`, and untrustworthy evidence abstains.
+- TaskAssessment reliability, S2 witness traces and corpus selection cannot
+  alter Episode reward.
+- The target policy receives only instruction, reset observation, ToolSpecs,
+  prior ToolObservations and answer schema. Start input, semantic keys,
+  protected bindings, expected branch, native facts, checker data and S2
+  witness/admission evidence remain trusted-only.
+- Provider-private reasoning/chain-of-thought is not a required Episode artifact.
+  S3 stores public function calls, observations, final structured answer or
+  public terminal failure and usage.
+- The current research-specific hard-coded `AgentRoute` does not identify S3
+  target policies. S3 introduces a non-secret PolicySpec and one small
+  PolicyDriver boundary, with Responses as the production driver and a later S4
+  adapter using the same public Host path.
+- EpisodeRecord identity binds exact Task/Release/policy/public trajectory,
+  close/reopen evidence, frozen checker result and Reward/abstention. Paths and
+  credentials are excluded.
+- TrainingEpisodeView contains public trajectory and reward labels only; it
+  cannot expose protected facts/checker inputs or TaskPack witnesses.
+- S3 does not implement trainer-specific formatting, tokenization, logprobs,
+  token masks, optimizer steps or checkpoints. Those remain S4.
+
 ## Clean-break and anti-overdesign
 
 - The abandoned RequirementObligation/TaskSpecification/V0 parallel path is
   deleted; Git history is its audit record.
-- The actual production APIs are `run_task_foundry_batch` and
+- The actual S2 production APIs are `run_task_foundry_batch` and
   `run_task_foundry_product`; no second candidate/admission path or feature flag
   is allowed.
 - Framework code contains no Git/SQLite/booking/domain branches.
-- Universal State/Rule/Task ontology, unrestricted per-Task verifier code,
-  hidden setup, fake result mutation and mandatory optional samplers remain
+- Universal State/Rule/Task/reward ontology, unrestricted per-Task verifier
+  code, hidden setup, fake result mutation and mandatory optional samplers remain
   forbidden.
-- Add a component only for a demonstrated Direct Good-Task/corpus claim that
+- S3 adds no service, registry, queue, database, plugin system or Agent framework.
+  Add a component only for a demonstrated Episode trust or S4 handoff claim that
   existing code cannot prove.
 
 ## Execution record
