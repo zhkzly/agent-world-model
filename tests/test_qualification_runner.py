@@ -6,15 +6,48 @@ from types import SimpleNamespace
 import pytest
 
 import agent_env_foundry.qualification_runner as runner_module
-from agent_env_foundry.qualification_contracts import PublicSurfaceManifest
+from agent_env_foundry.qualification_contracts import (
+    NativeVerificationResult,
+    PublicSurfaceManifest,
+)
 from agent_env_foundry.qualification_runner import QualificationBudget
+from agent_env_foundry.qualification_v2 import validate_qualification_case_outcome
 from agent_env_foundry.semantics import (
     AnswerFieldSpec,
+    AtomCheckResult,
     CapabilitySpec,
     PublicValueSource,
     RenderingSpec,
     TraceEvent,
 )
+
+
+def test_noop_qualification_accepts_unchanged_collateral_but_not_task_completion() -> None:
+    semantic = AtomCheckResult(
+        initially_satisfied=False,
+        satisfied=False,
+        required_effects_ok=False,
+        collateral_ok=True,
+        answer_ok=False,
+        process_ok=False,
+        report_values={},
+        failure_codes=("REQUIRED_EFFECT_MISSING",),
+    )
+    verifier = NativeVerificationResult(
+        required_effects_ok=False,
+        collateral_ok=True,
+        failure_codes=("REQUIRED_EFFECT_MISSING",),
+    )
+
+    validate_qualification_case_outcome("noop", semantic, verifier)
+
+    for bad_semantic, bad_verifier in (
+        (replace(semantic, collateral_ok=False), verifier),
+        (semantic, replace(verifier, collateral_ok=False)),
+    ):
+        with pytest.raises(runner_module.QualificationV2Error) as caught:
+            validate_qualification_case_outcome("noop", bad_semantic, bad_verifier)
+        assert caught.value.code == "qualification_case_outcome_invalid"
 
 
 def test_qualification_budget_is_bounded_and_positive() -> None:

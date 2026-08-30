@@ -200,19 +200,54 @@ def _case(root: Path, *, capability_id: str = "cap-1") -> dict[str, object]:
     }
 
 
+def _noop_case(root: Path, *, capability_id: str = "cap-1") -> dict[str, object]:
+    semantics = _result(satisfied=False)
+    verifier = {
+        "required_effects_ok": False,
+        "collateral_ok": True,
+        "failure_codes": ["REQUIRED_EFFECT_MISSING"],
+    }
+    before = root / f"{capability_id}-noop-before"
+    after = root / f"{capability_id}-noop-after"
+    before.mkdir(parents=True, exist_ok=True)
+    after.mkdir(parents=True, exist_ok=True)
+    (before / "state.json").write_text('{"count":0}')
+    (after / "state.json").write_text('{"count":0}')
+    return {
+        "category": "noop",
+        "capability_id": capability_id,
+        "start_case_id": "case-1",
+        "semantic_key": "counter",
+        "public_descriptor": {"name": "counter"},
+        "before_instance_directory": str(before),
+        "after_instance_directory": str(after),
+        "reset_observation": {"count": 0},
+        "axis_agreement": True,
+        "readers_unchanged": True,
+        "trace": [],
+        "final_answer": {},
+        "semantics_result": semantics,
+        "verifier_result": verifier,
+        "answer_source_evidence": [],
+    }
+
+
 def test_evidence_sealing_requires_one_positive_per_capability(tmp_path: Path) -> None:
     core = derive_qualification_core(_inputs(tmp_path / "inputs"))
     destination = tmp_path / "evidence"
     manifest = seal_qualification_evidence(
         core,
         destination,
-        case_records=(_case(tmp_path / "case-inputs"),),
+        case_records=(
+            _case(tmp_path / "case-inputs"),
+            _noop_case(tmp_path / "case-inputs"),
+        ),
         required_capability_ids=("cap-1",),
     )
 
-    assert manifest["format"] == "qualification-evidence/2"
+    assert manifest["format"] == "qualification-evidence/3"
     assert manifest["core_id"] == core.core_id
-    assert len(manifest["cases"]) == 1
+    assert len(manifest["cases"]) == 2
     assert "mutations" not in manifest
     assert (destination / "evidence-manifest.json").is_file()
     for entry in manifest["cases"]:
@@ -249,7 +284,10 @@ def test_evidence_sealing_requires_one_positive_per_capability(tmp_path: Path) -
         seal_qualification_evidence(
             core,
             tmp_path / "missing-capability",
-            case_records=(_case(tmp_path / "missing-capability-inputs"),),
+            case_records=(
+                _case(tmp_path / "missing-capability-inputs"),
+                _noop_case(tmp_path / "missing-capability-inputs"),
+            ),
             required_capability_ids=("cap-1", "cap-2"),
         )
     assert caught.value.code == "qualification_positive_coverage_missing"
@@ -267,7 +305,10 @@ def test_evidence_sealing_rejects_native_state_disagreement(tmp_path: Path) -> N
         seal_qualification_evidence(
             core,
             tmp_path / "disagreement",
-            case_records=(disagreeing,),
+            case_records=(
+                disagreeing,
+                _noop_case(tmp_path / "disagreeing-inputs"),
+            ),
             required_capability_ids=("cap-1",),
         )
     assert caught.value.code == "qualification_reader_disagreement"

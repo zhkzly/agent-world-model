@@ -76,7 +76,7 @@ class QualificationRuntimeSet:
     verifier: RuntimeLock
 
 
-_CASE_CATEGORIES = frozenset({"positive"})
+_CASE_CATEGORIES = frozenset({"positive", "noop"})
 
 
 def seal_qualification_evidence(
@@ -119,7 +119,7 @@ def seal_qualification_evidence(
             for index, record in enumerate(normalized_cases, start=1)
         ]
         manifest: JSONObject = {
-            "format": "qualification-evidence/2",
+            "format": "qualification-evidence/3",
             "core_id": core.core_id,
             "required_capability_ids": list(required_capability_ids),
             "cases": [cast(JSONValue, item) for item in case_entries],
@@ -165,7 +165,7 @@ def verify_qualification_evidence(
             "Qualification evidence manifest bytes are not canonical",
         )
     keys = {"format", "core_id", "required_capability_ids", "cases"}
-    if set(manifest) != keys or manifest["format"] != "qualification-evidence/2":
+    if set(manifest) != keys or manifest["format"] != "qualification-evidence/3":
         raise QualificationV2Error(
             "qualification_evidence_manifest_invalid",
             "Qualification evidence manifest has an invalid shape or format",
@@ -245,6 +245,16 @@ def _validate_evidence_matrix(
             "qualification_positive_coverage_missing",
             "Every required capability needs positive physical evidence",
             missing=sorted(missing_capabilities),
+        )
+    noop_capabilities = {
+        cast(str, item["capability_id"]) for item in cases if item["category"] == "noop"
+    }
+    missing_noop = set(required_capability_ids) - noop_capabilities
+    if missing_noop:
+        raise QualificationV2Error(
+            "qualification_noop_coverage_missing",
+            "Every required capability needs a no-op physical case",
+            missing=sorted(missing_noop),
         )
 
 
@@ -477,15 +487,26 @@ def _validate_case_semantics(normalized: JSONObject) -> None:
             category=category,
             capability_id=capability_id,
         )
-    _validate_category_result(category, semantic, verifier)
+    validate_qualification_case_outcome(category, semantic, verifier)
 
 
-def _validate_category_result(
+def validate_qualification_case_outcome(
     category: str,
     semantic: AtomCheckResult,
     verifier: NativeVerificationResult,
 ) -> None:
-    valid = category == "positive" and semantic.satisfied and verifier.satisfied
+    if category == "positive":
+        valid = semantic.satisfied and verifier.satisfied
+    elif category == "noop":
+        valid = (
+            not semantic.initially_satisfied
+            and not semantic.satisfied
+            and semantic.collateral_ok
+            and semantic.process_ok is not True
+            and verifier.collateral_ok
+        )
+    else:
+        valid = False
     if not valid:
         raise QualificationV2Error(
             "qualification_case_outcome_invalid",
@@ -846,5 +867,6 @@ __all__ = [
     "derive_qualification_core",
     "materialize_qualification_core",
     "seal_qualification_evidence",
+    "validate_qualification_case_outcome",
     "verify_qualification_evidence",
 ]

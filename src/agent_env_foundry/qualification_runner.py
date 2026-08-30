@@ -35,6 +35,7 @@ from agent_env_foundry.qualification_v2 import (
     derive_qualification_core,
     materialize_qualification_core,
     seal_qualification_evidence,
+    validate_qualification_case_outcome,
 )
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.schema import SchemaError, validate_instance
@@ -763,13 +764,18 @@ def _evaluate(
             semantics_result=semantics_result.to_document(),
             verifier_result=verifier_result.to_document(),
         )
-    answer_source_evidence = _answer_field_evidence(
-        capability,
-        live_binding,
-        reset_observation,
-        trace,
-        semantics_result.report_values,
+    answer_source_evidence = (
+        _answer_field_evidence(
+            capability,
+            live_binding,
+            reset_observation,
+            trace,
+            semantics_result.report_values,
+        )
+        if category == "positive"
+        else ()
     )
+    validate_qualification_case_outcome(category, semantics_result, verifier_result)
     return _EvaluatedCase(
         category,
         capability,
@@ -861,6 +867,33 @@ def _run_episode_case(
         reset,
         episode.trace,
         episode.final_answer,
+    )
+
+
+def _run_noop_case(
+    harness: _QualificationHarness,
+    root: Path,
+    capability: CapabilitySpec,
+    start: StartCase,
+    binding: BindingCandidate,
+    ordinal: int,
+) -> _EvaluatedCase:
+    """Evaluate an unchanged physical world with no public episode."""
+
+    case = _case_root(root, "noop", capability, start, binding.semantic_key, ordinal)
+    before, after, actor, reset, _before_facts = _reset_pair(harness, case, start)
+    actor.close()
+    return _evaluate(
+        harness,
+        "noop",
+        capability,
+        start,
+        binding,
+        before,
+        after,
+        reset,
+        (),
+        {},
     )
 
 
@@ -986,6 +1019,7 @@ def run_v2_qualification(
         ordinal = 0
         for capability in capabilities:
             positive: _EvaluatedCase | None = None
+            noop: _EvaluatedCase | None = None
             for start in starts:
                 discovered = _discover_bindings(
                     harness,
@@ -996,6 +1030,15 @@ def run_v2_qualification(
                 eligible = [item for item in discovered if item.eligible]
                 if not eligible:
                     continue
+                noop = _run_noop_case(
+                    harness,
+                    work / "cases",
+                    capability,
+                    start,
+                    eligible[0],
+                    ordinal,
+                )
+                ordinal += 1
                 positive = _run_episode_case(
                     harness,
                     work / "cases",
@@ -1010,7 +1053,7 @@ def run_v2_qualification(
                 )
                 ordinal += 1
                 break
-            if positive is None:
+            if positive is None or noop is None:
                 raise QualificationV2Error(
                     "qualification_positive_coverage_missing",
                     "No eligible public Qualification case represents a capability",
@@ -1029,7 +1072,7 @@ def run_v2_qualification(
                 harness.inspect(positive.before),
                 harness.inspect(positive.after),
             )
-            cases.append(positive)
+            cases.extend((noop, positive))
 
         manifest = seal_qualification_evidence(
             core,

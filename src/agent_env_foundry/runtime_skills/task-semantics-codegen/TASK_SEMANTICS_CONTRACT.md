@@ -195,6 +195,12 @@ public process. Compute `required_effects_ok`, `collateral_ok`, `answer_ok` and
 `process_ok` from their distinct obligations; do not copy one `satisfied`
 boolean into every field.
 
+For every capability, `collateral_ok` is independent of whether its required
+effect occurred. If `before_facts` and `after_facts` are identical, no
+prohibited collateral mutation occurred: a missing required effect may make
+`required_effects_ok=false`, but it must not by itself make
+`collateral_ok=false`. Generated tests must cover this no-op axis separation.
+
 For a query, "real public read" means evidence carried by a successful public
 ToolObservation for the selected referent, not one hard-coded tool name or one
 reference sequence. When the frozen public surface exposes the same qualified
