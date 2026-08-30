@@ -184,3 +184,5 @@
 `s2-if-false-context|介入0|返工0|explicit report fields+mandatory branch execution+2 fresh PATH_NOT_FOUND witnesses+2 mutation licences|红线违反0`
 
 `s2-deterministic-foreach-reverse|介入0|返工1|discriminating descriptor leaves+dependency-safe public replay+old 3x failure admitted+3 mutation licences|红线违反0`
+
+`s2-public-agent-prompt-contract|介入1|返工1|required-first-tool+lean evidence prompt+single Structured Output schema+6/6 real eval+4 mutation licences|红线违反1: initially proposed a repeated prose-only execution instruction before global prompt audit`

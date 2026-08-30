@@ -926,3 +926,12 @@ def test_nullable_union_has_a_schema_valid_non_null_wrong_answer() -> None:
         )
         is False
     )
+
+
+def test_atom_instruction_does_not_duplicate_structured_output_schema() -> None:
+    instruction = task_foundry_module._instruction(
+        "Complete the requested outcome.",
+        {"item": "one"},
+        (),
+    )
+    assert "Return a JSON object with these fields" not in instruction

@@ -250,19 +250,7 @@ def test_if_instruction_discloses_report_fields_and_requires_branch_execution() 
         "Complete the true outcome.",
         "Complete the false outcome.",
         {"item": "one"},
-        {
-            "type": "object",
-            "properties": {
-                "result": {
-                    "type": "string",
-                    "description": "The exact public result.",
-                }
-            },
-            "required": ["result"],
-            "additionalProperties": False,
-        },
     )
 
-    assert '"field_id":"result"' in instruction
-    assert "must execute the selected branch with public tools" in instruction
+    assert "Return a JSON object with these fields" not in instruction
     assert "condition evaluation alone does not complete the Task" in instruction

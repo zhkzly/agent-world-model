@@ -31,7 +31,6 @@ from agent_env_foundry.task_foundry import (
     TaskFoundryError,
     _context,
     _evaluate_report_atom,
-    _report_field_ids,
     _resolve_binding,
     _task_by_id,
     _verify_checker_preimage,
@@ -402,7 +401,6 @@ def compile_if_tasks(
                         cast(str, prepared.task_goals[true_capability]),
                         cast(str, prepared.task_goals[false_capability]),
                         atom.public_descriptor,
-                        atom.answer_schema,
                     )
                     checker_preimage: JSONObject = {
                         "release_id": prepared.identity.release_id,
@@ -637,16 +635,7 @@ def _instruction(
     true_goal: str,
     false_goal: str,
     descriptor: JSONObject,
-    answer_schema: JSONObject,
 ) -> str:
-    properties = cast(dict[str, Any], answer_schema["properties"])
-    fields = [
-        {
-            "field_id": field_id,
-            "description": cast(dict[str, Any], properties[field_id]).get("description", ""),
-        }
-        for field_id in _report_field_ids(answer_schema)
-    ]
     return "\n".join(
         (
             f"Evaluate this public condition for the selected target: {public_condition}",
@@ -659,10 +648,8 @@ def _instruction(
                 sort_keys=True,
                 separators=(",", ":"),
             ),
-            "Return a JSON object with these fields: "
-            + json.dumps(fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-            "You must execute the selected branch with public tools before returning; "
-            "condition evaluation alone does not complete the Task.",
+            "Choose and complete exactly one branch; condition evaluation alone does not "
+            "complete the Task.",
             "Use only public observations to choose the branch; do not guess hidden state.",
         )
     )

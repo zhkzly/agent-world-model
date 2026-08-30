@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from agent_env_foundry.public_agent import (
+    PUBLIC_AGENT_SYSTEM_PROMPT,
     PublicAgentFailure,
     run_public_episode,
 )
@@ -109,6 +110,12 @@ def test_public_episode_preserves_exact_tool_loop_and_returns_trace(
     assert episode.trace[0].tool_name == "inspect_item"
     assert episode.trace[0].arguments == {"item": "public-1"}
     assert actor.calls == [("inspect_item", {"item": "public-1"})]
+    assert responses.requests[0]["tool_choice"] == "required"
+    assert responses.requests[1]["tool_choice"] == "auto"
+    assert "ok=true" in responses.requests[0]["tools"][0]["description"]
+    assert "error.code" in responses.requests[0]["tools"][0]["description"]
+    assert "when needed" not in PUBLIC_AGENT_SYSTEM_PROMPT
+    assert "final JSON" not in PUBLIC_AGENT_SYSTEM_PROMPT
     continuation = responses.requests[1]["input"]
     assert continuation[1]["type"] == "function_call"
     assert continuation[2] == {
@@ -154,7 +161,22 @@ def test_public_episode_rejects_unknown_tool_and_invalid_final_answer(
         )
     assert caught.value.code == "unknown_tool_call"
 
-    invalid = Responses([{"output": [], "output_text": '{"wrong":true}'}])
+    invalid = Responses(
+        [
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "inspect_item",
+                        "arguments": '{"item":"public-1"}',
+                        "call_id": "call-1",
+                    }
+                ],
+                "output_text": None,
+            },
+            {"output": [], "output_text": '{"wrong":true}'},
+        ]
+    )
     with pytest.raises(PublicAgentFailure) as caught:
         run_public_episode(
             actor=Actor(),
@@ -163,9 +185,22 @@ def test_public_episode_rejects_unknown_tool_and_invalid_final_answer(
             tool_specs=(_tool(),),
             answer_schema=_answer_schema(),
             client_factory=lambda **_kwargs: Client(invalid),
-            max_provider_turns=1,
+            max_provider_turns=2,
         )
     assert caught.value.code == "final_answer_invalid"
+
+    premature = Responses([{"output": [], "output_text": '{"value":"guessed"}'}])
+    with pytest.raises(PublicAgentFailure) as caught:
+        run_public_episode(
+            actor=Actor(),
+            instruction="Inspect one item.",
+            reset_observation={},
+            tool_specs=(_tool(),),
+            answer_schema=_answer_schema(),
+            client_factory=lambda **_kwargs: Client(premature),
+            max_provider_turns=1,
+        )
+    assert caught.value.code == "required_tool_call_missing"
 
 
 def test_public_episode_rejects_zero_budget_and_attributes_actor_defects(

@@ -1979,16 +1979,11 @@ def _alternative_value(schema: dict[str, Any], value: JSONValue) -> JSONValue | 
 
 
 def _instruction(goal: str, descriptor: JSONObject, answer_fields: tuple[Any, ...]) -> str:
-    labels = [
-        {"field_id": field.field_id, "public_label": field.public_label} for field in answer_fields
-    ]
     lines = [
         goal.strip(),
         "Selected public target descriptor: "
         + json.dumps(descriptor, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        "Return a JSON object with these fields: "
-        + json.dumps(labels, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        "Copy exact public JSON values from the instruction or observations; do not paraphrase.",
+        "Use exact public values; do not paraphrase observed identifiers or content.",
     ]
     if any(
         marker in field.public_label.casefold()

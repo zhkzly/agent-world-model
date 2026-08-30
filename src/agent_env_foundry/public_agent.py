@@ -30,11 +30,16 @@ PublicAgentFailureKind = Literal[
     "NoPublicWitness",
 ]
 PUBLIC_AGENT_SYSTEM_PROMPT = (
-    "Solve only the public task. Use the provided function tools when needed. "
-    "Treat every tool observation as authoritative. Never invent hidden state. "
-    "Return only the final JSON object matching the required schema."
+    "Complete only the public task using the instruction, reset observation, and public "
+    "function-tool observations. Treat tool observations as authoritative. Do not invent "
+    "hidden state or claim completion before the requested outcome and evidence are observed."
 )
 PUBLIC_AGENT_PROMPT_DIGEST = hashlib.sha256(PUBLIC_AGENT_SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+_TOOL_OBSERVATION_GUIDANCE = (
+    "The function result is a public observation object: ok=true returns data; ok=false "
+    "returns error.code, error.message, and optional error.details. Inspect the observation "
+    "before deciding the next action."
+)
 
 
 class _ResponsesResource(Protocol):
@@ -139,7 +144,7 @@ def run_public_episode(
         {
             "type": "function",
             "name": spec["name"],
-            "description": spec["description"],
+            "description": f"{spec['description'].rstrip()} {_TOOL_OBSERVATION_GUIDANCE}",
             "parameters": spec["input_schema"],
             "strict": True,
         }
@@ -151,7 +156,7 @@ def run_public_episode(
             "instructions": PUBLIC_AGENT_SYSTEM_PROMPT,
             "input": history,
             "tools": tools,
-            "tool_choice": "auto",
+            "tool_choice": "required" if not trace else "auto",
             "parallel_tool_calls": False,
             "text": {
                 "format": {
@@ -267,6 +272,12 @@ def run_public_episode(
                     }
                 )
             continue
+        if not trace:
+            raise PublicAgentFailure(
+                "NoPublicWitness",
+                "required_tool_call_missing",
+                "public Agent returned a final answer before any required public tool call",
+            )
         output_text = _item(response, "output_text")
         if not isinstance(output_text, str) or not output_text.strip():
             raise PublicAgentFailure(
