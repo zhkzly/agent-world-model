@@ -37,7 +37,10 @@ def test_active_s2_authority_keeps_graph_and_programmatic_optional() -> None:
 def test_active_task_and_context_select_only_the_direct_product_path() -> None:
     task = json.loads(_text(S2_TASK / "task.json"))
     assert task["meta"]["candidate_samplers"] == ["direct"]
-    assert task["meta"]["implementation_checkpoint"] == "direct_sampling_product_path"
+    checkpoint = task["meta"]["implementation_checkpoint"]
+    assert checkpoint.startswith("direct_")
+    assert "graph" not in checkpoint.lower()
+    assert "programmatic" not in checkpoint.lower()
     context = _text(S2_TASK / "implement.jsonl") + _text(S2_TASK / "check.jsonl")
     assert "direct/Graph/Programmatic" not in context
     assert "Graph/Programmatic" not in context

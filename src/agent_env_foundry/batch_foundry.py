@@ -45,6 +45,7 @@ FailureKind = Literal[
 ]
 type CandidateTask = AtomTask | ForEachTask | IfTask
 _GOAL_ORDER: tuple[GoalKind, ...] = ("atom", "foreach", "if")
+_HEX = frozenset("0123456789abcdef")
 _RETRYABLE_TASK_CODES = frozenset(
     {
         "public_witness_failed",
@@ -510,7 +511,9 @@ def _persist_pack(output_root: Path, kind: GoalKind, pack: _Pack) -> str:
     }
     relative = Path("taskpacks") / pack.task_pack_id / names[kind]
     path = output_root / relative
-    payload = canonical_bytes(pack.to_document())
+    document = _object(pack.to_document())
+    _validate_task_pack_document(document, pack.task_pack_id)
+    payload = canonical_bytes(document)
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_bytes() != payload:
         raise TaskFoundryError(
@@ -519,7 +522,59 @@ def _persist_pack(output_root: Path, kind: GoalKind, pack: _Pack) -> str:
             task_pack_id=pack.task_pack_id,
         )
     path.write_bytes(payload)
+    verify_task_pack_artifact(path, pack.task_pack_id)
     return relative.as_posix()
+
+
+def verify_task_pack_artifact(path: Path, task_pack_id: str) -> None:
+    """Cold-read canonical TaskPack bytes and recompute their claimed identity."""
+
+    _task_pack_digest(task_pack_id)
+    try:
+        payload = Path(path).read_bytes()
+        document = json.loads(payload)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise TaskFoundryError(
+            "task_pack_artifact_unreadable",
+            "TaskPack artifact is unreadable",
+            task_pack_id=task_pack_id,
+        ) from exc
+    if not is_json_object(document) or payload != canonical_bytes(document):
+        raise TaskFoundryError(
+            "task_pack_artifact_not_canonical",
+            "TaskPack artifact is not canonical JSON",
+            task_pack_id=task_pack_id,
+        )
+    _validate_task_pack_document(cast(JSONObject, document), task_pack_id)
+
+
+def _validate_task_pack_document(document: JSONObject, task_pack_id: str) -> None:
+    _task_pack_digest(task_pack_id)
+    if document.get("task_pack_id") != task_pack_id:
+        raise TaskFoundryError(
+            "task_pack_artifact_identity_mismatch",
+            "TaskPack artifact identity differs from its batch record",
+            task_pack_id=task_pack_id,
+        )
+    preimage = dict(document)
+    preimage.pop("task_pack_id")
+    actual = hashlib.sha256(canonical_bytes(preimage)).hexdigest()
+    if actual != task_pack_id:
+        raise TaskFoundryError(
+            "task_pack_artifact_preimage_mismatch",
+            "TaskPack artifact preimage differs from its identity",
+            task_pack_id=task_pack_id,
+            actual_task_pack_id=actual,
+        )
+
+
+def _task_pack_digest(value: str) -> None:
+    if len(value) != 64 or any(character not in _HEX for character in value):
+        raise TaskFoundryError(
+            "task_pack_artifact_identity_invalid",
+            "TaskPack artifact identity must be a sha256 digest",
+            task_pack_id=value,
+        )
 
 
 def _persist_report(output_root: Path, report: TaskBatchReport) -> None:
@@ -609,4 +664,5 @@ __all__ = [
     "TaskBatchReport",
     "run_task_foundry_batch",
     "task_structure_id",
+    "verify_task_pack_artifact",
 ]

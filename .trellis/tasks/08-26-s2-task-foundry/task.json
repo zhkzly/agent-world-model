@@ -45,7 +45,7 @@
     ".trellis/spec/backend/v2-qualification-publication.md",
     ".trellis/spec/backend/s2-assessment-corpus.md"
   ],
-  "notes": "The active product is the Direct Goal-first Good-Task sampling path. Physical reload/provenance is retained; the later parallel obligation/TaskSpecification path and mandatory Graph/Programmatic plan are deleted. Post-deletion Git and SQLite Direct batches cold-ran successfully; current work audits structural dedup, admission, assessment/corpus, cold handoff and held-out transfer.",
+  "notes": "The active product is the Direct Goal-first Good-Task sampling path. Physical reload/provenance is retained; the later parallel obligation/TaskSpecification path and mandatory Graph/Programmatic plan are deleted. Authority restoration and structural batch/cold TaskPack identity checkpoints are closed on fresh Git and SQLite runs; current work closes intrinsic Good-Task admission, assessment/corpus, cold handoff and held-out transfer.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "release-direct_candidates-structural_dedup-freeze-two_fresh_witnesses-physical_challenges-taskpack-assessment-corpus",
@@ -69,6 +69,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "direct_sampling_product_path"
+    "implementation_checkpoint": "direct_good_task_admission"
   }
 }

@@ -116,3 +116,31 @@ The target of one structure was a cutover regression only and is not an S2
 scale/completion claim. Full deterministic validation remained GREEN after the
 deletion. The next product audit is structural dedup/batch evidence followed by
 remaining Direct Good-Task admission and strict cold TaskPack/PublicTaskView.
+
+## Structural batch checkpoint evidence
+
+The Direct structure audit compiled both exact releases without an acting
+policy: Git produced 20 candidates in 16 structures and SQLite produced 12
+candidates in 8 structures. Concrete entity substitutions grouped together;
+Goal kind, Start regime, If condition/branch, ForEach cardinality and answer
+contract remained distinct.
+
+TaskPack persistence now validates the in-memory preimage before admission,
+writes canonical bytes and immediately cold-reads/recomputes the identity. The
+assessment path reuses the same verifier. A focused identity-bypass mutant was
+killed.
+
+Fresh fixed-budget production batches after that change:
+
+- Git run
+  `69d66e7235c36c7535bb97aa909e682dd6f560f1f854ce12bf3b536fd9c741a2`:
+  20 candidates, 16 structures, 3 admitted (Atom, ForEach, ForEach), 2 recorded
+  `public_witness_failed` attempts;
+- SQLite run
+  `dc71c2d7ed93a539604092f95bfa89037a4459d389ffb5a083e711c3fc1648fa`:
+  12 candidates, 8 structures, 3 admitted (Atom, ForEach, Atom), 3 recorded
+  failures (`public_witness_failed` and two `challenge_baseline_failed`).
+
+Checkpoint 2 is closed. These runs prove honest structure grouping, attempt
+retention and cold TaskPack identity; they do not by themselves close all
+Good-Task challenge classes or S2 completion.

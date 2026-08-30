@@ -15,6 +15,7 @@ from agent_env_foundry.batch_foundry import (
     TaskBatchReport,
     _compile_candidates,
     run_task_foundry_batch,
+    verify_task_pack_artifact,
 )
 from agent_env_foundry.environment import JSONObject
 from agent_env_foundry.foreach_foundry import (
@@ -559,7 +560,7 @@ def run_task_foundry_product(
             or matching[0].structure_id != record.structure_id
         ):
             raise AssessmentError("admitted Task cannot be resolved from the sealed release")
-        _verify_task_pack_artifact(batch_output / record.artifact_path, record.task_pack_id)
+        verify_task_pack_artifact(batch_output / record.artifact_path, record.task_pack_id)
         assessment = assess_task(
             prepared,
             record.kind,
@@ -722,24 +723,6 @@ def _seeded_order(
             "candidate": item.to_document(),
         }
     )
-
-
-def _verify_task_pack_artifact(path: Path, task_pack_id: str) -> None:
-    _digest(task_pack_id, "TaskPack artifact ID")
-    try:
-        payload = path.read_bytes()
-        document = json.loads(payload)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise AssessmentError("TaskPack artifact is unreadable") from exc
-    if not is_json_object(document) or payload != canonical_bytes(document):
-        raise AssessmentError("TaskPack artifact is not canonical JSON")
-    normalized = cast(JSONObject, document)
-    if normalized.get("task_pack_id") != task_pack_id:
-        raise AssessmentError("TaskPack artifact identity differs from its batch record")
-    preimage = dict(normalized)
-    preimage.pop("task_pack_id")
-    if _document_digest(preimage) != task_pack_id:
-        raise AssessmentError("TaskPack artifact preimage differs from its identity")
 
 
 def _persist_identity_document(path: Path, document: JSONObject) -> None:

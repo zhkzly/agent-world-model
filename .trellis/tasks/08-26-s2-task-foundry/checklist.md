@@ -1,8 +1,8 @@
 # S2 Direct Good-Task Sampling Completion Checklist
 
-- [ ] Is the only required sampling path Direct Goal-first over the exact
+- [x] Is the only required sampling path Direct Goal-first over the exact
   EnvironmentRelease, with Graph/Programmatic explicitly optional?
-- [ ] Does the production API compile candidates, deduplicate structures,
+- [x] Does the production API compile candidates, deduplicate structures,
   execute admission and persist both TaskPacks and typed rejections?
 - [ ] Is every admitted Task publicly solvable twice on fresh instances with
   all acting-time operands grounded in instruction/reset/tool observations?
@@ -18,5 +18,5 @@
   without domain branches or weakened Good-Task gates?
 - [ ] Are Graph/Programmatic evaluated only after a demonstrated coverage gap,
   under matched budgets, and removable when they add no useful Tasks?
-- [ ] Are the old parallel semantic path and all mandatory-sampler authority
+- [x] Are the old parallel semantic path and all mandatory-sampler authority
   references absent from production code, tests and active Trellis context?

@@ -12,6 +12,18 @@ from agent_env_foundry.semantics import StartCase
 from agent_env_foundry.task_foundry import AtomTask, TaskFoundryError
 
 
+class _CanonicalPack:
+    def __init__(self, marker: str = "accepted") -> None:
+        self._preimage = {"format": "test-task-pack/1", "marker": marker}
+
+    @property
+    def task_pack_id(self) -> str:
+        return hashlib.sha256(canonical_bytes(self._preimage)).hexdigest()
+
+    def to_document(self) -> dict[str, object]:
+        return {**self._preimage, "task_pack_id": self.task_pack_id}
+
+
 def _atom(
     semantic_key: str,
     descriptor: str,
@@ -75,11 +87,7 @@ def test_batch_tries_another_parameterization_after_candidate_rejection(
     candidates = tuple(batch_module._candidate("atom", task) for task in (first, second))
     attempts: list[str] = []
 
-    class Pack:
-        task_pack_id = "b" * 64
-
-        def to_document(self) -> dict[str, object]:
-            return {"format": "atom-task-pack/1", "task_pack_id": self.task_pack_id}
+    pack = _CanonicalPack("second-parameterization")
 
     monkeypatch.setattr(
         batch_module,
@@ -87,12 +95,12 @@ def test_batch_tries_another_parameterization_after_candidate_rejection(
         lambda *_args: (candidates, (first, second)),
     )
 
-    def admit(*_args: object, **_kwargs: object) -> Pack:
+    def admit(*_args: object, **_kwargs: object) -> _CanonicalPack:
         candidate = next(item for item in _args if isinstance(item, batch_module._Candidate))
         attempts.append(candidate.task_id)
         if candidate.task_id == first.task_id:
             raise TaskFoundryError("public_witness_failed", "first parameterization failed")
-        return Pack()
+        return pack
 
     monkeypatch.setattr(batch_module, "_admit_candidate", admit)
     report = batch_module.run_task_foundry_batch(
@@ -119,26 +127,22 @@ def test_batch_retries_retryable_failure_with_a_fresh_attempt_root(
     candidate = batch_module._candidate("atom", task)
     roots: list[Path] = []
 
-    class Pack:
-        task_pack_id = "f" * 64
-
-        def to_document(self) -> dict[str, object]:
-            return {"format": "atom-task-pack/1", "task_pack_id": self.task_pack_id}
-
     monkeypatch.setattr(
         batch_module,
         "_compile_candidates",
         lambda *_args: ((candidate,), (task,)),
     )
 
-    def admit(*args: object, **_kwargs: object) -> Pack:
+    pack = _CanonicalPack("second-attempt")
+
+    def admit(*args: object, **_kwargs: object) -> _CanonicalPack:
         root = next(
             item for item in args if isinstance(item, Path) and item.name.startswith("attempt-")
         )
         roots.append(root)
         if len(roots) == 1:
             raise TaskFoundryError("public_witness_failed", "transient policy failure")
-        return Pack()
+        return pack
 
     monkeypatch.setattr(batch_module, "_admit_candidate", admit)
     report = batch_module.run_task_foundry_batch(
@@ -206,18 +210,13 @@ def test_batch_persists_canonical_pack_and_report(
     task = _atom("item:one", "one")
     candidate = batch_module._candidate("atom", task)
 
-    class Pack:
-        task_pack_id = "c" * 64
-
-        def to_document(self) -> dict[str, object]:
-            return {"format": "atom-task-pack/1", "task_pack_id": self.task_pack_id}
-
     monkeypatch.setattr(
         batch_module,
         "_compile_candidates",
         lambda *_args: ((candidate,), (task,)),
     )
-    monkeypatch.setattr(batch_module, "_admit_candidate", lambda *_args, **_kwargs: Pack())
+    pack = _CanonicalPack()
+    monkeypatch.setattr(batch_module, "_admit_candidate", lambda *_args, **_kwargs: pack)
 
     report = batch_module.run_task_foundry_batch(
         SimpleNamespace(identity=SimpleNamespace(release_id="a" * 64)),
@@ -226,10 +225,61 @@ def test_batch_persists_canonical_pack_and_report(
         target_structures=1,
     )
 
-    pack_path = tmp_path / "output" / "taskpacks" / ("c" * 64) / "AtomTaskPack.json"
+    pack_path = tmp_path / "output" / "taskpacks" / pack.task_pack_id / "AtomTaskPack.json"
     report_path = tmp_path / "output" / "runs" / f"{report.run_id}.json"
-    assert pack_path.read_bytes() == canonical_bytes(Pack().to_document())
+    assert pack_path.read_bytes() == canonical_bytes(pack.to_document())
     assert report_path.read_bytes() == canonical_bytes(report.to_document())
+
+
+def test_batch_rejects_task_pack_with_forged_identity_before_recording_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    task = _atom("item:one", "one")
+    candidate = batch_module._candidate("atom", task)
+
+    class ForgedPack:
+        task_pack_id = "c" * 64
+
+        def to_document(self) -> dict[str, object]:
+            return {"format": "test-task-pack/1", "task_pack_id": self.task_pack_id}
+
+    monkeypatch.setattr(
+        batch_module,
+        "_compile_candidates",
+        lambda *_args: ((candidate,), (task,)),
+    )
+    monkeypatch.setattr(
+        batch_module,
+        "_admit_candidate",
+        lambda *_args, **_kwargs: ForgedPack(),
+    )
+
+    with pytest.raises(TaskFoundryError) as raised:
+        batch_module.run_task_foundry_batch(
+            SimpleNamespace(identity=SimpleNamespace(release_id="a" * 64)),
+            tmp_path / "work",
+            tmp_path / "output",
+            target_structures=1,
+        )
+
+    assert raised.value.code == "task_pack_artifact_preimage_mismatch"
+    assert not (tmp_path / "output" / "runs").exists()
+
+
+def test_task_pack_cold_verifier_recomputes_identity_from_disk(tmp_path: Path) -> None:
+    pack = _CanonicalPack()
+    path = tmp_path / "TaskPack.json"
+    path.write_bytes(canonical_bytes(pack.to_document()))
+
+    batch_module.verify_task_pack_artifact(path, pack.task_pack_id)
+    tampered = {**pack.to_document(), "marker": "tampered"}
+    path.write_bytes(canonical_bytes(tampered))
+
+    with pytest.raises(TaskFoundryError) as raised:
+        batch_module.verify_task_pack_artifact(path, pack.task_pack_id)
+
+    assert raised.value.code == "task_pack_artifact_preimage_mismatch"
 
 
 def test_batch_reports_dependency_packs_and_progress_events(
@@ -240,19 +290,15 @@ def test_batch_reports_dependency_packs_and_progress_events(
     candidate = batch_module._candidate("atom", task)
     events: list[dict[str, object]] = []
 
-    class Pack:
-        task_pack_id = "d" * 64
-
-        def to_document(self) -> dict[str, object]:
-            return {"format": "atom-task-pack/1", "task_pack_id": self.task_pack_id}
-
     monkeypatch.setattr(
         batch_module,
         "_compile_candidates",
         lambda *_args: ((candidate,), (task,)),
     )
 
-    def admit(*args: object, **_kwargs: object) -> Pack:
+    pack = _CanonicalPack("dependency-parent")
+
+    def admit(*args: object, **_kwargs: object) -> _CanonicalPack:
         dependencies = args[-1]
         assert isinstance(dependencies, dict)
         dependencies[task.task_id] = batch_module.AdmittedTaskRecord(
@@ -262,7 +308,7 @@ def test_batch_reports_dependency_packs_and_progress_events(
             "e" * 64,
             "taskpacks/dependency/AtomTaskPack.json",
         )
-        return Pack()
+        return pack
 
     monkeypatch.setattr(batch_module, "_admit_candidate", admit)
     report = batch_module.run_task_foundry_batch(
