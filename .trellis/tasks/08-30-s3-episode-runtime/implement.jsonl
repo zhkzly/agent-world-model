@@ -1,0 +1,8 @@
+{"file":"PROJECT.md","reason":"Keep S3 aligned with the paper-grade S1->S2->S3->S4 causal chain and semantic-completion standard."}
+{"file":"DECISIONS.md","reason":"Preserve accepted Task truth, trust boundaries, clean-break rules and anti-overdesign constraints."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/prd.md","reason":"Consume the exact S2 TaskPack/PublicTaskView handoff without reopening Task generation or admission."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/design.md","reason":"Reuse Direct execution, provenance, physical reload and failure ownership instead of creating parallel runtime paths."}
+{"file":"src/agent_env_foundry/public_agent.py","reason":"Refactor one Responses loop to preserve complete policy outcomes, including failed trajectories."}
+{"file":"src/agent_env_foundry/task_execution.py","reason":"Reuse and generalize the existing open-reset-act-close-reopen-check lifecycle for success and policy failure."}
+{"file":"src/agent_env_foundry/batch_foundry.py","reason":"Cold-read exact TaskPacks and preserve the strict PublicTaskView/TrustedTaskView boundary."}
+{"file":"src/agent_env_foundry/assessment.py","reason":"Prevent S2 TaskAssessment and S3 Episode execution from drifting into duplicate policy/runtime mechanics."}
