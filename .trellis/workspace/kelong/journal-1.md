@@ -38,3 +38,31 @@ Implemented and independently validated the project Agent alignment harness: neu
 ### Next Steps
 
 - Create and discuss the first concrete product implementation candidate task; discussion remains ungated until plan-document review.
+
+
+## Session 2: Complete S2 Direct Good-Task Foundry
+
+**Date**: 2026-08-30
+**Task**: Complete S2 Direct Good-Task Foundry
+**Branch**: `s2-task-foundry`
+
+### Summary
+
+Restored the single Direct path, closed physical Good-Task admission and cold corpus identities, refreshed Git/SQLite qualification with noop axes, and proved a post-freeze maintenance held-out release plus strict PublicTaskView handoff.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6994f4c` | (see git log) |
+| `93ff1be` | (see git log) |
+| `8476e04` | (see git log) |
+| `436ad34` | (see git log) |
+| `4d040bd` | (see git log) |
+| `81c4c1b` | (see git log) |
+| `93c1de6` | (see git log) |
+| `1612de9` | (see git log) |
+
+### Status
+
+[OK] **Completed**
