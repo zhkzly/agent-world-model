@@ -242,7 +242,6 @@ class NativeVerificationRequest:
     start_case_id: str
     public_descriptor: JSONObject
     public_trace: tuple[TraceEvent, ...]
-    final_answer: JSONValue | None
     before_instance_directory: Path
     after_instance_directory: Path
 
@@ -251,8 +250,6 @@ class NativeVerificationRequest:
         _identifier(self.start_case_id, "native start_case_id")
         if not is_json_object(self.public_descriptor):
             raise QualificationContractError("native public_descriptor must be an object")
-        if not is_json_value(self.final_answer):
-            raise QualificationContractError("native final_answer must be JSON")
         _unique(tuple(item.seq for item in self.public_trace), "native trace sequence numbers")
         if self.before_instance_directory == self.after_instance_directory:
             raise QualificationContractError(
@@ -265,7 +262,6 @@ class NativeVerificationRequest:
             "start_case_id": self.start_case_id,
             "public_descriptor": _json(self.public_descriptor),
             "public_trace": [item.to_document() for item in self.public_trace],
-            "final_answer": _json(self.final_answer),
             "before_instance_directory": str(self.before_instance_directory),
             "after_instance_directory": str(self.after_instance_directory),
         }
@@ -273,51 +269,27 @@ class NativeVerificationRequest:
 
 @dataclass(frozen=True, slots=True)
 class NativeVerificationResult:
-    initially_satisfied: bool
-    satisfied: bool
     required_effects_ok: bool
     collateral_ok: bool
-    answer_ok: bool | None
-    process_ok: bool | None
-    report_values: JSONObject
     failure_codes: tuple[str, ...]
 
     def __post_init__(self) -> None:
         for boolean_value, role in (
-            (self.initially_satisfied, "initially_satisfied"),
-            (self.satisfied, "satisfied"),
             (self.required_effects_ok, "required_effects_ok"),
             (self.collateral_ok, "collateral_ok"),
         ):
             if not isinstance(boolean_value, bool):
                 raise QualificationContractError(f"native {role} must be boolean")
-        for optional_value, role in (
-            (self.answer_ok, "answer_ok"),
-            (self.process_ok, "process_ok"),
-        ):
-            if optional_value is not None and not isinstance(optional_value, bool):
-                raise QualificationContractError(f"native {role} must be boolean or null")
-        if not is_json_object(self.report_values):
-            raise QualificationContractError("native report_values must be an object")
         _identifiers(self.failure_codes, "native failure_codes")
-        if self.satisfied and (
-            not self.required_effects_ok
-            or not self.collateral_ok
-            or self.answer_ok is False
-            or self.process_ok is False
-            or self.failure_codes
-        ):
-            raise QualificationContractError("satisfied native result is contradictory")
+
+    @property
+    def satisfied(self) -> bool:
+        return self.required_effects_ok and self.collateral_ok and not self.failure_codes
 
     def to_document(self) -> JSONObject:
         return {
-            "initially_satisfied": self.initially_satisfied,
-            "satisfied": self.satisfied,
             "required_effects_ok": self.required_effects_ok,
             "collateral_ok": self.collateral_ok,
-            "answer_ok": self.answer_ok,
-            "process_ok": self.process_ok,
-            "report_values": _json(self.report_values),
             "failure_codes": list(self.failure_codes),
         }
 
@@ -522,15 +494,11 @@ def native_verification_request_from_document(value: Any) -> NativeVerificationR
             "start_case_id",
             "public_descriptor",
             "public_trace",
-            "final_answer",
             "before_instance_directory",
             "after_instance_directory",
         },
         "NativeVerificationRequest",
     )
-    final_answer = document["final_answer"]
-    if not is_json_value(final_answer):
-        raise QualificationContractError("final_answer must be JSON")
     return NativeVerificationRequest(
         _string(document["capability_id"], "capability_id"),
         _string(document["start_case_id"], "start_case_id"),
@@ -539,7 +507,6 @@ def native_verification_request_from_document(value: Any) -> NativeVerificationR
             trace_event_from_document(item)
             for item in _array(document["public_trace"], "public_trace")
         ),
-        cast(JSONValue | None, final_answer),
         Path(_string(document["before_instance_directory"], "before_instance_directory")),
         Path(_string(document["after_instance_directory"], "after_instance_directory")),
     )
@@ -549,25 +516,15 @@ def native_verification_result_from_document(value: Any) -> NativeVerificationRe
     document = _exact(
         value,
         {
-            "initially_satisfied",
-            "satisfied",
             "required_effects_ok",
             "collateral_ok",
-            "answer_ok",
-            "process_ok",
-            "report_values",
             "failure_codes",
         },
         "NativeVerificationResult",
     )
     return NativeVerificationResult(
-        _boolean(document["initially_satisfied"], "initially_satisfied"),
-        _boolean(document["satisfied"], "satisfied"),
         _boolean(document["required_effects_ok"], "required_effects_ok"),
         _boolean(document["collateral_ok"], "collateral_ok"),
-        _optional_boolean(document["answer_ok"], "answer_ok"),
-        _optional_boolean(document["process_ok"], "process_ok"),
-        _object(document["report_values"], "report_values"),
         _string_tuple(document["failure_codes"], "failure_codes"),
     )
 

@@ -101,12 +101,13 @@ binding schemas must have object roots. Every capability supports `atom`;
 additional goal kinds are only `all`, `if`, and `foreach`. Facet operators are
 only `eq`, `neq`, `lt`, `lte`, `gt`, `gte`, `min`, and `max`.
 
-`PublicValueSource.kind` is exactly `task_literal`, `reset`, `tool_output`, or
-`tool_schema_constant`. Binding-leaf task literals supply their actual `value`;
-reset sources supply an
-RFC 6901 reset-observation pointer; tool sources supply a tool name and exact
-schema pointer. Unused fields are null. Broad object schemas do not authorize a
-descendant path.
+`PublicValueSource.kind` is exactly `task_literal`, `task_descriptor`, `reset`,
+`tool_observation`, or `tool_schema_constant`. Binding-leaf task literals supply
+their actual `value`; task-descriptor and reset sources supply an RFC 6901
+pointer; tool-observation pointers are rooted at the complete public
+`{ok,data,error}` observation. Tool schema constants supply a tool input-schema
+pointer and exact value. Unused fields are null. Broad object schemas do not
+authorize a descendant path.
 
 Every generated capability must preserve the exact `field_id`/`public_label`
 pairs frozen in its expected capability record. You author the release-local
@@ -165,9 +166,9 @@ Every Taskable capability declares at least one `answer_fields` record,
 including state-change and process/refusal capabilities. Every Task therefore
 has a structured public final answer; requiring `final_answer` without
 publishing its answer contract is invalid. Capabilities licensed by the same
-ConditionSpec use identical branch-neutral answer field IDs and schemas. A
-field that does not apply to one branch uses its declared JSON `null` value;
-the answer schema must not reveal which branch is expected.
+ConditionSpec may use different answer field IDs and schemas. Each capability
+declares only values needed by its own user objective; state/process/collateral
+evidence is not padded into another branch's final answer.
 
 Every answer-field schema must also be accepted as a strict structured-output
 subschema. Recursively, every array declares an `items` schema. Every object
@@ -180,9 +181,9 @@ For every declared answer field, compute the expected value from independently
 decoded native facts and the qualified public trace, put that value under the
 same field ID in `report_values`, and compare the submitted `final_answer`
 exactly. Return `report_values` with exactly the declared answer field IDs of
-the capability; JSON `null` is the neutral value for a field that is
-inapplicable on the observed branch, never a silent omission. Readers compare
-source-bound exact public values, not synonyms, reformattings, or
+the capability. Use JSON `null` only when that capability's own field contract
+permits a missing public occurrence. Compare source-bound exact public values,
+not synonyms, reformattings, or
 near-equivalents. A missing, schema-valid wrong or stale answer must set
 `answer_ok=false` and `satisfied=false`. Never read an undeclared final-answer
 field or treat mere field presence as semantic agreement.

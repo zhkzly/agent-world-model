@@ -204,7 +204,6 @@ def test_native_verifier_request_has_no_tasksemantics_protected_projection() -> 
                 {"ok": True, "data": {"count": 1}, "error": None},
             ),
         ),
-        final_answer={"count": 1},
         before_instance_directory=Path("/instances/before"),
         after_instance_directory=Path("/instances/after"),
     )
@@ -216,15 +215,13 @@ def test_native_verifier_request_has_no_tasksemantics_protected_projection() -> 
     with pytest.raises(QualificationContractError, match="distinct"):
         replace(request, after_instance_directory=request.before_instance_directory)
 
-    result = NativeVerificationResult(False, True, True, True, True, None, {"count": 1}, ())
+    result = NativeVerificationResult(True, True, ())
     assert result.satisfied
     assert native_verification_result_from_document(result.to_document()) == result
-    with pytest.raises(QualificationContractError, match="contradictory"):
-        NativeVerificationResult(False, True, False, True, True, None, {}, ())
     with pytest.raises(QualificationContractError, match="boolean"):
         native_verification_result_from_document(
             {
                 **result.to_document(),
-                "satisfied": "yes",
+                "required_effects_ok": "yes",
             }
         )

@@ -21,7 +21,8 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 | [S1 Coordinator](./s1-coordinator.md) | Need anchoring, standalone uv workspace, fail-closed cold publication | Active |
 | [V2 Preparation](./v2-preparation.md) | Two locked runtimes, private stdio and trusted no-mutation enforcement | Active |
-| [V2 Qualification/Publication](./v2-qualification-publication.md) | Independent native verifier implemented; acyclic Core Qualification, strict receipt and cold sealing remain planned | Active |
+| [V2 Qualification/Publication](./v2-qualification-publication.md) | Positive capability qualification, minimal native audit, strict receipt, and cold publication | Active |
+| [S2 Assessment/Corpus](./s2-assessment-corpus.md) | Fresh model-relative Task assessment and identity-separated corpus selection | Active |
 
 ---
 

@@ -264,19 +264,10 @@ def invoke_verifier_transition(
     request: NativeVerificationRequest,
     *,
     expected_verifier_project_digest: str,
-    expected_report_field_ids: tuple[str, ...],
     config: BuilderConfig,
 ) -> NativeVerificationResult:
     """Run one typed verifier call and prove both native trees stayed unchanged."""
 
-    if len(set(expected_report_field_ids)) != len(expected_report_field_ids) or any(
-        not isinstance(item, str) or not item for item in expected_report_field_ids
-    ):
-        raise VerifierAuthorFailure(
-            "verifier_transition",
-            "expected_report_fields_invalid",
-            "Host expected report field IDs must be unique non-empty strings",
-        )
     verifier_path = Path(root)
     if verifier_path.is_symlink():
         raise VerifierAuthorFailure(
@@ -361,17 +352,6 @@ def invoke_verifier_transition(
             original_code=type(exc).__name__,
             original_message=str(exc),
         ) from exc
-    actual_fields = tuple(result.report_values)
-    if set(actual_fields) != set(expected_report_field_ids):
-        raise VerifierAuthorFailure(
-            "verifier_transition",
-            "verifier_report_fields_mismatch",
-            "Qualification Verifier report fields differ from frozen Expected Semantics",
-            expected=list(expected_report_field_ids),
-            actual=list(actual_fields),
-            missing=sorted(set(expected_report_field_ids) - set(actual_fields)),
-            unexpected=sorted(set(actual_fields) - set(expected_report_field_ids)),
-        )
     return result
 
 

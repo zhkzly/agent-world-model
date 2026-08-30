@@ -11,7 +11,7 @@ from typing import Any, cast
 
 from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.builder import ACTOR_FACTORY, BuilderConfig
-from agent_env_foundry.environment import JSONObject, JSONValue
+from agent_env_foundry.environment import JSONObject, JSONValue, ToolSpec
 from agent_env_foundry.preparation import (
     ActorProxy,
     PreparationSettings,
@@ -21,6 +21,7 @@ from agent_env_foundry.public_agent import run_public_episode
 from agent_env_foundry.qualification_contracts import (
     NativeVerificationRequest,
     NativeVerificationResult,
+    PublicSurfaceManifest,
     QualificationCore,
     QualificationReceipt,
     QualifiedCatalogManifest,
@@ -36,6 +37,7 @@ from agent_env_foundry.qualification_v2 import (
     seal_qualification_evidence,
 )
 from agent_env_foundry.release import canonical_bytes
+from agent_env_foundry.schema import SchemaError, validate_instance
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
     AtomCheckResult,
@@ -53,7 +55,7 @@ from agent_env_foundry.semantics import (
     validate_start_cases,
 )
 from agent_env_foundry.semantics_author import SEMANTICS_FACTORY
-from agent_env_foundry.task_foundry import _answer_schema, _instruction, _wrong_answer
+from agent_env_foundry.task_foundry import _answer_schema, _instruction
 from agent_env_foundry.tree_manifest import tree_manifest
 from agent_env_foundry.verifier_author import invoke_verifier_transition
 
@@ -111,20 +113,17 @@ class _EvaluatedCase:
     binding: BindingCandidate
     before: Path
     after: Path
+    reset_observation: JSONValue
     trace: tuple[TraceEvent, ...]
     final_answer: JSONObject
     semantics_result: AtomCheckResult
     verifier_result: NativeVerificationResult
+    answer_source_evidence: tuple[JSONObject, ...]
 
     def to_record(self) -> dict[str, object]:
         agreement_fields = (
-            "initially_satisfied",
-            "satisfied",
             "required_effects_ok",
             "collateral_ok",
-            "answer_ok",
-            "process_ok",
-            "report_values",
         )
         agreement = all(
             getattr(self.semantics_result, name) == getattr(self.verifier_result, name)
@@ -138,12 +137,14 @@ class _EvaluatedCase:
             "public_descriptor": self.binding.public_descriptor,
             "before_instance_directory": str(self.before),
             "after_instance_directory": str(self.after),
+            "reset_observation": self.reset_observation,
             "axis_agreement": agreement,
             "readers_unchanged": True,
             "trace": [item.to_document() for item in self.trace],
             "final_answer": self.final_answer,
             "semantics_result": self.semantics_result.to_document(),
             "verifier_result": self.verifier_result.to_document(),
+            "answer_source_evidence": list(self.answer_source_evidence),
         }
 
 
@@ -311,7 +312,6 @@ class _QualificationHarness:
         before: Path,
         after: Path,
         trace: tuple[TraceEvent, ...],
-        final_answer: JSONObject,
     ) -> NativeVerificationResult:
         return invoke_verifier_transition(
             self.runtimes.verifier.project_root,
@@ -320,12 +320,10 @@ class _QualificationHarness:
                 start.case_id,
                 binding.public_descriptor,
                 trace,
-                final_answer,
                 before,
                 after,
             ),
             expected_verifier_project_digest=self.runtimes.verifier.project_digest,
-            expected_report_field_ids=tuple(item.field_id for item in capability.answer_fields),
             config=BuilderConfig(
                 uv_cache_dir=self.settings.uv_cache_dir,
                 command_timeout_seconds=self.settings.command_timeout_seconds,
@@ -413,6 +411,296 @@ def _validate_task_kind_transition(
         )
 
 
+_TOOL_ERROR_SCHEMA: JSONObject = {
+    "type": "object",
+    "properties": {
+        "code": {"type": "string"},
+        "message": {"type": "string"},
+        "details": {},
+    },
+    "required": ["code", "message"],
+    "additionalProperties": False,
+}
+
+
+def _validate_answer_field_source_contract(
+    capabilities: tuple[CapabilitySpec, ...],
+    surface: PublicSurfaceManifest,
+) -> None:
+    """Bind every AnswerField declaration to one real public schema source."""
+
+    tools = {item["name"]: item for item in surface.tool_specs}
+    for capability in capabilities:
+        for field in capability.answer_fields:
+            source = field.public_source
+            try:
+                _answer_source_schema(capability, source, surface, tools)
+                if source.kind in {"task_literal", "tool_schema_constant"}:
+                    validate_instance(
+                        source.value,
+                        field.schema,
+                        role=(
+                            f"capability {capability.capability_id!r} answer field "
+                            f"{field.field_id!r} source value"
+                        ),
+                    )
+            except (KeyError, SchemaError, TypeError, ValueError) as exc:
+                raise QualificationV2Error(
+                    "qualification_answer_source_pointer_invalid",
+                    "AnswerField public source does not resolve through the sealed public schemas",
+                    capability_id=capability.capability_id,
+                    field_id=field.field_id,
+                    source=source.to_document(),
+                    original_code=type(exc).__name__,
+                    original_message=str(exc),
+                ) from exc
+
+
+def _answer_source_schema(
+    capability: CapabilitySpec,
+    source: Any,
+    surface: PublicSurfaceManifest,
+    tools: dict[str, ToolSpec],
+) -> dict[str, Any]:
+    if source.kind == "task_literal":
+        return {}
+    pointer = cast(str, source.json_pointer)
+    if source.kind == "task_descriptor":
+        return _schema_at_public_pointer(capability.public_descriptor_schema, pointer)
+    if source.kind == "reset":
+        return _schema_at_public_pointer(surface.reset_observation_schema, pointer)
+    tool = tools[cast(str, source.tool_name)]
+    if source.kind == "tool_schema_constant":
+        schema = _schema_at_public_pointer(tool["input_schema"], pointer)
+        constant = schema.get("const")
+        enum = schema.get("enum")
+        is_constant = ("const" in schema and _same_json(constant, source.value)) or (
+            isinstance(enum, list) and len(enum) == 1 and _same_json(enum[0], source.value)
+        )
+        if not is_constant:
+            raise ValueError("tool_schema_constant pointer is not an exact const or singleton enum")
+        return schema
+    if source.kind != "tool_observation":
+        raise ValueError(f"unsupported AnswerField source kind {source.kind!r}")
+    tokens = _pointer_tokens(pointer)
+    if not tokens:
+        return {
+            "type": "object",
+            "properties": {
+                "ok": {"type": "boolean"},
+                "data": {"anyOf": [tool["output_schema"], {"type": "null"}]},
+                "error": {"anyOf": [_TOOL_ERROR_SCHEMA, {"type": "null"}]},
+            },
+            "required": ["ok", "data", "error"],
+            "additionalProperties": False,
+        }
+    head, *tail = tokens
+    relative = "" if not tail else "/" + "/".join(_escape_pointer_token(item) for item in tail)
+    if head == "ok":
+        if tail:
+            raise ValueError("tool observation ok is scalar")
+        return {"type": "boolean"}
+    if head == "data":
+        return _schema_at_public_pointer(tool["output_schema"], relative)
+    if head == "error":
+        return _schema_at_public_pointer(_TOOL_ERROR_SCHEMA, relative)
+    raise ValueError("tool observation pointer must start at /ok, /data, or /error")
+
+
+def _schema_at_public_pointer(schema: JSONObject, pointer: str) -> dict[str, Any]:
+    current: Any = schema
+    root: Any = schema
+    seen_refs: set[str] = set()
+    for token in _pointer_tokens(pointer):
+        current = _dereference_local_schema(current, root, seen_refs)
+        if not isinstance(current, dict):
+            raise TypeError("schema pointer traverses a non-object schema")
+        properties = current.get("properties")
+        if isinstance(properties, dict) and token in properties:
+            current = properties[token]
+            continue
+        items = current.get("items")
+        if isinstance(items, dict) and token.isdigit():
+            current = items
+            continue
+        raise KeyError(token)
+    current = _dereference_local_schema(current, root, seen_refs)
+    if not isinstance(current, dict):
+        raise TypeError("schema pointer does not resolve to a schema object")
+    return cast(dict[str, Any], current)
+
+
+def _dereference_local_schema(current: Any, root: Any, seen: set[str]) -> Any:
+    while isinstance(current, dict) and isinstance(current.get("$ref"), str):
+        reference = cast(str, current["$ref"])
+        if not reference.startswith("#") or reference in seen:
+            raise ValueError("schema source contains an invalid or cyclic local reference")
+        seen.add(reference)
+        current = _json_pointer_value(root, reference.removeprefix("#"))
+    return current
+
+
+def _answer_field_evidence(
+    capability: CapabilitySpec,
+    binding: Any,
+    reset_observation: JSONValue,
+    trace: tuple[TraceEvent, ...],
+    report_values: JSONObject,
+) -> tuple[JSONObject, ...]:
+    expected_ids = {field.field_id for field in capability.answer_fields}
+    if set(report_values) != expected_ids:
+        raise QualificationV2Error(
+            "qualification_answer_report_fields_mismatch",
+            "Reader report_values differ from the qualified AnswerField IDs",
+            capability_id=capability.capability_id,
+            expected=sorted(expected_ids),
+            actual=sorted(report_values),
+        )
+    records: list[JSONObject] = []
+    for field in capability.answer_fields:
+        report_value = report_values[field.field_id]
+        try:
+            validate_instance(
+                report_value,
+                field.schema,
+                role=(f"capability {capability.capability_id!r} report field {field.field_id!r}"),
+            )
+        except SchemaError as exc:
+            raise QualificationV2Error(
+                "qualification_answer_report_schema_mismatch",
+                "Reader report value violates its frozen AnswerField schema",
+                capability_id=capability.capability_id,
+                field_id=field.field_id,
+                report_value=report_value,
+                original_message=str(exc),
+            ) from exc
+        occurrences = _source_occurrences(
+            field.public_source,
+            binding.public_descriptor,
+            reset_observation,
+            trace,
+        )
+        matching = [
+            occurrence
+            for occurrence in occurrences
+            if _same_json(occurrence["value"], report_value)
+        ]
+        if occurrences and not matching:
+            raise QualificationV2Error(
+                "qualification_answer_source_value_mismatch",
+                "Reader report value differs from every real public source occurrence",
+                capability_id=capability.capability_id,
+                field_id=field.field_id,
+                report_value=report_value,
+                source=field.public_source.to_document(),
+                observed_values=[item["value"] for item in occurrences],
+            )
+        if not occurrences and report_value is not None:
+            raise QualificationV2Error(
+                "qualification_answer_source_value_mismatch",
+                "Reader emitted a non-null report value without a real public source occurrence",
+                capability_id=capability.capability_id,
+                field_id=field.field_id,
+                report_value=report_value,
+                source=field.public_source.to_document(),
+            )
+        records.append(
+            {
+                "field_id": field.field_id,
+                "source": field.public_source.to_document(),
+                "report_value": report_value,
+                "occurrences": cast(JSONValue, matching),
+            }
+        )
+    return tuple(records)
+
+
+def _source_occurrences(
+    source: Any,
+    public_descriptor: JSONObject,
+    reset_observation: JSONValue,
+    trace: tuple[TraceEvent, ...],
+) -> list[JSONObject]:
+    pointer = source.json_pointer
+    if source.kind == "task_literal":
+        return [_source_occurrence(source.kind, None, None, source.value)]
+    if source.kind == "task_descriptor":
+        return [
+            _source_occurrence(
+                source.kind,
+                None,
+                pointer,
+                _json_pointer_value(public_descriptor, cast(str, pointer)),
+            )
+        ]
+    if source.kind == "reset":
+        return [
+            _source_occurrence(
+                source.kind,
+                None,
+                pointer,
+                _json_pointer_value(reset_observation, cast(str, pointer)),
+            )
+        ]
+    if source.kind == "tool_schema_constant":
+        return [_source_occurrence(source.kind, None, pointer, source.value)]
+    occurrences: list[JSONObject] = []
+    for event in trace:
+        if event.tool_name != source.tool_name:
+            continue
+        try:
+            value = _json_pointer_value(event.observation, cast(str, pointer))
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
+        occurrences.append(_source_occurrence(source.kind, event.seq, pointer, value))
+    return occurrences
+
+
+def _source_occurrence(
+    kind: str,
+    trace_event_seq: int | None,
+    pointer: str | None,
+    value: JSONValue,
+) -> JSONObject:
+    return {
+        "kind": kind,
+        "trace_event_seq": trace_event_seq,
+        "json_pointer": pointer,
+        "value": value,
+    }
+
+
+def _json_pointer_value(value: Any, pointer: str) -> JSONValue:
+    current = value
+    for token in _pointer_tokens(pointer):
+        if isinstance(current, dict):
+            current = current[token]
+        elif isinstance(current, list):
+            current = current[int(token)]
+        else:
+            raise TypeError("JSON pointer traverses a scalar")
+    return cast(JSONValue, current)
+
+
+def _pointer_tokens(pointer: str) -> tuple[str, ...]:
+    if pointer == "":
+        return ()
+    if not pointer.startswith("/"):
+        raise ValueError("not an RFC 6901 pointer")
+    return tuple(token.replace("~1", "/").replace("~0", "~") for token in pointer[1:].split("/"))
+
+
+def _escape_pointer_token(token: str) -> str:
+    return token.replace("~", "~0").replace("/", "~1")
+
+
+def _same_json(left: Any, right: Any) -> bool:
+    try:
+        return canonical_bytes(left) == canonical_bytes(right)
+    except (TypeError, ValueError):
+        return False
+
+
 def _evaluate(
     harness: _QualificationHarness,
     category: str,
@@ -421,6 +709,7 @@ def _evaluate(
     binding: BindingCandidate,
     before: Path,
     after: Path,
+    reset_observation: JSONValue,
     trace: tuple[TraceEvent, ...],
     final_answer: JSONObject,
 ) -> _EvaluatedCase:
@@ -450,16 +739,10 @@ def _evaluate(
         before,
         after,
         trace,
-        final_answer,
     )
     agreement_fields = (
-        "initially_satisfied",
-        "satisfied",
         "required_effects_ok",
         "collateral_ok",
-        "answer_ok",
-        "process_ok",
-        "report_values",
     )
     disagreements = {
         name: {
@@ -480,6 +763,13 @@ def _evaluate(
             semantics_result=semantics_result.to_document(),
             verifier_result=verifier_result.to_document(),
         )
+    answer_source_evidence = _answer_field_evidence(
+        capability,
+        live_binding,
+        reset_observation,
+        trace,
+        semantics_result.report_values,
+    )
     return _EvaluatedCase(
         category,
         capability,
@@ -487,10 +777,12 @@ def _evaluate(
         live_binding,
         before,
         after,
+        reset_observation,
         trace,
         final_answer,
         semantics_result,
         verifier_result,
+        answer_source_evidence,
     )
 
 
@@ -566,292 +858,10 @@ def _run_episode_case(
         binding,
         before,
         after,
+        reset,
         episode.trace,
         episode.final_answer,
     )
-
-
-def _run_noop_case(
-    harness: _QualificationHarness,
-    root: Path,
-    capability: CapabilitySpec,
-    start: StartCase,
-    binding: BindingCandidate,
-    ordinal: int,
-) -> _EvaluatedCase:
-    case = _case_root(root, "no_op", capability, start, binding.semantic_key, ordinal)
-    before, after, actor, _, _ = _reset_pair(harness, case, start)
-    actor.close()
-    return _evaluate(
-        harness,
-        "no_op",
-        capability,
-        start,
-        binding,
-        before,
-        after,
-        (),
-        {},
-    )
-
-
-def _variant_case(
-    harness: _QualificationHarness,
-    source: _EvaluatedCase,
-    category: str,
-    *,
-    trace: tuple[TraceEvent, ...] | None = None,
-    final_answer: JSONObject | None = None,
-) -> _EvaluatedCase:
-    return _evaluate(
-        harness,
-        category,
-        source.capability,
-        source.start,
-        source.binding,
-        source.before,
-        source.after,
-        source.trace if trace is None else trace,
-        source.final_answer if final_answer is None else final_answer,
-    )
-
-
-def _run_wrong_target_case(
-    harness: _QualificationHarness,
-    root: Path,
-    capability: CapabilitySpec,
-    start: StartCase,
-    target: BindingCandidate,
-    control: BindingCandidate,
-    goal: str,
-    route: AgentRoute,
-    budget: QualificationBudget,
-    ordinal: int,
-) -> _EvaluatedCase:
-    case = _case_root(root, "wrong_target", capability, start, target.semantic_key, ordinal)
-    before, after, actor, reset, before_facts = _reset_pair(harness, case, start)
-    try:
-        live_control = _resolve_binding(
-            harness,
-            capability,
-            before_facts,
-            before,
-            control.semantic_key,
-        )
-        episode = run_public_episode(
-            actor=actor,
-            instruction=_instruction(
-                goal,
-                live_control.public_descriptor,
-                capability.answer_fields,
-            ),
-            reset_observation=reset,
-            tool_specs=actor.tools(),
-            answer_schema=_answer_schema(capability.answer_fields),
-            route=route,
-            max_provider_turns=budget.max_provider_turns,
-        )
-    finally:
-        actor.close()
-    control_result = _evaluate(
-        harness,
-        "positive",
-        capability,
-        start,
-        live_control,
-        before,
-        after,
-        episode.trace,
-        episode.final_answer,
-    )
-    if not control_result.semantics_result.satisfied:
-        raise QualificationV2Error(
-            "qualification_wrong_target_control_failed",
-            "Wrong-target control binding did not satisfy its own semantics",
-            capability_id=capability.capability_id,
-            semantic_key=live_control.semantic_key,
-        )
-    return _evaluate(
-        harness,
-        "wrong_target",
-        capability,
-        start,
-        target,
-        before,
-        after,
-        episode.trace,
-        episode.final_answer,
-    )
-
-
-def _run_collateral_case(
-    harness: _QualificationHarness,
-    root: Path,
-    primary: tuple[CapabilitySpec, StartCase, BindingCandidate, str],
-    control: tuple[CapabilitySpec, BindingCandidate, str],
-    route: AgentRoute,
-    budget: QualificationBudget,
-) -> _EvaluatedCase:
-    capability, start, binding, goal = primary
-    control_capability, control_binding, control_goal = control
-    case = _case_root(root, "collateral", capability, start, binding.semantic_key, 0)
-    before, after, actor, reset, before_facts = _reset_pair(harness, case, start)
-    try:
-        live_primary = _resolve_binding(
-            harness,
-            capability,
-            before_facts,
-            before,
-            binding.semantic_key,
-        )
-        primary_episode = run_public_episode(
-            actor=actor,
-            instruction=_instruction(
-                goal,
-                live_primary.public_descriptor,
-                capability.answer_fields,
-            ),
-            reset_observation=reset,
-            tool_specs=actor.tools(),
-            answer_schema=_answer_schema(capability.answer_fields),
-            route=route,
-            max_provider_turns=budget.max_provider_turns,
-        )
-        middle = case / "middle"
-        shutil.copytree(after, middle)
-        middle_facts = harness.inspect(middle)
-        live_control = _resolve_binding(
-            harness,
-            control_capability,
-            middle_facts,
-            middle,
-            control_binding.semantic_key,
-        )
-        control_episode = run_public_episode(
-            actor=actor,
-            instruction=_instruction(
-                control_goal,
-                live_control.public_descriptor,
-                control_capability.answer_fields,
-            ),
-            reset_observation=reset,
-            tool_specs=actor.tools(),
-            answer_schema=_answer_schema(control_capability.answer_fields),
-            route=route,
-            max_provider_turns=budget.max_provider_turns,
-        )
-    finally:
-        actor.close()
-    middle_facts = harness.inspect(middle)
-    after_facts = harness.inspect(after)
-    control_result = harness.evaluate(
-        control_capability,
-        live_control,
-        middle_facts,
-        after_facts,
-        middle,
-        after,
-        control_episode.trace,
-        control_episode.final_answer,
-    )
-    if not control_result.satisfied:
-        raise QualificationV2Error(
-            "qualification_collateral_control_failed",
-            "Collateral control capability did not satisfy its own semantics",
-            capability_id=control_capability.capability_id,
-            result=control_result.to_document(),
-        )
-    offset = max((item.seq for item in primary_episode.trace), default=0)
-    combined = primary_episode.trace + tuple(
-        TraceEvent(
-            offset + item.seq,
-            item.tool_name,
-            item.arguments,
-            item.observation,
-        )
-        for item in control_episode.trace
-    )
-    return _evaluate(
-        harness,
-        "collateral",
-        capability,
-        start,
-        live_primary,
-        before,
-        after,
-        combined,
-        primary_episode.final_answer,
-    )
-
-
-def _mutation_records(cases: tuple[_EvaluatedCase, ...]) -> tuple[dict[str, object], ...]:
-    agreement_fields = (
-        "initially_satisfied",
-        "satisfied",
-        "required_effects_ok",
-        "collateral_ok",
-        "answer_ok",
-        "process_ok",
-        "report_values",
-    )
-    mutable_axes = ("required_effects_ok", "collateral_ok", "answer_ok", "process_ok")
-    records: list[dict[str, object]] = []
-    for role in ("semantics", "verifier"):
-        selected: tuple[_EvaluatedCase, str, JSONObject, JSONObject] | None = None
-        for item in cases:
-            own = (
-                item.semantics_result.to_document()
-                if role == "semantics"
-                else item.verifier_result.to_document()
-            )
-            independent = (
-                item.verifier_result.to_document()
-                if role == "semantics"
-                else item.semantics_result.to_document()
-            )
-            axis = next(
-                (
-                    name
-                    for name in mutable_axes
-                    if own[name] is False and independent[name] is False
-                ),
-                None,
-            )
-            if axis is not None:
-                selected = (item, axis, own, independent)
-                break
-        if selected is None:
-            raise QualificationV2Error(
-                "qualification_mutation_killer_missing",
-                "Qualification lacks an independently false result axis for a reader mutant",
-                role=role,
-            )
-        item, axis, original, independent = selected
-        mutant = {**original, axis: True}
-        killed = any(mutant[name] != independent[name] for name in agreement_fields)
-        if not killed:
-            raise QualificationV2Error(
-                "qualification_mutant_survived",
-                "Executable result-axis mutant survived physical cross-reader comparison",
-                role=role,
-                axis=axis,
-            )
-        records.append(
-            {
-                "mutant_id": f"{role}-{axis}-always-true",
-                "target_role": role,
-                "killed": True,
-                "killed_by": "physical_axis_comparison",
-                "evidence": {
-                    "category": item.category,
-                    "capability_id": item.capability.capability_id,
-                    "original": original,
-                    "mutant": mutant,
-                    "independent": independent,
-                },
-            }
-        )
-    return tuple(records)
 
 
 def _requirement_coverage(
@@ -958,6 +968,7 @@ def run_v2_qualification(
         work.mkdir(parents=True)
         harness = _QualificationHarness(inputs, core, Path(cache_root), selected_settings)
         capabilities = harness.capabilities()
+        _validate_answer_field_source_contract(capabilities, inputs.public_surface)
         starts = harness.start_cases(budget.start_seed, budget.start_limit)
         goals = _goals(inputs)
         if set(goals) != {item.capability_id for item in capabilities}:
@@ -972,11 +983,10 @@ def run_v2_qualification(
             starts,
         )
         cases: list[_EvaluatedCase] = []
-        positives: list[_EvaluatedCase] = []
-        ineligible: list[tuple[CapabilitySpec, StartCase, BindingCandidate]] = []
         ordinal = 0
-        for start in starts:
-            for capability in capabilities:
+        for capability in capabilities:
+            positive: _EvaluatedCase | None = None
+            for start in starts:
                 discovered = _discover_bindings(
                     harness,
                     work / "discovery",
@@ -984,231 +994,47 @@ def run_v2_qualification(
                     start,
                 )
                 eligible = [item for item in discovered if item.eligible]
-                ineligible.extend(
-                    (capability, start, item) for item in discovered if not item.eligible
-                )
                 if not eligible:
                     continue
-                binding = eligible[0]
                 positive = _run_episode_case(
                     harness,
                     work / "cases",
                     "positive",
                     capability,
                     start,
-                    binding,
+                    eligible[0],
                     goals[capability.capability_id],
                     route,
                     budget,
                     ordinal,
                 )
                 ordinal += 1
-                if not positive.semantics_result.satisfied:
-                    raise QualificationV2Error(
-                        "qualification_positive_failed",
-                        "Public Qualification episode did not satisfy TaskSemantics",
-                        capability_id=capability.capability_id,
-                        result=positive.semantics_result.to_document(),
-                    )
-                _validate_task_kind_transition(
-                    capability,
-                    harness.inspect(positive.before),
-                    harness.inspect(positive.after),
+                break
+            if positive is None:
+                raise QualificationV2Error(
+                    "qualification_positive_coverage_missing",
+                    "No eligible public Qualification case represents a capability",
+                    capability_id=capability.capability_id,
                 )
-                positives.append(positive)
-                cases.append(positive)
-                replay = _run_episode_case(
-                    harness,
-                    work / "cases",
-                    "fresh_replay",
-                    capability,
-                    start,
-                    binding,
-                    goals[capability.capability_id],
-                    route,
-                    budget,
-                    ordinal,
+            if not positive.semantics_result.satisfied or not positive.verifier_result.satisfied:
+                raise QualificationV2Error(
+                    "qualification_positive_failed",
+                    "Public capability execution or native audit did not pass",
+                    capability_id=capability.capability_id,
+                    semantics_result=positive.semantics_result.to_document(),
+                    verifier_result=positive.verifier_result.to_document(),
                 )
-                ordinal += 1
-                _validate_task_kind_transition(
-                    capability,
-                    harness.inspect(replay.before),
-                    harness.inspect(replay.after),
-                )
-                cases.append(replay)
+            _validate_task_kind_transition(
+                capability,
+                harness.inspect(positive.before),
+                harness.inspect(positive.after),
+            )
+            cases.append(positive)
 
-        represented = {item.capability.capability_id for item in positives}
-        missing = {item.capability_id for item in capabilities} - represented
-        if missing:
-            raise QualificationV2Error(
-                "qualification_positive_coverage_missing",
-                "No eligible public Qualification case represents a capability",
-                missing=sorted(missing),
-            )
-
-        stateful_positives = [
-            item for item in positives if item.capability.task_kind == "state_change"
-        ]
-        if not stateful_positives:
-            raise QualificationV2Error(
-                "qualification_state_change_case_missing",
-                "Qualification requires one positive case with a real native state change",
-            )
-        no_op_source = stateful_positives[0]
-        cases.append(
-            _run_noop_case(
-                harness,
-                work / "cases",
-                no_op_source.capability,
-                no_op_source.start,
-                no_op_source.binding,
-                ordinal,
-            )
-        )
-        ordinal += 1
-        cases.append(_variant_case(harness, no_op_source, "missing_process", trace=()))
-
-        query_source = next(
-            (item for item in positives if item.capability.task_kind == "query"),
-            None,
-        )
-        if query_source is None:
-            raise QualificationV2Error(
-                "qualification_query_case_missing",
-                "Qualification requires one query capability for answer challenges",
-            )
-        wrong = _wrong_answer(
-            _answer_schema(query_source.capability.answer_fields),
-            query_source.semantics_result.report_values,
-        )
-        if wrong is None:
-            raise QualificationV2Error(
-                "qualification_wrong_answer_unavailable",
-                "Query answer schema has no deterministic wrong alternative",
-            )
-        cases.append(_variant_case(harness, query_source, "wrong_answer", final_answer=wrong))
-        cases.append(_variant_case(harness, query_source, "missing_process", trace=()))
-
-        query_bindings = [
-            item
-            for item in _discover_bindings(
-                harness,
-                work / "wrong-target-discovery",
-                query_source.capability,
-                query_source.start,
-            )
-            if item.eligible
-        ]
-        wrong_control = next(
-            (
-                item
-                for item in query_bindings
-                if item.semantic_key != query_source.binding.semantic_key
-            ),
-            None,
-        )
-        if wrong_control is None:
-            raise QualificationV2Error(
-                "qualification_wrong_target_binding_missing",
-                "Qualification requires two eligible bindings for a wrong-target challenge",
-            )
-        cases.append(
-            _run_wrong_target_case(
-                harness,
-                work / "cases",
-                query_source.capability,
-                query_source.start,
-                query_source.binding,
-                wrong_control,
-                goals[query_source.capability.capability_id],
-                route,
-                budget,
-                ordinal,
-            )
-        )
-        ordinal += 1
-
-        state_ineligible = [item for item in ineligible if item[0].task_kind == "state_change"]
-        if state_ineligible:
-            capability, start, binding = state_ineligible[0]
-            cases.append(
-                _run_episode_case(
-                    harness,
-                    work / "cases",
-                    "near_miss",
-                    capability,
-                    start,
-                    binding,
-                    goals[capability.capability_id],
-                    route,
-                    budget,
-                    ordinal,
-                )
-            )
-            ordinal += 1
-
-        primary = (
-            query_source.capability,
-            query_source.start,
-            query_source.binding,
-            goals[query_source.capability.capability_id],
-        )
-        control_source = next(
-            item
-            for item in stateful_positives
-            if set(item.capability.workflow_ids).isdisjoint(query_source.capability.workflow_ids)
-            and item.start == query_source.start
-        )
-        control = (
-            control_source.capability,
-            control_source.binding,
-            goals[control_source.capability.capability_id],
-        )
-        cases.append(
-            _run_collateral_case(
-                harness,
-                work / "cases",
-                primary,
-                control,
-                route,
-                budget,
-            )
-        )
-
-        reference_route = tuple(item.tool_name for item in query_source.trace)
-        existing_alternative = next(
-            (
-                item
-                for item in cases
-                if item.category == "fresh_replay"
-                and item.capability.capability_id == query_source.capability.capability_id
-                and item.start == query_source.start
-                and item.binding.semantic_key == query_source.binding.semantic_key
-                and tuple(event.tool_name for event in item.trace) != reference_route
-            ),
-            None,
-        )
-        if existing_alternative is not None:
-            cases.append(
-                _evaluate(
-                    harness,
-                    "alternative_route",
-                    existing_alternative.capability,
-                    existing_alternative.start,
-                    existing_alternative.binding,
-                    existing_alternative.before,
-                    existing_alternative.after,
-                    existing_alternative.trace,
-                    existing_alternative.final_answer,
-                )
-            )
-
-        mutations = _mutation_records(tuple(cases))
         manifest = seal_qualification_evidence(
             core,
             evidence_root,
             case_records=tuple(item.to_record() for item in cases),
-            mutation_records=mutations,
             required_capability_ids=tuple(item.capability_id for item in capabilities),
         )
         coverage = _requirement_coverage(inputs, manifest, start_manifest)

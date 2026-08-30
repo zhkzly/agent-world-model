@@ -36,8 +36,6 @@ _ATOM_CHALLENGE_CATEGORIES = (
     "no_op",
     "wrong_target",
     "wrong_answer",
-    "missing_process",
-    "collateral",
 )
 
 
@@ -147,7 +145,7 @@ class AtomPlannedChallenge:
                 "Applicable challenges cannot have a reason; non-applicable challenges require one",
                 category=self.category,
             )
-        if self.category in {"wrong_target", "collateral"} and self.applicable:
+        if self.category == "wrong_target" and self.applicable:
             if not self.target_task_id:
                 raise TaskFoundryError(
                     f"admission_plan_{self.category}_missing",
@@ -183,51 +181,12 @@ class AtomPlannedChallenge:
 
 
 @dataclass(frozen=True, slots=True)
-class AtomCheckerMutationSpec:
-    mutation_id: str
-    challenge_category: str
-    result_field: str
-
-    def __post_init__(self) -> None:
-        allowed_fields = {
-            "satisfied",
-            "required_effects_ok",
-            "collateral_ok",
-            "answer_ok",
-            "process_ok",
-        }
-        if (
-            self.mutation_id != f"force_{self.result_field}"
-            or self.challenge_category not in _ATOM_CHALLENGE_CATEGORIES
-            or self.result_field not in allowed_fields
-        ):
-            raise TaskFoundryError(
-                "checker_mutation_spec_invalid",
-                "Atom checker mutation must force one declared result axis",
-            )
-
-    def to_document(self) -> JSONObject:
-        return {
-            "mutation_id": self.mutation_id,
-            "challenge_category": self.challenge_category,
-            "result_field": self.result_field,
-        }
-
-
-@dataclass(frozen=True, slots=True)
 class AtomAdmissionPlan:
     task_id: str
-    agent_choice_policy: str
     no_op_result: AtomCheckResult
-    checker_mutations: tuple[AtomCheckerMutationSpec, ...]
     challenges: tuple[AtomPlannedChallenge, ...]
 
     def __post_init__(self) -> None:
-        if self.agent_choice_policy != "perturb_each_occurrence":
-            raise TaskFoundryError(
-                "admission_agent_choice_policy_invalid",
-                "Atom admission must perturb every AgentChoice occurrence",
-            )
         if self.no_op_result.satisfied:
             raise TaskFoundryError(
                 "admission_plan_noop_accepted",
@@ -246,15 +205,6 @@ class AtomAdmissionPlan:
                 "admission_plan_noop_missing",
                 "Atom admission plan requires an applicable no-op challenge",
             )
-        expected_mutations = _derive_checker_mutation_specs(
-            self.challenges,
-            self.no_op_result,
-        )
-        if self.checker_mutations != expected_mutations:
-            raise TaskFoundryError(
-                "checker_mutation_plan_incomplete",
-                "Atom admission plan must freeze every applicable result-axis mutation",
-            )
 
     @property
     def plan_id(self) -> str:
@@ -262,46 +212,14 @@ class AtomAdmissionPlan:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-admission-plan/3",
+            "format": "atom-admission-plan/4",
             "task_id": self.task_id,
-            "agent_choice_policy": self.agent_choice_policy,
             "no_op_result": self.no_op_result.to_document(),
-            "checker_mutations": [item.to_document() for item in self.checker_mutations],
             "challenges": [item.to_document() for item in self.challenges],
         }
 
     def to_document(self) -> JSONObject:
         return {**self._preimage(), "plan_id": self.plan_id}
-
-
-def _derive_checker_mutation_specs(
-    challenges: tuple[AtomPlannedChallenge, ...],
-    no_op_result: AtomCheckResult,
-) -> tuple[AtomCheckerMutationSpec, ...]:
-    by_category = {item.category: item for item in challenges}
-    if no_op_result.satisfied:
-        raise TaskFoundryError(
-            "admission_plan_noop_accepted",
-            "Atom admission cannot derive mutations from an accepted no-op",
-        )
-    specs = [AtomCheckerMutationSpec("force_satisfied", "no_op", "satisfied")]
-    if not no_op_result.required_effects_ok:
-        specs.append(
-            AtomCheckerMutationSpec(
-                "force_required_effects_ok",
-                "no_op",
-                "required_effects_ok",
-            )
-        )
-    for category, field in (
-        ("wrong_answer", "answer_ok"),
-        ("missing_process", "process_ok"),
-        ("collateral", "collateral_ok"),
-    ):
-        planned = by_category.get(category)
-        if planned is not None and planned.applicable:
-            specs.append(AtomCheckerMutationSpec(f"force_{field}", category, field))
-    return tuple(specs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,7 +284,7 @@ class AtomChallengeResult:
                 "Non-applicable Atom challenge requires only its frozen reason",
                 category=self.category,
             )
-        requires_control = self.applicable and self.category in {"wrong_target", "collateral"}
+        requires_control = self.applicable and self.category == "wrong_target"
         if requires_control and (self.control_result is None or not self.control_result.satisfied):
             raise TaskFoundryError(
                 "challenge_control_result_missing",
@@ -447,224 +365,24 @@ class AtomChallengeReport:
 
 
 @dataclass(frozen=True, slots=True)
-class AtomCheckerMutationResult:
-    spec: AtomCheckerMutationSpec
-    challenge_materialization_id: str
-    original_result: JSONObject
-    mutant_result: JSONObject
-    killed: bool
-
-    def __post_init__(self) -> None:
-        if not self.killed:
-            raise TaskFoundryError(
-                "checker_mutant_survived",
-                "Planned Atom checker result-axis mutant survived its physical challenge",
-                mutation_id=self.spec.mutation_id,
-                challenge_category=self.spec.challenge_category,
-            )
-
-    def to_document(self) -> JSONObject:
-        return {
-            "format": "atom-checker-mutation-result/1",
-            "spec": self.spec.to_document(),
-            "challenge_materialization_id": self.challenge_materialization_id,
-            "original_result": _json_object(self.original_result),
-            "mutant_result": _json_object(self.mutant_result),
-            "killed": self.killed,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class AtomCheckerMutationReport:
-    task_id: str
-    admission_plan_id: str
-    mutations: tuple[AtomCheckerMutationResult, ...]
-
-    @property
-    def report_id(self) -> str:
-        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
-
-    def _preimage(self) -> JSONObject:
-        return {
-            "format": "atom-checker-mutation-report/1",
-            "task_id": self.task_id,
-            "admission_plan_id": self.admission_plan_id,
-            "mutations": [item.to_document() for item in self.mutations],
-        }
-
-    def to_document(self) -> JSONObject:
-        return {**self._preimage(), "report_id": self.report_id}
-
-
-def run_atom_checker_mutations(
-    plan: AtomAdmissionPlan,
-    challenge_report: AtomChallengeReport,
-) -> AtomCheckerMutationReport:
-    """Execute every pre-witness result-axis mutant against its live challenge result."""
-
-    if (
-        challenge_report.task_id != plan.task_id
-        or challenge_report.admission_plan.plan_id != plan.plan_id
-    ):
-        raise TaskFoundryError(
-            "checker_mutation_plan_mismatch",
-            "Checker mutation inputs do not share one Task and AdmissionPlan",
-        )
-    challenges = {item.category: item for item in challenge_report.challenges}
-    results: list[AtomCheckerMutationResult] = []
-    for spec in plan.checker_mutations:
-        challenge = challenges[spec.challenge_category]
-        if not challenge.applicable or challenge.result is None or not challenge.materialization_id:
-            raise TaskFoundryError(
-                "checker_mutation_challenge_missing",
-                "Planned checker mutant has no applicable physical challenge result",
-                mutation_id=spec.mutation_id,
-            )
-        original = challenge.result.to_document()
-        mutant = _json_object(original)
-        field_was_false = mutant.get(spec.result_field) is False
-        mutant[spec.result_field] = True
-        results.append(
-            AtomCheckerMutationResult(
-                spec,
-                challenge.materialization_id,
-                original,
-                mutant,
-                field_was_false and mutant != original,
-            )
-        )
-    if tuple(item.spec for item in results) != plan.checker_mutations:
-        raise TaskFoundryError(
-            "checker_mutation_report_incomplete",
-            "Checker mutation report does not account for its frozen plan",
-        )
-    return AtomCheckerMutationReport(plan.task_id, plan.plan_id, tuple(results))
-
-
-@dataclass(frozen=True, slots=True)
-class AgentChoicePerturbation:
-    witness_id: str
-    materialization_id: str
-    event_seq: int
-    argument_pointer: str
-    original_value: JSONValue
-    replacement_value: JSONValue
-    trace: tuple[TraceEvent, ...]
-    result: AtomCheckResult
-
-    def __post_init__(self) -> None:
-        if (
-            not self.witness_id
-            or not self.materialization_id
-            or self.event_seq <= 0
-            or not self.argument_pointer.startswith("/")
-        ):
-            raise TaskFoundryError(
-                "agent_choice_perturbation_identity_invalid",
-                "AgentChoice perturbation identity is invalid",
-            )
-        if self.original_value == self.replacement_value:
-            raise TaskFoundryError(
-                "agent_choice_perturbation_unchanged",
-                "AgentChoice perturbation must use a different schema-valid value",
-            )
-        if not self.result.satisfied:
-            raise TaskFoundryError(
-                "agent_choice_is_load_bearing",
-                "Changing an AgentChoice caused the frozen checker to fail",
-                event_seq=self.event_seq,
-                argument_pointer=self.argument_pointer,
-                result=self.result.to_document(),
-            )
-
-    def to_document(self) -> JSONObject:
-        return {
-            "format": "agent-choice-perturbation/1",
-            "witness_id": self.witness_id,
-            "materialization_id": self.materialization_id,
-            "event_seq": self.event_seq,
-            "argument_pointer": self.argument_pointer,
-            "original_value": _json(self.original_value),
-            "replacement_value": _json(self.replacement_value),
-            "trace": [item.to_document() for item in self.trace],
-            "result": self.result.to_document(),
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class AgentChoiceProof:
-    task_id: str
-    admission_plan_id: str
-    perturbations: tuple[AgentChoicePerturbation, ...]
-
-    @property
-    def proof_id(self) -> str:
-        return hashlib.sha256(canonical_bytes(self._preimage())).hexdigest()
-
-    def _preimage(self) -> JSONObject:
-        return {
-            "format": "agent-choice-proof/1",
-            "task_id": self.task_id,
-            "admission_plan_id": self.admission_plan_id,
-            "perturbations": [item.to_document() for item in self.perturbations],
-        }
-
-    def to_document(self) -> JSONObject:
-        return {**self._preimage(), "proof_id": self.proof_id}
-
-
-@dataclass(frozen=True, slots=True)
 class AtomAdmissionReport:
     solved: SolvedAtomTask
     challenges: AtomChallengeReport
-    agent_choices: AgentChoiceProof
-    checker_mutations: AtomCheckerMutationReport
 
     def __post_init__(self) -> None:
         task_id = self.solved.task.task_id
         plan_id = self.solved.admission_plan.plan_id
-        if (
-            self.challenges.task_id != task_id
-            or self.agent_choices.task_id != task_id
-            or self.checker_mutations.task_id != task_id
-            or self.challenges.admission_plan.plan_id != plan_id
-            or self.agent_choices.admission_plan_id != plan_id
-            or self.checker_mutations.admission_plan_id != plan_id
-        ):
+        if self.challenges.task_id != task_id or self.challenges.admission_plan.plan_id != plan_id:
             raise TaskFoundryError(
                 "atom_admission_identity_mismatch",
                 "Atom admission evidence does not share one Task and AdmissionPlan",
-            )
-        expected_choices = {
-            (witness.witness_id, item.event_seq, item.argument_pointer)
-            for witness in self.solved.witnesses
-            for item in witness.argument_provenance
-            if item.source_kind == "agent_choice"
-        }
-        actual_choices = {
-            (item.witness_id, item.event_seq, item.argument_pointer)
-            for item in self.agent_choices.perturbations
-        }
-        if expected_choices != actual_choices or len(actual_choices) != len(
-            self.agent_choices.perturbations
-        ):
-            raise TaskFoundryError(
-                "atom_admission_agent_choice_incomplete",
-                "Atom admission does not perturb every witness AgentChoice exactly once",
-            )
-        if tuple(item.spec for item in self.checker_mutations.mutations) != (
-            self.solved.admission_plan.checker_mutations
-        ):
-            raise TaskFoundryError(
-                "atom_admission_mutations_incomplete",
-                "Atom admission mutation evidence differs from its frozen plan",
             )
         witness_materializations = {item.materialization_id for item in self.solved.witnesses}
         later_materializations = {
             item.materialization_id
             for item in self.challenges.challenges
             if item.materialization_id is not None
-        } | {item.materialization_id for item in self.agent_choices.perturbations}
+        }
         if witness_materializations & later_materializations:
             raise TaskFoundryError(
                 "atom_admission_materialization_reused",
@@ -677,13 +395,11 @@ class AtomAdmissionReport:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "atom-admission-report/2",
+            "format": "atom-admission-report/3",
             "task_id": self.solved.task.task_id,
             "admission_plan": self.solved.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.solved.witnesses],
             "challenges": self.challenges.to_document(),
-            "agent_choices": self.agent_choices.to_document(),
-            "checker_mutations": self.checker_mutations.to_document(),
         }
 
     def to_document(self) -> JSONObject:
@@ -720,18 +436,11 @@ class AtomTaskPack:
 def seal_atom_task_pack(
     solved: SolvedAtomTask,
     challenges: AtomChallengeReport,
-    agent_choices: AgentChoiceProof,
-    checker_mutations: AtomCheckerMutationReport,
 ) -> AtomTaskPack:
-    """Seal one Atom Task only after every same-plan admission proof is complete."""
+    """Seal one Atom Task after solvability and applicable core negatives pass."""
 
     _verify_task_preimage(solved.task)
-    admission = AtomAdmissionReport(
-        solved,
-        challenges,
-        agent_choices,
-        checker_mutations,
-    )
+    admission = AtomAdmissionReport(solved, challenges)
     return AtomTaskPack(solved.task, admission)
 
 
@@ -763,13 +472,7 @@ def admit_atom_task(
         route=route,
         max_provider_turns=max_provider_turns,
     )
-    choices = prove_agent_choices_non_load_bearing(
-        prepared,
-        solved,
-        root / "agent-choices",
-    )
-    mutations = run_atom_checker_mutations(solved.admission_plan, challenges)
-    return seal_atom_task_pack(solved, challenges, choices, mutations)
+    return seal_atom_task_pack(solved, challenges)
 
 
 def compile_atom_tasks(
@@ -830,7 +533,7 @@ def compile_atom_tasks(
                             capability_id=capability.capability_id,
                             semantic_key=binding.semantic_key,
                         )
-                    for answer_fields in _answer_field_profiles(capability.answer_fields):
+                    for answer_fields in (capability.answer_fields,):
                         answer_schema = _answer_schema(answer_fields)
                         checker_preimage: JSONObject = {
                             "release_id": prepared.identity.release_id,
@@ -894,75 +597,20 @@ def solve_atom_task_twice(
     selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
     witnesses: list[AtomWitness] = []
     for index in (1, 2):
-        instance = Path(instance_root) / f"witness-{index}"
-        with prepared.open(instance) as session:
-            reset = session.actor.reset(task.start_case.reset_input)
-            before = session.trusted.inspect(instance)
-            capabilities = {item.capability_id: item for item in session.trusted.capabilities()}
-            capability = capabilities.get(task.capability_id)
-            if capability is None:
-                raise TaskFoundryError(
-                    "task_capability_missing",
-                    "live release no longer exposes the Task capability",
-                )
-            bindings = session.trusted.enumerate_bindings(task.capability_id, before)
-            matching = [item for item in bindings if item.semantic_key == task.semantic_key]
-            if len(matching) != 1:
-                raise TaskFoundryError(
-                    "task_binding_unresolved",
-                    "fresh materialization cannot resolve the Task semantic key exactly once",
-                )
-            binding = matching[0]
-            if binding.public_descriptor != task.public_descriptor:
-                raise TaskFoundryError(
-                    "task_public_descriptor_drift",
-                    "fresh logical binding changed the public Task descriptor",
-                )
-            _verify_checker_preimage(prepared, task)
-            tool_specs = session.actor.tools()
-            episode = run_public_episode(
-                actor=session.actor,
-                instruction=task.instruction,
-                reset_observation=reset,
-                tool_specs=tool_specs,
-                answer_schema=task.answer_schema,
-                route=selected_route,
-                max_provider_turns=max_provider_turns,
+        witness = run_atom_task_once(
+            prepared,
+            task,
+            Path(instance_root) / f"witness-{index}",
+            route=selected_route,
+            max_provider_turns=max_provider_turns,
+        )
+        if not witness.result.satisfied:
+            raise TaskFoundryError(
+                "public_witness_failed",
+                "public Agent trace did not satisfy the frozen Atom checker",
+                result=witness.result.to_document(),
             )
-            after = session.trusted.inspect(instance)
-            result = _evaluate_report_atom(
-                session,
-                AtomCheckRequest(
-                    task.capability_id,
-                    before,
-                    after,
-                    binding.protected_binding,
-                    episode.trace,
-                    episode.final_answer,
-                    _context(
-                        task.capability_id,
-                        binding.semantic_key,
-                        binding.protected_binding,
-                    ),
-                ),
-                task.answer_schema,
-            )
-            if not result.satisfied:
-                raise TaskFoundryError(
-                    "public_witness_failed",
-                    "public Agent trace did not satisfy the frozen Atom checker",
-                    result=result.to_document(),
-                )
-            witnesses.append(
-                _witness(
-                    task,
-                    session.identity.materialization_id,
-                    reset,
-                    tool_specs,
-                    episode,
-                    result,
-                )
-            )
+        witnesses.append(witness)
     return SolvedAtomTask(
         task,
         admission_plan,
@@ -970,139 +618,70 @@ def solve_atom_task_twice(
     )
 
 
-def prove_agent_choices_non_load_bearing(
+def run_atom_task_once(
     prepared: OpenPreparedRelease,
-    solved: SolvedAtomTask,
+    task: AtomTask,
     instance_root: Path,
-) -> AgentChoiceProof:
-    """Physically perturb every witness AgentChoice on a fresh public replay."""
+    *,
+    route: AgentRoute | None = None,
+    max_provider_turns: int = 8,
+) -> AtomWitness:
+    """Run one fresh public Atom attempt without turning failure into admission."""
 
-    task = solved.task
     if task.release_id != prepared.identity.release_id:
         raise TaskFoundryError(
             "task_release_mismatch",
             "Atom Task belongs to another release",
         )
-    if solved.admission_plan.agent_choice_policy != "perturb_each_occurrence":
-        raise TaskFoundryError(
-            "admission_agent_choice_policy_invalid",
-            "Solved Atom Task did not precommit to perturb every AgentChoice",
+    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
+    instance = Path(instance_root)
+    with prepared.open(instance) as session:
+        reset = session.actor.reset(task.start_case.reset_input)
+        before = session.trusted.inspect(instance)
+        capabilities = {item.capability_id: item for item in session.trusted.capabilities()}
+        if task.capability_id not in capabilities:
+            raise TaskFoundryError(
+                "task_capability_missing",
+                "live release no longer exposes the Task capability",
+            )
+        binding = _resolve_binding(session, task, before)
+        _verify_checker_preimage(prepared, task)
+        tool_specs = session.actor.tools()
+        episode = run_public_episode(
+            actor=session.actor,
+            instruction=task.instruction,
+            reset_observation=reset,
+            tool_specs=tool_specs,
+            answer_schema=task.answer_schema,
+            route=selected_route,
+            max_provider_turns=max_provider_turns,
         )
-    choices = [
-        (witness, occurrence)
-        for witness in solved.witnesses
-        for occurrence in witness.argument_provenance
-        if occurrence.source_kind == "agent_choice"
-    ]
-    perturbations: list[AgentChoicePerturbation] = []
-    for index, (witness, occurrence) in enumerate(choices, start=1):
-        instance = Path(instance_root) / f"choice-{index}"
-        with prepared.open(instance) as session:
-            reset = session.actor.reset(task.start_case.reset_input)
-            before = session.trusted.inspect(instance)
-            binding = _resolve_binding(session, task, before)
-            tool_specs = {item["name"]: item for item in session.actor.tools()}
-            source_event = next(item for item in witness.trace if item.seq == occurrence.event_seq)
-            source_spec = tool_specs[source_event.tool_name]
-            schema = _schema_at_pointer(source_spec["input_schema"], occurrence.argument_pointer)
-            replacement = _alternative_value(schema, occurrence.value)
-            if replacement is _NO_ALTERNATIVE:
-                raise TaskFoundryError(
-                    "agent_choice_not_perturbable",
-                    "AgentChoice schema has no distinct schema-valid alternative",
-                    event_seq=occurrence.event_seq,
-                    argument_pointer=occurrence.argument_pointer,
-                )
-            replay_observations: dict[int, JSONObject] = {}
-            replay_trace: list[TraceEvent] = []
-            provenance_by_event = {
-                event.seq: tuple(
-                    item for item in witness.argument_provenance if item.event_seq == event.seq
-                )
-                for event in witness.trace
-            }
-            for event in witness.trace:
-                arguments = _replay_arguments(
-                    event,
-                    provenance_by_event[event.seq],
-                    reset,
-                    replay_observations,
-                    (occurrence.event_seq, occurrence.argument_pointer),
-                    cast(JSONValue, replacement),
-                )
-                spec = tool_specs[event.tool_name]
-                errors = tuple(Draft202012Validator(spec["input_schema"]).iter_errors(arguments))
-                if errors:
-                    raise TaskFoundryError(
-                        "replay_arguments_schema_invalid",
-                        "Perturbed replay arguments violate the frozen ToolSpec",
-                        event_seq=event.seq,
-                        original_message=errors[0].message,
-                    )
-                observation = _json_object(session.actor.invoke(event.tool_name, arguments))
-                replay_observations[event.seq] = observation
-                replay_trace.append(TraceEvent(event.seq, event.tool_name, arguments, observation))
-            after = session.trusted.inspect(instance)
-            probe_result = _evaluate_report_atom(
-                session,
-                AtomCheckRequest(
+        after = session.trusted.inspect(instance)
+        result = _evaluate_report_atom(
+            session,
+            AtomCheckRequest(
+                task.capability_id,
+                before,
+                after,
+                binding.protected_binding,
+                episode.trace,
+                episode.final_answer,
+                _context(
                     task.capability_id,
-                    before,
-                    after,
+                    binding.semantic_key,
                     binding.protected_binding,
-                    tuple(replay_trace),
-                    witness.final_answer,
-                    _context(
-                        task.capability_id,
-                        binding.semantic_key,
-                        binding.protected_binding,
-                    ),
                 ),
-                task.answer_schema,
-            )
-            rebound_answer = _rebound_final_answer(
-                probe_result,
-                task.answer_schema,
-            )
-            result = _evaluate_report_atom(
-                session,
-                AtomCheckRequest(
-                    task.capability_id,
-                    before,
-                    after,
-                    binding.protected_binding,
-                    tuple(replay_trace),
-                    rebound_answer,
-                    _context(
-                        task.capability_id,
-                        binding.semantic_key,
-                        binding.protected_binding,
-                    ),
-                ),
-                task.answer_schema,
-            )
-            perturbations.append(
-                AgentChoicePerturbation(
-                    witness.witness_id,
-                    session.identity.materialization_id,
-                    occurrence.event_seq,
-                    occurrence.argument_pointer,
-                    occurrence.value,
-                    cast(JSONValue, replacement),
-                    tuple(replay_trace),
-                    result,
-                )
-            )
-    if len(perturbations) != len(choices):
-        raise TaskFoundryError(
-            "agent_choice_proof_incomplete",
-            "AgentChoice proof did not account for every witness occurrence",
+            ),
+            task.answer_schema,
         )
-    return AgentChoiceProof(
-        task.task_id,
-        solved.admission_plan.plan_id,
-        tuple(perturbations),
-    )
+        return _witness(
+            task,
+            session.identity.materialization_id,
+            reset,
+            tool_specs,
+            episode,
+            result,
+        )
 
 
 def challenge_atom_task(
@@ -1336,131 +915,6 @@ def challenge_atom_task(
                 )
             )
 
-        missing_process_plan = _planned_challenge(admission_plan, "missing_process")
-        if not missing_process_plan.applicable:
-            challenges.append(
-                AtomChallengeResult(
-                    "missing_process",
-                    False,
-                    None,
-                    (),
-                    {},
-                    None,
-                    None,
-                    missing_process_plan.reason,
-                )
-            )
-        else:
-            missing_result = _evaluate_report_atom(
-                session,
-                AtomCheckRequest(
-                    task.capability_id,
-                    before,
-                    after,
-                    binding.protected_binding,
-                    (),
-                    episode.final_answer,
-                    context,
-                ),
-                task.answer_schema,
-            )
-            if missing_result.process_ok is not False:
-                raise TaskFoundryError(
-                    "missing_process_not_discriminated",
-                    "Atom checker did not reject removal of the public process trace",
-                )
-            challenges.append(
-                AtomChallengeResult(
-                    "missing_process",
-                    True,
-                    session.identity.materialization_id,
-                    (),
-                    episode.final_answer,
-                    missing_result,
-                    None,
-                    None,
-                )
-            )
-        collateral_plan = _planned_challenge(admission_plan, "collateral")
-        if not collateral_plan.applicable:
-            challenges.append(
-                AtomChallengeResult(
-                    "collateral",
-                    False,
-                    None,
-                    (),
-                    {},
-                    None,
-                    None,
-                    collateral_plan.reason,
-                )
-            )
-        else:
-            assert collateral_plan.target_task_id is not None
-            collateral_task = _task_by_id(task_universe, collateral_plan.target_task_id)
-            _verify_checker_preimage(prepared, collateral_task)
-            collateral_binding = _resolve_binding(session, collateral_task, after)
-            collateral_episode = run_public_episode(
-                actor=session.actor,
-                instruction=collateral_task.instruction,
-                reset_observation=reset,
-                tool_specs=session.actor.tools(),
-                answer_schema=collateral_task.answer_schema,
-                route=selected_route,
-                max_provider_turns=max_provider_turns,
-            )
-            after_collateral = session.trusted.inspect(active_root)
-            collateral_result = _evaluate_report_atom(
-                session,
-                AtomCheckRequest(
-                    collateral_task.capability_id,
-                    after,
-                    after_collateral,
-                    collateral_binding.protected_binding,
-                    collateral_episode.trace,
-                    collateral_episode.final_answer,
-                    _context(
-                        collateral_task.capability_id,
-                        collateral_binding.semantic_key,
-                        collateral_binding.protected_binding,
-                    ),
-                ),
-                collateral_task.answer_schema,
-            )
-            if not collateral_result.satisfied:
-                raise TaskFoundryError(
-                    "collateral_baseline_failed",
-                    "Planned collateral Task did not satisfy its own frozen checker",
-                    target_task_id=collateral_task.task_id,
-                    result=collateral_result.to_document(),
-                )
-            combined_trace = _combine_traces(episode.trace, collateral_episode.trace)
-            current_with_collateral = _evaluate_report_atom(
-                session,
-                AtomCheckRequest(
-                    task.capability_id,
-                    before,
-                    after_collateral,
-                    binding.protected_binding,
-                    combined_trace,
-                    episode.final_answer,
-                    context,
-                ),
-                task.answer_schema,
-            )
-            _assert_collateral_discriminated(current_with_collateral)
-            challenges.append(
-                AtomChallengeResult(
-                    "collateral",
-                    True,
-                    session.identity.materialization_id,
-                    combined_trace,
-                    episode.final_answer,
-                    current_with_collateral,
-                    collateral_result,
-                    None,
-                )
-            )
     return AtomChallengeReport(task.task_id, admission_plan, tuple(challenges))
 
 
@@ -1524,41 +978,14 @@ def _derive_atom_admission_plan(
             "answer schema has no schema-valid alternative value",
         )
     )
-    process_plan = (
-        AtomPlannedChallenge("missing_process", True, None, None, None)
-        if initial.process_ok is not None
-        else AtomPlannedChallenge(
-            "missing_process",
-            False,
-            None,
-            None,
-            "capability checker declares no process outcome axis",
-        )
-    )
-    collateral = _select_collateral_task(task, task_universe, capabilities)
-    collateral_plan = (
-        AtomPlannedChallenge("collateral", True, collateral.task_id, None, None)
-        if collateral is not None
-        else AtomPlannedChallenge(
-            "collateral",
-            False,
-            None,
-            None,
-            "no disjoint-workflow state-change Task is available",
-        )
-    )
     planned_challenges = (
         AtomPlannedChallenge("no_op", True, None, None, None),
         wrong_target_plan,
         wrong_answer_plan,
-        process_plan,
-        collateral_plan,
     )
     return AtomAdmissionPlan(
         task.task_id,
-        "perturb_each_occurrence",
         initial,
-        _derive_checker_mutation_specs(planned_challenges, initial),
         planned_challenges,
     )
 
@@ -1609,41 +1036,6 @@ def _select_wrong_target_task(
     return min(candidates, key=rank) if candidates else None
 
 
-def _select_collateral_task(
-    task: AtomTask,
-    task_universe: tuple[AtomTask, ...],
-    capabilities: dict[str, CapabilitySpec],
-) -> AtomTask | None:
-    current = capabilities.get(task.capability_id)
-    if current is None:
-        raise TaskFoundryError(
-            "task_capability_missing",
-            "live release no longer exposes the Task capability",
-        )
-    current_workflows = set(current.workflow_ids)
-    candidates = []
-    for item in task_universe:
-        candidate = capabilities.get(item.capability_id)
-        if candidate is None:
-            raise TaskFoundryError(
-                "admission_target_capability_missing",
-                "Task universe contains a capability absent from the live release",
-                capability_id=item.capability_id,
-            )
-        if (
-            item.task_id != task.task_id
-            and item.start_case == task.start_case
-            and candidate.task_kind == "state_change"
-            and current_workflows.isdisjoint(candidate.workflow_ids)
-        ):
-            candidates.append(item)
-    return min(
-        candidates,
-        key=lambda item: (item.capability_id, item.semantic_key, item.task_id),
-        default=None,
-    )
-
-
 def _planned_challenge(plan: AtomAdmissionPlan, category: str) -> AtomPlannedChallenge:
     return next(item for item in plan.challenges if item.category == category)
 
@@ -1657,182 +1049,6 @@ def _task_by_id(task_universe: tuple[AtomTask, ...], task_id: str) -> AtomTask:
             target_task_id=task_id,
         )
     return matching[0]
-
-
-def _replay_arguments(
-    event: TraceEvent,
-    provenance: tuple[ArgumentProvenance, ...],
-    reset_observation: JSONValue,
-    replay_observations: dict[int, JSONObject],
-    perturbed_occurrence: tuple[int, str],
-    replacement: JSONValue,
-) -> JSONObject:
-    arguments = _json_object(event.arguments)
-    for occurrence in provenance:
-        if occurrence.event_seq != event.seq:
-            raise TaskFoundryError(
-                "replay_provenance_event_mismatch",
-                "Replay received provenance for another trace event",
-            )
-        occurrence_key = (occurrence.event_seq, occurrence.argument_pointer)
-        if occurrence_key == perturbed_occurrence:
-            if occurrence.source_kind != "agent_choice":
-                raise TaskFoundryError(
-                    "replay_perturbation_not_agent_choice",
-                    "Replay may perturb only an AgentChoice occurrence",
-                )
-            value = replacement
-        elif occurrence.source_kind == "reset":
-            assert occurrence.source_pointer is not None
-            value = _resolve_json_pointer(reset_observation, occurrence.source_pointer)
-        elif occurrence.source_kind == "tool_observation":
-            assert occurrence.source_event_seq is not None
-            assert occurrence.source_pointer is not None
-            source = replay_observations.get(occurrence.source_event_seq)
-            if source is None:
-                raise TaskFoundryError(
-                    "replay_source_event_missing",
-                    "Replay has not produced the required prior observation",
-                    source_event_seq=occurrence.source_event_seq,
-                )
-            value = _resolve_json_pointer(source, occurrence.source_pointer)
-        else:
-            value = occurrence.value
-        _set_json_pointer(arguments, occurrence.argument_pointer, value)
-    return arguments
-
-
-def _combine_traces(
-    first: tuple[TraceEvent, ...],
-    second: tuple[TraceEvent, ...],
-) -> tuple[TraceEvent, ...]:
-    offset = max((item.seq for item in first), default=0)
-    return first + tuple(
-        TraceEvent(
-            offset + item.seq,
-            item.tool_name,
-            item.arguments,
-            item.observation,
-        )
-        for item in second
-    )
-
-
-def _assert_collateral_discriminated(result: AtomCheckResult) -> None:
-    if result.collateral_ok is not False or result.satisfied:
-        raise TaskFoundryError(
-            "collateral_not_discriminated",
-            "Atom checker did not reject a successful disjoint-workflow state change",
-        )
-
-
-def _resolve_json_pointer(value: JSONValue, pointer: str) -> JSONValue:
-    current = value
-    for token in _pointer_tokens(pointer):
-        if isinstance(current, dict):
-            if token not in current:
-                raise TaskFoundryError(
-                    "replay_source_pointer_missing",
-                    "Replay source pointer does not resolve",
-                    pointer=pointer,
-                )
-            current = current[token]
-        elif isinstance(current, list):
-            try:
-                current = current[int(token)]
-            except (IndexError, ValueError) as exc:
-                raise TaskFoundryError(
-                    "replay_source_pointer_missing",
-                    "Replay source pointer does not resolve",
-                    pointer=pointer,
-                ) from exc
-        else:
-            raise TaskFoundryError(
-                "replay_source_pointer_scalar",
-                "Replay source pointer traverses a scalar",
-                pointer=pointer,
-            )
-    return _json(current)
-
-
-def _set_json_pointer(document: JSONObject, pointer: str, value: JSONValue) -> None:
-    tokens = _pointer_tokens(pointer)
-    if not tokens:
-        raise TaskFoundryError(
-            "replay_argument_pointer_root",
-            "Replay argument pointer cannot replace the object root",
-        )
-    current: JSONValue = document
-    for token in tokens[:-1]:
-        if isinstance(current, dict):
-            current = current[token]
-        elif isinstance(current, list):
-            current = current[int(token)]
-        else:
-            raise TaskFoundryError(
-                "replay_argument_pointer_scalar",
-                "Replay argument pointer traverses a scalar",
-            )
-    final = tokens[-1]
-    if isinstance(current, dict):
-        current[final] = _json(value)
-    elif isinstance(current, list):
-        current[int(final)] = _json(value)
-    else:
-        raise TaskFoundryError(
-            "replay_argument_pointer_scalar",
-            "Replay argument pointer traverses a scalar",
-        )
-
-
-def _pointer_tokens(pointer: str) -> tuple[str, ...]:
-    if pointer == "":
-        return ()
-    if not pointer.startswith("/"):
-        raise TaskFoundryError(
-            "replay_pointer_invalid",
-            "Replay value source is not an RFC 6901 pointer",
-        )
-    return tuple(token.replace("~1", "/").replace("~0", "~") for token in pointer[1:].split("/"))
-
-
-def _schema_at_pointer(schema: JSONObject, pointer: str) -> dict[str, Any]:
-    current: Any = schema
-    for token in _pointer_tokens(pointer):
-        if not isinstance(current, dict):
-            raise TaskFoundryError(
-                "agent_choice_schema_pointer_invalid",
-                "AgentChoice argument pointer traverses a non-object schema",
-                pointer=pointer,
-            )
-        properties = current.get("properties")
-        if isinstance(properties, dict) and token in properties:
-            current = properties[token]
-            continue
-        items = current.get("items")
-        if isinstance(items, dict):
-            try:
-                int(token)
-            except ValueError as exc:
-                raise TaskFoundryError(
-                    "agent_choice_schema_pointer_invalid",
-                    "AgentChoice array pointer token is not an index",
-                    pointer=pointer,
-                ) from exc
-            current = items
-            continue
-        raise TaskFoundryError(
-            "agent_choice_schema_pointer_invalid",
-            "AgentChoice argument pointer does not resolve in the ToolSpec",
-            pointer=pointer,
-        )
-    if not isinstance(current, dict):
-        raise TaskFoundryError(
-            "agent_choice_schema_pointer_invalid",
-            "AgentChoice argument schema is not an object",
-            pointer=pointer,
-        )
-    return cast(dict[str, Any], current)
 
 
 def _verify_checker_preimage(
@@ -1905,29 +1121,6 @@ def _wrong_answer(schema: JSONObject, answer: JSONObject) -> JSONObject | None:
         if not tuple(Draft202012Validator(schema).iter_errors(candidate)):
             return candidate
     return None
-
-
-def _rebound_final_answer(
-    result: AtomCheckResult,
-    answer_schema: JSONObject,
-) -> JSONObject:
-    properties = answer_schema.get("properties")
-    if not isinstance(properties, dict) or any(
-        field not in result.report_values for field in properties
-    ):
-        raise TaskFoundryError(
-            "rebound_final_answer_fields_missing",
-            "Checker report values do not cover the Task report fields",
-        )
-    answer = _json_object({field: result.report_values[field] for field in properties})
-    errors = tuple(Draft202012Validator(answer_schema).iter_errors(answer))
-    if errors:
-        raise TaskFoundryError(
-            "rebound_final_answer_schema_invalid",
-            "Checker report values cannot rebind the perturbed run's final answer",
-            original_message=errors[0].message,
-        )
-    return answer
 
 
 _NO_ALTERNATIVE = object()
@@ -2011,12 +1204,6 @@ def _answer_schema(answer_fields: tuple[Any, ...]) -> JSONObject:
         },
         "required": [field.field_id for field in answer_fields],
     }
-
-
-def _answer_field_profiles(answer_fields: tuple[Any, ...]) -> tuple[tuple[Any, ...], ...]:
-    if len(answer_fields) <= 1:
-        return (answer_fields,)
-    return (answer_fields, *((field,) for field in answer_fields))
 
 
 def _report_field_ids(answer_schema: JSONObject) -> tuple[str, ...]:
@@ -2137,15 +1324,10 @@ def _json_object(value: Any) -> JSONObject:
 
 
 __all__ = [
-    "AgentChoicePerturbation",
-    "AgentChoiceProof",
     "AtomAdmissionPlan",
     "AtomAdmissionReport",
     "AtomChallengeReport",
     "AtomChallengeResult",
-    "AtomCheckerMutationReport",
-    "AtomCheckerMutationResult",
-    "AtomCheckerMutationSpec",
     "AtomPlannedChallenge",
     "AtomTask",
     "AtomTaskPack",
@@ -2155,8 +1337,7 @@ __all__ = [
     "admit_atom_task",
     "challenge_atom_task",
     "compile_atom_tasks",
-    "prove_agent_choices_non_load_bearing",
-    "run_atom_checker_mutations",
     "seal_atom_task_pack",
+    "run_atom_task_once",
     "solve_atom_task_twice",
 ]

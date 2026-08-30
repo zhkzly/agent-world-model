@@ -16,13 +16,8 @@ Read completely before editing:
 
 Implement `generated_qualification_verifier.release:make_verifier` and
 diagnostic tests. Independently decode native before/after state and implement
-`verify_transition` from the frozen Requirement/capability meaning.
-
-For query capabilities, accept every equivalent successful public read that
-exposes the selected referent and exact answer values; never bind process truth
-to one reference tool sequence. Treat a complete query answer already visible
-in reset as an upstream environment defect, not a reason to invent a mandatory
-call.
+`verify_transition` for required native effects and forbidden collateral only.
+Do not reconstruct final answers, report values, or public process truth.
 
 You must not access or infer TaskSemantics source, outputs, tests or repair
 history. Do not import/call actor business code as an oracle. Do not write

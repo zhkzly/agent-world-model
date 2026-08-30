@@ -158,13 +158,8 @@ def test_batch_retries_retryable_failure_with_a_fresh_attempt_root(
 
 def test_batch_failure_taxonomy_distinguishes_policy_and_framework_owners() -> None:
     assert batch_module._task_failure_kind("public_witness_failed") == "NoPublicWitness"
-    assert (
-        batch_module._task_failure_kind("foreach_alternative_order_not_reversed")
-        == "ChallengePolicyFailure"
-    )
-    assert (
-        batch_module._task_failure_kind("foreach_wrong_answer_unavailable")
-        == "AdmissionPlanningDefect"
+    assert batch_module._task_failure_kind("foreach_partial_not_discriminated") == (
+        "ChallengePolicyFailure"
     )
     assert batch_module._task_failure_kind("checker_mutant_survived") == "RejectedTaskPack"
 
@@ -186,7 +181,7 @@ def test_batch_does_not_retry_non_policy_framework_failure(
         nonlocal attempts
         attempts += 1
         raise TaskFoundryError(
-            "foreach_wrong_answer_unavailable",
+            "invalid_task_contract",
             "deterministic challenge construction failed",
         )
 
@@ -201,7 +196,7 @@ def test_batch_does_not_retry_non_policy_framework_failure(
 
     assert attempts == 1
     assert report.target_reached is False
-    assert report.rejected[0].failure_kind == "AdmissionPlanningDefect"
+    assert report.rejected[0].failure_kind == "RejectedTaskPack"
 
 
 def test_batch_persists_canonical_pack_and_report(

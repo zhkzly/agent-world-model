@@ -80,7 +80,6 @@ def _witness(task: IfTask, materialization_id: str) -> IfWitness:
         (),
         ConditionCheckResult("true", {}, ()),
         _atom_result(),
-        _atom_result(satisfied=False),
         1,
         (None,),
     )
@@ -119,9 +118,7 @@ def test_if_task_binds_condition_branch_and_two_fresh_witnesses() -> None:
     assert task.task_id
     with pytest.raises(TaskFoundryError, match="instruction"):
         if_module._verify_task_preimage(replace(task, instruction="tampered"))
-    plan = IfAdmissionPlan(task.task_id, ("flip_condition_branch",))
-    with pytest.raises(TaskFoundryError, match="flip-condition"):
-        IfAdmissionPlan(task.task_id, ())
+    plan = IfAdmissionPlan(task.task_id)
     solved = SolvedIfTask(
         task,
         plan,
@@ -142,19 +139,13 @@ def test_if_task_binds_condition_branch_and_two_fresh_witnesses() -> None:
     )
     with pytest.raises(TaskFoundryError, match="selected Atom branch"):
         SolvedIfTask(task, plan, (_witness(task, "c" * 64), failed_branch))
-    false_accept = replace(
-        _witness(task, "f" * 64),
-        opposite_branch_result=_atom_result(),
-    )
-    with pytest.raises(TaskFoundryError, match="opposite Atom branch"):
-        SolvedIfTask(task, plan, (_witness(task, "c" * 64), false_accept))
     with pytest.raises(TaskFoundryError, match="fresh"):
         SolvedIfTask(task, plan, (_witness(task, "c" * 64), _witness(task, "c" * 64)))
 
 
 def test_if_task_pack_reuses_the_exact_admitted_atom_branch() -> None:
     task = _task()
-    plan = IfAdmissionPlan(task.task_id, ("flip_condition_branch",))
+    plan = IfAdmissionPlan(task.task_id)
     solved = SolvedIfTask(
         task,
         plan,

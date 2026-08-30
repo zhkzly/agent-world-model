@@ -57,9 +57,9 @@ class MechanicalSemantics:
                         "schema": {"type": "integer"},
                         "public_label": "count",
                         "public_source": {
-                            "kind": "tool_output",
+                            "kind": "tool_observation",
                             "tool_name": "increment",
-                            "json_pointer": "/count",
+                            "json_pointer": "/data/count",
                             "value": None,
                         },
                     }

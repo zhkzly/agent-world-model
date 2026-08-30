@@ -45,13 +45,15 @@ protected trusted surface
 The protected surface is release-specific and hidden from acting Agents. It is
 not a universal State IR. S1 Qualification must compare it with authoritative
 native SQLite/files/Git or another independently readable representation and
-must physically challenge every declared taskable capability.
+must execute one real representative case for every declared taskable capability.
 
-That comparison is produced by one qualification-only verifier authored in an
-independent clean context. It is archived for cold audit but is never exposed to
+That comparison is produced by one qualification-only native auditor authored in an
+independent clean context. It is archived with the release but is never exposed to
 the actor, S2 compiler, witness Agent or Consumer. It cannot see TaskSemantics
 source, outputs or repair history. The Host executes both lineages against the
-same physical instances and owns every comparison and verdict.
+same physical instances and compares only required native effects and collateral.
+Public process, AnswerFields and final-answer truth remain TaskSemantics/Host
+responsibilities rather than being duplicated by the auditor.
 
 S1 may change when a demonstrated cross-environment S2/S3 consumer requirement
 requires it. Compatibility with earlier research releases is not a product
@@ -101,13 +103,13 @@ artifacts:
 1. the S1 Environment Builder writes the executable actor project;
 2. an independent S1 Semantics Author writes the protected semantics package
    after Brief-derived expected relations are frozen;
-3. an independent Qualification Verifier Author writes one audit-only native
-   verifier package from the same frozen expectations and actor view, without
+3. an independent Native Auditor Author writes one audit-only native
+   effects/collateral package from the same frozen expectations and actor view, without
    access to the semantics project.
 
 Codex never decides release admission, Task admission, identity, reward or final
-checker verdict. Generated code passes deterministic Host checks, native reads
-and physical negatives before publication.
+checker verdict. Generated code passes deterministic Host checks and real
+positive physical execution before publication.
 
 ### OpenAI Responses tool-calling Agent
 
@@ -125,9 +127,8 @@ Every admitted Task must be:
 
 - **publicly solvable:** at least two fresh real executions of the exact final
   instruction succeed using public information and tools only;
-- **reliably verifiable:** deterministic checking rejects no-op, wrong target,
-  near miss, partial completion, collateral damage and wrong/stale answers where
-  applicable, while accepting a valid alternative route;
+- **reliably verifiable:** deterministic checking rejects the minimal applicable
+  no-op, wrong-target, partial-completion and wrong/stale-answer cases;
 - **well-posed:** all material constraints are explicit without exposing hidden
   operands, native fields, tool names or a reference route;
 - **non-trivial:** the checker is false at the initial state, and query answers
@@ -179,7 +180,7 @@ S2 is complete only when the same frozen framework:
 - regenerates and consumes the contrasting SQLite and filesystem/Git releases;
 - produces non-trivial Task yield and multiple canonical GoalProgram shapes for
   both without domain patches;
-- passes public solvability, checker sensitivity, leakage and fresh-start gates;
+- passes public solvability, minimal checker sensitivity, leakage and fresh-start gates;
 - transfers to a held-out Need selected after framework/prompt freeze;
 - reports matched-budget baselines and downstream utility rather than relying on
   internal diversity claims.

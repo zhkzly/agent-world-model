@@ -604,7 +604,7 @@ def _align_expected_catalog(
             "reset"
             if condition.public_source.kind == "reset"
             else "public_tool"
-            if condition.public_source.kind == "tool_output"
+            if condition.public_source.kind == "tool_observation"
             else condition.public_source.kind
         )
         expected_values = {

@@ -123,11 +123,11 @@ def test_verifier_skill_and_contract_define_one_audit_only_role() -> None:
     combined = f"{skill}\n{contract}"
     assert "generated_qualification_verifier.release:make_verifier" in combined
     assert "verify_transition" in combined
-    assert "entire Task goal" in combined
-    assert "not capability eligibility" in combined
-    assert "`seq`, `tool_name`, `arguments`, and\n`observation`" in combined
-    assert "A no-op may therefore" in combined
-    assert "must not return an empty" in combined
+    assert "`seq`, `tool_name`, `arguments`" in combined
+    assert "required_effects_ok" in combined
+    assert "collateral_ok" in combined
+    assert "must not become a second public-answer" in combined
+    assert "final answers" in combined
     assert "TaskSemantics source" in combined
     assert "must not" in combined
     assert "receipt" in combined

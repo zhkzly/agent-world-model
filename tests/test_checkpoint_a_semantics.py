@@ -47,7 +47,7 @@ def _capability() -> CapabilitySpec:
                 "confirmation",
                 STRING,
                 "confirmation",
-                PublicValueSource("tool_output", "finish_item", "/confirmation", None),
+                PublicValueSource("tool_observation", "finish_item", "/data/confirmation", None),
             ),
         ),
         supported_goal_kinds=("atom",),
@@ -62,11 +62,17 @@ def test_public_value_source_is_one_closed_non_contradictory_encoding() -> None:
         "json_pointer": "/items/0/name",
         "value": None,
     }
-    assert PublicValueSource("tool_output", "lookup", "/items/0/id", None).tool_name == "lookup"
+    assert PublicValueSource("task_descriptor", None, "/item", None).json_pointer == "/item"
+    assert (
+        PublicValueSource("tool_observation", "lookup", "/data/items/0/id", None).tool_name
+        == "lookup"
+    )
     with pytest.raises(SemanticsContractError, match="reset.*tool_name"):
         PublicValueSource("reset", "lookup", "/name", None)
-    with pytest.raises(SemanticsContractError, match="tool_output.*tool_name"):
-        PublicValueSource("tool_output", None, "/name", None)
+    with pytest.raises(SemanticsContractError, match="tool_observation.*tool_name"):
+        PublicValueSource("tool_observation", None, "/data/name", None)
+    with pytest.raises(SemanticsContractError, match="kind"):
+        PublicValueSource("tool_output", "lookup", "/name", None)  # type: ignore[arg-type]
     literal = PublicValueSource("task_literal", None, None, "alpha")
     assert literal.value == "alpha"
     with pytest.raises(SemanticsContractError, match="task_literal"):

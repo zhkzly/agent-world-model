@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from agent_env_foundry.agents import AgentRoute
+from agent_env_foundry.qualification_contracts import PublicSurfaceManifest
 from agent_env_foundry.research import BuilderProjection, ResearchFailure
 from agent_env_foundry.semantics_authoring import (
     EXPECTED_TASK_SEMANTICS_SCHEMA,
@@ -70,6 +71,37 @@ def _projection() -> BuilderProjection:
             },
         ),
         cited_evidence=({"source_revision_id": "source-secret-must-not-be-forwarded"},),
+    )
+
+
+def _surface() -> PublicSurfaceManifest:
+    return PublicSurfaceManifest(
+        start_schema={"type": "object", "additionalProperties": True},
+        reset_observation_schema={
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"],
+            "additionalProperties": False,
+        },
+        tool_specs=(
+            {
+                "name": "read_counter",
+                "description": "Read the current counter.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+                "output_schema": {
+                    "type": "object",
+                    "properties": {"current_count": {"type": "integer"}},
+                    "required": ["current_count"],
+                    "additionalProperties": False,
+                },
+            },
+        ),
+        public_documents_digest="a" * 64,
     )
 
 
@@ -259,12 +291,11 @@ def test_expected_semantics_rejects_unanchored_composition_and_condition() -> No
     assert "conditions[0].requirement_ids" in message
     assert "conditions[0].true_capability_ids" in message
 
-    leaking_branch_contract = _document()
-    leaking_branch_contract["capabilities"][0]["answer_fields"] = [
+    branch_specific_contract = _document()
+    branch_specific_contract["capabilities"][0]["answer_fields"] = [
         {"field_id": "updated-count", "public_label": "Updated count"}
     ]
-    with pytest.raises(ExpectedSemanticsError, match="branch-neutral answer field IDs"):
-        freeze_expected_task_semantics(_projection(), leaking_branch_contract)
+    assert freeze_expected_task_semantics(_projection(), branch_specific_contract).digest
 
 
 class _Response:
@@ -297,6 +328,7 @@ def test_expected_semantics_provider_turn_is_fresh_typed_and_candidate_blind(
     responses = _Responses([_document()], calls)
     result = generate_expected_task_semantics(
         _projection(),
+        public_surface=_surface(),
         route=AgentRoute(),
         client_factory=lambda **_: _Client(responses),
     )
@@ -307,6 +339,9 @@ def test_expected_semantics_provider_turn_is_fresh_typed_and_candidate_blind(
     visible = json.dumps(request["input"], sort_keys=True)
     assert "candidate" not in visible.casefold()
     assert "source-secret-must-not-be-forwarded" not in visible
+    assert "public_surface" in visible
+    assert "read_counter" in visible
+    assert "current_count" in visible
     assert "REQ-001" in visible
     assert "required_requirement_ids" in visible
     assert "covers every mapped Taskable Requirement outcome" in visible
@@ -315,7 +350,9 @@ def test_expected_semantics_provider_turn_is_fresh_typed_and_candidate_blind(
     assert "must use task_kind=state_change" in visible
     assert "task_kind=process only when success requires no business state change" in visible
     assert "Every Taskable capability must declare at least one answer field" in visible
-    assert "branch-neutral answer field IDs" in visible
+    assert "padded AnswerFields" in visible
+    assert "one uniform public source" in visible
+    assert "split capabilities" in visible.casefold()
 
 
 def test_provider_validation_feedback_reports_all_findings_then_accepts_replacement(
@@ -329,6 +366,7 @@ def test_provider_validation_feedback_reports_all_findings_then_accepts_replacem
     responses = _Responses([invalid, _document()], calls)
     result = generate_expected_task_semantics(
         _projection(),
+        public_surface=_surface(),
         route=replace(AgentRoute(), max_provider_turns=2),
         client_factory=lambda **_: _Client(responses),
     )
@@ -350,6 +388,7 @@ def test_provider_validation_failure_exhausts_bounded_turns(
     with pytest.raises(ResearchFailure, match="budget"):
         generate_expected_task_semantics(
             _projection(),
+            public_surface=_surface(),
             route=replace(AgentRoute(), max_provider_turns=1),
             client_factory=lambda **_: _Client(responses),
         )

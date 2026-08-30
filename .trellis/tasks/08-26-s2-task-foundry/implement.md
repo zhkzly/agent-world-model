@@ -1,222 +1,111 @@
 # S2 Goal-First Task Foundry — Implementation Plan
 
-## 1. Execution rule
+## 1. Execution rules
 
-Implement only in the dependency order below. Every checkpoint uses production
-interfaces and real processes; an early vertical is not an MVP or completion
-claim. A failure returns to its owning checkpoint rather than adding a fallback,
-domain branch or compatibility path.
+- Implement vertical evidence paths, not speculative schemas.
+- Framework owns deterministic mechanics; generated code owns domain semantics.
+- Fix the first incorrect owner and delete downstream compensating checks.
+- No v1 compatibility, fallback, dual reader, or feature flag.
+- A green unit suite is necessary but never substitutes for real execution.
 
-Current baseline:
-
-- v1 code/guidance removed in `9ba397b`;
-- v2 release byte verification and two-runtime preparation exist;
-- expected-semantics, Semantics Author and Task/S2 identity models exist;
-- strict v2 Qualification/Publication and executable S2 do not yet exist.
-
-## 2. No standalone future-contract checkpoint
-
-Do not create model-only TaskDefinition, TaskPack, AdmissionPlan, assessment or
-corpus packages before an admitted release and executable compiler consume them.
-The former `agent_task_foundry` contract scaffold was deleted because only its
-tests consumed it. Implement each S2 record together with its first real runtime
-consumer in Checkpoints E–G.
-
-## 3. Checkpoint B — Independent verifier authoring
+## 2. Checkpoint A — Simplified contracts
 
 ### Work
 
-Implement one fixed standalone uv project authoring route:
-
-```text
-EXPECTED_TASK_SEMANTICS.json
-PUBLIC_SURFACE.json
-QUALIFICATION_VERIFIER_CONTRACT.md
-read-only actor view
--> generated_qualification_verifier.release:make_verifier
-```
-
-- fresh HOME/CODEX_HOME/thread/workspace;
-- no access to TaskSemantics source, outputs, tests or feedback;
-- Framework initializes project and owns lock/sync/build/tests/source scan,
-  import separation, digest and acceptance;
-- model never writes manifest, digest, evidence, receipt or verdict;
-- bounded factual repairs stay in the same verifier thread.
+- Keep exact public AnswerField source kinds and full ToolObservation pointers.
+- Remove `reportable_field_ids` and singleton report profiles.
+- Allow condition branches to use their own necessary answer schemas.
+- Reduce Native Auditor result to required effects, collateral, and diagnostics.
+- Remove final answer from the Native Auditor request.
 
 ### Validation
 
-- verifier source cannot import actor, semantics or Host packages;
-- immutable inputs remain byte/mode identical after every turn;
-- verifier calls are read-only by before/after tree manifests;
-- query/state/process cases exercise distinct axes;
-- one real cross-domain verifier project passes its own locked environment.
+- old `tool_output` is rejected;
+- source pointers resolve against sealed schemas;
+- public surface is visible to the Expected Semantics turn;
+- Native Auditor cannot emit public report/process/answer authority;
+- branch-specific answer contracts freeze successfully.
 
-### Stop conditions
-
-- old three-script Qualifier/native-oracle route returns;
-- verifier becomes a public/runtime/S2 tool;
-- Framework learns domain field names.
-
-## 4. Checkpoint C — Shared core materialization and v2 Qualification
+## 3. Checkpoint B — S1 positive qualification
 
 ### Work
 
-- Refactor the existing per-project copy/sync/origin/import logic into one
-  internal `materialize_project` primitive.
-- Qualification materializes actor, semantics and verifier through it.
-- Sealed release preparation continues to materialize actor and semantics only.
-- Implement Host-owned physical case runner and evidence manifest.
-- Seal exact public-surface, qualified catalog, Requirement coverage and
-  qualified StartCase documents from observed accepted evidence.
-- Compare TaskSemantics and verifier results axis-by-axis on identical physical
-  before/after instances.
-- Run positive, no-op, wrong/near-miss target, answer, collateral, process,
-  fresh-replay and executable mutation cases as applicable.
+- Run one representative positive public episode per capability.
+- Compare TaskSemantics and Native Auditor only on effects/collateral.
+- Match every reported AnswerField to a real public source occurrence.
+- Seal only positive capability evidence and requirement coverage.
+- Remove S1 Task-level negatives, replay matrix, result mutation records, and
+  full cold historical replay.
 
 ### Validation
 
-- no duplicate uv/cache/child-transport implementation;
-- public Agent sees no semantics/verifier/checker data;
-- verifier sees no protected TaskSemantics binding/facts;
-- semantics/verifier call cannot mutate either instance;
-- a matched wrong decoder/evaluator mutant cannot pass merely by agreeing with itself;
-- missing applicable case or Requirement disposition fails closed.
-- S2-visible projections contain no verifier path, native evidence or
-  Qualification reference trace.
+- every capability has one positive case;
+- a source/report mismatch rejects Qualification;
+- a native effects/collateral disagreement rejects Qualification;
+- an answer/process disagreement is owned only by TaskSemantics/Host;
+- environments without state changes, multi-binding queries, or disjoint
+  workflows remain valid when their Need permits them.
 
-### First production vertical
+### Real vertical
 
-Use one real SQLite-backed generated world. The result may establish Checkpoint C
-only; it cannot claim S1/S2 completion. Then repeat unchanged Framework code on
-the filesystem/Git world before Publication is considered stable.
+Fresh-author and publish the filesystem/Git release, then relocate it and open
+one Consumer session. Repeat later with SQLite using unchanged Framework code.
 
-## 5. Checkpoint D — Strict Publication and cold admission
+## 4. Checkpoint C — Minimal Task admission
 
-### Work
+### Atom
 
-- Assemble the frozen actor, semantics, verifier, docs and evidence bytes.
-- Write the strict passed receipt from Host evidence.
-- Build canonical payload manifest and final descriptor.
-- Recompute Core/receipt/payload/Release identities from the assembled directory.
-- Produce deterministic directory and ZIP forms.
-- Cold install actor/semantics and replay Qualification with archived verifier.
-- Expose a direct Python API first; add CLI only after that API is real and tested.
+- compile one full answer schema per capability/binding;
+- freeze checker before instruction;
+- run two fresh public witnesses;
+- execute no-op, applicable wrong-target, and constructible wrong-answer;
+- seal AtomTaskPack.
 
-### Validation
+### ForEach
 
-- any byte/mode/path/digest/receipt/evidence tamper rejected;
-- structural mechanical fixture cannot be admitted or prepared as a release;
-- Publication copies frozen bytes and does not rebuild/rewrite projects;
-- directory and relocated ZIP resolve to the same Release ID;
-- S2 can open exact released bytes without a development checkout.
-- admitted runtime ToolSpecs/CapabilitySpecs/qualified StartCases equal their
-  sealed digests; audit bytes are reachable only through the cold-audit API.
+- freeze complete eligible selection;
+- run two fresh witnesses;
+- run no-op and one representative omitted-member challenge;
+- seal ForEachTaskPack.
 
-### Stop conditions
+### If
 
-- provisional public release or `allow_unqualified` option appears;
-- final Release ID is required to produce Qualification;
-- publisher reruns semantic authoring or mutates evidence.
+- freeze qualified condition and selected branch;
+- preserve the selected branch answer schema;
+- run two fresh witnesses confirming condition and selected branch;
+- reuse the admitted Atom branch TaskPack.
 
-## 6. Checkpoint E — Logical binding and deterministic compiler
+### All
 
-### Work
-
-- Implement public source decoders/audits.
-- Consume only `AdmittedReleaseView`, its sealed qualified StartCases/catalog and
-  live-equality-checked actor/TaskSemantics sessions.
-- Build stable `LogicalBindingRef` values and prove fresh rebinding.
-- Freeze `LogicalSelection` for every selector, All and ForEach complete set.
-- Enumerate bounded Atom/All/If/ForEach Blueprints.
-- Compile checker templates with `GoalEvaluationContext`.
-- Prove checker false initially.
-- Freeze checker, render/audit exact instruction, persist TaskDefinition, then
-  permit model calls.
+- require an explicit CompositionRule;
+- run two witnesses, no-op, and one representative missing child.
 
 ### Validation
 
-- different incidental IDs across fresh starts resolve the same semantic key;
-- every fresh run resolves the exact frozen semantic-key set with no missing,
-  extra, tie or cardinality drift;
-- unresolved/ambiguous/unstable public selector rejects Blueprint;
-- All requires exact CompositionRule; If requires qualified public condition;
-- ForEach binds the complete selected set;
-- permitted sibling effects are not collateral, unrelated effects are;
-- compiler contains no domain label/field branches;
-- ordering journal makes early model call impossible.
+- no protected checker/native/verifier data reaches the public Agent;
+- fresh materializations resolve the same logical Task;
+- exact final answers match public occurrences;
+- applicable minimal negatives fail for their intended reason;
+- no mandatory alternative route, reverse order, collateral manufacture,
+  AgentChoice perturbation, or result-object mutation remains.
 
-### First production vertical
-
-Compile one real Atom Task from a cold SQLite release and take it through the
-same final checker/instruction path later used by every Task. This is a causal
-architecture proof, not a Task-yield or completion claim.
-
-## 7. Checkpoint F — Public runner, two witnesses and admission
+## 5. Checkpoint D — Assessment and paper experiments
 
 ### Work
 
-- Implement one Host-owned Responses function-tool loop.
-- Create a fresh `EpisodeIdentity` and empty conversation state for every
-  qualification, witness and assessment run; never reuse previous response IDs.
-- Preserve exact prior response/function-result items across turns.
-- Validate tool arguments/observations and final answer schemas.
-- Resolve every argument leaf to an instruction/reset/tool-output/schema source.
-- Run two fresh materializations with independent logical rebinding.
-- Derive/freeze `AdmissionPlan` before witnesses and account for every planned
-  challenge/mutation in the final report.
-- Execute concrete challenges and live checker mutations.
-- Seal TaskPack only after complete admission.
+- assess admitted TaskPacks with an independent acting policy;
+- select a CorpusManifest without changing Task truth;
+- run Git, SQLite, and a post-freeze held-out Need;
+- report yield, Goal distribution, success rate, cost, and downstream SFT/RL utility;
+- optionally run robustness experiments over sampled Tasks.
 
-### Validation
+### Important boundary
 
-- no Codex SDK witness loop;
-- no checker/native/verifier leakage;
-- protected guess, prose/error scraping and load-bearing AgentChoice rejected;
-- two witnesses have distinct materialization and resolution evidence;
-- same tool/pointer from multiple calls is disambiguated by trace event sequence;
-- no Qualification/audit/reference-trace projection reaches compiler or runner;
-- valid alternate public route accepted;
-- crashing/unreachable mutant gives no credit;
-- bounded planner failure remains `NoPublicWitness`.
+Targets such as corpus size, Goal diversity, multiple StartCases, alternative
+routes, mutations, or perturbations are reported experiment outcomes. They are
+not EnvironmentRelease or individual TaskPack admission gates.
 
-## 8. Checkpoint G — Assessment, corpus and full paper gates
-
-### Work
-
-- Reuse the public runner with independent model/policy identity for assessment.
-- Implement structural fingerprint, semantic deduplication and corpus selection.
-- Keep assessment/corpus identities outside TaskPack.
-- Run the same frozen framework over SQLite and filesystem/Git releases.
-- Freeze code/contracts/prompts, select a held-out Need, and repeat without
-  framework domain edits.
-- Run matched-budget baselines and downstream SFT/RL or acting-Agent evaluation.
-
-### Required floors
-
-Per conformance release:
-
-```text
->= 20 admitted TaskPacks after semantic deduplication
->= 4 canonical Goal/selector structures
->= 2 qualified StartCase regimes
-every core Taskable capability represented or newly Unsupported with evidence
-```
-
-Held-out:
-
-```text
->= 10 admitted TaskPacks
->= 3 canonical structures
->= 2 taskable capabilities or an explicit method-falsifying result
-```
-
-Completion additionally requires full solvability/checker/leakage/cold evidence
-and matched-budget downstream value. Parameter swaps/paraphrases do not count as
-new structures.
-
-## 9. Validation commands
-
-Every checkpoint:
+## 6. Validation commands
 
 ```bash
 UV_CACHE_DIR=/tmp/foundry-s2-uv-cache uv lock --check
@@ -227,38 +116,36 @@ UV_CACHE_DIR=/tmp/foundry-s2-uv-cache uv lock --check
 git diff --check
 ```
 
-New deterministic enforcement requires RED/GREEN and a mutation licence. Real
-provider/process evidence is mandatory for authoring, Qualification, witness and
-assessment claims; fake clients prove transport shape only.
+New deterministic enforcement requires RED/GREEN and mutation-licensed tests.
+Real provider/process claims require retained run artifacts.
 
-## 10. Causal rollback
-
-Attribute the first incorrect owner before editing:
+## 7. Rollback ownership
 
 ```text
-Research/Brief
+Need/Research
 Environment Builder
-Expected semantics
+Expected Semantics
 TaskSemantics Author
-Verifier Author
-Core materialization
-Qualification
+Native Auditor Author
+Qualification Framework
 Publication/preparation
-logical binding/compiler
-checker/instruction
-public runner/provenance
-admission
+Task compiler
+public runner
+Task checker/admission
 assessment/corpus
 Infrastructure
 ```
 
-Rollback the current checkpoint. Never add a v1 path, alternate reader,
-`allow_unqualified`, domain patch or relaxed gate.
+Rollback the first incorrect owner. Do not widen a later validator to absorb an
+upstream semantic defect.
 
-## 11. Completion boundaries
+## 8. Completion
 
-- Before D: no EnvironmentRelease v2 product claim.
-- Before F: no publicly solved Task.
-- Before complete admission: no TaskPack.
-- Before G cross-domain floors: no S2 completion.
-- Before held-out/downstream gates: no generalization or paper-value claim.
+This task completes only after:
+
+- simplified deterministic gates are green;
+- a fresh Git release passes real positive Qualification and cold use;
+- Atom, ForEach, and If TaskPacks pass minimal admission across the real releases;
+- no environment is required to manufacture a Goal kind absent from its qualified semantics;
+- SQLite repeats with unchanged Framework code;
+- held-out and downstream experiments are reported separately.

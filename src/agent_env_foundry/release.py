@@ -844,12 +844,11 @@ def _validate_requirement_coverage(
             "Requirement coverage does not disposition every Expected Requirement"
         )
     raw_cases = evidence.get("cases")
-    raw_mutations = evidence.get("mutations")
-    if not isinstance(raw_cases, list) or not isinstance(raw_mutations, list):
-        raise EnvironmentContractError("Qualification evidence entry arrays are invalid")
+    if not isinstance(raw_cases, list):
+        raise EnvironmentContractError("Qualification evidence cases are invalid")
     evidence_ids = {
         item["digest"]
-        for item in (*raw_cases, *raw_mutations)
+        for item in raw_cases
         if isinstance(item, dict) and isinstance(item.get("digest"), str)
     }
     evidence_ids.add(start_cases_digest)

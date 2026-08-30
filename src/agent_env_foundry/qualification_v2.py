@@ -16,7 +16,6 @@ from agent_env_foundry.preparation import (
     PreparationSettings,
     ProjectMaterializationInput,
     RuntimeLock,
-    _ChildTransport,
     materialize_project,
 )
 from agent_env_foundry.project_identity import (
@@ -27,12 +26,13 @@ from agent_env_foundry.qualification_contracts import (
     NativeVerificationResult,
     PublicSurfaceManifest,
     QualificationCore,
-    native_verification_request_from_document,
     native_verification_result_from_document,
-    qualification_core_from_document,
 )
-from agent_env_foundry.release import ValidatedReleaseV2, canonical_bytes, verify_release_v2
-from agent_env_foundry.semantics import binding_from_document
+from agent_env_foundry.release import canonical_bytes
+from agent_env_foundry.semantics import (
+    AtomCheckResult,
+    atom_result_from_document,
+)
 from agent_env_foundry.semantics_author import SEMANTICS_FACTORY
 from agent_env_foundry.semantics_inputs import (
     EXPECTED_TASK_SEMANTICS_NAME,
@@ -42,8 +42,6 @@ from agent_env_foundry.semantics_inputs import (
 from agent_env_foundry.tree_manifest import tree_manifest
 from agent_env_foundry.verifier_author import (
     VERIFIER_FACTORY,
-    compute_verifier_project_digest,
-    invoke_verifier_transition,
 )
 from agent_env_foundry.verifier_inputs import PreparedVerifierAuthorWorkspace
 
@@ -78,31 +76,7 @@ class QualificationRuntimeSet:
     verifier: RuntimeLock
 
 
-_CASE_CATEGORIES = frozenset(
-    {
-        "positive",
-        "no_op",
-        "wrong_target",
-        "near_miss",
-        "wrong_answer",
-        "collateral",
-        "missing_process",
-        "alternative_route",
-        "fresh_replay",
-    }
-)
-_REQUIRED_CASE_CATEGORIES = _CASE_CATEGORIES - {"alternative_route", "near_miss"}
-_AGREEMENT_FIELDS = (
-    "initially_satisfied",
-    "satisfied",
-    "required_effects_ok",
-    "collateral_ok",
-    "answer_ok",
-    "process_ok",
-    "report_values",
-)
-_MUTANT_ROLES = frozenset({"semantics", "verifier"})
-_MUTANT_KILLERS = frozenset({"generated_project_tests", "physical_axis_comparison"})
+_CASE_CATEGORIES = frozenset({"positive"})
 
 
 def seal_qualification_evidence(
@@ -110,7 +84,6 @@ def seal_qualification_evidence(
     destination: Path,
     *,
     case_records: tuple[dict[str, object], ...],
-    mutation_records: tuple[dict[str, object], ...],
     required_capability_ids: tuple[str, ...],
 ) -> JSONObject:
     """Validate and persist the one C3 evidence manifest bound by a receipt."""
@@ -130,8 +103,7 @@ def seal_qualification_evidence(
             "required capability IDs must be unique non-empty strings",
         )
     normalized_cases = tuple(_validate_case_input(item) for item in case_records)
-    normalized_mutants = tuple(_validate_mutation_record(item) for item in mutation_records)
-    _validate_evidence_matrix(normalized_cases, normalized_mutants, required_capability_ids)
+    _validate_evidence_matrix(normalized_cases, required_capability_ids)
 
     root = Path(destination)
     if root.exists() or root.is_symlink():
@@ -141,22 +113,16 @@ def seal_qualification_evidence(
         )
     try:
         (root / "cases").mkdir(parents=True)
-        (root / "mutations").mkdir()
         (root / "instances").mkdir()
         case_entries = [
             _write_case_evidence_record(root, index, record)
             for index, record in enumerate(normalized_cases, start=1)
-        ]
-        mutation_entries = [
-            _write_evidence_record(root, "mutations", index, record)
-            for index, record in enumerate(normalized_mutants, start=1)
         ]
         manifest: JSONObject = {
             "format": "qualification-evidence/2",
             "core_id": core.core_id,
             "required_capability_ids": list(required_capability_ids),
             "cases": [cast(JSONValue, item) for item in case_entries],
-            "mutations": [cast(JSONValue, item) for item in mutation_entries],
         }
         (root / "evidence-manifest.json").write_bytes(canonical_bytes(manifest))
     except Exception:
@@ -198,7 +164,7 @@ def verify_qualification_evidence(
             "qualification_evidence_manifest_invalid",
             "Qualification evidence manifest bytes are not canonical",
         )
-    keys = {"format", "core_id", "required_capability_ids", "cases", "mutations"}
+    keys = {"format", "core_id", "required_capability_ids", "cases"}
     if set(manifest) != keys or manifest["format"] != "qualification-evidence/2":
         raise QualificationV2Error(
             "qualification_evidence_manifest_invalid",
@@ -215,8 +181,7 @@ def verify_qualification_evidence(
             "Qualification evidence capability set differs from admission",
         )
     raw_cases = manifest["cases"]
-    raw_mutations = manifest["mutations"]
-    if not isinstance(raw_cases, list) or not isinstance(raw_mutations, list):
+    if not isinstance(raw_cases, list):
         raise QualificationV2Error(
             "qualification_evidence_manifest_invalid",
             "Qualification evidence entries must be arrays",
@@ -243,22 +208,6 @@ def verify_qualification_evidence(
         sealed, instance_files = _validate_sealed_case_record(root, record)
         listed.update(instance_files)
         cases.append(sealed)
-    mutations: list[JSONObject] = []
-    for entry in raw_mutations:
-        item = _json_object(entry, "mutation evidence entry")
-        if set(item) != {"path", "digest", "mutant_id", "target_role"}:
-            raise QualificationV2Error(
-                "qualification_evidence_manifest_invalid",
-                "mutation evidence entry has unexpected fields",
-            )
-        record, relative = _read_evidence_record(root, item, "mutations")
-        if record["mutant_id"] != item["mutant_id"] or record["target_role"] != item["target_role"]:
-            raise QualificationV2Error(
-                "qualification_evidence_manifest_invalid",
-                "mutation evidence entry metadata differs from its record",
-            )
-        listed.add(relative)
-        mutations.append(_validate_mutation_record(cast(dict[str, object], record)))
     actual = {
         PurePosixPath(path.relative_to(root).as_posix())
         for path in root.rglob("*")
@@ -271,202 +220,16 @@ def verify_qualification_evidence(
             unlisted=sorted(str(item) for item in actual - listed),
             missing=sorted(str(item) for item in listed - actual),
         )
-    _validate_evidence_matrix(tuple(cases), tuple(mutations), required_capability_ids)
+    _validate_evidence_matrix(tuple(cases), required_capability_ids)
     return manifest
-
-
-def audit_release_v2(
-    release_root: Path,
-    cache_root: Path,
-    *,
-    settings: PreparationSettings,
-) -> ValidatedReleaseV2:
-    """Cold-install archived readers and replay every sealed physical case."""
-
-    release = verify_release_v2(release_root)
-    if release.sealed_capabilities is None:
-        raise QualificationV2Error(
-            "qualification_audit_catalog_missing",
-            "strict release did not expose its sealed capability catalog",
-        )
-    core = qualification_core_from_document(
-        json.loads((release.root / "qualification/core.json").read_bytes())
-    )
-    required_capability_ids = tuple(item.capability_id for item in release.sealed_capabilities)
-    evidence_root = release.root / "qualification/evidence"
-    manifest = verify_qualification_evidence(
-        core,
-        evidence_root,
-        required_capability_ids=required_capability_ids,
-    )
-    runtime_root = Path(cache_root).resolve() / "qualification-audit" / release.release_id
-    actor_module = release.descriptor.actor_factory.partition(":")[0].partition(".")[0]
-    semantics_module = release.descriptor.semantics_factory.partition(":")[0].partition(".")[0]
-    semantics_lock = materialize_project(
-        ProjectMaterializationInput(
-            release.root / release.descriptor.semantics_project,
-            core.semantics_project_digest,
-            semantics_module,
-            (actor_module, "generated_qualification_verifier", "agent_env_foundry"),
-            "semantics",
-        ),
-        runtime_root / "semantics",
-        settings=settings,
-    )
-    verifier_lock = materialize_project(
-        ProjectMaterializationInput(
-            release.root / "qualification/verifier",
-            core.verifier_project_digest,
-            "generated_qualification_verifier",
-            (actor_module, semantics_module, "agent_env_foundry"),
-            "verifier",
-        ),
-        runtime_root / "verifier",
-        settings=settings,
-    )
-    semantics_manifest = tree_manifest(semantics_lock.project_root)
-    report_fields = {
-        item.capability_id: tuple(field.field_id for field in item.answer_fields)
-        for item in release.sealed_capabilities
-    }
-    for entry in cast(list[JSONObject], manifest["cases"]):
-        record_path = evidence_root / cast(str, entry["path"])
-        record = _json_object(json.loads(record_path.read_bytes()), "cold case record")
-        before = evidence_root / cast(str, record["before_instance_path"])
-        after = evidence_root / cast(str, record["after_instance_path"])
-        before_manifest = tree_manifest(before)
-        after_manifest = tree_manifest(after)
-        transport = _ChildTransport(
-            semantics_lock.python,
-            Path(__file__).resolve().parent / "_semantics_runner.py",
-            (release.descriptor.semantics_factory,),
-            cwd=semantics_lock.project_root,
-            timeout=settings.command_timeout_seconds,
-            role="semantics",
-        )
-        try:
-            before_facts = transport.call("inspect", {"instance_directory": str(before)})
-            after_facts = transport.call("inspect", {"instance_directory": str(after)})
-            raw_bindings = transport.call(
-                "enumerate_bindings",
-                {
-                    "capability_id": record["capability_id"],
-                    "facts": before_facts,
-                },
-            )
-            if not isinstance(raw_bindings, list):
-                raise QualificationV2Error(
-                    "qualification_audit_bindings_invalid",
-                    "cold TaskSemantics bindings are not an array",
-                )
-            bindings = tuple(binding_from_document(item) for item in raw_bindings)
-            selected = [item for item in bindings if item.semantic_key == record["semantic_key"]]
-            if len(selected) != 1:
-                raise QualificationV2Error(
-                    "qualification_audit_binding_mismatch",
-                    "cold replay cannot resolve the sealed semantic key exactly once",
-                    capability_id=record["capability_id"],
-                    semantic_key=record["semantic_key"],
-                    category=record["category"],
-                    record_path=str(record_path),
-                    binding_keys=[item.semantic_key for item in bindings],
-                )
-            binding = selected[0]
-            request = cast(
-                JSONObject,
-                {
-                    "capability_id": record["capability_id"],
-                    "before_facts": before_facts,
-                    "after_facts": after_facts,
-                    "protected_binding": binding.protected_binding,
-                    "trace_projection": record["trace"],
-                    "final_answer": record["final_answer"],
-                    "evaluation_context": {
-                        "current_slot": "target",
-                        "resolved_bindings": [
-                            {
-                                "slot": "target",
-                                "capability_id": record["capability_id"],
-                                "semantic_key": binding.semantic_key,
-                                "protected_binding": binding.protected_binding,
-                            }
-                        ],
-                        "composition_rule_id": None,
-                        "foreach_selector_id": None,
-                        "permitted_sibling_slots": [],
-                    },
-                },
-            )
-            semantic_document = transport.call("evaluate_atom", {"request": request})
-        finally:
-            transport.close(operation="close")
-        semantic_result = native_verification_result_from_document(semantic_document)
-        if semantic_result.to_document() != record["semantics_result"]:
-            raise QualificationV2Error(
-                "qualification_audit_semantics_mismatch",
-                "cold TaskSemantics result differs from sealed evidence",
-                capability_id=record["capability_id"],
-                category=record["category"],
-            )
-        native_request = native_verification_request_from_document(
-            {
-                "capability_id": record["capability_id"],
-                "start_case_id": record["start_case_id"],
-                "public_descriptor": record["public_descriptor"],
-                "public_trace": record["trace"],
-                "final_answer": record["final_answer"],
-                "before_instance_directory": str(before),
-                "after_instance_directory": str(after),
-            }
-        )
-        verifier_result = invoke_verifier_transition(
-            verifier_lock.project_root,
-            native_request,
-            expected_verifier_project_digest=compute_verifier_project_digest(
-                verifier_lock.project_root
-            ),
-            expected_report_field_ids=report_fields[cast(str, record["capability_id"])],
-            config=_audit_builder_config(settings),
-        )
-        if verifier_result.to_document() != record["verifier_result"]:
-            raise QualificationV2Error(
-                "qualification_audit_verifier_mismatch",
-                "cold Qualification Verifier result differs from sealed evidence",
-                capability_id=record["capability_id"],
-                category=record["category"],
-            )
-        if (
-            tree_manifest(before).digest != before_manifest.digest
-            or tree_manifest(after).digest != after_manifest.digest
-        ):
-            raise QualificationV2Error(
-                "qualification_audit_instance_mutation",
-                "cold replay changed an archived instance tree",
-            )
-    if tree_manifest(semantics_lock.project_root).digest != semantics_manifest.digest:
-        raise QualificationV2Error(
-            "qualification_audit_semantics_mutation",
-            "cold replay changed the archived TaskSemantics project",
-        )
-    return release
-
-
-def _audit_builder_config(settings: PreparationSettings) -> Any:
-    from agent_env_foundry.builder import BuilderConfig
-
-    return BuilderConfig(
-        uv_cache_dir=settings.uv_cache_dir,
-        command_timeout_seconds=settings.command_timeout_seconds,
-    )
 
 
 def _validate_evidence_matrix(
     cases: tuple[JSONObject, ...],
-    mutations: tuple[JSONObject, ...],
     required_capability_ids: tuple[str, ...],
 ) -> None:
     present_categories = {cast(str, item["category"]) for item in cases}
-    missing_categories = _REQUIRED_CASE_CATEGORIES - present_categories
+    missing_categories = _CASE_CATEGORIES - present_categories
     if missing_categories:
         raise QualificationV2Error(
             "qualification_evidence_categories_missing",
@@ -482,14 +245,6 @@ def _validate_evidence_matrix(
             "qualification_positive_coverage_missing",
             "Every required capability needs positive physical evidence",
             missing=sorted(missing_capabilities),
-        )
-    mutant_roles = {cast(str, item["target_role"]) for item in mutations}
-    missing_roles = _MUTANT_ROLES - mutant_roles
-    if missing_roles:
-        raise QualificationV2Error(
-            "qualification_mutation_roles_missing",
-            "Qualification requires executable Semantics and Verifier mutants",
-            missing=sorted(missing_roles),
         )
 
 
@@ -560,12 +315,14 @@ def _validate_case_input(value: dict[str, object]) -> JSONObject:
         "public_descriptor",
         "before_instance_directory",
         "after_instance_directory",
+        "reset_observation",
         "axis_agreement",
         "readers_unchanged",
         "trace",
         "final_answer",
         "semantics_result",
         "verifier_result",
+        "answer_source_evidence",
     }
     if not isinstance(value, dict) or set(value) != keys:
         raise QualificationV2Error(
@@ -614,12 +371,14 @@ def _validate_sealed_case_record(
         "after_instance_path",
         "before_tree_digest",
         "after_tree_digest",
+        "reset_observation",
         "axis_agreement",
         "readers_unchanged",
         "trace",
         "final_answer",
         "semantics_result",
         "verifier_result",
+        "answer_source_evidence",
     }
     if set(value) != keys:
         raise QualificationV2Error(
@@ -696,8 +455,15 @@ def _validate_case_semantics(normalized: JSONObject) -> None:
             "qualification_case_record_invalid",
             "physical case trace or final answer is invalid",
         )
+    if not is_json_value(normalized["reset_observation"]) or not isinstance(
+        normalized["answer_source_evidence"], list
+    ):
+        raise QualificationV2Error(
+            "qualification_case_record_invalid",
+            "physical case reset observation or answer-source evidence is invalid",
+        )
     try:
-        semantic = native_verification_result_from_document(normalized["semantics_result"])
+        semantic = atom_result_from_document(normalized["semantics_result"])
         verifier = native_verification_result_from_document(normalized["verifier_result"])
     except Exception as exc:
         raise QualificationV2Error(
@@ -707,30 +473,19 @@ def _validate_case_semantics(normalized: JSONObject) -> None:
     if not _results_agree(semantic, verifier):
         raise QualificationV2Error(
             "qualification_reader_disagreement",
-            "TaskSemantics and Verifier disagree on an outcome axis or report value",
+            "TaskSemantics and native audit disagree on required effects or collateral",
             category=category,
             capability_id=capability_id,
         )
-    _validate_category_result(category, semantic)
+    _validate_category_result(category, semantic, verifier)
 
 
-def _validate_category_result(category: str, result: NativeVerificationResult) -> None:
-    if category in {"positive", "alternative_route", "fresh_replay"}:
-        valid = result.satisfied
-    elif category in {"no_op", "near_miss"}:
-        valid = not result.satisfied and not result.required_effects_ok
-    elif category == "wrong_target":
-        valid = not result.satisfied and (
-            not result.required_effects_ok
-            or result.answer_ok is False
-            or result.process_ok is False
-        )
-    elif category == "wrong_answer":
-        valid = not result.satisfied and result.answer_ok is False
-    elif category == "collateral":
-        valid = not result.satisfied and not result.collateral_ok
-    else:
-        valid = not result.satisfied and result.process_ok is False
+def _validate_category_result(
+    category: str,
+    semantic: AtomCheckResult,
+    verifier: NativeVerificationResult,
+) -> None:
+    valid = category == "positive" and semantic.satisfied and verifier.satisfied
     if not valid:
         raise QualificationV2Error(
             "qualification_case_outcome_invalid",
@@ -739,47 +494,14 @@ def _validate_category_result(category: str, result: NativeVerificationResult) -
         )
 
 
-def _validate_mutation_record(value: dict[str, object]) -> JSONObject:
-    keys = {"mutant_id", "target_role", "killed", "killed_by", "evidence"}
-    if not isinstance(value, dict) or set(value) != keys:
-        raise QualificationV2Error(
-            "qualification_mutation_record_invalid",
-            "mutation record has unexpected fields",
-        )
-    normalized = _json_object(value, "mutation record")
-    mutant_id = normalized["mutant_id"]
-    if not isinstance(mutant_id, str) or not mutant_id:
-        raise QualificationV2Error(
-            "qualification_mutation_record_invalid",
-            "mutant ID must be a non-empty string",
-        )
-    if (
-        normalized["target_role"] not in _MUTANT_ROLES
-        or normalized["killed_by"] not in _MUTANT_KILLERS
-    ):
-        raise QualificationV2Error(
-            "qualification_mutation_record_invalid",
-            "mutant role or kill mechanism is invalid",
-        )
-    if normalized["killed"] is not True:
-        raise QualificationV2Error(
-            "qualification_mutant_survived",
-            "an executable semantic mutant survived Qualification",
-            mutant_id=mutant_id,
-        )
-    if not is_json_object(normalized["evidence"]):
-        raise QualificationV2Error(
-            "qualification_mutation_record_invalid",
-            "mutation evidence must be a JSON object",
-        )
-    return normalized
-
-
 def _results_agree(
-    semantic: NativeVerificationResult,
+    semantic: AtomCheckResult,
     verifier: NativeVerificationResult,
 ) -> bool:
-    return all(getattr(semantic, field) == getattr(verifier, field) for field in _AGREEMENT_FIELDS)
+    return (
+        semantic.required_effects_ok == verifier.required_effects_ok
+        and semantic.collateral_ok == verifier.collateral_ok
+    )
 
 
 def _write_case_evidence_record(
@@ -1118,7 +840,6 @@ def _validate_author_handoffs(inputs: FrozenCoreInputs) -> None:
 
 
 __all__ = [
-    "audit_release_v2",
     "FrozenCoreInputs",
     "QualificationRuntimeSet",
     "QualificationV2Error",

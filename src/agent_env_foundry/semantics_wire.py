@@ -19,7 +19,13 @@ _PUBLIC_VALUE_SOURCE = {
     "properties": {
         "kind": {
             "type": "string",
-            "enum": ["task_literal", "reset", "tool_output", "tool_schema_constant"],
+            "enum": [
+                "task_literal",
+                "task_descriptor",
+                "reset",
+                "tool_observation",
+                "tool_schema_constant",
+            ],
         },
         "tool_name": {"type": ["string", "null"]},
         "json_pointer": {"type": ["string", "null"]},
@@ -280,9 +286,9 @@ _EXAMPLES: dict[str, Any] = {
                 "schema": {"type": "string"},
                 "public_label": "Value",
                 "public_source": {
-                    "kind": "tool_output",
+                    "kind": "tool_observation",
                     "tool_name": "inspect_item",
-                    "json_pointer": "/value",
+                    "json_pointer": "/data/value",
                     "value": None,
                 },
             }

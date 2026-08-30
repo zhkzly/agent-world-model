@@ -450,7 +450,6 @@ def _native_request(before: Path, after: Path) -> NativeVerificationRequest:
                 observation={"ok": True, "data": {"item": "public-1"}, "error": None},
             ),
         ),
-        final_answer={"item": "public-1"},
         before_instance_directory=before,
         after_instance_directory=after,
     )
@@ -458,13 +457,8 @@ def _native_request(before: Path, after: Path) -> NativeVerificationRequest:
 
 def _native_result_document() -> dict[str, Any]:
     return {
-        "initially_satisfied": False,
-        "satisfied": True,
         "required_effects_ok": True,
         "collateral_ok": True,
-        "answer_ok": True,
-        "process_ok": True,
-        "report_values": {"item": "public-1"},
         "failure_codes": [],
     }
 
@@ -499,13 +493,12 @@ def test_host_verifier_boundary_decodes_exact_result_and_proves_read_only(
         verifier,
         _native_request(before, after),
         expected_verifier_project_digest=compute_verifier_project_digest(verifier),
-        expected_report_field_ids=("item",),
         config=BuilderConfig(uv_cache_dir=tmp_path / "cache"),
     )
 
     assert result.satisfied
-    assert result.initially_satisfied is False
     assert json.loads(observed["input_text"])["capability_id"] == "CAP-001"
+    assert "final_answer" not in json.loads(observed["input_text"])
 
 
 def test_host_verifier_boundary_rejects_native_mutation_even_when_result_passes(
@@ -539,47 +532,13 @@ def test_host_verifier_boundary_rejects_native_mutation_even_when_result_passes(
             verifier,
             _native_request(before, after),
             expected_verifier_project_digest=compute_verifier_project_digest(verifier),
-            expected_report_field_ids=("item",),
             config=BuilderConfig(uv_cache_dir=tmp_path / "cache"),
         )
 
     assert caught.value.code == "verifier_instance_mutation"
 
 
-def test_host_verifier_boundary_rejects_report_field_aliases(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    before = tmp_path / "before"
-    after = tmp_path / "after"
-    before.mkdir()
-    after.mkdir()
-
-    def alias(command: tuple[str, ...], **kwargs: Any) -> CommandResult:
-        del kwargs
-        payload = _native_result_document()
-        payload["report_values"] = {"deadline": "2026-02-01T00:00:00Z"}
-        return CommandResult("verifier_transition", command, 0, json.dumps(payload), "")
-
-    monkeypatch.setattr(verifier_author_module, "_run", alias)
-
-    verifier = tmp_path / "verifier"
-    verifier.mkdir()
-    with pytest.raises(VerifierAuthorFailure) as caught:
-        invoke_verifier_transition(
-            verifier,
-            _native_request(before, after),
-            expected_verifier_project_digest=compute_verifier_project_digest(verifier),
-            expected_report_field_ids=("deadline_utc",),
-            config=BuilderConfig(uv_cache_dir=tmp_path / "cache"),
-        )
-
-    assert caught.value.code == "verifier_report_fields_mismatch"
-    assert caught.value.details["missing"] == ["deadline_utc"]
-    assert caught.value.details["unexpected"] == ["deadline"]
-
-
-def test_host_verifier_boundary_accepts_neutral_null_report_on_unresolved_branch(
+def test_host_verifier_boundary_accepts_native_audit_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -591,10 +550,7 @@ def test_host_verifier_boundary_accepts_neutral_null_report_on_unresolved_branch
     def unresolved(command: tuple[str, ...], **kwargs: Any) -> CommandResult:
         del kwargs
         payload = _native_result_document()
-        payload["satisfied"] = False
         payload["required_effects_ok"] = False
-        payload["answer_ok"] = False
-        payload["report_values"] = {"item": None}
         payload["failure_codes"] = ["UNSUPPORTED_REFERENT"]
         return CommandResult("verifier_transition", command, 0, json.dumps(payload), "")
 
@@ -606,25 +562,23 @@ def test_host_verifier_boundary_accepts_neutral_null_report_on_unresolved_branch
         verifier,
         _native_request(before, after),
         expected_verifier_project_digest=compute_verifier_project_digest(verifier),
-        expected_report_field_ids=("item",),
         config=BuilderConfig(uv_cache_dir=tmp_path / "cache"),
     )
 
     assert result.satisfied is False
-    assert result.report_values == {"item": None}
     assert result.failure_codes == ("UNSUPPORTED_REFERENT",)
 
 
-def test_verifier_contract_states_exact_report_and_referent_rules() -> None:
+def test_verifier_contract_limits_the_auditor_to_native_state_truth() -> None:
     contract = (
         Path(__file__).resolve().parents[1]
         / "src/agent_env_foundry/runtime_skills/qualification-verifier-codegen/"
         "QUALIFICATION_VERIFIER_CONTRACT.md"
     ).read_text()
 
-    assert "exactly the declared" in contract
-    assert "`null`" in contract
-    assert "authoritative intended referent" in " ".join(contract.split())
+    assert "required_effects_ok" in contract
+    assert "collateral_ok" in contract
+    assert "must not become a second public-answer" in contract
 
 
 def test_host_verifier_boundary_rejects_verifier_project_mutation(
@@ -656,7 +610,6 @@ def test_host_verifier_boundary_rejects_verifier_project_mutation(
             verifier,
             _native_request(before, after),
             expected_verifier_project_digest=compute_verifier_project_digest(verifier),
-            expected_report_field_ids=("item",),
             config=BuilderConfig(uv_cache_dir=tmp_path / "cache"),
         )
 
@@ -679,7 +632,6 @@ def test_host_verifier_boundary_binds_accepted_digest_and_resolved_instances(
             verifier,
             _native_request(before, tmp_path / "distinct"),
             expected_verifier_project_digest="0" * 64,
-            expected_report_field_ids=("item",),
             config=BuilderConfig(uv_cache_dir=tmp_path / "cache"),
         )
     assert digest_error.value.code == "verifier_project_digest_mismatch"
@@ -689,7 +641,6 @@ def test_host_verifier_boundary_binds_accepted_digest_and_resolved_instances(
             verifier,
             _native_request(before, after_alias),
             expected_verifier_project_digest=compute_verifier_project_digest(verifier),
-            expected_report_field_ids=("item",),
             config=BuilderConfig(uv_cache_dir=tmp_path / "cache"),
         )
     assert alias_error.value.code == "verifier_instance_alias"

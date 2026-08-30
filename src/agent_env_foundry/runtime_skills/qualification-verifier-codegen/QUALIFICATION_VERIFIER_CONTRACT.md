@@ -1,30 +1,26 @@
-# Qualification Verifier Project Contract
+# Qualification Native-Audit Project Contract
 
-Write one standalone Python 3.12 uv project exposing the fixed factory:
+Write one standalone Python 3.12 uv project exposing:
 
 ```text
 generated_qualification_verifier.release:make_verifier
 ```
 
-The factory returns an object with one method:
+The factory returns an object with:
 
 ```python
 verify_transition(request: dict) -> dict
 ```
 
-## Authority and visibility
+## Authority
 
-The project is audit-only proposal code. It may read:
+This is an audit-only native-state reader. It may see frozen Expected
+TaskSemantics meaning, public schemas/ToolSpecs, and the read-only actor
+source/native-format view. It must not see or import TaskSemantics source,
+outputs, tests, or repair history. It must not import/call the actor package or
+the Host package as an oracle.
 
-- frozen Expected TaskSemantics meaning;
-- public schemas, ToolSpecs and documents;
-- the read-only actor source/native-format view.
-
-It must not see or import TaskSemantics source, outputs, tests or repair history.
-It must not import/call the actor package, actor business functions or the Host
-package as an expected-answer oracle.
-
-## Exact request
+## Request
 
 The request contains exactly:
 
@@ -33,113 +29,44 @@ capability_id
 start_case_id
 public_descriptor
 public_trace
-final_answer
 before_instance_directory
 after_instance_directory
 ```
 
-It never contains a protected binding, TaskSemantics facts, checker, Task,
-reference solution or verdict. Identify the native referent from the public
-descriptor/trace. The `public_descriptor` is the authoritative intended
-referent whenever it uniquely resolves one referent; unrelated identities that
-merely appear inside broad public trace observations must not create false
-ambiguity or override that resolution. If identification is impossible without
-a hidden ID, return a structured unsupported failure; never guess or inspect
-TaskSemantics.
+It never contains protected bindings, TaskSemantics facts, final answers,
+checkers, Tasks, reference solutions, or verdicts. Resolve the intended native
+referent from the public descriptor and trace. If that is impossible without a
+hidden identifier, return a structured failure instead of guessing.
 
-Every `public_trace` item has exactly `seq`, `tool_name`, `arguments`, and
-`observation`. `observation` is the public ToolObservation returned by the
-actor. A business refusal is an executed process: its observation has
-`ok=false`, `data=null`, and a structured domain `error`. When a refusal
-capability expects that error code, do not mistake `ok=false` for a missing or
-failed process.
+Every trace event has `seq`, `tool_name`, `arguments`, and the exact public
+`observation`. Trace may identify the selected attempted operation, but this
+verifier must not become a second public-answer or process evaluator.
 
-Scope public process evidence to the selected public referent. A sibling call,
-success, or business refusal may be collateral-safe but must not satisfy the
-current referent's required effect or process axis; validate its arguments and
-corresponding outcome/error code.
-
-## Exact result
+## Result
 
 Return exactly:
 
 ```text
-initially_satisfied: boolean
-satisfied: boolean
 required_effects_ok: boolean
 collateral_ok: boolean
-answer_ok: boolean or null
-process_ok: boolean or null
-report_values: object
 failure_codes: unique string array
 ```
 
-A satisfied result requires required effects and collateral to pass, all
-applicable answer/process axes not to be false, and no failure codes.
+`required_effects_ok` states whether the capability's required native relation
+holds across before/after for the selected referent. `collateral_ok` states
+whether forbidden unrelated native state changed. Keep the two axes
+independent. Use failure codes only for native-state audit diagnostics.
 
-`initially_satisfied` means that the entire Task goal would already pass for
-the selected referent in the before state, before any public action, tool
-observation, final answer, or process evidence is credited. It is not capability eligibility,
-a workflow precondition, or a refusal condition. For example, an eligible
-object still requiring a mutation is not initially satisfied; neither is a
-query still requiring a public read and correct answer. Keep this value
-independent from final `satisfied` so the Host can later reject trivial goals.
+Do not derive final answers, `report_values`, public process truth, scalar
+rewards, or a pass verdict. The Host validates public AnswerField sources, and
+TaskSemantics evaluates public process/final-answer truth.
 
-Compute each result axis from its own obligation. `required_effects_ok` asks
-whether the intended outcome occurred; `collateral_ok` asks only whether
-forbidden unrelated state changed; `answer_ok` checks the submitted answer; and
-`process_ok` checks the required public calls/observations. A no-op may therefore
-have `required_effects_ok=false` while `collateral_ok=true`. Never gate one axis
-on another merely to make them match final `satisfied`.
-
-The frozen `task_kind` uses state-effect precedence: any successful goal that
-requires a business-state change is `state_change`, even if it also has a
-multi-step public process. `process` requires public action/process evidence
-but no business-state change; `query` is likewise state-preserving and returns
-public answers. The Host independently checks this declaration against the two
-semantic state projections.
-
-For every `answer_fields` entry of the selected capability in
-`EXPECTED_TASK_SEMANTICS.json`, independently derive the expected value from
-native before/after state and the qualified public trace, return it under the
-same field ID in `report_values`, and compare the submitted `final_answer`
-against it. Report `report_values` with exactly the declared answer field IDs;
-JSON `null` is the neutral value for a field that is inapplicable on the
-observed branch, never a silent omission. Compare source-bound exact public
-values, never synonyms, reformattings, or paraphrases. A capability with
-declared answer fields must not return an empty `report_values`. Missing,
-wrong, or stale answers set `answer_ok=false` without changing the other
-independently computed axes.
-
-For a query, public-process evidence is any successful public observation that
-contains the selected referent and the exact qualified answer values. Do not
-bind `process_ok` to one tool name or one reference sequence when the frozen
-public surface exposes an equivalent read route. If reset already exposes the
-complete answer, do not mask that upstream environment defect by requiring a
-redundant call.
-
-The query axes are independent and have one fixed interpretation:
-
-- `required_effects_ok=true` for a supported selected query because it has no
-  state-effect obligation;
-- `collateral_ok` is exact permitted before/after native-state equality and is
-  independent of whether a read occurred;
-- `answer_ok` compares the submitted answer with native `report_values` and is
-  independent of process evidence;
-- `process_ok` alone records whether an equivalent selected public read
-  occurred.
-
-Read the two instance directories with independent standard/native readers.
-`verify_transition` must be read-only. Do not write marker files, mutate state,
-call public tools, restore snapshots or return a scalar reward.
+The verifier must be read-only. Do not write marker files, mutate instances,
+call public tools, or restore snapshots.
 
 ## Project requirements
 
-Include `pyproject.toml`, `uv.lock`, source and diagnostic tests. Declare every
-dependency. Tests should cover supported success/no-op/wrong-target/collateral/
-wrong-answer/process cases implied by the frozen expectations. Cover every
-Taskable capability, its declared report fields, initial truth, expected
-business refusal, and the no-op distinction between required effects and
-collateral. Framework owns
-lock/sync/build/test/source/import/factory checks and later physical mutation
-evidence. The model must not write a qualification receipt or pass verdict.
+Include `pyproject.toml`, `uv.lock`, source, and focused diagnostic tests for
+the required-effect and collateral rules of every Taskable capability.
+Framework owns lock/sync/build/test/source/import/factory checks and the final
+Qualification verdict.

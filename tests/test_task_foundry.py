@@ -9,23 +9,18 @@ import pytest
 
 import agent_env_foundry.task_foundry as task_foundry_module
 from agent_env_foundry.environment import ToolSpec
-from agent_env_foundry.provenance import ArgumentProvenance
 from agent_env_foundry.public_agent import PublicEpisodeRun
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import AtomCheckRequest, AtomCheckResult, StartCase, TraceEvent
 from agent_env_foundry.task_foundry import (
-    AgentChoicePerturbation,
-    AgentChoiceProof,
     AtomAdmissionPlan,
     AtomChallengeReport,
     AtomChallengeResult,
-    AtomCheckerMutationSpec,
     AtomPlannedChallenge,
     AtomTask,
     AtomWitness,
     SolvedAtomTask,
     TaskFoundryError,
-    run_atom_checker_mutations,
     seal_atom_task_pack,
     solve_atom_task_twice,
 )
@@ -87,21 +82,7 @@ def _plan(task: AtomTask) -> AtomAdmissionPlan:
     no_op_result = _witness(task, "0" * 64, satisfied=False).result
     return AtomAdmissionPlan(
         task.task_id,
-        "perturb_each_occurrence",
         no_op_result,
-        (
-            AtomCheckerMutationSpec("force_satisfied", "no_op", "satisfied"),
-            AtomCheckerMutationSpec(
-                "force_required_effects_ok",
-                "no_op",
-                "required_effects_ok",
-            ),
-            AtomCheckerMutationSpec(
-                "force_process_ok",
-                "missing_process",
-                "process_ok",
-            ),
-        ),
         (
             AtomPlannedChallenge("no_op", True, None, None, None),
             AtomPlannedChallenge("wrong_target", True, "d" * 64, None, None),
@@ -111,14 +92,6 @@ def _plan(task: AtomTask) -> AtomAdmissionPlan:
                 None,
                 None,
                 "answer schema has no schema-valid alternative value",
-            ),
-            AtomPlannedChallenge("missing_process", True, None, None, None),
-            AtomPlannedChallenge(
-                "collateral",
-                False,
-                None,
-                None,
-                "no disjoint-workflow state-change Task is available",
             ),
         ),
     )
@@ -186,22 +159,17 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
     task = _task()
     plan = _plan(task)
     assert plan.plan_id
-    assert plan.agent_choice_policy == "perturb_each_occurrence"
     assert tuple(item.category for item in plan.challenges) == (
         "no_op",
         "wrong_target",
         "wrong_answer",
-        "missing_process",
-        "collateral",
     )
     assert plan.challenges[1].target_task_id == "d" * 64
 
     with pytest.raises(TaskFoundryError) as caught:
         AtomAdmissionPlan(
             task.task_id,
-            "perturb_each_occurrence",
             plan.no_op_result,
-            plan.checker_mutations,
             plan.challenges[:-1],
         )
     assert caught.value.code == "admission_plan_incomplete"
@@ -210,117 +178,44 @@ def test_atom_admission_plan_is_complete_and_bound_before_witnesses() -> None:
         AtomPlannedChallenge("wrong_target", True, None, None, None)
     assert caught.value.code == "admission_plan_wrong_target_missing"
 
-    with pytest.raises(TaskFoundryError) as caught:
-        AtomAdmissionPlan(
-            task.task_id,
-            "ignore_choices",
-            plan.no_op_result,
-            plan.checker_mutations,
-            plan.challenges,
-        )
-    assert caught.value.code == "admission_agent_choice_policy_invalid"
 
-    assert tuple(item.mutation_id for item in plan.checker_mutations) == (
-        "force_satisfied",
-        "force_required_effects_ok",
-        "force_process_ok",
-    )
-
-
-def test_replay_rebinds_dynamic_outputs_and_changes_only_the_targeted_choice() -> None:
-    first = TraceEvent(
-        1,
-        "submit",
-        {"charge_reference": "CHG-1", "reason": "original"},
-        {"ok": True, "data": {"dispute_reference": "DSP-OLD"}, "error": None},
-    )
-    first_provenance = (
-        ArgumentProvenance(
-            1,
-            "/charge_reference",
-            "CHG-1",
-            "task_literal",
-            None,
-            None,
-            "/public_descriptor/charge_reference",
-        ),
-        ArgumentProvenance(1, "/reason", "original", "agent_choice", None, None, None),
-    )
-    first_arguments = task_foundry_module._replay_arguments(
-        first,
-        first_provenance,
-        {},
-        {},
-        (1, "/reason"),
-        "alternative",
-    )
-    assert first_arguments == {"charge_reference": "CHG-1", "reason": "alternative"}
-
-    second = TraceEvent(
-        2,
-        "inspect",
-        {"dispute_reference": "DSP-OLD"},
-        {"ok": True, "data": {}, "error": None},
-    )
-    second_provenance = (
-        ArgumentProvenance(
-            2,
-            "/dispute_reference",
-            "DSP-OLD",
-            "tool_observation",
-            1,
-            "submit",
-            "/data/dispute_reference",
-        ),
-    )
-    second_arguments = task_foundry_module._replay_arguments(
-        second,
-        second_provenance,
-        {},
-        {1: {"ok": True, "data": {"dispute_reference": "DSP-NEW"}, "error": None}},
-        (1, "/reason"),
-        "alternative",
-    )
-    assert second_arguments == {"dispute_reference": "DSP-NEW"}
-
-
-def test_agent_choice_perturbation_requires_the_checker_to_stay_satisfied() -> None:
+def test_atom_challenge_report_requires_each_applicable_core_negative_to_fail() -> None:
     task = _task()
-    failed = _witness(task, "b" * 64, satisfied=False).result
-    with pytest.raises(TaskFoundryError) as caught:
-        AgentChoicePerturbation(
-            "c" * 64,
-            "d" * 64,
-            1,
-            "/reason",
-            "original",
-            "alternative",
-            (),
-            failed,
-        )
-    assert caught.value.code == "agent_choice_is_load_bearing"
-
-
-def test_agent_choice_rebinds_dynamic_final_answer_from_checker_report() -> None:
-    result = AtomCheckResult(
-        initially_satisfied=False,
-        satisfied=False,
-        required_effects_ok=True,
-        collateral_ok=True,
-        answer_ok=False,
-        process_ok=True,
-        report_values={"commit_reference": "new-commit"},
-        failure_codes=("ANSWER_MISMATCH",),
+    plan = _plan(task)
+    rejected = plan.no_op_result
+    no_op = AtomChallengeResult("no_op", True, "b" * 64, (), {}, rejected, None, None)
+    wrong_target = AtomChallengeResult(
+        "wrong_target",
+        True,
+        "c" * 64,
+        (),
+        {},
+        rejected,
+        _witness(task, "d" * 64).result,
+        None,
     )
-    schema = {
-        "type": "object",
-        "properties": {"commit_reference": {"type": "string"}},
-        "required": ["commit_reference"],
-        "additionalProperties": False,
-    }
-    assert task_foundry_module._rebound_final_answer(result, schema) == {
-        "commit_reference": "new-commit"
-    }
+    wrong_answer = AtomChallengeResult(
+        "wrong_answer",
+        False,
+        None,
+        (),
+        {},
+        None,
+        None,
+        "answer schema has no schema-valid alternative value",
+    )
+
+    report = AtomChallengeReport(task.task_id, plan, (no_op, wrong_target, wrong_answer))
+    assert report.to_document()["format"] == "atom-challenge-report/1"
+    assert plan.to_document()["format"] == "atom-admission-plan/4"
+
+    with pytest.raises(TaskFoundryError) as caught:
+        AtomChallengeReport(
+            task.task_id,
+            plan,
+            (replace(no_op, result=_witness(task, "e" * 64).result), wrong_target, wrong_answer),
+        )
+    assert caught.value.code == "challenge_false_acceptance"
 
 
 def test_instruction_preserves_temporal_answer_qualifiers() -> None:
@@ -368,66 +263,15 @@ def test_atom_task_pack_seals_only_one_complete_same_plan_admission() -> None:
         None,
         "answer schema has no schema-valid alternative value",
     )
-    missing_process = AtomChallengeResult(
-        "missing_process",
-        True,
-        "5" * 64,
-        (),
-        {},
-        rejected,
-        None,
-        None,
-    )
-    collateral = AtomChallengeResult(
-        "collateral",
-        False,
-        None,
-        (),
-        {},
-        None,
-        None,
-        "no disjoint-workflow state-change Task is available",
-    )
     challenges = AtomChallengeReport(
         task.task_id,
         plan,
-        (no_op, wrong_target, wrong_answer, missing_process, collateral),
+        (no_op, wrong_target, wrong_answer),
     )
-    mutations = run_atom_checker_mutations(plan, challenges)
-    choices = AgentChoiceProof(task.task_id, plan.plan_id, ())
 
-    task_pack = seal_atom_task_pack(solved, challenges, choices, mutations)
+    task_pack = seal_atom_task_pack(solved, challenges)
     assert task_pack.task_pack_id
     assert task_pack.to_document()["format"] == "atom-task-pack/2"
-
-    with pytest.raises(TaskFoundryError) as caught:
-        seal_atom_task_pack(
-            solved,
-            challenges,
-            replace(choices, admission_plan_id="8" * 64),
-            mutations,
-        )
-    assert caught.value.code == "atom_admission_identity_mismatch"
-
-    choice_trace = (
-        TraceEvent(
-            1,
-            "submit",
-            {"reason": "original"},
-            {"ok": True, "data": {}, "error": None},
-        ),
-    )
-    choice_witness = replace(
-        first,
-        trace=choice_trace,
-        argument_provenance=(
-            ArgumentProvenance(1, "/reason", "original", "agent_choice", None, None, None),
-        ),
-    )
-    choice_solved = SolvedAtomTask(task, plan, (choice_witness, second))
-    with pytest.raises(TaskFoundryError) as caught:
-        seal_atom_task_pack(choice_solved, challenges, choices, mutations)
-    assert caught.value.code == "atom_admission_agent_choice_incomplete"
 
 
 def test_solve_freezes_admission_plan_before_opening_a_witness(
@@ -534,228 +378,6 @@ def test_wrong_target_selection_prefers_closest_public_descriptor() -> None:
     assert selected == close
 
 
-def test_collateral_selection_requires_a_disjoint_state_change_workflow() -> None:
-    current = _task()
-    shared_state_change = replace(
-        current,
-        capability_id="cap-2",
-        semantic_key="item:2",
-        public_descriptor={"item": "two"},
-    )
-    disjoint_query = replace(
-        current,
-        capability_id="cap-3",
-        semantic_key="item:3",
-        public_descriptor={"item": "three"},
-    )
-    disjoint_state_change = replace(
-        current,
-        capability_id="cap-4",
-        semantic_key="item:4",
-        public_descriptor={"item": "four"},
-    )
-    capabilities = {
-        "cap-1": SimpleNamespace(workflow_ids=("workflow-1",), task_kind="query"),
-        "cap-2": SimpleNamespace(workflow_ids=("workflow-1",), task_kind="state_change"),
-        "cap-3": SimpleNamespace(workflow_ids=("workflow-2",), task_kind="query"),
-        "cap-4": SimpleNamespace(workflow_ids=("workflow-2",), task_kind="state_change"),
-    }
-    selected = task_foundry_module._select_collateral_task(
-        current,
-        (current, shared_state_change, disjoint_query, disjoint_state_change),
-        capabilities,  # type: ignore[arg-type]
-    )
-    assert selected == disjoint_state_change
-
-    with pytest.raises(TaskFoundryError) as caught:
-        task_foundry_module._assert_collateral_discriminated(
-            _witness(current, "b" * 64, satisfied=False).result
-        )
-    assert caught.value.code == "collateral_not_discriminated"
-    task_foundry_module._assert_collateral_discriminated(
-        replace(
-            _witness(current, "b" * 64, satisfied=False).result,
-            collateral_ok=False,
-        )
-    )
-
-
-def test_atom_challenge_report_requires_rejected_noop() -> None:
-    task = _task()
-    plan = _plan(task)
-    rejected = plan.no_op_result
-    no_op = AtomChallengeResult(
-        "no_op",
-        True,
-        "b" * 64,
-        (),
-        {},
-        rejected,
-        None,
-        None,
-    )
-    with pytest.raises(TaskFoundryError) as caught:
-        replace(no_op, category="wrong_target")
-    assert caught.value.code == "challenge_control_result_missing"
-    wrong_target = replace(
-        no_op,
-        category="wrong_target",
-        control_result=_witness(task, "c" * 64).result,
-    )
-    not_applicable = AtomChallengeResult(
-        "wrong_answer",
-        False,
-        None,
-        (),
-        {},
-        None,
-        None,
-        "answer schema has no schema-valid alternative value",
-    )
-    missing_process = replace(no_op, category="missing_process")
-    collateral = AtomChallengeResult(
-        "collateral",
-        False,
-        None,
-        (),
-        {},
-        None,
-        None,
-        "no disjoint-workflow state-change Task is available",
-    )
-    report = AtomChallengeReport(
-        task.task_id,
-        plan,
-        (no_op, wrong_target, not_applicable, missing_process, collateral),
-    )
-    assert report.to_document()["format"] == "atom-challenge-report/1"
-    assert plan.to_document()["format"] == "atom-admission-plan/3"
-    mutation_report = run_atom_checker_mutations(plan, report)
-    assert all(item.killed for item in mutation_report.mutations)
-
-    with pytest.raises(TaskFoundryError) as caught:
-        AtomChallengeReport(
-            task.task_id,
-            plan,
-            (
-                replace(no_op, result=replace(no_op.result, collateral_ok=False)),
-                wrong_target,
-                not_applicable,
-                missing_process,
-                collateral,
-            ),
-        )
-    assert caught.value.code == "challenge_noop_result_drift"
-
-    surviving_process = replace(
-        missing_process,
-        result=replace(missing_process.result, process_ok=True),
-    )
-    surviving_report = AtomChallengeReport(
-        task.task_id,
-        plan,
-        (no_op, wrong_target, not_applicable, surviving_process, collateral),
-    )
-    with pytest.raises(TaskFoundryError) as caught:
-        run_atom_checker_mutations(plan, surviving_report)
-    assert caught.value.code == "checker_mutant_survived"
-
-    with pytest.raises(TaskFoundryError) as caught:
-        AtomChallengeReport(
-            task.task_id,
-            plan,
-            (no_op, wrong_target, not_applicable, missing_process),
-        )
-    assert caught.value.code == "challenge_plan_incomplete"
-
-    accepted = replace(no_op, result=_witness(task, "c" * 64).result)
-    with pytest.raises(TaskFoundryError) as caught:
-        AtomChallengeReport(
-            task.task_id,
-            plan,
-            (accepted, wrong_target, not_applicable, missing_process, collateral),
-        )
-    assert caught.value.code == "challenge_false_acceptance"
-    accepted_wrong_target = replace(wrong_target, result=_witness(task, "c" * 64).result)
-    with pytest.raises(TaskFoundryError) as caught:
-        AtomChallengeReport(
-            task.task_id,
-            plan,
-            (no_op, accepted_wrong_target, not_applicable, missing_process, collateral),
-        )
-    assert caught.value.code == "challenge_false_acceptance"
-
-    applicable_collateral_challenges = (
-        *plan.challenges[:-1],
-        AtomPlannedChallenge("collateral", True, "e" * 64, None, None),
-    )
-    applicable_collateral_plan = replace(
-        plan,
-        checker_mutations=task_foundry_module._derive_checker_mutation_specs(
-            applicable_collateral_challenges,
-            plan.no_op_result,
-        ),
-        challenges=applicable_collateral_challenges,
-    )
-    accepted_collateral = replace(
-        wrong_target,
-        category="collateral",
-        result=_witness(task, "c" * 64).result,
-    )
-    with pytest.raises(TaskFoundryError) as caught:
-        AtomChallengeReport(
-            task.task_id,
-            applicable_collateral_plan,
-            (no_op, wrong_target, not_applicable, missing_process, accepted_collateral),
-        )
-    assert caught.value.code == "challenge_false_acceptance"
-
-
-def test_checker_mutation_plan_uses_the_actual_pre_witness_noop_axes() -> None:
-    challenges = (
-        AtomPlannedChallenge("no_op", True, None, None, None),
-        AtomPlannedChallenge("wrong_target", False, None, None, "no sibling Task"),
-        AtomPlannedChallenge("wrong_answer", False, None, None, "no alternate answer"),
-        AtomPlannedChallenge("missing_process", True, None, None, None),
-        AtomPlannedChallenge("collateral", False, None, None, "no collateral Task"),
-    )
-    query_noop = AtomCheckResult(
-        initially_satisfied=False,
-        satisfied=False,
-        required_effects_ok=True,
-        collateral_ok=True,
-        answer_ok=False,
-        process_ok=False,
-        report_values={"value": "public"},
-        failure_codes=("PUBLIC_READ_MISSING", "ANSWER_MISMATCH"),
-    )
-    query_specs = task_foundry_module._derive_checker_mutation_specs(
-        challenges,
-        query_noop,
-    )
-    assert tuple(item.mutation_id for item in query_specs) == (
-        "force_satisfied",
-        "force_process_ok",
-    )
-
-    state_change_noop = replace(
-        query_noop,
-        required_effects_ok=False,
-        answer_ok=None,
-        report_values={},
-        failure_codes=("REQUIRED_EFFECT_MISSING", "PUBLIC_PROCESS_MISSING"),
-    )
-    state_change_specs = task_foundry_module._derive_checker_mutation_specs(
-        challenges,
-        state_change_noop,
-    )
-    assert tuple(item.mutation_id for item in state_change_specs) == (
-        "force_satisfied",
-        "force_required_effects_ok",
-        "force_process_ok",
-    )
-
-
 def test_admit_atom_task_runs_one_complete_existing_pipeline(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -767,8 +389,6 @@ def test_admit_atom_task_runs_one_complete_existing_pipeline(
     plan = SimpleNamespace(plan_id="plan")
     solved = SimpleNamespace(admission_plan=plan)
     challenges = object()
-    choices = object()
-    mutations = object()
     task_pack = object()
 
     monkeypatch.setattr(
@@ -780,18 +400,6 @@ def test_admit_atom_task_runs_one_complete_existing_pipeline(
         task_foundry_module,
         "challenge_atom_task",
         lambda *_args, **kwargs: events.append(("challenge", kwargs)) or challenges,
-    )
-    monkeypatch.setattr(
-        task_foundry_module,
-        "prove_agent_choices_non_load_bearing",
-        lambda *_args: events.append(("choices", _args[-1])) or choices,
-    )
-    monkeypatch.setattr(
-        task_foundry_module,
-        "run_atom_checker_mutations",
-        lambda actual_plan, actual_challenges: (
-            events.append(("mutations", (actual_plan, actual_challenges))) or mutations
-        ),
     )
     monkeypatch.setattr(
         task_foundry_module,
@@ -812,34 +420,11 @@ def test_admit_atom_task_runs_one_complete_existing_pipeline(
     assert [item[0] for item in events] == [
         "solve",
         "challenge",
-        "choices",
-        "mutations",
         "seal",
     ]
     assert events[0][1] == {"route": route, "max_provider_turns": 5}
     assert events[1][1] == {"route": route, "max_provider_turns": 5}
-    assert events[2][1] == tmp_path / "agent-choices"
-    assert events[3][1] == (plan, challenges)
-    assert events[4][1] == (solved, challenges, choices, mutations)
-
-
-def test_report_profiles_are_bounded_to_full_plus_each_single_field() -> None:
-    fields = (
-        SimpleNamespace(field_id="first"),
-        SimpleNamespace(field_id="second"),
-        SimpleNamespace(field_id="third"),
-    )
-
-    profiles = task_foundry_module._answer_field_profiles(fields)
-
-    assert tuple(tuple(item.field_id for item in profile) for profile in profiles) == (
-        ("first", "second", "third"),
-        ("first",),
-        ("second",),
-        ("third",),
-    )
-    assert task_foundry_module._answer_field_profiles((fields[0],)) == ((fields[0],),)
-    assert task_foundry_module._answer_field_profiles(()) == ((),)
+    assert events[2][1] == (solved, challenges)
 
 
 def test_report_projection_reuses_release_truth_and_only_scores_selected_fields() -> None:

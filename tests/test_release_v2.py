@@ -13,12 +13,44 @@ import rfc8785
 import agent_env_foundry.preparation as preparation_module
 import agent_env_foundry.release as release_module
 from agent_env_foundry.errors import EnvironmentContractError
+from agent_env_foundry.qualification_contracts import (
+    RequirementCoverageEntry,
+    RequirementCoverageManifest,
+)
 from agent_env_foundry.release import (
     _verify_release_layout_v2,
     verify_release_v2,
     write_release_zip_v2,
 )
 from v2_release_factory import build_v2_release
+
+
+def test_requirement_coverage_accepts_positive_only_evidence() -> None:
+    case_digest = "a" * 64
+    expected = {
+        "format": "expected-task-semantics/1",
+        "requirements": [{"requirement_id": "REQ-1", "disposition": "Taskable"}],
+        "capabilities": [{"capability_id": "cap-1", "requirement_ids": ["REQ-1"]}],
+    }
+    coverage = RequirementCoverageManifest(
+        (RequirementCoverageEntry("REQ-1", "Taskable", ("cap-1",), (case_digest,)),)
+    )
+    evidence = {
+        "cases": [
+            {
+                "category": "positive",
+                "capability_id": "cap-1",
+                "digest": case_digest,
+            }
+        ]
+    }
+
+    release_module._validate_requirement_coverage(
+        expected,
+        coverage,
+        evidence,
+        "b" * 64,
+    )
 
 
 def test_v2_descriptor_binds_actor_semantics_and_rejects_other_formats(tmp_path: Path) -> None:

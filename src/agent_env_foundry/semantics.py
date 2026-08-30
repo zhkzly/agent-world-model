@@ -19,10 +19,24 @@ FacetOperator = Literal["eq", "neq", "lt", "lte", "gt", "gte", "min", "max"]
 GoalKind = Literal["atom", "all", "if", "foreach"]
 TaskKind = Literal["query", "state_change", "process"]
 ConditionStatus = Literal["true", "false", "abstain"]
-PublicValueKind = Literal["task_literal", "reset", "tool_output", "tool_schema_constant"]
+PublicValueKind = Literal[
+    "task_literal",
+    "task_descriptor",
+    "reset",
+    "tool_observation",
+    "tool_schema_constant",
+]
 BindingScope = Literal["world", "selected_binding"]
 _FACET_OPERATORS = frozenset({"eq", "neq", "lt", "lte", "gt", "gte", "min", "max"})
-_PUBLIC_VALUE_KINDS = frozenset({"task_literal", "reset", "tool_output", "tool_schema_constant"})
+_PUBLIC_VALUE_KINDS = frozenset(
+    {
+        "task_literal",
+        "task_descriptor",
+        "reset",
+        "tool_observation",
+        "tool_schema_constant",
+    }
+)
 _BINDING_SCOPES = frozenset({"world", "selected_binding"})
 _TASK_KINDS = frozenset({"query", "state_change", "process"})
 _GOAL_KINDS = frozenset({"atom", "all", "if", "foreach"})
@@ -68,14 +82,14 @@ class PublicValueSource:
                     "task_literal source must not declare tool_name or json_pointer"
                 )
             return
-        if self.kind == "reset":
+        if self.kind in {"task_descriptor", "reset"}:
             if self.tool_name is not None:
-                raise SemanticsContractError("reset source must not declare tool_name")
+                raise SemanticsContractError(f"{self.kind} source must not declare tool_name")
             if self.json_pointer is None:
-                raise SemanticsContractError("reset source requires json_pointer")
-            _pointer(self.json_pointer, "reset source json_pointer")
+                raise SemanticsContractError(f"{self.kind} source requires json_pointer")
+            _pointer(self.json_pointer, f"{self.kind} source json_pointer")
             if self.value is not None:
-                raise SemanticsContractError("reset source must not declare value")
+                raise SemanticsContractError(f"{self.kind} source must not declare value")
             return
         if self.tool_name is None:
             raise SemanticsContractError(f"{self.kind} source requires tool_name")
@@ -83,8 +97,8 @@ class PublicValueSource:
         if self.json_pointer is None:
             raise SemanticsContractError(f"{self.kind} source requires json_pointer")
         _pointer(self.json_pointer, f"{self.kind} source json_pointer")
-        if self.kind == "tool_output" and self.value is not None:
-            raise SemanticsContractError("tool_output source must not declare value")
+        if self.kind == "tool_observation" and self.value is not None:
+            raise SemanticsContractError("tool_observation source must not declare value")
 
     def to_document(self) -> JSONObject:
         return {

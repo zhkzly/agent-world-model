@@ -15,6 +15,7 @@ from agent_env_foundry.agents import (
     _ProviderTurnBudget,
     _run_fresh_json_turn,
 )
+from agent_env_foundry.qualification_contracts import PublicSurfaceManifest
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.research import BuilderProjection, ResearchFailure
 
@@ -330,18 +331,6 @@ def freeze_expected_task_semantics(
         for reference in branch_refs & set(capability_index):
             if not condition_workflows.intersection(capability_index[reference]["workflow_ids"]):
                 findings.append(f"{path}: capability {reference!r} shares no condition workflow")
-        branch_answer_contracts = {
-            tuple(
-                (field["field_id"], field["public_label"])
-                for field in capability_index[reference]["answer_fields"]
-            )
-            for reference in branch_refs & set(capability_index)
-        }
-        if len(branch_answer_contracts) > 1:
-            findings.append(
-                f"{path}: condition branches require identical branch-neutral answer field IDs "
-                "and labels"
-            )
 
     if findings:
         raise ExpectedSemanticsError(findings)
@@ -363,9 +352,12 @@ def freeze_expected_task_semantics(
 def generate_expected_task_semantics(
     projection: BuilderProjection,
     *,
+    public_surface: PublicSurfaceManifest,
     route: AgentRoute | None = None,
     client_factory: ClientFactory | None = None,
 ) -> ExpectedTaskSemantics:
+    if not isinstance(public_surface, PublicSurfaceManifest):
+        raise TypeError("Expected Semantics requires one frozen public-surface/2 manifest")
     selected = route or AgentRoute()
 
     def validate(document: dict[str, Any]) -> None:
@@ -383,12 +375,30 @@ def generate_expected_task_semantics(
             ) from exc
 
     projection_document = projection.to_document()
+    surface_document = public_surface.to_document()
     provider_input = {
         "builder_projection": {
             "frozen_need": projection_document["frozen_need"],
             "selected_world": projection_document["selected_world"],
             "requirements": projection_document["requirements"],
             "initial_world_relations": projection_document["initial_world_relations"],
+        },
+        "public_surface": {
+            "start_schema": surface_document["start_schema"],
+            "reset_observation_schema": surface_document["reset_observation_schema"],
+            "tool_specs": surface_document["tool_specs"],
+            "tool_observation_envelope": {
+                "success": {"ok": True, "data": "matches the tool output_schema", "error": None},
+                "failure": {
+                    "ok": False,
+                    "data": None,
+                    "error": {
+                        "code": "stable public string",
+                        "message": "public diagnostic string",
+                        "details": "optional public JSON value",
+                    },
+                },
+            },
         },
         "host_contract": {
             "required_requirement_ids": list(_projection_requirement_ids(projection)),
@@ -425,10 +435,15 @@ def generate_expected_task_semantics(
                 "can copy from the public instruction or a public observation. Its public_label "
                 "must define that value and any null case without a run-specific answer. Do not "
                 "invent free-form summaries of state changes or verifier judgments.",
-                "Capabilities licensed by the same public condition must declare identical "
-                "branch-neutral answer field IDs and labels. A field inapplicable to one branch "
-                "uses its declared null value; never vary the output schema to reveal the selected "
-                "branch. Do not omit a publicly observable condition when it distinguishes a "
+                "Within one capability, each answer field must have one uniform public source "
+                "across every eligible binding and StartCase. Split capabilities that map to the "
+                "same Requirement when their successful or refusal outcomes come from different "
+                "public tool observations; never require the TaskSemantics Author to invent a "
+                "union source.",
+                "Each capability declares only the final-answer values needed by its own user "
+                "objective. State integrity, process completion and collateral evidence belong to "
+                "the checker, not padded AnswerFields. Condition branches may use different answer "
+                "schemas. Do not omit a publicly observable condition when it distinguishes a "
                 "Taskable success outcome from a Taskable refusal for the same user request.",
                 "Every capability must provide one source-blind qualification_goal: a concise "
                 "public user objective that covers every mapped Taskable Requirement outcome, "
@@ -447,7 +462,9 @@ def generate_expected_task_semantics(
         instructions=(
             "Independently derive complete release-local task semantics from the accepted Need, "
             "world choice and frozen Requirement relations. Treat the supplied Host contract as "
-            "mandatory. Preconditions, outcomes, refusals and collateral constraints describe "
+            "mandatory. The supplied public surface is the complete public observation authority "
+            "for answer/report feasibility; actor source and native state remain unavailable. "
+            "Preconditions, outcomes, refusals and collateral constraints describe "
             "business truth, not tool call recipes. A shared workflow alone does not justify "
             "composition. Environment reset/reconstruction is StartCase setup, not a user Task "
             "capability. A condition is legal only when its truth is publicly observable. Do "

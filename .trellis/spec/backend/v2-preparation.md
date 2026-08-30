@@ -3,8 +3,7 @@
 > **Status: strict product admission and cold preparation implemented for the
 > SQLite and filesystem/Git C3+D verticals.** Public `verify_release_v2` and `prepare_release` reject
 > mechanical fixtures, bind the strict receipt/evidence/Core, reproduce sealed
-> ToolSpecs/CapabilitySpecs/StartCases and expose actor/semantics only. The
-> audit-only verifier is installed solely by `audit_release_v2` for cold replay.
+> ToolSpecs/CapabilitySpecs/StartCases and expose actor/semantics only.
 
 ## 1. Scope / Trigger
 
@@ -46,16 +45,14 @@ with prepared.open(instance_directory) as session:
   content digest.
 - Materialization copies only identity-bound project files. Author inputs,
   actor/candidate views, old `.venv`, caches and `dist` never enter the runtime.
-- Checkpoint D target: admit only a strict passed
-  `environment-qualification/2` receipt whose Core and evidence bindings
-  recompute from archived bytes. Until implemented, preparation is structural
-  test infrastructure and cannot authorize S2.
+- Admit only a strict passed `environment-qualification/2` receipt whose Core
+  and positive capability evidence bindings recompute from archived bytes.
 - Copy actor and semantics projects into different content-addressed runtime roots
   and run real `uv sync --frozen --all-groups --link-mode copy` in each.
-- Checkpoint C target: use the same internal per-project materializer for
-  pre-publication Qualification and sealed preparation. Qualification additionally
-  materializes its audit-only verifier; `prepare_release` never exposes or
-  installs that verifier for Consumers.
+- Use the same internal per-project materializer for pre-publication
+  Qualification and sealed preparation. Qualification additionally materializes
+  its Native Auditor; `prepare_release` never exposes or installs that auditor
+  for Consumers.
 - Children run their own `.venv/bin/python -I -B`; scrub `VIRTUAL_ENV`,
   `PYTHONPATH` and `PYTHONHOME`. Generated packages are never imported by Host.
 - The private request is exactly `{seq, op, args}`. Responses echo `seq` and are

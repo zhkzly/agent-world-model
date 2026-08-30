@@ -13,13 +13,8 @@ from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.environment import JSONObject
 from agent_env_foundry.foreach_foundry import (
     ForEachTask,
-    challenge_foreach_collateral,
     challenge_foreach_partials,
-    challenge_foreach_wrong_answer,
     compile_foreach_tasks,
-    prove_foreach_agent_choices_non_load_bearing,
-    prove_foreach_reverse_order,
-    run_foreach_checker_mutations,
     run_foreach_noop,
     seal_foreach_task_pack,
     solve_foreach_task_twice,
@@ -46,7 +41,6 @@ GoalKind = Literal["atom", "foreach", "if"]
 FailureKind = Literal[
     "NoPublicWitness",
     "ChallengePolicyFailure",
-    "AdmissionPlanningDefect",
     "RejectedTaskPack",
 ]
 type CandidateTask = AtomTask | ForEachTask | IfTask
@@ -59,8 +53,6 @@ _RETRYABLE_TASK_CODES = frozenset(
         "challenge_baseline_failed",
         "wrong_target_baseline_failed",
         "foreach_partial_not_discriminated",
-        "foreach_alternative_order_incomplete",
-        "foreach_alternative_order_not_reversed",
     }
 )
 
@@ -423,9 +415,6 @@ def _admit_candidate(
             max_provider_turns=max_provider_turns,
         )
         noop = run_foreach_noop(prepared, solved_foreach, root / "noop")
-        wrong_answer = challenge_foreach_wrong_answer(
-            prepared, solved_foreach, root / "wrong-answer"
-        )
         partials = challenge_foreach_partials(
             prepared,
             solved_foreach,
@@ -433,34 +422,10 @@ def _admit_candidate(
             route=route,
             max_provider_turns=max_provider_turns,
         )
-        choices = prove_foreach_agent_choices_non_load_bearing(
-            prepared,
-            solved_foreach,
-            root / "agent-choices",
-        )
-        alternative = prove_foreach_reverse_order(
-            prepared,
-            solved_foreach,
-            root / "alternative-order",
-        )
-        collateral = challenge_foreach_collateral(
-            prepared,
-            solved_foreach,
-            atom_tasks,
-            root / "collateral",
-            route=route,
-            max_provider_turns=max_provider_turns,
-        )
-        mutations = run_foreach_checker_mutations(solved_foreach, partials)
         return seal_foreach_task_pack(
             solved_foreach,
             noop,
-            wrong_answer,
             partials,
-            choices,
-            alternative,
-            collateral,
-            mutations,
         )
     if_task = cast(IfTask, candidate.task)
     matching = [item for item in atom_tasks if item.task_id == if_task.branch_task_id]
@@ -601,12 +566,8 @@ def _task_failure_kind(code: str) -> FailureKind:
         "challenge_baseline_failed",
         "wrong_target_baseline_failed",
         "foreach_partial_not_discriminated",
-        "foreach_alternative_order_incomplete",
-        "foreach_alternative_order_not_reversed",
     }:
         return "ChallengePolicyFailure"
-    if code == "foreach_wrong_answer_unavailable":
-        return "AdmissionPlanningDefect"
     return "RejectedTaskPack"
 
 

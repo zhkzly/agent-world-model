@@ -119,10 +119,10 @@ def test_trusted_call_event_records_and_rejects_instance_mutation() -> None:
 
 def test_public_tool_source_binds_tool_and_output_pointer_together() -> None:
     with pytest.raises(SemanticsContractError, match="tool_name"):
-        PublicValueSource("tool_output", None, "/reference", None)
+        PublicValueSource("tool_observation", None, "/data/reference", None)
     with pytest.raises(SemanticsContractError, match="json_pointer"):
-        PublicValueSource("tool_output", "lookup", None, None)
-    source = PublicValueSource("tool_output", "lookup", "/reference", None)
+        PublicValueSource("tool_observation", "lookup", None, None)
+    source = PublicValueSource("tool_observation", "lookup", "/data/reference", None)
     assert source.tool_name == "lookup"
     facet = FacetSpec(
         "reference",
@@ -156,7 +156,7 @@ def test_composition_and_rendering_use_the_final_plan_contract() -> None:
         "confirmation",
         STRING,
         "confirmation",
-        PublicValueSource("tool_output", "finish_item", "/confirmation", None),
+        PublicValueSource("tool_observation", "finish_item", "/data/confirmation", None),
     )
     rendering = RenderingSpec("finish", "item", "report the confirmation")
     assert answer.to_document() == {
@@ -164,9 +164,9 @@ def test_composition_and_rendering_use_the_final_plan_contract() -> None:
         "schema": STRING,
         "public_label": "confirmation",
         "public_source": {
-            "kind": "tool_output",
+            "kind": "tool_observation",
             "tool_name": "finish_item",
-            "json_pointer": "/confirmation",
+            "json_pointer": "/data/confirmation",
             "value": None,
         },
     }
@@ -175,7 +175,7 @@ def test_composition_and_rendering_use_the_final_plan_contract() -> None:
 
 
 def test_answer_field_schema_is_strict_structured_output_compatible() -> None:
-    source = PublicValueSource("tool_output", "inspect", "/value", None)
+    source = PublicValueSource("tool_observation", "inspect", "/data/value", None)
     invalid = (
         {"type": "array"},
         {"type": ["array", "null"]},
@@ -225,7 +225,7 @@ def _capability(*, capability_id: str = "finish") -> CapabilitySpec:
                 "confirmation",
                 STRING,
                 "confirmation",
-                PublicValueSource("tool_output", "finish_item", "/confirmation", None),
+                PublicValueSource("tool_observation", "finish_item", "/data/confirmation", None),
             ),
         ),
         supported_goal_kinds=("atom",),

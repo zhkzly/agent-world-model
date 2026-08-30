@@ -168,105 +168,54 @@ def _result(*, satisfied: bool) -> dict[str, object]:
     }
 
 
-def _case(
-    category: str,
-    root: Path,
-    *,
-    capability_id: str = "cap-1",
-) -> dict[str, object]:
-    satisfied = category in {"positive", "alternative_route", "fresh_replay"}
-    semantics = _result(satisfied=satisfied)
-    if category == "wrong_answer":
-        semantics.update(
-            required_effects_ok=True,
-            answer_ok=False,
-            process_ok=True,
-        )
-    elif category == "collateral":
-        semantics.update(
-            required_effects_ok=True,
-            collateral_ok=False,
-            process_ok=True,
-        )
-    elif category == "missing_process":
-        semantics.update(required_effects_ok=True, process_ok=False)
-    verifier = {**semantics, "failure_codes": [] if satisfied else ["OTHER_DIAGNOSTIC"]}
-    before = root / f"{capability_id}-{category}-before"
-    after = root / f"{capability_id}-{category}-after"
+def _case(root: Path, *, capability_id: str = "cap-1") -> dict[str, object]:
+    semantics = _result(satisfied=True)
+    verifier = {
+        "required_effects_ok": True,
+        "collateral_ok": True,
+        "failure_codes": [],
+    }
+    before = root / f"{capability_id}-positive-before"
+    after = root / f"{capability_id}-positive-after"
     before.mkdir(parents=True, exist_ok=True)
     after.mkdir(parents=True, exist_ok=True)
     (before / "state.json").write_text('{"count":0}')
     (after / "state.json").write_text('{"count":1}')
     return {
-        "category": category,
+        "category": "positive",
         "capability_id": capability_id,
         "start_case_id": "case-1",
         "semantic_key": "counter",
         "public_descriptor": {"name": "counter"},
         "before_instance_directory": str(before),
         "after_instance_directory": str(after),
+        "reset_observation": {"count": 0},
         "axis_agreement": True,
         "readers_unchanged": True,
         "trace": [],
         "final_answer": {},
         "semantics_result": semantics,
         "verifier_result": verifier,
+        "answer_source_evidence": [],
     }
 
 
-def _cases(root: Path) -> tuple[dict[str, object], ...]:
-    return tuple(
-        _case(category, root)
-        for category in (
-            "positive",
-            "no_op",
-            "wrong_target",
-            "near_miss",
-            "wrong_answer",
-            "collateral",
-            "missing_process",
-            "alternative_route",
-            "fresh_replay",
-        )
-    )
-
-
-def _mutants() -> tuple[dict[str, object], ...]:
-    return (
-        {
-            "mutant_id": "semantics-effects",
-            "target_role": "semantics",
-            "killed": True,
-            "killed_by": "generated_project_tests",
-            "evidence": {"test": "failed"},
-        },
-        {
-            "mutant_id": "verifier-collateral",
-            "target_role": "verifier",
-            "killed": True,
-            "killed_by": "physical_axis_comparison",
-            "evidence": {"axis": "collateral_ok"},
-        },
-    )
-
-
-def test_evidence_sealing_requires_complete_physical_matrix(tmp_path: Path) -> None:
+def test_evidence_sealing_requires_one_positive_per_capability(tmp_path: Path) -> None:
     core = derive_qualification_core(_inputs(tmp_path / "inputs"))
     destination = tmp_path / "evidence"
     manifest = seal_qualification_evidence(
         core,
         destination,
-        case_records=_cases(tmp_path / "case-inputs"),
-        mutation_records=_mutants(),
+        case_records=(_case(tmp_path / "case-inputs"),),
         required_capability_ids=("cap-1",),
     )
 
     assert manifest["format"] == "qualification-evidence/2"
     assert manifest["core_id"] == core.core_id
-    assert len(manifest["cases"]) == 9
-    assert len(manifest["mutations"]) == 2
+    assert len(manifest["cases"]) == 1
+    assert "mutations" not in manifest
     assert (destination / "evidence-manifest.json").is_file()
-    for entry in (*manifest["cases"], *manifest["mutations"]):
+    for entry in manifest["cases"]:
         assert (destination / entry["path"]).is_file()
     assert (
         verify_qualification_evidence(
@@ -276,48 +225,6 @@ def test_evidence_sealing_requires_complete_physical_matrix(tmp_path: Path) -> N
         )
         == manifest
     )
-
-    without_alternative = tuple(
-        item
-        for item in _cases(tmp_path / "no-alternative-inputs")
-        if item["category"] not in {"alternative_route", "near_miss"}
-    )
-    no_alternative_manifest = seal_qualification_evidence(
-        core,
-        tmp_path / "no-alternative",
-        case_records=without_alternative,
-        mutation_records=_mutants(),
-        required_capability_ids=("cap-1",),
-    )
-    assert len(no_alternative_manifest["cases"]) == 7
-
-    query_wrong_target = list(_cases(tmp_path / "query-wrong-target-inputs"))
-    wrong_target_index = next(
-        index for index, item in enumerate(query_wrong_target) if item["category"] == "wrong_target"
-    )
-    wrong_target = query_wrong_target[wrong_target_index]
-    query_result = {
-        **wrong_target["semantics_result"],
-        "required_effects_ok": True,
-        "answer_ok": False,
-        "process_ok": False,
-    }
-    query_wrong_target[wrong_target_index] = {
-        **wrong_target,
-        "semantics_result": query_result,
-        "verifier_result": {
-            **query_result,
-            "failure_codes": ["INDEPENDENT_WRONG_TARGET"],
-        },
-    }
-    query_manifest = seal_qualification_evidence(
-        core,
-        tmp_path / "query-wrong-target",
-        case_records=tuple(query_wrong_target),
-        mutation_records=_mutants(),
-        required_capability_ids=("cap-1",),
-    )
-    assert len(query_manifest["cases"]) == 9
 
     first = destination / manifest["cases"][0]["path"]
     first.write_bytes(b"{}")
@@ -329,46 +236,41 @@ def test_evidence_sealing_requires_complete_physical_matrix(tmp_path: Path) -> N
         )
     assert caught.value.code == "qualification_evidence_digest_mismatch"
 
-    missing = _cases(tmp_path / "missing-inputs")[:-1]
     with pytest.raises(QualificationV2Error) as caught:
         seal_qualification_evidence(
             core,
             tmp_path / "missing",
-            case_records=missing,
-            mutation_records=_mutants(),
+            case_records=(),
             required_capability_ids=("cap-1",),
         )
     assert caught.value.code == "qualification_evidence_categories_missing"
 
+    with pytest.raises(QualificationV2Error) as caught:
+        seal_qualification_evidence(
+            core,
+            tmp_path / "missing-capability",
+            case_records=(_case(tmp_path / "missing-capability-inputs"),),
+            required_capability_ids=("cap-1", "cap-2"),
+        )
+    assert caught.value.code == "qualification_positive_coverage_missing"
 
-def test_evidence_sealing_rejects_disagreement_or_surviving_mutant(tmp_path: Path) -> None:
+
+def test_evidence_sealing_rejects_native_state_disagreement(tmp_path: Path) -> None:
     core = derive_qualification_core(_inputs(tmp_path / "inputs"))
-    disagreeing = list(_cases(tmp_path / "disagreeing-inputs"))
-    disagreeing[0] = {
-        **disagreeing[0],
-        "verifier_result": _result(satisfied=False),
+    disagreeing = _case(tmp_path / "disagreeing-inputs")
+    disagreeing["verifier_result"] = {
+        "required_effects_ok": False,
+        "collateral_ok": True,
+        "failure_codes": ["REQUIRED_EFFECT_MISSING"],
     }
     with pytest.raises(QualificationV2Error) as caught:
         seal_qualification_evidence(
             core,
             tmp_path / "disagreement",
-            case_records=tuple(disagreeing),
-            mutation_records=_mutants(),
+            case_records=(disagreeing,),
             required_capability_ids=("cap-1",),
         )
     assert caught.value.code == "qualification_reader_disagreement"
-
-    surviving = list(_mutants())
-    surviving[0] = {**surviving[0], "killed": False}
-    with pytest.raises(QualificationV2Error) as caught:
-        seal_qualification_evidence(
-            core,
-            tmp_path / "surviving",
-            case_records=_cases(tmp_path / "surviving-inputs"),
-            mutation_records=tuple(surviving),
-            required_capability_ids=("cap-1",),
-        )
-    assert caught.value.code == "qualification_mutant_survived"
 
 
 def test_core_derivation_and_three_runtime_materialization_are_exact(tmp_path: Path) -> None:

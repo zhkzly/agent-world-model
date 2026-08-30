@@ -11,14 +11,13 @@ from typing import Any, Literal, cast
 from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
-from agent_env_foundry.preparation import OpenPreparedRelease, OpenPreparedSession
+from agent_env_foundry.preparation import OpenPreparedRelease
 from agent_env_foundry.provenance import ArgumentProvenance, resolve_argument_provenance
 from agent_env_foundry.public_agent import run_public_episode
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
     AtomCheckResult,
-    BindingCandidate,
     ConditionCheckRequest,
     ConditionCheckResult,
     ConditionSpec,
@@ -62,12 +61,6 @@ class IfTask:
         )
 
     @property
-    def opposite_capability_id(self) -> str:
-        return (
-            self.false_capability_id if self.expected_branch == "true" else self.true_capability_id
-        )
-
-    @property
     def task_id(self) -> str:
         return hashlib.sha256(canonical_bytes(self.to_document())).hexdigest()
 
@@ -93,14 +86,6 @@ class IfTask:
 @dataclass(frozen=True, slots=True)
 class IfAdmissionPlan:
     task_id: str
-    checker_mutations: tuple[str, ...]
-
-    def __post_init__(self) -> None:
-        if self.checker_mutations != ("flip_condition_branch",):
-            raise TaskFoundryError(
-                "if_admission_plan_invalid",
-                "If admission must precommit to the flip-condition-branch mutant",
-            )
 
     @property
     def plan_id(self) -> str:
@@ -108,9 +93,8 @@ class IfAdmissionPlan:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "if-admission-plan/1",
+            "format": "if-admission-plan/2",
             "task_id": self.task_id,
-            "checker_mutations": list(self.checker_mutations),
         }
 
     def to_document(self) -> JSONObject:
@@ -127,7 +111,6 @@ class IfWitness:
     argument_provenance: tuple[ArgumentProvenance, ...]
     condition_result: ConditionCheckResult
     branch_result: AtomCheckResult
-    opposite_branch_result: AtomCheckResult
     provider_turns: int
     usage: tuple[JSONObject | None, ...]
 
@@ -146,7 +129,6 @@ class IfWitness:
             "argument_provenance": [item.to_document() for item in self.argument_provenance],
             "condition_result": self.condition_result.to_document(),
             "branch_result": self.branch_result.to_document(),
-            "opposite_branch_result": self.opposite_branch_result.to_document(),
             "provider_turns": self.provider_turns,
             "usage": [_json(item) for item in self.usage],
         }
@@ -186,11 +168,6 @@ class SolvedIfTask:
                 "if_witness_branch_failed",
                 "If witness did not satisfy its selected Atom branch",
             )
-        if any(item.opposite_branch_result.satisfied for item in self.witnesses):
-            raise TaskFoundryError(
-                "if_witness_opposite_branch_accepted",
-                "If witness was falsely accepted by the opposite Atom branch",
-            )
 
     def to_document(self) -> JSONObject:
         return {
@@ -220,14 +197,6 @@ class IfAdmissionReport:
                 "if_branch_task_pack_mismatch",
                 "If admission branch TaskPack differs from its frozen Atom branch",
             )
-        if self.solved.admission_plan.checker_mutations != ("flip_condition_branch",) or any(
-            not item.branch_result.satisfied or item.opposite_branch_result.satisfied
-            for item in self.solved.witnesses
-        ):
-            raise TaskFoundryError(
-                "if_branch_mutation_survived",
-                "If flip-condition-branch mutant survived admission",
-            )
 
     @property
     def report_id(self) -> str:
@@ -235,16 +204,11 @@ class IfAdmissionReport:
 
     def _preimage(self) -> JSONObject:
         return {
-            "format": "if-admission-report/1",
+            "format": "if-admission-report/2",
             "task_id": self.solved.task.task_id,
             "admission_plan": self.solved.admission_plan.to_document(),
             "witnesses": [item.to_document() for item in self.solved.witnesses],
             "branch_task_pack": self.branch_task_pack.to_document(),
-            "checker_mutation": {
-                "mutation_id": "flip_condition_branch",
-                "killed": True,
-                "witness_ids": [item.witness_id for item in self.solved.witnesses],
-            },
         }
 
     def to_document(self) -> JSONObject:
@@ -341,16 +305,6 @@ def compile_if_tasks(
                     and item.capability_id in {true_capability, false_capability}
                 )
                 for atom in sorted(branch_atoms, key=lambda item: item.semantic_key):
-                    profile_capabilities = {
-                        item.capability_id
-                        for item in branch_atoms
-                        if item.answer_schema == atom.answer_schema
-                    }
-                    if profile_capabilities != {true_capability, false_capability}:
-                        raise TaskFoundryError(
-                            "if_branch_answer_contract_mismatch",
-                            "If branches require the same bounded report profile",
-                        )
                     binding = _resolve_binding(session, atom, facts)
                     condition_result = session.trusted.evaluate_condition(
                         ConditionCheckRequest(
@@ -459,109 +413,26 @@ def solve_if_task_twice(
     max_provider_turns: int = 12,
 ) -> SolvedIfTask:
     _verify_task(prepared, task)
-    branch_task = _task_by_id(atom_task_universe, task.branch_task_id)
-    _verify_checker_preimage(prepared, branch_task)
-    admission_plan = IfAdmissionPlan(task.task_id, ("flip_condition_branch",))
+    admission_plan = IfAdmissionPlan(task.task_id)
     selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
     witnesses: list[IfWitness] = []
     for index in (1, 2):
-        instance = Path(instance_root) / f"witness-{index}"
-        with prepared.open(instance) as session:
-            reset = session.actor.reset(task.start_case.reset_input)
-            before = session.trusted.inspect(instance)
-            binding = _resolve_binding(session, branch_task, before)
-            opposite_binding = _resolve_opposite_binding(session, task, before)
-            condition_result = session.trusted.evaluate_condition(
-                ConditionCheckRequest(
-                    task.condition_id,
-                    before,
-                    binding.protected_binding,
-                    (),
-                )
+        witness = run_if_task_once(
+            prepared,
+            task,
+            atom_task_universe,
+            Path(instance_root) / f"witness-{index}",
+            route=selected_route,
+            max_provider_turns=max_provider_turns,
+        )
+        if not witness.branch_result.satisfied:
+            raise TaskFoundryError(
+                "if_public_witness_failed",
+                "Public Agent did not satisfy the condition-selected branch",
+                condition_result=witness.condition_result.to_document(),
+                branch_result=witness.branch_result.to_document(),
             )
-            if condition_result.status != task.expected_branch:
-                raise TaskFoundryError(
-                    "if_condition_drift",
-                    "Fresh If condition selected another branch",
-                )
-            tool_specs = session.actor.tools()
-            episode = run_public_episode(
-                actor=session.actor,
-                instruction=task.instruction,
-                reset_observation=reset,
-                tool_specs=tool_specs,
-                answer_schema=task.answer_schema,
-                route=selected_route,
-                max_provider_turns=max_provider_turns,
-            )
-            after = session.trusted.inspect(instance)
-            branch_result = _evaluate_report_atom(
-                session,
-                AtomCheckRequest(
-                    task.branch_capability_id,
-                    before,
-                    after,
-                    binding.protected_binding,
-                    episode.trace,
-                    episode.final_answer,
-                    _context(
-                        task.branch_capability_id,
-                        binding.semantic_key,
-                        binding.protected_binding,
-                    ),
-                ),
-                task.answer_schema,
-            )
-            opposite_result = _evaluate_report_atom(
-                session,
-                AtomCheckRequest(
-                    task.opposite_capability_id,
-                    before,
-                    after,
-                    opposite_binding.protected_binding,
-                    episode.trace,
-                    episode.final_answer,
-                    _context(
-                        task.opposite_capability_id,
-                        opposite_binding.semantic_key,
-                        opposite_binding.protected_binding,
-                    ),
-                ),
-                task.answer_schema,
-            )
-            if not branch_result.satisfied:
-                raise TaskFoundryError(
-                    "if_public_witness_failed",
-                    "Public Agent did not satisfy the condition-selected branch",
-                    condition_result=condition_result.to_document(),
-                    branch_result=branch_result.to_document(),
-                )
-            if opposite_result.satisfied:
-                raise TaskFoundryError(
-                    "if_opposite_branch_false_acceptance",
-                    "Physical If witness was accepted by the opposite branch checker",
-                    opposite_result=opposite_result.to_document(),
-                )
-            witnesses.append(
-                IfWitness(
-                    task.task_id,
-                    session.identity.materialization_id,
-                    _json(reset),
-                    episode.trace,
-                    episode.final_answer,
-                    resolve_argument_provenance(
-                        trace=episode.trace,
-                        instruction_values={"selected_target": task.public_descriptor},
-                        reset_observation=reset,
-                        tool_specs=tool_specs,
-                    ),
-                    condition_result,
-                    branch_result,
-                    opposite_result,
-                    episode.provider_turns,
-                    episode.usage,
-                )
-            )
+        witnesses.append(witness)
     return SolvedIfTask(
         task,
         admission_plan,
@@ -569,22 +440,84 @@ def solve_if_task_twice(
     )
 
 
-def _resolve_opposite_binding(
-    session: OpenPreparedSession,
+def run_if_task_once(
+    prepared: OpenPreparedRelease,
     task: IfTask,
-    facts: JSONValue,
-) -> BindingCandidate:
-    matching = [
-        item
-        for item in session.trusted.enumerate_bindings(task.opposite_capability_id, facts)
-        if item.semantic_key == task.semantic_key
-    ]
-    if len(matching) != 1 or matching[0].public_descriptor != task.public_descriptor:
-        raise TaskFoundryError(
-            "if_opposite_binding_unresolved",
-            "If checker cannot resolve the same public referent in the opposite branch",
+    atom_task_universe: tuple[AtomTask, ...],
+    instance_root: Path,
+    *,
+    route: AgentRoute | None = None,
+    max_provider_turns: int = 12,
+) -> IfWitness:
+    """Run one fresh public If attempt without changing Task admission."""
+
+    _verify_task(prepared, task)
+    branch_task = _task_by_id(atom_task_universe, task.branch_task_id)
+    _verify_checker_preimage(prepared, branch_task)
+    selected_route = route or AgentRoute(max_provider_turns=max_provider_turns)
+    instance = Path(instance_root)
+    with prepared.open(instance) as session:
+        reset = session.actor.reset(task.start_case.reset_input)
+        before = session.trusted.inspect(instance)
+        binding = _resolve_binding(session, branch_task, before)
+        condition_result = session.trusted.evaluate_condition(
+            ConditionCheckRequest(
+                task.condition_id,
+                before,
+                binding.protected_binding,
+                (),
+            )
         )
-    return matching[0]
+        if condition_result.status != task.expected_branch:
+            raise TaskFoundryError(
+                "if_condition_drift",
+                "Fresh If condition selected another branch",
+            )
+        tool_specs = session.actor.tools()
+        episode = run_public_episode(
+            actor=session.actor,
+            instruction=task.instruction,
+            reset_observation=reset,
+            tool_specs=tool_specs,
+            answer_schema=task.answer_schema,
+            route=selected_route,
+            max_provider_turns=max_provider_turns,
+        )
+        after = session.trusted.inspect(instance)
+        branch_result = _evaluate_report_atom(
+            session,
+            AtomCheckRequest(
+                task.branch_capability_id,
+                before,
+                after,
+                binding.protected_binding,
+                episode.trace,
+                episode.final_answer,
+                _context(
+                    task.branch_capability_id,
+                    binding.semantic_key,
+                    binding.protected_binding,
+                ),
+            ),
+            task.answer_schema,
+        )
+        return IfWitness(
+            task.task_id,
+            session.identity.materialization_id,
+            _json(reset),
+            episode.trace,
+            episode.final_answer,
+            resolve_argument_provenance(
+                trace=episode.trace,
+                instruction_values={"selected_target": task.public_descriptor},
+                reset_observation=reset,
+                tool_specs=tool_specs,
+            ),
+            condition_result,
+            branch_result,
+            episode.provider_turns,
+            episode.usage,
+        )
 
 
 def _conditions(catalog: dict[str, Any]) -> tuple[ConditionSpec, ...]:
@@ -676,6 +609,7 @@ __all__ = [
     "IfWitness",
     "SolvedIfTask",
     "compile_if_tasks",
+    "run_if_task_once",
     "seal_if_task_pack",
     "solve_if_task_twice",
 ]
