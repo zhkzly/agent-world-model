@@ -25,7 +25,13 @@ from agent_env_foundry.project_identity import (
     compute_authored_project_digest,
     project_files,
 )
-from agent_env_foundry.release import canonical_bytes
+from agent_env_foundry.release import (
+    canonical_bytes,
+    validate_requirement_obligation_references,
+)
+from agent_env_foundry.requirement_obligations import (
+    requirement_obligations_from_expected_document,
+)
 from agent_env_foundry.semantics import (
     CapabilitySpec,
     capability_from_document,
@@ -436,9 +442,13 @@ def _contract_check(
             limit=start_limit,
         )
         catalog = validate_catalog(tuple(specs))
-        _align_expected_catalog(
-            _read_json(prepared.root / EXPECTED_TASK_SEMANTICS_NAME),
-            catalog,
+        expected = _read_json(prepared.root / EXPECTED_TASK_SEMANTICS_NAME)
+        _align_expected_catalog(expected, catalog)
+        validate_requirement_obligation_references(
+            requirement_obligations_from_expected_document(expected),
+            tuple(specs),
+            tuple(cases),
+            expected,
         )
     except Exception as exc:
         return CommandResult(

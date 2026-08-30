@@ -297,3 +297,44 @@ Evidence: the pre-fix implementation accepted an unrelated 64-hex attempt ID;
 the new focused test observed that RED, the corrected code is GREEN, and an
 attempt-identity-check mutant is killed. The audit found no sampler, S3,
 compatibility, domain-specific or extra service/node drift.
+
+## Checkpoint B activated — sealed Requirement obligation boundary
+
+Smallest observed gap: one real Git Requirement currently covers list, read and
+status capabilities, so its free-text outcomes cannot tell S2 which clauses
+apply to one concrete Task. Requirement-to-capability coverage alone therefore
+cannot support bidirectional Task coverage.
+
+Selected: each expected-semantics clause carries one finite applicability
+handle; Framework derives its stable obligation ID and text digest. Taskable
+clauses must carry a handle, while non-Taskable background clauses must not.
+The catalog remains inside the already-digested expected-semantics payload, so
+no new Agent, receipt field, package, service or generic expression language is
+introduced.
+
+Rejected: treating every Requirement clause as always applicable, asking S2 or
+a witness trace to decide relevance, model-authored hashes/manifest IDs, or a
+separate obligation-authoring turn. Evidence that would reverse this choice is
+a deterministic mapping from the current free-text clauses to per-Task
+applicability across Git and SQLite; the existing multi-capability Requirements
+are direct counterexamples.
+
+## Checkpoint B1 execution evidence — sealed obligation input
+
+Implemented `expected-task-semantics/2` with Framework-derived obligation IDs,
+finite applicability handles, strict Publication/cold-read reference checks and
+a read-only prepared-release projection. The existing expected-semantics digest
+binds the catalog; no extra receipt field or generated runtime method was added.
+
+The first live request failed before model execution because the strict
+Responses schema allowed an unconstrained array/object facet literal. The
+responsible Framework boundary was corrected by restricting facet literals to
+comparable JSON scalars and reusing one deterministic strict-output schema
+preflight for both AnswerFields and Expected Semantics.
+
+The next Luna live turn passed and produced canonical SQLite-derived expected
+semantics digest
+`e0e08a3f647f178d7c59ad130a80def73333e27737f8c6a125a89da27dc93704`
+with three sealed obligations. This is live B1 contract evidence only: it is
+not a new qualified Release and does not complete TaskSpecification/V0 or
+Checkpoint B.

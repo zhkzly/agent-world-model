@@ -18,6 +18,10 @@ Read completely before editing:
 Implement `generated_task_semantics.release:make_semantics` plus diagnostic
 tests. Own the release-specific native decoder, deterministic StartCases,
 CapabilitySpecs, binding enumeration and atomic/condition evaluation logic.
+Every finite applicability handle in `EXPECTED_TASK_SEMANTICS.json` must resolve
+against the exact StartCase, Capability, Condition or Facet IDs your project
+returns. Those handles are frozen semantic inputs: implement their references;
+do not rename, drop or reinterpret them to simplify the code.
 
 For query capabilities, inspect the complete public surface and accept any
 successful public read that exposes the selected referent and the exact

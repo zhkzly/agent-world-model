@@ -128,3 +128,5 @@ session.
 `s2-checkpoint-a-reload|介入1|返工1|roleplay trace+shared lifecycle+7 mutation licenses+SQLite/Git/ForEach/If real reopen|红线违反0`
 
 `s2-checkpoint-a-identity-audit|介入1|返工1|post-GREEN scope audit+attempt preimage RED/GREEN+mutation license|红线违反0`
+
+`s2-checkpoint-b1-obligations|介入1|返工1|real Git multi-capability counterexample+expected/2 finite handles+strict schema preflight+live Luna digest|红线违反0`

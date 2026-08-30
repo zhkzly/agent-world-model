@@ -33,6 +33,8 @@ with prepared.open(instance_directory) as session:
     session.actor.tools()
     session.actor.invoke(...)
     session.trusted.inspect(instance_directory)
+
+prepared.requirement_obligations  # read-only sealed S1 catalog for S2
 ```
 
 `open` never resets or deletes the caller-owned instance.
@@ -68,6 +70,9 @@ with prepared.open(instance_directory) as session:
   trees can contain meaningful empty directories.
 - Structured semantics documents use exact-key decoders and existing constructors;
   no expression language, recipe or executable verifier crosses the wire.
+- `requirement_obligations` is reconstructed from exact
+  `expected-task-semantics/2` bytes during release verification. Preparation
+  never asks generated code or S2 to author/reclassify it.
 
 ## S2 witness/assessment attempt lifecycle
 
@@ -102,6 +107,7 @@ already converted.
 | response timeout/EOF after healthy use | `InfrastructureFailure` |
 | ZIP drops an empty sealed directory or changes its mode | strict evidence tree mismatch before preparation |
 | response seq or shape mismatch | fail closed; no value reaches caller |
+| missing/tampered obligation or unresolved applicability reference | release rejection before sync/open |
 | prepared source or `.pth` origin changes | reject before child launch |
 | actor imports semantics | `EnvironmentDefect/runtime_import_leak` |
 | semantics imports actor | `SemanticsDefect/runtime_import_leak` |
@@ -132,6 +138,8 @@ already converted.
 - S2 witness/assessment evidence rejects same-session reuse, another native
   instance, a second reset, missing close, reordered lifecycle and checker
   evaluation before reopen.
+- Current-format obligation identities, exact handle variants and prepared
+  read-only projection; `/1` is rejected without conversion.
 - Trusted mutation and mutate-then-error both produce an unchanged=false event and rejection.
 - Both import-leak directions, ambient Host import, source and `.pth` tamper.
 - Generated stdout noise, startup attribution, sequence mismatch and real timeout.

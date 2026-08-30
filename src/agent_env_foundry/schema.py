@@ -23,6 +23,7 @@ __all__ = [
     "require_object_root",
     "validate_instance",
     "validate_schema_document",
+    "validate_strict_output_schema",
 ]
 
 # Keywords whose values are URIs/URI references; release schemas may only use
@@ -65,6 +66,64 @@ def validate_instance(instance: Any, schema: Any, *, role: str) -> None:
     if error is not None:
         location = "$" + "".join(f"[{part!r}]" for part in error.absolute_path)
         raise SchemaError(f"{role} does not match its schema at {location}: {error.message}")
+
+
+def validate_strict_output_schema(schema: Any, *, role: str) -> None:
+    """Require the recursive shape accepted by strict Responses structured output."""
+
+    validate_schema_document(schema, role=role)
+    pending: list[tuple[Any, str]] = [(schema, "$")]
+    while pending:
+        node, path = pending.pop()
+        if not isinstance(node, dict):
+            raise SchemaError(f"{role} strict structured output schema at {path} must be an object")
+        raw_types = node.get("type")
+        types = (
+            {raw_types}
+            if isinstance(raw_types, str)
+            else set(raw_types)
+            if isinstance(raw_types, list)
+            else set()
+        )
+        if "array" in types:
+            items = node.get("items")
+            if not isinstance(items, dict):
+                raise SchemaError(f"{role} strict structured output array at {path} requires items")
+            pending.append((items, f"{path}.items"))
+        if "object" in types:
+            properties = node.get("properties")
+            required = node.get("required")
+            if (
+                not isinstance(properties, dict)
+                or node.get("additionalProperties") is not False
+                or not isinstance(required, list)
+                or set(required) != set(properties)
+            ):
+                raise SchemaError(
+                    f"{role} strict structured output object at {path} requires properties, "
+                    "all properties in required, and additionalProperties=false"
+                )
+            pending.extend(
+                (child, f"{path}.properties.{name}") for name, child in properties.items()
+            )
+        for keyword in ("anyOf", "oneOf", "allOf"):
+            branches = node.get(keyword)
+            if branches is None:
+                continue
+            if not isinstance(branches, list):
+                raise SchemaError(
+                    f"{role} strict structured output {keyword} at {path} must be an array"
+                )
+            pending.extend(
+                (branch, f"{path}.{keyword}[{index}]") for index, branch in enumerate(branches)
+            )
+        definitions = node.get("$defs")
+        if definitions is not None:
+            if not isinstance(definitions, dict):
+                raise SchemaError(
+                    f"{role} strict structured output $defs at {path} must be an object"
+                )
+            pending.extend((child, f"{path}.$defs.{name}") for name, child in definitions.items())
 
 
 def _require_local_references(node: Any, *, role: str) -> None:

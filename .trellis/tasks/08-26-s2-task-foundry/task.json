@@ -32,10 +32,12 @@
     "src/agent_env_foundry/release.py",
     "src/agent_env_foundry/assessment.py",
     "src/agent_env_foundry/task_execution.py",
+    "src/agent_env_foundry/requirement_obligations.py",
     "src/agent_env_foundry/_actor_runner.py",
     "src/agent_env_foundry/_semantics_runner.py",
     "tests/test_semantics_contract.py",
     "tests/test_task_execution.py",
+    "tests/test_requirement_obligations.py",
     "tests/v2_release_factory.py",
     "tests/test_release_v2.py",
     "tests/test_preparation.py",
@@ -45,7 +47,7 @@
     ".trellis/spec/backend/v2-qualification-publication.md",
     ".trellis/spec/backend/s2-assessment-corpus.md"
   ],
-  "notes": "Checkpoint A physical lifecycle/ReloadEvidence is GREEN: 353 tests and real SQLite state-change, Git query, SQLite ForEach/If reopen evidence pass. One public-policy failure was retained honestly. Commit 189be1b remains only the older Capability-to-Task checkpoint; Good Task Checkpoints B-H remain pending.",
+  "notes": "Checkpoint A physical lifecycle/ReloadEvidence is GREEN. Checkpoint B1 now seals expected-task-semantics/2 Requirement obligations with finite applicability and has one live Luna expected-semantics digest; TaskSpecification/V0, new qualified Git/SQLite releases, and Checkpoints C-H remain pending.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "release-discovery-task_spec-v0-start-binding-freeze-witness-truth_challenge-taskpack-assessment-corpus",
@@ -71,6 +73,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "checkpoint_a_reload_evidence_green"
+    "implementation_checkpoint": "checkpoint_b1_requirement_obligations_green"
   }
 }

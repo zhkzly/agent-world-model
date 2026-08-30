@@ -24,6 +24,26 @@ and Qualification alone decide whether it is usable.
 Do not edit these files. Do not copy Host digests, manifests, run IDs or verdicts
 into generated semantic records.
 
+`EXPECTED_TASK_SEMANTICS.json` uses `expected-task-semantics/2`. Every Taskable
+precondition, effect, refusal, collateral or required public-process clause has
+one Framework-derived obligation identity and one finite applicability handle.
+The generated project does not return obligation records, IDs or digests. It
+must instead make every referenced semantic ID real in its ordinary outputs:
+
+```text
+always                         -> no additional reference
+start_case(case_id)            -> start_cases returns that exact case_id
+binding_eligible(capability)   -> capabilities returns it and eligible bindings can exist
+condition_branch(condition,b)  -> capabilities exposes that exact ConditionSpec and branch
+facet_predicate(cap,facet,op)  -> the capability exposes the facet and allowed operator
+```
+
+Host checks these references immediately after `start_cases` and `capabilities`.
+Do not turn a sampled tool sequence into a process constraint or weaken a clause
+whose handle is inconvenient. `process_constraints` means the user objective
+requires that public process semantic (for example confirmation after reopen),
+not that one particular tool name or reference call order is mandatory.
+
 Generated diagnostic tests must validate representative `start_cases`,
 `capabilities`, `enumerate_bindings`, atom results and condition results against
 `TASK_SEMANTICS_WIRE.json` before reporting completion.

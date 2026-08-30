@@ -45,6 +45,7 @@ from agent_env_foundry.release import (
     safe_member_path,
     verify_release_v2,
 )
+from agent_env_foundry.requirement_obligations import RequirementObligation
 from agent_env_foundry.schema import SchemaError, validate_instance
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
@@ -637,6 +638,12 @@ class OpenPreparedRelease:
             JSONObject,
             json.loads(json.dumps(self._release.sealed_task_goals, ensure_ascii=False)),
         )
+
+    @property
+    def requirement_obligations(self) -> tuple[RequirementObligation, ...]:
+        if self._release.sealed_requirement_obligations is None:
+            raise PreparationContractError("prepared release has no sealed Requirement obligations")
+        return self._release.sealed_requirement_obligations
 
     def open(self, instance_directory: Path) -> OpenPreparedSession:
         _verify_runtime(self._actor, self._settings.command_timeout_seconds)

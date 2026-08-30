@@ -4,6 +4,8 @@ import os
 import sys
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest import mock
 
 import pytest
@@ -21,6 +23,10 @@ from agent_env_foundry.preparation import (
 )
 from agent_env_foundry.project_identity import ProjectIdentityError
 from agent_env_foundry.release import _verify_release_layout_v2
+from agent_env_foundry.requirement_obligations import (
+    ObligationApplicability,
+    RequirementObligation,
+)
 from agent_env_foundry.semantics import (
     AtomCheckRequest,
     ConditionCheckRequest,
@@ -64,6 +70,28 @@ def test_product_prepare_rejects_mechanical_fixture(tmp_path: Path) -> None:
     release = build_v2_release(tmp_path / "mechanical")
     with pytest.raises(EnvironmentContractError, match="strict Qualification receipt"):
         prepare_release(release, tmp_path / "cache", settings=_settings())
+
+
+def test_prepared_release_exposes_only_the_sealed_obligation_projection() -> None:
+    obligation = RequirementObligation(
+        "REQ-1",
+        "effect",
+        "The selected operation succeeds.",
+        ObligationApplicability("binding_eligible", capability_id="cap-1"),
+    )
+    release = SimpleNamespace(
+        identity=SimpleNamespace(release_id="a" * 64),
+        sealed_requirement_obligations=(obligation,),
+        sealed_task_goals={},
+    )
+    prepared = OpenPreparedRelease(
+        cast(Any, release),
+        cast(Any, None),
+        cast(Any, None),
+        _settings(),
+    )
+
+    assert prepared.requirement_obligations == (obligation,)
 
 
 def test_product_prepare_rejects_live_catalog_drift(
