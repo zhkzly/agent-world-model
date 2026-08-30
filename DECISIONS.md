@@ -172,3 +172,5 @@
 `s2-git-f-first-atoms|介入0|返工3|2 current-release TaskPacks+4 AgentChoice rebinds+physical collateral+8 checker mutants|红线违反0`
 
 `s2-git-foreach-wrong-answer|介入1|返工2|v8 real two-witness replay+single-member answer mutation+full ForEach TaskPack+mutation licence|红线违反1: initially used an unnecessary stochastic Agent call for a deterministic checker challenge`
+
+`s2-bounded-report-profiles|介入2|返工2|shared full+singleton report profiles+3 real Goal TaskPacks+5 mutation licences+338 tests|红线违反1: initially misread code-redundancy concern as a reason to restrict ForEach/If semantics`

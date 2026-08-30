@@ -206,6 +206,18 @@ def test_if_atom_uniqueness_is_scoped_by_start_case(tmp_path: Path) -> None:
     with pytest.raises(ReachedOpen):
         compile_if_tasks(Prepared(), (first, second), tmp_path)  # type: ignore[arg-type]
 
+    profile = replace(
+        first,
+        answer_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    )
+    with pytest.raises(ReachedOpen):
+        compile_if_tasks(Prepared(), (first, profile), tmp_path)  # type: ignore[arg-type]
+
     with pytest.raises(TaskFoundryError) as caught:
         compile_if_tasks(Prepared(), (first, first), tmp_path)  # type: ignore[arg-type]
     assert caught.value.code == "if_atom_universe_invalid"

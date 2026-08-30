@@ -514,3 +514,51 @@ def test_foreach_collateral_target_is_out_of_selection_state_change() -> None:
         catalog,
     )
     assert actual is expected
+
+
+def test_foreach_compiler_keeps_report_profiles_in_separate_groups(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    start = StartCase("default", None, ("base",))
+    full = {
+        "type": "object",
+        "properties": {"first": {"type": "string"}, "second": {"type": "string"}},
+        "required": ["first", "second"],
+        "additionalProperties": False,
+    }
+    single = {
+        "type": "object",
+        "properties": {"first": {"type": "string"}},
+        "required": ["first"],
+        "additionalProperties": False,
+    }
+    atoms = tuple(
+        SimpleNamespace(
+            release_id="a" * 64,
+            start_case=start,
+            capability_id="cap-1",
+            semantic_key=f"item:{item}",
+            public_descriptor={"item": item},
+            answer_schema=schema,
+        )
+        for schema in (full, single)
+        for item in ("one", "two")
+    )
+    prepared = SimpleNamespace(
+        identity=SimpleNamespace(release_id="a" * 64),
+        task_goals={"cap-1": "Complete every selected target."},
+    )
+    monkeypatch.setattr(foreach_module, "_prove_initially_false", lambda *_args: None)
+
+    compiled = foreach_module.compile_foreach_tasks(  # type: ignore[arg-type]
+        prepared,
+        atoms,
+        tmp_path,
+    )
+
+    assert len(compiled) == 2
+    assert {tuple(item.member_answer_schema["required"]) for item in compiled} == {
+        ("first", "second"),
+        ("first",),
+    }

@@ -33,6 +33,8 @@ from agent_env_foundry.task_foundry import (
     _alternative_value,
     _combine_traces,
     _context,
+    _evaluate_report_atom,
+    _rebound_final_answer,
     _replay_arguments,
     _resolve_binding,
     _schema_at_pointer,
@@ -781,16 +783,21 @@ def compile_foreach_tasks(
 
     if max_members < 2:
         raise ValueError("max_members must be at least two")
-    groups: dict[tuple[str, str], list[AtomTask]] = {}
-    for atom_task in atom_tasks:
-        if atom_task.release_id != prepared.identity.release_id:
-            raise TaskFoundryError(
-                "task_release_mismatch",
-                "Atom Task belongs to another release",
-            )
-        groups.setdefault((atom_task.start_case.case_id, atom_task.capability_id), []).append(
-            atom_task
+    if any(item.release_id != prepared.identity.release_id for item in atom_tasks):
+        raise TaskFoundryError(
+            "task_release_mismatch",
+            "Atom Task belongs to another release",
         )
+    groups: dict[tuple[str, str, bytes], list[AtomTask]] = {}
+    for atom_task in atom_tasks:
+        groups.setdefault(
+            (
+                atom_task.start_case.case_id,
+                atom_task.capability_id,
+                canonical_bytes(atom_task.answer_schema),
+            ),
+            [],
+        ).append(atom_task)
 
     compiled: list[ForEachTask] = []
     for index, members in enumerate(groups.values(), start=1):
@@ -913,7 +920,8 @@ def solve_foreach_task_twice(
             after = session.trusted.inspect(instance)
             contexts = _contexts(task, bindings)
             results = tuple(
-                session.trusted.evaluate_atom(
+                _evaluate_report_atom(
+                    session,
                     AtomCheckRequest(
                         task.capability_id,
                         before,
@@ -922,7 +930,8 @@ def solve_foreach_task_twice(
                         episode.trace,
                         answers[position],
                         contexts[position],
-                    )
+                    ),
+                    task.member_answer_schema,
                 )
                 for position, binding in enumerate(bindings)
             )
@@ -1020,7 +1029,8 @@ def challenge_foreach_partials(
             after = session.trusted.inspect(instance)
             contexts = _contexts(task, bindings)
             results = tuple(
-                session.trusted.evaluate_atom(
+                _evaluate_report_atom(
+                    session,
                     AtomCheckRequest(
                         task.capability_id,
                         before,
@@ -1029,7 +1039,8 @@ def challenge_foreach_partials(
                         episode.trace,
                         answers[position],
                         contexts[position],
-                    )
+                    ),
+                    task.member_answer_schema,
                 )
                 for position, binding in enumerate(bindings)
             )
@@ -1113,7 +1124,8 @@ def prove_foreach_agent_choices_non_load_bearing(
             after = session.trusted.inspect(instance)
             contexts = _contexts(task, bindings)
             results = tuple(
-                session.trusted.evaluate_atom(
+                _evaluate_report_atom(
+                    session,
                     AtomCheckRequest(
                         task.capability_id,
                         before,
@@ -1122,7 +1134,8 @@ def prove_foreach_agent_choices_non_load_bearing(
                         replay_trace,
                         answers[position],
                         contexts[position],
-                    )
+                    ),
+                    task.member_answer_schema,
                 )
                 for position, binding in enumerate(bindings)
             )
@@ -1163,7 +1176,8 @@ def run_foreach_noop(
         bindings = _resolve_complete_selection(session, task, before)
         contexts = _contexts(task, bindings)
         results = tuple(
-            session.trusted.evaluate_atom(
+            _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1172,7 +1186,8 @@ def run_foreach_noop(
                     (),
                     {},
                     contexts[position],
-                )
+                ),
+                task.member_answer_schema,
             )
             for position, binding in enumerate(bindings)
         )
@@ -1210,7 +1225,8 @@ def challenge_foreach_wrong_answer(
             )
         after = session.trusted.inspect(instance_root)
         probe_results = tuple(
-            session.trusted.evaluate_atom(
+            _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1219,13 +1235,17 @@ def challenge_foreach_wrong_answer(
                     replay_trace,
                     _json_object(answers[position]),
                     contexts[position],
-                )
+                ),
+                task.member_answer_schema,
             )
             for position, binding in enumerate(bindings)
         )
-        correct_answers = [_json_object(item.report_values) for item in probe_results]
+        correct_answers = [
+            _rebound_final_answer(item, task.member_answer_schema) for item in probe_results
+        ]
         baseline_results = tuple(
-            session.trusted.evaluate_atom(
+            _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1234,7 +1254,8 @@ def challenge_foreach_wrong_answer(
                     replay_trace,
                     correct_answers[position],
                     contexts[position],
-                )
+                ),
+                task.member_answer_schema,
             )
             for position, binding in enumerate(bindings)
         )
@@ -1257,7 +1278,8 @@ def challenge_foreach_wrong_answer(
         wrong_answers[member_index] = wrong_member
         wrong_final = _json_object({"results": wrong_answers})
         wrong_results = tuple(
-            session.trusted.evaluate_atom(
+            _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1266,7 +1288,8 @@ def challenge_foreach_wrong_answer(
                     replay_trace,
                     wrong_answers[position],
                     contexts[position],
-                )
+                ),
+                task.member_answer_schema,
             )
             for position, binding in enumerate(bindings)
         )
@@ -1322,7 +1345,8 @@ def challenge_foreach_collateral(
             )
         after_foreach = session.trusted.inspect(instance_root)
         baseline_results = tuple(
-            session.trusted.evaluate_atom(
+            _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1331,7 +1355,8 @@ def challenge_foreach_collateral(
                     foreach_episode.trace,
                     answers[position],
                     contexts[position],
-                )
+                ),
+                task.member_answer_schema,
             )
             for position, binding in enumerate(bindings)
         )
@@ -1346,7 +1371,8 @@ def challenge_foreach_collateral(
             max_provider_turns=max_provider_turns,
         )
         after_collateral = session.trusted.inspect(instance_root)
-        control_result = session.trusted.evaluate_atom(
+        control_result = _evaluate_report_atom(
+            session,
             AtomCheckRequest(
                 control_task.capability_id,
                 after_foreach,
@@ -1359,11 +1385,13 @@ def challenge_foreach_collateral(
                     control_binding.semantic_key,
                     control_binding.protected_binding,
                 ),
-            )
+            ),
+            control_task.answer_schema,
         )
         combined_trace = _combine_traces(foreach_episode.trace, control_episode.trace)
         collateral_results = tuple(
-            session.trusted.evaluate_atom(
+            _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1372,7 +1400,8 @@ def challenge_foreach_collateral(
                     combined_trace,
                     answers[position],
                     contexts[position],
-                )
+                ),
+                task.member_answer_schema,
             )
             for position, binding in enumerate(bindings)
         )
@@ -1438,7 +1467,8 @@ def prove_foreach_reverse_order(
         after = session.trusted.inspect(instance_root)
         contexts = _contexts(task, bindings)
         results = tuple(
-            session.trusted.evaluate_atom(
+            _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1447,7 +1477,8 @@ def prove_foreach_reverse_order(
                     episode.trace,
                     answers[position],
                     contexts[position],
-                )
+                ),
+                task.member_answer_schema,
             )
             for position, binding in enumerate(bindings)
         )

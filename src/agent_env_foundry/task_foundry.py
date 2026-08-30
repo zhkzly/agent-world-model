@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -807,15 +807,6 @@ def compile_atom_tasks(
                 for binding in bindings:
                     if not binding.eligible:
                         continue
-                    answer_schema = _answer_schema(capability.answer_fields)
-                    checker_preimage: JSONObject = {
-                        "release_id": prepared.identity.release_id,
-                        "start_case_id": start.case_id,
-                        "capability_id": capability.capability_id,
-                        "semantic_key": binding.semantic_key,
-                        "answer_schema": answer_schema,
-                    }
-                    checker_digest = hashlib.sha256(canonical_bytes(checker_preimage)).hexdigest()
                     context = _context(
                         capability.capability_id,
                         binding.semantic_key,
@@ -839,24 +830,36 @@ def compile_atom_tasks(
                             capability_id=capability.capability_id,
                             semantic_key=binding.semantic_key,
                         )
-                    instruction = _instruction(
-                        goal,
-                        binding.public_descriptor,
-                        capability.answer_fields,
-                    )
-                    tasks.append(
-                        AtomTask(
-                            prepared.identity.release_id,
-                            start,
-                            capability.capability_id,
-                            binding.semantic_key,
-                            _json_object(binding.public_descriptor),
-                            checker_digest,
-                            instruction,
-                            hashlib.sha256(instruction.encode()).hexdigest(),
-                            answer_schema,
+                    for answer_fields in _answer_field_profiles(capability.answer_fields):
+                        answer_schema = _answer_schema(answer_fields)
+                        checker_preimage: JSONObject = {
+                            "release_id": prepared.identity.release_id,
+                            "start_case_id": start.case_id,
+                            "capability_id": capability.capability_id,
+                            "semantic_key": binding.semantic_key,
+                            "answer_schema": answer_schema,
+                        }
+                        checker_digest = hashlib.sha256(
+                            canonical_bytes(checker_preimage)
+                        ).hexdigest()
+                        instruction = _instruction(
+                            goal,
+                            binding.public_descriptor,
+                            answer_fields,
                         )
-                    )
+                        tasks.append(
+                            AtomTask(
+                                prepared.identity.release_id,
+                                start,
+                                capability.capability_id,
+                                binding.semantic_key,
+                                _json_object(binding.public_descriptor),
+                                checker_digest,
+                                instruction,
+                                hashlib.sha256(instruction.encode()).hexdigest(),
+                                answer_schema,
+                            )
+                        )
     ids = tuple(item.task_id for item in tasks)
     if len(ids) != len(set(ids)):
         raise TaskFoundryError(
@@ -927,7 +930,8 @@ def solve_atom_task_twice(
                 max_provider_turns=max_provider_turns,
             )
             after = session.trusted.inspect(instance)
-            result = session.trusted.evaluate_atom(
+            result = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -940,7 +944,8 @@ def solve_atom_task_twice(
                         binding.semantic_key,
                         binding.protected_binding,
                     ),
-                )
+                ),
+                task.answer_schema,
             )
             if not result.satisfied:
                 raise TaskFoundryError(
@@ -1038,7 +1043,8 @@ def prove_agent_choices_non_load_bearing(
                 replay_observations[event.seq] = observation
                 replay_trace.append(TraceEvent(event.seq, event.tool_name, arguments, observation))
             after = session.trusted.inspect(instance)
-            probe_result = session.trusted.evaluate_atom(
+            probe_result = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1051,13 +1057,15 @@ def prove_agent_choices_non_load_bearing(
                         binding.semantic_key,
                         binding.protected_binding,
                     ),
-                )
+                ),
+                task.answer_schema,
             )
             rebound_answer = _rebound_final_answer(
                 probe_result,
                 task.answer_schema,
             )
-            result = session.trusted.evaluate_atom(
+            result = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1070,7 +1078,8 @@ def prove_agent_choices_non_load_bearing(
                         binding.semantic_key,
                         binding.protected_binding,
                     ),
-                )
+                ),
+                task.answer_schema,
             )
             perturbations.append(
                 AgentChoicePerturbation(
@@ -1122,7 +1131,8 @@ def challenge_atom_task(
         session.actor.reset(task.start_case.reset_input)
         before = session.trusted.inspect(no_op_root)
         binding = _resolve_binding(session, task, before)
-        result = session.trusted.evaluate_atom(
+        result = _evaluate_report_atom(
+            session,
             AtomCheckRequest(
                 task.capability_id,
                 before,
@@ -1135,7 +1145,8 @@ def challenge_atom_task(
                     binding.semantic_key,
                     binding.protected_binding,
                 ),
-            )
+            ),
+            task.answer_schema,
         )
         challenges.append(
             AtomChallengeResult(
@@ -1184,7 +1195,8 @@ def challenge_atom_task(
                 max_provider_turns=max_provider_turns,
             )
             after = session.trusted.inspect(wrong_target_root)
-            target_result = session.trusted.evaluate_atom(
+            target_result = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     target_task.capability_id,
                     before,
@@ -1197,7 +1209,8 @@ def challenge_atom_task(
                         target_binding.semantic_key,
                         target_binding.protected_binding,
                     ),
-                )
+                ),
+                target_task.answer_schema,
             )
             if not target_result.satisfied:
                 raise TaskFoundryError(
@@ -1206,7 +1219,8 @@ def challenge_atom_task(
                     target_task_id=target_task.task_id,
                     result=target_result.to_document(),
                 )
-            current_result = session.trusted.evaluate_atom(
+            current_result = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1219,7 +1233,8 @@ def challenge_atom_task(
                         current_binding.semantic_key,
                         current_binding.protected_binding,
                     ),
-                )
+                ),
+                task.answer_schema,
             )
             challenges.append(
                 AtomChallengeResult(
@@ -1254,7 +1269,8 @@ def challenge_atom_task(
             binding.semantic_key,
             binding.protected_binding,
         )
-        correct = session.trusted.evaluate_atom(
+        correct = _evaluate_report_atom(
+            session,
             AtomCheckRequest(
                 task.capability_id,
                 before,
@@ -1263,7 +1279,8 @@ def challenge_atom_task(
                 episode.trace,
                 episode.final_answer,
                 context,
-            )
+            ),
+            task.answer_schema,
         )
         if not correct.satisfied:
             raise TaskFoundryError(
@@ -1288,7 +1305,8 @@ def challenge_atom_task(
         else:
             assert wrong_answer_plan.final_answer is not None
             wrong_answer = wrong_answer_plan.final_answer
-            wrong_result = session.trusted.evaluate_atom(
+            wrong_result = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1297,7 +1315,8 @@ def challenge_atom_task(
                     episode.trace,
                     wrong_answer,
                     context,
-                )
+                ),
+                task.answer_schema,
             )
             if wrong_result.answer_ok is not False:
                 raise TaskFoundryError(
@@ -1332,7 +1351,8 @@ def challenge_atom_task(
                 )
             )
         else:
-            missing_result = session.trusted.evaluate_atom(
+            missing_result = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1341,7 +1361,8 @@ def challenge_atom_task(
                     (),
                     episode.final_answer,
                     context,
-                )
+                ),
+                task.answer_schema,
             )
             if missing_result.process_ok is not False:
                 raise TaskFoundryError(
@@ -1389,7 +1410,8 @@ def challenge_atom_task(
                 max_provider_turns=max_provider_turns,
             )
             after_collateral = session.trusted.inspect(active_root)
-            collateral_result = session.trusted.evaluate_atom(
+            collateral_result = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     collateral_task.capability_id,
                     after,
@@ -1402,7 +1424,8 @@ def challenge_atom_task(
                         collateral_binding.semantic_key,
                         collateral_binding.protected_binding,
                     ),
-                )
+                ),
+                collateral_task.answer_schema,
             )
             if not collateral_result.satisfied:
                 raise TaskFoundryError(
@@ -1412,7 +1435,8 @@ def challenge_atom_task(
                     result=collateral_result.to_document(),
                 )
             combined_trace = _combine_traces(episode.trace, collateral_episode.trace)
-            current_with_collateral = session.trusted.evaluate_atom(
+            current_with_collateral = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.capability_id,
                     before,
@@ -1421,7 +1445,8 @@ def challenge_atom_task(
                     combined_trace,
                     episode.final_answer,
                     context,
-                )
+                ),
+                task.answer_schema,
             )
             _assert_collateral_discriminated(current_with_collateral)
             challenges.append(
@@ -1552,7 +1577,8 @@ def _select_wrong_target_task(
     candidates = [
         item
         for item in task_universe
-        if item.task_id != task.task_id and item.start_case == task.start_case
+        if item.start_case == task.start_case
+        and (item.capability_id, item.semantic_key) != (task.capability_id, task.semantic_key)
     ]
     for item in candidates:
         if item.capability_id not in capabilities:
@@ -1867,13 +1893,14 @@ def _wrong_answer(schema: JSONObject, answer: JSONObject) -> JSONObject | None:
     properties = schema.get("properties")
     if not isinstance(properties, dict):
         return None
+    projected = {field: answer[field] for field in properties if field in answer}
     for field, raw_schema in properties.items():
         if field not in answer or not isinstance(raw_schema, dict):
             continue
         replacement = _alternative_value(raw_schema, answer[field])
         if replacement is _NO_ALTERNATIVE:
             continue
-        candidate = _json_object(answer)
+        candidate = _json_object(projected)
         candidate[field] = cast(JSONValue, replacement)
         if not tuple(Draft202012Validator(schema).iter_errors(candidate)):
             return candidate
@@ -1884,7 +1911,15 @@ def _rebound_final_answer(
     result: AtomCheckResult,
     answer_schema: JSONObject,
 ) -> JSONObject:
-    answer = _json_object(result.report_values)
+    properties = answer_schema.get("properties")
+    if not isinstance(properties, dict) or any(
+        field not in result.report_values for field in properties
+    ):
+        raise TaskFoundryError(
+            "rebound_final_answer_fields_missing",
+            "Checker report values do not cover the Task report fields",
+        )
+    answer = _json_object({field: result.report_values[field] for field in properties})
     errors = tuple(Draft202012Validator(answer_schema).iter_errors(answer))
     if errors:
         raise TaskFoundryError(
@@ -1965,6 +2000,69 @@ def _answer_schema(answer_fields: tuple[Any, ...]) -> JSONObject:
         },
         "required": [field.field_id for field in answer_fields],
     }
+
+
+def _answer_field_profiles(answer_fields: tuple[Any, ...]) -> tuple[tuple[Any, ...], ...]:
+    if len(answer_fields) <= 1:
+        return (answer_fields,)
+    return (answer_fields, *((field,) for field in answer_fields))
+
+
+def _report_field_ids(answer_schema: JSONObject) -> tuple[str, ...]:
+    properties = answer_schema.get("properties")
+    required = answer_schema.get("required")
+    if (
+        not isinstance(properties, dict)
+        or not isinstance(required, list)
+        or any(not isinstance(field, str) for field in required)
+        or set(required) != set(properties)
+    ):
+        raise TaskFoundryError(
+            "report_schema_invalid",
+            "Task answer schema does not declare one exact report field set",
+        )
+    return tuple(cast(list[str], required))
+
+
+def _evaluate_report_atom(
+    session: OpenPreparedSession,
+    request: AtomCheckRequest,
+    answer_schema: JSONObject,
+) -> AtomCheckResult:
+    raw = session.trusted.evaluate_atom(request)
+    selected_fields = _report_field_ids(answer_schema)
+    if set(selected_fields) == set(raw.report_values):
+        return raw
+    final_answer = request.final_answer
+    if not is_json_object(final_answer) or tuple(
+        Draft202012Validator(answer_schema).iter_errors(final_answer)
+    ):
+        return raw
+    final_object = cast(JSONObject, final_answer)
+    if any(field not in raw.report_values for field in selected_fields):
+        raise TaskFoundryError(
+            "report_field_missing",
+            "Release-local evaluator omitted a Task-selected report field",
+            selected_fields=selected_fields,
+            report_fields=tuple(raw.report_values),
+        )
+    reconstructed = _json_object(raw.report_values)
+    for field in selected_fields:
+        reconstructed[field] = final_object[field]
+    projected = session.trusted.evaluate_atom(replace(request, final_answer=reconstructed))
+    stable_axes = (
+        "initially_satisfied",
+        "required_effects_ok",
+        "collateral_ok",
+        "process_ok",
+        "report_values",
+    )
+    if any(getattr(raw, field) != getattr(projected, field) for field in stable_axes):
+        raise TaskFoundryError(
+            "report_projection_semantics_drift",
+            "Submitted report fields changed release-local environment semantics",
+        )
+    return projected
 
 
 def _context(

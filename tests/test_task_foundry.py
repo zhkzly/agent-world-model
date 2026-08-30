@@ -12,7 +12,7 @@ from agent_env_foundry.environment import ToolSpec
 from agent_env_foundry.provenance import ArgumentProvenance
 from agent_env_foundry.public_agent import PublicEpisodeRun
 from agent_env_foundry.release import canonical_bytes
-from agent_env_foundry.semantics import AtomCheckResult, StartCase, TraceEvent
+from agent_env_foundry.semantics import AtomCheckRequest, AtomCheckResult, StartCase, TraceEvent
 from agent_env_foundry.task_foundry import (
     AgentChoicePerturbation,
     AgentChoiceProof,
@@ -459,6 +459,15 @@ def test_solve_freezes_admission_plan_before_opening_a_witness(
 
 def test_wrong_target_selection_prefers_same_capability_then_shared_workflow() -> None:
     current = _task()
+    same_target_profile = replace(
+        current,
+        answer_schema={
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+    )
     same_capability = replace(
         current,
         semantic_key="item:2",
@@ -484,7 +493,7 @@ def test_wrong_target_selection_prefers_same_capability_then_shared_workflow() -
 
     selected = task_foundry_module._select_wrong_target_task(
         current,
-        (current, unrelated, shared_workflow, same_capability),
+        (current, same_target_profile, unrelated, shared_workflow, same_capability),
         capabilities,  # type: ignore[arg-type]
     )
     assert selected == same_capability
@@ -812,3 +821,91 @@ def test_admit_atom_task_runs_one_complete_existing_pipeline(
     assert events[2][1] == tmp_path / "agent-choices"
     assert events[3][1] == (plan, challenges)
     assert events[4][1] == (solved, challenges, choices, mutations)
+
+
+def test_report_profiles_are_bounded_to_full_plus_each_single_field() -> None:
+    fields = (
+        SimpleNamespace(field_id="first"),
+        SimpleNamespace(field_id="second"),
+        SimpleNamespace(field_id="third"),
+    )
+
+    profiles = task_foundry_module._answer_field_profiles(fields)
+
+    assert tuple(tuple(item.field_id for item in profile) for profile in profiles) == (
+        ("first", "second", "third"),
+        ("first",),
+        ("second",),
+        ("third",),
+    )
+    assert task_foundry_module._answer_field_profiles((fields[0],)) == ((fields[0],),)
+    assert task_foundry_module._answer_field_profiles(()) == ((),)
+
+
+def test_report_projection_reuses_release_truth_and_only_scores_selected_fields() -> None:
+    expected = {"first": "expected", "second": "other"}
+
+    class Trusted:
+        def __init__(self) -> None:
+            self.answers: list[object] = []
+
+        def evaluate_atom(self, request: AtomCheckRequest) -> AtomCheckResult:
+            self.answers.append(request.final_answer)
+            answer_ok = request.final_answer == expected
+            return AtomCheckResult(
+                initially_satisfied=False,
+                satisfied=answer_ok,
+                required_effects_ok=True,
+                collateral_ok=True,
+                answer_ok=answer_ok,
+                process_ok=True,
+                report_values=expected,
+                failure_codes=() if answer_ok else ("ANSWER_MISMATCH",),
+            )
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"first": {"type": "string"}},
+        "required": ["first"],
+    }
+    context = task_foundry_module._context("cap-1", "item:1", {"item": "one"})
+    trusted = Trusted()
+    session = SimpleNamespace(trusted=trusted)
+    correct_request = AtomCheckRequest(
+        "cap-1",
+        {},
+        {},
+        {"item": "one"},
+        (),
+        {"first": "expected"},
+        context,
+    )
+
+    correct = task_foundry_module._evaluate_report_atom(  # type: ignore[arg-type]
+        session,
+        correct_request,
+        schema,
+    )
+    wrong = task_foundry_module._evaluate_report_atom(  # type: ignore[arg-type]
+        session,
+        AtomCheckRequest(
+            "cap-1",
+            {},
+            {},
+            {"item": "one"},
+            (),
+            {"first": "wrong"},
+            context,
+        ),
+        schema,
+    )
+
+    assert correct.satisfied is True
+    assert wrong.satisfied is False and wrong.answer_ok is False
+    assert trusted.answers == [
+        {"first": "expected"},
+        expected,
+        {"first": "wrong"},
+        {"first": "wrong", "second": "other"},
+    ]

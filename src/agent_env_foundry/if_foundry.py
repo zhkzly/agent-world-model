@@ -30,6 +30,7 @@ from agent_env_foundry.task_foundry import (
     AtomTaskPack,
     TaskFoundryError,
     _context,
+    _evaluate_report_atom,
     _resolve_binding,
     _task_by_id,
     _verify_checker_preimage,
@@ -295,14 +296,25 @@ def compile_if_tasks(
             "task_release_mismatch",
             "Atom Task belongs to another release",
         )
+    task_ids = tuple(item.task_id for item in atom_tasks)
+    if len(task_ids) != len(set(task_ids)):
+        raise TaskFoundryError(
+            "if_atom_universe_invalid",
+            "If compiler requires a unique Atom Task universe",
+        )
     atom_index = {
-        (item.start_case.case_id, item.capability_id, item.semantic_key): item
+        (
+            item.start_case.case_id,
+            item.capability_id,
+            item.semantic_key,
+            canonical_bytes(item.answer_schema),
+        ): item
         for item in atom_tasks
     }
     if len(atom_index) != len(atom_tasks):
         raise TaskFoundryError(
             "if_atom_universe_invalid",
-            "If compiler requires one Atom Task per StartCase, capability and semantic key",
+            "If compiler requires one Atom Task per logical target and report profile",
         )
     root = Path(instance_root)
     compiled: list[IfTask] = []
@@ -328,13 +340,17 @@ def compile_if_tasks(
                     if item.start_case == start
                     and item.capability_id in {true_capability, false_capability}
                 )
-                schemas = {canonical_bytes(item.answer_schema) for item in branch_atoms}
-                if len(schemas) > 1:
-                    raise TaskFoundryError(
-                        "if_branch_answer_contract_mismatch",
-                        "If branches require one non-leaking public answer contract",
-                    )
                 for atom in sorted(branch_atoms, key=lambda item: item.semantic_key):
+                    profile_capabilities = {
+                        item.capability_id
+                        for item in branch_atoms
+                        if item.answer_schema == atom.answer_schema
+                    }
+                    if profile_capabilities != {true_capability, false_capability}:
+                        raise TaskFoundryError(
+                            "if_branch_answer_contract_mismatch",
+                            "If branches require the same bounded report profile",
+                        )
                     binding = _resolve_binding(session, atom, facts)
                     condition_result = session.trusted.evaluate_condition(
                         ConditionCheckRequest(
@@ -479,7 +495,8 @@ def solve_if_task_twice(
                 max_provider_turns=max_provider_turns,
             )
             after = session.trusted.inspect(instance)
-            branch_result = session.trusted.evaluate_atom(
+            branch_result = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.branch_capability_id,
                     before,
@@ -492,9 +509,11 @@ def solve_if_task_twice(
                         binding.semantic_key,
                         binding.protected_binding,
                     ),
-                )
+                ),
+                task.answer_schema,
             )
-            opposite_result = session.trusted.evaluate_atom(
+            opposite_result = _evaluate_report_atom(
+                session,
                 AtomCheckRequest(
                     task.opposite_capability_id,
                     before,
@@ -507,7 +526,8 @@ def solve_if_task_twice(
                         opposite_binding.semantic_key,
                         opposite_binding.protected_binding,
                     ),
-                )
+                ),
+                task.answer_schema,
             )
             if not branch_result.satisfied:
                 raise TaskFoundryError(
