@@ -39,6 +39,13 @@ Auditor, fake-mutation deletion and anti-compatibility decisions remain active.
   Task formats and cannot define truth from a successful route.
 - TaskSpecification and bounded V0 freeze before witness search and must prove
   bidirectional coverage over the declared S1 Requirement set.
+- S1 seals stable RequirementObligation IDs, semantic kinds and a finite
+  applicability handle union before S2 begins. S2 cannot create/delete handles;
+  an `irrelevant` disposition is valid only when Framework evaluates the sealed
+  handle false.
+- S1 obligations/qualified semantic operations authorize Task/checker meaning.
+  Instruction spans, schemas and public pointers prove disclosure/provenance
+  only and cannot authorize a semantic predicate.
 - Production admission physically exercises one discriminating case for each
   applicable semantic failure class: no-op, wrong entity/answer, near-miss,
   partial/omitted obligation, collateral and required process/reload. A known
@@ -48,6 +55,12 @@ Auditor, fake-mutation deletion and anti-compatibility decisions remain active.
   forbidden.
 - A declared persistence claim requires close/reopen of the same native
   instance before final trusted evaluation.
+- A required process predicate must cite an S1 obligation classified as
+  process. Graph state-enablement may guide search but cannot freeze its observed
+  route as mandatory. Admission uses real-trace ablation, a physical omission
+  episode when constructible, and known alternative routes.
+- CandidateTaskProposal and ReloadEvidence use one compact canonical schema each;
+  sampler graphs/programs and absolute temporary paths remain run-local evidence.
 - S2 publishes a strict cold-readable TaskPack/PublicTaskView handoff. Reward,
   trajectory messages/tokens/masks/logprobs and training remain S3/S4.
 - Corpus counts never waive Good Task validity, but fixed-budget sampler yield,
@@ -109,3 +122,5 @@ acceptance verdict. Final assessment/corpus review was completed in the main
 session.
 
 `s2-good-task-docs|介入1|返工1|Good Task memory+real reopen counterexample+main-session drift/overdesign audit|红线违反0`
+
+`s2-good-task-independent-review|介入1|返工1|Terra REVISE→authority/process/proposal/reload corrections→Terra ALLOW|红线违反0`

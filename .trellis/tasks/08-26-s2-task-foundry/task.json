@@ -43,7 +43,7 @@
     ".trellis/spec/backend/v2-qualification-publication.md",
     ".trellis/spec/backend/s2-assessment-corpus.md"
   ],
-  "notes": "Commit 189be1b is a real Git/SQLite Capability-to-Task execution checkpoint, not S2 completion. Revised Good Task documents are awaiting user acceptance before implementation. Known gold failure: a SQLite Task claimed reopen persistence but admission performed only same-process reads.",
+  "notes": "Commit 189be1b is a real Git/SQLite Capability-to-Task execution checkpoint, not S2 completion. Independent Good Task review returned REVISE; corrected semantic-authority, process-necessity, canonical proposal and reload-evidence contracts then passed a fresh independent ALLOW review. Checkpoint A awaits explicit user acceptance. Gold failure: a SQLite Task claimed reopen persistence but admission performed only same-process reads.",
   "meta": {
     "compatibility": "clean-break",
     "semantic_order": "release-discovery-task_spec-v0-start-binding-freeze-witness-truth_challenge-taskpack-assessment-corpus",
@@ -69,6 +69,6 @@
       "difficulty",
       "corpus_policy"
     ],
-    "implementation_checkpoint": "good_task_documents_reopened_pending_review"
+    "implementation_checkpoint": "good_task_plan_independent_allow_pending_user_acceptance"
   }
 }

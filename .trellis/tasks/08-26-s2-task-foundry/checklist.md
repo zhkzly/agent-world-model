@@ -2,8 +2,9 @@
 
 - [ ] Do direct, Graph and Programmatic proposal mechanisms execute public tools
   and feed one common CandidateTaskProposal/admission boundary?
-- [ ] Is TaskSpecification frozen before witness search with bidirectional
-  predicate-to-anchor and applicable-obligation coverage?
+- [ ] Is TaskSpecification frozen before witness search, with every semantic
+  predicate authorized only by an S1 obligation/qualified operation and every
+  sealed applicable obligation included rather than self-waived by S2?
 - [ ] Is the task-local VerifierBundle compiled from frozen semantics without
   learning truth, allowed effects or answers from witness diffs?
 - [ ] Are every target/argument/condition/answer operand publicly grounded, the
@@ -11,7 +12,8 @@
   checked after close/reopen?
 - [ ] Do all applicable no-op, wrong-entity, wrong/stale-answer, partial,
   omitted-obligation, near-miss, collateral and process challenges have physical
-  evidence, while known valid alternatives remain accepted?
+  evidence; does every required process cite an S1 process obligation; and do
+  known valid alternatives remain accepted without reference-route equality?
 - [ ] Are admitted Tasks well-posed, non-vacuous, replayable, isolated and
   minimally purposeful rather than arbitrary tool chains or padded witnesses?
 - [ ] Can current TaskPacks be cold-read with exact identity recomputation and

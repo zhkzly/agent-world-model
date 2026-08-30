@@ -39,6 +39,7 @@ protected trusted surface
   deterministic start-case generator
   read-only semantic state inspection
   qualified taskable CapabilitySpecs
+  sealed RequirementObligations with finite applicability handles
   binding enumeration and atomic evaluation
 ```
 
@@ -134,9 +135,10 @@ Every admitted Task must be:
   constructible applicable no-op, wrong-entity, near-miss, partial,
   omitted-obligation, collateral, wrong/stale-answer and required-process
   violation, while accepting a known valid alternative route when one exists;
-- **bidirectionally anchored and well-posed:** every checker predicate has a
-  public entailment, and every publicly applicable Requirement obligation is
-  included or has a frozen justified irrelevance decision, without exposing
+- **bidirectionally anchored and well-posed:** every checker predicate is
+  authorized by an S1-issued RequirementObligation/qualified semantic operation,
+  and every obligation whose sealed S1 applicability handle evaluates true is
+  included; instruction/schema sources prove disclosure only, without exposing
   hidden operands, native fields, tool names or a reference route;
 - **non-trivial:** the checker is false at the initial state, and query answers
   are not already leaked by the instruction/reset context;
@@ -183,6 +185,9 @@ proof of complete Task-space coverage.
     never Task truth, verifier acceptance or S3 public projection.
 15. S2 publishes a strict cold-readable TaskPack and non-leaking PublicTaskView;
     complete TaskPack bytes are never handed to the acting policy.
+16. A required process predicate must cite an S1 obligation classified as
+    process. An executed sampler route or state-enablement edge cannot make its
+    own tool sequence semantically mandatory.
 
 ## Completion evidence
 

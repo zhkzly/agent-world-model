@@ -47,8 +47,9 @@ S1 owns:
   effects/collateral audit;
 - exact prepare/open process isolation and immutable publication.
 
-S1 publishes qualified capability atoms, workflow/condition metadata, start cases
-and atomic evaluators. It does not publish concrete Tasks, reference traces,
+S1 publishes qualified capability atoms, workflow/condition metadata, start
+cases, atomic evaluators and a sealed RequirementObligation catalog with finite
+applicability handles. It does not publish concrete Tasks, reference traces,
 Task checkers, corpus cells, rewards or trajectories.
 
 ### S2
@@ -135,6 +136,8 @@ shared public episode-runner contracts.
   native/physical Qualification and process-isolated prepare/open.
 - [ ] Every core Brief Requirement is explicitly Taskable, NotTaskable or
   Unsupported.
+- [ ] Every S2-visible Requirement obligation has a stable S1-owned semantic
+  kind and finite applicability handle; S2 cannot invent or waive it.
 - [ ] Checker and final instruction freeze before any witness-model call.
 - [ ] Each TaskPack has two fresh successful public executions of the exact final
   instruction and no load-bearing hidden operand.

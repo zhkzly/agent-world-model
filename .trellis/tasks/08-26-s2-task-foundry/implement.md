@@ -30,19 +30,19 @@ checker accepts
 The first new acceptance must reject that exact artifact. Do not edit the old
 artifact to make the test pass.
 
-## 3. Checkpoint A — Strict TaskPack handoff and physical reload
+## 3. Checkpoint A — Physical attempt lifecycle and ReloadEvidence
 
 ### Product claim
 
-S2 can cold-read one exact current TaskPack, expose a non-leaking PublicTaskView
-and physically verify persistence across process close/reopen.
+S2 has one reusable public-attempt lifecycle that physically verifies declared
+persistence across process close/reopen and emits exact ReloadEvidence without
+depending on the current provisional TaskPack format.
 
 ### Work
 
-- add exact Atom/ForEach/If TaskPack decoders with no legacy fallback;
-- recompute Task, admission and pack identities from canonical bytes;
-- define one minimal PublicTaskView: instruction and final-answer schema;
-- keep StartRecipe/checker/semantic keys/expected branches trusted-only;
+- bind Host-produced ReloadEvidence to one native_instance_id, distinct acting/
+  reopened session IDs, one reset-before-act lifecycle journal, pre-close and
+  post-reopen facts, and post-reopen checker result;
 - extract one reusable single-attempt lifecycle:
 
 ```text
@@ -50,16 +50,17 @@ open -> reset -> public episode -> close
 -> reopen same instance -> trusted inspect/evaluate -> close
 ```
 
-- use that lifecycle for admission and assessment rather than duplicating it.
+- use that lifecycle for admission and assessment rather than duplicating it;
+- retain the current SQLite TaskPack only as a gold rejected behavior trace, not
+  as a format the new code must support.
 
 ### RED acceptance
 
-- the current SQLite “reopen” TaskPack is rejected because no reopen evidence is
-  bound;
-- tampered Task/pack IDs fail cold read;
-- PublicTaskView contains no semantic key, expected branch, checker, witness,
-  Start reset input or protected binding;
+- a real-derived current SQLite attempt that claims reload but performs only
+  same-process inspection cannot produce ReloadEvidence;
 - after-state collected before reopen cannot satisfy a declared reload claim.
+- another native instance, reused session ID, second reset, missing close or
+  checker evaluation before reopen cannot satisfy ReloadEvidence.
 
 ### Real exit
 
@@ -69,9 +70,9 @@ native instance. Git query Tasks must remain valid without domain branches.
 
 ### Expected files
 
-`task_foundry.py`, `foreach_foundry.py`, `if_foundry.py`, a small TaskPack reader
-module if needed, `assessment.py`, and focused tests. Do not add a service or
-Registry.
+`task_foundry.py`, `foreach_foundry.py`, `if_foundry.py`, `assessment.py`, the
+existing preparation/session boundary, and focused tests. Do not add a TaskPack
+reader, service or Registry in this checkpoint.
 
 ## 4. Checkpoint B — TaskSpecification, coverage and V0
 
@@ -83,15 +84,22 @@ Requirement obligation in both directions.
 ### Work
 
 - introduce one bounded TaskSpecification document;
+- add the narrow sealed S1 RequirementObligation catalog with stable semantic
+  kinds and finite always/start/binding/condition/facet applicability handles;
+- require every sampler to emit the exact canonical CandidateTaskProposal/1
+  schema; sampler-specific evidence stays behind digests;
+- reject multi-capability proposals without one matching sealed S1
+  CompositionRule, regardless of executed sampler success;
 - freeze its parameterized semantic section from qualified
   Requirements/Capabilities and a Candidate proposal;
 - after Start, append only concrete public-provenance values to its binding
   section without changing semantic fields;
-- record predicate-to-anchor and obligation-to-predicate/irrelevance mappings;
-- deterministically enumerate stable obligation IDs from every declared
-  precondition/outcome/refusal/collateral item and require complete accounting;
-- require an executable public applicability predicate for every irrelevance
-  disposition; free-text rationale cannot remove an obligation;
+- record semantic-predicate-to-S1-obligation/qualified-operation mappings and
+  separate public disclosure/provenance mappings;
+- consume and verify every S1-issued obligation ID; S2 cannot create/delete an
+  obligation or applicability handle;
+- evaluate the sealed S1 handle in Framework; irrelevance is permitted only
+  when it is false, and free-text rationale cannot remove an obligation;
 - fail closed on unanchored predicates, omitted obligations or unjustified
   irrelevance;
 - compile V0 as an evaluation plan over existing qualified TaskSemantics, not
@@ -100,6 +108,8 @@ Requirement obligation in both directions.
   predicate leakage, answer leakage and solver-route leakage; a fresh
   public-view critic may reject ambiguity/purposefulness but cannot authorize a
   deterministic failure;
+- seal PublicClosureEvidence that accounts exactly once for each load-bearing
+  predicate, public operand and answer-opacity decision;
 - make the current direct Capability compiler emit proposals into this path.
 
 ### RED acceptance
@@ -113,15 +123,18 @@ issue refund
 ```
 
 A candidate/checker that encodes only the first two must be rejected even when
-its witness and existing predicates pass. Also reject a checker predicate with
-no public anchor, an instruction that omits one load-bearing frozen constraint,
-and an instruction that exposes a dynamic answer or prescribed reference route.
+its witness and existing predicates pass. Also reject: a checker predicate
+authorized only by instruction/schema; an S2-created applicability handle; an
+`irrelevant` obligation whose sealed handle evaluates true; an instruction that
+omits one load-bearing frozen constraint; and an instruction that exposes a
+dynamic answer or prescribed reference route.
 
 ### Real exit
 
-Compile one Git and one SQLite Task through direct proposal -> specification ->
-V0 -> freeze. The frozen digest must be identical across recompilation and must
-not depend on witness bytes.
+Republish one Git and SQLite release with the narrow obligation catalog, then
+compile one Task through direct proposal -> specification -> V0 -> freeze. The
+frozen digest must be identical across recompilation and must not depend on
+witness bytes.
 
 ### Anti-overdesign
 
@@ -159,6 +172,8 @@ state-enablement evidence rather than LLM-imagined tool edges.
   Requirement objective;
 - a successful executed path with an omitted Requirement obligation still fails
   Checkpoint B.
+- state-enablement evidence may prioritize a proposal/witness but cannot, by
+  itself, authorize a required process predicate.
 
 ### Real exit
 
@@ -222,6 +237,12 @@ an exhaustive or decorative challenge matrix.
 - derive and freeze challenge applicability before witness search;
 - implement physical initial/no-op, wrong entity, wrong/stale answer,
   partial/omitted obligation, near-miss, collateral and process/reload cases;
+- allow a required process predicate only when it cites an S1 obligation of
+  kind process; Graph state-enablement is not semantic authorization;
+- record a bounded process evidence section with milestone/obligation IDs,
+  semantic trace-predicate digest, real witness, missing-milestone trace
+  ablation, a physical omission episode when constructible, and known
+  alternative-route results;
 - prune retained constructive witness evidence to calls that support a public
   operand, branch, required effect or declared process milestone, without making
   trace minimality an acceptance rule for future acting policies;
@@ -235,6 +256,9 @@ an exhaustive or decorative challenge matrix.
 Each applicable category must have one real-derived mutant that the unmodified
 checker would accept and the strengthened admission rejects. Mutating result
 booleans or hand-writing an impossible native state is not physical evidence.
+Additionally reject a witness-derived required process with no S1 process
+obligation, and prove trace ablation of each declared milestone fails V0 while a
+different route satisfying the same semantic milestone remains accepted.
 
 ### Real exit
 
@@ -260,6 +284,11 @@ honest yield and rejection causes.
 - seal TaskSpecification, StartRecipe, V0 and AdmissionEvidence into one current
   TaskPackManifest;
 - remove any current in-memory-only identity assumption;
+- add exact current TaskPack decoders with no legacy fallback and recompute all
+  section/pack identities from canonical bytes;
+- return a trusted host projection plus one minimal PublicTaskView containing
+  only instruction and final-answer schema; reset observation and ToolSpecs are
+  obtained freshly from the release;
 - run direct, Graph and Programmatic proposals under declared budgets;
 - deduplicate by semantic/execution structure, not text or entity ID;
 - persist accepted packs and typed rejected-proposal/admission records;
@@ -273,11 +302,15 @@ honest yield and rejection causes.
   distinct;
 - sampler lineage changes evidence identity but not Task truth;
 - batch target cannot override Good Task failure.
+- tampered section/pack identities fail cold read, and PublicTaskView containing
+  semantic keys, expected branch, checker, witness, Start reset input or
+  protected binding is rejected.
 
 ### Real exit
 
-Run complete fixed-budget batches on Git and SQLite and report proposal count,
-execution count, TaskPack yield, unique structures, rejection classes and cost.
+Run complete fixed-budget batches on Git and SQLite, cold-read every admitted
+pack, and report proposal count, execution count, TaskPack yield, unique
+structures, rejection classes and cost.
 
 ## 9. Checkpoint G — Difficulty and CorpusManifest
 

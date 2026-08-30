@@ -9,7 +9,12 @@ Invariant 3: semantic completion requires real state transitions and physical ev
 Not doing: do not implement S3 reward or training inside S2.
 Gold reference: contrasting real Git and SQLite releases plus a held-out Need.
 
-## Accepted deletion-first correction
+## Historical deletion-first checkpoint — superseded for S2 completion
+
+This section records why S1 duplication and fake robustness machinery were
+deleted. Its S1/anti-compatibility decisions remain active, but its minimal S2
+challenge set and “optional” alternative/collateral language no longer define
+S2 completion; the Good Task correction below supersedes them.
 
 - S1 qualifies one representative positive execution per capability.
 - Native Auditor checks only required native effects and collateral.
@@ -24,7 +29,7 @@ Gold reference: contrasting real Git and SQLite releases plus a held-out Need.
   manufacture, and result-object mutation are optional paper experiments.
 - Corpus-count/structure floors are experiment metrics, not product gates.
 
-## Current implementation state
+## Historical implementation checkpoint at `189be1b`
 
 - v1 production paths remain absent.
 - S1 source authority and positive-only evidence formats are implemented.
@@ -34,7 +39,7 @@ Gold reference: contrasting real Git and SQLite releases plus a held-out Need.
 - deterministic full-suite quality gates are green after the deletion.
 - prior `/tmp` v1/v2 Author outputs are diagnostic only and are not accepted artifacts.
 
-## Executed real evidence
+## Historical executed evidence (checkpoint only)
 
 1. Fresh-generated Expected Semantics with per-capability minimal answers.
 2. Fresh-authored TaskSemantics and Native Auditor under the new contracts.
@@ -44,7 +49,7 @@ Gold reference: contrasting real Git and SQLite releases plus a held-out Need.
    environments that actually declare those Goal semantics.
 6. Repeated on SQLite with unchanged Framework code.
 
-## Real closure evidence — 2026-08-30
+## Historical vertical evidence — not S2 closure
 
 - Git Release `bdb1f97e3cded9960df7cf2c8c7112406ded1525c5e2529c962d2d3059d4e810`
   passed simplified positive Qualification, ZIP relocation, cold preparation and
@@ -63,7 +68,7 @@ Gold reference: contrasting real Git and SQLite releases plus a held-out Need.
   and downstream utility remain paper evaluation work, not individual release
   or TaskPack admission gates.
 
-## Assessment and corpus closure — 2026-08-30
+## Historical assessment/corpus checkpoint evidence
 
 - TaskAssessment runs fresh public-only trials after TaskPack admission. It binds
   the acting model/route/prompt policy and records checker failures instead of
@@ -122,7 +127,7 @@ No product code may be changed from this correction until the revised PRD,
 design and implementation plan pass the main-session drift/overdesign review
 and the user accepts the plan.
 
-## Documentation self-review — 2026-08-30
+## Historical main-session self-review — superseded by independent REVISE
 
 Main-session review passed after correcting detected drift. Verified:
 
@@ -142,5 +147,58 @@ Main-session review passed after correcting detected drift. Verified:
 - all eight checkpoints contain a product claim, RED acceptance and real exit;
   the ten-item completion checklist, task JSON/JSONL and Markdown diff validate.
 
-This review authorizes presenting the plan to the user. It does not authorize
-Checkpoint A implementation until the user accepts the revised plan.
+This review authorized presenting the draft only. A later independent review
+found unresolved semantic-authority and process-necessity ambiguity, so it does
+not authorize Checkpoint A.
+
+## Independent S2 responsibility/Good Task review correction — 2026-08-30
+
+Independent Terra review returned `REVISE`, not `ALLOW`:
+
+- instruction/schema disclosure could still be used to self-authorize checker
+  meaning;
+- S2 could propose its own applicability/irrelevance and thereby omit an
+  obligation;
+- witness/state-enablement could still be frozen as a mandatory process route;
+- CandidateTaskProposal and ReloadEvidence lacked exact compact contracts;
+- historical minimal-admission wording remained easy to misread as current.
+
+Critical corrections now applied in the authority documents:
+
+- S1 seals RequirementObligation IDs, semantic kinds and finite applicability
+  handles; S2 only evaluates/references them;
+- only S1 obligations/qualified operations authorize semantic predicates;
+  instruction/schema sources provide disclosure/provenance evidence;
+- a required process must cite an S1 process obligation. Graph edges guide
+  search only; AdmissionEvidence proves checker sensitivity by trace ablation,
+  physical omission when constructible and known alternatives;
+- CandidateTaskProposal/1, PublicClosureEvidence and ReloadEvidence/1 have
+  compact canonical fields without new services or generic DSLs;
+- deletion-first sections are explicitly historical and superseded for S2
+  completion.
+
+The wholesale legacy implementation remains rejected. Checkpoint A remains
+blocked until these corrected documents pass a new independent review and the
+user accepts the plan.
+
+## Independent corrected-plan review — ALLOW
+
+Fresh Terra max re-review confirmed all prior CRITICAL/HIGH/MEDIUM findings are
+closed:
+
+- S1 obligations/qualified operations exclusively authorize semantics;
+- applicability is finite, sealed before S2 and cannot be self-waived;
+- required process cites an S1 process obligation and cannot be inferred from a
+  sampler/witness route;
+- process evidence uses trace ablation, physical omission when constructible and
+  known alternatives;
+- CandidateTaskProposal/1, PublicClosureEvidence and ReloadEvidence/1 are compact
+  and bounded;
+- historical deletion-first language is explicitly superseded;
+- Checkpoint A correctly owns reusable lifecycle/reload evidence, while final
+  TaskPack decoder/PublicTaskView waits for unified format freeze in F;
+- no world ontology, large DSL, dual ABI, second native reader or S3 work was
+  introduced.
+
+Independent verdict: `ALLOW`. No code was reviewed as implementing these future
+stages. Checkpoint A may begin only after explicit user acceptance.

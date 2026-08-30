@@ -72,18 +72,31 @@ The order is semantic, not merely a call sequence:
 
 ## 4. Common sampler boundary
 
-All samplers emit an ephemeral proposal with one minimal shape:
+All samplers emit one canonical ephemeral JSON proposal:
 
 ```text
-CandidateTaskProposal
-  sampler_id
+CandidateTaskProposal/1
+  sampler: {kind: direct|graph|programmatic, version}
   release_id
-  requirement_anchors
-  proposed objective and quantifiers
-  proposed capability/process composition
-  proposed public variable slots
-  public execution evidence references
+  requirement_ids[]
+  obligation_ids[]
+  objective
+  goal_shape: atom|all|if|foreach
+  capability_ids[]
+  composition_rule_id?
+  condition_id?
+  public_slots[]:
+    {slot_id, capability_id, cardinality, facet_constraints[]}
+  public_evidence_refs[]: {kind, digest}
 ```
+
+Framework canonicalizes and schema-validates this exact shape before coverage
+work. Sampler-specific graphs/programs remain behind evidence digests, so they
+cannot create de facto internal Task ABIs.
+
+More than one capability is legal only when `composition_rule_id` resolves to a
+sealed S1 CompositionRule covering those capabilities/workflow. Executed
+adjacency alone cannot license a composed objective.
 
 It contains no expected dynamic answer, protected binding, verifier result,
 reward, difficulty label or admission verdict.
@@ -175,34 +188,55 @@ descriptors/values to the binding section, but any change to objective,
 quantifiers, effects, answers, process or obligation disposition creates a new
 semantic version and restarts V0.
 
+S1 seals a compact obligation catalog before S2 begins:
+
+```text
+RequirementObligation
+  obligation_id
+  requirement_id
+  kind: precondition|effect|answer|process|refusal|collateral
+  canonical_text_digest
+  applicability_handle
+```
+
+Applicability is not S2-authored. The handle is one finite S1-owned form over
+already-qualified semantics:
+
+```text
+always
+start_case(case_id)
+binding_eligible(capability_id)
+condition_branch(condition_id, true|false)
+facet_predicate(capability_id, facet_name, allowed_operator, public_literal)
+```
+
+This is a narrow expected-semantics section, not a general expression language.
+Framework evaluates it against sealed StartCase/BindingCandidate/Condition/Facet
+values.
+
 Coverage is checked in both directions:
 
 ```text
-for predicate in TaskSpecification/checker:
-    require one public entailment anchor
+for semantic predicate in TaskSpecification/V0:
+    require one S1 obligation_id or qualified semantic operation
 
-for obligation in applicable Requirement set:
-    require included(predicate)
-        or frozen_irrelevance_reason(obligation)
+for obligation in sealed S1 catalog:
+    applicable = evaluate_S1_handle(obligation.applicability_handle)
+    if applicable:
+        require included_by(predicate_id)
+    else:
+        permit irrelevant(obligation_id, evaluated_handle_evidence)
 ```
 
-Framework first deterministically enumerates every declared S1 obligation as:
-
-```text
-obligation_id = digest(requirement_id, section, index, canonical text)
-section in {precondition, outcome, refusal, collateral_constraint}
-```
-
-TaskSpecification must account for every ID. An irrelevance disposition also
-declares a public applicability predicate evaluated for the concrete Start and
-binding; free-text rationale alone cannot remove an obligation.
+Instruction spans, schemas and public source pointers are recorded separately
+as disclosure/provenance evidence. They can show that the acting policy sees a
+constraint or operand; they can never authorize the semantic predicate.
 
 A fresh semantic challenger may identify a wrong predicate mapping or wrong
-applicability decision from the same public S1 Requirement view, but it cannot
-create/delete obligation IDs or authorize admission. Framework validates exact
-references and fails closed on unresolved disagreement. LLM agreement is not
-proof of hidden-world truth; the claim is limited to the declared S1 Requirement
-set.
+applicability result from the same public S1 catalog, but it cannot create/delete
+obligations or handles, change evaluation, or authorize admission. Framework
+fails closed on unresolved challenge findings. LLM agreement is not proof of
+hidden-world truth; the claim is limited to the sealed S1 obligation catalog.
 
 ## 6. VerifierBundle V0
 
@@ -248,6 +282,20 @@ render final canonical instruction
 audit public closure and answer opacity
 ```
 
+The Host seals compact `PublicClosureEvidence`:
+
+```text
+task_semantic_digest
+constraint_disclosures[]: {predicate_id, obligation_id, instruction_span_digest}
+operand_sources[]: {slot_or_answer_field, public_source_kind, pointer_or_span}
+answer_opacity[]: {answer_field, absent_from_instruction, absent_from_reset}
+```
+
+Every load-bearing predicate/operand must appear exactly once. Dynamic answers
+whose declared source is a future ToolObservation are rejected if already
+resolved from instruction/reset. A fresh public-view critic may reject ambiguity
+or unnatural wording, but cannot authorize a missing deterministic entry.
+
 Dynamic IDs need not match across starts; their logical constraints and public
 rediscovery path must match.
 
@@ -271,6 +319,25 @@ repeat independently on Start B
 The current SQLite failure case is mandatory regression evidence: a Task that
 says “reopen and confirm” must be rejected if the trace/checker only performs an
 in-process read.
+
+When reload is required, AdmissionEvidence contains one Host-produced section:
+
+```text
+ReloadEvidence/1
+  release_id, task_id, witness_id
+  native_instance_id                 # assigned before creating its directory
+  acting_session_id
+  reopened_session_id                # distinct session, same native_instance_id
+  ordered_lifecycle_event_digest     # reset once -> act -> close -> reopen(no reset)
+  pre_close_facts_digest
+  post_reopen_facts_digest
+  post_reopen_checker_result_digest
+```
+
+The Host event journal binds both session IDs to one run-local native instance;
+absolute temporary paths are not product identity. The reader rejects reused
+session IDs, another native instance, a second reset, missing close, or checker
+evaluation before reopen.
 
 ## 9. Challenge plan without a Cartesian matrix
 
@@ -298,6 +365,27 @@ receipt for each atomic Capability and requires task-level agreement across
 fresh/reloaded instances. A proposed composed predicate that cannot reduce to
 qualified TaskSemantics operations is rejected rather than licensed by new
 unreviewed decoder code.
+
+A V0 process predicate is legal only when it references an S1 obligation whose
+kind is `process`. Graph state-enablement may guide proposal/witness search, but
+cannot make one observed route mandatory. For each process predicate,
+AdmissionEvidence records:
+
+```text
+milestone_id
+process_obligation_id
+semantic trace-predicate digest       # no fixed tool name/order unless obligated
+real witness trace/result digest
+missing-milestone trace-ablation result
+physical omission episode result, when constructible
+known alternative-route results[]
+```
+
+The missing-milestone check reuses real after-state facts but removes the
+milestone evidence; V0 must reject. If a distinct physical omission episode can
+be constructed, run it as well. A different route satisfying the same public
+process semantic remains valid. If there is no S1 process obligation, S2 cannot
+freeze a witness step as required process.
 
 ## 10. TaskPack sealing and cold read
 
