@@ -1,0 +1,7 @@
+{"file":".trellis/tasks/08-30-s3-episode-runtime/prd.md","reason":"Verify S3 records target-policy behavior and Reward/abstention without taking Task truth or training ownership."}
+{"file":".trellis/tasks/08-30-s3-episode-runtime/design.md","reason":"Audit reuse of one policy/tool/reload path, exact public/trusted projections and minimal component count."}
+{"file":".trellis/tasks/08-30-s3-episode-runtime/implement.md","reason":"Check checkpoint order, real evidence exits, failure attribution and no demo/MVP substitution."}
+{"file":"src/agent_env_foundry/public_agent.py","reason":"Ensure failed policy turns are preserved and infrastructure remains distinct without a second Responses loop."}
+{"file":"src/agent_env_foundry/task_execution.py","reason":"Ensure every valid episode is checked only after closing and reopening the same native instance."}
+{"file":"src/agent_env_foundry/batch_foundry.py","reason":"Ensure TaskPack public/trusted boundaries and identities remain unchanged by S3."}
+{"file":"src/agent_env_foundry/assessment.py","reason":"Ensure TaskAssessment remains downstream metadata and shares mechanics without determining Episode reward."}
