@@ -144,3 +144,11 @@ boundary; both were removed before task activation or product implementation.
 The CP1 violation was using missing-module import noise as the initial RED.
 Mutation evidence later proved the contract tests, but did not rewrite that
 history; every later checkpoint must begin with a reachable behavioral RED.
+
+`s3-cp2-public-loop|介入1|返工2|behavioral RED+37 focused+425 full+live Responses+semantic mutation+independent review|红线违反1`
+
+The CP2 redline was temporary overgrowth of the existing 350-line public loop
+to 1202 lines despite the anti-overdesign guard. It was reduced to one 866-line
+Host/adapter implementation before review. Live evidence then found the blank
+Responses terminal bug; independent rework corrected that and three adjacent
+attribution defects before acceptance. No CP3 or later component was introduced.
