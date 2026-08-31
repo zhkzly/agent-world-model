@@ -1,279 +1,206 @@
 # S4 Verified Agent Learning — Product Requirements
 
-## 1. Product goal
+## 1. Authority and stage
 
-Given exact current S1–S3 authority, train one target model through a verified
-SFT path and a verified online GRPO path, then determine whether the automatically
-generated environments, Tasks and Episodes produce real held-out Agent gains.
+This task is a candidate specialization of the stable S4 `SFT/RL` stage in
+`PROJECT.md` and the accepted decisions in `DECISIONS.md`. It cannot redefine
+S1–S3 truth or cite edits made by this candidate as upstream authority.
 
-```text
-EnvironmentRelease + TaskPack/CorpusManifest
-+ EpisodeRecord/TrainingEpisodeView
-+ target model
--> trainer-neutral learning data
--> SFT checkpoint
--> online S3-backed rollouts
--> terminal verified reward
--> GRPO checkpoint
--> frozen held-out evaluation
-```
+The task remains planning authority until it is explicitly activated. Its
+purpose is to test one concrete learning path, not to build a training platform.
 
-S4 closes the paper-grade causal claim. A training script that starts, a falling
-loss, one optimizer step or one improved training Task is not completion.
+## 2. Product goal and claim boundary
 
-## 2. What S3 verification means for S4
-
-S3 does **not** assign a separate Task reward to every tool call.
-
-There are three distinct layers:
-
-### 2.1 Per-call execution integrity
-
-For every proposed call, the shared Host records and validates:
+Use current S1–S3 artifacts to train one target model through:
 
 ```text
-call parseability
-known public tool name
-input-schema validity
-dispatch status
-structured public ToolObservation
-ordered public trace
+fixed-budget teacher Episodes through S3
+-> verified-success SFT data
+-> one SFT checkpoint
+-> online veRL rollout through the same S3 Host
+-> terminal S3 reward
+-> one GRPO checkpoint
+-> matched evaluation on one post-freeze release-held-out Need
 ```
 
-This determines whether the action was a well-formed public environment action.
-It does not determine whether the overall user Task was completed.
+Completion requires real checkpoints and S3-verified behavior. A dataset build,
+falling loss, one optimizer call or one successful training Task is not enough.
 
-A malformed call, unknown tool or invalid argument can terminate the policy as a
-valid policy failure. A provider outage, actor crash or invalid observation is a
-trusted-path defect and therefore abstains.
+One final held-out Release supports only a bounded conclusion about that frozen
+Release and evaluation protocol. It does not establish population-wide transfer
+to arbitrary Needs or prove that verification is causally superior to every
+unverified-data alternative.
 
-### 2.2 Trajectory/process evidence
+## 3. Frozen inputs
 
-The full ordered trace is retained. A frozen checker may inspect the trace when
-the Task has a real public process requirement, for example performing a
-required action before another action. The trace is evidence; it is never
-compared with an S2 witness route.
+Checkpoint 0 freezes:
 
-### 2.3 Terminal Task verification
+- exact EnvironmentRelease, CorpusManifest and TaskPack identities;
+- one explicit teacher `PolicySpec` and one executable driver factory/route whose
+  resolved provider sampling configuration matches it;
+- teacher collection budget, including rollouts per TaskPack and turn limit;
+- one exact target model, tokenizer, tool-use chat template, tool-call parser and
+  tool-observation representation;
+- exact train/dev role assignments keyed by existing Corpus fields;
+- exact veRL upstream commit, literal SFT/GRPO entrypoints and resolved training
+  configuration;
+- SFT, rollout and GRPO budgets and the framework-consumed training seeds.
 
-After the policy emits a final answer or reaches a policy terminal state, S3:
+The upstream pin is the latest stable veRL `v0.9.0` release at
+`483b8a009ba3a97563edee3a19887e4862b8094a`. Checkpoint 0 verifies the installed
+checkout and required APIs against that exact SHA before consuming it. S4 does
+not track the release branch after the freeze.
+
+veRL remains an external unmodified checkout by default. Foundry integration is
+an installable overlay; it does not vendor or fork upstream first. A patch is
+considered only after a focused extension-point failure and separate review.
+
+Device selection is ordinary framework/runtime configuration. S4 implements one
+normal veRL path and adds no CPU/GPU fork, remote runner, scheduler or handoff
+protocol.
+
+The target profile must pass veRL v0.9.0's Continuous Token model-family wiring
+and chat-template checker. Failure stops CP0; S4 does not add another codec to
+support an incompatible target.
+
+## 4. Formal teacher Episode collection
+
+Existing S3 checkpoint/acceptance Episodes prove the S3 contract; they are not
+implicitly the S4 training cohort. In particular, scripted-policy Episodes are
+test evidence rather than primary imitation targets.
+
+The first S4 data action uses the existing S3 `run_episode_batch` path:
 
 ```text
-inspects pre-close state
-closes the acting session
-reopens the same native instance without reset
-inspects authoritative post-reopen state
-runs the frozen task-kind checker over:
-  initial facts
-  post-reopen facts
-  actual public trace
-  actual final answer
-  fresh protected binding/condition context
+exact CorpusManifest
++ frozen teacher PolicySpec
++ matching fresh PolicyDriver factory/route
++ frozen rollouts_per_task and turn budget
++ fresh isolated instances
+-> one honest result per requested slot
+-> persistent EpisodeRecord/TrainingEpisodeView bundles
+-> existing EpisodeBatchManifest
 ```
 
-The terminal checker evaluates the whole Task:
+Collection rules:
 
-| Task kind | load-bearing truth |
-| --- | --- |
-| `Atom` | required effect/query truth, target binding, collateral, answer and required process |
-| `ForEach` | complete selected member set, no omitted/extra member, member answers, collateral/process |
-| `If` | fresh public condition, correct branch semantics, branch outcome, answer/process |
+- no retry-until-success, success backfilling or failed-slot replacement;
+- retain verified success, verified failure, abstain and blocked outcomes;
+- write to a declared persistent artifact root rather than treating `/tmp` as
+  canonical training authority;
+- bind the eligible cohort to exact batch, policy and Episode identities;
+- never use S2 witnesses, admission routes or protected facts as demonstrations.
 
-Therefore:
+No arbitrary Task/structure/sample threshold is invented in this task. The
+primary SFT source set is all allowlisted train-role verified successes from the
+frozen batch; it is not post-hoc success subsampling. If that set is empty,
+Checkpoint 0 stops with concrete evidence.
 
-- tool-call validity alone is insufficient;
-- final answer text alone is insufficient for state-changing or mixed Tasks;
-- final state alone is insufficient when the Task requires an answer or public
-  process;
-- the terminal checker result is the only Task-success authority.
+## 5. S3 truth and reward boundary
 
-## 3. Base reward timing and mapping
+S4 preserves the current terminal policy:
 
-S4 consumes the unchanged S3 policy:
-
-```text
-binary-task-success/1
-```
-
-The scalar is produced once per complete rollout, only after terminal
-close/reopen verification:
-
-| S3 outcome | S4 score | trainability |
+| S3 disposition | reward | use |
 | --- | ---: | --- |
-| `verified_success` | `1.0` | trainable |
-| `verified_failure` | `0.0` | trainable for RL, excluded from positive SFT |
-| `abstain` | `null` | not trainable |
+| `verified_success` | `1.0` | eligible for positive SFT and RL |
+| `verified_failure` | `0.0` | excluded from positive SFT; eligible for RL |
+| `abstain` | `null` | never trainable |
 
-`verified_failure` includes policy-owned failures such as wrong target, partial
-completion, collateral damage, wrong/missing answer, malformed public action or
-healthy turn-budget exhaustion when the environment/truth path remains valid.
+Tool-call parsing, schema validation, dispatch and observation integrity are not
+Task reward. S3 produces the one Task-level reward only after closing/reopening
+the same native instance and running the frozen checker over authoritative state,
+actual public trace and final answer.
 
-`abstain` includes provider, infrastructure, Environment, Task artifact,
-Semantics, Verifier or evidence-integrity defects. S4 must never coerce an
-abstention to zero.
+S4 transports that outcome. It cannot add per-call shaping, an LLM judge, a
+second verifier or a witness-trace comparison.
 
-No per-tool reward, process reward model or auxiliary shaping is part of the
-initial product path. Intermediate call/checker facts may be reported as
-metrics, but they cannot alter the binary terminal truth.
+For initial GRPO behavior, S4 uses the v0.9.0 V1 `verl.trainer.main_ppo`
+entrypoint in sync mode, one TaskPack/prompt group per optimizer step, and one
+pin-specific `FoundryFailClosedReplayBuffer` through the documented custom
+sampler hook. It rejects any failed/incomplete/non-numeric/all-equal group before
+advantage or update and never refills it. Any S3 abstention therefore makes the
+whole optimizer step fail closed. The Episode is retained when sealable; no
+numeric sentinel, replacement, retry or requeue is introduced.
 
-## 4. GRPO rollout semantics
+## 6. Primary SFT cohort and format
 
-For one TaskPack, veRL samples `G` independent rollouts:
-
-```text
-same frozen Task semantics
-+ same logical StartCase
-+ G fresh isolated native instances
-+ dynamic identifiers rediscovered in each instance
--> G terminal S3 outcomes
-```
-
-Example:
+A primary SFT sample must be:
 
 ```text
-Task T
-  rollout 1 -> 1.0
-  rollout 2 -> 0.0
-  rollout 3 -> 1.0
-  rollout 4 -> 0.0
+member of the frozen teacher batch allowlist
+and teacher policy is not scripted
+and cold-valid TrainingEpisodeView
+and disposition == verified_success
+and reward == 1.0
 ```
 
-The Task/group key is frozen before rollout. veRL owns token generation,
-log-probabilities, response masks, group-relative advantage, optimization and
-checkpointing. S3 owns tool execution, environment state, terminal checker and
-reward truth.
+Scripted Episodes remain available for S3 regression tests and analysis but do
+not enter the primary imitation cohort.
 
-A group containing an S3 `abstain` is invalid for optimization. The initial
-implementation records the affected Episode and aborts that optimizer group;
-it does not silently replace the sample, retry until success or treat it as a
-model failure.
+`TrainingEpisodeView` contains structured public turns, not the teacher model's
+original token IDs. Offline SFT therefore:
 
-A group whose valid rewards are all equal has zero/degenerate relative signal.
-S4 must report the zero-advantage-group rate. It must not invent shaping merely
-to force variance.
+1. maps the structured public conversation into the frozen target model's
+   messages/tools format;
+2. applies the target tokenizer/chat template deterministically once;
+3. trains assistant tool-call and final-answer spans;
+4. masks system, user, reset and tool-observation context.
 
-## 5. Inputs
+It must not claim equality with unavailable teacher token IDs. Failed and
+abstained Episodes cannot become positive SFT targets. The SFT command exports
+one HF-compatible model/tokenizer directory that the CP2 rollout `model.path`
+loads directly; a trainer-only shard layout is not the handoff.
 
-S4 consumes only cold-verified current artifacts:
+## 7. Online veRL/S3 path
 
-- exact EnvironmentRelease and prepared runtime;
-- exact TaskPack and CorpusManifest identities;
-- exact S3 EpisodeRecord/TrainingEpisodeView bundles;
-- one frozen learning split;
-- one exact target-model/tokenizer/chat-template profile;
-- one exact upstream veRL revision and accelerator runtime.
+Implement one model-family integration against the exact veRL pin. First test
+the smallest bridge through the existing S3 `PolicyDriver` and
+`run_task_episode` ownership. A new incremental S3 session API is not authorized
+by this plan.
 
-S4 may request a narrowly demonstrated S3 refactor only when the current
-whole-policy `PolicyDriver` boundary cannot support veRL's token-owned async
-rollout without duplicating Host tool/checker logic. It cannot alter TaskPack,
-checker or Episode truth.
+Only a focused functional failure proving that the existing boundary cannot
+preserve exact generated token IDs, masks, S3 lifecycle/reward or correct defect
+attribution may stop the checkpoint and trigger a separate design review for the
+smallest S3 change.
 
-## 6. Outputs
-
-S4 publishes:
+For a trainable rollout, enable the v0.9.0 Continuous Token path for the one
+CP0-validated target model family:
 
 ```text
-LearningSplitManifest
-DataReadinessReport
-SFTDatasetManifest
-TrainingRunManifest
-CheckpointManifest
-EvaluationRunManifest
-LearningUtilityReport
+veRL Continuous Token builds the public prompt
+-> veRL returns exact model token IDs
+-> parsing uses a decoded copy only
+-> existing S3 Host validates and executes public tool calls
+-> upstream Continuous Token merges public observation messages with mask 0
+-> exact model-generated tokens retain mask 1
+-> existing S3 close/reopen checker produces 1.0 / 0.0 / null
+-> AgentLoop transports the S3 result
 ```
 
-Every output binds exact upstream Release, TaskPack, Episode, model, tokenizer,
-veRL revision, config and checkpoint identities. Paths and credentials do not
-enter semantic identities.
+The adapter cannot call the actor directly, rebuild generated assistant tokens,
+inspect trusted state or implement a second environment/checker loop.
 
-## 7. veRL integration policy
+## 8. Learning splits
 
-S4 does not copy veRL into this repository and does not fork it first.
-
-Required order:
-
-1. clone official `verl-project/verl` at one exact tested tag/commit;
-2. install it editable in a separate environment/worktree;
-3. keep Foundry integration code under this repository;
-4. fail closed when the installed veRL revision/API differs from the frozen pin;
-5. use upstream extension points (`AgentLoopBase`, rollout client, trainer and
-   reward fields) before modifying upstream code;
-6. permit a minimal recorded patch only after a focused compatibility test
-   demonstrates that upstream cannot preserve model-generated token IDs,
-   response masks, terminal reward or the shared S3 Host truth path.
-
-The planning candidate is `release/v0.8.0`; Checkpoint 0 must resolve it to an
-exact commit after compatibility and hardware tests. veRL Agent Loop remains an
-alpha API, so tracking moving `main` is forbidden.
-
-## 8. Offline SFT path
-
-The first SFT dataset consumes only:
+Split identity comes from existing Corpus authority:
 
 ```text
-verified_success
-reward == 1.0
-cold-valid TrainingEpisodeView
+corpus_id + release_id + structure_id + task_pack_id
 ```
 
-It converts each public Episode to the selected model's exact tool-use chat
-format. The trainable mask is:
+S4 assigns train/dev roles in the cohort file using those existing keys; `role`
+is not claimed to be a Corpus field. If no dev role is available, the experiment
+uses the single frozen training recipe without dev-driven tuning or checkpoint
+selection. The final release-held-out role is created only after
+code/config/metric freeze.
 
-```text
-system/user/reset/tool observation tokens -> 0
-assistant tool-call/final-answer tokens    -> 1
-```
+The current Corpus does not demonstrate same-structure/different-instance pairs,
+so instance-held-out is not a completion gate. S4 does not add a
+`task_structure_id` field or synthesize a proxy identity.
 
-Failed and abstained Episodes remain available for analysis and RL, but cannot
-become positive imitation targets in the initial SFT path.
+## 9. Required comparisons and reporting
 
-SFT completion requires a real checkpoint and S3-based evaluation against the
-base model under the same evaluation budget; training loss alone is not
-evidence.
-
-## 9. Online GRPO path
-
-Implement one custom veRL Agent Loop for one model family:
-
-```text
-veRL model generates exact token IDs
--> parse one public tool call or final answer
--> shared S3 Host validates/dispatches the call
--> public observation is encoded with mask 0
--> model continues with generated-token mask 1
--> terminal S3 close/reopen checker
--> reward_score = 1.0 or 0.0
--> veRL computes GRPO advantage and updates the model
-```
-
-The adapter must return the exact model-generated token IDs. It must not rebuild
-the entire conversation with a decode/re-encode cycle that changes policy
-tokens. Tool-observation tokens are environment tokens and therefore masked out
-of the policy loss.
-
-The S3 terminal reward is transported, not recomputed, by the veRL adapter.
-No LLM Judge or second verifier is allowed.
-
-## 10. Learning splits and final held-out
-
-S4 distinguishes:
-
-1. **instance-held-out** — known structure, unseen Start/binding;
-2. **structure-held-out** — known release, unseen `task_structure_id`;
-3. **release-held-out** — Need/EnvironmentRelease unseen during training and
-   hyperparameter selection.
-
-Existing Git, SQLite and maintenance releases are conformance/development
-assets, not the final untouched release-held-out test. After the S4 code,
-training recipe and allowed hyperparameter range freeze, select and generate a
-new final held-out Need through the unchanged S1–S3 path.
-
-No TaskPack, semantic structure or release assigned to final test may enter SFT,
-RL rollout selection or hyperparameter tuning.
-
-## 11. Required experiment matrix
-
-Minimum product comparison:
+Use one S3 runtime, prompt/tool template and matched evaluation slot budget for:
 
 ```text
 base model
@@ -281,64 +208,93 @@ SFT checkpoint
 SFT -> GRPO checkpoint
 ```
 
-Use matched evaluation budgets and the same S3 verifier. Report at least:
+Report only evidence with an existing producer:
 
-```text
-verified success rate
-macro success by Task structure/release
-pass@1 and repeated-run reliability
-wrong-target/partial/collateral/wrong-answer failures
-average model turns/tool calls/tokens/latency
-abstain rate and owner
-GRPO reward variance and zero-advantage-group rate
-```
+- verified success, verified failure and abstain counts/rates;
+- result by existing Release/structure identities when the denominator exists;
+- repeated-run reliability under the frozen slot budget;
+- public calls, turns, tokens and latency when present;
+- GRPO reward variance and all-equal-group rate;
+- exact model, tokenizer, data, config, checkpoint and Episode identities;
+- raw frozen S3 failure codes when already available, without inventing a new
+  cross-TaskKind error taxonomy.
 
-Paper experiments may add RL-only and weak-data baselines after the minimum path
-works. They are not allowed to delay or replace the product path.
+Before the final Release is selected, freeze:
 
-## 12. Explicitly outside S4
+- primary contrast: `SFT->GRPO minus Base`;
+- primary metric: mean paired S3 numeric terminal reward over matched slots that
+  are trustworthy in both arms;
+- abstentions: excluded from the numeric reward estimate but retained and
+  reported for every requested slot, with no replacement;
+- improvement direction and threshold: strictly greater than `0`;
+- statistical unit: TaskPack, with the exact paired TaskPack-clustered 95% CI
+  procedure checked in before evaluation;
+- checkpoint-selection rule: use the terminal checkpoint at the exact frozen SFT
+  and GRPO step budgets; no best-of-run selection;
+- all secondary `SFT-Base` / `GRPO-SFT` reports.
 
-- Task generation, admission, correction or new checkers;
-- per-call scalar truth or a general reward DSL;
-- LLM-as-Judge reward;
-- a generic trainer/algorithm/plugin registry;
-- HTTP Episode service, queue, scheduler or distributed environment platform;
-- automatic curriculum or automatic Task evolution;
-- simultaneous support for PPO, DAPO, GSPO and multiple model families;
-- silently retrying/replacing abstained or failed rollouts;
-- protected-state features in prompts or training views.
+`SUPPORTED_ON_FROZEN_RELEASE` is emitted only when the primary point estimate is
+positive and the frozen CI lower bound is greater than `0`. Otherwise, including
+when the CI cannot be computed under the frozen method, the result is
+`NOT_SUPPORTED_ON_FROZEN_RELEASE` with the reason retained. This is a support
+decision, not a claim of zero effect.
 
-## 13. Acceptance criteria
+## 10. Evidence artifacts
+
+Each checkpoint persists only the resolved configuration and receipt consumed by
+the next checkpoint beside its real dataset, checkpoint or evaluation output.
+Existing S3 manifests and trainer checkpoint/config outputs are reused.
+
+Do not create a generic artifact base class, registry or seven predeclared
+manifest types. Paths and credentials are operational metadata; semantic
+identity binds exact content and configuration digests.
+
+## 11. Explicitly outside S4
+
+- changes to S1/S2 generation, Task admission or checkers;
+- S2 witness demonstrations or protected-state model features;
+- per-call reward, shaping or reward models;
+- trainer/model/algorithm registries;
+- additional model families or RL algorithms;
+- HTTP Episode services, queues, schedulers or environment pools;
+- CPU/GPU-specific Foundry implementations;
+- automatic curriculum or Task evolution;
+- silent rollout retry/replacement;
+- a normalized failure taxonomy without a stable S3 producer.
+
+## 12. Acceptance criteria
 
 S4 is complete only when:
 
-- one exact veRL revision and one target-model profile are frozen and verified;
-- TrainingEpisodeView deterministically produces a non-leaking SFT dataset;
-- one SFT checkpoint is trained and evaluated through S3;
-- a custom veRL Agent Loop drives the same S3 Host tool/checker path;
-- generated-token and tool-observation masks are proven correct;
-- every RL trajectory binds one EpisodeRecord and one transported S3 terminal
-  reward;
-- abstentions are excluded from optimization without becoming zero;
-- one real GRPO optimizer update, checkpoint save/reload and continued rollout
-  succeed;
-- base, SFT and SFT->GRPO are compared under matched held-out evaluation;
-- a newly selected release-held-out environment is evaluated after freeze;
-- all gains and failures remain traceable to exact artifacts/config/checkpoints;
-- S1–S3 truth and identities remain unchanged.
+- the formal collection command completes, the cohort binds its in-process
+  validated batch identity, and every sealable cohort Episode cold-reads;
+- one target model/template and exact veRL commit are bound to resolved configs;
+- primary SFT data contains only eligible real teacher successes;
+- one real SFT optimizer update changes trainable parameters, exports an
+  HF-compatible checkpoint, cold-loads with the same logical tensor digest and
+  is evaluated through S3;
+- the veRL model drives the existing S3 Host path with exact token/mask truth;
+- every trainable rollout binds one matching S3 Episode and terminal reward;
+- abstention causes a recorded zero-update step rather than numeric reward;
+- at least one nonzero-signal GRPO update, save/reload and continued rollout run;
+- base/SFT/GRPO use matched S3 evaluation slots;
+- one post-freeze release-held-out evaluation mechanically yields the bounded
+  frozen-rule result;
+- all five checkpoints pass alignment/deletion review and separate commits;
+- S1–S3 truth and public/trusted boundaries remain unchanged.
 
-## 14. Fatal rejection criteria
+## 13. Fatal rejection criteria
 
-Reject S4 completion if:
+Reject completion if:
 
-- tool-call success is mistaken for Task success;
-- final answer text replaces native state/process/collateral verification;
-- per-call shaping is introduced before terminal binary reward is validated;
-- `abstain` becomes zero or is silently dropped/replaced;
-- generated token IDs are reconstructed through a mismatching template;
-- veRL uses a second environment/checker implementation;
-- S2 witness or protected data enters model input;
-- only training loss or training-Task success improves;
-- groups have no reward variance and training is still claimed effective;
-- the final held-out Need was used during implementation or tuning;
-- a moving veRL `main` or undocumented fork is required for reproduction.
+- scripted or non-allowlisted evidence silently enters primary SFT;
+- tool validity or final text alone becomes Task success;
+- `abstain` becomes zero, disappears or triggers replacement;
+- online model tokens are reconstructed through decode/re-encode;
+- offline SFT claims preservation of unavailable teacher token IDs;
+- a second Host/checker path or protected-data input is introduced;
+- a predesigned S3 session refactor is implemented without focused failure;
+- all available GRPO groups are zero-signal but useful RL is claimed;
+- final evaluation data enters training, tuning or checkpoint selection;
+- one held-out Release is generalized to arbitrary Needs;
+- falling loss or code completion substitutes for physical learning evidence.

@@ -1,83 +1,96 @@
 # S4 Verified Agent Learning — Completion Checklist
 
-## Reward and trust boundary
+## Project and stage alignment
 
-- [ ] Does every tool call receive only Host parse/schema/dispatch/observation checks rather than Task reward?
-- [ ] Is Task success decided only by the existing S3 post-reopen frozen checker?
-- [ ] Does final-answer correctness remain one checker axis rather than the sole truth for stateful Tasks?
-- [ ] Is S3 `1.0 / 0.0 / null` transported exactly, with no LLM Judge or second verifier?
-- [ ] Does any `abstain` block optimization rather than become zero or disappear?
-- [ ] Are S2 witnesses, protected bindings, native facts and checker internals absent from model input and learning data?
+- [ ] Does this checkpoint answer the S4 learning-utility question rather than
+  merely demonstrate a training framework feature?
+- [ ] Does it consume completed S1–S3 authority without generating, repairing or
+  weakening EnvironmentRelease, TaskPack, Corpus or checker truth?
+- [ ] Is one unseen-Release result described as bounded evidence rather than a
+  universal cross-Need claim?
+- [ ] Is a valid negative or insufficient-data outcome accepted?
 
-## External veRL authority
+## Formal cohort
 
-- [ ] Is one exact official veRL commit/tag frozen and fail-closed?
-- [ ] Is the integration an overlay rather than a vendored/fork-first copy?
-- [ ] Has unmodified upstream extension-point compatibility been tested first?
-- [ ] If a patch exists, is it minimal, based on one exact SHA, covered by a failing compatibility test and assigned a deletion condition?
-- [ ] Are accelerator, PyTorch, rollout backend, model and tokenizer revisions recorded?
-
-## Data readiness and split integrity
-
-- [ ] Are Release, Task structure, TaskPack and Episode counts reported before training?
-- [ ] Are verified-success SFT token counts sufficient for the declared run?
-- [ ] Are base-policy success and candidate GRPO reward variance measured?
-- [ ] Are zero-advantage-group and abstain rates reported?
-- [ ] Are instance-, structure- and release-held-out roles disjoint and frozen?
-- [ ] Is the final release-held-out Need selected only after S4 code/config freeze?
+- [ ] Was the teacher PolicySpec, matching fresh-driver route/provider sampling
+  config, Corpus, slot budget/order and output root frozen before collection?
+- [ ] Did existing `run_episode_batch` retain every requested success, failure,
+  abstain or blocked slot without retry/backfill?
+- [ ] Is every primary SFT Episode in the exact batch/policy allowlist?
+- [ ] Are scripted, failed, abstained, duplicate and non-cold-valid Episodes
+  excluded from primary SFT?
+- [ ] Are split roles bound only to existing `release_id`, `structure_id` and
+  `task_pack_id` authority?
+- [ ] Are `/tmp` acceptance fixtures excluded from canonical training authority
+  unless explicitly recollected into the formal batch?
 
 ## SFT data and checkpoint
 
-- [ ] Does every SFT sample cold-bind one verified-success Episode ID?
-- [ ] Are system/user/reset/tool-observation tokens masked out?
-- [ ] Are assistant tool-call and final-answer tokens trained?
-- [ ] Are generated assistant tokens preserved rather than reconstructed by a second render pass?
-- [ ] Are verified failures and abstentions excluded from positive SFT?
-- [ ] Does the dataset manifest bind tokenizer/template/config/checksums?
-- [ ] Is a real checkpoint saved, cold-loaded and evaluated through S3 against the base model?
+- [ ] Does each row use only public `TrainingEpisodeView` fields?
+- [ ] Is the frozen target tokenizer/chat template applied deterministically
+  once rather than through competing render paths?
+- [ ] Are assistant tool-call/final-answer spans trainable and prompt/tool
+  observation spans masked out?
+- [ ] Does the plan avoid claiming preservation of unavailable teacher token IDs?
+- [ ] Is one real checkpoint saved and cold-loaded before behavior claims?
+- [ ] Did a real optimizer step change a trainable tensor digest, and does the
+  HF-compatible cold-loaded handoff have the saved logical tensor digest?
+- [ ] Is loss treated as a diagnostic rather than learning evidence?
 
-## Shared S3 online seam
+## S3/veRL bridge
 
-- [ ] Is there one current consumer-driven incremental Episode seam or a proven smaller adapter?
-- [ ] Do Responses and veRL reuse the same Host tool validation/dispatch/trace path?
-- [ ] Do they reuse the same close/reopen/checker/reward path?
-- [ ] Can S4 neither reset twice nor inspect trusted state/checker?
-- [ ] Are S3 EpisodeRecord, TrainingEpisodeView, TaskPack and Reward identities unchanged?
+- [ ] Was the existing `PolicyDriver`/`run_task_episode` path attempted before
+  proposing any new S3 seam?
+- [ ] Do all public actions still pass through the existing Host validation,
+  dispatch and trace path?
+- [ ] Does terminal reward still come only from existing close/reopen/checker
+  truth?
+- [ ] Are exact online model IDs retained while decoded text is parsing-only?
+- [ ] Does the target pass pinned v0.9.0 Continuous Token model-family and
+  chat-template compatibility without a second Foundry codec?
+- [ ] Are model tokens mask `1`, environment tokens mask `0`, with equal lengths?
+- [ ] Are model-server and trusted-path failures attributed without becoming
+  healthy policy failures?
+- [ ] Do Base and SFT use the same adapter, template, slots and budget?
 
-## veRL Agent Loop token truth
+## GRPO
 
-- [ ] Does one custom AgentLoop retain exact IDs returned by the rollout server?
-- [ ] Is decoded text used only for parsing, never to replace generated token IDs?
-- [ ] Are model tokens mask 1 and environment observation tokens mask 0?
-- [ ] Do response IDs and response mask have identical length?
-- [ ] Does each rollout use a fresh S3 native instance and exact Task group identity?
-- [ ] Does each trainable AgentLoopOutput bind one cold-valid Episode ID and matching terminal reward?
-- [ ] Does an injected S3 abstain prevent the optimizer group from updating?
-
-## GRPO and checkpointing
-
-- [ ] Does each group contain rollouts from one exact TaskPack/split group?
-- [ ] Does every member have numeric S3 reward and at least one model-generated token?
-- [ ] Are all-equal groups reported rather than hidden or shaped?
-- [ ] Has one nonzero-signal GRPO optimizer update physically run?
+- [ ] Does each group bind one exact TaskPack and fresh isolated instances?
+- [ ] Does every trainable member bind one matching cold S3 Episode and numeric
+  terminal reward?
+- [ ] Does any abstention abort the entire optimizer step before advantage or
+  update, leaving parameters unchanged?
+- [ ] Is pinned v0.9.0 `main_ppo` using V1 sync, one group per step and the
+  pin-specific fail-closed ReplayBuffer with no refill/resampling?
+- [ ] Are all-equal groups reported as zero signal rather than shaped or hidden?
+- [ ] Has a real nonzero-signal update, save, cold reload and continued rollout
+  run?
 - [ ] Are rollout weights synchronized after update?
-- [ ] Does checkpoint save/reload preserve model/tokenizer/parent/config/data/veRL identities?
-- [ ] Can training continue from the reloaded checkpoint?
 
-## Final learning utility
+## Final held-out evidence
 
-- [ ] Are base, SFT and SFT->GRPO evaluated with the same frozen S3 budget?
-- [ ] Are verified success, structure/release macro results and repeated reliability reported?
-- [ ] Are wrong-target, partial, collateral and wrong-answer errors retained?
-- [ ] Are calls, turns, tokens, latency and abstain owners retained?
-- [ ] Is the final held-out result accompanied by confidence intervals and exact artifact/config identities?
-- [ ] Is a valid negative/no-gain result accepted without changing S1–S3 truth?
+- [ ] Were code/config/checkpoints, primary contrast/metric/direction, statistical
+  unit, exact CI implementation, decision rule, checkpoint selection and slot
+  budget frozen before the final Release?
+- [ ] Are the terminal checkpoints at the exact frozen step budgets used, with no
+  best-of-run selection?
+- [ ] Did the parent Foundry operator deliver exact post-freeze S1–S3 artifacts
+  before S4 made any final model call?
+- [ ] Is the final Need/Release absent from all training and tuning history?
+- [ ] Are Base, SFT and SFT→GRPO evaluated on the same S3 slots?
+- [ ] Are all failures and abstentions retained in requested-slot accounting,
+  with null excluded only from the predeclared paired numeric estimate?
+- [ ] Are only metrics/raw codes with existing S3 producers reported?
+- [ ] Can exact source, config, checkpoint and Episode identities reconstruct the
+  result?
 
-## Anti-overdesign
+## Anti-overdesign and execution discipline
 
-- [ ] Is there no trainer/model/algorithm registry?
-- [ ] Is there no HTTP Episode service, queue or extra Ray environment platform?
-- [ ] Is there no reward DSL or per-tool shaping path?
-- [ ] Is there no automatic curriculum/Task evolution?
-- [ ] Is only one model family, one veRL pin and one GRPO path required for completion?
-- [ ] Does every added field/module have one current producer and consumer?
+- [ ] Is there one normal veRL path with no Foundry CPU/GPU fork or remote runner?
+- [ ] Is there no predesigned incremental S3 session, second Host or evaluator?
+- [ ] Is there no trainer/model/algorithm/codec/artifact registry?
+- [ ] Is there no shaping, reward model, LLM judge, retry, replacement, requeue,
+  scheduler, service or curriculum?
+- [ ] Does every new file/type/field have a current producer and consumer?
+- [ ] Did the checkpoint begin with reachable behavioral RED, pass mutation and
+  full checks, receive independent review and land in its own commit?

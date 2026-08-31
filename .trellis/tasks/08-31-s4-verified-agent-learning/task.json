@@ -2,10 +2,10 @@
   "id": "s4-verified-agent-learning",
   "name": "s4-verified-agent-learning",
   "title": "S4 Verified Agent Learning",
-  "description": "Convert exact S3 public Episode evidence into one reproducible SFT path and one veRL GRPO path, then prove learning utility with frozen held-out evaluation",
+  "description": "Materialize one honest teacher cohort through S3, train one SFT-to-GRPO path, and measure bounded learning utility on a frozen unseen Release",
   "status": "planning",
   "dev_type": "ml",
-  "scope": "Implement trainer-neutral learning data, a pinned veRL integration, one model-family SFT pipeline, one terminal-reward GRPO rollout path over the shared S3 runtime, checkpoint/evaluation identity, and matched-budget held-out evidence; do not alter S1-S3 truth or build a training platform",
+  "scope": "Use existing S1-S3 authority to collect a fixed-budget teacher cohort, train one model family through verified-success SFT and terminal-reward GRPO over the shared S3 runtime, and compare Base/SFT/GRPO on one post-freeze Release; do not alter S1-S3 truth or build a training platform",
   "package": "agent_env_foundry",
   "priority": "P0",
   "creator": "kelong",
@@ -29,16 +29,16 @@
     "src/agent_env_foundry/episode_batch.py",
     "src/agent_env_foundry/public_agent.py"
   ],
-  "notes": "Planning authority only. S4 must first pin one exact upstream veRL revision and one target model profile after resource/data preflight. Integration should live as an overlay in this repository; upstream veRL is not forked or patched unless a concrete extension-point failure blocks token truth, terminal reward, or the shared S3 Host path.",
+  "notes": "Planning authority only. S4 specializes the stable SFT/RL stage and cannot authorize itself by editing PROJECT.md. CP0 freezes one teacher driver route plus one target model/tokenizer/template/parser. The integration uses latest stable veRL v0.9.0 at exact SHA 483b8a009ba3a97563edee3a19887e4862b8094a, V1 sync training with one pin-specific fail-closed replay-buffer extension, Continuous Token, and the existing S3 PolicyDriver/Host path. No S3 seam is pre-authorized; a focused functional failure must trigger separate review.",
   "meta": {
-    "semantic_order": "readiness-freeze-sft-data-sft-checkpoint-online-rollout-terminal-verification-grpo-update-heldout-utility",
+    "semantic_order": "formal-teacher-cohort-sft-candidate-proof-first-s3-bridge-matched-evaluation-grpo-update-frozen-release-utility",
     "base_reward": "binary-task-success/1",
     "reward_timing": "terminal_task_level_after_close_reopen_checker",
     "initial_training_paths": [
       "verified_success_sft",
       "sft_then_grpo"
     ],
-    "candidate_verl_ref": "release/v0.8.0",
+    "verl_ref": "483b8a009ba3a97563edee3a19887e4862b8094a",
     "forbidden": [
       "per_tool_call_reward_as_task_truth",
       "llm_judge_reward",
@@ -49,7 +49,11 @@
       "reward_dsl",
       "service_or_queue",
       "automatic_curriculum",
-      "multiple_rl_algorithms_before_grpo_exit"
+      "multiple_rl_algorithms_before_grpo_exit",
+      "scripted_primary_sft",
+      "preauthorized_s3_session_refactor",
+      "cpu_gpu_product_fork",
+      "remote_execution_framework"
     ]
   }
 }

@@ -4,10 +4,8 @@
 
 Deliver a publishable system that converts a natural-language Need into a real
 executable Agent environment, samples good training Tasks, verifies real Agent
-episodes and determines whether the resulting data improves held-out Agent
-behavior. Product completion means semantic completion of the causal chain,
-never a demo, mock, canned Task, green suite, falling loss or one successful
-training example.
+episodes and produces SFT/RL evidence. Product completion means semantic
+completion of the causal chain, never a demo, mock, canned Task or green suite.
 
 ## Product stages
 
@@ -25,15 +23,12 @@ S3 Verified Episode Runtime
   -> deterministic Reward/abstention
   -> EpisodeRecord and EpisodeBatchManifest
 
-S4 Verified Agent Learning
-  -> verified-success SFT data/checkpoint
-  -> veRL online rollout through S3
-  -> terminal-reward GRPO checkpoint
-  -> frozen held-out learning evidence
+S4 SFT/RL
+  -> datasets, optimizer runs, checkpoints and held-out evidence
 ```
 
-The parent owns the cross-stage causal claim only; it is not another runtime or
-training layer.
+The parent owns the cross-stage causal claim only; it is not another runtime
+layer.
 
 ## Stage boundaries
 
@@ -78,42 +73,22 @@ valid policy failure -> 0.0
 untrustworthy infrastructure/truth path -> null / abstain
 ```
 
-Per-call parsing, schema, dispatch and observation checks establish public action
-integrity. They do not independently establish Task success. The terminal checker
-uses authoritative post-reopen state, actual trace and final answer.
-
 S3 preserves failed policy trajectories and distinguishes them from provider,
 Environment, Task artifact, Semantics, Verifier and evidence defects. It cannot
 regenerate/re-admit Tasks, change checker truth, choose another corpus or train a
 model.
 
 The target policy receives only instruction, fresh reset context, ToolSpecs,
-ToolObservations and final-answer schema. S3 exposes one restricted public
-execution boundary for the current Responses adapter and an S4 rollout adapter,
-but no service, registry or second verifier loop.
+ToolObservations and final-answer schema. S3 may expose one restricted
+PolicyDriver boundary for the current Responses adapter and a future S4 rollout
+adapter, but no service, registry or second Agent loop.
 
 ### S4
 
-S4 owns model-side learning and the final utility claim:
-
-```text
-readiness/split freeze
--> TrainingEpisodeView to assistant-only SFT data
--> SFT checkpoint and S3 evaluation
--> target model generates exact multi-turn rollout tokens in veRL
--> shared S3 Host executes public tools
--> terminal S3 close/reopen checker supplies 1.0/0.0/null
--> GRPO update/checkpoint
--> new release-held-out evaluation
-```
-
-S4 cannot redefine Environment or Task truth, use tool-call validity/final text
-alone as success, expose protected data, coerce abstention to zero or compare a
-trajectory with an S2 witness.
-
-The initial product supports one exact veRL revision, one target model family,
-one verified-success SFT path and one SFT-to-GRPO path. Additional algorithms,
-models, shaping, curriculum and services are not completion requirements.
+S4 consumes exact Release/TaskPack/Episode identities and public trajectory
+views. It may construct SFT/RL batches, but cannot redefine environment behavior,
+Task truth or turn abstained evidence into a policy reward. The active S4 child
+task, once explicitly accepted, owns its concrete learning experiment.
 
 ## Trust boundary
 
@@ -124,15 +99,12 @@ acting policy
 trusted runtime
   reset recipe + protected binding + native facts + frozen checker
 
-S4 model side
-  generated token IDs + response mask + logprobs + optimizer/checkpoint
-
 S4 data consumer
   public trajectory + verified status/reward label
 ```
 
-Protected state may select and verify a Task but never provide an acting-time or
-training operand. Model consensus cannot override deterministic failure.
+Protected state may select and verify a Task but never provide an acting-time
+operand. Model consensus cannot override deterministic failure.
 
 ## Product acceptance
 
@@ -172,20 +144,7 @@ training operand. Model consensus cannot override deterministic failure.
 
 ### S4
 
-- [ ] One exact official veRL revision, model, tokenizer and tool template are
-  frozen after data/hardware readiness.
-- [ ] A non-leaking SFT dataset is deterministically derived from verified-success
-  TrainingEpisodeViews with assistant-only loss masks.
-- [ ] A real SFT checkpoint is saved, cold-loaded and evaluated through S3.
-- [ ] The veRL model itself drives multi-turn tool use through the shared S3 Host
-  without a second environment/checker path.
-- [ ] Exact generated token IDs are retained; tool observation tokens are mask 0.
-- [ ] Each trustworthy rollout receives exactly one transported S3 terminal
-  reward; abstentions never enter optimization.
-- [ ] A nonzero-signal GRPO update, checkpoint save/reload and continued rollout
-  succeed.
-- [ ] Base, SFT and SFT->GRPO use one matched S3 evaluation budget.
-- [ ] A newly selected post-freeze release-held-out Need is evaluated without
-  training/tuning leakage.
-- [ ] The final report supports or rejects the learning-utility claim with exact
-  artifacts, confidence intervals, errors and cost.
+- [ ] S4 produces real SFT/RL checkpoints and held-out evidence from public
+  verified Episodes without changing S1–S3 truth.
+- [ ] Exact artifacts and matched evaluation support or reject the bounded
+  learning-utility claim.

@@ -1,9 +1,7 @@
-{"file":"PROJECT.md","reason":"Preserve the S1-S4 causal product boundary and exact S3 reward authority."}
-{"file":"DECISIONS.md","reason":"Follow accepted trust, abstention, clean-break and anti-overdesign decisions."}
-{"file":".trellis/tasks/08-31-s4-verified-agent-learning/prd.md","reason":"Primary S4 product, reward, split, veRL and completion authority."}
-{"file":".trellis/tasks/08-31-s4-verified-agent-learning/design.md","reason":"Implement the pinned overlay, shared S3 interactive seam, exact token masks and terminal reward transport."}
-{"file":".trellis/tasks/08-31-s4-verified-agent-learning/implement.md","reason":"Execute Checkpoints 0-6 in order with behavioral RED and real GPU/S3 exits."}
-{"file":".trellis/spec/backend/s3-episode-runtime.md","reason":"Do not change current Episode/Reward/TrainingEpisodeView truth while adding the concrete S4 consumer."}
-{"file":"src/agent_env_foundry/episodes.py","reason":"Consume current Policy/Episode/Reward/TrainingEpisodeView contracts without protected leakage."}
-{"file":"src/agent_env_foundry/episode_runtime.py","reason":"Reuse terminal close-reopen verification; permit only a current-consumer incremental refactor."}
-{"file":"src/agent_env_foundry/public_agent.py","reason":"Reuse Host call validation and DriverDecision semantics instead of creating a second tool loop."}
+{"file":"AGENTS.md","reason":"Preserve the stable-authority rule, candidate-task boundary and anti-future-shape constraint."}
+{"file":"PROJECT.md","reason":"Anchor implementation in the stable S1-S4 product purpose rather than candidate-added training details."}
+{"file":"DECISIONS.md","reason":"Preserve accepted S3 reward, public/trusted projection, PolicyDriver and anti-overdesign decisions."}
+{"file":".trellis/tasks/08-26-foundry-paper-product/prd.md","reason":"Keep S4 within the parent causal chain and current completed S1-S3 stage."}
+{"file":".trellis/spec/backend/s3-episode-runtime.md","reason":"Consume the frozen Episode, TrainingEpisodeView, batch and reward contracts without duplicating truth."}
+{"file":".trellis/tasks/archive/2026-08/08-30-s3-episode-runtime/task.md","reason":"Use actual S3 completion evidence and public handoff rather than assuming future runtime behavior."}
+{"file":".trellis/tasks/08-31-s4-verified-agent-learning/research/verl-v0.9.0-contract.md","reason":"Implement against the latest stable exact-SHA AgentLoop, Continuous Token, SFT and fail-closed V1 sampler contracts."}
