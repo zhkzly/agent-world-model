@@ -1,0 +1,55 @@
+{
+  "id": "s4-verified-agent-learning",
+  "name": "s4-verified-agent-learning",
+  "title": "S4 Verified Agent Learning",
+  "description": "Convert exact S3 public Episode evidence into one reproducible SFT path and one veRL GRPO path, then prove learning utility with frozen held-out evaluation",
+  "status": "planning",
+  "dev_type": "ml",
+  "scope": "Implement trainer-neutral learning data, a pinned veRL integration, one model-family SFT pipeline, one terminal-reward GRPO rollout path over the shared S3 runtime, checkpoint/evaluation identity, and matched-budget held-out evidence; do not alter S1-S3 truth or build a training platform",
+  "package": "agent_env_foundry",
+  "priority": "P0",
+  "creator": "kelong",
+  "assignee": "kelong",
+  "createdAt": "2026-08-31",
+  "completedAt": null,
+  "branch": "s4-verified-agent-learning",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": "08-26-foundry-paper-product",
+  "relatedFiles": [
+    "PROJECT.md",
+    "DECISIONS.md",
+    ".trellis/tasks/08-26-foundry-paper-product/prd.md",
+    "src/agent_env_foundry/episodes.py",
+    "src/agent_env_foundry/episode_runtime.py",
+    "src/agent_env_foundry/episode_batch.py",
+    "src/agent_env_foundry/public_agent.py"
+  ],
+  "notes": "Planning authority only. S4 must first pin one exact upstream veRL revision and one target model profile after resource/data preflight. Integration should live as an overlay in this repository; upstream veRL is not forked or patched unless a concrete extension-point failure blocks token truth, terminal reward, or the shared S3 Host path.",
+  "meta": {
+    "semantic_order": "readiness-freeze-sft-data-sft-checkpoint-online-rollout-terminal-verification-grpo-update-heldout-utility",
+    "base_reward": "binary-task-success/1",
+    "reward_timing": "terminal_task_level_after_close_reopen_checker",
+    "initial_training_paths": [
+      "verified_success_sft",
+      "sft_then_grpo"
+    ],
+    "candidate_verl_ref": "release/v0.8.0",
+    "forbidden": [
+      "per_tool_call_reward_as_task_truth",
+      "llm_judge_reward",
+      "abstain_as_zero",
+      "task_or_checker_rewrite",
+      "fork_first_verl_integration",
+      "trainer_registry",
+      "reward_dsl",
+      "service_or_queue",
+      "automatic_curriculum",
+      "multiple_rl_algorithms_before_grpo_exit"
+    ]
+  }
+}
