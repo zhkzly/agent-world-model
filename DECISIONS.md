@@ -212,3 +212,12 @@ first manifest had already published. The first `6a92bd64…` batch remains sole
 authority; the `6affea4a…` duplicate is quarantined, no third collection ran,
 and only derived cohort metadata was clean-break republished with prior bytes
 preserved.
+
+`s4-cp1-sft-input|介入4|返工4|behavioral RED+lossless parquet boundary+native veRL masks+13 mutation licences+deletion review|红线违反2`
+
+The CP1 redlines were declaring the first partial Hydra file a real composition
+before the inherited base was proven, and declaring the first row/config scope
+complete before running the heterogeneous real cohort through Parquet and the
+pinned dataset. Both claims were revoked before commit. The current result is
+implementation-only: the GPU optimizer/digest/checkpoint/cold-load gate remains
+pending and CP1 is not physically complete.

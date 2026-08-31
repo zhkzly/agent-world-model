@@ -9,6 +9,7 @@ from typing import Any, cast
 
 import pytest
 import scripts.s4_collect as s4_collect
+import yaml
 
 import agent_env_foundry.learning_data as learning_data
 import test_episode_runtime as episode_fixtures
@@ -26,6 +27,7 @@ from agent_env_foundry.learning_data import (
     LearningDataError,
     S4CoreConfig,
     TeacherCohort,
+    build_sft_rows,
     read_s4_core_config,
     read_teacher_cohort,
     select_teacher_cohort,
@@ -871,3 +873,370 @@ def test_collect_cli_exposes_only_invocation_local_paths(
         == 0
     )
     assert received == values
+
+
+SFT_CONFIG = Path(__file__).parents[1] / "configs" / "s4" / "sft_trainer_qwen3_0_6b.yaml"
+
+
+def _persisted_gold_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    config, manifest, views = _real_config(), _gold_manifest(), _gold_views()
+    root = tmp_path / "published-batch"
+    root.mkdir()
+    write_teacher_cohort(root, select_teacher_cohort(config, manifest, views))
+    _publish_manifest(root, manifest)
+    by_id = {view.episode_id: view for view in views}
+    monkeypatch.setattr(
+        learning_data,
+        "read_episode_bundle",
+        lambda _root, episode_id: by_id[episode_id],
+    )
+    return root
+
+
+def test_sft_rows_match_native_verl_multiturn_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _persisted_gold_root(tmp_path, monkeypatch)
+    cohort = select_teacher_cohort(_real_config(), _gold_manifest(), _gold_views())
+
+    rows = build_sft_rows(root, _real_config())
+
+    assert [cast(str, source["episode_id"]) for source in (row["source"] for row in rows)] == [
+        *cohort.primary_sft_episode_ids
+    ]
+    assert all(set(row) == {"messages", "tools", "source"} for row in rows)
+    view = _gold_view()
+    public_input = view.public_input
+    row = rows[0]
+    expected_messages: list[JSONObject] = [
+        {"role": "system", "content": public_input.system_prompt},
+        {
+            "role": "user",
+            "content": canonical_bytes(
+                {
+                    "instruction": public_input.instruction,
+                    "reset_observation": public_input.reset_observation,
+                }
+            ).decode(),
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_hTA6aTfJO5EVVYGDobUOHyCL",
+                    "type": "function",
+                    "function": {"name": "repository_status", "arguments": {}},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": (
+                '{"data":{"branch":"main","clean":true,"entries":[]},"error":null,"ok":true}'
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_KafzjB295RazHoukbhR8ADJX",
+                    "type": "function",
+                    "function": {
+                        "name": "create_commit",
+                        "arguments": {"message": "Attempt empty commit"},
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": (
+                '{"data":null,"error":{"code":"NO_STAGED_CHANGE","message":"No staged content'
+                ' differs from HEAD."},"ok":false}'
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_BOINSTLz15Y0C7zvjimQjIv2",
+                    "type": "function",
+                    "function": {"name": "repository_status", "arguments": {}},
+                },
+                {
+                    "id": "call_qXOnXNtJ2BJAM6DZBnXQHmRc",
+                    "type": "function",
+                    "function": {"name": "commit_history", "arguments": {"limit": 5}},
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "content": (
+                '{"data":{"branch":"main","clean":true,"entries":[]},"error":null,"ok":true}'
+            ),
+        },
+        {
+            "role": "tool",
+            "content": (
+                '{"data":{"commits":[{"commit_id":"2b0a7380a1c2f1968c3df5785d8e7d6c55ea0493",'
+                '"message":"Initialize repository","parent_id":null}]},"error":null,"ok":true}'
+            ),
+        },
+        {"role": "assistant", "content": '{"commit_refusal_code":"NO_STAGED_CHANGE"}'},
+    ]
+    expected_tools: list[JSONObject] = [
+        {
+            "type": "function",
+            "function": {
+                "name": cast(str, spec["name"]),
+                "description": cast(str, spec["description"]),
+                "parameters": spec["input_schema"],
+            },
+        }
+        for spec in public_input.tool_specs
+    ]
+    # messages/tools are Parquet-ready deterministic compact JSON strings that
+    # preserve the exact projection key order; source stays the native identity
+    # object
+    assert row["messages"] == json.dumps(
+        expected_messages, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    )
+    assert row["tools"] == json.dumps(
+        expected_tools, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    )
+    decoded = json.loads(cast(str, row["messages"]))
+    assert decoded == expected_messages
+    assert list(decoded[0]) == ["role", "content"]
+    assert list(decoded[2]) == ["role", "content", "tool_calls"]
+    assert list(decoded[2]["tool_calls"][0]) == ["id", "type", "function"]
+    assert list(decoded[2]["tool_calls"][0]["function"]) == ["name", "arguments"]
+    decoded_tools = json.loads(cast(str, row["tools"]))
+    assert decoded_tools == expected_tools
+    assert list(decoded_tools[0]) == ["type", "function"]
+    assert list(decoded_tools[0]["function"]) == ["name", "description", "parameters"]
+    teacher_user_content = json.dumps(
+        {
+            "instruction": public_input.instruction,
+            "reset_observation": public_input.reset_observation,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    assert decoded[1]["content"] == teacher_user_content
+    assert row["source"] == {
+        "cohort_id": cohort.cohort_id,
+        "batch_id": cohort.batch_id,
+        "episode_id": view.episode_id,
+        "request_id": view.request_id,
+        "release_id": view.request.release_id,
+        "task_pack_id": view.request.task_pack_id,
+        "policy_id": view.request.policy_id,
+    }
+
+
+def _mutated_turns(
+    view: TrainingEpisodeView,
+    mutate: Any,
+) -> tuple[JSONObject, ...]:
+    turns = json.loads(json.dumps([dict(turn) for turn in view.turns]))
+    mutate(turns)
+    return tuple(cast(JSONObject, turn) for turn in turns)
+
+
+def _serve_views(
+    monkeypatch: pytest.MonkeyPatch,
+    views: tuple[TrainingEpisodeView, ...],
+) -> None:
+    by_id = {view.episode_id: view for view in views}
+    monkeypatch.setattr(
+        learning_data,
+        "read_episode_bundle",
+        lambda _root, episode_id: by_id[episode_id],
+    )
+
+
+def test_sft_rows_use_parsed_arguments_not_raw_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _persisted_gold_root(tmp_path, monkeypatch)
+    views = _gold_views()
+
+    def drift(turns: list[JSONObject]) -> None:
+        turns[1]["calls"][0]["raw_arguments"] = '{"message":"RAW-DRIFT-SENTINEL"}'
+
+    drifted = replace(views[0], turns=_mutated_turns(views[0], drift))
+    _serve_views(monkeypatch, (drifted, *views[1:]))
+
+    rows = build_sft_rows(root, _real_config())
+
+    assistant = json.loads(cast(str, rows[0]["messages"]))[4]
+    assert assistant["tool_calls"][0]["function"] == {
+        "name": "create_commit",
+        "arguments": {"message": "Attempt empty commit"},
+    }
+    text = canonical_bytes(rows[0]).decode()
+    assert "RAW-DRIFT-SENTINEL" not in text
+    assert '"raw_arguments"' not in text
+
+
+def test_sft_rows_reject_undispatched_call_or_uncompleted_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _persisted_gold_root(tmp_path, monkeypatch)
+    views = _gold_views()
+
+    def undispatch(turns: list[JSONObject]) -> None:
+        turns[0]["calls"][0]["dispatch_status"] = "duplicate_call_id"
+        turns[0]["calls"][0]["observation"] = None
+
+    undispatched = replace(views[0], turns=_mutated_turns(views[0], undispatch))
+    uncompleted = replace(views[1], completion=None)
+    for mutated in (undispatched, uncompleted):
+        _serve_views(
+            monkeypatch,
+            tuple(mutated if view.episode_id == mutated.episode_id else view for view in views),
+        )
+        with pytest.raises(LearningDataError, match="SOURCE_INELIGIBLE"):
+            build_sft_rows(root, _real_config())
+
+
+def test_sft_rows_reject_nonprimary_episode_through_cohort(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    views = (
+        _gold_view(),
+        replace(_gold_view(VIEW_FILES[1]), disposition="abstain", reward=None),
+        _gold_view(VIEW_FILES[2]),
+    )
+    config = _real_config()
+    manifest = _manifest_for_views(views)
+    cohort = select_teacher_cohort(config, manifest, views)
+    assert views[1].episode_id not in cohort.primary_sft_episode_ids
+    forged = TeacherCohort(
+        cohort.config_digest,
+        cohort.batch_id,
+        cohort.corpus_id,
+        cohort.release_id,
+        cohort.policy_id,
+        (views[0].episode_id, views[1].episode_id, views[2].episode_id),
+    )
+    root = tmp_path / "published-batch"
+    root.mkdir()
+    write_teacher_cohort(root, forged)
+    _publish_manifest(root, manifest)
+    _serve_views(monkeypatch, views)
+
+    with pytest.raises(LearningDataError, match="primary selection differs"):
+        build_sft_rows(root, config)
+
+
+def test_sft_rows_exclude_nonpublic_and_private_material(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = build_sft_rows(_persisted_gold_root(tmp_path, monkeypatch), _real_config())
+
+    for row in rows:
+        assert set(row) == {"messages", "tools", "source"}
+        assert set(row["source"]) == {
+            "cohort_id",
+            "batch_id",
+            "episode_id",
+            "request_id",
+            "release_id",
+            "task_pack_id",
+            "policy_id",
+        }
+        for tool in json.loads(cast(str, row["tools"])):
+            assert set(tool) == {"type", "function"}
+            assert set(tool["function"]) == {"name", "description", "parameters"}
+        text = canonical_bytes(row).decode()
+        for banned in (
+            '"raw_arguments"',
+            '"raw_call_id"',
+            '"raw_tool_name"',
+            '"usage"',
+            '"output_schema"',
+            '"defect"',
+            '"blocked_',
+            '"abstain_',
+            '"parse_status"',
+            '"schema_status"',
+            '"dispatch_status"',
+        ):
+            assert banned not in text
+
+
+def test_sft_rows_are_deterministic_in_cohort_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _persisted_gold_root(tmp_path, monkeypatch)
+    config = _real_config()
+
+    first = build_sft_rows(root, config)
+    second = build_sft_rows(root, config)
+
+    cohort = select_teacher_cohort(config, _gold_manifest(), _gold_views())
+    assert [canonical_bytes(row) for row in first] == [canonical_bytes(row) for row in second]
+    assert [row["source"]["episode_id"] for row in first] == list(cohort.primary_sft_episode_ids)
+    assert {row["source"]["cohort_id"] for row in first} == {cohort.cohort_id}
+    assert {row["source"]["batch_id"] for row in first} == {cohort.batch_id}
+    by_id = {view.episode_id: view for view in _gold_views()}
+    for row in first:
+        view = by_id[cast(str, row["source"]["episode_id"])]
+        assert row["source"]["request_id"] == view.request_id
+        assert row["source"]["task_pack_id"] == view.request.task_pack_id
+        assert row["source"]["policy_id"] == view.request.policy_id
+        assert row["source"]["release_id"] == view.request.release_id
+
+
+def test_sft_config_pins_native_verl_contract() -> None:
+    document = yaml.safe_load(SFT_CONFIG.read_text())
+
+    assert set(document) == {"defaults", "data", "model", "optim", "checkpoint", "trainer"}
+    assert document["defaults"] == ["/sft_trainer_engine", "_self_"]
+    data = document["data"]
+    assert set(data) == {
+        "train_batch_size",
+        "micro_batch_size_per_gpu",
+        "max_length",
+        "max_token_len_per_gpu",
+        "custom_cls",
+        "enable_thinking_default",
+        "train_files",
+        "ignore_input_ids_mismatch",
+    }
+    assert data["train_batch_size"] == 3
+    assert data["micro_batch_size_per_gpu"] == 1
+    assert data["max_length"] == 2048
+    assert data["max_token_len_per_gpu"] == 2048
+    assert data["enable_thinking_default"] is False
+    assert data["custom_cls"]["path"] == "pkg://agent_env_foundry.verl_sft_dataset"
+    assert data["custom_cls"]["name"] == "FoundryJSONColumnsSFTDataset"
+    assert data["train_files"] == "${oc.env:S4_SFT_TRAIN_PARQUET}"
+    assert data["ignore_input_ids_mismatch"] is True
+    assert document["optim"]["lr"] == 1e-5
+    assert document["model"]["path"] == "${oc.env:S4_TARGET_MODEL_SNAPSHOT}"
+    assert document["checkpoint"]["save_contents"] == ["model", "optimizer", "extra", "hf_model"]
+    trainer = document["trainer"]
+    assert set(trainer) == {"default_local_dir", "total_training_steps", "logger", "resume_mode"}
+    assert trainer["total_training_steps"] == 1
+    assert trainer["logger"] == ["console"]
+    assert trainer["resume_mode"] == "disable"
+    assert trainer["default_local_dir"] == "${oc.env:S4_SFT_CHECKPOINT_DIR}"
+    text = SFT_CONFIG.read_text()
+    assert "/home/" not in text
+    assert "/tmp/" not in text

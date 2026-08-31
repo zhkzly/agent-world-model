@@ -1,4 +1,4 @@
-"""S4 CP0 semantic configuration and formal teacher cohort contracts."""
+"""S4 teacher-cohort contracts and lossless SFT row projection."""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from agent_env_foundry.environment import JSONObject
+from agent_env_foundry.environment import JSONObject, JSONValue
 from agent_env_foundry.episode_batch import EpisodeBatchManifest
 from agent_env_foundry.episode_runtime import read_episode_bundle
-from agent_env_foundry.episodes import PolicySpec, TrainingEpisodeView
+from agent_env_foundry.episodes import PolicySpec, PublicEpisodeInput, TrainingEpisodeView
 from agent_env_foundry.jsonvalue import is_json_object
 from agent_env_foundry.public_agent import PUBLIC_AGENT_PROMPT_DIGEST
 from agent_env_foundry.release import canonical_bytes
@@ -442,6 +442,132 @@ def select_teacher_cohort(
         manifest.policy_id,
         primary,
     )
+
+
+def _sft_json_text(value: JSONValue) -> str:
+    """Deterministic compact JSON text preserving the row projection key order.
+
+    ``messages`` and ``tools`` travel to Parquet under this exact encoding so
+    the pinned reader decodes them back to the pristine in-memory projection:
+    no key sorting, because the target-template tool text must stay byte-equal
+    to the in-memory render.
+    """
+
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def build_sft_rows(output_root: Path, config: S4CoreConfig) -> tuple[JSONObject, ...]:
+    """Map the cold formal teacher cohort to native veRL multi-turn SFT rows.
+
+    Each row carries exactly ``messages``, ``tools`` and ``source``:
+    ``messages``/``tools`` are deterministic compact JSON strings (Parquet
+    struct inference null-unions heterogeneous tool JSON), while ``source``
+    stays the uniform native identity object. The pinned veRL
+    ``MultiTurnSFTDataset`` owns target-template application and the
+    assistant-only loss mask; Foundry emits no token IDs and no mask.
+    """
+
+    root = Path(output_root)
+    cohort = read_teacher_cohort(root, config)
+    return tuple(
+        _sft_row(cohort, read_episode_bundle(root, episode_id))
+        for episode_id in cohort.primary_sft_episode_ids
+    )
+
+
+def _sft_row(cohort: TeacherCohort, view: TrainingEpisodeView) -> JSONObject:
+    completion = view.completion
+    if (
+        completion is None
+        or completion.terminal_kind != "completed"
+        or completion.final_answer is None
+    ):
+        raise LearningDataError(
+            "SOURCE_INELIGIBLE", "primary SFT row requires a completed public final answer"
+        )
+    public_input = view.public_input
+    messages: list[JSONValue] = [
+        {"role": "system", "content": public_input.system_prompt},
+        {"role": "user", "content": _user_content(public_input)},
+    ]
+    for turn in view.turns:
+        calls = cast(list[JSONObject], turn["calls"])
+        if not calls:
+            continue
+        pairs = [_tool_call_payload(call, view.episode_id) for call in calls]
+        tool_calls: list[JSONValue] = [payload for payload, _observation in pairs]
+        messages.append({"role": "assistant", "content": "", "tool_calls": tool_calls})
+        messages.extend({"role": "tool", "content": observation} for _payload, observation in pairs)
+    messages.append(
+        {
+            "role": "assistant",
+            "content": canonical_bytes(completion.final_answer).decode(),
+        }
+    )
+    request = view.request
+    return {
+        "messages": _sft_json_text(messages),
+        "tools": _sft_json_text(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": spec["name"],
+                        "description": spec["description"],
+                        "parameters": spec["input_schema"],
+                    },
+                }
+                for spec in public_input.tool_specs
+            ]
+        ),
+        "source": {
+            "cohort_id": cohort.cohort_id,
+            "batch_id": cohort.batch_id,
+            "episode_id": view.episode_id,
+            "request_id": view.request_id,
+            "release_id": request.release_id,
+            "task_pack_id": request.task_pack_id,
+            "policy_id": request.policy_id,
+        },
+    }
+
+
+def _user_content(public_input: PublicEpisodeInput) -> str:
+    """The same semantic object the S3 teacher received as its initial user message."""
+
+    return canonical_bytes(
+        {
+            "instruction": public_input.instruction,
+            "reset_observation": public_input.reset_observation,
+        }
+    ).decode()
+
+
+def _tool_call_payload(call: JSONObject, episode_id: str) -> tuple[JSONObject, str]:
+    """Return one native assistant tool call plus its public observation text."""
+
+    call_id = call["call_id"]
+    tool_name = call["tool_name"]
+    arguments = call["parsed_arguments"]
+    observation = call["observation"]
+    if (
+        call["dispatch_status"] != "dispatched"
+        or not isinstance(call_id, str)
+        or not isinstance(tool_name, str)
+        or not is_json_object(arguments)
+        or not is_json_object(observation)
+    ):
+        raise LearningDataError(
+            "SOURCE_INELIGIBLE",
+            f"primary SFT row {episode_id} requires every public call dispatched"
+            " with validated arguments and a public observation",
+        )
+    payload: JSONObject = {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": tool_name, "arguments": arguments},
+    }
+    return payload, canonical_bytes(observation).decode()
 
 
 def _require_primary_teacher(policy: PolicySpec) -> None:

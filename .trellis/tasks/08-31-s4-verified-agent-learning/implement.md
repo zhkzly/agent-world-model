@@ -152,8 +152,16 @@ The checkout path is not checked in or added to `configs/s4/core.json`.
 ### Work
 
 Extend `learning_data.py` to emit only `messages`, `tools` and source identities.
-Use each call's validated `parsed_arguments`, ordered ToolObservation and terminal
-answer. Do not tokenize or create a custom loss mask.
+`messages` and `tools` are deterministic compact JSON text so ordinary Parquet
+materialization cannot union/coerce heterogeneous objects; `source` remains the
+uniform native identity struct. Use each call's validated `parsed_arguments`,
+ordered ToolObservation and terminal answer.
+
+Add exactly one `FoundryJSONColumnsSFTDataset` subclass in
+`verl_sft_dataset.py`, selected through upstream `data.custom_cls`. It calls the
+pinned parent read, fails closed unless both cells are exact expected JSON text,
+decodes those columns in place, and inherits `__getitem__` plus every
+template/token/mask operation. Do not tokenize or create a custom loss mask.
 
 The resolved command is the pinned configuration of:
 
@@ -177,15 +185,17 @@ First test:
 tests/test_learning_data.py::test_pinned_verl_masks_context_not_assistant_output
 ```
 
-The test must exercise the real pinned `MultiTurnSFTDataset`; Foundry produces no
-mask. Reject each incorrect result:
+The test must exercise the real pinned subclass and inherited
+`MultiTurnSFTDataset`; Foundry produces no mask. Reject each incorrect result:
 
 - assistant call/final-answer token has mask `0`;
 - system/user/reset/tool-observation token has mask `1`;
 - parsed arguments, observation or answer reordered/dropped;
 - protected/checker/witness data included;
 - non-allowlisted source included;
-- nondeterministic row bytes or missing source identity.
+- nondeterministic row bytes or missing source identity;
+- native struct/null-union or non-text `messages`/`tools` cells;
+- decoded JSON differing from the pre-Parquet row value.
 
 Mask, allowlist and protected-data mutants must fail.
 
@@ -212,7 +222,8 @@ Loss is diagnostic only. This checkpoint makes no improvement claim.
 ### Alignment/deletion gate
 
 - public TrainingEpisodeView fields only;
-- one target format, no custom dataset class/codec/trainer;
+- one target format and one decode-only exact-pin dataset subclass; no other
+  dataset/codec/trainer surface;
 - no CP2 AgentLoop or CP3 GRPO implementation early;
 - checkpoint is directly loadable as CP2 `model.path`.
 

@@ -27,7 +27,10 @@ wrap environment installation in another runtime.
 ```text
 src/agent_env_foundry/learning_data.py
   select formal primary cohort
-  map public TrainingEpisodeView to veRL messages/tools rows
+  map public TrainingEpisodeView to lossless messages/tools JSON columns
+
+src/agent_env_foundry/verl_sft_dataset.py
+  decode those two columns after the pinned upstream parquet read
 
 src/agent_env_foundry/verl_agent_loop.py
   bridge veRL generation to current synchronous PolicyDriver
@@ -83,10 +86,15 @@ source:
   Episode / TaskPack / Release identities
 ```
 
-The mapper does not tokenize and does not create a loss mask. The pinned veRL
-`MultiTurnSFTDataset` owns target-template application and assistant-only mask;
-the CP1 compatibility test imports that exact checkout and checks its produced
-mask rather than duplicating the algorithm.
+The mapper does not tokenize and does not create a loss mask. It stores
+`messages` and `tools` as deterministic compact JSON text because Arrow struct
+inference null-unions heterogeneous argument and JSON-Schema keys even within a
+single row. `FoundryJSONColumnsSFTDataset` subclasses the pinned
+`MultiTurnSFTDataset`, calls the upstream read, rejects non-text or non-exact
+compact-JSON cells, decodes only those two columns, and changes nothing else. The pinned
+dataset still owns target-template application and assistant-only mask; the CP1
+compatibility test checks exact decoded values and produced masks through that
+real class.
 
 The only training implementation is the resolved config for:
 
@@ -197,6 +205,7 @@ Delete or reject:
 
 - any custom trainer or checkpoint manager;
 - custom prompt/token/mask codec code duplicated from Continuous Token;
+- any SFT dataset override beyond strict post-read JSON decoding;
 - model, algorithm, device, sampler or artifact registries;
 - incremental S3 session/service/queue/pool;
 - retry, refill, survivor filtering or reward shaping;

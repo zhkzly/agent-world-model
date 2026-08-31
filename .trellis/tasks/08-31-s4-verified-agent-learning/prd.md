@@ -94,8 +94,13 @@ system prompt + instruction + reset observation + ToolSpecs
 ```
 
 The pinned veRL SFT dataset applies the target chat template once and owns the
-loss mask. Foundry emits no token IDs or mask. CP1 executes the real pinned
-dataset and requires assistant tool-call/final-answer spans to be trainable while
+loss mask. Foundry emits no token IDs or mask. Because Parquet structs cannot
+losslessly represent heterogeneous JSON objects inside one tool catalog/call
+list, the persisted `messages` and `tools` cells are deterministic compact JSON
+text. One pin-specific `MultiTurnSFTDataset` subclass strictly decodes only those
+two cells immediately after the upstream read, then delegates all template,
+tokenization, sanity-check and mask behavior unchanged. CP1 executes that exact
+path and requires assistant tool-call/final-answer spans to be trainable while
 system/user/reset/tool-observation context is masked out.
 
 The SFT command uses `verl.trainer.sft_trainer` and exports
@@ -177,7 +182,10 @@ Production additions are limited to:
 
 ```text
 src/agent_env_foundry/learning_data.py
-  cohort allowlist + TrainingEpisodeView to messages/tools
+  cohort allowlist + TrainingEpisodeView to lossless messages/tools JSON columns
+
+src/agent_env_foundry/verl_sft_dataset.py
+  exact-pin decode-only MultiTurnSFTDataset subclass
 
 src/agent_env_foundry/verl_agent_loop.py
   PolicyDriver AgentLoop + FoundryFailClosedReplayBuffer
@@ -188,9 +196,11 @@ one GRPO config
 focused tests
 ```
 
-Do not add a custom trainer, token codec, experiment runner, evaluation framework,
-split manager, artifact superclass, Registry, service, queue, scheduler or
-curriculum. Reuse native S3 manifests and veRL configs/checkpoints.
+Do not add a custom trainer, token/mask/template codec, experiment runner,
+evaluation framework, split manager, artifact superclass, Registry, service,
+queue, scheduler or curriculum. Reuse native S3 manifests and veRL
+configs/checkpoints. The one decode-only dataset subclass above is the complete
+exception; it cannot transform JSON values or override `__getitem__`.
 
 ## 8. Explicitly deferred
 
@@ -232,7 +242,7 @@ Reject completion if:
 - tool validity/final text becomes Task success;
 - `abstain` becomes zero, padding, filtering, refill or replacement;
 - a second Host/checker or predesigned S3 session appears;
-- veRL-native training/checkpoint/device behavior is reimplemented;
+- veRL-native training/checkpoint/device/template/token/mask behavior is reimplemented;
 - all-equal groups are shaped into signal;
 - code completion or loss substitutes for real checkpoint/update evidence;
 - held-out/statistical experiment code is added to this task.

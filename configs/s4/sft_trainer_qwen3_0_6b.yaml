@@ -1,0 +1,85 @@
+# Foundry S4 CP1 — the one native veRL v0.9.0 SFT command configuration.
+#
+# Consumed by the pinned upstream entrypoint exactly as shipped:
+#   torchrun --nnodes=1 --nproc_per_node=<n> -m verl.trainer.sft_trainer \
+#     --config-dir <foundry-repo>/configs/s4 --config-name sft_trainer_qwen3_0_6b
+#
+# The defaults inherit the COMPLETE pinned upstream base config
+# (`verl/trainer/config/sft_trainer_engine.yaml`, including its model/engine/
+# optim/profiler groups and every base data/checkpoint/trainer value); the
+# leading slash resolves that base from the trainer's own config source
+# regardless of which search-path source provides this file. This file changes
+# only the fields CP1 pins. veRL v0.9.0
+# @ 483b8a009ba3a97563edee3a19887e4862b8094a is installed editable in the
+# dedicated training environment. Foundry adds no trainer, tokenizer or
+# checkpoint code; the one decode-only dataset reader is configured below.
+#
+# Operational locators resolve from the invoking environment (no machine-local
+# bytes are checked in):
+#   S4_TARGET_MODEL_SNAPSHOT  exact local snapshot of Qwen/Qwen3-0.6B
+#                             @ c1899de289a04d12100db370d81485cdf75e47ca whose
+#                             tokenizer_config.json carries the frozen chat template
+#   S4_SFT_TRAIN_PARQUET      parquet whose rows are build_sft_rows() output
+#                             (columns: messages, tools, source)
+#   S4_SFT_CHECKPOINT_DIR     absent checkpoint output root
+
+defaults:
+  - /sft_trainer_engine
+  - _self_
+
+data:
+  # one real optimizer step over the frozen 3-Episode primary cohort; the
+  # trainer's StatefulDataLoader drops the last partial batch, so any larger
+  # global batch size would silently produce zero optimizer steps
+  train_batch_size: 3
+
+  # one sequence per micro batch for a 3-row global batch
+  micro_batch_size_per_gpu: 1
+
+  # evidence-based from the frozen physical cohort through the real pinned
+  # dataset: sequence lengths 1175/1461/1472 tokens with assistant-mask tokens
+  # 138/262/267 (final answer in mask 1, canonical user content in mask 0 on
+  # every row); 2048 covers the measured maximum with headroom, while the
+  # inherited max_length 1024 would abort under truncation=error
+  max_length: 2048
+  max_token_len_per_gpu: 2048
+
+  # the one reviewed reader exception: strict compact-JSON string columns
+  # (Parquet struct inference null-unions heterogeneous tool JSON)
+  custom_cls:
+    path: pkg://agent_env_foundry.verl_sft_dataset
+    name: FoundryJSONColumnsSFTDataset
+
+  # no thinking blocks in the SFT target; keeps the render convention explicit
+  # for the CP2 rollout path
+  enable_thinking_default: false
+
+  train_files: ${oc.env:S4_SFT_TRAIN_PARQUET}
+
+  # Qwen3 groups consecutive tool responses into one user block and appends a
+  # final <think> block, so per-message tokenization concatenated by the pinned
+  # MultiTurnSFTDataset cannot byte-equal whole-conversation tokenization; the
+  # dataset must accept the concatenated IDs as the training sequence
+  ignore_input_ids_mismatch: true
+
+model:
+  # exact invocation-local snapshot; tokenizer and chat template come from the
+  # same snapshot (model.tokenizer_path stays null)
+  path: ${oc.env:S4_TARGET_MODEL_SNAPSHOT}
+
+optim:
+  # conservative full-parameter SFT learning rate for one 3-row batch; the
+  # upstream fsdp optim default 1e-3 is far too hot for this run
+  lr: 1.0e-5
+
+checkpoint:
+  # CP2 consumes the HF export of this checkpoint as model.path
+  save_contents: [model, optimizer, extra, hf_model]
+
+trainer:
+  default_local_dir: ${oc.env:S4_SFT_CHECKPOINT_DIR}
+
+  # exactly one real optimizer step; the last step saves the checkpoint
+  total_training_steps: 1
+  logger: ['console']
+  resume_mode: disable
