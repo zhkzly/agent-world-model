@@ -1,0 +1,8 @@
+{"file":"PROJECT.md","reason":"Audit that S4 proves learning utility and cannot redefine upstream truth."}
+{"file":".trellis/tasks/08-31-s4-verified-agent-learning/prd.md","reason":"Review terminal verification versus per-call integrity, reward timing, splits and fatal criteria."}
+{"file":".trellis/tasks/08-31-s4-verified-agent-learning/design.md","reason":"Review exact token ownership, S3 seam reuse, veRL pin/patch policy and abstention handling."}
+{"file":".trellis/tasks/08-31-s4-verified-agent-learning/implement.md","reason":"Verify every checkpoint has a reachable RED, smallest current consumer and real GPU/S3 exit."}
+{"file":".trellis/tasks/08-31-s4-verified-agent-learning/checklist.md","reason":"Final drift and anti-overdesign checklist."}
+{"file":".trellis/spec/backend/s3-episode-runtime.md","reason":"Ensure S4 does not duplicate or weaken the frozen Episode/checker/reward path."}
+{"file":"src/agent_env_foundry/public_agent.py","reason":"Audit that veRL integration reuses Host call/observation semantics."}
+{"file":"src/agent_env_foundry/episode_runtime.py","reason":"Audit terminal close-reopen verification and reward transport remain exact."}
