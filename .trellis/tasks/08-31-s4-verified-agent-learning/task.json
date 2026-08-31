@@ -3,7 +3,7 @@
   "name": "s4-verified-agent-learning",
   "title": "S4 Verified SFT/GRPO Core",
   "description": "Materialize one honest teacher cohort through S3 and implement one config-first veRL SFT-to-GRPO path through a reloadable checkpoint",
-  "status": "planning",
+  "status": "in_progress",
   "dev_type": "ml",
   "scope": "Use existing S1-S3 authority to collect a fixed-budget teacher cohort, train one model family through verified-success SFT and terminal-reward GRPO over the shared S3 runtime, and prove checkpoint save/reload/continued rollout; do not alter S1-S3 truth, build a training platform or implement the later learning-utility experiment",
   "package": "agent_env_foundry",
