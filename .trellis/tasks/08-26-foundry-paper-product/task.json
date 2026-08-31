@@ -20,7 +20,8 @@
   "subtasks": [],
   "children": [
     "08-26-s2-task-foundry",
-    "08-30-s3-episode-runtime"
+    "08-30-s3-episode-runtime",
+    "08-31-s4-verified-agent-learning"
   ],
   "parent": null,
   "relatedFiles": [],
