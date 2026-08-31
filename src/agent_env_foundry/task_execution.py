@@ -21,6 +21,7 @@ from agent_env_foundry.release import canonical_bytes
 LifecycleKind = Literal[
     "acting_open",
     "reset",
+    "capture_terminal",
     "episode_complete",
     "pre_close_inspect",
     "acting_close",
@@ -30,6 +31,18 @@ LifecycleKind = Literal[
     "reopened_close",
 ]
 _LIFECYCLE_KINDS: tuple[LifecycleKind, ...] = (
+    "acting_open",
+    "reset",
+    "capture_terminal",
+    "episode_complete",
+    "pre_close_inspect",
+    "acting_close",
+    "reopened_open",
+    "post_reopen_inspect",
+    "checker_evaluated",
+    "reopened_close",
+)
+_RELOAD_LIFECYCLE_KINDS: tuple[LifecycleKind, ...] = (
     "acting_open",
     "reset",
     "episode_complete",
@@ -125,13 +138,13 @@ class ReloadEvidence:
                 "reload evidence requires distinct acting and reopened sessions",
             )
         actual_kinds = tuple(item.kind for item in self.lifecycle_events)
-        if actual_kinds != _LIFECYCLE_KINDS:
+        if actual_kinds != _RELOAD_LIFECYCLE_KINDS:
             raise TaskExecutionError(
                 "reload_lifecycle_order_invalid",
                 "reload lifecycle events differ from the exact close/reopen order",
             )
         if tuple(item.seq for item in self.lifecycle_events) != tuple(
-            range(1, len(_LIFECYCLE_KINDS) + 1)
+            range(1, len(_RELOAD_LIFECYCLE_KINDS) + 1)
         ):
             raise TaskExecutionError(
                 "reload_lifecycle_sequence_invalid",

@@ -50,34 +50,34 @@
 
 ## Physical lifecycle and verification
 
-- [ ] Do valid success, policy-failure and sealable defect paths use one real
+- [x] Do valid success, policy-failure and sealable defect paths use one real
   open/reset/close/reopen/check lifecycle?
-- [ ] Is the same native instance reopened in a distinct session without reset?
-- [ ] Does every S3 attempt use explicit `capture_terminal` evidence, while only
+- [x] Is the same native instance reopened in a distinct session without reset?
+- [x] Does every S3 attempt use explicit `capture_terminal` evidence, while only
   protocol-completed canonical paths project the existing S2
   `ReloadEvidence/1` format/identity preimage?
-- [ ] Does every interrupted attempt retain achieved lifecycle events and defect
+- [x] Does every interrupted attempt retain achieved lifecycle events and defect
   phase rather than only `reload_evidence=None`?
-- [ ] Does every EpisodeRecord directly bind its logical `request_id` to the
+- [x] Does every EpisodeRecord directly bind its logical `request_id` to the
   achieved lifecycle facts?
-- [ ] Are exact current Atom v4, ForEach v3 and If v3 TaskPacks loaded without
+- [x] Are exact current Atom v4, ForEach v3 and If v3 TaskPacks loaded without
   candidate recompilation or format changes?
-- [ ] Is the exact embedded If branch AtomTaskPack validated and used?
-- [ ] Are checker request/result frozen, executed after reopen and retained only
+- [x] Is the exact embedded If branch AtomTaskPack validated and used?
+- [x] Are checker request/result frozen, executed after reopen and retained only
   as trusted evidence?
 
 ## Reward and Episode artifacts
 
-- [ ] Is reward exactly `1.0` for healthy completed+satisfied,
+- [x] Is reward exactly `1.0` for healthy completed+satisfied,
   `0.0` for trustworthy policy/checker failure, and `null` for typed defects?
-- [ ] Does any defect take precedence over an otherwise satisfying state?
-- [ ] Do pre-public-input authority failures avoid fabricated EpisodeRecords and
+- [x] Does any defect take precedence over an otherwise satisfying state?
+- [x] Do pre-public-input authority failures avoid fabricated EpisodeRecords and
   TrainingEpisodeViews?
 - [ ] Do post-request reset/preflight failures become request-bound blocked
   results with no fabricated empty capture?
-- [ ] Are TaskAssessment reliability and S2 witness/admission data incapable of
+- [x] Are TaskAssessment reliability and S2 witness/admission data incapable of
   changing Episode reward?
-- [ ] Is Episode identity path-independent and bound to request, policy,
+- [x] Is Episode identity path-independent and bound to request, policy,
   trajectory, lifecycle, checker and outcome?
 - [ ] Are nested JSON contracts deeply snapshotted against alias mutation?
 - [ ] Are EpisodeRecord and TrainingEpisodeView written/read as one verified

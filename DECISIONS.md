@@ -174,3 +174,10 @@ The standalone callback lifecycle had no current production consumer. It and
 the TaskAssessment side repair were deleted; the exact Task Episode runtime now
 owns only the lifecycle facts required by its EpisodeRecord. No directory or
 package split is part of S3.
+
+`s3-cp3-exact-runtime|介入1|返工2|If authority RED+Atom/ForEach/If runtime+452 full+4 mutation licences+Git/SQLite physical+independent review|红线违反1`
+
+The CP3 redline was allowing the new runtime to reach roughly 990 lines before
+its first focused test existed. Main stopped the worker, required tests first,
+and deletion review removed extra catalog dependencies, over-tight If/ForEach
+truth, a duplicate checker-result ledger and future carriers before acceptance.

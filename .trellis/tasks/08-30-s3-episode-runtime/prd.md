@@ -15,7 +15,7 @@ episode and publish trustworthy immutable evidence containing:
 complete public policy trajectory
 + post-reopen frozen Task verification
 + deterministic base Reward or typed abstention
-+ causal failure ownership, provider usage and latency
++ causal failure ownership, reported provider usage and Host policy elapsed time
 ```
 
 S3 turns admitted Task truth into target-policy behavior evidence. It does not
@@ -67,8 +67,8 @@ S3 publishes:
 - an exact non-leaking `TrainingEpisodeView` derived from that trusted record;
 - one `EpisodeBatchManifest` binding an exact CorpusManifest, policy, every
   rollout result and honest aggregates;
-- complete public calls, reported provider usage, latency, lifecycle evidence,
-  verification and causal ownership.
+- complete public calls, reported provider usage, Host monotonic policy elapsed
+  time, lifecycle evidence, verification and causal ownership.
 
 ### Explicitly outside S3
 
@@ -212,10 +212,11 @@ compatibility projection only when the public protocol completed and the full
 canonical lifecycle finished; successful S2 wrappers continue to require that
 projection.
 
-If close, reopen, inspection, checker or cleanup fails, S3 stores the achieved
-lifecycle events plus the defect phase. `reload_evidence=None` alone is never
-sufficient evidence. An incomplete lifecycle can only abstain; it cannot be
-called verified failure.
+If an observable reopen, inspection, checker or cleanup operation fails, S3
+stores the achieved lifecycle events plus the defect phase. The current child
+close transport does not surface swallowed close errors and S3 does not invent
+them. `reload_evidence=None` alone is never sufficient evidence. An incomplete
+lifecycle can only abstain; it cannot be called verified failure.
 
 For each Episode S3 must:
 
@@ -223,8 +224,8 @@ For each Episode S3 must:
 - reconstruct fresh logical bindings rather than reuse witness IDs;
 - recompute the current checker preimage before acting;
 - evaluate actual trace, final answer and post-reopen facts;
-- store the exact canonical task-kind checker request and result as trusted
-  evidence;
+- store the exact existing Atom and Condition checker request/result documents,
+  grouped directly by Task kind as trusted evidence;
 - bind verification, lifecycle and reward consistently.
 
 For If, the private loader validates and extracts the exact embedded current
@@ -264,7 +265,7 @@ Closed abstain owners are:
 | `provider` | a valid request crossed the provider boundary and received an explicit remote 429, 5xx, provider outage/timeout code or declared service failure |
 | `infrastructure` | credential/auth/route configuration, client initialization, DNS/TLS/proxy/socket transport, dependency, process or I/O failure |
 | `environment` | actor reset/tools/invoke/observation, native persistence or environment close behavior is invalid |
-| `task_artifact` | post-freeze TaskPack/Corpus identity, release binding or checker preimage drifts |
+| `task_artifact` | invalid TaskPack/Corpus identity, release binding or checker preimage |
 | `semantics` | trusted inspect, binding or condition semantics are invalid |
 | `verifier` | the frozen checker execution or result contract is invalid |
 | `evidence` | Host lifecycle, identity, projection, canonical write or cold-read sealing is incomplete/corrupt |
@@ -321,7 +322,7 @@ Trusted immutable artifact containing:
 - request and PolicySpec;
 - exact public input and Host-recorded public turns;
 - public completion and at most one primary typed defect;
-- reported provider usage and latency;
+- reported provider usage and Host monotonic policy elapsed milliseconds;
 - request-bound native instance and lifecycle evidence;
 - optional legacy `ReloadEvidence/1` only for a protocol-completed full
   lifecycle, while the record itself always binds authoritative request-bound

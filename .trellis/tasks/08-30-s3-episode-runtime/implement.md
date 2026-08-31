@@ -410,7 +410,8 @@ After acting:
   inspect, the exact task-kind checker and final close;
 - retain only the achieved lifecycle facts and one primary defect; do not add a
   reusable `AttemptOutcome` framework or per-owner exception hierarchy;
-- execute the exact canonical task-kind checker request after reopen;
+- execute and retain the exact existing Atom/Condition checker request documents
+  after reopen, grouped directly by Task kind without a new checker type;
 - bind request, PolicySpec, capture, elapsed latency, minimal request-bound
   lifecycle facts, exact checker request/result and RewardOutcome into
   EpisodeRecord;
@@ -427,8 +428,6 @@ Input-authority behavior:
   or corpus-slot blocked result, no EpisodeRecord/View;
 - reset/preflight/environment/semantics failure after request but before public
   input: request-bound blocked result, no empty capture/Record/View;
-- post-freeze Task artifact drift: abstained EpisodeRecord if the attempt can be
-  honestly sealed;
 - unattributed exception: block, no completion claim.
 
 ### Files
@@ -452,7 +451,8 @@ is an upper bound, not a requirement to touch every file.
 - after a real public mutation, policy budget or invalid final answer still
   reaches same-instance reopen and the frozen checker;
 - reset/preflight failure before PublicEpisodeInput creates no EpisodeRecord;
-- close/reopen/inspect/checker failure retains achieved events and abstains;
+- observable reopen/inspect/checker/cleanup failure retains achieved events and
+  abstains; swallowed child-close failures are not fabricated;
 - another native instance, second reset, same session or checker-before-reopen
   is rejected;
 - a failed/incomplete S3 path cannot fabricate legacy `episode_complete` or
@@ -471,7 +471,6 @@ completed+satisfied + any trust defect           -> abstain / null
 policy failure + incomplete reopen/checker       -> abstain / null
 environment/semantics/verifier/evidence defect   -> abstain / null
 pre-input Task/checker authority defect          -> no Episode / typed failure
-post-freeze Task/checker drift                    -> abstain / null
 unattributed exception                           -> block / no training view
 ```
 

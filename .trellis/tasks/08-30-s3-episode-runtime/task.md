@@ -84,3 +84,20 @@
 - Scope deleted: TaskAssessment repair, loader union, generic supplied-evaluator seam and independent lifecycle checkpoint; EpisodeRecord directly binds request/policy/capture/latency/achieved lifecycle/checker/reward.
 - Compatibility: existing S2 `run_public_attempt` and `ReloadEvidence/1` remain unchanged; the exact S3 Task runtime owns its concrete failure lifecycle.
 - Review: independent plan review ACCEPTED after removing all positive `EpisodeAttemptEvidence`, CP7 and assessment.py remnants; plan diff net deletes about 190 lines and directory restructuring remains out of scope.
+
+### 2026-08-31 — CP3 authority RED
+
+- Chosen: an exact current If TaskPack reader must reject an invalid embedded branch pack before any policy use, even when the outer canonical identity is honestly recomputed.
+- Alternative rejected: use a missing `episode_runtime` import or a not-implemented stub as RED.
+- Evidence: a canonical outer If v3 document containing `atom-task-pack/999` currently reaches `read_task_pack_artifact` successfully; the focused test fails with `DID NOT RAISE`, not setup noise.
+- Lifecycle baseline: the existing success-only `run_public_attempt` raises on a policy terminal before pre-close/reopen/checker; the new concrete `run_task_episode`, not the legacy wrapper, owns the corresponding green path.
+
+### 2026-08-31 — CP3 ACCEPTED
+
+- Chosen: one concrete `run_task_episode` and one direct EpisodeRecord over exact Atom/ForEach/If authority; no standalone lifecycle/checker/evidence carrier.
+- Deterministic evidence: 45 focused and 452 full tests, locked Ruff/format/Mypy/lock checks, four mutation licences covering nested If authority, unchanged ReloadEvidence, lifecycle order and defect/reward precedence, and independent deletion-first ACCEPTED review.
+- Reviewed source: HEAD `41623eaf37a9c4e80ca4be905ced2f86a0b7d4a9`; source/test diff digest `98f6e9eaa2110a6802d7b10ee12a37680f3fe32fdfe385a9a4b0a5d0cfc358fb`.
+- SQLite physical exit: Release `64fa07e1a144536df2ae3ff9b0cf30175e8b0f913f1e34d8731b8377a80ebb87`; exact Atom `dc3991...`, ForEach `055a57...`, If `fc1080...`; Episode IDs `33172d3c...`/`e2f5da5d...`/`f25376ad...` produced real `1.0`, `0cf15159...` produced policy `0.0`, and `e5aa65a9...`/`3080e1a1...` produced provider/infrastructure null after full real close/reopen/checker.
+- Git transfer exit: Release `14331ac6e82e0ac79382d5c5e964c62f6cc9ece506f726299d0645594fbafe80`, Atom pack `242b2987...`, Episode `f2b6d461...`, real reward `1.0` after the same nine-event lifecycle.
+- Drift correction: the implementer reached about 990 production lines before adding tests; main paused it, required focused tests and deletion review, and independent review reduced the module to 936 lines while removing over-tight If/ForEach checks and duplicate checker-result state.
+- Boundary: TaskAssessment, persistence, TrainingEpisodeView, batch, generic callbacks, directory/package changes and close-transport invention remain absent.

@@ -349,9 +349,11 @@ helper only when two current call sites would otherwise duplicate exact checker
 construction.
 
 The in-memory EpisodeRecord binds the frozen request and policy, complete public
-capture, achieved same-instance lifecycle, exact checker request/result and one
-RewardOutcome. Do not introduce a reusable `AttemptOutcome`, public callback
-framework or owner-specific exception family.
+capture, Host policy elapsed milliseconds, achieved same-instance lifecycle,
+the exact existing Atom/Condition request/result documents grouped by Task kind,
+and one RewardOutcome. Do not introduce a reusable `AttemptOutcome`, public
+callback framework, public checker wrapper type or owner-specific exception
+family.
 
 Reward precedence is:
 
