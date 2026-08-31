@@ -2,14 +2,14 @@
 
 ## Frozen user execution checklist
 
-- [ ] Does the implementation remain a full S3 product path rather than a demo/MVP?
-- [ ] Are exact S1/S2 Release, TaskPack, checker and Corpus identities unchanged?
-- [ ] Is there one Host loop with complete healthy policy success/failure capture?
-- [ ] Does every trainable result use same-instance close/reopen frozen verification?
+- [x] Does the implementation remain a full S3 product path rather than a demo/MVP?
+- [x] Are exact S1/S2 Release, TaskPack, checker and Corpus identities unchanged?
+- [x] Is there one Host loop with complete healthy policy success/failure capture?
+- [x] Does every trainable result use same-instance close/reopen frozen verification?
 - [x] Are reward ownership and TrainingEpisodeView leakage rules exact?
-- [ ] Do batch and Git/SQLite/maintenance exits collectively complete S3 without veRL?
-- [ ] Is each checkpoint independently reviewed for drift and accepted before the next?
-- [ ] Does every checkpoint have RED, mutation, full validation and a separate commit?
+- [x] Do batch and Git/SQLite/maintenance exits collectively complete S3 without veRL?
+- [x] Is each checkpoint independently reviewed for drift and accepted before the next?
+- [x] Does every checkpoint have RED, mutation, full validation and a separate commit?
 
 ## CP1/CP2 deletion-first rework
 
@@ -25,28 +25,28 @@
 
 ## Planning and authority
 
-- [ ] Are the parent and S3 task treated as `planning` until the latest final
+- [x] Are the parent and S3 task treated as `planning` until the latest final
   summary receives explicit approval and `task.py start` succeeds?
-- [ ] Are exact Git, SQLite and inherited maintenance Release/Corpus/TaskPack
+- [x] Are exact Git, SQLite and inherited maintenance Release/Corpus/TaskPack
   identities cold-ready, with reproducible provenance and no path identity?
-- [ ] Do implementation/check manifests contain only curated authority,
+- [x] Do implementation/check manifests contain only curated authority,
   spec/research context rather than code files?
-- [ ] Is every checkpoint accepted independently before the next begins?
+- [x] Is every checkpoint accepted independently before the next begins?
 
 ## Policy capture and trust boundary
 
-- [ ] Is there exactly one Host-owned turn/tool loop reused by S2 witnesses,
+- [x] Is there exactly one Host-owned turn/tool loop reused by S2 witnesses,
   TaskAssessment and S3 Episodes?
-- [ ] Does a PolicyDriver produce one decision per Host call without reset,
+- [x] Does a PolicyDriver produce one decision per Host call without reset,
   invoke, inspect, checker, retry or loop authority?
-- [ ] Is every PolicyDriver single-Episode, closed on every terminal path and
+- [x] Is every PolicyDriver single-Episode, closed on every terminal path and
   never reused across rollout/batch boundaries?
-- [ ] Does the Responses adapter apply the exact non-secret PolicySpec?
-- [ ] Are complete successful and healthy failed public turns retained,
+- [x] Does the Responses adapter apply the exact non-secret PolicySpec?
+- [x] Are complete successful and healthy failed public turns retained,
   including raw malformed calls and terminal material?
-- [ ] Are provider-private reasoning and hidden chain-of-thought absent?
-- [ ] Are `provider`, `infrastructure` and policy failures kept distinct?
-- [ ] Do unattributed exceptions block instead of receiving a guessed owner?
+- [x] Are provider-private reasoning and hidden chain-of-thought absent?
+- [x] Are `provider`, `infrastructure` and policy failures kept distinct?
+- [x] Do unattributed exceptions block instead of receiving a guessed owner?
 
 ## Physical lifecycle and verification
 
@@ -73,7 +73,7 @@
 - [x] Does any defect take precedence over an otherwise satisfying state?
 - [x] Do pre-public-input authority failures avoid fabricated EpisodeRecords and
   TrainingEpisodeViews?
-- [ ] Do post-request reset/preflight failures become request-bound blocked
+- [x] Do post-request reset/preflight failures become request-bound blocked
   results with no fabricated empty capture?
 - [x] Are TaskAssessment reliability and S2 witness/admission data incapable of
   changing Episode reward?
@@ -103,10 +103,10 @@
   provider usage and abstain owners, with no monetary-cost claim?
 - [x] Are scheduler, queue, Registry, database, explicit-TaskPack-set and
   multi-release batch mechanisms absent?
-- [ ] Do Git, SQLite and inherited maintenance evidence collectively cover
+- [x] Do Git, SQLite and inherited maintenance evidence collectively cover
   Atom, ForEach and If without domain branches?
-- [ ] Do one real Responses policy and one scripted second PolicyDriver identity
+- [x] Do one real Responses policy and one scripted second PolicyDriver identity
   use the same frozen Host runtime?
-- [ ] Does CP6 add no production component, S4 consumer or veRL/trainer code?
-- [ ] Has every checkpoint retained its named RED, killed mutation licence,
+- [x] Does CP6 add no production component, S4 consumer or veRL/trainer code?
+- [x] Has every checkpoint retained its named RED, killed mutation licence,
   locked full validation, required evidence, independent review and verdict?

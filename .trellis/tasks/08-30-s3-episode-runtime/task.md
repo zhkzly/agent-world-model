@@ -134,3 +134,13 @@
 - Git physical batch: exact Corpus `4fddce70...`, Release `14331ac...`, Batch `62b41ef0...`; three exact slots produced three verified successes, eight attempted/dispatched calls and eight explicitly missing-usage turns.
 - SQLite physical batch: exact Corpus `a750a812...`, Release `64fa07e1...`, Batch `85a1135d...`; retained one verified failure, one provider abstain and one verified success with no blocked/dropped slot.
 - Drift correction: batch source reached about 709 lines before its own test file appeared; main froze source expansion and required focused coverage. Final public surface remains exactly EpisodeBatchManifest plus `run_episode_batch`; no retry/scheduler/reader/report/Registry or multi-release mechanism.
+
+### 2026-08-31 — CP6 S3 stage ACCEPTED
+
+- Frozen production snapshot: `bc778aa88ae989373ab3665d8f5a32218431c191`; CP6 added no production component or schema.
+- Final deterministic gate: uv lock, Ruff check/format, Mypy over 37 source files, 486 full tests, import/diff checks all pass; independent frozen-stage reviewer returned ACCEPTED with no blocker.
+- Live Responses batch: exact Git Release `14331ac...` and Corpus `4fddce70...`, Batch `655b1fd8...`; all three slots verified success through `run_episode_batch`, with 9 attempted/dispatched calls, 8 provider turns, 9517 reported input tokens, 739 output tokens and zero missing-usage turns.
+- Second driver/transfer: scripted Git Batch `62b41ef0...`, SQLite Batch `85a1135d...` and held-out maintenance Batch `81759cfa...`; maintenance ran all three exact slots successfully with no domain edit.
+- Authority freeze: all 3 Releases, all 3 Corpus IDs and all 10 current TaskPacks cold-verified again; Git/SQLite/maintenance TaskPack and Corpus identities remain unchanged.
+- Product matrix: complete success/failure trajectories, same-instance close/reopen Atom/ForEach/If checkers, physical `1.0/0.0/provider-null/infrastructure-null`, relocated paired views, exact serial batches and non-leaking S4 handoff are all evidenced.
+- Forbidden-scope scan: no Framework Git/SQLite/maintenance/domain branch and no veRL/trainer/service/Registry/queue/scheduler/retry mechanism.

@@ -195,3 +195,10 @@ The CP5 redline was allowing the new 709-line batch source to appear before its
 own focused tests. Source expansion was frozen; subsequent work added tests and
 only fixed unattributed-abort and same-Task stop behavior. The final batch has
 one class, one public function and no scheduler/retry/framework surface.
+
+`s3-cp6-frozen-acceptance|介入0|返工0|486 full+all authority cold IDs+live Responses batch+scripted Git/SQLite/maintenance+independent frozen review|红线违反0`
+
+CP6 froze `bc778aa` and introduced no production code. The exact current S3
+runtime transferred across Git, SQLite and held-out maintenance authority, and
+the real Responses adapter plus scripted second driver used the same serial
+batch/Host path without trainer or service scope.
