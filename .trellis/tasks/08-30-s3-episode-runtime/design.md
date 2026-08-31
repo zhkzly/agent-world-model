@@ -5,6 +5,14 @@
 S3 is one thin trusted execution/evaluation layer over current S1/S2 authority,
 not another foundry and not an S4 trainer.
 
+Deletion-first correction: CP1 and CP2 are reopened before any lifecycle work.
+Only mechanisms used by the original Episode/Policy/Reward request or the
+current shared public path survive. Later sections describing CP3-CP7 shapes
+are candidate outcomes, not authority to retain or prebuild a field, helper,
+exception, runtime carrier or package layout. The correction deliberately
+keeps current paths stable; flat-directory cleanup is considered only after
+code deletion exposes a real remaining cohesion boundary.
+
 The repository already owns most physical mechanics:
 
 | Existing component | S3 reuse |
@@ -60,7 +68,6 @@ verification, persistence or batch aggregate.
 @dataclass(frozen=True, slots=True)
 class PolicySpec:
     model_id: str
-    checkpoint_id: str | None
     driver_id: str
     driver_version: str
     route_id: str
@@ -76,8 +83,8 @@ Rules:
 - there is no generic generation/config bag in CP1; if CP2 proves another
   applied parameter is identity-bearing, implementation returns to CP1 and
   adds one explicit named field before CP2 can pass;
-- human labels do not change identity unless they are the declared
-  model/checkpoint identifier;
+- human labels do not change identity unless they are the declared model
+  identifier;
 - the Responses adapter proves its actual request matches the spec.
 
 ### `EpisodeRequest`
@@ -127,18 +134,18 @@ that reward is exactly `1.0`, `0.0` or `None` and enforces the complete truth
 table. It cannot by itself decide reward; CP4's pure mapper does that from
 capture, verification and defect.
 
-### Deep immutability
+### JSON snapshots
 
-Frozen dataclasses are not enough when they contain JSON dictionaries/lists.
 Every contract:
 
 - snapshots input JSON rather than retaining caller aliases;
-- exposes no mutable internal identity preimage;
+- exposes ordinary structural JSON values to current consumers;
 - returns fresh JSON documents from serialization;
 - rejects non-JSON, noncanonical or unexpected-key content.
 
-Alias-mutation tests are required for policy config and all later public,
-checker, usage and artifact JSON values.
+Alias-mutation tests are required. Persistent Episode immutability is enforced
+later by canonical artifact identity and cold readers, not by a private
+freeze/thaw container framework in these in-memory leaf values.
 
 ## 4. One Host-owned policy loop
 
@@ -216,12 +223,12 @@ the model saw; it is not hidden inside the Responses adapter.
 
 ### Decision and ledger values
 
-These immutable ledger values are part of the CP1 contract kernel. CP2 adds the
+These snapshotted ledger values are part of the CP1 contract kernel. CP2 adds the
 driver protocol and the Host loop that produces them; it does not redesign
 their persisted shape.
 
 `DriverDecision` is an ephemeral provider-adapter result. The Host converts it
-into immutable public records:
+into public records:
 
 ```python
 @dataclass(frozen=True, slots=True)

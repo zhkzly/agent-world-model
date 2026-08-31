@@ -289,7 +289,7 @@ is repaired.
 
 ### `PolicySpec`
 
-A non-secret identity over the actual model/checkpoint, driver kind/version,
+A non-secret identity over the actual model, driver kind/version,
 public prompt digest, explicit normalized non-secret route ID and provider-turn
 limit. S3 has no generic generation/config bag; any additional applied
 identity-bearing parameter must be added as an explicit named contract field.

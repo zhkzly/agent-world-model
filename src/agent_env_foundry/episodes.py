@@ -1,13 +1,11 @@
-"""Immutable leaf contracts for S3 public policy Episodes and base reward."""
+"""Leaf contracts for S3 public policy Episodes and base reward."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Any, Literal, cast
 
 from agent_env_foundry.environment import (
@@ -32,15 +30,6 @@ type DefectOwner = Literal[
 type _CompletionKind = Literal["completed", "policy_failure"]
 type _RewardDisposition = Literal["verified_success", "verified_failure", "abstain"]
 
-
-class _FrozenJSONArray(tuple[Any, ...]):
-    """Marker tuple used only for an internally frozen JSON array."""
-
-
-type _FrozenJSONValue = (
-    None | bool | int | float | str | _FrozenJSONArray | Mapping[str, _FrozenJSONValue]
-)
-
 _DEFECT_OWNERS = frozenset(
     {
         "provider",
@@ -61,7 +50,6 @@ _ROUTE_ID = re.compile(r"[a-z0-9](?:[a-z0-9._:-]*[a-z0-9])?")
 @dataclass(frozen=True, slots=True)
 class PolicySpec:
     model_id: str
-    checkpoint_id: str | None
     driver_id: str
     driver_version: str
     route_id: str
@@ -70,8 +58,6 @@ class PolicySpec:
 
     def __post_init__(self) -> None:
         _text(self.model_id, "model_id")
-        if self.checkpoint_id is not None:
-            _text(self.checkpoint_id, "checkpoint_id")
         _text(self.driver_id, "driver_id")
         _text(self.driver_version, "driver_version")
         _route_id(self.route_id)
@@ -86,7 +72,6 @@ class PolicySpec:
         return {
             "format": "policy-spec/1",
             "model_id": self.model_id,
-            "checkpoint_id": self.checkpoint_id,
             "driver_id": self.driver_id,
             "driver_version": self.driver_version,
             "route_id": self.route_id,
@@ -148,22 +133,15 @@ class PublicEpisodeInput:
             raise ValueError(str(exc)) from exc
         object.__setattr__(self, "reset_observation", reset_observation)
         object.__setattr__(self, "tool_specs", tool_specs)
-        object.__setattr__(
-            self,
-            "answer_schema",
-            cast(JSONObject, _freeze_json(answer_schema)),
-        )
+        object.__setattr__(self, "answer_schema", answer_schema)
 
     def to_document(self) -> JSONObject:
         return {
             "system_prompt": self.system_prompt,
             "instruction": self.instruction,
-            "reset_observation": _thaw_public_json(self.reset_observation),
-            "tool_specs": [
-                cast(JSONObject, _thaw_public_json(cast(JSONValue, spec)))
-                for spec in self.tool_specs
-            ],
-            "answer_schema": _thaw_object(self.answer_schema),
+            "reset_observation": _copy_json(self.reset_observation),
+            "tool_specs": [_copy_object(cast(JSONObject, spec)) for spec in self.tool_specs],
+            "answer_schema": _copy_object(self.answer_schema),
         }
 
 
@@ -215,16 +193,16 @@ class EpisodeToolCall:
 
     def to_document(self) -> JSONObject:
         return {
-            "raw_call_id": _thaw_public_json(self.raw_call_id),
-            "raw_tool_name": _thaw_public_json(self.raw_tool_name),
+            "raw_call_id": _copy_json(self.raw_call_id),
+            "raw_tool_name": _copy_json(self.raw_tool_name),
             "call_id": self.call_id,
             "tool_name": self.tool_name,
-            "raw_arguments": _thaw_public_json(self.raw_arguments),
-            "parsed_arguments": _thaw_optional_object(self.parsed_arguments),
+            "raw_arguments": _copy_json(self.raw_arguments),
+            "parsed_arguments": _copy_optional_object(self.parsed_arguments),
             "parse_status": self.parse_status,
             "schema_status": self.schema_status,
             "dispatch_status": self.dispatch_status,
-            "observation": _thaw_optional_object(self.observation),
+            "observation": _copy_optional_object(self.observation),
         }
 
 
@@ -256,8 +234,8 @@ class PolicyTurn:
         return {
             "turn_index": self.turn_index,
             "calls": [item.to_document() for item in self.calls],
-            "raw_public_terminal": _thaw_public_json(self.raw_public_terminal),
-            "usage": _thaw_optional_object(self.usage),
+            "raw_public_terminal": _copy_json(self.raw_public_terminal),
+            "usage": _copy_optional_object(self.usage),
         }
 
 
@@ -286,7 +264,7 @@ class PolicyCompletion:
     def to_document(self) -> JSONObject:
         return {
             "terminal_kind": self.terminal_kind,
-            "final_answer": _thaw_optional_object(self.final_answer),
+            "final_answer": _copy_optional_object(self.final_answer),
             "terminal_code": self.terminal_code,
         }
 
@@ -396,17 +374,17 @@ def _snapshot_tool_specs(value: Any) -> tuple[ToolSpec, ...]:
         validate_tool_catalog(normalized, role="public episode ToolSpecs")
     except Exception as exc:
         raise ValueError(str(exc)) from exc
-    return tuple(cast(ToolSpec, _freeze_json(cast(JSONValue, item))) for item in normalized)
+    return normalized
 
 
 def _snapshot_optional_object(value: Any, role: str) -> JSONObject | None:
     if value is None:
         return None
-    return cast(JSONObject, _freeze_json(_normal_object(value, role)))
+    return _normal_object(value, role)
 
 
 def _snapshot_json(value: Any, role: str) -> JSONValue:
-    return cast(JSONValue, _freeze_json(_normal_json(value, role)))
+    return _normal_json(value, role)
 
 
 def _normal_object(value: Any, role: str) -> JSONObject:
@@ -417,8 +395,6 @@ def _normal_object(value: Any, role: str) -> JSONObject:
 
 
 def _normal_json(value: Any, role: str) -> JSONValue:
-    if isinstance(value, (MappingProxyType, _FrozenJSONArray)):
-        value = _thaw_json(cast(_FrozenJSONValue, value))
     if not is_json_value(value):
         raise ValueError(f"{role} must be JSON")
     try:
@@ -431,32 +407,19 @@ def _normal_json(value: Any, role: str) -> JSONValue:
     return cast(JSONValue, normalized)
 
 
-def _freeze_json(value: JSONValue) -> _FrozenJSONValue:
-    if isinstance(value, dict):
-        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
-    if isinstance(value, list):
-        return _FrozenJSONArray(_freeze_json(item) for item in value)
-    return value
+def _copy_json(value: JSONValue) -> JSONValue:
+    return cast(
+        JSONValue,
+        json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False)),
+    )
 
 
-def _thaw_public_json(value: JSONValue | str | None) -> JSONValue:
-    return _thaw_json(cast(_FrozenJSONValue, value))
+def _copy_object(value: JSONObject) -> JSONObject:
+    return cast(JSONObject, _copy_json(value))
 
 
-def _thaw_object(value: JSONObject) -> JSONObject:
-    return cast(JSONObject, _thaw_json(cast(_FrozenJSONValue, value)))
-
-
-def _thaw_optional_object(value: JSONObject | None) -> JSONObject | None:
-    return _thaw_object(value) if value is not None else None
-
-
-def _thaw_json(value: _FrozenJSONValue) -> JSONValue:
-    if isinstance(value, Mapping):
-        return {key: _thaw_json(item) for key, item in value.items()}
-    if isinstance(value, _FrozenJSONArray):
-        return [_thaw_json(cast(_FrozenJSONValue, item)) for item in value]
-    return value
+def _copy_optional_object(value: JSONObject | None) -> JSONObject | None:
+    return _copy_object(value) if value is not None else None
 
 
 def _document_digest(document: JSONObject) -> str:

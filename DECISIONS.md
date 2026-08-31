@@ -152,3 +152,10 @@ to 1202 lines despite the anti-overdesign guard. It was reduced to one 866-line
 Host/adapter implementation before review. Live evidence then found the blank
 Responses terminal bug; independent rework corrected that and three adjacent
 attribution defects before acceptance. No CP3 or later component was introduced.
+
+`s3-cp1r-deletion|介入1|返工1|structural JSON RED+remove checkpoint/freeze-thaw+427 full+mutation licence+independent review|红线违反0`
+
+The user challenged future-oriented retention. CP1R therefore removed the
+producer-less checkpoint field and non-JSON deep-freeze framework instead of
+preserving them for CP4/S4. Current consumers require only caller-alias
+snapshotting and fresh document projection; directory layout remained unchanged.

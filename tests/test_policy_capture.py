@@ -52,7 +52,6 @@ def _answer_schema() -> dict[str, Any]:
 def _spec(turns: int = 4) -> PolicySpec:
     return PolicySpec(
         model_id="scripted-policy",
-        checkpoint_id=None,
         driver_id="scripted",
         driver_version="1",
         route_id="test:scripted",

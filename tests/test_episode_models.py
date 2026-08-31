@@ -17,6 +17,7 @@ from agent_env_foundry.episodes import (
     PublicEpisodeInput,
     RewardOutcome,
 )
+from agent_env_foundry.jsonvalue import is_json_object, is_json_value
 from agent_env_foundry.release import canonical_bytes
 
 DIGEST_A = "a" * 64
@@ -28,7 +29,6 @@ DIGEST_D = "d" * 64
 def _policy() -> PolicySpec:
     return PolicySpec(
         model_id="gpt-5.6-luna",
-        checkpoint_id="checkpoint-7",
         driver_id="responses",
         driver_version="1",
         route_id="openai:primary",
@@ -93,7 +93,6 @@ def test_policy_spec_is_a_closed_non_secret_canonical_identity(
 
     assert {field.name for field in fields(PolicySpec)} == {
         "model_id",
-        "checkpoint_id",
         "driver_id",
         "driver_version",
         "route_id",
@@ -103,7 +102,6 @@ def test_policy_spec_is_a_closed_non_secret_canonical_identity(
     assert policy.to_document() == {
         "format": "policy-spec/1",
         "model_id": "gpt-5.6-luna",
-        "checkpoint_id": "checkpoint-7",
         "driver_id": "responses",
         "driver_version": "1",
         "route_id": "openai:primary",
@@ -111,7 +109,6 @@ def test_policy_spec_is_a_closed_non_secret_canonical_identity(
         "max_provider_turns": 12,
     }
     assert policy.policy_id == hashlib.sha256(canonical_bytes(policy.to_document())).hexdigest()
-    assert replace(policy, checkpoint_id="checkpoint-8").policy_id != policy.policy_id
     assert replace(policy, route_id="openai:secondary").policy_id != policy.policy_id
     monkeypatch.setenv("OPENAI_API_KEY", "old-secret")
     before_rotation = _policy().policy_id
@@ -128,6 +125,10 @@ def test_policy_spec_is_a_closed_non_secret_canonical_identity(
     ):
         with pytest.raises(TypeError):
             PolicySpec(**{**policy_fields, **forbidden})
+
+
+def test_policy_spec_has_no_producerless_checkpoint_slot() -> None:
+    assert "checkpoint_id" not in {field.name for field in fields(PolicySpec)}
 
 
 @pytest.mark.parametrize(
@@ -213,12 +214,31 @@ def test_public_input_snapshots_deep_json_and_returns_fresh_documents() -> None:
     emitted["tool_specs"][0]["input_schema"]["required"].append("emitted-mutation")
     assert public_input.to_document() == expected
 
-    with pytest.raises(TypeError):
-        public_input.reset_observation["items"] = []
-    with pytest.raises(TypeError):
-        public_input.answer_schema["required"] = []
-    with pytest.raises(TypeError):
-        public_input.tool_specs[0]["input_schema"]["required"] = []
+
+def test_contract_json_fields_remain_structural_json_values() -> None:
+    public_input = _public_input()
+    call = EpisodeToolCall(
+        "call-1",
+        "inspect_item",
+        "call-1",
+        "inspect_item",
+        '{"selector":{"tags":["hot"]}}',
+        {"selector": {"tags": ["hot"]}},
+        "valid",
+        "valid",
+        "dispatched",
+        {"ok": True, "data": {"name": "alpha"}},
+    )
+    turn = PolicyTurn(1, (call,), None, {"input_tokens": 3})
+
+    assert is_json_value(public_input.reset_observation)
+    assert is_json_object(public_input.answer_schema)
+    assert all(is_json_object(tool) for tool in public_input.tool_specs)
+    assert is_json_value(call.raw_call_id)
+    assert is_json_value(call.raw_tool_name)
+    assert is_json_object(call.parsed_arguments)
+    assert is_json_object(call.observation)
+    assert is_json_object(turn.usage)
 
 
 def test_public_input_rejects_non_json_and_non_tool_contract_content() -> None:

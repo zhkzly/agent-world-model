@@ -11,6 +11,18 @@
 - [ ] Is each checkpoint independently reviewed for drift and accepted before the next?
 - [ ] Does every checkpoint have RED, mutation, full validation and a separate commit?
 
+## CP1/CP2 deletion-first rework
+
+- [ ] Do exposed JSON-typed contract values satisfy the project's structural JSON predicates without type-safety casts to non-JSON containers?
+- [ ] Are caller inputs snapshotted and serialized as fresh documents without a private freeze/thaw framework?
+- [ ] Does every retained PolicySpec field have a current producer and consumer rather than a hypothetical S4 use?
+- [ ] Does one full S2 public attempt call `actor.tools()` exactly once?
+- [ ] Is each ToolSpec and answer schema validated by one contract owner rather than repeated layers?
+- [ ] Is the public capture the sole call/observation ledger, with checker `TraceEvent` derived from it?
+- [ ] Are test-only driver defenses and duplicate defect-detail channels deleted?
+- [ ] Do legacy S2 success behavior, complete policy-failure capture, owner separation and the live Responses path remain unchanged?
+- [ ] Are CP3 code and package/directory moves absent until CP1R and CP2R are separately accepted and committed?
+
 ## Planning and authority
 
 - [ ] Are the parent and S3 task treated as `planning` until the latest final

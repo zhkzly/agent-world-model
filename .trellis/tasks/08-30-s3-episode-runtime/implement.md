@@ -25,6 +25,24 @@ Execution rules after activation:
 - no later checkpoint starts until the current checkpoint is explicitly
   `ACCEPTED`.
 
+### Deletion-first rework override
+
+The earlier CP1/CP2 design verdicts are reopened. Before CP3, execute CP1R and
+CP2R as separate checkpoints and commits. A retained field, helper, validation,
+exception or projection must be required by the original Episode/Policy/Reward
+request or by the current S2/S3 execution path. Tests written solely around an
+introduced abstraction do not count as consumers. Future CP4/S4 usefulness is
+not a retention reason; later code may add a mechanism when a real consumer
+exists.
+
+CP1R removes non-JSON freeze/thaw internals and producer-less PolicySpec
+surface while preserving input alias snapshots and the closed outcome
+contracts. CP2R uses one ToolSpec snapshot, one validation owner and one public
+call ledger, derives the legacy checker trace, and deletes duplicate driver
+defenses/details. Neither rework moves packages or adds directories. The
+remaining CP3-CP7 details are non-authoritative until this rework is accepted
+and the plan is pruned against the smaller implementation.
+
 No checkpoint may add task generation, automatic retry, a second Agent loop,
 veRL/trainer code, a service, Registry, queue, database or optional framework.
 

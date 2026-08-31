@@ -170,7 +170,6 @@ class ResponsesPolicyDriver:
         turns = route.max_provider_turns if max_provider_turns is None else max_provider_turns
         spec = PolicySpec(
             route.model,
-            None,
             "openai-responses",
             "1",
             _route_id(route.base_url),
@@ -255,7 +254,7 @@ class ResponsesPolicyDriver:
         public = self._input.to_document()
         tools = cast(list[JSONObject], public["tool_specs"])
         return {
-            "model": self._spec.checkpoint_id or self._spec.model_id,
+            "model": self._spec.model_id,
             "instructions": self._input.system_prompt,
             "input": list(self._history),
             "tools": [

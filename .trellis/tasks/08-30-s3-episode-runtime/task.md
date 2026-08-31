@@ -49,3 +49,20 @@
 - Live exit: Git Release `14331ac6e82e0ac79382d5c5e964c62f6cc9ece506f726299d0645594fbafe80`, TaskPack `242b298797d5dc9cdc558ebb74f59977a35033b113e84f2f1190890f746a48bc`, Task `81cb99623100f26c9e2ad19feac147a5a7dc26b6f707cbc2cf9781928e1b0b74`; four Responses turns continued across four real public tool observations and ended in a structured answer with usage retained on every turn.
 - Rework retained: blank `output_text` beside calls, malformed/missing Responses output, actor-tools infrastructure ownership and generic driver-close naming were corrected before acceptance.
 - Boundary: `DriverDecision.defect` remains limited to same-turn evidence defects; no hypothetical S4 failure hierarchy, retry, lifecycle, EpisodeRecord/View/Batch or veRL surface was added.
+
+### 2026-08-31 — CP1/CP2 reopened: deletion before extension
+
+- Chosen: revoke the design-level ACCEPTED verdicts and rework CP1 then CP2 before CP3; retain only original Episode/Policy/Reward requirements and behavior exercised by the current S2/S3 path.
+- Alternative rejected: preserve fields, validation layers, public exceptions or ledgers because CP4/S4 might use them later.
+- Evidence: frozen JSON fields are runtime `mappingproxy` values that fail the project's own JSON predicates; the S2 path calls `actor.tools()` twice; capture and `TraceEvent` are maintained as parallel mutable ledgers.
+- Boundary: no package moves or new directories during deletion-first rework; directory changes require remaining post-deletion responsibilities, not the current flat file count.
+- Order: CP1R valid RED, deletion, mutation, independent review and commit; then CP2R under the same gate. CP3 remains paused.
+
+### 2026-08-31 — CP1R ACCEPTED
+
+- Chosen: expose ordinary structural JSON snapshots and delete `checkpoint_id` plus the complete MappingProxy/frozen-array freeze/thaw implementation.
+- Alternative rejected: keep nested read-only containers or checkpoint identity because a later trainer might use them.
+- RED: the old values failed `is_json_value`/`is_json_object`, and the old PolicySpec still exposed the producer-less field through a reachable dataclass contract.
+- Evidence: 58 focused and 427 full tests, locked Ruff/format/Mypy/lock checks, independent ACCEPTED review, and a mutation-license run that replaced JSON snapshotting with caller aliases and was killed by the alias test.
+- Reviewed source: HEAD `5f5cc1191e90791424e1d4fb33627ec1ed8bd067`; pre-record diff digest `2ddfab4e8ebe354987054eefc774e919c2651c3c69d5015f0cc7350a6fbcae95`.
+- Deletion: `episodes.py` 505 to 468 lines and the mechanical Responses consumer 866 to 865; production net `-38`, no replacement framework, package move or CP2/CP3 behavior.
