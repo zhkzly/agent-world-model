@@ -1,11 +1,11 @@
 {
   "id": "s4-verified-agent-learning",
   "name": "s4-verified-agent-learning",
-  "title": "S4 Verified Agent Learning",
-  "description": "Materialize one honest teacher cohort through S3, train one SFT-to-GRPO path, and measure bounded learning utility on a frozen unseen Release",
+  "title": "S4 Verified SFT/GRPO Core",
+  "description": "Materialize one honest teacher cohort through S3 and implement one config-first veRL SFT-to-GRPO path through a reloadable checkpoint",
   "status": "planning",
   "dev_type": "ml",
-  "scope": "Use existing S1-S3 authority to collect a fixed-budget teacher cohort, train one model family through verified-success SFT and terminal-reward GRPO over the shared S3 runtime, and compare Base/SFT/GRPO on one post-freeze Release; do not alter S1-S3 truth or build a training platform",
+  "scope": "Use existing S1-S3 authority to collect a fixed-budget teacher cohort, train one model family through verified-success SFT and terminal-reward GRPO over the shared S3 runtime, and prove checkpoint save/reload/continued rollout; do not alter S1-S3 truth, build a training platform or implement the later learning-utility experiment",
   "package": "agent_env_foundry",
   "priority": "P0",
   "creator": "kelong",
@@ -29,9 +29,9 @@
     "src/agent_env_foundry/episode_batch.py",
     "src/agent_env_foundry/public_agent.py"
   ],
-  "notes": "Planning authority only. S4 specializes the stable SFT/RL stage and cannot authorize itself by editing PROJECT.md. CP0 freezes one teacher driver route plus one target model/tokenizer/template/parser. The integration uses latest stable veRL v0.9.0 at exact SHA 483b8a009ba3a97563edee3a19887e4862b8094a, V1 sync training with one pin-specific fail-closed replay-buffer extension, Continuous Token, and the existing S3 PolicyDriver/Host path. No S3 seam is pre-authorized; a focused functional failure must trigger separate review.",
+  "notes": "Planning authority only. This task owns the SFT/GRPO training core, not a held-out utility experiment. CP0 freezes one teacher driver route plus one target model/tokenizer/template/parser. The integration uses latest stable veRL v0.9.0 at exact SHA 483b8a009ba3a97563edee3a19887e4862b8094a, V1 sync training with one pin-specific fail-closed replay-buffer extension, Continuous Token, and the existing S3 PolicyDriver/Host path. No S3 seam is pre-authorized; a focused functional failure must trigger separate review.",
   "meta": {
-    "semantic_order": "formal-teacher-cohort-sft-candidate-proof-first-s3-bridge-matched-evaluation-grpo-update-frozen-release-utility",
+    "semantic_order": "formal-teacher-cohort-verified-sft-checkpoint-continuous-token-s3-bridge-fail-closed-grpo-update-checkpoint-reload-continued-rollout",
     "base_reward": "binary-task-success/1",
     "reward_timing": "terminal_task_level_after_close_reopen_checker",
     "initial_training_paths": [
@@ -53,7 +53,9 @@
       "scripted_primary_sft",
       "preauthorized_s3_session_refactor",
       "cpu_gpu_product_fork",
-      "remote_execution_framework"
+      "remote_execution_framework",
+      "learning_utility_experiment_in_core",
+      "heldout_statistics_in_core"
     ]
   }
 }

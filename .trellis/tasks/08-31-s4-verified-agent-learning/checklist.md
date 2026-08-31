@@ -1,96 +1,65 @@
-# S4 Verified Agent Learning — Completion Checklist
+# S4 Verified SFT/GRPO Core — Completion Checklist
 
-## Project and stage alignment
+## Current-stage alignment
 
-- [ ] Does this checkpoint answer the S4 learning-utility question rather than
-  merely demonstrate a training framework feature?
+- [ ] Does the checkpoint build the real SFT/GRPO path rather than an experiment
+  or generic training platform?
 - [ ] Does it consume completed S1–S3 authority without generating, repairing or
-  weakening EnvironmentRelease, TaskPack, Corpus or checker truth?
-- [ ] Is one unseen-Release result described as bounded evidence rather than a
-  universal cross-Need claim?
-- [ ] Is a valid negative or insufficient-data outcome accepted?
+  weakening Release, Task, Corpus, checker or reward truth?
+- [ ] Are improvement, held-out and statistical claims explicitly absent?
+- [ ] Is a valid `DATA_INSUFFICIENT`/`NO_GRPO_SIGNAL` stop accepted?
 
-## Formal cohort
+## Formal teacher cohort
 
-- [ ] Was the teacher PolicySpec, matching fresh-driver route/provider sampling
-  config, Corpus, slot budget/order and output root frozen before collection?
-- [ ] Did existing `run_episode_batch` retain every requested success, failure,
-  abstain or blocked slot without retry/backfill?
-- [ ] Is every primary SFT Episode in the exact batch/policy allowlist?
-- [ ] Are scripted, failed, abstained, duplicate and non-cold-valid Episodes
+- [ ] Are Corpus, teacher PolicySpec, matching fresh-driver route, collection
+  budget and output root frozen?
+- [ ] Does existing `run_episode_batch` retain every requested slot without
+  retry/backfill?
+- [ ] Does every primary SFT Episode belong to the exact batch/policy allowlist?
+- [ ] Are scripted, failed, abstained, duplicate and non-cold-valid sources
   excluded from primary SFT?
-- [ ] Are split roles bound only to existing `release_id`, `structure_id` and
-  `task_pack_id` authority?
-- [ ] Are `/tmp` acceptance fixtures excluded from canonical training authority
-  unless explicitly recollected into the formal batch?
+- [ ] Are unpublished-run recovery and published-manifest finality distinct?
+- [ ] Are existing S3 artifacts/manifests reused without a new artifact framework?
 
-## SFT data and checkpoint
+## SFT
 
-- [ ] Does each row use only public `TrainingEpisodeView` fields?
-- [ ] Is the frozen target tokenizer/chat template applied deterministically
-  once rather than through competing render paths?
-- [ ] Are assistant tool-call/final-answer spans trainable and prompt/tool
-  observation spans masked out?
-- [ ] Does the plan avoid claiming preservation of unavailable teacher token IDs?
-- [ ] Is one real checkpoint saved and cold-loaded before behavior claims?
-- [ ] Did a real optimizer step change a trainable tensor digest, and does the
-  HF-compatible cold-loaded handoff have the saved logical tensor digest?
-- [ ] Is loss treated as a diagnostic rather than learning evidence?
+- [ ] Does the mapper emit only public `messages/tools` plus source identities?
+- [ ] Are tool calls built from validated `parsed_arguments`?
+- [ ] Does pinned veRL own template application and assistant-only loss mask?
+- [ ] Is there no custom tokenizer, codec, dataset class or trainer?
+- [ ] Did a real optimizer step change a trainable-tensor digest?
+- [ ] Does the HF export cold-load with the saved logical tensor digest?
+- [ ] Is loss treated only as a diagnostic?
 
-## S3/veRL bridge
+## AgentLoop/S3 boundary
 
-- [ ] Was the existing `PolicyDriver`/`run_task_episode` path attempted before
-  proposing any new S3 seam?
-- [ ] Do all public actions still pass through the existing Host validation,
-  dispatch and trace path?
-- [ ] Does terminal reward still come only from existing close/reopen/checker
-  truth?
-- [ ] Are exact online model IDs retained while decoded text is parsing-only?
-- [ ] Does the target pass pinned v0.9.0 Continuous Token model-family and
-  chat-template compatibility without a second Foundry codec?
-- [ ] Are model tokens mask `1`, environment tokens mask `0`, with equal lengths?
-- [ ] Are model-server and trusted-path failures attributed without becoming
-  healthy policy failures?
-- [ ] Do Base and SFT use the same adapter, template, slots and budget?
+- [ ] Was the current PolicyDriver/thread bridge attempted before any S3 seam?
+- [ ] Does every call still pass through the existing Host and every reward through
+  existing close/reopen/checker truth?
+- [ ] Does the target pass v0.9 Continuous Token/chat-template compatibility?
+- [ ] Are exact model IDs retained and decoded text parsing-only?
+- [ ] Are model spans mask `1` and environment/tool spans mask `0`?
+- [ ] Does every rollout use a fresh matching driver/native instance?
+- [ ] Does each rollout receipt bind exact token/mask evidence to one Episode ID
+  and matching S3 reward?
 
 ## GRPO
 
-- [ ] Does each group bind one exact TaskPack and fresh isolated instances?
-- [ ] Does every trainable member bind one matching cold S3 Episode and numeric
-  terminal reward?
-- [ ] Does any abstention abort the entire optimizer step before advantage or
-  update, leaving parameters unchanged?
-- [ ] Is pinned v0.9.0 `main_ppo` using V1 sync, one group per step and the
-  pin-specific fail-closed ReplayBuffer with no refill/resampling?
-- [ ] Are all-equal groups reported as zero signal rather than shaped or hidden?
-- [ ] Has a real nonzero-signal update, save, cold reload and continued rollout
-  run?
-- [ ] Are rollout weights synchronized after update?
-
-## Final held-out evidence
-
-- [ ] Were code/config/checkpoints, primary contrast/metric/direction, statistical
-  unit, exact CI implementation, decision rule, checkpoint selection and slot
-  budget frozen before the final Release?
-- [ ] Are the terminal checkpoints at the exact frozen step budgets used, with no
-  best-of-run selection?
-- [ ] Did the parent Foundry operator deliver exact post-freeze S1–S3 artifacts
-  before S4 made any final model call?
-- [ ] Is the final Need/Release absent from all training and tuning history?
-- [ ] Are Base, SFT and SFT→GRPO evaluated on the same S3 slots?
-- [ ] Are all failures and abstentions retained in requested-slot accounting,
-  with null excluded only from the predeclared paired numeric estimate?
-- [ ] Are only metrics/raw codes with existing S3 producers reported?
-- [ ] Can exact source, config, checkpoint and Episode identities reconstruct the
-  result?
+- [ ] Is v0.9 V1 sync configured with one prompt group per step and frozen `G`?
+- [ ] Does the one pin-specific ReplayBuffer reject failure, incomplete sibling
+  count, non-numeric reward and all-equal signal before materialization?
+- [ ] Is refill/retry/padding/survivor filtering/replacement disabled?
+- [ ] Does an injected abstain leave the parameter digest unchanged?
+- [ ] Did one complete nonzero-signal group produce a real actor update?
+- [ ] Does the checkpoint save, cold-load and continue a fresh S3 rollout with
+  synchronized weights?
 
 ## Anti-overdesign and execution discipline
 
-- [ ] Is there one normal veRL path with no Foundry CPU/GPU fork or remote runner?
-- [ ] Is there no predesigned incremental S3 session, second Host or evaluator?
-- [ ] Is there no trainer/model/algorithm/codec/artifact registry?
-- [ ] Is there no shaping, reward model, LLM judge, retry, replacement, requeue,
-  scheduler, service or curriculum?
-- [ ] Does every new file/type/field have a current producer and consumer?
-- [ ] Did the checkpoint begin with reachable behavioral RED, pass mutation and
-  full checks, receive independent review and land in its own commit?
+- [ ] Are production additions limited to `learning_data.py`,
+  `verl_agent_loop.py`, `s4_collect.py`, two configs and focused tests?
+- [ ] Is there no custom trainer/checkpoint/device layer, Registry, service,
+  scheduler or experiment/evaluation framework?
+- [ ] Does every new field/type/file have a current adjacent producer/consumer?
+- [ ] Did the checkpoint begin with reachable behavioral RED, pass mutation/full
+  checks, receive independent review and land in its own commit?

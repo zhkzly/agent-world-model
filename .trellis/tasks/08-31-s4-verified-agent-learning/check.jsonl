@@ -1,5 +1,5 @@
 {"file":"AGENTS.md","reason":"Reject candidate self-authorization, state transitions during review and future product surfaces."}
-{"file":"PROJECT.md","reason":"Judge whether the change answers the stable product learning-utility stage."}
+{"file":"PROJECT.md","reason":"Judge whether the change implements the stable SFT/RL stage without prebuilding the later utility experiment."}
 {"file":"DECISIONS.md","reason":"Audit exact S3 truth, abstention, public-data and anti-overdesign boundaries."}
 {"file":".trellis/tasks/08-26-foundry-paper-product/prd.md","reason":"Check cross-stage causal alignment and bounded S4 ownership."}
 {"file":".trellis/spec/backend/s3-episode-runtime.md","reason":"Ensure S4 reuses current S3 Episode/Host/reward contracts without a second path."}
