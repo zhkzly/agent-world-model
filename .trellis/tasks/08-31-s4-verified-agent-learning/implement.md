@@ -42,12 +42,11 @@ teacher PolicySpec + executable fresh-driver route/provider config
 rollouts_per_task + turn limit
 target model/tokenizer/template/tool parser
 veRL v0.9.0 exact SHA 483b8a009ba3a97563edee3a19887e4862b8094a
-literal SFT and GRPO configs/commands
 persistent output roots
 ```
 
-The target must pass v0.9 Continuous Token model-family and chat-template
-compatibility before CP0 exits.
+CP0 freezes target/tokenizer/template/parser identity only. CP1 and CP2 own the
+actual SFT-template and Continuous Token compatibility exits.
 
 ### Work
 
@@ -62,7 +61,12 @@ scripts/s4_collect.py
 The literal command is:
 
 ```bash
-uv run python scripts/s4_collect.py --config <config> --output <absent-root>
+uv run python scripts/s4_collect.py \
+  --config configs/s4/core.json \
+  --release-root <EnvironmentRelease> \
+  --task-store-root <S2-output-root> \
+  --corpus-manifest <CorpusManifest.json> \
+  --output <absent-root>
 ```
 
 It prepares the declared Release, constructs a fresh matching teacher driver per
@@ -89,7 +93,7 @@ Then cover:
 - duplicate Episode ID;
 - failed/abstained/non-cold-valid primary source;
 - missing requested slot;
-- acceptance fixture silently promoted to primary authority.
+- cohort/batch/config identity mismatch.
 
 Mutations must prove the scripted and disposition filters are load-bearing.
 
@@ -99,7 +103,7 @@ Mutations must prove the scripted and disposition filters are load-bearing.
 frozen request
 -> S3 EpisodeBatchManifest with one result per slot
 -> cold-valid sealable Episode bundles
--> exact primary/analysis cohort
+-> exact primary SFT cohort bound to the current task authority
 ```
 
 If the primary set is empty, return `DATA_INSUFFICIENT` and stop.

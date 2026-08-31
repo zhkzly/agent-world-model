@@ -31,14 +31,14 @@ Checkpoint 0 freezes:
 - one target model, tokenizer, chat template and tool-call parser;
 - latest stable veRL `v0.9.0` at exact tag commit
   `483b8a009ba3a97563edee3a19887e4862b8094a`;
-- literal SFT and V1-sync GRPO configs/commands;
 - persistent artifact roots for Episodes, datasets and checkpoints.
 
 Device/backend selection remains normal veRL/PyTorch configuration. Foundry adds
 no CPU/GPU fork, remote runner, hardware abstraction or scheduler.
 
-The target must pass v0.9.0 Continuous Token model-family and chat-template
-compatibility. An incompatible target stops CP0; S4 does not add another codec.
+CP0 freezes the exact target/tokenizer/template/parser identity. CP1 validates
+the SFT template/mask path and CP2 validates v0.9.0 Continuous Token; neither
+compatibility implementation is pulled into CP0.
 
 ## 3. Formal teacher trajectory collection
 

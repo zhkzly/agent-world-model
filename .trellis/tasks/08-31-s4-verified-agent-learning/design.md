@@ -45,13 +45,17 @@ codec, artifact framework, Registry or service.
 
 `scripts/s4_collect.py` is a thin owner for one missing literal command. It:
 
-1. reads the exact checked-in S4 config;
-2. prepares the declared Release and Corpus;
+1. reads the exact checked-in semantic S4 config;
+2. accepts invocation-local Release/TaskStore/Corpus locators and prepares the
+   declared identities;
 3. builds a fresh teacher driver per requested slot;
 4. calls existing `run_episode_batch` once;
 5. verifies returned/written manifest identity before exit;
 6. cold-reads every sealable paired Episode bundle;
 7. writes one cohort file with exact batch/policy/driver/Episode identities.
+
+Artifact paths are operational command arguments, not semantic config identity;
+the checked-in config contains IDs, policy/model revisions and budgets only.
 
 The cohort selector lives in `learning_data.py` from CP0, so CP1 has no backwards
 dependency. Scripted drivers are analysis/regression only. Every published slot

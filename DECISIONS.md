@@ -202,3 +202,13 @@ CP6 froze `bc778aa` and introduced no production code. The exact current S3
 runtime transferred across Git, SQLite and held-out maintenance authority, and
 the real Responses adapter plus scripted second driver used the same serial
 batch/Host path without trainer or service scope.
+
+`s4-cp0-formal-cohort|介入1|返工1|behavioral RED+cold cohort+real Responses batch+4 mutation licences+517 full+independent review|红线违反2`
+
+The first CP0 redline was manually attempting the project-disabled Alignment
+Patrol (the absent runner failed without changing state). The second was a
+supervisor/worker race that issued the same frozen teacher collection after the
+first manifest had already published. The first `6a92bd64…` batch remains sole
+authority; the `6affea4a…` duplicate is quarantined, no third collection ran,
+and only derived cohort metadata was clean-break republished with prior bytes
+preserved.
