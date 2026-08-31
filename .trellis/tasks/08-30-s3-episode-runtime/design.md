@@ -410,7 +410,8 @@ One bundle, no Registry/database:
     EpisodeBatchManifest.json
 ```
 
-Write order under a required-new output root:
+Write order under a required-new Episode directory; CP5 may place multiple
+distinct Episode directories under its one new output root:
 
 ```text
 validate in-memory record

@@ -384,3 +384,19 @@ def test_business_named_keys_survive_the_paired_reader_without_structural_leakag
     assert (
         runtime.read_episode_bundle(output, changed.episode_id).to_document() == view.to_document()
     )
+
+
+def test_distinct_episode_bundles_share_one_new_batch_root(tmp_path: Path) -> None:
+    first_root, second_root = tmp_path / "first", tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first = _record(first_root, "success")
+    second = _record(second_root, "failure")
+    assert first.episode_id != second.episode_id
+    output = tmp_path / "batch-output"
+
+    runtime.write_episode_bundle(output, first)
+    runtime.write_episode_bundle(output, second)
+
+    assert runtime.read_episode_bundle(output, first.episode_id).episode_id == first.episode_id
+    assert runtime.read_episode_bundle(output, second.episode_id).episode_id == second.episode_id

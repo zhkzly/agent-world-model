@@ -523,7 +523,9 @@ material.
 
 ### Framework work
 
-Persist one paired bundle only under a required-new output root:
+Persist one paired bundle only in a required-new Episode directory. A direct
+call may create the output root; the current CP5 batch may reuse that one root
+for other distinct Episode IDs:
 
 ```text
 episodes/<episode_id>/

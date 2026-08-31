@@ -117,3 +117,20 @@
 - Review rework: fresh-ID cold bundles carrying malformed Atom evaluation context/protected binding or If condition request were initially accepted; private reconstruction with existing checker constructors now rejects all four variants without a new public type.
 - Physical/cold exit: exact SQLite Release `64fa07e1...` persisted and relocated success `f2f73822...`, policy failure `55999f67...`, provider abstain `2128424d...` and infrastructure abstain `8773a13b...`; paired cold reads reproduced exact public inputs/turns/rewards with usage/checker/lifecycle structurally absent.
 - Boundary: public additions are only TrainingEpisodeView, `write_episode_bundle` and `read_episode_bundle`; no bundle class, view ID, view-only reader, Registry, transaction layer, S4 helper, batch or directory split.
+
+### 2026-08-31 — CP5 shared-root RED
+
+- Chosen: one new batch output root must accept multiple distinct non-colliding Episode bundle directories while still rejecting an existing Episode ID.
+- Alternative rejected: use missing `episode_batch` import or prebuild a batch persistence abstraction as RED.
+- Evidence: two valid current Records write the first bundle, then the second reachable write fails only because `write_episode_bundle` still requires the entire root absent; focused failure is `Episode output root must be absent`.
+- Boundary: CP5 may relax root creation once for current batch consumption, but bundle-directory collision and paired cold-read remain unchanged.
+
+### 2026-08-31 — CP5 ACCEPTED
+
+- Chosen: one serial `run_episode_batch` and one EpisodeBatchManifest; ordered slot JSON and aggregates are derived from persisted Records without slot/aggregate classes.
+- Deterministic evidence: 33 focused and 486 full tests, locked Ruff/format/Mypy/lock checks, three mutation licences for shared-root, retained blocked slot and token aggregate, and independent deletion-first ACCEPTED review.
+- Reviewed source: HEAD `afa1de10e550054fbb41502cbf51e416f5610a74`; source/test diff digest `435253ad52a89cb49ffbc8be6f8f75bac5fa1c981554ac980a886c64d74a2ae0`.
+- Review rework: unattributed factory/runtime exceptions initially became owner-null blocked slots with a final manifest, and trusted Task defects retried later rollouts; unknown failures now abort, while remaining same-Task requests become blocked without another driver.
+- Git physical batch: exact Corpus `4fddce70...`, Release `14331ac...`, Batch `62b41ef0...`; three exact slots produced three verified successes, eight attempted/dispatched calls and eight explicitly missing-usage turns.
+- SQLite physical batch: exact Corpus `a750a812...`, Release `64fa07e1...`, Batch `85a1135d...`; retained one verified failure, one provider abstain and one verified success with no blocked/dropped slot.
+- Drift correction: batch source reached about 709 lines before its own test file appeared; main froze source expansion and required focused coverage. Final public surface remains exactly EpisodeBatchManifest plus `run_episode_batch`; no retry/scheduler/reader/report/Registry or multi-release mechanism.

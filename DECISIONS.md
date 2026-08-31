@@ -188,3 +188,10 @@ CP4 exposes only one non-leaking view contract and two paired IO functions.
 Independent review found and fixed four fresh-ID malformed checker-request
 acceptances; no independent view trust, artifact framework or future consumer
 surface was added.
+
+`s3-cp5-exact-batch|介入1|返工2|shared-root RED+exact Corpus serial batch+486 full+3 mutation licences+Git/SQLite physical+independent review|红线违反1`
+
+The CP5 redline was allowing the new 709-line batch source to appear before its
+own focused tests. Source expansion was frozen; subsequent work added tests and
+only fixed unattributed-abort and same-Task stop behavior. The final batch has
+one class, one public function and no scheduler/retry/framework surface.

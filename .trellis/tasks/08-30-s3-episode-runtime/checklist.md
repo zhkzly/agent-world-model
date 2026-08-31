@@ -93,15 +93,15 @@
 
 ## Batch and stage completion
 
-- [ ] Does one batch accept one exact expected single-release CorpusManifest?
-- [ ] Is every valid logical request frozen before the first policy call?
-- [ ] In every successfully published batch, is each rollout represented by one
+- [x] Does one batch accept one exact expected single-release CorpusManifest?
+- [x] Is every valid logical request frozen before the first policy call?
+- [x] In every successfully published batch, is each rollout represented by one
   success, failure, abstention or blocked slot with no automatic/SDK retry?
-- [ ] Are invalid TaskPack entries blocked without fabricated request/public
+- [x] Are invalid TaskPack entries blocked without fabricated request/public
   data, while an invalid CorpusManifest fails the batch?
-- [ ] Are aggregates derived from retained records and explicit about missing
+- [x] Are aggregates derived from retained records and explicit about missing
   provider usage and abstain owners, with no monetary-cost claim?
-- [ ] Are scheduler, queue, Registry, database, explicit-TaskPack-set and
+- [x] Are scheduler, queue, Registry, database, explicit-TaskPack-set and
   multi-release batch mechanisms absent?
 - [ ] Do Git, SQLite and inherited maintenance evidence collectively cover
   Atom, ForEach and If without domain branches?

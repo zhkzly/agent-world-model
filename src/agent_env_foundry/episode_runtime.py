@@ -215,21 +215,9 @@ def run_task_episode(
 ) -> EpisodeRecord:
     """Run one exact admitted Task through capture, reopen, checker, and Reward."""
 
-    authority = read_task_pack_artifact(Path(task_pack_path), expected_task_pack_id)
-    if authority.public.release_id != prepared.identity.release_id:
-        raise TaskFoundryError(
-            "task_release_mismatch", "TaskPack belongs to another prepared release"
-        )
-    task, branch_task = _decode_authority(authority)
-    if isinstance(task, AtomTask):
-        _verify_checker_preimage(prepared, task)
-    elif isinstance(task, ForEachTask):
-        _verify_foreach_task(prepared, task)
-    else:
-        _verify_if_task(prepared, task)
-        if branch_task is None:
-            raise AssertionError("validated If Task has no embedded branch")
-        _verify_checker_preimage(prepared, branch_task)
+    authority, task, branch_task = _load_task_authority(
+        prepared, Path(task_pack_path), expected_task_pack_id
+    )
     policy_spec = policy_driver.policy_spec
     if not isinstance(policy_spec, PolicySpec):
         raise ValueError("PolicyDriver policy_spec must be a PolicySpec")
@@ -438,6 +426,31 @@ def run_task_episode(
     )
 
 
+def _load_task_authority(
+    prepared: OpenPreparedRelease,
+    task_pack_path: Path,
+    expected_task_pack_id: str,
+) -> tuple[TrustedTaskView, AtomTask | ForEachTask | IfTask, AtomTask | None]:
+    """Cold-check the exact static Task authority shared by direct and batch execution."""
+
+    authority = read_task_pack_artifact(Path(task_pack_path), expected_task_pack_id)
+    if authority.public.release_id != prepared.identity.release_id:
+        raise TaskFoundryError(
+            "task_release_mismatch", "TaskPack belongs to another prepared release"
+        )
+    task, branch_task = _decode_authority(authority)
+    if isinstance(task, AtomTask):
+        _verify_checker_preimage(prepared, task)
+    elif isinstance(task, ForEachTask):
+        _verify_foreach_task(prepared, task)
+    else:
+        _verify_if_task(prepared, task)
+        if branch_task is None:
+            raise AssertionError("validated If Task has no embedded branch")
+        _verify_checker_preimage(prepared, branch_task)
+    return authority, task, branch_task
+
+
 def _training_view(record: EpisodeRecord) -> TrainingEpisodeView:
     turns: list[JSONObject] = []
     for turn in record.capture.turns:
@@ -470,9 +483,17 @@ def write_episode_bundle(
     if not isinstance(record, EpisodeRecord):
         raise ValueError("record must be an EpisodeRecord")
     root = Path(output_root)
-    if root.exists() or root.is_symlink():
-        raise ValueError("Episode output root must be absent")
-    directory = root / "episodes" / record.episode_id
+    episodes = root / "episodes"
+    directory = episodes / record.episode_id
+    if (
+        root.is_symlink()
+        or (root.exists() and not root.is_dir())
+        or episodes.is_symlink()
+        or (episodes.exists() and not episodes.is_dir())
+        or directory.exists()
+        or directory.is_symlink()
+    ):
+        raise ValueError("Episode bundle directory must be absent under ordinary directories")
     directory.mkdir(parents=True)
     view = _training_view(record)
     (directory / "EpisodeRecord.json").write_bytes(canonical_bytes(record.to_document()))
@@ -485,6 +506,15 @@ def read_episode_bundle(
     episode_id: str,
 ) -> TrainingEpisodeView:
     """Cold-verify one Record/View pair and return only the derived public view."""
+
+    return _read_episode_bundle_pair(output_root, episode_id)[1]
+
+
+def _read_episode_bundle_pair(
+    output_root: Path,
+    episode_id: str,
+) -> tuple[EpisodeRecord, TrainingEpisodeView]:
+    """Private trusted pair used by the public view reader and exact batch reconciliation."""
 
     _digest(episode_id, "episode_id")
     root = Path(output_root)
@@ -522,7 +552,7 @@ def read_episode_bundle(
     derived = _training_view(record)
     if raw_view != derived.to_document():
         raise ValueError("TrainingEpisodeView differs from its trusted EpisodeRecord")
-    return derived
+    return record, derived
 
 
 def _read_canonical_object(path: Path, role: str) -> JSONObject:
