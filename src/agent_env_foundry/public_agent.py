@@ -1,4 +1,4 @@
-"""Fresh public-only Responses function-tool episode runner."""
+"""One Host-owned public policy loop and its one-turn Responses adapter."""
 
 from __future__ import annotations
 
@@ -16,30 +16,40 @@ from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.environment import (
     Environment,
     JSONObject,
+    JSONValue,
     ToolSpec,
     validate_observation,
-    validate_tool_catalog,
+)
+from agent_env_foundry.episodes import (
+    EpisodeDefect,
+    EpisodeToolCall,
+    PolicyCompletion,
+    PolicySpec,
+    PolicyTurn,
+    PublicEpisodeCapture,
+    PublicEpisodeInput,
 )
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
-from agent_env_foundry.schema import SchemaError, require_object_root, validate_instance
+from agent_env_foundry.schema import SchemaError, validate_instance
 from agent_env_foundry.semantics import TraceEvent
 
-PublicAgentFailureKind = Literal[
-    "EnvironmentDefect",
-    "InfrastructureFailure",
-    "NoPublicWitness",
-]
+PublicAgentFailureKind = Literal["EnvironmentDefect", "InfrastructureFailure", "NoPublicWitness"]
+type _DriverCall = tuple[JSONValue, JSONValue, JSONValue]
+type _DriverTerminal = Literal["none", "final_answer", "refusal"]
+
 PUBLIC_AGENT_SYSTEM_PROMPT = (
     "Complete only the public task using the instruction, reset observation, and public "
     "function-tool observations. Treat tool observations as authoritative. Do not invent "
     "hidden state or claim completion before the requested outcome and evidence are observed."
 )
-PUBLIC_AGENT_PROMPT_DIGEST = hashlib.sha256(PUBLIC_AGENT_SYSTEM_PROMPT.encode("utf-8")).hexdigest()
-_TOOL_OBSERVATION_GUIDANCE = (
+PUBLIC_AGENT_PROMPT_DIGEST = hashlib.sha256(PUBLIC_AGENT_SYSTEM_PROMPT.encode()).hexdigest()
+_OBSERVATION_GUIDANCE = (
     "The function result is a public observation object: ok=true returns data; ok=false "
     "returns error.code, error.message, and optional error.details. Inspect the observation "
     "before deciding the next action."
 )
+_BASE_URL = "http://127.0.0.1:8317/v1"
+_ROUTE_ID = "responses:local-8317"
 
 
 class _ResponsesResource(Protocol):
@@ -56,16 +66,54 @@ class ClientFactory(Protocol):
 
 class PublicAgentFailure(RuntimeError):
     def __init__(
-        self,
-        kind: PublicAgentFailureKind,
-        code: str,
-        message: str,
-        **details: Any,
+        self, kind: PublicAgentFailureKind, code: str, message: str, **details: Any
     ) -> None:
         super().__init__(message)
-        self.kind = kind
-        self.code = code
-        self.details = details
+        self.kind, self.code, self.details = kind, code, details
+
+
+class UnattributedPolicyDriverFailure(RuntimeError):
+    def __init__(self, code: str, phase: str, **details: JSONValue) -> None:
+        super().__init__(code)
+        self.code, self.phase = code, phase
+        self.details = _object(details, "unattributed details")
+
+
+class _DriverFailure(RuntimeError):
+    def __init__(
+        self,
+        owner: Literal["provider", "infrastructure", "evidence"],
+        code: str,
+        phase: str,
+        **details: JSONValue,
+    ) -> None:
+        super().__init__(code)
+        self.defect = EpisodeDefect(owner, code, phase)
+        self.details = _object(details, "driver details")
+
+
+@dataclass(frozen=True, slots=True)
+class DriverDecision:
+    """Public material from exactly one decision; never tool authority."""
+
+    calls: tuple[_DriverCall, ...] = ()
+    terminal_kind: _DriverTerminal = "none"
+    raw_public_terminal: JSONValue = None
+    usage: JSONObject | None = None
+    defect: EpisodeDefect | None = None
+
+
+class PolicyDriver(Protocol):
+    @property
+    def policy_spec(self) -> PolicySpec: ...
+
+    def start(self, public_input: PublicEpisodeInput) -> None: ...
+
+    def next_decision(
+        self, prior_public_results: tuple[tuple[str, JSONObject], ...]
+    ) -> DriverDecision: ...
+
+    def close(self) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +122,153 @@ class PublicEpisodeRun:
     final_answer: JSONObject
     provider_turns: int
     usage: tuple[JSONObject | None, ...]
+
+
+class ResponsesPolicyDriver:
+    """Single-use Responses mapper; the Host owns the loop and every invoke."""
+
+    def __init__(
+        self,
+        *,
+        policy_spec: PolicySpec,
+        base_url: str = _BASE_URL,
+        client_factory: ClientFactory | None = None,
+    ) -> None:
+        if (
+            policy_spec.driver_id != "openai-responses"
+            or policy_spec.driver_version != "1"
+            or policy_spec.route_id != _route_id(base_url)
+        ):
+            raise ValueError("PolicySpec does not match ResponsesPolicyDriver")
+        self._spec, self._base_url = policy_spec, base_url
+        self._factory = client_factory or cast(ClientFactory, OpenAI)
+        self._started = self._closed = False
+        self._client: _ResponsesClient | None = None
+        self._credential = ""
+        self._input: PublicEpisodeInput | None = None
+        self._history: list[Any] = []
+        self._has_result = False
+
+    @classmethod
+    def from_route(
+        cls,
+        route: AgentRoute,
+        *,
+        max_provider_turns: int | None = None,
+        client_factory: ClientFactory | None = None,
+    ) -> ResponsesPolicyDriver:
+        turns = route.max_provider_turns if max_provider_turns is None else max_provider_turns
+        spec = PolicySpec(
+            route.model,
+            "openai-responses",
+            "1",
+            _route_id(route.base_url),
+            PUBLIC_AGENT_PROMPT_DIGEST,
+            turns,
+        )
+        return cls(policy_spec=spec, base_url=route.base_url, client_factory=client_factory)
+
+    @property
+    def policy_spec(self) -> PolicySpec:
+        return self._spec
+
+    def start(self, public_input: PublicEpisodeInput) -> None:
+        if self._started or self._closed:
+            raise _DriverFailure("evidence", "policy_driver_reused", "policy_driver_start")
+        self._started = True
+        digest = hashlib.sha256(public_input.system_prompt.encode()).hexdigest()
+        if digest != self._spec.system_prompt_digest:
+            raise _DriverFailure("evidence", "policy_prompt_digest_mismatch", "policy_driver_start")
+        credential = os.environ.get("OPENAI_API_KEY")
+        if not credential:
+            raise _DriverFailure(
+                "infrastructure", "provider_credential_missing", "policy_driver_start"
+            )
+        try:
+            client = self._factory(api_key=credential, base_url=self._base_url, max_retries=0)
+        except Exception as exc:
+            raise _DriverFailure(
+                "infrastructure",
+                "responses_client_init_failed",
+                "policy_driver_start",
+                original_code=type(exc).__name__,
+                original_message=str(exc).replace(credential, "[REDACTED]"),
+            ) from exc
+        self._credential, self._client, self._input = credential, client, public_input
+        self._history = [{"role": "user", "content": _initial_user_content(public_input)}]
+
+    def next_decision(
+        self, prior_public_results: tuple[tuple[str, JSONObject], ...]
+    ) -> DriverDecision:
+        if self._client is None or self._input is None or self._closed:
+            raise _DriverFailure("evidence", "policy_driver_not_active", "policy_driver_decision")
+        for call_id, observation in prior_public_results:
+            self._history.append(_response_result(call_id, observation))
+        self._has_result |= bool(prior_public_results)
+        try:
+            response = self._client.responses.create(**self._request())
+        except Exception as exc:
+            raise _request_failure(exc, self._credential) from exc
+        decision, output = _map_response(response)
+        self._history.extend(output)  # opaque continuation, never persisted
+        return decision
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        client, self._client = self._client, None
+        self._credential, self._input = "", None
+        self._history.clear()
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+    def _request(self) -> dict[str, Any]:
+        if self._input is None:
+            raise AssertionError("Responses request before driver start")
+        public = self._input.to_document()
+        tools = cast(list[JSONObject], public["tool_specs"])
+        return {
+            "model": self._spec.model_id,
+            "instructions": self._input.system_prompt,
+            "input": list(self._history),
+            "tools": [
+                {
+                    "type": "function",
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["input_schema"],
+                    "strict": True,
+                }
+                for tool in tools
+            ],
+            "tool_choice": "auto" if self._has_result else "required",
+            "parallel_tool_calls": False,
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "public_episode_answer",
+                    "schema": public["answer_schema"],
+                    "strict": True,
+                }
+            },
+            "store": False,
+        }
+
+
+def capture_public_episode(
+    *,
+    actor: Environment,
+    instruction: str,
+    reset_observation: JSONValue,
+    answer_schema: JSONObject,
+    policy_driver: PolicyDriver,
+) -> PublicEpisodeCapture:
+    capture, _details = _capture(
+        actor, instruction, reset_observation, answer_schema, policy_driver, None
+    )
+    return capture
 
 
 def run_public_episode(
@@ -87,264 +282,555 @@ def run_public_episode(
     client_factory: ClientFactory | None = None,
     max_provider_turns: int | None = None,
 ) -> PublicEpisodeRun:
-    selected_route = route or AgentRoute()
-    turn_limit = (
-        selected_route.max_provider_turns if max_provider_turns is None else max_provider_turns
+    """Existing S2 success projection over the shared Host capture."""
+
+    driver = ResponsesPolicyDriver.from_route(
+        route or AgentRoute(),
+        max_provider_turns=max_provider_turns,
+        client_factory=client_factory,
     )
-    if turn_limit <= 0:
-        raise ValueError("max_provider_turns must be positive")
-    if not isinstance(instruction, str) or not instruction.strip():
-        raise ValueError("public instruction must be non-empty")
-    if not is_json_value(reset_observation):
-        raise ValueError("reset observation must be JSON")
-    try:
-        require_object_root(answer_schema, role="public final answer")
-        catalog = validate_tool_catalog(tuple(tool_specs), role="public episode tools")
-    except Exception as exc:
-        raise ValueError(str(exc)) from exc
-    credential = os.environ.get("OPENAI_API_KEY")
-    if not credential:
-        raise PublicAgentFailure(
-            "InfrastructureFailure",
-            "provider_credential_missing",
-            "OPENAI_API_KEY is required for a public episode",
+    capture, details = _capture(
+        actor, instruction, reset_observation, answer_schema, driver, tool_specs
+    )
+    if capture.defect is not None:
+        kind: PublicAgentFailureKind = (
+            "EnvironmentDefect"
+            if capture.defect.owner == "environment"
+            else "InfrastructureFailure"
         )
-    factory = client_factory or cast(ClientFactory, OpenAI)
-    try:
-        client = factory(
-            api_key=credential,
-            base_url=selected_route.base_url,
-            max_retries=0,
-        )
-    except Exception as exc:
         raise PublicAgentFailure(
-            "InfrastructureFailure",
-            "responses_client_init_failed",
-            "public episode provider client initialization failed",
-            original_code=type(exc).__name__,
-            original_message=str(exc).replace(credential, "[REDACTED]"),
-        ) from exc
-    history: list[Any] = [
-        {
-            "role": "user",
-            "content": json.dumps(
-                {
-                    "instruction": instruction,
-                    "reset_observation": reset_observation,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        }
-    ]
-    trace: list[TraceEvent] = []
-    usage_records: list[JSONObject | None] = []
-    tools = [
-        {
-            "type": "function",
-            "name": spec["name"],
-            "description": f"{spec['description'].rstrip()} {_TOOL_OBSERVATION_GUIDANCE}",
-            "parameters": spec["input_schema"],
-            "strict": True,
-        }
-        for spec in catalog.values()
-    ]
-    for turn in range(1, turn_limit + 1):
-        request = {
-            "model": selected_route.model,
-            "instructions": PUBLIC_AGENT_SYSTEM_PROMPT,
-            "input": history,
-            "tools": tools,
-            "tool_choice": "required" if not trace else "auto",
-            "parallel_tool_calls": False,
-            "text": {
-                "format": {
-                    "type": "json_schema",
-                    "name": "public_episode_answer",
-                    "schema": answer_schema,
-                    "strict": True,
-                }
-            },
-            "store": False,
-        }
+            kind,
+            capture.defect.code,
+            "public episode defect",
+            **details,
+            capture=capture.to_document(),
+        )
+    completion = capture.completion
+    if completion is None or completion.terminal_kind != "completed":
+        code = completion.terminal_code if completion is not None else None
+        raise PublicAgentFailure(
+            "NoPublicWitness",
+            code or "public_policy_failed",
+            "public policy failure",
+            **details,
+            capture=capture.to_document(),
+        )
+    return PublicEpisodeRun(
+        _trace_from_capture(capture),
+        cast(JSONObject, completion.to_document()["final_answer"]),
+        len(capture.turns),
+        tuple(cast(JSONObject | None, turn.to_document()["usage"]) for turn in capture.turns),
+    )
+
+
+def _capture(
+    actor: Environment,
+    instruction: Any,
+    reset_observation: Any,
+    answer_schema: Any,
+    driver: PolicyDriver,
+    tool_specs: Sequence[ToolSpec | Mapping[str, Any]] | None,
+) -> tuple[PublicEpisodeCapture, JSONObject]:
+    try:
+        actor_tool_specs = tool_specs is None
         try:
-            response = client.responses.create(**request)
+            resolved_tool_specs = actor.tools() if tool_specs is None else tool_specs
+            public_input, catalog = _public_input(
+                instruction, reset_observation, answer_schema, resolved_tool_specs
+            )
         except Exception as exc:
-            raise PublicAgentFailure(
-                "InfrastructureFailure",
-                "responses_request_failed",
-                "public episode provider request failed",
-                original_code=type(exc).__name__,
-                original_message=str(exc).replace(credential, "[REDACTED]"),
-            ) from exc
-        usage_records.append(_usage(response))
-        output_items = list(cast(Sequence[Any], _item(response, "output") or ()))
-        history.extend(output_items)
-        calls = [item for item in output_items if _item(item, "type") == "function_call"]
-        if calls:
-            for call in calls:
-                name = _item(call, "name")
-                arguments_text = _item(call, "arguments")
-                call_id = _item(call, "call_id")
-                if not isinstance(name, str) or name not in catalog:
-                    raise PublicAgentFailure(
-                        "NoPublicWitness",
-                        "unknown_tool_call",
-                        "public Agent requested a tool outside the public catalog",
-                        tool_name=name,
-                    )
-                if not isinstance(arguments_text, str) or not isinstance(call_id, str):
-                    raise PublicAgentFailure(
-                        "NoPublicWitness",
-                        "malformed_tool_call",
-                        "public Agent emitted a malformed function call",
-                    )
-                try:
-                    arguments = json.loads(arguments_text)
-                except json.JSONDecodeError as exc:
-                    raise PublicAgentFailure(
-                        "NoPublicWitness",
-                        "tool_arguments_invalid",
-                        "public Agent tool arguments are not JSON",
-                    ) from exc
-                if not is_json_object(arguments):
-                    raise PublicAgentFailure(
-                        "NoPublicWitness",
-                        "tool_arguments_invalid",
-                        "public Agent tool arguments must be an object",
-                    )
-                spec = catalog[name]
-                try:
-                    validate_instance(
-                        arguments,
-                        spec["input_schema"],
-                        role=f"public tool {name!r} arguments",
-                    )
-                except SchemaError as exc:
-                    raise PublicAgentFailure(
-                        "NoPublicWitness",
-                        "tool_arguments_schema_invalid",
-                        str(exc),
-                    ) from exc
-                try:
-                    observation = actor.invoke(name, arguments)
-                except Exception as exc:
-                    inherited_kind = getattr(exc, "kind", None)
-                    kind: PublicAgentFailureKind = (
-                        "InfrastructureFailure"
-                        if inherited_kind == "InfrastructureFailure"
-                        else "EnvironmentDefect"
-                    )
-                    raise PublicAgentFailure(
-                        kind,
-                        "actor_dispatch_failed",
-                        "public actor tool dispatch failed",
-                        original_code=type(exc).__name__,
-                        original_message=str(exc),
-                    ) from exc
-                try:
-                    validate_observation(observation, spec, role=f"public tool {name!r}")
-                except Exception as exc:
-                    raise PublicAgentFailure(
-                        "EnvironmentDefect",
-                        "tool_observation_invalid",
-                        str(exc),
-                    ) from exc
-                trace.append(
-                    TraceEvent(
-                        len(trace) + 1,
-                        name,
-                        arguments,
-                        cast(JSONObject, dict(observation)),
-                    )
-                )
-                history.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": json.dumps(
-                            observation,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                    }
-                )
-            continue
-        if not trace:
-            raise PublicAgentFailure(
-                "NoPublicWitness",
-                "required_tool_call_missing",
-                "public Agent returned a final answer before any required public tool call",
+            if not actor_tool_specs:
+                raise
+            kind: PublicAgentFailureKind = (
+                "InfrastructureFailure"
+                if getattr(exc, "kind", None) == "InfrastructureFailure"
+                else "EnvironmentDefect"
             )
-        output_text = _item(response, "output_text")
-        if not isinstance(output_text, str) or not output_text.strip():
-            raise PublicAgentFailure(
-                "NoPublicWitness",
-                "final_answer_missing",
-                "public Agent returned neither a tool call nor a final answer",
-            )
+            raise PublicAgentFailure(kind, "actor_tool_catalog_invalid", str(exc)) from exc
+        frozen_answer_schema = cast(JSONObject, public_input.to_document()["answer_schema"])
+        spec = driver.policy_spec
+    except Exception:
+        driver.close()
+        raise
+    turns: list[PolicyTurn] = []
+    completion: PolicyCompletion | None = None
+    defect: EpisodeDefect | None = None
+    details: JSONObject = {}
+    results: tuple[tuple[str, JSONObject], ...] = ()
+    seen_ids: set[str] = set()
+    unattributed: UnattributedPolicyDriverFailure | None = None
+    try:
+        if not isinstance(spec, PolicySpec):
+            raise ValueError("PolicyDriver policy_spec must be a PolicySpec")
+        if spec.system_prompt_digest != PUBLIC_AGENT_PROMPT_DIGEST:
+            raise ValueError("PolicySpec prompt digest does not match the Host prompt")
         try:
-            answer = json.loads(output_text)
-        except json.JSONDecodeError as exc:
-            raise PublicAgentFailure(
-                "NoPublicWitness",
-                "final_answer_invalid",
-                "public Agent final answer is not JSON",
-            ) from exc
-        errors = sorted(Draft202012Validator(answer_schema).iter_errors(answer), key=str)
-        if errors or not is_json_object(answer):
-            error = errors[0] if errors else None
-            raise PublicAgentFailure(
-                "NoPublicWitness",
-                "final_answer_invalid",
-                "public Agent final answer violates its schema",
-                original_message=error.message if error else "answer root is not an object",
+            driver.start(public_input)
+        except _DriverFailure as exc:
+            defect, details = exc.defect, exc.details
+        except Exception as exc:
+            raise _unattributed(exc, "policy_driver_start") from exc
+        while completion is None and defect is None and len(turns) < spec.max_provider_turns:
+            if driver.policy_spec.policy_id != spec.policy_id:
+                defect = EpisodeDefect("evidence", "policy_spec_changed", "policy_driver_decision")
+                break
+            try:
+                decision = driver.next_decision(results)
+            except _DriverFailure as exc:
+                defect, details = exc.defect, exc.details
+                break
+            except Exception as exc:
+                raise _unattributed(exc, "policy_driver_decision") from exc
+            if not isinstance(decision, DriverDecision):
+                raise UnattributedPolicyDriverFailure(
+                    "policy_driver_decision_invalid", "policy_driver_decision"
+                )
+            calls, results, policy_code, call_defect, call_details = _apply_calls(
+                decision.calls, actor, catalog, seen_ids, decision.defect is None
             )
-        return PublicEpisodeRun(tuple(trace), answer, turn, tuple(usage_records))
-    raise PublicAgentFailure(
-        "NoPublicWitness",
-        "provider_turn_budget_exhausted",
-        "public Agent exhausted its provider-turn budget",
-        max_provider_turns=turn_limit,
+            turns.append(
+                PolicyTurn(
+                    len(turns) + 1,
+                    calls,
+                    _json(decision.raw_public_terminal, "public terminal"),
+                    _optional_object(decision.usage, "usage"),
+                )
+            )
+            if call_defect is not None:
+                defect, details = call_defect, call_details
+            elif policy_code is not None:
+                completion = _failed(policy_code)
+            else:
+                completion = _decision_completion(decision, frozen_answer_schema, turns)
+            if decision.defect is not None and defect is None:
+                defect = decision.defect
+        if completion is None and defect is None:
+            completion = _failed("provider_turn_budget_exhausted")
+            details = {"max_provider_turns": spec.max_provider_turns}
+    except UnattributedPolicyDriverFailure as exc:
+        unattributed = exc
+    finally:
+        try:
+            driver.close()
+        except OSError as exc:
+            if defect is None:
+                defect = EpisodeDefect(
+                    "infrastructure", "policy_driver_close_failed", "policy_driver_close"
+                )
+                details = _exception_details(exc)
+        except Exception as exc:
+            unattributed = _unattributed(exc, "policy_driver_close")
+    if unattributed is not None:
+        raise unattributed
+    return (
+        PublicEpisodeCapture(public_input, tuple(turns), completion, defect),
+        details,
     )
+
+
+def _trace_from_capture(capture: PublicEpisodeCapture) -> tuple[TraceEvent, ...]:
+    dispatched = (
+        call
+        for turn in capture.turns
+        for call in turn.calls
+        if call.dispatch_status == "dispatched"
+    )
+    return tuple(
+        TraceEvent(
+            seq,
+            cast(str, call.tool_name),
+            _object(call.parsed_arguments, "trace arguments"),
+            _object(call.observation, "trace observation"),
+        )
+        for seq, call in enumerate(dispatched, 1)
+    )
+
+
+def _public_input(
+    instruction: Any,
+    reset_observation: Any,
+    answer_schema: Any,
+    tool_specs: Sequence[ToolSpec | Mapping[str, Any]],
+) -> tuple[PublicEpisodeInput, dict[str, ToolSpec]]:
+    public_tools: list[ToolSpec] = []
+    for tool in tool_specs:
+        copied = dict(tool)
+        description = copied.get("description")
+        if isinstance(description, str):
+            copied["description"] = f"{description.rstrip()} {_OBSERVATION_GUIDANCE}"
+        public_tools.append(cast(ToolSpec, copied))
+    public_input = PublicEpisodeInput(
+        PUBLIC_AGENT_SYSTEM_PROMPT,
+        instruction,
+        cast(JSONValue, reset_observation),
+        tuple(public_tools),
+        cast(JSONObject, answer_schema),
+    )
+    public_tool_documents = cast(list[JSONObject], public_input.to_document()["tool_specs"])
+    return public_input, {
+        cast(str, tool["name"]): cast(ToolSpec, tool) for tool in public_tool_documents
+    }
+
+
+def _apply_calls(
+    calls: tuple[_DriverCall, ...],
+    actor: Environment,
+    catalog: Mapping[str, ToolSpec],
+    seen_ids: set[str],
+    dispatch: bool,
+) -> tuple[
+    tuple[EpisodeToolCall, ...],
+    tuple[tuple[str, JSONObject], ...],
+    str | None,
+    EpisodeDefect | None,
+    JSONObject,
+]:
+    records: list[EpisodeToolCall] = []
+    results: list[tuple[str, JSONObject]] = []
+    policy_code: str | None = None
+    defect: EpisodeDefect | None = None
+    details: JSONObject = {}
+    if not isinstance(calls, tuple):
+        raise UnattributedPolicyDriverFailure(
+            "policy_driver_calls_invalid", "policy_driver_decision"
+        )
+    for raw in calls:
+        if not isinstance(raw, tuple) or len(raw) != 3:
+            raise UnattributedPolicyDriverFailure(
+                "policy_driver_call_invalid", "policy_driver_decision"
+            )
+        raw_id, raw_name, raw_arguments = (
+            _json(raw[0], "call id"),
+            _json(raw[1], "tool name"),
+            _json(raw[2], "arguments"),
+        )
+        call_id = raw_id if isinstance(raw_id, str) and raw_id.strip() else None
+        tool_name = raw_name if isinstance(raw_name, str) and raw_name.strip() else None
+        parsed: JSONObject | None = None
+        parse_status = schema_status = "not_checked"
+        dispatch_status, observation = "not_dispatched", None
+        duplicate_id = call_id is not None and call_id in seen_ids
+        if call_id is not None and not duplicate_id:
+            seen_ids.add(call_id)
+        if policy_code is not None or defect is not None or not dispatch:
+            dispatch_status = "not_dispatched_after_terminal"
+        elif duplicate_id:
+            dispatch_status, policy_code = "duplicate_call_id", "duplicate_tool_call_id"
+        elif call_id is None or tool_name is None:
+            dispatch_status, policy_code = "malformed_call", "malformed_tool_call"
+        elif not isinstance(raw_arguments, str):
+            parse_status, dispatch_status, policy_code = (
+                "invalid_type",
+                "invalid_arguments",
+                "tool_arguments_invalid",
+            )
+        else:
+            try:
+                decoded = json.loads(raw_arguments)
+            except json.JSONDecodeError:
+                parse_status, dispatch_status, policy_code = (
+                    "invalid_json",
+                    "invalid_arguments",
+                    "tool_arguments_invalid",
+                )
+            else:
+                if not is_json_object(decoded):
+                    parse_status, dispatch_status, policy_code = (
+                        "non_object",
+                        "invalid_arguments",
+                        "tool_arguments_invalid",
+                    )
+                else:
+                    parsed, parse_status = cast(JSONObject, decoded), "valid"
+                    if tool_name not in catalog:
+                        dispatch_status, policy_code = "unknown_tool", "unknown_tool_call"
+                    else:
+                        try:
+                            validate_instance(
+                                parsed,
+                                catalog[tool_name]["input_schema"],
+                                role=f"public tool {tool_name!r} arguments",
+                            )
+                        except SchemaError:
+                            schema_status, dispatch_status, policy_code = (
+                                "invalid",
+                                "schema_invalid",
+                                "tool_arguments_schema_invalid",
+                            )
+                        else:
+                            schema_status = "valid"
+                            try:
+                                value = actor.invoke(
+                                    tool_name, _object(parsed, "tool dispatch arguments")
+                                )
+                            except Exception as exc:
+                                owner: Literal["environment", "infrastructure"] = (
+                                    "infrastructure"
+                                    if getattr(exc, "kind", None) == "InfrastructureFailure"
+                                    else "environment"
+                                )
+                                defect = EpisodeDefect(
+                                    owner, "actor_dispatch_failed", "tool_dispatch"
+                                )
+                                dispatch_status = "dispatch_failed"
+                                details = _exception_details(exc)
+                            else:
+                                try:
+                                    validate_observation(value, catalog[tool_name], role=tool_name)
+                                    observation = _object(value, "tool observation")
+                                except Exception as exc:
+                                    defect = EpisodeDefect(
+                                        "environment",
+                                        "tool_observation_invalid",
+                                        "tool_observation",
+                                    )
+                                    dispatch_status = "observation_invalid"
+                                    details = _exception_details(exc)
+                                else:
+                                    dispatch_status = "dispatched"
+                                    results.append((call_id, _object(observation, "public result")))
+        records.append(
+            EpisodeToolCall(
+                raw_id,
+                raw_name,
+                call_id,
+                tool_name,
+                raw_arguments,
+                parsed,
+                parse_status,
+                schema_status,
+                dispatch_status,
+                observation,
+            )
+        )
+    return tuple(records), tuple(results), policy_code, defect, details
+
+
+def _decision_completion(
+    decision: DriverDecision, schema: JSONObject, turns: Sequence[PolicyTurn]
+) -> PolicyCompletion | None:
+    has_dispatched_call = any(
+        call.dispatch_status == "dispatched" for turn in turns for call in turn.calls
+    )
+    if decision.calls and decision.terminal_kind != "none":
+        return _failed("ambiguous_policy_decision")
+    if decision.calls:
+        return None
+    if decision.terminal_kind == "refusal":
+        return _failed("policy_refusal")
+    if decision.terminal_kind == "none":
+        return _failed(
+            "final_answer_missing" if has_dispatched_call else "required_tool_call_missing"
+        )
+    if decision.terminal_kind != "final_answer":
+        raise UnattributedPolicyDriverFailure(
+            "policy_driver_terminal_invalid", "policy_driver_decision"
+        )
+    raw = decision.raw_public_terminal
+    if not has_dispatched_call:
+        return _failed("required_tool_call_missing")
+    if not isinstance(raw, str) or not raw.strip():
+        return _failed("final_answer_missing")
+    try:
+        answer = json.loads(raw)
+    except json.JSONDecodeError:
+        return _failed("final_answer_invalid")
+    if not is_json_object(answer) or next(Draft202012Validator(schema).iter_errors(answer), None):
+        return _failed("final_answer_invalid")
+    return PolicyCompletion("completed", cast(JSONObject, answer), None)
+
+
+def _failed(code: str) -> PolicyCompletion:
+    return PolicyCompletion("policy_failure", None, code)
+
+
+def _map_response(response: Any) -> tuple[DriverDecision, list[Any]]:
+    output = _item(response, "output")
+    if isinstance(output, Sequence) and not isinstance(output, (str, bytes)):
+        items = list(output)
+    else:
+        raise UnattributedPolicyDriverFailure("responses_output_invalid", "policy_driver_response")
+    calls: list[_DriverCall] = []
+    texts: list[str] = []
+    refusal: JSONValue = None
+    for item in items:
+        kind = _item(item, "type")
+        if kind == "function_call":
+            calls.append(
+                (
+                    _json(_item(item, "call_id"), "call id"),
+                    _json(_item(item, "name"), "tool name"),
+                    _json(_item(item, "arguments"), "arguments"),
+                )
+            )
+        elif kind == "reasoning":
+            continue
+        elif kind == "message":
+            content = _item(item, "content")
+            if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+                raise UnattributedPolicyDriverFailure(
+                    "responses_message_invalid", "policy_driver_response"
+                )
+            for part in content:
+                if _item(part, "type") == "output_text" and isinstance(_item(part, "text"), str):
+                    texts.append(_item(part, "text"))
+                elif _item(part, "type") == "refusal" and refusal is None:
+                    refusal = _json(_item(part, "refusal"), "refusal")
+                else:
+                    raise UnattributedPolicyDriverFailure(
+                        "responses_message_part_unexpected", "policy_driver_response"
+                    )
+        else:
+            raise UnattributedPolicyDriverFailure(
+                "responses_output_item_unexpected",
+                "policy_driver_response",
+                item_type=_json(kind, "output item type"),
+            )
+    raw_terminal = _item(response, "output_text")
+    if (
+        raw_terminal is None or isinstance(raw_terminal, str) and not raw_terminal.strip()
+    ) and texts:
+        raw_terminal = "".join(texts)
+    if calls and isinstance(raw_terminal, str) and not raw_terminal.strip():
+        raw_terminal = None
+    terminal = _json(raw_terminal, "public terminal")
+    terminal_kind: _DriverTerminal = (
+        "final_answer" if terminal is not None else "refusal" if refusal is not None else "none"
+    )
+    terminal = refusal if terminal_kind == "refusal" else terminal
+    usage = _item(response, "usage")
+    if usage is not None and callable(getattr(usage, "model_dump", None)):
+        usage = usage.model_dump()
+    try:
+        normalized_usage = _optional_object(usage, "usage")
+    except ValueError:
+        return (
+            DriverDecision(
+                tuple(calls),
+                terminal_kind,
+                terminal,
+                None,
+                EpisodeDefect("evidence", "provider_usage_invalid", "policy_driver_usage"),
+            ),
+            items,
+        )
+    return DriverDecision(tuple(calls), terminal_kind, terminal, normalized_usage), items
+
+
+def _request_failure(
+    exc: Exception, credential: str
+) -> _DriverFailure | UnattributedPolicyDriverFailure:
+    status, name = getattr(exc, "status_code", None), type(exc).__name__
+    details: dict[str, JSONValue] = _exception_details(exc, credential)
+    if isinstance(status, int):
+        details["status_code"] = status
+    if (
+        status == 429
+        or (isinstance(status, int) and status >= 500)
+        or name
+        in {
+            "RateLimitError",
+            "InternalServerError",
+            "ServiceUnavailableError",
+        }
+    ):
+        owner: Literal["provider", "infrastructure", "evidence"] = "provider"
+    elif status in {400, 422} or name in {"BadRequestError", "UnprocessableEntityError"}:
+        owner = "evidence"
+    elif status in {401, 403, 404} or name in {
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "NotFoundError",
+    }:
+        owner = "infrastructure"
+    elif status == 408:
+        owner = "provider"
+    elif isinstance(exc, (OSError, ImportError)) or name in {
+        "APIConnectionError",
+        "APITimeoutError",
+        "ConnectError",
+        "ReadTimeout",
+    }:
+        owner = "infrastructure"
+    else:
+        return UnattributedPolicyDriverFailure(
+            "responses_request_unattributed", "policy_driver_request", **details
+        )
+    return _DriverFailure(owner, "responses_request_failed", "policy_driver_request", **details)
+
+
+def _unattributed(exc: Exception, phase: str) -> UnattributedPolicyDriverFailure:
+    if isinstance(exc, UnattributedPolicyDriverFailure):
+        return exc
+    return UnattributedPolicyDriverFailure(
+        "policy_driver_exception_unattributed", phase, **_exception_details(exc)
+    )
+
+
+def _initial_user_content(public_input: PublicEpisodeInput) -> str:
+    return json.dumps(
+        {
+            "instruction": public_input.instruction,
+            "reset_observation": public_input.to_document()["reset_observation"],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _response_result(call_id: str, observation: JSONObject) -> JSONObject:
+    return {
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": json.dumps(
+            observation, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ),
+    }
+
+
+def _exception_details(exc: Exception, secret: str = "") -> JSONObject:
+    message = str(exc).replace(secret, "[REDACTED]") if secret else str(exc)
+    return {"original_code": type(exc).__name__, "original_message": message}
+
+
+def _route_id(base_url: str) -> str:
+    if base_url != _BASE_URL:
+        raise ValueError("unsupported Responses route")
+    return _ROUTE_ID
 
 
 def _item(value: Any, name: str) -> Any:
-    if isinstance(value, Mapping):
-        return value.get(name)
-    return getattr(value, name, None)
+    return value.get(name) if isinstance(value, Mapping) else getattr(value, name, None)
 
 
-def _usage(response: Any) -> JSONObject | None:
-    value = _item(response, "usage")
-    if value is None:
-        return None
-    if not isinstance(value, Mapping) and callable(getattr(value, "model_dump", None)):
-        value = value.model_dump()
-    try:
-        normalized = json.loads(json.dumps(value, ensure_ascii=False))
-    except (TypeError, ValueError) as exc:
-        raise PublicAgentFailure(
-            "InfrastructureFailure",
-            "provider_usage_invalid",
-            "provider usage is not JSON-serializable",
-        ) from exc
-    if not is_json_object(normalized):
-        raise PublicAgentFailure(
-            "InfrastructureFailure",
-            "provider_usage_invalid",
-            "provider usage must be an object when present",
-        )
-    return cast(JSONObject, normalized)
+def _json(value: Any, role: str) -> JSONValue:
+    if not is_json_value(value):
+        raise ValueError(f"{role} must be JSON")
+    return cast(JSONValue, json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False)))
+
+
+def _object(value: Any, role: str) -> JSONObject:
+    copied = _json(value, role)
+    if not is_json_object(copied):
+        raise ValueError(f"{role} must be a JSON object")
+    return cast(JSONObject, copied)
+
+
+def _optional_object(value: Any, role: str) -> JSONObject | None:
+    return None if value is None else _object(value, role)
 
 
 __all__ = [
     "ClientFactory",
+    "DriverDecision",
     "PUBLIC_AGENT_PROMPT_DIGEST",
     "PUBLIC_AGENT_SYSTEM_PROMPT",
+    "PolicyDriver",
     "PublicAgentFailure",
     "PublicEpisodeRun",
+    "ResponsesPolicyDriver",
+    "UnattributedPolicyDriverFailure",
+    "capture_public_episode",
     "run_public_episode",
 ]

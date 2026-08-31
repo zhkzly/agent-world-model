@@ -15,6 +15,11 @@ from agent_env_foundry.public_agent import (
 class Actor:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.tool_snapshots = 0
+
+    def tools(self) -> tuple[dict[str, Any], ...]:
+        self.tool_snapshots += 1
+        return (_tool(),)
 
     def invoke(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         self.calls.append((tool_name, arguments))
@@ -89,13 +94,14 @@ def test_public_episode_preserves_exact_tool_loop_and_returns_trace(
         ]
     )
     actor = Actor()
+    tool_specs = actor.tools()
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     episode = run_public_episode(
         actor=actor,
         instruction="Inspect public-1 and report its value.",
         reset_observation={"items": [{"item": "public-1"}]},
-        tool_specs=(_tool(),),
+        tool_specs=tool_specs,
         answer_schema=_answer_schema(),
         client_factory=lambda **_kwargs: Client(responses),
         max_provider_turns=2,
@@ -109,6 +115,7 @@ def test_public_episode_preserves_exact_tool_loop_and_returns_trace(
     )
     assert episode.trace[0].tool_name == "inspect_item"
     assert episode.trace[0].arguments == {"item": "public-1"}
+    assert actor.tool_snapshots == 1
     assert actor.calls == [("inspect_item", {"item": "public-1"})]
     assert responses.requests[0]["tool_choice"] == "required"
     assert responses.requests[1]["tool_choice"] == "auto"
@@ -201,6 +208,106 @@ def test_public_episode_rejects_unknown_tool_and_invalid_final_answer(
             max_provider_turns=1,
         )
     assert caught.value.code == "required_tool_call_missing"
+
+
+def test_public_episode_failure_retains_prior_public_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    responses = Responses(
+        [
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "inspect_item",
+                        "arguments": '{"item":"public-1"}',
+                        "call_id": "call-1",
+                    }
+                ],
+                "output_text": None,
+                "usage": {"input_tokens": 10, "output_tokens": 4},
+            },
+            {
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": "hidden_tool",
+                        "arguments": "{}",
+                        "call_id": "call-2",
+                    }
+                ],
+                "output_text": None,
+                "usage": {"input_tokens": 20, "output_tokens": 3},
+            },
+        ]
+    )
+
+    with pytest.raises(PublicAgentFailure) as caught:
+        run_public_episode(
+            actor=Actor(),
+            instruction="Inspect public-1 and report its value.",
+            reset_observation={"items": [{"item": "public-1"}]},
+            tool_specs=(_tool(),),
+            answer_schema=_answer_schema(),
+            client_factory=lambda **_kwargs: Client(responses),
+            max_provider_turns=2,
+        )
+
+    assert caught.value.kind == "NoPublicWitness"
+    assert caught.value.code == "unknown_tool_call"
+    assert "capture" in caught.value.details
+    capture = caught.value.details["capture"]
+    json.dumps(capture, allow_nan=False)
+    assert capture["turns"] == [
+        {
+            "turn_index": 1,
+            "calls": [
+                {
+                    "raw_call_id": "call-1",
+                    "raw_tool_name": "inspect_item",
+                    "call_id": "call-1",
+                    "tool_name": "inspect_item",
+                    "raw_arguments": '{"item":"public-1"}',
+                    "parsed_arguments": {"item": "public-1"},
+                    "parse_status": "valid",
+                    "schema_status": "valid",
+                    "dispatch_status": "dispatched",
+                    "observation": {
+                        "ok": True,
+                        "data": {"value": "public-1"},
+                        "error": None,
+                    },
+                }
+            ],
+            "raw_public_terminal": None,
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+        },
+        {
+            "turn_index": 2,
+            "calls": [
+                {
+                    "raw_call_id": "call-2",
+                    "raw_tool_name": "hidden_tool",
+                    "call_id": "call-2",
+                    "tool_name": "hidden_tool",
+                    "raw_arguments": "{}",
+                    "parsed_arguments": {},
+                    "parse_status": "valid",
+                    "schema_status": "not_checked",
+                    "dispatch_status": "unknown_tool",
+                    "observation": None,
+                }
+            ],
+            "raw_public_terminal": None,
+            "usage": {"input_tokens": 20, "output_tokens": 3},
+        },
+    ]
+    assert capture["completion"] == {
+        "terminal_kind": "policy_failure",
+        "final_answer": None,
+        "terminal_code": "unknown_tool_call",
+    }
 
 
 def test_public_episode_rejects_zero_budget_and_attributes_actor_defects(

@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 
 import agent_env_foundry.batch_foundry as batch_module
+from agent_env_foundry.if_foundry import IfTask
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import StartCase
 from agent_env_foundry.task_foundry import AtomTask, TaskFoundryError
@@ -57,6 +59,63 @@ def _atom(
         hashlib.sha256(instruction.encode()).hexdigest(),
         answer_schema,
     )
+
+
+def _current_if_pack_document(
+    *,
+    expected_branch: Literal["true", "false"] = "true",
+    branch_format: str = "atom-task-pack/4",
+) -> tuple[dict[str, object], str, IfTask]:
+    branch = _atom("item:branch", "branch")
+    branch_preimage = {
+        "format": branch_format,
+        "task": branch.to_document(),
+        "admission": {"task_id": branch.task_id},
+    }
+    branch_pack_id = hashlib.sha256(canonical_bytes(branch_preimage)).hexdigest()
+    branch_pack = {**branch_preimage, "task_pack_id": branch_pack_id}
+    instruction = "Apply the selected branch."
+    task = IfTask(
+        branch.release_id,
+        branch.start_case,
+        "condition-1",
+        branch.semantic_key,
+        branch.public_descriptor,
+        branch.capability_id if expected_branch == "true" else "cap-true",
+        branch.capability_id if expected_branch == "false" else "cap-false",
+        expected_branch,
+        branch.task_id,
+        "b" * 64,
+        instruction,
+        hashlib.sha256(instruction.encode()).hexdigest(),
+        branch.answer_schema,
+    )
+    plan_preimage = {
+        "format": "if-admission-plan/2",
+        "task_id": task.task_id,
+    }
+    admission_plan = {
+        **plan_preimage,
+        "plan_id": hashlib.sha256(canonical_bytes(plan_preimage)).hexdigest(),
+    }
+    admission_preimage = {
+        "format": "if-admission-report/4",
+        "task_id": task.task_id,
+        "admission_plan": admission_plan,
+        "witnesses": [],
+        "branch_task_pack": branch_pack,
+    }
+    admission = {
+        **admission_preimage,
+        "report_id": hashlib.sha256(canonical_bytes(admission_preimage)).hexdigest(),
+    }
+    pack_preimage = {
+        "format": "if-task-pack/3",
+        "task": task.to_document(),
+        "admission": admission,
+    }
+    task_pack_id = hashlib.sha256(canonical_bytes(pack_preimage)).hexdigest()
+    return {**pack_preimage, "task_pack_id": task_pack_id}, task_pack_id, task
 
 
 def test_structure_id_ignores_parameters_but_keeps_report_and_regime_semantics() -> None:
@@ -308,6 +367,47 @@ def test_task_pack_reader_projects_only_the_public_acting_view(tmp_path: Path) -
     assert "public_descriptor" not in loaded.public.to_document()
     assert loaded.start_case == task.start_case.to_document()
     assert loaded.checker_digest == task.checker_digest
+
+
+def test_task_pack_reader_rejects_a_forged_if_branch_before_policy_use(
+    tmp_path: Path,
+) -> None:
+    document, task_pack_id, _task = _current_if_pack_document(branch_format="atom-task-pack/999")
+    path = tmp_path / "IfTaskPack.json"
+    path.write_bytes(canonical_bytes(document))
+
+    with pytest.raises(TaskFoundryError) as raised:
+        batch_module.read_task_pack_artifact(path, task_pack_id)
+
+    assert raised.value.code == "task_pack_reader_if_branch_invalid"
+
+
+@pytest.mark.parametrize("expected_branch", ["true", "false"])
+def test_task_pack_reader_accepts_a_current_if_branch_and_retains_admission(
+    tmp_path: Path,
+    expected_branch: Literal["true", "false"],
+) -> None:
+    document, task_pack_id, task = _current_if_pack_document(expected_branch=expected_branch)
+    path = tmp_path / "IfTaskPack.json"
+    path.write_bytes(canonical_bytes(document))
+
+    loaded = batch_module.read_task_pack_artifact(path, task_pack_id)
+
+    assert loaded.public.task_id == task.task_id
+    admission = document["admission"]
+    assert isinstance(admission, dict)
+    branch_pack = admission["branch_task_pack"]
+    assert isinstance(branch_pack, dict)
+    assert loaded.branch_task_document == branch_pack["task"]
+    assert set(loaded.public.to_document()) == {
+        "format",
+        "task_pack_id",
+        "task_id",
+        "release_id",
+        "goal_kind",
+        "instruction",
+        "answer_schema",
+    }
 
 
 def test_batch_reports_dependency_packs_and_progress_events(

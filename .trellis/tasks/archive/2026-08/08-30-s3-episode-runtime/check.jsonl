@@ -1,0 +1,10 @@
+{"file":"PROJECT.md","reason":"Reject any diff that substitutes a demo, green suite or partial slice for full S3 completion."}
+{"file":"DECISIONS.md","reason":"Audit exact S2 authority, Host ownership, reward precedence, provider/infrastructure separation and forbidden scope."}
+{"file":".trellis/tasks/08-26-foundry-paper-product/prd.md","reason":"Check cross-stage S1->S2->S3->S4 claims and ensure the parent remains planning authority only."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/prd.md","reason":"Verify successful S2 TaskPack/Witness/Corpus identities and semantics do not drift."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/design.md","reason":"Compare shared execution/checker behavior with the accepted Direct upstream path."}
+{"file":".trellis/spec/backend/v2-preparation.md","reason":"Audit same-instance close/reopen order, distinct sessions, no second reset and unchanged ReloadEvidence/1."}
+{"file":".trellis/spec/backend/s2-assessment-corpus.md","reason":"Audit cold TaskPack/Corpus identity and strict public/trusted projection boundaries."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reject duplicated Responses, lifecycle, checker, decoder or projection logic."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Audit end-to-end data ownership and mutation resistance from policy input through S4-facing view."}
+{"file":".trellis/tasks/08-30-s3-episode-runtime/research/input-readiness.md","reason":"Reject activation or physical claims when exact upstream IDs lack current cold-reader receipts."}

@@ -17,9 +17,11 @@ S2 Direct Good-Task Sampling Foundry
   -> admitted TaskPacks
   -> separate TaskAssessments and CorpusManifest
 
-S3 Episode Runtime and Evaluator
-  -> real public tool trajectory
-  -> frozen Task verification and Reward/abstention
+S3 Verified Episode Runtime
+  -> complete public target-policy trajectory
+  -> post-reopen frozen Task verification
+  -> deterministic Reward/abstention
+  -> EpisodeRecord and EpisodeBatchManifest
 
 S4 SFT/RL
   -> datasets, optimizer runs, checkpoints and held-out evidence
@@ -60,13 +62,32 @@ gap. They are not required nodes and cannot define Task truth.
 
 ### S3
 
-S3 recreates a TaskPack, gives only the public projection to the acting policy,
-records real actions/observations/final answer and executes the frozen verifier.
+S3 runs an admitted TaskPack under a target policy. It freezes the Episode
+request and public projection before acting, records the complete public tool
+trajectory, closes and reopens the same native instance, executes the frozen
+Task checker and maps the result to:
+
+```text
+verified success -> 1.0
+valid policy failure -> 0.0
+untrustworthy infrastructure/truth path -> null / abstain
+```
+
+S3 preserves failed policy trajectories and distinguishes them from provider,
+Environment, Task artifact, Semantics, Verifier and evidence defects. It cannot
+regenerate/re-admit Tasks, change checker truth, choose another corpus or train a
+model.
+
+The target policy receives only instruction, fresh reset context, ToolSpecs,
+ToolObservations and final-answer schema. S3 may expose one restricted
+PolicyDriver boundary for the current Responses adapter and a future S4 rollout
+adapter, but no service, registry or second Agent loop.
 
 ### S4
 
-S4 consumes exact Release/TaskPack/Episode identities. It cannot redefine
-environment or Task truth.
+S4 consumes exact Release/TaskPack/Episode identities and public trajectory
+views. It may construct SFT/RL batches and auxiliary shaping, but cannot redefine
+environment behavior, Task truth or turn abstained evidence into a policy reward.
 
 ## Trust boundary
 
@@ -75,36 +96,61 @@ acting policy
   instruction + reset context + ToolSpecs + ToolObservations
 
 trusted runtime
-  reset recipe + protected binding + native facts + checker
+  reset recipe + protected binding + native facts + frozen checker
+
+S4 data consumer
+  public trajectory + verified status/reward label
 ```
 
 Protected state may select and verify a Task but never provide an acting-time
 operand. Model consensus cannot override deterministic failure.
 
-## Current S2 scope
+## Planned S3 scope
 
-The active child owns completion of the existing Direct sampling, admission,
-batch, assessment and corpus path plus minimum demonstrated S1 corrections.
-Backward compatibility, mandatory Graph/Programmatic, Registry, S3 reward and
-S4 training are outside the active implementation.
+Once explicitly activated, the planned S3 child will own:
+
+```text
+shared complete public-policy outcome capture
+shared success/failure close-reopen lifecycle
+strict TaskPack runtime dispatch
+binary Reward/typed abstention
+EpisodeRecord/TrainingEpisodeView persistence
+CorpusManifest batch execution
+S4-shaped public trajectory handoff
+```
+
+It may make narrowly required refactors to current S2 execution primitives, but
+must leave TaskPack truth/admission unchanged. Trainer-specific formatting,
+tokenization, logprobs, optimizer code and checkpoints are outside S3.
 
 ## Product acceptance
 
-- [ ] S1 cold-publishes real actor and protected semantics projects with
+- [x] S1 cold-publishes real actor and protected semantics projects with
   independent native Qualification.
-- [ ] The production S2 API directly samples and structurally deduplicates
+- [x] The production S2 API directly samples and structurally deduplicates
   candidates from exact Release capabilities/Starts/bindings/conditions.
-- [ ] Every admitted Task is public-only solvable twice, non-trivial,
+- [x] Every admitted Task is public-only solvable twice, non-trivial,
   reproducible and deterministically verifiable.
-- [ ] Applicable no-op, wrong-target, partial, collateral and wrong-answer cases
+- [x] Applicable no-op, wrong-target, partial, collateral and wrong-answer cases
   fail without enforcing one witness path.
-- [ ] Declared persistence is verified after close/reopen of the same instance.
-- [ ] TaskPack identity excludes model assessment and corpus selection.
-- [ ] Git, SQLite and a post-freeze held-out Need run without Framework domain
+- [x] Declared persistence is verified after close/reopen of the same instance.
+- [x] TaskPack identity excludes model assessment and corpus selection.
+- [x] Git, SQLite and a post-freeze held-out Need run without Framework domain
   edits or weakened Task gates.
-- [ ] Strict cold TaskPack read produces a non-leaking S3 PublicTaskView.
-- [ ] Assessment/corpus reports difficulty, cost, redundancy and distribution
+- [x] Strict cold TaskPack read produces a non-leaking S3 PublicTaskView.
+- [x] Assessment/corpus reports difficulty, cost, redundancy and distribution
   separately from Task validity.
-- [ ] Optional sampler experiments are retained only when matched-budget evidence
-  shows additional useful non-redundant admitted Tasks.
-- [ ] Exact artifacts reproduce the complete S1 -> S2 -> S3-shaped handoff.
+- [x] Exact artifacts reproduce the complete S1 -> S2 -> S3-shaped handoff.
+- [ ] S3 preserves complete public trajectories for policy success and failure.
+- [ ] S3 evaluates every valid attempt only after closing/reopening the same
+  native instance.
+- [ ] S3 produces physical `1.0`, `0.0` and typed `null` outcomes without causal
+  conflation.
+- [ ] EpisodeRecord and TrainingEpisodeView cold-read after relocation and have
+  exact trusted/public projections.
+- [ ] One direct batch API executes exact CorpusManifest entries and retains one
+  honest success, failure, abstention or blocked result for every rollout slot.
+- [ ] Git, SQLite and held-out TaskPacks run through one target-policy runtime
+  without domain edits.
+- [ ] S4 can consume public trajectories/reward labels without protected data or
+  trainer code in S3.

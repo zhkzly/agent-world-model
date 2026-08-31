@@ -1,0 +1,62 @@
+{
+  "id": "s3-episode-runtime",
+  "name": "s3-episode-runtime",
+  "title": "S3 Verified Episode Runtime",
+  "description": "Run admitted TaskPacks with target policies, preserve complete public trajectories, execute frozen verification, and publish deterministic Reward/abstention Episode artifacts for S4",
+  "status": "completed",
+  "dev_type": "backend",
+  "scope": "Implement one reusable public-policy episode runtime and immutable Episode artifacts over exact EnvironmentRelease v2 and S2 TaskPacks; allow narrowly required refactors of S2 execution code, but do not generate Tasks or train models",
+  "package": "agent_env_foundry",
+  "priority": "P0",
+  "creator": "kelong",
+  "assignee": "kelong",
+  "createdAt": "2026-08-30",
+  "completedAt": "2026-08-31",
+  "branch": "s3-episode-runtime",
+  "base_branch": "s2-task-foundry",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": "08-26-foundry-paper-product",
+  "relatedFiles": [
+    "PROJECT.md",
+    "DECISIONS.md",
+    ".trellis/tasks/08-26-foundry-paper-product/prd.md",
+    ".trellis/tasks/08-30-s3-episode-runtime/prd.md",
+    ".trellis/tasks/08-30-s3-episode-runtime/design.md",
+    ".trellis/tasks/08-30-s3-episode-runtime/implement.md",
+    "src/agent_env_foundry/public_agent.py",
+    "src/agent_env_foundry/task_execution.py",
+    "src/agent_env_foundry/batch_foundry.py",
+    "src/agent_env_foundry/assessment.py"
+  ],
+  "notes": "Candidate plan only; no implementation authority until the revised artifacts receive explicit user approval and task.py start runs. Exact Git, SQLite and inherited-maintenance Release/Corpus/TaskPack authority passed current production cold readers on 2026-08-31; Git regeneration provenance is recorded in research/input-readiness.md. S3 must reuse exact S2 Task truth and the existing close/reopen lifecycle. It may refactor shared execution primitives where failed policy trajectories or S4 policy driving cannot otherwise be represented, but may not add a second Agent loop, Task generator, verifier authority, automatic retry scheduler, service layer, Registry, optimizer or training format.",
+  "meta": {
+    "semantic_order": "cold-inputs-policy-execution-close-reopen-frozen-verification-reward-or-abstention-persistence",
+    "base_reward": "binary-task-success/1",
+    "trainable_dispositions": [
+      "verified_success",
+      "verified_failure"
+    ],
+    "abstain_owners": [
+      "provider",
+      "infrastructure",
+      "environment",
+      "task_artifact",
+      "semantics",
+      "verifier",
+      "evidence"
+    ],
+    "forbidden": [
+      "task_generation",
+      "task_readmission",
+      "llm_judge_reward",
+      "hidden_reasoning_storage",
+      "sft_or_rl_optimization",
+      "automatic_retry",
+      "service_or_registry"
+    ]
+  }
+}

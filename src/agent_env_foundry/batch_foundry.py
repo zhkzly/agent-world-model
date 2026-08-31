@@ -97,6 +97,14 @@ _TASK_DOCUMENT_KEYS = {
         "answer_schema",
     },
 }
+_IF_ADMISSION_KEYS = {
+    "format",
+    "task_id",
+    "admission_plan",
+    "witnesses",
+    "branch_task_pack",
+    "report_id",
+}
 _RETRYABLE_TASK_CODES = frozenset(
     {
         "public_witness_failed",
@@ -145,6 +153,7 @@ class TrustedTaskView:
     start_case: JSONObject
     checker_digest: str
     task_document: JSONObject
+    branch_task_document: JSONObject | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -665,51 +674,16 @@ def read_task_pack_artifact(path: Path, task_pack_id: str) -> TrustedTaskView:
             "TaskPack format is not current",
         )
     kind, expected_task_format = _TASK_PACK_FORMATS[pack_format]
-    task = _object(document.get("task"))
-    if (
-        task.get("format") != expected_task_format
-        or set(task) != _TASK_DOCUMENT_KEYS[expected_task_format]
-    ):
-        raise TaskFoundryError(
-            "task_pack_reader_task_shape_invalid",
-            "TaskPack Task document has an invalid current shape",
-        )
-    task_id = hashlib.sha256(canonical_bytes(task)).hexdigest()
+    task, task_id, release_id, checker_digest, instruction = _read_task_document(
+        document.get("task"), expected_task_format
+    )
     admission = _object(document.get("admission"))
     if admission.get("task_id") != task_id:
         raise TaskFoundryError(
             "task_pack_reader_admission_mismatch",
             "TaskPack admission belongs to another Task",
         )
-    release_id = task.get("release_id")
-    checker_digest = task.get("checker_digest")
-    instruction = task.get("instruction")
-    instruction_digest = task.get("instruction_digest")
-    if not all(
-        isinstance(value, str)
-        for value in (release_id, checker_digest, instruction, instruction_digest)
-    ):
-        raise TaskFoundryError(
-            "task_pack_reader_task_shape_invalid",
-            "TaskPack Task identity or instruction fields are invalid",
-        )
-    assert isinstance(release_id, str)
-    assert isinstance(checker_digest, str)
-    assert isinstance(instruction, str)
-    assert isinstance(instruction_digest, str)
-    for value, role in (
-        (task_pack_id, "task_pack_id"),
-        (task_id, "task_id"),
-        (release_id, "release_id"),
-        (checker_digest, "checker_digest"),
-        (instruction_digest, "instruction_digest"),
-    ):
-        _reader_digest(value, role)
-    if hashlib.sha256(instruction.encode()).hexdigest() != instruction_digest:
-        raise TaskFoundryError(
-            "task_pack_reader_instruction_mismatch",
-            "TaskPack instruction differs from its digest",
-        )
+    branch_task = _validate_if_admission(task, admission) if kind == "if" else None
     public = PublicTaskView(
         task_pack_id,
         task_id,
@@ -723,7 +697,103 @@ def read_task_pack_artifact(path: Path, task_pack_id: str) -> TrustedTaskView:
         _object(task.get("start_case")),
         checker_digest,
         task,
+        branch_task,
     )
+
+
+def _read_task_document(
+    value: Any,
+    expected_format: str,
+) -> tuple[JSONObject, str, str, str, str]:
+    task = _object(value)
+    if task.get("format") != expected_format or set(task) != _TASK_DOCUMENT_KEYS[expected_format]:
+        raise TaskFoundryError(
+            "task_pack_reader_task_shape_invalid",
+            "TaskPack Task document has an invalid current shape",
+        )
+    task_id = hashlib.sha256(canonical_bytes(task)).hexdigest()
+    release_id = task.get("release_id")
+    checker_digest = task.get("checker_digest")
+    instruction = task.get("instruction")
+    instruction_digest = task.get("instruction_digest")
+    if not all(
+        isinstance(item, str)
+        for item in (release_id, checker_digest, instruction, instruction_digest)
+    ):
+        raise TaskFoundryError(
+            "task_pack_reader_task_shape_invalid",
+            "TaskPack Task identity or instruction fields are invalid",
+        )
+    assert isinstance(release_id, str)
+    assert isinstance(checker_digest, str)
+    assert isinstance(instruction, str)
+    assert isinstance(instruction_digest, str)
+    for item, role in (
+        (task_id, "task_id"),
+        (release_id, "release_id"),
+        (checker_digest, "checker_digest"),
+        (instruction_digest, "instruction_digest"),
+    ):
+        _reader_digest(item, role)
+    if hashlib.sha256(instruction.encode()).hexdigest() != instruction_digest:
+        raise TaskFoundryError(
+            "task_pack_reader_instruction_mismatch",
+            "TaskPack instruction differs from its digest",
+        )
+    return task, task_id, release_id, checker_digest, instruction
+
+
+def _validate_if_admission(task: JSONObject, admission: JSONObject) -> JSONObject:
+    try:
+        if (
+            set(admission) != _IF_ADMISSION_KEYS
+            or admission.get("format") != "if-admission-report/4"
+        ):
+            raise ValueError("If admission shape is not current")
+        report_id = admission.get("report_id")
+        if not isinstance(report_id, str):
+            raise TypeError("If admission report_id is not a string")
+        _reader_digest(report_id, "If admission report_id")
+        admission_preimage = dict(admission)
+        admission_preimage.pop("report_id")
+        if hashlib.sha256(canonical_bytes(admission_preimage)).hexdigest() != report_id:
+            raise ValueError("If admission report identity is invalid")
+
+        branch_pack = _object(admission.get("branch_task_pack"))
+        if (
+            set(branch_pack) != {"format", "task", "admission", "task_pack_id"}
+            or branch_pack.get("format") != "atom-task-pack/4"
+        ):
+            raise ValueError("If branch TaskPack shape is not current")
+        branch_pack_id = branch_pack.get("task_pack_id")
+        if not isinstance(branch_pack_id, str):
+            raise TypeError("If branch TaskPack ID is not a string")
+        _validate_task_pack_document(branch_pack, branch_pack_id)
+        branch_task, branch_task_id, branch_release_id, _checker_digest, _instruction = (
+            _read_task_document(branch_pack.get("task"), "atom-task/1")
+        )
+        branch_admission = _object(branch_pack.get("admission"))
+        if branch_admission.get("task_id") != branch_task_id:
+            raise ValueError("If branch admission belongs to another Task")
+
+        expected_branch = task.get("expected_branch")
+        if expected_branch not in {"true", "false"}:
+            raise ValueError("If expected branch is invalid")
+        selected_capability = task.get(f"{expected_branch}_capability_id")
+        if (
+            task.get("branch_task_id") != branch_task_id
+            or task.get("release_id") != branch_release_id
+            or task.get("start_case") != branch_task.get("start_case")
+            or selected_capability != branch_task.get("capability_id")
+            or task.get("semantic_key") != branch_task.get("semantic_key")
+        ):
+            raise ValueError("If branch TaskPack differs from its frozen branch")
+        return branch_task
+    except (TaskFoundryError, TypeError, ValueError) as exc:
+        raise TaskFoundryError(
+            "task_pack_reader_if_branch_invalid",
+            "If TaskPack embedded Atom branch is invalid",
+        ) from exc
 
 
 def _validate_task_pack_document(document: JSONObject, task_pack_id: str) -> None:
