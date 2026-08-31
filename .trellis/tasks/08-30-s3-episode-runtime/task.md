@@ -66,3 +66,13 @@
 - Evidence: 58 focused and 427 full tests, locked Ruff/format/Mypy/lock checks, independent ACCEPTED review, and a mutation-license run that replaced JSON snapshotting with caller aliases and was killed by the alias test.
 - Reviewed source: HEAD `5f5cc1191e90791424e1d4fb33627ec1ed8bd067`; pre-record diff digest `2ddfab4e8ebe354987054eefc774e919c2651c3c69d5015f0cc7350a6fbcae95`.
 - Deletion: `episodes.py` 505 to 468 lines and the mechanical Responses consumer 866 to 865; production net `-38`, no replacement framework, package move or CP2/CP3 behavior.
+
+### 2026-08-31 — CP2R ACCEPTED
+
+- Chosen: one ToolSpec snapshot and validated catalog, PublicEpisodeCapture as the sole call ledger, and a pure legacy TraceEvent projection.
+- Alternative rejected: keep caller-versus-actor divergence checks, adapter-side result ledger, parallel mutable trace, defect detail channel or provider self-attribution restriction for hypothetical consumers.
+- RED: the existing legacy wrapper called `actor.tools()` after its trusted caller already supplied the snapshot, producing an exact reachable `2 != 1` failure.
+- Evidence: 37 focused and 427 full tests, locked Ruff/format/Mypy/lock checks, two mutation licences for snapshot and dispatched-only trace bindings, independent ACCEPTED review, and the same live Responses Git episode with four provider turns/calls and complete usage.
+- Live authority: Release `14331ac6e82e0ac79382d5c5e964c62f6cc9ece506f726299d0645594fbafe80`, TaskPack `242b298797d5dc9cdc558ebb74f59977a35033b113e84f2f1190890f746a48bc`, Task `81cb99623100f26c9e2ad19feac147a5a7dc26b6f707cbc2cf9781928e1b0b74`.
+- Reviewed source: HEAD `758d734952a4c9f545ed639b5357ba98488cea46`; pre-record diff digest `ba55ed0459b651d84a3fa018cf30ff7642d67a29d8efb0663388fe048bdc7aa0`.
+- Deletion: `public_agent.py` 865 to 836 lines; source/tests combined net `-68`; no replacement API, CP3 code, package move or directory split.

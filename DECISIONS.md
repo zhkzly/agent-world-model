@@ -159,3 +159,11 @@ The user challenged future-oriented retention. CP1R therefore removed the
 producer-less checkpoint field and non-JSON deep-freeze framework instead of
 preserving them for CP4/S4. Current consumers require only caller-alias
 snapshotting and fresh document projection; directory layout remained unchanged.
+
+`s3-cp2r-deletion|介入1|返工1|single-snapshot RED+single capture ledger+427 full+live Responses+2 mutation licences+independent review|红线违反0`
+
+CP2R deleted the caller/actor divergence check, adapter-side pending-result
+ledger, parallel mutable TraceEvent list, duplicate defect details and the
+self-attribution rule. The current Host, Responses owner split and S2 success
+projection remain. Package and directory restructuring were explicitly deferred
+by the user.

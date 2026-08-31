@@ -11,8 +11,8 @@ from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.episodes import EpisodeDefect, PolicySpec, PublicEpisodeInput
 from agent_env_foundry.public_agent import (
     PUBLIC_AGENT_PROMPT_DIGEST,
-    PUBLIC_AGENT_SYSTEM_PROMPT,
     DriverDecision,
+    PublicAgentFailure,
     PublicEpisodeRun,
     ResponsesPolicyDriver,
     UnattributedPolicyDriverFailure,
@@ -431,22 +431,6 @@ def test_unattributed_request_or_envelope_blocks_instead_of_guessing_owner(
             )
 
 
-def test_decision_defect_cannot_self_attribute_a_provider_boundary() -> None:
-    driver = ScriptedDriver(
-        [
-            DriverDecision(
-                defect=EpisodeDefect("provider", "self_attributed", "policy_driver_decision")
-            )
-        ]
-    )
-
-    with pytest.raises(UnattributedPolicyDriverFailure) as caught:
-        _capture(driver)
-
-    assert caught.value.code == "policy_driver_defect_invalid"
-    assert driver.close_count == 1
-
-
 def test_completion_survives_usage_and_close_sealing_defects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -547,9 +531,7 @@ def test_responses_request_matches_policy_and_private_reasoning_is_not_captured(
     assert client.close_count == 1
 
 
-def test_host_rejects_duplicate_call_ids_and_adapter_rejects_result_mismatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_host_rejects_duplicate_call_ids() -> None:
     duplicate = _capture(
         ScriptedDriver(
             [DriverDecision(calls=(VALID_CALL, ("call-1", "inspect_item", '{"item":"x"}')))]
@@ -562,55 +544,56 @@ def test_host_rejects_duplicate_call_ids_and_adapter_rejects_result_mismatch(
         "duplicate_call_id",
     ]
 
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    responses = Responses([_call_response()])
-    driver = ResponsesPolicyDriver.from_route(
-        AgentRoute(max_provider_turns=2),
-        client_factory=lambda **_kwargs: Client(responses),
-    )
-    public_input = PublicEpisodeInput(
-        PUBLIC_AGENT_SYSTEM_PROMPT,
-        "Inspect public-1.",
-        {},
-        (_tool(),),
-        _answer_schema(),
-    )
-    driver.start(public_input)
-    driver.next_decision(())
-    with pytest.raises(RuntimeError) as caught:
-        driver.next_decision((("wrong-call", VALID_OBSERVATION),))
-    assert caught.value.defect == EpisodeDefect(
-        "evidence", "policy_result_ledger_mismatch", "policy_driver_decision"
-    )
-    driver.close()
 
-
-def test_prompt_and_tool_authority_fail_before_first_provider_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_prompt_authority_fails_before_first_provider_call() -> None:
     bad_spec_driver = ScriptedDriver([], spec=replace(_spec(), system_prompt_digest="0" * 64))
     with pytest.raises(ValueError, match="prompt digest"):
         _capture(bad_spec_driver)
     assert bad_spec_driver.started == []
     assert bad_spec_driver.close_count == 1
 
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    responses = Responses([])
-    actor = Actor()
-    divergent_tool = _tool()
-    divergent_tool["description"] = "different"
-    with pytest.raises(ValueError, match="differ"):
-        run_public_episode(
-            actor=actor,
-            instruction="Inspect public-1.",
+
+def test_capture_preserves_actor_tools_infrastructure_owner() -> None:
+    class ToolsTransportFailure(RuntimeError):
+        kind = "InfrastructureFailure"
+
+    class BrokenToolsActor(Actor):
+        def tools(self) -> tuple[dict[str, Any], ...]:
+            raise ToolsTransportFailure("actor transport unavailable")
+
+    driver = ScriptedDriver([])
+    with pytest.raises(PublicAgentFailure) as caught:
+        capture_public_episode(
+            actor=BrokenToolsActor(),
+            instruction="Inspect one item.",
             reset_observation={},
-            tool_specs=(divergent_tool,),
             answer_schema=_answer_schema(),
-            client_factory=lambda **_kwargs: Client(responses),
-            max_provider_turns=1,
+            policy_driver=driver,
         )
-    assert actor.tools_count == 1
-    assert responses.requests == []
+
+    assert caught.value.kind == "InfrastructureFailure"
+    assert caught.value.code == "actor_tool_catalog_invalid"
+    assert driver.close_count == 1
+
+
+def test_capture_attributes_an_invalid_actor_tool_catalog_to_environment() -> None:
+    class BrokenCatalogActor(Actor):
+        def tools(self) -> tuple[dict[str, Any], ...]:
+            return ({"name": "incomplete"},)
+
+    driver = ScriptedDriver([])
+    with pytest.raises(PublicAgentFailure) as caught:
+        capture_public_episode(
+            actor=BrokenCatalogActor(),
+            instruction="Inspect one item.",
+            reset_observation={},
+            answer_schema=_answer_schema(),
+            policy_driver=driver,
+        )
+
+    assert caught.value.kind == "EnvironmentDefect"
+    assert caught.value.code == "actor_tool_catalog_invalid"
+    assert driver.close_count == 1
 
 
 def test_host_uses_frozen_tool_and_answer_schema_snapshots() -> None:

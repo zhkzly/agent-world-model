@@ -15,8 +15,10 @@ from agent_env_foundry.public_agent import (
 class Actor:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.tool_snapshots = 0
 
     def tools(self) -> tuple[dict[str, Any], ...]:
+        self.tool_snapshots += 1
         return (_tool(),)
 
     def invoke(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -92,13 +94,14 @@ def test_public_episode_preserves_exact_tool_loop_and_returns_trace(
         ]
     )
     actor = Actor()
+    tool_specs = actor.tools()
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
 
     episode = run_public_episode(
         actor=actor,
         instruction="Inspect public-1 and report its value.",
         reset_observation={"items": [{"item": "public-1"}]},
-        tool_specs=(_tool(),),
+        tool_specs=tool_specs,
         answer_schema=_answer_schema(),
         client_factory=lambda **_kwargs: Client(responses),
         max_provider_turns=2,
@@ -112,6 +115,7 @@ def test_public_episode_preserves_exact_tool_loop_and_returns_trace(
     )
     assert episode.trace[0].tool_name == "inspect_item"
     assert episode.trace[0].arguments == {"item": "public-1"}
+    assert actor.tool_snapshots == 1
     assert actor.calls == [("inspect_item", {"item": "public-1"})]
     assert responses.requests[0]["tool_choice"] == "required"
     assert responses.requests[1]["tool_choice"] == "auto"
@@ -378,29 +382,3 @@ def test_public_episode_attributes_client_initialization_to_infrastructure(
     assert caught.value.kind == "InfrastructureFailure"
     assert caught.value.code == "responses_client_init_failed"
     assert "secret-test-key" not in caught.value.details["original_message"]
-
-
-def test_public_episode_preserves_actor_tools_infrastructure_owner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class ToolsTransportFailure(RuntimeError):
-        kind = "InfrastructureFailure"
-
-    class BrokenToolsActor(Actor):
-        def tools(self) -> tuple[dict[str, Any], ...]:
-            raise ToolsTransportFailure("actor transport unavailable")
-
-    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
-    with pytest.raises(PublicAgentFailure) as caught:
-        run_public_episode(
-            actor=BrokenToolsActor(),
-            instruction="Inspect one item.",
-            reset_observation={},
-            tool_specs=(_tool(),),
-            answer_schema=_answer_schema(),
-            client_factory=lambda **_kwargs: Client(Responses([])),
-            max_provider_turns=1,
-        )
-
-    assert caught.value.kind == "InfrastructureFailure"
-    assert caught.value.code == "actor_tool_catalog_invalid"

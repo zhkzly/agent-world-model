@@ -19,7 +19,6 @@ from agent_env_foundry.environment import (
     JSONValue,
     ToolSpec,
     validate_observation,
-    validate_tool_catalog,
 )
 from agent_env_foundry.episodes import (
     EpisodeDefect,
@@ -31,7 +30,7 @@ from agent_env_foundry.episodes import (
     PublicEpisodeInput,
 )
 from agent_env_foundry.jsonvalue import is_json_object, is_json_value
-from agent_env_foundry.schema import SchemaError, require_object_root, validate_instance
+from agent_env_foundry.schema import SchemaError, validate_instance
 from agent_env_foundry.semantics import TraceEvent
 
 PublicAgentFailureKind = Literal["EnvironmentDefect", "InfrastructureFailure", "NoPublicWitness"]
@@ -102,7 +101,6 @@ class DriverDecision:
     raw_public_terminal: JSONValue = None
     usage: JSONObject | None = None
     defect: EpisodeDefect | None = None
-    defect_details: JSONObject | None = None
 
 
 class PolicyDriver(Protocol):
@@ -124,13 +122,6 @@ class PublicEpisodeRun:
     final_answer: JSONObject
     provider_turns: int
     usage: tuple[JSONObject | None, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class _CaptureResult:
-    capture: PublicEpisodeCapture
-    details: JSONObject
-    trace: tuple[TraceEvent, ...]
 
 
 class ResponsesPolicyDriver:
@@ -156,7 +147,6 @@ class ResponsesPolicyDriver:
         self._credential = ""
         self._input: PublicEpisodeInput | None = None
         self._history: list[Any] = []
-        self._pending_ids: tuple[str, ...] = ()
         self._has_result = False
 
     @classmethod
@@ -212,15 +202,6 @@ class ResponsesPolicyDriver:
     ) -> DriverDecision:
         if self._client is None or self._input is None or self._closed:
             raise _DriverFailure("evidence", "policy_driver_not_active", "policy_driver_decision")
-        result_ids = tuple(call_id for call_id, _ in prior_public_results)
-        if result_ids != self._pending_ids or len(set(result_ids)) != len(result_ids):
-            raise _DriverFailure(
-                "evidence",
-                "policy_result_ledger_mismatch",
-                "policy_driver_decision",
-                expected_call_ids=list(self._pending_ids),
-                actual_call_ids=list(result_ids),
-            )
         for call_id, observation in prior_public_results:
             self._history.append(_response_result(call_id, observation))
         self._has_result |= bool(prior_public_results)
@@ -230,11 +211,6 @@ class ResponsesPolicyDriver:
             raise _request_failure(exc, self._credential) from exc
         decision, output = _map_response(response)
         self._history.extend(output)  # opaque continuation, never persisted
-        self._pending_ids = tuple(
-            call_id
-            for call_id, _name, _arguments in decision.calls
-            if isinstance(call_id, str) and call_id
-        )
         return decision
 
     def close(self) -> None:
@@ -242,7 +218,7 @@ class ResponsesPolicyDriver:
             return
         self._closed = True
         client, self._client = self._client, None
-        self._credential, self._input, self._pending_ids = "", None, ()
+        self._credential, self._input = "", None
         self._history.clear()
         close = getattr(client, "close", None)
         if callable(close):
@@ -289,9 +265,10 @@ def capture_public_episode(
     answer_schema: JSONObject,
     policy_driver: PolicyDriver,
 ) -> PublicEpisodeCapture:
-    return _capture(
+    capture, _details = _capture(
         actor, instruction, reset_observation, answer_schema, policy_driver, None
-    ).capture
+    )
+    return capture
 
 
 def run_public_episode(
@@ -312,8 +289,9 @@ def run_public_episode(
         max_provider_turns=max_provider_turns,
         client_factory=client_factory,
     )
-    result = _capture(actor, instruction, reset_observation, answer_schema, driver, tool_specs)
-    capture = result.capture
+    capture, details = _capture(
+        actor, instruction, reset_observation, answer_schema, driver, tool_specs
+    )
     if capture.defect is not None:
         kind: PublicAgentFailureKind = (
             "EnvironmentDefect"
@@ -324,7 +302,7 @@ def run_public_episode(
             kind,
             capture.defect.code,
             "public episode defect",
-            **result.details,
+            **details,
             capture=capture.to_document(),
         )
     completion = capture.completion
@@ -334,11 +312,11 @@ def run_public_episode(
             "NoPublicWitness",
             code or "public_policy_failed",
             "public policy failure",
-            **result.details,
+            **details,
             capture=capture.to_document(),
         )
     return PublicEpisodeRun(
-        result.trace,
+        _trace_from_capture(capture),
         cast(JSONObject, completion.to_document()["final_answer"]),
         len(capture.turns),
         tuple(cast(JSONObject | None, turn.to_document()["usage"]) for turn in capture.turns),
@@ -351,19 +329,30 @@ def _capture(
     reset_observation: Any,
     answer_schema: Any,
     driver: PolicyDriver,
-    expected_tools: Sequence[ToolSpec | Mapping[str, Any]] | None,
-) -> _CaptureResult:
+    tool_specs: Sequence[ToolSpec | Mapping[str, Any]] | None,
+) -> tuple[PublicEpisodeCapture, JSONObject]:
     try:
-        public_input, catalog = _public_input(
-            actor, instruction, reset_observation, answer_schema, expected_tools
-        )
+        actor_tool_specs = tool_specs is None
+        try:
+            resolved_tool_specs = actor.tools() if tool_specs is None else tool_specs
+            public_input, catalog = _public_input(
+                instruction, reset_observation, answer_schema, resolved_tool_specs
+            )
+        except Exception as exc:
+            if not actor_tool_specs:
+                raise
+            kind: PublicAgentFailureKind = (
+                "InfrastructureFailure"
+                if getattr(exc, "kind", None) == "InfrastructureFailure"
+                else "EnvironmentDefect"
+            )
+            raise PublicAgentFailure(kind, "actor_tool_catalog_invalid", str(exc)) from exc
         frozen_answer_schema = cast(JSONObject, public_input.to_document()["answer_schema"])
         spec = driver.policy_spec
     except Exception:
         driver.close()
         raise
     turns: list[PolicyTurn] = []
-    trace: list[TraceEvent] = []
     completion: PolicyCompletion | None = None
     defect: EpisodeDefect | None = None
     details: JSONObject = {}
@@ -397,7 +386,7 @@ def _capture(
                     "policy_driver_decision_invalid", "policy_driver_decision"
                 )
             calls, results, policy_code, call_defect, call_details = _apply_calls(
-                decision.calls, actor, catalog, trace, seen_ids, decision.defect is None
+                decision.calls, actor, catalog, seen_ids, decision.defect is None
             )
             turns.append(
                 PolicyTurn(
@@ -412,14 +401,9 @@ def _capture(
             elif policy_code is not None:
                 completion = _failed(policy_code)
             else:
-                completion = _decision_completion(decision, frozen_answer_schema, trace)
+                completion = _decision_completion(decision, frozen_answer_schema, turns)
             if decision.defect is not None and defect is None:
-                if decision.defect.owner != "evidence":
-                    raise UnattributedPolicyDriverFailure(
-                        "policy_driver_defect_invalid", "policy_driver_decision"
-                    )
                 defect = decision.defect
-                details = decision.defect_details or {}
         if completion is None and defect is None:
             completion = _failed("provider_turn_budget_exhausted")
             details = {"max_provider_turns": spec.max_provider_turns}
@@ -438,69 +422,60 @@ def _capture(
             unattributed = _unattributed(exc, "policy_driver_close")
     if unattributed is not None:
         raise unattributed
-    return _CaptureResult(
+    return (
         PublicEpisodeCapture(public_input, tuple(turns), completion, defect),
         details,
-        tuple(trace),
+    )
+
+
+def _trace_from_capture(capture: PublicEpisodeCapture) -> tuple[TraceEvent, ...]:
+    dispatched = (
+        call
+        for turn in capture.turns
+        for call in turn.calls
+        if call.dispatch_status == "dispatched"
+    )
+    return tuple(
+        TraceEvent(
+            seq,
+            cast(str, call.tool_name),
+            _object(call.parsed_arguments, "trace arguments"),
+            _object(call.observation, "trace observation"),
+        )
+        for seq, call in enumerate(dispatched, 1)
     )
 
 
 def _public_input(
-    actor: Environment,
     instruction: Any,
     reset_observation: Any,
     answer_schema: Any,
-    expected_tools: Sequence[ToolSpec | Mapping[str, Any]] | None,
+    tool_specs: Sequence[ToolSpec | Mapping[str, Any]],
 ) -> tuple[PublicEpisodeInput, dict[str, ToolSpec]]:
-    if not isinstance(instruction, str) or not instruction.strip():
-        raise ValueError("public instruction must be non-empty")
-    if not is_json_value(reset_observation):
-        raise ValueError("reset observation must be JSON")
-    require_object_root(answer_schema, role="public final answer")
-    try:
-        raw_tools = actor.tools()
-        validate_tool_catalog(raw_tools, role="public episode actor tools")
-        tools = tuple(
-            cast(ToolSpec, tool)
-            for tool in cast(list[JSONValue], _json(list(raw_tools), "actor tools"))
-        )
-        catalog = validate_tool_catalog(tools, role="public episode actor tools")
-    except Exception as exc:
-        kind: PublicAgentFailureKind = (
-            "InfrastructureFailure"
-            if getattr(exc, "kind", None) == "InfrastructureFailure"
-            else "EnvironmentDefect"
-        )
-        raise PublicAgentFailure(kind, "actor_tool_catalog_invalid", str(exc)) from exc
-    if expected_tools is not None:
-        supplied = tuple(cast(ToolSpec, dict(tool)) for tool in expected_tools)
-        validate_tool_catalog(supplied, role="supplied public episode tools")
-        if _json(list(supplied), "supplied tools") != _json(list(tools), "actor tools"):
-            raise ValueError("supplied public ToolSpecs differ from actor.tools()")
     public_tools: list[ToolSpec] = []
-    for tool in tools:
-        copied = _object(tool, "ToolSpec")
-        copied["description"] = (
-            f"{cast(str, copied['description']).rstrip()} {_OBSERVATION_GUIDANCE}"
-        )
+    for tool in tool_specs:
+        copied = dict(tool)
+        description = copied.get("description")
+        if isinstance(description, str):
+            copied["description"] = f"{description.rstrip()} {_OBSERVATION_GUIDANCE}"
         public_tools.append(cast(ToolSpec, copied))
-    return (
-        PublicEpisodeInput(
-            PUBLIC_AGENT_SYSTEM_PROMPT,
-            instruction,
-            cast(JSONValue, reset_observation),
-            tuple(public_tools),
-            cast(JSONObject, answer_schema),
-        ),
-        catalog,
+    public_input = PublicEpisodeInput(
+        PUBLIC_AGENT_SYSTEM_PROMPT,
+        instruction,
+        cast(JSONValue, reset_observation),
+        tuple(public_tools),
+        cast(JSONObject, answer_schema),
     )
+    public_tool_documents = cast(list[JSONObject], public_input.to_document()["tool_specs"])
+    return public_input, {
+        cast(str, tool["name"]): cast(ToolSpec, tool) for tool in public_tool_documents
+    }
 
 
 def _apply_calls(
     calls: tuple[_DriverCall, ...],
     actor: Environment,
     catalog: Mapping[str, ToolSpec],
-    trace: list[TraceEvent],
     seen_ids: set[str],
     dispatch: bool,
 ) -> tuple[
@@ -613,14 +588,6 @@ def _apply_calls(
                                     details = _exception_details(exc)
                                 else:
                                     dispatch_status = "dispatched"
-                                    trace.append(
-                                        TraceEvent(
-                                            len(trace) + 1,
-                                            tool_name,
-                                            _object(parsed, "trace arguments"),
-                                            _object(observation, "trace observation"),
-                                        )
-                                    )
                                     results.append((call_id, _object(observation, "public result")))
         records.append(
             EpisodeToolCall(
@@ -640,8 +607,11 @@ def _apply_calls(
 
 
 def _decision_completion(
-    decision: DriverDecision, schema: JSONObject, trace: list[TraceEvent]
+    decision: DriverDecision, schema: JSONObject, turns: Sequence[PolicyTurn]
 ) -> PolicyCompletion | None:
+    has_dispatched_call = any(
+        call.dispatch_status == "dispatched" for turn in turns for call in turn.calls
+    )
     if decision.calls and decision.terminal_kind != "none":
         return _failed("ambiguous_policy_decision")
     if decision.calls:
@@ -649,13 +619,15 @@ def _decision_completion(
     if decision.terminal_kind == "refusal":
         return _failed("policy_refusal")
     if decision.terminal_kind == "none":
-        return _failed("final_answer_missing" if trace else "required_tool_call_missing")
+        return _failed(
+            "final_answer_missing" if has_dispatched_call else "required_tool_call_missing"
+        )
     if decision.terminal_kind != "final_answer":
         raise UnattributedPolicyDriverFailure(
             "policy_driver_terminal_invalid", "policy_driver_decision"
         )
     raw = decision.raw_public_terminal
-    if not trace:
+    if not has_dispatched_call:
         return _failed("required_tool_call_missing")
     if not isinstance(raw, str) or not raw.strip():
         return _failed("final_answer_missing")
@@ -731,7 +703,7 @@ def _map_response(response: Any) -> tuple[DriverDecision, list[Any]]:
         usage = usage.model_dump()
     try:
         normalized_usage = _optional_object(usage, "usage")
-    except ValueError as exc:
+    except ValueError:
         return (
             DriverDecision(
                 tuple(calls),
@@ -739,7 +711,6 @@ def _map_response(response: Any) -> tuple[DriverDecision, list[Any]]:
                 terminal,
                 None,
                 EpisodeDefect("evidence", "provider_usage_invalid", "policy_driver_usage"),
-                _exception_details(exc),
             ),
             items,
         )
