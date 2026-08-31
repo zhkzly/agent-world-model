@@ -19,6 +19,13 @@ Each checkpoint requires:
 Normal veRL device/backend configuration is used. A command that has not run is
 unverified; it is not replaced by a fake or CPU/GPU-specific Foundry path.
 
+By explicit user authorization, CP1–CP3 implementation commits may proceed
+before their GPU physical exits. Such commits establish code/config/API
+compatibility only and must remain labelled `physical pending`. The task is not
+complete until the final GPU sequence runs CP1 SFT, CP2 real rollout and CP3
+GRPO/update/checkpoint/reload in order; later code cannot substitute for an
+earlier missing physical result.
+
 ```bash
 uv run python -m pytest
 uv run ruff check src tests
@@ -324,7 +331,7 @@ input. No Base comparison or utility experiment is performed.
 ### Commit
 
 ```text
-s4(cp2): bridge continuous-token rollouts to s3 truth
+s4(cp2): implement the continuous-token s3 bridge
 ```
 
 ## 5. Checkpoint 3 — Fail-closed V1 GRPO checkpoint
@@ -407,7 +414,7 @@ unchanged parameter digest.
 ### Commit
 
 ```text
-s4(cp3): run the fail-closed grpo checkpoint
+s4(cp3): implement the fail-closed grpo path
 ```
 
 ## 6. Task completion
