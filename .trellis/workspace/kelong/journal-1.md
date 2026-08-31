@@ -66,3 +66,35 @@ Restored the single Direct path, closed physical Good-Task admission and cold co
 ### Status
 
 [OK] **Completed**
+
+
+## Session 3: Complete S3 verified episode runtime
+
+**Date**: 2026-08-31
+**Task**: Complete S3 verified episode runtime
+**Branch**: `s3-episode-runtime`
+
+### Summary
+
+Completed deletion-first S3: exact policy capture, real close/reopen Task verification, binary reward/typed abstention, canonical paired TrainingEpisodeView, exact serial Corpus batch, and frozen Git/SQLite/maintenance plus live Responses acceptance. Archived the S3 task with 486 tests and no veRL or service scope.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `cd8f0e6` | (see git log) |
+| `1d7c55a` | (see git log) |
+| `bd16d09` | (see git log) |
+| `001992d` | (see git log) |
+| `5f5cc11` | (see git log) |
+| `758d734` | (see git log) |
+| `d59b177` | (see git log) |
+| `41623ea` | (see git log) |
+| `616de09` | (see git log) |
+| `afa1de1` | (see git log) |
+| `bc778aa` | (see git log) |
+| `a1d1838` | (see git log) |
+
+### Status
+
+[OK] **Completed**
