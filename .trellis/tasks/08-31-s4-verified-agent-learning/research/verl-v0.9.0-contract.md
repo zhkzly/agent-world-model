@@ -13,6 +13,13 @@ and [signed tag commit](https://github.com/verl-project/verl/commit/483b8a009ba3
 S4 verifies the installed checkout against the full SHA and fails closed on API
 drift. It does not track `release/v0.9.0` or moving `main`.
 
+The checkout is operational rather than a Foundry product dependency: clone tag
+`v0.9.0` at an invocation-local path, require the full `HEAD` above, and install
+that tree editable inside the isolated training environment with
+`pip install --no-deps -e <verl-root>`. The root Foundry lock remains free of the
+backend-specific PyTorch/vLLM/SGLang dependency graph, and no vendored copy or
+submodule is introduced.
+
 ## AgentLoop and token contracts
 
 - `AgentLoopOutput` still carries prompt/response IDs, response mask and

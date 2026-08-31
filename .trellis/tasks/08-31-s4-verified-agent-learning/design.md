@@ -16,6 +16,12 @@ existing S3 batch/runtime
 The implementation is configuration-first. Foundry code exists only where veRL
 cannot know the project-specific Episode/S3 Host contract.
 
+The exact veRL source is an external operational checkout. It is cloned at tag
+`v0.9.0`, verified at SHA `483b8a009ba3a97563edee3a19887e4862b8094a`,
+and installed editable in an isolated training environment. Foundry does not
+vendor it, add a submodule, put its backend dependencies in the root lockfile or
+wrap environment installation in another runtime.
+
 ## 2. Minimal file surface
 
 ```text
@@ -78,7 +84,9 @@ source:
 ```
 
 The mapper does not tokenize and does not create a loss mask. The pinned veRL
-`MultiTurnSFTDataset` owns target-template application and assistant-only mask.
+`MultiTurnSFTDataset` owns target-template application and assistant-only mask;
+the CP1 compatibility test imports that exact checkout and checks its produced
+mask rather than duplicating the algorithm.
 
 The only training implementation is the resolved config for:
 

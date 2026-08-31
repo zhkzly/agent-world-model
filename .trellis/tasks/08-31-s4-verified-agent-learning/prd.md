@@ -36,6 +36,12 @@ Checkpoint 0 freezes:
 Device/backend selection remains normal veRL/PyTorch configuration. Foundry adds
 no CPU/GPU fork, remote runner, hardware abstraction or scheduler.
 
+veRL remains an external upstream checkout, not a vendored tree, submodule or
+root-project dependency. Each training environment clones tag `v0.9.0`, verifies
+that checkout `HEAD` is the frozen full SHA, and installs that source editable in
+the environment that already owns its PyTorch/rollout backend. Checkout and
+Foundry roots are invocation-local paths and never enter semantic identities.
+
 CP0 freezes the exact target/tokenizer/template/parser identity. CP1 validates
 the SFT template/mask path and CP2 validates v0.9.0 Continuous Token; neither
 compatibility implementation is pulled into CP0.
@@ -87,9 +93,10 @@ system prompt + instruction + reset observation + ToolSpecs
 + terminal public answer
 ```
 
-The pinned veRL SFT dataset applies the target chat template once. Assistant
-tool-call/final-answer spans are trainable; system/user/reset/tool-observation
-context is masked out.
+The pinned veRL SFT dataset applies the target chat template once and owns the
+loss mask. Foundry emits no token IDs or mask. CP1 executes the real pinned
+dataset and requires assistant tool-call/final-answer spans to be trainable while
+system/user/reset/tool-observation context is masked out.
 
 The SFT command uses `verl.trainer.sft_trainer` and exports
 `checkpoint.save_contents=[model,optimizer,extra,hf_model]`. Completion requires:

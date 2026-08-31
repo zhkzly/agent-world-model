@@ -128,6 +128,27 @@ s4(cp0): collect the formal teacher cohort
 The formal public teacher trajectories can drive one real v0.9 multi-turn SFT
 update and produce an HF-compatible checkpoint for the online path.
 
+### Upstream preflight
+
+Use any invocation-local checkout path in the dedicated training environment:
+
+```bash
+git clone --branch v0.9.0 --depth 1 \
+  https://github.com/verl-project/verl.git <verl-root>
+git -C <verl-root> rev-parse HEAD
+git -C <verl-root> status --porcelain
+python -m pip install --no-deps -e <verl-root>
+python -m pip install -e <foundry-root>
+python -c "import pathlib, verl; print(pathlib.Path(verl.__file__).resolve())"
+```
+
+The reported `HEAD` must equal
+`483b8a009ba3a97563edee3a19887e4862b8094a`, the status output must be empty,
+and the imported module path must resolve inside `<verl-root>`. Repeat those
+three read-only checks before every CP1–CP3 physical command. A
+wrong/moving/dirty checkout stops; do not add a compatibility path.
+The checkout path is not checked in or added to `configs/s4/core.json`.
+
 ### Work
 
 Extend `learning_data.py` to emit only `messages`, `tools` and source identities.
@@ -153,13 +174,14 @@ masking.
 First test:
 
 ```text
-tests/test_learning_data.py::test_sft_row_masks_tool_observation
+tests/test_learning_data.py::test_pinned_verl_masks_context_not_assistant_output
 ```
 
-Then cover:
+The test must exercise the real pinned `MultiTurnSFTDataset`; Foundry produces no
+mask. Reject each incorrect result:
 
-- assistant call/final answer masked out;
-- prompt/tool observation trained;
+- assistant call/final-answer token has mask `0`;
+- system/user/reset/tool-observation token has mask `1`;
 - parsed arguments, observation or answer reordered/dropped;
 - protected/checker/witness data included;
 - non-allowlisted source included;
@@ -246,7 +268,7 @@ First test:
 tests/test_verl_agent_loop.py::test_generated_token_ids_survive_non_round_trip_text
 ```
 
-Then cover:
+Then reject:
 
 - tool observation receives mask `1`;
 - assistant token receives mask `0`;
