@@ -363,6 +363,88 @@ class RewardOutcome:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class TrainingEpisodeView:
+    """Exact public trajectory and reward projection handed to S4."""
+
+    episode_id: str
+    request_id: str
+    request: EpisodeRequest
+    public_input: PublicEpisodeInput
+    turns: tuple[JSONObject, ...]
+    completion: PolicyCompletion | None
+    disposition: _RewardDisposition
+    reward: float | None
+
+    def __post_init__(self) -> None:
+        _digest(self.episode_id, "episode_id")
+        _digest(self.request_id, "request_id")
+        if not isinstance(self.request, EpisodeRequest):
+            raise ValueError("request must be an EpisodeRequest")
+        if self.request_id != self.request.request_id:
+            raise ValueError("request_id differs from the EpisodeRequest")
+        if not isinstance(self.public_input, PublicEpisodeInput):
+            raise ValueError("public_input must be a PublicEpisodeInput")
+        if not isinstance(self.turns, tuple):
+            raise ValueError("turns must be a tuple")
+        turns = tuple(_training_turn(item, position) for position, item in enumerate(self.turns, 1))
+        object.__setattr__(self, "turns", turns)
+        if self.completion is not None and not isinstance(self.completion, PolicyCompletion):
+            raise ValueError("completion must be a PolicyCompletion")
+        expected_rewards = {
+            "verified_success": 1.0,
+            "verified_failure": 0.0,
+            "abstain": None,
+        }
+        if self.disposition not in _REWARD_DISPOSITIONS:
+            raise ValueError("training disposition is invalid")
+        expected_reward = expected_rewards[self.disposition]
+        if self.reward != expected_reward or (
+            expected_reward is not None and type(self.reward) is not float
+        ):
+            raise ValueError("training reward contradicts disposition")
+
+    def to_document(self) -> JSONObject:
+        return {
+            "format": "training-episode-view/1",
+            "episode_id": self.episode_id,
+            "request_id": self.request_id,
+            "request": self.request.to_document(),
+            "public_input": self.public_input.to_document(),
+            "turns": [_copy_object(item) for item in self.turns],
+            "completion": self.completion.to_document() if self.completion is not None else None,
+            "disposition": self.disposition,
+            "reward": self.reward,
+        }
+
+
+def _training_turn(value: Any, expected_index: int) -> JSONObject:
+    turn = _normal_object(value, "training turn")
+    if (
+        set(turn) != {"turn_index", "calls", "raw_public_terminal"}
+        or turn.get("turn_index") != expected_index
+    ):
+        raise ValueError("training turns must use the exact contiguous public shape")
+    calls = turn.get("calls")
+    if not isinstance(calls, list):
+        raise ValueError("training turn calls must be an array")
+    call_keys = {
+        "raw_call_id",
+        "raw_tool_name",
+        "call_id",
+        "tool_name",
+        "raw_arguments",
+        "parsed_arguments",
+        "parse_status",
+        "schema_status",
+        "dispatch_status",
+        "observation",
+    }
+    if any(not isinstance(call, dict) or set(call) != call_keys for call in calls):
+        raise ValueError("training tool call has an invalid public shape")
+    return turn
+
+
 def _snapshot_tool_specs(value: Any) -> tuple[ToolSpec, ...]:
     if not isinstance(value, tuple):
         raise ValueError("tool_specs must be a tuple of ToolSpec values")
@@ -465,4 +547,5 @@ __all__ = [
     "PublicEpisodeCapture",
     "PublicEpisodeInput",
     "RewardOutcome",
+    "TrainingEpisodeView",
 ]

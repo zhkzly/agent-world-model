@@ -763,3 +763,28 @@ def test_if_condition_truth_is_load_bearing(tmp_path: Path) -> None:
 
     assert changed.reward.reward == 0.0
     assert changed.episode_id != record.episode_id
+
+
+def test_episode_record_rejects_checker_trace_that_differs_from_capture(
+    tmp_path: Path,
+) -> None:
+    pack, pack_id, _task = _write_pack(tmp_path, "atom")
+    record = run_task_episode(
+        Prepared(),  # type: ignore[arg-type]
+        pack,
+        pack_id,
+        policy_driver=Driver(
+            [
+                DriverDecision(calls=(("call-1", "set_value", '{"value":1}'),)),
+                DriverDecision(),
+            ]
+        ),
+        rollout_index=1,
+        instance_root=tmp_path / "instance",
+    )
+    checker = deepcopy(record.checker_documents)
+    assert checker is not None
+    cast(dict[str, Any], checker)["atom"]["request"]["trace_projection"] = []
+
+    with pytest.raises(ValueError, match="checker trace"):
+        replace(record, checker_documents=checker, episode_id="")

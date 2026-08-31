@@ -531,13 +531,14 @@ episodes/<episode_id>/
   TrainingEpisodeView.json
 ```
 
-Implement one authoritative paired reader. An S4-facing helper may return only
-the view, but must verify the trusted record and exact projection internally.
+Implement one authoritative paired reader that verifies the trusted record and
+exact projection, then returns only the newly derived TrainingEpisodeView. No
+second view-only helper exists.
 
 Cold verification checks:
 
 - canonical bytes/current format;
-- request/policy/task/release/attempt/lifecycle/checker cross-bindings;
+- request/policy/task/release/lifecycle/checker cross-bindings;
 - Host turns versus checker trace;
 - checker result versus reload digest and RewardOutcome;
 - exact nested TrainingEpisodeView schema;

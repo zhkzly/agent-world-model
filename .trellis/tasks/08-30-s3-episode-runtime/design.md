@@ -426,12 +426,12 @@ readers reject any partial directory.
 The primary reader verifies the pair:
 
 ```python
-read_episode_bundle(root, episode_id) -> EpisodeBundle
+read_episode_bundle(root, episode_id) -> TrainingEpisodeView
 ```
 
-An S4-facing helper may return only `TrainingEpisodeView`, but it must
-internally resolve and verify the trusted record. A separately trusted view is
-not accepted.
+The paired reader internally reconstructs and verifies the trusted record, then
+returns its newly derived TrainingEpisodeView. There is no `EpisodeBundle`
+class, independent view reader or separately trusted view.
 
 The exact training projection includes:
 

@@ -101,3 +101,19 @@
 - Git transfer exit: Release `14331ac6e82e0ac79382d5c5e964c62f6cc9ece506f726299d0645594fbafe80`, Atom pack `242b2987...`, Episode `f2b6d461...`, real reward `1.0` after the same nine-event lifecycle.
 - Drift correction: the implementer reached about 990 production lines before adding tests; main paused it, required focused tests and deletion review, and independent review reduced the module to 936 lines while removing over-tight If/ForEach checks and duplicate checker-result state.
 - Boundary: TaskAssessment, persistence, TrainingEpisodeView, batch, generic callbacks, directory/package changes and close-transport invention remain absent.
+
+### 2026-08-31 — CP4 cross-binding RED
+
+- Chosen: a cold-persistable EpisodeRecord must reject checker requests whose trace differs from the sole PublicEpisodeCapture ledger before any view can be trusted.
+- Alternative rejected: use a missing bundle/view symbol or an unimplemented writer as RED.
+- Evidence: a policy-failed Atom Record with one dispatched call currently accepts a checker trace changed to empty and recomputes a new valid Episode ID; the focused assertion fails with `DID NOT RAISE`.
+- Projection boundary: TrainingEpisodeView has no independent identity or reader; it is derived only after the paired Record passes canonical and semantic validation.
+
+### 2026-08-31 — CP4 ACCEPTED
+
+- Chosen: one TrainingEpisodeView contract and exactly two bundle functions; paired reader reconstructs the full Record and returns only its newly derived view.
+- Deterministic evidence: 46 focused and 476 full tests, locked Ruff/format/Mypy/lock checks, three mutation licences for checker binding, usage leakage and view reward truth, and independent deletion-first ACCEPTED review.
+- Reviewed source: HEAD `616de09127e5324393062a5c133f802d4e7deccb`; source/test diff digest `892173f7f5cc403622c13f8d5bb0fdc0bedb2ae661292e2f659a32e30a9358bd`.
+- Review rework: fresh-ID cold bundles carrying malformed Atom evaluation context/protected binding or If condition request were initially accepted; private reconstruction with existing checker constructors now rejects all four variants without a new public type.
+- Physical/cold exit: exact SQLite Release `64fa07e1...` persisted and relocated success `f2f73822...`, policy failure `55999f67...`, provider abstain `2128424d...` and infrastructure abstain `8773a13b...`; paired cold reads reproduced exact public inputs/turns/rewards with usage/checker/lifecycle structurally absent.
+- Boundary: public additions are only TrainingEpisodeView, `write_episode_bundle` and `read_episode_bundle`; no bundle class, view ID, view-only reader, Registry, transaction layer, S4 helper, batch or directory split.

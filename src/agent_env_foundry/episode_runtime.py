@@ -11,14 +11,19 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from agent_env_foundry.batch_foundry import GoalKind, TrustedTaskView, read_task_pack_artifact
-from agent_env_foundry.environment import JSONObject, JSONValue
+from agent_env_foundry.environment import JSONObject, JSONValue, ToolSpec
 from agent_env_foundry.episodes import (
     DefectOwner,
     EpisodeDefect,
     EpisodeRequest,
+    EpisodeToolCall,
+    PolicyCompletion,
     PolicySpec,
+    PolicyTurn,
     PublicEpisodeCapture,
+    PublicEpisodeInput,
     RewardOutcome,
+    TrainingEpisodeView,
 )
 from agent_env_foundry.foreach_foundry import (
     ForEachTask,
@@ -48,10 +53,15 @@ from agent_env_foundry.semantics import (
     BindingCandidate,
     ConditionCheckRequest,
     ConditionCheckResult,
+    EvaluationBinding,
+    GoalEvaluationContext,
     SemanticsContractError,
+    atom_result_from_document,
+    condition_result_from_document,
     start_case_from_document,
+    trace_event_from_document,
 )
-from agent_env_foundry.task_execution import LifecycleEvent, ReloadEvidence
+from agent_env_foundry.task_execution import LifecycleEvent, LifecycleKind, ReloadEvidence
 from agent_env_foundry.task_foundry import (
     AtomTask,
     TaskFoundryError,
@@ -140,6 +150,7 @@ class EpisodeRecord:
         object.__setattr__(self, "checker_documents", checker)
         if checker is not None and set(checker) != {self.goal_kind}:
             raise ValueError("checker documents belong to another goal kind")
+        _validate_checker_bindings(self)
         if self.lifecycle_defect is not None and not isinstance(
             self.lifecycle_defect, EpisodeDefect
         ):
@@ -425,6 +436,339 @@ def run_task_episode(
         reload_evidence=reload_evidence,
         reward=reward,
     )
+
+
+def _training_view(record: EpisodeRecord) -> TrainingEpisodeView:
+    turns: list[JSONObject] = []
+    for turn in record.capture.turns:
+        document = turn.to_document()
+        turns.append(
+            {
+                "turn_index": document["turn_index"],
+                "calls": document["calls"],
+                "raw_public_terminal": document["raw_public_terminal"],
+            }
+        )
+    return TrainingEpisodeView(
+        episode_id=record.episode_id,
+        request_id=record.request.request_id,
+        request=record.request,
+        public_input=record.capture.public_input,
+        turns=tuple(turns),
+        completion=record.capture.completion,
+        disposition=record.reward.disposition,
+        reward=record.reward.reward,
+    )
+
+
+def write_episode_bundle(
+    output_root: Path,
+    record: EpisodeRecord,
+) -> TrainingEpisodeView:
+    """Write one new paired Episode bundle and verify it through the cold reader."""
+
+    if not isinstance(record, EpisodeRecord):
+        raise ValueError("record must be an EpisodeRecord")
+    root = Path(output_root)
+    if root.exists() or root.is_symlink():
+        raise ValueError("Episode output root must be absent")
+    directory = root / "episodes" / record.episode_id
+    directory.mkdir(parents=True)
+    view = _training_view(record)
+    (directory / "EpisodeRecord.json").write_bytes(canonical_bytes(record.to_document()))
+    (directory / "TrainingEpisodeView.json").write_bytes(canonical_bytes(view.to_document()))
+    return read_episode_bundle(root, record.episode_id)
+
+
+def read_episode_bundle(
+    output_root: Path,
+    episode_id: str,
+) -> TrainingEpisodeView:
+    """Cold-verify one Record/View pair and return only the derived public view."""
+
+    _digest(episode_id, "episode_id")
+    root = Path(output_root)
+    episodes = root / "episodes"
+    directory = episodes / episode_id
+    if (
+        root.is_symlink()
+        or episodes.is_symlink()
+        or directory.is_symlink()
+        or not root.is_dir()
+        or not episodes.is_dir()
+        or not directory.is_dir()
+    ):
+        raise ValueError("Episode bundle directory is invalid")
+    try:
+        entries = tuple(directory.iterdir())
+    except OSError as exc:
+        raise ValueError("Episode bundle directory is unreadable") from exc
+    names = {"EpisodeRecord.json", "TrainingEpisodeView.json"}
+    if (
+        len(entries) != 2
+        or {item.name for item in entries} != names
+        or any(item.is_symlink() or not item.is_file() for item in entries)
+    ):
+        raise ValueError("Episode bundle must contain exactly two ordinary files")
+
+    raw_record = _read_canonical_object(directory / "EpisodeRecord.json", "EpisodeRecord")
+    record = _decode_episode_record(raw_record)
+    if record.episode_id != episode_id or raw_record.get("episode_id") != episode_id:
+        raise ValueError("Episode bundle directory and Record identity differ")
+    if record.to_document() != raw_record:
+        raise ValueError("EpisodeRecord differs from its current canonical projection")
+
+    raw_view = _read_canonical_object(directory / "TrainingEpisodeView.json", "TrainingEpisodeView")
+    derived = _training_view(record)
+    if raw_view != derived.to_document():
+        raise ValueError("TrainingEpisodeView differs from its trusted EpisodeRecord")
+    return derived
+
+
+def _read_canonical_object(path: Path, role: str) -> JSONObject:
+    try:
+        payload = path.read_bytes()
+        raw = json.loads(payload)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{role} is unreadable") from exc
+    if not is_json_object(raw) or payload != canonical_bytes(raw):
+        raise ValueError(f"{role} is not a canonical JSON object")
+    return cast(JSONObject, raw)
+
+
+def _decode_episode_record(value: Any) -> EpisodeRecord:
+    document = _exact_object(
+        value,
+        "format request policy_spec capture policy_elapsed_ms native_instance_id "
+        "acting_session_id reopened_session_id lifecycle_events before_facts_digest "
+        "pre_close_facts_digest post_reopen_facts_digest goal_kind checker_documents "
+        "lifecycle_defect reload_evidence reward episode_id",
+        "EpisodeRecord",
+    )
+    if document["format"] != "episode-record/1":
+        raise ValueError("EpisodeRecord format is unsupported")
+    checker = document["checker_documents"]
+    return EpisodeRecord(
+        request=_decode_request(document["request"]),
+        policy_spec=_decode_policy(document["policy_spec"]),
+        capture=_decode_capture(document["capture"]),
+        policy_elapsed_ms=cast(int, document["policy_elapsed_ms"]),
+        native_instance_id=_string(document, "native_instance_id"),
+        acting_session_id=_string(document, "acting_session_id"),
+        reopened_session_id=cast(str | None, document["reopened_session_id"]),
+        lifecycle_events=tuple(
+            _decode_lifecycle(item)
+            for item in _array(document["lifecycle_events"], "lifecycle_events")
+        ),
+        before_facts_digest=_string(document, "before_facts_digest"),
+        pre_close_facts_digest=cast(str | None, document["pre_close_facts_digest"]),
+        post_reopen_facts_digest=cast(str | None, document["post_reopen_facts_digest"]),
+        goal_kind=cast(GoalKind, _string(document, "goal_kind")),
+        checker_documents=(None if checker is None else _object(checker, "checker_documents")),
+        lifecycle_defect=_decode_optional_defect(document["lifecycle_defect"]),
+        reload_evidence=_decode_reload(document["reload_evidence"]),
+        reward=_decode_reward(document["reward"]),
+        episode_id=_string(document, "episode_id"),
+    )
+
+
+def _decode_policy(value: Any) -> PolicySpec:
+    document = _exact_object(
+        value,
+        "format model_id driver_id driver_version route_id system_prompt_digest max_provider_turns",
+        "PolicySpec",
+    )
+    if document["format"] != "policy-spec/1":
+        raise ValueError("PolicySpec format is unsupported")
+    return PolicySpec(
+        _string(document, "model_id"),
+        _string(document, "driver_id"),
+        _string(document, "driver_version"),
+        _string(document, "route_id"),
+        _string(document, "system_prompt_digest"),
+        cast(int, document["max_provider_turns"]),
+    )
+
+
+def _decode_request(value: Any) -> EpisodeRequest:
+    document = _exact_object(
+        value,
+        "format release_id task_pack_id task_id policy_id rollout_index",
+        "EpisodeRequest",
+    )
+    if document["format"] != "episode-request/1":
+        raise ValueError("EpisodeRequest format is unsupported")
+    return EpisodeRequest(
+        _string(document, "release_id"),
+        _string(document, "task_pack_id"),
+        _string(document, "task_id"),
+        _string(document, "policy_id"),
+        cast(int, document["rollout_index"]),
+    )
+
+
+def _decode_capture(value: Any) -> PublicEpisodeCapture:
+    document = _exact_object(
+        value,
+        "public_input turns completion defect",
+        "PublicEpisodeCapture",
+    )
+    return PublicEpisodeCapture(
+        _decode_public_input(document["public_input"]),
+        tuple(_decode_turn(item) for item in _array(document["turns"], "policy turns")),
+        _decode_completion(document["completion"]),
+        _decode_optional_defect(document["defect"]),
+    )
+
+
+def _decode_public_input(value: Any) -> PublicEpisodeInput:
+    document = _exact_object(
+        value,
+        "system_prompt instruction reset_observation tool_specs answer_schema",
+        "PublicEpisodeInput",
+    )
+    return PublicEpisodeInput(
+        _string(document, "system_prompt"),
+        _string(document, "instruction"),
+        _json(document["reset_observation"], "reset_observation"),
+        tuple(
+            cast(ToolSpec, _object(item, "ToolSpec"))
+            for item in _array(document["tool_specs"], "tool_specs")
+        ),
+        _object(document["answer_schema"], "answer_schema"),
+    )
+
+
+def _decode_turn(value: Any) -> PolicyTurn:
+    document = _exact_object(
+        value,
+        "turn_index calls raw_public_terminal usage",
+        "PolicyTurn",
+    )
+    usage = document["usage"]
+    return PolicyTurn(
+        cast(int, document["turn_index"]),
+        tuple(_decode_call(item) for item in _array(document["calls"], "tool calls")),
+        _json(document["raw_public_terminal"], "raw_public_terminal"),
+        None if usage is None else _object(usage, "usage"),
+    )
+
+
+def _decode_call(value: Any) -> EpisodeToolCall:
+    document = _exact_object(
+        value,
+        "raw_call_id raw_tool_name call_id tool_name raw_arguments parsed_arguments "
+        "parse_status schema_status dispatch_status observation",
+        "EpisodeToolCall",
+    )
+    parsed = document["parsed_arguments"]
+    observation = document["observation"]
+    return EpisodeToolCall(
+        _json(document["raw_call_id"], "raw_call_id"),
+        _json(document["raw_tool_name"], "raw_tool_name"),
+        cast(str | None, document["call_id"]),
+        cast(str | None, document["tool_name"]),
+        _json(document["raw_arguments"], "raw_arguments"),
+        None if parsed is None else _object(parsed, "parsed_arguments"),
+        _string(document, "parse_status"),
+        _string(document, "schema_status"),
+        _string(document, "dispatch_status"),
+        None if observation is None else _object(observation, "observation"),
+    )
+
+
+def _decode_completion(value: Any) -> PolicyCompletion | None:
+    if value is None:
+        return None
+    document = _exact_object(
+        value,
+        "terminal_kind final_answer terminal_code",
+        "PolicyCompletion",
+    )
+    answer = document["final_answer"]
+    return PolicyCompletion(
+        cast(Any, _string(document, "terminal_kind")),
+        None if answer is None else _object(answer, "final_answer"),
+        cast(str | None, document["terminal_code"]),
+    )
+
+
+def _decode_optional_defect(value: Any) -> EpisodeDefect | None:
+    if value is None:
+        return None
+    document = _exact_object(value, "owner code phase", "EpisodeDefect")
+    return EpisodeDefect(
+        cast(DefectOwner, _string(document, "owner")),
+        _string(document, "code"),
+        _string(document, "phase"),
+    )
+
+
+def _decode_reward(value: Any) -> RewardOutcome:
+    document = _exact_object(
+        value,
+        "disposition reward abstain_owner abstain_code",
+        "RewardOutcome",
+    )
+    raw_reward = document["reward"]
+    reward = (
+        float(raw_reward)
+        if isinstance(raw_reward, int) and not isinstance(raw_reward, bool)
+        else raw_reward
+    )
+    return RewardOutcome(
+        cast(Any, _string(document, "disposition")),
+        cast(float | None, reward),
+        cast(DefectOwner | None, document["abstain_owner"]),
+        cast(str | None, document["abstain_code"]),
+    )
+
+
+def _decode_lifecycle(value: Any) -> LifecycleEvent:
+    document = _exact_object(
+        value,
+        "seq kind session_id native_instance_id",
+        "LifecycleEvent",
+    )
+    return LifecycleEvent(
+        cast(int, document["seq"]),
+        cast(LifecycleKind, _string(document, "kind")),
+        _string(document, "session_id"),
+        _string(document, "native_instance_id"),
+    )
+
+
+def _decode_reload(value: Any) -> ReloadEvidence | None:
+    if value is None:
+        return None
+    document = _exact_object(
+        value,
+        "format release_id task_id attempt_id native_instance_id acting_session_id "
+        "reopened_session_id lifecycle_events lifecycle_event_digest "
+        "pre_close_facts_digest post_reopen_facts_digest "
+        "post_reopen_checker_result_digest evidence_id",
+        "ReloadEvidence",
+    )
+    if document["format"] != "reload-evidence/1":
+        raise ValueError("ReloadEvidence format is unsupported")
+    evidence = ReloadEvidence(
+        _string(document, "release_id"),
+        _string(document, "task_id"),
+        _string(document, "attempt_id"),
+        _string(document, "native_instance_id"),
+        _string(document, "acting_session_id"),
+        _string(document, "reopened_session_id"),
+        tuple(
+            _decode_lifecycle(item)
+            for item in _array(document["lifecycle_events"], "reload lifecycle_events")
+        ),
+        _string(document, "pre_close_facts_digest"),
+        _string(document, "post_reopen_facts_digest"),
+        _string(document, "post_reopen_checker_result_digest"),
+    )
+    if evidence.to_document() != document:
+        raise ValueError("ReloadEvidence differs from its current canonical projection")
+    return evidence
 
 
 def _decode_authority(
@@ -738,6 +1082,190 @@ def _checker_satisfied(documents: JSONObject) -> bool:
     return False
 
 
+def _validate_checker_bindings(record: EpisodeRecord) -> None:
+    documents = record.checker_documents
+    if documents is None:
+        return
+    expected_trace = [item.to_document() for item in _trace_from_capture(record.capture)]
+    completion = record.capture.completion
+    completed_answer = (
+        completion.final_answer
+        if completion is not None and completion.terminal_kind == "completed"
+        else None
+    )
+
+    if record.goal_kind == "atom":
+        grouped = _exact_object(documents["atom"], "request result", "Atom checker documents")
+        result = _object(grouped.get("result"), "Atom checker result")
+        if atom_result_from_document(result).to_document() != result:
+            raise ValueError("Atom checker result differs from its current shape")
+        _validate_atom_request_binding(
+            _object(grouped.get("request"), "Atom checker request"),
+            record,
+            expected_trace,
+            completed_answer,
+        )
+        return
+
+    if record.goal_kind == "foreach":
+        members = documents["foreach"]
+        if not isinstance(members, list) or not members:
+            raise ValueError("ForEach checker documents must be a non-empty array")
+        raw_answers = completed_answer.get("results") if completed_answer is not None else None
+        expected_answers = raw_answers if isinstance(raw_answers, list) else []
+        for position, member in enumerate(members):
+            grouped = _exact_object(member, "request result", "ForEach checker member")
+            result = _object(grouped.get("result"), "ForEach checker result")
+            if atom_result_from_document(result).to_document() != result:
+                raise ValueError("ForEach checker result differs from its current shape")
+            expected_answer = (
+                expected_answers[position] if position < len(expected_answers) else None
+            )
+            _validate_atom_request_binding(
+                _object(grouped.get("request"), "ForEach checker request"),
+                record,
+                expected_trace,
+                expected_answer,
+            )
+        return
+
+    grouped = _exact_object(
+        documents["if"],
+        "expected_branch condition branch",
+        "If checker documents",
+    )
+    condition = _exact_object(grouped.get("condition"), "request result", "If condition documents")
+    condition_request = _decode_condition_checker_request(
+        condition.get("request"),
+    )
+    condition_result = _object(condition.get("result"), "If condition result")
+    if condition_result_from_document(condition_result).to_document() != condition_result:
+        raise ValueError("If condition result differs from its current shape")
+    if _document_digest(condition_request.get("before_facts")) != record.before_facts_digest:
+        raise ValueError("If condition checker before facts differ from the Episode")
+    if condition_request.get("trace_projection") != []:
+        raise ValueError("If condition checker trace must be empty")
+    branch = _exact_object(grouped.get("branch"), "request result", "If branch documents")
+    branch_result = _object(branch.get("result"), "If branch result")
+    if atom_result_from_document(branch_result).to_document() != branch_result:
+        raise ValueError("If branch result differs from its current shape")
+    _validate_atom_request_binding(
+        _object(branch.get("request"), "If branch checker request"),
+        record,
+        expected_trace,
+        completed_answer,
+    )
+
+
+def _validate_atom_request_binding(
+    request: JSONObject,
+    record: EpisodeRecord,
+    expected_trace: list[JSONObject],
+    expected_answer: JSONValue | None,
+) -> None:
+    request = _decode_atom_checker_request(request)
+    if request.get("trace_projection") != expected_trace:
+        raise ValueError("checker trace differs from the public Episode capture")
+    if request.get("final_answer") != expected_answer:
+        raise ValueError("checker final answer differs from the public Episode completion")
+    if _document_digest(request.get("before_facts")) != record.before_facts_digest:
+        raise ValueError("checker before facts differ from the Episode")
+    if (
+        record.post_reopen_facts_digest is None
+        or _document_digest(request.get("after_facts")) != record.post_reopen_facts_digest
+    ):
+        raise ValueError("checker after facts differ from the post-reopen Episode facts")
+
+
+def _decode_atom_checker_request(value: Any) -> JSONObject:
+    document = _exact_object(
+        value,
+        "capability_id before_facts after_facts protected_binding trace_projection "
+        "final_answer evaluation_context",
+        "Atom checker request",
+    )
+    context_document = _exact_object(
+        document["evaluation_context"],
+        "current_slot resolved_bindings composition_rule_id foreach_selector_id "
+        "permitted_sibling_slots",
+        "Goal evaluation context",
+    )
+    bindings: list[EvaluationBinding] = []
+    for raw_binding in _array(context_document["resolved_bindings"], "resolved_bindings"):
+        binding = _exact_object(
+            raw_binding,
+            "slot capability_id semantic_key protected_binding",
+            "Evaluation binding",
+        )
+        bindings.append(
+            EvaluationBinding(
+                _string(binding, "slot"),
+                _string(binding, "capability_id"),
+                _string(binding, "semantic_key"),
+                _object(binding["protected_binding"], "evaluation protected_binding"),
+            )
+        )
+    composition_rule_id = context_document["composition_rule_id"]
+    foreach_selector_id = context_document["foreach_selector_id"]
+    if composition_rule_id is not None and not isinstance(composition_rule_id, str):
+        raise ValueError("composition_rule_id must be text or null")
+    if foreach_selector_id is not None and not isinstance(foreach_selector_id, str):
+        raise ValueError("foreach_selector_id must be text or null")
+    siblings = _array(context_document["permitted_sibling_slots"], "permitted_sibling_slots")
+    if any(not isinstance(item, str) for item in siblings):
+        raise ValueError("permitted_sibling_slots must contain text")
+    context = GoalEvaluationContext(
+        _string(context_document, "current_slot"),
+        tuple(bindings),
+        composition_rule_id,
+        foreach_selector_id,
+        tuple(cast(list[str], siblings)),
+    )
+    decoded = AtomCheckRequest(
+        _string(document, "capability_id"),
+        _json(document["before_facts"], "checker before_facts"),
+        _json(document["after_facts"], "checker after_facts"),
+        _object(document["protected_binding"], "checker protected_binding"),
+        tuple(
+            trace_event_from_document(item)
+            for item in _array(document["trace_projection"], "checker trace_projection")
+        ),
+        _json(document["final_answer"], "checker final_answer"),
+        context,
+    )
+    if decoded.to_document() != document:
+        raise ValueError("Atom checker request differs from its current shape")
+    return decoded.to_document()
+
+
+def _decode_condition_checker_request(value: Any) -> JSONObject:
+    document = _exact_object(
+        value,
+        "condition_id before_facts protected_binding trace_projection",
+        "If condition request",
+    )
+    condition_id = _string(document, "condition_id")
+    if (
+        not condition_id
+        or condition_id.strip() != condition_id
+        or any(character.isspace() for character in condition_id)
+    ):
+        raise ValueError("condition_id must be a non-empty whitespace-free string")
+    raw_binding = document["protected_binding"]
+    decoded = ConditionCheckRequest(
+        condition_id,
+        _json(document["before_facts"], "condition before_facts"),
+        None if raw_binding is None else _object(raw_binding, "condition protected_binding"),
+        tuple(
+            trace_event_from_document(item)
+            for item in _array(document["trace_projection"], "condition trace_projection")
+        ),
+    )
+    if decoded.to_document() != document:
+        raise ValueError("If condition request differs from its current shape")
+    return decoded.to_document()
+
+
 def _result_satisfied(value: Any) -> bool:
     return isinstance(value, dict) and value.get("satisfied") is True
 
@@ -911,6 +1439,20 @@ def _objects(document: JSONObject, key: str) -> tuple[JSONObject, ...]:
     return tuple(_object(item, key) for item in value)
 
 
+def _exact_object(value: Any, keys: str, role: str) -> JSONObject:
+    document = _object(value, role)
+    if set(document) != set(keys.split()):
+        raise ValueError(f"{role} has an invalid current shape")
+    return document
+
+
+def _array(value: Any, role: str) -> list[JSONValue]:
+    copied = _json(value, role)
+    if not isinstance(copied, list):
+        raise ValueError(f"{role} must be an array")
+    return copied
+
+
 def _document_digest(value: Any) -> str:
     return hashlib.sha256(canonical_bytes(value)).hexdigest()
 
@@ -933,4 +1475,9 @@ def _digest(value: Any, role: str) -> None:
         raise ValueError(f"{role} must be a sha256 digest")
 
 
-__all__ = ["EpisodeRecord", "run_task_episode"]
+__all__ = [
+    "EpisodeRecord",
+    "read_episode_bundle",
+    "run_task_episode",
+    "write_episode_bundle",
+]

@@ -181,3 +181,10 @@ The CP3 redline was allowing the new runtime to reach roughly 990 lines before
 its first focused test existed. Main stopped the worker, required tests first,
 and deletion review removed extra catalog dependencies, over-tight If/ForEach
 truth, a duplicate checker-result ledger and future carriers before acceptance.
+
+`s3-cp4-paired-view|介入1|返工2|checker-binding RED+paired canonical cold reader+476 full+3 mutation licences+real relocation+independent review|红线违反0`
+
+CP4 exposes only one non-leaking view contract and two paired IO functions.
+Independent review found and fixed four fresh-ID malformed checker-request
+acceptances; no independent view trust, artifact framework or future consumer
+surface was added.

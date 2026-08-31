@@ -6,7 +6,7 @@
 - [ ] Are exact S1/S2 Release, TaskPack, checker and Corpus identities unchanged?
 - [ ] Is there one Host loop with complete healthy policy success/failure capture?
 - [ ] Does every trainable result use same-instance close/reopen frozen verification?
-- [ ] Are reward ownership and TrainingEpisodeView leakage rules exact?
+- [x] Are reward ownership and TrainingEpisodeView leakage rules exact?
 - [ ] Do batch and Git/SQLite/maintenance exits collectively complete S3 without veRL?
 - [ ] Is each checkpoint independently reviewed for drift and accepted before the next?
 - [ ] Does every checkpoint have RED, mutation, full validation and a separate commit?
@@ -79,17 +79,17 @@
   changing Episode reward?
 - [x] Is Episode identity path-independent and bound to request, policy,
   trajectory, lifecycle, checker and outcome?
-- [ ] Are nested JSON contracts deeply snapshotted against alias mutation?
-- [ ] Are EpisodeRecord and TrainingEpisodeView written/read as one verified
+- [x] Are nested JSON contracts deeply snapshotted against alias mutation?
+- [x] Are EpisodeRecord and TrainingEpisodeView written/read as one verified
   canonical bundle?
-- [ ] Does a paired bundle write/cold-read failure invalidate the new run and
+- [x] Does a paired bundle write/cold-read failure invalidate the new run and
   prevent any TrainingView/final batch claim?
-- [ ] Does TrainingEpisodeView contain exact public prompt, instruction, reset
+- [x] Does TrainingEpisodeView contain exact public prompt, instruction, reset
   observation, model-facing ToolSpecs, answer schema, public turns, nullable
   PolicyCompletion kind/code and reward?
-- [ ] Does TrainingEpisodeView exclude usage/latency, lifecycle/native facts,
+- [x] Does TrainingEpisodeView exclude usage/latency, lifecycle/native facts,
   checker request/result/codes, defect details, S2 evidence and hidden reasoning?
-- [ ] Do success, failure and abstention bundles cold-read after relocation?
+- [x] Do success, failure and abstention bundles cold-read after relocation?
 
 ## Batch and stage completion
 
