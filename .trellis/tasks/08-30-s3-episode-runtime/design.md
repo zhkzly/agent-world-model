@@ -5,13 +5,12 @@
 S3 is one thin trusted execution/evaluation layer over current S1/S2 authority,
 not another foundry and not an S4 trainer.
 
-Deletion-first correction: CP1 and CP2 are reopened before any lifecycle work.
-Only mechanisms used by the original Episode/Policy/Reward request or the
-current shared public path survive. Later sections describing CP3-CP7 shapes
-are candidate outcomes, not authority to retain or prebuild a field, helper,
-exception, runtime carrier or package layout. The correction deliberately
-keeps current paths stable; flat-directory cleanup is considered only after
-code deletion exposes a real remaining cohesion boundary.
+Deletion-first correction: CP1R and CP2R are accepted at `758d734` and
+`d59b177`. Only mechanisms used by the original Episode/Policy/Reward request
+or the current shared public path survived. CP3-CP6 describe required outcomes,
+not authority to prebuild a field, helper, exception, runtime carrier or package
+layout. Current paths remain stable; directory restructuring is outside this
+task by user direction.
 
 The repository already owns most physical mechanics:
 
@@ -22,7 +21,7 @@ The repository already owns most physical mechanics:
 | `run_public_episode` | the one Responses loop to refactor, never duplicate |
 | `run_public_attempt` / `ReloadEvidence/1` | physical reset/close/reopen/check path |
 | Atom/ForEach/If evaluators | frozen Task truth |
-| `TaskAssessment` | shared capture/lifecycle consumer, never reward authority |
+| `TaskAssessment` | unchanged S2 consumer; never an S3 reward or completion gate |
 | `CorpusManifest` | exact batch membership |
 
 Concrete gaps in current code are:
@@ -43,17 +42,15 @@ their named checkpoint; S3 does not prebuild future batch/trainer machinery.
 ```text
 CP1 contract kernel
   -> CP2 Host policy loop and Responses decision adapter
-  -> CP3 shared physical lifecycle and partial evidence
-  -> CP4 strict Task runtime, verification, reward and EpisodeRecord
-  -> CP5 canonical Episode bundle and TrainingEpisodeView
-  -> CP6 exact Corpus batch and EpisodeBatchManifest
-  -> CP7 frozen acceptance only
+  -> CP3 exact Task runtime, lifecycle, verification, reward and EpisodeRecord
+  -> CP4 canonical Episode bundle and TrainingEpisodeView
+  -> CP5 exact Corpus batch and EpisodeBatchManifest
+  -> CP6 frozen acceptance only
 ```
 
-CP3 is callback-driven and does not depend on the CP4 cold Task loader. CP4
-supplies current Atom/ForEach/If callbacks to the already accepted lifecycle.
-This removes the previous circular dependency where CP3 accepted an undefined
-`task_runtime`.
+There is no standalone callback framework between CP2 and the concrete Task
+runtime. The first current consumer owns the smallest lifecycle generalization
+and exact Atom/ForEach/If checker wiring together.
 
 ## 3. CP1 contract kernel
 
@@ -131,7 +128,7 @@ class RewardOutcome:
 
 Python typing does not use float Literals here. The constructor runtime-validates
 that reward is exactly `1.0`, `0.0` or `None` and enforces the complete truth
-table. It cannot by itself decide reward; CP4's pure mapper does that from
+table. It cannot by itself decide reward; CP3's pure mapper does that from
 capture, verification and defect.
 
 ### JSON snapshots
@@ -308,25 +305,10 @@ An exception without sufficient causal evidence is not guessed into either
 owner. It becomes an internal unattributed blocker: no TrainingEpisodeView,
 the run stops, and checkpoint acceptance fails until classification is repaired.
 
-## 7. Shared physical attempt lifecycle
+## 7. Exact single-Task Episode runtime
 
-The existing successful lifecycle is generalized, not replaced:
-
-```python
-run_episode_attempt(
-    prepared,
-    instance_root,
-    *,
-    task_id,
-    start_input,
-    preflight,
-    execute_policy,
-    evaluate_after_reopen,
-) -> AttemptOutcome
-```
-
-The concrete signature may retain the current context-manager style. Required
-behavior is:
+The existing successful S2 lifecycle is generalized only inside the concrete
+`run_task_episode` consumer:
 
 ```text
 acting open
@@ -338,45 +320,11 @@ acting open
 -> acting close
 -> reopened open on same native instance
 -> post-reopen inspect
--> supplied frozen evaluator
+-> exact decoded task-kind checker
 -> reopened close
 ```
 
-`AttemptOutcome` owns:
-
-- an optional `PublicEpisodeCapture` because reset/preflight may fail before
-  public input exists;
-- every lifecycle event actually achieved in causal order;
-- native and acting/reopened session identities when available;
-- pre-close/post-reopen fact digests when available;
-- checker result digest when available;
-- one optional lifecycle defect; the Episode's primary defect is
-  `capture.defect` when present, otherwise this lifecycle defect;
-- authoritative request-bound S3 lifecycle evidence with an explicit
-  `capture_terminal` event;
-- unchanged `ReloadEvidence/1` only as a compatibility projection when the
-  public protocol completed and the canonical lifecycle finished.
-
-S3 adds a request-bound attempt envelope containing `request_id`; it does not
-change the existing S2 reload document/preimage.
-
-Cleanup may continue after a provider/policy defect, so lifecycle evidence may
-extend past the primary defect. A later cleanup failure makes the lifecycle
-incomplete but does not create a general multi-defect event model; the Episode
-already abstains and records the achieved terminal phase.
-Only protocol-completed exact canonical sequences project to
-`ReloadEvidence/1`. A fully closed/reopened policy/provider/infrastructure
-terminal remains complete S3 attempt evidence but never receives the misleading
-legacy `episode_complete` event.
-
-The S2 `run_public_attempt` wrapper and Atom/ForEach/If witness projections
-remain exact for successful paths. New failed TaskAssessment trials use the
-shared capture/lifecycle and retain partial public activity and usage without
-changing Task truth.
-
-## 8. Strict current TaskPack runtime
-
-S3 supports only:
+Before the first policy call it cold-verifies and privately decodes only:
 
 ```text
 atom-task-pack/4
@@ -384,21 +332,10 @@ foreach-task-pack/3
 if-task-pack/3
 ```
 
-The private loader consumes the complete output of canonical TaskPack
-verification and uses exact-key current decoders:
-
-```python
-type LoadedRuntimeTask = LoadedAtom | LoadedForEach | LoadedIf
-```
-
-- `LoadedAtom` contains the exact AtomTask;
-- `LoadedForEach` contains the exact ForEachTask;
-- `LoadedIf` contains the exact IfTask plus the validated embedded branch
-  AtomTask extracted from `admission.branch_task_pack`.
-
 For If, the loader recomputes nested AtomTaskPack identity/current shape,
-checker preimages and If-to-Atom release/start/capability/semantic bindings. It
-then discards admission witnesses from the runtime value.
+checker preimages and If-to-Atom bindings, then uses the validated embedded
+branch task. It never recompiles candidates or retains admission witnesses in
+the Episode runtime.
 
 The loader never:
 
@@ -407,38 +344,16 @@ The loader never:
 - loads arbitrary Python verifier code;
 - invents a dependency registry or universal Task DSL.
 
-Current task-kind evaluator logic remains authoritative. Only the smallest
-private helpers needed for the shared preflight/post-reopen callback are
-extracted from Atom/ForEach/If modules.
+Current task-kind evaluator logic remains authoritative. Extract a private
+helper only when two current call sites would otherwise duplicate exact checker
+construction.
 
-## 9. Verification, reward and EpisodeRecord
+The in-memory EpisodeRecord binds the frozen request and policy, complete public
+capture, achieved same-instance lifecycle, exact checker request/result and one
+RewardOutcome. Do not introduce a reusable `AttemptOutcome`, public callback
+framework or owner-specific exception family.
 
-### `EpisodeVerification`
-
-```text
-checker_digest
-exact canonical task-kind checker request or request set
-exact canonical checker result or result set
-derived satisfied/failed status
-trusted checker failure codes
-```
-
-It stores no universal state ontology. The exact request/result remain trusted
-and never enter the training view.
-
-### Reward mapper
-
-```python
-def map_base_reward(
-    *,
-    capture: PublicEpisodeCapture,
-    verification: EpisodeVerification | None,
-    attempt_evidence: EpisodeAttemptEvidence,
-) -> RewardOutcome:
-    ...
-```
-
-Precedence:
+Reward precedence is:
 
 ```text
 any provider/infrastructure/trust defect
@@ -457,28 +372,6 @@ A valid checker returning failed is not a verifier defect. A policy terminal
 with satisfying state is still reward zero. A provider defect after satisfying
 mutation is still null.
 
-### `EpisodeRecord`
-
-Introduced at CP4 after capture, lifecycle and verification shapes are real:
-
-```python
-@dataclass(frozen=True, slots=True)
-class EpisodeRecord:
-    request: EpisodeRequest
-    policy: PolicySpec
-    capture: PublicEpisodeCapture
-    attempt_evidence: EpisodeAttemptEvidence
-    verification: EpisodeVerification | None
-    outcome: RewardOutcome
-    latency_ms: int
-```
-
-`EpisodeAttemptEvidence` binds `request_id`, physical native/session
-identities, achieved lifecycle events, available fact/checker digests and
-optional protocol-completed `ReloadEvidence/1` compatibility projection, and
-owns the lifecycle defect when the capture itself does not already own the
-primary defect.
-
 The Episode ID hashes the complete canonical record except its own ID. All
 duplicate projections are derived or cross-validated:
 
@@ -494,11 +387,15 @@ EpisodeRecord. A cold authority failure before valid public input produces no
 EpisodeRecord.
 
 A valid logical request may exist before reset/preflight constructs public
-input. If that early physical/trusted step fails, AttemptOutcome has
-`capture=None`; direct execution returns the typed failure and batch records a
-request-bound blocked result, never an empty Episode capture.
+input. If that early physical/trusted step fails, direct execution returns the
+typed failure and later batch work may record the blocked request; it never
+fabricates an empty Episode capture.
 
-## 10. Canonical Episode bundle
+The existing `run_public_attempt`, successful witnesses and
+`ReloadEvidence/1` bytes/preimages remain unchanged. TaskAssessment is outside
+this runtime correction.
+
+## 8. Canonical Episode bundle
 
 One bundle, no Registry/database:
 
@@ -555,7 +452,7 @@ defect attribution, S2 evidence and hidden reasoning.
 Relocation changes no identity. Any call, observation, terminal, lifecycle,
 checker, policy, request or reward mutation under an old claimed ID fails.
 
-## 11. Exact single-release Corpus batch
+## 9. Exact single-release Corpus batch
 
 ```python
 run_episode_batch(
@@ -591,7 +488,7 @@ Provider SDK retries are zero. Policy failure is never repaired or retried.
 If any Episode bundle fails write/cold-read, the batch aborts and writes no final
 EpisodeBatchManifest; remaining slots are not fabricated as blocked outcomes.
 
-`EpisodeBatchManifest` appears first in CP6 and binds:
+`EpisodeBatchManifest` appears first in CP5 and binds:
 
 - expected corpus/release/policy identity;
 - rollout count and ordered requests;
@@ -603,7 +500,7 @@ EpisodeBatchManifest; remaining slots are not fabricated as blocked outcomes.
 It does not reselect Tasks, load an explicit TaskPack set, calculate monetary
 cost, schedule parallel work or emit a duplicate run artifact.
 
-## 12. S2 integration and compatibility
+## 10. S2 integration and compatibility
 
 Allowed shared changes:
 
@@ -614,8 +511,7 @@ Allowed shared changes:
 - TaskPack reader/private loader: retain the already verified full pack long
   enough to build current runtime truth;
 - Atom/ForEach/If modules: expose only concrete shared preflight/evaluation
-  helpers;
-- `assessment.py`: retain partial failed-trial capture through the shared path.
+  helpers.
 
 Forbidden as S3 cleanup:
 
@@ -628,7 +524,7 @@ Forbidden as S3 cleanup:
 If a TaskPack format blocker is discovered, implementation stops and returns to
 planning/S2 authority. It is not an escape hatch inside S3.
 
-## 13. Evidence classes
+## 11. Evidence classes
 
 The plan uses four non-interchangeable evidence classes:
 
@@ -643,7 +539,7 @@ A natural live failure is never a deterministic gate. A scripted policy with a
 real environment is physical evidence, not a demo, but it does not prove model
 solvability.
 
-## 14. Anti-overdesign constraints
+## 12. Anti-overdesign constraints
 
 Do not add:
 
@@ -659,5 +555,5 @@ Do not add:
 - a production second driver or S4 consumer.
 
 Every new type/function must name its immediate checkpoint consumer and the
-identity, trust or S4 handoff claim it protects. CP7 adds no production
-component; it only evaluates the frozen CP1–CP6 runtime.
+identity, trust or S4 handoff claim it protects. CP6 adds no production
+component; it only evaluates the frozen CP1–CP5 runtime.

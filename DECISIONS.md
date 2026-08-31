@@ -167,3 +167,10 @@ ledger, parallel mutable TraceEvent list, duplicate defect details and the
 self-attribution rule. The current Host, Responses owner split and S2 success
 projection remain. Package and directory restructuring were explicitly deferred
 by the user.
+
+`s3-plan-merge-lifecycle|介入1|返工1|delete standalone CP3+merge into exact runtime+independent plan review|红线违反0`
+
+The standalone callback lifecycle had no current production consumer. It and
+the TaskAssessment side repair were deleted; the exact Task Episode runtime now
+owns only the lifecycle facts required by its EpisodeRecord. No directory or
+package split is part of S3.

@@ -58,7 +58,8 @@
   `ReloadEvidence/1` format/identity preimage?
 - [ ] Does every interrupted attempt retain achieved lifecycle events and defect
   phase rather than only `reload_evidence=None`?
-- [ ] Does S3 attempt evidence bind the logical `request_id`?
+- [ ] Does every EpisodeRecord directly bind its logical `request_id` to the
+  achieved lifecycle facts?
 - [ ] Are exact current Atom v4, ForEach v3 and If v3 TaskPacks loaded without
   candidate recompilation or format changes?
 - [ ] Is the exact embedded If branch AtomTaskPack validated and used?
@@ -106,6 +107,6 @@
   Atom, ForEach and If without domain branches?
 - [ ] Do one real Responses policy and one scripted second PolicyDriver identity
   use the same frozen Host runtime?
-- [ ] Does CP7 add no production component, S4 consumer or veRL/trainer code?
+- [ ] Does CP6 add no production component, S4 consumer or veRL/trainer code?
 - [ ] Has every checkpoint retained its named RED, killed mutation licence,
   locked full validation, required evidence, independent review and verdict?

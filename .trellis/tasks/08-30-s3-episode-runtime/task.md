@@ -76,3 +76,11 @@
 - Live authority: Release `14331ac6e82e0ac79382d5c5e964c62f6cc9ece506f726299d0645594fbafe80`, TaskPack `242b298797d5dc9cdc558ebb74f59977a35033b113e84f2f1190890f746a48bc`, Task `81cb99623100f26c9e2ad19feac147a5a7dc26b6f707cbc2cf9781928e1b0b74`.
 - Reviewed source: HEAD `758d734952a4c9f545ed639b5357ba98488cea46`; pre-record diff digest `ba55ed0459b651d84a3fa018cf30ff7642d67a29d8efb0663388fe048bdc7aa0`.
 - Deletion: `public_agent.py` 865 to 836 lines; source/tests combined net `-68`; no replacement API, CP3 code, package move or directory split.
+
+### 2026-08-31 — standalone lifecycle checkpoint deleted
+
+- Chosen: merge lifecycle generalization into the first concrete consumer, exact `run_task_episode`, and renumber the remaining work to CP3 runtime, CP4 bundle, CP5 batch and CP6 frozen acceptance.
+- Alternative rejected: retain a test-only callback lifecycle, `AttemptOutcome`, `EpisodeVerification` or separate attempt-evidence carrier until a later runtime consumes it.
+- Scope deleted: TaskAssessment repair, loader union, generic supplied-evaluator seam and independent lifecycle checkpoint; EpisodeRecord directly binds request/policy/capture/latency/achieved lifecycle/checker/reward.
+- Compatibility: existing S2 `run_public_attempt` and `ReloadEvidence/1` remain unchanged; the exact S3 Task runtime owns its concrete failure lifecycle.
+- Review: independent plan review ACCEPTED after removing all positive `EpisodeAttemptEvidence`, CP7 and assessment.py remnants; plan diff net deletes about 190 lines and directory restructuring remains out of scope.

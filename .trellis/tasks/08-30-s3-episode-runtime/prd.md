@@ -96,12 +96,10 @@ S3 preserves success and failure trajectories and never compares them with an
 S2 witness. TaskAssessment reliability, witness identity, admission challenges
 and corpus selection cannot alter Episode reward.
 
-The required shared-path refactor may make new failed TaskAssessment trials
-retain their real partial calls, observations, provider turns and reported
-usage. It must preserve the current successful S2 public-run, witness,
-`ReloadEvidence/1` and TaskPack formats, key sets and identity preimages so
-existing current artifacts remain readable; fresh physical IDs may naturally
-differ. It cannot change Task truth.
+The shared-path refactor must preserve the current successful S2 public-run,
+witness, `ReloadEvidence/1` and TaskPack formats, key sets and identity
+preimages so existing current artifacts remain readable; fresh physical IDs
+may naturally differ. It does not change TaskAssessment or Task truth.
 
 ## 4. Required causal order
 
@@ -206,12 +204,13 @@ acting open -> reset once -> preflight -> public capture terminal -> pre-close i
 -> reopened close
 ```
 
-S3 always records a new request-bound `EpisodeAttemptEvidence` with an explicit
-`capture_terminal` event, so provider/infrastructure defects are not
-mislabelled as the legacy `episode_complete`. The current `ReloadEvidence/1`
-shape, validation and identity preimage remain an unchanged compatibility
-projection only when the public protocol completed and the full canonical
-lifecycle finished; successful S2 wrappers continue to require that projection.
+Every EpisodeRecord directly binds its `request_id`, achieved lifecycle facts
+and an explicit `capture_terminal` event, so provider/infrastructure defects are
+not mislabelled as the legacy `episode_complete`. The current
+`ReloadEvidence/1` shape, validation and identity preimage remain an unchanged
+compatibility projection only when the public protocol completed and the full
+canonical lifecycle finished; successful S2 wrappers continue to require that
+projection.
 
 If close, reopen, inspection, checker or cleanup fails, S3 stores the achieved
 lifecycle events plus the defect phase. `reload_evidence=None` alone is never
@@ -325,7 +324,8 @@ Trusted immutable artifact containing:
 - reported provider usage and latency;
 - request-bound native instance and lifecycle evidence;
 - optional legacy `ReloadEvidence/1` only for a protocol-completed full
-  lifecycle, plus authoritative S3 EpisodeAttemptEvidence for every Episode;
+  lifecycle, while the record itself always binds authoritative request-bound
+  achieved lifecycle facts;
 - exact frozen checker request/result when available;
 - one validated `RewardOutcome` whose abstain owner/code match that defect.
 
@@ -442,8 +442,8 @@ S3 completes only when the frozen runtime:
 - passes deterministic tests, named mutation licences, physical evidence, live
   provider evidence where required and independent checkpoint review.
 
-Checkpoints are acceptance gates, not demos or MVP milestones. CP1–CP5 may close
-the single-Task runtime slice; only CP1–CP7 together complete S3.
+Checkpoints are acceptance gates, not demos or MVP milestones. CP1–CP4 may close
+the single-Task runtime slice; only CP1–CP6 together complete S3.
 
 ## 13. Fatal rejection criteria
 
