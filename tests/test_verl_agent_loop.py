@@ -10,15 +10,18 @@ import pytest
 
 pytest.importorskip("verl")
 
+import numpy as np
+import torch
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 from verl.experimental.agent_loop.agent_loop import DictConfigWrap
+from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
 from verl.workers.rollout.replica import TokenOutput
 
 import agent_env_foundry.verl_agent_loop as adapter
 from agent_env_foundry.episodes import RewardOutcome
 from agent_env_foundry.public_agent import capture_public_episode
-from agent_env_foundry.verl_agent_loop import FoundryS3AgentLoop
+from agent_env_foundry.verl_agent_loop import FoundryFailClosedReplayBuffer, FoundryS3AgentLoop
 
 _TOKENIZER_ROOT = Path("/tmp/foundry-s4-qwen3-tokenizer")
 _VERL_COMMIT = "483b8a009ba3a97563edee3a19887e4862b8094a"
@@ -225,6 +228,141 @@ def _run(loop: FoundryS3AgentLoop, tmp_path: Path) -> Any:
     )
 
 
+def _make_sampler() -> FoundryFailClosedReplayBuffer:
+    return FoundryFailClosedReplayBuffer(
+        trainer_mode="sync",
+        trainer_config=OmegaConf.create({}),
+        max_off_policy_threshold=8,
+        max_off_policy_strategy="drop",
+        sampler_kwargs=OmegaConf.create({}),
+        refill_fn=lambda _count: pytest.fail("abstained groups must not refill"),
+    )
+
+
+def _gate(buffer: FoundryFailClosedReplayBuffer) -> set[str]:
+    return buffer._sampleable_terminal_keys("train", (set(), set(), set(), {}))
+
+
+def test_failure_root_stops_before_stock_padding() -> None:
+    buffer = _make_sampler()
+    buffer.failure_keys["train"].add("group-1")
+    buffer.partitions["train"]["group-1_0_0"] = {"status": "success"}
+
+    with pytest.raises(RuntimeError, match="S3_ABSTAIN"):
+        _gate(buffer)
+
+    buffer.failure_keys["train"].clear()
+    buffer.finished_keys["train"].add("group-1")
+    assert _gate(buffer) == {"group-1"}
+    assert buffer.refill_fn is None
+
+
+def test_native_grpo_owns_numeric_group_math() -> None:
+    def advantages(rewards: list[float]) -> torch.Tensor:
+        values = torch.tensor(rewards, dtype=torch.float32).unsqueeze(-1)
+        result, _returns = compute_grpo_outcome_advantage(
+            values,
+            torch.ones_like(values),
+            np.array(["group-1"] * len(rewards)),
+        )
+        return result.squeeze(-1)
+
+    contrasted = advantages([1.0, 0.0])
+    assert contrasted[0] > 0
+    assert contrasted[1] < 0
+    assert torch.equal(advantages([1.0, 1.0]), torch.zeros(2))
+    assert torch.equal(advantages([0.0, 0.0]), torch.zeros(2))
+
+
+def test_grpo_configs_pin_only_native_training_and_foundry_abstain_guard() -> None:
+    config = OmegaConf.to_container(
+        OmegaConf.load("configs/s4/grpo_qwen3_0_6b.yaml"), resolve=False
+    )
+    assert isinstance(config, dict)
+    assert config["defaults"] == ["/ppo_trainer", "_self_"]
+    assert config["data"] == {
+        "train_files": "${oc.env:S4_GRPO_TRAIN_PARQUET}",
+        "val_files": None,
+        "train_batch_size": 1,
+        "gen_batch_size": 1,
+        "max_prompt_length": 2048,
+        "max_response_length": 2048,
+        "truncation": "error",
+        "continuous_token": {"enable": True, "model_family": "qwen"},
+        "apply_chat_template_kwargs": {"enable_thinking": False},
+    }
+    actor_rollout_ref = config["actor_rollout_ref"]
+    assert actor_rollout_ref["model"] == {
+        "path": "${oc.env:S4_SFT_HF_MODEL}",
+        "tokenizer_path": "${oc.env:S4_SFT_HF_MODEL}",
+    }
+    assert actor_rollout_ref["actor"] == {
+        "ppo_mini_batch_size": 2,
+        "ppo_micro_batch_size_per_gpu": 1,
+        "ppo_max_token_len_per_gpu": 6144,
+        "checkpoint": {"save_contents": ["model", "optimizer", "extra", "hf_model"]},
+    }
+    rollout = actor_rollout_ref["rollout"]
+    assert rollout["name"] == "vllm"
+    assert rollout["mode"] == "async"
+    assert rollout["n"] == 2
+    assert rollout["load_format"] == "auto"
+    assert rollout["tensor_model_parallel_size"] == 1
+    assert rollout["log_prob_micro_batch_size_per_gpu"] == 1
+    assert rollout["multi_turn"] == {"enable": True, "format": "hermes"}
+    assert rollout["agent"] == {
+        "num_workers": 1,
+        "default_agent_loop": "foundry_s3",
+        "agent_loop_config_path": "configs/s4/grpo_agent_loop_qwen3_0_6b.yaml",
+    }
+    assert config["algorithm"] == {
+        "adv_estimator": "grpo",
+        "filter_groups": {"enable": False},
+        "use_kl_in_reward": False,
+    }
+    assert config["reward"] == {"num_workers": 1, "reward_model": {"enable": False}}
+    assert config["trainer"] == {
+        "use_v1": True,
+        "v1": {
+            "trainer_mode": "sync",
+            "sampler": {
+                "sync_refill_failed_groups": False,
+                "custom_sampler": {
+                    "path": "pkg://agent_env_foundry.verl_agent_loop",
+                    "name": "FoundryFailClosedReplayBuffer",
+                },
+            },
+        },
+        "nnodes": 1,
+        "n_gpus_per_node": 1,
+        "total_epochs": 1,
+        "total_training_steps": 1,
+        "project_name": "agent-env-foundry-s4",
+        "experiment_name": "qwen3-0.6b-grpo-core",
+        "logger": ["console"],
+        "val_before_train": False,
+        "test_freq": -1,
+        "save_freq": 1,
+        "default_local_dir": "${oc.env:S4_GRPO_CHECKPOINT_DIR}",
+        "resume_mode": "disable",
+        "device": "cuda",
+    }
+
+    agent_loops = OmegaConf.to_container(
+        OmegaConf.load("configs/s4/grpo_agent_loop_qwen3_0_6b.yaml"), resolve=False
+    )
+    assert agent_loops == [
+        {
+            "name": "foundry_s3",
+            "_target_": "agent_env_foundry.verl_agent_loop.FoundryS3AgentLoop",
+            "policy_model_id": "${oc.env:S4_SFT_POLICY_ID}",
+            "max_provider_turns": 12,
+            "target_model": _target_model(),
+            "verl_commit": _VERL_COMMIT,
+        }
+    ]
+
+
 def test_generated_token_ids_survive_non_round_trip_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -269,10 +407,9 @@ def test_provider_failure_is_s3_abstain_not_policy_zero(
     actor = _Actor()
     events, _drivers = _install_s3(monkeypatch, tmp_path, actor)
 
-    output = _run(loop, tmp_path)
+    with pytest.raises(RuntimeError, match="S3_ABSTAIN"):
+        _run(loop, tmp_path)
 
-    assert output.reward_score is None
-    assert output.response_ids == []
     assert actor.calls == []
     assert events == ["run", "write"]
     receipt = json.loads(

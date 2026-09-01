@@ -1,0 +1,13 @@
+- name: foundry_s3
+  _target_: agent_env_foundry.verl_agent_loop.FoundryS3AgentLoop
+  policy_model_id: ${oc.env:S4_SFT_POLICY_ID}
+  max_provider_turns: 12
+  target_model:
+    model_id: Qwen/Qwen3-0.6B
+    revision: c1899de289a04d12100db370d81485cdf75e47ca
+    tokenizer_id: Qwen/Qwen3-0.6B
+    tokenizer_revision: c1899de289a04d12100db370d81485cdf75e47ca
+    chat_template_source: tokenizer_config.json
+    continuous_token_model_family: qwen
+    tool_parser: hermes
+  verl_commit: 483b8a009ba3a97563edee3a19887e4862b8094a

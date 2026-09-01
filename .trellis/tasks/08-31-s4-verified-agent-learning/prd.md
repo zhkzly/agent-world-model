@@ -152,46 +152,32 @@ data.gen_batch_size=1 prompt group
 actor_rollout_ref.rollout.n=2
 trainer.v1.sampler.custom_sampler.path=pkg://agent_env_foundry.verl_agent_loop
 trainer.v1.sampler.custom_sampler.name=FoundryFailClosedReplayBuffer
-trainer.v1.sampler.sampler_kwargs.group_size=2
 trainer.v1.sampler.sync_refill_failed_groups=false
 algorithm.filter_groups.enable=false
-reward.num_workers=1
-reward.custom_reward_function.path=pkg://agent_env_foundry.verl_agent_loop
-reward.custom_reward_function.name=compute_s3_receipt_reward
 ```
 
-For this single proof group, freeze `G=2`: the smallest cardinality that can
-carry a nonzero binary GRPO signal. An all-equal pair returns
-`NO_GRPO_SIGNAL`; it is not enlarged or resampled to manufacture variance.
+The proof config uses the native two-rollout GRPO group. veRL owns grouping and
+advantage: `[1.0,0.0]` is contrasting signal, while `[1.0,1.0]` and
+`[0.0,0.0]` natively produce zero relative advantage. Foundry does not inspect,
+filter or reinterpret numeric groups.
 
 Pinned v0.9 V1 creates reward-loop workers in the normal
 `reward_model.enable=false` path. Leaving an abstain as
 `AgentLoopOutput.reward_score=None` therefore invokes upstream default scoring,
-while `reward.num_workers=0` leaves a non-null empty handle list and crashes.
-The GRPO config must instead select one exact Foundry custom reward function
-through the native `reward.custom_reward_function` hook. That function only
-cold-reads the CP2 rollout receipt: numeric S3 `0.0/1.0` is returned unchanged;
-`null`, malformed or mismatched evidence raises before a successful trajectory
-is published to TransferQueue. It does not inspect model text or recompute Task
-truth.
-
-Every GRPO prompt row also carries the two standard fields the pinned naive
-reward manager reads before invoking the custom function:
-`data_source="s3_receipt"` and
-`reward_model={"ground_truth": null}`. They convey no answer key and the
-receipt function ignores both values.
+so the AgentLoop writes the Episode/receipt and then raises on S3 `null` before
+returning an output. Numeric `0.0/1.0` remains the exact `reward_score` and skips
+reward recomputation entirely. No custom reward function is added.
 
 Stock v0.9 sync ReplayBuffer may sample/pad failed groups. S4 therefore adds one
 pin-specific `FoundryFailClosedReplayBuffer` through the documented custom
 sampler hook. It rejects before materialization when:
 
-- any sibling/parent group is failed or incomplete;
-- the group does not contain exactly `G` matching Episodes;
-- any member lacks numeric S3 reward or rollout-binding evidence;
-- the group is all-equal and has no GRPO signal.
+- any prompt root is `failure`, including an abstained sibling with a surviving
+  numeric trajectory.
 
-It never refills, filters survivors, retries or replaces a group. An S3 abstain
-therefore leaves the whole optimizer step and parameter digest unchanged.
+Otherwise it delegates the native sampleable-key decision unchanged. It never
+reads numeric rewards, refills, filters survivors, retries or replaces a group.
+An S3 abstain therefore stops before stock padding/materialization.
 
 GRPO completion requires one real nonzero-signal group to produce:
 
@@ -200,8 +186,8 @@ advantages -> backward/update -> changed parameter digest
 -> checkpoint save -> cold reload -> fresh continued S3 rollout
 ```
 
-If no nonzero-signal group exists under the frozen collection budget, return
-`NO_GRPO_SIGNAL`; do not add shaping or weaken S3 truth.
+An all-equal numeric group is a valid native zero-advantage result but cannot
+satisfy the later physical changed-parameter acceptance claim.
 
 ## 7. Minimal implementation surface
 
@@ -215,7 +201,7 @@ src/agent_env_foundry/verl_sft_dataset.py
   exact-pin decode-only MultiTurnSFTDataset subclass
 
 src/agent_env_foundry/verl_agent_loop.py
-  PolicyDriver AgentLoop + receipt reward reader + FoundryFailClosedReplayBuffer
+  PolicyDriver AgentLoop + failure-root ReplayBuffer guard
 
 scripts/s4_collect.py
 one SFT config
@@ -252,7 +238,7 @@ The current task is complete only when:
 - one real SFT update produces a cold-loadable HF checkpoint;
 - v0.9 Continuous Token drives the unchanged S3 PolicyDriver/Host path;
 - exact model/environment masks and Episode reward bindings are proven;
-- any abstain/incomplete/all-equal group fails closed before update;
+- any S3 abstain/failure root stops before padding or update;
 - one nonzero-signal GRPO update changes parameters;
 - the GRPO checkpoint saves, cold-loads and continues a fresh S3 rollout;
 - all four checkpoints pass behavioral RED, mutation, full checks, alignment and
@@ -270,6 +256,6 @@ Reject completion if:
 - `abstain` becomes zero, padding, filtering, refill or replacement;
 - a second Host/checker or predesigned S3 session appears;
 - veRL-native training/checkpoint/device/template/token/mask behavior is reimplemented;
-- all-equal groups are shaped into signal;
+- Foundry overrides veRL's native numeric-group/advantage behavior;
 - code completion or loss substitutes for real checkpoint/update evidence;
 - held-out/statistical experiment code is added to this task.

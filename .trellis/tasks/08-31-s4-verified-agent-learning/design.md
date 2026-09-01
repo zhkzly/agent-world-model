@@ -166,30 +166,20 @@ Use v0.9 V1 sync trainer with one prompt group per optimizer step. Stock sync
 ReplayBuffer permits failed groups to remain sampleable and may pad missing
 trajectories, which conflicts with S3 `abstain=null`.
 
-The pinned AgentLoop manager normally attaches reward-loop workers even with no
-reward model. Its `_compute_score` replaces `reward_score=None`, so config-only
-worker disabling cannot preserve abstention (`num_workers=0` instead crashes on
-an empty worker list). Configure the native custom reward-function hook to call
-one `compute_s3_receipt_reward` function in `verl_agent_loop.py`. It returns only
-the cold receipt's numeric `0.0/1.0`; a null or invalid receipt raises, which
-makes v0.9 settle the whole prompt root as `failure` before sampler
-materialization. This is transport of S3 truth, not another reward policy.
+The pinned AgentLoop manager would recompute `reward_score=None`. The existing
+Foundry AgentLoop therefore persists the cold Episode/receipt and raises on S3
+`null` before returning output; numeric `0.0/1.0` is returned directly. v0.9
+then settles the whole prompt root as `failure` after sibling sessions finish.
 
 `FoundryFailClosedReplayBuffer` is the only trainer-side extension. It subclasses
 the exact-pin sync `ReplayBuffer` and overrides `_sampleable_terminal_keys`, which
 runs after TransferQueue metadata sync and before materialization. It verifies:
 
-- root status is `finished`, never `failure`;
-- exactly frozen `G` sibling rows exist;
-- every sibling binds a cold S3 Episode and rollout receipt;
-- TransferQueue IDs/masks/`rm_scores` and `extra_fields` receipt pointers match
-  each cold receipt;
-- all receipt rewards are numeric `0.0/1.0` and match S3;
-- the group has nonzero variance.
+- no prompt root has status `failure`.
 
-Any violation raises a typed failure. With one group per step, no advantage,
-backward or actor update runs. The class never refills, retries, pads, filters or
-requeues a group.
+On failure it raises before materialization; otherwise it delegates upstream
+unchanged. The class never reads numeric rewards, refills, retries, pads,
+filters or requeues a group.
 
 It is configured through the upstream `trainer.v1.sampler.custom_sampler` hook
 and remains inside `verl_agent_loop.py`; no sampler framework is created.
@@ -204,23 +194,13 @@ trainer.v1.trainer_mode: sync
 data.train_batch_size: 1
 data.gen_batch_size: 1
 actor_rollout_ref.rollout.n: 2
-reward.num_workers: 1
-reward.custom_reward_function.path: pkg://agent_env_foundry.verl_agent_loop
-reward.custom_reward_function.name: compute_s3_receipt_reward
 trainer.v1.sampler.custom_sampler.path: pkg://agent_env_foundry.verl_agent_loop
 trainer.v1.sampler.custom_sampler.name: FoundryFailClosedReplayBuffer
-trainer.v1.sampler.sampler_kwargs.group_size: 2
 trainer.v1.sampler.sync_refill_failed_groups: false
 algorithm.filter_groups.enable: false
 ```
 
-`G` is exactly `2` for this proof: the smallest binary nonzero-signal group.
-Each input row uses standard veRL plumbing
-`data_source="s3_receipt"` and `reward_model.ground_truth=null`; neither is
-reward authority or model-visible truth.
-CP2 numeric outputs already set `reward_score` and therefore skip the custom
-function; its reachable role is null/tamper-to-failure only. Numeric transport
-is validated at the sampler seam against `rm_scores` and the receipt.
+The two numeric outputs and all relative-advantage behavior remain native veRL.
 
 The exact model, rollout backend, device and distributed settings are ordinary
 resolved veRL config. Foundry does not wrap them.

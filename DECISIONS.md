@@ -230,3 +230,13 @@ reduced to one 336-line file whose runtime bridge is about 280 lines; independen
 review then removed the duplicate cold read and non-upstream bool guard. GPU
 rollout remains pending, and the pinned V1 default reward-worker overwrite of
 `None` is carried as a CP3 constraint rather than hidden by a CP2 fallback.
+
+`s4-cp4-native-grpo|介入5|返工3|delete custom group/reward logic+native GRPO config+4 mutation licences+524 root/10 external+independent review|红线违反2`
+
+The first CP4 redline was assigning native numeric/all-equal GRPO decisions to
+Foundry and committing that overbroad plan. The second was allowing the worker
+draft to add 182 production and 332 test lines of receipt/TQ/group recertification
+before the user challenged the boundary. Both were superseded and deleted. The
+accepted result is 26 production lines: persist then raise on S3 null, reject the
+resulting V1 failure root, and delegate every numeric group plus optimizer and
+checkpoint behavior to pinned veRL. GPU physical acceptance remains pending.

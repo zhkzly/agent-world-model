@@ -55,7 +55,7 @@ trainer.use_v1: true
 trainer.v1.trainer_mode: sync
 data.train_batch_size: 1 prompt group
 data.gen_batch_size: 1 prompt group
-actor_rollout_ref.rollout.n: frozen GRPO group size G
+actor_rollout_ref.rollout.n: 2
 trainer.v1.sampler.sync_refill_failed_groups: false
 algorithm.filter_groups.enable: false
 ```
@@ -70,16 +70,11 @@ S4 therefore supplies exactly one pin-specific upstream extension:
 `trainer.v1.sampler.custom_sampler` hook. It subclasses the v0.9.0 sync
 `ReplayBuffer` and overrides the exact-pin `_sampleable_terminal_keys` decision,
 which runs after TransferQueue metadata synchronization and before
-materialization. It raises a typed step failure when:
-
-- any selected prompt root has status `failure`;
-- the group has fewer or more than the frozen `G` successful siblings;
-- any sibling lacks numeric S3 reward or exact rollout-binding evidence;
-- the numeric group is all-equal and therefore has no GRPO signal.
-
-It never refills, retries, replaces or silently filters a group. Because the
-trainer step contains one prompt group, the exception occurs before advantage,
-backward and actor update; the before/after parameter digest must be identical.
+materialization. It raises only when the metadata snapshot contains a prompt
+root with status `failure`, then delegates the native decision unchanged for
+every numeric group. It never reads numeric rewards, refills, retries, replaces
+or silently filters a group. The exception occurs before advantage, backward
+and actor update.
 
 The custom-sampler hook is part of the exact V1 source:
 [trainer construction](https://github.com/verl-project/verl/blob/483b8a009ba3a97563edee3a19887e4862b8094a/verl/trainer/ppo/v1/trainer_base.py#L132-L176)
@@ -96,13 +91,11 @@ by default when the reward model is disabled (`reward.num_workers` defaults to
 8); setting that count to zero produces an empty non-null list and fails at
 `random.choice`, so it is not a disable switch.
 
-The exact native hook is `reward.custom_reward_function`. The naive reward
-manager merges `AgentLoopOutput.extra_fields` into `extra_info`, so CP2's
-`episode_id` and `rollout_receipt` reach one configured function without a new
-service or trainer. CP3 must use that function only to cold-read the canonical
-receipt: return numeric S3 truth, raise on `null`/tamper, then have the custom
-sampler cross-check the same receipt against TransferQueue before materializing
-the one `G=2` group.
+The smaller correction is earlier: after writing the cold Episode and receipt,
+the Foundry AgentLoop raises on `null` rather than returning an output. Numeric
+`0.0/1.0` continues through `AgentLoopOutput.reward_score`, so `_compute_score`
+is not entered. The custom sampler only rejects the resulting failure root to
+prevent stock survivor padding; it does not read receipts or numeric tensors.
 
 The custom AgentLoop constructor arguments cannot be embedded in the PPO config:
 v0.9 `AgentLoopWorker` resolves `rollout.agent.agent_loop_config_path`, then

@@ -39,6 +39,15 @@ if TYPE_CHECKING:
 
         def __getattr__(self, name: str) -> Any: ...
 
+    class _ReplayBufferBase:
+        def __init__(self, *args: Any, **kwargs: Any) -> None: ...
+
+        def __getattr__(self, name: str) -> Any: ...
+
+        def _sampleable_terminal_keys(
+            self, partition_id: str, eviction_reasons: Any
+        ) -> set[str]: ...
+
     def _register(name: str) -> Callable[[type[_LoopBase]], type[_LoopBase]]: ...
 
     class _ParserFactory:
@@ -51,6 +60,7 @@ else:
     from verl.experimental.agent_loop.agent_loop import AgentLoopOutput as _Output
     from verl.experimental.agent_loop.agent_loop import register as _register
     from verl.experimental.agent_loop.tool_parser import ToolParser as _ParserFactory
+    from verl.trainer.ppo.v1.replay_buffer import ReplayBuffer as _ReplayBufferBase
 
 
 class _PolicyDriver:
@@ -305,6 +315,8 @@ class FoundryS3AgentLoop(_LoopBase):
             "sampling_params": cast(JSONObject, dict(sampling_params)),
         }
         receipt_path = await asyncio.to_thread(_write_receipt, output_root, receipt)
+        if cold.reward is None:
+            raise RuntimeError(f"S3_ABSTAIN: Episode {record.episode_id} has no trainable reward")
         return _Output(
             prompt_ids=prompt_ids,
             response_ids=response_ids,
@@ -314,6 +326,20 @@ class FoundryS3AgentLoop(_LoopBase):
             metrics=_Metrics(),
             extra_fields={"episode_id": record.episode_id, "rollout_receipt": str(receipt_path)},
         )
+
+
+class FoundryFailClosedReplayBuffer(_ReplayBufferBase):
+    """Prevent stock V1 from padding survivors of an abstained S3 group."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["refill_fn"] = None
+        super().__init__(*args, **kwargs)
+
+    def _sampleable_terminal_keys(self, partition_id: str, eviction_reasons: Any) -> set[str]:
+        failures = set(self.failure_keys[partition_id])
+        if failures:
+            raise RuntimeError(f"S3_ABSTAIN: refusing failed root(s) {sorted(failures)}")
+        return super()._sampleable_terminal_keys(partition_id, eviction_reasons)
 
 
 def _defect(owner: DefectOwner, error: Exception, phase: str) -> DriverDecision:

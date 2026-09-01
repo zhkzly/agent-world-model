@@ -1,0 +1,76 @@
+defaults:
+  - /ppo_trainer
+  - _self_
+
+data:
+  train_files: ${oc.env:S4_GRPO_TRAIN_PARQUET}
+  val_files: null
+  train_batch_size: 1
+  gen_batch_size: 1
+  max_prompt_length: 2048
+  max_response_length: 2048
+  truncation: error
+  continuous_token:
+    enable: true
+    model_family: qwen
+  apply_chat_template_kwargs:
+    enable_thinking: false
+
+actor_rollout_ref:
+  model:
+    path: ${oc.env:S4_SFT_HF_MODEL}
+    tokenizer_path: ${oc.env:S4_SFT_HF_MODEL}
+  actor:
+    ppo_mini_batch_size: 2
+    ppo_micro_batch_size_per_gpu: 1
+    ppo_max_token_len_per_gpu: 6144
+    checkpoint:
+      save_contents: [model, optimizer, extra, hf_model]
+  rollout:
+    name: vllm
+    mode: async
+    n: 2
+    load_format: auto
+    tensor_model_parallel_size: 1
+    log_prob_micro_batch_size_per_gpu: 1
+    multi_turn:
+      enable: true
+      format: hermes
+    agent:
+      num_workers: 1
+      default_agent_loop: foundry_s3
+      agent_loop_config_path: configs/s4/grpo_agent_loop_qwen3_0_6b.yaml
+
+algorithm:
+  adv_estimator: grpo
+  filter_groups:
+    enable: false
+  use_kl_in_reward: false
+
+reward:
+  num_workers: 1
+  reward_model:
+    enable: false
+
+trainer:
+  use_v1: true
+  v1:
+    trainer_mode: sync
+    sampler:
+      sync_refill_failed_groups: false
+      custom_sampler:
+        path: pkg://agent_env_foundry.verl_agent_loop
+        name: FoundryFailClosedReplayBuffer
+  nnodes: 1
+  n_gpus_per_node: 1
+  total_epochs: 1
+  total_training_steps: 1
+  project_name: agent-env-foundry-s4
+  experiment_name: qwen3-0.6b-grpo-core
+  logger: [console]
+  val_before_train: false
+  test_freq: -1
+  save_freq: 1
+  default_local_dir: ${oc.env:S4_GRPO_CHECKPOINT_DIR}
+  resume_mode: disable
+  device: cuda
