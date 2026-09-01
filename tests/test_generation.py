@@ -17,7 +17,6 @@ from agent_env_foundry.preparation import (
     read_actor_tool_catalog,
 )
 from agent_env_foundry.project_identity import compute_authored_project_digest
-from agent_env_foundry.qualification_v2 import QualificationV2Error
 from agent_env_foundry.research import NotReleased
 from agent_env_foundry.semantics import SemanticsContractError
 
@@ -241,38 +240,6 @@ def test_builder_failure_preserves_owner_and_stops_later_stages(
             "child_call_failed",
         ),
         (SemanticsContractError("facets must be a JSON object"), "semantics_wire_invalid"),
-        (
-            QualificationV2Error(
-                "qualification_positive_failed",
-                "Public capability execution or native audit did not pass",
-                capability_id="CAP-RETURN",
-                semantic_key="book:B-001",
-                trace=[
-                    {
-                        "seq": 1,
-                        "tool_name": "inspect_book",
-                        "arguments": {"book_id": "B-001"},
-                        "observation": {"ok": True, "data": {}, "error": None},
-                    }
-                ],
-                final_answer={"AF-RETURNED-LOAN": None},
-                semantics_result={
-                    "satisfied": False,
-                    "required_effects_ok": False,
-                    "collateral_ok": True,
-                    "process_ok": False,
-                    "answer_ok": False,
-                    "report_values": {"AF-RETURNED-LOAN": None},
-                    "failure_codes": ["REQUIRED_EFFECT_MISSING"],
-                },
-                verifier_result={
-                    "required_effects_ok": False,
-                    "collateral_ok": True,
-                    "failure_codes": ["RETURN_EFFECT_MISSING"],
-                },
-            ),
-            "qualification_positive_failed",
-        ),
     ),
 )
 def test_semantics_defect_resumes_original_author_before_requalification(
@@ -326,36 +293,8 @@ def test_semantics_defect_resumes_original_author_before_requalification(
     assert attempts == 2
     assert observed["finding"].source == "native_physical_check"
     assert observed["finding"].code == expected_code
-    if expected_code == "qualification_positive_failed":
-        assert "eligible binding" in observed["finding"].condition
-        assert observed["finding"].decisive_inputs["capability_id"] == "CAP-RETURN"
-        assert observed["finding"].decisive_inputs["semantic_key"] == "book:B-001"
     assert [event["stage"] for event in result.events].count("qualification") == 2
     assert any(event["stage"] == "semantics_repair" for event in result.events)
-
-
-def test_positive_failure_routes_by_failed_authority_axis() -> None:
-    import agent_env_foundry.generation as subject
-
-    semantics_failed = QualificationV2Error(
-        "qualification_positive_failed",
-        "positive failed",
-        semantics_result={"satisfied": False},
-        verifier_result={"required_effects_ok": False, "collateral_ok": True},
-    )
-    verifier_only_failed = QualificationV2Error(
-        "qualification_positive_failed",
-        "positive failed",
-        semantics_result={"satisfied": True},
-        verifier_result={"required_effects_ok": False, "collateral_ok": True},
-    )
-
-    assert subject._author_defect(semantics_failed) == "SemanticsDefect"
-    assert subject._author_defect(verifier_only_failed) == "VerifierDefect"
-    assert (
-        "native verifier"
-        in subject._physical_finding(verifier_only_failed, "VerifierDefect").condition
-    )
 
 
 def test_actor_catalog_is_read_in_its_locked_runtime(tmp_path: Path) -> None:

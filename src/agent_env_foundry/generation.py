@@ -23,11 +23,7 @@ from agent_env_foundry.preparation import (
 )
 from agent_env_foundry.qualification_contracts import PublicSurfaceManifest
 from agent_env_foundry.qualification_runner import QualificationBudget, run_v2_qualification
-from agent_env_foundry.qualification_v2 import (
-    FrozenCoreInputs,
-    QualificationV2Error,
-    derive_qualification_core,
-)
+from agent_env_foundry.qualification_v2 import FrozenCoreInputs, derive_qualification_core
 from agent_env_foundry.release import (
     ValidatedReleaseV2,
     publish_release_v2,
@@ -298,45 +294,15 @@ def _author_defect(error: Exception) -> str | None:
         return error.kind
     if isinstance(error, SemanticsContractError):
         return "SemanticsDefect"
-    if isinstance(error, QualificationV2Error):
-        if error.code == "qualification_positive_failed":
-            semantic = error.details.get("semantics_result")
-            verifier = error.details.get("verifier_result")
-            if isinstance(semantic, dict) and semantic.get("satisfied") is False:
-                return "SemanticsDefect"
-            if isinstance(verifier, dict) and (
-                verifier.get("required_effects_ok") is False
-                or verifier.get("collateral_ok") is False
-            ):
-                return "VerifierDefect"
     return None
 
 
-def _physical_finding(error: Exception, defect: str) -> AuthorFinding:
-    details = (
-        error.details
-        if isinstance(error, (PreparationExecutionError, QualificationV2Error))
-        else {}
-    )
-    code = (
-        error.code
-        if isinstance(error, (PreparationExecutionError, QualificationV2Error))
-        else "semantics_wire_invalid"
-    )
-    if isinstance(error, QualificationV2Error) and error.code == "qualification_positive_failed":
-        condition = (
-            "an eligible binding must be physically achievable; otherwise enumerate_bindings "
-            "must mark it ineligible, and evaluation must never accept the failed trace"
-            if defect == "SemanticsDefect"
-            else "the native verifier must report the actual required effects and collateral "
-            "for the physically executed eligible binding"
-        )
-        expected: object = {"owner": defect, "qualification_case": "passed"}
-    else:
-        condition = "generated code must execute the reported Qualification operation"
-        expected = {"status": "completed_without_runtime_error"}
+def _physical_finding(error: Exception) -> AuthorFinding:
+    details = error.details if isinstance(error, PreparationExecutionError) else {}
+    kind = error.kind if isinstance(error, PreparationExecutionError) else "SemanticsDefect"
+    code = error.code if isinstance(error, PreparationExecutionError) else "semantics_wire_invalid"
     actual = {
-        "kind": defect,
+        "kind": kind,
         "code": code,
         "message": str(error),
         "details": details,
@@ -345,8 +311,8 @@ def _physical_finding(error: Exception, defect: str) -> AuthorFinding:
     return AuthorFinding(
         "native_physical_check",
         code,
-        condition,
-        expected,
+        "generated code must execute the reported Qualification operation",
+        {"status": "completed_without_runtime_error"},
         safe_actual,
         json.loads(json.dumps(details, ensure_ascii=False, default=str)),
     )
@@ -513,7 +479,7 @@ def generate_environment_v2(
                 defect = _author_defect(error)
                 if defect is None or repair_count >= config.physical_author_repairs:
                     raise
-                finding = (_physical_finding(error, defect),)
+                finding = (_physical_finding(error),)
                 if defect == "SemanticsDefect":
                     current = semantics
                     semantics = _run_stage(
