@@ -1,0 +1,31 @@
+{
+  "id": "batch-environment-task-evidence",
+  "name": "batch-environment-task-evidence",
+  "title": "Batch Environment and Task Evidence Campaign",
+  "description": "Run the frozen S1/S2 production path across a cross-domain Need suite, preserve all real outcomes, publish reproducible aggregate statistics, and produce evidence-backed project/resume material without weakening semantic gates.",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": "Thin S1 coordinator, frozen 20-Need S1/S2 campaign, reproducible statistics and evidence-backed project material; no S3/S4 or alternative samplers",
+  "package": null,
+  "priority": "P0",
+  "creator": "kelong",
+  "assignee": "kelong",
+  "createdAt": "2026-09-01",
+  "completedAt": null,
+  "branch": "batch-env-task-experiment",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": "08-26-foundry-paper-product",
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "need_count": "20",
+    "target_structures": "3",
+    "assessment_trials": "3",
+    "sampler": "existing-direct-goal-first"
+  }
+}

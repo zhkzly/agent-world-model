@@ -185,7 +185,7 @@ class ResponsesPolicyDriver:
                 "infrastructure", "provider_credential_missing", "policy_driver_start"
             )
         try:
-            client = self._factory(api_key=credential, base_url=self._base_url, max_retries=0)
+            client = self._factory(api_key=credential, base_url=self._base_url, max_retries=2)
         except Exception as exc:
             raise _DriverFailure(
                 "infrastructure",

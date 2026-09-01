@@ -236,6 +236,11 @@ def test_task_semantics_contract_separates_initial_truth_from_eligibility() -> N
     assert 'field_pointer="/public_descriptor/charge_reference"' in contract
     assert "exactly the declared answer field IDs" in contract
     assert "`null`" in contract
+    assert "native refusal relation" in contract
+    assert "`required_effects_ok=true` and `collateral_ok=true`" in contract
+    assert "every process/refusal capability" in contract
+    assert "unscoped enumeration" in contract
+    assert "Do not pre-filter the complete trace by target arguments" in contract
 
 
 def test_semantics_repair_binds_same_thread_current_digest_and_typed_finding(

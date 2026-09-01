@@ -784,7 +784,12 @@ def _evaluate(
         else ()
     )
     if category != "positive":
-        validate_qualification_case_outcome(category, semantics_result, verifier_result)
+        validate_qualification_case_outcome(
+            category,
+            semantics_result,
+            verifier_result,
+            capability_id=capability.capability_id,
+        )
     return _EvaluatedCase(
         category,
         capability,
@@ -1073,6 +1078,9 @@ def run_v2_qualification(
                     "qualification_positive_failed",
                     "Public capability execution or native audit did not pass",
                     capability_id=capability.capability_id,
+                    semantic_key=positive.binding.semantic_key,
+                    trace=[event.to_document() for event in positive.trace],
+                    final_answer=positive.final_answer,
                     semantics_result=positive.semantics_result.to_document(),
                     verifier_result=positive.verifier_result.to_document(),
                 )

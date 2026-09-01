@@ -202,3 +202,12 @@ CP6 froze `bc778aa` and introduced no production code. The exact current S3
 runtime transferred across Git, SQLite and held-out maintenance authority, and
 the real Responses adapter plus scripted second driver used the same serial
 batch/Host path without trainer or service scope.
+
+`batch-env-task-harness|介入2|返工3|focused RED+2 mutation licences+full suite+real S1 Release+real S2 Product/Corpus|红线违反1`
+
+The redline was a worker creating a 946-line idealized coordinator fixture
+after prolonged exploration. Main stopped it, deleted the file, and replaced
+it with focused orchestration tests and physical actor/Qualification evidence.
+Remote inspection proved the existing Direct sampler remained the sole S2 path;
+real execution then closed one new Release and three assessed TaskPacks before
+the official 20-Need campaign freeze.

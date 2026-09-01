@@ -1023,6 +1023,43 @@ def materialize_project(
     return lock
 
 
+def read_actor_tool_catalog(
+    project_input: ProjectMaterializationInput,
+    runtime_root: Path,
+    *,
+    factory: str,
+    settings: PreparationSettings,
+) -> tuple[ToolSpec, ...]:
+    """Read one authored actor project's real tool catalog in a locked child.
+
+    This is the Host-side surface-freeze probe: the generated actor code is
+    executed in its own materialized interpreter and never imported here.
+    """
+
+    lock = materialize_project(project_input, runtime_root, settings=settings)
+    probe_instance = runtime_root / "probe-instance"
+    probe_instance.mkdir(parents=True, exist_ok=True)
+    transport = _ChildTransport(
+        lock.python,
+        Path(__file__).resolve().parent / "_actor_runner.py",
+        (factory, str(probe_instance)),
+        cwd=lock.project_root,
+        timeout=settings.command_timeout_seconds,
+        role="actor",
+    )
+    try:
+        raw = transport.call("tools", {})
+    finally:
+        transport.close(operation="close")
+    if not isinstance(raw, list):
+        raise PreparationExecutionError(
+            "EnvironmentDefect",
+            "actor_tools_invalid",
+            "materialized actor tools response is not an array",
+        )
+    return tuple(validate_tool_catalog(tuple(raw), role="materialized actor tools").values())
+
+
 def _run_uv_sync(project: Path, settings: PreparationSettings) -> None:
     environment = dict(os.environ)
     for name in ("VIRTUAL_ENV", "PYTHONPATH", "PYTHONHOME"):

@@ -201,6 +201,24 @@ prohibited collateral mutation occurred: a missing required effect may make
 `required_effects_ok=false`, but it must not by itself make
 `collateral_ok=false`. Generated tests must cover this no-op axis separation.
 
+For a process/refusal capability, keep the native refusal relation separate
+from the public refusal process. If the selected native precondition already
+holds and before/after are unchanged, an empty-trace no-op may have
+`required_effects_ok=true` and `collateral_ok=true` while `process_ok=false`,
+`answer_ok=false`, and `satisfied=false`. Do not set `required_effects_ok=false`
+merely because the public refusal call or observation is absent. Generated
+tests must exercise this exact empty-trace axis for every process/refusal capability,
+not only query capabilities.
+
+Required public process evidence may combine an unscoped enumeration with a
+selected-referent operation. A list call with no target argument cannot match a
+target-argument predicate, but it still counts when its successful public
+observation contains the selected logical referent and the qualified process
+requires enumeration. Do not pre-filter the complete trace by target arguments
+before evaluating such a process. This does not license decorative calls: the
+enumeration observation must contain the selected referent and the other
+required selected operation must still occur.
+
 For a query, "real public read" means evidence carried by a successful public
 ToolObservation for the selected referent, not one hard-coded tool name or one
 reference sequence. When the frozen public surface exposes the same qualified

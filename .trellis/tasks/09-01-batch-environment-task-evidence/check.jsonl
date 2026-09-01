@@ -1,0 +1,11 @@
+{"file":"PROJECT.md","reason":"Reject statistics or implementation that substitute demo evidence for semantic completion."}
+{"file":"DECISIONS.md","reason":"Audit clean-break, Framework/model boundaries, retry behavior and forbidden compatibility/domain paths."}
+{"file":".trellis/tasks/08-26-foundry-paper-product/prd.md","reason":"Verify campaign scope preserves the completed S1/S2 boundaries and does not absorb S3/S4."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/prd.md","reason":"Ensure every counted Task still satisfies the accepted Good-Task contract."}
+{"file":".trellis/tasks/archive/2026-08/08-26-s2-task-foundry/checklist.md","reason":"Reuse completed S2 physical admission and cross-domain evidence gates."}
+{"file":".trellis/spec/backend/s1-coordinator.md","reason":"Check the coordinator implements exactly the accepted stage order and typed failures."}
+{"file":".trellis/spec/backend/v2-qualification-publication.md","reason":"Check every counted release has strict physical Qualification and cold publication evidence."}
+{"file":".trellis/spec/backend/s2-assessment-corpus.md","reason":"Check Task/Assessment/Corpus identities and metric semantics remain separated."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reject duplicated validators, runners, retry machinery or semantic paths."}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Audit campaign denominators, artifact lineage and external claim data flow end to end."}
+{"file":".trellis/tasks/09-01-batch-environment-task-evidence/research/current-evidence-baseline.md","reason":"Compare new claims with exact historical baseline and prevent debug-artifact inflation."}

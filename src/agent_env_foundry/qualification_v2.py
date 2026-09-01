@@ -487,13 +487,20 @@ def _validate_case_semantics(normalized: JSONObject) -> None:
             category=category,
             capability_id=capability_id,
         )
-    validate_qualification_case_outcome(category, semantic, verifier)
+    validate_qualification_case_outcome(
+        category,
+        semantic,
+        verifier,
+        capability_id=capability_id,
+    )
 
 
 def validate_qualification_case_outcome(
     category: str,
     semantic: AtomCheckResult,
     verifier: NativeVerificationResult,
+    *,
+    capability_id: str | None = None,
 ) -> None:
     if category == "positive":
         valid = semantic.satisfied and verifier.satisfied
@@ -508,10 +515,25 @@ def validate_qualification_case_outcome(
     else:
         valid = False
     if not valid:
+        expected: JSONObject = (
+            {"semantics_satisfied": True, "verifier_satisfied": True}
+            if category == "positive"
+            else {
+                "semantics_initially_satisfied": False,
+                "semantics_satisfied": False,
+                "semantics_collateral_ok": True,
+                "semantics_process_ok": False,
+                "verifier_collateral_ok": True,
+            }
+        )
         raise QualificationV2Error(
             "qualification_case_outcome_invalid",
             "physical case did not discriminate its declared category",
             category=category,
+            capability_id=capability_id,
+            expected=expected,
+            semantics_result=semantic.to_document(),
+            verifier_result=verifier.to_document(),
         )
 
 

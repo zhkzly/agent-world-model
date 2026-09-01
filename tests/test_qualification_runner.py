@@ -48,6 +48,10 @@ def test_noop_qualification_accepts_unchanged_collateral_but_not_task_completion
         with pytest.raises(runner_module.QualificationV2Error) as caught:
             validate_qualification_case_outcome("noop", bad_semantic, bad_verifier)
         assert caught.value.code == "qualification_case_outcome_invalid"
+        assert caught.value.details["category"] == "noop"
+        assert caught.value.details["expected"]["semantics_satisfied"] is False
+        assert caught.value.details["semantics_result"] == bad_semantic.to_document()
+        assert caught.value.details["verifier_result"] == bad_verifier.to_document()
 
 
 def test_answer_source_evidence_is_required_only_for_a_satisfied_positive_case() -> None:

@@ -1,0 +1,125 @@
+{
+  "format": "need-suite/1",
+  "needs": [
+    {
+      "id": "need-01-library-circulation",
+      "domain": "library circulation",
+      "family": "transactional-policy",
+      "need": "Create a resettable small-library circulation environment. Public tools must list and inspect books and patrons, check out an available book to an eligible patron, return a checked-out book, and list active loans. Checkout must be refused with stable public business error codes when a book is unavailable or the patron has reached a public loan limit, without prohibited state mutation. Reset must seed available, checked-out, eligible, and limit-reached regimes deterministically, and successful loans and returns must remain visible after close and reopen."
+    },
+    {
+      "id": "need-02-inventory-reservation",
+      "domain": "warehouse inventory",
+      "family": "transactional-policy",
+      "need": "Create a resettable warehouse inventory-reservation environment. Public tools must list and inspect stock items and reservations, reserve a requested positive quantity when sufficient unreserved stock exists, release an active reservation, and report available versus reserved quantities. Insufficient-stock, duplicate-reservation, unknown-item, and invalid-quantity requests must return stable public error codes and leave state unchanged. Reset must seed sufficient, insufficient, already-reserved, and zero-stock regimes, with successful changes persistent after reopening."
+    },
+    {
+      "id": "need-03-expense-approval",
+      "domain": "employee expense reimbursement",
+      "family": "approval-workflow",
+      "need": "Create a resettable employee expense-reimbursement environment for one small organization. Public tools must list and inspect expense claims, submit a draft claim, approve an eligible submitted claim, reject a submitted claim with a reason, and inspect status history. Approval must be refused for drafts, already-decided claims, and claims above a public approver limit, using stable error codes without collateral mutation. Reset must seed draft, approvable, over-limit, approved, and rejected claims, and accepted transitions must persist after close and reopen."
+    },
+    {
+      "id": "need-04-access-requests",
+      "domain": "IT application access",
+      "family": "approval-workflow",
+      "need": "Create a resettable IT application-access request environment. Public tools must list users, applications, current grants, and access requests; submit a request; approve a request when the requester is active and does not already hold the grant; deny a request; and inspect resulting grants. Duplicate grants, inactive users, unknown applications, and already-decided requests must be refused with stable public codes and no prohibited change. Reset must seed each regime and successful approvals must survive reopening."
+    },
+    {
+      "id": "need-05-support-sla",
+      "domain": "customer support tickets",
+      "family": "state-machine",
+      "need": "Create a resettable customer-support ticket environment with public priority and SLA state. Public tools must list and inspect customers and tickets, open a ticket, assign an unassigned ticket, add a public note, resolve an assigned ticket, and list overdue open tickets as of a deterministic clock. Invalid transitions such as resolving an unassigned or already-resolved ticket must return stable public errors without state mutation. Reset must seed normal, overdue, unassigned, assigned, and resolved cases, with updates persistent after reopen."
+    },
+    {
+      "id": "need-06-clinic-appointments",
+      "domain": "outpatient appointment scheduling",
+      "family": "resource-scheduling",
+      "need": "Create a resettable outpatient appointment-scheduling environment for one clinic. Public tools must list practitioners, patients, appointment slots, and appointments; book an open slot for an active patient; cancel a booked appointment; and inspect availability after changes. Double-booking, inactive-patient, past-slot, duplicate-booking, and already-cancelled requests must be refused with stable public error codes and no prohibited mutation. Reset must seed open, occupied, past, inactive, and cancellable regimes and persist accepted changes across reopen."
+    },
+    {
+      "id": "need-07-product-returns",
+      "domain": "retail returns and refunds",
+      "family": "transactional-policy",
+      "need": "Create a resettable retail return-authorization environment. Public tools must list and inspect orders, line items, return requests, and refund records; request a return for an eligible delivered item; approve a pending return; receive an approved return; and inspect the resulting refund. Requests outside a deterministic return window, duplicate returns, non-returnable items, and invalid transitions must fail with stable public codes and no collateral state change. Reset must seed eligible and refusal regimes and persist accepted transitions after reopening."
+    },
+    {
+      "id": "need-08-purchase-orders",
+      "domain": "procurement purchase orders",
+      "family": "approval-workflow",
+      "need": "Create a resettable purchase-order approval environment for one department. Public tools must list and inspect suppliers, budgets, requisitions, and purchase orders; submit a draft requisition; approve an eligible requisition within public budget and approver limits; reject one with a reason; and inspect committed budget. Over-budget, inactive-supplier, duplicate, draft, and already-decided operations must return stable errors without prohibited mutation. Reset must seed representative regimes and persist approvals across reopen."
+    },
+    {
+      "id": "need-09-incident-response",
+      "domain": "service incident management",
+      "family": "state-machine",
+      "need": "Create a resettable service-incident management environment. Public tools must list and inspect services, incidents, responders, and timelines; declare an incident for a degraded service; assign an available responder; acknowledge, mitigate, and resolve incidents through valid transitions; and list active incidents by severity. Invalid orderings, duplicate active incidents for the same service, unavailable responders, and already-resolved operations must fail with stable public codes and no collateral mutation. Reset must seed multiple lifecycle regimes and persistence across reopen."
+    },
+    {
+      "id": "need-10-subscription-cancellation",
+      "domain": "software subscriptions",
+      "family": "transactional-policy",
+      "need": "Create a resettable software-subscription cancellation and refund environment. Public tools must list and inspect customers, plans, subscriptions, invoices, cancellations, and refunds; cancel an active subscription; compute and issue a refund only when a public refund policy allows it; and inspect the final status. Already-cancelled, unpaid, expired-window, and duplicate-refund requests must return stable errors without prohibited mutation. Reset must seed refundable and non-refundable regimes and persist successful outcomes after reopen."
+    },
+    {
+      "id": "need-11-git-release-workspace",
+      "domain": "Git release preparation",
+      "family": "repository-filesystem",
+      "need": "Create a resettable real Git repository environment for release preparation. Public tools must list tracked files, inspect file content and repository status, update an allowed changelog file, create a commit only when staged content changed, inspect commit history, and report the current release marker. Attempts to edit protected files, create an empty commit, use an invalid release marker, or repeat the same release update must return stable public errors without unintended repository mutation. Reset must create deterministic clean and pending-change regimes using real Git objects and persist commits after reopen."
+    },
+    {
+      "id": "need-12-document-review",
+      "domain": "controlled document review",
+      "family": "repository-filesystem",
+      "need": "Create a resettable controlled-document review workspace backed by real files and revision history. Public tools must list documents, read exact content and metadata, submit a draft for review, record an approval or requested change, publish an approved revision, and inspect revision history. Publishing unapproved content, approving an already-decided revision, modifying locked published bytes, and unknown-document requests must fail with stable public codes and no collateral file change. Reset must seed draft, in-review, approved, rejected, and published regimes with persistence after reopen."
+    },
+    {
+      "id": "need-13-lab-chain-of-custody",
+      "domain": "laboratory samples",
+      "family": "state-machine",
+      "need": "Create a resettable laboratory sample chain-of-custody environment. Public tools must list and inspect samples, storage locations, custody events, and test requests; receive a collected sample, transfer it between allowed locations, start an eligible test, and record a result. Transfers from the wrong custodian, invalid lifecycle transitions, duplicate results, and unavailable storage must return stable public errors without prohibited mutation. Reset must seed collected, received, testing, completed, and invalid-transfer regimes, with accepted custody history persistent after reopen."
+    },
+    {
+      "id": "need-14-fleet-inspections",
+      "domain": "vehicle fleet compliance",
+      "family": "maintenance-policy",
+      "need": "Create a resettable small-fleet inspection environment. Public tools must list and inspect vehicles, mileage, inspection schedules, defects, and work restrictions; record an inspection, open a repair order for a blocking defect, clear a restriction only after qualifying repair, and list vehicles currently due or restricted. Premature inspection, duplicate open repair, unresolved-defect clearance, and unknown-vehicle operations must fail with stable public codes and no collateral mutation. Reset must seed due, not-due, restricted, and repaired regimes with persistence after reopen."
+    },
+    {
+      "id": "need-15-equipment-loans",
+      "domain": "campus equipment loans",
+      "family": "resource-scheduling",
+      "need": "Create a resettable campus equipment-loan environment. Public tools must list and inspect borrowers, equipment, reservations, and active loans; reserve available equipment for an eligible borrower; check out a valid reservation; return a loan; and list overdue loans at a deterministic time. Unavailable equipment, borrower limits, expired reservations, duplicate checkout, and already-returned requests must return stable public errors without unintended mutation. Reset must seed each regime and persist valid loans and returns after reopen."
+    },
+    {
+      "id": "need-16-insurance-claims",
+      "domain": "small insurance claims",
+      "family": "approval-workflow",
+      "need": "Create a resettable small insurance-claim review environment. Public tools must list and inspect policies, claims, submitted evidence, and decisions; submit a draft claim against an active policy; request missing evidence; approve an eligible complete claim within a public coverage limit; deny a claim with a public reason; and inspect payment status. Inactive-policy, duplicate-event, incomplete, over-limit, and already-decided actions must fail with stable codes and no prohibited mutation. Reset must seed representative regimes and persist decisions after reopen."
+    },
+    {
+      "id": "need-17-table-reservations",
+      "domain": "restaurant table reservations",
+      "family": "resource-scheduling",
+      "need": "Create a resettable restaurant table-reservation environment for one service day. Public tools must list and inspect tables, service slots, customers, reservations, and current capacity; create a reservation only when party size and slot capacity permit; modify a future reservation; cancel one; and inspect availability afterward. Over-capacity, duplicate-customer, past-slot, invalid-party-size, and already-cancelled requests must return stable public errors without collateral mutation. Reset must seed open, full, future, past, and cancellable regimes and persist accepted changes after reopen."
+    },
+    {
+      "id": "need-18-customs-documents",
+      "domain": "shipment customs documents",
+      "family": "document-policy",
+      "need": "Create a resettable shipment customs-document validation environment. Public tools must list and inspect shipments, required document types, uploaded document metadata, validation findings, and clearance status; upload metadata for an allowed document, validate completeness, record a correction, and clear a shipment only when all public requirements pass. Missing, expired, duplicate, mismatched, and already-cleared operations must return stable public codes and no prohibited mutation. Reset must seed complete and incomplete regimes and persist accepted corrections and clearance after reopen."
+    },
+    {
+      "id": "need-19-course-enrollment",
+      "domain": "course enrollment and waitlists",
+      "family": "resource-scheduling",
+      "need": "Create a resettable course enrollment and waitlist environment. Public tools must list and inspect students, courses, prerequisites, enrollments, capacities, and waitlists; enroll an eligible student when capacity exists; place an eligible student on a full-course waitlist; drop an enrollment; and promote the next valid waitlisted student. Missing prerequisite, duplicate enrollment, time conflict, full capacity, and invalid promotion requests must return stable public errors without collateral mutation. Reset must seed all regimes and persist valid transitions after reopen."
+    },
+    {
+      "id": "need-20-property-maintenance",
+      "domain": "rental property maintenance",
+      "family": "state-machine",
+      "need": "Create a resettable rental-property maintenance request environment. Public tools must list and inspect properties, tenants, maintenance requests, technicians, visits, and request history; open a request for an active tenancy; assign an available qualified technician; schedule a visit; record completion; and close a completed request. Duplicate open requests, inactive tenancy, unqualified technician, invalid transition, and already-closed operations must return stable public errors without unintended mutation. Reset must seed representative regimes and persist accepted updates after reopen."
+    }
+  ]
+}

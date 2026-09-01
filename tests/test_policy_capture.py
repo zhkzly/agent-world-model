@@ -504,7 +504,7 @@ def test_responses_request_matches_policy_and_private_reasoning_is_not_captured(
 
     assert capture.completion is not None and capture.completion.terminal_kind == "completed"
     assert factory_calls == [
-        {"api_key": "test-key", "base_url": "http://127.0.0.1:8317/v1", "max_retries": 0}
+        {"api_key": "test-key", "base_url": "http://127.0.0.1:8317/v1", "max_retries": 2}
     ]
     assert responses.requests[0]["model"] == driver.policy_spec.model_id
     assert responses.requests[0]["instructions"] == capture.public_input.system_prompt
