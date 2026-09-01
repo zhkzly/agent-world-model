@@ -199,7 +199,7 @@ def test_responses_loop_resends_unmodified_output_items_and_matching_tool_output
             {"queries": [{"query": "unfamiliar workflow", "focus": "NEED-001"}]},
         )
     ]
-    assert factory_calls == [(secret, "http://127.0.0.1:8317/v1", 0)]
+    assert factory_calls == [(secret, "http://127.0.0.1:8317/v1", 2)]
     first, second = client.responses.calls
     assert first["model"] == "gpt-5.6-luna"
     assert first["store"] is False
@@ -406,8 +406,10 @@ def test_fresh_evidence_reviewer_receives_only_need_bounded_evidence_and_brief(
     monkeypatch.setenv("OPENAI_API_KEY", "reviewer-secret")
     review_document = _review_document()
     client = _FakeClient([_FakeResponse("reviewer-1", [], json.dumps(review_document))])
+    factory_calls: list[tuple[str, str, int]] = []
 
     def factory(*, api_key: str, base_url: str, max_retries: int) -> _FakeClient:
+        factory_calls.append((api_key, base_url, max_retries))
         return client
 
     reviewer = BriefEvidenceReviewer(client_factory=factory)
@@ -415,6 +417,7 @@ def test_fresh_evidence_reviewer_receives_only_need_bounded_evidence_and_brief(
     review = reviewer.review(need=need, brief=_brief())
 
     assert review.clause_findings[0]["judgment"] == "supported"
+    assert factory_calls == [("reviewer-secret", "http://127.0.0.1:8317/v1", 2)]
     assert len(client.responses.calls) == 1
     request = client.responses.calls[0]
     rendered_input = repr(request["input"])

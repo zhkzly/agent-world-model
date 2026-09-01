@@ -613,7 +613,7 @@ def _run_tool_json_loop(
                 },
             )
     credential = _credential()
-    client = client_factory(api_key=credential, base_url=route.base_url, max_retries=0)
+    client = client_factory(api_key=credential, base_url=route.base_url, max_retries=2)
     history: list[Any] = [{"role": "user", "content": input_text}]
     next_phase = "agent"
     next_original_code = "budget_exhausted"
@@ -827,7 +827,7 @@ def _run_fresh_json_turn(
     ),
 ) -> dict[str, Any]:
     credential = _credential()
-    client = client_factory(api_key=credential, base_url=route.base_url, max_retries=0)
+    client = client_factory(api_key=credential, base_url=route.base_url, max_retries=2)
     history: list[Any] = [{"role": "user", "content": input_text}]
     next_original_code = "budget_exhausted"
     next_original_message = "no provider turns remaining"
