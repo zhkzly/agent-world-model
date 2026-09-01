@@ -238,7 +238,7 @@ class ResponsesPolicyDriver:
                     "type": "function",
                     "name": tool["name"],
                     "description": tool["description"],
-                    "parameters": tool["input_schema"],
+                    "parameters": _responses_parameters(cast(JSONObject, tool["input_schema"])),
                     "strict": True,
                 }
                 for tool in tools
@@ -255,6 +255,16 @@ class ResponsesPolicyDriver:
             },
             "store": False,
         }
+
+
+def _responses_parameters(value: JSONObject) -> JSONObject:
+    """Add only the mechanical empty-object members required by strict tools."""
+
+    schema = cast(JSONObject, json.loads(json.dumps(value, ensure_ascii=False)))
+    if schema.get("type") == "object" and "properties" not in schema and "required" not in schema:
+        schema["properties"] = {}
+        schema["required"] = []
+    return schema
 
 
 def capture_public_episode(

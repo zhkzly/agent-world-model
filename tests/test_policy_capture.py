@@ -11,6 +11,7 @@ from agent_env_foundry.agents import AgentRoute
 from agent_env_foundry.episodes import EpisodeDefect, PolicySpec, PublicEpisodeInput
 from agent_env_foundry.public_agent import (
     PUBLIC_AGENT_PROMPT_DIGEST,
+    PUBLIC_AGENT_SYSTEM_PROMPT,
     DriverDecision,
     PublicAgentFailure,
     PublicEpisodeRun,
@@ -529,6 +530,37 @@ def test_responses_request_matches_policy_and_private_reasoning_is_not_captured(
     assert reused.defect == EpisodeDefect("evidence", "policy_driver_reused", "policy_driver_start")
     assert len(responses.requests) == 2
     assert client.close_count == 1
+
+
+def test_responses_request_normalizes_mechanical_zero_argument_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    tool = _tool()
+    tool["input_schema"] = {"type": "object", "additionalProperties": False}
+    responses = Responses([_call_response()])
+    driver = ResponsesPolicyDriver.from_route(
+        AgentRoute(),
+        client_factory=lambda **_kwargs: Client(responses),
+    )
+    public_input = PublicEpisodeInput(
+        PUBLIC_AGENT_SYSTEM_PROMPT,
+        "List public items.",
+        {},
+        (tool,),
+        _answer_schema(),
+    )
+
+    driver.start(public_input)
+    driver.next_decision(())
+    parameters = responses.requests[0]["tools"][0]["parameters"]
+
+    assert parameters == {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {},
+        "required": [],
+    }
 
 
 def test_host_rejects_duplicate_call_ids() -> None:
