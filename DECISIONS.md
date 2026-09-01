@@ -221,3 +221,12 @@ complete before running the heterogeneous real cohort through Parquet and the
 pinned dataset. Both claims were revoked before commit. The current result is
 implementation-only: the GPU optimizer/digest/checkpoint/cold-load gate remains
 pending and CP1 is not physically complete.
+
+`s4-cp2-continuous-token|介入1|返工2|behavioral RED+exact CT/S3 Host+3 mutation licences+524 root/7 external+independent deletion review|红线违反1`
+
+The CP2 redline was allowing the first production draft to reach 459 lines after
+the explicit roughly-300-line guard. It was rejected before acceptance and
+reduced to one 336-line file whose runtime bridge is about 280 lines; independent
+review then removed the duplicate cold read and non-upstream bool guard. GPU
+rollout remains pending, and the pinned V1 default reward-worker overwrite of
+`None` is carried as a CP3 constraint rather than hidden by a CP2 fallback.
