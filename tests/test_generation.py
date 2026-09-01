@@ -37,6 +37,12 @@ class _Tools:
         self.closed = True
 
 
+def test_generation_reserves_a_post_mechanical_semantic_repair_turn() -> None:
+    import agent_env_foundry.generation as subject
+
+    assert subject.GenerationConfig().author.max_turns == 4
+
+
 def _install_success_stages(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[str]]:
     import agent_env_foundry.generation as subject
 

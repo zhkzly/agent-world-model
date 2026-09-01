@@ -203,7 +203,7 @@ runtime transferred across Git, SQLite and held-out maintenance authority, and
 the real Responses adapter plus scripted second driver used the same serial
 batch/Host path without trainer or service scope.
 
-`batch-env-task-harness|介入2|返工3|focused RED+5 mutation licences+full suite+real S1 Release+real S2 Product/Corpus|红线违反1`
+`batch-env-task-harness|介入2|返工3|focused RED+6 mutation licences+full suite+real S1 Release+real S2 Product/Corpus|红线违反1`
 
 The redline was a worker creating a 946-line idealized coordinator fixture
 after prolonged exploration. Main stopped it, deleted the file, and replaced

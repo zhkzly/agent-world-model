@@ -110,7 +110,8 @@ class GenerationConfig:
     builder: BuilderConfig = field(default_factory=BuilderConfig)
     author: BuilderConfig = field(
         default_factory=lambda: BuilderConfig(
-            uv_cache_dir=Path("/tmp/agent-env-foundry-author-uv-cache")
+            max_turns=4,
+            uv_cache_dir=Path("/tmp/agent-env-foundry-author-uv-cache"),
         )
     )
     qualification: QualificationBudget = field(default_factory=QualificationBudget)
