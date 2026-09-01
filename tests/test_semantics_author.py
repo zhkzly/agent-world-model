@@ -489,6 +489,65 @@ def test_frozen_catalog_feedback_reports_every_capability_field_together(
     assert "answer_fields" in message
 
 
+def test_semantics_contract_checks_answer_sources_inside_author_repair_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    expected = json.loads((workspace.root / EXPECTED_TASK_SEMANTICS_NAME).read_text())
+    item = expected["capabilities"][0]
+    capability = {
+        "capability_id": item["capability_id"],
+        "requirement_ids": item["requirement_ids"],
+        "workflow_ids": item["workflow_ids"],
+        "composition_rules": [],
+        "actor_role": item["actor_role"],
+        "task_kind": item["task_kind"],
+        "intent_label": item["intent_label"],
+        "protected_binding_schema": {"type": "object", "additionalProperties": True},
+        "public_descriptor_schema": {"type": "object", "additionalProperties": True},
+        "facets": [],
+        "conditions": [],
+        "answer_fields": [],
+        "supported_goal_kinds": ["atom"],
+        "rendering": {
+            "imperative": "increment",
+            "target_noun": "counter",
+            "answer_phrase": None,
+        },
+    }
+
+    class Transport:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def call(self, operation: str, _arguments: dict[str, Any]) -> Any:
+            if operation == "start_cases":
+                return [{"case_id": "default", "reset_input": None, "regime_tags": []}]
+            if operation == "capabilities":
+                return [capability]
+            raise AssertionError(operation)
+
+        def close(self, *, operation: str) -> None:
+            assert operation == "close"
+
+    monkeypatch.setattr(semantics_author_module, "_ChildTransport", Transport)
+    monkeypatch.setattr(
+        semantics_author_module,
+        "validate_answer_field_source_contract",
+        lambda *_args: (_ for _ in ()).throw(ValueError("source pointer sentinel")),
+        raising=False,
+    )
+
+    result = semantics_author_module._contract_check(
+        workspace,
+        BuilderConfig(uv_cache_dir=tmp_path / "cache"),
+    )
+
+    assert not result.passed
+    assert "source pointer sentinel" in result.stderr
+
+
 def test_runtime_import_probe_requires_own_source_and_rejects_actor(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

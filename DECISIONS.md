@@ -223,3 +223,9 @@ Qualification rule, S2 sampler or domain-specific instruction changed.
 The rejected approach inferred author ownership from a failed logical axis.
 That inference could make independent readers converge on one observed case,
 so it was removed before any Release; logical disagreements remain terminal.
+
+`batch-answer-source-placement|介入1|返工1|real Need-4 artifact+shared-validator RED+3 mutation licences+498 full tests|红线违反0`
+
+The unchanged AnswerField source validator now runs while the Semantics Author
+still has correction authority and again at final Qualification. The old
+Qualification-local copy was deleted; no source rule or admission gate changed.

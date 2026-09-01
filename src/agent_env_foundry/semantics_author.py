@@ -10,6 +10,7 @@ from typing import Any, cast
 
 from openai_codex import ApprovalMode, Codex, CodexConfig, Sandbox
 
+from agent_env_foundry.answer_sources import validate_answer_field_source_contract
 from agent_env_foundry.author_finding import AuthorFinding
 from agent_env_foundry.builder import (
     ACTOR_FACTORY,
@@ -25,6 +26,7 @@ from agent_env_foundry.project_identity import (
     compute_authored_project_digest,
     project_files,
 )
+from agent_env_foundry.qualification_contracts import public_surface_manifest_from_document
 from agent_env_foundry.release import canonical_bytes
 from agent_env_foundry.semantics import (
     CapabilitySpec,
@@ -409,6 +411,7 @@ def _contract_check(
             role="semantics",
         )
         public = _read_json(prepared.root / PUBLIC_SURFACE_NAME)
+        surface = public_surface_manifest_from_document(public)
         start_limit = 4
         raw_cases = transport.call("start_cases", {"seed": 0, "limit": start_limit})
         repeated_cases = transport.call("start_cases", {"seed": 0, "limit": start_limit})
@@ -446,7 +449,7 @@ def _contract_check(
             raise ValueError(json.dumps({"findings": findings}, ensure_ascii=False, sort_keys=True))
         validate_start_cases(
             tuple(cases),
-            start_schema=cast(dict[str, Any], public["start_schema"]),
+            start_schema=surface.start_schema,
             limit=start_limit,
         )
         catalog = validate_catalog(tuple(specs))
@@ -454,6 +457,7 @@ def _contract_check(
             _read_json(prepared.root / EXPECTED_TASK_SEMANTICS_NAME),
             catalog,
         )
+        validate_answer_field_source_contract(tuple(catalog.values()), surface)
     except Exception as exc:
         return CommandResult(
             "semantics_contract",
