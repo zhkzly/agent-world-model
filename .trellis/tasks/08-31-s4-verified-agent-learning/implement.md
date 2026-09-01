@@ -347,6 +347,7 @@ save/reload the checkpoint and continue a fresh S3 rollout.
 entrypoint: python -m verl.trainer.main_ppo
 trainer.use_v1: true
 trainer.v1.trainer_mode: sync
+actor_rollout_ref.rollout.agent.agent_loop_config_path: configs/s4/grpo_agent_loop_qwen3_0_6b.yaml
 trainer.v1.sampler.custom_sampler.path: pkg://agent_env_foundry.verl_agent_loop
 trainer.v1.sampler.custom_sampler.name: FoundryFailClosedReplayBuffer
 trainer.v1.sampler.sampler_kwargs.group_size: 2
@@ -367,6 +368,15 @@ GRPO input rows must include `data_source="s3_receipt"` and
 `reward_model={"ground_truth": null}` because the pinned naive manager reads
 both before calling the configured function. The function ignores them and
 uses only `extra_info.episode_id/rollout_receipt`.
+
+Add one native v0.9 AgentLoop list config at
+`configs/s4/grpo_agent_loop_qwen3_0_6b.yaml`. It contains exactly the existing
+`FoundryS3AgentLoop` target plus CP0 model/template/parser/commit pins,
+`max_provider_turns=12`, and an env-supplied semantic SFT checkpoint model ID.
+The trainer config points to this checked-in relative path. This second small
+file is required because `agent_loop_config_path` calls `OmegaConf.load` on a
+standalone list before Hydra instantiation; no registry/config framework is
+added.
 
 Freeze `G=2`. Add only `compute_s3_receipt_reward`, the strict private receipt
 reader it shares with `FoundryFailClosedReplayBuffer`, and that sampler inside

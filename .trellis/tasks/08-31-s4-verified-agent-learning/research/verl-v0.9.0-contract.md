@@ -103,3 +103,9 @@ service or trainer. CP3 must use that function only to cold-read the canonical
 receipt: return numeric S3 truth, raise on `null`/tamper, then have the custom
 sampler cross-check the same receipt against TransferQueue before materializing
 the one `G=2` group.
+
+The custom AgentLoop constructor arguments cannot be embedded in the PPO config:
+v0.9 `AgentLoopWorker` resolves `rollout.agent.agent_loop_config_path`, then
+`OmegaConf.load`s a standalone list and instantiates its selected entry. CP3
+therefore checks in one small exact-pin AgentLoop list config alongside the one
+GRPO trainer config; this is upstream-required wiring, not a Foundry registry.

@@ -44,7 +44,8 @@ tests/test_learning_data.py
 tests/test_verl_agent_loop.py
 
 one SFT config
-one GRPO config
+one GRPO trainer config
+one exact v0.9 AgentLoop instantiation config
 ```
 
 There is no `s4_evaluate.py`, split module, experiment package, custom trainer,

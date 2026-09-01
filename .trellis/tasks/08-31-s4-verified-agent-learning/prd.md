@@ -219,7 +219,7 @@ src/agent_env_foundry/verl_agent_loop.py
 
 scripts/s4_collect.py
 one SFT config
-one GRPO config
+one GRPO trainer config + one exact v0.9 AgentLoop instantiation config
 focused tests
 ```
 

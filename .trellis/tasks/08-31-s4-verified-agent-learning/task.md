@@ -115,3 +115,4 @@ Acceptance: four checkpoints pass real physical exits, mutation licences, drift 
 - Alternative rejected: stock default scoring, `reward.num_workers=0`, sentinel/zero abstention, survivor filtering, group enlargement or a new reward/trainer service.
 - Reconsider only if the pinned hooks cannot expose `extra_info`/TransferQueue fields proven in the exact-source review, or a new veRL pin changes those contracts.
 - CP3 plan correction review: ACCEPTED after replacing the sampler's bare class name with exact `pkg://` path/name keys and requiring standard input fields `data_source="s3_receipt"` plus `reward_model.ground_truth=null`.
+- CP3 native config correction: v0.9 loads AgentLoop constructor arguments only from a standalone `agent_loop_config_path` list, so the implementation may add exactly one small AgentLoop instantiation YAML beside the GRPO trainer YAML; no Python registry or generic config layer is authorized.
