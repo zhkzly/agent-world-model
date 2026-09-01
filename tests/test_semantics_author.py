@@ -172,6 +172,8 @@ def test_run_semantics_author_uses_codex_only_for_semantic_project_bytes(
         def run(self, prompt: str) -> Result:
             observed["prompt"] = prompt
             assert (workspace.root / "pyproject.toml").is_file()
+            assert "pytest" in (workspace.root / "pyproject.toml").read_text()
+            assert (workspace.root / "tests").is_dir()
             source = workspace.root / "src/generated_task_semantics/release.py"
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text("def make_semantics():\n    return object()\n")
@@ -218,9 +220,53 @@ def test_run_semantics_author_uses_codex_only_for_semantic_project_bytes(
     instructions = observed["thread"]["base_instructions"]
     assert "Do not write manifests, digests, verdicts, Tasks, rewards" in instructions
     assert "write the tasksemantics project" in observed["prompt"].casefold()
+    assert "tests/test_*.py" in observed["prompt"]
+    assert "pytest" in observed["prompt"]
     assert "verdict" not in observed["prompt"].casefold()
     assert stat.S_IMODE((workspace.root / PUBLIC_SURFACE_NAME).stat().st_mode) == 0o444
     workspace.verify_inputs()
+
+
+def test_semantics_checks_report_contract_and_missing_tests_together(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = workspace.root / "src/generated_task_semantics/release.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def make_semantics():\n    return object()\n")
+
+    def passed_run(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        phase: str,
+        config: BuilderConfig,
+        extra_env: dict[str, str] | None = None,
+        input_text: str | None = None,
+    ) -> CommandResult:
+        del cwd, config, extra_env, input_text
+        return CommandResult(phase, command, 0, "passed", "")
+
+    monkeypatch.setattr(semantics_author_module, "_run", passed_run)
+    monkeypatch.setattr(
+        semantics_author_module,
+        "_import_separation_check",
+        lambda *_args: CommandResult("import_separation", ("host",), 0, "passed", ""),
+    )
+    monkeypatch.setattr(
+        semantics_author_module,
+        "_contract_check",
+        lambda *_args: CommandResult("semantics_contract", ("host",), 1, "", "catalog mismatch"),
+    )
+
+    checks = semantics_author_module.run_semantics_checks(
+        workspace,
+        BuilderConfig(uv_cache_dir=tmp_path / "cache"),
+    )
+
+    failures = [item.phase for item in checks if not item.passed]
+    assert failures == ["semantics_contract", "tests"]
 
 
 def test_task_semantics_contract_separates_initial_truth_from_eligibility() -> None:

@@ -79,8 +79,10 @@ def run_verifier_author(
     prompt = (
         "Write the standalone Qualification Verifier project described by the immutable "
         "Host inputs. Implement independent native before/after evaluation in the fixed "
-        "generated_qualification_verifier.release:make_verifier factory. Framework checks "
-        "decide acceptance."
+        "generated_qualification_verifier.release:make_verifier factory. The Host already "
+        "installed pytest and created tests/. Before responding, complete the factory, "
+        "write diagnostic tests in tests/test_*.py, run pytest, and fix all failures. "
+        "Framework checks decide acceptance."
     )
     codex_home = prepared.root.parent / "verifier-codex-home"
     _require_fresh_codex_home(codex_home)
@@ -241,19 +243,15 @@ def run_verifier_checks(
     results.append(build)
     if not build.passed:
         return tuple(results)
+    results.append(_factory_check(prepared, config))
     tests = prepared.root / "tests"
     test_command = (str(prepared.root / ".venv/bin/python"), "-m", "pytest", "-q")
     if not tests.is_dir():
         results.append(CommandResult("tests", test_command, 2, "", "tests missing"))
+        prepared.verify_inputs()
         return tuple(results)
     tested = _run(test_command, cwd=prepared.root, phase="tests", config=config)
     results.append(tested)
-    if not tested.passed:
-        return tuple(results)
-    factory = _factory_check(prepared, config)
-    results.append(factory)
-    if not factory.passed:
-        return tuple(results)
     results.append(_source_check(prepared.root, phase="post_source_contract"))
     prepared.verify_inputs()
     return tuple(results)
@@ -386,33 +384,46 @@ def _require_fresh_codex_home(path: Path) -> None:
 
 
 def _initialize_project(root: Path, config: BuilderConfig) -> None:
-    if (root / "pyproject.toml").exists():
-        return
-    initialized = _run(
-        (
-            "uv",
-            "init",
-            "--package",
-            "--no-workspace",
-            "--vcs",
-            "none",
-            "--name",
-            "generated-qualification-verifier",
-            "--python",
-            "3.12",
-            str(root),
-        ),
-        cwd=root.parent,
-        phase="workspace_init",
+    if not (root / "pyproject.toml").exists():
+        initialized = _run(
+            (
+                "uv",
+                "init",
+                "--package",
+                "--no-workspace",
+                "--vcs",
+                "none",
+                "--name",
+                "generated-qualification-verifier",
+                "--python",
+                "3.12",
+                str(root),
+            ),
+            cwd=root.parent,
+            phase="workspace_init",
+            config=config,
+        )
+        if not initialized.passed:
+            raise VerifierAuthorFailure(
+                "workspace_init",
+                "verifier_uv_init_failed",
+                "uv init failed for the Verifier Author workspace",
+                command=initialized.to_document(),
+            )
+    scaffolded = _run(
+        ("uv", "add", "--dev", "pytest>=8.3,<10"),
+        cwd=root,
+        phase="workspace_test_scaffold",
         config=config,
     )
-    if not initialized.passed:
+    if not scaffolded.passed:
         raise VerifierAuthorFailure(
             "workspace_init",
-            "verifier_uv_init_failed",
-            "uv init failed for the Verifier Author workspace",
-            command=initialized.to_document(),
+            "verifier_test_scaffold_failed",
+            "Framework could not install the Verifier Author test dependency",
+            command=scaffolded.to_document(),
         )
+    (root / "tests").mkdir(exist_ok=True)
 
 
 def _project_files(root: Path) -> tuple[Path, ...]:

@@ -78,8 +78,10 @@ def run_semantics_author(
     prompt = (
         "Write the TaskSemantics project described by the immutable Host inputs. "
         "Implement release-specific native decoding and semantic records in the fixed "
-        "generated_task_semantics.release:make_semantics factory. Framework checks, not "
-        "your response, decide acceptance."
+        "generated_task_semantics.release:make_semantics factory. The Host already "
+        "installed pytest and created tests/. Before responding, complete the factory, "
+        "write diagnostic tests in tests/test_*.py, run pytest, and fix all failures. "
+        "Framework checks, not your response, decide acceptance."
     )
     codex_home = prepared.root.parent / "semantics-codex-home"
     _require_fresh_codex_home(codex_home)
@@ -268,16 +270,15 @@ def run_semantics_checks(
     results.append(build_result)
     if not build_result.passed:
         return tuple(results)
+    results.append(_contract_check(prepared, config))
     tests = prepared.root / "tests"
     test_command = (str(prepared.root / ".venv/bin/python"), "-m", "pytest", "-q")
     if not tests.is_dir():
         results.append(CommandResult("tests", test_command, 2, "", "tests missing"))
+        prepared.verify_inputs()
         return tuple(results)
     test_result = _run(test_command, cwd=prepared.root, phase="tests", config=config)
     results.append(test_result)
-    if not test_result.passed:
-        return tuple(results)
-    results.append(_contract_check(prepared, config))
     prepared.verify_inputs()
     return tuple(results)
 
@@ -295,33 +296,46 @@ def compute_semantics_project_digest(root: Path) -> str:
 
 
 def _initialize_project(root: Path, config: BuilderConfig) -> None:
-    if (root / "pyproject.toml").exists():
-        return
-    initialized = _run(
-        (
-            "uv",
-            "init",
-            "--package",
-            "--no-workspace",
-            "--vcs",
-            "none",
-            "--name",
-            "generated-task-semantics",
-            "--python",
-            "3.12",
-            str(root),
-        ),
-        cwd=root.parent,
-        phase="workspace_init",
+    if not (root / "pyproject.toml").exists():
+        initialized = _run(
+            (
+                "uv",
+                "init",
+                "--package",
+                "--no-workspace",
+                "--vcs",
+                "none",
+                "--name",
+                "generated-task-semantics",
+                "--python",
+                "3.12",
+                str(root),
+            ),
+            cwd=root.parent,
+            phase="workspace_init",
+            config=config,
+        )
+        if not initialized.passed:
+            raise SemanticsAuthorFailure(
+                "workspace_init",
+                "semantics_uv_init_failed",
+                "uv init failed for the Semantics Author workspace",
+                command=initialized.to_document(),
+            )
+    scaffolded = _run(
+        ("uv", "add", "--dev", "pytest>=8.3,<10"),
+        cwd=root,
+        phase="workspace_test_scaffold",
         config=config,
     )
-    if not initialized.passed:
+    if not scaffolded.passed:
         raise SemanticsAuthorFailure(
             "workspace_init",
-            "semantics_uv_init_failed",
-            "uv init failed for the Semantics Author workspace",
-            command=initialized.to_document(),
+            "semantics_test_scaffold_failed",
+            "Framework could not install the Semantics Author test dependency",
+            command=scaffolded.to_document(),
         )
+    (root / "tests").mkdir(exist_ok=True)
 
 
 def _project_files(root: Path) -> tuple[Path, ...]:

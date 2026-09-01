@@ -211,3 +211,9 @@ it with focused orchestration tests and physical actor/Qualification evidence.
 Remote inspection proved the existing Direct sampler remained the sole S2 path;
 real execution then closed one new Release and three assessed TaskPacks before
 the official 20-Need campaign freeze.
+
+`batch-author-context|介入1|返工1|cross-run roleplay trace+author scaffold RED+6 mutation licences+497 full tests|红线违反0`
+
+Agent-owned semantic errors remain Agent-owned, while deterministic pytest
+setup and complete same-turn validation feedback moved to Framework. No Need,
+Qualification rule, S2 sampler or domain-specific instruction changed.

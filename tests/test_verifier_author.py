@@ -39,6 +39,8 @@ def test_run_verifier_author_uses_one_fresh_codex_project_only(
 
         def run(self, prompt: str) -> Result:
             observed["prompt"] = prompt
+            assert "pytest" in (workspace.root / "pyproject.toml").read_text()
+            assert (workspace.root / "tests").is_dir()
             source = workspace.root / "src/generated_qualification_verifier/release.py"
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_text("def make_verifier():\n    return object()\n")
@@ -77,8 +79,52 @@ def test_run_verifier_author_uses_one_fresh_codex_project_only(
     assert observed["thread"]["sandbox"] is Sandbox.full_access
     assert set(observed["config"].env) == {"CODEX_HOME", "HOME", "UV_CACHE_DIR"}
     assert "TaskSemantics source" in observed["thread"]["base_instructions"]
+    assert "tests/test_*.py" in observed["prompt"]
+    assert "pytest" in observed["prompt"]
     assert "verdict" not in observed["prompt"].casefold()
     workspace.verify_inputs()
+
+
+def test_verifier_checks_report_factory_and_missing_tests_together(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    source = workspace.root / "src/generated_qualification_verifier/release.py"
+    source.parent.mkdir(parents=True)
+    source.write_text("def make_verifier():\n    return object()\n")
+
+    def passed_run(
+        command: tuple[str, ...],
+        *,
+        cwd: Path,
+        phase: str,
+        config: BuilderConfig,
+        extra_env: dict[str, str] | None = None,
+        input_text: str | None = None,
+    ) -> CommandResult:
+        del cwd, config, extra_env, input_text
+        return CommandResult(phase, command, 0, "passed", "")
+
+    monkeypatch.setattr(verifier_author_module, "_run", passed_run)
+    monkeypatch.setattr(
+        verifier_author_module,
+        "_import_separation_check",
+        lambda *_args: CommandResult("import_separation", ("host",), 0, "passed", ""),
+    )
+    monkeypatch.setattr(
+        verifier_author_module,
+        "_factory_check",
+        lambda *_args: CommandResult("verifier_contract", ("host",), 1, "", "factory mismatch"),
+    )
+
+    checks = verifier_author_module.run_verifier_checks(
+        workspace,
+        BuilderConfig(uv_cache_dir=tmp_path / "cache"),
+    )
+
+    failures = [item.phase for item in checks if not item.passed]
+    assert failures == ["verifier_contract", "tests"]
 
 
 def test_framework_rejects_actor_semantics_host_or_staged_view_runtime_access(
@@ -210,8 +256,8 @@ def test_framework_runs_complete_verifier_gate_in_candidate_environment(
         "sync",
         "import_separation",
         "build",
-        "tests",
         "verifier_contract",
+        "tests",
         "post_source_contract",
     ]
     tests_command = next(command for phase, command in observed if phase == "tests")
