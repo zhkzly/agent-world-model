@@ -182,7 +182,8 @@ runs after TransferQueue metadata sync and before materialization. It verifies:
 - root status is `finished`, never `failure`;
 - exactly frozen `G` sibling rows exist;
 - every sibling binds a cold S3 Episode and rollout receipt;
-- TransferQueue IDs/masks/reward and reward metadata match each cold receipt;
+- TransferQueue IDs/masks/`rm_scores` and `extra_fields` receipt pointers match
+  each cold receipt;
 - all receipt rewards are numeric `0.0/1.0` and match S3;
 - the group has nonzero variance.
 
@@ -217,6 +218,9 @@ algorithm.filter_groups.enable: false
 Each input row uses standard veRL plumbing
 `data_source="s3_receipt"` and `reward_model.ground_truth=null`; neither is
 reward authority or model-visible truth.
+CP2 numeric outputs already set `reward_score` and therefore skip the custom
+function; its reachable role is null/tamper-to-failure only. Numeric transport
+is validated at the sampler seam against `rm_scores` and the receipt.
 
 The exact model, rollout backend, device and distributed settings are ordinary
 resolved veRL config. Foundry does not wrap them.

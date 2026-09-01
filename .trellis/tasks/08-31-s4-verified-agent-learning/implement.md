@@ -384,8 +384,9 @@ reader it shares with `FoundryFailClosedReplayBuffer`, and that sampler inside
 returns a numeric receipt reward unchanged; abstain/tamper raises so V1 marks
 the prompt root failed. At the exact-pin `_sampleable_terminal_keys` gate, the
 sampler rejects failed/incomplete/non-numeric/all-equal groups and cross-checks
-TransferQueue response IDs/masks/reward metadata against both receipts before
-materialization. Never pad, refill, retry, filter survivors or replace siblings.
+TransferQueue response IDs/masks/`rm_scores` plus `extra_fields` receipt
+pointers against both receipts before materialization. Never pad, refill, retry,
+filter survivors or replace siblings.
 The two top-level no-refill/filter settings remain explicit configuration
 guards; because v0.9 does not forward them into a custom sampler, the subclass
 itself owns and tests the raise-only semantics using `sampler_kwargs.group_size`.
