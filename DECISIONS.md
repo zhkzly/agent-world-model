@@ -217,3 +217,10 @@ the official 20-Need campaign freeze.
 Agent-owned semantic errors remain Agent-owned, while deterministic pytest
 setup and complete same-turn validation feedback moved to Framework. No Need,
 Qualification rule, S2 sampler or domain-specific instruction changed.
+
+`batch-physical-feedback-route|介入1|返工1|real failed Qualification trace+authority-axis RED+2 mutation licences+499 full tests|红线违反0`
+
+Only evidence-rich `qualification_positive_failed` is routed back to the
+author that still owns the failed axis. The full binding/trace/results travel
+as feedback; unrelated Qualification errors remain terminal and no gate was
+weakened.
